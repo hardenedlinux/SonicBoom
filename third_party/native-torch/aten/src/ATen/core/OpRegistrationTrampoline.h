@@ -7,16 +7,16 @@
 
 namespace at::impl {
 
-class TORCH_API PythonOpRegistrationTrampoline final {
-  static std::atomic<c10::impl::PyInterpreter*> interpreter_;
+class TORCH_API OpRegistrationTrampoline final {
+  static std::atomic<c10::impl::SubstrateInterpreter*> interpreter_;
 
 public:
   //  Returns true if you successfully registered yourself (that means
   //  you are in the hot seat for doing the operator registrations!)
-  static bool registerInterpreter(c10::impl::PyInterpreter* /*interp*/);
+  static bool registerInterpreter(c10::impl::SubstrateInterpreter* /*interp*/);
 
   // Returns nullptr if no interpreter has been registered yet.
-  static c10::impl::PyInterpreter* getInterpreter();
+  static c10::impl::SubstrateInterpreter* getInterpreter();
 };
 
 } // namespace at::impl

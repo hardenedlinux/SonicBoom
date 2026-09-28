@@ -2,11 +2,11 @@
 
 namespace c10::impl {
 
-std::atomic<const PyInterpreter*> GPUTrace::gpuTraceState{nullptr};
+std::atomic<const SubstrateInterpreter*> GPUTrace::gpuTraceState{nullptr};
 
 bool GPUTrace::haveState{false};
 
-void GPUTrace::set_trace(const PyInterpreter* trace) {
+void GPUTrace::set_trace(const SubstrateInterpreter* trace) {
   static bool once_flag [[maybe_unused]] = [&]() {
     gpuTraceState.store(trace, std::memory_order_release);
     haveState = true;

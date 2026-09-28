@@ -1,8 +1,8 @@
 #pragma once
 
-#include <c10/core/impl/PyInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
 #include <c10/macros/Export.h>
-#include <c10/util/python_stub.h>
+#include <c10/util/object_stub.h>
 #include <utility>
 
 namespace c10 {
@@ -19,24 +19,24 @@ namespace c10 {
 //
 // It is INVALID to store a reference to a Tensor object in this way;
 // you should just use TensorImpl directly in that case!
-struct C10_API SafePyObject {
+struct C10_API SafeObject {
   // Steals a reference to data
-  SafePyObject(PyObject* data, c10::impl::PyInterpreter* pyinterpreter)
+  SafeObject(PyObject* data, c10::impl::SubstrateInterpreter* pyinterpreter)
       : data_(data), pyinterpreter_(pyinterpreter) {}
-  SafePyObject(SafePyObject&& other) noexcept
+  SafeObject(SafeObject&& other) noexcept
       : data_(std::exchange(other.data_, nullptr)),
         pyinterpreter_(other.pyinterpreter_) {}
   // For now it's not used, so we just disallow it.
-  SafePyObject& operator=(SafePyObject&&) = delete;
+  SafeObject& operator=(SafeObject&&) = delete;
 
-  SafePyObject(SafePyObject const& other)
+  SafeObject(SafeObject const& other)
       : data_(other.data_), pyinterpreter_(other.pyinterpreter_) {
     if (data_ != nullptr) {
       (*pyinterpreter_)->incref(data_);
     }
   }
 
-  SafePyObject& operator=(SafePyObject const& other) {
+  SafeObject& operator=(SafeObject const& other) {
     if (this == &other) {
       return *this; // Handle self-assignment
     }
@@ -51,16 +51,16 @@ struct C10_API SafePyObject {
     return *this;
   }
 
-  ~SafePyObject() {
+  ~SafeObject() {
     if (data_ != nullptr) {
       (*pyinterpreter_)->decref(data_);
     }
   }
 
-  c10::impl::PyInterpreter& pyinterpreter() const {
+  c10::impl::SubstrateInterpreter& pyinterpreter() const {
     return *pyinterpreter_;
   }
-  PyObject* ptr(const c10::impl::PyInterpreter* /*interpreter*/) const;
+  PyObject* ptr(const c10::impl::SubstrateInterpreter* /*interpreter*/) const;
 
   // stop tracking the current object, and return it
   PyObject* release() {
@@ -71,39 +71,39 @@ struct C10_API SafePyObject {
 
  private:
   PyObject* data_;
-  c10::impl::PyInterpreter* pyinterpreter_;
+  c10::impl::SubstrateInterpreter* pyinterpreter_;
 };
 
-// A newtype wrapper around SafePyObject for type safety when a python object
+// A newtype wrapper around SafeObject for type safety when a python object
 // represents a specific type. Note that `T` is only used as a tag and isn't
 // actually used for any true purpose.
 template <typename T>
-struct SafePyObjectT : private SafePyObject {
-  SafePyObjectT(PyObject* data, c10::impl::PyInterpreter* pyinterpreter)
-      : SafePyObject(data, pyinterpreter) {}
-  ~SafePyObjectT() = default;
-  SafePyObjectT(SafePyObjectT&& other) noexcept : SafePyObject(other) {}
-  SafePyObjectT(SafePyObjectT const&) = delete;
-  SafePyObjectT& operator=(SafePyObjectT const&) = delete;
-  SafePyObjectT& operator=(SafePyObjectT&&) = delete;
+struct SafeObjectT : private SafeObject {
+  SafeObjectT(PyObject* data, c10::impl::SubstrateInterpreter* pyinterpreter)
+      : SafeObject(data, pyinterpreter) {}
+  ~SafeObjectT() = default;
+  SafeObjectT(SafeObjectT&& other) noexcept : SafeObject(other) {}
+  SafeObjectT(SafeObjectT const&) = delete;
+  SafeObjectT& operator=(SafeObjectT const&) = delete;
+  SafeObjectT& operator=(SafeObjectT&&) = delete;
 
-  using SafePyObject::ptr;
-  using SafePyObject::pyinterpreter;
-  using SafePyObject::release;
+  using SafeObject::ptr;
+  using SafeObject::pyinterpreter;
+  using SafeObject::release;
 };
 
-// Like SafePyObject, but non-owning.  Good for references to global PyObjects
+// Like SafeObject, but non-owning.  Good for references to global PyObjects
 // that will be leaked on interpreter exit.  You get a copy constructor/assign
 // this way.
 struct C10_API SafePyHandle {
   SafePyHandle() : data_(nullptr), pyinterpreter_(nullptr) {}
-  SafePyHandle(PyObject* data, c10::impl::PyInterpreter* pyinterpreter)
+  SafePyHandle(PyObject* data, c10::impl::SubstrateInterpreter* pyinterpreter)
       : data_(data), pyinterpreter_(pyinterpreter) {}
 
-  c10::impl::PyInterpreter& pyinterpreter() const {
+  c10::impl::SubstrateInterpreter& pyinterpreter() const {
     return *pyinterpreter_;
   }
-  PyObject* ptr(const c10::impl::PyInterpreter* /*interpreter*/) const;
+  PyObject* ptr(const c10::impl::SubstrateInterpreter* /*interpreter*/) const;
   void reset() {
     data_ = nullptr;
     pyinterpreter_ = nullptr;
@@ -114,7 +114,7 @@ struct C10_API SafePyHandle {
 
  private:
   PyObject* data_;
-  c10::impl::PyInterpreter* pyinterpreter_;
+  c10::impl::SubstrateInterpreter* pyinterpreter_;
 };
 
 } // namespace c10

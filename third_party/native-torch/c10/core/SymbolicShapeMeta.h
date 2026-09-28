@@ -23,7 +23,7 @@ class C10_API SymbolicShapeMeta {
 
   bool strides_valid_ = true; // e.g. for sparse where there are no strides
 
-  // storing concrete sizes/strides for C++ FakeTensors without a PyInterpreter
+  // storing concrete sizes/strides for C++ FakeTensors without a SubstrateInterpreter
   // this is what owns the vector for sizes/strides
   // so that sizes_custom()/strides_custom() can return a proper IntArrayRef
 

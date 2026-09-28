@@ -5,7 +5,7 @@
 #include <c10/core/DeviceType.h>
 #include <c10/core/StorageMaterializer.h>
 #include <c10/core/SymInt.h>
-#include <c10/core/impl/PyObjectSlot.h>
+#include <c10/core/impl/ObjectSlot.h>
 #include <c10/macros/Export.h>
 #include <c10/util/Exception.h>
 #include <c10/util/UniqueVoidPtr.h>
@@ -289,11 +289,11 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
     return received_cuda_;
   }
 
-  impl::PyObjectSlot* pyobj_slot() {
+  impl::ObjectSlot* pyobj_slot() {
     return &pyobj_slot_;
   }
 
-  const impl::PyObjectSlot* pyobj_slot() const {
+  const impl::ObjectSlot* pyobj_slot() const {
     return &pyobj_slot_;
   }
 
@@ -408,7 +408,7 @@ struct C10_API StorageImpl : public c10::intrusive_ptr_target {
   // Pluggable materialization hook. See MaterializeFn in StorageMaterializer.h.
   MaterializeFn materialize_fn_ = nullptr;
   Allocator* allocator_;
-  impl::PyObjectSlot pyobj_slot_;
+  impl::ObjectSlot pyobj_slot_;
   std::unique_ptr<StorageExtraMeta> extra_meta_ = nullptr;
 };
 

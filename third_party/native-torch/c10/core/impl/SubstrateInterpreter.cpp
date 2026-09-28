@@ -1,10 +1,10 @@
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/core/TensorImpl.h>
-#include <c10/core/impl/PyInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunused-parameter")
 namespace c10::impl {
 
-struct NoopPyInterpreterVTable final : public PyInterpreterVTable {
+struct NoopSubstrateInterpreterVTable final : public SubstrateInterpreterVTable {
   std::string name() const override {
     return "<unloaded interpreter>";
   }
@@ -13,7 +13,7 @@ struct NoopPyInterpreterVTable final : public PyInterpreterVTable {
 
   void decref(PyObject* pyobj) const override {} // do nothing
 
-  bool try_incref(const c10::impl::PyObjectSlot& pyobj_slot) const override {
+  bool try_incref(const c10::impl::ObjectSlot& pyobj_slot) const override {
     return false;
   }
 
@@ -151,9 +151,9 @@ struct NoopPyInterpreterVTable final : public PyInterpreterVTable {
 
 // If `noop_vtable` goes out of scope first, other objects will have dangling
 // reference to it.
-static NoopPyInterpreterVTable noop_vtable;
+static NoopSubstrateInterpreterVTable noop_vtable;
 
-void PyInterpreter::disarm() noexcept {
+void SubstrateInterpreter::disarm() noexcept {
   vtable_ = &noop_vtable;
 }
 

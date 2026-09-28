@@ -1,6 +1,6 @@
 #pragma once
 
-#include <c10/core/SafePyObject.h>
+#include <c10/core/SafeObject.h>
 #include <c10/macros/Export.h>
 
 namespace c10::impl {
@@ -12,7 +12,7 @@ enum class TorchDispatchModeKey : int8_t {
   NUM_MODE_KEYS
 };
 
-using PyObject_TorchDispatchMode = SafePyObjectT<TorchDispatchModeKey>;
+using PyObject_TorchDispatchMode = SafeObjectT<TorchDispatchModeKey>;
 
 struct C10_API TorchDispatchModeTLS {
   // This API is NOT invariant safe.

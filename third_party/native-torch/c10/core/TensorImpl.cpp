@@ -6,7 +6,7 @@
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
-#include <c10/core/impl/PyInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
 #include <c10/core/impl/TorchDispatchModeTLS.h>
 #include <c10/util/Logging.h>
 #include <c10/util/accumulate.h>
@@ -360,10 +360,10 @@ c10::SymBool TensorImpl::sym_is_contiguous_custom(
     // TO reduce BC breaking and reduce having to introduce
     // sym_is_contiguous. call is_contiguous when tensor does not
     if (C10_UNLIKELY(has_symbolic_sizes_strides_)) {
-      return (*c10::impl::getGlobalPyInterpreter())
+      return (*c10::impl::getGlobalSubstrateInterpreter())
           ->sym_is_contiguous(this, memory_format);
     } else {
-      return (*c10::impl::getGlobalPyInterpreter())
+      return (*c10::impl::getGlobalSubstrateInterpreter())
           ->is_contiguous(this, memory_format);
     }
   }
@@ -373,7 +373,7 @@ c10::SymBool TensorImpl::sym_is_contiguous_custom(
 
 bool TensorImpl::is_strides_like_custom(at::MemoryFormat memory_format) const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomStrides))) {
-    return (*c10::impl::getGlobalPyInterpreter())
+    return (*c10::impl::getGlobalSubstrateInterpreter())
         ->is_strides_like(this, memory_format);
   }
   return is_strides_like_default(memory_format);
@@ -381,7 +381,7 @@ bool TensorImpl::is_strides_like_custom(at::MemoryFormat memory_format) const {
 
 c10::SymBool TensorImpl::sym_is_non_overlapping_and_dense_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomStrides))) {
-    return (*c10::impl::getGlobalPyInterpreter())
+    return (*c10::impl::getGlobalSubstrateInterpreter())
         ->is_non_overlapping_and_dense(this);
   }
   return sym_is_non_overlapping_and_dense_default();
@@ -392,7 +392,7 @@ IntArrayRef TensorImpl::sizes_custom() const {
   // because in order to return a ref you need to have smth owning it and for
   // SymInts this is not materialized yet
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->sizes(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->sizes(this);
   }
   if (C10_UNLIKELY(has_symbolic_sizes_strides_)) {
     // guard_int() the SymInts to materialize an int64_t vector owned by
@@ -406,28 +406,28 @@ IntArrayRef TensorImpl::sizes_custom() const {
 
 c10::SymIntArrayRef TensorImpl::sym_sizes_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->sym_sizes(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->sym_sizes(this);
   }
   return sym_sizes_default();
 }
 
 c10::SymInt TensorImpl::sym_numel_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->sym_numel(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->sym_numel(this);
   }
   return sym_numel_default();
 }
 
 c10::SymIntArrayRef TensorImpl::sym_strides_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomStrides))) {
-    return (*c10::impl::getGlobalPyInterpreter())->sym_strides(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->sym_strides(this);
   }
   return sym_strides_default();
 }
 
 c10::Device TensorImpl::device_custom() const {
   if (C10_UNLIKELY(python_custom_device_)) {
-    return (*c10::impl::getGlobalPyInterpreter())->device(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->device(this);
   }
   if (C10_UNLIKELY(extra_meta_ && extra_meta_->fake_device_.has_value())) {
     if (c10::impl::tls_is_dispatch_key_excluded(DispatchKey::Fake)) {
@@ -445,7 +445,7 @@ IntArrayRef TensorImpl::strides_custom() const {
   // because in order to return a ref you need to have smth owning it and for
   // SymInts this is not materialized yet
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomStrides))) {
-    return (*c10::impl::getGlobalPyInterpreter())->strides(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->strides(this);
   }
   if (C10_UNLIKELY(has_symbolic_sizes_strides_)) {
     // same reasoning as sizes_custom() above
@@ -456,21 +456,21 @@ IntArrayRef TensorImpl::strides_custom() const {
 
 int64_t TensorImpl::dim_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->dim(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->dim(this);
   }
   return dim_default();
 }
 
 int64_t TensorImpl::numel_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->numel(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->numel(this);
   }
   return numel_default();
 }
 
 c10::Layout TensorImpl::layout_custom() const {
   if (C10_UNLIKELY(python_custom_layout_)) {
-    return (*c10::impl::getGlobalPyInterpreter())->layout(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->layout(this);
   }
   // TODO: fix this
   TORCH_CHECK(
@@ -481,7 +481,7 @@ c10::Layout TensorImpl::layout_custom() const {
 int64_t TensorImpl::storage_offset_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
     // TODO: fix this
-    return (*c10::impl::getGlobalPyInterpreter())
+    return (*c10::impl::getGlobalSubstrateInterpreter())
         ->sym_storage_offset(this)
         .guard_int(__FILE__, __LINE__);
   }
@@ -490,7 +490,7 @@ int64_t TensorImpl::storage_offset_custom() const {
 
 c10::SymInt TensorImpl::sym_storage_offset_custom() const {
   if (C10_UNLIKELY(matches_python_custom(SizesStridesPolicy::CustomSizes))) {
-    return (*c10::impl::getGlobalPyInterpreter())->sym_storage_offset(this);
+    return (*c10::impl::getGlobalSubstrateInterpreter())->sym_storage_offset(this);
   }
   return sym_storage_offset_default();
 }
@@ -573,7 +573,7 @@ c10::intrusive_ptr<TensorImpl> TensorImpl::shallow_copy_and_detach_core(
   } else if (
       key_set_.has(DispatchKey::Python) &&
       !c10::impl::tls_is_dispatch_key_excluded(DispatchKey::Python)) {
-    r = (*c10::impl::getGlobalPyInterpreter())->detach(this);
+    r = (*c10::impl::getGlobalSubstrateInterpreter())->detach(this);
   }
   if (r) {
     if (!r->is_inference()) {

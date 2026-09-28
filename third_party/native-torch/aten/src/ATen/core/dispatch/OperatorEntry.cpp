@@ -672,7 +672,7 @@ std::string OperatorEntry::dumpComputedTable() const {
   return std::move(oss).str();
 }
 
-void OperatorEntry::setReportErrorCallback_(std::unique_ptr<c10::SafePyObject> callback) {
+void OperatorEntry::setReportErrorCallback_(std::unique_ptr<c10::SafeObject> callback) {
   report_error_callback_ = std::move(callback);
 }
 

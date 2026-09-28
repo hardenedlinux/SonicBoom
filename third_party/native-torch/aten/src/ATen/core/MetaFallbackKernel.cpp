@@ -1,5 +1,5 @@
 #include <ATen/core/dispatch/Dispatcher.h>
-#include <c10/core/impl/PyInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
 #include <torch/library.h>
 
 namespace at::impl {

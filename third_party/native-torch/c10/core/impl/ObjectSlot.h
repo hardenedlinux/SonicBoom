@@ -1,8 +1,8 @@
 #pragma once
 
-#include <c10/core/impl/PyInterpreter.h>
-#include <c10/core/impl/PyInterpreterHooks.h>
-#include <c10/util/python_stub.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreterHooks.h>
+#include <c10/util/object_stub.h>
 #include <optional>
 
 #include <atomic>
@@ -13,9 +13,9 @@ class PyObjectPreservation;
 
 namespace c10::impl {
 
-struct C10_API PyObjectSlot {
+struct C10_API ObjectSlot {
  public:
-  PyObjectSlot() : pyobj_(nullptr) {}
+  ObjectSlot() : pyobj_(nullptr) {}
 
   PyObject* load_pyobj() const {
     return pyobj_.load(std::memory_order_acquire);
@@ -27,7 +27,7 @@ struct C10_API PyObjectSlot {
 
   bool has_unique_reference() const {
     PyObject* pyobj = load_pyobj();
-    return pyobj != nullptr && (*getGlobalPyInterpreter())->refcnt(pyobj) == 1;
+    return pyobj != nullptr && (*getGlobalSubstrateInterpreter())->refcnt(pyobj) == 1;
   }
 
   void clear() {
@@ -44,16 +44,16 @@ struct C10_API PyObjectSlot {
     // NB: This is a no-op on x86/x86-64
     std::atomic_thread_fence(std::memory_order_acquire);
     PyObject* obj = load_pyobj();
-    (*c10::impl::getGlobalPyInterpreter())->incref(obj);
+    (*c10::impl::getGlobalSubstrateInterpreter())->incref(obj);
   }
 
   void decref() const noexcept {
     PyObject* obj = load_pyobj();
-    (*c10::impl::getGlobalPyInterpreter())->decref(obj);
+    (*c10::impl::getGlobalSubstrateInterpreter())->decref(obj);
   }
 
   bool try_incref() const noexcept {
-    PyInterpreter* interp = c10::impl::getGlobalPyInterpreter();
+    SubstrateInterpreter* interp = c10::impl::getGlobalSubstrateInterpreter();
     if (C10_UNLIKELY(!interp)) {
       return false;
     }
@@ -62,7 +62,7 @@ struct C10_API PyObjectSlot {
 
  private:
   // The PyObject representing this Tensor or nullptr. Ownership is managed
-  // by intrusive_ptr. By the time the PyObjectSlot is destroyed, this
+  // by intrusive_ptr. By the time the ObjectSlot is destroyed, this
   // reference is already dead.
   std::atomic<PyObject*> pyobj_;
 

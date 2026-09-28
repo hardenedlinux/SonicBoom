@@ -5,8 +5,8 @@
 #include <ATen/core/function_schema.h>
 #include <ATen/core/ivalue.h>
 #include <c10/core/DispatchKey.h>
-#include <c10/core/PyHandleCache.h>
-#include <c10/core/SafePyObject.h>
+#include <c10/core/HandleCache.h>
+#include <c10/core/SafeObject.h>
 #include <c10/util/Metaprogramming.h>
 #include <c10/util/flat_hash_map.h>
 
@@ -221,7 +221,7 @@ class TORCH_API OperatorEntry final {
   SafeKernelFunction getComputedKernelForDispatchKey(DispatchKey k) const;
   // Returns all the operator tags added at the time of registration
   const std::vector<at::Tag>& getTags() const;
-  void setReportErrorCallback_(std::unique_ptr<c10::SafePyObject> callback);
+  void setReportErrorCallback_(std::unique_ptr<c10::SafeObject> callback);
 
   template <typename F>
   PyObject* getPythonOp(F slow_accessor) const {
@@ -237,7 +237,7 @@ class TORCH_API OperatorEntry final {
   std::array<KernelFunction, c10::num_runtime_entries> dispatchTable_;
   DispatchKeyExtractor dispatchKeyExtractor_;
   // Pointer to the torch.ops.ns.op.overload object for speed
-  c10::PyHandleCache py_cache_;
+  c10::HandleCache py_cache_;
 
   // kernels_ stores all registered kernels for the corresponding dispatch key
   // and catchAllKernels_ stores the catch-all kernels.
@@ -299,7 +299,7 @@ class TORCH_API OperatorEntry final {
   std::optional<CppSignatureWithDebug> sym_cpp_signature_;
 
   // A Python custom error handler for OperatorEntry::reportError
-  std::unique_ptr<c10::SafePyObject> report_error_callback_;
+  std::unique_ptr<c10::SafeObject> report_error_callback_;
 
   // Whether this operator needs to be observed with RecordFunction
   const bool is_observed_;

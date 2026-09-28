@@ -8,7 +8,7 @@
 #include <c10/macros/Export.h>
 #include <c10/util/ArrayRef.h>
 #include <c10/util/intrusive_ptr.h>
-#include <c10/util/python_stub.h>
+#include <c10/util/object_stub.h>
 #include <string>
 #include <vector>
 
@@ -19,7 +19,7 @@ struct IValue;
 class OperatorHandle;
 struct TensorImpl;
 namespace impl {
-struct PyObjectSlot;
+struct ObjectSlot;
 } // namespace impl
 } // namespace c10
 
@@ -31,7 +31,7 @@ using Stack = std::vector<c10::IValue>;
 
 namespace c10::impl {
 
-struct C10_API PyInterpreter;
+struct C10_API SubstrateInterpreter;
 
 // Note [Python interpreter tag]
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -57,7 +57,7 @@ struct C10_API PyInterpreter;
 // multiple interpreters, we must take care not to accidentally pass a
 // PyObject from one interpreter with another interpreter.
 //
-// To prevent these mixups, we introduce a PyInterpreter "tag" (object with
+// To prevent these mixups, we introduce a SubstrateInterpreter "tag" (object with
 // a vtable), which specifies a specific Python interpreter.
 //
 //  - Any given object can be associated with AT MOST one Python interpreter.
@@ -66,7 +66,7 @@ struct C10_API PyInterpreter;
 //    we can request the interpreter to perform operations for us, if
 //    necessary).
 //
-//  - It can be recorded with a PyObject (PyInterpreterObject) so that
+//  - It can be recorded with a PyObject (SubstrateInterpreterObject) so that
 //    we know what interpreter the object is associated with, and we can
 //    raise an error if you try to use the PyObject from the wrong
 //    interpreter context.
@@ -95,13 +95,13 @@ struct C10_API PyInterpreter;
 // virtual methods very dangerous, because the vtable may be garbage at that
 // point (on a good day, you might get "pure virtual method called").
 //
-// The idea to solve this problem is we always leak PyInterpreters (so they
+// The idea to solve this problem is we always leak SubstrateInterpreters (so they
 // always stay live even after dlclose), and make sure we can disarm their
-// virtual methods by indirecting through a separate PyInterpreterVTable
+// virtual methods by indirecting through a separate SubstrateInterpreterVTable
 // object.  This can be replaced with a no-op vtable from libc10.so, which
 // is guaranteed to stick around until the bitter end.
 //
-// NB: The downside with representing PyInterpreter tags as full objects is that
+// NB: The downside with representing SubstrateInterpreter tags as full objects is that
 // it takes an extra word on TensorImpl.  If tags were instead just integer
 // indices, on 64-bit architectures we could pack the tag and PyObject together
 // into a single atomic word.  On 32-bit architectures we could simply say that
@@ -109,20 +109,20 @@ struct C10_API PyInterpreter;
 // interpreter tag is attempted to be set).
 //
 // The difficulty with this scheme is we need to maintain an out-of-line table
-// to get at the PyInterpreters so that we can do virtual method calls on them,
+// to get at the SubstrateInterpreters so that we can do virtual method calls on them,
 // and registration/deregistration to this table must be done in a thread safe
-// manner.  This can be easily done if the number of possible PyInterpreters is
+// manner.  This can be easily done if the number of possible SubstrateInterpreters is
 // small enough (e.g., 8-bit integer) by simply preallocating an array of
 // sufficient size to hold all possible interpreters.  Surely 128 threads is
 // more than enough for anyone!
 //
 // I didn't decide to do this technique at the moment, because the extra word
-// added by the PyInterpreter tag takes us to 24 words, which means that we
+// added by the SubstrateInterpreter tag takes us to 24 words, which means that we
 // still fit inside three eight word cache lines.  If you need to penny pinch
 // another word consider doing this!
 
-struct C10_API PyInterpreterVTable {
-  virtual ~PyInterpreterVTable() = default;
+struct C10_API SubstrateInterpreterVTable {
+  virtual ~SubstrateInterpreterVTable() = default;
 
   // Report the name of this interpreter
   virtual std::string name() const = 0;
@@ -132,7 +132,7 @@ struct C10_API PyInterpreterVTable {
   // Run Py_DECREF on a PyObject.  We DO NOT assume the GIL is held on call.
   virtual void decref(PyObject* pyobj) const = 0;
   // Run PyUnstable_TryIncRef on a PyObject if it's not NULL.
-  virtual bool try_incref(const c10::impl::PyObjectSlot& pyobj_slot) const = 0;
+  virtual bool try_incref(const c10::impl::ObjectSlot& pyobj_slot) const = 0;
   // Run Py_REFCNT on a PyObject.
   virtual size_t refcnt(PyObject* pyobj) const = 0;
 
@@ -226,19 +226,19 @@ struct C10_API PyInterpreterVTable {
   virtual void reset_backward_hooks(const TensorImpl* self) const = 0;
 };
 
-struct C10_API PyInterpreter {
-  const PyInterpreterVTable* vtable_;
+struct C10_API SubstrateInterpreter {
+  const SubstrateInterpreterVTable* vtable_;
 
-  PyInterpreter(const PyInterpreterVTable* vtable) : vtable_(vtable) {}
+  SubstrateInterpreter(const SubstrateInterpreterVTable* vtable) : vtable_(vtable) {}
 
-  const PyInterpreterVTable& operator*() const noexcept {
+  const SubstrateInterpreterVTable& operator*() const noexcept {
     return *vtable_;
   }
-  const PyInterpreterVTable* operator->() const noexcept {
+  const SubstrateInterpreterVTable* operator->() const noexcept {
     return vtable_;
   }
 
-  // Disarm this PyInterpreter, making all of its methods noops.
+  // Disarm this SubstrateInterpreter, making all of its methods noops.
   // The vtable pointer is not an atomic at the moment, which means
   // a disarm() invocation that is concurrent with active destructors
   // is not thread safe and will trigger TSAN.  My hope is that this

@@ -1,16 +1,16 @@
 #pragma once
 
-#include <c10/core/impl/PyInterpreter.h>
+#include <c10/core/impl/SubstrateInterpreter.h>
 #include <c10/macros/Macros.h>
 #include <c10/util/DeadlockDetection.h>
 #include <c10/util/Exception.h>
-#include <c10/util/python_stub.h>
+#include <c10/util/object_stub.h>
 
 #include <atomic>
 
 namespace c10 {
 
-// A PyHandleCache represents a cached pointer from a C++ object to
+// A HandleCache represents a cached pointer from a C++ object to
 // a Python object that represents that object analogously in Python.
 // Upon a cache hit, the relevant object can be retrieved after a test
 // and then a memory load.  Two conditions must hold to be able to use this
@@ -36,9 +36,9 @@ namespace c10 {
 // the relevant state in the Python library, rather than in the non-Python
 // library (although in many cases, this is not convenient, as there may
 // not be a way to conveniently index based on the object.)
-class PyHandleCache {
+class HandleCache {
  public:
-  PyHandleCache() = default;
+  HandleCache() = default;
 
   // Attempt to fetch the pointer from the cache, if the PyObject
   // matches.  If it doesn't exist, or the cache entry is not valid,

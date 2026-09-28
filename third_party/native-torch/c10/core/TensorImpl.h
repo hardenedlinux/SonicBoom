@@ -8,7 +8,7 @@
 #include <c10/core/InferenceMode.h>
 #include <c10/core/Layout.h>
 #include <c10/core/MemoryFormat.h>
-#include <c10/core/SafePyObject.h>
+#include <c10/core/SafeObject.h>
 #include <c10/core/ScalarType.h>
 #include <c10/core/ScalarTypeToTypeMeta.h>
 #include <c10/core/Storage.h>
@@ -17,7 +17,7 @@
 #include <c10/core/SymIntArrayRef.h>
 #include <c10/core/SymbolicShapeMeta.h>
 #include <c10/core/WrapDimMinimal.h>
-#include <c10/core/impl/PyObjectSlot.h>
+#include <c10/core/impl/ObjectSlot.h>
 #include <c10/core/impl/SizesAndStrides.h>
 #include <c10/macros/Export.h>
 #include <c10/macros/Macros.h>
@@ -232,12 +232,12 @@ struct C10_API BackendMeta : intrusive_ptr_target {
 // this doesn't have caching because we're not implementing it
 // no in_kernel_invocation_manager since that's handled by dispatch keys in C++
 struct C10_API FakeTensorMode {
-  std::shared_ptr<c10::SafePyObject> shape_env_;
-  std::shared_ptr<c10::SafePyObject> fake_tensor_converter_;
+  std::shared_ptr<c10::SafeObject> shape_env_;
+  std::shared_ptr<c10::SafeObject> fake_tensor_converter_;
 
   FakeTensorMode(
-      std::shared_ptr<c10::SafePyObject> shape_env,
-      std::shared_ptr<c10::SafePyObject> converter)
+      std::shared_ptr<c10::SafeObject> shape_env,
+      std::shared_ptr<c10::SafeObject> converter)
       : shape_env_(std::move(shape_env)),
         fake_tensor_converter_(std::move(converter)) {}
 };
@@ -2158,11 +2158,11 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
     version_counter_.bump();
   }
 
-  impl::PyObjectSlot* pyobj_slot() {
+  impl::ObjectSlot* pyobj_slot() {
     return &pyobj_slot_;
   }
 
-  const impl::PyObjectSlot* pyobj_slot() const {
+  const impl::ObjectSlot* pyobj_slot() const {
     return &pyobj_slot_;
   }
 
@@ -2918,7 +2918,7 @@ struct C10_API TensorImpl : public c10::intrusive_ptr_target {
 
   c10::VariableVersion version_counter_;
 
-  impl::PyObjectSlot pyobj_slot_;
+  impl::ObjectSlot pyobj_slot_;
 
   c10::impl::SizesAndStrides sizes_and_strides_;
 
@@ -3103,7 +3103,7 @@ struct TargetTraits<
 //    storage pointer
 //    autograd metadata pointer
 //    version counter pointer
-//    PyObjectSlot
+//    ObjectSlot
 //    SizesAndStrides size/pointer
 //    SizesAndStrides sizes (pre-allocated 0)
 //    SizesAndStrides sizes (pre-allocated 1)
