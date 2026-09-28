@@ -770,3 +770,152 @@ The v0 operator subset is the union of:
 
 M1 registers neither set as real kernels; the proof registers `aten::relu`
 directly. Layer 1 adapters are out of scope (next phase).
+
+## 17. M2 — Layer 2 Stable Interface Boundary (implemented)
+
+**Status:** M2 boundary complete. Establishes the first real Layer 2 / Layer 1
+boundary: a stable, compilable, testable **Native Torch** public API (`nt::`)
+under `core/include/sonicboom/` that exposes **zero** native-torch types, plus a
+Layer 1 adapter (`core/layer1/`) that bridges it to the M1 dispatcher. This is
+architectural proof, not new functionality. `dispatch_proof` continues to pass.
+
+### A. Public API (Layer 2, `core/include/sonicboom/`, namespace `nt`)
+
+No `c10::`/`at::`/`ATen` type is reachable from any public header (verified by
+grep; only comment mentions remain). New types, all SonicBoom-owned:
+
+| Header | Type(s) |
+|---|---|
+| `backend.h` | `BackendId { uint16_t value; int32_t priority; }` + `BackendId::cpu()`; `enum class Functionality { Dense, Sparse, Quantized, Autograd }` |
+| `scalar_type.h` | `enum class ScalarType` (v0 dtypes) |
+| `device.h` | `enum class DeviceType { CPU }`; `struct Device { type; index; }` + `Device::cpu()` |
+| `layout.h` | `enum class Layout { Strided, Sparse }` |
+| `memory_format.h` | `enum class MemoryFormat { Contiguous, Preserve, ChannelsLast }` |
+| `scalar.h` | `Scalar` = `std::variant<int64_t, double, bool>` + `is*`/`to*` |
+| `value.h` | `Value` = `std::variant` over Native Torch-owned types + `ValueKind`; `is*`/`to*` accessors |
+| `argument.h` | `enum class ArgKind` (15 kinds) + `Argument { name; kind; }` |
+| `schema.h` | `OperatorSchema { name; overload_name; arguments; returns; }` + `num_args()`/`num_returns()` |
+| `argument_list.h` | `ArgumentList` / `ResultList` (Layer-2-owned `std::vector<Value>` wrapper; not `c10::Stack`) |
+| `operator_handle.h` | `OperatorName` + `OperatorHandle` (pimpl) + `find_operator()` |
+| `registration.h` | `KernelFn`, `RegistrationHandle` (RAII), `define_operator()`, `register_kernel()` |
+| `tensor.h` | `Tensor` (pimpl) + `empty(sizes, dtype)` factory |
+| `allocator.h` | `Allocator` interface (C-compatible deleter `void(*)(void*,void*)`, no `std::function`) |
+| `sonicboom.h` | umbrella re-export |
+
+**Key decisions:**
+- **Namespace** `nt` (per M2 directive); directory stays `core/include/sonicboom/`
+  with include prefix `<sonicboom/...>`. Dir-vs-namespace mismatch is intentional
+  and cheap to rename later.
+- **`Value` is a variant, not `c10::IValue`.** Alternative order in `data_`
+  matches `ValueKind` index 0 == None.
+- **`Tensor` is an opaque pimpl** (`std::shared_ptr<detail::TensorImpl>`), with
+  `detail::Adapter` as friend. `detail::TensorImpl` is SonicBoom-owned (holds an
+  `at::Tensor` inside the adapter); the c10 `TensorImpl`/`StorageImpl`/
+  `intrusive_ptr` never appear in Layer 2.
+- **`Scalar`/`Value` carry an `int` overload** in addition to `int64_t`/`double`/
+  `bool`, because an `int` literal is otherwise ambiguous between the three
+  (verified: `S(42)` is ill-formed without it).
+
+### B. Layer 1 adapter (`core/layer1/adapter/` + `core/layer1/registration/`)
+
+The only SonicBoom-owned code that uses c10/ATen headers (PRIVATE include dirs in
+`core/CMakeLists.txt`). Internal header `adapter/adapter.h` defines
+`detail::TensorImpl`, `detail::OperatorHandleImpl`, `detail::RegistrationState`,
+the `detail::Adapter` friend, and all conversion decls.
+
+| Source | Responsibility |
+|---|---|
+| `scalar_type.cpp`, `device.cpp`, `layout.cpp`, `memory_format.cpp`, `scalar.cpp` | value-type conversions ↔ c10 |
+| `value.cpp` | `nt::Value ↔ c10::IValue` |
+| `schema.cpp` | `nt::Argument/OperatorSchema ↔ c10::Argument/c10::FunctionSchema` |
+| `argument_list.cpp` | `nt::ArgumentList ↔ c10::Stack` |
+| `operator_handle.cpp` | lookup + boxed `call` |
+| `tensor.cpp` | `Tensor` accessors + `empty` factory via `make_cpu_tensor` |
+| `backend.cpp` | `(BackendId, Functionality) → c10::DispatchKey` |
+| `registration/registration.cpp` | `define_operator` (→ `registerDef`), `register_kernel` (→ `registerImpl`) |
+
+**Known c10 semantics recorded during implementation:**
+
+1. **`c10::OperatorHandle` has no `defined()`** — validity is `hasSchema()`.
+2. **CPU device index normalization:** `c10` reports a CPU tensor's device as
+   index `-1` (meaning "current/default"), so `from_aten(Device)` maps CPU →
+   index `0` to match `Device::cpu()`.
+3. **Stateful kernel registration** uses
+   `BoxedKernel::makeFromFunctor<NtKernel>(...)` +
+   `KernelFunction::makeFromBoxedKernel(...)` (an `NtKernel : c10::OperatorKernel`
+   functor bridging `nt::KernelFn` onto the boxed stack), because
+   `makeFromBoxedFunction<&fn>()` cannot capture the `nt::KernelFn` pointer.
+
+### C. Dispatch mapping
+
+v0 is single-backend (CPU), so "highest-priority applicable backend wins" is
+trivially satisfied. The adapter maps:
+
+```text
+(BackendId::cpu(), Functionality::Dense)     -> DispatchKey::CPU
+(BackendId::cpu(), Functionality::Sparse)    -> DispatchKey::Sparse
+(BackendId::cpu(), Functionality::Quantized) -> DispatchKey::QuantizedCPU
+(BackendId::cpu(), Functionality::Autograd)  -> DispatchKey::Autograd
+```
+
+`OperatorHandle::call` dispatches to `DispatchKey::CPU` explicitly (same as the
+M1 proof); generic backend selection from a tensor's key set is deferred.
+
+### D. Build wiring
+
+- `core/CMakeLists.txt`: static lib `sonicboom` (globbed adapter `.cpp`), PUBLIC
+  include `core/include`, PRIVATE native-torch include roots, links `aten_core`
+  PRIVATE (so native-torch does not leak to Layer 2 consumers). SonicBoom-owned
+  code compiles at C++23 (global default); native-torch keeps its own C++17.
+- Root `CMakeLists.txt`: `add_subdirectory(core)` + `add_subdirectory(tests/core)`.
+- `tests/core/CMakeLists.txt`: 5 executables linking `sonicboom`.
+
+### E. Tests (5 focused executables, `assert`-based, no framework)
+
+| Test | Proves |
+|---|---|
+| `test_schema.cpp` (A) | `OperatorSchema` build → register → lookup → round-trip |
+| `test_value.cpp` (B) | `Value` kind/`is*`/`to*` accessors (all variant arms) |
+| `test_operator.cpp` (C) | `define_operator` + `register_kernel` + `call` boxed end-to-end (double→double) |
+| `test_backend.cpp` (D) | `BackendId` value/priority/equality + highest-priority selection |
+| `test_tensor.cpp` (E) | `empty` factory + `Tensor` accessors; no `TensorImpl` in scope |
+
+All tests include only `<sonicboom/...>`; the Value↔IValue and BackendId→key
+mappings are exercised end-to-end via tests C/E rather than exposed.
+
+### F. Leakage checklist
+
+- Layer 2 PyTorch internal leakage: **NO** (no `c10::`/`at::`/`ATen` token outside
+  comments in `core/include/`; no native `#include`).
+- New native-torch dependency beyond the M1 closure: **NO** (only existing
+  `c10`/`aten_core`; no new migrated source).
+- Python / fmt / CUDA / mobile: **NO** each.
+- `dispatch_proof` (M1): **still passes**.
+
+## 18. M2 audit (frozen)
+
+- M2 semantic API audit completed.
+- All public Layer 2 headers were inspected with their transitive include
+  closure.
+- Layer 2 compiler-level firewall verified.
+- All 6 binaries pass: M1 `dispatch_proof` + 5 M2 tests.
+- No code changes were required by the audit.
+- No new dependency beyond the existing M1 `c10`/`aten_core` closure.
+- No Python, fmt, CUDA, or mobile dependency.
+- Layer 2 semantics are backend-independent.
+- PyTorch-specific translation remains confined to Layer 1.
+- `nt::OperatorHandle` was explicitly reviewed and confirmed as a genuine
+  Native Torch abstraction rather than a leaked c10 handle.
+- CPU device index `-1 → 0` normalization was explicitly reviewed and confirmed
+  as intentional Native Torch semantics.
+
+Two DESIGN GAPs recorded, not fixed (both non-blocking for v0):
+
+1. `ScalarType`/`Layout`/`MemoryFormat` round-trip through `c10::IValue` is
+   lossy in the adapter (c10 stores them as an `Int` IValue, so `from_aten`
+   degrades them to `Value(Int)`).
+2. `OperatorHandle` lifetime is coupled to registration in the current v0
+   invariant (the c10 handle is a non-owning view into the dispatcher list;
+   v0 never deregisters, so it is unexercised).
+
+Final verdict: **M2 FREEZE READY**.

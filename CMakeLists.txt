@@ -22,3 +22,10 @@ option(SONICBOOM_USE_CUDA "Enable CUDA support (deferred — not in v0)" OFF)
 # with its own language constraints (C++17) and CPU-only; its headers must not
 # leak into SonicBoom's public Layer 2 interface.
 add_subdirectory(third_party/native-torch)
+
+# SonicBoom core: Layer 2 public API (core/include/sonicboom/) + Layer 1 adapter
+# (core/layer1/). The adapter is the only SonicBoom-owned code that uses c10/ATen.
+add_subdirectory(core)
+
+# M2 Layer 2 boundary tests.
+add_subdirectory(tests/core)
