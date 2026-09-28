@@ -983,3 +983,50 @@ All six binaries PASS: M1 `dispatch_proof`, M2 `test_schema`, `test_value`,
 `test_operator`, `test_backend`, `test_tensor`.
 
 Final verdict: **M3 FREEZE READY — Python bridge requires no modification**.
+
+## 20. M4 — c10 `env.cpp` fmt Dependency Isolation (complete)
+
+**Objective:** keep the Native Torch v0 Linux c10 closure fmt-free by isolating
+the `fmt` usage in `c10/util/env.cpp`. Verified complete — no further source
+change was required (the guard was already staged with the M1 foundation,
+commit `dc7f01b`).
+
+### A. Root cause
+
+Upstream `c10/util/env.cpp` includes `<fmt/format.h>` unconditionally, but
+`fmt::format` is only actually invoked in the `_MSC_VER` (Windows) branches of
+`set_env` and `unset_env`. On POSIX the code uses `setenv`/`unsetenv` directly,
+so the fmt include is dead on Linux. Because the v0 closure does not ship the
+fmt header, the unconditional include would have forced a Linux fmt dependency.
+
+### B. Minimal change
+
+| File | Old | New | Reason |
+|---|---|---|---|
+| `c10/util/env.cpp` | `#include <fmt/format.h>` unconditional | `#include <fmt/format.h>` guarded by `#ifdef _MSC_VER` | fmt is used only on the Windows `_MSC_VER` path; the guard removes the Linux fmt dependency without changing behavior |
+
+### C. Platform boundary
+
+Linux / g++-13 / C++17 is the v0 target; g++ does not define `_MSC_VER`
+(verified: `g++ -dM -E` shows it undefined), so the fmt include and the
+`fmt::format` calls are compiled out. The existing Windows/MSVC behavior is
+preserved untouched inside the `_MSC_VER` guard.
+
+### D. fmt dependency proof
+
+- No `{fmt}` symbols (`fmt::` / `fmt::vXX` mangled names) in `libc10.a`,
+  `libaten_core.a`, or `libsonicboom.a`.
+- `ldd` on all six binaries shows no `libfmt`.
+- No fmt target or link in any `CMakeLists.txt`; `signal_handler.cpp` and
+  `tempfile.cpp` (the other unconditional fmt users) remain excluded.
+
+### E. Test result
+
+All six binaries PASS: M1 `dispatch_proof`, M2 `test_schema`, `test_value`,
+`test_operator`, `test_backend`, `test_tensor`.
+
+### F. Dependency checklist
+
+Python: NO — fmt: NO — CUDA: NO — mobile: NO.
+
+Final verdict: **M4 FREEZE READY**.
