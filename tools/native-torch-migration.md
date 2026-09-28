@@ -919,3 +919,67 @@ Two DESIGN GAPs recorded, not fixed (both non-blocking for v0):
    v0 never deregisters, so it is unexercised).
 
 Final verdict: **M2 FREEZE READY**.
+
+## 19. M3 — c10 Python-Bridge Dependency Audit (complete)
+
+**Objective:** determine whether any c10 Python-bridge source file needs
+modification to maintain the Native Torch v0 build closure. Result: none do. The
+bridge may remain in the source tree; it requires no modification.
+
+### A. Python bridge inventory
+
+| File | Role | In v0 closure? | Why |
+|---|---|---|---|
+| `c10/core/impl/PyInterpreter.{h,cpp}` | interpreter dispatch interface | **compiled** (in closure) | `TensorImpl`/trampoline compile closure; Python-free |
+| `c10/core/impl/PyInterpreterHooks.{h,cpp}` | interpreter hook dispatch | **compiled** | same; Python-free |
+| `c10/core/impl/PyObjectSlot.h` | per-TensorImpl object slot | **in closure** (header) | included by `TensorImpl` |
+| `c10/core/impl/PythonDispatcherTLS.{h,cpp}` | `__torch_dispatch__` TLS | **compiled** | Python-free |
+| `c10/core/SafePyObject.{h,cpp}` | opaque `PyObject*` owner | **compiled** | Python-free |
+| `c10/core/PyHandleCache.h` | interpreter handle cache | **in closure** (header) | Python-free |
+| `c10/util/python_stub.h` | opaque `PyObject` forward decl | **in closure** (header) | the reason none of the above need Python |
+| `aten/src/ATen/core/PythonOpRegistrationTrampoline.{h,cpp}` | op registration trampoline | **compiled** (COPY, un-excluded) | self-contained `PyInterpreter*` holder |
+| `aten/src/ATen/core/PythonFallbackKernel.{h,cpp}` | Python dispatch fallback | **outside closure** | excluded from `aten_core` |
+
+### B. Build/include evidence
+
+- `c10` target globs `c10/core/*.cpp` (recursive); the four Python-bridge
+  `.cpp` files (PyInterpreter, PyInterpreterHooks, PythonDispatcherTLS,
+  SafePyObject) are compiled — confirmed by their `.o` files under
+  `c10.dir/`. They are not excluded.
+- `aten_core` target excludes `PythonFallbackKernel.cpp` (and
+  `VariableFallbackKernel.cpp` / `VariableHooksInterface.cpp`) via a REGEX
+  filter; `PythonOpRegistrationTrampoline.cpp` is compiled (COPY, §16.D).
+- `c10/util/python_stub.h` is exactly:
+  ```cpp
+  struct _object;
+  using PyObject = _object;
+  ```
+  and is included by `SafePyObject.h`, `PyHandleCache.h`, `PyInterpreter.h`, and
+  `PyObjectSlot.h` — never `<Python.h>`.
+- `grep` finds no `#include <Python.h>` / `<pybind11>` / `<python3>` anywhere in
+  `c10/core`, `c10/util`, or `aten/src/ATen/core`.
+- `nm` shows no undefined Python C API symbols in `libc10.a` / `libaten_core.a`;
+  `ldd dispatch_proof` shows no `libpython`.
+
+### C. Modification assessment
+
+All Python-bridge files: **modification required = NO**. The c10-level bridge is
+compiled but Python-free (opaque `PyObject*`); the aten-level fallback is outside
+the closure. No source file was modified by M3.
+
+### D. Python runtime assessment
+
+| Dependency | Present? |
+|---|---|
+| `Python.h` | NO |
+| `libpython` | NO |
+| Python C API | NO |
+| `pybind11` | NO |
+| Python bindings | NO |
+
+### E. Test result
+
+All six binaries PASS: M1 `dispatch_proof`, M2 `test_schema`, `test_value`,
+`test_operator`, `test_backend`, `test_tensor`.
+
+Final verdict: **M3 FREEZE READY — Python bridge requires no modification**.
