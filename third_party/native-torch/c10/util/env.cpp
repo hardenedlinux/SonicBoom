@@ -1,6 +1,11 @@
 #include <c10/util/Exception.h>
 #include <c10/util/env.h>
+// fmt::format is used only in the Windows (_MSC_VER) set/unset_env paths; on
+// POSIX setenv/unsetenv are used directly. Guard the include so the CPU-only
+// v0 build does not need the fmt library. (SonicBoom manifest M4.)
+#ifdef _MSC_VER
 #include <fmt/format.h>
+#endif
 #include <cstdlib>
 #include <mutex>
 #include <shared_mutex>

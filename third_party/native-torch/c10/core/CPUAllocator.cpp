@@ -3,8 +3,12 @@
 #include <c10/core/DeviceType.h>
 #include <c10/core/alignment.h>
 #include <c10/core/impl/alloc_cpu.h>
+// c10/mobile (caching/profiling allocator) is out of v0 scope (manifest M5);
+// it backs the mobile QNNPACK/XNNPACK guard-byte allocator only.
+#ifdef C10_MOBILE
 #include <c10/mobile/CPUCachingAllocator.h>
 #include <c10/mobile/CPUProfilingAllocator.h>
+#endif
 #include <c10/util/Logging.h>
 
 // TODO: rename flag to C10
@@ -72,6 +76,7 @@ ProfiledCPUMemoryReporter& profiledCPUMemoryReporter() {
 // PreGuardBytes: Number of guard bytes to allocate before the allocation.
 // PostGuardBytes: Number of guard bytes to allocate after the allocation.
 
+#ifdef C10_MOBILE
 template <uint32_t PreGuardBytes, uint32_t PostGuardBytes>
 class DefaultMobileCPUAllocator final : public at::Allocator {
  public:
@@ -153,6 +158,7 @@ class DefaultMobileCPUAllocator final : public at::Allocator {
     default_copy_data(dest, src, count);
   }
 };
+#endif // C10_MOBILE
 
 void NoDelete(void* /*unused*/) {}
 
@@ -172,14 +178,13 @@ void SetCPUAllocator(at::Allocator* alloc, uint8_t priority) {
 //            returned to the user.
 // Post-guard: 16 bytes for XNNPACK.
 
+#ifdef C10_MOBILE
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-magic-numbers,cppcoreguidelines-avoid-non-const-global-variables)
 static DefaultMobileCPUAllocator<gAlignment, 16u> g_mobile_cpu_allocator;
 
 at::Allocator* GetDefaultMobileCPUAllocator() {
   return &g_mobile_cpu_allocator;
 }
-
-#ifdef C10_MOBILE
 
 at::Allocator* GetDefaultCPUAllocator() {
   return GetDefaultMobileCPUAllocator();

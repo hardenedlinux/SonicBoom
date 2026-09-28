@@ -19,7 +19,11 @@ TORCH_API std::ostream& print(
     const Tensor& tensor,
     int64_t linesize);
 inline std::ostream& operator<<(std::ostream & out, const Tensor & t) {
-  return print(out,t,80);
+  // SonicBoom M1 ADAPT: upstream delegates to at::print (fmt-based tensor
+  // pretty-printing, deferred). v0 emits a minimal placeholder so the
+  // dispatcher core stays fmt-free (manifest M4).
+  (void)t;
+  return out << "Tensor";
 }
 TORCH_API void print(const Tensor & t, int64_t linesize=80);
 

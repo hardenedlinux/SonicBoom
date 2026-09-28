@@ -1,0 +1,25 @@
+#pragma once
+
+// ATen/Config.h — SonicBoom-supplied (manifest M2).
+//
+// Deterministic CPU-only configuration for the v0 build. Generated from this
+// Config.h.in by SonicBoom CMake; do not edit the generated file. No upstream
+// generated build output is used.
+//
+// CUDA / MKL / cuDNN / MIOpen / ROCm are all disabled: they are deferred
+// manifest amendments, not v0 requirements.
+
+#define AT_CUDNN_ENABLED() 0
+#define AT_MKL_ENABLED() 0
+#define AT_MKLDNN_ENABLED() 0
+#define AT_MIOPEN_ENABLED() 0
+#define AT_ROCM_ENABLED() 0
+#define AT_NNPACK_ENABLED() 0
+#define AT_FFTW_ENABLED() 0
+#define AT_BUILD_WITH_BLAS() 0
+#define AT_BLAS_GENERIC() 1
+#define AT_EXPERIMENTAL_SOCKS() 0
+#define CAFFE2_STATIC_LINK_CUDA() 0
+#define USE_CUDA() 0
+#define USE_ROCM() 0
+#define USE_DISTRIBUTED() 0
