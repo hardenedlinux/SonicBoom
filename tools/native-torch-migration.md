@@ -1030,3 +1030,104 @@ All six binaries PASS: M1 `dispatch_proof`, M2 `test_schema`, `test_value`,
 Python: NO — fmt: NO — CUDA: NO — mobile: NO.
 
 Final verdict: **M4 FREEZE READY**.
+
+## 21. M5 — c10/mobile Dependency Isolation (complete)
+
+**Objective:** keep the Native Torch v0 Linux closure free of any `c10/mobile`
+dependency while preserving normal desktop/Linux CPU allocation semantics.
+Verified complete — no further source change was required (the mobile guard was
+already staged with the M1 foundation, commit `dc7f01b`).
+
+### A. Root cause
+
+Upstream `c10/core/CPUAllocator.cpp` reaches `c10/mobile` through a
+mobile-only allocation path:
+
+```text
+c10/core/CPUAllocator.cpp
+    #include <c10/mobile/CPUCachingAllocator.h>      (unconditional upstream)
+    #include <c10/mobile/CPUProfilingAllocator.h>
+        ↓
+    DefaultMobileCPUAllocator<PreGuard,PostGuard>    (guard-byte allocator)
+        ↓
+    GetThreadLocalCachingAllocator / GetThreadLocalProfilingAllocator
+    GetThreadLocalAllocationPlanner
+        ↓
+    c10/mobile (thread-local caching / profiling / allocation-planning)
+```
+
+The mobile allocator exists upstream to add QNNPACK/XNNPACK guard bytes and
+thread-local caching/profiling, selected as the default CPU allocator on mobile
+builds. It is not required for the desktop `DefaultCPUAllocator`, which calls
+`c10::alloc_cpu`/`c10::free_cpu` directly.
+
+### B. Exact dependency path
+
+The only `c10/mobile` reference in the entire migrated tree is
+`c10/core/CPUAllocator.cpp`:
+
+```text
+line 8   #ifdef C10_MOBILE
+line 9   #include <c10/mobile/CPUCachingAllocator.h>
+line 10  #include <c10/mobile/CPUProfilingAllocator.h>
+line 79  #ifdef C10_MOBILE  → DefaultMobileCPUAllocator (lines 80-161)
+line 181 #ifdef C10_MOBILE  → g_mobile_cpu_allocator + GetDefaultMobileCPUAllocator
+line 193 #else              → desktop g_cpu_alloc + GetDefaultCPUAllocator
+line 206 #endif
+```
+
+`C10_MOBILE` is defined only on Android/iOS
+(`torch/headeronly/macros/Macros.h` lines 607-615: `__ANDROID__`, or
+`__APPLE__` with `TARGET_IPHONE_SIMULATOR || TARGET_OS_SIMULATOR ||
+TARGET_OS_IPHONE`). Neither is defined on Linux g++-13.
+
+### C. Minimal change
+
+Already applied in `dc7f01b` (M1 staging) — no change this task:
+
+| File | Old | New | Reason |
+|---|---|---|---|
+| `c10/core/CPUAllocator.cpp` | mobile includes / `DefaultMobileCPUAllocator` / `g_mobile_cpu_allocator` compiled unconditionally | all guarded behind `#ifdef C10_MOBILE`; desktop `DefaultCPUAllocator` selected via `#else` | the mobile allocator only adds QNNPACK/XNNPACK guard bytes + thread-local caching/profiling (out of v0 scope); the desktop allocator is independent |
+
+### D. Desktop / mobile boundary
+
+- **In v0 closure (desktop):** `DefaultCPUAllocator` (`allocate` →
+  `c10::alloc_cpu`, `ReportAndDelete` → `free_cpu`, `raw_deleter`,
+  `copy_data`), `GetDefaultCPUAllocator()` → `&g_cpu_alloc`,
+  `REGISTER_ALLOCATOR(DeviceType::CPU, &g_cpu_alloc)`, `ProfiledCPUMemoryReporter`
+  (memory statistics/hooks), and the desktop caching-allocator registration
+  API (`cpu_caching_alloc`, `cpu_caching_alloc_priority`, `GetCPUCachingAllocator`,
+  `SetCPUCachingAllocator`).
+- **Outside v0 closure (mobile):** `c10/mobile/` was never migrated (the
+  directory does not exist in the tree); `DefaultMobileCPUAllocator`,
+  thread-local caching/profiling, allocation-planning, and guard bytes are all
+  compiled out.
+
+### E. Dependency proof
+
+- `C10_MOBILE` is undefined on Linux g++-13 (defined only under `__ANDROID__`
+  or iOS `__APPLE__` in `Macros.h`).
+- CMake `C10_SOURCES` globs only `c10/core/*.cpp` + `c10/util/*.cpp`; no
+  `c10/mobile` source is compiled; `CXX_DEFINES` is only `-DC10_BUILD_MAIN_LIB`
+  (no `-DC10_MOBILE`).
+- The `.d` dependency file for `CPUAllocator.cpp.o` lists no `c10/mobile`
+  header.
+- `nm -C` on `libc10.a`, `libaten_core.a`, `libsonicboom.a` shows no mobile
+  symbol: no `c10::CPUCachingAllocator::`, `c10::CPUProfilingAllocator::`,
+  `DefaultMobileCPUAllocator`, `GetThreadLocalCachingAllocator`,
+  `GetThreadLocalProfilingAllocator`, `GetThreadLocalAllocationPlanner`,
+  `GetDefaultMobileCPUAllocator`, or `g_mobile_cpu_allocator`.
+- Logical closure: the build succeeds even though `c10/mobile/` does not exist,
+  so the `#ifdef C10_MOBILE` include path is never reached.
+
+### F. Test result
+
+All six binaries PASS: M1 `dispatch_proof`, M2 `test_schema`, `test_value`,
+`test_operator`, `test_backend`, `test_tensor`.
+
+### G. Dependency checklist
+
+Python: NO — fmt: NO — CUDA: NO — mobile: NO (mobile source is absent from the
+tree entirely; the v0 build does not depend on it).
+
+Final verdict: **M5 FREEZE READY**.
