@@ -18,6 +18,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Backend selection. Only CPU is in v0 scope.
 option(SONICBOOM_USE_CUDA "Enable CUDA support (deferred — not in v0)" OFF)
 
+# SonicCross regeneration hook: optional build-time code generator for the
+# native-torch sources. Exposes the `generate-native-torch` target only when
+# guild/SonicCross is available; normal builds use the checked-in generated/
+# tree and never require SonicCross.
+include(tools/generation/GenerateNativeTorch.cmake)
+
 # The native-torch implementation dependency (c10 + aten/core). It is built
 # with its own language constraints (C++17) and CPU-only; its headers must not
 # leak into SonicBoom's public Layer 2 interface.

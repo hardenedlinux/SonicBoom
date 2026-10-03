@@ -1,0 +1,30 @@
+# SonicCross generation lock — the frozen, reproducible inputs for the
+# generated native-torch C++ baseline under third_party/native-torch/generated/.
+#
+# Do not bump any of these without an explicit migration/generation decision.
+# Regenerating from different inputs will not be byte-identical.
+
+# Upstream PyTorch source reference (torchgen input origin).
+pytorch_repository = pytorch/pytorch
+pytorch_branch     = release/2.14
+pytorch_commit     = 41ffbc4a994e058af9fe00ed5caba73fc1033359
+pytorch_version    = 2.14.1a0
+
+# SonicCross — the build-time torchgen replacement that produced the baseline.
+soniccross_version = v0.0.1
+soniccross_commit  = 13aa2e0f6a2a86bf8785581f70235d55f78ce88c
+
+# Generation input snapshot (no full PyTorch checkout required).
+native_functions_yaml        = tools/generation/native/native_functions.yaml
+native_functions_yaml_sha256 = d68d30699549d4b75ed0a8765a9a29663e7d7be7a25e381a40f6ce72ad2d3060
+
+# tags.yaml is NOT a file: SonicCross embeds the frozen valid-tags constant
+# (native-function.scm). There is nothing to snapshot or pin here.
+tags_yaml = embedded-in-soniccross
+
+# Generation invocation that produced the checked-in baseline.
+generate_command = guild torchgen -s tools/generation \
+                   -d third_party/native-torch/generated \
+                   --generate headers,sources
+generated_output  = third_party/native-torch/generated/
+generate_subsets  = headers,sources
