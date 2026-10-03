@@ -101,7 +101,7 @@ unless explicitly requested.
   upstream PyTorch, the migration manifest, native-torch, and SonicBoom Core
   into a single "PyTorch dependency".
 - The authoritative migration scope will be recorded in
-  `tools/native-torch-migration.md`; it has not yet been established. Once it
+  `design/native-torch-migration.md`; it has not yet been established. Once it
   exists, it is authoritative.
 - **Migration categories** (each source item gets exactly one): **COPY**
   (migrate as-is), **MODIFY** (required but must change), **ADAPT** (explicit

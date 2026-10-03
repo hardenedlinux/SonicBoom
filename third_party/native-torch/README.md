@@ -2,7 +2,7 @@
 
 Unmodified native PyTorch implementation, staged from `~/Project/pytorch`.
 
-Staged scope (see `tools/native-torch-migration.md` — authoritative):
+Staged scope (see `design/native-torch-migration.md` — authoritative):
 
 - `c10/core`, `c10/util`, `c10/macros` — c10 core library (types, dispatcher keys, allocator, TensorImpl/StorageImpl).
 - `aten/src/ATen/core` — ATen core (Tensor, IValue/Stack, Dispatcher, KernelFunction, op registration).

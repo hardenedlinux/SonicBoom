@@ -70,5 +70,5 @@ Several torchgen outputs (`core/TensorBody.h`, `core/aten_interned_strings.h`,
 `core/enum_tag.h`, `core/ATenOpList.*`) were also hand-staged under
 `third_party/native-torch/aten/src/ATen/core/` during migration. Reconciling
 those staged copies with the generated `core/` files is a native-torch
-migration-manifest decision, deferred until `tools/native-torch-migration.md`
+migration-manifest decision, deferred until `design/native-torch-migration.md`
 is established.

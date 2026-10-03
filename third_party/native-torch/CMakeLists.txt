@@ -4,7 +4,7 @@
 # It is NOT exposed through SonicBoom public headers: core/include/sonicboom/
 # must never include <ATen/...>, <c10/...>, or <torch/...>.
 #
-# Dependency-closure amendment (see tools/native-torch-migration.md §15):
+# Dependency-closure amendment (see design/native-torch-migration.md §15):
 #   - torch/headeronly/**   — minimal header-only subset now staged under this
 #                             tree; resolves via NATIVE_TORCH_ROOT.
 #   - cpuinfo               — EXCLUDED (thread_pool.cpp not on the v0 path).

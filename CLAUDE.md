@@ -36,8 +36,9 @@ SonicBoom/
 ├── bindings/guile/      official Guile binding
 ├── capi/                stable C ABI
 ├── core/                SonicBoom Layer 2 runtime + Layer 1 adapter
+├── design/              design documents (S-Expr spec, native-torch migration manifest)
 ├── tests/               tests for SonicBoom
-├── tools/               project tooling + migration documentation
+├── tools/               project tooling
 └── third_party/native-torch/   selected native implementation (Layer 1)
 ```
 
@@ -278,7 +279,7 @@ The migration manifest will classify each source item into exactly one of:
 
 `third_party/native-torch/` is a modifiable implementation area, but agents
 must **not** arbitrarily modify native-torch files. Once
-`tools/native-torch-migration.md` exists it is authoritative for which files
+`design/native-torch-migration.md` exists it is authoritative for which files
 may be copied, modified, kept untouched, excluded, or are required
 dependencies. That manifest has not yet been established. Until it exists:
 
