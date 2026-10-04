@@ -148,6 +148,30 @@ as that operand folds uninitialized memory — typically NaN — into every resu
 The lowering therefore initializes each accumulator to its identity with
 `linalg.fill`: `0.0` for conv/matmul/sum, `-∞` for max pooling.
 
+## Correctness hardening
+
+Beyond the accumulator identities above, malformed input now fails cleanly
+rather than producing wrong results or undefined behavior:
+
+- **`max_pool` pads with `-∞`, not `0.0`.** ONNX pads max-pool windows with NaN
+  (treated as `-∞`); zero-padding would drag negative inputs toward zero. Conv
+  keeps zero-padding (its ONNX semantics). See `s-expr-to-mlir-lowering.md`.
+- **Overflow-checked shape/byte arithmetic.** `numel_checked` /
+  `tensor_byte_size` (`core/src/sx/ir.cpp`) use `__builtin_mul_overflow`;
+  `Executable::compile` and `load_external_weights` reject overflowing sizes
+  before any allocation, file read, MLIR constant, or memcpy, so a wrapped size
+  can never reach one.
+- **Attribute/shape validation.** `strides`/`dilations` must be exactly 2
+  entries, `pads` 4, `kernel_shape` 2; `gemm` A/B must be rank-2; `reduce_mean`
+  axes must be distinct and in range — each a structured error before indexing.
+- **C ABI exception containment.** No C++ exception escapes an exported `sb_*`
+  function: each is wrapped so `std::exception` and unexpected exceptions map to
+  `SB_ERR_INTERNAL` + a diagnostic, and `set_error` frees a reused error slot
+  before writing a new one (leak-free reuse). The documented residual is
+  allocation failure during error construction: the slot is left NULL and the
+  failure is still reported by the status code, without a message (see
+  `capi.h`).
+
 ## Build and dependencies
 
 - `libsonicboom.so` is the final published core library (SHARED); native-torch
@@ -163,16 +187,21 @@ The lowering therefore initializes each accumulator to its identity with
 
 All 13 executables pass: `test_schema`, `test_value`, `test_operator`,
 `test_backend`, `test_tensor`, `test_mlir`, `test_s_expr`,
-`test_s_expr_lowering`, `test_s_expr_exec`, `test_s_expr_resnet18`,
-`test_s_expr_resnet18_mlir`, `test_s_expr_resnet18_exec`, `test_capi`.
+`test_s_expr_lowering` (16 cases, incl. attribute/rank/dup-axes validation),
+`test_s_expr_exec` (5 cases, incl. `max_pool` -inf padding and overflow
+rejection), `test_s_expr_resnet18`, `test_s_expr_resnet18_mlir`,
+`test_s_expr_resnet18_exec`, `test_capi` (incl. error-slot reuse).
 
 ## Limitations
 
 - v0 execution scope is exactly one float32 input and one float32 output.
 - `conv`: `group == 1`, `dilations == 1` only; `max_pool`: `ceil_mode == 0`,
-  `dilations == 1` only.
+  `dilations == 1` only; `gemm`: rank-2 A/B only.
 - Static shapes only; integer signedness is not materialized.
 - No autograd, training, SymInt, quantized dtypes, or code generation (all
   deferred by the v0 scope).
 - The pooling kernel operand is a dummy shape carrier (correct for max).
+- Overflowing tensor byte sizes are rejected at compile/weight-load time.
+- C ABI error handling is best-effort under allocation failure (the failure is
+  still reported by status, but a message may be unavailable).
 - No GPU execution, dynamic roofline, device placement, or adaptive scheduling.

@@ -16,8 +16,10 @@ out of scope here.
 ## Files
 
 - `core/include/sonicboom/sx/lowering.h` — public facade (MLIR-free).
-- `core/src/sx/lowering.cpp` — implementation (the only SonicBoom file that
-  includes MLIR headers, apart from the temporary smoke test).
+- `core/src/sx/lowering.cpp` — implementation (MLIR types stay behind this
+  boundary and `core/src/sx/exec.cpp`).
+- `core/src/sx/lowering_internal.h` — internal `lower_into_module` +
+  `WeightMap`, shared with the execution path (see `cpu-execution-mvp.md`).
 
 ## Goal and boundary
 
@@ -125,24 +127,32 @@ or an error string, and writes its output value into the SSA map.
    channel axis (dim 1), since `conv_2d_nchw_fchw` has no bias operand.
 
 Restricted to `group == 1` and `dilations == 1` (explicit error otherwise).
+`strides` and `dilations` must each be exactly 2 entries and `pads` exactly 4;
+the sizes are validated **before** any indexing, so a malformed attribute
+produces a structured `Operator` error rather than an out-of-bounds read.
 
 ### Max pooling (`max_pool`)
 
 `max_pool` takes one input; `linalg.pooling_nchw_max` is also a *valid* pooling,
-so padding uses the same "exact ONNX pads" convention as conv. The pooling
-kernel is carried as a dummy `[KH, KW]` operand (`tensor.empty`): its **shape**
-drives the window size, and its values are never read by the max reduction
-(the region uses only the input and the accumulator). Restricted to
-`dilations == 1` and `ceil_mode == 0` (explicit error otherwise).
+so padding uses the same "exact ONNX pads" convention as conv — but with the
+**`-∞` pad value**, not zero. ONNX pads max-pool windows with NaN (treated as
+`-∞`); padding with `0.0` instead would drag negative inputs toward zero, so
+the pad constant is `-∞`, matching the accumulator identity. The pooling kernel
+is carried as a dummy `[KH, KW]` operand (`tensor.empty`): its **shape** drives
+the window size, and its values are never read by the max reduction (the region
+uses only the input and the accumulator). Restricted to `dilations == 1` and
+`ceil_mode == 0` (explicit error otherwise); `kernel_shape` must be 2 entries,
+`pads` 4, and `strides`/`dilations` 2, validated before indexing.
 
 ### Reduce mean (`reduce_mean`)
 
 `reduce_mean(x, axes)` requires an explicit `axes` input that references a
-`:values` int64 parameter (negative axes are normalized). The reduction is a
-`linalg.generic` with `reduction` iterators over the reduced dims and
-`parallel` iterators elsewhere, summing into an accumulator; the result is
-then divided by the element count with `arith.divf`. `keepdims` is honored
-implicitly: the output type keeps the reduced dims at size `1`.
+`:values` int64 parameter (negative axes are normalized). **Duplicate axes are
+rejected** (a repeated axis would otherwise double-count into the divisor). The
+reduction is a `linalg.generic` with `reduction` iterators over the reduced
+dims and `parallel` iterators elsewhere, summing into an accumulator; the
+result is then divided by the element count with `arith.divf`. `keepdims` is
+honored implicitly: the output type keeps the reduced dims at size `1`.
 
 ### GEMM (`gemm`)
 
@@ -151,6 +161,10 @@ implicitly: the output type keeps the reduced dims at size `1`.
 - `linalg.transpose` on A/B when `transA`/`transB` is set,
 - `arith.mulf` for a non-unit `alpha` / `beta`,
 - a trailing-axis `linalg.generic` broadcast-add for the bias C.
+
+v0 gemm is strictly 2-D: A and B must both be rank-2 (the bias broadcasts along
+the trailing axis). The rank is validated **before** `transpose_2d`/`matmul`
+touch the dimensions, so a rank-mismatched input is an explicit error.
 
 ## External data
 
@@ -190,7 +204,11 @@ std::expected<std::string, LoweringError> lower_to_mlir(const Document& doc);
 All failures are explicit strings routed through `std::expected`. Any operator
 that cannot yet be lowered cleanly fails explicitly rather than inventing
 semantics (e.g. `conv group != 1`, `max_pool ceil_mode != 0`, unknown op name,
-missing `reduce_mean` axes). MLIR verification failures are captured as
+missing `reduce_mean` axes). Malformed attributes and unsupported shapes are
+also validated up front and rejected with a structured error before any MLIR
+builder API is reached: `strides`/`dilations` must be exactly 2 entries, `pads`
+4, `kernel_shape` 2, `gemm` A/B must be rank-2, and `reduce_mean` axes must be
+distinct and in range. MLIR verification failures are captured as
 `Verification` errors with the diagnostic text.
 
 ## Known limitations
@@ -199,17 +217,22 @@ missing `reduce_mean` axes). MLIR verification failures are captured as
 - Static shapes only; no dynamic or symbolic dimensions.
 - `conv`: `group == 1`, `dilations == 1` only.
 - `max_pool`: `dilations == 1`, `ceil_mode == 0` only.
-- `reduce_mean`: requires an explicit `:values` int64 `axes` parameter.
-- `:external` weights are placeholders (`tensor.empty`); values are not loaded.
+- `gemm`: rank-2 A/B only (no batched matmul in v0).
+- `reduce_mean`: requires an explicit `:values` int64 `axes` parameter; duplicate
+  axes are rejected.
+- `:external` weights are placeholders (`tensor.empty`); values are not loaded
+  (the execution path bakes them as dense constants — see
+  `cpu-execution-mvp.md`).
 - The pooling kernel operand is a dummy — correct for max (its values are
   unused), but not a general pooling representation.
 
 ## Tests
 
-- `tests/core/test_s_expr_lowering.cpp` — 12 focused cases (type mapping, input
+- `tests/core/test_s_expr_lowering.cpp` — 16 focused cases (type mapping, input
   argument, constant, add, relu, reshape, reduce_mean, conv, max_pool, gemm,
-  return wiring, unsupported-operator error); structural checks, not
-  byte-for-byte.
+  return wiring, unsupported-operator error, plus four validation cases:
+  empty conv strides, empty conv dilations, gemm rank mismatch, duplicate
+  reduce_mean axes); structural checks, not byte-for-byte.
 - `tests/core/test_s_expr_resnet18_mlir.cpp` — integration: parse the frozen
   ResNet-18 example → lower → verify → structural checks (op census, input /
   output types, external-data attribute).
