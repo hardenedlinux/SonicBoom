@@ -1,7 +1,17 @@
-# M2 Layer 2 boundary tests (manifest M2 §tests). Five focused executables,
-# one per architectural proof (A–E). They include only <sonicboom/...> headers.
+# M2 Layer 2 boundary tests (manifest M2 §tests). They include only
+# <sonicboom/...> headers and link libsonicboom.so (the SHARED core library).
+# test_mlir additionally proves the statically-linked MLIR infrastructure.
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
+endforeach()
+
+# Integration tests: parse the frozen ResNet-18 S-Expr v0.1 example document.
+# They need the repository root to locate the example file at build/run time.
+foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir)
+  add_executable(${test_name} ${test_name}.cpp)
+  target_link_libraries(${test_name} PRIVATE sonicboom)
+  target_compile_definitions(${test_name} PRIVATE
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 endforeach()

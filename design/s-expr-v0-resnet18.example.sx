@@ -111,4 +111,4 @@
       (node reshape (inputs "mean" "val_191") (outputs ("view" (tensor float32 (shape 1 512)))) (attrs (allowzero (int 1))))
       (node gemm (inputs "view" "fc.weight" "fc.bias") (outputs ("output" (tensor float32 (shape 1 1000)))) (attrs (alpha (float 1.0)) (beta (float 1.0)) (transA (int 0)) (transB (int 1))))
       ))
-  ))
+  )

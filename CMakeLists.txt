@@ -15,6 +15,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# libsonicboom.so is the final published core library; native-torch and MLIR are
+# statically linked into it, so all static libraries must be position-independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Backend selection. Only CPU is in v0 scope.
 option(SONICBOOM_USE_CUDA "Enable CUDA support (deferred — not in v0)" OFF)
 
@@ -28,6 +32,21 @@ include(tools/generation/GenerateNativeTorch.cmake)
 # with its own language constraints (C++17) and CPU-only; its headers must not
 # leak into SonicBoom's public Layer 2 interface.
 add_subdirectory(third_party/native-torch)
+
+# MLIR integration: link the official MLIR CMake targets into libsonicboom.so.
+# MLIR/LLVM are built once from third_party/llvm-project via
+# tools/mlir/build-mlir.sh and installed to build/llvm-mlir-install; they are not
+# a runtime dependency and no system MLIR/LLVM is used.
+option(SONICBOOM_ENABLE_MLIR "Link MLIR into libsonicboom.so" ON)
+if(SONICBOOM_ENABLE_MLIR)
+  set(MLIR_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/build/llvm-mlir-install"
+      CACHE PATH "Prefix where tools/mlir/build-mlir.sh installed LLVM/MLIR")
+  set(MLIR_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/mlir"
+      CACHE PATH "MLIR CMake package directory")
+  set(LLVM_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/llvm"
+      CACHE PATH "LLVM CMake package directory")
+  find_package(MLIR CONFIG REQUIRED)
+endif()
 
 # SonicBoom core: Layer 2 public API (core/include/sonicboom/) + Layer 1 adapter
 # (core/layer1/). The adapter is the only SonicBoom-owned code that uses c10/ATen.

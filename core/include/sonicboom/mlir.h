@@ -14,28 +14,19 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "adapter.h"
+#pragma once
 
-namespace nt {
-namespace detail {
+#include <string>
 
-c10::Stack to_aten(const ArgumentList& args) {
-  c10::Stack stack;
-  stack.reserve(args.size());
-  for (const auto& v : args.values()) {
-    stack.push_back(to_aten(v));
-  }
-  return stack;
-}
+namespace sonicboom {
 
-ArgumentList from_aten(c10::Stack stack) {
-  std::vector<Value> values;
-  values.reserve(stack.size());
-  for (const auto& iv : stack) {
-    values.push_back(from_aten(iv));
-  }
-  return ArgumentList(std::move(values));
-}
+// MLIR integration smoke test: build an empty MLIR module and return its
+// textual form (e.g. "module {\n}\n").
+//
+// This is a temporary placeholder proving that SonicBoom can create an
+// MLIRContext, a ModuleOp, and print it — the minimal linkage proof for the
+// MLIR infrastructure. It exposes no MLIR types and will be replaced by the
+// S-Expr → MLIR lowering.
+std::string mlir_emit_empty_module();
 
-} // namespace detail
-} // namespace nt
+} // namespace sonicboom

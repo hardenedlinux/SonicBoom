@@ -14,28 +14,24 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "adapter.h"
+#include <sonicboom/sx/ir.h>
 
-namespace nt {
-namespace detail {
+namespace sonicboom::sx {
 
-c10::Stack to_aten(const ArgumentList& args) {
-  c10::Stack stack;
-  stack.reserve(args.size());
-  for (const auto& v : args.values()) {
-    stack.push_back(to_aten(v));
+const char* dtype_name(DType d) {
+  switch (d) {
+    case DType::Float32: return "float32";
+    case DType::Float16: return "float16";
+    case DType::BFloat16: return "bfloat16";
+    case DType::Float64: return "float64";
+    case DType::Int8: return "int8";
+    case DType::UInt8: return "uint8";
+    case DType::Int16: return "int16";
+    case DType::Int32: return "int32";
+    case DType::Int64: return "int64";
+    case DType::Bool: return "bool";
   }
-  return stack;
+  return "?";
 }
 
-ArgumentList from_aten(c10::Stack stack) {
-  std::vector<Value> values;
-  values.reserve(stack.size());
-  for (const auto& iv : stack) {
-    values.push_back(from_aten(iv));
-  }
-  return ArgumentList(std::move(values));
-}
-
-} // namespace detail
-} // namespace nt
+} // namespace sonicboom::sx

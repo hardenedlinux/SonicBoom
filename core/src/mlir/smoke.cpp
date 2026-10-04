@@ -14,28 +14,28 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "adapter.h"
+#include "sonicboom/mlir.h"
 
-namespace nt {
-namespace detail {
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+#include "llvm/Support/raw_ostream.h"
 
-c10::Stack to_aten(const ArgumentList& args) {
-  c10::Stack stack;
-  stack.reserve(args.size());
-  for (const auto& v : args.values()) {
-    stack.push_back(to_aten(v));
-  }
-  return stack;
+namespace sonicboom {
+
+std::string mlir_emit_empty_module() {
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<mlir::BuiltinDialect>();
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::ModuleOp::create(mlir::UnknownLoc::get(&context));
+
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  module->print(os);
+  return os.str();
 }
 
-ArgumentList from_aten(c10::Stack stack) {
-  std::vector<Value> values;
-  values.reserve(stack.size());
-  for (const auto& iv : stack) {
-    values.push_back(from_aten(iv));
-  }
-  return ArgumentList(std::move(values));
-}
-
-} // namespace detail
-} // namespace nt
+} // namespace sonicboom

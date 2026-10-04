@@ -210,6 +210,20 @@ unless explicitly requested.
 - Do not rely on C++ ABI stability across compilers or standard libraries.
 - The stable binary compatibility target is the C API.
 
+## Build architecture (libsonicboom.so)
+
+- `libsonicboom.so` is SonicBoom's **final published core library**. Layer 2 is
+  a stable native runtime/library consumed through FFI (first Guile, possibly
+  other languages later).
+- The top-level `sonicboom` CMake target **must be SHARED**, producing
+  `libsonicboom.so`; `libsonicboom.a` is never the final artifact.
+- Internal implementation components (native-torch, MLIR, LLVM) are built as
+  **static libraries** and statically linked into `libsonicboom.so`.
+- Any library statically linked into `libsonicboom.so` **must be built with
+  position-independent code (PIC)**.
+- Do **not** use a "STATIC core + SHARED wrapper" two-layer arrangement.
+- Tests link against and load `libsonicboom.so` to exercise the shared library.
+
 ## Native-torch migration rules
 
 ### native-torch is a selective, modifiable subset

@@ -14,28 +14,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#include "adapter.h"
+// MLIR infrastructure smoke test: links against libsonicboom.so (which has the
+// required MLIR libraries statically linked in) and verifies that an empty
+// module can be created and printed.
+#include "sonicboom/mlir.h"
 
-namespace nt {
-namespace detail {
+#include <iostream>
 
-c10::Stack to_aten(const ArgumentList& args) {
-  c10::Stack stack;
-  stack.reserve(args.size());
-  for (const auto& v : args.values()) {
-    stack.push_back(to_aten(v));
-  }
-  return stack;
+int main() {
+  const std::string text = sonicboom::mlir_emit_empty_module();
+  std::cout << text;
+  return text.find("module") == std::string::npos ? 1 : 0;
 }
-
-ArgumentList from_aten(c10::Stack stack) {
-  std::vector<Value> values;
-  values.reserve(stack.size());
-  for (const auto& iv : stack) {
-    values.push_back(from_aten(iv));
-  }
-  return ArgumentList(std::move(values));
-}
-
-} // namespace detail
-} // namespace nt
