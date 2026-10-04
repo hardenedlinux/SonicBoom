@@ -23,6 +23,12 @@ file(GLOB_RECURSE SONICBOOM_ADAPTER_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/sx/*.cpp)
 
+# Static execution planner (core/src/planner/). Pure SonicBoom C++ that
+# consumes the sx IR and the sx::Executable facade; no MLIR/LLVM/ATen/c10
+# headers (the public facade in <sonicboom/sx/exec.h> is MLIR-free).
+file(GLOB_RECURSE SONICBOOM_PLANNER_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/*.cpp)
+
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
 # Native-torch and MLIR are statically linked into it. The stable C ABI
 # (sonicboom_capi object library) is folded in so its `extern "C"` symbols are
@@ -30,6 +36,7 @@ file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
 add_library(sonicboom SHARED
   ${SONICBOOM_ADAPTER_SOURCES}
   ${SONICBOOM_SX_SOURCES}
+  ${SONICBOOM_PLANNER_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 

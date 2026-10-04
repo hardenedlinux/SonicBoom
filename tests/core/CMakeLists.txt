@@ -7,9 +7,16 @@ foreach(test_name IN ITEMS test_schema test_value test_operator test_backend tes
   target_link_libraries(${test_name} PRIVATE sonicboom)
 endforeach()
 
+# Static execution planner tests (unit + integration). They include only
+# <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
+foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_planner_telemetry test_planner_benchmark)
+  add_executable(${test_name} ${test_name}.cpp)
+  target_link_libraries(${test_name} PRIVATE sonicboom)
+endforeach()
+
 # Integration tests: parse the frozen ResNet-18 S-Expr v0.1 example document.
 # They need the repository root to locate the example file at build/run time.
-foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir test_s_expr_resnet18_exec test_onnx_import_resnet18_exec)
+foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir test_s_expr_resnet18_exec test_onnx_import_resnet18_exec test_planner_acceptance)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
