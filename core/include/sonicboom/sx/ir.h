@@ -24,6 +24,7 @@
 // models is documented in design/s-expr-v0-spec.md and must not be redesigned
 // here.
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -51,6 +52,10 @@ enum class DType : uint8_t {
 // Textual name of a dtype as it appears in the format (e.g. "float32").
 const char* dtype_name(DType d);
 
+// Size in bytes of a single element of `d` (the frozen set is all fixed-width;
+// returns 0 only on a value outside the enum, which cannot occur in practice).
+std::size_t dtype_size(DType d);
+
 // Static, non-negative dimensions (spec §5). rank == dims.size(); a scalar
 // tensor has an empty dims vector.
 struct Shape {
@@ -62,6 +67,22 @@ struct TensorType {
   DType dtype;
   Shape shape;
 };
+
+// Number of elements in a shape (1 for a scalar / empty shape).
+int64_t numel(const Shape& s);
+
+// Number of elements in a tensor type.
+int64_t numel(const TensorType& t);
+
+// Checked element count: nullopt if the product overflows int64_t (or any
+// dimension is negative). The unchecked `numel` delegates to this and returns
+// -1 on overflow (never a valid element count).
+std::optional<int64_t> numel_checked(const Shape& s);
+
+// Checked byte size of a tensor (numel × dtype_size): nullopt on element-count
+// or byte-count overflow, or an unknown dtype. Every byte-size computation that
+// feeds an allocation, file read, MLIR constant, or memcpy must use this.
+std::optional<int64_t> tensor_byte_size(const TensorType& t);
 
 // --- Attributes ------------------------------------------------------------
 

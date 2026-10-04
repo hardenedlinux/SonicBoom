@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// test_s_expr_resnet18_exec.cpp — Stage C: end-to-end ResNet-18 CPU inference.
+//
+// Parses the frozen ResNet-18 S-Expr v0.1 fixture, loads the flat float32
+// weight sidecar (design/resnet18.weights.bin), feeds the deterministic input
+// (design/resnet18.input.bin, seed 1234) through the JITted executable, and
+// compares the [1,1000] logits against the independent ONNX reference
+// (design/resnet18.reference.bin, onnx.reference.ReferenceEvaluator). Reports
+// max absolute and relative error and asserts the argmax and a loose tolerance.
+
+#include <sonicboom/sx/exec.h>
+#include <sonicboom/sx/parser.h>
+
+#include <cmath>
+#include <cstddef>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#ifndef SONICBOOM_SRC_DIR
+#error "SONICBOOM_SRC_DIR must be defined to the repository root"
+#endif
+
+namespace sx = sonicboom::sx;
+
+namespace {
+
+int g_failures = 0;
+
+void check(bool ok, const char* what) {
+  if (!ok) {
+    std::cerr << "  FAIL: " << what << "\n";
+    ++g_failures;
+  }
+}
+
+// Read a whole binary file into a byte vector.
+bool read_file(const std::string& path, std::vector<std::byte>& out) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f)
+    return false;
+  f.seekg(0, std::ios::end);
+  std::streamoff n = f.tellg();
+  f.seekg(0, std::ios::beg);
+  out.resize(static_cast<std::size_t>(n));
+  f.read(reinterpret_cast<char*>(out.data()), n);
+  return f.gcount() == n;
+}
+
+std::vector<float> as_floats(const sx::Bytes& b) {
+  std::vector<float> v(b.size() / sizeof(float));
+  std::memcpy(v.data(), b.data(), b.size());
+  return v;
+}
+
+} // namespace
+
+int main() {
+  const std::string design = std::string(SONICBOOM_SRC_DIR) + "/design";
+  const std::string fixture = design + "/s-expr-v0-resnet18.example.sx";
+
+  // 1. Parse the frozen fixture.
+  std::ifstream in(fixture);
+  if (!in) {
+    std::cerr << "cannot open " << fixture << "\n";
+    return 1;
+  }
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  auto doc = sx::parse_document(ss.str());
+  if (!doc) {
+    std::cerr << "resnet18 parse failed: " << doc.error().message << "\n";
+    return 1;
+  }
+
+  // 2. Load the weight sidecar.
+  auto weights = sx::load_external_weights(*doc, design);
+  if (!weights) {
+    std::cerr << "weight load failed: " << weights.error().message << "\n";
+    return 1;
+  }
+  std::cout << "loaded " << weights->size() << " external weight buffers\n";
+
+  // 3. Load the deterministic input.
+  sx::Bytes input;
+  if (!read_file(design + "/resnet18.input.bin", input)) {
+    std::cerr << "cannot read resnet18.input.bin\n";
+    return 1;
+  }
+
+  // 4. Compile the graph to a native callable.
+  auto exe = sx::Executable::compile(*doc, *weights);
+  if (!exe) {
+    std::cerr << "resnet18 compile failed: " << exe.error().message << "\n";
+    return 1;
+  }
+  std::cout << "compiled (input " << (*exe)->input_type().shape.dims[1] << "x"
+            << (*exe)->input_type().shape.dims[2] << "x"
+            << (*exe)->input_type().shape.dims[3] << ", output "
+            << (*exe)->output_type().shape.dims[1] << ")\n";
+
+  // 5. Run.
+  sx::Bytes output;
+  auto res = (*exe)->run(input, output);
+  if (!res) {
+    std::cerr << "resnet18 run failed: " << res.error().message << "\n";
+    return 1;
+  }
+  std::vector<float> got = as_floats(output);
+  if (got.size() != 1000) {
+    std::cerr << "unexpected output size " << got.size() << "\n";
+    return 1;
+  }
+
+  // 6. Compare against the independent ONNX reference.
+  std::vector<std::byte> ref_bytes;
+  if (!read_file(design + "/resnet18.reference.bin", ref_bytes)) {
+    std::cerr << "cannot read resnet18.reference.bin\n";
+    return 1;
+  }
+  std::vector<float> ref = as_floats(ref_bytes);
+  if (ref.size() != 1000) {
+    std::cerr << "unexpected reference size " << ref.size() << "\n";
+    return 1;
+  }
+
+  float max_abs = 0.0f, max_rel = 0.0f;
+  std::size_t argmax_got = 0, argmax_ref = 0;
+  for (std::size_t i = 0; i < 1000; ++i) {
+    float abs_err = std::fabs(got[i] - ref[i]);
+    if (abs_err > max_abs)
+      max_abs = abs_err;
+    float scale = std::max(std::fabs(ref[i]), 1e-6f);
+    float rel_err = abs_err / scale;
+    if (rel_err > max_rel)
+      max_rel = rel_err;
+    if (got[i] > got[argmax_got])
+      argmax_got = i;
+    if (ref[i] > ref[argmax_ref])
+      argmax_ref = i;
+  }
+
+  std::cout << "max abs error = " << max_abs << "\n";
+  std::cout << "max rel error = " << max_rel << "\n";
+  std::cout << "argmax: got " << argmax_got << ", ref " << argmax_ref << "\n";
+
+  check(argmax_got == argmax_ref, "argmax matches reference");
+  // Float32 accumulation-order differences through ~50 ops keep agreement well
+  // below 1e-2 absolute; anything beyond that indicates a real lowering bug.
+  check(max_abs < 5e-2f, "max absolute error < 5e-2");
+
+  if (g_failures == 0) {
+    std::cout << "test_s_expr_resnet18_exec OK (ResNet-18 inference matches "
+                 "ONNX reference)\n";
+    return 0;
+  }
+  std::cerr << "test_s_expr_resnet18_exec FAILED: " << g_failures
+            << " check(s)\n";
+  return 1;
+}

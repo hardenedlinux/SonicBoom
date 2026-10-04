@@ -16,9 +16,11 @@
 
 // test_s_expr_lowering.cpp — S-Expr v0.1 → MLIR lowering focused unit tests.
 //
-// Twelve cases covering the frozen v0 operator subset and its lowering
-// contract: type mapping, input/constant materialization, each of the seven
-// operators, graph-return wiring, and the explicit unsupported-operator error.
+// Sixteen cases covering the frozen v0 operator subset, its lowering contract
+// (type mapping, input/constant materialization, each of the seven operators,
+// graph-return wiring), and the attribute/shape validation that keeps malformed
+// inputs (empty strides/dilations, gemm rank mismatch, duplicate reduce_mean
+// axes, unsupported operators) from reaching the MLIR builder out of bounds.
 // Each case parses a small document, lowers it to textual MLIR, and checks
 // structural properties (substrings), never byte-for-byte output.
 //
@@ -70,6 +72,30 @@ bool must_lower(const std::string& src, std::string& out, const char* what) {
   }
   out = std::move(*mlir);
   return true;
+}
+
+// Parse `src`, then expect lowering to FAIL with an Operator error whose
+// message contains `needle`. Used to prove malformed attributes / unsupported
+// shapes fail cleanly (structured error) rather than indexing out of bounds.
+void expect_lower_error(const std::string& src, const std::string& needle,
+                        const char* what) {
+  auto doc = sx::parse_document(src);
+  if (!doc) {
+    std::cerr << "  FAIL: " << what << " (unexpected parse error: "
+              << doc.error().message << ")\n";
+    ++g_failures;
+    return;
+  }
+  auto mlir = sx::lower_to_mlir(*doc);
+  if (mlir) {
+    std::cerr << "  FAIL: " << what << " (expected lowering error, got MLIR)\n";
+    ++g_failures;
+    return;
+  }
+  check(mlir.error().kind == sx::LoweringErrorKind::Operator,
+        (std::string(what) + ": error kind is Operator").c_str());
+  check(mlir.error().message.find(needle) != std::string::npos,
+        (std::string(what) + ": message contains \"" + needle + "\"").c_str());
 }
 
 // 1. dtype/shape → MLIR tensor type (float32 NCHW + int64 rank-1).
@@ -283,6 +309,67 @@ void test_unsupported_op() {
         "unsupported-op: message names 'foo'");
 }
 
+// 13. conv with an empty strides attr → structured error, never OOB.
+void test_conv_empty_strides() {
+  expect_lower_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"x\" (tensor float32 (shape 1 3 4 4))))"
+      " (outputs (output \"y\"))"
+      " (parameters"
+      "   (parameter \"w\" (tensor float32 (shape 2 3 2 2))"
+      "     (data :external \"w.bin\" 0 96))"
+      "   (parameter \"b\" (tensor float32 (shape 2))"
+      "     (data :external \"b.bin\" 0 8)))"
+      " (nodes (node conv (inputs \"x\" \"w\" \"b\")"
+      "   (outputs (\"y\" (tensor float32 (shape 1 2 3 3))))"
+      "   (attrs (strides (ints)))))))",
+      "conv strides must have 2 entries", "conv empty strides");
+}
+
+// 14. conv with an empty dilations attr → structured error, never OOB.
+void test_conv_empty_dilations() {
+  expect_lower_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"x\" (tensor float32 (shape 1 3 4 4))))"
+      " (outputs (output \"y\"))"
+      " (parameters"
+      "   (parameter \"w\" (tensor float32 (shape 2 3 2 2))"
+      "     (data :external \"w.bin\" 0 96))"
+      "   (parameter \"b\" (tensor float32 (shape 2))"
+      "     (data :external \"b.bin\" 0 8)))"
+      " (nodes (node conv (inputs \"x\" \"w\" \"b\")"
+      "   (outputs (\"y\" (tensor float32 (shape 1 2 3 3))))"
+      "   (attrs (dilations (ints)))))))",
+      "conv dilations must have 2 entries", "conv empty dilations");
+}
+
+// 15. gemm with a rank-3 input → structured error (v0 gemm is strictly 2-D).
+void test_gemm_rank_mismatch() {
+  expect_lower_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 1 2 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters"
+      "   (parameter \"b\" (tensor float32 (shape 3 4))"
+      "     (data :external \"b.bin\" 0 48)))"
+      " (nodes (node gemm (inputs \"a\" \"b\")"
+      "   (outputs (\"c\" (tensor float32 (shape 1 2 4))))))))",
+      "gemm requires rank-2 A and B in v0", "gemm rank mismatch");
+}
+
+// 16. reduce_mean with a duplicated axis → structured error (no divisor bloat).
+void test_reduce_mean_duplicate_axes() {
+  expect_lower_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 4 3 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters (parameter \"axes\" (tensor int64 (shape 2))"
+      "   (data :values 1 1)))"
+      " (nodes (node reduce_mean (inputs \"a\" \"axes\")"
+      "   (outputs (\"c\" (tensor float32 (shape 4 1 3))))))))",
+      "reduce_mean has duplicate axes", "reduce_mean duplicate axes");
+}
+
 } // namespace
 
 int main() {
@@ -298,9 +385,13 @@ int main() {
   test_gemm();
   test_return_values();
   test_unsupported_op();
+  test_conv_empty_strides();
+  test_conv_empty_dilations();
+  test_gemm_rank_mismatch();
+  test_reduce_mean_duplicate_axes();
 
   if (g_failures == 0) {
-    std::cout << "test_s_expr_lowering OK (12 cases)\n";
+    std::cout << "test_s_expr_lowering OK (16 cases)\n";
     return 0;
   }
   std::cerr << "test_s_expr_lowering FAILED: " << g_failures << " check(s)\n";

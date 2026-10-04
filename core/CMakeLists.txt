@@ -24,14 +24,18 @@ file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/sx/*.cpp)
 
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
-# Native-torch and MLIR are statically linked into it.
+# Native-torch and MLIR are statically linked into it. The stable C ABI
+# (sonicboom_capi object library) is folded in so its `extern "C"` symbols are
+# exported from the one published library that FFI consumers load.
 add_library(sonicboom SHARED
   ${SONICBOOM_ADAPTER_SOURCES}
   ${SONICBOOM_SX_SOURCES}
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
+  $<TARGET_OBJECTS:sonicboom_capi>)
 
 target_include_directories(sonicboom
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+         ${CMAKE_SOURCE_DIR}/capi/include
   PRIVATE
     ${SONICBOOM_NATIVE_TORCH_ROOT}
     ${SONICBOOM_NATIVE_TORCH_ROOT}/aten/src
@@ -52,14 +56,42 @@ target_link_libraries(sonicboom PRIVATE aten_core)
 # (this mirrors mlir/examples/standalone, which uses ${MLIR_INCLUDE_DIRS}).
 # ${MLIR_INCLUDE_DIRS} = <install-prefix>/include, covering both mlir/ and llvm/.
 if(SONICBOOM_ENABLE_MLIR)
-  # MLIRIR provides MLIRContext/ModuleOp/BuiltinDialect and the asm printer.
-  # The S-Expr → MLIR lowering additionally needs the func/arith/tensor/linalg
-  # dialects (their transitive MLIR/LLVM deps come via the official graph).
+  # S-Expr → MLIR lowering dialects (core/src/sx/lowering.cpp).
   target_link_libraries(sonicboom PRIVATE
     MLIRIR
     MLIRFuncDialect
     MLIRArithDialect
     MLIRTensorDialect
-    MLIRLinalgDialect)
+    MLIRLinalgDialect
+    # CPU JIT execution (core/src/sx/exec.cpp): the lowering pipeline dialects
+    # and passes (bufferize → linalg-to-loops → … → LLVM dialect).
+    MLIRBufferizationDialect
+    MLIRBufferizationTransforms
+    MLIRBufferizationToMemRef
+    MLIRLinalgTransforms
+    # One-shot-bufferize external models for arith/tensor (constants) and the
+    # func.func boundary live in the *Transforms libraries below.
+    MLIRArithTransforms
+    MLIRTensorTransforms
+    MLIRSCFDialect
+    MLIRSCFToControlFlow
+    MLIRMemRefDialect
+    MLIRMemRefTransforms
+    MLIRAffineDialect
+    MLIRAffineToStandard
+    MLIRControlFlowDialect
+    MLIRControlFlowToLLVM
+    MLIRArithToLLVM
+    MLIRMemRefToLLVM
+    MLIRFuncToLLVM
+    MLIRReconcileUnrealizedCasts
+    MLIRLLVMDialect
+    # MLIR ExecutionEngine (JIT) + the builtin/LLVM LLVM-IR translations it needs.
+    MLIRExecutionEngine
+    MLIRBuiltinToLLVMIRTranslation
+    MLIRLLVMToLLVMIRTranslation
+    # Native (x86-64) target asm parser for InitializeNativeTargetAsmParser;
+    # the X86 target/desc/info libs come transitively via MLIRExecutionEngine.
+    LLVMX86AsmParser)
   target_include_directories(sonicboom PRIVATE ${MLIR_INCLUDE_DIRS})
 endif()

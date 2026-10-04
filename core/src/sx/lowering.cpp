@@ -27,6 +27,8 @@
 
 #include "sonicboom/sx/lowering.h"
 
+#include "lowering_internal.h"
+
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/DenseMap.h>
@@ -51,6 +53,7 @@
 #include <mlir/IR/Verifier.h>
 #include <mlir/Support/LLVM.h>
 
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -138,9 +141,11 @@ struct Ctx {
   func::FuncOp func;
   llvm::DenseMap<llvm::StringRef, Value> values;          // SSA name → value
   llvm::DenseMap<llvm::StringRef, const Parameter*> params; // name → parameter
+  const WeightMap* weights;  // non-null ⇒ bake :external params as constants
 
-  Ctx(MLIRContext& c, const Graph& g, OpBuilder& b, Location l, ModuleOp m)
-      : ctx(c), graph(g), builder(b), loc(l), module(m) {}
+  Ctx(MLIRContext& c, const Graph& g, OpBuilder& b, Location l, ModuleOp m,
+      const WeightMap* w = nullptr)
+      : ctx(c), graph(g), builder(b), loc(l), module(m), weights(w) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -177,8 +182,9 @@ Value splat_constant(OpBuilder& b, Location loc, RankedTensorType t,
 // A dense constant from a :values literal list (element type from `t`).
 Value dense_constant(OpBuilder& b, Location loc, RankedTensorType t,
                      const ValuesData& data) {
+  Type e = t.getElementType();
   TypedAttr dense;
-  if (mlir::isa<IntegerType>(t.getElementType())) {
+  if (mlir::isa<IntegerType>(e)) {
     SmallVector<int64_t> vals;
     for (const auto& v : data.values) {
       if (const auto* i = std::get_if<int64_t>(&v))
@@ -187,7 +193,18 @@ Value dense_constant(OpBuilder& b, Location loc, RankedTensorType t,
         vals.push_back(static_cast<int64_t>(std::get<double>(v)));
     }
     dense = DenseElementsAttr::get(t, llvm::ArrayRef<int64_t>(vals));
-  } else {
+  } else if (e.isF32()) {
+    // DenseElementsAttr::get stores raw bytes of the C++ value type, so the
+    // element width must match (float, not double) or the data is corrupted.
+    SmallVector<float> vals;
+    for (const auto& v : data.values) {
+      if (const auto* d = std::get_if<double>(&v))
+        vals.push_back(static_cast<float>(*d));
+      else
+        vals.push_back(static_cast<float>(std::get<int64_t>(v)));
+    }
+    dense = DenseElementsAttr::get(t, llvm::ArrayRef<float>(vals));
+  } else if (e.isF64()) {
     SmallVector<double> vals;
     for (const auto& v : data.values) {
       if (const auto* d = std::get_if<double>(&v))
@@ -196,8 +213,32 @@ Value dense_constant(OpBuilder& b, Location loc, RankedTensorType t,
         vals.push_back(static_cast<double>(std::get<int64_t>(v)));
     }
     dense = DenseElementsAttr::get(t, llvm::ArrayRef<double>(vals));
+  } else {
+    // f16/bf16 (and any other floating point element type): build via APFloat
+    // and convert to the target semantics, since there is no native C++ type.
+    SmallVector<APFloat> vals;
+    for (const auto& v : data.values) {
+      double value = std::get_if<double>(&v)
+                         ? *std::get_if<double>(&v)
+                         : static_cast<double>(std::get<int64_t>(v));
+      APFloat fv(value);
+      bool ignored;
+      fv.convert(mlir::cast<FloatType>(e).getFloatSemantics(),
+                 APFloat::rmNearestTiesToEven, &ignored);
+      vals.push_back(fv);
+    }
+    dense = DenseElementsAttr::get(t, llvm::ArrayRef<APFloat>(vals));
   }
   return b.create<arith::ConstantOp>(loc, t, dense);
+}
+
+// A dense constant from raw little-endian bytes (a baked :external weight).
+Value dense_from_bytes(Ctx& c, RankedTensorType t,
+                       const std::vector<std::byte>& bytes) {
+  auto attr = DenseElementsAttr::getFromRawBuffer(
+      t, llvm::ArrayRef<char>(reinterpret_cast<const char*>(bytes.data()),
+                              bytes.size()));
+  return c.builder.create<arith::ConstantOp>(c.loc, t, attr);
 }
 
 // An uninitialized tensor of the given type (used for :external placeholders
@@ -207,11 +248,42 @@ Value empty_tensor(Ctx& c, RankedTensorType t) {
                                            t.getElementType());
 }
 
-// A scalar zero of element type `e` (for tensor.pad's constant region).
-Value scalar_zero(OpBuilder& b, Location loc, Type e) {
-  TypedAttr a = mlir::isa<FloatType>(e) ? TypedAttr(FloatAttr::get(e, 0.0))
-                                   : TypedAttr(IntegerAttr::get(e, 0));
+// A scalar constant of element type `e` (for linalg.fill identity values).
+Value scalar_constant(OpBuilder& b, Location loc, Type e, double value) {
+  TypedAttr a;
+  if (e.isF32())
+    a = b.getF32FloatAttr(static_cast<float>(value));
+  else if (e.isF64())
+    a = b.getF64FloatAttr(value);
+  else if (e.isInteger(64))
+    a = b.getI64IntegerAttr(static_cast<int64_t>(value));
+  else if (e.isInteger(32))
+    a = b.getI32IntegerAttr(static_cast<int32_t>(value));
+  else if (e.isInteger(16))
+    a = b.getI16IntegerAttr(static_cast<int16_t>(value));
+  else if (e.isInteger(8))
+    a = b.getI8IntegerAttr(static_cast<int8_t>(value));
+  else if (e.isInteger(1))
+    a = b.getBoolAttr(value != 0.0);
+  else {
+    APFloat v(value);
+    bool ignored;
+    v.convert(mlir::cast<FloatType>(e).getFloatSemantics(),
+              APFloat::rmNearestTiesToEven, &ignored);
+    a = FloatAttr::get(e, v);
+  }
   return b.create<arith::ConstantOp>(loc, e, a);
+}
+
+// An identity-initialized tensor: tensor.empty + linalg.fill. This is the
+// correct `outs` operand for linalg structured ops that *read* their output as
+// the running accumulator (conv/matmul/pooling/reductions). A bare tensor.empty
+// would fold uninitialized memory — typically NaN — into every result.
+Value filled_tensor(Ctx& c, RankedTensorType t, double value) {
+  Value empty = c.builder.create<tensor::EmptyOp>(c.loc, t.getShape(),
+                                                  t.getElementType());
+  Value scalar = scalar_constant(c.builder, c.loc, t.getElementType(), value);
+  return c.builder.create<linalg::FillOp>(c.loc, scalar, empty).getResult(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,18 +327,27 @@ Value broadcast_add_axis(Ctx& c, Value lhs, Value rhs, unsigned axis,
   return op.getResult(0);
 }
 
-// Zero-pad a tensor along the given per-dim low/high amounts.
-Value pad_zeros(Ctx& c, Value src, RankedTensorType resultType,
-                llvm::ArrayRef<int64_t> low, llvm::ArrayRef<int64_t> high) {
+// Pad a tensor along the given per-dim low/high amounts with a constant fill
+// value. `fill` is the scalar inserted into the padding region (0.0 for conv,
+// -inf for max_pool).
+Value pad_constant(Ctx& c, Value src, RankedTensorType resultType,
+                   llvm::ArrayRef<int64_t> low, llvm::ArrayRef<int64_t> high,
+                   double fill) {
   SmallVector<OpFoldResult> lowOfr, highOfr;
   for (int64_t p : low)
     lowOfr.push_back(c.builder.getI64IntegerAttr(p));
   for (int64_t p : high)
     highOfr.push_back(c.builder.getI64IntegerAttr(p));
-  Value padVal = scalar_zero(c.builder, c.loc, resultType.getElementType());
+  Value padVal = scalar_constant(c.builder, c.loc, resultType.getElementType(), fill);
   return c.builder
       .create<tensor::PadOp>(c.loc, resultType, src, lowOfr, highOfr, padVal)
       .getResult();
+}
+
+// Zero-pad (conv padding semantics: ONNX Conv pads with zero).
+Value pad_zeros(Ctx& c, Value src, RankedTensorType resultType,
+                llvm::ArrayRef<int64_t> low, llvm::ArrayRef<int64_t> high) {
+  return pad_constant(c, src, resultType, low, high, 0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +397,16 @@ std::string lower_conv(Ctx& c, const Node& node,
   if (get_int_attr(node, "group", 1) != 1)
     return "conv with group != 1 is unsupported in v0";
   auto dilations = get_ints_attr(node, "dilations", {1, 1});
+  if (dilations.size() != 2)
+    return "conv dilations must have 2 entries";
   if (dilations[0] != 1 || dilations[1] != 1)
     return "conv with dilations != 1 is unsupported in v0";
   auto pads = get_ints_attr(node, "pads", {0, 0, 0, 0});
   if (pads.size() != 4)
     return "conv pads must have 4 entries";
   auto strides = get_ints_attr(node, "strides", {1, 1});
+  if (strides.size() != 2)
+    return "conv strides must have 2 entries";
 
   auto outType = lower_tensor_type(c.ctx, node.outputs[0].type);
   auto inType = mlir::cast<RankedTensorType>(inputs[0].getType());
@@ -341,7 +426,7 @@ std::string lower_conv(Ctx& c, const Node& node,
                   {0, 0, pads[2], pads[3]});
   }
 
-  Value init = empty_tensor(c, outType);
+  Value init = filled_tensor(c, outType, 0.0);
   auto stridesAttr = c.builder.getI64VectorAttr({sh, sw});
   auto dilationsAttr = c.builder.getI64VectorAttr({1, 1});
   Value conv = c.builder
@@ -362,6 +447,8 @@ std::string lower_max_pool(Ctx& c, const Node& node,
   if (get_int_attr(node, "ceil_mode", 0) != 0)
     return "max_pool with ceil_mode != 0 is unsupported in v0";
   auto dilations = get_ints_attr(node, "dilations", {1, 1});
+  if (dilations.size() != 2)
+    return "max_pool dilations must have 2 entries";
   if (dilations[0] != 1 || dilations[1] != 1)
     return "max_pool with dilations != 1 is unsupported in v0";
   auto kernel = get_ints_attr(node, "kernel_shape", {});
@@ -371,6 +458,8 @@ std::string lower_max_pool(Ctx& c, const Node& node,
   if (pads.size() != 4)
     return "max_pool pads must have 4 entries";
   auto strides = get_ints_attr(node, "strides", {1, 1});
+  if (strides.size() != 2)
+    return "max_pool strides must have 2 entries";
 
   auto outType = lower_tensor_type(c.ctx, node.outputs[0].type);
   auto inType = mlir::cast<RankedTensorType>(inputs[0].getType());
@@ -387,15 +476,16 @@ std::string lower_max_pool(Ctx& c, const Node& node,
         {inShape[0], inShape[1], inShape[2] + pads[0] + pads[2],
          inShape[3] + pads[1] + pads[3]},
         inType.getElementType());
-    x = pad_zeros(c, x, paddedType, {0, 0, pads[0], pads[1]},
-                  {0, 0, pads[2], pads[3]});
+    x = pad_constant(c, x, paddedType, {0, 0, pads[0], pads[1]},
+                     {0, 0, pads[2], pads[3]},
+                     -std::numeric_limits<float>::infinity());
   }
 
   // Dummy [KH,KW] kernel operand (shape drives the reduction; unused by max).
   Value kernelInit = empty_tensor(
       c, RankedTensorType::get({kh, kw}, inType.getElementType()));
 
-  Value init = empty_tensor(c, outType);
+  Value init = filled_tensor(c, outType, -std::numeric_limits<float>::infinity());
   auto stridesAttr = c.builder.getI64VectorAttr({sh, sw});
   auto dilationsAttr = c.builder.getI64VectorAttr({1, 1});
   Value pool = c.builder
@@ -440,6 +530,8 @@ std::string lower_reduce_mean(Ctx& c, const Node& node,
       a += static_cast<int64_t>(rank);
     if (a < 0 || a >= static_cast<int64_t>(rank))
       return "reduce_mean axis out of range";
+    if (reduced[static_cast<unsigned>(a)])
+      return "reduce_mean has duplicate axes";
     reduced[static_cast<unsigned>(a)] = true;
   }
 
@@ -460,7 +552,7 @@ std::string lower_reduce_mean(Ctx& c, const Node& node,
   AffineMap inMap = AffineMap::get(rank, 0, inExprs, &c.ctx);
   AffineMap outMap = AffineMap::get(rank, 0, outExprs, &c.ctx);
 
-  Value init = empty_tensor(c, outType);
+  Value init = filled_tensor(c, outType, 0.0);
   auto op = c.builder.create<linalg::GenericOp>(
       c.loc, TypeRange{outType}, ValueRange{inputs[0]}, ValueRange{init},
       llvm::ArrayRef<AffineMap>{inMap, outMap}, iters,
@@ -487,6 +579,13 @@ std::string lower_gemm(Ctx& c, const Node& node,
   if (inputs.size() < 2 || inputs.size() > 3)
     return "gemm expects 2 or 3 inputs";
 
+  // v0 gemm is strictly 2-D (A and B are rank-2; the bias broadcasts along the
+  // trailing axis). Enforce before transpose_2d / matmul touch dimensions.
+  auto aType = mlir::cast<RankedTensorType>(inputs[0].getType());
+  auto bType = mlir::cast<RankedTensorType>(inputs[1].getType());
+  if (aType.getRank() != 2 || bType.getRank() != 2)
+    return "gemm requires rank-2 A and B in v0";
+
   Value a = inputs[0], b = inputs[1];
   bool hasBias = inputs.size() == 3;
   double alpha = get_float_attr(node, "alpha", 1.0);
@@ -501,7 +600,7 @@ std::string lower_gemm(Ctx& c, const Node& node,
   if (transB)
     b = transpose_2d(c, b);
 
-  Value init = empty_tensor(c, outType);
+  Value init = filled_tensor(c, outType, 0.0);
   Value mm = c.builder
                  .create<linalg::MatmulOp>(c.loc, TypeRange{outType},
                                            ValueRange{a, b}, ValueRange{init})
@@ -632,9 +731,17 @@ std::string lower_graph(Ctx& c) {
   for (const auto& p : g.parameters) {
     auto t = lower_tensor_type(c.ctx, p.type);
     if (std::holds_alternative<ExternalData>(p.data)) {
-      // Placeholder: uninitialized tensor of the right type; sidecar metadata
-      // is recorded on the module (record_external_data).
-      c.values[p.name] = empty_tensor(c, t);
+      if (c.weights) {
+        // Bake the external weight as a dense constant (execution path).
+        auto it = c.weights->find(p.name);
+        if (it == c.weights->end())
+          return "missing weight for external parameter '" + p.name + "'";
+        c.values[p.name] = dense_from_bytes(c, t, it->second);
+      } else {
+        // Placeholder: uninitialized tensor of the right type; sidecar metadata
+        // is recorded on the module (record_external_data).
+        c.values[p.name] = empty_tensor(c, t);
+      }
     } else {
       c.values[p.name] =
           dense_constant(c.builder, c.loc, t, std::get<ValuesData>(p.data));
@@ -660,6 +767,28 @@ std::string lower_graph(Ctx& c) {
 
 } // namespace
 
+std::string lower_into_module(MLIRContext& ctx, ModuleOp module,
+                              const Document& doc, const WeightMap* weights) {
+  Location loc = UnknownLoc::get(&ctx);
+  OpBuilder builder(&ctx);
+  builder.setInsertionPointToStart(module.getBody());
+
+  Ctx c(ctx, doc.graph, builder, loc, module, weights);
+  for (const auto& p : doc.graph.parameters)
+    c.params[p.name] = &p;
+
+  std::string err = lower_graph(c);
+  if (!err.empty())
+    return err;
+
+  // Sidecar metadata is only meaningful when :external params are left as
+  // placeholders (the serialization view). With weights baked, they are gone.
+  if (!weights)
+    record_external_data(c);
+
+  return "";
+}
+
 std::expected<std::string, LoweringError> lower_to_mlir(const Document& doc) {
   MLIRContext context;
   context.getOrLoadDialect<func::FuncDialect>();
@@ -670,18 +799,9 @@ std::expected<std::string, LoweringError> lower_to_mlir(const Document& doc) {
   Location loc = UnknownLoc::get(&context);
   OwningOpRef<ModuleOp> module = ModuleOp::create(loc);
 
-  OpBuilder builder(&context);
-  builder.setInsertionPointToStart(module->getBody());
-
-  Ctx c(context, doc.graph, builder, loc, *module);
-  for (const auto& p : doc.graph.parameters)
-    c.params[p.name] = &p;
-
-  std::string err = lower_graph(c);
+  std::string err = lower_into_module(context, *module, doc, nullptr);
   if (!err.empty())
     return std::unexpected(LoweringError{LoweringErrorKind::Operator, err});
-
-  record_external_data(c);
 
   std::string diagMsg;
   {

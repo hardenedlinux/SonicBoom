@@ -8,7 +8,7 @@ cmake_minimum_required(VERSION 3.20)
 project(SonicBoom
   VERSION 0.0.0
   DESCRIPTION "Native tensor runtime"
-  LANGUAGES CXX)
+  LANGUAGES C CXX)
 
 # SonicBoom-owned code targets C++23 with g++-13.
 set(CMAKE_CXX_STANDARD 23)
@@ -47,6 +47,10 @@ if(SONICBOOM_ENABLE_MLIR)
       CACHE PATH "LLVM CMake package directory")
   find_package(MLIR CONFIG REQUIRED)
 endif()
+
+# SonicBoom stable C ABI (Layer 3). Built as an object library and linked into
+# libsonicboom.so; added before core so its target is available there.
+add_subdirectory(capi)
 
 # SonicBoom core: Layer 2 public API (core/include/sonicboom/) + Layer 1 adapter
 # (core/layer1/). The adapter is the only SonicBoom-owned code that uses c10/ATen.
