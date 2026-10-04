@@ -17,6 +17,8 @@ PREFIX="$ROOT/build/llvm-mlir-install"
 
 # Map the host architecture to the LLVM target name. `LLVM_TARGETS_TO_BUILD`
 # accepts concrete target names (not "Native"/"host") in this LLVM version.
+# NVPTX is always added so the install can emit PTX for the GPU backend; it is a
+# pure codegen target (no CUDA toolchain is needed at build time).
 case "$(uname -m)" in
   x86_64|amd64)   HOST_TARGET=X86 ;;
   aarch64|arm64)  HOST_TARGET=AArch64 ;;
@@ -28,7 +30,7 @@ cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_C_COMPILER=gcc-13 \
   -DCMAKE_CXX_COMPILER=g++-13 \
   -DLLVM_ENABLE_PROJECTS=mlir \
-  -DLLVM_TARGETS_TO_BUILD="$HOST_TARGET" \
+  -DLLVM_TARGETS_TO_BUILD="$HOST_TARGET;NVPTX" \
   -DLLVM_INCLUDE_TESTS=OFF \
   -DLLVM_INCLUDE_EXAMPLES=OFF \
   -DLLVM_INCLUDE_BENCHMARKS=OFF \
