@@ -20,15 +20,31 @@ namespace nt {
 namespace detail {
 
 c10::Device to_aten(const Device& d) {
-  TORCH_CHECK(d.type == DeviceType::CPU, "v0 supports the CPU device only");
-  return c10::Device(c10::DeviceType::CPU, static_cast<int8_t>(d.index));
+  switch (d.type) {
+    case DeviceType::CPU:
+      return c10::Device(c10::DeviceType::CPU, static_cast<int8_t>(d.index));
+    case DeviceType::CUDA:
+      // c10::DeviceIndex is int8_t; the CUDA device ordinal is 0 for v0.
+      return c10::Device(c10::DeviceType::CUDA, static_cast<int8_t>(d.index));
+  }
+  TORCH_CHECK(false, "unsupported nt::DeviceType");
+  return c10::Device(c10::DeviceType::CPU); // unreachable
 }
 
 Device from_aten(const c10::Device& d) {
-  TORCH_CHECK(d.type() == c10::DeviceType::CPU, "v0 supports the CPU device only");
-  // c10 uses index -1 to mean "current/default" device; v0 CPU is
-  // single-device, so normalize to index 0 (matching Device::cpu()).
-  return Device{DeviceType::CPU, 0};
+  switch (d.type()) {
+    case c10::DeviceType::CPU:
+      // c10 uses index -1 to mean "current/default" device; v0 CPU is
+      // single-device, so normalize to index 0 (matching Device::cpu()).
+      return Device{DeviceType::CPU, 0};
+    case c10::DeviceType::CUDA:
+      // Preserve the CUDA device ordinal (-1 means "current device" in c10;
+      // v0 uses the explicit index, normalizing -1 to 0).
+      return Device{DeviceType::CUDA,
+                    d.index() < 0 ? 0 : static_cast<int32_t>(d.index())};
+  }
+  TORCH_CHECK(false, "unsupported c10::DeviceType");
+  return Device{DeviceType::CPU, 0}; // unreachable
 }
 
 } // namespace detail

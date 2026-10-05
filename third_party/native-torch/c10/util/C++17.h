@@ -8,10 +8,14 @@
 
 namespace c10::guts {
 
-#if defined(__HIP__)
+#if defined(__HIP__) || defined(__CUDACC__)
 
 // std::apply is not available in HIP device code because it lacks
-// __host__ __device__ annotations in the standard library.
+// __host__ __device__ annotations in the standard library. It is likewise
+// not device-callable under nvcc 12.0 with a g++-13 host compiler, whose
+// libstdc++-13 std::apply/std::invoke use decltype(auto) + a noexcept
+// builtin that --expt-relaxed-constexpr cannot relax; provide the
+// device-safe apply for CUDA builds too.
 namespace detail {
 template <class F, class Tuple, std::size_t... INDEX>
 C10_HOST_DEVICE constexpr auto apply_impl(

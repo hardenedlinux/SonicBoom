@@ -68,6 +68,14 @@ ArgKind arg_kind_from_type(const c10::Type& t) {
       if (lt.getElementType()->kind() == TypeKind::IntType) {
         return ArgKind::IntList;
       }
+      // SymInt[] (e.g. conv2d stride/padding/dilation). v0 handles only the
+      // constant-compatible path: IValue::toSymIntList() accepts an int list
+      // (constant SymInts decay to plain ints), so this maps to the existing
+      // IntList kind. This is NOT dynamic symbolic-shape support — a genuinely
+      // symbolic (SymNode-backed) SymInt is still out of v0 scope.
+      if (lt.getElementType()->kind() == TypeKind::SymIntType) {
+        return ArgKind::IntList;
+      }
       TORCH_CHECK(false, "unsupported list element type");
       return ArgKind::TensorList; // unreachable
     }
@@ -85,6 +93,10 @@ ArgKind arg_kind_from_type(const c10::Type& t) {
     case TypeKind::NumberType:
       return ArgKind::Scalar;
     case TypeKind::IntType:
+      return ArgKind::Int;
+    // SymInt scalar (constant) — same constant-compatible mapping as SymInt[]
+    // in the ListType branch above; not dynamic symbolic-shape support.
+    case TypeKind::SymIntType:
       return ArgKind::Int;
     case TypeKind::FloatType:
       return ArgKind::Float;

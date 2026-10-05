@@ -24,10 +24,11 @@ namespace nt {
 // for c10::DispatchKey. The Layer 1 adapter maps it onto the native dispatch
 // representation (see core/layer1/adapter/backend.cpp).
 struct BackendId {
-  uint16_t value;   // backend discriminator (0 = CPU in v0)
+  uint16_t value;   // backend discriminator (0 = CPU, 1 = CUDA in v0)
   int32_t priority; // ordering key; highest-priority applicable backend wins
 
   static constexpr BackendId cpu() { return BackendId{0, 0}; }
+  static constexpr BackendId cuda() { return BackendId{1, 0}; }
 
   friend bool operator==(const BackendId& a, const BackendId& b) {
     return a.value == b.value;

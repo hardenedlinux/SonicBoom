@@ -20,17 +20,21 @@
 
 namespace nt {
 
-// v0 is CPU-only; CUDA is a deferred manifest amendment and must not appear
-// here as an abstraction.
+// CPU and CUDA. ROCm / other accelerators are deferred manifest amendments and
+// must not appear here.
 enum class DeviceType : uint8_t {
   CPU,
+  CUDA,
 };
 
 struct Device {
   DeviceType type = DeviceType::CPU;
-  int32_t index = 0; // device ordinal; always 0 for CPU in v0.
+  int32_t index = 0; // device ordinal; 0 for CPU, the CUDA device index for CUDA.
 
   static constexpr Device cpu() { return Device{DeviceType::CPU, 0}; }
+  static constexpr Device cuda(int32_t index = 0) {
+    return Device{DeviceType::CUDA, index};
+  }
 };
 
 inline bool operator==(const Device& a, const Device& b) {

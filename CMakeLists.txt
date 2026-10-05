@@ -19,13 +19,27 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # statically linked into it, so all static libraries must be position-independent.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# Backend selection. Only CPU is in v0 scope.
-option(SONICBOOM_USE_CUDA "Enable CUDA support (deferred — not in v0)" OFF)
+# Backend selection. CPU is always on; CUDA is opt-in (SONICBOOM_USE_CUDA=ON),
+# wiring the native-torch CUDA sources into libsonicboom.so and linking the
+# CUDA runtime. cuDNN / MAGMA / cutlass remain disabled (see the CUDA plan).
+option(SONICBOOM_USE_CUDA "Enable CUDA support (native-torch CUDA kernels)" OFF)
 
-# SonicCross regeneration hook: optional build-time code generator for the
-# native-torch sources. Exposes the `generate-native-torch` target only when
-# guild/SonicCross is available; normal builds use the checked-in generated/
-# tree and never require SonicCross.
+if(SONICBOOM_USE_CUDA)
+  # RTX 3050 = compute capability 8.6 (sm_86).
+  set(CMAKE_CUDA_ARCHITECTURES 86)
+  # native-torch headers (c10/util/intrusive_ptr.h) use C++20's operator<=>,
+  # so .cu host compilation needs C++20 (nvcc 12.0's highest supported host
+  # standard). This mirrors the C++23 the CPU native-torch TUs already compile
+  # under; C++20 is the closest nvcc 12.0 can reach.
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
+endif()
+
+# SonicCross build-time code generator for the native-torch sources (matches
+# upstream PyTorch's build-time torchgen). Defines the generation hook used by
+# third_party/native-torch; `guild` is a required build-time dependency.
 include(tools/generation/GenerateNativeTorch.cmake)
 
 # The native-torch implementation dependency (c10 + aten/core). It is built

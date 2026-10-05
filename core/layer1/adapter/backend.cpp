@@ -21,21 +21,36 @@ namespace detail {
 
 c10::DispatchKey to_dispatch_key(BackendId backend,
                                  Functionality functionality) {
-  // v0: single backend (CPU), so "highest-priority applicable backend wins" is
+  // v0: CPU + CUDA backends, so "highest-priority applicable backend wins" is
   // trivially satisfied. The adapter maps (backend, functionality) onto the
   // native dispatch representation.
-  TORCH_CHECK(backend == BackendId::cpu(), "v0 supports the CPU backend only");
-  switch (functionality) {
-    case Functionality::Dense:
-      return c10::DispatchKey::CPU;
-    case Functionality::Sparse:
-      return c10::DispatchKey::Sparse;
-    case Functionality::Quantized:
-      return c10::DispatchKey::QuantizedCPU;
-    case Functionality::Autograd:
-      return c10::DispatchKey::Autograd;
+  switch (backend.value) {
+    case 0: // BackendId::cpu()
+      switch (functionality) {
+        case Functionality::Dense:
+          return c10::DispatchKey::CPU;
+        case Functionality::Sparse:
+          return c10::DispatchKey::Sparse;
+        case Functionality::Quantized:
+          return c10::DispatchKey::QuantizedCPU;
+        case Functionality::Autograd:
+          return c10::DispatchKey::Autograd;
+      }
+      break;
+    case 1: // BackendId::cuda()
+      switch (functionality) {
+        case Functionality::Dense:
+          return c10::DispatchKey::CUDA;
+        case Functionality::Sparse:
+          return c10::DispatchKey::SparseCUDA;
+        case Functionality::Quantized:
+          return c10::DispatchKey::QuantizedCUDA;
+        case Functionality::Autograd:
+          return c10::DispatchKey::AutogradCUDA;
+      }
+      break;
   }
-  TORCH_CHECK(false, "unsupported nt::Functionality");
+  TORCH_CHECK(false, "unsupported nt::BackendId/Functionality");
   return c10::DispatchKey::CPU; // unreachable
 }
 

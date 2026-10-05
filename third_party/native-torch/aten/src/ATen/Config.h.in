@@ -6,20 +6,46 @@
 // Config.h.in by SonicBoom CMake; do not edit the generated file. No upstream
 // generated build output is used.
 //
-// CUDA / MKL / cuDNN / MIOpen / ROCm are all disabled: they are deferred
-// manifest amendments, not v0 requirements.
+// CUDA / MKL / cuDNN / MIOpen / ROCm / oneDNN / LAPACK / KleidiAI / FFT are
+// all disabled: they are deferred manifest amendments, not v0 requirements.
 
+// Backends (all OFF for the v0 CPU build):
 #define AT_CUDNN_ENABLED() 0
 #define AT_MKL_ENABLED() 0
+#define AT_MKL_SEQUENTIAL() 0
 #define AT_MKLDNN_ENABLED() 0
+#define AT_MKLDNN_ACL_ENABLED() 0
 #define AT_MIOPEN_ENABLED() 0
 #define AT_ROCM_ENABLED() 0
 #define AT_NNPACK_ENABLED() 0
 #define AT_FFTW_ENABLED() 0
+#define AT_POCKETFFT_ENABLED() 0
+#define AT_KLEIDIAI_ENABLED() 0
+
+// Linear algebra: BLAS is generic (guardable); LAPACK is deferred.
 #define AT_BUILD_WITH_BLAS() 0
 #define AT_BLAS_GENERIC() 1
+#define AT_BUILD_WITH_LAPACK() 0
+#define AT_BLAS_F2C() 0
+#define AT_BLAS_USE_CBLAS_DOT() 0
+#define AT_USE_EIGEN_SPARSE() 0
+
+// CPU intra-op parallelism: native thread pool (c10::ThreadPool backed by
+// cpuinfo). OpenMP is not wired for v0. See manifest §15.D — cpuinfo is
+// required for the full CPU path (thread pool + parallel dispatch).
+#define AT_PARALLEL_OPENMP 0
+#define AT_PARALLEL_NATIVE 1
+
 #define AT_EXPERIMENTAL_SOCKS() 0
 #define CAFFE2_STATIC_LINK_CUDA() 0
-#define USE_CUDA() 0
-#define USE_ROCM() 0
-#define USE_DISTRIBUTED() 0
+// USE_CUDA / USE_ROCM / USE_DISTRIBUTED are OBJECT-LIKE macros upstream (set via
+// -D on the compiler command line), and the ATen/c10 code checks them with
+// `#if defined(USE_CUDA)` / `#ifdef USE_DISTRIBUTED`. Defining them here as
+// function-like `USE_CUDA()` etc. would make `defined(USE_CUDA)` true even in
+// the CPU-only build (and wrongly pull in the ROCm hipsolver include via
+// CUDAContextLight.h's `#if defined(USE_ROCM)`). They are therefore NOT defined
+// here: SonicBoom CMake adds `USE_CUDA=1` as an object-like compile definition
+// only when SONICBOOM_USE_CUDA=ON (see third_party/native-torch/CMakeLists.txt),
+// and USE_ROCM / USE_DISTRIBUTED are never defined (ROCm + distributed are out
+// of v0 scope). cuDNN/MAGMA/ROCm backend switches live in ATen/cuda/CUDAConfig.h
+// (all 0); those ARE function-like macros (`AT_CUDNN_ENABLED()` etc.).

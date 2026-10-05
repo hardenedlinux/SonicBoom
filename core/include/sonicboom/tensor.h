@@ -61,4 +61,17 @@ class Tensor {
 // factory; the underlying storage lives behind the Layer 1 boundary.
 Tensor empty(const std::vector<int64_t>& sizes, ScalarType dtype);
 
+// Allocate an (uninitialized) tensor of the given sizes/dtype on `device`.
+// CPU goes through the CPU allocator; CUDA through the CUDA caching allocator
+// (requires a CUDA-enabled build — see cuda_available()).
+Tensor empty(const std::vector<int64_t>& sizes, ScalarType dtype, Device device);
+
+// Copy `t` to `device` (CPU ↔ CUDA), returning a new tensor. The transfer runs
+// through the native-torch copy kernel behind the Layer 1 boundary.
+Tensor to_device(const Tensor& t, Device device);
+
+// True when this build is CUDA-enabled AND a CUDA device is present at runtime.
+// Always false for a CPU-only build. Never throws.
+bool cuda_available();
+
 } // namespace nt

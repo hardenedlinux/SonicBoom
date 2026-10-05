@@ -51,7 +51,31 @@ target_include_directories(sonicboom
 # SonicBoom-owned code targets C++23 (global default); the native-torch targets
 # carry their own C++17 constraint. Linking aten_core is PRIVATE so the
 # native-torch dependency does not leak into Layer 2 consumers.
-target_link_libraries(sonicboom PRIVATE aten_core)
+#
+# aten_core is a STATIC library whose generated Register{Schema,CPU,...}*.cpp
+# register kernels via static initializers (TORCH_LIBRARY / TORCH_LIBRARY_IMPL).
+# Without --whole-archive the linker drops those objects (no symbol is referenced
+# from libsonicboom.so's own objects), so the dispatcher would find no operators
+# at runtime. c10 is whole-archived alongside aten_core for the same reason:
+# c10/cuda/impl/CUDAGuardImpl.cpp is a static-initializer-ONLY object
+# (C10_REGISTER_GUARD_IMPL(CUDA, ...) — all CUDAGuardImpl methods are inline),
+# so no symbol references it and the normal link drops it, leaving
+# getDeviceGuardImpl(CUDA) unregistered ("not linked with support for cuda
+# devices"). The --no-whole-archive immediately after closes the scope so the
+# later MLIR/LLVM deps stay normally-linked.
+target_link_libraries(sonicboom PRIVATE
+  "-Wl,--whole-archive" aten_core c10 "-Wl,--no-whole-archive")
+
+# CUDA: define the adapter's build-time switch (guards cuda_available() and the
+# CUDA tensor factory in core/layer1/adapter/tensor.cpp) and link cudart for
+# cudaGetDeviceCount. The heavier CUDA libs (cublas/cusolver/cusparse/cufft/
+# nvrtc) flow through from aten_core's PRIVATE links (static lib → $<LINK_ONLY:>),
+# and cudart is already PUBLIC on c10; this explicit link keeps the adapter's
+# direct cudart use self-documenting.
+if(SONICBOOM_USE_CUDA)
+  target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_CUDA=1)
+  target_link_libraries(sonicboom PRIVATE CUDA::cudart)
+endif()
 
 # MLIRIR provides MLIRContext / ModuleOp / BuiltinDialect and the asm printer;
 # its transitive LLVM dependencies (MLIRSupport, LLVMSupport, …) come via the

@@ -16,6 +16,8 @@
 
 #include "adapter.h"
 
+#include <ATen/core/dispatch/DispatchKeyExtractor.h>
+
 namespace nt {
 
 OperatorHandle::OperatorHandle() = default;
@@ -36,9 +38,31 @@ OperatorSchema OperatorHandle::schema() const {
 
 ResultList OperatorHandle::call(ArgumentList args) const {
   c10::Stack stack = detail::to_aten(args);
-  // v0 is CPU-only. A tensor input would carry DispatchKey::CPU and the generic
-  // backend-selection path would pick it; that path is deferred (backend.cpp).
-  impl_->handle.callBoxedForDispatchKey(c10::DispatchKey::CPU, stack);
+  // Tensor-driven dispatch: derive the dispatch key set from the tensor
+  // arguments, then resolve the kernel through redispatchBoxed →
+  // OperatorEntry::lookup — the computed dispatch table, including the
+  // Composite{Implicit,Explicit}Autograd alias keys and backend fallback.
+  //
+  // We must use the operator's OWN registered DispatchKeyExtractor (via
+  // OperatorHandle::dispatchKeyExtractor()), NOT a fresh one built from the
+  // schema: makeFallthrough() has already called setOperatorHasFallthroughForKey
+  // on it, masking BackendSelect / ADInplaceOrView / Autograd* out of the
+  // derived key set. A fresh extractor leaves those fallthrough keys in, so
+  // lookup() would return fallthrough_kernel and redispatchBoxed (which, unlike
+  // callBoxed, does not short-circuit fallthrough) would execute it → throw.
+  //
+  // For scalar-only operators (e.g. the M2 m2::scale test) the tensor-derived
+  // key set is empty; an empty key set would resolve to Undefined under lookup,
+  // so fall back to an explicit CPU key set (a CPU-registered kernel is
+  // unreachable otherwise). A missing kernel throws a clean
+  // TORCH_CHECK_NOT_IMPLEMENTED via lookup → reportError, never a null call
+  // target.
+  c10::DispatchKeySet keys =
+      impl_->handle.dispatchKeyExtractor().getDispatchKeySetBoxed(&stack);
+  if (keys.empty()) {
+    keys = c10::DispatchKeySet(c10::DispatchKey::CPU);
+  }
+  impl_->handle.redispatchBoxed(keys, &stack);
   return detail::from_aten(std::move(stack));
 }
 

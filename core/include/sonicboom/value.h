@@ -43,6 +43,7 @@ enum class ValueKind : uint8_t {
   Layout,
   MemoryFormat,
   TensorList,
+  IntList,
 };
 
 // Layer 2 runtime value. Self-contained (a std::variant of Native Torch-owned
@@ -63,6 +64,7 @@ class Value {
   Value(Layout l) : data_(l) {}
   Value(MemoryFormat mf) : data_(mf) {}
   Value(std::vector<Tensor> tl) : data_(std::move(tl)) {}
+  Value(std::vector<int64_t> il) : data_(std::move(il)) {}
 
   ValueKind kind() const { return static_cast<ValueKind>(data_.index()); }
 
@@ -84,6 +86,9 @@ class Value {
   bool isTensorList() const {
     return std::holds_alternative<std::vector<Tensor>>(data_);
   }
+  bool isIntList() const {
+    return std::holds_alternative<std::vector<int64_t>>(data_);
+  }
 
   Tensor toTensor() const { return std::get<Tensor>(data_); }
   Scalar toScalar() const { return std::get<Scalar>(data_); }
@@ -98,12 +103,15 @@ class Value {
   const std::vector<Tensor>& toTensorList() const {
     return std::get<std::vector<Tensor>>(data_);
   }
+  const std::vector<int64_t>& toIntList() const {
+    return std::get<std::vector<int64_t>>(data_);
+  }
 
  private:
   // Alternative order MUST match ValueKind (index 0 == None).
   std::variant<std::monostate, Tensor, Scalar, int64_t, double, bool,
                std::string, Device, ScalarType, Layout, MemoryFormat,
-               std::vector<Tensor>>
+               std::vector<Tensor>, std::vector<int64_t>>
       data_;
 };
 

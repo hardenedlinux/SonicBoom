@@ -16,6 +16,12 @@
 
 #include "adapter.h"
 
+#include <ATen/ops/empty.h>
+
+#ifdef SONICBOOM_USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
+
 namespace nt {
 
 Tensor::Tensor() = default;
@@ -38,6 +44,37 @@ void* Tensor::data_ptr() const { return impl_->t.data_ptr(); }
 
 Tensor empty(const std::vector<int64_t>& sizes, ScalarType dtype) {
   return detail::make_cpu_tensor(sizes, dtype);
+}
+
+Tensor empty(const std::vector<int64_t>& sizes, ScalarType dtype, Device device) {
+  if (device.type == DeviceType::CPU) {
+    return detail::make_cpu_tensor(sizes, dtype);
+  }
+  // CUDA: allocate through at::empty, which dispatches empty.memory_format to
+  // the CUDA kernel and backs the tensor with the CUDA caching allocator. We
+  // deliberately do not hand-build a CUDA storage here (mirrors the plan's
+  // "don't hand-build storage" note).
+  at::Tensor t = at::empty(
+      at::IntArrayRef(sizes),
+      at::TensorOptions().dtype(detail::to_aten(dtype))
+                         .device(detail::to_aten(device)));
+  return detail::from_aten(std::move(t));
+}
+
+Tensor to_device(const Tensor& t, Device device) {
+  at::Tensor native = detail::to_aten(t);
+  at::Tensor moved = native.to(detail::to_aten(device), native.scalar_type(),
+                               /*non_blocking=*/false, /*copy=*/false);
+  return detail::from_aten(std::move(moved));
+}
+
+bool cuda_available() {
+#ifdef SONICBOOM_USE_CUDA
+  int count = 0;
+  return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+#else
+  return false;
+#endif
 }
 
 } // namespace nt

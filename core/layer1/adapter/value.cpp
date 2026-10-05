@@ -51,6 +51,12 @@ c10::IValue to_aten(const Value& v) {
       }
       return c10::IValue(std::move(vec));
     }
+    case ValueKind::IntList:
+      // A plain int64 list. For operators whose schema declares SymInt[]
+      // (e.g. conv2d stride/padding/dilation), the boxed kernel unboxes via
+      // IValue::toSymIntList(), which accepts an int list (constant SymInts
+      // decay to plain ints), so no SymInt representation is required in v0.
+      return c10::IValue(v.toIntList());
   }
   TORCH_CHECK(false, "unsupported nt::ValueKind");
   return c10::IValue(); // unreachable
@@ -84,6 +90,9 @@ Value from_aten(const c10::IValue& iv) {
       vec.push_back(from_aten(t));
     }
     return Value(std::move(vec));
+  }
+  if (iv.isIntList()) {
+    return Value(iv.toIntVector());
   }
   if (iv.isScalar()) {
     return Value(from_aten(iv.toScalar()));
