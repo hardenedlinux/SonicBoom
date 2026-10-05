@@ -16,18 +16,22 @@
 
 #pragma once
 
-// Runtime executor. Given a validated ExecutionPlan and a Backend, it verifies
-// the live resource fingerprint still matches the plan, re-validates the plan
-// defensively, then walks execution_order and dispatches each task. It never
-// replans, migrates, or alters the plan — on any mismatch it fails with a
-// RuntimeError instead of silently doing something different.
+// Runtime executor. Given a validated ExecutionPlan and a set of backends keyed
+// by BackendTag, it verifies the live resource fingerprint still matches the
+// plan, re-validates the plan defensively, then walks execution_order and
+// dispatches each compute task to its routed backend, handing intermediate
+// tensors between tasks by TensorId. It never replans, migrates, or alters the
+// plan — on any mismatch it fails with a RuntimeError instead of silently doing
+// something different.
 
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/execution_plan.h>
+#include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/resource.h>
 #include <sonicboom/sx/exec.h>
 
 #include <expected>
+#include <map>
 #include <vector>
 
 namespace sonicboom::planner {
@@ -40,17 +44,23 @@ struct ExecutionResult {
 
 class RuntimeExecutor {
 public:
-  // `backend` must outlive the executor.
+  // Single-backend form (backward compatible): the backend serves the Mlir tag,
+  // which is the whole-graph compute task's backend. Backends must outlive the
+  // executor.
   explicit RuntimeExecutor(Backend& backend);
 
+  // Multi-backend form: dispatch each compute task by its BackendTag. A task
+  // whose tag has no registered backend fails with a RuntimeError.
+  explicit RuntimeExecutor(std::map<BackendTag, Backend*> backends);
+
   // Execute `plan`. `inputs` holds one raw buffer per graph-input tensor (in
-  // plan order); constants/weights are baked into the backend's compiled unit.
+  // plan order); constants/weights are baked into the backends' compiled units.
   std::expected<ExecutionResult, RuntimeError> execute(
       const ExecutionPlan& plan, const ResourceSnapshot& live,
       const std::vector<sx::Bytes>& inputs) const;
 
 private:
-  Backend& backend_;
+  std::map<BackendTag, Backend*> backends_;
 };
 
 } // namespace sonicboom::planner

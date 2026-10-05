@@ -33,6 +33,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Reshape;
   if (name == "gemm")
     return OpKind::Gemm;
+  if (name == "softmax")
+    return OpKind::Softmax;
   return std::nullopt;
 }
 
@@ -45,6 +47,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::ReduceMean: return "reduce_mean";
     case OpKind::Reshape: return "reshape";
     case OpKind::Gemm: return "gemm";
+    case OpKind::Softmax: return "softmax";
     case OpKind::WholeGraph: return "whole_graph";
   }
   return "?";

@@ -18,7 +18,10 @@
 
 #include "fingerprint.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace sonicboom::planner {
@@ -127,34 +130,10 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
   plan.memory_spaces = snapshot_.memory_spaces;
   plan.tensors = graph.tensors;
 
-  // v0 task granularity matches the compiled unit: the compiler emits one
-  // whole-graph JIT entry, so there is exactly one compute task covering every
-  // node (jit_entry 0). Per-operator identity is preserved in graph_nodes.
-  TaskDesc task;
-  task.id = TaskId{0};
-  task.kind = TaskKind::Compute;
-  task.device = cpu->id;
-  task.memory_space = host->id;
-
-  ComputeTaskDesc compute;
-  compute.op = OpKind::WholeGraph;
-  compute.jit_entry = JitEntryId{0};
-  for (const auto& node : graph.nodes)
-    compute.graph_nodes.push_back(node.id);
-  task.payload = compute;
-
-  for (const auto& t : graph.tensors) {
-    if (t.is_graph_input || t.is_constant)
-      task.inputs.push_back(t.id);
-    if (t.is_graph_output)
-      task.outputs.push_back(t.id);
-  }
-
-  // Decompose the whole graph into per-node compute requests and sum, since the
-  // cost model estimates single operators (it rejects WholeGraph).
-  double total_latency_us = 0.0;
-  double min_confidence = 1.0;
-  for (const auto& node : graph.nodes) {
+  // Per-node compute cost, shared by both task models below (the cost model
+  // estimates single operators and rejects WholeGraph).
+  auto node_cost = [&](const GraphNodeDesc& node)
+      -> std::expected<ComputeCost, PlannerError> {
     uint64_t in_bytes = 0;
     for (TensorId tid : node.inputs)
       if (const auto* t = graph.find_tensor(tid))
@@ -174,18 +153,104 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     req.input_bytes = in_bytes;
     req.output_bytes = out_bytes;
     req.dtype = dtype;
+    return cost_model_.estimate_compute(req, cpu->id);
+  };
 
-    auto est = cost_model_.estimate_compute(req, cpu->id);
-    if (!est)
-      return std::unexpected(est.error());
-    total_latency_us += est->estimated_latency_us;
-    if (est->confidence < min_confidence)
-      min_confidence = est->confidence;
+  double total_latency_us = 0.0;
+  double min_confidence = 1.0;
+
+  // Does any node dispatch to the native-torch backend?
+  bool has_native = false;
+  for (const auto& node : graph.nodes)
+    if (route_op(node.op) == BackendTag::NativeTorch)
+      has_native = true;
+
+  if (!has_native) {
+    // Homogeneous MLIR graph: one whole-graph compute task (jit_entry 0), as
+    // before co-execution. Per-operator identity is preserved in graph_nodes.
+    TaskDesc task;
+    task.id = TaskId{0};
+    task.kind = TaskKind::Compute;
+    task.device = cpu->id;
+    task.memory_space = host->id;
+
+    ComputeTaskDesc compute;
+    compute.op = OpKind::WholeGraph;
+    compute.backend = BackendTag::Mlir;
+    compute.jit_entry = JitEntryId{0};
+    for (const auto& node : graph.nodes)
+      compute.graph_nodes.push_back(node.id);
+    task.payload = compute;
+
+    for (const auto& t : graph.tensors) {
+      if (t.is_graph_input || t.is_constant)
+        task.inputs.push_back(t.id);
+      if (t.is_graph_output)
+        task.outputs.push_back(t.id);
+    }
+
+    for (const auto& node : graph.nodes) {
+      auto est = node_cost(node);
+      if (!est)
+        return std::unexpected(est.error());
+      total_latency_us += est->estimated_latency_us;
+      min_confidence = std::min(min_confidence, est->confidence);
+    }
+    task.cost = ComputeCost{total_latency_us, min_confidence};
+
+    plan.tasks.push_back(std::move(task));
+    plan.execution_order.push_back(TaskId{0});
+  } else {
+    // Mixed graph: one compute task per node, routed by route_op. Node order is
+    // topological (every node's inputs are inputs/parameters/earlier outputs),
+    // so dependencies point strictly backward and node order is a valid
+    // execution order. Intermediate tensors are handed off by TensorId at
+    // runtime; the MLIR backend receives per-region slices compiled separately.
+    std::unordered_map<uint32_t, TaskId> producer;  // tensor -> producing task
+    uint32_t next_task = 0;
+    for (const auto& node : graph.nodes) {
+      TaskDesc task;
+      task.id = TaskId{next_task};
+      task.kind = TaskKind::Compute;
+      task.device = cpu->id;
+      task.memory_space = host->id;
+
+      ComputeTaskDesc compute;
+      compute.op = node.op;
+      compute.backend = route_op(node.op);
+      compute.jit_entry = JitEntryId{0};  // single MLIR region in v0
+      compute.graph_nodes.push_back(node.id);
+      task.payload = compute;
+
+      task.inputs = node.inputs;
+      task.outputs = node.outputs;
+
+      std::unordered_set<uint32_t> deps;
+      for (TensorId in : node.inputs) {
+        auto it = producer.find(in.value);
+        if (it != producer.end() && it->second.value != task.id.value)
+          deps.insert(it->second.value);
+      }
+      for (uint32_t d : deps)
+        task.dependencies.push_back(TaskId{d});
+
+      auto est = node_cost(node);
+      if (!est)
+        return std::unexpected(est.error());
+      task.cost = *est;
+      total_latency_us += est->estimated_latency_us;
+      min_confidence = std::min(min_confidence, est->confidence);
+
+      plan.tasks.push_back(std::move(task));
+      plan.execution_order.push_back(TaskId{next_task});
+      for (TensorId out : node.outputs)
+        producer[out.value] = TaskId{next_task};
+      if (!next_id(next_task))
+        return std::unexpected(PlannerError(
+            PlannerErrorCode::InternalError,
+            "task id counter overflow", Phase::Planning));
+    }
   }
-  task.cost = ComputeCost{total_latency_us, min_confidence};
-
-  plan.tasks.push_back(std::move(task));
-  plan.execution_order.push_back(TaskId{0});
 
   plan.estimated_cost.estimated_compute_us = total_latency_us;
   plan.estimated_cost.estimated_transfer_us = 0.0;

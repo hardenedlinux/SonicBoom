@@ -18,8 +18,9 @@
 
 // Execution backends. A Backend executes compute tasks on a device; the runtime
 // executor never touches MLIR/LLVM/native-torch directly — it dispatches to a
-// Backend. v0 provides exactly one backend: CpuBackend, which wraps the
-// whole-graph sx::Executable JIT entry (one float32 input, one float32 output).
+// Backend. v0 provides two backends: CpuBackend, which wraps an sx::Executable
+// JIT entry (one or more float32 inputs, one float32 output), and
+// NativeTorchBackend, which dispatches a single native-torch node per task.
 
 #include <sonicboom/planner/errors.h>
 #include <sonicboom/planner/resource.h>

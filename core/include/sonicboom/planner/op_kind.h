@@ -16,10 +16,11 @@
 
 #pragma once
 
-// The planner's operator vocabulary. The seven concrete operators mirror the
-// frozen S-Expr v0.1 supported operator set (used for per-node capability and
-// cost analysis); `WholeGraph` is a task-granularity marker for the single
-// whole-graph compute task the v0 compiler emits, not a node-level operator.
+// The planner's operator vocabulary. The concrete operators mirror the frozen
+// S-Expr v0.1 supported operator set (used for per-node capability and cost
+// analysis); `Softmax` is a native-torch-routed operator (no MLIR lowering);
+// `WholeGraph` is a task-granularity marker for the single whole-graph compute
+// task the v0 compiler emits, not a node-level operator.
 
 #include <cstdint>
 #include <optional>
@@ -36,6 +37,7 @@ enum class OpKind : uint8_t {
   ReduceMean,
   Reshape,
   Gemm,
+  Softmax,
   WholeGraph,
 };
 

@@ -218,7 +218,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   cpu.capability.supports_concurrent_copy = false; // honest: no concurrent copy
   cpu.capability.supported_ops = {
       OpKind::Conv,   OpKind::Relu,    OpKind::Add,       OpKind::MaxPool,
-      OpKind::ReduceMean, OpKind::Reshape, OpKind::Gemm,
+      OpKind::ReduceMean, OpKind::Reshape, OpKind::Gemm,  OpKind::Softmax,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, not computed tensors.

@@ -16,7 +16,7 @@ endif()
 
 # Static execution planner tests (unit + integration). They include only
 # <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
-foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_planner_telemetry test_planner_benchmark)
+foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_coexecution test_planner_telemetry test_planner_benchmark)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
 endforeach()

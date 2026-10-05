@@ -19,12 +19,19 @@
 #include <sonicboom/planner/plan_validator.h>
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace sonicboom::planner {
 
-RuntimeExecutor::RuntimeExecutor(Backend& backend) : backend_(backend) {}
+RuntimeExecutor::RuntimeExecutor(Backend& backend) {
+  backends_[BackendTag::Mlir] = &backend;
+}
+
+RuntimeExecutor::RuntimeExecutor(std::map<BackendTag, Backend*> backends)
+    : backends_(std::move(backends)) {}
 
 std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
     const ExecutionPlan& plan, const ResourceSnapshot& live,
@@ -56,9 +63,15 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         "input buffer count does not match the plan's graph inputs",
         Phase::Execution));
 
-  // 4. Walk execution_order and dispatch. v0 has a single whole-graph compute
-  //    task, so the graph-input buffers are passed straight through.
-  std::vector<sx::Bytes> outputs;
+  // 4. Seed the value map with the graph-input buffers, in plan tensor order.
+  std::map<uint32_t, sx::Bytes> values;  // TensorId -> raw bytes
+  std::size_t in_i = 0;
+  for (const auto& t : plan.tensors)
+    if (t.is_graph_input)
+      values[t.id.value] = inputs[in_i++];
+
+  // 5. Walk execution_order: dispatch each compute task to its routed backend,
+  //    handing intermediate tensors between tasks by TensorId.
   for (TaskId tid : plan.execution_order) {
     const TaskDesc* task = plan.find_task(tid);
     if (!task)
@@ -68,10 +81,48 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
 
     switch (task->kind) {
       case TaskKind::Compute: {
-        auto res = backend_.execute(*task, inputs);
+        const auto* compute = task->as_compute();
+        if (!compute)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "compute task has no compute payload", Phase::Execution));
+        Backend* backend = nullptr;
+        auto it = backends_.find(compute->backend);
+        if (it != backends_.end())
+          backend = it->second;
+        if (!backend)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::BackendFailure,
+              "no backend registered for tag '" +
+                  std::string(backend_tag_name(compute->backend)) + "'",
+              Phase::Execution));
+
+        std::vector<sx::Bytes> task_inputs;
+        task_inputs.reserve(task->inputs.size());
+        for (TensorId in : task->inputs) {
+          // Constants (weights/axes/shapes) are baked into the backend's
+          // compiled unit, not passed as runtime buffers.
+          if (const auto* td = plan.find_tensor(in);
+              td && td->is_constant)
+            continue;
+          auto v = values.find(in.value);
+          if (v == values.end())
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::InvalidPlan,
+                "missing value for input tensor", Phase::Execution));
+          task_inputs.push_back(v->second);
+        }
+
+        auto res = backend->execute(*task, task_inputs);
         if (!res)
           return std::unexpected(res.error());
-        outputs = std::move(*res);
+        if (res->size() != task->outputs.size())
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "backend produced an unexpected number of outputs",
+              Phase::Execution));
+        for (std::size_t k = 0; k < task->outputs.size(); ++k)
+          values[task->outputs[k].value] = std::move((*res)[k]);
         break;
       }
       case TaskKind::Transfer:
@@ -88,6 +139,18 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
             Phase::Execution));
     }
   }
+
+  // 6. Gather the graph-output buffers in plan tensor order.
+  std::vector<sx::Bytes> outputs;
+  for (const auto& t : plan.tensors)
+    if (t.is_graph_output) {
+      auto v = values.find(t.id.value);
+      if (v == values.end())
+        return std::unexpected(RuntimeError(
+            RuntimeErrorCode::InvalidPlan,
+            "graph output tensor has no computed value", Phase::Execution));
+      outputs.push_back(std::move(v->second));
+    }
 
   if (outputs.size() != n_outputs)
     return std::unexpected(RuntimeError(

@@ -16,9 +16,11 @@
 
 #include <sonicboom/planner/memory_planner.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 namespace sonicboom::planner {
@@ -73,24 +75,72 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
         "compute task memory space is not present in the plan", Phase::Memory));
   const uint64_t align = space->alignment_bytes == 0 ? 1 : space->alignment_bytes;
 
-  const TaskId compute_task = compute->id;
+  // 1. Lifetimes. The whole-graph model (a single whole-graph compute task)
+  //    keeps every intermediate internal to the compiled unit, so a
+  //    non-input/non-constant tensor is produced by that task and a non-output
+  //    tensor is consumed by it. The per-node model instead derives producer
+  //    and consumers from each task's explicit inputs/outputs.
+  bool whole_graph = false;
+  for (const auto& t : plan.tasks)
+    if (t.kind == TaskKind::Compute && t.as_compute() &&
+        t.as_compute()->op == OpKind::WholeGraph)
+      whole_graph = true;
 
-  // 1. Lifetimes. In the whole-graph model every tensor is live for the single
-  //    compute task: inputs/constants are produced before it (no producer) and
-  //    read by it; node outputs (intermediate and final) are produced by it.
   plan.lifetimes.clear();
   plan.lifetimes.reserve(plan.tensors.size());
-  for (const auto& t : plan.tensors) {
-    TensorLifetime lt;
-    lt.tensor = t.id;
-    const bool produced_outside = t.is_graph_input || t.is_constant;
-    if (!produced_outside)
-      lt.producer = compute_task;
-    if (!t.is_graph_output)
-      lt.consumers.push_back(compute_task);
-    lt.first_required = compute_task;
-    lt.last_required = compute_task;
-    plan.lifetimes.push_back(std::move(lt));
+  if (whole_graph) {
+    const TaskId wg = compute->id;
+    for (const auto& t : plan.tensors) {
+      TensorLifetime lt;
+      lt.tensor = t.id;
+      const bool produced_outside = t.is_graph_input || t.is_constant;
+      if (!produced_outside)
+        lt.producer = wg;
+      if (!t.is_graph_output)
+        lt.consumers.push_back(wg);
+      lt.first_required = wg;
+      lt.last_required = wg;
+      plan.lifetimes.push_back(std::move(lt));
+    }
+  } else {
+    std::unordered_map<uint32_t, uint32_t> position;
+    for (uint32_t p = 0; p < plan.execution_order.size(); ++p)
+      position[plan.execution_order[p].value] = p;
+
+    for (const auto& t : plan.tensors) {
+      TensorLifetime lt;
+      lt.tensor = t.id;
+      for (const auto& task : plan.tasks) {
+        if (task.kind != TaskKind::Compute)
+          continue;
+        for (TensorId o : task.outputs)
+          if (o == t.id)
+            lt.producer = task.id;
+        for (TensorId i : task.inputs)
+          if (i == t.id)
+            lt.consumers.push_back(task.id);
+      }
+
+      uint32_t first = UINT32_MAX, last = 0;
+      auto consider = [&](TaskId id) {
+        auto it = position.find(id.value);
+        if (it == position.end())
+          return;
+        first = std::min(first, it->second);
+        last = std::max(last, it->second);
+      };
+      if (lt.producer)
+        consider(*lt.producer);
+      for (TaskId c : lt.consumers)
+        consider(c);
+      if (first == UINT32_MAX) {  // no producer or consumer: pin to first task
+        first = 0;
+        last = 0;
+      }
+      lt.first_required = plan.execution_order[first];
+      lt.last_required = plan.execution_order[last];
+      plan.lifetimes.push_back(std::move(lt));
+    }
   }
 
   // 2. Buffer allocation: one aligned buffer per tensor. Because the whole-graph

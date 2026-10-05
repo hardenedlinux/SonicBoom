@@ -26,6 +26,7 @@
 #include <sonicboom/planner/cost.h>
 #include <sonicboom/planner/ids.h>
 #include <sonicboom/planner/op_kind.h>
+#include <sonicboom/planner/partition.h>
 
 #include <cstdint>
 #include <optional>
@@ -50,6 +51,7 @@ struct ComputeTaskDesc {
   OpKind op = OpKind::WholeGraph;
   std::vector<GraphNodeId> graph_nodes;
   JitEntryId jit_entry;
+  BackendTag backend = BackendTag::Mlir;
 };
 
 // Transfer payload: an explicit move of `bytes` of one tensor between two
