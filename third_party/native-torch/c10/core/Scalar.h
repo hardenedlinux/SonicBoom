@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <ostream>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
@@ -467,5 +468,25 @@ DEFINE_TO(uint16_t, UInt16)
 DEFINE_TO(uint32_t, UInt32)
 DEFINE_TO(uint64_t, UInt64)
 #undef DEFINE_TO
+
+// SonicBoom ADAPT: `operator<<(ostream, Scalar)` lives in
+// aten/src/ATen/core/Formatting.cpp upstream, but that file is fmt-based and
+// deferred (manifest M4). v0 supplies the stream operator inline. SymInt/SymFloat
+// branches are omitted — symbolic scalars are deferred (CLAUDE.md §4.1.5).
+inline std::ostream& operator<<(std::ostream& out, const Scalar& s) {
+  if (s.isFloatingPoint()) {
+    return out << s.toDouble();
+  }
+  if (s.isComplex()) {
+    return out << s.toComplexDouble();
+  }
+  if (s.isBoolean()) {
+    return out << (s.toBool() ? "true" : "false");
+  }
+  if (s.isIntegral(false)) {
+    return out << s.toLong();
+  }
+  throw std::logic_error("Unknown type in Scalar");
+}
 
 } // namespace c10

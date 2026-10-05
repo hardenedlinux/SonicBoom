@@ -93,4 +93,21 @@ bool isRecordFunctionEnabled() {
   return false;
 }
 
+// SonicBoom ADAPT: get/set_record_function_tls_ are defined upstream in
+// torch/csrc/profiler/orchestration/observer.cpp (the profiler orchestrator),
+// which is outside the v0 migration scope. The record-function TLS is only
+// consumed by the profiler, so v0 supplies a thread_local that is always
+// default/empty — matching the no-op profiler hooks above.
+namespace {
+thread_local RecordFunctionTLS tls_record_function;
+} // namespace
+
+const RecordFunctionTLS& get_record_function_tls_() {
+  return tls_record_function;
+}
+
+void set_record_function_tls_(const RecordFunctionTLS& tls) {
+  tls_record_function = tls;
+}
+
 } // namespace at

@@ -20,9 +20,11 @@ tools/generation/
 ├── README.md                      # this file
 └── GenerateNativeTorch.cmake      # the `generate-native-torch` CMake target
 
-third_party/native-torch/generated/   # SonicCross output root (checked in)
-├── TensorBody.h … Register{Key}.cpp …   # headers + registration/dispatch sources
-└── core/                                # TensorMethods.cpp, ATenOpList.cpp, …
+<build>/third_party/native-torch/generated/ATen/   # SonicCross output (build dir, gitignored)
+├── Functions.h, NativeFunctions.h, …             # aggregate declaration headers
+├── ops/<op>.h, <op>_native.h, …                  # per-operator split headers
+├── core/                                         # TensorBody.h, TensorMethods.cpp, …
+└── Register{Key}*.cpp, Operators*.cpp            # registration + dispatch sources
 ```
 
 `tags.yaml` is intentionally absent: SonicCross embeds the frozen valid-tags
@@ -30,37 +32,30 @@ constant internally rather than reading a file.
 
 ## Generated-source policy
 
-- `third_party/native-torch/generated/` is a **checked-in baseline**. A normal
-  `git clone → cmake → build` never needs SonicCross installed; it compiles the
-  committed generated sources.
-- Regeneration is an **explicit developer action**, never part of a normal
-  build:
+- Generation is **build-time** (matching upstream PyTorch's build-time torchgen):
+  `cmake` runs SonicCross during configure and writes the generated C++ into the
+  build directory (`<build>/third_party/native-torch/generated/ATen/`), which is
+  gitignored and never committed.
+- SonicCross is a **required build-time dependency** (like torchgen for PyTorch):
+  a `git clone → cmake → build` must have `guild` installed.
 
-  ```sh
-  cmake -B build
-  cmake --build build --target generate-native-torch
-  ```
-
-  This overwrites the checked-in baseline in place. The regenerated files are
-  then committed by hand (the generator does not commit).
-
-## Regeneration prerequisites
+## Generation prerequisites (required)
 
 SonicCross must be installed (`./bootstrap && ./configure && make && make
 install` in the SonicCross tree, so `guild torchgen` runs from compiled
-`.go` modules). Alternatively point CMake at a source tree:
+`.go` modules), or point CMake at an explicit `guild` executable:
 
 ```sh
-cmake -B build -DSONICCROSS_SOURCE_DIR=/path/to/SonicCross
+cmake -B build -DSONICCROSS_GUILD=/path/to/guild
 ```
 
-The `generate-native-torch` target only exists when `guild` is found; otherwise
-it is omitted and the build falls back to the checked-in sources.
+Configuration fails if `guild` is not found.
 
 ## Reproducibility
 
-`SONICCROSS.lock` pins the PyTorch reference commit, the SonicCross release,
-and the `native_functions.yaml` SHA256. Regenerating with those exact inputs is
+`SONICCROSS.lock` pins the PyTorch reference commit, the SonicCross release
+(now `e3acee5`, which adds `--per-operator-headers`), and the
+`native_functions.yaml` SHA256. Regenerating with those exact inputs is
 byte-identical to the committed baseline. SonicCross v0 is frozen; do not
 regenerate against a different PyTorch revision.
 

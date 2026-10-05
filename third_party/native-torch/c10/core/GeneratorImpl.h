@@ -8,7 +8,7 @@
 #include <c10/core/TensorImpl.h>
 #include <c10/macros/Export.h>
 #include <c10/util/intrusive_ptr.h>
-#include <c10/util/object_stub.h>
+#include <c10/util/python_stub.h>
 
 /**
  * Note [Generator]

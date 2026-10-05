@@ -58,7 +58,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
   const auto& schema = op.schema();
   const auto num_arguments = schema.arguments().size();
 
-  // If Torch Dispatch Mode is active, use its SubstrateInterpreter for dispatch
+  // If Torch Dispatch Mode is active, use its PyInterpreter for dispatch
   const auto mode_stack_len = c10::impl::TorchDispatchModeTLS::stack_len();
   if (mode_stack_len > 0) {
     RECORD_FUNCTION("PythonDispatchMode", torch::jit::last(*stack, num_arguments));
@@ -69,7 +69,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
 
   RECORD_FUNCTION("PythonSubclass", torch::jit::last(*stack, num_arguments));
 
-  // Otherwise, find a SubstrateInterpreter on a Tensor
+  // Otherwise, find a PyInterpreter on a Tensor
 
   // It is safe to dispatch on the very first Tensor with a pyobj_interpreter
   // without checking the interpreters of any of the arguments, because when
@@ -77,7 +77,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
   // of that interpreter, and this will ensure that everyone is on the same
   // interpreter.
   bool tensors_with_python_key_present = false;
-  c10::impl::SubstrateInterpreter* interpreter = nullptr;
+  c10::impl::PyInterpreter* interpreter = nullptr;
   for (const auto& ivalue : torch::jit::last(*stack, num_arguments)) {
     if (ivalue.isTensor()) {
       auto* t = ivalue.unsafeToTensorImpl();
@@ -86,7 +86,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
       }
 
       if (!interpreter && t->pyobj_slot()->load_pyobj()) {
-        interpreter = c10::impl::getGlobalSubstrateInterpreter();
+        interpreter = c10::impl::getGlobalPyInterpreter();
       }
     } else if (ivalue.isTensorList() || ivalue.isOptionalTensorList()) {
       // NB: use toListRef as it doesn't induce refcount bumps (toTensorListRef
@@ -102,7 +102,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
         }
 
         if (!interpreter && t->pyobj_slot()->load_pyobj()) {
-          interpreter = c10::impl::getGlobalSubstrateInterpreter();
+          interpreter = c10::impl::getGlobalPyInterpreter();
         }
       }
     }
@@ -129,7 +129,7 @@ void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_
     return;
   }
 
-  TORCH_INTERNAL_ASSERT(0, "Hit Python dispatch key but no arguments had SubstrateInterpreter (no tensor args?)");
+  TORCH_INTERNAL_ASSERT(0, "Hit Python dispatch key but no arguments had PyInterpreter (no tensor args?)");
 }
 
 void pythonDispatcherFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack) {

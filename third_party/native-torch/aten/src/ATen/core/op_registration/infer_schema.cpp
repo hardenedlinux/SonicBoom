@@ -41,52 +41,10 @@ FunctionSchema make_function_schema(
 }
 } // namespace detail
 
-std::optional<std::string> findSchemaDifferences(
-    const FunctionSchema& lhs,
-    const FunctionSchema& rhs) {
-  if (lhs.arguments().size() != rhs.arguments().size()) {
-    return fmt::format(
-        "The number of arguments is different. {} vs {}.",
-        lhs.arguments().size(),
-        rhs.arguments().size());
-  }
-  if (lhs.returns().size() != rhs.returns().size()) {
-    return fmt::format(
-        "The number of returns is different. {} vs {}.",
-        lhs.returns().size(),
-        rhs.returns().size());
-  }
-
-  for (const auto i : c10::irange(lhs.arguments().size())) {
-    const TypePtr& leftType = lhs.arguments()[i].type();
-    const TypePtr& rightType = rhs.arguments()[i].type();
-    // Type::operator== is virtual. Comparing pointers first is
-    // cheaper, particularly when one of the types is a singleton like
-    // NumberType or AnyType.
-    if (leftType.get() != rightType.get() && *leftType != *rightType) {
-      return fmt::format(
-          "Type mismatch in argument {}: {} vs {}.",
-          i + 1,
-          lhs.arguments()[i].type()->str(),
-          rhs.arguments()[i].type()->str());
-    }
-  }
-
-  for (const auto i : c10::irange(lhs.returns().size())) {
-    const TypePtr& leftType = lhs.returns()[i].type();
-    const TypePtr& rightType = rhs.returns()[i].type();
-    // See above about comparing pointers first.
-    if (leftType.get() != rightType.get() && *leftType != *rightType) {
-      return fmt::format(
-          "Type mismatch in return {}: {} vs {}.",
-          i + 1,
-          lhs.returns()[i].type()->str(),
-          rhs.returns()[i].type()->str());
-    }
-  }
-
-  // no differences found
-  return std::nullopt;
-}
+// SonicBoom ADAPT: c10::findSchemaDifferences is provided fmt-free by
+// core/op_registration/find_schema_differences.cpp (M1). Upstream also defined
+// it here; keeping both causes a multiple-definition link error, so it is
+// removed from this translation unit (make_function_schema above is retained —
+// it backs inferFunctionSchemaFromFunctor used by the fallback kernels).
 
 } // namespace c10

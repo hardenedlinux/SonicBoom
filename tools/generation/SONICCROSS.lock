@@ -1,5 +1,7 @@
 # SonicCross generation lock — the frozen, reproducible inputs for the
-# generated native-torch C++ baseline under third_party/native-torch/generated/.
+# native-torch C++ sources that SonicCross generates at build time into the
+# build directory (matching upstream PyTorch's build-time torchgen). Generated
+# sources are gitignored and never committed.
 #
 # Do not bump any of these without an explicit migration/generation decision.
 # Regenerating from different inputs will not be byte-identical.
@@ -12,7 +14,7 @@ pytorch_version    = 2.14.1a0
 
 # SonicCross — the build-time torchgen replacement that produced the baseline.
 soniccross_version = v0.0.1
-soniccross_commit  = 13aa2e0f6a2a86bf8785581f70235d55f78ce88c
+soniccross_commit  = e3acee5afede1b63074f1aa6f9622c90eb3b0bd4
 
 # Generation input snapshot (no full PyTorch checkout required).
 native_functions_yaml        = tools/generation/native/native_functions.yaml
@@ -22,9 +24,15 @@ native_functions_yaml_sha256 = d68d30699549d4b75ed0a8765a9a29663e7d7be7a25e381a4
 # (native-function.scm). There is nothing to snapshot or pin here.
 tags_yaml = embedded-in-soniccross
 
-# Generation invocation that produced the checked-in baseline.
+# Generation invocation. The destination is the `ATen/` parent inside the build
+# directory: SonicCross emits Functions.h / core/ / ops/ flat relative to -d,
+# and every generated source #includes <ATen/...>, so -d must be the `ATen/`
+# parent (resolved against the include root `${ATEN_GENERATED_DIR}`).
+# --per-operator-headers additionally emits the per-op split headers under ops/
+# + per-op Register{key}.cpp.
 generate_command = guild torchgen -s tools/generation \
-                   -d third_party/native-torch/generated \
+                   -d ${ATEN_GENERATED_DIR}/ATen \
+                   --per-operator-headers \
                    --generate headers,sources
-generated_output  = third_party/native-torch/generated/
+generated_output  = ${ATEN_GENERATED_DIR}/ATen/   (build dir; gitignored, not committed)
 generate_subsets  = headers,sources

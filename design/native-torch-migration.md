@@ -206,9 +206,15 @@ below the Layer 2 boundary and do **not** affect the public SonicBoom API.
 | M3 | (none at c10/aten source level) | — | — | The c10 Python-bridge files (`PyInterpreter`, `PyObjectSlot`, `SafePyObject`, `PyHandleCache`, `PythonDispatcherTLS`) compile **without** Python because `PyObject*` is forward-declared opaque. No source modification required; do not "fix" them. | n/a | n/a |
 | M4 | `c10/util/env.cpp` | `third_party/native-torch/c10/util/env.cpp` | Guard `#include <fmt/format.h>` behind `#ifdef _MSC_VER` | `fmt::format` is used only in the Windows `_MSC_VER` `set_env`/`unset_env` paths; POSIX uses `setenv`/`unsetenv` directly. Removes the fmt dependency for the CPU-only Linux build. See §15.C. | Yes — drops a Linux-dead fmt dependency. | No |
 | M5 | `c10/core/CPUAllocator.cpp` | `third_party/native-torch/c10/core/CPUAllocator.cpp` | Guard the mobile `DefaultMobileCPUAllocator` (and its `c10/mobile/*` includes + `g_mobile_cpu_allocator` global) behind `#ifdef C10_MOBILE` | The mobile allocator only adds QNNPACK/XNNPACK guard bytes + thread-local caching/profiling (out of v0 scope); the non-mobile default `DefaultCPUAllocator` already calls `alloc_cpu`/`free_cpu` directly. Removes the `c10/mobile` dependency. See §15.D. | Yes — drops the mobile caching/profiling layer. | No |
+| M6 | `aten/src/ATen/record_function.cpp` | `third_party/native-torch/aten/src/ATen/record_function.cpp` | Replace profiler callback runtime with no-op hooks + supply `get/set_record_function_tls_` | Upstream's real implementation (and the record-function TLS) lives in `torch/csrc/profiler/**`, outside the v0 migration scope. No-op hooks make the dispatcher skip record-function bookkeeping. | Yes — drops the profiler observer runtime. | No |
+| M7 | `c10/core/Scalar.h` | `third_party/native-torch/c10/core/Scalar.h` | Add inline `operator<<(ostream, Scalar)` (omit SymInt/SymFloat branches) | Upstream's stream operator lives in fmt-based `Formatting.cpp` (deferred, M4). Symbolic branches are omitted because SymInt/SymFloat are deferred (§4.1.5). | Yes — drops the fmt dependency. | No |
+| M8 | `aten/src/ATen/core/DispatchFallthroughStubs.cpp` (new file) | `third_party/native-torch/aten/src/ATen/core/DispatchFallthroughStubs.cpp` | Register `makeFallthrough()` for `BackendSelect` + `ADInplaceOrView` + all `Autograd*` keys | v0 has no autograd/VariableType. Upstream registers these fallthroughs in `BackendSelectFallbackKernel.cpp` and `VariableFallbackKernel.cpp` (both excluded). Without them every op fails at dispatch ("Could not run ... from the 'ADInplaceOrView'/'AutogradCPU' backend"). See §22.E / Stage E audit. | Yes — folds the no-autograd (C10_MOBILE) fallthrough subset into one stub. | No |
+| M9 | `aten/src/ATen/native/quantized/QuantizedStubs.cpp` (new file) | `third_party/native-torch/aten/src/ATen/native/quantized/QuantizedStubs.cpp` | `REGISTER_NO_CPU_DISPATCH` for 15 quantized stubs + throwing fbgemm prepack stubs + bare `register_linear_params()` | Quantized compute is deferred (§4.1.5); the monolithic `QuantizedOpKernels.cpp` (fbgemm/NEON) is excluded. Stubs mirror upstream's "not built with FBGEMM" fallback and keep the quantized custom-class type map resolvable for `RNN.cpp`. | Yes — drops fbgemm/qnnpack/mkldnn packed-weight compute. | No |
+| M10 | `aten/src/ATen/Version.cpp` | `third_party/native-torch/aten/src/ATen/Version.cpp` | Drop the `caffe2::GetBuildOptions()` reference | `caffe2` is excluded (legacy); `Version.cpp` is needed for `at::get_version()` but must not pull the caffe2 build-options symbol. | Yes — drops the caffe2 dependency. | No |
 
 The MODIFY work is therefore concentrated in the **build/generated-code
-strategy** (M1, M2), not in rewriting native source.
+strategy** (M1, M2) and the **deferred-feature stubs** (M6–M10), not in
+rewriting native compute kernels.
 
 ### 4.3 ADAPT
 
@@ -392,10 +398,11 @@ kernels pull in their own backend deps (BLACK BOX, link-time).
 
 | Backend | Status | Notes |
 |---|---|---|
-| CPU | **required** | `c10/core` CPU allocator + `native/cpu` kernels |
-| CUDA | **deferred** | not in v0; keep `USE_CUDA=OFF` |
+| CPU | **required / verified** | `c10/core` CPU allocator + `native/cpu` kernels; `numeric_proof` executes 7 ops through the real dispatcher (§22.E) |
+| CUDA | **deferred (source copied)** | source fully copied; build not wired. SDK now present (nvcc 12.0 + RTX 3050). cuDNN absent blocks `cudnn/`; MAGMA absent blocks cuda linalg (§22.E / §23 G-2) |
 | MPS / Metal / Vulkan / ROCm / XPU / HPU | **excluded** | not in v0 |
-| MKL / MKLDNN / cuDNN / MIOpen | **excluded** | not in v0 |
+| MKL / MKLDNN / oneDNN / BLAS / LAPACK / FFT | **excluded (guarded out)** | `AT_MKL_ENABLED=0` etc.; accelerated matmul/fft paths stubbed, not verified (§23 G-5) |
+| cuDNN / MIOpen | **excluded** | not in v0; cuDNN header absent on this machine |
 
 ---
 
@@ -439,7 +446,7 @@ kernels pull in their own backend deps (BLACK BOX, link-time).
 | Metric | Count |
 |---|---|
 | COPY entries | 4 directories staged (413 files) + §4.1.6 top-level ATen header closure (transitive; resolved at compile) + generated headers (M1) |
-| MODIFY entries | 3 (M1 generated registration subset, M2 Config.h, M3 "no source change — do not modify Python bridge") |
+| MODIFY entries | 10 (M1 generated registration subset, M2 Config.h, M3 "no source change — do not modify Python bridge", M4 env.cpp fmt guard, M5 CPUAllocator mobile guard, M6 record_function no-op, M7 Scalar operator<<, M8 DispatchFallthroughStubs, M9 QuantizedStubs, M10 Version.cpp caffe2 drop) |
 | ADAPT entries | 15 (14 adapters + 1 registration) |
 | BLACK BOX areas | 4 (native kernels, backend dirs, c10 backend dirs, Python bridge + allocator internals) |
 | EXCLUDE areas | 6 (torch, functorch, caffe2, torchgen, non-runtime dirs, autograd/distributed/quantization/dtype-systems) |
@@ -1131,3 +1138,127 @@ Python: NO — fmt: NO — CUDA: NO — mobile: NO (mobile source is absent from
 tree entirely; the v0 build does not depend on it).
 
 Final verdict: **M5 FREEZE READY**.
+
+## 22. Full-Inheritance Phase (post-M5, in progress)
+
+### A. Corrected goal
+
+The MVP (M1–M5) established the SonicBoom framework with a **minimal** native
+subset. The intended end-state is **full inheritance of PyTorch's underlying
+C++ compute capability** (not a minimal subset, not a wholesale copy of the
+PyTorch repo): remove Python, port the C++ lower layer (c10 / ATen core /
+native kernels), copy all YAML, and let SonicCross compile the YAML into C++.
+See `design/soniccross-per-op-header-requirement.md` for the generation
+requirement.
+
+### B. Complete source copy (DONE — "Copied" state)
+
+From the frozen baseline (§1), copied into `third_party/native-torch/`:
+
+- `aten/src/ATen/native/` (1877 files: all CPU/CUDA/quantized/sparse/nested/
+  mkldnn/mkl/mps/metal/vulkan/hip/transformers/xnnpack/ao_sparse/kleidiai kernels)
+- `aten/src/ATen/cpu/` (71), `cuda/` (102), `cudnn/` (11), `detail/` (24),
+  `hip/` (5), `metal/` (2), `miopen/` (10), `mkl/` (9), `mps/` (20),
+  `quantized/` (5), `templates/` (42), `vulkan/` (2), `xpu/` (26),
+  `accelerator/` (2), top-level facade (~150 .h/.cpp)
+- `native_functions.yaml` + `tags.yaml`
+- `c10/{cuda,hip,metal,xpu,mobile}` backend types (85 files)
+
+Excluded with justification: `benchmarks/` (dev benchmarks), `functorch/`
+(functional-transform, autograd-adjacent), `nnapi/` (Android-only backend),
+`test/` (unit tests). The 64 files excluded by `test/` were all qnnpack+clog
+unit tests — no kernel lost.
+
+### C. Per-op header gap (DONE — SonicCross delivered + verified)
+
+`aten/src/ATen/native/*.cpp` (237 files) `#include <ATen/ops/*.h>` in four
+kinds (`.h` 1320, `_native.h` 1653, `_meta.h` 37, `_ops.h` 14; ~1765 op names).
+SonicCross (`--per-operator-headers`, commit `e3acee5`) emits the per-op split
+headers + per-op `Register{key}.cpp`, byte-identical to the frozen torchgen
+oracle (7082 headers + 47 Register files). Verified 2026-10-04: 1595/1597
+distinct `#include <ATen/ops/*.h>` targets are generated; the 2 non-generated
+(`from_blob.h`, `tensor.h`) are hand-authored facade headers already staged
+under `aten/src/ATen/ops/` (committed upstream, not torchgen output). Full
+coverage. See the requirement doc.
+
+### D. Dependency surface (CLOSED — vendored as submodules)
+
+CPU build needs: cpuinfo, sleef, FP16, fmt + BLAS (MKL/OpenBLAS, guardable) +
+oneDNN (mkldnn, guardable) + qnnpack (already vendored in-tree). The four
+external deps are now git submodules under
+`third_party/native-torch/third_party/` (aligned with upstream's `third_party/`
+layout), pinned to the frozen baseline's submodule commits:
+
+- `cpuinfo` — pytorch fork @ `bc3c01e` (Sapphire Rapids detection)
+- `sleef`    — @ `5a1d179` (Release 3.8)
+- `FP16`     — @ `4dfe081`
+- `fmt`      — @ `c0330b74` (12.2.0-34)
+
+§15's `cpuinfo EXCLUDED` is superseded — cpuinfo is required for the full CPU
+path (thread pool + parallel dispatch).
+
+### E. Build/verify plan (CPU DONE — CUDA deferred, SDK now present)
+
+CPU path is **built and verified** (Stage D, tasks #72–#73):
+
+- Full ATen + native/cpu + generated registration + per-op headers compile
+  into `aten_core` (439 objects) + `c10` (89 objects), linked into
+  `libsonicboom.so` (SHARED).
+- Generation is BUILD-TIME (matching upstream PyTorch): SonicCross emits into
+  the build dir (`${ATEN_GENERATED_DIR}/ATen`, gitignored, never committed);
+  `guild` is a required build-time dependency.
+- Two deferred-feature stub files were added to keep the dispatcher clean in a
+  no-autograd/no-fbgemm build (recorded as M8/M9 in §4.2):
+  `aten/src/ATen/core/DispatchFallthroughStubs.cpp` (BackendSelect /
+  ADInplaceOrView / Autograd* `makeFallthrough()`) and
+  `aten/src/ATen/native/quantized/QuantizedStubs.cpp` (quantized
+  `REGISTER_NO_CPU_DISPATCH` + fbgemm prepack stubs + `register_linear_params`).
+- **Verified executed** by `numeric_proof` (links `aten_core` with
+  `--whole-archive`, runs through the real dispatcher + CPU kernels, asserts
+  `ones`/`full`/`add`/`mul`/`relu`/`sum`): exit 0, "numeric proof OK".
+  `dispatch_proof` (M1) also passes.
+
+CUDA/other backends source is fully copied but build+verify is **deferred** —
+the earlier "BLOCKED on SDK/toolkit availability" note is **stale**: the CUDA
+SDK is now present (`nvcc` 12.0 + GeForce RTX 3050 8 GB + cudart/cublas/
+cusparse/cusolver/cufft). The real blockers are (a) the CUDA build is not wired
+(no `.cu` glob, no `RegisterCUDA*`) and (b) **cuDNN is absent** (`cudnn.h` not
+found — blocks the `ATen/cudnn/` subset only; MAGMA absent — blocks the cuda
+linalg subset). See §23 / `design/stage-e-completeness-audit.md` for the full
+gap list and resolution paths.
+
+---
+
+## 23. Stage E Completeness Audit
+
+Full detail: `design/stage-e-completeness-audit.md` (audit date 2026-10-05).
+Summary of the five-way state (migrated / generated / compiled / registered /
+executed-verified):
+
+- **Migrated**: 2711 source files in tree (c10 core 45 + util 43, ATen core 57,
+  facade 51+12+2, native 479 with 64 cpu; CUDA `native/cuda` 221 `.cu` + 27
+  `.cpp`, `ATen/cuda` 102, `cudnn` 4, `ATen/quantized` 5).
+- **Generated** (SonicCross): 7063 `ops/*.h`; 69 `.cpp` (54 `Register*` — 26
+  split + 28 `*Everything*` — plus `Operators_0..4`, `Functions`,
+  `TensorMethods`, `ATenOpList`, `CompositeViewCopyKernels`, `ViewMetaClasses`,
+  `UfuncCPU_add`, `UfuncCPUKernel_add`, `core/` copies).
+- **Compiled**: `libaten_core.a` 439 objects (273 native, 51 generated/ATen, 51
+  facade, 36 core, 12 detail, 6 jit-frontend, 2 quantized, 2 cpu, 1 caffe2,
+  1 vulkan, 1 metal, 1 ops); `libc10.a` 89 objects. Register files compiled:
+  the CPU split set (Schema, BackendSelect, CPU_0..3, Composite*, Meta_0,
+  Functionalization_0..3, SparseCPU/CsrCPU/CsrMeta/Meta, NestedTensorCPU/Meta,
+  ZeroTensor). Not compiled: CUDA/HPU/Mkldnn/Quantized registers + all
+  `*Everything*`.
+- **Registered / executed-verified**: `dispatch_proof` (M1) and `numeric_proof`
+  (7 ops through real dispatcher + CPU kernels) both PASS.
+
+**Confirmed gaps** (resolution paths in the audit doc):
+
+| # | Gap | Severity |
+|---|---|---|
+| G-1 | `libsonicboom.so` links `aten_core` without `--whole-archive` → op registrations dropped (`nm -C` shows 0 `TorchLibraryInit` vs numeric_proof's 4). Fix: `-Wl,--whole-archive aten_core -Wl,--no-whole-archive` in `core/CMakeLists.txt:54`. | critical |
+| G-2 | CUDA not wired (SDK now present: nvcc 12.0 + RTX 3050); cuDNN absent blocks `cudnn/`; MAGMA absent blocks cuda linalg. | blocking |
+| G-3 | No `libsonicboom.so`-level native-dispatch test (blocked on G-1). | medium |
+| G-4 | Op coverage: 7 verified vs ~1595 registered. | medium |
+| G-5 | BLAS/LAPACK/MKL/oneDNN/FFT guarded out (`AT_BUILD_WITH_BLAS=0` …); accelerated matmul/fft stubbed, not verified. | informational |
+| G-6 | Autograd / quantized compute / SymInt / Generator — deferred by design (not gaps to fix). | n/a |

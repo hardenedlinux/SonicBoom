@@ -201,6 +201,14 @@ at::Allocator* GetDefaultCPUAllocator() {
   return &g_cpu_alloc;
 }
 
+// SonicBoom ADAPT: upstream defines GetDefaultMobileCPUAllocator() only under
+// #ifdef C10_MOBILE, but aten/src/ATen/Context.cpp references it
+// unconditionally (Context::setDefaultMobileCPUAllocator). In a non-mobile
+// build it simply aliases the default CPU allocator.
+at::Allocator* GetDefaultMobileCPUAllocator() {
+  return GetDefaultCPUAllocator();
+}
+
 REGISTER_ALLOCATOR(DeviceType::CPU, &g_cpu_alloc)
 
 #endif /* C10_Mobile */

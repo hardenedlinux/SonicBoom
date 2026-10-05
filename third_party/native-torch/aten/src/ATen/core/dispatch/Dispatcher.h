@@ -7,7 +7,7 @@
 #include <ATen/core/dispatch/OperatorEntry.h>
 #include <ATen/core/dispatch/RegistrationHandleRAII.h>
 #include <ATen/record_function.h>
-#include <c10/core/SafeObject.h>
+#include <c10/core/SafePyObject.h>
 #include <c10/util/Exception.h>
 #include <c10/util/LeftRight.h>
 #include <condition_variable>
@@ -514,7 +514,7 @@ class TORCH_API OperatorHandle {
     return operatorDef_->op.getTags();
   }
 
-  void setReportErrorCallback_(std::unique_ptr<c10::SafeObject> callback) {
+  void setReportErrorCallback_(std::unique_ptr<c10::SafePyObject> callback) {
     operatorDef_->op.setReportErrorCallback_(std::move(callback));
   }
 

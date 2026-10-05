@@ -88,7 +88,7 @@
 #include <c10/core/UndefinedTensorImpl.h>
 #include <c10/core/WrapDimMinimal.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
-#include <c10/core/impl/SubstrateInterpreter.h>
+#include <c10/core/impl/PyInterpreter.h>
 #include <c10/core/impl/SizesAndStrides.h>
 
 #include <c10/macros/Export.h>
@@ -132,7 +132,7 @@
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/irange.h>
 #include <c10/util/llvmMathExtras.h>
-#include <c10/util/object_stub.h>
+#include <c10/util/python_stub.h>
 #include <c10/util/qint32.h>
 #include <c10/util/qint8.h>
 #include <c10/util/quint2x4.h>

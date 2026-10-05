@@ -1,5 +1,5 @@
 #include <ATen/core/dispatch/Dispatcher.h>
-#include <ATen/core/OpRegistrationTrampoline.h>
+#include <ATen/core/PythonOpRegistrationTrampoline.h>
 #include <list>
 #include <utility>
 #include <c10/util/env.h>
@@ -344,7 +344,7 @@ void Dispatcher::throwIfHasPythonModule(OperatorName op_name) {
   }
   const char* pymodule = elt->second.first;
   const char* context = elt->second.second;
-  auto* interpreter = at::impl::OpRegistrationTrampoline::getInterpreter();
+  auto* interpreter = at::impl::PythonOpRegistrationTrampoline::getInterpreter();
   TORCH_CHECK(
       interpreter != nullptr,
       op_name,

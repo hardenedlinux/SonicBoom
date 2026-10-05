@@ -6,6 +6,7 @@
 #include <c10/macros/Macros.h>
 #include <c10/util/Exception.h>
 
+#include <ostream>
 #include <stdexcept>
 
 C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wswitch-enum")
@@ -402,6 +403,14 @@ inline bool isSparseCsr(Backend b) {
     default:
       return false;
   }
+}
+
+// SonicBoom ADAPT: `operator<<(ostream, Backend)` lives in
+// aten/src/ATen/core/Formatting.cpp upstream, but that file is fmt-based and
+// deferred (manifest M4). `toString(Backend)` is already inline here, so v0
+// provides the stream operator inline in the same header.
+inline std::ostream& operator<<(std::ostream& stream, Backend backend) {
+  return stream << toString(backend);
 }
 
 } // namespace c10

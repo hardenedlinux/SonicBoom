@@ -2,3 +2,15 @@
 	path = third_party/llvm-project
 	url = https://github.com/llvm/llvm-project.git
 	branch = llvmorg-23.1.2
+[submodule "third_party/native-torch/third_party/cpuinfo"]
+	path = third_party/native-torch/third_party/cpuinfo
+	url = https://github.com/pytorch/cpuinfo.git
+[submodule "third_party/native-torch/third_party/sleef"]
+	path = third_party/native-torch/third_party/sleef
+	url = https://github.com/shibatch/sleef
+[submodule "third_party/native-torch/third_party/FP16"]
+	path = third_party/native-torch/third_party/FP16
+	url = https://github.com/Maratyszcza/FP16.git
+[submodule "third_party/native-torch/third_party/fmt"]
+	path = third_party/native-torch/third_party/fmt
+	url = https://github.com/fmtlib/fmt.git
