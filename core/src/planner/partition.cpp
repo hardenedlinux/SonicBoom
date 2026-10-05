@@ -37,10 +37,14 @@ PlannerError slice_err(std::string msg) {
   return PlannerError(PlannerErrorCode::InvalidGraph, std::move(msg),
                       Phase::GraphAnalysis);
 }
-} // namespace
 
-std::expected<sx::Document, PlannerError> slice_document(
-    const sx::Document& doc, const std::vector<std::string>& keep_outputs) {
+// Shared core for slice_document and slice_region. Keeps the nodes that produce
+// any name in `kept_outputs`; exposes `region_outputs` (a subset of kept-node
+// outputs) as the graph output list. Everything else (external inputs,
+// parameter carry-over, node ordering) is identical between the two callers.
+std::expected<sx::Document, PlannerError> slice_impl(
+    const sx::Document& doc, const std::vector<std::string>& kept_outputs,
+    const std::vector<std::string>& region_outputs) {
   const sx::Graph& sg = doc.graph;
 
   // 1. Value name → type, gathered from every SSA definition source.
@@ -54,7 +58,7 @@ std::expected<sx::Document, PlannerError> slice_document(
       type_of[o.name] = &o.type;
 
   // 2. Kept nodes = those producing at least one requested output.
-  std::unordered_set<std::string> keep(keep_outputs.begin(), keep_outputs.end());
+  std::unordered_set<std::string> keep(kept_outputs.begin(), kept_outputs.end());
   std::vector<const sx::Node*> kept;
   for (const auto& n : sg.nodes) {
     bool is_kept = false;
@@ -77,7 +81,7 @@ std::expected<sx::Document, PlannerError> slice_document(
     for (const auto& o : n->outputs)
       produced.insert(o.name);
 
-  for (const auto& o : keep_outputs)
+  for (const auto& o : region_outputs)
     if (!produced.count(o))
       return std::unexpected(slice_err("slice output '" + o +
                                        "' is not produced by a kept node"));
@@ -118,7 +122,7 @@ std::expected<sx::Document, PlannerError> slice_document(
   out.name = sg.name;
   out.opsets = sg.opsets;
   out.inputs = std::move(ins);
-  out.outputs = keep_outputs;
+  out.outputs = region_outputs;
   out.parameters = std::move(params);
   out.nodes = std::move(nodes);
 
@@ -127,6 +131,19 @@ std::expected<sx::Document, PlannerError> slice_document(
   d.version_minor = doc.version_minor;
   d.graph = std::move(out);
   return d;
+}
+} // namespace
+
+std::expected<sx::Document, PlannerError> slice_document(
+    const sx::Document& doc, const std::vector<std::string>& keep_outputs) {
+  return slice_impl(doc, keep_outputs, keep_outputs);
+}
+
+std::expected<sx::Document, PlannerError> slice_region(
+    const sx::Document& doc,
+    const std::vector<std::string>& kept_node_outputs,
+    const std::vector<std::string>& region_outputs) {
+  return slice_impl(doc, kept_node_outputs, region_outputs);
 }
 
 } // namespace sonicboom::planner

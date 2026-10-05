@@ -201,14 +201,42 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     plan.tasks.push_back(std::move(task));
     plan.execution_order.push_back(TaskId{0});
   } else {
-    // Mixed graph: one compute task per node, routed by route_op. Node order is
-    // topological (every node's inputs are inputs/parameters/earlier outputs),
-    // so dependencies point strictly backward and node order is a valid
-    // execution order. Intermediate tensors are handed off by TensorId at
-    // runtime; the MLIR backend receives per-region slices compiled separately.
+    // Mixed graph: group topologically-consecutive same-backend nodes into
+    // execution regions. A NativeTorch node is always its own single-node
+    // region (the dispatcher runs one node per task); a run of consecutive MLIR
+    // nodes merges into one region compiled from a single slice, so region-
+    // internal tensors never cross a task boundary. Node order is topological
+    // (every node's inputs are inputs/parameters/earlier outputs), so
+    // dependencies point strictly backward and region order is a valid
+    // execution order.
     std::unordered_map<uint32_t, TaskId> producer;  // tensor -> producing task
-    uint32_t next_task = 0;
+
+    // 1. Partition nodes into regions (greedy scan over topological order).
+    struct Region {
+      BackendTag backend;
+      std::vector<const GraphNodeDesc*> nodes;
+    };
+    std::vector<Region> regions;
     for (const auto& node : graph.nodes) {
+      const BackendTag b = route_op(node.op);
+      if (!regions.empty() && regions.back().backend == BackendTag::Mlir &&
+          b == BackendTag::Mlir) {
+        regions.back().nodes.push_back(&node);  // extend the MLIR run
+      } else {
+        Region r;
+        r.backend = b;
+        r.nodes.push_back(&node);
+        regions.push_back(std::move(r));
+      }
+    }
+
+    std::unordered_set<uint32_t> graph_outputs;
+    for (TensorId o : graph.outputs)
+      graph_outputs.insert(o.value);
+
+    // 2. Emit one compute task per region.
+    uint32_t next_task = 0;
+    for (const Region& r : regions) {
       TaskDesc task;
       task.id = TaskId{next_task};
       task.kind = TaskKind::Compute;
@@ -216,35 +244,75 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       task.memory_space = host->id;
 
       ComputeTaskDesc compute;
-      compute.op = node.op;
-      compute.backend = route_op(node.op);
-      compute.jit_entry = JitEntryId{0};  // single MLIR region in v0
-      compute.graph_nodes.push_back(node.id);
+      compute.backend = r.backend;
+      // Representative op (WholeGraph is reserved for the homogeneous fast
+      // path); graph_nodes below carries the full region membership.
+      compute.op = r.nodes.front()->op;
+      compute.jit_entry = JitEntryId{0};  // each region compiled separately
+      for (const auto* n : r.nodes)
+        compute.graph_nodes.push_back(n->id);
       task.payload = compute;
 
-      task.inputs = node.inputs;
-      task.outputs = node.outputs;
+      // Region-internal produced set: tensors produced by any region node.
+      std::unordered_set<uint32_t> produced;
+      std::unordered_set<uint32_t> region_nodes;
+      for (const auto* n : r.nodes) {
+        region_nodes.insert(n->id.value);
+        for (TensorId o : n->outputs)
+          produced.insert(o.value);
+      }
 
+      // External inputs: node inputs not produced within the region, first-
+      // reference order, deduplicated.
+      std::unordered_set<uint32_t> seen_in;
+      for (const auto* n : r.nodes)
+        for (TensorId in : n->inputs)
+          if (!produced.count(in.value) && seen_in.insert(in.value).second)
+            task.inputs.push_back(in);
+
+      // External outputs: region-produced tensors that are graph outputs or are
+      // consumed by a node outside the region, in node order then output order.
+      std::unordered_set<uint32_t> outside_consumers;
+      for (const auto& node : graph.nodes) {
+        if (region_nodes.count(node.id.value))
+          continue;
+        for (TensorId in : node.inputs)
+          outside_consumers.insert(in.value);
+      }
+      for (const auto* n : r.nodes)
+        for (TensorId o : n->outputs)
+          if (outside_consumers.count(o.value) || graph_outputs.count(o.value))
+            task.outputs.push_back(o);
+
+      // Dependencies: producers of the external inputs (strictly earlier).
       std::unordered_set<uint32_t> deps;
-      for (TensorId in : node.inputs) {
+      for (TensorId in : task.inputs) {
         auto it = producer.find(in.value);
-        if (it != producer.end() && it->second.value != task.id.value)
+        if (it != producer.end())
           deps.insert(it->second.value);
       }
       for (uint32_t d : deps)
         task.dependencies.push_back(TaskId{d});
 
-      auto est = node_cost(node);
-      if (!est)
-        return std::unexpected(est.error());
-      task.cost = *est;
-      total_latency_us += est->estimated_latency_us;
-      min_confidence = std::min(min_confidence, est->confidence);
+      // Region cost: sum per-node costs (the model estimates single operators).
+      double region_latency = 0.0;
+      double region_conf = 1.0;
+      for (const auto* n : r.nodes) {
+        auto est = node_cost(*n);
+        if (!est)
+          return std::unexpected(est.error());
+        region_latency += est->estimated_latency_us;
+        region_conf = std::min(region_conf, est->confidence);
+      }
+      task.cost = ComputeCost{region_latency, region_conf};
+      total_latency_us += region_latency;
+      min_confidence = std::min(min_confidence, region_conf);
 
       plan.tasks.push_back(std::move(task));
       plan.execution_order.push_back(TaskId{next_task});
-      for (TensorId out : node.outputs)
-        producer[out.value] = TaskId{next_task};
+      for (const auto* n : r.nodes)
+        for (TensorId o : n->outputs)
+          producer[o.value] = TaskId{next_task};
       if (!next_id(next_task))
         return std::unexpected(PlannerError(
             PlannerErrorCode::InternalError,

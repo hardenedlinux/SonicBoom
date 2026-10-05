@@ -63,6 +63,37 @@ sx::Bytes pack(const std::vector<float>& v) {
   return b;
 }
 
+const pl::TaskDesc* task_producing(const pl::ExecutionPlan& plan,
+                                   const std::string& name) {
+  for (const auto& t : plan.tasks)
+    for (pl::TensorId o : t.outputs)
+      if (const auto* td = plan.find_tensor(o))
+        if (td->name == name)
+          return &t;
+  return nullptr;
+}
+
+// Slice a region task into a standalone Document (its graph_nodes select the
+// kept nodes; its outputs become the graph output list).
+std::expected<sx::Document, pl::PlannerError> region_slice(
+    const sx::Document& doc, const pl::Graph& g, const pl::TaskDesc& task) {
+  const auto* compute = task.as_compute();
+  std::vector<std::string> kept;
+  for (pl::GraphNodeId nid : compute->graph_nodes) {
+    const pl::GraphNodeDesc* nd = g.find_node(nid);
+    if (!nd)
+      return std::unexpected(pl::PlannerError(
+          pl::PlannerErrorCode::InvalidGraph, "region node not found",
+          pl::Phase::GraphAnalysis));
+    for (pl::TensorId o : nd->outputs)
+      kept.push_back(g.find_tensor(o)->name);
+  }
+  std::vector<std::string> outs;
+  for (pl::TensorId o : task.outputs)
+    outs.push_back(g.find_tensor(o)->name);
+  return pl::slice_region(doc, kept, outs);
+}
+
 struct Stats {
   double first_us;
   double min_us;
@@ -127,6 +158,27 @@ const char* SOFTMAX_RELU =
     "     (outputs (\"y\" (tensor float32 (shape 128 128))))"
     "     (attrs (axis (int 1))))"
     "   (node relu (inputs \"y\")"
+    "     (outputs (\"z\" (tensor float32 (shape 128 128))))))))";
+
+// Region-merge comparison graph: softmax → relu → relu → relu → relu. The Stage
+// 4 per-node model would emit 5 tasks (1 native + 4 mlir); Stage 5 region
+// partitioning emits 2 (1 native + 1 merged mlir region of 4 nodes).
+const char* CHAIN =
+    "(sonicboom-s-expr (version 0 1) (graph (name \"chain\")"
+    " (inputs (input \"x\" (tensor float32 (shape 128 128))))"
+    " (outputs (output \"z\"))"
+    " (parameters)"
+    " (nodes"
+    "   (node softmax (inputs \"x\")"
+    "     (outputs (\"s\" (tensor float32 (shape 128 128))))"
+    "     (attrs (axis (int 1))))"
+    "   (node relu (inputs \"s\")"
+    "     (outputs (\"a\" (tensor float32 (shape 128 128)))))"
+    "   (node relu (inputs \"a\")"
+    "     (outputs (\"b\" (tensor float32 (shape 128 128)))))"
+    "   (node relu (inputs \"b\")"
+    "     (outputs (\"c\" (tensor float32 (shape 128 128)))))"
+    "   (node relu (inputs \"c\")"
     "     (outputs (\"z\" (tensor float32 (shape 128 128))))))))";
 } // namespace
 
@@ -263,6 +315,160 @@ int main() {
   report("native-torch alone (softmax)", native_stats, kIters);
   report("mlir alone (relu)", mlir_stats, kIters);
   report("mixed (softmax->relu, 1 handoff)", mixed_stats, kIters);
+
+  // --- Region-merge comparison: per-node (Stage 4 model) vs merged (Stage 5) --
+  {
+    auto doc = sx::parse_document(CHAIN);
+    auto g = pl::adapt_graph(*doc);
+    auto plan = pl::plan_execution(*g, *snap, cost);
+    check(doc && g && plan, "chain plan succeeds");
+    if (!(doc && g && plan))
+      return 1;
+
+    const std::size_t n_nodes = g->nodes.size();
+    const std::size_t n_regions = plan->tasks.size();
+    const pl::TaskDesc* t_softmax = task_producing(*plan, "s");
+    const pl::TaskDesc* t_region = task_producing(*plan, "z");
+    check(t_softmax && t_region, "chain regions located");
+    if (!(t_softmax && t_region))
+      return 1;
+    const std::size_t merged_mlir_nodes =
+        t_region->as_compute()->graph_nodes.size();
+
+    std::cout << "\nregion-merge (softmax -> relu x4, [128x128] f32):\n";
+    std::cout << "  structure: " << n_nodes << " nodes -> " << n_regions
+              << " regions (merged " << merged_mlir_nodes
+              << " mlir nodes); per-node model would emit " << n_nodes
+              << " tasks\n";
+
+    auto nt_chain = pl::NativeTorchBackend::compile(*g);
+    check(nt_chain.has_value(), "chain native backend compiles");
+    if (!nt_chain)
+      return 1;
+
+    // "after" (merged): one MLIR region compile + one native = 2 compiles.
+    auto merged_slice = region_slice(*doc, *g, *t_region);
+    check(merged_slice.has_value(), "chain merged region slices");
+    if (!merged_slice)
+      return 1;
+    double after_mlir_us = 0.0;
+    std::unique_ptr<pl::CpuBackend> merged_cpu;
+    {
+      pl::Timer t;
+      auto cpu = pl::CpuBackend::compile(*merged_slice, {});
+      after_mlir_us = t.elapsed_us();
+      check(cpu.has_value(), "chain merged region compiles");
+      if (!cpu)
+        return 1;
+      merged_cpu = std::move(*cpu);
+    }
+
+    // "before" (per-node): four per-node MLIR slices = 4 compiles + 1 native.
+    double before_mlir_us = 0.0;
+    std::vector<std::unique_ptr<pl::CpuBackend>> per_node;
+    {
+      const char* outs[4] = {"a", "b", "c", "z"};
+      for (const char* o : outs) {
+        auto slice = pl::slice_document(*doc, {o});
+        check(slice.has_value(), "per-node slice succeeds");
+        if (!slice)
+          return 1;
+        pl::Timer t;
+        auto cpu = pl::CpuBackend::compile(*slice, {});
+        before_mlir_us += t.elapsed_us();
+        check(cpu.has_value(), "per-node mlir compiles");
+        if (!cpu)
+          return 1;
+        per_node.push_back(std::move(*cpu));
+      }
+    }
+
+    std::cout << "  compile: before=" << (1 + per_node.size())
+              << " (1 native + " << per_node.size()
+              << " per-node mlir) vs after=2 (1 native + 1 merged mlir)\n";
+    std::cout << "  compile time (mlir only, one-shot, no cache): before="
+              << before_mlir_us << "us vs after=" << after_mlir_us << "us\n";
+
+    // Exec "after" through the executor (merged region, 2 tasks).
+    pl::RuntimeExecutor exec(std::map<pl::BackendTag, pl::Backend*>{
+        {pl::BackendTag::Mlir, merged_cpu.get()},
+        {pl::BackendTag::NativeTorch, nt_chain->get()}});
+
+    // Exec "before" as a manually-orchestrated per-node chain. This bypasses the
+    // executor (no per-iteration fingerprint/plan re-validation/gather), so it
+    // is a *lower bound* on the true per-node path cost — conservative (favors
+    // "before"). A dummy compute task suffices: CpuBackend only checks the kind.
+    pl::TaskDesc dummy;
+    dummy.kind = pl::TaskKind::Compute;
+
+    // Sanity: both paths must compute the same result (softmax(x); relu is
+    // identity on its positive output).
+    {
+      auto a = exec.execute(*plan, *snap, {xbuf});
+      check(a && a->outputs.size() == 1, "chain merged sanity run");
+
+      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      bool per_node_ok = s && s->size() == 1;
+      std::vector<sx::Bytes> acc = per_node_ok ? std::vector<sx::Bytes>{(*s)[0]}
+                                               : std::vector<sx::Bytes>{};
+      for (const auto& cpu : per_node) {
+        auto r = cpu->execute(dummy, {acc.empty() ? sx::Bytes{} : acc[0]});
+        per_node_ok = per_node_ok && r && r->size() == 1;
+        if (!r || r->size() != 1)
+          break;
+        acc = std::move(*r);
+      }
+      check(per_node_ok, "chain per-node sanity run");
+
+      if (a && per_node_ok && a->outputs[0].size() == acc[0].size()) {
+        const auto* f1 = reinterpret_cast<const float*>(a->outputs[0].data());
+        const auto* f2 = reinterpret_cast<const float*>(acc[0].data());
+        bool same = true;
+        for (int i = 0; i < kDim * kDim; ++i)
+          if (std::fabs(f1[i] - f2[i]) > 1e-5f) {
+            same = false;
+            break;
+          }
+        check(same, "merged and per-node chains agree");
+      }
+    }
+
+    auto merged_stats = measure(kIters, [&] {
+      auto r = exec.execute(*plan, *snap, {xbuf});
+      return r.has_value() && r->outputs.size() == 1;
+    });
+    // Merged path also run manually (bypassing the executor) so the two manual
+    // rows are comparable: the merge's effect on exec time is 2 backend calls
+    // (1 native + 1 region) vs 5 (1 native + 4 per-node), i.e. fewer JIT-call
+    // boundaries and fewer intermediate buffer handoffs.
+    auto merged_manual_stats = measure(kIters, [&] {
+      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      if (!s || s->size() != 1)
+        return false;
+      auto z = merged_cpu->execute(dummy, {(*s)[0]});
+      return z && z->size() == 1;
+    });
+    auto pernode_stats = measure(kIters, [&] {
+      // softmax (native) → relu → relu → relu → relu (4 per-node mlir calls).
+      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      if (!s || s->size() != 1)
+        return false;
+      std::vector<sx::Bytes> acc = {(*s)[0]};
+      for (const auto& cpu : per_node) {
+        auto r = cpu->execute(dummy, {acc[0]});
+        if (!r || r->size() != 1)
+          return false;
+        acc = std::move(*r);
+      }
+      return true;
+    });
+
+    report("merged (2 tasks, 1 region, via executor)", merged_stats, kIters);
+    report("merged (2 calls, manual, no executor overhead)", merged_manual_stats,
+           kIters);
+    report("per-node (5 calls, manual, no executor overhead)", pernode_stats,
+           kIters);
+  }
 
   if (g_failures == 0) {
     std::cout << "test_coexecution_benchmark OK\n";

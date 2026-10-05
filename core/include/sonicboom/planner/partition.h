@@ -61,4 +61,17 @@ inline BackendTag route_op(OpKind op) noexcept {
 std::expected<sx::Document, PlannerError> slice_document(
     const sx::Document& doc, const std::vector<std::string>& keep_outputs);
 
+// Extract an explicit node set (a backend region) into a standalone Document.
+// `kept_node_outputs` names one output per kept node (v0 nodes are
+// single-output), selecting exactly those nodes regardless of transitive
+// dataflow; `region_outputs` (a subset of kept-node outputs) becomes the graph
+// output list. Any value a kept node references but no kept node produces
+// becomes a graph input; parameters referenced by the region are carried over
+// verbatim. Used by the region-partitioned mixed path, where consecutive
+// same-backend nodes are compiled as one unit.
+std::expected<sx::Document, PlannerError> slice_region(
+    const sx::Document& doc,
+    const std::vector<std::string>& kept_node_outputs,
+    const std::vector<std::string>& region_outputs);
+
 } // namespace sonicboom::planner

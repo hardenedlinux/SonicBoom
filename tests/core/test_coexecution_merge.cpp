@@ -14,23 +14,22 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// CPU co-execution branch/merge test (Stage 4). The four-node graph
+// CPU co-execution branch/merge test (Stage 5 region partitioning). The
+// four-node graph
 //
 //                    ┌─ softmax(x) → s ─ relu → a ─┐
 //   x ───────────────┤                             ├─ add(a, b) → z
 //                    └─ relu(x) → b ───────────────┘
 //
-// is planned into four compute tasks: softmax on NativeTorch, and three MLIR
-// nodes (relu(s), relu(x), add) each compiled from its own slice_document
-// region. The executor is wired per-task so the three MLIR slices dispatch to
-// three distinct CpuBackends. It verifies:
-//   - four tasks in topological order, with the add task depending on both relu
-//     tasks and consuming two *distinct* input tensors (a and b, neither the
-//     graph input nor a previous task's output);
-//   - intermediate tensors a and b carry their own shape/dtype and are not
-//     overwritten across branches;
+// is planned into TWO regions: softmax on NativeTorch, and the three
+// consecutive MLIR nodes (relu(s), relu(x), add) merged into one MLIR region
+// compiled from a single slice. It verifies:
+//   - two tasks in topological order, the MLIR region depending on the softmax
+//     task and consuming two *distinct* external inputs (s and x);
+//   - the region's internal tensors a and b stay inside the compiled unit (no
+//     task-level I/O), yet the plan still records their shape/dtype;
 //   - the numeric result z = relu(softmax(x)) + relu(x) matches an independent
-//     hand-computed reference;
+//     hand-computed reference (the merge happens inside the compiled region);
 //   - a task with no registered backend fails with a RuntimeError (no crash).
 
 #include <sonicboom/planner/backend.h>
@@ -91,6 +90,27 @@ const pl::TaskDesc* task_producing(const pl::ExecutionPlan& plan,
   return nullptr;
 }
 
+// Build a slice Document for a region task: its graph_nodes select the kept
+// nodes (one output name per node), its outputs become the graph output list.
+std::expected<sx::Document, pl::PlannerError> region_slice(
+    const sx::Document& doc, const pl::Graph& g, const pl::TaskDesc& task) {
+  const auto* compute = task.as_compute();
+  std::vector<std::string> kept;
+  for (pl::GraphNodeId nid : compute->graph_nodes) {
+    const pl::GraphNodeDesc* nd = g.find_node(nid);
+    if (!nd)
+      return std::unexpected(pl::PlannerError(
+          pl::PlannerErrorCode::InvalidGraph, "region node not found",
+          pl::Phase::GraphAnalysis));
+    for (pl::TensorId o : nd->outputs)
+      kept.push_back(g.find_tensor(o)->name);
+  }
+  std::vector<std::string> outs;
+  for (pl::TensorId o : task.outputs)
+    outs.push_back(g.find_tensor(o)->name);
+  return pl::slice_region(doc, kept, outs);
+}
+
 // Branch/merge graph: z = add(relu(softmax(x, axis=1)), relu(x)).
 const char* MERGE =
     "(sonicboom-s-expr (version 0 1) (graph (name \"merge\")"
@@ -110,7 +130,7 @@ const char* MERGE =
 } // namespace
 
 int main() {
-  // --- plan the four-node graph into four routed compute tasks -------------
+  // --- plan the four-node graph into two routed regions --------------------
   auto doc = sx::parse_document(MERGE);
   check(doc.has_value(), "doc parses");
   if (!doc)
@@ -134,93 +154,78 @@ int main() {
     return 1;
   }
 
-  check(plan->tasks.size() == 4, "plan has four compute tasks");
-  check(plan->execution_order.size() == 4, "four-task execution order");
+  check(plan->tasks.size() == 2, "plan has two region tasks");
+  check(plan->execution_order.size() == 2, "two-task execution order");
 
   const pl::TaskDesc* t_softmax = task_producing(*plan, "s");
-  const pl::TaskDesc* t_relu_s = task_producing(*plan, "a");
-  const pl::TaskDesc* t_relu_x = task_producing(*plan, "b");
-  const pl::TaskDesc* t_add = task_producing(*plan, "z");
-  check(t_softmax && t_relu_s && t_relu_x && t_add,
-        "all four tasks located by their output tensor");
-
-  if (!(t_softmax && t_relu_s && t_relu_x && t_add))
+  const pl::TaskDesc* t_region = task_producing(*plan, "z");
+  check(t_softmax && t_region, "both regions located by an output tensor");
+  if (!(t_softmax && t_region))
     return 1;
 
-  // Routing: softmax → NativeTorch, all three MLIR nodes → Mlir.
+  // softmax → NativeTorch, single node.
   check(t_softmax->as_compute() &&
             t_softmax->as_compute()->backend == pl::BackendTag::NativeTorch &&
-            t_softmax->as_compute()->op == pl::OpKind::Softmax,
-        "softmax task is native-torch");
-  check(t_relu_s->as_compute() &&
-            t_relu_s->as_compute()->backend == pl::BackendTag::Mlir &&
-            t_relu_s->as_compute()->op == pl::OpKind::Relu,
-        "relu(s) task is mlir relu");
-  check(t_relu_x->as_compute() &&
-            t_relu_x->as_compute()->backend == pl::BackendTag::Mlir &&
-            t_relu_x->as_compute()->op == pl::OpKind::Relu,
-        "relu(x) task is mlir relu");
-  check(t_add->as_compute() &&
-            t_add->as_compute()->backend == pl::BackendTag::Mlir &&
-            t_add->as_compute()->op == pl::OpKind::Add,
-        "add task is mlir add");
+            t_softmax->as_compute()->op == pl::OpKind::Softmax &&
+            t_softmax->as_compute()->graph_nodes.size() == 1,
+        "softmax region is native-torch, single node");
 
-  // The add task must consume exactly two *distinct* input tensors (a and b),
-  // neither the graph input "x" nor the softmax intermediate "s".
-  check(t_add->inputs.size() == 2, "add task has two inputs");
-  if (t_add->inputs.size() == 2) {
-    const pl::TensorDesc* a = plan->find_tensor(t_add->inputs[0]);
-    const pl::TensorDesc* b = plan->find_tensor(t_add->inputs[1]);
-    check(a && b, "add task inputs resolve to tensors");
-    if (a && b) {
-      check(a->name == "a", "add task first input is 'a'");
-      check(b->name == "b", "add task second input is 'b'");
-      check(a->id != b->id, "a and b are distinct tensors");
-      check(a->shape == (std::vector<int64_t>{2, 3}) &&
-                b->shape == (std::vector<int64_t>{2, 3}),
-            "a and b both carry shape [2,3]");
-      check(a->dtype == sx::DType::Float32 && b->dtype == sx::DType::Float32,
-            "a and b are float32");
+  // The three consecutive MLIR nodes merge into one region.
+  check(t_region->as_compute() &&
+            t_region->as_compute()->backend == pl::BackendTag::Mlir &&
+            t_region->as_compute()->graph_nodes.size() == 3,
+        "mlir region has three merged nodes");
+  check(t_region->as_compute()->op == pl::OpKind::Relu,
+        "mlir region representative op is the first node's op (relu)");
+
+  // The region consumes two *distinct* external inputs (s and x) and emits one
+  // output (z).
+  check(t_region->inputs.size() == 2, "mlir region has two external inputs");
+  if (t_region->inputs.size() == 2) {
+    const pl::TensorDesc* in0 = plan->find_tensor(t_region->inputs[0]);
+    const pl::TensorDesc* in1 = plan->find_tensor(t_region->inputs[1]);
+    check(in0 && in1, "region inputs resolve to tensors");
+    if (in0 && in1) {
+      check(in0->name == "s" && in1->name == "x", "region inputs are s and x");
+      check(in0->id != in1->id, "s and x are distinct tensors");
     }
   }
+  check(t_region->outputs.size() == 1, "mlir region has one output");
+  if (!t_region->outputs.empty()) {
+    const pl::TensorDesc* z = plan->find_tensor(t_region->outputs.front());
+    check(z && z->name == "z", "region output is z");
+  }
 
-  // add depends on both relu tasks (producer/consumer relationships).
+  // Region depends on the softmax task (producer of s).
   {
-    bool dep_on_relu_s = false, dep_on_relu_x = false;
-    for (pl::TaskId d : t_add->dependencies) {
-      if (d == t_relu_s->id)
-        dep_on_relu_s = true;
-      if (d == t_relu_x->id)
-        dep_on_relu_x = true;
-    }
-    check(dep_on_relu_s && dep_on_relu_x, "add task depends on both relu tasks");
+    bool dep_on_softmax = false;
+    for (pl::TaskId d : t_region->dependencies)
+      if (d == t_softmax->id)
+        dep_on_softmax = true;
+    check(dep_on_softmax, "mlir region depends on the softmax task");
   }
 
-  // Intermediate tensors are recorded with their own shape/dtype.
-  for (const char* name : {"s", "a", "b"}) {
+  // Internal tensors a and b are recorded with shape/dtype, but no task lists
+  // them as I/O (they live inside the compiled region).
+  for (const char* name : {"a", "b"}) {
     const pl::TensorDesc* t = find_tensor(*plan, name);
-    check(t != nullptr, "plan records intermediate tensor");
+    check(t != nullptr, "plan records internal tensor");
     if (t) {
-      check(t->shape == (std::vector<int64_t>{2, 3}), "intermediate shape [2,3]");
-      check(t->dtype == sx::DType::Float32, "intermediate dtype float32");
+      check(t->shape == (std::vector<int64_t>{2, 3}), "internal shape [2,3]");
+      check(t->dtype == sx::DType::Float32, "internal dtype float32");
     }
+    check(task_producing(*plan, name) == nullptr,
+          "internal tensor is not a task output");
   }
 
-  // --- slice each MLIR region and compile a backend per slice ---------------
-  auto doc_a = pl::slice_document(*doc, {"a"});
-  auto doc_b = pl::slice_document(*doc, {"b"});
-  auto doc_z = pl::slice_document(*doc, {"z"});
-  check(doc_a.has_value() && doc_b.has_value() && doc_z.has_value(),
-        "three MLIR regions slice");
-  if (!(doc_a && doc_b && doc_z))
+  // --- compile the MLIR region (one slice) and the native backend ----------
+  auto region_doc = region_slice(*doc, *g, *t_region);
+  check(region_doc.has_value(), "mlir region slices");
+  if (!region_doc)
     return 1;
-
-  auto cpu_a = pl::CpuBackend::compile(*doc_a, {});
-  auto cpu_b = pl::CpuBackend::compile(*doc_b, {});
-  auto cpu_z = pl::CpuBackend::compile(*doc_z, {});
-  check(cpu_a.has_value() && cpu_b.has_value() && cpu_z.has_value(),
-        "three mlir backends compile");
-  if (!(cpu_a && cpu_b && cpu_z))
+  auto cpu = pl::CpuBackend::compile(*region_doc, {});
+  check(cpu.has_value(), "mlir region compiles");
+  if (!cpu)
     return 1;
 
   auto nt = pl::NativeTorchBackend::compile(*g);
@@ -228,12 +233,10 @@ int main() {
   if (!nt)
     return 1;
 
-  // --- wire the executor per-task (the Mlir tag alone is ambiguous) ---------
-  pl::RuntimeExecutor exec(std::map<pl::BackendTag, pl::Backend*>{});
-  exec.set_task_backend(t_softmax->id, nt->get());
-  exec.set_task_backend(t_relu_s->id, cpu_a->get());
-  exec.set_task_backend(t_relu_x->id, cpu_b->get());
-  exec.set_task_backend(t_add->id, cpu_z->get());
+  // Single MLIR region → the Mlir tag is unambiguous; map dispatch suffices.
+  pl::RuntimeExecutor exec(std::map<pl::BackendTag, pl::Backend*>{
+      {pl::BackendTag::Mlir, cpu->get()},
+      {pl::BackendTag::NativeTorch, nt->get()}});
 
   // --- execute and check the numeric result --------------------------------
   // x rows are identical ([1,2,3] twice); axis=1 softmax of a row gives
@@ -258,15 +261,13 @@ int main() {
 
   // --- error path: a task with no backend → RuntimeError (no crash) ---------
   {
-    pl::RuntimeExecutor missing(std::map<pl::BackendTag, pl::Backend*>{});
-    missing.set_task_backend(t_softmax->id, nt->get());
-    missing.set_task_backend(t_relu_s->id, cpu_a->get());
-    missing.set_task_backend(t_relu_x->id, cpu_b->get());
-    // t_add intentionally has no backend registered.
+    pl::RuntimeExecutor missing(std::map<pl::BackendTag, pl::Backend*>{
+        {pl::BackendTag::NativeTorch, nt->get()}});
+    // the Mlir region intentionally has no registered backend.
     auto r = missing.execute(*plan, *snap, {pack(x)});
     check(!r.has_value() &&
               r.error().code == pl::RuntimeErrorCode::BackendFailure,
-          "missing add backend maps to BackendFailure");
+          "missing mlir backend maps to BackendFailure");
   }
 
   if (g_failures == 0) {
