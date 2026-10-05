@@ -47,6 +47,21 @@ or duplicate definition (`InvalidGraph`). Attributes are preserved verbatim.
 6. Fill devices/memory spaces/tensors, both fingerprints, `resource_version`,
    the single-entry `execution_order`, and a deterministic `plan_id`.
 
+### 2.1 Mixed-graph path (co-execution)
+
+When `route_op` classifies any node as `NativeTorch` (`has_native`, i.e. the
+graph contains `softmax`), planning takes a second branch instead of the
+whole-graph task above. Nodes are grouped into topologically-consecutive
+regions by backend — a `NativeTorch` node is always its own single-node region,
+and a run of consecutive `Mlir` nodes merges into one region — and one `Compute`
+task is emitted per region. Region inputs (external node inputs, first-reference
+order), outputs (region-produced tensors that are graph outputs or consumed
+outside the region), dependencies (producers of the external inputs), and cost
+(sum of per-node estimates, minimum confidence) are computed across the merged
+node set; the representative `op` is the first node's op. Each MLIR region is
+compiled from a single `slice_region()` sub-document. See
+`design/mlir-native-torch-coexecution-audit.md`.
+
 ## 3. Memory planning (`MemoryPlanner::plan_memory`)
 
 1. Lifetimes: every tensor is live for the single compute task — graph

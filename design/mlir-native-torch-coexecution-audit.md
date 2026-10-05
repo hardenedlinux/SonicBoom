@@ -8,6 +8,11 @@
 Date: 2026-10-05. Branch: `native-torch/refactor`. Baseline `214bde6`, CUDA
 checkpoint `f667257`.
 
+> **Status update (2026-10-06):** the gap this audit describes has since been
+> closed. The co-execution loop landed as `6a8030f`, branch/merge + cost
+> benchmark as `f973e20`, and region-partitioned mixed co-execution as `0a12303`.
+> See §11 "Implemented since the audit".
+
 ---
 
 ## 0. Executive summary
@@ -334,8 +339,47 @@ After the loop is correct end-to-end, in order:
 | Item | State |
 |---|---|
 | MLIR → JIT → C ABI chain (7 ops, ResNet-18 verified) | ✅ done, committed |
-| native-torch dispatcher (CPU kernels + CUDA loop) | ✅ committed (`f667257`); CPU migration uncommitted |
-| Dispatch + op-coverage tests (G-3/G-4) | ⚠️ written, **uncommitted** |
-| op routing / `Bytes↔Tensor` / op-name mapping / `NativeTorchBackend` / multi-backend executor | ❌ not built (the gap) |
-| First end-to-end co-execution loop (`[softmax → relu]`, CPU) | ❌ proposed here, not started |
+| native-torch dispatcher (CPU kernels + CUDA loop) | ✅ committed (`f667257`) |
+| op routing / `Bytes↔Tensor` / op-name mapping / `NativeTorchBackend` / multi-backend executor (G-1…G-5) | ✅ done (`6a8030f`) |
+| First end-to-end co-execution loop (`[softmax → relu]`, CPU) | ✅ done (`6a8030f`) |
+| Branch/merge DAG correctness + cost benchmark | ✅ done (`f973e20`) |
+| Region-partitioned mixed co-execution (merge consecutive MLIR nodes) | ✅ done (`0a12303`) |
 | Fusion / DP / cost model | ⏸ deferred (step 4) |
+
+---
+
+## 11. Implemented since the audit
+
+The gap (§4) and the first milestone (§7) have been closed on
+`native-torch/refactor`, using partitioning strategy **A** (planner-level
+multi-backend, §5) and the copy-based `Bytes ↔ Tensor` bridge (§6):
+
+- **G-1 op routing** — `planner/partition.h` `route_op()`: `Softmax` →
+  `NativeTorch`, everything else → `Mlir`. `StaticPlanner::plan` branches on
+  "any node routes to NativeTorch" (`has_native`): homogeneous MLIR graphs keep
+  the single whole-graph fast path; otherwise the mixed path runs.
+- **G-2 `sx::Bytes ↔ nt::Tensor`** — `NativeTorchBackend` materializes host
+  float32 buffers as `nt::Tensor` and copies results back.
+- **G-3 op-name mapping** — `NativeTorchBackend` dispatches the loop's ops to
+  `aten::_softmax` / `aten::relu` / `aten::add.Tensor`.
+- **G-4 `NativeTorchBackend`** — `core/src/planner/native_torch_backend.cpp`,
+  a peer to `CpuBackend`.
+- **G-5 multi-backend executor** — `RuntimeExecutor` takes a
+  `map<BackendTag, Backend*>` plus per-task `set_task_backend()` overrides, and
+  hands `sx::Bytes` between tasks by `TensorId`.
+
+The mixed path evolved in two steps:
+
+1. `6a8030f` — one compute task per node (the §7.1 `[softmax → relu]` loop);
+   `slice_document()` extracts each MLIR node's sub-document.
+2. `f973e20` + `0a12303` — branch/merge DAG + cost benchmark, then **region
+   partitioning**: topologically-consecutive same-backend nodes merge into one
+   region (NativeTorch stays single-node; a run of MLIR nodes compiles as one
+   unit), so region-internal tensors never cross a task boundary.
+   `slice_region()` extracts an explicit node set into a standalone Document.
+   `test_coexecution_merge` / `test_coexecution_region` /
+   `test_coexecution_benchmark` verify region structure and numeric results.
+
+§9 open decisions resolved: strategy A (1), planner-owned mapping (2), CPU-only
+first loop (4), copy bridge (5). Stage E CPU-migration sequencing (3) is tracked
+in `design/native-torch-migration.md`.
