@@ -27,11 +27,11 @@
 //     → finalize-memref-to-llvm → convert-func-to-llvm (bare-ptr call conv)
 //     → convert-cf-to-llvm → reconcile-unrealized-casts
 //
-// The function is invoked through the bare-pointer calling convention: the
-// single `func.func @main(tensor<...xf32>) -> tensor<...xf32>` becomes
-// `float *main(float *)`; the returned pointer is malloc'd by the JIT runtime
-// and freed by the caller. v0 execution scope is exactly one float32 input and
-// one float32 output.
+// The function is invoked through the bare-pointer calling convention: a
+// `func.func @main(tensor<...xf32>, ..., tensor<...xf32>) -> tensor<...xf32>`
+// (identity layout) becomes `float *main(float *, ..., float *)`; the returned
+// pointer is malloc'd by the JIT runtime and freed by the caller. v0 execution
+// scope is one or more float32 inputs and exactly one float32 output.
 
 #include <sonicboom/sx/exec.h>
 
@@ -176,12 +176,38 @@ std::string run_cpu_pipeline(MLIRContext& ctx, ModuleOp module) {
 
 struct Executable::Impl {
   std::unique_ptr<mlir::ExecutionEngine> engine;
-  void* (*entry)(void*);  // float* main(float*) under the bare-ptr ABI
-  TensorType input;
-  TensorType output;
-  std::size_t input_bytes;
-  std::size_t output_bytes;
+  void* entry;  // raw JIT symbol; the number of input pointers is fixed by the graph
+  std::vector<TensorType> inputs;
+  std::vector<TensorType> outputs;
+  std::vector<std::size_t> input_bytes;
+  std::vector<std::size_t> output_bytes;
 };
+
+// Invoke the JIT entry with one bare pointer per graph input. The bare-ptr call
+// convention turns `func @main(memref<..>, ..., memref<..>) -> memref<..>`
+// (identity layout) into `float* main(float*, ..., float*)`, so the entry takes
+// one pointer per input and returns the single output pointer. Arity is fixed
+// at compile time by the graph, so dispatch on it. Returns nullptr for an
+// unsupported (larger) arity.
+void* call_entry(void* entry, const std::vector<const void*>& ptrs) {
+  switch (ptrs.size()) {
+    case 1:
+      return reinterpret_cast<void* (*)(const void*)>(entry)(ptrs[0]);
+    case 2:
+      return reinterpret_cast<void* (*)(const void*, const void*)>(entry)(
+          ptrs[0], ptrs[1]);
+    case 3:
+      return reinterpret_cast<void* (*)(const void*, const void*,
+                                       const void*)>(entry)(
+          ptrs[0], ptrs[1], ptrs[2]);
+    case 4:
+      return reinterpret_cast<void* (*)(const void*, const void*, const void*,
+                                       const void*)>(entry)(
+          ptrs[0], ptrs[1], ptrs[2], ptrs[3]);
+    default:
+      return nullptr;
+  }
+}
 
 Executable::Executable() : impl_(std::make_unique<Impl>()) {}
 Executable::Executable(Executable&&) noexcept = default;
@@ -192,21 +218,33 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
     const Document& doc, const std::unordered_map<std::string, Bytes>& weights) {
   const Graph& g = doc.graph;
 
-  // v0 execution scope: exactly one float32 input and one float32 output.
-  if (g.inputs.size() != 1)
+  // v0 execution scope: one or more float32 inputs, exactly one float32 output.
+  if (g.inputs.empty())
     return std::unexpected(make_error(
-        ExecErrorKind::Compile,
-        "execution requires exactly one graph input (got " +
-            std::to_string(g.inputs.size()) + ")"));
+        ExecErrorKind::Compile, "execution requires at least one graph input"));
   if (g.outputs.size() != 1)
     return std::unexpected(make_error(
         ExecErrorKind::Compile,
         "execution requires exactly one graph output (got " +
             std::to_string(g.outputs.size()) + ")"));
-  const TensorType& in_type = g.inputs[0].type;
-  if (in_type.dtype != DType::Float32)
-    return std::unexpected(make_error(
-        ExecErrorKind::Compile, "execution input must be float32 in v0"));
+
+  // Reject overflowing byte sizes up front, before any MLIR lowering or JIT,
+  // so a wrapped size can never reach an allocation, file read, or memcpy.
+  std::vector<TensorType> in_types;
+  std::vector<std::size_t> in_bytes;
+  for (const auto& in : g.inputs) {
+    if (in.type.dtype != DType::Float32)
+      return std::unexpected(make_error(
+          ExecErrorKind::Compile,
+          "execution input '" + in.name + "' must be float32 in v0"));
+    auto b = tensor_byte_size(in.type);
+    if (!b)
+      return std::unexpected(make_error(
+          ExecErrorKind::Compile, "input tensor byte size overflows"));
+    in_types.push_back(in.type);
+    in_bytes.push_back(static_cast<std::size_t>(*b));
+  }
+
   const TensorType* out_type = find_def_type(g, g.outputs[0]);
   if (!out_type)
     return std::unexpected(make_error(
@@ -215,13 +253,6 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
   if (out_type->dtype != DType::Float32)
     return std::unexpected(make_error(
         ExecErrorKind::Compile, "execution output must be float32 in v0"));
-
-  // Reject overflowing byte sizes up front, before any MLIR lowering or JIT,
-  // so a wrapped size can never reach an allocation, file read, or memcpy.
-  auto in_bytes = tensor_byte_size(in_type);
-  if (!in_bytes)
-    return std::unexpected(make_error(
-        ExecErrorKind::Compile, "input tensor byte size overflows"));
   auto out_bytes = tensor_byte_size(*out_type);
   if (!out_bytes)
     return std::unexpected(make_error(
@@ -295,9 +326,9 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
 
   std::unique_ptr<mlir::ExecutionEngine> eng = std::move(*engine);
 
-  // Bare-ptr ABI: the single tensor argument/result is a raw data pointer.
-  // The lowering names the entry function after the graph (`g.name`), so look
-  // that symbol up (its LLVM symbol name is unchanged by the conversion).
+  // Bare-ptr ABI: each tensor argument/result is a raw data pointer. The
+  // lowering names the entry function after the graph (`g.name`), so look that
+  // symbol up (its LLVM symbol name is unchanged by the conversion).
   auto sym = eng->lookup(g.name);
   if (!sym)
     return std::unexpected(make_error(
@@ -307,38 +338,71 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
 
   auto exe = std::unique_ptr<Executable>(new Executable());
   exe->impl_->engine = std::move(eng);
-  exe->impl_->entry = reinterpret_cast<void* (*)(void*)>(*sym);
-  exe->impl_->input = in_type;
-  exe->impl_->output = *out_type;
-  exe->impl_->input_bytes = static_cast<std::size_t>(*in_bytes);
-  exe->impl_->output_bytes = static_cast<std::size_t>(*out_bytes);
+  exe->impl_->entry = *sym;
+  exe->impl_->inputs = std::move(in_types);
+  exe->impl_->outputs = {*out_type};
+  exe->impl_->input_bytes = std::move(in_bytes);
+  exe->impl_->output_bytes = {static_cast<std::size_t>(*out_bytes)};
   return exe;
 }
 
-const TensorType& Executable::input_type() const { return impl_->input; }
-const TensorType& Executable::output_type() const { return impl_->output; }
+const TensorType& Executable::input_type() const { return impl_->inputs.front(); }
+const TensorType& Executable::output_type() const { return impl_->outputs.front(); }
 
-std::expected<void, ExecError> Executable::run(const Bytes& input,
-                                               Bytes& output) const {
-  if (input.size() != impl_->input_bytes)
+std::expected<void, ExecError> Executable::run(const std::vector<Bytes>& inputs,
+                                               std::vector<Bytes>& outputs) const {
+  if (inputs.size() != impl_->inputs.size())
     return std::unexpected(make_error(
         ExecErrorKind::Binding,
-        "input buffer is " + std::to_string(input.size()) + " bytes, expected " +
-            std::to_string(impl_->input_bytes)));
-  if (impl_->output_bytes == 0)
+        "expected " + std::to_string(impl_->inputs.size()) +
+            " input buffers, got " + std::to_string(inputs.size())));
+  for (std::size_t i = 0; i < inputs.size(); ++i)
+    if (inputs[i].size() != impl_->input_bytes[i])
+      return std::unexpected(make_error(
+          ExecErrorKind::Binding,
+          "input buffer " + std::to_string(i) + " is " +
+              std::to_string(inputs[i].size()) + " bytes, expected " +
+              std::to_string(impl_->input_bytes[i])));
+  if (impl_->output_bytes.front() == 0)
     return std::unexpected(make_error(ExecErrorKind::Binding,
                                       "output tensor has zero elements"));
 
-  output.resize(impl_->output_bytes);
+  if (inputs.size() > 4)
+    return std::unexpected(make_error(
+        ExecErrorKind::Binding,
+        "execution supports at most 4 graph inputs, got " +
+            std::to_string(inputs.size())));
 
-  void* result = impl_->entry(
-      const_cast<void*>(static_cast<const void*>(input.data())));
+  std::vector<const void*> ptrs;
+  ptrs.reserve(inputs.size());
+  for (const auto& b : inputs)
+    ptrs.push_back(b.data());
+
+  void* result = call_entry(impl_->entry, ptrs);
   if (!result)
     return std::unexpected(make_error(
         ExecErrorKind::Runtime, "JIT entry returned a null pointer"));
 
-  std::memcpy(output.data(), result, impl_->output_bytes);
+  outputs.assign(impl_->outputs.size(), Bytes{});
+  outputs.front().resize(impl_->output_bytes.front());
+  std::memcpy(outputs.front().data(), result, impl_->output_bytes.front());
   std::free(result);  // the bare-ptr ABI returns a malloc'd buffer
+  return {};
+}
+
+std::expected<void, ExecError> Executable::run(const Bytes& input,
+                                               Bytes& output) const {
+  if (impl_->inputs.size() != 1)
+    return std::unexpected(make_error(
+        ExecErrorKind::Binding,
+        "single-input run() requires exactly one graph input, got " +
+            std::to_string(impl_->inputs.size())));
+  std::vector<Bytes> ins{input};
+  std::vector<Bytes> outs;
+  auto r = run(ins, outs);
+  if (!r)
+    return std::unexpected(r.error());
+  output = std::move(outs.front());
   return {};
 }
 

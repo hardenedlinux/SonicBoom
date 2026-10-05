@@ -33,6 +33,10 @@ RuntimeExecutor::RuntimeExecutor(Backend& backend) {
 RuntimeExecutor::RuntimeExecutor(std::map<BackendTag, Backend*> backends)
     : backends_(std::move(backends)) {}
 
+void RuntimeExecutor::set_task_backend(TaskId task, Backend* backend) {
+  task_backends_[task] = backend;
+}
+
 std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
     const ExecutionPlan& plan, const ResourceSnapshot& live,
     const std::vector<sx::Bytes>& inputs) const {
@@ -87,9 +91,13 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
               RuntimeErrorCode::InvalidPlan,
               "compute task has no compute payload", Phase::Execution));
         Backend* backend = nullptr;
-        auto it = backends_.find(compute->backend);
-        if (it != backends_.end())
-          backend = it->second;
+        if (auto t = task_backends_.find(tid); t != task_backends_.end())
+          backend = t->second;
+        else {
+          auto it = backends_.find(compute->backend);
+          if (it != backends_.end())
+            backend = it->second;
+        }
         if (!backend)
           return std::unexpected(RuntimeError(
               RuntimeErrorCode::BackendFailure,

@@ -49,19 +49,11 @@ std::expected<std::vector<sx::Bytes>, RuntimeError> CpuBackend::execute(
     return std::unexpected(RuntimeError(
         RuntimeErrorCode::InvalidPlan,
         "CPU backend can only execute compute tasks", Phase::Execution));
-  if (inputs.size() != 1)
-    return std::unexpected(RuntimeError(
-        RuntimeErrorCode::InvalidPlan,
-        "v0 whole-graph entry expects exactly one input buffer",
-        Phase::Execution));
-
-  sx::Bytes out;
-  auto r = exe_->run(inputs[0], out);
-  if (!r)
-    return std::unexpected(backend_error(r.error()));
 
   std::vector<sx::Bytes> outputs;
-  outputs.push_back(std::move(out));
+  auto r = exe_->run(inputs, outputs);
+  if (!r)
+    return std::unexpected(backend_error(r.error()));
   return outputs;
 }
 

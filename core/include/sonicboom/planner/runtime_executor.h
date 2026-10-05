@@ -53,6 +53,14 @@ public:
   // whose tag has no registered backend fails with a RuntimeError.
   explicit RuntimeExecutor(std::map<BackendTag, Backend*> backends);
 
+  // Register a per-task backend override. When set, `execute` dispatches that
+  // specific task to `backend` instead of looking up the task's BackendTag.
+  // This wires a graph whose MLIR region was sliced per node into several
+  // independently-compiled CpuBackends — the Mlir tag alone is ambiguous, but
+  // each task maps to exactly one compiled slice. `backend` must outlive the
+  // executor.
+  void set_task_backend(TaskId task, Backend* backend);
+
   // Execute `plan`. `inputs` holds one raw buffer per graph-input tensor (in
   // plan order); constants/weights are baked into the backends' compiled units.
   std::expected<ExecutionResult, RuntimeError> execute(
@@ -61,6 +69,7 @@ public:
 
 private:
   std::map<BackendTag, Backend*> backends_;
+  std::map<TaskId, Backend*> task_backends_;
 };
 
 } // namespace sonicboom::planner

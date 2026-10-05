@@ -25,9 +25,10 @@
 // it into a callable native function. `run` executes that function over raw
 // little-endian tensor buffers.
 //
-// v0 execution scope: exactly one float32 graph input and one float32 graph
-// output (the ResNet-18 example and the Add/Relu smoke graphs both satisfy
-// this). Compiling a graph outside this scope is an explicit error.
+// v0 execution scope: one or more float32 graph inputs and exactly one float32
+// graph output (the ResNet-18 example and the Add/Relu smoke graphs have a
+// single input/output; a co-execution merge slice such as `add(a, b)` has two).
+// Compiling a graph outside this scope is an explicit error.
 
 #include <cstddef>
 #include <cstdint>
@@ -69,8 +70,8 @@ class Executable {
 public:
   // Compile `doc` for CPU execution. `weights` must provide a buffer for every
   // `:external` parameter (see load_external_weights); `:values` parameters are
-  // taken from `doc` itself. Requires exactly one float32 graph input and one
-  // float32 graph output (v0 execution scope).
+  // taken from `doc` itself. Requires one or more float32 graph inputs and
+  // exactly one float32 graph output (v0 execution scope).
   static std::expected<std::unique_ptr<Executable>, ExecError> compile(
       const Document& doc, const std::unordered_map<std::string, Bytes>& weights);
 
@@ -80,14 +81,21 @@ public:
   Executable& operator=(const Executable&) = delete;
   ~Executable();
 
-  // The graph's single input and output tensor types (binding contract).
+  // The graph's input and output tensor types (binding contract). `input_type`
+  // returns the first input; single-input graphs are the common case. The
+  // full vector form is available via the multi-input run() overload.
   const TensorType& input_type() const;
   const TensorType& output_type() const;
 
-  // Run the graph. `input` is the raw little-endian buffer for the single input
-  // tensor (byte count must equal numel(input_type()) * dtype_size); `output`
-  // is resized to the single output tensor and filled. Returns an error on
-  // size/type mismatch or runtime failure.
+  // Run the graph over one raw little-endian buffer per graph input (in graph
+  // input order). Each buffer's byte count must equal numel(its type) *
+  // dtype_size; `outputs` is resized to one buffer per graph output and filled.
+  // Returns an error on count/size mismatch or runtime failure.
+  std::expected<void, ExecError> run(const std::vector<Bytes>& inputs,
+                                     std::vector<Bytes>& outputs) const;
+
+  // Single-input convenience overload (the v0 common case): equivalent to the
+  // multi-input form with exactly one input buffer.
   std::expected<void, ExecError> run(const Bytes& input, Bytes& output) const;
 
 private:

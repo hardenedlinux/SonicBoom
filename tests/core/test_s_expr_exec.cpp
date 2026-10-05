@@ -19,8 +19,8 @@
 // Proves the end-to-end S-Expr → MLIR → LLVM → JIT path produces a callable
 // native function and computes correct results, against an independently
 // hand-computed reference (no placeholder, no hardcoded JIT output). It also
-// exercises the v0 execution-scope guard (single f32 input/output) and the
-// input-buffer size check.
+// exercises the v0 execution-scope guards (at-least-one f32 input, single f32
+// output), a two-input merge graph, and the input-buffer size check.
 
 #include <sonicboom/sx/exec.h>
 #include <sonicboom/sx/parser.h>
@@ -122,8 +122,9 @@ void test_add_relu_executes() {
   }
 }
 
-// 2. A graph with two inputs is outside v0 execution scope → Compile error.
-void test_scope_single_input() {
+// 2. A two-input merge graph (`add(a, b)`) now compiles and runs — the v0
+//    single-input scope was relaxed to support co-execution merge slices.
+void test_two_input_add() {
   auto doc = sx::parse_document(
       "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
       " (inputs (input \"a\" (tensor float32 (shape 2)))"
@@ -132,18 +133,31 @@ void test_scope_single_input() {
       " (nodes (node add (inputs \"a\" \"b\")"
       "   (outputs (\"c\" (tensor float32 (shape 2))))))))");
   if (!doc) {
-    std::cerr << "  FAIL: scope (parse error: " << doc.error().message << ")\n";
+    std::cerr << "  FAIL: two-input (parse error: " << doc.error().message << ")\n";
     ++g_failures;
     return;
   }
   auto exe = sx::Executable::compile(*doc, {});
-  if (exe) {
-    std::cerr << "  FAIL: scope (expected Compile error for 2 inputs)\n";
+  if (!exe) {
+    std::cerr << "  FAIL: two-input (compile error: " << exe.error().message << ")\n";
     ++g_failures;
     return;
   }
-  check(exe.error().kind == sx::ExecErrorKind::Compile,
-        "scope: error kind is Compile");
+
+  const std::vector<sx::Bytes> ins = {pack({1.0f, 2.0f}), pack({3.0f, 4.0f})};
+  std::vector<sx::Bytes> outs;
+  auto res = (*exe)->run(ins, outs);
+  if (!res) {
+    std::cerr << "  FAIL: two-input (run error: " << res.error().message << ")\n";
+    ++g_failures;
+    return;
+  }
+
+  check(outs.size() == 1, "two-input: one output buffer");
+  const std::vector<float> expected = {4.0f, 6.0f};
+  std::vector<float> got = unpack(outs[0]);
+  for (std::size_t i = 0; i < expected.size() && i < got.size(); ++i)
+    check(std::fabs(got[i] - expected[i]) <= 1e-5f, "two-input: add value correct");
 }
 
 // 3. A wrong-sized input buffer → Binding error (byte-count check).
@@ -258,7 +272,7 @@ void test_overflow_rejected() {
 
 int main() {
   test_add_relu_executes();
-  test_scope_single_input();
+  test_two_input_add();
   test_binding_size_check();
   test_max_pool_neg_inf_pad();
   test_overflow_rejected();
