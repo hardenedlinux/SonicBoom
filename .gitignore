@@ -60,3 +60,4 @@ design/resnet18.reference.bin
 models/
 third_party/native-torch/generated/
 
+*.log
