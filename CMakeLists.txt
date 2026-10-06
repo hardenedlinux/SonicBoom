@@ -15,6 +15,10 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Enable CTest up front so every subdirectory (tests/core, bindings/guile)
+# registers its suites under a single `ctest` invocation.
+enable_testing()
+
 # libsonicboom.so is the final published core library; native-torch and MLIR are
 # statically linked into it, so all static libraries must be position-independent.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -72,3 +76,7 @@ add_subdirectory(core)
 
 # M2 Layer 2 boundary tests.
 add_subdirectory(tests/core)
+
+# Guile binding (Layer 3): Scheme sources + tests. The binding targets Guile
+# 3.0.9+.
+add_subdirectory(bindings/guile)
