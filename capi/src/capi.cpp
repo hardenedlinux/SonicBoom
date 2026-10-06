@@ -24,15 +24,22 @@
 
 #include <sonicboom/capi.h>
 
+#include <sonicboom/autograd.h>
+#include <sonicboom/runtime.h>
+#include <sonicboom/scalar_type.h>
 #include <sonicboom/sx/exec.h>
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
+#include <sonicboom/tensor.h>
 
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <new>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -55,6 +62,14 @@ struct sb_executable {
 struct sb_error {
   sb_error_kind kind;
   std::string message;
+};
+
+struct sb_tensor {
+  nt::Tensor t;
+};
+
+struct sb_tape {
+  sonicboom::Tape tape;
 };
 
 namespace {
@@ -366,3 +381,234 @@ sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
 void sb_document_free(sb_document *doc) { delete doc; }
 
 void sb_executable_free(sb_executable *exe) { delete exe; }
+
+// --- Training (minimal autograd) ---------------------------------------------
+
+namespace {
+
+// All training tensors are float32: byte size is numel * 4.
+size_t f32_bytes(int64_t numel) {
+  return static_cast<size_t>(numel) * 4;
+}
+
+// Allocate a fresh tensor handle for `t` (or fail under memory pressure).
+sb_status make_tensor(nt::Tensor t, sb_tensor **out, sb_error **err_out) {
+  auto *h = new (std::nothrow) sb_tensor();
+  if (!h) {
+    set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
+    return SB_ERR_INTERNAL;
+  }
+  h->t = std::move(t);
+  *out = h;
+  return SB_OK;
+}
+
+} // namespace
+
+sb_status sb_tensor_from_f32(const int64_t *dims, int64_t rank, const void *data,
+                             size_t len, sb_tensor **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (rank < 0 || !out)
+          return fail_arg(err_out);
+        *out = nullptr;
+
+        std::vector<int64_t> shape;
+        int64_t numel = 1;
+        for (int64_t i = 0; i < rank; ++i) {
+          if (dims[i] < 0)
+            return fail_arg(err_out);
+          shape.push_back(dims[i]);
+          numel *= dims[i];
+        }
+        if (len != f32_bytes(numel)) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "tensor byte count does not match shape");
+          return SB_ERR_BINDING;
+        }
+
+        nt::Tensor t = nt::empty(shape, nt::ScalarType::Float);
+        if (numel > 0 && data)
+          std::memcpy(t.data_ptr(), data, len);
+        return make_tensor(std::move(t), out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
+                          size_t *written_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!t || !out)
+          return fail_arg(err_out);
+        size_t n = f32_bytes(t->t.numel());
+        if (cap < n) {
+          set_error(err_out, SB_ERRKIND_BINDING, "output buffer too small");
+          return SB_ERR_BINDING;
+        }
+        if (n > 0)
+          std::memcpy(out, t->t.data_ptr(), n);
+        if (written_out)
+          *written_out = n;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_tensor_free(sb_tensor *t) { delete t; }
+
+sb_status sb_tape_new(sb_tape **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!out)
+          return fail_arg(err_out);
+        *out = nullptr;
+        auto *t = new (std::nothrow) sb_tape();
+        if (!t) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
+          return SB_ERR_INTERNAL;
+        }
+        *out = t;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_tape_free(sb_tape *tape) { delete tape; }
+
+void sb_tape_zero_grad(sb_tape *tape) {
+  if (tape)
+    tape->tape.zero_grad();
+}
+
+sb_status sb_linear(const sb_tensor *x, const sb_tensor *w, const sb_tensor *b,
+                    sb_tape *tape, sb_tensor **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!x || !w || !b || !tape || !out)
+          return fail_arg(err_out);
+        *out = nullptr;
+        nt::Tensor y = sonicboom::linear(x->t, w->t, b->t, tape->tape);
+        return make_tensor(std::move(y), out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_relu(const sb_tensor *x, sb_tape *tape, sb_tensor **out,
+                  sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!x || !tape || !out)
+          return fail_arg(err_out);
+        *out = nullptr;
+        nt::Tensor y = sonicboom::relu(x->t, tape->tape);
+        return make_tensor(std::move(y), out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_mse_loss(const sb_tensor *pred, const sb_tensor *target,
+                      sb_tape *tape, sb_tensor **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!pred || !target || !tape || !out)
+          return fail_arg(err_out);
+        *out = nullptr;
+        nt::Tensor y = sonicboom::mse_loss(pred->t, target->t, tape->tape);
+        return make_tensor(std::move(y), out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_backward(const sb_tensor *loss, sb_tape *tape, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!loss || !tape)
+          return fail_arg(err_out);
+        sonicboom::backward(loss->t, tape->tape);
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_sgd_step(sb_tape *tape, sb_tensor *param, double lr,
+                      sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!tape || !param)
+          return fail_arg(err_out);
+        nt::Tensor g = tape->tape.grad(param->t);
+        if (!g.defined()) {
+          set_error(err_out, SB_ERRKIND_RUNTIME,
+                    "no gradient accumulated for parameter");
+          return SB_ERR_RUNTIME;
+        }
+        sonicboom::sgd_step(param->t, g, lr);
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
+                  sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!tape || !param || !out)
+          return fail_arg(err_out);
+        *out = nullptr;
+        nt::Tensor g = tape->tape.grad(param->t);
+        if (!g.defined()) {
+          set_error(err_out, SB_ERRKIND_RUNTIME,
+                    "no gradient accumulated for parameter");
+          return SB_ERR_RUNTIME;
+        }
+        return make_tensor(std::move(g), out, err_out);
+      },
+      err_out);
+}
+
+// --- Export -----------------------------------------------------------------
+
+sb_status sb_export_model(const char *sx_text, size_t sx_len,
+                          const char *const *names, const sb_tensor *const *params,
+                          size_t count, const char *dir, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!sx_text || !dir)
+          return fail_arg(err_out);
+        if (count > 0 && (!names || !params))
+          return fail_arg(err_out);
+
+        auto res = sx::parse_document(std::string_view(sx_text, sx_len));
+        if (!res) {
+          set_error(err_out, parse_errkind(res.error().category),
+                    res.error().message.c_str());
+          return SB_ERR_PARSE;
+        }
+
+        // Marshal the trained float32 tensors into the name → bytes map the
+        // exporter consumes. Byte counts are validated against each parameter's
+        // declared shape inside export_model (SB_ERR_INTERNAL on mismatch).
+        std::unordered_map<std::string, sx::Bytes> map;
+        map.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (!names[i] || !params[i])
+            return fail_arg(err_out);
+          const nt::Tensor &t = params[i]->t;
+          size_t n = f32_bytes(t.numel());
+          sx::Bytes bytes(n);
+          if (n > 0)
+            std::memcpy(bytes.data(), t.data_ptr(), n);
+          map.emplace(std::string(names[i]), std::move(bytes));
+        }
+
+        auto r = sonicboom::export_model(*res, map, dir);
+        if (!r) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    ("export: " + r.error().message).c_str());
+          return SB_ERR_INTERNAL;
+        }
+        return SB_OK;
+      },
+      err_out);
+}

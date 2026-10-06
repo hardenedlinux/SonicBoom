@@ -52,6 +52,12 @@ class Tensor {
 
   void* data_ptr() const;
 
+  // Stable identity of the underlying tensor: the Layer 1 impl address. Two
+  // handles that share a TensorImpl compare equal, and the address is stable
+  // across in-place updates (so it is a sound key for gradient accumulation
+  // across a training loop). The void* exposes no native type.
+  const void* identity() const noexcept { return impl_.get(); }
+
  private:
   std::shared_ptr<detail::TensorImpl> impl_;
   friend struct detail::Adapter;

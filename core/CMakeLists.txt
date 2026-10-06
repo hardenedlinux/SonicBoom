@@ -29,6 +29,12 @@ file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_PLANNER_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/*.cpp)
 
+# Minimal autograd (core/src/autograd/). Layer 2 only: it dispatches through
+# the nt:: adapter (no direct c10/ATen use), so it belongs to the same public
+# library surface as the planner/sx code above.
+file(GLOB_RECURSE SONICBOOM_AUTOGRAD_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/autograd/*.cpp)
+
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
 # Native-torch and MLIR are statically linked into it. The stable C ABI
 # (sonicboom_capi object library) is folded in so its `extern "C"` symbols are
@@ -37,6 +43,7 @@ add_library(sonicboom SHARED
   ${SONICBOOM_ADAPTER_SOURCES}
   ${SONICBOOM_SX_SOURCES}
   ${SONICBOOM_PLANNER_SOURCES}
+  ${SONICBOOM_AUTOGRAD_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 

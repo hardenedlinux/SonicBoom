@@ -38,6 +38,8 @@ extern "C" {
 typedef struct sb_document sb_document;      /* a parsed S-Expr v0.1 document  */
 typedef struct sb_executable sb_executable;  /* a compiled, runnable graph     */
 typedef struct sb_error sb_error;            /* a failure detail               */
+typedef struct sb_tensor sb_tensor;          /* a float32 tensor (autograd)     */
+typedef struct sb_tape sb_tape;              /* a differentiable-op tape        */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
 typedef enum sb_status {
@@ -158,6 +160,80 @@ sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
 
 void sb_document_free(sb_document *doc);
 void sb_executable_free(sb_executable *exe);
+
+/* --- Training (minimal autograd) ------------------------------------------- */
+/* A float32-only reverse-mode autograd surface for a small MLP: linear/relu/
+ * mse forward ops recorded on a tape, backward (VJP replay), and an in-place
+ * SGD step. Guile (or another binding) drives the training loop; all numeric
+ * work happens in native C++ behind these handles. No tensor is exposed as a
+ * raw pointer; data crosses the boundary only as little-endian byte buffers. */
+
+/* Create a float32 tensor of the given shape (dims[0..rank)) from little-endian
+ * bytes. `len` must equal numel * 4. The handle owns the native tensor. */
+sb_status sb_tensor_from_f32(const int64_t *dims, int64_t rank, const void *data,
+                             size_t len, sb_tensor **out, sb_error **err_out);
+
+/* Copy a tensor's little-endian float32 bytes into `out` (capacity `cap`). On
+ * success *written_out is the byte count (== numel * 4). */
+sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
+                          size_t *written_out, sb_error **err_out);
+
+void sb_tensor_free(sb_tensor *t);
+
+/* Create an empty tape (no recorded ops, no gradients). */
+sb_status sb_tape_new(sb_tape **out, sb_error **err_out);
+
+void sb_tape_free(sb_tape *tape);
+
+/* Clear the tape's recorded ops and accumulated gradients. */
+void sb_tape_zero_grad(sb_tape *tape);
+
+/* Forward ops: each returns a new tensor handle and records a node on `tape`.
+ * linear: y = x @ Wᵀ + b (x [N,in], W [out,in], b [out] → [N,out]). */
+sb_status sb_linear(const sb_tensor *x, const sb_tensor *w, const sb_tensor *b,
+                    sb_tape *tape, sb_tensor **out, sb_error **err_out);
+
+/* relu: y = max(x, 0), elementwise. */
+sb_status sb_relu(const sb_tensor *x, sb_tape *tape, sb_tensor **out,
+                  sb_error **err_out);
+
+/* mse_loss: scalar = mean((pred - target)²); returns a 0-dim tensor. */
+sb_status sb_mse_loss(const sb_tensor *pred, const sb_tensor *target,
+                      sb_tape *tape, sb_tensor **out, sb_error **err_out);
+
+/* Reverse-mode backprop from `loss` (seeds dL/dL = 1), accumulating gradients
+ * into `tape`. */
+sb_status sb_backward(const sb_tensor *loss, sb_tape *tape, sb_error **err_out);
+
+/* In-place SGD update param <- param - lr * grad, using `param`'s accumulated
+ * gradient in `tape`. The parameter keeps its identity across calls. */
+sb_status sb_sgd_step(sb_tape *tape, sb_tensor *param, double lr,
+                      sb_error **err_out);
+
+/* Read `param`'s accumulated gradient as a new tensor handle. Returns
+ * SB_ERR_RUNTIME if no gradient has been accumulated for `param`. */
+sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
+                  sb_error **err_out);
+
+/* --- Export ----------------------------------------------------------------- */
+
+/* Persist a trained model as a self-contained artifact directory (`dir`):
+ *
+ *   <dir>/model.sx    — the S-Expr v0.1 graph text; parameters whose name is in
+ *                       `names` are rewritten to :external references into
+ *                       weights.bin
+ *   <dir>/weights.bin — concatenated little-endian float32 bytes of those
+ *                       parameters, in graph parameter-declaration order
+ *
+ * `sx_text`/`sx_len` is the graph (the same text the nn composition emits).
+ * `names[i]` names the parameter; `params[i]` is its trained float32 tensor,
+ * whose byte count must equal the declared shape (SB_ERR_INTERNAL otherwise).
+ * Parameters not listed keep their existing inline/external data. `dir` is
+ * created if needed. The artifact is loadable later with sb_compile using
+ * `dir` as base_dir, with no Guile or Python at load time. */
+sb_status sb_export_model(const char *sx_text, size_t sx_len,
+                          const char *const *names, const sb_tensor *const *params,
+                          size_t count, const char *dir, sb_error **err_out);
 
 #ifdef __cplusplus
 } /* extern "C" */
