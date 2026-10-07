@@ -12,7 +12,7 @@
 //
 // Usage: llama_bench -m <model.gguf> [-n steps] [--token id] [--ctx n]
 //
-// Build: tools/oracle/build_llama_bench.sh
+// Build: tools/baseline/build_llama_bench.sh
 
 #include "llama.h"
 

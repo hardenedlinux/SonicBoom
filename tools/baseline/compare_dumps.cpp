@@ -1,4 +1,4 @@
-// compare_dumps — differential comparison of two SonicBoom/oracle tensor dumps.
+// compare_dumps — differential comparison of two SonicBoom/baseline tensor dumps.
 //
 // Dev-time reference tool only. Reads two dumps in the format written by
 // gemma4_dump (and by SonicBoom's dump tool):
@@ -18,7 +18,7 @@
 // Relative error is |a-b| / max(|a|, |b|, 1e-12), so it degrades gracefully to
 // absolute error at/around zero.
 //
-// Build: tools/oracle/build_compare.sh   Run: compare_dumps <ref> <cand> [tol]
+// Build: tools/baseline/build_compare.sh   Run: compare_dumps <ref> <cand> [tol]
 
 #include <algorithm>
 #include <cmath>
@@ -167,7 +167,7 @@ int main(int argc, char** argv) {
   }
 
   // Names present in reference but never in candidate (expected to be large:
-  // the oracle dump contains far more tensors than the checkpoints we check).
+  // the baseline dump contains far more tensors than the checkpoints we check).
   for (const auto& [name, idxs] : ref_idx)
     if (cand_idx.find(name) == cand_idx.end()) n_only_ref += idxs.size();
 

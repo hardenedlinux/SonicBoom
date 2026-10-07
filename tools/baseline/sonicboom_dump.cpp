@@ -1,6 +1,6 @@
 // sonicboom_dump — export SonicBoom's native Gemma 4 block intermediates in the
-// same machine-readable format as tools/oracle/gemma4_dump.cpp (the llama.cpp
-// oracle), for differential comparison via tools/oracle/compare_dumps.
+// same machine-readable format as tools/baseline/gemma4_dump.cpp (the llama.cpp
+// baseline), for differential comparison via tools/baseline/compare_dumps.
 //
 // This links against libsonicboom.so (the SHARED core) and uses only public
 // Layer 2 headers (<sonicboom/...>). It computes the token embedding and a
@@ -12,7 +12,7 @@
 //   @ <name> <dtype> <d0> <d1> <d2> <d3>
 //   <v0> ... <vn-1>   (%.9g, one per line)
 //
-// Build: tools/oracle/build_sonicboom.sh   Run: sonicboom_dump -m <model> ...
+// Build: tools/baseline/build_sonicboom.sh   Run: sonicboom_dump -m <model> ...
 //
 // Phase 5D: `--all` dumps the full 42-block forward (chained residual stream +
 // Gemma 4 shared-KV) via forward_traced, emitting every block's intermediates.

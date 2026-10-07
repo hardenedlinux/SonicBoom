@@ -1,10 +1,10 @@
-# Gemma 4 E4B-It — block semantics (Phase 5C-1 → oracle-resolved)
+# Gemma 4 E4B-It — block semantics (Phase 5C-1 → baseline-resolved)
 
 Phase 5C-1 closed the *weight binding* gap and recorded the semantic questions
 that gate numerical correctness. This revision **resolves** those questions from
 the authoritative llama.cpp source (`src/models/gemma4.cpp`,
 `src/llama-graph.cpp`, `src/llama-model.cpp`, `ggml/src/ggml-cpu/vec.h`), now that
-llama.cpp is available at `/path/to/llama.cpp` (HEAD 43fe9c642).
+llama.cpp is available (local checkout, HEAD 43fe9c642).
 Status is `confirmed` only where the source states it directly; the differential
 *run* (dump llama.cpp tensors, compare against SonicBoom) is the remaining
 execution step and is not claimed here.
@@ -171,7 +171,7 @@ frequency" convention (partial RoPE across head dims). `freq_base` per layer:
 SWA → `rope_freq_base_train_swa` = 10000, global → `rope_freq_base_train` = 1e6
 (matches the loader's per-layer `rope_base`). The exact `ggml_rope_ext`
 proportional-RoPE arithmetic is the one detail still to transcribe into the
-oracle's reference graph.
+baseline's reference graph.
 
 ## 4. Authoritative reference graph (single token, block l)
 
@@ -231,8 +231,8 @@ out    = x3 * layer_output_scale
 ## 6. Numerical-equivalence findings (Phase 5C-2 differential run)
 
 The §3–§4 arithmetic was implemented in `run_block`/`embed_*` and validated
-against a llama.cpp oracle (dump tool `tools/oracle/gemma4_dump.cpp`, compare
-tool `tools/oracle/compare_dumps.cpp`). The differential run surfaced three
+against a llama.cpp baseline (dump tool `tools/baseline/gemma4_dump.cpp`, compare
+tool `tools/baseline/compare_dumps.cpp`). The differential run surfaced three
 *arithmetic-level* divergences that source-reading alone does not reveal — each
 is a place where llama.cpp's CPU kernels do not compute the naive f32 formula.
 All three are now reproduced in SonicBoom so the two agree to within fp noise.
@@ -261,7 +261,7 @@ llama.cpp's `build_attn_mha` casts the f32 K and V to fp16 before
 `ggml_flash_attn_ext`. For single-token decode the softmax over one logit is 1,
 so `kqv_out == fp16(V)` (the K cast is irrelevant until multi-token KV
 attention). A full-f32 attention would be *more* accurate but would not match
-the oracle.
+the baseline.
 
 Fix: `cast_v_to_fp16` (`core/src/model/exec.cpp`) round-trips V through
 `std::float16_t` after `Vcur_normed`.
@@ -293,15 +293,15 @@ reference (still used by `test_nn`).
 (measured 0.061 / 0.160 / 0.445 for layers 0/1/41), applied once to the whole
 block output. llama.cpp's `cb("out_scaled")` and `cb("l_out")` name the *same*
 tensor (gemma4's `build_cvec` is identity), so only `l_out` survives to the
-oracle dump. `run_block` applies the scale and emits only `l_out` to match.
+baseline dump. `run_block` applies the scale and emits only `l_out` to match.
 
 ## 7. Differential result (layer 0, token 0, pos 0)
 
-`sonicboom_dump` vs the oracle, `compare_dumps` (tolerance 1e-4). The tool flags
+`sonicboom_dump` vs the baseline, `compare_dumps` (tolerance 1e-4). The tool flags
 a tensor when **either** `max_abs` or `max_rel` exceeds 1e-4, so the "mismatch"
 count is dominated by relative error on near-zero elements — not by large
-absolute error. `only in candidate: 0` (every SonicBoom stage has an oracle
-counterpart); the 1628 "only in reference" tensors are the oracle graph's
+absolute error. `only in candidate: 0` (every SonicBoom stage has an baseline
+counterpart); the 1628 "only in reference" tensors are the baseline graph's
 weights/intermediates that SonicBoom does not emit.
 
 | stage | max_abs | rms |
@@ -338,15 +338,15 @@ division, not absolute divergence).
 
 **Source revisions.**
 - SonicBoom: `f64c418d53a857d205be15fd0ee3f8f3de8b5861` (branch `master`).
-- llama.cpp oracle (reference-only): `43fe9c64281ef735046adc025e9e7559a1f659a5`
-  at `/path/to/llama.cpp`.
+- llama.cpp baseline (reference-only): `43fe9c64281ef735046adc025e9e7559a1f659a5`
+  (local checkout).
 
 **Worktree status.** Nothing committed; the whole native transformer path is
 uncommitted on `master`. Modified: `core/CMakeLists.txt`,
 `tests/core/CMakeLists.txt`. Untracked (new this phase): the `core/include/sonicboom/{gguf,model,nn,quant}/`
-and `core/src/{gguf,model,nn,quant}/` trees, `tests/core/{ggml_oracle.h,test_dequant.cpp,test_gemma4.cpp,test_gguf.cpp,test_nn.cpp,test_quantized_matmul.cpp}`,
-`tools/oracle/` (dump/compare tools + build scripts), and the
-`design/{gguf-reader,gemma4-model-map,gemma4-execution-gap,gemma4-oracle,gemma4-semantics}.md`
+and `core/src/{gguf,model,nn,quant}/` trees, `tests/core/{ggml_baseline.h,test_dequant.cpp,test_gemma4.cpp,test_gguf.cpp,test_nn.cpp,test_quantized_matmul.cpp}`,
+`tools/baseline/` (dump/compare tools + build scripts), and the
+`design/{gguf-reader,gemma4-model-map,gemma4-execution-gap,gemma4-baseline,gemma4-semantics}.md`
 docs. No branch switch, no commit, no push, no destructive op.
 
 **Changed files (this phase — §5 rewrite + §6 fixes).**
@@ -359,18 +359,18 @@ docs. No branch switch, no commit, no push, no destructive op.
 - `core/src/quant/quantized_matmul.cpp` / `.h` — q8_K activation quantization
   (`matvec_f32_q8_K`, `matmul_f32_q8_K`, `quantize_q8_K_to_f32`, `nearest_int`).
 - `tests/core/test_nn.cpp` — `test_gelu_fp16` regression.
-- `tools/oracle/{gemma4_dump.cpp,sonicboom_dump.cpp,compare_dumps.cpp}` +
-  `build{,_compare,_sonicboom}.sh` — oracle/candidate dump + comparator.
+- `tools/baseline/{gemma4_dump.cpp,sonicboom_dump.cpp,compare_dumps.cpp}` +
+  `build{,_compare,_sonicboom}.sh` — baseline/candidate dump + comparator.
 
 **Commands.**
 ```
 cmake --build build --target sonicboom -j            # SHARED libsonicboom.so
 cd build && ctest --output-on-failure                # 45/45 pass
-tools/oracle/build.sh                                # oracle dump (links llama.cpp, dev-only)
-tools/oracle/build_sonicboom.sh                      # candidate dump (links libsonicboom.so)
-tools/oracle/gemma4_dump  <model.gguf> --layer 0 --token 0 --pos 0 > tools/oracle/oracle.dump
-tools/oracle/sonicboom_dump <model.gguf> --layer 0 --token 0 --pos 0 > tools/oracle/sonicboom.dump
-tools/oracle/compare_dumps tools/oracle/oracle.dump tools/oracle/sonicboom.dump
+tools/baseline/build.sh                                # baseline dump (links llama.cpp, dev-only)
+tools/baseline/build_sonicboom.sh                      # candidate dump (links libsonicboom.so)
+tools/baseline/gemma4_dump  <model.gguf> --layer 0 --token 0 --pos 0 > tools/baseline/baseline.dump
+tools/baseline/sonicboom_dump <model.gguf> --layer 0 --token 0 --pos 0 > tools/baseline/sonicboom.dump
+tools/baseline/compare_dumps tools/baseline/baseline.dump tools/baseline/sonicboom.dump
 ```
 
 **Test results.** `ctest` 45/45 passed, 0 failed (includes `test_nn` with
@@ -392,7 +392,7 @@ decoding (§8); only layer 0 / token 0 / pos 0 is validated.
 
 **Result.** All 42 blocks chain through the residual stream with Gemma 4's
 shared-KV (layers 24–41 reuse the V cache of donors 22 SWA / 23 global), and
-every SonicBoom-emitted intermediate matches the llama.cpp oracle **bit-for-bit**
+every SonicBoom-emitted intermediate matches the llama.cpp baseline **bit-for-bit**
 (max_abs = max_rel = rms = 0 on all 794 common tensors, 0 mismatches).
 
 **Key insight — bit-exactness, not just closeness.** The q8_K activation
@@ -403,14 +403,14 @@ from layer ~12 onward. The only stable fix was to reproduce ggml's scalar
 reduction semantics exactly, so both sides round identically at every q8_K
 boundary.
 
-**Oracle rebuilt scalar.** The AVX2 llama.cpp build reduces in a different
+**Baseline rebuilt scalar.** The AVX2 llama.cpp build reduces in a different
 order (4×8-lane tree in `ggml_vec_dot_f32/bf16` and the AVX2 q4/q3/q5_K dots)
-that a scalar implementation cannot cheaply match. The oracle was therefore
+that a scalar implementation cannot cheaply match. The baseline was therefore
 rebuilt with SIMD disabled (`GGML_AVX/AVX2/F16C/FMA/SSE42/BMI2=OFF`), which
 selects ggml's `ggml_float = double` scalar reductions — deterministic and
-directly bit-matchable. The AVX2 oracle dump was preserved at
-`/tmp/oracle_avx2.dump` for reference; the committed comparison is against the
-scalar `tools/oracle/oracle.dump`.
+directly bit-matchable. The AVX2 baseline dump was preserved at
+`/tmp/baseline_avx2.dump` for reference; the committed comparison is against the
+scalar `tools/baseline/baseline.dump`.
 
 **Code changes (this phase — three accumulation-order fixes).**
 - `core/src/nn/norm.cpp` — `rms_norm` sum now `double(v * v)` (f32 product
@@ -424,14 +424,14 @@ scalar `tools/oracle/oracle.dump`.
 **Remaining (out of this phase's scope — the lm-head).** `forward_traced`
 returns the final hidden state (`l_out-41`) but does not yet apply the final
 `output_norm` (`result_norm`) or the vocab projection (`result_output`, the
-q4_K output matrix × 262144 vocab). The oracle's `node_*`, weight (`norm*`,
+q4_K output matrix × 262144 vocab). The baseline's `node_*`, weight (`norm*`,
 `per_layer_proj`), `h_nextn`, `inp_per_layer_selected`, and `(reshaped)/(view)`
 tensors are ggml graph internals SonicBoom intentionally does not emit.
 
 ## 11. Phase 5E acceptance report — lm-head, bit-exact logits
 
 **Result.** The full single-token forward now extends through the lm-head and is
-bit-exact against the scalar oracle end-to-end: 797 common tensors, 0
+bit-exact against the scalar baseline end-to-end: 797 common tensors, 0
 mismatches, worst rms 0 (`compare_dumps`). This includes the two head tensors
 `h_nextn` / `result_norm` (both 0) and `result_output` (262144 softcapped
 logits, 0).

@@ -40,7 +40,7 @@ bool axpy(std::span<const float> a, float alpha, std::span<float> y);
 // In-place float32 -> float16 -> float32 round-trip (each element is rounded
 // through fp16). Reproduces llama.cpp flash-attention's fp16 value cast
 // (ggml_cast(v, F16) then accumulate back in f32), so the single-token
-// reference matches the oracle bit-for-bit. An empty span is a no-op.
+// reference matches the baseline bit-for-bit. An empty span is a no-op.
 void cast_fp16(std::span<float> v);
 
 } // namespace sonicboom::nn

@@ -76,7 +76,7 @@ Status today:
   every tensor.
 - **Model framework: done, but as a scalar loop.** `run_block_core` is a
   hard-coded per-block C++ sequence that calls `nn::`/`quant::` scalar kernels
-  directly. It is numerically correct (bit-exact vs. the llama.cpp oracle —
+  directly. It is numerically correct (bit-exact vs. the llama.cpp baseline —
   see `design/gemma4-semantics.md` §10–§11), but it **bypasses the planner** and
   does **not** use the native-torch / MLIR compute spine.
 - **Planning: not connected.** The "plan" is `Gemma4Model::plan` (`LayerConfig`
@@ -163,5 +163,5 @@ GGUF loading -> model framework emits plan -> planning -> native-torch / MLIR
   it goes through the Layer 2 operator interface (`nt::`).
 - Transformer ops added to the spine belong in `core/include/sonicboom/planner/op_kind.h`
   and the Layer 2 operator surface, not as free scalar functions in `exec.cpp`.
-- llama.cpp / ggml remains a dev-time oracle only (`tools/oracle/`); it is never
+- llama.cpp / ggml remains a dev-time baseline only (`tools/baseline/`); it is never
   a runtime dependency of `libsonicboom.so`.

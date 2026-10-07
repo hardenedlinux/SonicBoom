@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build llama_bench against the llama.cpp CUDA build (build-cuda). Dev-time only.
-# Requires tools/oracle/build_llama_bench.sh's sibling build-cuda to exist (see
+# Requires tools/baseline/build_llama_bench.sh's sibling build-cuda to exist (see
 # the llama.cpp CUDA build command at the bottom of this file).
 set -euo pipefail
 
-LLAMA_ROOT="${LLAMA_ROOT:-/path/to/llama.cpp}"
+LLAMA_ROOT="${LLAMA_ROOT:?set LLAMA_ROOT to the llama.cpp checkout}"
 LLAMA_BIN="$LLAMA_ROOT/build-cuda/bin"
 
 CXX="${CXX:-g++}"

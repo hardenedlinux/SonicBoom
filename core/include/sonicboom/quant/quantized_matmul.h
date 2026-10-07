@@ -63,8 +63,9 @@ bool matvec(const QuantizedTensor& W, std::span<const float> x,
             std::span<float> y, MatmulBackend backend);
 
 // Backend-dispatching batched matmul: Y = W @ X ([cols, n] activation). Cuda
-// only handles the n == 1 (single-column) case and falls back to the f32 CPU
-// reference for n > 1. Same contracts as matmul_f32 / matmul_f32_q8_K.
+// routes to cuda::matmul_f32 (per-column gemv) and falls back to the f32 CPU
+// reference when CUDA is unavailable. Same contracts as matmul_f32 /
+// matmul_f32_q8_K.
 bool matmul(const QuantizedTensor& W, std::span<const float> X,
             std::span<float> Y, uint64_t n, MatmulBackend backend);
 
@@ -93,7 +94,7 @@ bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
 // does (ggml_vec_dot_q*_K_q8_K / quantize_row_q8_K). llama.cpp's output differs
 // from a full-f32-activation matmul by roughly 0.1-2% on transformer activations,
 // so use these variants when SonicBoom's result must be directly comparable to a
-// llama.cpp oracle; matmul_f32/matvec_f32 above remain the more accurate
+// llama.cpp baseline; matmul_f32/matvec_f32 above remain the more accurate
 // f32-activation reference. Same shape/size contracts and failure semantics.
 bool matvec_f32_q8_K(const QuantizedTensor& W, std::span<const float> x,
                      std::span<float> y);

@@ -34,4 +34,9 @@ namespace sonicboom::quant::cuda {
 // floats, zero-initialized before accumulation). No host copies.
 bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 
+// Y = W @ X (batched, the prefill shape), device in/out. X is device
+// [cols, n] row-major (n innermost), Y is device [rows, n] (n innermost).
+// n == 1 falls back to matvec_f32_dev. No host copies.
+bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
+
 } // namespace sonicboom::quant::cuda

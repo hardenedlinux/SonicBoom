@@ -182,7 +182,7 @@ bool embed_per_layer(const Gemma4Model& m, uint32_t layer, uint64_t token_id,
   //
   // llama.cpp packs the f32 activation to bf16 (the weight's vec_dot_type) before
   // the dot product, so each input element is rounded through bf16 here — a
-  // full-f32 input would not reproduce the oracle's rounding (Phase 5D finding).
+  // full-f32 input would not reproduce the baseline's rounding (Phase 5D finding).
   // The dot accumulates in double (ggml's ggml_float), with each bf16 product
   // rounded to f32 first, matching scalar ggml_vec_dot_bf16; the projection
   // scale is applied to the f32-cast dot, exactly as ggml_scale does.
@@ -385,7 +385,7 @@ static bool run_block_core(const Gemma4Model& m, uint32_t layer,
   // a per-layer scalar here (e.g. 0.061/0.16/0.44 across layers); llama.cpp
   // multiplies it in and then cb()'s "out_scaled" and "l_out" on the *same*
   // tensor (build_cvec is identity for gemma4), so the scale survives only as
-  // "l_out". Apply the scale and emit only "l_out" to match the oracle dump.
+  // "l_out". Apply the scale and emit only "l_out" to match the baseline dump.
   if (!bw.layer_output_scale.empty()) {
     if (!scale_d(use_cuda, x3, bw.layer_output_scale[0], out)) return false;
   } else {
@@ -430,7 +430,7 @@ bool forward_traced(const Gemma4Model& m, uint64_t token_id, uint64_t pos,
   // Device-resident fast path (Phase 6a Option A): without a trace and with a
   // present device, run the whole forward with activations resident on the GPU
   // (synchronizes only at the end). The host path below remains the reference
-  // for the CPU backend and for trace-based oracle dumps.
+  // for the CPU backend and for trace-based baseline dumps.
   if (!trace && backend == quant::MatmulBackend::Cuda && quant::cuda_available())
     return cuda_forward_resident(m, token_id, pos, out);
 #endif
@@ -471,7 +471,7 @@ bool forward_traced(const Gemma4Model& m, uint64_t token_id, uint64_t pos,
   std::copy(inpL.begin(), inpL.end(), out.begin());
 
   // Phase 5E lm-head (trace only): emit the post-loop intermediates so the dump
-  // validates the whole head against the oracle. h_nextn == result_norm (the
+  // validates the whole head against the baseline. h_nextn == result_norm (the
   // post-output-norm hidden; llama.cpp cb()s the same tensor under both names for
   // single-token decode). result_output is the softcapped logits.
   if (trace) {
@@ -553,6 +553,24 @@ uint64_t generate(const Gemma4Model& m, uint64_t start_token, uint64_t start_pos
       return generate_spine(m, start_token, start_pos, tokens);
     case quant::MatmulBackend::CpuF32:
       return generate_reference(m, start_token, start_pos, tokens, backend);
+  }
+  return 0;
+}
+
+uint64_t generate_prompt(const Gemma4Model& m, std::span<const uint64_t> prompt,
+                         uint64_t start_pos, std::span<int64_t> tokens,
+                         quant::MatmulBackend backend) {
+  // Phase 7 (M4): the prompt path is prefill (batched flash attention) + decode.
+  // There is no f32 prefill variant, so CpuF32 degrades to the q8_K CPU prefill
+  // (the reference oracle remains generate_reference for single-token decode).
+  switch (backend) {
+    case quant::MatmulBackend::Cuda:
+      if (quant::cuda_available())
+        return generate_prefill_spine_cuda(m, prompt, start_pos, tokens);
+      [[fallthrough]];  // no device: run the CPU prefill
+    case quant::MatmulBackend::CpuQ8K:
+    case quant::MatmulBackend::CpuF32:
+      return generate_prefill_spine(m, prompt, start_pos, tokens);
   }
   return 0;
 }

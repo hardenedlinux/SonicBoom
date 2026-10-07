@@ -40,7 +40,7 @@ bool gelu(std::span<const float> x, std::span<float> y);
 // kernels use this fp16 lookup-table path (ggml_vec_gelu_f32 / ggml_vec_geglu_f32
 // under GGML_GELU_FP16), which quantizes both the input and the result to fp16.
 // Gemma 4's FFN and per-layer gates are computed through it; use gelu_fp16 to make
-// run_block directly comparable to a llama.cpp oracle. The fp16 quantization
+// run_block directly comparable to a llama.cpp baseline. The fp16 quantization
 // introduces ~1e-3 relative error versus the accurate gelu() above.
 bool gelu_fp16(std::span<const float> x, std::span<float> y);
 

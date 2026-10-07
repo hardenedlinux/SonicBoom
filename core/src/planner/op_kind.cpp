@@ -69,6 +69,28 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Argmax;
   if (name == "layer_combine")
     return OpKind::LayerCombine;
+  if (name == "embedding_batched")
+    return OpKind::EmbeddingBatched;
+  if (name == "quantized_matmul_batched")
+    return OpKind::QuantizedMatmulBatched;
+  if (name == "transpose")
+    return OpKind::Transpose;
+  if (name == "rms_norm_cols")
+    return OpKind::RmsNormCols;
+  if (name == "rms_norm_heads_batched")
+    return OpKind::RmsNormHeadsBatched;
+  if (name == "rope_batched")
+    return OpKind::RopeBatched;
+  if (name == "flash_attention")
+    return OpKind::FlashAttention;
+  if (name == "flash_attention_shared")
+    return OpKind::FlashAttentionShared;
+  if (name == "matvec_f32_batched")
+    return OpKind::MatvecF32Batched;
+  if (name == "matvec_bf16_batched")
+    return OpKind::MatvecBf16Batched;
+  if (name == "layer_combine_batched")
+    return OpKind::LayerCombineBatched;
   return std::nullopt;
 }
 
@@ -100,6 +122,17 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Softcap: return "softcap";
     case OpKind::Argmax: return "argmax";
     case OpKind::LayerCombine: return "layer_combine";
+    case OpKind::EmbeddingBatched: return "embedding_batched";
+    case OpKind::QuantizedMatmulBatched: return "quantized_matmul_batched";
+    case OpKind::Transpose: return "transpose";
+    case OpKind::RmsNormCols: return "rms_norm_cols";
+    case OpKind::RmsNormHeadsBatched: return "rms_norm_heads_batched";
+    case OpKind::RopeBatched: return "rope_batched";
+    case OpKind::FlashAttention: return "flash_attention";
+    case OpKind::FlashAttentionShared: return "flash_attention_shared";
+    case OpKind::MatvecF32Batched: return "matvec_f32_batched";
+    case OpKind::MatvecBf16Batched: return "matvec_bf16_batched";
+    case OpKind::LayerCombineBatched: return "layer_combine_batched";
   }
   return "?";
 }

@@ -91,6 +91,20 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                           int n_heads_q, int n_heads_kv, int head_dim,
                           uint64_t sliding_window, float scale, float* out);
 
+// Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
+// tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
+// never materialized (O(n_q + n_kv) memory). q is [n_q, n_heads_q, head_dim] f32
+// (RoPE'd); k/v are [n_kv, n_heads_kv, head_dim] (fp16-rounded f32, same
+// representation as the KV cache). The causal + sliding-window mask is computed
+// in-kernel from (iq, j) — Gemma 4 has no data-dependent mask, so this is exactly
+// equivalent to a precomputed mask. out is [n_q, n_heads_q, head_dim] f32.
+// scale == 1.0 for Gemma 4; no logit softcap. One warp per (query position, query
+// head); requires head_dim % 32 == 0, head_dim <= 512, n_heads_q <= 32.
+bool flash_attention_dev(const float* q, const float* k, const float* v,
+                         int n_q, int n_kv, int n_heads_q, int n_heads_kv,
+                         int head_dim, uint64_t sliding_window, float scale,
+                         float* out);
+
 // Per-layer embedding combine: y[i] = (proj[i] + ple[i] * ple_scale) * combine_scale.
 // `ple` is the caller-offset device pointer into the full per-layer embedding
 // row (i.e. already advanced by `layer * per_layer_input`). Mirrors

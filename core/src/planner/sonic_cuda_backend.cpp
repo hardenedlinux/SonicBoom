@@ -16,7 +16,15 @@
 
 #include <sonicboom/planner/sonic_cuda_backend.h>
 
+#include <sonicboom/model/exec.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/nn/activation.h>
+#include <sonicboom/nn/elementwise.h>
+#include <sonicboom/nn/matmul.h>
+#include <sonicboom/nn/norm.h>
+#include <sonicboom/nn/rope.h>
+#include <sonicboom/nn/cuda_elementwise.h>
+#include <sonicboom/quant/quantized_matmul_cuda.h>
 
 #include "../nn/cuda_resident.h"
 #include "../quant/cuda_resident.h"
@@ -329,6 +337,198 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   std::vector<TensorValue> res;
   res.push_back(TensorValue::from_device(out_handle, out_bytes));
   return res;
+}
+
+bool SonicCudaBackend::prefill(std::span<const uint64_t> tokens, uint64_t start_pos,
+                               std::span<float> out_hidden) {
+  const auto& cfg = model_.config;
+  if (model_.weights.blocks.empty()) return false;
+  if (!quant::cuda::available() || !nn::cuda::available()) return false;
+  const uint32_t d = cfg.embedding_length;
+  const uint32_t ff = cfg.feed_forward_length;
+  const uint32_t per = cfg.per_layer_input;
+  const float eps = cfg.rms_epsilon;
+  const uint32_t n = uint32_t(tokens.size());
+  if (n == 0 || out_hidden.size() < d) return false;
+  if (caches_.size() != cfg.n_layer_kv()) return false;
+
+  // The prompt's positions must land in a straight, wrap-free run of each KV
+  // layer's cache (SWA ring n_slots == sliding_window, global n_slots == n_ctx).
+  for (uint32_t l = 0; l < cfg.n_layer_kv(); ++l) {
+    const KvCacheDev& c = caches_[l];
+    if (c.n_slots == 0 || (start_pos % c.n_slots) + n > c.n_slots) return false;
+  }
+
+  // Activations are [dim, n] column-major (n innermost) to match the batched
+  // f32 matmul layout; Q/K/V are transposed to [n, dim] position-major for the
+  // per-position head norm / RoPE / flash attention, then back. Mirrors the CPU
+  // SonicBackend::prefill; only the heavy kernels (batched matmul + flash
+  // attention) run on the device.
+  auto transpose = [&](const float* src, float* dst, uint32_t dim) {
+    for (uint32_t c = 0; c < n; ++c)
+      for (uint32_t k = 0; k < dim; ++k) dst[c * dim + k] = src[k * n + c];
+  };
+  auto transpose_back = [&](const float* src, float* dst, uint32_t dim) {
+    for (uint32_t c = 0; c < n; ++c)
+      for (uint32_t k = 0; k < dim; ++k) dst[k * n + c] = src[c * dim + k];
+  };
+  auto rms_cols = [&](const float* x, std::span<const float> w, uint32_t dim,
+                      float* y) {
+    std::vector<float> col(dim);
+    for (uint32_t c = 0; c < n; ++c) {
+      for (uint32_t k = 0; k < dim; ++k) col[k] = x[k * n + c];
+      if (!nn::rms_norm(col, w, eps, col)) return false;
+      for (uint32_t k = 0; k < dim; ++k) y[k * n + c] = col[k];
+    }
+    return true;
+  };
+
+  // Batched token embedding: res[k*n+c] = token_embd[tokens[c]][k] * sqrt(d).
+  std::vector<float> res(uint64_t(d) * n);
+  {
+    std::vector<float> col(d);
+    for (uint32_t c = 0; c < n; ++c) {
+      if (!model::embed_token(model_, tokens[c], col)) return false;
+      for (uint32_t k = 0; k < d; ++k) res[k * n + c] = col[k];
+    }
+  }
+
+  const uint32_t n_kv = cfg.n_layer_kv();
+  const uint32_t donor_swa_layer = n_kv - 2;
+  const uint32_t donor_global_layer = n_kv - 1;
+  std::vector<float> donor_swa_k, donor_swa_v, donor_global_k, donor_global_v;
+
+  std::vector<float> next(uint64_t(d) * n);
+
+  for (uint32_t l = 0; l < cfg.block_count; ++l) {
+    const model::LayerConfig& lc = model_.plan[l];
+    const model::BlockWeights& bw = model_.weights.blocks[l];
+    const uint32_t n_q = lc.n_heads_q;
+    const uint32_t n_kvh = lc.n_heads_kv;
+    const uint32_t hd = lc.head_dim;
+    const uint32_t qw = n_q * hd;
+    const uint32_t kvw = n_kvh * hd;
+    const bool is_kv = cfg.has_kv(l);
+    const std::span<const float> freq =
+        lc.attention == model::AttentionKind::Global ? model_.weights.rope_freqs
+                                                     : std::span<const float>{};
+
+    // --- attention -----------------------------------------------------------
+    std::vector<float> h(uint64_t(d) * n);
+    if (!rms_cols(res.data(), bw.attn_norm, d, h.data())) return false;
+
+    std::vector<float> q_col(uint64_t(qw) * n);
+    if (!quant::cuda::matmul_f32(bw.attn_q, h, q_col, n)) return false;
+    std::vector<float> q(uint64_t(qw) * n);
+    transpose(q_col.data(), q.data(), qw);
+    for (uint32_t c = 0; c < n; ++c) {
+      std::span<float> qc(q.data() + uint64_t(c) * qw, qw);
+      if (!nn::rms_norm_heads(qc, bw.attn_q_norm, hd, eps)) return false;
+      if (!nn::rope_neox_heads(qc, hd, start_pos + c, lc.rope_base, 1.0f, freq))
+        return false;
+    }
+
+    std::vector<float> attn(uint64_t(qw) * n);
+    if (is_kv) {
+      std::vector<float> k_col(uint64_t(kvw) * n), v_col(uint64_t(kvw) * n);
+      if (!quant::cuda::matmul_f32(bw.attn_k, h, k_col, n)) return false;
+      if (!quant::cuda::matmul_f32(bw.attn_v, h, v_col, n)) return false;
+
+      std::vector<float> k(uint64_t(kvw) * n), v(uint64_t(kvw) * n);
+      transpose(k_col.data(), k.data(), kvw);
+      transpose(v_col.data(), v.data(), kvw);
+
+      KvCacheDev& cache = caches_[l];
+      const size_t row = (size_t)cache.n_heads_kv * cache.head_dim;  // == kvw
+      for (uint32_t c = 0; c < n; ++c) {
+        std::span<float> kc(k.data() + uint64_t(c) * kvw, kvw);
+        std::span<float> vc(v.data() + uint64_t(c) * kvw, kvw);
+        if (!nn::rms_norm_heads(kc, bw.attn_k_norm, hd, eps)) return false;
+        if (!nn::rms_norm_heads(vc, {}, hd, eps)) return false;
+        nn::cast_fp16(vc);  // V is fp16-rounded without RoPE
+        if (!nn::rope_neox_heads(kc, hd, start_pos + c, lc.rope_base, 1.0f, freq))
+          return false;
+        nn::cast_fp16(kc);  // K is fp16-rounded after RoPE (spine cache repr)
+        const size_t off = (size_t)((start_pos + c) % cache.n_slots) * row;
+        if (!cache.k_handle || !cache.v_handle ||
+            !device::upload(kc.data(), cache.k_handle + off * sizeof(float),
+                            kvw * sizeof(float)) ||
+            !device::upload(vc.data(), cache.v_handle + off * sizeof(float),
+                            kvw * sizeof(float)))
+          return false;
+      }
+
+      if (!nn::cuda::flash_attention(q, n, k, v, n, n_q, n_kvh, hd,
+                                     lc.sliding_window, 1.0f, attn))
+        return false;
+
+      if (l == donor_swa_layer) {
+        donor_swa_k = std::move(k);
+        donor_swa_v = std::move(v);
+      } else if (l == donor_global_layer) {
+        donor_global_k = std::move(k);
+        donor_global_v = std::move(v);
+      }
+    } else {
+      const uint32_t donor = cfg.kv_donor_layer(l);
+      const std::vector<float>& dk =
+          cfg.sliding_window_pattern[l] ? donor_swa_k : donor_global_k;
+      const std::vector<float>& dv =
+          cfg.sliding_window_pattern[l] ? donor_swa_v : donor_global_v;
+      if (dk.empty() || dv.empty()) return false;
+      if (!nn::cuda::flash_attention(q, n, dk, dv, n, n_q, n_kvh, hd,
+                                     lc.sliding_window, 1.0f, attn))
+        return false;
+    }
+
+    std::vector<float> attn_col(uint64_t(qw) * n);
+    transpose_back(attn.data(), attn_col.data(), qw);
+    std::vector<float> ap(uint64_t(d) * n);
+    if (!quant::cuda::matmul_f32(bw.attn_output, attn_col, ap, n)) return false;
+
+    std::vector<float> o(uint64_t(d) * n);
+    if (!rms_cols(ap.data(), bw.post_attention_norm, d, o.data())) return false;
+    std::vector<float> x1(uint64_t(d) * n);
+    if (!nn::add(o, res, x1)) return false;
+
+    // --- gated feed-forward --------------------------------------------------
+    std::vector<float> f(uint64_t(d) * n);
+    if (!rms_cols(x1.data(), bw.ffn_norm, d, f.data())) return false;
+    std::vector<float> up(uint64_t(ff) * n), gate(uint64_t(ff) * n);
+    if (!quant::cuda::matmul_f32(bw.ffn_up, f, up, n)) return false;
+    if (!quant::cuda::matmul_f32(bw.ffn_gate, f, gate, n)) return false;
+    if (!nn::gelu_fp16(gate, gate)) return false;
+    if (!nn::mul(gate, up, gate)) return false;
+    std::vector<float> ffn_out(uint64_t(d) * n);
+    if (!quant::cuda::matmul_f32(bw.ffn_down, gate, ffn_out, n)) return false;
+    std::vector<float> f2(uint64_t(d) * n);
+    if (!rms_cols(ffn_out.data(), bw.post_ffw_norm, d, f2.data())) return false;
+    std::vector<float> x2(uint64_t(d) * n);
+    if (!nn::add(f2, x1, x2)) return false;
+
+    // --- per-layer gate (per position; matches the spine's embed_per_layer) --
+    std::vector<float> x2_col(d), g0(per), g1(d), g2(d), x3_col(d), ple(per);
+    for (uint32_t c = 0; c < n; ++c) {
+      for (uint32_t k = 0; k < d; ++k) x2_col[k] = x2[k * n + c];
+      if (!model::embed_per_layer(model_, l, tokens[c], ple, false)) return false;
+      if (!nn::matvec_f32(bw.inp_gate, d, x2_col, g0)) return false;
+      if (!nn::gelu_fp16(g0, g0)) return false;
+      if (!nn::mul(g0, ple, g0)) return false;
+      if (!nn::matvec_f32(bw.proj, per, g0, g1)) return false;
+      if (!nn::rms_norm(g1, bw.post_norm, eps, g2)) return false;
+      if (!nn::add(x2_col, g2, x3_col)) return false;
+      if (!bw.layer_output_scale.empty() &&
+          !nn::scale(x3_col, bw.layer_output_scale[0], x3_col))
+        return false;
+      for (uint32_t k = 0; k < d; ++k) next[k * n + c] = x3_col[k];
+    }
+
+    std::swap(res, next);
+  }
+
+  // The final residual column (position n-1) is the post-prefill hidden state.
+  for (uint32_t k = 0; k < d; ++k) out_hidden[k] = res[k * n + (n - 1)];
+  return true;
 }
 
 } // namespace sonicboom::planner

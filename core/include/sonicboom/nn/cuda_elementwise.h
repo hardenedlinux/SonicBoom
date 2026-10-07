@@ -81,6 +81,21 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
 bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols,
                  std::span<const float> x, std::span<float> y);
 
+// Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
+// tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
+// never materialized. q is [n_q, n_heads_q, head_dim]; k/v are [n_kv, n_heads_kv,
+// head_dim] (fp16-rounded f32); out is [n_q, n_heads_q, head_dim]. The causal +
+// sliding-window mask is computed in-kernel from (iq, j) — Gemma 4 has no
+// data-dependent mask. scale == 1.0 for Gemma 4, no logit softcap. Requires
+// n_heads_q a multiple of n_heads_kv, head_dim % 32 == 0 and <= 512, n_heads_q
+// <= 32. fp32 accumulation, ~1e-4 relative error vs the CPU reference (same
+// relaxation as the other kernels here).
+bool flash_attention(std::span<const float> q, uint64_t n_q,
+                     std::span<const float> k, std::span<const float> v,
+                     uint64_t n_kv, uint64_t n_heads_q, uint64_t n_heads_kv,
+                     uint64_t head_dim, uint64_t sliding_window, float scale,
+                     std::span<float> out);
+
 // Drop all cached device weight copies (call when a model is reloaded at a new
 // address so stale device buffers are not reused).
 void clear_cache();

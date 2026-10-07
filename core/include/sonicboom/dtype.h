@@ -38,7 +38,7 @@ inline float bf16_to_f32(uint16_t h) { return std::bit_cast<float>(uint32_t(h) <
 // bf16 vec_dot). NaN is quieted to match ggml. The bf16 matvec must round its
 // f32 input through bf16 — llama.cpp packs src1 (the activation) to the weight's
 // vec_dot_type (bf16) before the dot product, so a full-f32 input would not
-// reproduce the oracle's rounding.
+// reproduce the baseline's rounding.
 inline uint16_t f32_to_bf16(float f) {
   const uint32_t u = std::bit_cast<uint32_t>(f);
   if ((u & 0x7fffffff) > 0x7f800000) return uint16_t((u >> 16) | 64);  // NaN

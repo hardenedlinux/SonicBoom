@@ -52,6 +52,14 @@ bool available() noexcept;
 bool matvec_f32(const QuantizedTensor& W, std::span<const float> x,
                 std::span<float> y);
 
+// Y = W @ X (batched, the prefill shape). X is a host row-major [cols, n]
+// matrix (n innermost, X[k*n + c] = element (k, c)); Y is a host row-major
+// [rows, n] matrix (Y[r*n + c]). n == 1 falls back to matvec_f32. Uploads X,
+// runs one gemv per column (each gathered from the strided activation), and
+// copies Y back. Same contracts and failure semantics as matvec_f32.
+bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
+                std::span<float> Y, uint64_t n);
+
 // Drop all cached device weight copies (call when a model is reloaded at a new
 // address so stale device buffers are not reused).
 void clear_cache();

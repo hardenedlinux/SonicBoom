@@ -61,12 +61,14 @@ design/resnet18.reference.bin
 models/
 third_party/native-torch/generated/
 
-# oracle tool build outputs + regenerated reference dumps (tools/oracle/*.sh build them)
-tools/oracle/compare_dumps
-tools/oracle/gemma4_dump
-tools/oracle/llama_bench
-tools/oracle/llama_bench_cuda
-tools/oracle/sonicboom_dump
+# baseline tool build outputs + regenerated reference dumps (tools/baseline/*.sh build them)
+tools/baseline/compare_dumps
+tools/baseline/gemma4_dump
+tools/baseline/llama_bench
+tools/baseline/llama_bench_cuda
+tools/baseline/sonicboom_dump
+tools/baseline/attention_bench
+tools/baseline/gemv_bench
 *.dump
 
 *.log

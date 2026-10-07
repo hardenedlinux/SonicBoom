@@ -62,6 +62,23 @@ enum class OpKind : uint8_t {
   Softcap,          // final-logit softcapping sc * tanh(x / sc)
   Argmax,           // nn::argmax
   LayerCombine,     // nn::layer_combine
+
+  // Transformer operators — batched prefill (Phase 7). Mirrors the per-token
+  // vocabulary on [dim, n] (column-major) / [n, dim] (position-major) batched
+  // tensors; each loops over the batch dim calling the same kernel the per-token
+  // OpKind uses. The batch size n (and `dim` where needed) is baked into the
+  // node attributes by the prefill graph emitter.
+  EmbeddingBatched,        // nn::embedding_f32 per token -> [dim, n]
+  QuantizedMatmulBatched,  // quant::matmul_f32_q8_K(W, X, Y, n)
+  Transpose,               // [dim,n] <-> [n,dim] (attr: dir)
+  RmsNormCols,             // nn::rms_norm per column over [dim, n]
+  RmsNormHeadsBatched,     // nn::rms_norm_heads per position over [n, dim]
+  RopeBatched,             // nn::rope_neox_heads per position over [n, dim]
+  FlashAttention,          // append n KV rows + nn::scaled_dot_product_attention
+  FlashAttentionShared,    // donor nn::scaled_dot_product_attention (no append)
+  MatvecF32Batched,        // nn::matvec_f32 per column
+  MatvecBf16Batched,       // nn::matvec_bf16 per column (bf16 activation)
+  LayerCombineBatched,     // nn::layer_combine per column
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

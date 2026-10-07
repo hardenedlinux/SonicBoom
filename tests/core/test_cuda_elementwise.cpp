@@ -10,6 +10,7 @@
 // Skips cleanly (exit 0) when no CUDA device is present.
 
 #include <sonicboom/nn/activation.h>
+#include <sonicboom/nn/attention.h>
 #include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/nn/elementwise.h>
 #include <sonicboom/nn/matmul.h>
@@ -196,6 +197,66 @@ void test_matvec_bf16(std::mt19937& rng) {
   check_cmp("cuda::matvec_bf16 matches CPU", y, yr);
 }
 
+void test_flash_attention(std::mt19937& rng) {
+  // GQA prefill: n_heads_q=8, n_heads_kv=2 (group=4). Compare the CUDA flash
+  // attention against the CPU full-SDPA reference (scaled_dot_product_attention).
+
+  // Causal (no window), head_dim=256, n=37 exercises a partial final tile.
+  {
+    const uint64_t n_q = 37, n_kv = 37, n_heads_q = 8, n_heads_kv = 2, hd = 256;
+    const size_t qn = n_q * n_heads_q * hd, kvn = n_kv * n_heads_kv * hd;
+    std::vector<float> q(qn), k(kvn), v(kvn), y(qn), yr(qn);
+    for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    check(sbnn::cuda::flash_attention(q, n_q, k, v, n_kv, n_heads_q, n_heads_kv,
+                                      hd, 0, 1.0f, y),
+          "cuda::flash_attention (GQA causal) returns true");
+    check(sbnn::scaled_dot_product_attention(q, n_q, k, v, n_kv, n_heads_q,
+                                             n_heads_kv, hd, true, 0, 0.0f, 1.0f,
+                                             yr),
+          "CPU sdpa (GQA causal) returns true");
+    check_cmp("cuda::flash_attention (GQA causal) matches CPU", y, yr);
+  }
+
+  // Sliding window=8, n=100: the early key tiles for late queries are fully
+  // masked, exercising the all-masked-tile skip path.
+  {
+    const uint64_t n_q = 100, n_kv = 100, n_heads_q = 8, n_heads_kv = 2, hd = 256;
+    const size_t qn = n_q * n_heads_q * hd, kvn = n_kv * n_heads_kv * hd;
+    std::vector<float> q(qn), k(kvn), v(kvn), y(qn), yr(qn);
+    for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    check(sbnn::cuda::flash_attention(q, n_q, k, v, n_kv, n_heads_q, n_heads_kv,
+                                      hd, 8, 1.0f, y),
+          "cuda::flash_attention (sliding window) returns true");
+    check(sbnn::scaled_dot_product_attention(q, n_q, k, v, n_kv, n_heads_q,
+                                             n_heads_kv, hd, true, 8, 0.0f, 1.0f,
+                                             yr),
+          "CPU sdpa (sliding window) returns true");
+    check_cmp("cuda::flash_attention (sliding window) matches CPU", y, yr);
+  }
+
+  // Global layer: head_dim=512.
+  {
+    const uint64_t n_q = 37, n_kv = 37, n_heads_q = 8, n_heads_kv = 2, hd = 512;
+    const size_t qn = n_q * n_heads_q * hd, kvn = n_kv * n_heads_kv * hd;
+    std::vector<float> q(qn), k(kvn), v(kvn), y(qn), yr(qn);
+    for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    check(sbnn::cuda::flash_attention(q, n_q, k, v, n_kv, n_heads_q, n_heads_kv,
+                                      hd, 0, 1.0f, y),
+          "cuda::flash_attention (head_dim=512) returns true");
+    check(sbnn::scaled_dot_product_attention(q, n_q, k, v, n_kv, n_heads_q,
+                                             n_heads_kv, hd, true, 0, 0.0f, 1.0f,
+                                             yr),
+          "CPU sdpa (head_dim=512) returns true");
+    check_cmp("cuda::flash_attention (head_dim=512) matches CPU", y, yr);
+  }
+}
+
 } // namespace
 
 int main() {
@@ -213,6 +274,7 @@ int main() {
   test_rope_heads(rng);
   test_matvec_f32(rng);
   test_matvec_bf16(rng);
+  test_flash_attention(rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_elementwise OK\n";

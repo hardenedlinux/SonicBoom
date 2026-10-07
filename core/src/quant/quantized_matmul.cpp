@@ -46,7 +46,7 @@
 //                     the outer d scale and the final sums are float. This
 //                     reproduces llama.cpp's arithmetic bit-for-bit (modulo fp32
 //                     accumulation order, which is kept identical), for direct
-//                     differential comparison against the oracle.
+//                     differential comparison against the baseline.
 
 namespace sonicboom::quant {
 
@@ -767,7 +767,7 @@ bool matmul(const QuantizedTensor& W, std::span<const float> X,
       return matmul_f32(W, X, Y, n);
     case MatmulBackend::Cuda:
 #ifdef SONICBOOM_USE_CUDA
-      if (n == 1 && cuda::available()) return cuda::matvec_f32(W, X, Y);
+      if (cuda::available()) return cuda::matmul_f32(W, X, Y, n);
 #endif
       return matmul_f32(W, X, Y, n);
   }

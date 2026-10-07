@@ -46,7 +46,7 @@ using sonicboom::f32_to_bf16;
 // (attn_q_norm/attn_k_norm/post_attention_norm/post_ffw_norm/post_norm/
 // inp_gate/proj) are bound + shape/type-validated but NOT yet consumed by
 // run_block; their exact arithmetic (q/k norm convention, per-layer gating,
-// post-norm residual order) is unresolved pending an oracle (see
+// post-norm residual order) is unresolved pending a baseline (see
 // design/gemma4-semantics.md). Bound-but-not-consumed spans are empty() only
 // when the loader failed to bind them, which the loader already reports.
 struct BlockWeights {

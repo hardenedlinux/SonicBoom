@@ -16,8 +16,6 @@
 
 #include <sonicboom/planner/runtime_executor.h>
 
-#include <sonicboom/planner/plan_validator.h>
-
 #include "device_pool.h"
 
 #include <cstddef>
@@ -51,10 +49,10 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         "live resource fingerprint does not match the plan",
         Phase::Execution));
 
-  // 2. Re-validate the plan defensively; never execute a corrupt plan.
-  if (auto v = PlanValidator::validate(plan); !v)
-    return std::unexpected(RuntimeError(RuntimeErrorCode::InvalidPlan,
-                                        v.error().message, Phase::Execution));
+  // 2. (Plan correctness is already validated once at build time by
+  //     plan_execution in pipeline.cpp; the plan is immutable afterward.
+  //     Re-running PlanValidator::validate here on every execute() — the hot
+  //     per-token decode path — is O(nodes × edges) redundant work.)
 
   // 3. Bound the input/output buffers against the plan's graph I/O.
   std::size_t n_inputs = 0, n_outputs = 0;

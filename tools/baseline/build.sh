@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Build the Gemma 4 oracle dump tool against the llama.cpp CPU-only build.
+# Build the Gemma 4 baseline dump tool against the llama.cpp CPU-only build.
 # This tool is dev-time only; it is NOT part of the SonicBoom CMake build and
 # adds no llama.cpp dependency to libsonicboom.so.
 set -euo pipefail
 
-LLAMA_ROOT="${LLAMA_ROOT:-/path/to/llama.cpp}"
+LLAMA_ROOT="${LLAMA_ROOT:?set LLAMA_ROOT to the llama.cpp checkout}"
 LLAMA_BIN="$LLAMA_ROOT/build/bin"
 
 CXX="${CXX:-g++}"

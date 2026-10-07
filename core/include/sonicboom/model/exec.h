@@ -26,7 +26,7 @@
 
 // Gemma 4 reference execution (Phase 5C-2): the token / per-layer embedding
 // paths and a single-block forward pass, in float32. The block arithmetic
-// follows the llama.cpp oracle graph recorded in design/gemma4-semantics.md §4
+// follows the llama.cpp baseline graph recorded in design/gemma4-semantics.md §4
 // (token-embedding sqrt(n_embd) scale, Q/K per-head RMSNorm, V RMSNorm without
 // weight, NEOX RoPE with global-layer freq_factors, attention scale 1.0,
 // GELU-tanh FFN, post-norms, per-layer gate, whole-block layer_output_scale).
@@ -94,14 +94,14 @@ bool run_block(const Gemma4Model& m, uint32_t layer, uint64_t token_id,
 // Dev-time differential-validation hook (Phase 5C-2): like run_block, but
 // invokes `trace(name, values)` for every named intermediate the llama.cpp
 // Gemma 4 graph marks with cb(), so the arithmetic can be compared stage by
-// stage against the oracle dump. Names use llama.cpp's convention — a per-layer
+// stage against the baseline dump. Names use llama.cpp's convention — a per-layer
 // suffix for block tensors ("Qcur_normed-0") and a bare name for the token
 // embedding ("inp_scaled") is emitted by embed_token, not here. `values` is a
 // view into an internal buffer and is valid only for the duration of the call;
 // `trace` must not retain it.
 //
 // This is a source-level Layer 2 helper, not part of the stable runtime
-// contract. It exists so the dump tool (tools/oracle) and tests can pin the
+// contract. It exists so the dump tool (tools/baseline) and tests can pin the
 // exact arithmetic of each stage rather than only the final block output.
 using BlockTraceFn = std::function<void(const char* name, std::span<const float> values)>;
 
@@ -168,12 +168,29 @@ uint64_t generate(const Gemma4Model& m, uint64_t start_token, uint64_t start_pos
                   std::span<int64_t> tokens,
                   quant::MatmulBackend backend = quant::MatmulBackend::CpuQ8K);
 
+// Prompt prefill + decode (Phase 7 prefill): process the whole non-empty `prompt`
+// in one batched pass (flash attention + batched matmul) then autoregressively
+// decode `tokens`. `tokens[0]` is sampled from the prompt's final lm-head logits;
+// the rest decode from it. Dispatched by `backend`:
+//
+//   Cuda   -> generate_prefill_spine_cuda (flash attention on device; falls
+//             back to the CPU prefill when no device is present)
+//   CpuQ8K -> generate_prefill_spine      (CPU prefill: batched q8_K + SDPA)
+//   CpuF32 -> no f32 prefill variant; falls back to generate_prefill_spine
+//
+// Writes each sampled token id into `tokens` and returns the number written
+// (stops early on an empty model, an empty prompt, or a plan/execute failure).
+// No tokenizer is involved: `prompt` is raw vocab ids (dev-test knob).
+uint64_t generate_prompt(const Gemma4Model& m, std::span<const uint64_t> prompt,
+                         uint64_t start_pos, std::span<int64_t> tokens,
+                         quant::MatmulBackend backend = quant::MatmulBackend::CpuQ8K);
+
 // The bespoke forward + lm_head + argmax decode loop, retained as an ORACLE for
 // differential validation against the spine (generate()). This is the pre-Phase-6
 // runtime path — run_block_core on the CPU and cuda_forward_resident on the
 // device underneath — demoted to reference-only. `backend` selects the
 // quantized-matmul backend exactly as generate() did before the spine landed
-// (CpuQ8K bit-exact oracle, f32 reference, or the CUDA device). Tools/oracle and
+// (CpuQ8K bit-exact oracle, f32 reference, or the CUDA device). tools/baseline and
 // tests use this to pin the arithmetic the spine must reproduce.
 uint64_t generate_reference(const Gemma4Model& m, uint64_t start_token,
                             uint64_t start_pos, std::span<int64_t> tokens,

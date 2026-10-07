@@ -231,6 +231,16 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
       OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
       OpKind::LayerCombine,
+      // Phase 7 batched prefill operators: executed on the CPU by the
+      // SonicBackend (looping the per-token nn::*/quant::* kernels over the batch
+      // dim). Declared here so the planner's capability check accepts the prefill
+      // graph. The elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused
+      // unchanged on flat batched buffers.
+      OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
+      OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
+      OpKind::FlashAttention,   OpKind::FlashAttentionShared,
+      OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
+      OpKind::LayerCombineBatched,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the

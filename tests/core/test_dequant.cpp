@@ -22,7 +22,7 @@
 //   - scale/min edge cases and signed-value reconstruction (q3_K hmask)
 //   - invalid / truncated / oversized buffers (QuantizedTensor::valid(),
 //     dequantize_f32 rejection)
-//   - random differential against a verbatim ggml oracle (bit-exact)
+//   - random differential against a verbatim ggml baseline (bit-exact)
 //   - real-model differential against the target Gemma 4 E4B GGUF (skipped
 //     cleanly when the model file is absent)
 
@@ -31,7 +31,7 @@
 
 #include <sonicboom/gguf/reader.h>
 
-#include "ggml_oracle.h"
+#include "ggml_baseline.h"
 
 #include <array>
 #include <cstdint>
@@ -44,7 +44,7 @@
 
 namespace sbquant = sonicboom::quant;
 namespace sbgguf = sonicboom::gguf;
-namespace oracle = ggml_oracle;
+namespace baseline = ggml_baseline;
 
 namespace {
 
@@ -226,7 +226,7 @@ void test_q3k_known_values() {
 // --- negative-subnormal scale regression -----------------------------------
 
 // A block scale (d / dmin) stored as a negative *subnormal* half must keep its
-// sign. The oracle's half->float once dropped the sign for subnormals, which
+// sign. The baseline's half->float once dropped the sign for subnormals, which
 // silently flipped every dequantized element for such blocks (random data
 // produces them; real GGUF scales are positive, so the model diff missed it).
 void test_negative_subnormal_scale() {
@@ -369,7 +369,7 @@ void test_validation() {
   }
 }
 
-// --- random differential vs oracle -----------------------------------------
+// --- random differential vs baseline -----------------------------------------
 
 void test_differential_random() {
   std::mt19937 rng(0x5EED);
@@ -395,7 +395,7 @@ void test_differential_random() {
 
     std::vector<float> mine(256), ref(256);
     sbquant::dequantize_q4_K(b, 1, mine.data());
-    oracle::dequantize_row_q4_K(reinterpret_cast<const oracle::block_q4_K*>(b.data()),
+    baseline::dequantize_row_q4_K(reinterpret_cast<const baseline::block_q4_K*>(b.data()),
                                 ref.data(), 256);
     for (int j = 0; j < 256; ++j)
       if (mine[j] != ref[j]) ++mismatches;
@@ -411,7 +411,7 @@ void test_differential_random() {
 
     std::vector<float> mine(256), ref(256);
     sbquant::dequantize_q5_K(b, 1, mine.data());
-    oracle::dequantize_row_q5_K(reinterpret_cast<const oracle::block_q5_K*>(b.data()),
+    baseline::dequantize_row_q5_K(reinterpret_cast<const baseline::block_q5_K*>(b.data()),
                                 ref.data(), 256);
     for (int j = 0; j < 256; ++j)
       if (mine[j] != ref[j]) ++mismatches;
@@ -426,13 +426,13 @@ void test_differential_random() {
 
     std::vector<float> mine(256), ref(256);
     sbquant::dequantize_q3_K(b, 1, mine.data());
-    oracle::dequantize_row_q3_K(reinterpret_cast<const oracle::block_q3_K*>(b.data()),
+    baseline::dequantize_row_q3_K(reinterpret_cast<const baseline::block_q3_K*>(b.data()),
                                 ref.data(), 256);
     for (int j = 0; j < 256; ++j)
       if (mine[j] != ref[j]) ++mismatches;
   }
 
-  check(mismatches == 0, "differential: bit-exact vs ggml oracle (random blocks)");
+  check(mismatches == 0, "differential: bit-exact vs ggml baseline (random blocks)");
   if (mismatches != 0)
     std::cerr << "  differential mismatches: " << mismatches << " / "
               << (3 * kBlocks * 256) << "\n";
@@ -483,20 +483,20 @@ void test_differential_model() {
     switch (qt->type()) {
       case sbquant::QuantType::Q3_K:
         sbquant::dequantize_q3_K(sub, n_blocks, mine.data());
-        oracle::dequantize_row_q3_K(
-            reinterpret_cast<const oracle::block_q3_K*>(sub.data()), ref.data(),
+        baseline::dequantize_row_q3_K(
+            reinterpret_cast<const baseline::block_q3_K*>(sub.data()), ref.data(),
             int64_t(n_blocks * 256));
         break;
       case sbquant::QuantType::Q4_K:
         sbquant::dequantize_q4_K(sub, n_blocks, mine.data());
-        oracle::dequantize_row_q4_K(
-            reinterpret_cast<const oracle::block_q4_K*>(sub.data()), ref.data(),
+        baseline::dequantize_row_q4_K(
+            reinterpret_cast<const baseline::block_q4_K*>(sub.data()), ref.data(),
             int64_t(n_blocks * 256));
         break;
       case sbquant::QuantType::Q5_K:
         sbquant::dequantize_q5_K(sub, n_blocks, mine.data());
-        oracle::dequantize_row_q5_K(
-            reinterpret_cast<const oracle::block_q5_K*>(sub.data()), ref.data(),
+        baseline::dequantize_row_q5_K(
+            reinterpret_cast<const baseline::block_q5_K*>(sub.data()), ref.data(),
             int64_t(n_blocks * 256));
         break;
     }
@@ -523,7 +523,7 @@ void test_differential_model() {
   std::cout << "  model differential: " << tensors_checked << " tensors, "
             << blocks_checked << " blocks compared\n";
   check(tensors_checked >= 3, "model differential: sampled >= 3 tensors");
-  check(mismatches == 0, "model differential: bit-exact vs ggml oracle");
+  check(mismatches == 0, "model differential: bit-exact vs ggml baseline");
 }
 
 } // namespace

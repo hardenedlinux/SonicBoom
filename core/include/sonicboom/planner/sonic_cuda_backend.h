@@ -53,6 +53,20 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
+  // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
+  // matching the CUDA spine's matvec_f32_dev) + flash attention
+  // (nn::cuda::flash_attention, n_q == n_kv == n) — filling the per-KV-layer
+  // device caches at slots `(start_pos + p) % n_slots`, exactly as n CUDA spine
+  // decode steps would. Writes the final hidden state (embedding_length floats)
+  // to `out_hidden` on the host. The elementwise norm/RoPE/gate steps reuse the
+  // CPU nn::* references (their arithmetic is fp16-erased before cache write and
+  // within fp32 tolerance elsewhere), so only the two heavy kernels are on the
+  // device. Requires n >= 1 and no SWA ring wrap (n <= every sliding-window
+  // layer's window) and start_pos + n <= n_ctx for global layers.
+  bool prefill(std::span<const uint64_t> tokens, uint64_t start_pos,
+               std::span<float> out_hidden);
+
 private:
   // One KV layer's persistent device-resident decode cache (mirrors
   // SonicBackend::KvCache): K is RoPE'd + per-head-normed then fp16-rounded; V

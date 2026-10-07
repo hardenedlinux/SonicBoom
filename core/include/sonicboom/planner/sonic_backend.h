@@ -32,6 +32,8 @@
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/graph.h>
 
+#include <memory>
+
 namespace sonicboom::planner {
 
 class SonicBackend : public Backend {
@@ -50,6 +52,13 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // Share another backend's KV cache (same session). The prefill graph's
+  // FlashAttention nodes fill the cache that the decode graph's Attention nodes
+  // then read, so the prefill backend and decode backend must reference the same
+  // cache. Both backends stay bound to their own Graph (for node lookup); only
+  // the per-KV-layer cache state is shared.
+  void share_caches(const SonicBackend& other);
+
 private:
   // One KV layer's persistent decode cache (K is RoPE'd + per-head-normed then
   // fp16-rounded; V is per-head-normed then fp16-rounded — the llama.cpp
@@ -65,7 +74,7 @@ private:
 
   const model::Gemma4Model& model_;
   const Graph& graph_;
-  std::vector<KvCache> caches_;  // index == KV layer (0 .. n_layer_kv-1)
+  std::shared_ptr<std::vector<KvCache>> caches_;  // index == KV layer
 
   void ensure_caches(uint64_t n_ctx);
 };

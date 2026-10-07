@@ -58,7 +58,7 @@ rejection).
 | GGUF parsing (header/KV/tensor dir/offsets) | IMPLEMENTED_AND_TESTED | `core/src/gguf/reader.cpp`; `tests/core/test_gguf.cpp`; real `hift.gguf`/`llm.gguf` parsed |
 | Quantized tensor **data access** (raw bytes, size) | IMPLEMENTED_NOT_TESTED | `ggml_type_size` + `tensor_data()` (`reader.cpp`); table ids 0–30 incl. `q4_K`/`q5_K`; byte-size tested, real quantized model not available |
 | Quantized tensor **representation** (typed value) | IMPLEMENTED_AND_TESTED | `sonicboom::quant::QuantizedTensor` + `quantized_tensor_from_gguf` (`core/include/sonicboom/quant/quantized_tensor.h`); exercised by `tests/core/test_dequant.cpp` |
-| Quantized **dequantization** (Q3_K, Q4_K, Q5_K) | IMPLEMENTED_AND_TESTED | `core/src/quant/dequant.cpp`; bit-exact vs ggml oracle (random + real-model differential, `tests/core/test_dequant.cpp`) |
+| Quantized **dequantization** (Q3_K, Q4_K, Q5_K) | IMPLEMENTED_AND_TESTED | `core/src/quant/dequant.cpp`; bit-exact vs ggml baseline (random + real-model differential, `tests/core/test_dequant.cpp`) |
 | Quantized GEMM / quantized matmul | PARTIALLY_SUPPORTED | CPU reference `quant::matvec_f32` (quantized weight @ f32 vector, on-the-fly dequant) in `core/src/quant/quantized_matmul.cpp`; `tests/core/test_quantized_matmul.cpp`. Matmul (batched) + CUDA + runtime selection still open |
 | RMSNorm / LayerNorm | MISSING | no norm op in `op_kind.h`; `reduce_mean` present but no `pow`/`sqrt`/`rsqrt`/`mul` graph ops to compose it |
 | RoPE | MISSING | no `rope`/`rotary` symbol anywhere in `core/ capi/ bindings/` |
@@ -114,7 +114,7 @@ Ordered by dependency, smallest first:
 7. **Assemble attention** — QKV `gemm` + `reshape`/split + `softmax` + scale
    `mul` + `gemm`, with causal/sliding mask and shared-KV head handling.
 8. **Dequantize Q3_K/Q4_K/Q5_K** — done: `sonicboom::quant` (Phase 1–2), bit-exact
-   vs the ggml oracle including the negative-subnormal scale edge case.
+   vs the ggml baseline including the negative-subnormal scale edge case.
 9. **First-token decode** — output `softmax` (have) + `argmax`/greedy token.
 
 Steps 2–7 are the operator/assembly work; 1 and 8 are gated on the model file.

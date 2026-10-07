@@ -1,6 +1,6 @@
 // gemma4_dump — export named f32 intermediate tensors from a Gemma 4 decode.
 //
-// Dev-time reference/oracle only. This tool links against llama.cpp (not
+// Dev-time reference/baseline only. This tool links against llama.cpp (not
 // SonicBoom) and is used for differential validation of SonicBoom's native
 // Gemma 4 block math. It is NOT part of libsonicboom.so and adds no llama.cpp
 // dependency to the SonicBoom runtime.
@@ -20,7 +20,7 @@
 //   <v1>
 //   ... (d0*d1*d2*d3 float values, %.9g, one per line)
 //
-// Build: tools/oracle/build.sh   Run: tools/oracle/gemma4_dump -m <model> ...
+// Build: tools/baseline/build.sh   Run: tools/baseline/gemma4_dump -m <model> ...
 
 #include "llama.h"
 
@@ -68,7 +68,7 @@ bool dump_cb(ggml_tensor* t, bool ask, void* user_data) {
 
 int main(int argc, char** argv) {
   const char* model_path = nullptr;
-  const char* out_path = "gemma4_oracle.dump";
+  const char* out_path = "gemma4_baseline.dump";
   int token = 0;
   int pos = 0;
   int n_ctx = 512;
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "failed to open output: %s\n", out_path);
     return 1;
   }
-  fprintf(fp, "# gemma4 oracle dump: model=%s token=%d pos=%d\n", model_path,
+  fprintf(fp, "# gemma4 baseline dump: model=%s token=%d pos=%d\n", model_path,
           token, pos);
 
   llama_context_params cparams = llama_context_default_params();

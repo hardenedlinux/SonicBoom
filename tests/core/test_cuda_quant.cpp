@@ -72,23 +72,20 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
 // Compare CUDA output to CPU reference within an fp32 tolerance. Returns the
 // worst relative error seen (against max(1, |ref|) to avoid cancellation blowup).
 double compare(std::span<const float> got, std::span<const float> ref,
-               bool* ok) {
+               double tol, bool* ok) {
   *ok = true;
   double worst = 0.0;
   for (size_t i = 0; i < ref.size(); ++i) {
     const double denom = std::max(1.0, double(std::fabs(ref[i])));
     const double err = std::fabs(double(got[i]) - double(ref[i])) / denom;
     worst = std::max(worst, err);
-    if (err > 1e-3) *ok = false;
+    if (err > tol) *ok = false;
   }
   return worst;
 }
 
-void test_one_type(sbquant::QuantType type, const char* name,
-                   std::mt19937& rng) {
-  const uint64_t rows = 64;
-  const uint64_t cols = 256 * 4;  // 4 blocks per row
-
+void test_one_shape(sbquant::QuantType type, const char* name, uint64_t rows,
+                    uint64_t cols, double tol, std::mt19937& rng) {
   auto bytes = build_weight(type, rows, cols, rng);
   sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
   if (!W.valid()) {
@@ -106,7 +103,7 @@ void test_one_type(sbquant::QuantType type, const char* name,
   check(sbquant::matvec_f32(W, x, y_ref), "CPU matvec_f32 returns true");
 
   bool cmp = false;
-  const double worst = compare(y, y_ref, &cmp);
+  const double worst = compare(y, y_ref, tol, &cmp);
   check(cmp, "cuda::matvec_f32 matches CPU reference");
   if (!cmp) std::cerr << "    worst rel err (" << name << ") = " << worst << "\n";
 
@@ -114,8 +111,59 @@ void test_one_type(sbquant::QuantType type, const char* name,
   std::vector<float> y2(rows);
   check(sbquant::cuda::matvec_f32(W, x, y2), "cuda::matvec_f32 (cached) returns true");
   bool cmp2 = false;
-  compare(y2, y_ref, &cmp2);
+  compare(y2, y_ref, tol, &cmp2);
   check(cmp2, "cuda::matvec_f32 (cached) matches CPU reference");
+}
+
+void test_one_type(sbquant::QuantType type, const char* name,
+                   std::mt19937& rng) {
+  // Small shape (4 blocks/row) -> one-thread-per-block kernel path. The fp32 dot
+  // over 4*256 terms reproduces the CPU reference closely, so 1e-3 suffices.
+  test_one_shape(type, name, 64, 256 * 4, 1e-3, rng);
+  // Large shape (40 blocks/row) -> cooperative warp-per-row kernel path. The fp32
+  // dot over 40*256 terms in a different accumulation order (__shfl reduction) is
+  // the same arithmetic but drifts ~3e-2, so the tolerance is loosened.
+  test_one_shape(type, name, 64, 256 * 40, 1e-1, rng);
+}
+
+// Batched (prefill) matmul: Y = W @ X for n columns, compared against the CPU
+// matmul_f32 reference (X/Y row-major with n innermost). The CUDA path gathers
+// each strided column into a contiguous buffer, runs the single-column gemv,
+// and scatters the row back — same arithmetic as matvec_f32, so the same fp32
+// tolerances apply.
+void test_batched(sbquant::QuantType type, const char* name, uint64_t rows,
+                  uint64_t cols, uint64_t n, double tol, std::mt19937& rng) {
+  auto bytes = build_weight(type, rows, cols, rng);
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+  if (!W.valid()) {
+    check(false, "batched: build_weight produced an invalid tensor");
+    return;
+  }
+
+  std::vector<float> X(cols * n), Y(rows * n), Y_ref(rows * n);
+  for (auto& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
+  check(ok, "cuda::matmul_f32 returns true");
+  if (!ok) return;
+
+  check(sbquant::matmul_f32(W, X, Y_ref, n), "CPU matmul_f32 returns true");
+
+  bool cmp = false;
+  const double worst = compare(Y, Y_ref, tol, &cmp);
+  check(cmp, "cuda::matmul_f32 matches CPU reference");
+  if (!cmp) std::cerr << "    worst rel err (batched " << name << ") = " << worst << "\n";
+}
+
+void test_batched_type(sbquant::QuantType type, const char* name,
+                       std::mt19937& rng) {
+  // n == 1 exercises the fallback to the single-column matvec path.
+  test_batched(type, name, 64, 256 * 4, 1, 1e-3, rng);
+  // Small shape (4 blocks/row), n == 8 -> gather/gemv/scatter over the
+  // one-thread-per-block kernel.
+  test_batched(type, name, 64, 256 * 4, 8, 1e-3, rng);
+  // Large shape (40 blocks/row), n == 4 -> cooperative warp-per-row kernel.
+  test_batched(type, name, 64, 256 * 40, 4, 1e-1, rng);
 }
 
 } // namespace
@@ -130,6 +178,10 @@ int main() {
   test_one_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_one_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_one_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+
+  test_batched_type(sbquant::QuantType::Q3_K, "q3_K", rng);
+  test_batched_type(sbquant::QuantType::Q4_K, "q4_K", rng);
+  test_batched_type(sbquant::QuantType::Q5_K, "q5_K", rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";

@@ -287,59 +287,188 @@ __global__ void gqa_broadcast_kernel(const float* __restrict__ src,
   dst[i] = src[kv_h * head_dim + off];
 }
 
-// Incremental decode attention (mirrors nn::decode_attention): one thread per
-// query head, a scalar loop over the valid key slots. Three passes recompute the
-// q·k dot so no variable-size scores array is needed (the dot is deterministic,
-// so each pass yields identical scores — bit-identical to the CPU kernel's
-// single-pass-plus-storage, up to expf vs std::exp rounding).
+// Incremental decode attention (mirrors nn::decode_attention): one WARP per
+// query head (Gemma 4: n_heads_q=8 <= 32, so a single block of n_heads_q*32
+// threads). The q·k dot is computed ONCE per key — 32 lanes each sum a strided
+// head_dim/32 slice, then __shfl-reduce — and the scores land in dynamic shared
+// memory so the dot is never recomputed (the prior 3-pass form recomputed it
+// three times). max/sum use warp reductions, and exp is evaluated once (scores
+// are overwritten with exp(score-max)) and reused by the V-weighted sum.
+//
+// fp32 KV is unchanged. The only numeric difference from the CPU reference is
+// reduction order (lane-strided + tree, vs the CPU's sequential scalar sum) —
+// fmaxf is exact, so the max is order-independent; the sum and dot carry a
+// ~1e-4 relative error from reordering, well inside the fp32 tolerance.
 __global__ void decode_attention_kernel(const float* __restrict__ q,
                                         const float* __restrict__ k_cache,
                                         const float* __restrict__ v_cache,
-                                        uint64_t pos, uint64_t n_slots,
+                                        uint64_t start, uint64_t n_keys,
+                                        uint64_t n_slots,
                                         int n_heads_q, int n_heads_kv,
-                                        int head_dim, uint64_t sliding_window,
-                                        float scale, float* __restrict__ out) {
-  const int h = blockIdx.x * blockDim.x + threadIdx.x;
+                                        int head_dim, float scale,
+                                        float* __restrict__ out) {
+  extern __shared__ float scores[];  // [n_heads_q * n_keys]
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;    // warp id == query head
   if (h >= n_heads_q) return;
   const int kv_h = h * n_heads_kv / n_heads_q;
-  const uint64_t start =
-      (sliding_window > 0 && pos >= sliding_window) ? pos - sliding_window + 1 : 0;
-  const uint64_t n_keys = pos - start + 1;
   const float* qrow = q + (uint64_t)h * head_dim;
+  float* srow = scores + (uint64_t)h * n_keys;
 
-  // Pass 1: max score (scores are unit-norm cosine similarities ~ [-1,1]).
+  // Phase 1: one q·k dot per key, warp-cooperative.
+  for (uint64_t idx = 0; idx < n_keys; ++idx) {
+    const uint64_t slot = (start + idx) % n_slots;
+    const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    float partial = 0.0f;
+    for (int d = lane; d < head_dim; d += 32) partial += qrow[d] * krow[d];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      partial += __shfl_down_sync(0xffffffffu, partial, o);
+    if (lane == 0) srow[idx] = partial * scale;
+  }
+  __syncwarp();
+
+  // Phase 2a: max score (fmaxf is exact, so the reduction order is irrelevant).
   float max_score = -1e30f;
-  for (uint64_t idx = 0; idx < n_keys; ++idx) {
-    const uint64_t slot = (start + idx) % n_slots;
-    const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-    max_score = fmaxf(max_score, dot * scale);
-  }
+  for (uint64_t idx = lane; idx < n_keys; idx += 32)
+    max_score = fmaxf(max_score, srow[idx]);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    max_score = fmaxf(max_score, __shfl_down_sync(0xffffffffu, max_score, o));
+  max_score = __shfl_sync(0xffffffffu, max_score, 0);
 
-  // Pass 2: sum of exp(score - max).
+  // Phase 2b: exp once, store back, warp-reduce the sum.
   float sum = 0.0f;
-  for (uint64_t idx = 0; idx < n_keys; ++idx) {
-    const uint64_t slot = (start + idx) % n_slots;
-    const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-    sum += expf(dot * scale - max_score);
+  for (uint64_t idx = lane; idx < n_keys; idx += 32) {
+    const float e = expf(srow[idx] - max_score);
+    srow[idx] = e;
+    sum += e;
   }
-  const float inv = 1.0f / sum;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    sum += __shfl_down_sync(0xffffffffu, sum, o);
+  const float inv = 1.0f / __shfl_sync(0xffffffffu, sum, 0);
+  __syncwarp();
 
-  // Pass 3: weighted sum of V.
+  // Phase 3: V-weighted sum, warp-cooperative — each lane owns a strided slice
+  // of the output row's dims, accumulating over keys in the same sequential
+  // order as the CPU reference.
   float* orow = out + (uint64_t)h * head_dim;
-  for (int d = 0; d < head_dim; ++d) orow[d] = 0.0f;
-  for (uint64_t idx = 0; idx < n_keys; ++idx) {
-    const uint64_t slot = (start + idx) % n_slots;
-    const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-    const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-    float dot = 0.0f;
-    for (int d = 0; d < head_dim; ++d) dot += qrow[d] * krow[d];
-    const float prob = expf(dot * scale - max_score) * inv;
-    for (int d = 0; d < head_dim; ++d) orow[d] += prob * vrow[d];
+  for (int d = lane; d < head_dim; d += 32) {
+    float acc = 0.0f;
+    for (uint64_t idx = 0; idx < n_keys; ++idx) {
+      const uint64_t slot = (start + idx) % n_slots;
+      const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+      acc += srow[idx] * inv * vrow[d];
+    }
+    orow[d] = acc;
   }
+}
+
+// --- flash attention (prefill) ----------------------------------------------
+//
+// Tiled online-softmax attention (the "flash" part: the [n_q, n_kv] scores
+// matrix is never materialized; memory is O(n_q + n_kv)). One warp per (query
+// position, query head), so a block of n_heads_q warps handles one query
+// position. The KV sequence is walked in FA_BK-key tiles; within a tile each
+// q·k dot is a warp-cooperative strided sum (same as decode_attention_kernel),
+// then running-max / running-sum / V-accumulator are rescaled online-softmax
+// style. Numerics mirror nn::scaled_dot_product_attention: scale, no softcap,
+// causal + sliding-window mask, exp(s - max) / sum exp(s - max). The masked
+// sentinel -1e30f is far below any real score (q/k are RMSNormed), so
+// expf(-1e30 - max) == 0 exactly and an all-masked tile is detected by
+// tile_max == -1e30f and skipped. fp32 KV is unchanged (the caller pre-rounds
+// K/V to fp16 via cast_fp16, same as the decode path).
+constexpr int FA_BK = 32;  // keys per online-softmax tile
+
+__global__ void flash_attention_kernel(const float* __restrict__ q,
+                                       const float* __restrict__ k,
+                                       const float* __restrict__ v, int n_kv,
+                                       int n_heads_q, int n_heads_kv,
+                                       int head_dim, uint64_t sliding_window,
+                                       float scale, float* __restrict__ out) {
+  extern __shared__ float s_sh[];  // [n_heads_q * FA_BK]
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;  // warp == query head
+  const int iq = blockIdx.x;       // query position (0-based)
+  if (h >= n_heads_q) return;
+  const int kv_h = h * n_heads_kv / n_heads_q;
+  const float* qrow = q + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  float* tile = s_sh + h * FA_BK;
+
+  // acc[d] for d = lane, lane+32, ... (head_dim/32 dims per lane, <= 16).
+  float acc[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  float m = -1e30f, l = 0.0f;
+
+  for (int j0 = 0; j0 < n_kv; j0 += FA_BK) {
+    const int jj_count = (n_kv - j0 < FA_BK) ? (n_kv - j0) : FA_BK;
+
+    // 1. warp-cooperative q·k dot per key; mask in-line; store score in tile.
+    for (int jj = 0; jj < jj_count; ++jj) {
+      const int j = j0 + jj;
+      const float* krow = k + ((uint64_t)j * n_heads_kv + kv_h) * head_dim;
+      float dot = 0.0f;
+      for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        dot += __shfl_down_sync(0xffffffffu, dot, o);
+      if (lane == 0) {
+        const bool masked =
+            (j > iq) || (sliding_window > 0 && iq >= j + sliding_window);
+        tile[jj] = masked ? -1e30f : dot * scale;
+      }
+    }
+    __syncwarp();
+
+    // 2. tile max (== -1e30f iff every key in the tile is masked).
+    float tile_max = -1e30f;
+    for (int jj = lane; jj < jj_count; jj += 32)
+      tile_max = fmaxf(tile_max, tile[jj]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, o));
+    tile_max = __shfl_sync(0xffffffffu, tile_max, 0);
+    if (tile_max == -1e30f) { __syncwarp(); continue; }  // all keys masked
+
+    // 3. online-softmax rescale (m == -1e30f on the first live tile => expf(-inf)=0).
+    const float m_new = fmaxf(m, tile_max);
+    const float rescale = expf(m - m_new);
+
+    // 4. exp once, store p back into tile; warp-reduce the tile sum.
+    float tile_sum = 0.0f;
+    for (int jj = lane; jj < jj_count; jj += 32) {
+      const float p = expf(tile[jj] - m_new);
+      tile[jj] = p;
+      tile_sum += p;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, o);
+    tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0);
+    l = l * rescale + tile_sum;
+
+    // 5. V-weighted accumulate: acc[d] = acc[d]*rescale + sum_jj tile[jj]*v[j,d].
+    __syncwarp();
+    int di = 0;
+    for (int d = lane; d < head_dim; d += 32, ++di) {
+      float a = acc[di] * rescale;
+      for (int jj = 0; jj < jj_count; ++jj) {
+        const float* vrow = v + ((uint64_t)(j0 + jj) * n_heads_kv + kv_h) * head_dim;
+        a += tile[jj] * vrow[d];
+      }
+      acc[di] = a;
+    }
+    m = m_new;
+    __syncwarp();
+  }
+
+  // Finalize: out[d] = acc[d] / l.
+  const float inv = 1.0f / l;
+  float* orow = out + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  int di = 0;
+  for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
 }
 
 // --- device state (scratch + weight cache) ----------------------------------
@@ -643,6 +772,43 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
          cudaSuccess;
 }
 
+bool flash_attention(std::span<const float> q, uint64_t n_q,
+                     std::span<const float> k, std::span<const float> v,
+                     uint64_t n_kv, uint64_t n_heads_q, uint64_t n_heads_kv,
+                     uint64_t head_dim, uint64_t sliding_window, float scale,
+                     std::span<float> out) {
+  if (!available()) return false;
+  if (n_q == 0 || n_kv == 0 || n_heads_q == 0 || n_heads_kv == 0 || head_dim == 0)
+    return false;
+  if (n_heads_q % n_heads_kv != 0 || head_dim % 32 != 0 || head_dim > 512 ||
+      n_heads_q > 32)
+    return false;
+  const size_t qn = (size_t)n_q * n_heads_q * head_dim;
+  const size_t kvn = (size_t)n_kv * n_heads_kv * head_dim;
+  if (q.size() < qn || k.size() < kvn || v.size() < kvn || out.size() < qn)
+    return false;
+  void* d_q = grow_scratch(g_dx, g_dx_bytes, qn * sizeof(float));
+  void* d_k = grow_scratch(g_db, g_db_bytes, kvn * sizeof(float));
+  void* d_v = grow_scratch(g_dy, g_dy_bytes, kvn * sizeof(float));
+  void* d_o = grow_scratch(g_dff, g_dff_bytes, qn * sizeof(float));
+  if (!d_q || !d_k || !d_v || !d_o) return false;
+  if (cudaMemcpy(d_q, q.data(), qn * sizeof(float), cudaMemcpyHostToDevice) !=
+          cudaSuccess ||
+      cudaMemcpy(d_k, k.data(), kvn * sizeof(float), cudaMemcpyHostToDevice) !=
+          cudaSuccess ||
+      cudaMemcpy(d_v, v.data(), kvn * sizeof(float), cudaMemcpyHostToDevice) !=
+          cudaSuccess)
+    return false;
+  const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
+  flash_attention_kernel<<<(unsigned)n_q, (unsigned)(n_heads_q * 32), smem>>>(
+      static_cast<const float*>(d_q), static_cast<const float*>(d_k),
+      static_cast<const float*>(d_v), (int)n_kv, (int)n_heads_q, (int)n_heads_kv,
+      (int)head_dim, sliding_window, scale, static_cast<float*>(d_o));
+  if (cudaGetLastError() != cudaSuccess) return false;
+  return cudaMemcpy(out.data(), d_o, qn * sizeof(float), cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
+}
+
 // --- device-resident entry points (Phase 6a Option A) -----------------------
 // These mirror the public wrappers above but take/return device pointers and
 // never copy activations to/from the host. Weight operands are host spans,
@@ -803,9 +969,33 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || !q || !k_cache ||
       !v_cache || !out || n_slots == 0)
     return false;
-  decode_attention_kernel<<<grid_for(n_heads_q), 256>>>(
-      q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, head_dim,
-      sliding_window, scale, out);
+  const uint64_t start =
+      (sliding_window > 0 && pos >= sliding_window) ? pos - sliding_window + 1 : 0;
+  const uint64_t n_keys = pos - start + 1;
+  // One warp per query head (n_heads_q <= 32 for Gemma 4). Scores for all heads
+  // are staged in dynamic shared memory, sized to n_heads_q * n_keys floats.
+  const size_t smem = (size_t)n_heads_q * n_keys * sizeof(float);
+  decode_attention_kernel<<<1, n_heads_q * 32, smem>>>(
+      q, k_cache, v_cache, start, n_keys, n_slots, n_heads_q, n_heads_kv,
+      head_dim, scale, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool flash_attention_dev(const float* q, const float* k, const float* v,
+                         int n_q, int n_kv, int n_heads_q, int n_heads_kv,
+                         int head_dim, uint64_t sliding_window, float scale,
+                         float* out) {
+  if (!available()) return false;
+  if (n_q <= 0 || n_kv <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 ||
+      head_dim <= 0 || !q || !k || !v || !out)
+    return false;
+  if (n_heads_q % n_heads_kv != 0) return false;
+  if (head_dim % 32 != 0 || head_dim > 512) return false;
+  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
+  flash_attention_kernel<<<n_q, n_heads_q * 32, smem>>>(
+      q, k, v, n_kv, n_heads_q, n_heads_kv, head_dim, sliding_window, scale,
+      out);
   return cudaGetLastError() == cudaSuccess;
 }
 

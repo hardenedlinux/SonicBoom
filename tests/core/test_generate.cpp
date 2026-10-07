@@ -224,6 +224,43 @@ int main() {
               << "), " << spine_tps << " tok/s\n";
   }
 
+  // --- prefill (batched prompt) vs per-token prompt through the spine -------
+  // The prefill path processes the whole prompt in one batched pass (batched
+  // q8_K matmul + full-sequence causal attention) and fills the KV cache in one
+  // shot; the reference (use_prefill=false) feeds the prompt one token at a time
+  // through the same per-token spine. The two must produce the identical
+  // continuation token stream (the M3 gate, CPU).
+  {
+    const uint64_t pn = env_u64("SONICBOOM_PREFILL_N", 3);
+    std::vector<uint64_t> prompt(pn, seed);
+
+    std::vector<int64_t> pf_tokens(steps, -1);
+    const uint64_t pf_done =
+        sbmodel::generate_prefill_spine(*m, prompt, 0, pf_tokens, 0, /*use_prefill=*/true);
+    pf_tokens.resize(pf_done);
+
+    std::vector<int64_t> ref_tokens(steps, -1);
+    const uint64_t ref_done =
+        sbmodel::generate_prefill_spine(*m, prompt, 0, ref_tokens, 0, /*use_prefill=*/false);
+    ref_tokens.resize(ref_done);
+
+    check(pf_done == ref_done, "prefill: same step count as per-token prompt");
+    check(pf_tokens == ref_tokens,
+          "prefill: token stream identical to per-token prompt");
+
+    // M4: the public generate_prompt() routes a prompt to the prefill spine.
+    {
+      std::vector<int64_t> routed(steps, -1);
+      const uint64_t done = sbmodel::generate_prompt(
+          *m, prompt, 0, routed, sbquant::MatmulBackend::CpuQ8K);
+      routed.resize(done);
+      check(routed == pf_tokens, "generate_prompt(CpuQ8K): routes to the prefill spine");
+    }
+
+    std::cout << "  [prefill]  " << pf_tokens.size() << " tokens (" << toks(pf_tokens)
+              << ") over a " << pn << "-token prompt\n";
+  }
+
   // --- spine (CUDA): the Phase 6 fused decode path on device ----------------
   if (!sbquant::cuda_available()) {
     std::cout << "  (skipped: no CUDA device; Cuda spine would not run on device)\n";
@@ -264,6 +301,43 @@ int main() {
 
     std::cout << "  [spine-cuda] " << spine_cuda_tokens.size() << " tokens ("
               << toks(spine_cuda_tokens) << "), " << spine_cuda_tps << " tok/s\n";
+
+    // --- prefill (CUDA): batched prompt vs per-token prompt ------------------
+    // The CUDA prefill processes the whole prompt in one batched pass (batched
+    // f32-activation matmul + flash attention) and fills the device KV caches in
+    // one shot; the reference feeds the prompt one token at a time through the
+    // per-token CUDA spine. The two must produce the identical continuation token
+    // stream (the M3 gate, CUDA).
+    {
+      const uint64_t pn = env_u64("SONICBOOM_PREFILL_N", 3);
+      std::vector<uint64_t> prompt(pn, seed);
+
+      std::vector<int64_t> pf_tokens(steps, -1);
+      const uint64_t pf_done = sbmodel::generate_prefill_spine_cuda(
+          *m, prompt, 0, pf_tokens, 0, /*use_prefill=*/true);
+      pf_tokens.resize(pf_done);
+
+      std::vector<int64_t> ref_tokens(steps, -1);
+      const uint64_t ref_done = sbmodel::generate_prefill_spine_cuda(
+          *m, prompt, 0, ref_tokens, 0, /*use_prefill=*/false);
+      ref_tokens.resize(ref_done);
+
+      check(pf_done == ref_done, "prefill(Cuda): same step count as per-token prompt");
+      check(pf_tokens == ref_tokens,
+            "prefill(Cuda): token stream identical to per-token prompt");
+
+      // M4: the public generate_prompt() routes a prompt to the CUDA prefill spine.
+      {
+        std::vector<int64_t> routed(steps, -1);
+        const uint64_t done = sbmodel::generate_prompt(
+            *m, prompt, 0, routed, sbquant::MatmulBackend::Cuda);
+        routed.resize(done);
+        check(routed == pf_tokens, "generate_prompt(Cuda): routes to the CUDA prefill spine");
+      }
+
+      std::cout << "  [prefill-cuda] " << pf_tokens.size() << " tokens ("
+                << toks(pf_tokens) << ") over a " << pn << "-token prompt\n";
+    }
   }
 
   if (g_failures == 0) {

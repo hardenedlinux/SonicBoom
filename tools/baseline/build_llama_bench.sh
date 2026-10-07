@@ -3,7 +3,7 @@
 # against the llama.cpp CPU-only build, not SonicBoom. See llama_bench.cpp.
 set -euo pipefail
 
-LLAMA_ROOT="${LLAMA_ROOT:-/path/to/llama.cpp}"
+LLAMA_ROOT="${LLAMA_ROOT:?set LLAMA_ROOT to the llama.cpp checkout}"
 LLAMA_BIN="$LLAMA_ROOT/build/bin"
 
 CXX="${CXX:-g++}"

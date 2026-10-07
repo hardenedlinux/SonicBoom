@@ -30,7 +30,7 @@
 // (see https://github.com/hardenedlinux/velum/third_party/ggml). This file re-implements
 // the arithmetic independently in clean C++23 — it does not include or link
 // ggml. ggml is MIT-licensed; the differential tests in tests/core/
-// test_dequant.cpp run this code against a verbatim ggml oracle for bit-exact
+// test_dequant.cpp run this code against a verbatim ggml baseline for bit-exact
 // agreement.
 
 namespace sonicboom::quant {

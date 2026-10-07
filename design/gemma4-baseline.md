@@ -1,9 +1,9 @@
-# Gemma 4 E4B-It — differential oracle (Phase 5B)
+# Gemma 4 E4B-It — differential baseline (Phase 5B)
 
-Status: **unblocked.** llama.cpp is available at `/path/to/llama.cpp`
-(HEAD 43fe9c642). The blocked semantic questions are now **resolved from the
+Status: **unblocked.** llama.cpp is available (local checkout, HEAD 43fe9c642).
+The blocked semantic questions are now **resolved from the
 authoritative source** — see `design/gemma4-semantics.md` §3, which supersedes
-§5–§6 here. The oracle remains a *development/test* aid only — it adds no
+§5–§6 here. The baseline remains a *development/test* aid only — it adds no
 llama.cpp / ggml runtime dependency to SonicBoom and is never linked into
 `libsonicboom.so`.
 
@@ -11,7 +11,7 @@ llama.cpp / ggml runtime dependency to SonicBoom and is never linked into
 
 The "llama.cpp not installed / no network" blocker is gone. The reference is:
 
-- `/path/to/llama.cpp/src/models/gemma4.cpp` — authoritative Gemma 4
+- `src/models/gemma4.cpp` — authoritative Gemma 4
   E4B architecture (the `general.architecture = "gemma4"` layout; E4B = 42
   layers via the `case 42` in `load_arch_hparams`).
 - `src/models/gemma3.cpp`, `src/models/gemma3n.cpp` — sibling architectures for
@@ -25,11 +25,11 @@ The "llama.cpp not installed / no network" blocker is gone. The reference is:
 Local ground-truth assets (unchanged):
 
 - `models/gemma-4-E4B-it-Q3_K_M.gguf` — the weight file.
-- `tests/core/ggml_oracle.h` — verbatim ggml dequant transcription, already
-  bit-exact-checking dequant via `test_dequant` (the one oracle tier that was
+- `tests/core/ggml_baseline.h` — verbatim ggml dequant transcription, already
+  bit-exact-checking dequant via `test_dequant` (the one baseline tier that was
   always runnable and is passing).
 
-## 2. Oracle architecture (design, ready when a source is available)
+## 2. Baseline architecture (design, ready when a source is available)
 
 Follow velum's pattern, but keep it out of the runtime:
 
@@ -45,7 +45,7 @@ Follow velum's pattern, but keep it out of the runtime:
                                           │
                                           ▼
                         ┌─────────────────────────────┐
-                        │  test_gemma4_oracle: load   │
+                        │  test_gemma4_baseline: load   │
                         │  both, compare per-tensor   │
                         │  with tolerances / bit-exact │
                         └─────────────────────────────┘
@@ -57,7 +57,7 @@ Follow velum's pattern, but keep it out of the runtime:
   `libsonicboom.so`.
 - **Two comparison tiers** (already the project's convention):
   - *Bit-exact dequant* — token embedding, and every quantized matvec input, are
-    exactly reproducible; zero tolerance. (Covered today by `ggml_oracle.h`.)
+    exactly reproducible; zero tolerance. (Covered today by `ggml_baseline.h`.)
   - *Floating-point op* — RMSNorm, RoPE, attention, gating: compare in fp32 with
     an absolute/relative tolerance (start `rtol 1e-4 / atol 1e-5`, loosen only
     with evidence of accumulation order differences).
@@ -172,11 +172,11 @@ The implementation edit is now permitted (Phase 5B "don't change math until
 evidence lands" is satisfied by the source); it is tracked separately from this
 doc.
 
-## 7. Oracle plan (next)
+## 7. Baseline plan (next)
 
 Two comparison tiers, as before:
 
-- **Bit-exact dequant** — already passing (`test_dequant` via `ggml_oracle.h`).
+- **Bit-exact dequant** — already passing (`test_dequant` via `ggml_baseline.h`).
 - **Per-tensor fp32 diff** — dump llama.cpp's intermediate tensors and compare
   against SonicBoom's `run_block`/`embed_*` once the math in §6 is implemented.
 
@@ -194,7 +194,7 @@ landed):
 
 ## 8. Reproducible build/run (what works today)
 
-- `test_dequant` — bit-exact dequant oracle (ggml) vs SonicBoom, already passing.
+- `test_dequant` — bit-exact dequant baseline (ggml) vs SonicBoom, already passing.
 - `test_gemma4` — real-model structural checks; the blk.1 (Q5_K) → blk.2 (Q4_K)
   mixed-precision boundary and the 17-tensor binding completeness are asserted.
 
