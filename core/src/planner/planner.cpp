@@ -48,6 +48,22 @@ const MemorySpace* find_host(const ResourceSnapshot& s) {
   return best;
 }
 
+const Device* find_gpu(const ResourceSnapshot& s) {
+  const Device* best = nullptr;
+  for (const auto& d : s.devices)
+    if (d.kind == DeviceKind::GPU && (!best || d.id < best->id))
+      best = &d;
+  return best;
+}
+
+const MemorySpace* find_device_local(const ResourceSnapshot& s) {
+  const MemorySpace* best = nullptr;
+  for (const auto& m : s.memory_spaces)
+    if (m.kind == MemoryKind::DeviceLocal && (!best || m.id < best->id))
+      best = &m;
+  return best;
+}
+
 bool supports_dtype(const Device& d, sx::DType dt) {
   for (sx::DType x : d.capability.supported_dtypes)
     if (x == dt)
@@ -82,24 +98,51 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
         PlannerErrorCode::UnsupportedCapability,
         "no host memory space in snapshot", Phase::Planning));
 
-  // Capability check: every operator and dtype must be executable on the CPU.
+  const Device* gpu = find_gpu(snapshot_);
+  const MemorySpace* device_local = find_device_local(snapshot_);
+
+  // The effective backend of a node: its explicit per-node override (the Gemma 4
+  // plan emitter pins everything to Sonic), else the route_op default.
+  auto effective_backend = [](const GraphNodeDesc& node) noexcept {
+    return node.backend.value_or(route_op(node.op));
+  };
+
+  // M3 placement seam: route a node to the GPU (device-local) only when it
+  // dispatches to the Sonic backend AND a usable GPU device that supports its op
+  // is present; every other backend (MLIR JIT, native-torch dispatcher) is
+  // CPU-only in v0, so those nodes stay on the CPU (host). Tying placement to
+  // backend keeps it consistent with routing — the shared `Add` operator is MLIR
+  // by default (→ CPU) but is pinned to Sonic by the Gemma 4 emitter (→ GPU).
+  auto place = [&](const GraphNodeDesc& node)
+      -> std::pair<const Device*, const MemorySpace*> {
+    if (effective_backend(node) == BackendTag::Sonic && gpu &&
+        gpu->capability.can_execute && device_local &&
+        supports_op(*gpu, node.op))
+      return {gpu, device_local};
+    return {cpu, host};
+  };
+
+  // Capability check: every operator and dtype must be executable on its
+  // assigned device.
   for (const auto& node : graph.nodes) {
-    if (!supports_op(*cpu, node.op)) {
+    const Device* dev = place(node).first;
+    if (!supports_op(*dev, node.op)) {
       PlannerError e(PlannerErrorCode::UnsupportedCapability,
-                     "CPU device cannot execute operator '" + node.name + "'",
+                     "device cannot execute operator '" + node.name + "'",
                      Phase::Planning);
       e.context.node = node.id;
       return std::unexpected(std::move(e));
     }
     for (TensorId tid : node.inputs) {
       const auto* t = graph.find_tensor(tid);
-      // Constants (weights, axes, shapes) are baked into the lowering, not
-      // computed, so their dtype does not constrain the device's compute
-      // dtypes. Only non-constant inputs (graph inputs / other node outputs)
-      // are checked.
-      if (t && !t->is_constant && !supports_dtype(*cpu, t->dtype)) {
+      // Constants (weights, axes, shapes) are baked into the lowering, and graph
+      // inputs are externally-provided data (not computed), so neither dtype
+      // constrains the device's compute dtypes. Only computed tensors (other
+      // nodes' outputs) are checked.
+      if (t && !t->is_constant && !t->is_graph_input &&
+          !supports_dtype(*dev, t->dtype)) {
         PlannerError e(PlannerErrorCode::UnsupportedDType,
-                       "CPU device does not support dtype of tensor '" + t->name +
+                       "device does not support dtype of tensor '" + t->name +
                            "'",
                        Phase::Planning);
         e.context.node = node.id;
@@ -109,9 +152,9 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     }
     for (TensorId tid : node.outputs) {
       const auto* t = graph.find_tensor(tid);
-      if (t && !supports_dtype(*cpu, t->dtype)) {
+      if (t && !supports_dtype(*dev, t->dtype)) {
         PlannerError e(PlannerErrorCode::UnsupportedDType,
-                       "CPU device does not support dtype of tensor '" + t->name +
+                       "device does not support dtype of tensor '" + t->name +
                            "'",
                        Phase::Planning);
         e.context.node = node.id;
@@ -132,7 +175,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
 
   // Per-node compute cost, shared by both task models below (the cost model
   // estimates single operators and rejects WholeGraph).
-  auto node_cost = [&](const GraphNodeDesc& node)
+  auto node_cost = [&](const GraphNodeDesc& node, DeviceId device)
       -> std::expected<ComputeCost, PlannerError> {
     uint64_t in_bytes = 0;
     for (TensorId tid : node.inputs)
@@ -153,19 +196,19 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     req.input_bytes = in_bytes;
     req.output_bytes = out_bytes;
     req.dtype = dtype;
-    return cost_model_.estimate_compute(req, cpu->id);
+    return cost_model_.estimate_compute(req, device);
   };
 
   double total_latency_us = 0.0;
   double min_confidence = 1.0;
 
-  // Does any node dispatch to the native-torch backend?
-  bool has_native = false;
+  // Does any node dispatch to a non-MLIR backend (native-torch or Sonic)?
+  bool has_non_mlir = false;
   for (const auto& node : graph.nodes)
-    if (route_op(node.op) == BackendTag::NativeTorch)
-      has_native = true;
+    if (effective_backend(node) != BackendTag::Mlir)
+      has_non_mlir = true;
 
-  if (!has_native) {
+  if (!has_non_mlir) {
     // Homogeneous MLIR graph: one whole-graph compute task (jit_entry 0), as
     // before co-execution. Per-operator identity is preserved in graph_nodes.
     TaskDesc task;
@@ -190,7 +233,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     }
 
     for (const auto& node : graph.nodes) {
-      auto est = node_cost(node);
+      auto est = node_cost(node, cpu->id);
       if (!est)
         return std::unexpected(est.error());
       total_latency_us += est->estimated_latency_us;
@@ -218,7 +261,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     };
     std::vector<Region> regions;
     for (const auto& node : graph.nodes) {
-      const BackendTag b = route_op(node.op);
+      const BackendTag b = effective_backend(node);
       if (!regions.empty() && regions.back().backend == BackendTag::Mlir &&
           b == BackendTag::Mlir) {
         regions.back().nodes.push_back(&node);  // extend the MLIR run
@@ -240,8 +283,11 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       TaskDesc task;
       task.id = TaskId{next_task};
       task.kind = TaskKind::Compute;
-      task.device = cpu->id;
-      task.memory_space = host->id;
+      // Placement: a region is a single node (non-MLIR), so its device/memory
+      // space follows the node's backend + op.
+      auto placed = place(*r.nodes.front());
+      task.device = placed.first->id;
+      task.memory_space = placed.second->id;
 
       ComputeTaskDesc compute;
       compute.backend = r.backend;
@@ -298,7 +344,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       double region_latency = 0.0;
       double region_conf = 1.0;
       for (const auto* n : r.nodes) {
-        auto est = node_cost(*n);
+        auto est = node_cost(*n, place(*n).first->id);
         if (!est)
           return std::unexpected(est.error());
         region_latency += est->estimated_latency_us;

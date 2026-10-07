@@ -37,7 +37,8 @@ std::expected<ExecutionPlan, PlannerError> plan_execution(
   if (auto r = mem.plan_memory(*plan); !r)
     return std::unexpected(r.error());
 
-  if (auto r = TransferScheduler::schedule(*plan); !r)
+  TransferScheduler transfer(cost_model);
+  if (auto r = transfer.schedule(*plan); !r)
     return std::unexpected(r.error());
 
   if (auto r = PlanValidator::validate(*plan); !r)

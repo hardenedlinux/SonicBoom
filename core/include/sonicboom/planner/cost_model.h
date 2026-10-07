@@ -77,6 +77,11 @@ struct CpuCostParams {
   double host_bandwidth_bytes_per_us = 10000.0;  // host copy bandwidth
   double host_transfer_fixed_us = 1.0;           // fixed host copy latency
   double allocation_fixed_us = 0.5;              // per-allocation latency
+  // M3 GPU + device-transfer estimates. Analytical only (not real latency).
+  double gpu_per_op_base_us = 0.5;               // fixed GPU dispatch cost
+  double gpu_per_output_byte_us = 2e-6;          // per output-byte GPU compute
+  double device_bandwidth_bytes_per_us = 1000.0; // H2D/D2H/D2D bandwidth
+  double device_transfer_fixed_us = 2.0;         // fixed device transfer latency
 };
 
 // Deterministic analytical CPU cost model over a fixed resource snapshot.

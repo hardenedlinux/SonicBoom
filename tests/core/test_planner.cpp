@@ -142,7 +142,8 @@ int main() {
         "model fingerprint recorded");
   check(plan->resource_fingerprint == pl::resource_fingerprint(*snap),
         "resource fingerprint recorded");
-  check(plan->devices.size() == 1 && plan->memory_spaces.size() == 1 &&
+  check(plan->devices.size() == snap->devices.size() &&
+            plan->memory_spaces.size() == snap->memory_spaces.size() &&
             plan->tensors.size() == 2,
         "devices/memory/tensors copied into plan");
 

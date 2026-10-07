@@ -33,21 +33,49 @@
 
 namespace sonicboom::planner {
 
-// The backend a compute task is dispatched to. Distinct from DeviceKind: both
-// backends run on CPU in v0, so device kind alone cannot route a task.
+// The backend a compute task is dispatched to. Distinct from DeviceKind: the
+// Mlir and NativeTorch backends both run on CPU in v0, so device kind alone
+// cannot route a task; Sonic is the Phase 6 transformer backend (also CPU in
+// M2, later GPU in M3).
 enum class BackendTag : uint8_t {
   Mlir,        // sx::Executable (CpuBackend), the 7-op lowering set
   NativeTorch, // nt::OperatorHandle dispatcher (NativeTorchBackend)
+  Sonic,       // nn::*/quant::* kernels (SonicBackend), the transformer path
 };
 const char* backend_tag_name(BackendTag t) noexcept;
 
 // Default backend for an operator. This is the *entire* backend-selection seam:
 // replacing the routing strategy means replacing this one function, not
-// threading conditionals through the planner and executor.
+// threading conditionals through the planner and executor. A graph node may
+// override this default via GraphNodeDesc::backend (used by the Gemma 4 plan
+// emitter to pin every node — including the shared `Add` — to Sonic); when no
+// override is present, this function is the routing rule.
 inline BackendTag route_op(OpKind op) noexcept {
   switch (op) {
     case OpKind::Softmax:
       return BackendTag::NativeTorch;
+    // Phase 6 transformer operators. These are not part of the frozen S-Expr
+    // v0.1 vocabulary, so this branch is only reachable through a model-aware
+    // plan emitter (e.g. the Gemma 4 decode graph); it exists so the routing
+    // seam stays total over OpKind.
+    case OpKind::QuantizedMatmul:
+    case OpKind::RmsNorm:
+    case OpKind::RmsNormHeads:
+    case OpKind::GeluFp16:
+    case OpKind::Rope:
+    case OpKind::Attention:
+    case OpKind::AttentionShared:
+    case OpKind::GqaBroadcast:
+    case OpKind::Embedding:
+    case OpKind::MatvecF32:
+    case OpKind::MatvecBf16:
+    case OpKind::Mul:
+    case OpKind::Scale:
+    case OpKind::CastFp16:
+    case OpKind::Softcap:
+    case OpKind::Argmax:
+    case OpKind::LayerCombine:
+      return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;
   }

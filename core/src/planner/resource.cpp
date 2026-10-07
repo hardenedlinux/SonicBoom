@@ -16,6 +16,8 @@
 
 #include <sonicboom/planner/resource.h>
 
+#include <sonicboom/quant/quantized_matmul.h>
+
 #include "fingerprint.h"
 
 #include <algorithm>
@@ -219,9 +221,22 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   cpu.capability.supported_ops = {
       OpKind::Conv,   OpKind::Relu,    OpKind::Add,       OpKind::MaxPool,
       OpKind::ReduceMean, OpKind::Reshape, OpKind::Gemm,  OpKind::Softmax,
+      // Phase 6 transformer operators: executed on the CPU by the SonicBackend
+      // (nn::*/quant::* kernels), not by the MLIR lowering. Declared here so the
+      // static planner's capability check accepts a Gemma 4 decode graph.
+      OpKind::QuantizedMatmul, OpKind::RmsNorm,      OpKind::RmsNormHeads,
+      OpKind::GeluFp16,        OpKind::Rope,         OpKind::Attention,
+      OpKind::AttentionShared, OpKind::GqaBroadcast, OpKind::Embedding,
+      OpKind::MatvecF32,
+      OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
+      OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
+      OpKind::LayerCombine,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
-  // (reshape/reduce axes) are baked constants, not computed tensors.
+  // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the
+  // Int64 token id / position of the transformer decode graph) are
+  // externally-provided indices — neither constrains the device's compute
+  // dtypes, so only Float32 is declared.
   cpu.capability.supported_dtypes = {sx::DType::Float32};
   s.devices.push_back(std::move(cpu));
 
@@ -233,6 +248,40 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   host.reserved_bytes = cfg.reserved_bytes;
   host.alignment_bytes = cfg.alignment_bytes;
   s.memory_spaces.push_back(std::move(host));
+
+  // M3: enumerate a CUDA device + device-local memory space when one is present
+  // and the caller has not requested a host-only snapshot (a CPU-only spine sets
+  // cfg.enumerate_cuda = false). The GPU device declares exactly the transformer
+  // ops the SonicCudaBackend can execute (everything except Embedding/Softcap/
+  // Argmax, which have no *_dev kernel and stay on the CPU SonicBackend).
+  if (cfg.enumerate_cuda && quant::cuda_available()) {
+    Device gpu;
+    gpu.id = DeviceId{1};
+    gpu.kind = DeviceKind::GPU;
+    gpu.name = "cuda";
+    gpu.capability.can_execute = true;
+    gpu.capability.supports_async = false;           // default-stream serial
+    gpu.capability.supports_concurrent_copy = false; // synchronous cudaMemcpy
+    gpu.capability.supported_ops = {
+        OpKind::Scale,          OpKind::RmsNorm,    OpKind::RmsNormHeads,
+        OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,
+        OpKind::AttentionShared, OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
+        OpKind::MatvecF32,
+        OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
+        OpKind::Add,            OpKind::LayerCombine,
+    };
+    gpu.capability.supported_dtypes = {sx::DType::Float32};
+    s.devices.push_back(std::move(gpu));
+
+    MemorySpace device_local;
+    device_local.id = MemorySpaceId{1};
+    device_local.owner = DeviceId{1};
+    device_local.kind = MemoryKind::DeviceLocal;
+    device_local.capacity_bytes = 0;  // unknown; not budget-checked in v0
+    device_local.reserved_bytes = 0;
+    device_local.alignment_bytes = 256;
+    s.memory_spaces.push_back(std::move(device_local));
+  }
 
   s.fingerprint = resource_fingerprint(s);
   return s;

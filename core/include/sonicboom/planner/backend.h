@@ -24,6 +24,7 @@
 
 #include <sonicboom/planner/errors.h>
 #include <sonicboom/planner/resource.h>
+#include <sonicboom/planner/runtime_value.h>
 #include <sonicboom/planner/task.h>
 #include <sonicboom/sx/exec.h>
 
@@ -41,11 +42,17 @@ public:
   // The device kind this backend executes on.
   virtual DeviceKind kind() const noexcept = 0;
 
-  // Execute one compute task given its runtime input buffers (graph inputs
-  // only — constants/weights are baked into the compiled unit) in graph-input
-  // order, returning one buffer per graph output.
-  virtual std::expected<std::vector<sx::Bytes>, RuntimeError> execute(
-      const TaskDesc& task, const std::vector<sx::Bytes>& inputs) const = 0;
+  // Execute one compute task given its runtime input values (graph inputs only
+  // — constants/weights are baked into the compiled unit) in graph-input order,
+  // returning one value per graph output. Host backends read/write `.host`; a
+  // device backend reads/writes `.device`.
+  //
+  // Non-const: a backend may hold per-session state (e.g. the Gemma KV cache)
+  // that accumulates across the executor's repeated step executions. The executor
+  // keeps one backend instance per BackendTag for the lifetime of a generate
+  // session, so state persists between steps but is scoped to that session.
+  virtual std::expected<std::vector<TensorValue>, RuntimeError> execute(
+      const TaskDesc& task, const std::vector<TensorValue>& inputs) = 0;
 };
 
 // CPU backend: compiles an sx::Document to its whole-graph JIT entry once, then
@@ -59,8 +66,8 @@ public:
 
   DeviceKind kind() const noexcept override { return DeviceKind::CPU; }
 
-  std::expected<std::vector<sx::Bytes>, RuntimeError> execute(
-      const TaskDesc& task, const std::vector<sx::Bytes>& inputs) const override;
+  std::expected<std::vector<TensorValue>, RuntimeError> execute(
+      const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
 private:
   explicit CpuBackend(std::unique_ptr<sx::Executable> exe);

@@ -20,6 +20,8 @@
 
 #include <sonicboom/planner/resource.h>
 
+#include <sonicboom/quant/quantized_matmul.h>
+
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -45,8 +47,13 @@ int main() {
   check(snap.has_value(), "CPU snapshot builds");
   if (!snap)
     return 1;
-  check(snap->devices.size() == 1, "one device");
-  check(snap->memory_spaces.size() == 1, "one memory space");
+  // M3: the CPU provider also enumerates a CUDA device + device-local space
+  // when one is present, so the device/space counts follow cuda_available().
+  const bool has_cuda = sonicboom::quant::cuda_available();
+  check(snap->devices.size() == (has_cuda ? 2u : 1u),
+        "device count (CPU + optional GPU)");
+  check(snap->memory_spaces.size() == (has_cuda ? 2u : 1u),
+        "memory space count (host + optional device-local)");
   check(snap->devices[0].kind == pl::DeviceKind::CPU, "device is CPU");
   check(snap->devices[0].capability.can_execute, "CPU can execute");
   check(!snap->devices[0].capability.supports_async, "no async claimed");

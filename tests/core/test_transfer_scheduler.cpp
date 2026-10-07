@@ -14,8 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Transfer scheduler tests (P5): v0 records no transfers for a single memory
-// space, and rejects a cross-space tensor requirement it cannot implement.
+// Transfer scheduler tests (M3): a single host space records no transfers, and a
+// cross-space (host → device) tensor requirement emits an explicit Transfer task
+// (with the producer as its dependency and the consumer depending on it).
 
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/planner.h>
@@ -77,17 +78,28 @@ int main() {
         "no transfer cost in v0");
   check(plan && plan->tasks.size() == 1, "only the compute task (no transfers)");
 
-  // --- cross-space requirement → rejected (not silently scheduled) ---------
+  // --- cross-space (host → device) → an explicit Transfer task -------------
   {
-    pl::ExecutionPlan p;
-    p.schema_version = pl::ExecutionPlan::kSchemaVersion;
+    pl::ResourceSnapshot snap2;
+    snap2.version = 1;
 
-    pl::Device d0;
-    d0.id = pl::DeviceId{0};
-    d0.kind = pl::DeviceKind::CPU;
-    d0.name = "cpu";
-    d0.capability.can_execute = true;
-    p.devices.push_back(d0);
+    pl::Device cpu;
+    cpu.id = pl::DeviceId{0};
+    cpu.kind = pl::DeviceKind::CPU;
+    cpu.name = "cpu";
+    cpu.capability.can_execute = true;
+    cpu.capability.supported_ops = {pl::OpKind::Relu};
+    cpu.capability.supported_dtypes = {sx::DType::Float32};
+    snap2.devices.push_back(cpu);
+
+    pl::Device gpu;
+    gpu.id = pl::DeviceId{1};
+    gpu.kind = pl::DeviceKind::GPU;
+    gpu.name = "cuda";
+    gpu.capability.can_execute = true;
+    gpu.capability.supported_ops = {pl::OpKind::Relu};
+    gpu.capability.supported_dtypes = {sx::DType::Float32};
+    snap2.devices.push_back(gpu);
 
     pl::MemorySpace host;
     host.id = pl::MemorySpaceId{0};
@@ -95,15 +107,22 @@ int main() {
     host.kind = pl::MemoryKind::Host;
     host.capacity_bytes = 1u << 20;
     host.alignment_bytes = 8;
-    p.memory_spaces.push_back(host);
+    snap2.memory_spaces.push_back(host);
 
-    pl::MemorySpace pinned;
-    pinned.id = pl::MemorySpaceId{1};
-    pinned.owner = pl::DeviceId{0};
-    pinned.kind = pl::MemoryKind::PinnedHost;
-    pinned.capacity_bytes = 1u << 20;
-    pinned.alignment_bytes = 8;
-    p.memory_spaces.push_back(pinned);
+    pl::MemorySpace dev;
+    dev.id = pl::MemorySpaceId{1};
+    dev.owner = pl::DeviceId{1};
+    dev.kind = pl::MemoryKind::DeviceLocal;
+    dev.capacity_bytes = 1u << 20;
+    dev.alignment_bytes = 8;
+    snap2.memory_spaces.push_back(dev);
+
+    pl::AnalyticalCpuCostModel cost2(snap2);
+
+    pl::ExecutionPlan p;
+    p.schema_version = pl::ExecutionPlan::kSchemaVersion;
+    p.devices = snap2.devices;
+    p.memory_spaces = snap2.memory_spaces;
 
     pl::TensorDesc t;
     t.id = pl::TensorId{0};
@@ -113,28 +132,59 @@ int main() {
     t.size_bytes = 4;
     p.tensors.push_back(t);
 
-    // Tensor 0 lives in the pinned space…
-    pl::BufferAllocation b;
-    b.buffer = pl::BufferId{0};
-    b.memory_space = pl::MemorySpaceId{1};
-    b.size_bytes = 4;
-    b.assigned_tensors.push_back(pl::TensorId{0});
-    p.allocations.push_back(b);
+    // Task 0 produces tensor 0 on the host; task 1 consumes it on the device.
+    pl::TaskDesc producer;
+    producer.id = pl::TaskId{0};
+    producer.kind = pl::TaskKind::Compute;
+    producer.memory_space = pl::MemorySpaceId{0};
+    producer.outputs.push_back(pl::TensorId{0});
+    producer.payload = pl::ComputeTaskDesc{};
+    p.tasks.push_back(producer);
 
-    // …but the compute task executes in the host space.
-    pl::TaskDesc task;
-    task.id = pl::TaskId{0};
-    task.kind = pl::TaskKind::Compute;
-    task.memory_space = pl::MemorySpaceId{0};
-    task.inputs.push_back(pl::TensorId{0});
-    task.payload = pl::ComputeTaskDesc{};
-    p.tasks.push_back(task);
+    pl::TaskDesc consumer;
+    consumer.id = pl::TaskId{1};
+    consumer.kind = pl::TaskKind::Compute;
+    consumer.memory_space = pl::MemorySpaceId{1};
+    consumer.inputs.push_back(pl::TensorId{0});
+    consumer.payload = pl::ComputeTaskDesc{};
+    p.tasks.push_back(consumer);
+
     p.execution_order.push_back(pl::TaskId{0});
+    p.execution_order.push_back(pl::TaskId{1});
 
-    auto r = pl::TransferScheduler::schedule(p);
-    check(!r.has_value() &&
-              r.error().code == pl::PlannerErrorCode::UnsupportedCapability,
-          "cross-space tensor requirement rejected");
+    pl::TransferScheduler transfer(cost2);
+    auto r = transfer.schedule(p);
+    check(r.has_value(), "cross-space plan schedules");
+    check(p.tasks.size() == 3, "one transfer task inserted");
+    check(p.execution_order.size() == 3, "execution order covers the transfer");
+
+    const pl::TaskDesc* tr = nullptr;
+    const pl::TaskDesc* c = nullptr;
+    for (const auto& task : p.tasks) {
+      if (task.kind == pl::TaskKind::Transfer)
+        tr = &task;
+      if (task.id == pl::TaskId{1})
+        c = &task;
+    }
+    check(tr != nullptr, "a transfer task exists");
+    check(tr && tr->as_transfer() &&
+              tr->as_transfer()->source == pl::MemorySpaceId{0} &&
+              tr->as_transfer()->destination == pl::MemorySpaceId{1} &&
+              tr->as_transfer()->tensor == pl::TensorId{0} &&
+              tr->as_transfer()->bytes == 4,
+          "transfer payload is host→device for tensor 0");
+    check(tr && tr->dependencies.size() == 1 &&
+              tr->dependencies[0] == pl::TaskId{0},
+          "transfer depends on the producer");
+    bool dep_ok = false;
+    if (c)
+      for (pl::TaskId d : c->dependencies)
+        if (d == tr->id)
+          dep_ok = true;
+    check(dep_ok, "consumer depends on the transfer");
+    check(p.execution_order[0] == pl::TaskId{0} &&
+              p.execution_order[2] == pl::TaskId{1},
+          "execution order interleaves the transfer before the consumer");
   }
 
   if (g_failures == 0) {

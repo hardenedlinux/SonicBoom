@@ -40,8 +40,8 @@ public:
 
   DeviceKind kind() const noexcept override { return DeviceKind::CPU; }
 
-  std::expected<std::vector<sx::Bytes>, RuntimeError> execute(
-      const TaskDesc& task, const std::vector<sx::Bytes>& inputs) const override;
+  std::expected<std::vector<TensorValue>, RuntimeError> execute(
+      const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
 private:
   explicit NativeTorchBackend(Graph graph);

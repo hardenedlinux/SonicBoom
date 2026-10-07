@@ -28,12 +28,56 @@ file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
 # headers (the public facade in <sonicboom/sx/exec.h> is MLIR-free).
 file(GLOB_RECURSE SONICBOOM_PLANNER_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/*.cpp)
+# sonic_cuda_backend.cpp is host-only orchestration that depends on the CUDA
+# _dev primitives (cuda_resident.h / quant/cuda_resident.h) and <cuda_runtime.h>,
+# so like model/cuda_block.cpp it is compiled by g++ (C++23) only when
+# SONICBOOM_USE_CUDA is ON. Exclude it from the unconditional planner glob; it is
+# re-added in the CUDA block below.
+list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
 
 # Minimal autograd (core/src/autograd/). Layer 2 only: it dispatches through
 # the nt:: adapter (no direct c10/ATen use), so it belongs to the same public
 # library surface as the planner/sx code above.
 file(GLOB_RECURSE SONICBOOM_AUTOGRAD_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/autograd/*.cpp)
+
+# GGUF v3 reader (core/src/gguf/). Pure file-format reader: parses the header,
+# KV metadata and tensor directory, and exposes raw (quantized) tensor bytes by
+# offset + size. No ggml, llama.cpp, MLIR, or device backend — format constants
+# only, re-declared by reference to the public GGUF v3 spec.
+file(GLOB_RECURSE SONICBOOM_GGUF_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf/*.cpp)
+
+# Quantized weight representation + reference dequantization (core/src/quant/).
+# Backend-neutral storage semantics and the Q3_K/Q4_K/Q5_K scalar reference
+# kernels. No ggml, llama.cpp, MLIR, or device backend; pure C++23.
+file(GLOB_RECURSE SONICBOOM_QUANT_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/*.cpp)
+
+# Transformer operator primitives (core/src/nn/). Pure C++23 float32 reference
+# kernels (RMSNorm, SiLU/GELU, RoPE, attention, …) for the native inference
+# path. No ggml, llama.cpp, MLIR, or device backend.
+file(GLOB_RECURSE SONICBOOM_NN_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/*.cpp)
+
+# Gemma 4 model subsystem (core/src/model/): the explicit model loader + config,
+# weight binding, 42-layer plan, and the per-layer embedding / single-block
+# reference execution path. Pure C++23, depends only on gguf + quant + nn.
+file(GLOB_RECURSE SONICBOOM_MODEL_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.cpp)
+# cuda_block.cpp is host-only orchestration (no device kernels) but depends on
+# <cuda_runtime.h> and the CUDA _dev primitives, so it is compiled by g++
+# (C++23) instead of nvcc (C++20) and only built when SONICBOOM_USE_CUDA is ON.
+# Exclude it from the unconditional model glob; it is re-added in the CUDA block.
+list(REMOVE_ITEM SONICBOOM_MODEL_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp)
+
+# CPU thread pool (core/src/thread_pool.cpp): a process-wide, SonicBoom-owned
+# data-parallel executor used by the quantized matmul (and later the elementwise
+# primitives) to split row/element loops across workers. Pure C++23.
+file(GLOB_RECURSE SONICBOOM_THREADPOOL_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/thread_pool.cpp)
 
 # libsonicboom.so is SonicBoom's final published core library (SHARED).
 # Native-torch and MLIR are statically linked into it. The stable C ABI
@@ -44,6 +88,11 @@ add_library(sonicboom SHARED
   ${SONICBOOM_SX_SOURCES}
   ${SONICBOOM_PLANNER_SOURCES}
   ${SONICBOOM_AUTOGRAD_SOURCES}
+  ${SONICBOOM_GGUF_SOURCES}
+  ${SONICBOOM_QUANT_SOURCES}
+  ${SONICBOOM_NN_SOURCES}
+  ${SONICBOOM_MODEL_SOURCES}
+  ${SONICBOOM_THREADPOOL_SOURCES}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 
@@ -82,6 +131,15 @@ target_link_libraries(sonicboom PRIVATE
 if(SONICBOOM_USE_CUDA)
   target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_CUDA=1)
   target_link_libraries(sonicboom PRIVATE CUDA::cudart)
+  # SonicBoom-owned CUDA K-quant matvec kernel (dequantize-on-the-fly gemv).
+  # Compiled with nvcc (enable_language(CUDA) + CMAKE_CUDA_ARCHITECTURES=86 are
+  # set in the root CMakeLists), statically linked into libsonicboom.so like the
+  # other core sources. Its public header exposes only Layer 2 types.
+  target_sources(sonicboom PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
 endif()
 
 # MLIRIR provides MLIRContext / ModuleOp / BuiltinDialect and the asm printer;

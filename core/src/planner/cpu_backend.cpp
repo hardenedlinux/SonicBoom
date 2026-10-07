@@ -43,18 +43,34 @@ std::expected<std::unique_ptr<CpuBackend>, RuntimeError> CpuBackend::compile(
 CpuBackend::CpuBackend(std::unique_ptr<sx::Executable> exe)
     : exe_(std::move(exe)) {}
 
-std::expected<std::vector<sx::Bytes>, RuntimeError> CpuBackend::execute(
-    const TaskDesc& task, const std::vector<sx::Bytes>& inputs) const {
+std::expected<std::vector<TensorValue>, RuntimeError> CpuBackend::execute(
+    const TaskDesc& task, const std::vector<TensorValue>& inputs) {
   if (task.kind != TaskKind::Compute)
     return std::unexpected(RuntimeError(
         RuntimeErrorCode::InvalidPlan,
         "CPU backend can only execute compute tasks", Phase::Execution));
 
+  // The MLIR entry runs on host bytes; device values never reach the CPU path.
+  std::vector<sx::Bytes> host_inputs;
+  host_inputs.reserve(inputs.size());
+  for (const auto& v : inputs) {
+    if (v.on_device)
+      return std::unexpected(RuntimeError(
+          RuntimeErrorCode::InvalidPlan,
+          "CPU backend received a device-resident input", Phase::Execution));
+    host_inputs.push_back(v.host);
+  }
+
   std::vector<sx::Bytes> outputs;
-  auto r = exe_->run(inputs, outputs);
+  auto r = exe_->run(host_inputs, outputs);
   if (!r)
     return std::unexpected(backend_error(r.error()));
-  return outputs;
+
+  std::vector<TensorValue> result;
+  result.reserve(outputs.size());
+  for (auto& b : outputs)
+    result.push_back(TensorValue::from_host(std::move(b)));
+  return result;
 }
 
 } // namespace sonicboom::planner

@@ -28,6 +28,7 @@ const char* backend_tag_name(BackendTag t) noexcept {
   switch (t) {
     case BackendTag::Mlir: return "mlir";
     case BackendTag::NativeTorch: return "native_torch";
+    case BackendTag::Sonic: return "sonic";
   }
   return "?";
 }

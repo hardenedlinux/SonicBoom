@@ -62,17 +62,24 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
         "memory planner requires a compute task with a memory space",
         Phase::Memory));
 
-  const MemorySpaceId space_id = *compute->memory_space;
+  // M3: buffer bookkeeping is host-only. Device-local activations are pooled and
+  // managed by the device buffer pool (device_pool.h) inside the executor and
+  // the CUDA backend, not by static buffer allocations, so every tensor's
+  // logical buffer lives in the host space regardless of which device the
+  // producing task executes on. This also keeps the budget check against the
+  // host budget — weights are not graph tensors (see model/plan.h), so the host
+  // working set is only the float32 activations.
   const MemorySpace* space = nullptr;
   for (const auto& m : plan.memory_spaces)
-    if (m.id == space_id) {
+    if (m.kind == MemoryKind::Host) {
       space = &m;
       break;
     }
   if (!space)
     return std::unexpected(PlannerError(
         PlannerErrorCode::InvalidPlan,
-        "compute task memory space is not present in the plan", Phase::Memory));
+        "no host memory space in plan for buffer allocation", Phase::Memory));
+  const MemorySpaceId space_id = space->id;
   const uint64_t align = space->alignment_bytes == 0 ? 1 : space->alignment_bytes;
 
   // 1. Lifetimes. The whole-graph model (a single whole-graph compute task)

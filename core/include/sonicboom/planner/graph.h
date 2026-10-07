@@ -25,10 +25,12 @@
 #include <sonicboom/planner/errors.h>
 #include <sonicboom/planner/ids.h>
 #include <sonicboom/planner/op_kind.h>
+#include <sonicboom/planner/partition.h>
 #include <sonicboom/sx/ir.h>
 
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,6 +61,13 @@ struct GraphNodeDesc {
   std::vector<TensorId> outputs;
   std::vector<sx::Attribute> attributes;
   std::string name;  // original sx op name (identity/diagnostics)
+
+  // Optional per-node backend override. When set, the planner routes this node
+  // to `backend` regardless of `route_op(op)`. The Gemma 4 plan emitter pins
+  // every node to BackendTag::Sonic (its `Add` residual nodes would otherwise
+  // route to Mlir, the frozen S-Expr default for the shared `Add` operator).
+  // The sx::Document → adapt_graph path leaves this unset, so route_op applies.
+  std::optional<BackendTag> backend;
 };
 
 struct Graph {

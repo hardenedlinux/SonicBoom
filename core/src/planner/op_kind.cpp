@@ -35,6 +35,40 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Gemm;
   if (name == "softmax")
     return OpKind::Softmax;
+  if (name == "quantized_matmul")
+    return OpKind::QuantizedMatmul;
+  if (name == "rms_norm")
+    return OpKind::RmsNorm;
+  if (name == "rms_norm_heads")
+    return OpKind::RmsNormHeads;
+  if (name == "gelu_fp16")
+    return OpKind::GeluFp16;
+  if (name == "rope")
+    return OpKind::Rope;
+  if (name == "attention")
+    return OpKind::Attention;
+  if (name == "attention_shared")
+    return OpKind::AttentionShared;
+  if (name == "gqa_broadcast")
+    return OpKind::GqaBroadcast;
+  if (name == "embedding")
+    return OpKind::Embedding;
+  if (name == "matvec_f32")
+    return OpKind::MatvecF32;
+  if (name == "matvec_bf16")
+    return OpKind::MatvecBf16;
+  if (name == "mul")
+    return OpKind::Mul;
+  if (name == "scale")
+    return OpKind::Scale;
+  if (name == "cast_fp16")
+    return OpKind::CastFp16;
+  if (name == "softcap")
+    return OpKind::Softcap;
+  if (name == "argmax")
+    return OpKind::Argmax;
+  if (name == "layer_combine")
+    return OpKind::LayerCombine;
   return std::nullopt;
 }
 
@@ -49,6 +83,23 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Gemm: return "gemm";
     case OpKind::Softmax: return "softmax";
     case OpKind::WholeGraph: return "whole_graph";
+    case OpKind::QuantizedMatmul: return "quantized_matmul";
+    case OpKind::RmsNorm: return "rms_norm";
+    case OpKind::RmsNormHeads: return "rms_norm_heads";
+    case OpKind::GeluFp16: return "gelu_fp16";
+    case OpKind::Rope: return "rope";
+    case OpKind::Attention: return "attention";
+    case OpKind::AttentionShared: return "attention_shared";
+    case OpKind::GqaBroadcast: return "gqa_broadcast";
+    case OpKind::Embedding: return "embedding";
+    case OpKind::MatvecF32: return "matvec_f32";
+    case OpKind::MatvecBf16: return "matvec_bf16";
+    case OpKind::Mul: return "mul";
+    case OpKind::Scale: return "scale";
+    case OpKind::CastFp16: return "cast_fp16";
+    case OpKind::Softcap: return "softcap";
+    case OpKind::Argmax: return "argmax";
+    case OpKind::LayerCombine: return "layer_combine";
   }
   return "?";
 }

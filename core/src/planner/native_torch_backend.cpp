@@ -79,8 +79,8 @@ NativeTorchBackend::compile(const Graph& graph) {
 
 NativeTorchBackend::NativeTorchBackend(Graph graph) : graph_(std::move(graph)) {}
 
-std::expected<std::vector<sx::Bytes>, RuntimeError> NativeTorchBackend::execute(
-    const TaskDesc& task, const std::vector<sx::Bytes>& inputs) const {
+std::expected<std::vector<TensorValue>, RuntimeError> NativeTorchBackend::execute(
+    const TaskDesc& task, const std::vector<TensorValue>& inputs) {
   const auto* compute = task.as_compute();
   if (!compute)
     return std::unexpected(plan_err("native torch backend requires a compute task"));
@@ -108,11 +108,13 @@ std::expected<std::vector<sx::Bytes>, RuntimeError> NativeTorchBackend::execute(
     auto nt_dtype = sx_to_nt(t->dtype);
     if (!nt_dtype)
       return std::unexpected(rt_err("unsupported dtype for native torch bridge"));
-    if (inputs[i].size() != static_cast<std::size_t>(t->size_bytes))
+    if (inputs[i].on_device)
+      return std::unexpected(rt_err("native torch backend received a device input"));
+    if (inputs[i].host.size() != static_cast<std::size_t>(t->size_bytes))
       return std::unexpected(rt_err("input byte count does not match tensor '" +
                                     t->name + "'"));
     nt::Tensor tt = nt::empty(t->shape, *nt_dtype);
-    std::memcpy(tt.data_ptr(), inputs[i].data(), inputs[i].size());
+    std::memcpy(tt.data_ptr(), inputs[i].host.data(), inputs[i].host.size());
     tensors.push_back(std::move(tt));
   }
 
@@ -164,8 +166,8 @@ std::expected<std::vector<sx::Bytes>, RuntimeError> NativeTorchBackend::execute(
   sx::Bytes out_bytes(static_cast<std::size_t>(od->size_bytes));
   std::memcpy(out_bytes.data(), out_t.data_ptr(), out_bytes.size());
 
-  std::vector<sx::Bytes> outputs;
-  outputs.push_back(std::move(out_bytes));
+  std::vector<TensorValue> outputs;
+  outputs.push_back(TensorValue::from_host(std::move(out_bytes)));
   return outputs;
 }
 

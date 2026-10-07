@@ -113,6 +113,12 @@ struct CpuProviderConfig {
   uint64_t host_memory_budget_bytes = 0;
   uint64_t reserved_bytes = 0;   // runtime/JIT reservations, configurable
   uint64_t alignment_bytes = 64; // host allocation alignment
+
+  // M3: when true (default) and a CUDA device is present, also enumerate that
+  // GPU device + its device-local memory space so the planner can place Sonic
+  // nodes on it. A CPU-only spine (e.g. generate_spine) sets this false so the
+  // snapshot reflects a host-only execution context and placement stays on CPU.
+  bool enumerate_cuda = true;
 };
 
 class CpuResourceProvider {

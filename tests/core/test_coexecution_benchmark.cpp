@@ -196,6 +196,7 @@ int main() {
     for (int c = 0; c < kDim; ++c)
       x[static_cast<std::size_t>(r) * kDim + c] = static_cast<float>(c + 1);
   const sx::Bytes xbuf = pack(x);
+  const pl::TensorValue xval = pl::TensorValue::from_host(xbuf);
 
   auto snap = pl::CpuResourceProvider::snapshot();
   check(snap.has_value(), "snapshot builds");
@@ -280,14 +281,14 @@ int main() {
   {
     auto r = exec.execute(*plan_mixed, *snap, {xbuf});
     check(r.has_value() && r->outputs.size() == 1, "mixed sanity run");
-    auto native = (*nt)->execute(softmax_task, {xbuf});
+    auto native = (*nt)->execute(softmax_task, {xval});
     check(native.has_value() && native->size() == 1, "native sanity run");
-    auto mlir = (*cpu_relu)->execute(relu_task, {xbuf});
+    auto mlir = (*cpu_relu)->execute(relu_task, {xval});
     check(mlir.has_value() && mlir->size() == 1, "mlir sanity run");
     if (native) {
       // softmax(axis=1) of arange(1..128) is positive and sums to 1 per row.
       const auto& out = native->front();
-      const auto* f = reinterpret_cast<const float*>(out.data());
+      const auto* f = reinterpret_cast<const float*>(out.host.data());
       double row_sum = 0.0;
       for (int c = 0; c < kDim; ++c)
         row_sum += static_cast<double>(f[c]);
@@ -300,11 +301,11 @@ int main() {
 
   // --- timing loops -----------------------------------------------------------
   auto native_stats = measure(kIters, [&] {
-    auto r = (*nt)->execute(softmax_task, {xbuf});
+    auto r = (*nt)->execute(softmax_task, {xval});
     return r.has_value() && r->size() == 1;
   });
   auto mlir_stats = measure(kIters, [&] {
-    auto r = (*cpu_relu)->execute(relu_task, {xbuf});
+    auto r = (*cpu_relu)->execute(relu_task, {xval});
     return r.has_value() && r->size() == 1;
   });
   auto mixed_stats = measure(kIters, [&] {
@@ -407,12 +408,13 @@ int main() {
       auto a = exec.execute(*plan, *snap, {xbuf});
       check(a && a->outputs.size() == 1, "chain merged sanity run");
 
-      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      auto s = (*nt_chain)->execute(*t_softmax, {xval});
       bool per_node_ok = s && s->size() == 1;
-      std::vector<sx::Bytes> acc = per_node_ok ? std::vector<sx::Bytes>{(*s)[0]}
-                                               : std::vector<sx::Bytes>{};
+      std::vector<pl::TensorValue> acc =
+          per_node_ok ? std::vector<pl::TensorValue>{(*s)[0]}
+                      : std::vector<pl::TensorValue>{};
       for (const auto& cpu : per_node) {
-        auto r = cpu->execute(dummy, {acc.empty() ? sx::Bytes{} : acc[0]});
+        auto r = cpu->execute(dummy, {acc.empty() ? pl::TensorValue{} : acc[0]});
         per_node_ok = per_node_ok && r && r->size() == 1;
         if (!r || r->size() != 1)
           break;
@@ -420,9 +422,9 @@ int main() {
       }
       check(per_node_ok, "chain per-node sanity run");
 
-      if (a && per_node_ok && a->outputs[0].size() == acc[0].size()) {
+      if (a && per_node_ok && a->outputs[0].size() == acc[0].host.size()) {
         const auto* f1 = reinterpret_cast<const float*>(a->outputs[0].data());
-        const auto* f2 = reinterpret_cast<const float*>(acc[0].data());
+        const auto* f2 = reinterpret_cast<const float*>(acc[0].host.data());
         bool same = true;
         for (int i = 0; i < kDim * kDim; ++i)
           if (std::fabs(f1[i] - f2[i]) > 1e-5f) {
@@ -442,7 +444,7 @@ int main() {
     // (1 native + 1 region) vs 5 (1 native + 4 per-node), i.e. fewer JIT-call
     // boundaries and fewer intermediate buffer handoffs.
     auto merged_manual_stats = measure(kIters, [&] {
-      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      auto s = (*nt_chain)->execute(*t_softmax, {xval});
       if (!s || s->size() != 1)
         return false;
       auto z = merged_cpu->execute(dummy, {(*s)[0]});
@@ -450,10 +452,10 @@ int main() {
     });
     auto pernode_stats = measure(kIters, [&] {
       // softmax (native) → relu → relu → relu → relu (4 per-node mlir calls).
-      auto s = (*nt_chain)->execute(*t_softmax, {xbuf});
+      auto s = (*nt_chain)->execute(*t_softmax, {xval});
       if (!s || s->size() != 1)
         return false;
-      std::vector<sx::Bytes> acc = {(*s)[0]};
+      std::vector<pl::TensorValue> acc = {(*s)[0]};
       for (const auto& cpu : per_node) {
         auto r = cpu->execute(dummy, {acc[0]});
         if (!r || r->size() != 1)

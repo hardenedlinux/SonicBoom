@@ -18,7 +18,10 @@
 
 #include <sonicboom/planner/plan_validator.h>
 
+#include "device_pool.h"
+
 #include <cstddef>
+#include <cstring>
 #include <map>
 #include <string>
 #include <utility>
@@ -68,14 +71,19 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         Phase::Execution));
 
   // 4. Seed the value map with the graph-input buffers, in plan tensor order.
-  std::map<uint32_t, sx::Bytes> values;  // TensorId -> raw bytes
+  //    Graph inputs are host scalars (token id / position) even on the CUDA
+  //    path: they are read directly by the backends, never transferred.
+  std::map<uint32_t, TensorValue> values;  // TensorId -> runtime value
+  std::map<BufferId, uint64_t> allocated;  // buffer -> device handle (Allocate)
   std::size_t in_i = 0;
   for (const auto& t : plan.tensors)
     if (t.is_graph_input)
-      values[t.id.value] = inputs[in_i++];
+      values[t.id.value] = TensorValue::from_host(inputs[in_i++]);
 
-  // 5. Walk execution_order: dispatch each compute task to its routed backend,
-  //    handing intermediate tensors between tasks by TensorId.
+  // 5. Walk execution_order: dispatch each task to its routed backend, handing
+  //    intermediate tensors between tasks by TensorId. Transfer tasks move a
+  //    value between host and device; the device buffers are pooled and returned
+  //    at the end of the step (below).
   for (TaskId tid : plan.execution_order) {
     const TaskDesc* task = plan.find_task(tid);
     if (!task)
@@ -105,7 +113,7 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
                   std::string(backend_tag_name(compute->backend)) + "'",
               Phase::Execution));
 
-        std::vector<sx::Bytes> task_inputs;
+        std::vector<TensorValue> task_inputs;
         task_inputs.reserve(task->inputs.size());
         for (TensorId in : task->inputs) {
           // Constants (weights/axes/shapes) are baked into the backend's
@@ -133,23 +141,134 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
           values[task->outputs[k].value] = std::move((*res)[k]);
         break;
       }
-      case TaskKind::Transfer:
-        return std::unexpected(RuntimeError(
-            RuntimeErrorCode::TransferFailure,
-            "v0 executor does not implement transfer tasks", Phase::Execution));
-      case TaskKind::Allocate:
-      case TaskKind::Release:
+      case TaskKind::Transfer: {
+        const auto* tr = task->as_transfer();
+        if (!tr)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "transfer task has no transfer payload", Phase::Execution));
+        const MemorySpace* src = plan.find_memory_space(tr->source);
+        const MemorySpace* dst = plan.find_memory_space(tr->destination);
+        const bool src_dev = src && src->kind != MemoryKind::Host;
+        const bool dst_dev = dst && dst->kind != MemoryKind::Host;
+        auto v = values.find(tr->tensor.value);
+        if (v == values.end())
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "transfer task references a missing value", Phase::Execution));
+
+        if (!src_dev && dst_dev) {
+          // Host -> device: upload, drop the host bytes.
+          if (v->second.on_device)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "H2D transfer found an already-device value", Phase::Execution));
+          uint64_t handle = device::acquire(tr->bytes);
+          if (!handle)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "device buffer allocation failed", Phase::Execution));
+          if (!device::upload(v->second.host.data(), handle, tr->bytes)) {
+            device::release(handle, tr->bytes);
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure, "H2D copy failed",
+                Phase::Execution));
+          }
+          values[tr->tensor.value] = TensorValue::from_device(handle, tr->bytes);
+        } else if (src_dev && !dst_dev) {
+          // Device -> host: download, release the device buffer.
+          if (!v->second.on_device)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "D2H transfer found a host value", Phase::Execution));
+          sx::Bytes host(tr->bytes);
+          if (!device::download(v->second.device.handle, host.data(), tr->bytes)) {
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure, "D2H copy failed",
+                Phase::Execution));
+          }
+          device::release(v->second.device.handle, v->second.device.size_bytes);
+          values[tr->tensor.value] = TensorValue::from_host(std::move(host));
+        } else if (src_dev && dst_dev) {
+          // Device -> device: acquire a destination buffer and copy.
+          if (!v->second.on_device)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "D2D transfer found a host value", Phase::Execution));
+          uint64_t handle = device::acquire(tr->bytes);
+          if (!handle)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "device buffer allocation failed", Phase::Execution));
+          if (!device::device_copy(v->second.device.handle, handle, tr->bytes)) {
+            device::release(handle, tr->bytes);
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure, "D2D copy failed",
+                Phase::Execution));
+          }
+          device::release(v->second.device.handle, v->second.device.size_bytes);
+          values[tr->tensor.value] = TensorValue::from_device(handle, tr->bytes);
+        } else {
+          // Host -> host: a plain byte copy (defensive; the v0 planner never
+          // emits this).
+          if (v->second.on_device)
+            return std::unexpected(RuntimeError(
+                RuntimeErrorCode::TransferFailure,
+                "host transfer found a device value", Phase::Execution));
+          sx::Bytes host(tr->bytes);
+          std::memcpy(host.data(), v->second.host.data(), tr->bytes);
+          values[tr->tensor.value] = TensorValue::from_host(std::move(host));
+        }
+        break;
+      }
       case TaskKind::Synchronize:
-        return std::unexpected(RuntimeError(
-            RuntimeErrorCode::BackendFailure,
-            "v0 executor does not implement task kind '" +
-                std::string(task_kind_name(task->kind)) + "'",
-            Phase::Execution));
+        if (!device::synchronize())
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::TransferFailure, "device synchronize failed",
+              Phase::Execution));
+        break;
+      case TaskKind::Allocate: {
+        const auto* al = task->as_allocate();
+        if (!al)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "allocate task has no payload", Phase::Execution));
+        if (allocated.find(al->buffer) != allocated.end())
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "buffer already allocated", Phase::Execution));
+        uint64_t handle = device::acquire(al->size_bytes);
+        if (!handle)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::TransferFailure, "device allocation failed",
+              Phase::Execution));
+        allocated[al->buffer] = handle;
+        break;
+      }
+      case TaskKind::Release: {
+        const auto* rl = task->as_release();
+        if (!rl)
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "release task has no payload", Phase::Execution));
+        auto it = allocated.find(rl->buffer);
+        if (it == allocated.end())
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::InvalidPlan,
+              "release task references an unallocated buffer", Phase::Execution));
+        device::release(it->second, /*bytes=*/0);
+        allocated.erase(it);
+        break;
+      }
     }
   }
 
-  // 6. Gather the graph-output buffers in plan tensor order.
+  // 6. Gather the graph-output buffers in plan tensor order. A device-resident
+  //    output is downloaded to host first (its device buffer is returned to the
+  //    pool). The plan's transfer scheduler normally emits an explicit D2H for
+  //    such outputs; this is a defensive fallback.
   std::vector<sx::Bytes> outputs;
+  outputs.reserve(n_outputs);
   for (const auto& t : plan.tensors)
     if (t.is_graph_output) {
       auto v = values.find(t.id.value);
@@ -157,8 +276,24 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         return std::unexpected(RuntimeError(
             RuntimeErrorCode::InvalidPlan,
             "graph output tensor has no computed value", Phase::Execution));
-      outputs.push_back(std::move(v->second));
+      if (v->second.on_device) {
+        sx::Bytes host(v->second.device.size_bytes);
+        if (!device::download(v->second.device.handle, host.data(),
+                              v->second.device.size_bytes))
+          return std::unexpected(RuntimeError(
+              RuntimeErrorCode::TransferFailure,
+              "graph output D2H failed", Phase::Execution));
+        device::release(v->second.device.handle, v->second.device.size_bytes);
+        v->second = TensorValue::from_host(std::move(host));
+      }
+      outputs.push_back(std::move(v->second.host));
     }
+
+  // 7. Return every still-live device buffer to the pool so the next step's
+  //    working set reuses the same device memory instead of reallocating.
+  for (auto& [id, val] : values)
+    if (val.on_device)
+      device::release(val.device.handle, val.device.size_bytes);
 
   if (outputs.size() != n_outputs)
     return std::unexpected(RuntimeError(

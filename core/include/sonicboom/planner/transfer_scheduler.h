@@ -16,13 +16,18 @@
 
 #pragma once
 
-// v0 transfer scheduler. With a single host memory space and CPU-only compute,
-// no tensor movement between memory spaces is ever required. This stage
-// verifies that invariant: a tensor whose buffer lives in a memory space
-// different from the task that produces/consumes it would require a transfer,
-// which v0 does not implement — such a plan is rejected (UnsupportedCapability)
-// rather than silently scheduled. Otherwise it records zero transfer cost.
+// Transfer scheduler (M3). Walks the plan's execution order and emits explicit
+// Transfer tasks wherever a float32 activation is produced in one memory space
+// but consumed by a compute task in another (host↔device and device↔device).
+// Graph inputs and constants start in the host space; Int64 scalar graph inputs
+// (token id / position) are host metadata that backends read directly, so they
+// are never transferred. A device-resident graph output is downloaded back to
+// the host so the executor returns host bytes. Each transfer is placed in the
+// execution order after its producer and before its consumer, with the consumer
+// gaining a dependency on the transfer; the transfer cost is estimated through
+// the cost model and accumulated into the plan.
 
+#include <sonicboom/planner/cost_model.h>
 #include <sonicboom/planner/execution_plan.h>
 
 #include <expected>
@@ -31,7 +36,12 @@ namespace sonicboom::planner {
 
 class TransferScheduler {
 public:
-  static std::expected<void, PlannerError> schedule(ExecutionPlan& plan);
+  explicit TransferScheduler(const CostModel& cost_model);
+
+  std::expected<void, PlannerError> schedule(ExecutionPlan& plan);
+
+private:
+  const CostModel& cost_model_;
 };
 
 } // namespace sonicboom::planner

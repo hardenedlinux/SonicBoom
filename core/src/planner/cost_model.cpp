@@ -81,9 +81,9 @@ AnalyticalCpuCostModel::estimate_compute(const ComputeRequest& req,
   if (!d)
     return std::unexpected(cost_error("cost model: unknown device " +
                                       std::to_string(device.value)));
-  if (d->kind != DeviceKind::CPU)
+  if (d->kind != DeviceKind::CPU && d->kind != DeviceKind::GPU)
     return std::unexpected(cost_error(
-        "cost model: only CPU compute is estimated in v0 (device '" + d->name +
+        "cost model: only CPU/GPU compute is estimated (device '" + d->name +
         "' is " + device_kind_name(d->kind) + ")"));
   if (req.op == OpKind::WholeGraph)
     return std::unexpected(cost_error(
@@ -94,10 +94,15 @@ AnalyticalCpuCostModel::estimate_compute(const ComputeRequest& req,
         "cost model: device '" + d->name + "' does not support op '" +
         op_kind_name(req.op) + "'"));
 
+  const bool gpu = (d->kind == DeviceKind::GPU);
+  const double base = gpu ? params_.gpu_per_op_base_us : params_.per_op_base_us;
+  const double per_byte =
+      gpu ? params_.gpu_per_output_byte_us : params_.per_output_byte_us;
+  const double factor = gpu ? 1.0 : op_factor(req.op, params_);
+
   ComputeCost c;
-  c.estimated_latency_us = params_.per_op_base_us +
-                           static_cast<double>(req.output_bytes) *
-                               params_.per_output_byte_us * op_factor(req.op, params_);
+  c.estimated_latency_us =
+      base + static_cast<double>(req.output_bytes) * per_byte * factor;
   c.confidence = 0.5;  // analytical estimate, deliberately below 1.0
   if (!c.valid())
     return std::unexpected(cost_error(
@@ -112,13 +117,18 @@ AnalyticalCpuCostModel::estimate_transfer(MemorySpaceId source,
   const MemorySpace* t = snapshot_.find_memory_space(destination);
   if (!s || !t)
     return std::unexpected(cost_error("cost model: unknown memory space"));
-  if (s->kind != MemoryKind::Host || t->kind != MemoryKind::Host)
-    return std::unexpected(cost_error(
-        "cost model: only host↔host transfer is estimated in v0"));
+  const bool s_host = s->kind == MemoryKind::Host;
+  const bool t_host = t->kind == MemoryKind::Host;
 
   TransferCost c;
-  c.fixed_latency_us = params_.host_transfer_fixed_us;
-  c.effective_bandwidth_bytes_per_us = params_.host_bandwidth_bytes_per_us;
+  if (s_host && t_host) {
+    c.fixed_latency_us = params_.host_transfer_fixed_us;
+    c.effective_bandwidth_bytes_per_us = params_.host_bandwidth_bytes_per_us;
+  } else {
+    // host↔device or device↔device: the device transfer estimate.
+    c.fixed_latency_us = params_.device_transfer_fixed_us;
+    c.effective_bandwidth_bytes_per_us = params_.device_bandwidth_bytes_per_us;
+  }
   return c;
 }
 

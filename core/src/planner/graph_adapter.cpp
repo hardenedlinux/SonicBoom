@@ -124,6 +124,9 @@ uint64_t model_fingerprint(const Graph& g) noexcept {
     h.u32(static_cast<uint32_t>(n.attributes.size()));
     for (const auto& a : n.attributes)
       hash_attr(h, a);
+    h.u8(n.backend ? 1 : 0);
+    if (n.backend)
+      h.u8(static_cast<uint8_t>(*n.backend));
     h.str(n.name);
   }
   h.u32(static_cast<uint32_t>(g.inputs.size()));

@@ -1,6 +1,7 @@
 # build outputs
 /build/
 /cmake-build-*/
+/Testing/
 
 # ggml is a git submodule at third_party/ggml (see CMakeLists.txt); its build
 # outputs live under /build/. Nothing to ignore here beyond the generic *.o below.
@@ -59,5 +60,13 @@ design/resnet18.reference.bin
 .DS_Store
 models/
 third_party/native-torch/generated/
+
+# oracle tool build outputs + regenerated reference dumps (tools/oracle/*.sh build them)
+tools/oracle/compare_dumps
+tools/oracle/gemma4_dump
+tools/oracle/llama_bench
+tools/oracle/llama_bench_cuda
+tools/oracle/sonicboom_dump
+*.dump
 
 *.log

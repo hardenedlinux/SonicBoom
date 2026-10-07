@@ -15,11 +15,26 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_generate)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
 endforeach()
+
+# test_dequant optionally diffs against the real Gemma 4 GGUF (skips cleanly
+# when the file is absent). It needs the repository root to locate models/.
+target_compile_definitions(test_dequant PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_gemma4 loads the real Gemma 4 GGUF (skips cleanly when absent); same
+# repository-root requirement for locating models/.
+target_compile_definitions(test_gemma4 PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_generate (autoregressive decode + CUDA-vs-oracle agreement + timing) also
+# needs the repository root to locate models/.
+target_compile_definitions(test_generate PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
@@ -27,6 +42,17 @@ if(SONICBOOM_USE_CUDA)
   add_executable(test_cuda test_cuda.cpp)
   target_link_libraries(test_cuda PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda)
+
+  # CUDA K-quant matvec differential test (CUDA gemv vs scalar CPU reference).
+  add_executable(test_cuda_quant test_cuda_quant.cpp)
+  target_link_libraries(test_cuda_quant PRIVATE sonicboom)
+  sb_add_cpp_test(test_cuda_quant)
+
+  # CUDA elementwise/norm/RoPE/dense-matvec differential test (each nn::cuda::*
+  # kernel vs its CPU reference).
+  add_executable(test_cuda_elementwise test_cuda_elementwise.cpp)
+  target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
+  sb_add_cpp_test(test_cuda_elementwise)
 endif()
 
 # Static execution planner tests (unit + integration). They include only
