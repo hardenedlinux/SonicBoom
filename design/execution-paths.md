@@ -4,6 +4,16 @@ SonicBoom has **two execution paths** that share one compute/planning spine. Thi
 document makes the two paths and their shared spine explicit, maps the current
 code to each, and lists what Path 2 still needs to connect to the spine.
 
+> **Status update (2026-10-07):** this document predates the spine integration
+> ("feat(core): fuse GGUF + Gemma 4 inference into the planner spine" →
+> "feat(gemma4): prefill through the core + v0 benchmark", M4). Since then the
+> transformer operator vocabulary was added to `op_kind.h`, and Gemma 4
+> **decode + prefill now run through the spine** (`generate_spine` /
+> `generate_spine_cuda` in `core/src/model/gemma4_plan.cpp`). The "spine not yet
+> attached" / "operator-vocabulary gap" claims in the sections below are stale.
+> For the current CPU/GPU co-execution state see
+> `design/gemma4-cpu-gpu-coexecution.md`.
+
 ## The two paths
 
 ```text
