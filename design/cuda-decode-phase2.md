@@ -600,7 +600,10 @@ into it, and the two embedding gathers read it back from the device weight —
 the only host round-trip left is the 4-byte token id for the loop bookkeeping.
 This subsection re-runs the §3.1 attribution on a fresh capture and records the
 corrected per-token counts. `decode_step_32 == decode_step_33` still holds
-(2,050 kernels / 207 memcpy / 302 memset on both).
+(2,050 kernels / 207 memcpy / 302 memset on both). The capture below was taken
+with the background `fm.exe` (Football Manager 2023) closed, so the GPU-ns
+columns are **clean** — unlike §3.1's, which the ~3.6 GB VRAM contention inflated
+(GPU kernel time 38.9 ms there → 29.93 ms here, −23 %).
 
 | metric | per token (§3.1) | per token (post-3.2) |
 |---|---:|---:|
@@ -616,32 +619,32 @@ index. The +45 kernels and −42 memsets are fully accounted for below.
 
 | kernel | n | GPU ns |
 |---|---:|---:|
-| quantize_q8_1 | 259 | 1,678,287 |
-| rms_sum_sq_kernel | 211 | 957,495 |
-| rms_inv_kernel | 211 | 472,684 |
-| rms_apply_dev_kernel | 211 | 408,912 |
-| gemv_q3_K_q8_1 | 151 | 14,400,102 |
-| add_kernel | 126 | 241,847 |
-| gemv_q4_K_q8_1 | 104 | 4,425,671 |
-| rms_heads_sum_kernel | 91 | 1,210,865 |
-| rms_heads_inv_kernel | 91 | 196,759 |
-| rms_heads_apply_kernel | 91 | 190,615 |
-| mul_kernel | 84 | 194,231 |
-| gemv_dense_f32_v | 84 | 1,305,192 |
-| gelu_fp16_kernel | 84 | 210,234 |
-| rope_neox_heads_kernel | 66 | 148,536 |
-| cast_fp16_kernel | 48 | 82,428 |
-| scale_kernel | 44 | 76,351 |
-| gemv_reduce_kernel | 42 | 113,627 |
-| decode_attention_kernel | 42 | 9,051,686 |
-| gemv_q5_K_q8_1 | 4 | 207,929 |
+| quantize_q8_1 | 259 | 1,662,863 |
+| rms_sum_sq_kernel | 211 | 959,313 |
+| rms_inv_kernel | 211 | 467,454 |
+| rms_apply_dev_kernel | 211 | 405,591 |
+| gemv_q3_K_q8_1 | 151 | 10,984,565 |
+| add_kernel | 126 | 242,585 |
+| gemv_q4_K_q8_1 | 104 | 4,420,895 |
+| rms_heads_sum_kernel | 91 | 1,206,256 |
+| rms_heads_inv_kernel | 91 | 192,993 |
+| rms_heads_apply_kernel | 91 | 190,011 |
+| mul_kernel | 84 | 182,937 |
+| gemv_dense_f32_v | 84 | 1,293,840 |
+| gelu_fp16_kernel | 84 | 205,278 |
+| rope_neox_heads_kernel | 66 | 145,055 |
+| cast_fp16_kernel | 48 | 82,143 |
+| scale_kernel | 44 | 76,002 |
+| gemv_reduce_kernel | 42 | 102,141 |
+| decode_attention_kernel | 42 | 6,523,805 |
+| gemv_q5_K_q8_1 | 4 | 214,299 |
 | layer_combine_kernel | 1 | 2,240 |
-| gemv_bf16_v | 1 | 263,828 |
-| gather_q4_K_row | 1 | 6,239 |
-| gather_q3_K_row | 1 | 4,032 |
-| cast_bf16_kernel | 1 | 1,760 |
-| argmax_kernel | 1 | 79,516 |
-| **total** | **2,050** | **35,931,066** |
+| gemv_bf16_v | 1 | 279,228 |
+| gather_q4_K_row | 1 | 6,496 |
+| gather_q3_K_row | 1 | 4,063 |
+| cast_bf16_kernel | 1 | 1,792 |
+| argmax_kernel | 1 | 79,006 |
+| **total** | **2,050** | **29,930,851** |
 
 The +45 kernels vs §3.1 split into two independent causes:
 
@@ -653,15 +656,29 @@ The +45 kernels vs §3.1 split into two independent causes:
   layer's `inp_gate` dense gemv, the deterministic two-phase reduction described
   above.
 
-(GPU-ns columns are as noisy as §3.1's — the same `fm.exe` VRAM contention —
-and are listed only for reference; the counts are structural.)
+### Clean timing, one decode step (fm.exe closed)
+
+| metric | §3.1 (contended) | post-3.2 (clean) |
+|---|---:|---:|
+| GPU kernel time | 38.9 ms | **29.93 ms** |
+| memcpy + memset GPU time | 0.8 ms | **0.60 ms** |
+| host step wall | 49.2 ms | **37.99 ms** |
+| in-step GPU util | ≈ 81 % | ≈ 80 % |
+| `[spine-cuda]` tok/s (nsys) | 20.5 | **24.12** |
+
+The ~9 ms GPU-time drop is the fm.exe contention, not a code change. What
+remains is the real Phase 3 target: 37.99 ms host wall − 30.53 ms GPU busy =
+**7.46 ms idle gap (19.6 %)** per step — the host orchestration between kernels,
+not GPU-bound. The three quantized gemvs (q3 10.98 + q4 4.42 + q5 0.21 ms) +
+attention (6.52 ms) + quantize (1.66 ms) = 23.79 ms ≈ 79 % of GPU time —
+compute, not orchestration.
 
 ### memcpy by direction after 3.2 (one decode step)
 
 | direction | n | bytes | GPU ns |
 |---|---:|---:|---:|
-| DtoD | 206 | 741,380 | 357,491 |
-| DtoH | 1 | 4 | 1,792 |
+| DtoD | 206 | 741,380 | 358,806 |
+| DtoH | 1 | 4 | 1,600 |
 | HtoD | 0 | 0 | 0 |
 
 The DtoD count is 205 → 206 (the extra 4-byte device copy from the argmax output
