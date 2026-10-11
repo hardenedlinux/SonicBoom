@@ -16,6 +16,7 @@
 
 #include <sonicboom/planner/backend.h>
 
+#include <functional>
 #include <utility>
 
 namespace sonicboom::planner {
@@ -26,6 +27,22 @@ RuntimeError backend_error(const sx::ExecError& e) {
   return RuntimeError(RuntimeErrorCode::BackendFailure, e.message,
                       Phase::Execution);
 }
+
+// CPU StepProgram: a recorded step is just its step body, re-executed in order
+// on each replay. CPU work is synchronous, so sync() is a no-op and replay()
+// returns the step body's success.
+class CpuStepProgram final : public hal::StepProgram {
+ public:
+  explicit CpuStepProgram(std::function<bool()> step_fn)
+      : step_(std::move(step_fn)) {}
+
+  bool replay() override { return step_ ? step_() : false; }
+  bool sync() override { return true; }  // replay() is already synchronous
+  bool valid() const override { return static_cast<bool>(step_); }
+
+ private:
+  std::function<bool()> step_;
+};
 
 } // namespace
 
@@ -71,6 +88,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> CpuBackend::execute(
   for (auto& b : outputs)
     result.push_back(TensorValue::from_host(std::move(b)));
   return result;
+}
+
+std::unique_ptr<hal::StepProgram> CpuBackend::record_step(
+    std::function<bool()> step_fn) {
+  if (!step_fn) return nullptr;
+  return std::make_unique<CpuStepProgram>(std::move(step_fn));
 }
 
 } // namespace sonicboom::planner

@@ -83,6 +83,13 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // CPU HAL command seam: "recording" a step keeps the step body and re-runs it
+  // sequentially on each replay (there is no host-side capture — CPU work is
+  // synchronous and has no launch overhead to amortize). This is the CPU analog
+  // of the CUDA backend's pre-recorded graph, satisfying the same interface.
+  std::unique_ptr<hal::StepProgram> record_step(
+      std::function<bool()> step_fn) override;
+
 private:
   explicit CpuBackend(std::unique_ptr<sx::Executable> exe);
   std::unique_ptr<sx::Executable> exe_;
