@@ -18,6 +18,8 @@
 
 #include "cuda_resident.h"
 
+#include "../nn/cuda_stream.h"
+
 #include <cuda_runtime.h>
 
 #include <sm_32_intrinsics.h>  // __vsub4
@@ -55,6 +57,9 @@
 namespace sonicboom::quant::cuda {
 
 namespace {
+
+// Current stream for device-resident kernels (see cuda_stream.h).
+inline cudaStream_t cur_stream() { return ::sonicboom::cuda::sb_current_stream(); }
 
 // --- device helpers (mirror core/src/quant/dequant.cpp) --------------------
 
@@ -886,13 +891,13 @@ bool launch_gather_row(const uint8_t* w, int64_t row_host, const float* row_dev,
   const int grid = (width + 255) / 256;
   switch (type) {
     case QuantType::Q3_K:
-      gather_q3_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
+      gather_q3_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q4_K:
-      gather_q4_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
+      gather_q4_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q5_K:
-      gather_q5_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
+      gather_q5_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     default:
       return false;
@@ -957,13 +962,13 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
     const dim3 grid(1, (num_rows + 7) / 8);
     switch (qt) {
       case QuantType::Q3_K:
-        gemv_q3_K_coop<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_rows);
+        gemv_q3_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q4_K:
-        gemv_q4_K_coop<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_rows);
+        gemv_q4_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q5_K:
-        gemv_q5_K_coop<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_rows);
+        gemv_q5_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
     }
   } else {
@@ -973,13 +978,13 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
     const dim3 grid((num_blocks + 255) / 256);
     switch (qt) {
       case QuantType::Q3_K:
-        gemv_q3_K_base<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_blocks);
+        gemv_q3_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q4_K:
-        gemv_q4_K_base<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_blocks);
+        gemv_q4_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q5_K:
-        gemv_q5_K_base<<<grid, block>>>(wp, xp, yp, blocks_per_row, num_blocks);
+        gemv_q5_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
     }
   }
@@ -1004,19 +1009,19 @@ bool launch_gemv_q8_1(QuantType qt, const uint8_t* wp, const float* xp, float* y
       grow_scratch(g_q8, g_q8_bytes, nblocks * sizeof(q8_1::block_q8_1)));
   if (!d_q8) return false;
 
-  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256>>>(xp, d_q8, int(nblocks));
+  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
 
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
   switch (qt) {
     case QuantType::Q3_K:
-      q8_1::gemv_q3_K_q8_1<<<grid, block>>>(wp, d_q8, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
       break;
     case QuantType::Q4_K:
-      q8_1::gemv_q4_K_q8_1<<<grid, block>>>(wp, d_q8, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
       break;
     case QuantType::Q5_K:
-      q8_1::gemv_q5_K_q8_1<<<grid, block>>>(wp, d_q8, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
       break;
   }
   return cudaGetLastError() == cudaSuccess;
@@ -1126,7 +1131,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   const int ic = int(cols), ir = int(rows);
   for (int c = 0; c < n; ++c) {
-    gather_col<<<(ic + 255) / 256, 256>>>(X, col, ic, n, c);
+    gather_col<<<(ic + 255) / 256, 256, 0, cur_stream()>>>(X, col, ic, n, c);
     // Same activation-quantization gate as matvec_f32_dev (n == 1): prefill and
     // decode must use the same quantization for the same weights, or the KV cache
     // is built from a different numerical source and the continuation diverges.
@@ -1134,7 +1139,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
       launch_gemv_q8_1(W.type(), wp, col, row, int(blocks_per_row), ir);
     else
       launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
-    scatter_col<<<(ir + 255) / 256, 256>>>(row, Y, ir, n, c);
+    scatter_col<<<(ir + 255) / 256, 256, 0, cur_stream()>>>(row, Y, ir, n, c);
   }
   return cudaGetLastError() == cudaSuccess;
 }

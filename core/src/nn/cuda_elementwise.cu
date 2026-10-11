@@ -17,6 +17,7 @@
 #include <sonicboom/nn/cuda_elementwise.h>
 
 #include "cuda_resident.h"
+#include "cuda_stream.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -42,6 +43,9 @@
 namespace sonicboom::nn::cuda {
 
 namespace {
+
+// Current stream for device-resident kernels (see cuda_stream.h).
+inline cudaStream_t cur_stream() { return ::sonicboom::cuda::sb_current_stream(); }
 
 // --- device helpers ---------------------------------------------------------
 
@@ -817,7 +821,7 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
     return false;
   if (cudaMemset(g_sum, 0, sizeof(double)) != cudaSuccess) return false;
 
-  rms_sum_sq_kernel<<<1, 256>>>(static_cast<const float*>(d_x), int(n), g_sum);
+  rms_sum_sq_kernel<<<1, 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), int(n), g_sum);
   if (cudaGetLastError() != cudaSuccess) return false;
   double sum = 0.0;
   if (cudaMemcpy(&sum, g_sum, sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess)
@@ -826,7 +830,7 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
   // Reproduce the CPU's mean/rsqrt in double (mean) then float (sqrt/recip),
   // matching norm.cpp bit-for-bit.
   const float inv = 1.0f / std::sqrt(float(sum / double(n)) + eps);
-  rms_apply_kernel<<<grid_for(int(n)), 256>>>(static_cast<const float*>(d_x), d_w,
+  rms_apply_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), d_w,
                                               int(n), inv, static_cast<float*>(d_y));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, n * sizeof(float), cudaMemcpyDeviceToHost) ==
@@ -842,7 +846,7 @@ bool gelu_fp16(std::span<const float> x, std::span<float> y) {
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  gelu_fp16_kernel<<<grid_for(int(n)), 256>>>(static_cast<const float*>(d_x),
+  gelu_fp16_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x),
                                               static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, n * sizeof(float), cudaMemcpyDeviceToHost) ==
@@ -860,7 +864,7 @@ bool mul(std::span<const float> a, std::span<const float> b, std::span<float> y)
   if (cudaMemcpy(d_a, a.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(d_b, b.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  mul_kernel<<<grid_for(int(n)), 256>>>(static_cast<const float*>(d_a),
+  mul_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_a),
                                         static_cast<const float*>(d_b),
                                         static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -879,7 +883,7 @@ bool add(std::span<const float> a, std::span<const float> b, std::span<float> y)
   if (cudaMemcpy(d_a, a.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(d_b, b.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  add_kernel<<<grid_for(int(n)), 256>>>(static_cast<const float*>(d_a),
+  add_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_a),
                                         static_cast<const float*>(d_b),
                                         static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -896,7 +900,7 @@ bool scale(std::span<const float> x, float s, std::span<float> y) {
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  scale_kernel<<<grid_for(int(n)), 256>>>(static_cast<const float*>(d_x), s,
+  scale_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), s,
                                           static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, n * sizeof(float), cudaMemcpyDeviceToHost) ==
@@ -910,7 +914,7 @@ bool cast_fp16(std::span<float> v) {
   if (!d_v) return false;
   if (cudaMemcpy(d_v, v.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  cast_fp16_kernel<<<grid_for(int(n)), 256>>>(static_cast<float*>(d_v), int(n));
+  cast_fp16_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<float*>(d_v), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(v.data(), d_v, n * sizeof(float), cudaMemcpyDeviceToHost) ==
          cudaSuccess;
@@ -938,7 +942,7 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base, float freq_sc
     return false;
 
   const float log_base = std::log(theta_base);  // matches CPU's float(std::log(base))
-  rope_neox_kernel<<<grid_for(int(half)), 256>>>(static_cast<float*>(d_x), int(half),
+  rope_neox_kernel<<<grid_for(int(half)), 256, 0, cur_stream()>>>(static_cast<float*>(d_x), int(half),
                                                  int(n), pos, freq_scale, log_base, d_ff);
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(x.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost) ==
@@ -969,7 +973,7 @@ bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
     return false;
 
   const float log_base = std::log(theta_base);
-  rope_neox_heads_kernel<<<grid_for(int(n)), 256>>>(
+  rope_neox_heads_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(
       static_cast<float*>(d_x), int(head_dim), int(n), pos, freq_scale, log_base,
       d_ff);
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -997,19 +1001,19 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)r * k_split * sizeof(float)));
       if (!partial) return false;
-      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const float*>(d_w), static_cast<const float*>(d_x),
           partial, int(cols), r, k_split);
-      gemv_reduce_kernel<<<grid_for(r), 256>>>(partial,
+      gemv_reduce_kernel<<<grid_for(r), 256, 0, cur_stream()>>>(partial,
                                                static_cast<float*>(d_y), r,
                                                k_split);
     } else {
-      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const float*>(d_w), static_cast<const float*>(d_x),
           static_cast<float*>(d_y), int(cols), r, k_split);
     }
   } else {
-    gemv_dense_f32<<<grid_for(int(rows)), 256>>>(static_cast<const float*>(d_w),
+    gemv_dense_f32<<<grid_for(int(rows)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_w),
                                                  static_cast<const float*>(d_x),
                                                  static_cast<float*>(d_y), int(cols),
                                                  int(rows));
@@ -1039,19 +1043,19 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)r * k_split * sizeof(float)));
       if (!partial) return false;
-      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
           partial, int(cols), r, k_split);
-      gemv_reduce_kernel<<<grid_for(r), 256>>>(partial,
+      gemv_reduce_kernel<<<grid_for(r), 256, 0, cur_stream()>>>(partial,
                                                static_cast<float*>(d_y), r,
                                                k_split);
     } else {
-      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
           static_cast<float*>(d_y), int(cols), r, k_split);
     }
   } else {
-    gemv_bf16<<<grid_for(int(rows)), 256>>>(static_cast<const uint16_t*>(d_w),
+    gemv_bf16<<<grid_for(int(rows)), 256, 0, cur_stream()>>>(static_cast<const uint16_t*>(d_w),
                                             static_cast<const float*>(d_x),
                                             static_cast<float*>(d_y), int(cols), int(rows));
   }
@@ -1088,7 +1092,7 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
           cudaSuccess)
     return false;
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
-  flash_attention_kernel<<<(unsigned)n_q, (unsigned)(n_heads_q * 32), smem>>>(
+  flash_attention_kernel<<<(unsigned)n_q, (unsigned)(n_heads_q * 32), smem, cur_stream()>>>(
       static_cast<const float*>(d_q), static_cast<const float*>(d_k),
       static_cast<const float*>(d_v), (int)n_kv, (int)n_heads_q, (int)n_heads_kv,
       (int)head_dim, sliding_window, scale, static_cast<float*>(d_o));
@@ -1117,12 +1121,12 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     return false;
   if (!g_inv && cudaMalloc(reinterpret_cast<void**>(&g_inv), sizeof(float)) != cudaSuccess)
     return false;
-  if (cudaMemset(g_sum, 0, sizeof(double)) != cudaSuccess) return false;
-  rms_sum_sq_kernel<<<1, 256>>>(x, n, g_sum);
+  if (cudaMemsetAsync(g_sum, 0, sizeof(double), cur_stream()) != cudaSuccess) return false;
+  rms_sum_sq_kernel<<<1, 256, 0, cur_stream()>>>(x, n, g_sum);
   if (cudaGetLastError() != cudaSuccess) return false;
-  rms_inv_kernel<<<1, 1>>>(g_sum, n, eps, g_inv);
+  rms_inv_kernel<<<1, 1, 0, cur_stream()>>>(g_sum, n, eps, g_inv);
   if (cudaGetLastError() != cudaSuccess) return false;
-  rms_apply_dev_kernel<<<grid_for(n), 256>>>(x, d_w, n, g_inv, y);
+  rms_apply_dev_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_w, n, g_inv, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1148,55 +1152,55 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
       return false;
     g_head_cap = heads;
   }
-  if (cudaMemset(g_head_sum, 0, heads * sizeof(double)) != cudaSuccess) return false;
+  if (cudaMemsetAsync(g_head_sum, 0, heads * sizeof(double), cur_stream()) != cudaSuccess) return false;
   const int n = head_dim * heads;
-  rms_heads_sum_kernel<<<grid_for(heads), 256>>>(x, head_dim, heads, g_head_sum);
+  rms_heads_sum_kernel<<<grid_for(heads), 256, 0, cur_stream()>>>(x, head_dim, heads, g_head_sum);
   if (cudaGetLastError() != cudaSuccess) return false;
-  rms_heads_inv_kernel<<<grid_for(heads), 256>>>(g_head_sum, head_dim, eps, g_head_inv, heads);
+  rms_heads_inv_kernel<<<grid_for(heads), 256, 0, cur_stream()>>>(g_head_sum, head_dim, eps, g_head_inv, heads);
   if (cudaGetLastError() != cudaSuccess) return false;
-  rms_heads_apply_kernel<<<grid_for(n), 256>>>(x, d_w, head_dim, heads, g_head_inv, y);
+  rms_heads_apply_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_w, head_dim, heads, g_head_inv, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool gelu_fp16_dev(const float* x, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  gelu_fp16_kernel<<<grid_for(n), 256>>>(x, y, n);
+  gelu_fp16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool mul_dev(const float* a, const float* b, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !a || !b || !y) return false;
-  mul_kernel<<<grid_for(n), 256>>>(a, b, y, n);
+  mul_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool add_dev(const float* a, const float* b, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !a || !b || !y) return false;
-  add_kernel<<<grid_for(n), 256>>>(a, b, y, n);
+  add_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool scale_dev(const float* x, float s, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  scale_kernel<<<grid_for(n), 256>>>(x, s, y, n);
+  scale_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, s, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool cast_fp16_dev(float* v, int n) {
   if (!available()) return false;
   if (n <= 0 || !v) return false;
-  cast_fp16_kernel<<<grid_for(n), 256>>>(v, n);
+  cast_fp16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(v, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool cast_bf16_dev(float* v, int n) {
   if (!available()) return false;
   if (n <= 0 || !v) return false;
-  cast_bf16_kernel<<<grid_for(n), 256>>>(v, n);
+  cast_bf16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(v, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1215,7 +1219,7 @@ bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
     if (!d_ff) return false;
   }
   const float log_base = std::log(base);
-  rope_neox_heads_kernel<<<grid_for(n), 256>>>(x, head_dim, n, pos, freq_scale, log_base, d_ff);
+  rope_neox_heads_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, head_dim, n, pos, freq_scale, log_base, d_ff);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1233,15 +1237,15 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)rows * k_split * sizeof(float)));
       if (!partial) return false;
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      gemv_reduce_kernel<<<grid_for(rows), 256>>>(partial, y, rows, k_split);
+      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    gemv_dense_f32<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+    gemv_dense_f32<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1260,15 +1264,15 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)rows * k_split * sizeof(float)));
       if (!partial) return false;
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      gemv_reduce_kernel<<<grid_for(rows), 256>>>(partial, y, rows, k_split);
+      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    gemv_bf16<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+    gemv_bf16<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1277,7 +1281,7 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
   if (!available()) return false;
   if (n_q <= 0 || n_kv <= 0 || head_dim <= 0 || !src || !dst) return false;
   const int n = n_q * head_dim;
-  gqa_broadcast_kernel<<<grid_for(n), 256>>>(src, dst, n_q, n_kv, head_dim);
+  gqa_broadcast_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(src, dst, n_q, n_kv, head_dim);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1313,10 +1317,10 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
   const size_t smem = (size_t)group_q * chunk * sizeof(float);
   decode_attention_split_kernel<<<(unsigned)(n_chunks * (uint64_t)n_heads_kv),
-                                  group_q * 32, smem>>>(
+                                  group_q * 32, smem, cur_stream()>>>(
       q, k_cache, v_cache, start, n_keys, n_slots, chunk, n_heads_q, n_heads_kv,
       head_dim, scale, partial);
-  decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim>>>(
+  decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim, 0, cur_stream()>>>(
       partial, (int)n_chunks, n_heads_q, head_dim, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1333,7 +1337,7 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
   if (head_dim % 32 != 0 || head_dim > 512) return false;
   if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
-  flash_attention_kernel<<<n_q, n_heads_q * 32, smem>>>(
+  flash_attention_kernel<<<n_q, n_heads_q * 32, smem, cur_stream()>>>(
       q, k, v, n_kv, n_heads_q, n_heads_kv, head_dim, sliding_window, scale,
       out);
   return cudaGetLastError() == cudaSuccess;
@@ -1343,7 +1347,7 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
                        float combine_scale, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !proj || !ple || !y) return false;
-  layer_combine_kernel<<<grid_for(n), 256>>>(proj, ple, ple_scale, combine_scale,
+  layer_combine_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(proj, ple, ple_scale, combine_scale,
                                              y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1351,7 +1355,7 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
 bool argmax_dev(const float* x, int n, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !out) return false;
-  argmax_kernel<<<1, 1024>>>(x, out, n);
+  argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

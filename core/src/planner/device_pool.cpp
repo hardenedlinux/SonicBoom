@@ -20,6 +20,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "../nn/cuda_stream.h"
+
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -118,11 +120,23 @@ bool download(uint64_t handle, void* host, uint64_t bytes) {
 bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (src == 0 || dst == 0 || bytes == 0) return false;
-  return cudaMemcpy(reinterpret_cast<void*>(dst),
-                    reinterpret_cast<const void*>(src), bytes,
-                    cudaMemcpyDeviceToDevice) == cudaSuccess;
+  return cudaMemcpyAsync(reinterpret_cast<void*>(dst),
+                         reinterpret_cast<const void*>(src), bytes,
+                         cudaMemcpyDeviceToDevice,
+                         sonicboom::cuda::sb_current_stream()) == cudaSuccess;
 #else
   (void)src; (void)dst; (void)bytes;
+  return false;
+#endif
+}
+
+bool memset_device(uint64_t handle, int value, uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (handle == 0 || bytes == 0) return false;
+  return cudaMemsetAsync(reinterpret_cast<void*>(handle), value, bytes,
+                         sonicboom::cuda::sb_current_stream()) == cudaSuccess;
+#else
+  (void)handle; (void)value; (void)bytes;
   return false;
 #endif
 }

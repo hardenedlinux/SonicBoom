@@ -47,6 +47,11 @@ bool upload(const void* host, uint64_t handle, uint64_t bytes);      // H2D
 bool download(uint64_t handle, void* host, uint64_t bytes);          // D2H
 bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes);        // D2D
 
+// Zero-fill a device buffer. Runs on the current stream (see
+// core/src/nn/cuda_stream.h), so it is capturable into a CUDA Graph. On the
+// legacy default stream this is synchronous, matching the old cudaMemset.
+bool memset_device(uint64_t handle, int value, uint64_t bytes);
+
 // Block until all device work is complete.
 bool synchronize();
 
