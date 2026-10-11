@@ -5,8 +5,10 @@
 // build). Measures the internal quant::cuda::matvec_f32_dev kernel in isolation
 // — NOT end-to-end tok/s — across the Gemma 4 E4B-it matmul shapes, so we can
 // see how much of the decode-time cost is the dequantize-on-the-fly gemv and how
-// it scales with (cols, rows, blocks_per_row). The model is Q3_K_M, so Q3_K is
-// the headline; Q4_K/Q5_K are swept at the FFN shapes for reference only.
+// it scales with (cols, rows, blocks_per_row). Each tensor is timed at its
+// ACTUAL GGUF quant type (Unsloth Q3_K_M: q3_K for q/k/gate/up, q4_K for
+// o/v/down), and every line reports effective bandwidth (GB/s = weight bytes /
+// kernel time).
 //
 // Per-shape it (1) times the device-resident kernel with CUDA events using an
 // adaptive iteration count (the first call's one-time weight upload is excluded
@@ -87,22 +89,31 @@ double compare(std::span<const float> got, std::span<const float> ref) {
 
 struct Shape {
   const char* name;
-  uint64_t cols;   // contiguous / inner dim (W.dims()[0])
-  uint64_t rows;   // output dim (W.dims()[1])
-  int count;       // occurrences per decoder block
+  uint64_t cols;              // contiguous / inner dim (W.dims()[0])
+  uint64_t rows;              // output dim (W.dims()[1])
+  sbquant::QuantType type;    // actual GGUF quant type (dominant block type)
+  int count;                  // occurrences per decoder block
+  bool mixed;                 // true when blocks 0-1 are q5_K (Unsloth Q3_K_M)
 };
 
-// Gemma 4 E4B-it matmul shapes (d=2560, ff=10240, n_heads_q=8, n_heads_kv=2).
+// Gemma 4 E4B-it matmul shapes (d=2560, ff=10240, n_heads_q=8, n_heads_kv=2,
+// head_dim=256 for the 24 SWA layers 0-23) with the ACTUAL per-tensor GGUF
+// quant type read from models/gemma-4-E4B-it-Q3_K_M.gguf (Unsloth Q3_K_M):
+//   token_embd / attn_q / attn_k / ffn_gate / ffn_up = q3_K
+//   per_layer_token_embd / attn_output / attn_v / ffn_down = q4_K
+//   attn_v / ffn_down are q5_K in blocks 0-1 (mixed = true), q4_K elsewhere.
 const Shape kShapes[] = {
-    {"ffn_gate_up", 2560, 10240, 2},  // gate + up  (ff=10240)
-    {"ffn_down", 10240, 2560, 1},     // down       (2560→10240→2560)
-    {"attn_q", 2560, 2048, 1},        // q proj     (8 heads × 256)
-    {"attn_o", 2048, 2560, 1},        // o proj
-    {"attn_kv", 2560, 512, 2},        // k + v proj (2 kv heads × 256)
+    {"ffn_gate", 2560, 10240, sbquant::QuantType::Q3_K, 1, false},
+    {"ffn_up", 2560, 10240, sbquant::QuantType::Q3_K, 1, false},
+    {"ffn_down", 10240, 2560, sbquant::QuantType::Q4_K, 1, true},
+    {"attn_q", 2560, 2048, sbquant::QuantType::Q3_K, 1, false},
+    {"attn_k", 2560, 512, sbquant::QuantType::Q3_K, 1, false},
+    {"attn_v", 2560, 512, sbquant::QuantType::Q4_K, 1, true},
+    {"attn_output", 2048, 2560, sbquant::QuantType::Q4_K, 1, false},
 };
 
-void run(const Shape& s, sbquant::QuantType type, std::mt19937& rng,
-         std::vector<double>& us_out) {
+// Returns steady-state kernel time in µs/call (0.0 on failure).
+double run(const Shape& s, sbquant::QuantType type, std::mt19937& rng) {
   const char* tname =
       type == sbquant::QuantType::Q3_K ? "Q3_K" :
       type == sbquant::QuantType::Q4_K ? "Q4_K" : "Q5_K";
@@ -112,8 +123,7 @@ void run(const Shape& s, sbquant::QuantType type, std::mt19937& rng,
   if (!W.valid()) {
     std::printf("  %-14s [%6llu, %6llu] %s  INVALID\n", s.name,
                 (unsigned long long)s.cols, (unsigned long long)s.rows, tname);
-    us_out.push_back(0.0);
-    return;
+    return 0.0;
   }
 
   std::vector<float> x(s.cols), y(s.rows), y_ref(s.rows);
@@ -123,8 +133,7 @@ void run(const Shape& s, sbquant::QuantType type, std::mt19937& rng,
   if (!sbquant::matvec_f32(W, x, y_ref)) {
     std::printf("  %-14s [%6llu, %6llu] %s  CPU ref FAILED\n", s.name,
                 (unsigned long long)s.cols, (unsigned long long)s.rows, tname);
-    us_out.push_back(0.0);
-    return;
+    return 0.0;
   }
 
   float *dx = nullptr, *dy = nullptr;
@@ -162,16 +171,24 @@ void run(const Shape& s, sbquant::QuantType type, std::mt19937& rng,
   cudaMemcpy(y.data(), dy, s.rows * sizeof(float), cudaMemcpyDeviceToHost);
   const double err = compare(y, y_ref);
 
-  std::printf("  %-14s [%6llu, %6llu] %5s %7llu blk  %10.2f us  err %10.2e\n",
-              s.name, (unsigned long long)s.cols, (unsigned long long)s.rows,
-              tname, (unsigned long long)W.num_blocks(), us_per_call, err);
+  // Effective bandwidth: the packed weight bytes this gemv actually reads
+  // (num_blocks × bytes_per_block), over the measured kernel time. This is the
+  // number to compare against the card's ~224 GB/s DRAM ceiling (or ~half of it
+  // for a single-pass read-modify), not the unquantized f32 traffic.
+  const double weight_bytes =
+      double(W.num_blocks()) * double(sbquant::quant_type_info(type)->bytes_per_block);
+  const double gbs = weight_bytes / (us_per_call * 1e-6) / 1e9;
 
-  us_out.push_back(us_per_call);
+  std::printf("  %-14s [%6llu, %6llu] %5s %7llu blk  %10.2f us  %8.1f GB/s  err %10.2e\n",
+              s.name, (unsigned long long)s.cols, (unsigned long long)s.rows,
+              tname, (unsigned long long)W.num_blocks(), us_per_call, gbs, err);
 
   cudaEventDestroy(e0);
   cudaEventDestroy(e1);
   cudaFree(dx);
   cudaFree(dy);
+
+  return us_per_call;
 }
 
 } // namespace
@@ -184,32 +201,36 @@ int main() {
 
   std::mt19937 rng(0xC0FFEE);
 
-  std::printf("== Q3_K (model format) ==\n");
-  std::vector<double> q3;
-  q3.reserve(5);
-  for (int i = 0; i < 5; ++i) run(kShapes[i], sbquant::QuantType::Q3_K, rng, q3);
+  const int N = int(sizeof(kShapes) / sizeof(kShapes[0]));
 
-  std::printf("== Q4_K / Q5_K (reference, FFN shapes only) ==\n");
-  std::vector<double> q4, q5;
-  q4.reserve(2);
-  q5.reserve(2);
-  for (int i = 0; i < 2; ++i) {  // ffn_gate_up, ffn_down
-    run(kShapes[i], sbquant::QuantType::Q4_K, rng, q4);
-    run(kShapes[i], sbquant::QuantType::Q5_K, rng, q5);
-  }
+  std::printf("== per-tensor quant types (read from the GGUF) ==\n");
+  std::vector<double> us(N, 0.0);
+  std::vector<double> q5_us(N, -1.0);
+  for (int i = 0; i < N; ++i) us[i] = run(kShapes[i], kShapes[i].type, rng);
 
-  // Per-token cost: 42 decoder blocks × Σ(count_i × t_i). If every shape was
-  // timed, this is the steady-state gemv time a single decode step spends in
-  // K-quant matmuls (before the lm_head / attention kernel / norm overheads).
+  // q5_K reference for the two mixed-precision tensors (their blocks 0-1 are
+  // q5_K in Unsloth Q3_K_M, q4_K elsewhere).
+  std::printf("== q5_K reference (attn_v / ffn_down blocks 0-1 variant) ==\n");
+  for (int i = 0; i < N; ++i)
+    if (kShapes[i].mixed) q5_us[i] = run(kShapes[i], sbquant::QuantType::Q5_K, rng);
+
+  // Per-token K-quant gemv time = 42 decoder blocks × Σ(count_i × t_i), with the
+  // two mixed tensors (attn_v, ffn_down) at q5_K in blocks 0-1 and q4_K in
+  // blocks 2-41 (40×q4_K + 2×q5_K per tensor). This is the steady-state gemv
+  // time one decode step spends in K-quant matmuls (before lm_head / attention
+  // / norm overheads).
   double per_token_us = 0.0;
   bool all_timed = true;
-  for (int i = 0; i < 5; ++i) {
-    if (q3[i] <= 0.0) all_timed = false;
-    per_token_us += double(kShapes[i].count) * q3[i];
+  for (int i = 0; i < N; ++i) {
+    if (us[i] <= 0.0) all_timed = false;
+    double per_block_us = double(kShapes[i].count) * us[i];
+    if (kShapes[i].mixed && q5_us[i] > 0.0)
+      per_block_us = double(kShapes[i].count) * (40.0 * us[i] + 2.0 * q5_us[i]) / 42.0;
+    per_token_us += per_block_us;
   }
   per_token_us *= 42.0;
   if (all_timed) {
-    std::printf("\nQ3_K gemv total per token: %.0f us (%.2f ms)\n", per_token_us,
+    std::printf("\nK-quant gemv total per token: %.0f us (%.2f ms)\n", per_token_us,
                 per_token_us / 1000.0);
   } else {
     std::printf("\n(some shapes failed to time; per-token total omitted)\n");
