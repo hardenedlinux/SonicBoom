@@ -398,41 +398,33 @@ __global__ void rms_norm_fused_kernel(const float* __restrict__ x,
     y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
 }
 
-// Per-head sum-of-squares, one thread per head accumulating in double in
-// ascending index order — bit-identical to the CPU rms_norm_heads sequential
-// double sum (norm.cpp).
-__global__ void rms_heads_sum_kernel(const float* __restrict__ x, int head_dim,
-                                     int heads, double* __restrict__ sums) {
-  const int h = blockIdx.x * blockDim.x + threadIdx.x;
-  if (h >= heads) return;
-  const float* __restrict__ xh = x + (size_t)h * head_dim;
-  double s = 0.0;
-  for (int i = 0; i < head_dim; ++i) {
-    const float v = xh[i];
-    s += double(v * v);
-  }
-  sums[h] = s;
-}
-
-__global__ void rms_heads_inv_kernel(const double* __restrict__ sums, int head_dim,
-                                     float eps, float* __restrict__ inv, int heads) {
-  const int h = blockIdx.x * blockDim.x + threadIdx.x;
-  if (h >= heads) return;
-  const double s = sums[h];
-  inv[h] = 1.0f / sqrtf(float(double(s) / double(head_dim)) + eps);
-}
-
-__global__ void rms_heads_apply_kernel(const float* __restrict__ x,
+// Per-head rms_norm fused (T4): one block per head. Thread 0 computes the
+// sequential double sum-of-squares in ascending index order (bit-identical to
+// the CPU rms_norm_heads in norm.cpp), derives inv = 1/sqrtf(float(sum/head_dim)
+// + eps), and the whole block applies the normalization. Replaces the
+// sum + inv + apply three-kernel launch (and its g_head_sum/g_head_inv device
+// scratch buffers); the apply is elementwise so spreading it across the block
+// does not change the result.
+__global__ void rms_heads_fused_kernel(const float* __restrict__ x,
                                        const float* __restrict__ weight,
-                                       int head_dim, int heads,
-                                       const float* __restrict__ inv,
+                                       int head_dim, float eps,
                                        float* __restrict__ y) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  const int n = head_dim * heads;
-  if (i >= n) return;
-  const int h = i / head_dim;
-  const float iv = inv[h];
-  y[i] = weight ? x[i] * iv * weight[i % head_dim] : x[i] * iv;
+  const int h = blockIdx.x;
+  const float* __restrict__ xh = x + (size_t)h * head_dim;
+  float* __restrict__ yh = y + (size_t)h * head_dim;
+  __shared__ float inv;
+  if (threadIdx.x == 0) {
+    double s = 0.0;
+    for (int i = 0; i < head_dim; ++i) {
+      const float v = xh[i];
+      s += double(v * v);
+    }
+    inv = 1.0f / sqrtf(float(s / double(head_dim)) + eps);
+  }
+  __syncthreads();
+  const float iv = inv;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+    yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
 }
 
 // GQA broadcast for n_k == 1 attention: dst[hq*d + i] = src[kv_h*d + i],
@@ -758,9 +750,6 @@ size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
-double* g_head_sum = nullptr;   // device-resident per-head rms_norm sums (double)
-float* g_head_inv = nullptr;   // device-resident per-head rms_norm inv
-int g_head_cap = 0;            // number of heads allocated for g_head_sum/inv
 
 bool g_available_checked = false;
 bool g_available = false;
@@ -1208,25 +1197,9 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
     d_w = static_cast<const float*>(upload_bytes(weight.data(), head_dim * sizeof(float)));
     if (!d_w) return false;
   }
-  if (heads > g_head_cap) {
-    if (g_head_sum) cudaFree(g_head_sum);
-    if (g_head_inv) cudaFree(g_head_inv);
-    g_head_sum = nullptr;
-    g_head_inv = nullptr;
-    g_head_cap = 0;
-    if (cudaMalloc(reinterpret_cast<void**>(&g_head_sum), heads * sizeof(double)) != cudaSuccess)
-      return false;
-    if (cudaMalloc(reinterpret_cast<void**>(&g_head_inv), heads * sizeof(float)) != cudaSuccess)
-      return false;
-    g_head_cap = heads;
-  }
-  if (cudaMemsetAsync(g_head_sum, 0, heads * sizeof(double), cur_stream()) != cudaSuccess) return false;
-  const int n = head_dim * heads;
-  rms_heads_sum_kernel<<<grid_for(heads), 256, 0, cur_stream()>>>(x, head_dim, heads, g_head_sum);
-  if (cudaGetLastError() != cudaSuccess) return false;
-  rms_heads_inv_kernel<<<grid_for(heads), 256, 0, cur_stream()>>>(g_head_sum, head_dim, eps, g_head_inv, heads);
-  if (cudaGetLastError() != cudaSuccess) return false;
-  rms_heads_apply_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_w, head_dim, heads, g_head_inv, y);
+  // One block per head; thread 0 reduces the sum, the block applies. head_dim
+  // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
+  rms_heads_fused_kernel<<<heads, 256, 0, cur_stream()>>>(x, d_w, head_dim, eps, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
