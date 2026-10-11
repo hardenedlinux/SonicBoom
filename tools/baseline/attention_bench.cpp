@@ -67,19 +67,34 @@ double compare(const std::vector<float>& got, const std::vector<float>& ref) {
   return worst;
 }
 
+// max_abs and rms of the elementwise error (got[i] - ref[i]).
+void abs_rms(const std::vector<float>& got, const std::vector<float>& ref,
+             double& max_abs, double& rms) {
+  max_abs = 0.0;
+  double ssq = 0.0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    const double e = double(got[i]) - double(ref[i]);
+    max_abs = std::max(max_abs, std::fabs(e));
+    ssq += e * e;
+  }
+  rms = std::sqrt(ssq / double(ref.size()));
+}
+
 struct Config {
   const char* name;
   int head_dim;
   uint64_t sliding_window;
+  std::vector<uint64_t> pos_list;
 };
 
 void run(const Config& cfg) {
   const int n_heads_q = 8, n_heads_kv = 2;
-  const uint64_t pos_list[] = {32, 64, 128, 256, 512, 1024};
+  const auto& pos_list = cfg.pos_list;
 
   std::printf("== %s (head_dim=%d, sliding_window=%llu) ==\n", cfg.name, cfg.head_dim,
               (unsigned long long)cfg.sliding_window);
-  std::printf("  %6s | %8s | %10s | %13s\n", "pos", "n_keys", "us/call", "worst_rel_err");
+  std::printf("  %6s | %8s | %10s | %11s | %11s | %13s\n", "pos", "n_keys", "us/call",
+              "max_abs", "rms", "worst_rel_err");
 
   cudaEvent_t e0, e1;
   cudaEventCreate(&e0);
@@ -144,9 +159,12 @@ void run(const Config& cfg) {
 
     cudaMemcpy(out.data(), dout, q_n * sizeof(float), cudaMemcpyDeviceToHost);
     const double err = compare(out, ref);
+    double max_abs = 0.0, rms = 0.0;
+    abs_rms(out, ref, max_abs, rms);
 
-    std::printf("  %6llu | %8llu | %10.2f | %13.2e\n", (unsigned long long)pos,
-                (unsigned long long)n_keys, us_per_call, err);
+    std::printf("  %6llu | %8llu | %10.2f | %11.2e | %11.2e | %13.2e\n",
+                (unsigned long long)pos, (unsigned long long)n_keys, us_per_call,
+                max_abs, rms, err);
 
     cudaFree(dq);
     cudaFree(dk);
@@ -165,7 +183,9 @@ int main() {
     std::printf("attention_bench SKIP (no CUDA device)\n");
     return 0;
   }
-  run({"SWA", 256, 512});
-  run({"global", 512, 0});
+  // SWA: ring-buffer wraparound boundary (n_slots == sliding_window == 512) and
+  // a post-wrap position; global: full-sequence decode out to 4096.
+  run({"SWA", 256, 512, {32, 64, 128, 256, 511, 512, 513, 1000}});
+  run({"global", 512, 0, {32, 64, 128, 256, 512, 1024, 2048, 4096}});
   return 0;
 }
