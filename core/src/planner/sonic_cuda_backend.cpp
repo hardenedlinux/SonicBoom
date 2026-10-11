@@ -355,6 +355,24 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
       break;
     }
+    case OpKind::Quantize: {
+      // f32 activation -> q8_1 (quantize-once, T1). The input is a plain f32
+      // tensor; its element count is the input byte size / sizeof(float). The
+      // output buffer is f32-sized (a superset of the q8_1 bytes), so the q8_1
+      // blocks are packed into its front.
+      const int n = int(in[0].device.size_bytes / sizeof(float));
+      ok = quant::cuda::quantize_q8_1_dev(
+          dev(in[0]), reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n / 32);
+      break;
+    }
+    case OpKind::QuantizedMatmulQ8: {
+      // K-quant gemv against a pre-quantized q8_1 activation (T1): no internal
+      // quantize; blocks_per_row / num_rows come from the weight.
+      ok = quant::cuda::gemv_q8_1_dev(
+          qweight(slot), reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])),
+          out);
+      break;
+    }
     case OpKind::MatvecF32: {
       const int cols = int(in[0].device.size_bytes / sizeof(float));
       ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);

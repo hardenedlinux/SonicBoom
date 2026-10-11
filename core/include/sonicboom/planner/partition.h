@@ -59,6 +59,8 @@ inline BackendTag route_op(OpKind op) noexcept {
     // plan emitter (e.g. the Gemma 4 decode graph); it exists so the routing
     // seam stays total over OpKind.
     case OpKind::QuantizedMatmul:
+    case OpKind::Quantize:
+    case OpKind::QuantizedMatmulQ8:
     case OpKind::RmsNorm:
     case OpKind::RmsNormHeads:
     case OpKind::GeluFp16:

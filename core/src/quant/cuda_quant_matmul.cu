@@ -997,9 +997,60 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
 // quantize x to q8_1 and run the dp4a warp-per-row kernels. SONICBOOM_GEMV_F32=1
 // restores the fp32 base/coop hybrid for differential testing against the CPU
 // reference (the fp32 path is the exact dequant arithmetic).
-bool g_q8_enabled() {
+bool q8_1_enabled() noexcept {
   static const bool v = std::getenv("SONICBOOM_GEMV_F32") == nullptr;
   return v;
+}
+
+// The warp-per-row dp4a gemv against a *pre-quantized* q8_1 activation. Shared
+// by launch_gemv_q8_1 (quantize + gemv in one call) and gemv_q8_1_dev (the
+// quantize-once path, where the activation is already a q8_1 tensor).
+void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
+                                     const q8_1::block_q8_1* xq, float* yp,
+                                     int blocks_per_row, int num_rows) {
+  const dim3 block(32, 8);
+  const dim3 grid(1, (num_rows + 7) / 8);
+  switch (qt) {
+    case QuantType::Q3_K:
+      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      break;
+    case QuantType::Q4_K:
+      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      break;
+    case QuantType::Q5_K:
+      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      break;
+  }
+}
+
+// Quantize x -> q8_1 into `yq` (nblocks blocks, nblocks == n / 32). The
+// quantize-once seam: exposed so the CUDA backend can run a planner-inserted
+// explicit Quantize node whose output is shared by several gemvs.
+bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
+  if (!available() || !x || !yq || nblocks <= 0) return false;
+  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(
+      x, reinterpret_cast<q8_1::block_q8_1*>(yq), nblocks);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// The K-quant gemv against a pre-quantized q8_1 activation — no internal
+// quantize. W is uploaded+cached exactly as matvec_f32_dev.
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (!xq || !y) return false;
+  const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  const uint8_t* wp = static_cast<const uint8_t*>(d_w);
+  launch_gemv_q8_1_from_quantized(
+      W.type(), wp, reinterpret_cast<const q8_1::block_q8_1*>(xq), y,
+      int(blocks_per_row), int(rows));
+  return cudaGetLastError() == cudaSuccess;
 }
 
 // Quantize x -> q8_1 (int8 + per-32-block scale) into the device scratch, then
@@ -1014,19 +1065,7 @@ bool launch_gemv_q8_1(QuantType qt, const uint8_t* wp, const float* xp, float* y
 
   q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
 
-  const dim3 block(32, 8);
-  const dim3 grid(1, (num_rows + 7) / 8);
-  switch (qt) {
-    case QuantType::Q3_K:
-      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
-      break;
-    case QuantType::Q4_K:
-      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
-      break;
-    case QuantType::Q5_K:
-      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, d_q8, yp, blocks_per_row, num_rows);
-      break;
-  }
+  launch_gemv_q8_1_from_quantized(qt, wp, d_q8, yp, blocks_per_row, num_rows);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1061,7 +1100,7 @@ bool matvec_f32(const QuantizedTensor& W, std::span<const float> x,
   cudaEventCreate(&ev0);
   cudaEventCreate(&ev1);
   cudaEventRecord(ev0);
-  if (g_q8_enabled())
+  if (q8_1_enabled())
     launch_gemv_q8_1(W.type(), wp, xp, yp, int(blocks_per_row), num_rows);
   else
     launch_gemv(W.type(), wp, xp, yp, int(blocks_per_row), num_rows);
@@ -1099,7 +1138,7 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
   if (!d_w) return false;
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   const int num_rows = int(rows);
-  if (g_q8_enabled())
+  if (q8_1_enabled())
     return launch_gemv_q8_1(W.type(), wp, x, y, int(blocks_per_row), num_rows);
   launch_gemv(W.type(), wp, x, y, int(blocks_per_row), num_rows);
   return cudaGetLastError() == cudaSuccess;
@@ -1138,7 +1177,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
     // Same activation-quantization gate as matvec_f32_dev (n == 1): prefill and
     // decode must use the same quantization for the same weights, or the KV cache
     // is built from a different numerical source and the continuation diverges.
-    if (g_q8_enabled())
+    if (q8_1_enabled())
       launch_gemv_q8_1(W.type(), wp, col, row, int(blocks_per_row), ir);
     else
       launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);

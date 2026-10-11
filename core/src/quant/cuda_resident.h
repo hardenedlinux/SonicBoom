@@ -34,6 +34,26 @@ namespace sonicboom::quant::cuda {
 // floats, zero-initialized before accumulation). No host copies.
 bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 
+// One q8_1 activation block: an fp32 scale `d` and 32 int8 quants (amax/127
+// quantization, == llama.cpp's quantize_q8_1). Layout-identical to the .cu
+// kernel's block struct; a pure POD so it needs no CUDA includes.
+struct BlockQ8_1 {
+  float d;
+  int8_t qs[32];
+};
+
+// Quantize-once (T1): x -> q8_1 into `yq` (nblocks blocks, nblocks == n / 32).
+// Separated from the gemv so the planner can hoist the activation quantization
+// into an explicit Quantize node and CSE identical quantizations (h feeding
+// q/k/v, f feeding up/gate). Device in/out, no host copies.
+bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
+
+// The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
+// quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
+// blocks_per_row / num_rows are derived from W, so the caller passes only the
+// weight and the q8_1 pointer.
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y);
+
 // Y = W @ X (batched, the prefill shape), device in/out. X is device
 // [cols, n] row-major (n innermost), Y is device [rows, n] (n innermost).
 // n == 1 falls back to matvec_f32_dev. No host copies.

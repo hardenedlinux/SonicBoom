@@ -40,6 +40,13 @@ namespace sonicboom::quant::cuda {
 // True when a usable CUDA device is present (cached after the first call).
 bool available() noexcept;
 
+// True when the q8_1 mmvq decode path is active (the default).
+// SONICBOOM_GEMV_F32=1 disables it and restores the fp32 gemv for differential
+// testing against the CPU reference. Graph rewrites that introduce q8_1-only
+// nodes (the T1 quantize-once pass) gate on this so the fp32 fallback path
+// stays reachable.
+bool q8_1_enabled() noexcept;
+
 // y = W @ x for a single-column activation, computed on the device. W's packed
 // bytes are uploaded on first use and cached keyed by (data pointer, byte
 // size), so repeated calls with the same weight reuse the device copy. x and y

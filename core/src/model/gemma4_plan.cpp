@@ -21,6 +21,7 @@
 #include <sonicboom/planner/cost_model.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/resource.h>
+#include <sonicboom/planner/rewrites.h>
 #include <sonicboom/planner/runtime_executor.h>
 #include <sonicboom/planner/sonic_backend.h>
 #include <sonicboom/planner/sonic_cuda_backend.h>
@@ -28,6 +29,7 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <nvToolsExt.h>
+#include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
 #include <chrono>
@@ -707,6 +709,12 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const auto t_plan0 = std::chrono::steady_clock::now();
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
+  // T1 quantize-once: extract the activation quantize from each K-quant gemv
+  // into a shared explicit Quantize node (CUDA-only; the CPU reference keeps the
+  // unfused QuantizedMatmul path with its q8_K semantics). Gated on q8_1 so the
+  // SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
+  if (quant::cuda::q8_1_enabled())
+    planner::quantize_once_pass(graph);
 
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
@@ -886,6 +894,12 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
+  // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
+  // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
+  // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
+  if (quant::cuda::q8_1_enabled())
+    planner::quantize_once_pass(graph);
+
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);

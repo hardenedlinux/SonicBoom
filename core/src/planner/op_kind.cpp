@@ -37,6 +37,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Softmax;
   if (name == "quantized_matmul")
     return OpKind::QuantizedMatmul;
+  if (name == "quantize")
+    return OpKind::Quantize;
+  if (name == "quantized_matmul_q8")
+    return OpKind::QuantizedMatmulQ8;
   if (name == "rms_norm")
     return OpKind::RmsNorm;
   if (name == "rms_norm_heads")
@@ -110,6 +114,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Softmax: return "softmax";
     case OpKind::WholeGraph: return "whole_graph";
     case OpKind::QuantizedMatmul: return "quantized_matmul";
+    case OpKind::Quantize: return "quantize";
+    case OpKind::QuantizedMatmulQ8: return "quantized_matmul_q8";
     case OpKind::RmsNorm: return "rms_norm";
     case OpKind::RmsNormHeads: return "rms_norm_heads";
     case OpKind::GeluFp16: return "gelu_fp16";

@@ -46,6 +46,8 @@ enum class OpKind : uint8_t {
   // node-level operator the SonicBackend dispatches to a named nn::* / quant::*
   // kernel; the mapping below is the shared vocabulary, not the routing.
   QuantizedMatmul,  // K-quant matvec (quant::matvec)
+  Quantize,         // activation -> q8_1 (explicit quantize-once node, CUDA)
+  QuantizedMatmulQ8, // K-quant matvec consuming a pre-quantized q8_1 activation
   RmsNorm,          // nn::rms_norm
   RmsNormHeads,     // nn::rms_norm_heads (per-head, in place)
   GeluFp16,         // nn::gelu_fp16
