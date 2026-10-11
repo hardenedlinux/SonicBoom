@@ -401,6 +401,51 @@ Assessment for the split:
   if it does, the obstacle and options are recorded here and the step stops for
   review rather than force-proceeding (per the directive).
 
+### 3.2.1 Recorded obstacle (Step 4, commit `2e5680c`)
+
+Step 4 Deliverable 1 (CUDA-OFF build + clean ctest) is **done**: the
+`SONICBOOM_USE_CUDA=OFF` core builds with no CUDA runtime dependency (`ldd` clean
+— no cudart/cublas/cusolver/cufft/nvrtc) and `ctest` passes 45/45 with the CUDA
+tests compiled out.
+
+Deliverable 2 (CUDA backend → `libsonicboom-backend-cuda.so`, dlopen'd) is
+**blocked before any code is written**, at two places:
+
+1. **The `aten_core` split is a native-torch build restructure gated by the
+   un-established migration manifest.** `aten_core` is today one static library
+   that folds the CUDA sources in via `if(SONICBOOM_USE_CUDA)` source-list
+   appends (Layer A `c10/cuda/*.cpp`, Layer B `ATen/cuda/*.{cpp,cu}`, Layer C
+   `native/cuda/*.{cu,cpp}`) — there is no separate CUDA target, and **no
+   `ExcludedKernelsStubs` mechanism exists in the current tree** (the plan above
+   assumed it; the CPU-only build actually just omits the CUDA globs and lets the
+   dispatcher report "no kernel" for a CUDA dispatch key that cannot be reached
+   without a CUDA device). Splitting means restructuring
+   `third_party/native-torch/CMakeLists.txt` into `aten_core` (CPU-only) +
+   `aten_core_cuda` (the CUDA globs + `RegisterCUDA*` generated files) — a
+   native-torch modification not covered by `design/native-torch-migration.md`
+   (which does not yet exist). Per the migration rules this needs an explicit
+   scope amendment, not a silent expansion.
+2. **The plugin ABI/discovery (§2.3/§2.4) is not built, and the executor is not
+   routed through it.** The Step 1 HAL is the minimal `Backend::execute()` /
+   `record_step()` + `hal::Buffer`/`hal::Allocator`/`hal::StepProgram`; there is
+   no `sonicboom_backend_register`, no dlopen, no `enumerate_devices()`.
+   `gemma4_plan.cpp`'s `generate_spine_cuda`/`generate_prefill_spine_cuda`
+   directly `#include` and instantiate `SonicCudaBackend` (a public-tree class,
+   §1.1) and orchestrate raw CUDA via `cuda_block.cpp`/`cuda_graph.h`/
+   `cuda_stream.h`/`device_pool.cpp`, all compiled into the core under
+   `#ifdef SONICBOOM_USE_CUDA`. The split also requires moving `SonicCudaBackend`
+   out of the public Layer 2 tree and routing the CUDA path through runtime
+   discovery.
+
+Options (decision required):
+
+- **A. Amend the migration scope** to authorize the `aten_core` → CPU+CUDA target
+  restructure, then implement the plugin ABI and re-plumb the executor.
+- **B. Defer the plugin split** to a follow-up step; treat the CUDA-OFF build as
+  the Step 4 deliverable and proceed to the final report.
+- **C. Partial split** (SonicBoom-owned CUDA only, native-torch CUDA stays in
+  core) — does not satisfy "no CUDA refs in core when ON"; ruled out.
+
 The SonicBoom-owned CUDA sources (`.cu` kernels, `sonic_cuda_backend.cpp`,
 `cuda_block.cpp`, `cuda_stream.h`, `cuda_graph.h`) move wholesale into the CUDA
 plugin; they are not part of the core link at all once the HAL is in place.
@@ -440,6 +485,8 @@ Ordered, each step independently buildable/testable:
    dlopen'd; `SONICBOOM_USE_CUDA=OFF` build with no CUDA references and clean
    `ctest` (CUDA tests skipped). Resolve the §3.2 native-torch split; stop and
    report if it hits an obstacle.
+   **Status (commit `2e5680c`):** Deliverable 1 done (CUDA-OFF build clean);
+   Deliverable 2 blocked — see §3.2.1. Awaiting the amendment decision.
 
 ## 5. Open questions / deferred
 
