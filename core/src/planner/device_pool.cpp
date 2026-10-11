@@ -109,6 +109,11 @@ bool upload(const void* host, uint64_t handle, uint64_t bytes) {
 bool download(uint64_t handle, void* host, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (!host || handle == 0 || bytes == 0) return false;
+  // A synchronous cudaMemcpy cannot be recorded into a CUDA graph. Under
+  // capture (see cuda::CaptureScope) skip the copy: the caller recovers the
+  // result from a persistent device slot after replay, so the graph records
+  // only the capturable device work.
+  if (sonicboom::cuda::sb_capturing()) return true;
   return cudaMemcpy(host, reinterpret_cast<const void*>(handle), bytes,
                     cudaMemcpyDeviceToHost) == cudaSuccess;
 #else

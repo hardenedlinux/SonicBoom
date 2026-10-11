@@ -65,6 +65,18 @@ public:
   // an input to a capturable graph rather than a per-kernel launch argument.
   bool set_pos(uint64_t pos);
 
+  // Download the current token id from the persistent device-resident `token_dev_`
+  // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
+  // argmax result without the executor's host-output path (which is a synchronous
+  // cudaMemcpy and therefore not capturable). The synchronous D2H also serves as
+  // the replay's completion barrier.
+  bool read_token(float* host) const;
+
+  // Block until all device work completes (cudaDeviceSynchronize-equivalent via
+  // the device pool). Used to drain the warm-up step before capture so the
+  // recorded kernels never race the warm kernels on their shared scratch.
+  bool synchronize() const;
+
   // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
   // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
   // matching the CUDA spine's matvec_f32_dev) + flash attention

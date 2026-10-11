@@ -28,6 +28,8 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <nvToolsExt.h>
+#include "../nn/cuda_graph.h"
+#include "../nn/cuda_stream.h"
 #endif
 
 #include <chrono>
@@ -744,41 +746,110 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // the token id never round-trips through the host.
   cuda_backend.seed_token(start_token);
 
-  for (; step < tokens.size(); ++step) {
-    std::vector<sx::Bytes> in;
-    in.push_back(encode_i64(token));
-    in.push_back(encode_i64(pos));
-
-    // Stage the position into the device slot read by RoPE / KV-append /
-    // attention (Phase 3.2 B4 / CUDA Graphs): the kernels read it in-kernel.
-    cuda_backend.set_pos(pos);
-
-    // NVTX step marker: brackets one decode step so nsys can isolate the
-    // steady-state per-token window (instead of dividing whole-run totals).
-    const std::string step_name = "decode_step_" + std::to_string(step);
-    if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
-    auto res = exec.execute(*plan, *snap, in);
-    if (nvtx_enabled()) nvtxRangePop();
-    if (!res || res->outputs.empty()) {
-      if (!res)
-        std::cerr << "[spine] step " << step << " execute failed: "
-                  << res.error().message << "\n";
-      else
-        std::cerr << "[spine] step " << step << " no outputs\n";
-      break;
+  // --- CUDA Graph capture (CUDA Graphs) -------------------------------------
+  // Replace the ~2600 per-step device-op launches (each a host-side launch call)
+  // with a single cudaGraphLaunch. Opt-out via SONICBOOM_CUDA_GRAPHS=0; any
+  // capture failure falls back to the per-step dispatch path below, so the graph
+  // is a pure launch-overhead optimization with no numerics change.
+  const bool use_graphs =
+      std::getenv("SONICBOOM_CUDA_GRAPHS") == nullptr ||
+      std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
+  sonicboom::cuda::GraphStep graph_step;
+  bool graph_ok = false;
+  if (use_graphs) {
+    // Warm one real step so every device-pool buffer, kernel scratch buffer and
+    // weight upload is allocated before capture (cudaMalloc / synchronous
+    // cudaMemcpy cannot be recorded into a graph). The capture pass only records.
+    {
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+      cuda_backend.set_pos(pos);
+      auto res = exec.execute(*plan, *snap, in);
+      if (res) {
+        cuda_backend.synchronize();
+        // The warm step's Argmax overwrote the token slot; reset it so the first
+        // replay gathers the same start token the warm step did (the warm K/V
+        // append at this position is overwritten by the first replay's append).
+        cuda_backend.seed_token(start_token);
+        if (graph_step.begin()) {
+          bool captured = false;
+          {
+            sonicboom::cuda::CaptureScope cap;
+            sonicboom::cuda::StreamScope ss(graph_step.stream());
+            std::vector<sx::Bytes> cin;
+            cin.push_back(encode_i64(token));
+            cin.push_back(encode_i64(pos));
+            auto cres = exec.execute(*plan, *snap, cin);
+            captured = cres.has_value();
+          }
+          graph_ok = captured && graph_step.end();
+        }
+      }
     }
-    const sx::Bytes& arg = res->outputs[0];
-    if (arg.size() < sizeof(float)) {
-      std::cerr << "[spine] step " << step << " argmax too small: " << arg.size()
-                << " < " << sizeof(float) << "\n";
-      break;
+  }
+
+  if (graph_ok) {
+    // Replay the captured step: stage the position, launch the graph, read the
+    // winning token back from the persistent device slot. The synchronous D2H
+    // read also drains the graph stream before the next step.
+    for (; step < tokens.size(); ++step) {
+      const std::string step_name = "decode_step_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
+      cuda_backend.set_pos(pos);
+      if (!graph_step.replay()) {
+        if (nvtx_enabled()) nvtxRangePop();
+        std::cerr << "[spine] step " << step << " graph replay failed\n";
+        break;
+      }
+      float next_f = -1.0f;
+      cuda_backend.read_token(&next_f);
+      if (nvtx_enabled()) nvtxRangePop();
+      const int64_t next = int64_t(next_f);
+      if (next < 0) break;
+      tokens[step] = next;
+      token = static_cast<uint64_t>(next);
+      ++pos;
+      if (step == 0) t_first = std::chrono::steady_clock::now();
     }
-    const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
-    if (next < 0) break;
-    tokens[step] = next;
-    token = static_cast<uint64_t>(next);
-    ++pos;
-    if (step == 0) t_first = std::chrono::steady_clock::now();
+  } else {
+    // Fallback: per-step executor dispatch (the pre-graph decode path).
+    for (; step < tokens.size(); ++step) {
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+
+      // Stage the position into the device slot read by RoPE / KV-append /
+      // attention (Phase 3.2 B4 / CUDA Graphs): the kernels read it in-kernel.
+      cuda_backend.set_pos(pos);
+
+      // NVTX step marker: brackets one decode step so nsys can isolate the
+      // steady-state per-token window (instead of dividing whole-run totals).
+      const std::string step_name = "decode_step_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
+      auto res = exec.execute(*plan, *snap, in);
+      if (nvtx_enabled()) nvtxRangePop();
+      if (!res || res->outputs.empty()) {
+        if (!res)
+          std::cerr << "[spine] step " << step << " execute failed: "
+                    << res.error().message << "\n";
+        else
+          std::cerr << "[spine] step " << step << " no outputs\n";
+        break;
+      }
+      const sx::Bytes& arg = res->outputs[0];
+      if (arg.size() < sizeof(float)) {
+        std::cerr << "[spine] step " << step << " argmax too small: "
+                  << arg.size() << " < " << sizeof(float) << "\n";
+        break;
+      }
+      const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
+      if (next < 0) break;
+      tokens[step] = next;
+      token = static_cast<uint64_t>(next);
+      ++pos;
+      if (step == 0) t_first = std::chrono::steady_clock::now();
+    }
   }
 
   if (gen_timing) {

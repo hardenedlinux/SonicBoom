@@ -125,6 +125,15 @@ bool SonicCudaBackend::set_pos(uint64_t pos) {
   return device::upload(&pos, pos_dev_, sizeof(uint64_t));
 }
 
+bool SonicCudaBackend::read_token(float* host) const {
+  if (!token_dev_ || !host) return false;
+  return device::download(token_dev_, host, sizeof(float));
+}
+
+bool SonicCudaBackend::synchronize() const {
+  return device::synchronize();
+}
+
 void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
   const uint32_t n_kv = model_.config.n_layer_kv();
   caches_.clear();

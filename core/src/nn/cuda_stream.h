@@ -51,4 +51,24 @@ class StreamScope {
   cudaStream_t prev_;
 };
 
+inline bool& sb_capturing() {
+  static thread_local bool b = false;
+  return b;
+}
+
+// RAII: mark the current thread as capturing a CUDA graph for the scope. Under
+// capture the device pool's synchronous D2H download becomes a no-op (a
+// synchronous cudaMemcpy cannot be recorded into a graph); the caller recovers
+// the result from a persistent device slot after replay instead.
+class CaptureScope {
+ public:
+  CaptureScope() : prev_(sb_capturing()) { sb_capturing() = true; }
+  ~CaptureScope() { sb_capturing() = prev_; }
+  CaptureScope(const CaptureScope&) = delete;
+  CaptureScope& operator=(const CaptureScope&) = delete;
+
+ private:
+  bool prev_;
+};
+
 }  // namespace sonicboom::cuda

@@ -972,7 +972,10 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
         break;
     }
   } else {
-    cudaMemset(yp, 0, (size_t)num_rows * sizeof(float));
+    // Zero-fill on the current stream so the base (atomic-accumulate) gemv is
+    // capturable into a CUDA graph; the synchronous cudaMemset would otherwise
+    // break capture. Ordered before the gemv kernels on the same stream.
+    cudaMemsetAsync(yp, 0, (size_t)num_rows * sizeof(float), cur_stream());
     const int num_blocks = num_rows * blocks_per_row;
     const dim3 block(256);
     const dim3 grid((num_blocks + 255) / 256);
