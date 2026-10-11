@@ -30,6 +30,7 @@
 #include <nvToolsExt.h>
 #endif
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -702,6 +703,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
 
+  const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
+  const auto t_plan0 = std::chrono::steady_clock::now();
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -730,6 +733,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       exec.set_task_backend(task.id, &cpu_backend);
   }
 
+  const auto t_loop0 = std::chrono::steady_clock::now();
+  auto t_first = t_loop0;
   uint64_t token = start_token;
   uint64_t pos = start_pos;
   uint64_t step = 0;
@@ -763,6 +768,22 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
     ++pos;
+    if (step == 0) t_first = std::chrono::steady_clock::now();
+  }
+
+  if (gen_timing) {
+    using ms = std::chrono::duration<double, std::milli>;
+    const auto t_loop1 = std::chrono::steady_clock::now();
+    const double plan_ms = ms(t_loop0 - t_plan0).count();
+    const double loop_ms = ms(t_loop1 - t_loop0).count();
+    const double first_ms = ms(t_first - t_loop0).count();
+    const double rest_ms = loop_ms - first_ms;
+    std::cerr << "[cuda-timing] plan " << plan_ms << " ms | decode " << loop_ms
+              << " ms / " << step << " steps ("
+              << (loop_ms > 0 ? step * 1000.0 / loop_ms : 0.0)
+              << " tok/s) | first " << first_ms << " ms | steady "
+              << (rest_ms > 0 && step > 1 ? (step - 1) * 1000.0 / rest_ms : 0.0)
+              << " tok/s (excl plan+first)\n";
   }
   return step;
 }
