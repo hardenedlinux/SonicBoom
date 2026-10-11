@@ -575,13 +575,20 @@ three separate kernels is the single biggest per-layer contributor** and the
 obvious fusion target for §3.4 (sum_sq + inv + apply → one kernel, and
 norm→q8_1 quantize).
 
-### Split-K `atomicAdd` flakiness (pre-existing, not a 3.1 regression)
+### Split-K `atomicAdd` flakiness — RESOLVED (deterministic two-phase reduction)
 
 Isolating the decode step surfaced a test-stability issue: the live-vs-live CUDA
 checks in `test_generate` (`generate(Cuda)` routes, `prefill(Cuda)`,
-`generate_prompt(Cuda)`) fail ~1 run in 3 because the split-K gemv's `atomicAdd`
-accumulation order shifts with host timing. Verified at HEAD (no NVTX): 5 runs →
-1× "2 checks", 6 runs → 2× "1–3 checks". The golden/CPU checks stay green; only
-comparisons of two independently-run CUDA streams flake. This is orthogonal to
-Phase 3 orchestration and is the reason the NVTX markers are opt-in.
+`generate_prompt(Cuda)`) failed ~1 run in 3 because the split-K **dense** gemv's
+`atomicAdd` accumulation order shifted with host timing. The K-quant path was
+already deterministic (q8_1 dp4a is the default); the flake came from
+`gemv_dense_f32_v` / `gemv_bf16_v` (the `inp_gate` shape: 256 rows → k_split 4).
+
+Fixed by replacing the float `atomicAdd` with a deterministic two-phase
+reduction: each split chunk writes its own partial (`dst[row*k_split+chunk]`),
+and a second `gemv_reduce_kernel` sums the chunks in fixed order. Verified with
+50 consecutive `test_generate` runs — 50/50 green, uniform token stream. The
+NVTX opt-in rationale (avoid perturbing the atomic order) no longer applies to
+correctness; markers remain opt-in only to keep host timing out of the nsys
+measurement window.
 

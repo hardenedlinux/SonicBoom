@@ -239,14 +239,17 @@ __global__ void gemv_bf16(const uint16_t* __restrict__ W, const float* __restric
 // --- vectorized warp-per-row dense gemv (Phase 2.3b) ------------------------
 //
 // Each warp computes a partial dot over a contiguous chunk of one row's
-// float4/uint4 vectors, then __shfl-reduces. `k_split` warps cooperate per row
-// (k_split == 1 => direct write; k_split > 1 => atomicAdd into a zeroed y), so
-// the few-row shapes (inp_gate, 256 rows) still fill the SMs. W and x must be
-// 16-byte aligned; cols must be a multiple of 4 (f32) / 8 (bf16).
+// float4/uint4 vectors, then __shfl-reduces. `k_split` warps cooperate per row:
+// each chunk writes its partial into `dst[row * k_split + chunk]` (no atomics),
+// and a second `gemv_reduce_kernel` sums the chunks in fixed chunk order so the
+// accumulation order is deterministic across runs. k_split == 1 => dst == y and
+// chunk 0 writes y[row] directly. The few-row shapes (inp_gate, 256 rows) still
+// fill the SMs. W and x must be 16-byte aligned; cols must be a multiple of 4
+// (f32) / 8 (bf16).
 
 __global__ void gemv_dense_f32_v(const float* __restrict__ W,
                                  const float* __restrict__ x,
-                                 float* __restrict__ y, int cols, int rows,
+                                 float* __restrict__ dst, int cols, int rows,
                                  int k_split) {
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
@@ -271,15 +274,13 @@ __global__ void gemv_dense_f32_v(const float* __restrict__ W,
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-  if (lane == 0) {
-    if (k_split == 1) y[row] = acc;
-    else atomicAdd(&y[row], acc);
-  }
+  if (lane == 0) dst[(size_t)row * k_split + chunk] = acc;
 }
 
 __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
-                            const float* __restrict__ x, float* __restrict__ y,
-                            int cols, int rows, int k_split) {
+                            const float* __restrict__ x,
+                            float* __restrict__ dst, int cols, int rows,
+                            int k_split) {
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int row = warp_id / k_split;
@@ -311,10 +312,20 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
-  if (lane == 0) {
-    if (k_split == 1) y[row] = acc;
-    else atomicAdd(&y[row], acc);
-  }
+  if (lane == 0) dst[(size_t)row * k_split + chunk] = acc;
+}
+
+// Second phase of the split-K dense gemv: sum each row's `k_split` partial
+// chunks in fixed order (chunk 0, 1, ...) into y[row]. Deterministic by
+// construction — no atomics, no scheduling-dependent accumulation order.
+__global__ void gemv_reduce_kernel(const float* __restrict__ partial,
+                                   float* __restrict__ y, int rows, int k_split) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) return;
+  const float* p = partial + (size_t)row * k_split;
+  float acc = 0.0f;
+  for (int c = 0; c < k_split; ++c) acc += p[c];
+  y[row] = acc;
 }
 
 // --- device-resident rms_norm reduction (no D2H of the sum) -----------------
@@ -612,6 +623,8 @@ void* g_dy = nullptr;
 size_t g_dy_bytes = 0;
 void* g_dff = nullptr;
 size_t g_dff_bytes = 0;
+void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k_split floats)
+size_t g_partial_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
 float* g_inv = nullptr;        // device-resident rms_norm inv scalar
 double* g_head_sum = nullptr;   // device-resident per-head rms_norm sums (double)
@@ -913,12 +926,22 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
   if ((cols & 3) == 0) {
     const int r = int(rows);
     const int k_split = gemv_k_split(r);
-    if (k_split > 1 &&
-        cudaMemsetAsync(d_y, 0, rows * sizeof(float)) != cudaSuccess)
-      return false;
-    gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
-        static_cast<const float*>(d_w), static_cast<const float*>(d_x),
-        static_cast<float*>(d_y), int(cols), r, k_split);
+    if (k_split > 1) {
+      float* partial = static_cast<float*>(
+          grow_scratch(g_partial, g_partial_bytes,
+                       (size_t)r * k_split * sizeof(float)));
+      if (!partial) return false;
+      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+          static_cast<const float*>(d_w), static_cast<const float*>(d_x),
+          partial, int(cols), r, k_split);
+      gemv_reduce_kernel<<<grid_for(r), 256>>>(partial,
+                                               static_cast<float*>(d_y), r,
+                                               k_split);
+    } else {
+      gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+          static_cast<const float*>(d_w), static_cast<const float*>(d_x),
+          static_cast<float*>(d_y), int(cols), r, k_split);
+    }
   } else {
     gemv_dense_f32<<<grid_for(int(rows)), 256>>>(static_cast<const float*>(d_w),
                                                  static_cast<const float*>(d_x),
@@ -945,12 +968,22 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
   if ((cols & 7) == 0) {
     const int r = int(rows);
     const int k_split = gemv_k_split(r);
-    if (k_split > 1 &&
-        cudaMemsetAsync(d_y, 0, rows * sizeof(float)) != cudaSuccess)
-      return false;
-    gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
-        static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
-        static_cast<float*>(d_y), int(cols), r, k_split);
+    if (k_split > 1) {
+      float* partial = static_cast<float*>(
+          grow_scratch(g_partial, g_partial_bytes,
+                       (size_t)r * k_split * sizeof(float)));
+      if (!partial) return false;
+      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+          static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
+          partial, int(cols), r, k_split);
+      gemv_reduce_kernel<<<grid_for(r), 256>>>(partial,
+                                               static_cast<float*>(d_y), r,
+                                               k_split);
+    } else {
+      gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+          static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
+          static_cast<float*>(d_y), int(cols), r, k_split);
+    }
   } else {
     gemv_bf16<<<grid_for(int(rows)), 256>>>(static_cast<const uint16_t*>(d_w),
                                             static_cast<const float*>(d_x),
@@ -1129,11 +1162,18 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
   if (!d_w) return false;
   if ((cols & 3) == 0) {
     const int k_split = gemv_k_split(rows);
-    if (k_split > 1 &&
-        cudaMemsetAsync(y, 0, (size_t)rows * sizeof(float)) != cudaSuccess)
-      return false;
-    gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
-        d_w, x, y, cols, rows, k_split);
+    if (k_split > 1) {
+      float* partial = static_cast<float*>(
+          grow_scratch(g_partial, g_partial_bytes,
+                       (size_t)rows * k_split * sizeof(float)));
+      if (!partial) return false;
+      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+          d_w, x, partial, cols, rows, k_split);
+      gemv_reduce_kernel<<<grid_for(rows), 256>>>(partial, y, rows, k_split);
+    } else {
+      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+          d_w, x, y, cols, rows, k_split);
+    }
   } else {
     gemv_dense_f32<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
   }
@@ -1149,11 +1189,18 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
   if (!d_w) return false;
   if ((cols & 7) == 0) {
     const int k_split = gemv_k_split(rows);
-    if (k_split > 1 &&
-        cudaMemsetAsync(y, 0, (size_t)rows * sizeof(float)) != cudaSuccess)
-      return false;
-    gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
-        d_w, x, y, cols, rows, k_split);
+    if (k_split > 1) {
+      float* partial = static_cast<float*>(
+          grow_scratch(g_partial, g_partial_bytes,
+                       (size_t)rows * k_split * sizeof(float)));
+      if (!partial) return false;
+      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+          d_w, x, partial, cols, rows, k_split);
+      gemv_reduce_kernel<<<grid_for(rows), 256>>>(partial, y, rows, k_split);
+    } else {
+      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+          d_w, x, y, cols, rows, k_split);
+    }
   } else {
     gemv_bf16<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
   }

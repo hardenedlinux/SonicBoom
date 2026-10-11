@@ -52,11 +52,11 @@ RuntimeError fail(std::string msg) {
                       Phase::Execution);
 }
 
-// NVTX markers are opt-in: emitting them perturbs host-side timing, which
-// shifts the split-K gemv's atomicAdd accumulation order (non-deterministic by
-// design) and can flip a near-tie argmax in the live-vs-live prefill comparison.
-// So they stay OFF for normal runs (ctest) and turn ON only when SONICBOOM_NVTX
-// is set — the nsys measurement runs that need the per-step/per-layer ranges.
+// NVTX markers are opt-in. They stay OFF for normal runs (ctest) and turn ON
+// only when SONICBOOM_NVTX is set — the nsys measurement runs that need the
+// per-step/per-layer ranges. Emitting them perturbs host-side timing, which
+// would bias the tok/s measurement; it no longer affects numerics (the split-K
+// gemv is a deterministic two-phase reduction, no float atomicAdd).
 bool nvtx_enabled() {
   static const bool on = [] {
     const char* e = std::getenv("SONICBOOM_NVTX");
