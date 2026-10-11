@@ -422,3 +422,166 @@ reproducible tokens are required, the split-K reduction should be made
 deterministic (per-(row,chunk) partial buffer + fixed-order sum) — noted, not
 done here.
 
+## 3.0 re-measure — post-2.3 (DONE)
+
+Same full-`test_generate` nsys run as §3.0 (`SONICBOOM_GEN_STEPS=64`,
+`SONICBOOM_SKIP_CPU=1`, q8_1 default), `SQL SUM` over
+`CUPTI_ACTIVITY_KIND_KERNEL` (`end−start`), the same hardware timestamps. The
+`nsys` auto-import of `.qdstrm` is broken on this box ("importer binary …
+not found"); workaround is invoking the importer directly —
+`/usr/lib/nsight-systems/host-linux-x64/QdstrmImporter -i <x>.qdstrm -o <x>.nsys-rep -f`
+— then `nsys stats` as usual.
+
+| metric | §3.0 baseline | post-2.3 | Δ |
+|---|---|---|---|
+| total GPU kernel time (full run) | 27.17 s | **12.82 s** | **−52.8%** |
+| decode-busy GPU util (attn-bracketed) | 84.9 % | 71.7 % | −13 pt |
+| `[spine-cuda]` tok/s | 11.89 | **21.14** (nsys) / 23.9 (bare) | ~2.0× |
+| `cudaLaunchKernel` (host) | 867,076 (7.52 s) | 780,799 (4.24 s) | −10 % |
+| `cudaMemcpy` all (host) | 77,619 (16.34 s) | 77,941 (6.98 s) | +0.4 % calls, −57 % time |
+| `cudaMemset` | 129,670 | 116,509 | −10 % |
+| `cudaMemcpy` DtoD (GPU) | 65,614 | 65,935 | ~flat |
+
+The dense-gemv rewrite cut the GPU's per-token work roughly in half — exactly
+the ~62%-of-kernel cost §3.0 attributed to the three dense gemvs — while the
+**orchestration counts are essentially flat** (launches, memcpys, memsets moved
+≤10 %). The host `cudaMemcpy` time dropped 57 % purely because each synchronous
+transfer now waits on a much less busy GPU, not because there are fewer
+transfers.
+
+### Decision → Phase 3
+
+GPU kernel time is no longer the dominant term; the wall-clock is now bounded by
+orchestration (launches / memcpys / memsets). This is the Phase 3 budget
+(per-call sync / resident activations, Option A in
+`generation-integration-bottleneck.md`), not further per-op offload. The exact
+per-token budget is measured in §3.1, which corrects the whole-run÷64 figures.
+
+## 3.1 — measurement methodology (NVTX) + corrected per-token counts
+
+The §3.0 numbers ("~12,200 launches / ~1,218 memcpys / ~1,820 memsets per
+token") were **whole-run totals ÷ 64** — they swept in the resident path
+(`generate_reference(Cuda)`), the prefill spine, and the M4 `generate(Cuda)`
+re-routes, none of which is the decode hot path. 3.1 re-measures with **NVTX
+ranges** so every "per token" number counts only the steady-state decode-step
+window.
+
+### Instrumentation (opt-in)
+
+`SonicCudaBackend::execute` pushes an NVTX range per graph node (op name) and
+`generate_spine_cuda` brackets each decode step with `decode_step_N`. Both are
+gated by `SONICBOOM_NVTX=1` — OFF by default, because emitting the markers
+perturbs host timing (see the split-K note below). Capture:
+
+```
+SONICBOOM_GEN_STEPS=64 SONICBOOM_SKIP_CPU=1 SONICBOOM_NVTX=1 \
+  nsys profile -t cuda,nvtx,osrt --stats=false -o /tmp/nsys_32 ./tests/core/test_generate
+```
+
+The `.qdstrm` is converted with the importer workaround (§3.0), then device
+activities are attributed to one `decode_step_N` range by
+`globalTid` + `correlationId` (NVTX host range → `CUPTI_ACTIVITY_KIND_RUNTIME`
+host call → device `KERNEL`/`MEMCPY`/`MEMSET`).
+
+### One steady-state decode step (decode_step_32 == decode_step_33)
+
+| metric | per token |
+|---|---:|
+| kernels | **2,005** |
+| memcpy | **208** (205 DtoD + 2 HtoD + 1 DtoH) |
+| memset | **344** |
+| GPU kernel time | 38.9 ms |
+| host step wall | 49.2 ms |
+| in-step GPU util | ≈ 81 % (kernel 38.9 ms + memcpy/memset 0.8 ms ÷ 49.2 ms) |
+| `[spine-cuda]` tok/s | 20.5 (nsys) |
+
+The prior "~12,200 launches / ~1,218 memcpys / ~1,820 memsets per token" are
+**6× high**: 780,799 whole-run `cudaLaunchKernel` ÷ 64 also counted the resident
+path and the two extra spine re-runs. The real decode step is 2,005 kernels.
+
+> Timing is noisy on this box: the decode GPU contends with an unrelated
+> `fm.exe` (Football Manager 2023) holding ~3.6 GB VRAM, so bare `[spine-cuda]`
+> tok/s swings (12.5–26 depending on load; 23.9 in §2.3, 20.5 under nsys here).
+> The **counts** above are structural (fixed by the graph, not by timing) and are
+> unaffected by the contention.
+
+### Kernel list, one decode step (by name)
+
+| kernel | n | GPU ns |
+|---|---:|---:|
+| quantize_q8_1 | 259 | 3,020,220 |
+| rms_sum_sq_kernel | 211 | 959,600 |
+| rms_inv_kernel | 211 | 471,872 |
+| rms_apply_dev_kernel | 211 | 407,433 |
+| gemv_q3_K_q8_1 | 151 | 12,484,249 |
+| add_kernel | 126 | 243,875 |
+| gemv_q4_K_q8_1 | 104 | 8,325,755 |
+| rms_heads_sum_kernel | 91 | 1,589,490 |
+| rms_heads_inv_kernel | 91 | 196,100 |
+| rms_heads_apply_kernel | 91 | 193,279 |
+| mul_kernel | 84 | 198,469 |
+| gemv_dense_f32_v | 84 | 2,712,190 |
+| gelu_fp16_kernel | 84 | 219,363 |
+| rope_neox_heads_kernel | 66 | 147,453 |
+| cast_fp16_kernel | 48 | 80,674 |
+| scale_kernel | 44 | 81,246 |
+| decode_attention_kernel | 42 | 7,074,752 |
+| gemv_q5_K_q8_1 | 4 | 206,653 |
+| layer_combine_kernel | 1 | 2,176 |
+| gemv_bf16_v | 1 | 289,438 |
+| cast_bf16_kernel | 1 | 2,208 |
+| **total** | **2,005** | **38,906,495** |
+
+The three quantized gemvs (q3+q4+q5 = 23.0 ms) + attention (7.1 ms) + the
+quantize kernels (3.0 ms) are 85 % of GPU time — compute, not orchestration.
+
+### memcpy by direction (one decode step)
+
+| direction | n | bytes | GPU ns | host ns |
+|---|---:|---:|---:|---:|
+| DtoD | 205 | 741,376 | 354,366 | 1,922,078 |
+| HtoD | 2 | 53,248 | 8,447 | 2,341,074 |
+| DtoH | 1 | 1,048,576 | 159,679 | 10,013,837 |
+
+The **2 HtoD** are the two CPU-side embedding gathers, uploaded each token:
+
+- `token_embd` q3_K row gather — 10,240 B (= d 2560 × f32)
+- `per_layer_token_embd` q4_K row gather — 43,008 B (= 42 × 256 × f32)
+
+The **1 DtoH** is the full logits vector (262,144 × f32 = 1 MB) downloaded for
+CPU argmax. Its host cost is **10.0 ms** — the synchronous `cudaMemcpy` blocks
+until the GPU queue drains. The 205 **DtoD** are the defensive pre-in-place
+copies (§3.3); at ~9.4 µs host each they do *not* host-sync (DtoD has no stream
+sync), so they are cheap individually but numerous.
+
+### memset by value (one decode step) — 344 total, 48,488 B
+
+| bytes | n | what |
+|---|---:|---|
+| 8 | 211 | rms_sum accumulator zero (one per sum_sq) |
+| 16 | 48 | scalar/accum zero |
+| 1024 | 42 | per-layer 256-f32 zero |
+| 64 | 42 | 16-f32 zero |
+| 336 | 1 | 84-f32 zero |
+
+### Per-layer count: ~48, not ~290
+
+2,005 kernels / 42 blocks ≈ **48 kernels per layer** (the "~290" figure was
+~12,200 ÷ 42, the same whole-run inflation). Composition per layer: RMSNorm
+3 kernels × ~5 (sum_sq / inv / apply) ≈ 15, quantize_q8_1 ≈ 6, gemv ≈ 8
+(q3 3.6 + q4 2.5 + dense 2 + q5 ~0.1), elementwise ≈ 8 (add 3 + mul 2 + gelu 2
++ scale 1), attention 1 + rope 1.6 + rms_heads ≈ 2 + cast ≈ 1. **RMSNorm being
+three separate kernels is the single biggest per-layer contributor** and the
+obvious fusion target for §3.4 (sum_sq + inv + apply → one kernel, and
+norm→q8_1 quantize).
+
+### Split-K `atomicAdd` flakiness (pre-existing, not a 3.1 regression)
+
+Isolating the decode step surfaced a test-stability issue: the live-vs-live CUDA
+checks in `test_generate` (`generate(Cuda)` routes, `prefill(Cuda)`,
+`generate_prompt(Cuda)`) fail ~1 run in 3 because the split-K gemv's `atomicAdd`
+accumulation order shifts with host timing. Verified at HEAD (no NVTX): 5 runs →
+1× "2 checks", 6 runs → 2× "1–3 checks". The golden/CPU checks stay green; only
+comparisons of two independently-run CUDA streams flake. This is orthogonal to
+Phase 3 orchestration and is the reason the NVTX markers are opt-in.
+

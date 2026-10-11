@@ -30,9 +30,12 @@
 #include "../quant/cuda_resident.h"
 #include "device_pool.h"
 
+#include <nvToolsExt.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <string>
@@ -47,6 +50,19 @@ namespace {
 RuntimeError fail(std::string msg) {
   return RuntimeError(RuntimeErrorCode::BackendFailure, std::move(msg),
                       Phase::Execution);
+}
+
+// NVTX markers are opt-in: emitting them perturbs host-side timing, which
+// shifts the split-K gemv's atomicAdd accumulation order (non-deterministic by
+// design) and can flip a near-tie argmax in the live-vs-live prefill comparison.
+// So they stay OFF for normal runs (ctest) and turn ON only when SONICBOOM_NVTX
+// is set — the nsys measurement runs that need the per-step/per-layer ranges.
+bool nvtx_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_NVTX");
+    return e && *e && std::string_view(e) != "0";
+  }();
+  return on;
 }
 
 // Decode the little-endian 64-bit scalar graph inputs (token id / position).
@@ -189,6 +205,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   const int out_n = int(out_bytes / sizeof(float));
 
   bool ok = true;
+  // NVTX range named after the graph node (its op kind, e.g. "rms_norm",
+  // "quantized_matmul"), so nsys attributes each kernel launch to its operator
+  // for the per-op launch-count breakdown.
+  if (nvtx_enabled()) nvtxRangePushA(node->name.c_str());
   switch (node->op) {
     case OpKind::Scale: {
       ok = nn::cuda::scale_dev(dev(in[0]), float(scale_d), out, out_n);
@@ -369,6 +389,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = false;
       break;
   }
+  if (nvtx_enabled()) nvtxRangePop();
 
   if (!ok) {
     device::release(out_handle, out_bytes);

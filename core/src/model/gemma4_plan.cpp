@@ -26,12 +26,18 @@
 #include <sonicboom/planner/sonic_cuda_backend.h>
 #include <sonicboom/sx/exec.h>
 
+#ifdef SONICBOOM_USE_CUDA
+#include <nvToolsExt.h>
+#endif
+
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -39,6 +45,20 @@
 namespace sonicboom::model {
 
 namespace {
+
+#ifdef SONICBOOM_USE_CUDA
+// NVTX step markers are opt-in (see SonicCudaBackend::nvtx_enabled for why):
+// they perturb host timing and shift the split-K gemv's non-deterministic
+// atomicAdd order, so they stay OFF for normal runs and ON only when
+// SONICBOOM_NVTX is set (the nsys measurement runs).
+bool nvtx_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_NVTX");
+    return e && *e && std::string_view(e) != "0";
+  }();
+  return on;
+}
+#endif
 
 // Encode a scalar graph input as a little-endian 64-bit buffer (host x86-64).
 sx::Bytes encode_i64(uint64_t v) {
@@ -705,7 +725,12 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     in.push_back(encode_i64(token));
     in.push_back(encode_i64(pos));
 
+    // NVTX step marker: brackets one decode step so nsys can isolate the
+    // steady-state per-token window (instead of dividing whole-run totals).
+    const std::string step_name = "decode_step_" + std::to_string(step);
+    if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
     auto res = exec.execute(*plan, *snap, in);
+    if (nvtx_enabled()) nvtxRangePop();
     if (!res || res->outputs.empty()) {
       if (!res)
         std::cerr << "[spine] step " << step << " execute failed: "
