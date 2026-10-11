@@ -592,3 +592,95 @@ NVTX opt-in rationale (avoid perturbing the atomic order) no longer applies to
 correctness; markers remain opt-in only to keep host timing out of the nsys
 measurement window.
 
+### Re-measured after the 3.2 device-resident work (B1–B4)
+
+The 3.2 work (B1–B4) moved the token-embedding gather and the final argmax onto
+the device: the next-token id lives in a device buffer, `argmax_kernel` writes
+into it, and the two embedding gathers read it back from the device weight —
+the only host round-trip left is the 4-byte token id for the loop bookkeeping.
+This subsection re-runs the §3.1 attribution on a fresh capture and records the
+corrected per-token counts. `decode_step_32 == decode_step_33` still holds
+(2,050 kernels / 207 memcpy / 302 memset on both).
+
+| metric | per token (§3.1) | per token (post-3.2) |
+|---|---:|---:|
+| kernels | 2,005 | **2,050** |
+| memcpy | 208 (205 DtoD + 2 HtoD + 1 DtoH) | **207** (206 DtoD + 0 HtoD + 1 DtoH) |
+| memset | 344 | **302** |
+
+The goal of 3.2 is met: the **2 per-token HtoD** embedding uploads are gone, and
+the **1 DtoH** shrank from the full 1 MB logits vector to a **4-byte** argmax
+index. The +45 kernels and −42 memsets are fully accounted for below.
+
+### Kernel list after 3.2 (one decode step, by name)
+
+| kernel | n | GPU ns |
+|---|---:|---:|
+| quantize_q8_1 | 259 | 1,678,287 |
+| rms_sum_sq_kernel | 211 | 957,495 |
+| rms_inv_kernel | 211 | 472,684 |
+| rms_apply_dev_kernel | 211 | 408,912 |
+| gemv_q3_K_q8_1 | 151 | 14,400,102 |
+| add_kernel | 126 | 241,847 |
+| gemv_q4_K_q8_1 | 104 | 4,425,671 |
+| rms_heads_sum_kernel | 91 | 1,210,865 |
+| rms_heads_inv_kernel | 91 | 196,759 |
+| rms_heads_apply_kernel | 91 | 190,615 |
+| mul_kernel | 84 | 194,231 |
+| gemv_dense_f32_v | 84 | 1,305,192 |
+| gelu_fp16_kernel | 84 | 210,234 |
+| rope_neox_heads_kernel | 66 | 148,536 |
+| cast_fp16_kernel | 48 | 82,428 |
+| scale_kernel | 44 | 76,351 |
+| gemv_reduce_kernel | 42 | 113,627 |
+| decode_attention_kernel | 42 | 9,051,686 |
+| gemv_q5_K_q8_1 | 4 | 207,929 |
+| layer_combine_kernel | 1 | 2,240 |
+| gemv_bf16_v | 1 | 263,828 |
+| gather_q4_K_row | 1 | 6,239 |
+| gather_q3_K_row | 1 | 4,032 |
+| cast_bf16_kernel | 1 | 1,760 |
+| argmax_kernel | 1 | 79,516 |
+| **total** | **2,050** | **35,931,066** |
+
+The +45 kernels vs §3.1 split into two independent causes:
+
+- **+3 from 3.2 (B1–B4)** — the two embedding gathers moved from host
+  `dequantize_row_f32`+upload onto the device (`gather_q3_K_row` for
+  `token_embd`, `gather_q4_K_row` for `per_layer_token_embd`), and the CPU
+  argmax became `argmax_kernel`.
+- **+42 from the split-K fix (A stream)** — `gemv_reduce_kernel`, one per
+  layer's `inp_gate` dense gemv, the deterministic two-phase reduction described
+  above.
+
+(GPU-ns columns are as noisy as §3.1's — the same `fm.exe` VRAM contention —
+and are listed only for reference; the counts are structural.)
+
+### memcpy by direction after 3.2 (one decode step)
+
+| direction | n | bytes | GPU ns |
+|---|---:|---:|---:|
+| DtoD | 206 | 741,380 | 357,491 |
+| DtoH | 1 | 4 | 1,792 |
+| HtoD | 0 | 0 | 0 |
+
+The DtoD count is 205 → 206 (the extra 4-byte device copy from the argmax output
+into the resident token buffer), the two HtoD embedding uploads are gone, and
+the single DtoH is now just the 4-byte token id. The dominant DtoD traffic is
+unchanged: the defensive pre-in-place copies (§3.3) still dominate the count.
+
+### memset by value after 3.2 (one decode step) — 302 total, 5,480 B
+
+| bytes | n | what |
+|---|---:|---|
+| 8 | 211 | rms_sum accumulator zero (one per sum_sq) |
+| 16 | 48 | scalar/accum zero |
+| 64 | 42 | 16-f32 zero |
+| 336 | 1 | 84-f32 zero |
+
+The only change is the **1024-byte ×42** "per-layer 256-f32 zero" class is gone
+(344 → 302): the per-layer token-embedding buffer no longer needs a zero-fill,
+because the on-device gather writes the row directly. The remaining memsets are
+the rms accumulator / scalar / 16-f32 / 84-f32 zeros, all still on the table for
+the §3.4 fusion pass.
+
