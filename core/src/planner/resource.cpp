@@ -281,6 +281,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::AttentionShared, OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
         OpKind::RmsNormQuantize,
+        OpKind::GeluMulQuantize,
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
         OpKind::Add,            OpKind::LayerCombine,

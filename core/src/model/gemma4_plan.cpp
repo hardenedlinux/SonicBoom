@@ -718,6 +718,9 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     // T3: fold each rms_norm -> quantize pair into one RmsNormQuantize kernel so
     // the f32 normalized activation is never materialized.
     planner::fuse_rms_norm_quantize_pass(graph);
+    // T5: fold Quantize(Mul(GeluFp16(gate), up)) into one GeluMulQuantize kernel
+    // so the f32 gelu and fh intermediates are never materialized.
+    planner::fuse_gelu_mul_quantize_pass(graph);
   }
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -904,6 +907,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   if (quant::cuda::q8_1_enabled()) {
     planner::quantize_once_pass(graph);
     planner::fuse_rms_norm_quantize_pass(graph);
+    planner::fuse_gelu_mul_quantize_pass(graph);
   }
 
   auto snap = planner::CpuResourceProvider::snapshot();

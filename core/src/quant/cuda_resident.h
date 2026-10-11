@@ -58,6 +58,13 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
                                 float eps, BlockQ8_1* yq, int n);
 
+// gelu×up -> q8_1 fused (T5): yq = quantize_q8_1(gelu_fp16(gate) * up). One
+// kernel per 32-element block computes the fp16-gelu gate, multiplies by up, and
+// amax/127-quantizes — the f32 gelu and product intermediates are never
+// materialized. Device in/out, no host copies. n must be a multiple of 32.
+bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
+                                int n);
+
 // The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
 // blocks_per_row / num_rows are derived from W, so the caller passes only the

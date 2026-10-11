@@ -48,4 +48,15 @@ void quantize_once_pass(Graph& g);
 // after quantize_once_pass.
 void fuse_rms_norm_quantize_pass(Graph& g);
 
+// T5 gelu×up -> q8_1 fusion. After quantize_once_pass, the gated FFN down-
+// projection consumes Quantize(Mul(GeluFp16(gate), up)). When the gelu and the
+// mul product are each single-use (only the quantize reads the product, only the
+// mul reads the gelu), the three nodes are replaced by one GeluMulQuantize node
+// that computes quantize_q8_1(gelu_fp16(gate) * up) in one kernel — the f32 gelu
+// and fh intermediates are never materialized. The GeluMulQuantize node keeps the
+// GeluFp16 node's (layer) attribute, takes the gelu input (gate) and the mul's
+// up operand as its two inputs, and reuses the Quantize node's q8_1 output
+// tensor. Must run after quantize_once_pass (and after fuse_rms_norm_quantize_pass).
+void fuse_gelu_mul_quantize_pass(Graph& g);
+
 } // namespace sonicboom::planner

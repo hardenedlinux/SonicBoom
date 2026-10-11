@@ -20,6 +20,7 @@
 
 #include "../nn/cuda_stream.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <sm_32_intrinsics.h>  // __vsub4
@@ -123,6 +124,30 @@ __device__ inline void unpack_q3_K_scales(const uint8_t* src, int8_t* scales) {
   b[2] = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
   b[3] = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
   memcpy(scales, b, 16);
+}
+
+// f32 -> fp16 -> f32 round-trip (matches nn::cuda's half_roundtrip in
+// cuda_elementwise.cu; duplicated here because the fused gelu quantize kernel
+// lives in this translation unit).
+__device__ inline float half_roundtrip(float v) {
+  return __half2float(__float2half_rn(v));
+}
+
+// ggml's ggml_gelu_f32 (mirrors nn::cuda::gelu_tanh_f32, same constants and
+// operation order, so the fused kernel is bit-identical to gelu_fp16_dev).
+__device__ inline float gelu_tanh_f32(float x) {
+  constexpr float sqrt_2_over_pi = 0.79788456080286535587989211986876f;
+  constexpr float gelu_coef_a = 0.044715f;
+  return 0.5f * x * (1.0f + tanhf(sqrt_2_over_pi * x * (1.0f + gelu_coef_a * x * x)));
+}
+
+// nn::gelu_fp16's clamping + fp16 round-trip, mirroring gelu_fp16_kernel in
+// cuda_elementwise.cu (v clamped to [-10,10], fp16-rounded before and after the
+// tanh gelu).
+__device__ inline float gelu_fp16(float v) {
+  if (v <= -10.0f) return 0.0f;
+  if (v >= 10.0f) return v;
+  return half_roundtrip(gelu_tanh_f32(half_roundtrip(v)));
 }
 
 // --- gemv kernels: cooperative (large) + one-thread-per-block (small) -------
@@ -1124,6 +1149,44 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
   }
   rms_norm_quantize_q8_1_kernel<<<1, 1024, 0, cur_stream()>>>(
       x, d_w, n, eps, reinterpret_cast<q8_1::block_q8_1*>(yq));
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// gelu×up -> q8_1 fused (T5): one thread per 32-element q8_1 block (matching
+// quantize_q8_1), computing gelu_fp16(gate) * up and amax/127-quantizing the
+// product in one pass — the f32 gelu and fh intermediates are never
+// materialized. Bit-identical to gelu_fp16_dev + mul_dev + quantize_q8_1_dev:
+// the gelu/mul are pure functions of gate/up, recomputed identically in the
+// amax and quantize passes.
+__global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              int n, q8_1::block_q8_1* __restrict__ y) {
+  const int ib = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nblocks = n / 32;
+  if (ib >= nblocks) return;
+  const float* gb = gate + (size_t)ib * 32;
+  const float* ub = up + (size_t)ib * 32;
+
+  float amax = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < 32; ++k) {
+    const float fh = gelu_fp16(gb[k]) * ub[k];
+    amax = fmaxf(amax, fabsf(fh));
+  }
+  const float d = amax / 127.0f;
+  y[ib].d = d;
+  #pragma unroll
+  for (int k = 0; k < 32; ++k) {
+    const float fh = gelu_fp16(gb[k]) * ub[k];
+    y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(fh / d));
+  }
+}
+
+bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
+                                int n) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+  gelu_mul_quantize_q8_1_kernel<<<(n / 32 + 255) / 256, 256, 0, cur_stream()>>>(
+      gate, up, n, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }
 

@@ -382,6 +382,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
       break;
     }
+    case OpKind::GeluMulQuantize: {
+      // gelu_fp16(gate) * up, q8_1-quantized in one kernel (T5). Inputs are the
+      // gate/up projection outputs (device f32); the output is the q8_1
+      // activation for the down-projection gemv.
+      ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
+          dev(in[0]), dev(in[1]),
+          reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      break;
+    }
     case OpKind::MatvecF32: {
       const int cols = int(in[0].device.size_bytes / sizeof(float));
       ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);

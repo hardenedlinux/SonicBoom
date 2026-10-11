@@ -185,4 +185,94 @@ void fuse_rms_norm_quantize_pass(Graph& g) {
       g.tensors.end());
 }
 
+void fuse_gelu_mul_quantize_pass(Graph& g) {
+  std::unordered_map<uint32_t, uint32_t> producer;
+  for (uint32_t i = 0; i < g.nodes.size(); ++i)
+    for (const TensorId& o : g.nodes[i].outputs)
+      producer[o.value] = i;
+
+  std::unordered_map<uint32_t, uint32_t> consumers;
+  for (const GraphNodeDesc& node : g.nodes)
+    for (const TensorId& in : node.inputs)
+      ++consumers[in.value];
+
+  // For each Quantize(fh) whose producer is Mul(gelu, up) and whose gelu comes
+  // from a single-use GeluFp16(gate), fold the three nodes into one
+  // GeluMulQuantize(gate, up). Keys are gelu node indices.
+  std::unordered_map<uint32_t, uint32_t> mul_of_gelu;
+  std::unordered_map<uint32_t, uint32_t> quantize_of_gelu;
+  std::unordered_set<uint32_t> fused_mul;
+  std::unordered_set<uint32_t> fused_quantize;
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& node = g.nodes[i];
+    if (node.op != OpKind::Quantize || node.inputs.size() != 1)
+      continue;
+    const uint32_t fh = node.inputs[0].value;
+    auto mit = producer.find(fh);
+    if (mit == producer.end())
+      continue;
+    const GraphNodeDesc& mul = g.nodes[mit->second];
+    if (mul.op != OpKind::Mul || mul.inputs.size() != 2)
+      continue;
+    if (consumers[fh] != 1)
+      continue;  // the gelu*up product has another reader
+    const uint32_t gelu_t = mul.inputs[0].value;
+    auto git = producer.find(gelu_t);
+    if (git == producer.end())
+      continue;
+    const GraphNodeDesc& gelu = g.nodes[git->second];
+    if (gelu.op != OpKind::GeluFp16 || gelu.inputs.size() != 1)
+      continue;
+    if (consumers[gelu_t] != 1)
+      continue;  // the gelu output has another reader
+    mul_of_gelu[git->second] = mit->second;
+    quantize_of_gelu[git->second] = i;
+    fused_mul.insert(mit->second);
+    fused_quantize.insert(i);
+  }
+
+  if (quantize_of_gelu.empty())
+    return;
+
+  // Dead tensors: the gelu output and the gelu*up product (both folded away).
+  std::unordered_set<uint32_t> dead;
+  for (const auto& [gidx, midx] : mul_of_gelu) {
+    for (const TensorId& o : g.nodes[gidx].outputs)
+      dead.insert(o.value);
+    for (const TensorId& o : g.nodes[midx].outputs)
+      dead.insert(o.value);
+  }
+
+  std::vector<GraphNodeDesc> out_nodes;
+  out_nodes.reserve(g.nodes.size());
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    GraphNodeDesc node = g.nodes[i];
+    if ((node.op == OpKind::Mul && fused_mul.count(i)) ||
+        (node.op == OpKind::Quantize && fused_quantize.count(i))) {
+      continue;  // folded into the GeluMulQuantize
+    }
+    if (node.op == OpKind::GeluFp16) {
+      auto it = quantize_of_gelu.find(i);
+      if (it != quantize_of_gelu.end()) {
+        const GraphNodeDesc& mul = g.nodes[mul_of_gelu[i]];
+        const GraphNodeDesc& q = g.nodes[it->second];
+        // GeluMulQuantize: gelu's input (gate) + mul's up operand, Quantize's output.
+        node.op = OpKind::GeluMulQuantize;
+        node.inputs = {node.inputs[0], mul.inputs[1]};
+        node.outputs = q.outputs;
+        node.name = op_kind_name(OpKind::GeluMulQuantize);
+      }
+    }
+    out_nodes.push_back(std::move(node));
+  }
+
+  g.nodes = std::move(out_nodes);
+
+  g.tensors.erase(
+      std::remove_if(g.tensors.begin(), g.tensors.end(),
+                     [&](const TensorDesc& t) { return dead.count(t.id.value) != 0; }),
+      g.tensors.end());
+}
+
 } // namespace sonicboom::planner
