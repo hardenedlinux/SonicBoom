@@ -104,6 +104,7 @@ SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
                                    const Graph& graph, uint64_t n_ctx)
     : model_(model), graph_(graph) {
   ensure_caches(n_ctx);
+  token_dev_ = device::acquire(sizeof(float));  // persistent current-token slot
 }
 
 SonicCudaBackend::~SonicCudaBackend() {
@@ -111,6 +112,13 @@ SonicCudaBackend::~SonicCudaBackend() {
     if (c.k_handle) device::release(c.k_handle, c.bytes);
     if (c.v_handle) device::release(c.v_handle, c.bytes);
   }
+  if (token_dev_) device::release(token_dev_, sizeof(float));
+}
+
+bool SonicCudaBackend::seed_token(uint64_t token) {
+  if (!token_dev_) return false;
+  const float f = float(token);
+  return device::upload(&f, token_dev_, sizeof(float));
 }
 
 void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
@@ -385,29 +393,34 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Embedding: {
       // Token embedding gather on the device: dequantize the token's row of
-      // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device f32,
-      // so the two per-token H2D uploads of the embedding rows disappear. The
-      // token id is the Int64 host graph input, read directly (no transfer).
-      const uint64_t tok = read_i64(in[0].host);
+      // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device f32.
+      // The token id is read from the persistent device buffer `token_dev_`
+      // (Phase 3.2 B4), not the host graph input, so the next token id never
+      // round-trips through the host.
+      const float* tok_dev = dev_mut(token_dev_);
       if (slot == model::WeightSlot::PerLayerTokenEmbd) {
         // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
         // gather the token's row zero-copy (no per-token H2D).
-        ok = quant::cuda::gather_f32_mapped_dev(model_.weights.per_layer_token_embd,
-                                                int64_t(tok), out);
+        ok = quant::cuda::gather_f32_mapped_dev_row(
+            model_.weights.per_layer_token_embd, tok_dev, out);
       } else {
         // token_embd is the tied lm_head, already resident (the logits matvec
         // uploads it once): gather straight from the device weight, no H2D.
-        ok = quant::cuda::gather_f32_resident_dev(model_.weights.token_embd,
-                                                  int64_t(tok), out);
+        ok = quant::cuda::gather_f32_resident_dev_row(model_.weights.token_embd,
+                                                      tok_dev, out);
       }
       break;
     }
     case OpKind::Argmax: {
       // Greedy token selection on the device: reduce the [vocab] logits to a
       // single index, so the per-token 1 MiB D2H of the full logits becomes a
-      // 4-byte transfer of the winning index.
+      // 4-byte transfer of the winning index. The index is also written to the
+      // persistent `token_dev_` slot (Phase 3.2 B4) so the next step's Embedding
+      // gather reads it straight from the device.
       ok = nn::cuda::argmax_dev(dev(in[0]),
                                 int(in[0].device.size_bytes / sizeof(float)), out);
+      if (ok && token_dev_)
+        ok = device::device_copy(out_handle, token_dev_, sizeof(float));
       break;
     }
     default:

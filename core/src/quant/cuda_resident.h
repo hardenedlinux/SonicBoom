@@ -54,10 +54,19 @@ bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out);
 // lm_head), which the per-token logits matvec keeps on the device.
 bool gather_f32_resident_dev(const QuantizedTensor& W, int64_t token, float* out);
 
+// Device-row variants (Phase 3.2 B4): read the token id from a device buffer
+// (`token_dev`, one float index) at kernel time instead of a host value, so the
+// next token id stays on the device between decode steps (argmax -> token_dev ->
+// gather, no host round-trip).
+bool gather_f32_resident_dev_row(const QuantizedTensor& W, const float* token_dev,
+                                 float* out);
+
 // Zero-copy single-row gather: pins+maps W in place (cudaHostRegisterMapped)
 // and reads the token's row straight out of host memory via the mapped device
 // pointer — no per-token copy. For weights too big to keep resident (the
 // ~1.5 GiB per_layer_token_embd).
 bool gather_f32_mapped_dev(const QuantizedTensor& W, int64_t token, float* out);
+bool gather_f32_mapped_dev_row(const QuantizedTensor& W, const float* token_dev,
+                               float* out);
 
 } // namespace sonicboom::quant::cuda

@@ -53,6 +53,12 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // Seed the device-resident token-id buffer (Phase 3.2 B4): uploads `token` as
+  // a float index so the first decode step's Embedding gather reads it from the
+  // device. The decode loop calls this once before stepping; thereafter Argmax
+  // overwrites the buffer in place and no host round-trip carries the token id.
+  bool seed_token(uint64_t token);
+
   // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
   // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
   // matching the CUDA spine's matvec_f32_dev) + flash attention
@@ -84,6 +90,7 @@ private:
   const model::Gemma4Model& model_;
   const Graph& graph_;
   std::vector<KvCacheDev> caches_;  // index == KV layer (0 .. n_layer_kv-1)
+  uint64_t token_dev_ = 0;          // persistent device buffer: current token id (float)
 
   void ensure_caches(uint64_t n_ctx);
 };

@@ -738,6 +738,12 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   uint64_t token = start_token;
   uint64_t pos = start_pos;
   uint64_t step = 0;
+
+  // Seed the device-resident token-id slot (Phase 3.2 B4). Argmax overwrites it
+  // in place each step, and the Embedding gather reads it back on the device, so
+  // the token id never round-trips through the host.
+  cuda_backend.seed_token(start_token);
+
   for (; step < tokens.size(); ++step) {
     std::vector<sx::Bytes> in;
     in.push_back(encode_i64(token));
@@ -851,8 +857,12 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   } else {
     // Reference: feed the prompt one token at a time through the CUDA spine
     // (greedy graph -> per-token argmax output), keeping the final token's index.
+    // Each prompt token is seeded into the device token slot before its step
+    // (Phase 3.2 B4), since the Embedding gather now reads the token id on the
+    // device rather than the host graph input.
     float last_argmax = -1.0f;
     for (uint64_t p : prompt) {
+      cuda_backend.seed_token(p);
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(p));
       in.push_back(encode_i64(pos));
@@ -870,6 +880,10 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
+  // The decode loop below reads the next token id from the device slot, which the
+  // reference path already left at `first`; the prefill path never ran an
+  // Embedding/Argmax step, so seed it explicitly (Phase 3.2 B4).
+  cuda_backend.seed_token(token);
 
   // Decode the remaining tokens with the same planner/backend/cache.
   for (step = 1; step < tokens.size(); ++step) {

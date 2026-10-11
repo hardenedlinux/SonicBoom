@@ -792,11 +792,13 @@ __global__ void scatter_col(const float* __restrict__ src, float* __restrict__ Y
 // layout / reconstruction formulas as dequantize_row_f32 (dequant.cpp), so the
 // result is bit-identical to the CPU embedding gather.
 
-__global__ void gather_q3_K_row(const uint8_t* __restrict__ w, int64_t row,
+__global__ void gather_q3_K_row(const uint8_t* __restrict__ w, int64_t row_host,
+                                const float* __restrict__ row_dev,
                                 float* __restrict__ out, int blocks_per_row) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int width = blocks_per_row * 256;
   if (i >= width) return;
+  const int64_t row = row_dev ? (int64_t)row_dev[0] : row_host;
   const int b = i >> 8;
   const int l = i & 255;
   const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 110;
@@ -816,11 +818,13 @@ __global__ void gather_q3_K_row(const uint8_t* __restrict__ w, int64_t row,
   out[i] = d * float(scales[sidx] - 32) * float(qv - hmset);
 }
 
-__global__ void gather_q4_K_row(const uint8_t* __restrict__ w, int64_t row,
+__global__ void gather_q4_K_row(const uint8_t* __restrict__ w, int64_t row_host,
+                                const float* __restrict__ row_dev,
                                 float* __restrict__ out, int blocks_per_row) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int width = blocks_per_row * 256;
   if (i >= width) return;
+  const int64_t row = row_dev ? (int64_t)row_dev[0] : row_host;
   const int b = i >> 8;
   const int l = i & 255;
   const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 144;
@@ -840,11 +844,13 @@ __global__ void gather_q4_K_row(const uint8_t* __restrict__ w, int64_t row,
   out[i] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
-__global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row,
+__global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row_host,
+                                const float* __restrict__ row_dev,
                                 float* __restrict__ out, int blocks_per_row) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int width = blocks_per_row * 256;
   if (i >= width) return;
+  const int64_t row = row_dev ? (int64_t)row_dev[0] : row_host;
   const int b = i >> 8;
   const int l = i & 255;
   const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 176;
@@ -868,21 +874,23 @@ __global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row,
 }
 
 // Launch the single-row gather kernel for `row` of a device-resident packed
-// tensor. `w` points at the packed tensor start on the device; `row` selects
-// the token. Shared by gather_f32_dev (row 0 of a just-uploaded single row) and
-// gather_f32_resident_dev (row `token` of the cached resident weight).
-bool launch_gather_row(const uint8_t* w, int64_t row, QuantType type, int width,
-                       int blocks_per_row, float* out) {
+// tensor. `w` points at the packed tensor start on the device. The row is either
+// `row_host` (a host value baked into the launch) or, when `row_dev` is non-null,
+// read from a device-resident token buffer at kernel time (Phase 3.2 B4: the
+// next token id stays on the device). Shared by gather_f32_dev (row 0 of a
+// just-uploaded single row) and gather_f32_resident_dev / _mapped_dev.
+bool launch_gather_row(const uint8_t* w, int64_t row_host, const float* row_dev,
+                       QuantType type, int width, int blocks_per_row, float* out) {
   const int grid = (width + 255) / 256;
   switch (type) {
     case QuantType::Q3_K:
-      gather_q3_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      gather_q3_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q4_K:
-      gather_q4_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      gather_q4_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q5_K:
-      gather_q5_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      gather_q5_K_row<<<grid, 256>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     default:
       return false;
@@ -1183,8 +1191,8 @@ bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out) {
     return false;
 
   const uint8_t* wp = static_cast<const uint8_t*>(d_row);
-  return launch_gather_row(wp, /*row=*/0, W.type(), int(width),
-                           int(blocks_per_row), out);
+  return launch_gather_row(wp, /*row_host=*/0, /*row_dev=*/nullptr, W.type(),
+                           int(width), int(blocks_per_row), out);
 }
 
 // Device-resident single-row gather (Phase 3.2 B2): like gather_f32_dev, but
@@ -1207,7 +1215,27 @@ bool gather_f32_resident_dev(const QuantizedTensor& W, int64_t token, float* out
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   return launch_gather_row(static_cast<const uint8_t*>(d_w), int64_t(token),
-                           W.type(), int(width), int(blocks_per_row), out);
+                           /*row_dev=*/nullptr, W.type(), int(width),
+                           int(blocks_per_row), out);
+}
+
+// Device-resident single-row gather, device-row variant (Phase 3.2 B4): like
+// gather_f32_resident_dev but reads the token id from a device buffer
+// (`token_dev`, a float index) at kernel time instead of a host value, so the
+// next token id stays on the device between decode steps (argmax -> token_dev ->
+// gather, no host round-trip). `token_dev` must point at one device float.
+bool gather_f32_resident_dev_row(const QuantizedTensor& W, const float* token_dev,
+                                 float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0 || !token_dev || !out) return false;
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return launch_gather_row(static_cast<const uint8_t*>(d_w), /*row_host=*/0,
+                           token_dev, W.type(), int(width), int(blocks_per_row),
+                           out);
 }
 
 // Zero-copy single-row gather (Phase 3.2 B3): pin+map W's packed bytes in place
@@ -1248,7 +1276,45 @@ bool gather_f32_mapped_dev(const QuantizedTensor& W, int64_t token, float* out) 
     d_w = g_ple_mapped.dev;
   }
   return launch_gather_row(static_cast<const uint8_t*>(d_w), int64_t(token),
-                           W.type(), int(width), int(blocks_per_row), out);
+                           /*row_dev=*/nullptr, W.type(), int(width),
+                           int(blocks_per_row), out);
+}
+
+// Zero-copy single-row gather, device-row variant (Phase 3.2 B4): like
+// gather_f32_mapped_dev but reads the token id from a device buffer at kernel
+// time (see gather_f32_resident_dev_row).
+bool gather_f32_mapped_dev_row(const QuantizedTensor& W, const float* token_dev,
+                               float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0 || !token_dev || !out) return false;
+
+  const void* d_w = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    const void* src = W.data().data();
+    const size_t bytes = W.byte_size();
+    if (g_ple_mapped.host != src || g_ple_mapped.bytes != bytes) {
+      if (g_ple_mapped.host)
+        cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+      g_ple_mapped = {};
+      void* h = const_cast<void*>(src);
+      if (cudaHostRegister(h, bytes, cudaHostRegisterMapped) != cudaSuccess)
+        return false;
+      void* dev = nullptr;
+      if (cudaHostGetDevicePointer(&dev, h, 0) != cudaSuccess) {
+        cudaHostUnregister(h);
+        return false;
+      }
+      g_ple_mapped = {dev, src, bytes};
+    }
+    d_w = g_ple_mapped.dev;
+  }
+  return launch_gather_row(static_cast<const uint8_t*>(d_w), /*row_host=*/0,
+                           token_dev, W.type(), int(width), int(blocks_per_row),
+                           out);
 }
 
 } // namespace sonicboom::quant::cuda
