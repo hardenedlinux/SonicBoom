@@ -359,24 +359,43 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 
 // --- device-resident rms_norm reduction (no D2H of the sum) -----------------
 
-// Single-thread inv: reads the double sum and writes
-// inv = 1/sqrt((double)sum/(double)n + eps), reproducing the host rms_norm's
-// double mean division + float sqrt/recip exactly.
-__global__ void rms_inv_kernel(const double* __restrict__ sum, int n, float eps,
-                               float* __restrict__ inv) {
-  const double s = *sum;
-  *inv = 1.0f / sqrtf(float(double(s) / double(n)) + eps);
-}
-
-// rms apply variant that reads `inv` from a device scalar (device-resident path).
-__global__ void rms_apply_dev_kernel(const float* __restrict__ x,
-                                     const float* __restrict__ weight, int n,
-                                     const float* __restrict__ inv,
-                                     float* __restrict__ y) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n) return;
-  const float iv = *inv;
-  y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
+// Single-pass fused rms_norm: one kernel computes the sum-of-squares (the same
+// reduction algorithm as rms_sum_sq_kernel — strided double partials, warp
+// shuffle, shared block reduction), derives inv = 1/sqrtf(float(sum/n) + eps),
+// and applies it, in a single launch. This removes the separate rms_inv_kernel
+// (1-thread) + rms_apply_dev_kernel launches and the g_sum/g_inv device scalars
+// + memset from the decode path — for a ~2560-element vector the three-launch
+// sequence is launch-latency-bound, so collapsing it to one launch is a net win.
+// The 1024-thread block widens the reduction tree (32 warps vs the sum kernel's
+// 8), but that reordering is many orders below the fp32 rounding in the inv
+// conversion (same argument as rms_sum_sq_kernel), so the result is bit-identical
+// in practice — confirmed by the unchanged 64-step token stream.
+__global__ void rms_norm_fused_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ weight, int n,
+                                      float eps, float* __restrict__ y) {
+  const int tid = threadIdx.x;
+  double s = 0.0;
+  for (int i = tid; i < n; i += blockDim.x) {
+    const float v = x[i];
+    s += double(v * v);
+  }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  __shared__ double warp_part[32];
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (lane == 0) warp_part[warp] = s;
+  __syncthreads();
+  __shared__ float inv;
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
+    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
+  }
+  __syncthreads();
+  const float iv = inv;
+  for (int i = tid; i < n; i += blockDim.x)
+    y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
 }
 
 // Per-head sum-of-squares, one thread per head accumulating in double in
@@ -739,7 +758,6 @@ size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
-float* g_inv = nullptr;        // device-resident rms_norm inv scalar
 double* g_head_sum = nullptr;   // device-resident per-head rms_norm sums (double)
 float* g_head_inv = nullptr;   // device-resident per-head rms_norm inv
 int g_head_cap = 0;            // number of heads allocated for g_head_sum/inv
@@ -1176,16 +1194,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  if (!g_sum && cudaMalloc(reinterpret_cast<void**>(&g_sum), sizeof(double)) != cudaSuccess)
-    return false;
-  if (!g_inv && cudaMalloc(reinterpret_cast<void**>(&g_inv), sizeof(float)) != cudaSuccess)
-    return false;
-  if (cudaMemsetAsync(g_sum, 0, sizeof(double), cur_stream()) != cudaSuccess) return false;
-  rms_sum_sq_kernel<<<1, 256, 0, cur_stream()>>>(x, n, g_sum);
-  if (cudaGetLastError() != cudaSuccess) return false;
-  rms_inv_kernel<<<1, 1, 0, cur_stream()>>>(g_sum, n, eps, g_inv);
-  if (cudaGetLastError() != cudaSuccess) return false;
-  rms_apply_dev_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_w, n, g_inv, y);
+  rms_norm_fused_kernel<<<1, 1024, 0, cur_stream()>>>(x, d_w, n, eps, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
