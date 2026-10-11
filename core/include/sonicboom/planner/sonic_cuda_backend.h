@@ -77,6 +77,15 @@ public:
   // recorded kernels never race the warm kernels on their shared scratch.
   bool synchronize() const;
 
+  // HAL command seam: pre-record one decode step by running `step_fn` (which
+  // calls execute() for each task of the step) under CUDA Graph capture on a
+  // private stream, and return a re-playable program. Returns nullptr when the
+  // graph is disabled, capture fails, or the step body reports failure — the
+  // caller falls back to per-step execute(). The CUDA stream / graph machinery
+  // stays behind this method; the planner and executor never see it.
+  std::unique_ptr<hal::StepProgram> record_step(
+      std::function<bool()> step_fn) override;
+
   // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
   // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
   // matching the CUDA spine's matvec_f32_dev) + flash attention

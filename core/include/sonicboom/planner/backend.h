@@ -22,6 +22,7 @@
 // JIT entry (one or more float32 inputs, one float32 output), and
 // NativeTorchBackend, which dispatches a single native-torch node per task.
 
+#include <sonicboom/hal/command.h>
 #include <sonicboom/planner/errors.h>
 #include <sonicboom/planner/resource.h>
 #include <sonicboom/planner/runtime_value.h>
@@ -29,6 +30,7 @@
 #include <sonicboom/sx/exec.h>
 
 #include <expected>
+#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -53,6 +55,18 @@ public:
   // session, so state persists between steps but is scoped to that session.
   virtual std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) = 0;
+
+  // Pre-record one decode step into a re-playable program by running `step_fn`
+  // (which calls execute() for each task of the step). Returns nullptr when the
+  // backend has no pre-record capability or capture fails; the caller then falls
+  // back to per-step execute(). This is the HAL command seam: the concrete
+  // capture/replay mechanism (CUDA Graph, re-executed task list, …) is the
+  // backend's own. Default: unsupported.
+  virtual std::unique_ptr<hal::StepProgram> record_step(
+      std::function<bool()> step_fn) {
+    (void)step_fn;
+    return nullptr;
+  }
 };
 
 // CPU backend: compiles an sx::Document to its whole-graph JIT entry once, then

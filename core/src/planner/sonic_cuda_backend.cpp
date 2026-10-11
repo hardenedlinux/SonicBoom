@@ -26,7 +26,9 @@
 #include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include "../nn/cuda_graph.h"
 #include "../nn/cuda_resident.h"
+#include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
 #include "device_pool.h"
 
@@ -91,6 +93,22 @@ float* dev_mut(uint64_t handle) {
   return reinterpret_cast<float*>(handle);
 }
 
+// HAL StepProgram backed by an instantiated CUDA graph. Owns the GraphStep (and
+// therefore the cudaGraphExec_t / stream) and maps replay()/sync()/valid() onto
+// it. This is the only place the CUDA graph type appears behind the seam; it is
+// a backend-private detail and never crosses into Layer 2 or the planner.
+class CudaStepProgram final : public hal::StepProgram {
+ public:
+  bool replay() override { return graph_.replay(); }
+  bool sync() override { return graph_.sync(); }
+  bool valid() const override { return graph_.valid(); }
+
+  sonicboom::cuda::GraphStep& graph() { return graph_; }
+
+ private:
+  sonicboom::cuda::GraphStep graph_;
+};
+
 } // namespace
 
 SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
@@ -132,6 +150,21 @@ bool SonicCudaBackend::read_token(float* host) const {
 
 bool SonicCudaBackend::synchronize() const {
   return device::synchronize();
+}
+
+std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
+    std::function<bool()> step_fn) {
+  auto prog = std::make_unique<CudaStepProgram>();
+  auto& gs = prog->graph();
+  if (!gs.begin()) return nullptr;
+  bool captured = false;
+  {
+    sonicboom::cuda::CaptureScope cap;
+    sonicboom::cuda::StreamScope ss(gs.stream());
+    captured = step_fn();
+  }
+  if (!captured || !gs.end()) return nullptr;
+  return prog;
 }
 
 void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {

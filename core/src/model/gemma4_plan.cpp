@@ -28,8 +28,6 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <nvToolsExt.h>
-#include "../nn/cuda_graph.h"
-#include "../nn/cuda_stream.h"
 #endif
 
 #include <chrono>
@@ -39,6 +37,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -746,16 +745,18 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // the token id never round-trips through the host.
   cuda_backend.seed_token(start_token);
 
-  // --- CUDA Graph capture (CUDA Graphs) -------------------------------------
+  // --- CUDA Graph capture (HAL record_step) ----------------------------------
   // Replace the ~2600 per-step device-op launches (each a host-side launch call)
-  // with a single cudaGraphLaunch. Opt-out via SONICBOOM_CUDA_GRAPHS=0; any
-  // capture failure falls back to the per-step dispatch path below, so the graph
-  // is a pure launch-overhead optimization with no numerics change.
+  // with a single pre-recorded program (a cudaGraphLaunch inside the CUDA
+  // backend's record_step). Opt-out via SONICBOOM_CUDA_GRAPHS=0; any capture
+  // failure returns nullptr and falls back to the per-step dispatch path below,
+  // so the graph is a pure launch-overhead optimization with no numerics change.
+  // The CUDA stream / graph machinery lives behind SonicCudaBackend::record_step;
+  // this spine never touches it.
   const bool use_graphs =
       std::getenv("SONICBOOM_CUDA_GRAPHS") == nullptr ||
       std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
-  sonicboom::cuda::GraphStep graph_step;
-  bool graph_ok = false;
+  std::unique_ptr<hal::StepProgram> step_prog;
   if (use_graphs) {
     // Warm one real step so every device-pool buffer, kernel scratch buffer and
     // weight upload is allocated before capture (cudaMalloc / synchronous
@@ -772,24 +773,18 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
         // replay gathers the same start token the warm step did (the warm K/V
         // append at this position is overwritten by the first replay's append).
         cuda_backend.seed_token(start_token);
-        if (graph_step.begin()) {
-          bool captured = false;
-          {
-            sonicboom::cuda::CaptureScope cap;
-            sonicboom::cuda::StreamScope ss(graph_step.stream());
-            std::vector<sx::Bytes> cin;
-            cin.push_back(encode_i64(token));
-            cin.push_back(encode_i64(pos));
-            auto cres = exec.execute(*plan, *snap, cin);
-            captured = cres.has_value();
-          }
-          graph_ok = captured && graph_step.end();
-        }
+        step_prog = cuda_backend.record_step([&]() {
+          std::vector<sx::Bytes> cin;
+          cin.push_back(encode_i64(token));
+          cin.push_back(encode_i64(pos));
+          auto cres = exec.execute(*plan, *snap, cin);
+          return cres.has_value();
+        });
       }
     }
   }
 
-  if (graph_ok) {
+  if (step_prog) {
     // Replay the captured step: stage the position, launch the graph, read the
     // winning token back from the persistent device slot. The synchronous D2H
     // read also drains the graph stream before the next step.
@@ -797,7 +792,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       const std::string step_name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
       cuda_backend.set_pos(pos);
-      if (!graph_step.replay()) {
+      if (!step_prog->replay()) {
         if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[spine] step " << step << " graph replay failed\n";
         break;
