@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
   int steps = 4;
   int token = 2;
   int n_ctx = 512;
+  int depth = 0;        // warm-up decode steps before the timed window (cache depth)
   int n_threads = 0;   // 0 == llama.cpp default (4 threads)
   int n_gpu_layers = 0;  // 0 == CPU only; -1/999 == all layers offloaded
 
@@ -52,6 +53,8 @@ int main(int argc, char** argv) {
       token = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "--ctx")) {
       n_ctx = atoi(argv[++i]);
+    } else if (!strcmp(argv[i], "--depth")) {
+      depth = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "-t")) {
       n_threads = atoi(argv[++i]);
     } else if (!strcmp(argv[i], "-ngl")) {
@@ -103,22 +106,31 @@ int main(int argc, char** argv) {
   std::vector<int> tokens;
   tokens.reserve(steps);
 
-  const auto t0 = std::chrono::steady_clock::now();
   int cur = token;
   int pos = 0;
-  for (int s = 0; s < steps; ++s) {
+  auto decode_step = [&]() {
     batch.token[0] = cur;
     batch.pos[0] = pos;
-
     if (llama_decode(ctx, batch) != 0) {
-      fprintf(stderr, "decode failed at step %d (pos %d)\n", s, pos);
-      break;
+      fprintf(stderr, "decode failed at pos %d\n", pos);
+      return false;
     }
-
     const float* logits = llama_get_logits_ith(ctx, 0);
     cur = argmax(logits, vocab);
-    tokens.push_back(cur);
     ++pos;
+    return true;
+  };
+
+  // Warm the KV cache up to `depth` tokens (untimed) so the timed window below
+  // measures steady-state decode at that depth rather than averaging over the
+  // build-up from position 0.
+  for (int s = 0; s < depth; ++s)
+    if (!decode_step()) return 1;
+
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int s = 0; s < steps; ++s) {
+    if (!decode_step()) break;
+    tokens.push_back(cur);
   }
   const auto t1 = std::chrono::steady_clock::now();
 

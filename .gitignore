@@ -69,6 +69,7 @@ tools/baseline/llama_bench_cuda
 tools/baseline/sonicboom_dump
 tools/baseline/attention_bench
 tools/baseline/gemv_bench
+tools/baseline/longctx_bench
 *.dump
 
 *.log
