@@ -54,3 +54,10 @@ ctest --test-dir build --output-on-failure
 ```
 
 runs the full suite — 40 tests (36 C++ suites + 4 Guile suites) — in one pass.
+
+## Third-party notices
+
+Some quantized-dot kernels are derived from ggml (llama.cpp), which is
+MIT-licensed. See `NOTICE` for the file/function list and
+`LICENSES/ggml-MIT.txt` for the full license text. ggml is not linked as a
+runtime dependency.

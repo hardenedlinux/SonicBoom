@@ -4,8 +4,6 @@
 /cmake-build-*/
 /Testing/
 
-# ggml is a git submodule at third_party/ggml (see CMakeLists.txt); its build
-# outputs live under /build/. Nothing to ignore here beyond the generic *.o below.
 *.o
 *.a
 *.so

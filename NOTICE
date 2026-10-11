@@ -1,0 +1,69 @@
+SonicBoom third-party notices
+============================
+
+SonicBoom's own code is licensed GPL-3.0-or-later (see LICENSE). The files
+listed below incorporate material derived from ggml (llama.cpp), which is
+MIT-licensed under "Copyright (c) 2023-2026 The ggml authors". The full text of
+that license is in LICENSES/ggml-MIT.txt. Each derived source file also carries
+the ggml copyright and permission notice in its own header.
+
+Upstream reference: llama.cpp commit 43fe9c64281ef735046adc025e9e7559a1f659a5.
+
+----------------------------------------------------------------------------
+ggml / llama.cpp (MIT) — derived code
+----------------------------------------------------------------------------
+
+The following code is transcribed from ggml (ported, then adapted to
+SonicBoom's GGUF byte layouts where noted). It retains the MIT notice above.
+
+core/src/quant/ggml_derived/mmvq_q8_1.cuh
+    q8_1 int8-activation mmvq (CUDA). Ported from:
+      - quantize_q8_1            ← ggml/src/ggml-cuda/quantize.cu
+      - vec_dot_q3_K_q8_1        ← ggml/src/ggml-cuda/vecdotq.cuh
+      - vec_dot_q4_K_q8_1        ← ggml/src/ggml-cuda/vecdotq.cuh
+      - vec_dot_q5_K_q8_1        ← ggml/src/ggml-cuda/vecdotq.cuh
+      - gemv_q3_K_q8_1           ← ggml/src/ggml-cuda/mmvq.cu
+      - gemv_q4_K_q8_1           ← ggml/src/ggml-cuda/mmvq.cu
+      - gemv_q5_K_q8_1           ← ggml/src/ggml-cuda/mmvq.cu
+      - get_int_b2 / get_int_b4, block_q8_1 layout
+    (Adaptation: block_q8_1 keeps `d` as fp32; llama.cpp packs d+s into a half2.)
+
+core/src/quant/ggml_derived/vec_dot_qK_q8K.h
+    q8_K scalar fixed-point reference (CPU). Ported from:
+      - nearest_int              ← ggml/src/ggml-quants.c
+      - Q8KBlock (block_q8_K)    ← ggml/src/ggml-quants.h
+      - quantize_q8_K_blocks     ← ggml/src/ggml-quants.c (quantize_row_q8_K_ref)
+      - dot_q3_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q3_K_q8_K_generic)
+      - dot_q4_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q4_K_q8_K_generic)
+      - dot_q5_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q5_K_q8_K_generic)
+
+tests/core/ggml_baseline.h
+    Verbatim transcription of ggml dequantize_row_q3/q4/q5_K + get_scale_min_k4.
+    (Already carries its own attribution header.)
+
+----------------------------------------------------------------------------
+Same algorithm, independent expression (SonicBoom's own; no ggml code copied)
+----------------------------------------------------------------------------
+
+These reproduce ggml's *behavior* (bit-for-bit where the comment says so) but
+are written independently and are not derived works:
+
+  - core/src/quant/dequant.cpp     q3/q4/q5_K dequantize (independent C++23;
+                                   header already notes ggml is MIT-licensed)
+  - core/src/nn/activation.cpp     gelu_tanh_f32 / gelu_fp16 (standard tanh
+                                   GELU formula from the original paper)
+  - core/src/nn/norm.cpp           rms_norm (standard rms-norm formula)
+  - core/src/nn/matmul.cpp         matvec_bf16 (standard bf16 inner product)
+  - half_to_float (GGML_FP16_TO_FP32 semantics)  IEEE 754 binary16→binary32
+  - core/src/quant/quantized_matmul.cpp  AVX2 q8_K dot kernels
+  - core/src/quant/cuda_quant_matmul.cu   fp32 gemv_q*_K_base/_coop kernels
+
+----------------------------------------------------------------------------
+Format reference only (not derived code)
+----------------------------------------------------------------------------
+
+The GGUF reader and the quantized-tensor table
+(core/src/quant/quantized_tensor.cpp, core/include/sonicboom/quant/quantized_tensor.h)
+re-declare ggml's numeric *type ids* and the block-quantized *layouts* so they can
+parse GGUF files. These are data-format constants and structure layouts, not a
+derived implementation of ggml code.

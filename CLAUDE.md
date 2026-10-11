@@ -236,10 +236,13 @@ Rules:
   table); GPU kernels may use their own quantization (e.g. q8_1 + dp4a) and are
   accepted on tolerance plus greedy token-stream agreement, with any divergence
   reported (first divergent step, top-1/top-2 logit margin).
-- All layer boundaries, the C ABI rules, and the "llama.cpp/ggml is a dev-time
-  baseline only" rule remain in force. Generated code and JIT machinery live
-  behind Layer 2; no CUDA, MLIR, or native-torch types in
+- All layer boundaries and the C ABI rules remain in force. Generated code and
+  JIT machinery live behind Layer 2; no CUDA, MLIR, or native-torch types in
   `core/include/sonicboom/`.
+- **ggml / llama.cpp may be used as a reference.** Any code derived from them
+  must live in clearly marked files (e.g. `core/src/quant/ggml_derived/`)
+  carrying the original MIT copyright and permission notice, and must be listed
+  in the NOTICE file. ggml is not linked as a runtime dependency.
 
 ## Error handling
 
