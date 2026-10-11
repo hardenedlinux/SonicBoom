@@ -21,6 +21,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -401,42 +402,46 @@ __global__ void gqa_broadcast_kernel(const float* __restrict__ src,
   dst[i] = src[kv_h * head_dim + off];
 }
 
-// Split-KV incremental decode attention (flash-decoding). One block per KV
-// chunk; each block computes a partial (local max m, local sum l, V-weighted
-// output o) per query head over its chunk, and a second kernel merges the chunk
-// partials in fixed order. Splitting the KV sequence across blocks is what lets
-// the decode step use more than one SM: the single-block form was memory-latency
-// bound (63% of warp cycles stalled on the L1TEX K/V scoreboard, 16.7% achieved
-// occupancy, 1 grid block for 20 SMs). The GQA sharing is unchanged — all 8
-// query heads (one warp each) live in one block so each KV head is read once and
-// shared by its 4 query heads.
+// Split-KV incremental decode attention (flash-decoding). One block per
+// (chunk, GQA group): the KV sequence is split into `chunk`-key slices, and
+// within each slice the n_heads_kv GQA groups run as separate blocks so each KV
+// head is read once and shared by its group_q query heads. Each block computes a
+// partial (local max m, local sum l, V-weighted output o) per query head over
+// its slice, and a second kernel merges the slice partials in fixed order.
+// Splitting the KV sequence across blocks is what lets the decode step use more
+// than one SM: the single-block form was memory-latency bound (63% of warp
+// cycles stalled on the L1TEX K/V scoreboard, 16.7% achieved occupancy, 1 grid
+// block for 20 SMs). The chunk size is computed at runtime (see
+// decode_attention_dev) from n_keys and the SM count, so short context still
+// fills every SM instead of running a handful of blocks.
 //
 // Numerics: fmaxf is exact, so each chunk's local max is order-independent; the
 // merge rescales by exp(chunk_max - global_max) and sums the (l, o) partials in
 // fixed chunk order, so the whole result is deterministic (no float atomics).
 // It differs from the single-pass CPU reference only in fp32 summation order
 // (~1e-4 relative), inside the existing fp32 tolerance.
-constexpr int kAttnChunkKeys = 16;  // keys per chunk (tuned against attention_bench)
-
 __global__ void decode_attention_split_kernel(const float* __restrict__ q,
                                               const float* __restrict__ k_cache,
                                               const float* __restrict__ v_cache,
                                               uint64_t start, uint64_t n_keys,
-                                              uint64_t n_slots,
+                                              uint64_t n_slots, uint64_t chunk,
                                               int n_heads_q, int n_heads_kv,
                                               int head_dim, float scale,
                                               float* __restrict__ partial) {
-  extern __shared__ float scores[];  // [n_heads_q * kAttnChunkKeys]
+  extern __shared__ float scores[];  // [group_q * chunk]
+  const int group_q = n_heads_q / n_heads_kv;  // query heads sharing one KV head
+  const int kv_group = blockIdx.x % n_heads_kv;
+  const uint64_t chunk_idx = blockIdx.x / n_heads_kv;
   const int lane = threadIdx.x & 31;
-  const int h = threadIdx.x >> 5;    // warp id == query head
-  if (h >= n_heads_q) return;
-  const int kv_h = h * n_heads_kv / n_heads_q;
+  const int hg = threadIdx.x >> 5;   // query head within this GQA group
+  if (hg >= group_q) return;
+  const int h = kv_group * group_q + hg;  // global query head
+  const int kv_h = kv_group;
   const float* qrow = q + (uint64_t)h * head_dim;
-  float* srow = scores + (uint64_t)h * kAttnChunkKeys;
+  float* srow = scores + (uint64_t)hg * chunk;
 
-  const uint64_t c0 = (uint64_t)blockIdx.x * kAttnChunkKeys;
-  const uint64_t cn =
-      (c0 + kAttnChunkKeys < n_keys) ? kAttnChunkKeys : (n_keys - c0);
+  const uint64_t c0 = chunk_idx * chunk;
+  const uint64_t cn = (c0 + chunk < n_keys) ? chunk : (n_keys - c0);
 
   // Phase 1: one q·k dot per key, warp-cooperative.
   for (uint64_t j = 0; j < cn; ++j) {
@@ -485,44 +490,41 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   }
 
   // Write partial [m, l, o[0..head_dim-1]] for this head.
-  float* pp = partial + (uint64_t)blockIdx.x * n_heads_q * (head_dim + 2) +
+  float* pp = partial + chunk_idx * (uint64_t)n_heads_q * (head_dim + 2) +
               (uint64_t)h * (head_dim + 2);
   if (lane == 0) { pp[0] = m; pp[1] = l; }
   for (int i = 0; i < dims_per_lane; ++i) pp[2 + lane + i * 32] = acc[i];
 }
 
 // Merge the per-chunk partials in fixed order (flash-decoding online-softmax
-// combine). One warp per query head; grid == 1. Deterministic: the chunk loop
+// combine). One block per query head; threads split the head_dim outputs so each
+// output element is accumulated independently. Deterministic: the chunk loop
 // runs 0..n_chunks-1 in order and there are no atomics.
 __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
                                               int n_chunks, int n_heads_q,
                                               int head_dim,
                                               float* __restrict__ out) {
-  const int lane = threadIdx.x & 31;
-  const int h = threadIdx.x >> 5;
-  if (h >= n_heads_q) return;
+  const int h = blockIdx.x;    // one block per query head
+  const int t = threadIdx.x;   // one thread per output dim
+  if (t >= head_dim) return;
 
-  // Global max over chunks.
+  // Global max over chunks (every thread redundantly scans the same max; the
+  // chunk count is small, so this is cheaper than a block reduction).
   float m = -1e30f;
   for (int c = 0; c < n_chunks; ++c)
     m = fmaxf(m, partial[(uint64_t)c * n_heads_q * (head_dim + 2) +
                          (uint64_t)h * (head_dim + 2)]);
 
-  const int dims_per_lane = head_dim >> 5;
   float l = 0.0f;
-  float acc[16];
-#pragma unroll
-  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  float acc = 0.0f;
   for (int c = 0; c < n_chunks; ++c) {
     const float* pp = partial + (uint64_t)c * n_heads_q * (head_dim + 2) +
                       (uint64_t)h * (head_dim + 2);
     const float w = expf(pp[0] - m);
     l += w * pp[1];
-    for (int i = 0; i < dims_per_lane; ++i) acc[i] += w * pp[2 + lane + i * 32];
+    acc += w * pp[2 + t];
   }
-  const float inv = 1.0f / l;
-  float* orow = out + (uint64_t)h * head_dim;
-  for (int i = 0; i < dims_per_lane; ++i) orow[lane + i * 32] = acc[i] * inv;
+  out[(uint64_t)h * head_dim + t] = acc / l;
 }
 
 // --- flash attention (prefill) ----------------------------------------------
@@ -767,6 +769,22 @@ bool available() noexcept {
     g_available_checked = true;
   }
   return g_available;
+}
+
+// Cached SM count for the current device (used to size the decode-attention
+// launch grid so short context still fills every SM). Falls back to a sane
+// default if the query fails, so it never makes launch config invalid.
+int sm_count() noexcept {
+  static int n = [] {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 20;
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) !=
+        cudaSuccess)
+      return 20;
+    return v > 0 ? v : 20;
+  }();
+  return n;
 }
 
 void clear_cache() {
@@ -1275,22 +1293,30 @@ bool decode_attention_dev(const float* q, const float* k_cache,
       (sliding_window > 0 && pos >= sliding_window) ? pos - sliding_window + 1 : 0;
   const uint64_t n_keys = pos - start + 1;
 
-  // Split-KV: n_chunks blocks each compute a per-head partial over its slice of
-  // the KV sequence, then one merge block combines them in fixed order. The
-  // chunk count is what lets the decode step span multiple SMs.
-  const uint64_t n_chunks = (n_keys + kAttnChunkKeys - 1) / kAttnChunkKeys;
+  // Split-KV: n_chunks × n_kv_heads blocks each compute a per-head partial over
+  // its slice of the KV sequence, then n_heads_q merge blocks combine them in
+  // fixed order. The chunk size is computed from n_keys and the SM count so
+  // short context still fills every SM (a fixed chunk size would leave the
+  // device idle early in the sequence, e.g. 3 blocks for 33 keys).
+  const int group_q = n_heads_q / n_heads_kv;
+  const uint64_t target_chunks =
+      std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
+  const uint64_t chunk =
+      std::max<uint64_t>(1, (n_keys + target_chunks - 1) / target_chunks);
+  const uint64_t n_chunks = (n_keys + chunk - 1) / chunk;
+
   const size_t partial_floats =
       (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
   float* partial = static_cast<float*>(
       grow_scratch(g_attn_partial, g_attn_partial_bytes,
                    partial_floats * sizeof(float)));
 
-  const size_t smem =
-      (size_t)n_heads_q * kAttnChunkKeys * sizeof(float);
-  decode_attention_split_kernel<<<(unsigned)n_chunks, n_heads_q * 32, smem>>>(
-      q, k_cache, v_cache, start, n_keys, n_slots, n_heads_q, n_heads_kv,
+  const size_t smem = (size_t)group_q * chunk * sizeof(float);
+  decode_attention_split_kernel<<<(unsigned)(n_chunks * (uint64_t)n_heads_kv),
+                                  group_q * 32, smem>>>(
+      q, k_cache, v_cache, start, n_keys, n_slots, chunk, n_heads_q, n_heads_kv,
       head_dim, scale, partial);
-  decode_attention_merge_kernel<<<1, n_heads_q * 32>>>(
+  decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim>>>(
       partial, (int)n_chunks, n_heads_q, head_dim, out);
   return cudaGetLastError() == cudaSuccess;
 }
