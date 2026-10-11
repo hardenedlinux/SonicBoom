@@ -23,6 +23,9 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -230,6 +233,87 @@ __global__ void gemv_bf16(const uint16_t* __restrict__ W, const float* __restric
     float acc = 0.0f;
     for (int i = 0; i < cols; ++i) acc += bf16_to_float(wrow[i]) * x[i];
     y[j] = acc;
+  }
+}
+
+// --- vectorized warp-per-row dense gemv (Phase 2.3b) ------------------------
+//
+// Each warp computes a partial dot over a contiguous chunk of one row's
+// float4/uint4 vectors, then __shfl-reduces. `k_split` warps cooperate per row
+// (k_split == 1 => direct write; k_split > 1 => atomicAdd into a zeroed y), so
+// the few-row shapes (inp_gate, 256 rows) still fill the SMs. W and x must be
+// 16-byte aligned; cols must be a multiple of 4 (f32) / 8 (bf16).
+
+__global__ void gemv_dense_f32_v(const float* __restrict__ W,
+                                 const float* __restrict__ x,
+                                 float* __restrict__ y, int cols, int rows,
+                                 int k_split) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row = warp_id / k_split;
+  const int chunk = warp_id % k_split;
+  if (row >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 2;                       // float4 per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int v_end = min(v_begin + chunk_nv, nv);
+
+  const float4* wv = reinterpret_cast<const float4*>(W + (size_t)row * cols);
+  const float4* xv = reinterpret_cast<const float4*>(x);
+
+  float acc = 0.0f;
+  for (int v = v_begin + lane; v < v_end; v += 32) {
+    const float4 w = wv[v];
+    const float4 xi = xv[v];
+    acc += w.x * xi.x + w.y * xi.y + w.z * xi.z + w.w * xi.w;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    if (k_split == 1) y[row] = acc;
+    else atomicAdd(&y[row], acc);
+  }
+}
+
+__global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
+                            const float* __restrict__ x, float* __restrict__ y,
+                            int cols, int rows, int k_split) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row = warp_id / k_split;
+  const int chunk = warp_id % k_split;
+  if (row >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 3;                       // uint4 (8 bf16) per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int v_end = min(v_begin + chunk_nv, nv);
+
+  const uint4* wv = reinterpret_cast<const uint4*>(W + (size_t)row * cols);
+  const float4* xv = reinterpret_cast<const float4*>(x);
+
+  float acc = 0.0f;
+  for (int v = v_begin + lane; v < v_end; v += 32) {
+    const uint4 w = wv[v];
+    const float4 x0 = xv[(v << 1)];
+    const float4 x1 = xv[(v << 1) + 1];
+    acc += bf16_to_float(uint16_t(w.x & 0xffffu)) * x0.x +
+           bf16_to_float(uint16_t(w.x >> 16)) * x0.y +
+           bf16_to_float(uint16_t(w.y & 0xffffu)) * x0.z +
+           bf16_to_float(uint16_t(w.y >> 16)) * x0.w +
+           bf16_to_float(uint16_t(w.z & 0xffffu)) * x1.x +
+           bf16_to_float(uint16_t(w.z >> 16)) * x1.y +
+           bf16_to_float(uint16_t(w.w & 0xffffu)) * x1.z +
+           bf16_to_float(uint16_t(w.w >> 16)) * x1.w;
+  }
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
+  if (lane == 0) {
+    if (k_split == 1) y[row] = acc;
+    else atomicAdd(&y[row], acc);
   }
 }
 
@@ -497,7 +581,27 @@ struct DeviceWeight {
   size_t bytes = 0;
 };
 
-std::unordered_map<const void*, DeviceWeight> g_cache;
+// Key the weight cache by (host pointer, byte size) rather than pointer alone:
+// the same host pointer can legitimately serve different views (e.g. the full
+// per_layer_model_proj tensor vs. a contiguous leading per-block slice). Keying
+// by pointer alone lets one view shadow the other — the size-mismatched upload
+// misses forever and its freshly-allocated buffer leaks every decode step.
+struct CacheKey {
+  const void* host;
+  size_t bytes;
+  bool operator==(const CacheKey& o) const {
+    return host == o.host && bytes == o.bytes;
+  }
+};
+
+struct CacheKeyHash {
+  size_t operator()(const CacheKey& k) const noexcept {
+    return std::hash<const void*>{}(k.host) ^
+           (std::hash<size_t>{}(k.bytes) * 0x9e3779b97f4a7c15ull);
+  }
+};
+
+std::unordered_map<CacheKey, DeviceWeight, CacheKeyHash> g_cache;
 std::mutex g_cache_mutex;
 
 void* g_dx = nullptr;
@@ -534,8 +638,9 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
 // the device copy.
 const void* upload_bytes(const void* host, size_t bytes) {
   std::lock_guard<std::mutex> lk(g_cache_mutex);
-  auto it = g_cache.find(host);
-  if (it != g_cache.end() && it->second.bytes == bytes) return it->second.ptr;
+  const CacheKey key{host, bytes};
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) return it->second.ptr;
 
   void* dptr = nullptr;
   if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
@@ -543,11 +648,25 @@ const void* upload_bytes(const void* host, size_t bytes) {
     cudaFree(dptr);
     return nullptr;
   }
-  g_cache.emplace(host, DeviceWeight{dptr, bytes});
+  g_cache.emplace(key, DeviceWeight{dptr, bytes});
   return dptr;
 }
 
 inline int grid_for(int n, int block = 256) { return (n + block - 1) / block; }
+
+// Split-K selection for the vectorized dense gemv: choose enough warps to keep
+// the SMs busy even for few-row shapes (e.g. inp_gate's 256 rows).
+constexpr int kGemvWarpsPerBlock = 8;  // 256 threads
+constexpr int kGemvTargetWarps = 1024;
+
+inline int gemv_k_split(int rows) {
+  return rows >= kGemvTargetWarps ? 1 : (kGemvTargetWarps + rows - 1) / rows;
+}
+
+inline int gemv_grid(int rows, int k_split) {
+  const int warps = rows * k_split;
+  return (warps + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
+}
 
 } // namespace
 
@@ -762,10 +881,21 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  gemv_dense_f32<<<grid_for(int(rows)), 256>>>(static_cast<const float*>(d_w),
-                                               static_cast<const float*>(d_x),
-                                               static_cast<float*>(d_y), int(cols),
-                                               int(rows));
+  if ((cols & 3) == 0) {
+    const int r = int(rows);
+    const int k_split = gemv_k_split(r);
+    if (k_split > 1 &&
+        cudaMemsetAsync(d_y, 0, rows * sizeof(float)) != cudaSuccess)
+      return false;
+    gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+        static_cast<const float*>(d_w), static_cast<const float*>(d_x),
+        static_cast<float*>(d_y), int(cols), r, k_split);
+  } else {
+    gemv_dense_f32<<<grid_for(int(rows)), 256>>>(static_cast<const float*>(d_w),
+                                                 static_cast<const float*>(d_x),
+                                                 static_cast<float*>(d_y), int(cols),
+                                                 int(rows));
+  }
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, rows * sizeof(float), cudaMemcpyDeviceToHost) ==
          cudaSuccess;
@@ -783,9 +913,20 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  gemv_bf16<<<grid_for(int(rows)), 256>>>(static_cast<const uint16_t*>(d_w),
-                                          static_cast<const float*>(d_x),
-                                          static_cast<float*>(d_y), int(cols), int(rows));
+  if ((cols & 7) == 0) {
+    const int r = int(rows);
+    const int k_split = gemv_k_split(r);
+    if (k_split > 1 &&
+        cudaMemsetAsync(d_y, 0, rows * sizeof(float)) != cudaSuccess)
+      return false;
+    gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32>>>(
+        static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
+        static_cast<float*>(d_y), int(cols), r, k_split);
+  } else {
+    gemv_bf16<<<grid_for(int(rows)), 256>>>(static_cast<const uint16_t*>(d_w),
+                                            static_cast<const float*>(d_x),
+                                            static_cast<float*>(d_y), int(cols), int(rows));
+  }
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, rows * sizeof(float), cudaMemcpyDeviceToHost) ==
          cudaSuccess;
@@ -957,7 +1098,16 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const float* d_w = static_cast<const float*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
   if (!d_w) return false;
-  gemv_dense_f32<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+  if ((cols & 3) == 0) {
+    const int k_split = gemv_k_split(rows);
+    if (k_split > 1 &&
+        cudaMemsetAsync(y, 0, (size_t)rows * sizeof(float)) != cudaSuccess)
+      return false;
+    gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+        d_w, x, y, cols, rows, k_split);
+  } else {
+    gemv_dense_f32<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -968,7 +1118,16 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const uint16_t* d_w = static_cast<const uint16_t*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
-  gemv_bf16<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+  if ((cols & 7) == 0) {
+    const int k_split = gemv_k_split(rows);
+    if (k_split > 1 &&
+        cudaMemsetAsync(y, 0, (size_t)rows * sizeof(float)) != cudaSuccess)
+      return false;
+    gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32>>>(
+        d_w, x, y, cols, rows, k_split);
+  } else {
+    gemv_bf16<<<grid_for(rows), 256>>>(d_w, x, y, cols, rows);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 

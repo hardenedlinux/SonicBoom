@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <unordered_map>
 
@@ -679,7 +680,19 @@ struct DeviceWeight {
   size_t bytes = 0;
 };
 
-std::unordered_map<const void*, DeviceWeight> g_cache;
+struct CacheKey {
+  const void* host;
+  size_t bytes;
+  bool operator==(const CacheKey& o) const { return host == o.host && bytes == o.bytes; }
+};
+
+struct CacheKeyHash {
+  size_t operator()(const CacheKey& k) const noexcept {
+    return std::hash<const void*>{}(k.host) ^ (std::hash<size_t>{}(k.bytes) * 0x9e3779b97f4a7c15ull);
+  }
+};
+
+std::unordered_map<CacheKey, DeviceWeight, CacheKeyHash> g_cache;
 std::mutex g_cache_mutex;
 
 void* g_dx = nullptr;
@@ -714,8 +727,9 @@ const void* upload_weight(const QuantizedTensor& W) {
   std::lock_guard<std::mutex> lk(g_cache_mutex);
   const void* host = W.data().data();
   const size_t bytes = W.byte_size();
-  auto it = g_cache.find(host);
-  if (it != g_cache.end() && it->second.bytes == bytes) return it->second.ptr;
+  CacheKey key{host, bytes};
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) return it->second.ptr;
 
   void* dptr = nullptr;
   if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
@@ -723,7 +737,7 @@ const void* upload_weight(const QuantizedTensor& W) {
     cudaFree(dptr);
     return nullptr;
   }
-  g_cache.emplace(host, DeviceWeight{dptr, bytes});
+  g_cache.emplace(key, DeviceWeight{dptr, bytes});
   return dptr;
 }
 
