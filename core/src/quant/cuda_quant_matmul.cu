@@ -707,6 +707,8 @@ void* g_row = nullptr;
 size_t g_row_bytes = 0;
 void* g_gather = nullptr;
 size_t g_gather_bytes = 0;
+void* g_gather_out = nullptr;
+size_t g_gather_out_bytes = 0;
 
 // Zero-copy per_layer_token_embd gather (Phase 3.2 B3): the packed tensor is
 // pinned + mapped in place (cudaHostRegisterMapped) once, so the gather kernel
@@ -1193,6 +1195,25 @@ bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out) {
   const uint8_t* wp = static_cast<const uint8_t*>(d_row);
   return launch_gather_row(wp, /*row_host=*/0, /*row_dev=*/nullptr, W.type(),
                            int(width), int(blocks_per_row), out);
+}
+
+// Public host-in/out single-row gather (Phase 3.2 B5): allocates a device output
+// scratch, runs gather_f32_dev into it, and copies the dequantized row back to
+// host. Exists so the differential test (vs quant::dequantize_row_f32) can stay a
+// clean public-header suite without touching raw CUDA.
+bool gather_f32(const QuantizedTensor& W, int64_t token, std::span<float> out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  if (token < 0 || uint64_t(token) >= W.dims()[1]) return false;
+  if (out.size() < width) return false;
+
+  float* d_out = static_cast<float*>(
+      grow_scratch(g_gather_out, g_gather_out_bytes, width * sizeof(float)));
+  if (!d_out) return false;
+  if (!gather_f32_dev(W, token, d_out)) return false;
+  return cudaMemcpy(out.data(), d_out, width * sizeof(float),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 // Device-resident single-row gather (Phase 3.2 B2): like gather_f32_dev, but

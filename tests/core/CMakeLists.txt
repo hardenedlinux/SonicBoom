@@ -48,6 +48,11 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_cuda_quant PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_quant)
 
+  # CUDA single-row gather differential test (device gather vs dequantize_row_f32).
+  add_executable(test_cuda_gather test_cuda_gather.cpp)
+  target_link_libraries(test_cuda_gather PRIVATE sonicboom)
+  sb_add_cpp_test(test_cuda_gather)
+
   # CUDA elementwise/norm/RoPE/dense-matvec differential test (each nn::cuda::*
   # kernel vs its CPU reference).
   add_executable(test_cuda_elementwise test_cuda_elementwise.cpp)

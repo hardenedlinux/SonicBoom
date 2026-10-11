@@ -60,6 +60,16 @@ bool matvec_f32(const QuantizedTensor& W, std::span<const float> x,
 bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
                 std::span<float> Y, uint64_t n);
 
+// Single-row gather on the device (host in/out): out[k] = dequantized
+// W[k][token] for k in [0, W.dims()[0]). The CUDA twin of
+// <sonicboom/quant/dequant.h> dequantize_row_f32 — same block layouts and
+// reconstruction formulas, so the result is bit-identical to the CPU reference.
+// Only the token's packed row is uploaded (the full tensor may be ~1.5 GiB and
+// is not kept resident). `out` must hold >= dims()[0] floats. Returns false
+// (writing nothing) when CUDA is unavailable, W is invalid or not 2-D, `token`
+// is out of range, or `out` is too short.
+bool gather_f32(const QuantizedTensor& W, int64_t token, std::span<float> out);
+
 // Drop all cached device weight copies (call when a model is reloaded at a new
 // address so stale device buffers are not reused).
 void clear_cache();
