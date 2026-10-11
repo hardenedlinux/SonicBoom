@@ -112,7 +112,70 @@ stream unchanged before/after).
   (231 launches × ~122 µs saved).
 - ctest 48/48 pass; CUDA token stream bit-identical before/after.
 
-## 2.2 / 2.3 — quantized gemv + dense gemv (pending direction confirmation)
+## 2.2 — quantized gemv (direction: q8_1 全面化)
 
-See the 2.0(e) result and the q8_1 prefill-consistency caveat. Direction to be
-confirmed before 2.2 lands.
+### 2.2a — prefill/decode quantization consistency (DONE, f134000)
+
+The q8_1 gate `SONICBOOM_GEMV_Q8_1` applied to `matvec_f32_dev` (n=1, decode)
+but not to `matmul_f32_dev` (n>1, batched prefill), so prefill ran fp32 while
+decode ran q8_1 on the *same* weights. That is a constructive inconsistency, not
+a numeric bug: the two paths fed the KV cache from different activation
+quantizations, so "prefill == per-token spine" diverged at token ~52. Fix:
+`matmul_f32_dev`'s per-column loop now dispatches through the same
+`g_q8_enabled()` gate as `matvec_f32_dev`, so prefill and decode use the same
+activation quantization. Rule going forward: one weight set ⇒ one activation
+quantization for both prefill and decode.
+
+### 2.2b — Q3_K q8_1 small-shape "optimization" (verdict: no kernel rewrite needed)
+
+**The Q3_K q8_1 attention kernels are already fast; the 3.2/2.5 GB/s that
+gemv_bench reports for attn_q/attn_k (§2.0e) is a measurement artifact, not a
+kernel defect.**
+
+Kernel-level effective bandwidth (nsys gpukernsum — hardware timestamps, the
+authoritative number; the gemv_bench wall clock is polluted, see below):
+
+| kernel (shape) | grid | kernel µs | packed bytes | GB/s |
+|---|---|---|---|---|
+| `gemv_q3_K_q8_1` (attn_k, 512 rows) | 1×64 | 7.5 | 563 KB | **75** |
+| `gemv_q3_K_q8_1` (attn_q, 2048 rows) | 1×256 | 23.1 | 2.25 MB | **97.5** |
+| `gemv_q4_K_q8_1` (attn_v, 512 rows) | 1×64 | 6.0 | 737 KB | 123 |
+
+The fp32 base kernels for the same shapes are ~155 µs (attn_k) / ~500 µs
+(attn_q) — i.e. the q8_1 kernel is **~20×** the fp32 base, not 0.7× as the
+gemv_bench wall-clock numbers implied. "2× fp32 base" is met with ~20× margin;
+the 80 GB/s target is met by attn_q (97.5) and approached by attn_k (75).
+
+**Why gemv_bench misreports small shapes.** `matvec_f32_dev` = `quantize_q8_1`
+(6 µs) + gemv kernel (7.5 µs) + ~9 µs launch ≈ 23 µs steady-state for attn_k
+(measured directly: fixed N=1000 loop in a fresh process gives 23.3 µs/call GPU,
+12.7 µs/call CPU). But the gemv_bench `run()` frees/re-`cudaMalloc`s `dx/dy` and
+`cudaEventSynchronize`s between shapes; after the heavy FFN shapes the GPU drops
+to a low-power state and each subsequent tiny 64-block kernel pays a ~190 µs
+wake-up/scheduling latency. That latency does not exist in the real decode loop
+(533 launches/token, **0** sync calls — phase1 §1), which is why end-to-end q8_1
+is 7.09 tok/s (1.64×) with a bit-identical token stream even though gemv_bench
+says the small shapes "regressed". The artifact is measurement-only.
+
+**Occupancy + registers** (cuobjdump; `ncu` still blocked by `ERR_NVGPUCTRPERM`):
+
+| kernel | REG | LOCAL | max blocks/SM (register-limited) |
+|---|---|---|---|
+| `gemv_q3_K_q8_1` | 40 | 0 | 6 (40×256=10240 regs; 65536/10240) |
+| `gemv_q4_K_q8_1` | 35 | 0 | 7 |
+| `gemv_q5_K_q8_1` | 38 | 0 | 6 |
+| `quantize_q8_1` | 49 | 0 | 5 |
+
+block(32,8) = 256 threads. attn_k (64 blocks → 3.2 blocks/SM) = 40% occupancy;
+attn_q/ffn (≥256 blocks → 6 blocks/SM) = 75%. The kernel already fills all 20
+SMs (64/256 blocks > 20) and is latency/L1-bound (phase1 ncu), not
+occupancy-bound — so "one row per multiple warps / more rows per block" would
+not move the needle. The remaining per-call cost for small shapes is the
+`quantize_q8_1` launch (6 µs kernel + ~5 µs launch), addressed by
+quantize-once-per-step reuse (2.2d), not by changing the gemv launch config.
+
+### 2.2c — q8_1 as default (pending 2.2b sign-off)
+
+### 2.2d — quantize-once-per-step reuse (pending)
+
+## 2.3 — dense f32/bf16 gemv (pending)
