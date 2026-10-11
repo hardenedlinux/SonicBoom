@@ -978,7 +978,13 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const int ic = int(cols), ir = int(rows);
   for (int c = 0; c < n; ++c) {
     gather_col<<<(ic + 255) / 256, 256>>>(X, col, ic, n, c);
-    launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
+    // Same activation-quantization gate as matvec_f32_dev (n == 1): prefill and
+    // decode must use the same quantization for the same weights, or the KV cache
+    // is built from a different numerical source and the continuation diverges.
+    if (g_q8_enabled())
+      launch_gemv_q8_1(W.type(), wp, col, row, int(blocks_per_row), ir);
+    else
+      launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
     scatter_col<<<(ir + 255) / 256, 256>>>(row, Y, ir, n, c);
   }
   return cudaGetLastError() == cudaSuccess;
