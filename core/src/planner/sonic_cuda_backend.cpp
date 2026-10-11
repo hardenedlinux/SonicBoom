@@ -390,10 +390,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // token id is the Int64 host graph input, read directly (no transfer).
       const uint64_t tok = read_i64(in[0].host);
       if (slot == model::WeightSlot::PerLayerTokenEmbd) {
-        // ~1.5 GiB tensor that does not fit resident: gather from a per-token
-        // row upload (Phase 3.2 B3 replaces this with pinned/mapped async).
-        ok = quant::cuda::gather_f32_dev(model_.weights.per_layer_token_embd,
-                                         int64_t(tok), out);
+        // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
+        // gather the token's row zero-copy (no per-token H2D).
+        ok = quant::cuda::gather_f32_mapped_dev(model_.weights.per_layer_token_embd,
+                                                int64_t(tok), out);
       } else {
         // token_embd is the tied lm_head, already resident (the logits matvec
         // uploads it once): gather straight from the device weight, no H2D.

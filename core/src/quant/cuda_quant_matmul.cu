@@ -708,6 +708,18 @@ size_t g_row_bytes = 0;
 void* g_gather = nullptr;
 size_t g_gather_bytes = 0;
 
+// Zero-copy per_layer_token_embd gather (Phase 3.2 B3): the packed tensor is
+// pinned + mapped in place (cudaHostRegisterMapped) once, so the gather kernel
+// reads the token's row straight out of host memory over PCIe — the per-token
+// sync H2D disappears entirely. Single slot: only per_layer_token_embd uses
+// this path (token_embd is already device-resident via upload_weight, B2).
+struct MappedEmbedding {
+  void* dev = nullptr;         // device-visible pointer (cudaHostGetDevicePointer)
+  const void* host = nullptr;  // the registered host pointer (== W.data().data())
+  size_t bytes = 0;
+};
+MappedEmbedding g_ple_mapped;
+
 bool g_available_checked = false;
 bool g_available = false;
 
@@ -893,6 +905,8 @@ void clear_cache() {
   std::lock_guard<std::mutex> lk(g_cache_mutex);
   for (auto& kv : g_cache) cudaFree(kv.second.ptr);
   g_cache.clear();
+  if (g_ple_mapped.host) cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+  g_ple_mapped = {};
 }
 
 // Blocks-per-row threshold above which the cooperative warp-per-row (_coop)
@@ -1192,6 +1206,47 @@ bool gather_f32_resident_dev(const QuantizedTensor& W, int64_t token, float* out
   // already uploaded it, so this is a lookup, not a copy.
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
+  return launch_gather_row(static_cast<const uint8_t*>(d_w), int64_t(token),
+                           W.type(), int(width), int(blocks_per_row), out);
+}
+
+// Zero-copy single-row gather (Phase 3.2 B3): pin+map W's packed bytes in place
+// (cudaHostRegisterMapped) once, then let the gather kernel read the token's row
+// straight out of host memory via the mapped device pointer. No per-token copy,
+// synchronous or otherwise. Only for weights too big to keep resident (the
+// ~1.5 GiB per_layer_token_embd); token_embd uses gather_f32_resident_dev.
+bool gather_f32_mapped_dev(const QuantizedTensor& W, int64_t token, float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint64_t vocab = W.dims()[1];
+  if (token < 0 || uint64_t(token) >= vocab || !out) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  // Register once, keyed by the source address so a model reload (new address)
+  // re-pins instead of dereferencing a stale mapping.
+  const void* d_w = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    const void* src = W.data().data();
+    const size_t bytes = W.byte_size();
+    if (g_ple_mapped.host != src || g_ple_mapped.bytes != bytes) {
+      if (g_ple_mapped.host)
+        cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+      g_ple_mapped = {};
+      void* h = const_cast<void*>(src);
+      if (cudaHostRegister(h, bytes, cudaHostRegisterMapped) != cudaSuccess)
+        return false;
+      void* dev = nullptr;
+      if (cudaHostGetDevicePointer(&dev, h, 0) != cudaSuccess) {
+        cudaHostUnregister(h);
+        return false;
+      }
+      g_ple_mapped = {dev, src, bytes};
+    }
+    d_w = g_ple_mapped.dev;
+  }
   return launch_gather_row(static_cast<const uint8_t*>(d_w), int64_t(token),
                            W.type(), int(width), int(blocks_per_row), out);
 }
