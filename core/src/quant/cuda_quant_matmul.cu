@@ -410,7 +410,8 @@ __global__ void gemv_q5_K_coop(const uint8_t* __restrict__ w, const float* __res
 // converting back to fp32. This is llama.cpp's mmvq (vecdotq.cuh) structure,
 // ported to the same GGUF byte layouts SonicBoom reads. The dot reproduces the
 // fp32 reference to ~q8_1 rounding (amax/127), within model-level tolerance.
-// Off by default: SONICBOOM_GEMV_Q8_1=1 selects it.
+// This is the default decode path (Phase 2.2). SONICBOOM_GEMV_F32=1 restores
+// the fp32 dequant-on-the-fly hybrid for differential testing against the CPU.
 
 namespace q8_1 {
 
@@ -837,11 +838,12 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
   }
 }
 
-// q8_1 mmvq selection (dev-time gate). Off by default: the fp32 hybrid is the
-// tested path. When enabled, matvec_f32 / matvec_f32_dev quantize x to q8_1 and
-// run the dp4a warp-per-row kernels instead of the fp32 base/coop hybrid.
+// q8_1 mmvq selection. On by default: matvec_f32 / matvec_f32_dev / matmul_f32
+// quantize x to q8_1 and run the dp4a warp-per-row kernels. SONICBOOM_GEMV_F32=1
+// restores the fp32 base/coop hybrid for differential testing against the CPU
+// reference (the fp32 path is the exact dequant arithmetic).
 bool g_q8_enabled() {
-  static const bool v = std::getenv("SONICBOOM_GEMV_Q8_1") != nullptr;
+  static const bool v = std::getenv("SONICBOOM_GEMV_F32") == nullptr;
   return v;
 }
 

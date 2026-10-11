@@ -174,7 +174,27 @@ not move the needle. The remaining per-call cost for small shapes is the
 `quantize_q8_1` launch (6 µs kernel + ~5 µs launch), addressed by
 quantize-once-per-step reuse (2.2d), not by changing the gemv launch config.
 
-### 2.2c — q8_1 as default (pending 2.2b sign-off)
+### 2.2c — q8_1 as default (DONE)
+
+The q8_1 mmvq path is now the default decode path. `g_q8_enabled()` returns
+true unless `SONICBOOM_GEMV_F32=1` is set, so `matvec_f32` / `matvec_f32_dev` /
+`matmul_f32` all quantize x to q8_1 and run the dp4a warp-per-row kernels by
+default. The fp32 dequant-on-the-fly base/coop hybrid is **preserved** (not
+deleted) behind `SONICBOOM_GEMV_F32=1` as the exact-arithmetic differential
+path.
+
+- `test_cuda_quant` (the differential test that compares the CUDA kernel against
+  the scalar CPU f32 reference) now forces `SONICBOOM_GEMV_F32=1` at startup, so
+  it keeps testing the exact fp32 path. The q8_1 path is approximate (int8
+  activation) by design and is validated end-to-end by `test_generate`'s golden
+  token stream instead.
+- Full ctest **48/48** pass; `test_generate` token stream matches the llama.cpp
+  golden `236761 107 236769 236776`.
+
+**Before/after tok/s (64-step decode, spine-cuda): 4.33 → 12.04 (2.78×).**
+The q8_1 default gives 12.0431 tok/s vs the fp32 default's 4.33 tok/s, with a
+bit-identical continuation (the earlier explicit-gate run and this default run
+both yield 236761 107 236769 236776 …).
 
 ### 2.2d — quantize-once-per-step reuse (pending)
 

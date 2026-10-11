@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <span>
@@ -169,6 +170,13 @@ void test_batched_type(sbquant::QuantType type, const char* name,
 } // namespace
 
 int main() {
+  // This test diffs the CUDA kernel against the scalar CPU f32-activation
+  // reference, so it must exercise the exact fp32 dequant-on-the-fly path. The
+  // q8_1 mmvq path (the decode default) quantizes the activation to int8 and is
+  // approximate; it is validated end-to-end by test_generate's golden token
+  // stream instead of differentially.
+  setenv("SONICBOOM_GEMV_F32", "1", 1);
+
   if (!sbquant::cuda::available()) {
     std::cout << "test_cuda_quant SKIP (no CUDA device)\n";
     return 0;
