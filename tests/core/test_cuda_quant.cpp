@@ -87,7 +87,12 @@ double compare(std::span<const float> got, std::span<const float> ref,
 
 void test_one_shape(sbquant::QuantType type, const char* name, uint64_t rows,
                     uint64_t cols, double tol, std::mt19937& rng) {
-  auto bytes = build_weight(type, rows, cols, rng);
+  // The device weight cache keys by host pointer + byte size; keep each weight's
+  // backing buffer alive for the whole run so a later shape can't reuse the freed
+  // address at the same size and hit a stale device copy.
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
   sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
   if (!W.valid()) {
     check(false, "build_weight produced an invalid tensor");
@@ -134,7 +139,11 @@ void test_one_type(sbquant::QuantType type, const char* name,
 // tolerances apply.
 void test_batched(sbquant::QuantType type, const char* name, uint64_t rows,
                   uint64_t cols, uint64_t n, double tol, std::mt19937& rng) {
-  auto bytes = build_weight(type, rows, cols, rng);
+  // Same keepalive as test_one_shape: keep each weight's backing buffer alive so
+  // the pointer-keyed device cache never sees a freed-and-reused address.
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
   sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
   if (!W.valid()) {
     check(false, "batched: build_weight produced an invalid tensor");

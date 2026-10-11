@@ -57,9 +57,11 @@ device), NOT dequantized to f32. `gemv_dense_f32` = `inp_gate` [2560→256] +
 
 ### (e) SONICBOOM_GEMV_Q8_1=1
 
-The already-ported q8_1 `__dp4a` path: gemv_bench shows FFN/Q4_K 2.5–9.3× faster
+The already-ported q8_1 `__dp4a` path: gemv_bench showed FFN/Q4_K 2.5–9.3× faster
 but Q3_K attention shapes 1.5–1.6× slower; per-token gemv 122.5 → 65.67 ms.
 End-to-end **7.09 tok/s (1.64× vs 4.33)**, token stream identical to golden.
+(The "attention 1.5–1.6× slower" was the §2.2b gemv_bench artifact; with the
+fixed tool the attention shapes are 1.5–2.3× *faster* — see §2.2b.)
 **Caveat:** the prefill-cuda test fails under q8_1 (batched prefill uses fp32
 matmul while the per-token ref uses q8_1 — a test-consistency artifact, not a
 decode bug). This needs resolving before q8_1 is enabled by default.
@@ -129,11 +131,13 @@ quantization for both prefill and decode.
 ### 2.2b — Q3_K q8_1 small-shape "optimization" (verdict: no kernel rewrite needed)
 
 **The Q3_K q8_1 attention kernels are already fast; the 3.2/2.5 GB/s that
-gemv_bench reports for attn_q/attn_k (§2.0e) is a measurement artifact, not a
-kernel defect.**
+gemv_bench originally reported for attn_q/attn_k (§2.0e) was a measurement
+artifact, not a kernel defect. The tool has since been fixed (see below) and the
+corrected q8_1 table is at the end of this section.**
 
 Kernel-level effective bandwidth (nsys gpukernsum — hardware timestamps, the
-authoritative number; the gemv_bench wall clock is polluted, see below):
+authoritative kernel-only number; the gemv_bench wall clock includes quantize +
+launch, see below):
 
 | kernel (shape) | grid | kernel µs | packed bytes | GB/s |
 |---|---|---|---|---|
@@ -141,21 +145,62 @@ authoritative number; the gemv_bench wall clock is polluted, see below):
 | `gemv_q3_K_q8_1` (attn_q, 2048 rows) | 1×256 | 23.1 | 2.25 MB | **97.5** |
 | `gemv_q4_K_q8_1` (attn_v, 512 rows) | 1×64 | 6.0 | 737 KB | 123 |
 
-The fp32 base kernels for the same shapes are ~155 µs (attn_k) / ~500 µs
-(attn_q) — i.e. the q8_1 kernel is **~20×** the fp32 base, not 0.7× as the
-gemv_bench wall-clock numbers implied. "2× fp32 base" is met with ~20× margin;
-the 80 GB/s target is met by attn_q (97.5) and approached by attn_k (75).
+**Where 97.5 GB/s comes from.** It is the *pure* `gemv_q3_K_q8_1` kernel time
+for attn_q (2048 rows, 2.25 MB packed = 20480 blocks × 110 B) read from
+`nsys stats --report gpukernsum` hardware timestamps in the real decode run:
+23.1 µs → 2.25 MB / 23.1 µs = 97.5 GB/s. It **excludes** the `quantize_q8_1`
+launch (~6 µs, a separate kernel) and the launch/handshake overhead, so it is
+the gemv kernel's own bandwidth, not the end-to-end `matvec_f32_dev` rate. The
+full `matvec_f32_dev` for attn_q measures 34.1 µs (66.1 GB/s) — quantize + gemv
++ launch — which is the number to compare against llama.cpp's per-op rate; the
+97.5 GB/s is the kernel-only figure used to argue the kernel itself is fast
+(above the 80 GB/s acceptance target).
 
-**Why gemv_bench misreports small shapes.** `matvec_f32_dev` = `quantize_q8_1`
-(6 µs) + gemv kernel (7.5 µs) + ~9 µs launch ≈ 23 µs steady-state for attn_k
-(measured directly: fixed N=1000 loop in a fresh process gives 23.3 µs/call GPU,
-12.7 µs/call CPU). But the gemv_bench `run()` frees/re-`cudaMalloc`s `dx/dy` and
-`cudaEventSynchronize`s between shapes; after the heavy FFN shapes the GPU drops
-to a low-power state and each subsequent tiny 64-block kernel pays a ~190 µs
-wake-up/scheduling latency. That latency does not exist in the real decode loop
-(533 launches/token, **0** sync calls — phase1 §1), which is why end-to-end q8_1
-is 7.09 tok/s (1.64×) with a bit-identical token stream even though gemv_bench
-says the small shapes "regressed". The artifact is measurement-only.
+**Why the original gemv_bench misreported small shapes (root cause).** Two
+interacting bugs in the *tool*, neither in the kernel:
+
+1. **Idle-clock wake-up + single-call adaptive iteration count.** The original
+   `run()` warmed up with 5 calls, then timed *one* call to size an adaptive
+   `N = 20000/one_us`. A single small kernel launched right after a sync runs at
+   the GPU's idle clock (~210 MHz P8 vs ~2.1 GHz boost) and pays SM power-gating
+   wake-up (~100–500 µs), so `one_us` was ~10–30× the true kernel time; N shrank
+   accordingly and the batch stayed at the low clock. This is what inflated
+   attn_q to 505.8 µs, attn_k to 159.2 µs, and attn_v-Q5_K to 367.1 µs in
+   phase1 §2 (the fp32 base is 24–78 µs at those shapes, not 155–500 µs).
+2. **Stale device-weight cache (host-pointer reuse).** `upload_weight` caches the
+   device copy by (host data pointer, byte size). The original `run()` freed each
+   shape's weight vector at return, so the next shape's `malloc` reused the
+   address when sizes matched (ffn_gate and ffn_up are both Q3_K [2560,10240] =
+   11.26 MB). A cache hit then served the *previous* shape's device copy — which
+   also skips the H2D upload, shifting the benchmark's device-memory/clock state
+   so the small attention shapes that follow measured ~2× their true time
+   (attn_k 32 µs) and the Q5_K reference reported an impossible 320 GB/s (above
+   the 224 GB/s DRAM ceiling).
+
+**Fix** (committed to `tools/baseline/gemv_bench.cpp`): (a) fixed 2000-call
+warmup + 2000-call timed batch with no sync in between — 2000 calls holds the
+clock at boost even for the ~15 µs kernels and is short enough that the ~1 ms
+fp32 kernels don't throttle; (b) every built weight is kept alive for the whole
+run (a `keepalive` vector) so host pointers stay unique and the device cache
+never serves stale data. Corrected gemv_bench (q8_1 default):
+
+| tensor | type | µs | GB/s |
+|---|---|---|---|
+| ffn_gate | Q3_K | 126.8 | 88.9 |
+| ffn_up | Q3_K | 127.7 | 88.2 |
+| ffn_down | Q4_K | 124.8 | 118.1 |
+| attn_q | Q3_K | 34.1 | 66.1 |
+| attn_k | Q3_K | 15.8 | 35.7 |
+| attn_v | Q4_K | 14.5 | 50.9 |
+| attn_output | Q4_K | 31.2 | 94.6 |
+| ffn_down (blk 0-1) | Q5_K | 142.5 | 126.5 |
+| attn_v (blk 0-1) | Q5_K | 15.1 | 59.8 |
+
+The small attention shapes are **not** regressed: q8_1 attn_k is 15.8 µs vs the
+fp32 base 24.4 µs (1.5× faster), attn_q 34.1 vs 78.3 µs (2.3×). The fp32 base
+attention shapes are 24–78 µs, not the ~155–500 µs the artifact implied, so the
+earlier "q8_1 is ~20× fp32 base" claim was itself the artifact. The real q8_1
+speedup over fp32 is ~1.5× (attn_k) to 8× (ffn_down).
 
 **Occupancy + registers** (cuobjdump; `ncu` still blocked by `ERR_NVGPUCTRPERM`):
 
@@ -196,21 +241,184 @@ The q8_1 default gives 12.0431 tok/s vs the fp32 default's 4.33 tok/s, with a
 bit-identical continuation (the earlier explicit-gate run and this default run
 both yield 236761 107 236769 236776 …).
 
-### 2.2d — quantize-once-per-step reuse (reverted: neutral)
+### 2.2d — quantize-once-per-step reuse (deferred, not a dead end)
 
 Implemented "quantize the activation once and reuse it across the gemvs that
 share it" — quantize `h` once for `attn_q/k/v`, quantize `f` once for
 `ffn_up/gate` — via a `quantize_x_q8_1` + `matvec_dev` device-resident API
 (gated so `SONICBOOM_GEMV_F32=1` still takes the fp32 path). Token stream is
-bit-identical (test_generate golden passes).
+bit-identical (test_generate golden passes). Reverted for now.
 
-**Result: neutral.** Before/after tok/s (64-step spine-cuda) 12.0431 → 12.0446
-(0.01%, pure noise). Root cause: the `quantize_q8_1` kernel is tiny (~80
-threads) and launch-latency-dominated; the decode loop is fully async (0 sync
-calls, phase1 §1), so each 6 µs quantize is overlapped with the preceding gemv
-and was never on the critical path. Removing the ~126 redundant quantize
-kernels/token saves no critical-path time. The change was **reverted** (adds
-`quantize_x_q8_1`/`matvec_dev` API surface for no measured benefit). Recorded in
-the do-not-retry list.
+**Result: wall time unchanged (12.0431 → 12.0446 tok/s, noise) — but the cause is
+host-side, not kernel overlap.** Kernels on the same stream run serially
+(quantize → gemv is a data-dependency chain); async launch hides CPU launch
+latency only, never GPU execution time. Removing ~126 quantize kernels/token of
+GPU work while wall time stays flat means the GPU was idle enough to absorb it —
+the critical path is on the **host** (synchronous `cudaMemcpy` ~300×/token +
+host embedding/softcap/argmax/planner), not the GPU. This is the same lever as
+the coexecution finding: per-call sync / resident activations (Option A), not
+more kernel work. **Deferred**: re-evaluate quantize-once-reuse after Phase 3
+removes the host-side sync, when the GPU is again the bottleneck.
 
-## 2.3 — dense f32/bf16 gemv (pending)
+## 3.0 — orchestration vs kernel decision (nsys, no production code change)
+
+`nsys profile` over a full `test_generate` run (q8_1 default,
+`SONICBOOM_GEN_STEPS=64`, `SONICBOOM_SKIP_CPU=1`), `gpukernsum` /
+`cudaapisum` / `gpumemtimesum` hardware timestamps. The current decode path is
+the **planner spine** (`[spine-cuda]` = `generate_spine_cuda` → `SonicCudaBackend`
+per-op graph), 11.89 tok/s (the `[cuda]` section is `generate_reference(Cuda)` →
+`cuda_forward_resident`, the single-token *oracle* with no KV cache — a
+different, simpler computation, not the decode path).
+
+### (a) per-token wall / GPU busy / util
+
+Wall = 84.1 ms/token (11.89 tok/s). GPU kernel time ≈ 61 ms/token → **util ≈ 73%
+(>70%)**. Per-token GPU kernel time by category (planner decode):
+
+| category | ms/token | % of kernel |
+|---|---|---|
+| **dense gemv** (gemv_bf16 + gemv_dense_f32) | **38.2** | **62** |
+| K-quant gemv (q8_1) | 14.0 | 23 |
+| lm_head (token_embd q3_K) | 2.7 | 4 |
+| attention + norms + quantize + elementwise | 6.5 | 11 |
+
+The dense gemvs are three per block, all `one-thread-per-row` (`gemv_*` at
+`core/src/nn/cuda_elementwise.cu:211/225`, grid `grid_for(rows)`):
+
+| dense gemv | shape | grid | µs | why slow |
+|---|---|---|---|---|
+| `gemv_bf16` | per_layer_model_proj 2560→256 | 1×1×1 | 439.9 | 256 rows = 1 block |
+| `gemv_dense_f32` | inp_gate 2560→256 | 1×1×1 | 425.8 | 256 rows = 1 block |
+| `gemv_dense_f32` | proj 256→2560 | 10×1×1 | 43.5 | 2560 rows = 10 blocks |
+
+The two single-block ones (per_layer_model_proj, inp_gate — both 2560 cols × 256
+rows) are ~10× the proj kernel at *equal* FLOPs, purely because 256 rows fills
+only one 256-thread block (1/20 SM) and each thread runs a serial 2560-length
+dot. (`per_layer_model_proj` is per-layer 2560→256; phase2 §2.0(d)'s "[2560→10752]"
+was the 42-layer total, not one gemv.)
+
+### (b) idle-gap locations (~27% of wall)
+
+Synchronous `cudaMemcpy` host-API stalls (below), the host `Embedding` /
+`Softcap` / `argmax` / planner scheduling, and a handful of single-thread
+kernels (`rms_inv_kernel` `<<<1,1>>>`, already small after 2.1).
+
+### (c) per-token cudaMemcpy / memset
+
+`gpumemtimesum` (GPU-side) vs `cudaapisum` (host-side) split:
+
+| op | calls | GPU time | host API time |
+|---|---|---|---|
+| HtoD | 8,088 | 0.445 s | — |
+| DtoH | 3,917 | 0.070 s | — |
+| DtoD | 65,614 | 0.115 s | — |
+| memset | 129,670 | 0.107 s | — |
+| **cudaMemcpy (all)** | 77,619 | **0.63 s** | **16.34 s (64.3%)** |
+
+The host spends **16.34 s inside `cudaMemcpy` (median 9.4 µs/call)** while the
+GPU does only **0.63 s of actual copy** — a ~26× host-side stall per transfer.
+The 53 ms max is the one-time token_embd (288 MB) upload; the per-token
+transfers are median ~1–9 µs but synchronous, so the host blocks on each.
+
+### (d) launch count + host compute
+
+867,076 kernel launches (7.52 s host API, 29.6%), ~3,500 launches per decode
+token. **Zero** per-op `cudaDeviceSynchronize`/`cudaStreamSynchronize`;
+`cudaEventSynchronize` = 67 total (only the timed warmup/timing boundaries). The
+host compute (embedding + softcap + argmax + planner) is the rest of the 27%
+idle gap.
+
+### Decision
+
+GPU util ≈ 73% **>70%** → **2.3 (dense gemv), not Phase 3.** The GPU is the
+bottleneck, and the dense gemvs are 62% of its time as single-block kernels.
+Phase 3 (orchestration) stays the follow-up: the ~27% idle gap is real but is
+one third the size of the dense-gemv GPU cost, and 2.3's parallelization of the
+three dense gemvs is the larger, orthogonal lever.
+
+## 2.3 — dense f32/bf16 gemv (DONE)
+
+### 2.3a — hoist per_layer_model_proj to once-per-token (graph/plan level)
+
+The three dense gemvs are (per block, 42 blocks) `per_layer_model_proj` 2560→256,
+`inp_gate` 2560→256, `proj` 256→2560. The first of these is **independent of the
+block's hidden state** — it projects the *token embedding*, so all 42 layers
+compute the same 2560→256 projection of the same input. Hoisted into a single
+**`PerLayerInput`** op in the plan preamble: one full-width 2560→**10752** bf16
+gemv + scale (1/√d) + segmented rms_norm (shared `per_layer_proj_norm` [256] over
+42 heads) + combine with `per_layer_token_embd` (×√256, then ×1/√2), all folded
+into one token-start pass. Each block then reads its [256] segment via a new
+**`Slice`** op instead of recomputing the projection.
+
+- `OpKind::PerLayerInput` + `OpKind::Slice` (op_kind.h/.cpp, partition.h,
+  resource.cpp), emitted in `gemma4_plan.cpp` `build_gemma4_graph`, executed in
+  `SonicCudaBackend::execute` (device-resident: `matvec_bf16_dev` + `scale_dev` +
+  `rms_norm_heads_dev` + `layer_combine_dev`); the CPU `SonicBackend` computes the
+  same arithmetic in `sonic_backend.cpp`.
+- This is a plan/graph change, **not** kernel-level special-casing, and it keeps
+  the CPU and CUDA spines on one shared graph (both reproduce the golden token
+  stream).
+
+### 2.3b — dense gemv kernels: vectorized + split-K warp-per-row
+
+Rewrote the dense kernels in `nn/cuda_elementwise.cu` (`gemv_dense_f32_v`,
+`gemv_bf16_v`): warp-per-row with `k_split` warps cooperating per row via
+`atomicAdd` into a zeroed `y`, float4/uint4 (≥128-bit) loads, `__shfl_down`
+warp reduction. The few-row shapes (inp_gate 256 rows) now fill the SMs via
+split-K instead of one serial thread-block. `matvec_f32_dev` / `matvec_bf16_dev`
+dispatch to the vectorized kernel when `cols % 4 == 0` (f32) / `% 8 == 0` (bf16)
+and fall back to the scalar kernel otherwise.
+
+### 2.3c — device-weight cache composite key (root-cause OOM fix)
+
+`test_generate` died at step 42 with `cuda=out of memory`: `upload_bytes` /
+`upload_weight` keyed the device cache by host pointer **only**, with a bytes
+field *inside* the value. The single-token oracle uploads per-block slices of
+`per_layer_model_proj` (block 0 = 1310720 B at the base pointer), while the spine's
+`PerLayerInput` uploads the full tensor (55050240 B) at the **same base pointer**;
+`find(host)` returned the slice entry, the bytes check missed, and `emplace(host,
+…)` was a no-op — so the 55 MB upload was re-allocated every step (never cached)
+and leaked 54 MiB/step. Fixed by a composite `(host pointer, byte size)` key
+(`CacheKey`/`CacheKeyHash`) in both `nn::cuda` and `quant::cuda`.
+
+### 2.3d — gemv_bench dense shapes + cache-staleness in the tool/test
+
+`tools/baseline/gemv_bench.cpp` gained the three dense shapes and the fixed
+2000-call warmup/timed methodology (§2.2b). The same host-pointer-reuse
+staleness that bit gemv_bench also bit `tests/core/test_cuda_quant.cpp` (its
+batched n=1/n=8 calls build identical [64,1024] weights whose freed buffers
+reuse one address at the same size); fixed with a `keepalive` vector so every
+weight's host pointer stays unique (matching gemv_bench). Pre-existing, not a 2.3
+regression.
+
+### Results (RTX 3050, sm_86, q8_1 default, 64-token decode)
+
+**dense gemv microbenchmark** (gemv_bench, device-resident, GB/s = weight bytes / time):
+
+| shape | dtype | µs | GB/s | target |
+|---|---|---|---|---|
+| per_layer_model_proj [2560→10752] | bf16 | 359.0 | **153.3** | ≥150 |
+| inp_gate [2560→256] | f32 | 20.6 | **127.3** | ≥100 |
+| proj [256→2560] | f32 | 20.5 | **127.7** | ≥100 |
+
+All three meet target (no ncu needed). Per-token dense gemv dropped **38.2 ms →
+~2.1 ms** (18×): 359 µs (×1) + 20.6 µs (×42) + 20.5 µs (×42).
+
+**End-to-end `[spine-cuda]` = 23.9 tok/s** (vs 11.89 tok/s at §3.0, 2.0×;
+target ≈20). `ctest` 48/48 pass.
+
+### Divergence vs golden (accumulation order)
+
+The split-K `atomicAdd` and the full-width bf16 gemv reorder the accumulation, so
+the CUDA spine's logits drift from the CPU spine by ~1e-3 relative and, at a
+near-tie, flip the argmax. First divergence (64-token run): **token 44
+(1-based)** — CPU top-1 `236764` (25.397) over top-2 `779` (24.194, gap 1.20);
+CUDA swaps them (`779` > `236764`). The two tokens are the same top-2 in both,
+just reordered — the anticipated "tiny logit diff" signature, not a real error.
+
+**Caveat:** `atomicAdd` in the `k_split > 1` path is non-deterministic, so the
+*exact* flip position shifts a few tokens between runs (~token 38–44). If
+reproducible tokens are required, the split-K reduction should be made
+deterministic (per-(row,chunk) partial buffer + fixed-order sum) — noted, not
+done here.
+

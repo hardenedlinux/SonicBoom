@@ -55,32 +55,42 @@ kernel time (the correct metric for n=1 gemv, *not* GFLOPS).
 
 | tensor | shape (cols→rows) | type | µs | **GB/s** |
 |---|---|---|---|---|
-| ffn_gate | 2560→10240 | Q3_K | 437.8 | 25.7 |
-| ffn_up | 2560→10240 | Q3_K | 450.9 | 25.0 |
-| ffn_down | 10240→2560 | Q4_K | 1206.2 | 12.2 |
-| attn_q | 2560→2048 | Q3_K | 505.8 | **4.5** |
-| attn_k | 2560→512 | Q3_K | 159.2 | **3.5** |
-| attn_v | 2560→512 | Q4_K | 28.0 | 26.3 |
-| attn_output | 2048→2560 | Q4_K | 103.2 | 28.6 |
-| ffn_down (blk 0-1) | 10240→2560 | Q5_K | 1379.1 | 13.1 |
-| attn_v (blk 0-1) | 2560→512 | Q5_K | 367.1 | 2.5 |
+| ffn_gate | 2560→10240 | Q3_K | 346.4 | 32.5 |
+| ffn_up | 2560→10240 | Q3_K | 346.2 | 32.5 |
+| ffn_down | 10240→2560 | Q4_K | 994.5 | 14.8 |
+| attn_q | 2560→2048 | Q3_K | 78.3 | 28.8 |
+| attn_k | 2560→512 | Q3_K | 24.4 | 23.1 |
+| attn_v | 2560→512 | Q4_K | 24.5 | 30.1 |
+| attn_output | 2048→2560 | Q4_K | 82.4 | 35.8 |
+| ffn_down (blk 0-1) | 10240→2560 | Q5_K | 1053.9 | 17.1 |
+| attn_v (blk 0-1) | 2560→512 | Q5_K | 25.7 | 35.1 |
 
-**Effective bandwidth is 3.5–28.6 GB/s — 1.5–13% of the 224 GB/s ceiling.** The
+**Effective bandwidth is 14.8–35.8 GB/s — 7–16% of the 224 GB/s ceiling.** The
 gemv is **not** DRAM-bandwidth-bound; it is latency/occupancy-bound (consistent
 with the prior ncu finding of L1/TEX ~97%, math_pipe ~0.2%). The task's given
 premise "n=1 gemv is bandwidth-bound" is **refuted by measurement**.
 
-Two anomalies that shape Phase 2:
+> **This table supersedes the original (corrected 2026-10-11).** The original
+> reported attn_q 505.8 µs, attn_k 159.2 µs, and attn_v-Q5_K 367.1 µs — those
+> three numbers were a gemv_bench measurement artifact (idle-clock wake-up +
+> a single-call adaptive iteration count), not real kernel time. The corrected
+> fp32 values here are from the fixed gemv_bench (`SONICBOOM_GEMV_F32=1`); see
+> phase2 §2.2b for the root cause and the fixed methodology.
 
-1. **Q3_K base collapses at small shapes.** Per-block throughput: ffn_gate/up
-   (10,240 rows) ≈ 228–234 blocks/µs, but attn_q (2,048 rows) ≈ 40 blocks/µs and
-   attn_k (512 rows) ≈ 32 blocks/µs. Q4_K base holds up at 182–198 blocks/µs
-   regardless of row count. So the most common type (q3_K, serving q/k/gate/up)
-   is also the one that degrades hardest where rows are few.
-2. **Q3_K vs Q4_K base at the *same* shape** (2560→512): 159.2 µs vs 28.0 µs, a
-   5.7× gap. The likely cause is `unpack_q3_K_scales`'s `memcpy` of a 16×int8
-   local array → local-memory spill + higher register pressure (8 accumulators vs
-   4), which only shows up once occupancy is low.
+Two anomalies that shape Phase 2 (REVISED — the two original anomalies were
+mostly that same artifact):
+
+1. **Q3_K base degrades *mildly* at small shapes.** Per-block throughput:
+   ffn_gate/up (10,240 rows) ≈ 296 blocks/µs, attn_q (2,048 rows) ≈ 261
+   blocks/µs, attn_k (512 rows) ≈ 210 blocks/µs — a ~1.4× drop, not the ~7×
+   "collapse" the original table implied (the original 40 blocks/µs for attn_q
+   was the artifact). Q4_K base is flat (≈ 206–209 blocks/µs from 10,240 to 512
+   rows).
+2. **Q3_K vs Q4_K base at the *same* shape** (2560→512): 24.4 µs vs 24.5 µs —
+   essentially **equal**. The original 159.2 vs 28.0 (a "5.7× gap") was the
+   artifact; there is no large Q3_K-vs-Q4_K base gap at equal shape. (The
+   register-bound occupancy difference in phase2 §2.2f is real but does not
+   translate into a 5.7× time gap at these shapes.)
 
 ## 3. matvec_f32_dev thread mapping (what the code actually does)
 
