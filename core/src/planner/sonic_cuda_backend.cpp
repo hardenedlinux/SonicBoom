@@ -30,6 +30,7 @@
 #include "../nn/cuda_resident.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
+#include "device_allocator.h"
 #include "device_pool.h"
 
 #include <nvToolsExt.h>
@@ -93,6 +94,11 @@ float* dev_mut(uint64_t handle) {
   return reinterpret_cast<float*>(handle);
 }
 
+// The device allocator backing this backend's persistent buffers. Stateless: it
+// delegates to the process-wide device pool, so a single shared instance serves
+// all backends (mirrors the pool's global free-list).
+hal::DeviceAllocator g_alloc;
+
 // HAL StepProgram backed by an instantiated CUDA graph. Owns the GraphStep (and
 // therefore the cudaGraphExec_t / stream) and maps replay()/sync()/valid() onto
 // it. This is the only place the CUDA graph type appears behind the seam; it is
@@ -115,41 +121,41 @@ SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
                                    const Graph& graph, uint64_t n_ctx)
     : model_(model), graph_(graph), n_ctx_(n_ctx) {
   ensure_caches(n_ctx);
-  token_dev_ = device::acquire(sizeof(float));   // persistent current-token slot
-  pos_dev_ = device::acquire(sizeof(uint64_t));  // persistent position slot
-  if (pos_dev_) {
+  token_buf_ = g_alloc.allocate(sizeof(float));   // persistent current-token slot
+  pos_buf_ = g_alloc.allocate(sizeof(uint64_t));  // persistent position slot
+  if (pos_buf_) {
     const uint64_t zero = 0;
-    device::upload(&zero, pos_dev_, sizeof(uint64_t));  // defensive: pos starts at 0
+    g_alloc.copy_to_device(pos_buf_, &zero, sizeof(uint64_t));  // defensive: pos starts at 0
   }
 }
 
 SonicCudaBackend::~SonicCudaBackend() {
   for (const auto& c : caches_) {
-    if (c.k_handle) device::release(c.k_handle, c.bytes);
-    if (c.v_handle) device::release(c.v_handle, c.bytes);
+    if (c.k_buf) g_alloc.deallocate(c.k_buf);
+    if (c.v_buf) g_alloc.deallocate(c.v_buf);
   }
-  if (token_dev_) device::release(token_dev_, sizeof(float));
-  if (pos_dev_) device::release(pos_dev_, sizeof(uint64_t));
+  if (token_buf_) g_alloc.deallocate(token_buf_);
+  if (pos_buf_) g_alloc.deallocate(pos_buf_);
 }
 
 bool SonicCudaBackend::seed_token(uint64_t token) {
-  if (!token_dev_) return false;
+  if (!token_buf_) return false;
   const float f = float(token);
-  return device::upload(&f, token_dev_, sizeof(float));
+  return g_alloc.copy_to_device(token_buf_, &f, sizeof(float));
 }
 
 bool SonicCudaBackend::set_pos(uint64_t pos) {
-  if (!pos_dev_) return false;
-  return device::upload(&pos, pos_dev_, sizeof(uint64_t));
+  if (!pos_buf_) return false;
+  return g_alloc.copy_to_device(pos_buf_, &pos, sizeof(uint64_t));
 }
 
 bool SonicCudaBackend::read_token(float* host) const {
-  if (!token_dev_ || !host) return false;
-  return device::download(token_dev_, host, sizeof(float));
+  if (!token_buf_ || !host) return false;
+  return g_alloc.copy_from_device(host, token_buf_, sizeof(float));
 }
 
 bool SonicCudaBackend::synchronize() const {
-  return device::synchronize();
+  return g_alloc.synchronize();
 }
 
 std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
@@ -179,8 +185,8 @@ void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
     // SWA layers are a fixed-size ring; global layers the full decode length.
     c.n_slots = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx;
     c.bytes = c.n_slots * c.n_heads_kv * c.head_dim * sizeof(float);
-    c.k_handle = device::acquire(c.bytes);
-    c.v_handle = device::acquire(c.bytes);
+    c.k_buf = g_alloc.allocate(c.bytes);
+    c.v_buf = g_alloc.allocate(c.bytes);
   }
 }
 
@@ -293,7 +299,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       }
       ok = nn::cuda::rope_neox_heads_dev_pos(
           out, int(lc.head_dim), out_n / int(lc.head_dim),
-          reinterpret_cast<const uint64_t*>(pos_dev_), lc.rope_base, 1.0f, ff);
+          reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
       break;
     }
     case OpKind::CastFp16: {
@@ -306,23 +312,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Attention: {
       // KV layer: append the fp16-rounded K/V to this layer's device cache at
-      // slot `pos % n_slots` (computed in-kernel from pos_dev_), then run
+      // slot `pos % n_slots` (computed in-kernel from pos_buf_), then run
       // incremental decode attention over it. inputs: {q (RoPE'd f32, device),
       // kc (device), vc (device)}; the position comes from the device slot.
       KvCacheDev& cache = caches_[uint32_t(layer)];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
-      if (!cache.k_handle || !cache.v_handle ||
-          !nn::cuda::kv_append_dev(dev_mut(cache.k_handle), dev_mut(cache.v_handle),
+      if (!cache.k_buf || !cache.v_buf ||
+          !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                    dev(in[1]), dev(in[2]),
-                                   reinterpret_cast<const uint64_t*>(pos_dev_),
+                                   reinterpret_cast<const uint64_t*>(pos_buf_.id),
                                    cache.n_slots, row_elems)) {
         ok = false;
         break;
       }
       ok = nn::cuda::decode_attention_dev(
-          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle),
-          reinterpret_cast<const uint64_t*>(pos_dev_), window, cache.n_slots,
+          dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
+          reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, 1.0f, out);
       break;
@@ -334,8 +340,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const KvCacheDev& cache = caches_[donor];
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       ok = nn::cuda::decode_attention_dev(
-          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle),
-          reinterpret_cast<const uint64_t*>(pos_dev_), window, cache.n_slots,
+          dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
+          reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, 1.0f, out);
       break;
@@ -443,10 +449,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::Embedding: {
       // Token embedding gather on the device: dequantize the token's row of
       // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device f32.
-      // The token id is read from the persistent device buffer `token_dev_`
+      // The token id is read from the persistent device buffer `token_buf_`
       // (Phase 3.2 B4), not the host graph input, so the next token id never
       // round-trips through the host.
-      const float* tok_dev = dev_mut(token_dev_);
+      const float* tok_dev = dev_mut(token_buf_.id);
       if (slot == model::WeightSlot::PerLayerTokenEmbd) {
         // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
         // gather the token's row zero-copy (no per-token H2D).
@@ -464,12 +470,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // Greedy token selection on the device: reduce the [vocab] logits to a
       // single index, so the per-token 1 MiB D2H of the full logits becomes a
       // 4-byte transfer of the winning index. The index is also written to the
-      // persistent `token_dev_` slot (Phase 3.2 B4) so the next step's Embedding
+      // persistent `token_buf_` slot (Phase 3.2 B4) so the next step's Embedding
       // gather reads it straight from the device.
       ok = nn::cuda::argmax_dev(dev(in[0]),
                                 int(in[0].device.size_bytes / sizeof(float)), out);
-      if (ok && token_dev_)
-        ok = device::device_copy(out_handle, token_dev_, sizeof(float));
+      if (ok && token_buf_)
+        ok = device::device_copy(out_handle, token_buf_.id, sizeof(float));
       break;
     }
     default:
@@ -602,10 +608,10 @@ bool SonicCudaBackend::prefill(std::span<const uint64_t> tokens, uint64_t start_
           return false;
         nn::cast_fp16(kc);  // K is fp16-rounded after RoPE (spine cache repr)
         const size_t off = (size_t)((start_pos + c) % cache.n_slots) * row;
-        if (!cache.k_handle || !cache.v_handle ||
-            !device::upload(kc.data(), cache.k_handle + off * sizeof(float),
+        if (!cache.k_buf || !cache.v_buf ||
+            !device::upload(kc.data(), cache.k_buf.id + off * sizeof(float),
                             kvw * sizeof(float)) ||
-            !device::upload(vc.data(), cache.v_handle + off * sizeof(float),
+            !device::upload(vc.data(), cache.v_buf.id + off * sizeof(float),
                             kvw * sizeof(float)))
           return false;
       }

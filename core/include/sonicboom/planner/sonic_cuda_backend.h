@@ -30,6 +30,7 @@
 // Softcap are placed on the CPU SonicBackend (there is no *_dev kernel for
 // them), so this backend never sees them and returns a hard error if it does.
 
+#include <sonicboom/hal/buffer.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/graph.h>
@@ -59,13 +60,13 @@ public:
   // overwrites the buffer in place and no host round-trip carries the token id.
   bool seed_token(uint64_t token);
 
-  // Stage the current decode position into the device-resident `pos_dev_` slot
+  // Stage the current decode position into the device-resident `pos_buf_` slot
   // (uint64_t). The decode loop calls this once per step before execute(); the
   // RoPE, KV-append and attention kernels read it in-kernel, so the position is
   // an input to a capturable graph rather than a per-kernel launch argument.
   bool set_pos(uint64_t pos);
 
-  // Download the current token id from the persistent device-resident `token_dev_`
+  // Download the current token id from the persistent device-resident `token_buf_`
   // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
   // argmax result without the executor's host-output path (which is a synchronous
   // cudaMemcpy and therefore not capturable). The synchronous D2H also serves as
@@ -104,10 +105,12 @@ private:
   // One KV layer's persistent device-resident decode cache (mirrors
   // SonicBackend::KvCache): K is RoPE'd + per-head-normed then fp16-rounded; V
   // per-head-normed then fp16-rounded. Flat [n_slots, n_heads_kv, head_dim] in
-  // f32; slot for absolute position j is `j % n_slots`.
+  // f32; slot for absolute position j is `j % n_slots`. Allocated as hal::Buffer
+  // through the device allocator (hal::DeviceAllocator) so the persistent slots
+  // have a stable address for the pre-recorded step's replay.
   struct KvCacheDev {
-    uint64_t k_handle = 0;
-    uint64_t v_handle = 0;
+    hal::Buffer k_buf;
+    hal::Buffer v_buf;
     uint64_t bytes = 0;  // per-buffer byte size (k and v equal)
     uint64_t n_slots = 0;
     uint64_t n_heads_kv = 0;
@@ -117,8 +120,8 @@ private:
   const model::Gemma4Model& model_;
   const Graph& graph_;
   std::vector<KvCacheDev> caches_;  // index == KV layer (0 .. n_layer_kv-1)
-  uint64_t token_dev_ = 0;          // persistent device buffer: current token id (float)
-  uint64_t pos_dev_ = 0;            // persistent device buffer: current position (uint64_t)
+  hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
+  hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
 
   void ensure_caches(uint64_t n_ctx);
