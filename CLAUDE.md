@@ -12,8 +12,9 @@ SonicBoom is a **native tensor runtime**.
   permitted where required, but must remain controlled (see "Native-torch
   migration rules").
 - **First-class language binding:** **Guile** (**3.0.9+**).
-- **v0 shape:** an inference/runtime system with a generic interpreter
-  (no code-generation architecture unless explicitly requested).
+- **v0 shape (complete):** an inference/runtime system with a generic
+  interpreter. The v0 ban on code generation existed only to get a correct
+  end-to-end path first; it does not apply to v1 (see "v1 scope").
 
 ## Language and toolchain
 
@@ -189,11 +190,56 @@ dependencies):
 ```text
 Autograd, Training, SymInt / SymIntList, Generator
 quantized dtypes, float8, UInt16, UInt32, UInt64
-generic code generation
+generic code generation   (lifted in v1, see "v1 scope")
 ```
 
-v0 is a generic interpreter. Do not introduce a code-generation architecture
-unless explicitly requested.
+v0 is a generic interpreter. **v0 is complete**: Gemma 4 E4B runs end to end
+(CPU and CUDA), numerically checked against the llama.cpp baseline. The v0
+restriction on code generation was a sequencing decision (correctness first),
+not an architectural ban, and is lifted by the v1 scope below.
+
+## v1 scope (current): performance
+
+Goal: inference performance at or above the llama.cpp baseline on the same
+hardware, then beyond it where SonicBoom's planner and runtime knowledge give
+an advantage (resource-constrained execution, demand-driven specialization).
+
+Permitted and expected:
+
+- **Code generation where it serves performance.** In particular an MLIR GPU
+  lowering path (linalg → gpu → nvvm → cubin), JIT-compiled and cached by
+  shape signature, for fused glue kernels (norms, quantize, elementwise,
+  residual adds, RoPE) between the hot kernels. Graph-level rewrites in the
+  planner (fusion, dead-computation elimination, invariant hoisting) are in
+  scope.
+- **Kernel sourcing, in order of preference:**
+  1. native-torch kernels where they fit (cuBLAS-backed GEMM and flash
+     attention for prefill; argmax/topk/sampling and other one-off ops);
+  2. hand-written CUDA kernels where native-torch has no suitable kernel
+     (GGUF K-quant gemv/gemm, decode attention);
+  3. MLIR-generated kernels for fused glue regions.
+  Hand-written fused kernels serve as the performance and numerical reference
+  for any generated kernel.
+- **CUDA Graphs** and other launch-overhead reduction on the decode path.
+
+Rules:
+
+- **Measure first.** Performance decisions are driven by data: nsys/ncu,
+  effective GB/s for memory-bound kernels (not GFLOPS), and per-decode-step
+  counts (kernel launches, memcpy by direction, memset) taken inside an NVTX
+  decode-step window, never whole-run totals divided by step count.
+- **"Do-not-retry" notes must record their conditions** (what was measured,
+  on which code state, what was the bottleneck at the time). When those
+  conditions change, the note is re-evaluated, not obeyed blindly.
+- **GPU numerics need not be bit-identical to the CPU path.** The CPU path keeps
+  its llama.cpp-CPU-matching semantics (q8_K activation quantization, fp16 GELU
+  table); GPU kernels may use their own quantization (e.g. q8_1 + dp4a) and are
+  accepted on tolerance plus greedy token-stream agreement, with any divergence
+  reported (first divergent step, top-1/top-2 logit margin).
+- All layer boundaries, the C ABI rules, and the "llama.cpp/ggml is a dev-time
+  baseline only" rule remain in force. Generated code and JIT machinery live
+  behind Layer 2; no CUDA, MLIR, or native-torch types in
+  `core/include/sonicboom/`.
 
 ## Error handling
 
