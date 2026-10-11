@@ -61,6 +61,7 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::QuantizedMatmul:
     case OpKind::Quantize:
     case OpKind::QuantizedMatmulQ8:
+    case OpKind::RmsNormQuantize:
     case OpKind::RmsNorm:
     case OpKind::RmsNormHeads:
     case OpKind::GeluFp16:

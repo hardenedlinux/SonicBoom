@@ -48,6 +48,7 @@ enum class OpKind : uint8_t {
   QuantizedMatmul,  // K-quant matvec (quant::matvec)
   Quantize,         // activation -> q8_1 (explicit quantize-once node, CUDA)
   QuantizedMatmulQ8, // K-quant matvec consuming a pre-quantized q8_1 activation
+  RmsNormQuantize,  // nn::rms_norm + q8_1 quantize fused (CUDA, T3)
   RmsNorm,          // nn::rms_norm
   RmsNormHeads,     // nn::rms_norm_heads (per-head, in place)
   GeluFp16,         // nn::gelu_fp16

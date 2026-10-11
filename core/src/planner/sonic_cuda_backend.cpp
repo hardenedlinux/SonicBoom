@@ -373,6 +373,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           out);
       break;
     }
+    case OpKind::RmsNormQuantize: {
+      // rms_norm + q8_1 quantize fused (T3): the norm weight is keyed by `slot`
+      // (AttnNorm / FfnNorm / OutputNorm); the output is the q8_1 activation
+      // packed into an f32-sized buffer (same superset convention as Quantize).
+      ok = quant::cuda::rms_norm_quantize_q8_1_dev(
+          fweight(slot), dev(in[0]), eps,
+          reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      break;
+    }
     case OpKind::MatvecF32: {
       const int cols = int(in[0].device.size_bytes / sizeof(float));
       ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);

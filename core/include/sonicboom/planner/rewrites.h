@@ -38,4 +38,14 @@ namespace sonicboom::planner {
 // QuantizedMatmul path (that op and its matvec_f32_dev kernel remain).
 void quantize_once_pass(Graph& g);
 
+// T3 rms_norm + q8_1 quantize fusion. After quantize_once_pass, an rms_norm
+// whose output feeds only a Quantize node (attn_norm -> h -> q8_h; ffn_norm ->
+// f -> q8_f; output_norm -> hn -> q8_hn) is replaced by a single RmsNormQuantize
+// node that normalizes and quantizes in one kernel, so the f32 normalized
+// activation is never materialized. The RmsNormQuantize node keeps the RmsNorm
+// node's (layer, slot) attributes (so the backend still resolves the norm
+// weight) and the Quantize node's output tensor (the q8_1 buffer). Must run
+// after quantize_once_pass.
+void fuse_rms_norm_quantize_pass(Graph& g);
+
 } // namespace sonicboom::planner

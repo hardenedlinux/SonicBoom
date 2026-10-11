@@ -762,6 +762,26 @@ const void* upload_weight(const QuantizedTensor& W) {
   return dptr;
 }
 
+// Upload a raw host byte range to the device, cached by (pointer, byte size) via
+// the same cache as upload_weight. Used for the f32 norm weights of the fused
+// rms_norm+quantize kernel (T3), which are plain f32 vectors, not packed K-quant
+// tensors.
+const void* upload_bytes(const void* host, size_t bytes) {
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  CacheKey key{host, bytes};
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) return it->second.ptr;
+
+  void* dptr = nullptr;
+  if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
+  if (cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(dptr);
+    return nullptr;
+  }
+  g_cache.emplace(key, DeviceWeight{dptr, bytes});
+  return dptr;
+}
+
 // --- temporary profiling (remove after measuring) ---------------------------
 long g_prof_calls = 0;
 double g_prof_kernel_ms = 0.0;
@@ -1030,6 +1050,80 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
   if (!available() || !x || !yq || nblocks <= 0) return false;
   q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(
       x, reinterpret_cast<q8_1::block_q8_1*>(yq), nblocks);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// rms_norm + q8_1 quantize fused (T3): one kernel computes the rms_norm
+// sum-of-squares (double, warp-shuffle + shared reduction, matching
+// nn::cuda::rms_norm_dev's rms_sum_sq_kernel), derives
+// inv = 1/sqrtf(float(sum/n) + eps), then normalizes and quantizes to q8_1 in
+// the same pass — the f32 normalized activation is never materialized. Each
+// thread owns one 32-element q8_1 block (one thread per block, exactly as
+// quantize_q8_1), so the normalization + amax/127 quantization is bit-identical
+// to rms_norm_dev followed by quantize_q8_1_dev.
+//
+// The block is fixed at 1024 threads so the sum-of-squares accumulation order
+// (thread t reads x[t], x[t+1024], …) is identical to rms_norm_fused_kernel,
+// keeping `inv` bit-identical to the unfused path. The quantization loops are
+// deliberately *not* #pragma-unrolled: full unrolling keeps 32 loads in flight
+// per thread and pushes register usage past the 64-register/thread limit at
+// 1024 threads ("too many resources"), whereas the rolled loop needs only a
+// couple of live registers.
+__global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
+    const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
+    q8_1::block_q8_1* __restrict__ y) {
+  const int tid = threadIdx.x;
+  double s = 0.0;
+  for (int i = tid; i < n; i += blockDim.x) {
+    const float v = x[i];
+    s += double(v * v);
+  }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  __shared__ double warp_part[32];
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (lane == 0) warp_part[warp] = s;
+  __syncthreads();
+  __shared__ float inv;
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
+    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
+  }
+  __syncthreads();
+  const float iv = inv;
+  const int nblocks = n / 32;
+  for (int ib = tid; ib < nblocks; ib += blockDim.x) {
+    const float* xb = x + (size_t)ib * 32;
+    const float* wb = weight ? weight + (size_t)ib * 32 : nullptr;
+    // amax pass (rolled): the normalized value is recomputed identically in the
+    // quantize pass below, so no per-block norm[] array is materialized.
+    float amax = 0.0f;
+    for (int k = 0; k < 32; ++k) {
+      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
+      amax = fmaxf(amax, fabsf(nv));
+    }
+    const float d = amax / 127.0f;
+    y[ib].d = d;
+    for (int k = 0; k < 32; ++k) {
+      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
+      y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(nv / d));
+    }
+  }
+}
+
+bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
+                                float eps, BlockQ8_1* yq, int n) {
+  if (!available() || !x || !yq || n <= 0 || (n & 31) != 0) return false;
+  if (!weight.empty() && weight.size() < (size_t)n) return false;
+  const float* d_w = nullptr;
+  if (!weight.empty()) {
+    d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
+    if (!d_w) return false;
+  }
+  rms_norm_quantize_q8_1_kernel<<<1, 1024, 0, cur_stream()>>>(
+      x, d_w, n, eps, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }
 

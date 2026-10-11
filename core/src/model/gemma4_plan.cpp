@@ -713,8 +713,12 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // into a shared explicit Quantize node (CUDA-only; the CPU reference keeps the
   // unfused QuantizedMatmul path with its q8_K semantics). Gated on q8_1 so the
   // SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
-  if (quant::cuda::q8_1_enabled())
+  if (quant::cuda::q8_1_enabled()) {
     planner::quantize_once_pass(graph);
+    // T3: fold each rms_norm -> quantize pair into one RmsNormQuantize kernel so
+    // the f32 normalized activation is never materialized.
+    planner::fuse_rms_norm_quantize_pass(graph);
+  }
 
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
@@ -897,8 +901,10 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
   // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
   // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
-  if (quant::cuda::q8_1_enabled())
+  if (quant::cuda::q8_1_enabled()) {
     planner::quantize_once_pass(graph);
+    planner::fuse_rms_norm_quantize_pass(graph);
+  }
 
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;

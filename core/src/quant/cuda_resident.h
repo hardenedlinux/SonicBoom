@@ -48,6 +48,16 @@ struct BlockQ8_1 {
 // q/k/v, f feeding up/gate). Device in/out, no host copies.
 bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
 
+// rms_norm + q8_1 quantize fused (T3): yq = quantize_q8_1(rms_norm(x, weight)).
+// One kernel computes the rms_norm sum-of-squares reduction (double, matching
+// nn::cuda::rms_norm_dev), derives inv = 1/sqrtf(float(sum/n) + eps), then
+// applies the normalization and quantizes the result to q8_1 in the same pass —
+// the f32 normalized activation is never materialized. `weight` is a host span
+// of n floats (empty => unit). Bit-identical to rms_norm_dev followed by
+// quantize_q8_1_dev. Device in/out, no host copies. n must be a multiple of 32.
+bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
+                                float eps, BlockQ8_1* yq, int n);
+
 // The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
 // blocks_per_row / num_rows are derived from W, so the caller passes only the
