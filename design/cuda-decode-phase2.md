@@ -196,6 +196,21 @@ The q8_1 default gives 12.0431 tok/s vs the fp32 default's 4.33 tok/s, with a
 bit-identical continuation (the earlier explicit-gate run and this default run
 both yield 236761 107 236769 236776 …).
 
-### 2.2d — quantize-once-per-step reuse (pending)
+### 2.2d — quantize-once-per-step reuse (reverted: neutral)
+
+Implemented "quantize the activation once and reuse it across the gemvs that
+share it" — quantize `h` once for `attn_q/k/v`, quantize `f` once for
+`ffn_up/gate` — via a `quantize_x_q8_1` + `matvec_dev` device-resident API
+(gated so `SONICBOOM_GEMV_F32=1` still takes the fp32 path). Token stream is
+bit-identical (test_generate golden passes).
+
+**Result: neutral.** Before/after tok/s (64-step spine-cuda) 12.0431 → 12.0446
+(0.01%, pure noise). Root cause: the `quantize_q8_1` kernel is tiny (~80
+threads) and launch-latency-dominated; the decode loop is fully async (0 sync
+calls, phase1 §1), so each 6 µs quantize is overlapped with the preceding gemv
+and was never on the critical path. Removing the ~126 redundant quantize
+kernels/token saves no critical-path time. The change was **reverted** (adds
+`quantize_x_q8_1`/`matvec_dev` API surface for no measured benefit). Recorded in
+the do-not-retry list.
 
 ## 2.3 — dense f32/bf16 gemv (pending)
