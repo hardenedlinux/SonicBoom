@@ -855,6 +855,29 @@ __global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row,
   out[i] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
+// Launch the single-row gather kernel for `row` of a device-resident packed
+// tensor. `w` points at the packed tensor start on the device; `row` selects
+// the token. Shared by gather_f32_dev (row 0 of a just-uploaded single row) and
+// gather_f32_resident_dev (row `token` of the cached resident weight).
+bool launch_gather_row(const uint8_t* w, int64_t row, QuantType type, int width,
+                       int blocks_per_row, float* out) {
+  const int grid = (width + 255) / 256;
+  switch (type) {
+    case QuantType::Q3_K:
+      gather_q3_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      break;
+    case QuantType::Q4_K:
+      gather_q4_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      break;
+    case QuantType::Q5_K:
+      gather_q5_K_row<<<grid, 256>>>(w, row, out, blocks_per_row);
+      break;
+    default:
+      return false;
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
 } // namespace
 
 bool available() noexcept {
@@ -1146,22 +1169,31 @@ bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out) {
     return false;
 
   const uint8_t* wp = static_cast<const uint8_t*>(d_row);
-  const int n = int(width);
-  const int grid = (n + 255) / 256;
-  switch (W.type()) {
-    case QuantType::Q3_K:
-      gather_q3_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
-      break;
-    case QuantType::Q4_K:
-      gather_q4_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
-      break;
-    case QuantType::Q5_K:
-      gather_q5_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
-      break;
-    default:
-      return false;
-  }
-  return cudaGetLastError() == cudaSuccess;
+  return launch_gather_row(wp, /*row=*/0, W.type(), int(width),
+                           int(blocks_per_row), out);
+}
+
+// Device-resident single-row gather (Phase 3.2 B2): like gather_f32_dev, but
+// reads the token's row straight out of the cached resident weight — no
+// per-token H2D upload. Only for token_embd (the tied lm_head), whose full
+// tensor is already resident on the device (uploaded once by the logits matvec
+// via upload_weight). The packed layout is [vocab][blocks_per_row] blocks, so
+// the gather kernel's `row` offset walks straight to the token's packed row.
+bool gather_f32_resident_dev(const QuantizedTensor& W, int64_t token, float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint64_t vocab = W.dims()[1];
+  if (token < 0 || uint64_t(token) >= vocab || !out) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  // The resident copy is cached by (data pointer, byte size); the logits matvec
+  // already uploaded it, so this is a lookup, not a copy.
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return launch_gather_row(static_cast<const uint8_t*>(d_w), int64_t(token),
+                           W.type(), int(width), int(blocks_per_row), out);
 }
 
 } // namespace sonicboom::quant::cuda

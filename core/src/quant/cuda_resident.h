@@ -48,4 +48,10 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 // nn::embedding_f32 / quant::dequantize_row_f32.
 bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out);
 
+// Like gather_f32_dev but reads the token's packed row directly from the cached
+// resident device weight (upload_weight) instead of re-uploading the row. Only
+// for weights whose full tensor is already resident — token_embd (the tied
+// lm_head), which the per-token logits matvec keeps on the device.
+bool gather_f32_resident_dev(const QuantizedTensor& W, int64_t token, float* out);
+
 } // namespace sonicboom::quant::cuda
