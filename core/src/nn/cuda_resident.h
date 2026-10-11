@@ -67,6 +67,13 @@ bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
                          float base, float freq_scale,
                          std::span<const float> freq_factors);
 
+// Device-position variant of rope_neox_heads_dev: `pos` is a DEVICE uint64_t
+// read in-kernel, so the whole decode step is capturable into a CUDA Graph (the
+// position is an input to the graph, not a value baked into a node at capture).
+bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
+                             const uint64_t* pos, float base, float freq_scale,
+                             std::span<const float> freq_factors);
+
 // Dense (non-K-quant) matvec, device in/out: y[j] = sum_i W[j*cols + i] * x[i].
 // W is row-major with `cols` contiguous (GGUF order); rows = y length. W is a
 // host span uploaded+cached. Mirrors nn::cuda::matvec_f32 / matvec_bf16.
@@ -86,10 +93,29 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 // RoPE'd query [n_heads_q, head_dim]; k_cache/v_cache are flat device buffers
 // [n_slots, n_heads_kv, head_dim] (fp16-rounded f32), slot for absolute position
 // j == j % n_slots. out is [n_heads_q, head_dim].
+//
+// CUDA-Graph-capturable form: `pos` is a DEVICE uint64_t and `window` is the
+// fixed max key count the launch config is sized for (sliding_window for SWA
+// layers, n_ctx for global layers). The split kernel computes the actual
+// start/n_keys from *pos at runtime and early-exits chunks beyond n_keys, so a
+// single fixed grid/smem/chunk replays correctly for every position 0..window-1
+// (see decode_attention_dev in cuda_elementwise.cu). Requires window >= n_keys
+// at every position, i.e. window == sliding_window (SWA) or window == n_ctx
+// (global, since n_keys == pos+1 <= n_ctx).
 bool decode_attention_dev(const float* q, const float* k_cache,
-                          const float* v_cache, uint64_t pos, uint64_t n_slots,
-                          int n_heads_q, int n_heads_kv, int head_dim,
-                          uint64_t sliding_window, float scale, float* out);
+                          const float* v_cache, const uint64_t* pos,
+                          uint64_t window, uint64_t n_slots, int n_heads_q,
+                          int n_heads_kv, int head_dim, uint64_t sliding_window,
+                          float scale, float* out);
+
+// Append one token's K and V rows (row_elems floats each) into a device-resident
+// KV cache at slot (pos % n_slots). src/dst are device buffers; `pos` is a DEVICE
+// uint64_t, so the append is capturable into a CUDA Graph (the slot offset is
+// computed in-kernel, not baked into a launch argument). dst_k/dst_v are the
+// cache rows for this layer, src_k/src_v the freshly projected K/V.
+bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
+                   const float* src_v, const uint64_t* pos, uint64_t n_slots,
+                   int row_elems);
 
 // Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
 // tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is

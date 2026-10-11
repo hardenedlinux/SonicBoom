@@ -749,6 +749,10 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     in.push_back(encode_i64(token));
     in.push_back(encode_i64(pos));
 
+    // Stage the position into the device slot read by RoPE / KV-append /
+    // attention (Phase 3.2 B4 / CUDA Graphs): the kernels read it in-kernel.
+    cuda_backend.set_pos(pos);
+
     // NVTX step marker: brackets one decode step so nsys can isolate the
     // steady-state per-token window (instead of dividing whole-run totals).
     const std::string step_name = "decode_step_" + std::to_string(step);
@@ -863,6 +867,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
     float last_argmax = -1.0f;
     for (uint64_t p : prompt) {
       cuda_backend.seed_token(p);
+      cuda_backend.set_pos(pos);
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(p));
       in.push_back(encode_i64(pos));
@@ -887,6 +892,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 
   // Decode the remaining tokens with the same planner/backend/cache.
   for (step = 1; step < tokens.size(); ++step) {
+    cuda_backend.set_pos(pos);
     std::vector<sx::Bytes> in;
     in.push_back(encode_i64(token));
     in.push_back(encode_i64(pos));

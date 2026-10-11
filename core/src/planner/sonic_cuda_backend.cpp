@@ -65,13 +65,6 @@ bool nvtx_enabled() {
   return on;
 }
 
-// Decode the little-endian 64-bit scalar graph inputs (token id / position).
-uint64_t read_i64(const sx::Bytes& b) {
-  uint64_t v = 0;
-  std::memcpy(&v, b.data(), sizeof(v));
-  return v;
-}
-
 bool attr_i(const GraphNodeDesc& n, std::string_view name, int64_t& out) {
   for (const auto& a : n.attributes)
     if (a.name == name && a.kind() == sx::AttrValueKind::Int) {
@@ -102,9 +95,14 @@ float* dev_mut(uint64_t handle) {
 
 SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
                                    const Graph& graph, uint64_t n_ctx)
-    : model_(model), graph_(graph) {
+    : model_(model), graph_(graph), n_ctx_(n_ctx) {
   ensure_caches(n_ctx);
-  token_dev_ = device::acquire(sizeof(float));  // persistent current-token slot
+  token_dev_ = device::acquire(sizeof(float));   // persistent current-token slot
+  pos_dev_ = device::acquire(sizeof(uint64_t));  // persistent position slot
+  if (pos_dev_) {
+    const uint64_t zero = 0;
+    device::upload(&zero, pos_dev_, sizeof(uint64_t));  // defensive: pos starts at 0
+  }
 }
 
 SonicCudaBackend::~SonicCudaBackend() {
@@ -113,12 +111,18 @@ SonicCudaBackend::~SonicCudaBackend() {
     if (c.v_handle) device::release(c.v_handle, c.bytes);
   }
   if (token_dev_) device::release(token_dev_, sizeof(float));
+  if (pos_dev_) device::release(pos_dev_, sizeof(uint64_t));
 }
 
 bool SonicCudaBackend::seed_token(uint64_t token) {
   if (!token_dev_) return false;
   const float f = float(token);
   return device::upload(&f, token_dev_, sizeof(float));
+}
+
+bool SonicCudaBackend::set_pos(uint64_t pos) {
+  if (!pos_dev_) return false;
+  return device::upload(&pos, pos_dev_, sizeof(uint64_t));
 }
 
 void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
@@ -237,7 +241,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::Rope: {
-      const uint64_t pos = read_i64(in[1].host);
       const std::span<const float> ff =
           lc.attention == model::AttentionKind::Global
               ? model_.weights.rope_freqs
@@ -246,8 +249,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      ok = nn::cuda::rope_neox_heads_dev(out, int(lc.head_dim), out_n / int(lc.head_dim),
-                                         pos, lc.rope_base, 1.0f, ff);
+      ok = nn::cuda::rope_neox_heads_dev_pos(
+          out, int(lc.head_dim), out_n / int(lc.head_dim),
+          reinterpret_cast<const uint64_t*>(pos_dev_), lc.rope_base, 1.0f, ff);
       break;
     }
     case OpKind::CastFp16: {
@@ -260,35 +264,38 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Attention: {
       // KV layer: append the fp16-rounded K/V to this layer's device cache at
-      // slot `pos % n_slots`, then run incremental decode attention over it.
-      // inputs: {q (RoPE'd f32, device), kc (device), vc (device), pos (host)}.
-      const uint64_t pos = read_i64(in[3].host);
+      // slot `pos % n_slots` (computed in-kernel from pos_dev_), then run
+      // incremental decode attention over it. inputs: {q (RoPE'd f32, device),
+      // kc (device), vc (device)}; the position comes from the device slot.
       KvCacheDev& cache = caches_[uint32_t(layer)];
-      const uint64_t row_bytes =
-          cache.n_heads_kv * cache.head_dim * sizeof(float);
-      const uint64_t off = (pos % cache.n_slots) * row_bytes;
+      const int row_elems = int(cache.n_heads_kv * cache.head_dim);
+      const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       if (!cache.k_handle || !cache.v_handle ||
-          !device::device_copy(in[1].device.handle, cache.k_handle + off, row_bytes) ||
-          !device::device_copy(in[2].device.handle, cache.v_handle + off, row_bytes)) {
+          !nn::cuda::kv_append_dev(dev_mut(cache.k_handle), dev_mut(cache.v_handle),
+                                   dev(in[1]), dev(in[2]),
+                                   reinterpret_cast<const uint64_t*>(pos_dev_),
+                                   cache.n_slots, row_elems)) {
         ok = false;
         break;
       }
       ok = nn::cuda::decode_attention_dev(
-          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle), pos,
-          cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
-          int(cache.head_dim), lc.sliding_window, 1.0f, out);
+          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle),
+          reinterpret_cast<const uint64_t*>(pos_dev_), window, cache.n_slots,
+          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
+          lc.sliding_window, 1.0f, out);
       break;
     }
     case OpKind::AttentionShared: {
       // Shared layer (24..41): attend over the donor KV layer's cache (no
-      // append). inputs: {q (device), pos (host)}.
-      const uint64_t pos = read_i64(in[1].host);
+      // append). inputs: {q (device)}; the position comes from the device slot.
       const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
       const KvCacheDev& cache = caches_[donor];
+      const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       ok = nn::cuda::decode_attention_dev(
-          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle), pos,
-          cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
-          int(cache.head_dim), lc.sliding_window, 1.0f, out);
+          dev(in[0]), dev_mut(cache.k_handle), dev_mut(cache.v_handle),
+          reinterpret_cast<const uint64_t*>(pos_dev_), window, cache.n_slots,
+          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
+          lc.sliding_window, 1.0f, out);
       break;
     }
     case OpKind::GqaBroadcast: {

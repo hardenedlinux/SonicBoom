@@ -214,6 +214,30 @@ __global__ void rope_neox_heads_kernel(float* __restrict__ x, int head_dim, int 
   x[i + half] = x0 * s + x1 * c;
 }
 
+// Device-position variant of rope_neox_heads_kernel: `pos` is a DEVICE uint64_t
+// read in-kernel, so the position is an input to a capturable CUDA Graph rather
+// than a value baked into the node at capture time.
+__global__ void rope_neox_heads_pos_kernel(float* __restrict__ x, int head_dim,
+                                           int n,
+                                           const uint64_t* __restrict__ pos,
+                                           float freq_scale, float log_base,
+                                           const float* __restrict__ freq_factors) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int half = head_dim >> 1;
+  const int off = i % head_dim;
+  if (off >= half) return;
+  float theta = freq_scale * float(*pos) *
+                expf(-2.0f * float(off) / float(head_dim) * log_base);
+  if (freq_factors) theta /= freq_factors[off];
+  const float c = cosf(theta);
+  const float s = sinf(theta);
+  const float x0 = x[i];
+  const float x1 = x[i + half];
+  x[i] = x0 * c - x1 * s;
+  x[i + half] = x0 * s + x1 * c;
+}
+
 // y[j] = sum_i W[j*cols + i] * x[i], fp32 accumulation. W is row-major with
 // `cols` contiguous (GGUF order).
 __global__ void gemv_dense_f32(const float* __restrict__ W, const float* __restrict__ x,
@@ -427,8 +451,9 @@ __global__ void gqa_broadcast_kernel(const float* __restrict__ src,
 __global__ void decode_attention_split_kernel(const float* __restrict__ q,
                                               const float* __restrict__ k_cache,
                                               const float* __restrict__ v_cache,
-                                              uint64_t start, uint64_t n_keys,
+                                              const uint64_t* __restrict__ pos,
                                               uint64_t n_slots, uint64_t chunk,
+                                              uint64_t sliding_window,
                                               int n_heads_q, int n_heads_kv,
                                               int head_dim, float scale,
                                               float* __restrict__ partial) {
@@ -444,7 +469,15 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   const float* qrow = q + (uint64_t)h * head_dim;
   float* srow = scores + (uint64_t)hg * chunk;
 
+  // Device-resident position: the actual key window for this step, so a single
+  // fixed launch config (grid/smem/chunk) replays for every position.
+  const uint64_t p = *pos;
+  const uint64_t start =
+      (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+  const uint64_t n_keys = p - start + 1;
+
   const uint64_t c0 = chunk_idx * chunk;
+  if (c0 >= n_keys) return;  // neutral chunk: the merge only reads chunks < n_active
   const uint64_t cn = (c0 + chunk < n_keys) ? chunk : (n_keys - c0);
 
   // Phase 1: one q·k dot per key, warp-cooperative.
@@ -505,6 +538,9 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
 // output element is accumulated independently. Deterministic: the chunk loop
 // runs 0..n_chunks-1 in order and there are no atomics.
 __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
+                                              const uint64_t* __restrict__ pos,
+                                              uint64_t chunk,
+                                              uint64_t sliding_window,
                                               int n_chunks, int n_heads_q,
                                               int head_dim,
                                               float* __restrict__ out) {
@@ -512,16 +548,26 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
   const int t = threadIdx.x;   // one thread per output dim
   if (t >= head_dim) return;
 
-  // Global max over chunks (every thread redundantly scans the same max; the
-  // chunk count is small, so this is cheaper than a block reduction).
+  // Active chunk count from the device-resident position: the split kernel only
+  // wrote chunks with c0 < n_keys, so merging only those needs no neutral-value
+  // sentinel / partial memset. n_keys >= 1 always, so n_active >= 1.
+  const uint64_t p = *pos;
+  const uint64_t start =
+      (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+  const uint64_t n_keys = p - start + 1;
+  const uint64_t n_active = (n_keys + chunk - 1) / chunk;
+  const int nc = n_active < (uint64_t)n_chunks ? (int)n_active : n_chunks;
+
+  // Global max over the active chunks. Every thread redundantly scans the same
+  // max; the chunk count is small, so this is cheaper than a block reduction.
   float m = -1e30f;
-  for (int c = 0; c < n_chunks; ++c)
+  for (int c = 0; c < nc; ++c)
     m = fmaxf(m, partial[(uint64_t)c * n_heads_q * (head_dim + 2) +
                          (uint64_t)h * (head_dim + 2)]);
 
   float l = 0.0f;
   float acc = 0.0f;
-  for (int c = 0; c < n_chunks; ++c) {
+  for (int c = 0; c < nc; ++c) {
     const float* pp = partial + (uint64_t)c * n_heads_q * (head_dim + 2) +
                       (uint64_t)h * (head_dim + 2);
     const float w = expf(pp[0] - m);
@@ -529,6 +575,19 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
     acc += w * pp[2 + t];
   }
   out[(uint64_t)h * head_dim + t] = acc / l;
+}
+
+// Append one token's K/V row (row_elems floats) into the flat KV cache at slot
+// (pos % n_slots). Fixed grid == ceil(row_elems / 256); the slot offset is
+// computed in-kernel from a device-resident pos, so it is CUDA-Graph-capturable.
+__global__ void kv_append_kernel(float* __restrict__ dst,
+                                 const float* __restrict__ src,
+                                 const uint64_t* __restrict__ pos,
+                                 uint64_t n_slots, int row_elems) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= row_elems) return;
+  const uint64_t off = (*pos % n_slots) * (uint64_t)row_elems;
+  dst[off + i] = src[i];
 }
 
 // --- flash attention (prefill) ----------------------------------------------
@@ -1223,6 +1282,26 @@ bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
+                             const uint64_t* pos, float base, float freq_scale,
+                             std::span<const float> freq_factors) {
+  if (!available()) return false;
+  if (head_dim <= 0 || heads <= 0 || !x || !pos) return false;
+  const int n = head_dim * heads;
+  const int half = head_dim >> 1;
+  if ((head_dim & 1) != 0) return false;
+  if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
+  const float* d_ff = nullptr;
+  if (!freq_factors.empty()) {
+    d_ff = static_cast<const float*>(upload_bytes(freq_factors.data(), half * sizeof(float)));
+    if (!d_ff) return false;
+  }
+  const float log_base = std::log(base);
+  rope_neox_heads_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
+      x, head_dim, n, pos, freq_scale, log_base, d_ff);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
                     float* y, int rows) {
   if (!available()) return false;
@@ -1286,28 +1365,27 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 }
 
 bool decode_attention_dev(const float* q, const float* k_cache,
-                          const float* v_cache, uint64_t pos, uint64_t n_slots,
-                          int n_heads_q, int n_heads_kv, int head_dim,
-                          uint64_t sliding_window, float scale, float* out) {
+                          const float* v_cache, const uint64_t* pos,
+                          uint64_t window, uint64_t n_slots, int n_heads_q,
+                          int n_heads_kv, int head_dim, uint64_t sliding_window,
+                          float scale, float* out) {
   if (!available()) return false;
   if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || !q || !k_cache ||
-      !v_cache || !out || n_slots == 0)
+      !v_cache || !out || !pos || n_slots == 0 || window == 0)
     return false;
-  const uint64_t start =
-      (sliding_window > 0 && pos >= sliding_window) ? pos - sliding_window + 1 : 0;
-  const uint64_t n_keys = pos - start + 1;
 
   // Split-KV: n_chunks × n_kv_heads blocks each compute a per-head partial over
   // its slice of the KV sequence, then n_heads_q merge blocks combine them in
-  // fixed order. The chunk size is computed from n_keys and the SM count so
-  // short context still fills every SM (a fixed chunk size would leave the
-  // device idle early in the sequence, e.g. 3 blocks for 33 keys).
+  // fixed order. The launch config is sized from the FIXED `window` (max key
+  // count this graph replays for: sliding_window for SWA, n_ctx for global), so
+  // grid/smem/chunk are stable for CUDA Graph capture; the split kernel computes
+  // the real start/n_keys from *pos and early-exits chunks beyond n_keys.
   const int group_q = n_heads_q / n_heads_kv;
   const uint64_t target_chunks =
       std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
   const uint64_t chunk =
-      std::max<uint64_t>(1, (n_keys + target_chunks - 1) / target_chunks);
-  const uint64_t n_chunks = (n_keys + chunk - 1) / chunk;
+      std::max<uint64_t>(1, (window + target_chunks - 1) / target_chunks);
+  const uint64_t n_chunks = (window + chunk - 1) / chunk;
 
   const size_t partial_floats =
       (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
@@ -1318,10 +1396,26 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   const size_t smem = (size_t)group_q * chunk * sizeof(float);
   decode_attention_split_kernel<<<(unsigned)(n_chunks * (uint64_t)n_heads_kv),
                                   group_q * 32, smem, cur_stream()>>>(
-      q, k_cache, v_cache, start, n_keys, n_slots, chunk, n_heads_q, n_heads_kv,
-      head_dim, scale, partial);
+      q, k_cache, v_cache, pos, n_slots, chunk, sliding_window, n_heads_q,
+      n_heads_kv, head_dim, scale, partial);
   decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim, 0, cur_stream()>>>(
-      partial, (int)n_chunks, n_heads_q, head_dim, out);
+      partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
+      out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
+                   const float* src_v, const uint64_t* pos, uint64_t n_slots,
+                   int row_elems) {
+  if (!available()) return false;
+  if (row_elems <= 0 || !dst_k || !dst_v || !src_k || !src_v || !pos ||
+      n_slots == 0)
+    return false;
+  const int grid = grid_for(row_elems);
+  kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_k, src_k, pos, n_slots,
+                                                   row_elems);
+  kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_v, src_v, pos, n_slots,
+                                                   row_elems);
   return cudaGetLastError() == cudaSuccess;
 }
 

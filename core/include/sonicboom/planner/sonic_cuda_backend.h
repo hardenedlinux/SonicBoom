@@ -59,6 +59,12 @@ public:
   // overwrites the buffer in place and no host round-trip carries the token id.
   bool seed_token(uint64_t token);
 
+  // Stage the current decode position into the device-resident `pos_dev_` slot
+  // (uint64_t). The decode loop calls this once per step before execute(); the
+  // RoPE, KV-append and attention kernels read it in-kernel, so the position is
+  // an input to a capturable graph rather than a per-kernel launch argument.
+  bool set_pos(uint64_t pos);
+
   // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
   // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
   // matching the CUDA spine's matvec_f32_dev) + flash attention
@@ -91,6 +97,8 @@ private:
   const Graph& graph_;
   std::vector<KvCacheDev> caches_;  // index == KV layer (0 .. n_layer_kv-1)
   uint64_t token_dev_ = 0;          // persistent device buffer: current token id (float)
+  uint64_t pos_dev_ = 0;            // persistent device buffer: current position (uint64_t)
+  uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
 
   void ensure_caches(uint64_t n_ctx);
 };
