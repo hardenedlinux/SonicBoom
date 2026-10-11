@@ -142,7 +142,13 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m) {
                                   {int64_t(total_per)},
                                   {slot(WeightSlot::PerLayerTokenEmbd)});
 
-  const float proj_scale = 1.0f / std::sqrt(float(d));
+  // Hoisted per-layer input (Phase 2.3a): one full-width 2560→10752 bf16 gemv +
+  // scale + segmented rms_norm + combine per token, done once over [total_per].
+  // Each block's gate then slices its [per] segment instead of recomputing the
+  // 2560→256 projection. Backends fold the proj_scale (1/sqrt(d)), segmented
+  // rms_norm (shared per_layer_proj_norm), and combine (1/sqrt(2)) into this op.
+  const TensorId ple_all = b.node(OpKind::PerLayerInput, {inp, ple_row}, "ple_all",
+                                  {int64_t(total_per)}, {});
 
   TensorId residual = inp;
   for (uint32_t l = 0; l < block_count; ++l) {
@@ -214,14 +220,11 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m) {
                          {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
-    TensorId proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, {int64_t(per)},
-                           {layer_a(l), slot(WeightSlot::PerLayerModelProj)});
-    proj = b.node(OpKind::Scale, {proj}, "projs" + suff, {int64_t(per)},
-                  {attr_f("scale", proj_scale)});
-    proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, {int64_t(per)},
-                  {layer_a(l), slot(WeightSlot::PerLayerProjNorm)});
-    TensorId ple = b.node(OpKind::LayerCombine, {proj, ple_row}, "ple" + suff,
-                          {int64_t(per)}, {layer_a(l)});
+    // The per-layer input (proj/scale/rms/combine) was hoisted to the preamble;
+    // each block slices its [per] segment of ple_all.
+    TensorId ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
+                          {attr_i("offset", int64_t(l) * per),
+                           attr_i("length", int64_t(per))});
     TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
                          {layer_a(l), slot(WeightSlot::InpGate)});
     g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, {int64_t(per)}, {layer_a(l)});

@@ -69,6 +69,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Argmax;
   if (name == "layer_combine")
     return OpKind::LayerCombine;
+  if (name == "per_layer_input")
+    return OpKind::PerLayerInput;
+  if (name == "slice")
+    return OpKind::Slice;
   if (name == "embedding_batched")
     return OpKind::EmbeddingBatched;
   if (name == "quantized_matmul_batched")
@@ -122,6 +126,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Softcap: return "softcap";
     case OpKind::Argmax: return "argmax";
     case OpKind::LayerCombine: return "layer_combine";
+    case OpKind::PerLayerInput: return "per_layer_input";
+    case OpKind::Slice: return "slice";
     case OpKind::EmbeddingBatched: return "embedding_batched";
     case OpKind::QuantizedMatmulBatched: return "quantized_matmul_batched";
     case OpKind::Transpose: return "transpose";

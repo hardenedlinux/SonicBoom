@@ -62,6 +62,8 @@ enum class OpKind : uint8_t {
   Softcap,          // final-logit softcapping sc * tanh(x / sc)
   Argmax,           // nn::argmax
   LayerCombine,     // nn::layer_combine
+  PerLayerInput,    // hoisted full-width per-layer input (bf16 gemv + scale + seg rms + combine)
+  Slice,            // contiguous sub-span copy (attrs: offset, length)
 
   // Transformer operators — batched prefill (Phase 7). Mirrors the per-token
   // vocabulary on [dim, n] (column-major) / [n, dim] (position-major) batched

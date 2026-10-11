@@ -332,6 +332,45 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
                              combine_scale, f32_mut(out));
       break;
     }
+    case OpKind::PerLayerInput: {
+      // inputs: {inp [d], ple_row [total_per]}; output: [total_per]. One
+      // full-width bf16 projection per token (replaces the per-block 2560→256
+      // slices), then scale, segmented rms_norm, and combine over [total_per].
+      const uint32_t total_per = cfg.block_count * per;
+      std::span<const float> inp = f32(inputs[0]);
+      std::span<const float> ple_row = f32(inputs[1]);
+      std::vector<float> x_bf16(d);
+      for (uint32_t i = 0; i < d; ++i)
+        x_bf16[i] = bf16_to_f32(f32_to_bf16(inp[i]));
+      std::vector<float> proj(total_per);
+      ok = nn::matvec_bf16(model_.weights.per_layer_model_proj, d, x_bf16, proj);
+      if (!ok) break;
+      ok = nn::scale(proj, 1.0f / std::sqrt(float(d)), proj);
+      if (!ok) break;
+      if (!nn::rms_norm_heads(proj, model_.weights.per_layer_proj_norm, per, eps)) {
+        ok = false;
+        break;
+      }
+      ok = nn::layer_combine(proj, ple_row, std::sqrt(float(per)),
+                             1.0f / std::sqrt(2.0f), f32_mut(out));
+      break;
+    }
+    case OpKind::Slice: {
+      int64_t offset = 0, length = 0;
+      attr_i(*node, "offset", offset);
+      attr_i(*node, "length", length);
+      const std::span<const float> x = f32(inputs[0]);
+      std::span<float> o = f32_mut(out);
+      if (offset < 0 || length < 0 ||
+          uint64_t(offset) + uint64_t(length) > x.size() ||
+          o.size() < uint64_t(length)) {
+        ok = false;
+        break;
+      }
+      std::copy_n(x.begin() + offset, uint64_t(length), o.begin());
+      ok = true;
+      break;
+    }
     case OpKind::Softcap: {
       ok = nn::softcap(f32(inputs[0]), float(scale_d), f32_mut(out));
       break;

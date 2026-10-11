@@ -321,6 +321,48 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                        combine_scale, out, int(per));
       break;
     }
+    case OpKind::PerLayerInput: {
+      // inputs: {inp [d] (device), ple_row [total_per] (device)}; output
+      // [total_per]. One full-width bf16 gemv + scale + segmented rms_norm +
+      // combine per token (Phase 2.3a). In-place steps are safe: each kernel
+      // reads element i before writing it, and the rms reduction is a separate
+      // launch before the apply.
+      const int total_per = out_n;
+      const int cols = int(in[0].device.size_bytes / sizeof(float));  // d
+      const uint64_t xbytes = in[0].device.size_bytes;
+      uint64_t xtmp = device::acquire(xbytes);
+      if (!xtmp) {
+        ok = false;
+        break;
+      }
+      if (!device::device_copy(in[0].device.handle, xtmp, xbytes) ||
+          !nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols)) {
+        device::release(xtmp, xbytes);
+        ok = false;
+        break;
+      }
+      ok = nn::cuda::matvec_bf16_dev(model_.weights.per_layer_model_proj, cols,
+                                     reinterpret_cast<const float*>(xtmp), out,
+                                     total_per);
+      device::release(xtmp, xbytes);
+      if (!ok) break;
+      ok = nn::cuda::scale_dev(out, 1.0f / std::sqrt(float(d)), out, total_per);
+      if (!ok) break;
+      ok = nn::cuda::rms_norm_heads_dev(model_.weights.per_layer_proj_norm, out,
+                                        eps, out, int(per), total_per / int(per));
+      if (!ok) break;
+      ok = nn::cuda::layer_combine_dev(out, dev(in[1]), std::sqrt(float(per)),
+                                       1.0f / std::sqrt(2.0f), out, total_per);
+      break;
+    }
+    case OpKind::Slice: {
+      int64_t offset = 0, length = 0;
+      attr_i(*node, "offset", offset);
+      attr_i(*node, "length", length);
+      const uint64_t src = in[0].device.handle + uint64_t(offset) * sizeof(float);
+      ok = device::device_copy(src, out_handle, uint64_t(length) * sizeof(float));
+      break;
+    }
     default:
       // Embedding / Softcap are placed on the CPU SonicBackend; hitting them
       // here means the placement pass routed a host-only op to the device.

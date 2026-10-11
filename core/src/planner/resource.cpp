@@ -230,7 +230,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       OpKind::MatvecF32,
       OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
       OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
-      OpKind::LayerCombine,
+      OpKind::LayerCombine,    OpKind::PerLayerInput, OpKind::Slice,
       // Phase 7 batched prefill operators: executed on the CPU by the
       // SonicBackend (looping the per-token nn::*/quant::* kernels over the batch
       // dim). Declared here so the planner's capability check accepts the prefill
@@ -279,6 +279,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
         OpKind::Add,            OpKind::LayerCombine,
+        OpKind::PerLayerInput,  OpKind::Slice,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

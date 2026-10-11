@@ -75,6 +75,8 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::Softcap:
     case OpKind::Argmax:
     case OpKind::LayerCombine:
+    case OpKind::PerLayerInput:
+    case OpKind::Slice:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;
