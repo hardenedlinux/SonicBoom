@@ -28,6 +28,12 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # CUDA runtime. cuDNN / MAGMA / cutlass remain disabled (see the CUDA plan).
 option(SONICBOOM_USE_CUDA "Enable CUDA support (native-torch CUDA kernels)" OFF)
 
+# Vulkan is a community target. This option only builds the Vulkan *stub*
+# (VulkanBackend: a Backend subclass with zero kernels — no real Vulkan compute,
+# no Vulkan loader linked). It is OFF by default and exercises only the backend
+# authoring scaffold; the real Vulkan plugin is future community work.
+option(SONICBOOM_USE_VULKAN "Enable the Vulkan backend stub (community scaffold)" OFF)
+
 if(SONICBOOM_USE_CUDA)
   # RTX 3050 = compute capability 8.6 (sm_86).
   set(CMAKE_CUDA_ARCHITECTURES 86)

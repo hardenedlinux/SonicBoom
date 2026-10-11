@@ -36,6 +36,12 @@ file(GLOB_RECURSE SONICBOOM_PLANNER_SOURCES CONFIGURE_DEPENDS
 list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
 
+# vulkan_backend.cpp is the community-backend stub (zero kernels, no Vulkan
+# loader). Excluded from the unconditional planner glob and re-added only when
+# SONICBOOM_USE_VULKAN is ON, so the shipped core never carries the stub.
+list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/vulkan_backend.cpp)
+
 # Minimal autograd (core/src/autograd/). Layer 2 only: it dispatches through
 # the nt:: adapter (no direct c10/ATen use), so it belongs to the same public
 # library surface as the planner/sx code above.
@@ -140,6 +146,14 @@ if(SONICBOOM_USE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
+endif()
+
+# Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;
+# building with SONICBOOM_USE_VULKAN=ON compiles the zero-kernel scaffold that
+# backend authors use as a template (see design/backend-author-guide.md).
+if(SONICBOOM_USE_VULKAN)
+  target_sources(sonicboom PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/vulkan_backend.cpp)
 endif()
 
 # MLIRIR provides MLIRContext / ModuleOp / BuiltinDialect and the asm printer;
