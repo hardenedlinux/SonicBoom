@@ -262,8 +262,11 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   // M3: enumerate a CUDA device + device-local memory space when one is present
   // and the caller has not requested a host-only snapshot (a CPU-only spine sets
   // cfg.enumerate_cuda = false). The GPU device declares exactly the transformer
-  // ops the SonicCudaBackend can execute (everything except Embedding/Softcap/
-  // Argmax, which have no *_dev kernel and stay on the CPU SonicBackend).
+  // ops the SonicCudaBackend can execute (everything except Softcap, which has
+  // no *_dev kernel and stays on the CPU SonicBackend for the sampling path;
+  // the greedy decode path never emits Softcap). Embedding and Argmax have *_dev
+  // kernels (Phase 3.2), so they run on the GPU and drop the per-token embedding
+  // H2D uploads and the 1 MiB logits D2H.
   if (cfg.enumerate_cuda && quant::cuda_available()) {
     Device gpu;
     gpu.id = DeviceId{1};
@@ -279,7 +282,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
         OpKind::Add,            OpKind::LayerCombine,
-        OpKind::PerLayerInput,  OpKind::Slice,
+        OpKind::PerLayerInput,  OpKind::Slice,      OpKind::Embedding,
+        OpKind::Argmax,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

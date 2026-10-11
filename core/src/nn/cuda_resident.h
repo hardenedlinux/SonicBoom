@@ -112,4 +112,9 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
 bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
                        float combine_scale, float* y, int n);
 
+// Greedy argmax over a device f32 vector: writes the index (as a float) to
+// out[0]. Ties are broken toward the lowest index, exactly mirroring
+// nn::argmax. Requires n > 0 and a non-null x/out.
+bool argmax_dev(const float* x, int n, float* out);
+
 } // namespace sonicboom::nn::cuda

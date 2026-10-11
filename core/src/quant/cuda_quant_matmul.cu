@@ -705,6 +705,8 @@ void* g_col = nullptr;
 size_t g_col_bytes = 0;
 void* g_row = nullptr;
 size_t g_row_bytes = 0;
+void* g_gather = nullptr;
+size_t g_gather_bytes = 0;
 
 bool g_available_checked = false;
 bool g_available = false;
@@ -767,6 +769,90 @@ __global__ void scatter_col(const float* __restrict__ src, float* __restrict__ Y
                             int rows, int n, int c) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r < rows) Y[(size_t)r * n + c] = src[r];
+}
+
+// --- single-row embedding gather --------------------------------------------
+//
+// The decode preamble dequantizes token_embd[token] (Q3_K) and
+// per_layer_token_embd[token] (Q4_K) to device f32. These are plain
+// dequantizations (no dot product), one thread per element. Element i falls in
+// super-block b = i >> 8 at intra-block index l = i & 255; the same block
+// layout / reconstruction formulas as dequantize_row_f32 (dequant.cpp), so the
+// result is bit-identical to the CPU embedding gather.
+
+__global__ void gather_q3_K_row(const uint8_t* __restrict__ w, int64_t row,
+                                float* __restrict__ out, int blocks_per_row) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (i >= width) return;
+  const int b = i >> 8;
+  const int l = i & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 110;
+  const uint8_t* hm = blk;
+  const uint8_t* q = blk + 32;
+  const float d = half_to_float(ld_u16(blk + 108));
+  int8_t scales[16];
+  unpack_q3_K_scales(blk + 96, scales);
+
+  const int n = l >> 7;            // 0 or 1 (two 128-element halves)
+  const int r = l & 127;           // element within the 128 half
+  const int j = r >> 5;            // 32-element group (0..3)
+  const int l2 = r & 31;           // element within the 32 group
+  const int qv = int((q[n * 32 + l2] >> (j << 1)) & 3);
+  const int hmset = (hm[l2] & (1 << (j + (n << 2)))) ? 0 : 4;
+  const int sidx = (n << 3) + (j << 1) + (l2 >> 4);  // 8n + 2j + (l2 >= 16)
+  out[i] = d * float(scales[sidx] - 32) * float(qv - hmset);
+}
+
+__global__ void gather_q4_K_row(const uint8_t* __restrict__ w, int64_t row,
+                                float* __restrict__ out, int blocks_per_row) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (i >= width) return;
+  const int b = i >> 8;
+  const int l = i & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 144;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* q = blk + 16;
+
+  const int j = l >> 6;            // 64-element group (0..3)
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qb = q[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int v = low ? (qb & 0xF) : (qb >> 4);
+  out[i] = d * float(sc) * float(v) - dmin * float(mi);
+}
+
+__global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row,
+                                float* __restrict__ out, int blocks_per_row) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (i >= width) return;
+  const int b = i >> 8;
+  const int l = i & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 176;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* qh = blk + 16;
+  const uint8_t* ql = blk + 48;
+
+  const int j = l >> 6;
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qlb = ql[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int qhbit = (j << 1) + (low ? 0 : 1);  // u1/u2 = 1<<(2j) / 1<<(2j+1)
+  const int v = (low ? (qlb & 0xF) : (qlb >> 4)) +
+                ((qh[l2] & (1 << qhbit)) ? 16 : 0);
+  out[i] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
 } // namespace
@@ -1029,6 +1115,53 @@ bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
     return false;
   return cudaMemcpy(Y.data(), d_Y, rows * n * sizeof(float),
                     cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+// Device-resident single-row embedding gather (Phase 3.2): dequantize one row
+// of a K-quant embedding to device f32, so the decode preamble's token_embd /
+// per_layer_token_embd lookups run on the GPU and the two per-token H2D uploads
+// (embd 10240 B, ple_row 43008 B) disappear. Only the token's packed row is
+// uploaded (the full tensor may be ~1.5 GiB and is not kept resident); no host
+// copy of the dequantized row happens.
+bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint64_t vocab = W.dims()[1];
+  if (token < 0 || uint64_t(token) >= vocab || !out) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  // Upload only this token's packed row. The full tensor is ~1.5 GiB for
+  // per_layer_token_embd ([total_per, vocab] Q4_K) and does not fit resident
+  // next to the block weights on an 8 GiB part, so a whole-tensor cache is the
+  // wrong tool here — the gather needs just `blocks_per_row` blocks.
+  const uint32_t bpb = W.bytes_per_block();
+  const size_t row_bytes = size_t(blocks_per_row) * bpb;
+  const size_t row_off = size_t(token) * row_bytes;
+  void* d_row = grow_scratch(g_gather, g_gather_bytes, row_bytes);
+  if (!d_row) return false;
+  if (cudaMemcpy(d_row, reinterpret_cast<const uint8_t*>(W.data().data()) + row_off,
+                 row_bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+
+  const uint8_t* wp = static_cast<const uint8_t*>(d_row);
+  const int n = int(width);
+  const int grid = (n + 255) / 256;
+  switch (W.type()) {
+    case QuantType::Q3_K:
+      gather_q3_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
+      break;
+    case QuantType::Q4_K:
+      gather_q4_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
+      break;
+    case QuantType::Q5_K:
+      gather_q5_K_row<<<grid, 256>>>(wp, 0, out, int(blocks_per_row));
+      break;
+    default:
+      return false;
+  }
+  return cudaGetLastError() == cudaSuccess;
 }
 
 } // namespace sonicboom::quant::cuda

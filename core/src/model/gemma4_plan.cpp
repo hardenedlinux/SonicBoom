@@ -90,7 +90,7 @@ sx::Attribute attr_f(const char* name, double v) { return sx::Attribute{name, v}
 // (22 SWA / 23 global) cache. The residual stream is the *scaled* l_out of the
 // previous block.
 // ---------------------------------------------------------------------------
-planner::Graph build_gemma4_graph(const Gemma4Model& m) {
+planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -271,13 +271,24 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m) {
                        {slot(WeightSlot::OutputNorm)});
   TensorId logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
                            {slot(WeightSlot::TokenEmbd)});
-  TensorId logits_sc = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(vocab)},
-                              {attr_f("scale", double(cfg.final_logit_softcapping))});
+
+  // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
+  // change argmax — skip it and reduce the [vocab] logits to a single index on
+  // the device, so the per-token host transfer shrinks from the full 1 MiB
+  // logits to 4 bytes. Sampling mode keeps the softcapped full logits (the
+  // sampler needs the distribution).
+  TensorId out;
+  if (greedy) {
+    out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)}, {});
+  } else {
+    out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(vocab)},
+                 {attr_f("scale", double(cfg.final_logit_softcapping))});
+  }
 
   for (auto& t : b.g.tensors)
-    if (t.id == logits_sc)
+    if (t.id == out)
       t.is_graph_output = true;
-  b.g.outputs = {logits_sc};
+  b.g.outputs = {out};
 
   return std::move(b.g);
 }
@@ -502,7 +513,7 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
 
-  planner::Graph graph = build_gemma4_graph(m);
+  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
 
   // CPU-only spine: enumerate_cuda = false keeps the snapshot host-only so the
   // planner places every Sonic node on the CPU and the transfer scheduler emits
@@ -566,7 +577,7 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
-  planner::Graph graph = build_gemma4_graph(m);
+  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
   auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);
@@ -675,11 +686,14 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
 // ---------------------------------------------------------------------------
 // CUDA spine decode loop. Same token-stream contract as generate_spine, but the
 // plan is built against a CUDA-aware snapshot so every Sonic node with a *_dev
-// kernel is placed on the GPU (device-local) and only Embedding/Softcap stay on
-// the CPU (they have no *_dev kernel). The transfer scheduler inserts H2D/D2H
-// tasks at the three host/device boundaries; the executor registers the CUDA
-// backend as the default for Sonic and overrides host-memory-space compute tasks
-// back to the CPU SonicBackend. Greedy argmax is identical to generate_spine.
+// kernel is placed on the GPU (device-local) and only Softcap stays on the CPU
+// (it has no *_dev kernel; the greedy graph never emits it). Embedding and
+// Argmax also run on the device (Phase 3.2), so the per-token transfers drop to
+// a single 4-byte D2H of the winning token index — no embedding H2D uploads and
+// no full-logits download. The transfer scheduler inserts H2D/D2H tasks at the
+// remaining host/device boundary; the executor registers the CUDA backend as the
+// default for Sonic and overrides host-memory-space compute tasks back to the
+// CPU SonicBackend. Greedy argmax is identical to generate_spine.
 // ---------------------------------------------------------------------------
 #ifdef SONICBOOM_USE_CUDA
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
@@ -688,7 +702,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
 
-  planner::Graph graph = build_gemma4_graph(m);
+  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
 
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
@@ -702,9 +716,9 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, &cuda_backend}});
 
-  // Route host-memory-space compute tasks (Embedding, Softcap) to the CPU
-  // SonicBackend; device-memory-space tasks keep the default CUDA backend. The
-  // transfer scheduler has already emitted the H2D/D2H tasks that move their
+  // Route host-memory-space compute tasks (Softcap, in sampling mode) to the
+  // CPU SonicBackend; device-memory-space tasks keep the default CUDA backend.
+  // The transfer scheduler has already emitted the H2D/D2H tasks that move their
   // operands across the boundary.
   for (const auto& task : plan->tasks) {
     if (task.kind != planner::TaskKind::Compute)
@@ -716,7 +730,6 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       exec.set_task_backend(task.id, &cpu_backend);
   }
 
-  const uint64_t vocab = m.config.vocab_size;
   uint64_t token = start_token;
   uint64_t pos = start_pos;
   uint64_t step = 0;
@@ -739,15 +752,13 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
         std::cerr << "[spine] step " << step << " no outputs\n";
       break;
     }
-    const sx::Bytes& logits = res->outputs[0];
-    if (logits.size() < vocab * sizeof(float)) {
-      std::cerr << "[spine] step " << step << " logits too small: " << logits.size()
-                << " < " << vocab * sizeof(float) << "\n";
+    const sx::Bytes& arg = res->outputs[0];
+    if (arg.size() < sizeof(float)) {
+      std::cerr << "[spine] step " << step << " argmax too small: " << arg.size()
+                << " < " << sizeof(float) << "\n";
       break;
     }
-    std::span<const float> lf(reinterpret_cast<const float*>(logits.data()), vocab);
-
-    const int64_t next = nn::argmax(lf);
+    const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
@@ -777,7 +788,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
-  planner::Graph graph = build_gemma4_graph(m);
+  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);
@@ -808,15 +819,18 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   uint64_t pos = start_pos;
   uint64_t step = 0;
 
+  int64_t first = -1;
   if (use_prefill) {
     // One batched pass over the prompt, then sample tokens[0] from the final
     // hidden state's lm-head logits (same arithmetic as the CUDA spine's lm-head).
     std::vector<float> hidden(d);
     if (!cuda_backend.prefill(prompt, start_pos, hidden)) return 0;
     if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) return 0;
+    first = nn::argmax(logits);
   } else {
-    // Reference: feed the prompt one token at a time through the CUDA spine,
-    // keeping only the final logits.
+    // Reference: feed the prompt one token at a time through the CUDA spine
+    // (greedy graph -> per-token argmax output), keeping the final token's index.
+    float last_argmax = -1.0f;
     for (uint64_t p : prompt) {
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(p));
@@ -824,13 +838,13 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
       auto res = exec.execute(*plan, *snap, in);
       if (!res || res->outputs.empty()) return 0;
       const sx::Bytes& lo = res->outputs[0];
-      if (lo.size() < vocab * sizeof(float)) return 0;
-      std::memcpy(logits.data(), lo.data(), vocab * sizeof(float));
+      if (lo.size() < sizeof(float)) return 0;
+      last_argmax = *reinterpret_cast<const float*>(lo.data());
       ++pos;
     }
+    first = int64_t(last_argmax);
   }
 
-  const int64_t first = nn::argmax(logits);
   if (first < 0) return 0;
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
@@ -851,9 +865,8 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
       break;
     }
     const sx::Bytes& lo = res->outputs[0];
-    if (lo.size() < vocab * sizeof(float)) break;
-    std::span<const float> lf(reinterpret_cast<const float*>(lo.data()), vocab);
-    const int64_t next = nn::argmax(lf);
+    if (lo.size() < sizeof(float)) break;
+    const int64_t next = int64_t(*reinterpret_cast<const float*>(lo.data()));
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);

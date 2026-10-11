@@ -68,10 +68,13 @@ enum class WeightSlot : uint8_t {
 // exec.cpp, whose arithmetic is bit-exact against the llama.cpp baseline) into a
 // static, acyclic planner::Graph. Every node is pinned to BackendTag::Sonic
 // (including the shared `Add` residual nodes, which route_op would otherwise
-// send to Mlir). Graph inputs are `token_id` and `pos` (Int64); the graph output
-// is the softcapped logits (vocab float32). Argmax is left to the caller's
-// generate loop, not encoded as a graph node.
-planner::Graph build_gemma4_graph(const Gemma4Model& m);
+// send to Mlir). Graph inputs are `token_id` and `pos` (Int64). The graph output
+// depends on `greedy`: greedy=true (CUDA spine) emits an `Argmax` node producing
+// a single float32 token index, deleting the Softcap (monotonic, so it does not
+// affect argmax) and the 1 MiB logits download; greedy=false (CPU oracle spine)
+// emits the softcapped logits (vocab float32), leaving argmax to the caller's
+// generate loop so the oracle arithmetic stays bit-identical.
+planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy);
 
 // Expand the whole-prompt prefill (mirrors build_gemma4_graph per block) into a
 // static, acyclic planner::Graph over [dim, n] / [n, dim] batched tensors, where

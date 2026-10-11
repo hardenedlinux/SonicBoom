@@ -668,6 +668,35 @@ inline int gemv_grid(int rows, int k_split) {
   return (warps + kGemvWarpsPerBlock - 1) / kGemvWarpsPerBlock;
 }
 
+// Greedy argmax over a device f32 vector (Phase 3.2): one block grid-strides the
+// whole vector, each thread keeps the running max of its slice (ties broken to
+// the lowest index via a strict `>`), then a shared-memory tree reduction picks
+// the block winner. Single launch, deterministic, no atomics; mirrors nn::argmax.
+__global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ out,
+                              int n) {
+  __shared__ float s_val[1024];
+  __shared__ int s_idx[1024];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  for (int i = tid; i < n; i += blockDim.x) {
+    if (x[i] > mv) { mv = x[i]; mi = i; }
+  }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
 } // namespace
 
 bool available() noexcept {
@@ -1183,6 +1212,13 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
   if (n <= 0 || !proj || !ple || !y) return false;
   layer_combine_kernel<<<grid_for(n), 256>>>(proj, ple, ple_scale, combine_scale,
                                              y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool argmax_dev(const float* x, int n, float* out) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !out) return false;
+  argmax_kernel<<<1, 1024>>>(x, out, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

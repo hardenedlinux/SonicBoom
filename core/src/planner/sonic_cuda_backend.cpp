@@ -383,8 +383,29 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = device::device_copy(src, out_handle, uint64_t(length) * sizeof(float));
       break;
     }
+    case OpKind::Embedding: {
+      // Token embedding gather on the device: dequantize the token's row of
+      // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device f32,
+      // so the two per-token H2D uploads of the embedding rows disappear. The
+      // token id is the Int64 host graph input, read directly (no transfer).
+      const uint64_t tok = read_i64(in[0].host);
+      const quant::QuantizedTensor& W =
+          slot == model::WeightSlot::PerLayerTokenEmbd
+              ? model_.weights.per_layer_token_embd
+              : model_.weights.token_embd;
+      ok = quant::cuda::gather_f32_dev(W, int64_t(tok), out);
+      break;
+    }
+    case OpKind::Argmax: {
+      // Greedy token selection on the device: reduce the [vocab] logits to a
+      // single index, so the per-token 1 MiB D2H of the full logits becomes a
+      // 4-byte transfer of the winning index.
+      ok = nn::cuda::argmax_dev(dev(in[0]),
+                                int(in[0].device.size_bytes / sizeof(float)), out);
+      break;
+    }
     default:
-      // Embedding / Softcap are placed on the CPU SonicBackend; hitting them
+      // Softcap is placed on the CPU SonicBackend (no *_dev kernel); hitting it
       // here means the placement pass routed a host-only op to the device.
       ok = false;
       break;

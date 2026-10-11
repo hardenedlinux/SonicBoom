@@ -39,4 +39,13 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 // n == 1 falls back to matvec_f32_dev. No host copies.
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 
+// Dequantize a single row (token `token`) of a 2-D quantized embedding matrix
+// to device f32: out[k] = W[k][token] for k in [0, width). W has GGUF shape
+// [width, vocab]; `token` selects the row. `out` must hold `width` floats (the
+// caller sizes it from W.dims()[0]). Only the token's packed row (blocks_per_row
+// blocks) is uploaded to a scratch buffer each call — the full tensor can be
+// ~1.5 GiB (per_layer_token_embd) and is not kept resident. Mirrors
+// nn::embedding_f32 / quant::dequantize_row_f32.
+bool gather_f32_dev(const QuantizedTensor& W, int64_t token, float* out);
+
 } // namespace sonicboom::quant::cuda
