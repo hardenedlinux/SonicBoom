@@ -401,82 +401,128 @@ __global__ void gqa_broadcast_kernel(const float* __restrict__ src,
   dst[i] = src[kv_h * head_dim + off];
 }
 
-// Incremental decode attention (mirrors nn::decode_attention): one WARP per
-// query head (Gemma 4: n_heads_q=8 <= 32, so a single block of n_heads_q*32
-// threads). The q·k dot is computed ONCE per key — 32 lanes each sum a strided
-// head_dim/32 slice, then __shfl-reduce — and the scores land in dynamic shared
-// memory so the dot is never recomputed (the prior 3-pass form recomputed it
-// three times). max/sum use warp reductions, and exp is evaluated once (scores
-// are overwritten with exp(score-max)) and reused by the V-weighted sum.
+// Split-KV incremental decode attention (flash-decoding). One block per KV
+// chunk; each block computes a partial (local max m, local sum l, V-weighted
+// output o) per query head over its chunk, and a second kernel merges the chunk
+// partials in fixed order. Splitting the KV sequence across blocks is what lets
+// the decode step use more than one SM: the single-block form was memory-latency
+// bound (63% of warp cycles stalled on the L1TEX K/V scoreboard, 16.7% achieved
+// occupancy, 1 grid block for 20 SMs). The GQA sharing is unchanged — all 8
+// query heads (one warp each) live in one block so each KV head is read once and
+// shared by its 4 query heads.
 //
-// fp32 KV is unchanged. The only numeric difference from the CPU reference is
-// reduction order (lane-strided + tree, vs the CPU's sequential scalar sum) —
-// fmaxf is exact, so the max is order-independent; the sum and dot carry a
-// ~1e-4 relative error from reordering, well inside the fp32 tolerance.
-__global__ void decode_attention_kernel(const float* __restrict__ q,
-                                        const float* __restrict__ k_cache,
-                                        const float* __restrict__ v_cache,
-                                        uint64_t start, uint64_t n_keys,
-                                        uint64_t n_slots,
-                                        int n_heads_q, int n_heads_kv,
-                                        int head_dim, float scale,
-                                        float* __restrict__ out) {
-  extern __shared__ float scores[];  // [n_heads_q * n_keys]
+// Numerics: fmaxf is exact, so each chunk's local max is order-independent; the
+// merge rescales by exp(chunk_max - global_max) and sums the (l, o) partials in
+// fixed chunk order, so the whole result is deterministic (no float atomics).
+// It differs from the single-pass CPU reference only in fp32 summation order
+// (~1e-4 relative), inside the existing fp32 tolerance.
+constexpr int kAttnChunkKeys = 16;  // keys per chunk (tuned against attention_bench)
+
+__global__ void decode_attention_split_kernel(const float* __restrict__ q,
+                                              const float* __restrict__ k_cache,
+                                              const float* __restrict__ v_cache,
+                                              uint64_t start, uint64_t n_keys,
+                                              uint64_t n_slots,
+                                              int n_heads_q, int n_heads_kv,
+                                              int head_dim, float scale,
+                                              float* __restrict__ partial) {
+  extern __shared__ float scores[];  // [n_heads_q * kAttnChunkKeys]
   const int lane = threadIdx.x & 31;
   const int h = threadIdx.x >> 5;    // warp id == query head
   if (h >= n_heads_q) return;
   const int kv_h = h * n_heads_kv / n_heads_q;
   const float* qrow = q + (uint64_t)h * head_dim;
-  float* srow = scores + (uint64_t)h * n_keys;
+  float* srow = scores + (uint64_t)h * kAttnChunkKeys;
+
+  const uint64_t c0 = (uint64_t)blockIdx.x * kAttnChunkKeys;
+  const uint64_t cn =
+      (c0 + kAttnChunkKeys < n_keys) ? kAttnChunkKeys : (n_keys - c0);
 
   // Phase 1: one q·k dot per key, warp-cooperative.
-  for (uint64_t idx = 0; idx < n_keys; ++idx) {
-    const uint64_t slot = (start + idx) % n_slots;
+  for (uint64_t j = 0; j < cn; ++j) {
+    const uint64_t slot = (start + c0 + j) % n_slots;
     const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-    float partial = 0.0f;
-    for (int d = lane; d < head_dim; d += 32) partial += qrow[d] * krow[d];
+    float d = 0.0f;
+    for (int i = lane; i < head_dim; i += 32) d += qrow[i] * krow[i];
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
-      partial += __shfl_down_sync(0xffffffffu, partial, o);
-    if (lane == 0) srow[idx] = partial * scale;
+      d += __shfl_down_sync(0xffffffffu, d, o);
+    if (lane == 0) srow[j] = d * scale;
   }
   __syncwarp();
 
-  // Phase 2a: max score (fmaxf is exact, so the reduction order is irrelevant).
-  float max_score = -1e30f;
-  for (uint64_t idx = lane; idx < n_keys; idx += 32)
-    max_score = fmaxf(max_score, srow[idx]);
+  // Phase 2: local max (exact), exp once, local sum.
+  float m = -1e30f;
+  for (uint64_t j = lane; j < cn; j += 32) m = fmaxf(m, srow[j]);
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1)
-    max_score = fmaxf(max_score, __shfl_down_sync(0xffffffffu, max_score, o));
-  max_score = __shfl_sync(0xffffffffu, max_score, 0);
+    m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+  m = __shfl_sync(0xffffffffu, m, 0);
 
-  // Phase 2b: exp once, store back, warp-reduce the sum.
-  float sum = 0.0f;
-  for (uint64_t idx = lane; idx < n_keys; idx += 32) {
-    const float e = expf(srow[idx] - max_score);
-    srow[idx] = e;
-    sum += e;
+  float l = 0.0f;
+  for (uint64_t j = lane; j < cn; j += 32) {
+    const float e = expf(srow[j] - m);
+    srow[j] = e;
+    l += e;
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1)
-    sum += __shfl_down_sync(0xffffffffu, sum, o);
-  const float inv = 1.0f / __shfl_sync(0xffffffffu, sum, 0);
+    l += __shfl_down_sync(0xffffffffu, l, o);
+  l = __shfl_sync(0xffffffffu, l, 0);
   __syncwarp();
 
-  // Phase 3: V-weighted sum, warp-cooperative — each lane owns a strided slice
-  // of the output row's dims, accumulating over keys in the same sequential
-  // order as the CPU reference.
+  // Phase 3: V-weighted sum over the chunk — each lane owns a strided slice of
+  // the output row's dims.
+  const int dims_per_lane = head_dim >> 5;  // head_dim/32, <= 16
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  for (uint64_t j = 0; j < cn; ++j) {
+    const uint64_t slot = (start + c0 + j) % n_slots;
+    const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    const float p = srow[j];  // exp(score - local max)
+    for (int i = 0; i < dims_per_lane; ++i) acc[i] += p * vrow[lane + i * 32];
+  }
+
+  // Write partial [m, l, o[0..head_dim-1]] for this head.
+  float* pp = partial + (uint64_t)blockIdx.x * n_heads_q * (head_dim + 2) +
+              (uint64_t)h * (head_dim + 2);
+  if (lane == 0) { pp[0] = m; pp[1] = l; }
+  for (int i = 0; i < dims_per_lane; ++i) pp[2 + lane + i * 32] = acc[i];
+}
+
+// Merge the per-chunk partials in fixed order (flash-decoding online-softmax
+// combine). One warp per query head; grid == 1. Deterministic: the chunk loop
+// runs 0..n_chunks-1 in order and there are no atomics.
+__global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
+                                              int n_chunks, int n_heads_q,
+                                              int head_dim,
+                                              float* __restrict__ out) {
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;
+  if (h >= n_heads_q) return;
+
+  // Global max over chunks.
+  float m = -1e30f;
+  for (int c = 0; c < n_chunks; ++c)
+    m = fmaxf(m, partial[(uint64_t)c * n_heads_q * (head_dim + 2) +
+                         (uint64_t)h * (head_dim + 2)]);
+
+  const int dims_per_lane = head_dim >> 5;
+  float l = 0.0f;
+  float acc[16];
+#pragma unroll
+  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  for (int c = 0; c < n_chunks; ++c) {
+    const float* pp = partial + (uint64_t)c * n_heads_q * (head_dim + 2) +
+                      (uint64_t)h * (head_dim + 2);
+    const float w = expf(pp[0] - m);
+    l += w * pp[1];
+    for (int i = 0; i < dims_per_lane; ++i) acc[i] += w * pp[2 + lane + i * 32];
+  }
+  const float inv = 1.0f / l;
   float* orow = out + (uint64_t)h * head_dim;
-  for (int d = lane; d < head_dim; d += 32) {
-    float acc = 0.0f;
-    for (uint64_t idx = 0; idx < n_keys; ++idx) {
-      const uint64_t slot = (start + idx) % n_slots;
-      const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-      acc += srow[idx] * inv * vrow[d];
-    }
-    orow[d] = acc;
-  }
+  for (int i = 0; i < dims_per_lane; ++i) orow[lane + i * 32] = acc[i] * inv;
 }
 
 // --- flash attention (prefill) ----------------------------------------------
@@ -625,6 +671,8 @@ void* g_dff = nullptr;
 size_t g_dff_bytes = 0;
 void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k_split floats)
 size_t g_partial_bytes = 0;
+void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
+size_t g_attn_partial_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
 float* g_inv = nullptr;        // device-resident rms_norm inv scalar
 double* g_head_sum = nullptr;   // device-resident per-head rms_norm sums (double)
@@ -1226,12 +1274,24 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   const uint64_t start =
       (sliding_window > 0 && pos >= sliding_window) ? pos - sliding_window + 1 : 0;
   const uint64_t n_keys = pos - start + 1;
-  // One warp per query head (n_heads_q <= 32 for Gemma 4). Scores for all heads
-  // are staged in dynamic shared memory, sized to n_heads_q * n_keys floats.
-  const size_t smem = (size_t)n_heads_q * n_keys * sizeof(float);
-  decode_attention_kernel<<<1, n_heads_q * 32, smem>>>(
+
+  // Split-KV: n_chunks blocks each compute a per-head partial over its slice of
+  // the KV sequence, then one merge block combines them in fixed order. The
+  // chunk count is what lets the decode step span multiple SMs.
+  const uint64_t n_chunks = (n_keys + kAttnChunkKeys - 1) / kAttnChunkKeys;
+  const size_t partial_floats =
+      (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
+  float* partial = static_cast<float*>(
+      grow_scratch(g_attn_partial, g_attn_partial_bytes,
+                   partial_floats * sizeof(float)));
+
+  const size_t smem =
+      (size_t)n_heads_q * kAttnChunkKeys * sizeof(float);
+  decode_attention_split_kernel<<<(unsigned)n_chunks, n_heads_q * 32, smem>>>(
       q, k_cache, v_cache, start, n_keys, n_slots, n_heads_q, n_heads_kv,
-      head_dim, scale, out);
+      head_dim, scale, partial);
+  decode_attention_merge_kernel<<<1, n_heads_q * 32>>>(
+      partial, (int)n_chunks, n_heads_q, head_dim, out);
   return cudaGetLastError() == cudaSuccess;
 }
 
