@@ -567,6 +567,22 @@ __global__ void scatter_col(const float* __restrict__ src, float* __restrict__ Y
   if (r < rows) Y[(size_t)r * n + c] = src[r];
 }
 
+// Tiled transpose of a [rows, cols] row-major matrix -> [cols, rows]: dst[c*rows +
+// r] = src[r*cols + c]. Used by the batched matmul to turn the [cols, n]
+// column-major activation into [n, cols] position-major so each position's
+// q8_1 blocks are contiguous (quantize_q8_1 needs 32-element contiguous runs).
+__global__ void transpose_tiled(const float* __restrict__ src, float* __restrict__ dst,
+                                int rows, int cols) {
+  __shared__ float tile[32][33];  // +1 pad to avoid shared-memory bank conflicts
+  int x = blockIdx.x * 32 + threadIdx.x;
+  int y = blockIdx.y * 32 + threadIdx.y;
+  if (x < cols && y < rows) tile[threadIdx.y][threadIdx.x] = src[(size_t)y * cols + x];
+  __syncthreads();
+  x = blockIdx.y * 32 + threadIdx.x;
+  y = blockIdx.x * 32 + threadIdx.y;
+  if (x < rows && y < cols) dst[(size_t)y * rows + x] = tile[threadIdx.x][threadIdx.y];
+}
+
 // --- single-row embedding gather --------------------------------------------
 //
 // The decode preamble dequantizes token_embd[token] (Q3_K) and
@@ -774,9 +790,13 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
 // quantize x to q8_1 and run the dp4a warp-per-row kernels. SONICBOOM_GEMV_F32=1
 // restores the fp32 base/coop hybrid for differential testing against the CPU
 // reference (the fp32 path is the exact dequant arithmetic).
+//
+// Deliberately *not* cached: the env flag is a live toggle, so a differential
+// test can set/unset it mid-process to cover both the fp32 and q8_1 paths in one
+// binary. It is called once per matvec/matmul (not per element), so the getenv
+// cost is negligible.
 bool q8_1_enabled() noexcept {
-  static const bool v = std::getenv("SONICBOOM_GEMV_F32") == nullptr;
-  return v;
+  return std::getenv("SONICBOOM_GEMV_F32") == nullptr;
 }
 
 // The warp-per-row dp4a gemv against a *pre-quantized* q8_1 activation. Shared
@@ -796,6 +816,31 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
       break;
     case QuantType::Q5_K:
       q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      break;
+  }
+}
+
+// Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
+// position's blocks contiguous). One warp per output row; each weight block is
+// reused across a tile of T positions. dst is [num_rows, n] (n innermost).
+void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
+                              const q8_1::block_q8_1* xq, float* yp,
+                              int blocks_per_row, int num_rows, int n) {
+  const dim3 block(32, 8);
+  const dim3 grid(1, (num_rows + 7) / 8);
+  constexpr int T = q8_1::GEMV_BATCH_T;
+  switch (qt) {
+    case QuantType::Q3_K:
+      q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, n);
+      break;
+    case QuantType::Q4_K:
+      q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, n);
+      break;
+    case QuantType::Q5_K:
+      q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, n);
       break;
   }
 }
@@ -1034,12 +1079,15 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 }
 
 // Batched (prefill) matmul: Y = W @ X for X [cols, n] (n innermost) and Y
-// [rows, n] (n innermost). The K-quant gemv kernels take a contiguous
-// single-column activation, so each of the n columns is gathered into a
-// contiguous scratch buffer, run through the (unchanged) gemv, and scattered
-// back — the per-column arithmetic is bit-identical to matvec_f32_dev, so this
-// matches the CPU matmul_f32 to the same fp32 tolerance. n == 1 falls back to
-// the single-column path.
+// [rows, n] (n innermost). The q8_1 path transposes X to [n, cols], quantizes
+// each position's activation to q8_1 (contiguous blocks), then runs one batched
+// warp-per-row kernel that reuses each weight block across a tile of positions —
+// so the weight is read once per batch instead of once per column. The per-column
+// arithmetic is bit-identical to matvec_f32_dev (same vec_dot + same
+// quantize_q8_1), so this matches the CPU matmul_f32 to the same fp32 tolerance
+// and keeps prefill/decode quantization consistent. The fp32 fallback
+// (SONICBOOM_GEMV_F32=1) keeps the n× gather/gemv/scatter loop. n == 1 falls
+// back to the single-column path.
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
@@ -1053,23 +1101,43 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
 
+  const uint8_t* wp = static_cast<const uint8_t*>(d_w);
+  const int ic = int(cols), ir = int(rows);
+
+  if (q8_1_enabled()) {
+    // 1. Xt[n, cols] = X[cols, n]^T (each position contiguous).
+    float* xt = static_cast<float*>(
+        grow_scratch(g_col, g_col_bytes, cols * (size_t)n * sizeof(float)));
+    if (!xt) return false;
+    const dim3 tblock(32, 32);
+    // transpose_tiled reads src[rows=ic, cols=n]: blockIdx.x tiles cols (n),
+    // blockIdx.y tiles rows (ic).
+    const dim3 tgrid((n + 31) / 32, (ic + 31) / 32);
+    transpose_tiled<<<tgrid, tblock, 0, cur_stream()>>>(X, xt, ic, n);
+
+    // 2. Quantize each of the n positions to q8_1 (n * blocks_per_row * 8 blocks).
+    const size_t nblocks = (size_t)blocks_per_row * (q8_1::QK_K / q8_1::QK8_1);
+    q8_1::block_q8_1* xq = static_cast<q8_1::block_q8_1*>(grow_scratch(
+        g_q8, g_q8_bytes, nblocks * (size_t)n * sizeof(q8_1::block_q8_1)));
+    if (!xq) return false;
+    q8_1::quantize_q8_1<<<(nblocks * n + 255) / 256, 256, 0, cur_stream()>>>(
+        xt, xq, int(nblocks * n));
+
+    // 3. Batched warp-per-row gemv -> Y[rows, n].
+    launch_gemv_q8_1_batched(W.type(), wp, xq, Y, int(blocks_per_row), ir, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
+
+  // fp32 fallback (differential testing against the CPU reference): the n×
+  // gather/gemv/scatter loop, unchanged.
   float* col = static_cast<float*>(
       grow_scratch(g_col, g_col_bytes, cols * sizeof(float)));
   float* row = static_cast<float*>(
       grow_scratch(g_row, g_row_bytes, rows * sizeof(float)));
   if (!col || !row) return false;
-
-  const uint8_t* wp = static_cast<const uint8_t*>(d_w);
-  const int ic = int(cols), ir = int(rows);
   for (int c = 0; c < n; ++c) {
     gather_col<<<(ic + 255) / 256, 256, 0, cur_stream()>>>(X, col, ic, n, c);
-    // Same activation-quantization gate as matvec_f32_dev (n == 1): prefill and
-    // decode must use the same quantization for the same weights, or the KV cache
-    // is built from a different numerical source and the continuation diverges.
-    if (q8_1_enabled())
-      launch_gemv_q8_1(W.type(), wp, col, row, int(blocks_per_row), ir);
-    else
-      launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
+    launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
     scatter_col<<<(ir + 255) / 256, 256, 0, cur_stream()>>>(row, Y, ir, n, c);
   }
   return cudaGetLastError() == cudaSuccess;

@@ -359,4 +359,130 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
   if (lane == 0) dst[row] = sum;
 }
 
+// --- batched warp-per-row mmvq (prefill) ------------------------------------
+//
+// Y[row, pos] = sum_b vec_dot(W[row,b], Xq[pos,b]) for pos in [0, n).
+// Same one-warp-per-row decomposition as the single-column kernels, but the
+// weight block W[row,b] is read *once* and reused across a tile of T positions
+// (T register accumulators), so the weight's DRAM traffic is amortized over the
+// batch instead of re-read once per column. `y` is the q8_1 activation laid out
+// position-major: [pos * blocks_per_row + b] * (QK_K / QK8_1) blocks. `dst` is
+// [num_rows, n] with n innermost (matches the [rows, n] prefill layout).
+
+constexpr int GEMV_BATCH_T = 8;
+
+template <int T>
+__global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
+                                       const block_q8_1* __restrict__ y,
+                                       float* __restrict__ dst,
+                                       int blocks_per_row, int num_rows, int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane & 15;   // QI3_K=16 slices
+  const int ib = lane >> 4;    // 2 blocks per warp
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 110;
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          sum[t] += vec_dot_q3_K_q8_1(wb, yb, iqs);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+      }
+    }
+  }
+}
+
+template <int T>
+__global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
+                                       const block_q8_1* __restrict__ y,
+                                       float* __restrict__ dst,
+                                       int blocks_per_row, int num_rows, int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = 2 * (lane & 15);  // QI4_K=32, vdr=2 -> iqs even 0..30
+  const int ib = lane >> 4;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 144;
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          sum[t] += vec_dot_q4_K_q8_1(wb, yb, iqs);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+      }
+    }
+  }
+}
+
+template <int T>
+__global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
+                                       const block_q8_1* __restrict__ y,
+                                       float* __restrict__ dst,
+                                       int blocks_per_row, int num_rows, int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = 2 * (lane & 15);  // QI5_K=32, vdr=2 -> iqs even 0..30
+  const int ib = lane >> 4;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 176;
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          sum[t] += vec_dot_q5_K_q8_1(wb, yb, iqs);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+      }
+    }
+  }
+}
+
 } // namespace sonicboom::quant::cuda::q8_1

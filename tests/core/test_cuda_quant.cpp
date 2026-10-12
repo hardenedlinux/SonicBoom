@@ -132,11 +132,12 @@ void test_one_type(sbquant::QuantType type, const char* name,
   test_one_shape(type, name, 64, 256 * 40, 1e-1, rng);
 }
 
-// Batched (prefill) matmul: Y = W @ X for n columns, compared against the CPU
-// matmul_f32 reference (X/Y row-major with n innermost). The CUDA path gathers
-// each strided column into a contiguous buffer, runs the single-column gemv,
-// and scatters the row back — same arithmetic as matvec_f32, so the same fp32
-// tolerances apply.
+// Batched (prefill) matmul, fp32 differential path: Y = W @ X for n columns,
+// compared against the CPU matmul_f32 reference (X/Y row-major with n innermost).
+// main() sets SONICBOOM_GEMV_F32=1, so this exercises the fp32 fallback (the n×
+// gather/gemv/scatter loop) — the exact dequant arithmetic, compared at the fp32
+// tolerances below. The q8_1 batched path (the default) is covered separately by
+// test_batched_q8_1, bit-exact against the per-column q8_1 matvec.
 void test_batched(sbquant::QuantType type, const char* name, uint64_t rows,
                   uint64_t cols, uint64_t n, double tol, std::mt19937& rng) {
   // Same keepalive as test_one_shape: keep each weight's backing buffer alive so
@@ -176,6 +177,62 @@ void test_batched_type(sbquant::QuantType type, const char* name,
   test_batched(type, name, 64, 256 * 40, 4, 1e-1, rng);
 }
 
+// q8_1 batched matmul (the decode/prefill default), checked bit-exact against
+// the per-column q8_1 matvec. Unlike test_batched, this runs with
+// SONICBOOM_GEMV_F32 *unset* so matmul_f32 takes the transpose -> quantize_q8_1
+// -> batched warp-per-row path. That path must be bit-identical to n calls of
+// matvec_f32 (same quantize_q8_1, same vec_dot, same __shfl reduction order);
+// any divergence here means the transpose or the position-major q8_1 layout is
+// wrong (a swapped transpose grid silently produced garbage, so this is the
+// guard that catches it).
+void test_batched_q8_1(sbquant::QuantType type, const char* name, uint64_t rows,
+                       uint64_t cols, uint64_t n, std::mt19937& rng) {
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+  if (!W.valid()) {
+    check(false, "q8_1 batched: build_weight produced an invalid tensor");
+    return;
+  }
+
+  std::vector<float> X(cols * n), Yb(rows * n), Yr(rows * n);
+  for (auto& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  bool ok = sbquant::cuda::matmul_f32(W, X, Yb, n);
+  check(ok, "cuda::matmul_f32 (q8_1 batched) returns true");
+  if (!ok) return;
+
+  for (uint64_t c = 0; c < n; ++c) {
+    std::vector<float> xc(cols), yc(rows);
+    for (uint64_t k = 0; k < cols; ++k) xc[k] = X[k * n + c];
+    if (!sbquant::cuda::matvec_f32(W, xc, yc)) {
+      check(false, "cuda::matvec_f32 (q8_1 single-col) returns true");
+      return;
+    }
+    for (uint64_t r = 0; r < rows; ++r) Yr[r * n + c] = yc[r];
+  }
+
+  size_t ndiff = 0;
+  for (uint64_t i = 0; i < rows * n; ++i)
+    if (Yb[i] != Yr[i]) ++ndiff;
+  if (ndiff) {
+    std::cerr << "    q8_1 batched " << name << ": " << ndiff << "/" << rows * n
+              << " elements differ from per-column matvec\n";
+  }
+  check(ndiff == 0, "q8_1 batched == per-column matvec (bit-exact)");
+}
+
+void test_batched_q8_1_type(sbquant::QuantType type, const char* name,
+                            std::mt19937& rng) {
+  // n == 3 (partial tile), n == 8 (full tile), n == 10 (two tiles): covers the
+  // p0/T tile loop's partial-tile path and the multi-tile path.
+  test_batched_q8_1(type, name, 64, 256 * 4, 3, rng);
+  test_batched_q8_1(type, name, 64, 256 * 40, 3, rng);
+  test_batched_q8_1(type, name, 64, 256 * 40, 8, rng);
+  test_batched_q8_1(type, name, 64, 256 * 40, 10, rng);
+}
+
 } // namespace
 
 int main() {
@@ -199,6 +256,14 @@ int main() {
   test_batched_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+
+  // The q8_1 batched path is the decode/prefill default; the differential above
+  // used the fp32 fallback (SONICBOOM_GEMV_F32=1). Unset it here so the q8_1
+  // batched path is exercised bit-exact against the per-column q8_1 matvec.
+  unsetenv("SONICBOOM_GEMV_F32");
+  test_batched_q8_1_type(sbquant::QuantType::Q3_K, "q3_K", rng);
+  test_batched_q8_1_type(sbquant::QuantType::Q4_K, "q4_K", rng);
+  test_batched_q8_1_type(sbquant::QuantType::Q5_K, "q5_K", rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";
