@@ -21,6 +21,7 @@
 #include "../nn/cuda_stream.h"
 
 #include "ggml_derived/mmvq_q8_1.cuh"
+#include "ggml_derived/mmq.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
@@ -482,6 +483,15 @@ void* g_wf16 = nullptr;
 size_t g_wf16_bytes = 0;
 void* g_xf16 = nullptr;
 size_t g_xf16_bytes = 0;
+// MMQ int8 tensor-core scratch (C.2): the transposed activation Xt [n, cols],
+// the block_q8_1_mmq quantized activation [K/128][n] (+ J_max tail over-read),
+// and the column-major [rows, n] matmul result. Reused across layers.
+void* g_mmq_xt = nullptr;
+size_t g_mmq_xt_bytes = 0;
+void* g_mmq_q8 = nullptr;
+size_t g_mmq_q8_bytes = 0;
+void* g_mmq_dst = nullptr;
+size_t g_mmq_dst_bytes = 0;
 
 // Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
 // created lazily and the workspace is set so cublasGemmEx is stream-capturable
@@ -1065,6 +1075,29 @@ int cublas_min_n() {
   return v;
 }
 
+// MMQ int8 tensor-core path (C.2). On by default; SONICBOOM_MMQ=0 disables it
+// and restores the cuBLAS fp16 path at n >= cublas_min_n(). Requires
+// q8_1_enabled() (the fp32 fallback is the CPU-matching differential path and
+// must not be routed through int8 tensor cores).
+bool mmq_enabled() noexcept {
+  if (std::getenv("SONICBOOM_MMQ") == nullptr) return true;
+  return std::string_view(std::getenv("SONICBOOM_MMQ")) != "0";
+}
+
+// n (batch) threshold above which the mmq path is used. Tunable via
+// SONICBOOM_MMQ_MIN_N for the C.1-vs-C.2 per-n comparison.
+constexpr int kMmqMinN = 32;
+int mmq_min_n() {
+  static int v = [] {
+    if (const char* e = std::getenv("SONICBOOM_MMQ_MIN_N")) {
+      const int x = std::atoi(e);
+      if (x > 0) return x;
+    }
+    return kMmqMinN;
+  }();
+  return v;
+}
+
 // Lazily create the process-wide cuBLAS handle and its stream-capture workspace.
 // Returns nullptr on failure (the caller falls back to the dp4a batched path).
 cublasHandle_t cublas_handle() {
@@ -1429,6 +1462,72 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
 }
 
+// MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
+// shared memory as int8 and multiplies against a block_q8_1_mmq activation via
+// m16n8k16/m16n8k32 tensor cores. X is [cols, n] (n innermost); the kernel needs
+// the activation transposed to [n, cols] (for contiguous 128-element q8_1
+// blocks) and writes the result column-major [rows, n], so one transpose on
+// either side of the kernel. Q3_K uses a float d4 activation scale layout
+// (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's vec_dot path.
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  const int ic = int(cols), ir = int(rows);
+  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
+
+  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  if (!wp) return false;
+
+  // 1. Xt[n, cols] = X[cols, n]^T (each position's 128-element blocks contiguous).
+  float* xt = static_cast<float*>(
+      grow_scratch(g_mmq_xt, g_mmq_xt_bytes, cols * (size_t)n * sizeof(float)));
+  if (!xt) return false;
+  const dim3 tblock(32, 32);
+  transpose_tiled<<<dim3((n + 31) / 32, (ic + 31) / 32), tblock, 0, cur_stream()>>>(
+      X, xt, ic, n);
+
+  // 2. Quantize Xt -> block_q8_1_mmq [K/128][n] (+ J_max tail over-read guard).
+  mmq::block_q8_1_mmq* y_q8 = static_cast<mmq::block_q8_1_mmq*>(
+      grow_scratch(g_mmq_q8, g_mmq_q8_bytes,
+                   mmq::mmq_q8_blocks(ic, n) * sizeof(mmq::block_q8_1_mmq)));
+  if (!y_q8) return false;
+
+  // 3. Column-major [rows, n] result.
+  float* mmq_dst = static_cast<float*>(
+      grow_scratch(g_mmq_dst, g_mmq_dst_bytes, rows * (size_t)n * sizeof(float)));
+  if (!mmq_dst) return false;
+
+  bool ok = false;
+  switch (W.type()) {
+    case QuantType::Q3_K:
+      mmq::quantize_activation<mmq::D4>(xt, y_q8, ic, n, cur_stream());
+      ok = mmq::mul_mat_q<mmq::MMQ_Q3_K>(
+          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
+          mmq_dst, ir, n, blocks_per_row, cur_stream());
+      break;
+    case QuantType::Q4_K:
+      mmq::quantize_activation<mmq::DS4>(xt, y_q8, ic, n, cur_stream());
+      ok = mmq::mul_mat_q<mmq::MMQ_Q4_K>(
+          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
+          mmq_dst, ir, n, blocks_per_row, cur_stream());
+      break;
+    case QuantType::Q5_K:
+      mmq::quantize_activation<mmq::DS4>(xt, y_q8, ic, n, cur_stream());
+      ok = mmq::mul_mat_q<mmq::MMQ_Q5_K>(
+          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
+          mmq_dst, ir, n, blocks_per_row, cur_stream());
+      break;
+    default:
+      return false;
+  }
+  if (!ok) return false;
+
+  // 4. Y[rows, n] = transpose of mmq_dst (column-major [rows, n]).
+  transpose_tiled<<<dim3((ir + 31) / 32, (n + 31) / 32), tblock, 0, cur_stream()>>>(
+      mmq_dst, Y, n, ir);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
@@ -1438,6 +1537,14 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t rows = W.dims()[1];
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
+
+  // MMQ int8 tensor-core path (C.2) — measured faster than cuBLAS fp16 (C.1)
+  // at every n tested (wall tok/s, mmq vs cuBLAS: 64→193/127, 128→326/224,
+  // 256→434/336, 512→458/396, 2048→324/286), so it is selected for all
+  // n >= mmq_min_n(); cuBLAS stays reachable via SONICBOOM_MMQ=0. Only when
+  // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
+  if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n())
+    return matmul_mmq_dev(W, X, Y, n);
 
   // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.

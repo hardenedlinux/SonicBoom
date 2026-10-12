@@ -28,6 +28,21 @@ core/src/quant/ggml_derived/mmvq_q8_1.cuh
       - get_int_b2 / get_int_b4, block_q8_1 layout
     (Adaptation: block_q8_1 keeps `d` as fp32; llama.cpp packs d+s into a half2.)
 
+core/src/quant/ggml_derived/mmq.cuh
+    Q3_K / Q4_K / Q5_K int8-tensor-core "mmq" matmul (CUDA, Ampere). Ported from:
+      - tile<> + load_ldmatrix + mma         ← ggml/src/ggml-cuda/mma.cuh
+      - block_q8_1_mmq, sram_stride, process_tile,
+        mul_mat_q, write_back_mma            ← ggml/src/ggml-cuda/mmq.cuh
+      - J set (fallback = false)             ← ggml/src/ggml-cuda/mmq-config-ampere.cuh
+      - load_tiles_q3/q4/q5_K,
+        unpack_scales_q45_K                  ← ggml/src/ggml-cuda/mmq-load-tiles.cuh
+      - vec_dot_q8_0_16_q8_1_mma             ← ggml/src/ggml-cuda/mmq-vec-dot.cuh
+      - vec_dot_q8_1_q8_1_mma                ← ggml/src/ggml-cuda/mmq-vec-dot.cuh
+      - quantize_mmq_q8_1                    ← ggml/src/ggml-cuda/quantize.cu
+      - get_int_b2 / get_int_b4              ← ggml/src/ggml-cuda/vecdotq.cuh
+    (Adaptation: dropped the MoE / channels / samples / ids_dst / fallback
+     branches — Gemma has M%128==0 and no MoE; added the host-side launchers.)
+
 core/src/quant/ggml_derived/vec_dot_qK_q8K.h
     q8_K scalar fixed-point reference (CPU). Ported from:
       - nearest_int              ← ggml/src/ggml-quants.c
