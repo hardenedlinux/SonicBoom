@@ -147,8 +147,10 @@ accumulation order), and at a near-tie flip the argmax. First divergence in the
 tokens**. The divergence is a property of the model's near-tie token, not a
 SonicBoom defect. (An earlier Phase-2.3 run showed the same signature at token
 44 with logit gap 1.20 — CPU top-1 `236764` 25.397 vs top-2 `779` 24.194, CUDA
-swapping them; the exact flip position shifts a few tokens run-to-run because
-split-K `atomicAdd` accumulation is non-deterministic.)
+swapping them. That Phase-2.3 decode path still used split-K `atomicAdd`, so the
+flip position shifted run-to-run; the current decode path is deterministic —
+fixed-order split-KV merge (991a1bb) and two-phase split-K dense gemv (0318093)
+— so the flip position is now fixed.)
 
 ### 3.2 SWA ring-buffer wraparound
 
@@ -181,9 +183,13 @@ same top-2 tokens and merely swap them:
 
 (raw = pre-softcap logit; final_logit_softcapping = 30.) The margin is < 0.25
 raw, i.e. a near-tie, and the flip is the same class as §3.1's CUDA-vs-CPU token
-35: a property of the model's near-tie token, not a SonicBoom defect. As in §3.1,
-the exact flip position can shift a few tokens run-to-run because the per-token
-reference's split-KV decode uses non-deterministic `atomicAdd` accumulation.
+35: a property of the model's near-tie token, not a SonicBoom defect. The decode
+path is deterministic — the split-KV merge walks the chunk loop in fixed order
+with no atomics (991a1bb), the dense gemv uses a deterministic two-phase split-K
+reduction (0318093), and every q8_1 mmvq / attention / fused-T1–T5 reduction is a
+warp `__shfl`. 10× 64-step `generate_spine_cuda` runs produce the identical token
+stream, so this flip is a fixed, reproducible near-tie from the flash-attention
+(prefill) vs split-KV (per-token) KV-cache numerics, not run-to-run jitter.
 
 ## 4. Operator-level: quantized gemv vs cuBLAS (unchanged from v0)
 
