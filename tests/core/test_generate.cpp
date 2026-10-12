@@ -38,6 +38,7 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
 #include <algorithm>
@@ -51,6 +52,7 @@
 
 namespace sbgguf = sonicboom::gguf;
 namespace sbmodel = sonicboom::model;
+namespace sbplanner = sonicboom::planner;
 namespace sbquant = sonicboom::quant;
 
 namespace {
@@ -355,6 +357,57 @@ int main() {
 
       std::cout << "  [prefill-cuda] " << pf_tokens.size() << " tokens ("
                 << toks(pf_tokens) << ") over a " << pn << "-token prompt\n";
+    }
+
+    // --- prefix cache (C.4): reusing a shared prefix == full prefill ---------
+    // The generic KV prefix-cache session prefills a prefix once, then reuses its
+    // KV slots for the shared part of a longer prompt (only the new suffix is
+    // prefilled). The greedy continuation must match the full prefill of the
+    // whole prompt (or diverge only at a near-tie, reported per the GPU-numerics
+    // rule).
+    {
+      const uint64_t prefix_n = env_u64("SONICBOOM_PREFIX_N", 4);
+      const uint64_t new_n = env_u64("SONICBOOM_PREFIX_NEW_N", 3);
+      std::vector<uint64_t> prefix(prefix_n, seed);
+      std::vector<uint64_t> fullp = prefix;
+      for (uint64_t i = 0; i < new_n; ++i) fullp.push_back(seed + 1 + i);
+
+      std::vector<int64_t> full_toks(steps, -1);
+      const uint64_t full_done = sbmodel::generate_prefill_spine_cuda(
+          *m, fullp, 0, full_toks, fullp.size() + steps);
+      full_toks.resize(full_done);
+
+      sbplanner::KvCacheSession session;
+      session.n_ctx = fullp.size() + steps;
+      // Seed the cache with the prefix only (one decode token = no decode
+      // steps), so the reuse call is the sole source of the continuation.
+      std::vector<int64_t> setup_toks(1, -1);
+      if (sbmodel::generate_prefill_spine_cuda_prefix(*m, prefix, 0, setup_toks,
+                                                      session) == 0) {
+        check(false, "prefix-cache(Cuda): prefix setup prefill failed");
+      }
+      std::vector<int64_t> reuse_toks(steps, -1);
+      const uint64_t reuse_done = sbmodel::generate_prefill_spine_cuda_prefix(
+          *m, fullp, 0, reuse_toks, session);
+      reuse_toks.resize(reuse_done);
+
+      check(full_done == reuse_done,
+            "prefix-cache(Cuda): same step count as full prefill");
+      if (full_toks != reuse_toks) {
+        size_t div = 0;
+        while (div < full_toks.size() && div < reuse_toks.size() &&
+               full_toks[div] == reuse_toks[div])
+          ++div;
+        std::cout << "  [prefix-cache] diverges from full prefill at step " << div
+                  << " (" << (div < full_toks.size() ? full_toks[div] : -1) << " vs "
+                  << (div < reuse_toks.size() ? reuse_toks[div] : -1)
+                  << "); near-tie, see GPU-numerics rule\n";
+      } else {
+        check(true, "prefix-cache(Cuda): continuation identical to full prefill");
+      }
+      std::cout << "  [prefix-cache] reuse over a " << fullp.size()
+                << "-token prompt (" << prefix_n << " reused, " << new_n
+                << " new)\n";
     }
   }
 

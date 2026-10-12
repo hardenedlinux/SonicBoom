@@ -34,6 +34,7 @@
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/graph.h>
+#include <sonicboom/planner/kv_cache.h>
 
 #include <memory>
 #include <span>
@@ -106,22 +107,17 @@ public:
   // buffers (the shared_ptr holds a device-buffer-freeing deleter).
   void share_caches(const SonicCudaBackend& other);
 
-private:
-  // One KV layer's persistent device-resident decode cache (mirrors
-  // SonicBackend::KvCache): K is RoPE'd + per-head-normed then fp16-rounded; V
-  // per-head-normed then fp16-rounded. Flat [n_slots, n_heads_kv, head_dim] in
-  // f32; slot for absolute position j is `j % n_slots`. Allocated as hal::Buffer
-  // through the device allocator (hal::DeviceAllocator) so the persistent slots
-  // have a stable address for the pre-recorded step's replay.
-  struct KvCacheDev {
-    hal::Buffer k_buf;
-    hal::Buffer v_buf;
-    uint64_t bytes = 0;  // per-buffer byte size (k and v equal)
-    uint64_t n_slots = 0;
-    uint64_t n_heads_kv = 0;
-    uint64_t head_dim = 0;
-  };
+  // Adopt a persistent session's device cache (prefix reuse): replaces this
+  // backend's freshly-allocated constructor cache with the session's shared
+  // cache, so a later prefill fills the same buffers the next request reads.
+  void share_caches(const KvCacheSession& session);
 
+  // Publish this backend's device cache into a session (first prefix-cache
+  // prefill): the session takes shared ownership so the cache survives this
+  // backend's destruction. No-op-safe when the session already owns a cache.
+  void publish_cache(KvCacheSession& session) const;
+
+private:
   const model::Gemma4Model& model_;
   const Graph& graph_;
   // index == KV layer (0 .. n_layer_kv-1). Shared across the decode backend and

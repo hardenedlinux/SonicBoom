@@ -30,6 +30,7 @@
 
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/graph.h>
+#include <sonicboom/planner/kv_cache.h>
 
 namespace sonicboom::model {
 
@@ -145,5 +146,25 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      std::span<const uint64_t> prompt,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx = 0, bool use_prefill = true);
+
+// CUDA prefill + decode with prefix-cache reuse: the same token-stream contract
+// as generate_prefill_spine_cuda, but the KV cache persists in `session` across
+// calls. On each call it matches `prompt` against the session's token history
+// and reuses the shared prefix's KV slots, prefilling only the new suffix
+// (`prompt[prefix_len:]`). Prefix reuse requires `start_pos == 0` (the cache is
+// a contiguous history anchored at position 0); a non-zero start_pos disables
+// reuse and prefills the whole prompt. The cache size is `session.n_ctx`: set it
+// (once, before the first call) to the largest `start_pos + prompt.size() +
+// tokens.size()` the session will serve; a zero `session.n_ctx` sizes it from
+// the first call's own prompt. A request larger than `session.n_ctx` is rejected
+// (returns 0). The capability is generic — it knows nothing about Gemma's layer
+// structure, only the session's token history and the backend-owned slot
+// geometry.
+uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
+                                            std::span<const uint64_t> prompt,
+                                            uint64_t start_pos,
+                                            std::span<int64_t> tokens,
+                                            planner::KvCacheSession& session,
+                                            bool use_prefill = true);
 
 } // namespace sonicboom::model

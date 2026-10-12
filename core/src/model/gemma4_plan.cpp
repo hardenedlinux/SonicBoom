@@ -910,15 +910,58 @@ uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
 // first-token logits match the device spine's lm-head arithmetic.
 // ---------------------------------------------------------------------------
 #ifdef SONICBOOM_USE_CUDA
-uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
-                                     std::span<const uint64_t> prompt,
-                                     uint64_t start_pos, std::span<int64_t> tokens,
-                                     uint64_t n_ctx, bool use_prefill) {
+// Env-gated logit dump (C.4 isolation measurement). When SONICBOOM_DUMP_LOGITS
+// is set, the decode graph is built non-greedy (Softcap output) so each step's
+// softcapped logits reach the host, and the top-2 (with their logits) are
+// appended to SONICBOOM_DUMP_LOGITS_FILE (default stderr). Argmax(softcapped) ==
+// Argmax(raw), so the token stream is unchanged — this is measurement only.
+static void dump_logits_top2(const char* file, uint64_t step, uint64_t pos,
+                             std::span<const float> logits) {
+  int64_t i1 = -1, i2 = -1;
+  float l1 = -INFINITY, l2 = -INFINITY;
+  for (size_t i = 0; i < logits.size(); ++i) {
+    const float v = logits[i];
+    if (v > l1) {
+      l2 = l1;
+      i2 = i1;
+      l1 = v;
+      i1 = int64_t(i);
+    } else if (v > l2) {
+      l2 = v;
+      i2 = int64_t(i);
+    }
+  }
+  FILE* f = file ? std::fopen(file, "a") : stderr;
+  if (!f) f = stderr;
+  std::fprintf(f,
+               "[dump-logits] step=%llu pos=%llu top1=%lld logit1=%.6f top2=%lld "
+               "logit2=%.6f diff=%.6f\n",
+               (unsigned long long)step, (unsigned long long)pos, (long long)i1,
+               double(l1), (long long)i2, double(l2), double(l1 - l2));
+  if (file && f != stderr) std::fclose(f);
+}
+
+// Shared prefill + decode body. `prompt` is the tokens to actually prefill
+// (already the suffix when prefix reuse skipped a shared prefix); `session`, when
+// non-null, is the persistent prefix-cache session this run adopts/publishes its
+// device cache to. The full prompt prefill (generate_prefill_spine_cuda) passes
+// null; the prefix-reuse path passes the live session.
+static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
+                                         std::span<const uint64_t> prompt,
+                                         uint64_t start_pos,
+                                         std::span<int64_t> tokens,
+                                         uint64_t n_ctx, bool use_prefill,
+                                         planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
-  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
+  const bool dump_logits = std::getenv("SONICBOOM_DUMP_LOGITS") != nullptr;
+  const char* dump_logits_file = std::getenv("SONICBOOM_DUMP_LOGITS_FILE");
+  // Non-greedy (Softcap output) when dumping logits: argmax(softcapped) ==
+  // argmax(raw), so the token stream is unchanged while the per-step logits
+  // become reachable for the isolation measurement.
+  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/!dump_logits);
   // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
   // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
   // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
@@ -936,6 +979,16 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 
   planner::SonicBackend cpu_backend(m, graph);
   planner::SonicCudaBackend cuda_backend(m, graph, n_ctx);
+  // Prefix reuse: adopt the session's persistent cache if it has one, otherwise
+  // publish this backend's fresh cache into the session (first call) so it
+  // survives this run. The prefill segment backends then share it transitively
+  // via share_caches(cuda_backend).
+  if (session) {
+    if (session->caches)
+      cuda_backend.share_caches(*session);
+    else
+      cuda_backend.publish_cache(*session);
+  }
   planner::RuntimeExecutor exec(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, &cuda_backend}});
@@ -1033,7 +1086,15 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
         std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
     // Capture only when there is at least one non-final full-chunk segment to
     // replay (n > chunk); a single segment is always final and runs uncaptured.
-    if (use_graphs && n > chunk) {
+    // The capture's warm-up run executes the full-chunk segment once and its
+    // deferred KvAppendBatched overwrites the shared KV cache. That is safe only
+    // when the cache is empty before the run (start_pos == 0, a fresh full
+    // prefill). For a prefix-reuse suffix (start_pos > 0) the cache already
+    // holds the shared prefix, and the warm-up append would clobber the prefix
+    // positions the suffix's first segment still attends over, corrupting the
+    // reused cache. Reuse therefore runs uncaptured (correctness over the
+    // launch-overhead win, which only matters for long prompts).
+    if (use_graphs && n > chunk && start_pos == 0) {
       PrefillSegment* full = segment_for(chunk);
       if (full) {
         const std::span<const uint64_t> first_chunk = prompt.subspan(0, chunk);
@@ -1057,9 +1118,20 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
     }
 
     const auto t_pf0 = std::chrono::steady_clock::now();
-    for (uint64_t off = 0; off < n; off += chunk) {
-      const uint64_t nseg = std::min(chunk, n - off);
+    for (uint64_t off = 0; off < n; ) {
       const uint64_t pos = start_pos + off;
+      uint64_t nseg = std::min(chunk, n - off);
+      // Align the segment boundary to an absolute multiple of `chunk` so a
+      // segment never spans a ring-wraparound point: a KV slot is `pos %
+      // n_slots` with n_slots == chunk for the SWA layers, so a segment whose
+      // start_pos is not a multiple of `chunk` would wrap the ring and its
+      // deferred append would overwrite slots a later position still reads. The
+      // cap also makes a prefix-reuse suffix (start_pos not a multiple of
+      // `chunk`) split at the same boundaries a full prefill would, so the two
+      // paths write the same per-position KV.
+      const uint64_t rem = pos % chunk;
+      if (rem != 0 && chunk - rem < nseg)
+        nseg = chunk - rem;
       const bool is_final = (off + nseg == n);
       PrefillSegment* seg = segment_for(nseg);
       if (!seg)
@@ -1077,6 +1149,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                     << " graph replay failed\n";
           return 0;
         }
+        off += nseg;
         continue;
       }
 
@@ -1116,7 +1189,13 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
           return 0;
         }
         first = nn::argmax(logits);
+        if (dump_logits) {
+          std::vector<float> capped(vocab);
+          nn::softcap(logits, m.config.final_logit_softcapping, capped);
+          dump_logits_top2(dump_logits_file, /*step=*/0, start_pos + n, capped);
+        }
       }
+      off += nseg;
     }
     if (gen_timing) {
       using ms = std::chrono::duration<double, std::milli>;
@@ -1132,6 +1211,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
     // (Phase 3.2 B4), since the Embedding gather now reads the token id on the
     // device rather than the host graph input.
     float last_argmax = -1.0f;
+    std::vector<float> last_capped;  // softcapped logits of the final prompt token
     for (uint64_t p : prompt) {
       cuda_backend.seed_token(p);
       cuda_backend.set_pos(pos);
@@ -1141,11 +1221,22 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
       auto res = exec.execute(*plan, *snap, in);
       if (!res || res->outputs.empty()) return 0;
       const sx::Bytes& lo = res->outputs[0];
-      if (lo.size() < sizeof(float)) return 0;
-      last_argmax = *reinterpret_cast<const float*>(lo.data());
+      if (dump_logits) {
+        if (lo.size() < vocab * sizeof(float)) return 0;
+        last_capped.assign(reinterpret_cast<const float*>(lo.data()),
+                           reinterpret_cast<const float*>(lo.data()) + vocab);
+        const int64_t a = nn::argmax(last_capped);
+        if (a < 0) return 0;
+        last_argmax = float(a);
+      } else {
+        if (lo.size() < sizeof(float)) return 0;
+        last_argmax = *reinterpret_cast<const float*>(lo.data());
+      }
       ++pos;
     }
     first = int64_t(last_argmax);
+    if (dump_logits)
+      dump_logits_top2(dump_logits_file, /*step=*/0, pos, last_capped);
   }
 
   if (first < 0) return 0;
@@ -1173,19 +1264,80 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
       break;
     }
     const sx::Bytes& lo = res->outputs[0];
-    if (lo.size() < sizeof(float)) break;
-    const int64_t next = int64_t(*reinterpret_cast<const float*>(lo.data()));
-    if (next < 0) break;
+    int64_t next;
+    if (dump_logits) {
+      if (lo.size() < vocab * sizeof(float)) break;
+      std::span<const float> lf(reinterpret_cast<const float*>(lo.data()), vocab);
+      next = nn::argmax(lf);
+      if (next < 0) break;
+      dump_logits_top2(dump_logits_file, step, pos, lf);
+    } else {
+      if (lo.size() < sizeof(float)) break;
+      next = int64_t(*reinterpret_cast<const float*>(lo.data()));
+      if (next < 0) break;
+    }
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
     ++pos;
   }
   return step;
 }
+
+uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
+                                     std::span<const uint64_t> prompt,
+                                     uint64_t start_pos, std::span<int64_t> tokens,
+                                     uint64_t n_ctx, bool use_prefill) {
+  return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
+                                  use_prefill, /*session=*/nullptr);
+}
+
+uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
+                                            std::span<const uint64_t> prompt,
+                                            uint64_t start_pos,
+                                            std::span<int64_t> tokens,
+                                            planner::KvCacheSession& session,
+                                            bool use_prefill) {
+  if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
+
+  // Prefix reuse only anchors at position 0 (the session's token history is a
+  // contiguous run from 0); a non-zero start_pos disables reuse.
+  const uint64_t prefix_len =
+      (start_pos == 0) ? session.common_prefix_len(prompt) : 0;
+
+  // The cache size is the session's n_ctx (pre-set by the caller for its largest
+  // request); the first call sizes it from its own prompt when session.n_ctx is
+  // zero. A request larger than the session's cache is rejected outright rather
+  // than silently wrapping the global layers' ring.
+  const uint64_t required = start_pos + prompt.size() + tokens.size();
+  const uint64_t n_ctx = (session.n_ctx != 0) ? session.n_ctx : required;
+  if (n_ctx < required) return 0;
+
+  const uint64_t prefill_start = start_pos + prefix_len;
+  const std::span<const uint64_t> suffix = prompt.subspan(prefix_len);
+
+  const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
+                                                 tokens, n_ctx, use_prefill,
+                                                 &session);
+  if (done == 0) return 0;
+
+  // Record the tokens now resident in the cache for the next request's prefix
+  // match (positions 0..prefix_len-1 reused, prefix_len.. freshly filled).
+  if (start_pos == 0)
+    session.filled_tokens.assign(prompt.begin(), prompt.end());
+  else
+    session.filled_tokens.clear();
+  return done;
+}
 #else
 uint64_t generate_prefill_spine_cuda(const Gemma4Model&,
                                      std::span<const uint64_t>, uint64_t,
                                      std::span<int64_t>, uint64_t, bool) {
+  return 0;  // built without CUDA: no device prefill is available
+}
+uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
+                                            std::span<const uint64_t>, uint64_t,
+                                            std::span<int64_t>,
+                                            planner::KvCacheSession&, bool) {
   return 0;  // built without CUDA: no device prefill is available
 }
 #endif

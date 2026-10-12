@@ -1086,7 +1086,17 @@ bool mmq_enabled() noexcept {
 
 // n (batch) threshold above which the mmq path is used. Tunable via
 // SONICBOOM_MMQ_MIN_N for the C.1-vs-C.2 per-n comparison.
-constexpr int kMmqMinN = 32;
+//
+// Set to 2 (not 32) so the algorithm a prefill position uses does NOT depend on
+// the segment size it lands in: mmq's per-column numerics are batch-independent,
+// while the dp4a batched gemv (n < threshold) and mmq (n >= threshold) disagree
+// numerically. Prefix-cache reuse splits a prompt at an arbitrary non-512-aligned
+// position, so the seed prefix's final partial chunk and the full prefill's
+// segment covering the same positions can have different sizes; if the small
+// chunk fell below the mmq threshold it would take the gemv path and the reused
+// KV cache would diverge from a full prefill (n == 1 stays on the single-column
+// matvec path, which the decode spine also uses).
+constexpr int kMmqMinN = 2;
 int mmq_min_n() {
   static int v = [] {
     if (const char* e = std::getenv("SONICBOOM_MMQ_MIN_N")) {

@@ -70,6 +70,10 @@ tools/baseline/attention_bench
 tools/baseline/gemv_bench
 tools/baseline/longctx_bench
 tools/baseline/prefill_bench
+tools/baseline/prefix_cache_bench
+tools/baseline/prefix_cache_isolate
+tools/baseline/tokenize_text
+tools/baseline/real_prompt.txt
 *.dump
 
 *.log

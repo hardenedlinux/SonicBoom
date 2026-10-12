@@ -257,10 +257,15 @@ int main() {
   test_batched_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_type(sbquant::QuantType::Q5_K, "q5_K", rng);
 
-  // The q8_1 batched path is the decode/prefill default; the differential above
-  // used the fp32 fallback (SONICBOOM_GEMV_F32=1). Unset it here so the q8_1
-  // batched path is exercised bit-exact against the per-column q8_1 matvec.
+  // The q8_1 batched matmul is the prefill default; the differential above used
+  // the fp32 fallback (SONICBOOM_GEMV_F32=1). For n >= 2 the default is now the
+  // mmq int8 tensor-core path (C.2, and the sole n>=2 path since the C.4
+  // kMmqMinN==2 change), which is approximate and validated end-to-end rather
+  // than bit-exactly. This block targets the dp4a batched gemv (the n >= 2
+  // fallback when mmq is disabled), which must be bit-identical to n calls of
+  // matvec_f32 — so unset GEMV_F32 (activate q8_1) and disable mmq to force it.
   unsetenv("SONICBOOM_GEMV_F32");
+  setenv("SONICBOOM_MMQ", "0", 1);
   test_batched_q8_1_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q5_K, "q5_K", rng);

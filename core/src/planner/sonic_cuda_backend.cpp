@@ -218,6 +218,16 @@ void SonicCudaBackend::share_caches(const SonicCudaBackend& other) {
   caches_ = other.caches_;
 }
 
+void SonicCudaBackend::share_caches(const KvCacheSession& session) {
+  if (session.caches)
+    caches_ = session.caches;  // adopt the session's cache (prefix reuse)
+}
+
+void SonicCudaBackend::publish_cache(KvCacheSession& session) const {
+  session.caches = caches_;
+  session.n_ctx = n_ctx_;
+}
+
 std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     const TaskDesc& task, const std::vector<TensorValue>& in) {
   const auto* compute = task.as_compute();
