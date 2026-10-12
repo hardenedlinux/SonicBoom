@@ -143,7 +143,25 @@ __device__ __forceinline__ float vec_dot_q3_K_q8_1(const uint8_t* wb,
   const float d = half_to_float(ld_u16(wb + 108));
 
   const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));      // 4*(iqs/8)
-  const int scale_offset = iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+  // scale_offset == iqs - iqs%8 + (iqs%8)/4, but expressed without the div/mod:
+  // {0..3}->0, {4..7}->1, {8..11}->8, {12..15}->9.
+  const int scale_offset = (iqs & 8) | ((iqs >> 2) & 1);
+
+  // Cooperative 6-bit scale unpack (SonicBoom-owned, beyond the llama.cpp port):
+  // the 16 lanes of a super-block group each need 4 of the block's 16 scales,
+  // so the stock per-lane unpack recomputes every scale 4x. Here each lane
+  // unpacks *one* scale — scale[iqs] — and the 4 it actually needs are gathered
+  // from its group via __shfl. Bit-identical to the stock unpack (same integer
+  // sc values, same dot accumulation order); it only removes redundant ALU work
+  // from the instruction/compute-bound Q3_K kernel.
+  const int lane = threadIdx.x;                            // 0..31
+  const int group_base = (lane >> 4) << 4;                 // 0 or 16
+  const int my_sc = ((scales[iqs & 7] >> (4 * (iqs >> 3))) & 0xF)
+                  | (((scales[8 + (iqs & 3)] >> (2 * (iqs >> 2))) & 3) << 4);
+  int sc[QR3_K];
+  #pragma unroll
+  for (int i = 0; i < QR3_K; ++i)
+    sc[i] = __shfl_sync(0xffffffffu, my_sc, group_base + scale_offset + 2 * i);
 
   const int vl = get_int_b2(qs, iqs);
   const int vh = ~get_int_b2(hmask, iqs % (QI3_K / 2)) >> bq8_offset;
@@ -159,19 +177,10 @@ __device__ __forceinline__ float vec_dot_q3_K_q8_1(const uint8_t* wb,
   float sumf = 0.0f;
   #pragma unroll
   for (int i = 0; i < QR3_K; ++i) {
-    const int isc = scale_offset + 2 * i;
-    const int isc_low = isc % (QK_K / 32);
-    const int sc_shift_low = 4 * (isc / (QK_K / 32));
-    const int sc_low = (scales[isc_low] >> sc_shift_low) & 0xF;
-    const int isc_high = isc % (QK_K / 64);
-    const int sc_shift_high = 2 * (isc / (QK_K / 64));
-    const int sc_high = ((scales[QK_K / 32 + isc_high] >> sc_shift_high) & 3) << 4;
-    const int sc = (sc_low | sc_high) - 32;
-
     const int vil = (vl >> (2 * i)) & 0x03030303;
     const int vih = ((vh >> i) << 2) & 0x04040404;
     const int vi = __vsub4(vil, vih);
-    sumf += d8[i] * (__dp4a(vi, u[i], 0) * sc);
+    sumf += d8[i] * (__dp4a(vi, u[i], 0) * (sc[i] - 32));
   }
   return d * sumf;
 }

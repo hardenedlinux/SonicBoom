@@ -326,16 +326,26 @@ cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
    warp-per-row iqs slice + `__shfl` scale broadcast + `__dp4a`, 3.84× over the
    fp32 kernels). Native-torch and MLIR have *no* ggml K-quant kernels, so this
    is necessarily hand-written. **ncu (2026-10-12, base clock) resolved the
-   "DRAM vs L1/LSU" probe: the shared-memory tiling is not warranted.** The q8_1
-   port already eliminated the L1/LSU bound — `lg_throttle` collapsed from ~75%
-   (the fp32 kernels' dominant stall) to ~0.5% in both q8_1 kernels. The two FFN
-   shapes now diverge: `gemv_q4_K_q8_1` (ffn_down, bpr=40) is **DRAM-bound** (78%
-   DRAM, `long_scoreboard` 60%) — at the matmul floor, the residual ~22% is
-   memory *latency*, not bandwidth; `gemv_q3_K_q8_1` (ffn_gate/up, bpr=10) is
-   **SM/math-bound** (sm 79%, `math_pipe_throttle` 17%, DRAM 50%) — Q3_K's
-   3-super-block scale/dequant work keeps it off the DRAM floor. Neither limiter
-   is the L1/LSU data path a cooperative shared-memory tiling would relieve, so
-   that rewrite is now a do-not-retry on the q8_1 path. The do-not-retry list
+   "DRAM vs L1/LSU" probe: shared-memory tiling is not warranted.** The q8_1 port
+   already eliminated the L1/LSU bound — `lg_throttle` collapsed from ~75% (the
+   fp32 kernels' dominant stall) to ~0.5% in both q8_1 kernels. The two FFN
+   shapes now diverge:
+   - `gemv_q4_K_q8_1` (ffn_down, bpr=40): **DRAM-bound but not at the floor** —
+     78% DRAM + `long_scoreboard` 60% means in-flight requests are insufficient,
+     so a few % is still on the table (more super-blocks per warp, sw-pipeline /
+     cp.async prefetch of the next round's weights, wider aligned loads, checking
+     whether register usage caps occupancy). Recorded as a *possible* follow-up,
+     not being done now.
+   - `gemv_q3_K_q8_1` (ffn_gate/up, bpr=10): **instruction/compute-bound** (sm
+     79%, `math_pipe_throttle` 17%, DRAM 50%) — Q3_K's bit-unpack overhead. Item 1
+     (cooperative `__shfl` scale unpack, one unpack per lane then broadcast) landed:
+     ffn_gate 121.5→134.5 GB/s (−9.7%) and ffn_up 119.4→132.8 GB/s (−10.1%), still
+     below the Q4_K 160 GB/s DRAM floor, so Q3_K remains instruction-bound (the
+     150 GB/s / DRAM≥70% target was not met — bit-unpack still dominates). Bit-exact
+     (err unchanged). End-to-end +3.6% (64-step) / +4.5% (depth-512).
+   Neither limiter is the L1/LSU data path a cooperative shared-memory tiling
+   would relieve, so that rewrite is a do-not-retry on the q8_1 path (conditions:
+   `lg_throttle` ~0.5%, DRAM ~78%, `long_scoreboard` ~60%). The do-not-retry list
    (widen-loads no-op, dp4a-on-fp32, warp-per-row at small bpr, shared-memory
    tiling on q8_1) is recorded in the phase-6a notes.
 
