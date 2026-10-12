@@ -159,6 +159,32 @@ wraparound boundary (pos 511/512/513/1000 at n_slots=512) and global full-length
 decode out to pos 4096. Wraparound (`% n_slots`) and the chunked/merged online
 softmax are both exact.
 
+### 3.3 prefill(Cuda) vs per-token(Cuda) divergence (near-tie, token 37)
+
+The `prefill(Cuda)` test compares two *CUDA* paths over a 3-token prompt: the
+batched prefill (`SonicCudaBackend::prefill` — batched matmul + flash attention,
+one-shot KV fill) vs the per-token reference (three split-KV decode steps). Both
+paths use **q8_1** activation quantization for every K-quant matmul — the 2.2a
+fix (f134000) is intact, and `matmul_f32_dev`'s `q8_1_enabled()` gate is what
+both the prefill FFN/projection and the decode spine go through. The two paths
+differ only in how the 3-row KV cache is built: flash attention (prefill) vs
+split-KV decode attention (per-token), which accumulate in different fp32 orders.
+
+That ~1e-3 KV-cache difference flips a near-tie. First divergence (64-token run,
+seed 2): **step 36** (0-based; token 37 1-based), where the two paths hold the
+same top-2 tokens and merely swap them:
+
+| path       | top-1 | raw logit | top-2 | raw logit | margin |
+|------------|-------|-----------|-------|-----------|--------|
+| prefill    | 506   | 37.81     | 496   | 37.60     | 0.21   |
+| per-token  | 496   | 37.58     | 506   | 37.55     | 0.03   |
+
+(raw = pre-softcap logit; final_logit_softcapping = 30.) The margin is < 0.25
+raw, i.e. a near-tie, and the flip is the same class as §3.1's CUDA-vs-CPU token
+35: a property of the model's near-tie token, not a SonicBoom defect. As in §3.1,
+the exact flip position can shift a few tokens run-to-run because the per-token
+reference's split-KV decode uses non-deterministic `atomicAdd` accumulation.
+
 ## 4. Operator-level: quantized gemv vs cuBLAS (unchanged from v0)
 
 The dominant FFN matmul (`ffn_gate_up`, `ffn_down`) quantized q*_K gemv already
