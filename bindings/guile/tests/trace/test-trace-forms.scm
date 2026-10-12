@@ -22,7 +22,8 @@
              (sonicboom trace tensor)
              (sonicboom trace symbolic)
              (sonicboom trace tracer)
-             (sonicboom trace macro))
+             (sonicboom trace macro)
+             (sonicboom trace interp))
 
 ;;; --- plain-Scheme reference ------------------------------------------------------
 
@@ -325,6 +326,73 @@
     (stderr-of (lambda () (f (t x-neg)))))
   (test-equal "strict mode via the strict-tracing parameter" 1 (stat f 'strict-warnings)))
 
+;;; --- loop unroll limit: host loops ------------------------------------------------------
+
+(define w22 (t '((0.5 0.1) (0.2 0.9))))
+(define (l-matvec a w)                ; a: (1 2) list-of-lists, w: 2x2
+  (list (list (+ (* (caar a) (caar w)) (* (cadar a) (caadr w)))
+              (+ (* (caar a) (cadar w)) (* (cadar a) (cadadr w))))))
+(define (l-decay x n)
+  (do ((i 0 (+ i 1)) (acc x (deep-map (lambda (v) (max 0 (+ v 0.01))) (l-matvec acc '((0.5 0.1) (0.2 0.9))))))
+      ((= i n) (l-sum acc))))
+
+(define-traced (decay x w n)
+  (do ((i 0 (+ i 1)) (acc x (relu (add (matmul acc w) 0.01)))) ((= i n) (sum acc))))
+
+(let* ((x '((1.0 2.0)))
+       (before (interp-body-cache-stats))
+       (r1 (decay (t x) w22 100))
+       (mid (interp-body-cache-stats))
+       (r2 (decay (t x) w22 100))
+       (after (interp-body-cache-stats)))
+  (test-assert "do: 100 iterations (> max-unroll 64) match plain Scheme"
+    (and (close? (l-decay x 100) (ctensor-item r1)) (close? (l-decay x 100) (ctensor-item r2))))
+  (test-equal "do: one host loop node, iteration bodies 2..100 matched the cached body"
+    '(1 100 99) (stats decay '(host-loops loop-body-traces loop-body-hits)))
+  (test-equal "do: the graph is one loop node plus the exit (no unrolled iterations)"
+    '(loop reduce_sum) (node-ops (cdar (trace-segments decay))))
+  (test-equal "do: the body graph is parsed once, then every iteration reuses it"
+    (list 1 99 100)
+    (list (- (car mid) (car before)) (- (cdr mid) (cdr before)) (- (cdr after) (cdr mid))))
+  (test-equal "do: the second call is a cache hit running one graph" '(1 2)
+    (stats decay '(cache-hits executor-calls))))
+
+(test-assert "do: 10 iterations (<= max-unroll) are unrolled"
+  (and (close? (l-decay '((1.0 2.0)) 10) (ctensor-item (decay (t '((1.0 2.0))) w22 10)))
+       (= 1 (stat decay 'host-loops))))     ; still only the 100-iteration one
+
+(define-traced* (#:max-unroll 8) (halve-n x n)
+  ;; named let, static trip count above a small limit
+  (let loop ((i 0) (acc x))
+    (if (= i n) acc (loop (+ i 1) (mul acc 0.5)))))
+(test-assert "named let: 20 iterations with #:max-unroll 8 becomes a host loop"
+  (and (close? (l-scale x-pos (expt 0.5 20)) (ctensor->nested (halve-n (t x-pos) 20)))
+       (equal? '(1 20 19) (stats halve-n '(host-loops loop-body-traces loop-body-hits)))))
+
+(define-traced* (#:max-unroll 4) (ramp x n)
+  ;; the counter enters the tensor computation: bodies differ, one run each
+  (do ((i 0 (+ i 1)) (acc x (add acc i))) ((= i n) acc)))
+(test-assert "host loop whose body changes every iteration: one loop node per run"
+  (and (close? (l-shift x-pos (* 1/2 9 10)) (ctensor->nested (ramp (t x-pos) 10)))
+       (equal? '(10 10 0) (stats ramp '(host-loops loop-body-traces loop-body-hits)))))
+
+(define-traced* (#:max-unroll #f) (decay-unrolled x w n)
+  (do ((i 0 (+ i 1)) (acc x (relu (add (matmul acc w) 0.01)))) ((= i n) (sum acc))))
+(test-assert "#:max-unroll #f always unrolls"
+  (and (close? (l-decay '((1.0 2.0)) 100) (ctensor-item (decay-unrolled (t '((1.0 2.0))) w22 100)))
+       (= 0 (stat decay-unrolled 'host-loops))
+       (= 301 (length (node-ops (cdar (trace-segments decay-unrolled)))))))
+
+;;; --- strict mode: trace-pure -------------------------------------------------------------
+
+(define (plain-scale x) (mul x 3.0))             ; no `if`: safe, but plain
+(trace-pure plain-scale)
+(let ((f (traced-lambda* (#:strict? #t) (x) (add (plain-scale x) (plain-abs x)))))
+  (stderr-of (lambda () (f (t x-pos))))
+  (test-assert "strict: a trace-pure procedure is not reported; others still are"
+    (and (= 1 (stat f 'strict-warnings))
+         (string-contains (car (trace-strict-warnings f)) "plain-abs"))))
+
 ;;; --- portability: only compat.scm uses implementation-specific mechanisms -----------
 
 ;; Uses (an open paren and the primitive's name; compat's wrappers are
@@ -351,7 +419,8 @@
                 (let ((src (module-source m)))
                   (filter-map (lambda (w) (and (string-contains src w) (list m w)))
                               %guile-specific)))
-              '("tensor" "ops" "graph" "dce" "interp" "symbolic" "tracer" "macro")))
+              '("tensor" "ops" "graph" "dce" "interp" "symbolic" "tracer" "macro"
+                "loop" "autodiff")))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "sonicboom-trace-forms")

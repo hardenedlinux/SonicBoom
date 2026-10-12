@@ -30,11 +30,12 @@
             shape-of dtype-of
             ;; mode
             current-tracer tracing? %break-tag %branch-assumptions
-            strict-tracing covered-procedure! covered-procedure?
+            strict-tracing covered-procedure! covered-procedure? trace-pure
             ;; tracing context / recorder (used by the tracer)
             make-trace-context trace-context? trace-context-types
             trace-context-counters context-count!
             trace-context-strict trace-context-notes add-context-note!
+            trace-context-max-unroll
             fresh-name! register-type!
             make-recorder recorder? recorder-context recorder-nodes
             recorder-params recorder-count recorder-assumptions
@@ -43,7 +44,8 @@
             as-value record-node!
             ;; ops
             add sub mul matmul relu neg sum gt lt where bool trace-print
-            equal-to logical-and logical-or logical-not))
+            equal-to logical-and logical-or logical-not
+            div transpose reshape expand apply-op))
 
 ;;; --- symbolic tensor ------------------------------------------------------------
 
@@ -88,6 +90,11 @@
 (define (covered-procedure? proc)
   (and (procedure-tag proc 'sonicboom-trace-covered) #t))
 
+(define (trace-pure proc)
+  "Declare PROC, an ordinary procedure, safe to receive symbolic tensors (it
+has no `if` on tensor values): strict mode stops reporting it. Returns PROC."
+  (covered-procedure! proc))
+
 ;; Condition values fixed by an enclosing macro-rewritten `if` (%branch) while
 ;; it traces one of its arms: alist name -> boolean. A parameter rather than
 ;; recorder state, so that a continuation captured inside an arm restores it.
@@ -100,19 +107,23 @@
 ;; type of every value name ever introduced, and the per-side node budget used
 ;; by speculative (multi-resume) tracing.
 ;; STRICT is #t, #f or 'default (follow the strict-tracing parameter); NOTES
-;; collects strict-mode reports.
+;; collects strict-mode reports; MAX-UNROLL bounds loop unrolling (#f: none).
 (define-record-type <trace-context>
-  (%make-trace-context next-id types max-side-nodes counters strict notes)
+  (%make-trace-context next-id types max-side-nodes counters strict notes
+                       max-unroll)
   trace-context?
   (next-id trace-context-next-id set-trace-context-next-id!)
   (types trace-context-types)               ; table: name -> (dtype . shape)
   (max-side-nodes trace-context-max-side-nodes)
   (counters trace-context-counters)         ; table: event -> count
   (strict trace-context-strict)
-  (notes trace-context-notes set-trace-context-notes!))
+  (notes trace-context-notes set-trace-context-notes!)
+  (max-unroll trace-context-max-unroll))
 
-(define* (make-trace-context max-side-nodes #:optional (strict 'default))
-  (%make-trace-context 0 (make-table) max-side-nodes (make-table) strict '()))
+(define* (make-trace-context max-side-nodes #:optional (strict 'default)
+                             (max-unroll 64))
+  (%make-trace-context 0 (make-table) max-side-nodes (make-table) strict '()
+                       max-unroll))
 
 (define (context-count! ctx key)
   (let ((h (trace-context-counters ctx)))
@@ -220,6 +231,10 @@ concrete operands become an inline parameter of the current segment."
 (define (logical-and a b) (apply-op 'and (list a b) '()))
 (define (logical-or a b) (apply-op 'or (list a b) '()))
 (define (logical-not x) (apply-op 'not (list x) '()))
+(define (div a b) (apply-op 'div (list a b) '()))
+(define (transpose x) (apply-op 'transpose (list x) '()))
+(define (reshape x shape) (apply-op 'reshape (list x) `((shape (ints ,@shape)))))
+(define (expand x shape) (apply-op 'expand (list x) `((shape (ints ,@shape)))))
 
 (define* (trace-print x #:optional (label "trace-print"))
   "Print X (as LABEL: nested values) to current-output-port and return it. In
@@ -253,4 +268,5 @@ by aborting to %break-tag with X; the tracer resumes with #t or #f."
 
 (for-each covered-procedure!
           (list add sub mul matmul relu neg sum gt lt where bool trace-print
-                equal-to logical-and logical-or logical-not))
+                equal-to logical-and logical-or logical-not
+                div transpose reshape expand))

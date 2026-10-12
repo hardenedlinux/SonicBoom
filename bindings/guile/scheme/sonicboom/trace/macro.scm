@@ -14,8 +14,11 @@
 ;;;                                         `where` at the form
 ;;;   and, or                            -> %and / %or: `and` / `or` tensor ops
 ;;;   case                               -> %case: `equal` tests, %branch chain
-;;;   do                                 -> named-let loop whose test is a %branch
-;;;   named let, lambda, define          -> body walked; the procedure is marked
+;;;   do, named let                      -> %loop (see (sonicboom trace loop)):
+;;;                                         unrolled up to #:max-unroll iterations,
+;;;                                         beyond that a host loop over one graph;
+;;;                                         do's test is a %branch
+;;;   lambda, define                     -> body walked; the procedure is marked
 ;;;                                         as covered (see strict mode)
 ;;;
 ;;; It also walks the standard binding forms (let, let*, letrec, letrec*,
@@ -41,6 +44,7 @@
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace symbolic)
   #:use-module (sonicboom trace tracer)
+  #:use-module (sonicboom trace loop)
   #:export (traced-lambda traced-lambda* define-traced define-traced*
             trace-opaque
             %branch %and %or %case %call %covered))
@@ -380,7 +384,7 @@ tensor reaching a procedure the walker did not cover."
     ;; binding forms
     ((_ (let (b ...) body ...) w k) (%walk-let let (b ...) (body ...) k))
     ((_ (let name (b ...) body ...) w k)
-     (%walk-tails (b ...) (%k-named-let1 name (body ...) k)))
+     (%walk-tails (b ...) (%k-named-let1 name (body ...) w k)))
     ((_ (let* (b ...) body ...) w k) (%walk-let let* (b ...) (body ...) k))
     ((_ (letrec (b ...) body ...) w k) (%walk-let letrec (b ...) (body ...) k))
     ((_ (letrec* (b ...) body ...) w k) (%walk-let letrec* (b ...) (body ...) k))
@@ -457,11 +461,11 @@ tensor reaching a procedure the walker did not cover."
     ((_ (body ...) kw bindings* k) (%wret k (kw bindings* body ...)))))
 (define-syntax %k-named-let1
   (syntax-rules ()
-    ((_ bindings* name (body ...) k) (%walk-list (body ...) (%k-named-let2 name bindings* k)))))
+    ((_ bindings* name (body ...) w k) (%walk-list (body ...) (%k-named-let2 name bindings* w k)))))
 (define-syntax %k-named-let2
   (syntax-rules ()
-    ((_ (body ...) name ((v e) ...) k)
-     (%wret k ((letrec ((name (%covered (lambda (v ...) body ...)))) name) e ...)))))
+    ((_ (body ...) name ((v e) ...) w k)
+     (%wret k (%loop (%site w) (lambda (name v ...) body ...) e ...)))))
 (define-syntax %k-lambda
   (syntax-rules ()
     ((_ (body ...) formals k) (%wret k (%covered (lambda formals body ...))))))
@@ -541,10 +545,12 @@ tensor reaching a procedure the walker did not cover."
 (define-syntax %do
   (syntax-rules ()
     ((_ site ((v i s ...) ...) (test r ...) body ...)
-     (let loop ((v i) ...)
-       (%branch site test
-                (lambda () (if #f #f) r ...)
-                (lambda () body ... (loop (%do-step v s ...) ...)))))))
+     (%loop site
+            (lambda (loop v ...)
+              (%branch site test
+                       (lambda () (if #f #f) r ...)
+                       (lambda () body ... (loop (%do-step v s ...) ...))))
+            i ...))))
 
 ;;; --- entry points ----------------------------------------------------------------------------
 

@@ -63,8 +63,9 @@
 ;;; --- records --------------------------------------------------------------------
 
 ;; A trace-tree node. NODES/PARAMS are the segment as recorded (topological,
-;; before DCE). KEY is the value the segment ends on: the returned value for a
-;; leaf, the condition for a branch. K is the continuation suspended at the
+;; before DCE). KEY is what the segment ends on: for a branch the condition's
+;; value name; for a leaf the result template (the returned structure with a
+;; symbolic tensor at each tensor position). K is the continuation suspended at the
 ;; branch (#f in retrace-on-miss mode); CHILDREN maps the condition's boolean
 ;; to the next segment.
 (define-record-type <tnode>
@@ -163,8 +164,8 @@ outputs there."
   "N's segment with every value it defines as an output."
   (compile-segment st "replay" (tnode-nodes n) (tnode-params n)
                    (delete-duplicates
-                    (cons (tnode-key n)
-                          (append-map gnode-output-names (tnode-nodes n))))))
+                    (append (key-names n)
+                            (append-map gnode-output-names (tnode-nodes n))))))
 
 ;;; --- recorders and prompts ----------------------------------------------------------
 
@@ -203,9 +204,42 @@ outputs there."
       (unless (string-null? out) (warn! st out))
       r)))
 
-(define (leaf rec out)
+(define (leaf rec template)
   (make-tnode 'leaf (reverse (recorder-nodes rec)) (reverse (recorder-params rec))
-              (sym-name out) #f '() #f))
+              template #f '() #f))
+
+;;; Results. A traced procedure returns a tensor or a structure (pairs,
+;;; vectors) of tensors and other data; the leaf keeps it as a template.
+
+(define (lift-result rec x)
+  "Template for the returned value X: tensors and Scheme scalars at tensor
+positions become symbolic values of the segment; pairs and vectors are kept;
+other data (symbols, strings, '()) is static."
+  (cond ((sym? x) x)
+        ((or (ctensor? x) (number? x) (boolean? x)) (as-value rec x #f))
+        ((pair? x) (cons (lift-result rec (car x)) (lift-result rec (cdr x))))
+        ((vector? x) (list->vector (map (lambda (y) (lift-result rec y))
+                                        (vector->list x))))
+        (else x)))
+
+(define (template-map f t)
+  (cond ((sym? t) (f t))
+        ((pair? t) (cons (template-map f (car t)) (template-map f (cdr t))))
+        ((vector? t) (list->vector (map (lambda (y) (template-map f y))
+                                        (vector->list t))))
+        (else t)))
+
+(define (template-names t)
+  (cond ((sym? t) (list (sym-name t)))
+        ((pair? t) (append (template-names (car t)) (template-names (cdr t))))
+        ((vector? t) (append-map template-names (vector->list t)))
+        (else '())))
+
+(define (key-names n)
+  "Value names segment N must output for its own sake."
+  (if (eq? (tnode-kind n) 'leaf)
+      (delete-duplicates (template-names (tnode-key n)))
+      (list (tnode-key n))))
 
 ;;; --- multi-resume -------------------------------------------------------------------
 
@@ -216,7 +250,9 @@ budget."
   (%catch-signal 'sonicboom-trace-speculation-overflow
     (lambda ()
       (match (run-prompt st rec body)
-        (('done out) (cons rec (as-value rec out #f)))
+        ;; only single-tensor results can be joined with where
+        (('done out) (and (or (sym? out) (ctensor? out) (number? out) (boolean? out))
+                          (cons rec (as-value rec out #f))))
         (('break k c) (try-merge st rec k c))))
     (lambda _ #f)))
 
@@ -265,7 +301,7 @@ Returns (recorder . output) or #f."
   "Trace from BODY into recorder REC; returns the trace (sub)tree."
   (stat! st 'segments-traced)
   (match (run-prompt st rec body)
-    (('done out) (leaf rec (as-value rec out #f)))
+    (('done out) (leaf rec (lift-result rec out)))
     (('break k c)
      (let ((m (and (tstate-multi? st) (try-merge st rec k c))))
        (if m
@@ -307,8 +343,8 @@ earlier segments or the call's arguments."
                        (tnode-children node))))
          (defs (segment-defs (tnode-nodes node) (tnode-params node)))
          (req (delete-duplicates
-               (cons (tnode-key node)
-                     (filter (lambda (n) (member n defs)) child-needs))))
+               (append (key-names node)
+                       (filter (lambda (n) (member n defs)) child-needs))))
          (cs (compile-segment st label (tnode-nodes node) (tnode-params node) req)))
     (set-tnode-compiled! node cs)
     (lset-union equal? (cseg-inputs cs) (lset-difference equal? child-needs defs))))
@@ -385,7 +421,7 @@ position by position. Returns #f on any structural difference."
                                  (gnode-outputs no) (gnode-outputs nn))
                        #t)))
               (tnode-nodes old) (tnode-nodes new))
-       (equal? (tnode-key old) (rn (tnode-key new)))))
+       (equal? (key-names old) (map rn (key-names new)))))
 
 (define (rename-tree renames n)
   (define (rn x) (table-ref renames x x))
@@ -400,7 +436,12 @@ position by position. Returns #f on any structural difference."
                      (make-gparam (rn (gparam-name p)) (gparam-dtype p)
                                   (gparam-shape p) (gparam-values p)))
                    (tnode-params n))
-              (rn (tnode-key n)) #f
+              (if (eq? (tnode-kind n) 'leaf)
+                  (template-map (lambda (s) (make-sym (rn (sym-name s)) (sym-dtype s)
+                                                      (sym-shape s)))
+                                (tnode-key n))
+                  (rn (tnode-key n)))
+              #f
               (map (lambda (c) (cons (car c) (rename-tree renames (cdr c))))
                    (tnode-children n))
               #f))
@@ -450,9 +491,11 @@ extended?)."
     (reset-env! st args)
     (let loop ((node (entry-root entry)) (path '()) (extended? extended?))
       (run-segment! st (tnode-compiled node))
-      (let ((v (table-ref (tstate-env st) (tnode-key node))))
-        (if (eq? (tnode-kind node) 'leaf)
-            (values v extended?)
+      (if (eq? (tnode-kind node) 'leaf)
+          (values (template-map (lambda (s) (table-ref (tstate-env st) (sym-name s)))
+                                (tnode-key node))
+                  extended?)
+          (let ((v (table-ref (tstate-env st) (tnode-key node))))
             (let* ((b (truth v))
                    (child (assq-ref (tnode-children node) b)))
               (cond
@@ -537,7 +580,7 @@ extended?)."
 
 (define* (trace-function proc #:key (multi-resume? #f) (max-side-nodes 16)
                          (max-depth 3) (executor #f) (retrace-on-miss? #f)
-                         (guards '()) (strict? 'default))
+                         (guards '()) (strict? 'default) (max-unroll 64))
   "Return a procedure that runs PROC through the tracer. Tensor arguments are
 ctensors (they become symbolic inputs \"arg<i>\"); other arguments are static
 and part of the cache key. GUARDS is an alist (name . thunk): the thunks'
@@ -549,9 +592,11 @@ MAX-SIDE-NODES nodes and branches nest at most MAX-DEPTH deep.
 RETRACE-ON-MISS? traces PROC again from the start on a cache miss instead of
 re-entering a stored continuation (and stores none). STRICT? reports
 symbolic tensors passed to procedures the macro walker did not cover
-('default follows the strict-tracing parameter). EXECUTOR overrides
-`current-executor`."
-  (let* ((st (make-tstate proc (make-trace-context max-side-nodes strict?)
+('default follows the strict-tracing parameter). MAX-UNROLL bounds how many
+iterations of a do / named-let loop are unrolled into the graph; a longer loop
+becomes a host loop over one cached body graph (#f: always unroll). EXECUTOR
+overrides `current-executor`."
+  (let* ((st (make-tstate proc (make-trace-context max-side-nodes strict? max-unroll)
                           multi-resume? max-depth executor retrace-on-miss? guards
                           (make-table) #f (make-table) '()))
          (wrapper (lambda args
@@ -587,7 +632,8 @@ break), output-warnings, strict-warnings, executor-calls."
                        (table-ref h k (table-ref c k 0)))))
          '(calls cache-hits traces guard-misses retraces retrace-divergences
            segments-traced graph-breaks merges branch-merges logic-merges
-           loop-breaks output-warnings strict-warnings executor-calls))))
+           loop-breaks host-loops loop-body-traces loop-body-hits
+           output-warnings strict-warnings executor-calls))))
 
 (define (trace-strict-warnings f)
   "Strict-mode reports of F: one string per procedure that received a
@@ -631,7 +677,7 @@ tree is (leaf <output>) or (branch <condition> (#t . tree) (#f . tree))."
          (cons (cons (caar entry) (data-guards (cdar entry)))
                (let walk ((n (cdr entry)))
                  (if (eq? (tnode-kind n) 'leaf)
-                     (list 'leaf (tnode-key n))
+                     (list 'leaf (template-map sym-name (tnode-key n)))
                      (cons* 'branch (tnode-key n)
                             (map (lambda (c) (cons (car c) (walk (cdr c))))
                                  (tnode-children n)))))))

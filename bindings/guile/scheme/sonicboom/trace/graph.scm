@@ -13,6 +13,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (sonicboom trace tensor)
+  #:use-module (sonicboom trace ops)
   #:export (make-gnode gnode? gnode-op gnode-inputs gnode-outputs gnode-attrs
             gnode-output-names
             make-gparam gparam? gparam-name gparam-dtype gparam-shape
@@ -40,6 +41,15 @@
 
 (define (type->sx dtype shape) `(tensor ,dtype (shape ,@shape)))
 
+(define (node-attrs n)
+  ;; Emitted attrs: the node's own, plus the PyTorch Core ATen operator it
+  ;; corresponds to, (aten (string "...")), when there is one. Kernels never
+  ;; read this attribute.
+  (let ((aten (op-aten-name (gnode-op n))))
+    (if (and aten (not (assq 'aten (gnode-attrs n))))
+        (append (gnode-attrs n) `((aten (string ,aten))))
+        (gnode-attrs n))))
+
 (define (graph->sexpr name inputs outputs params nodes)
   "Build the S-Expr v0.1 document datum. INPUTS is a list of (name dtype shape),
 OUTPUTS a list of value names, PARAMS a list of gparams, NODES a list of gnodes
@@ -64,7 +74,7 @@ in topological order."
                       (outputs ,@(map (lambda (o)
                                         (list (car o) (type->sx (cadr o) (caddr o))))
                                       (gnode-outputs n)))
-                      (attrs ,@(gnode-attrs n))))
+                      (attrs ,@(node-attrs n))))
              nodes)))))
 
 (define (sexpr->text doc)

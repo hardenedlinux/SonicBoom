@@ -17,7 +17,41 @@
   #:use-module (ice-9 match)
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace ops)
-  #:export (interpret-sexpr interpret-sexpr-text))
+  #:export (interpret-sexpr interpret-sexpr-text interp-body-cache-stats))
+
+;;; `loop` nodes (host loops, see (sonicboom trace loop)) carry their body as
+;;; S-Expr text in a string attribute; it is parsed once per distinct text and
+;;; then run trip_count times.
+(define %body-cache (make-table))
+(define %body-parses 0)
+(define %body-hits 0)
+(define (interp-body-cache-stats)
+  "(parses . hits) of the loop-body parse cache since start."
+  (cons %body-parses %body-hits))
+(define (body-doc text)
+  (let ((doc (table-ref %body-cache text #f)))
+    (if doc
+        (begin (set! %body-hits (+ 1 %body-hits)) doc)
+        (let ((doc (call-with-input-string text read)))
+          (set! %body-parses (+ 1 %body-parses))
+          (table-set! %body-cache text doc)
+          doc))))
+
+(define (run-loop-node ins attrs)
+  (let* ((k (attr-ref attrs 'state_count 0))
+         (n (attr-ref attrs 'trip_count 0))
+         (text (attr-ref attrs 'body #f))
+         (invariants (map (lambda (x i) (cons (string-append "x" (number->string i)) x))
+                          (drop ins k) (iota (- (length ins) k)))))
+    (let iterate ((i 0) (state (take ins k)))
+      (if (= i n)
+          state
+          (iterate (+ i 1)
+                   (map cdr (interpret-sexpr
+                             (body-doc text)
+                             (append (map (lambda (x j) (cons (string-append "s" (number->string j)) x))
+                                          state (iota k))
+                                     invariants))))))))
 
 (define (field graph key)
   (let ((f (assq key (cdr graph))))
@@ -72,6 +106,11 @@ alist (output-name . ctensor) in the graph's output order."
      (field graph 'parameters))
     (for-each
      (match-lambda
+       (('node 'loop ('inputs ins ...) ('outputs (names types) ...) ('attrs attrs ...))
+        (for-each (lambda (name type r)
+                    (check-type 'loop name r (parse-type type))
+                    (define! name r))
+                  names types (run-loop-node (map lookup ins) attrs)))
        (('node op ('inputs ins ...) ('outputs (names types) ...) ('attrs attrs ...))
         (unless (op-known? op) (error "interp: unsupported op" op))
         (unless (= 1 (length names))

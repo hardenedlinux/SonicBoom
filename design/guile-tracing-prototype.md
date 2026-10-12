@@ -37,8 +37,19 @@ On top of either mechanism:
   reported, and `trace-print` provides run-time printing;
 - **conservative mode** (`#:retrace-on-miss?`);
 - **strict mode**: reports symbolic tensors reaching procedures the rewrite
-  does not cover;
+  does not cover (`trace-pure` exempts a procedure);
+- **loops**: `do` and named `let` with a static trip count are unrolled up to
+  `#:max-unroll` iterations (default 64); a longer loop becomes a host loop
+  that runs one cached body graph per iteration (§4.14);
+- **reverse-mode autodiff** (§4.16): `grad` appends the backward pass to the
+  traced graph, so a whole training step (forward, loss, gradients, SGD
+  update) is one graph;
+- **ATen names**: every emitted node whose op has a PyTorch Core ATen
+  counterpart carries it as an `aten` attribute (§4.17);
 - **DCE**: each emitted segment is pruned once, working back from its outputs.
+
+A traced function may return a tensor or a structure (lists, vectors) of
+tensors; the graph then has one output per tensor.
 
 Every implementation-specific mechanism sits in one module, `compat.scm`.
 
@@ -58,13 +69,17 @@ bindings/guile/scheme/sonicboom/trace/
   symbolic.scm  (sonicboom trace symbolic)  symbolic tensors, tracing mode, user ops, `bool`
   tracer.scm    (sonicboom trace tracer)    prompts, graph breaks, trace tree, multi-resume,
                                             guards, retrace-on-miss, output capture
+  loop.scm      (sonicboom trace loop)      %loop: unrolling with a limit, host loops
+  autodiff.scm  (sonicboom trace autodiff)  reverse-mode grad on the traced graph
   macro.scm     (sonicboom trace macro)     syntax-rules walker, %branch/%and/%or/%case,
                                             strict mode (%call)
 bindings/guile/tests/trace/
   test-trace.scm         continuation mechanism, S-Expr, DCE, cache        (49 checks)
   test-trace-macro.scm   if/cond/when/unless, guards, effects, retrace     (40 checks)
-  test-trace-forms.scm   and/or/case/do/named let/cond =>, nesting,
-                         strict mode, compat boundary                      (36 checks)
+  test-trace-forms.scm   and/or/case/do/named let/cond =>, nesting, host
+                         loops, strict mode, compat boundary               (46 checks)
+  test-trace-grad.scm    gradients vs finite differences, double where,
+                         ATen attributes, XOR training                     (33 checks)
 ```
 
 None of these modules imports `(sonicboom ffi)`, `(sonicboom tensor)` or any
@@ -72,24 +87,26 @@ other module that loads `libsonicboom.so`. No file outside the trace
 directories and this document was changed.
 
 `compat` imports no other prototype module. The modules that need a mechanism
-from it (`dce`, `interp`, `symbolic`, `tracer`, `macro`) import it. `tensor`,
-`ops` and `graph` need none.
+from it (`dce`, `interp`, `symbolic`, `tracer`, `loop`, `autodiff`, `macro`)
+import it. `tensor`, `ops` and `graph` need none.
 
 ## 3. Running the tests
 
 From the repository root, with Guile 3.0.9+ (`apt install guile-3.0`):
 
 ```sh
-for t in test-trace test-trace-macro test-trace-forms; do
+for t in test-trace test-trace-macro test-trace-forms test-trace-grad; do
   guile --no-auto-compile -L bindings/guile/scheme \
       bindings/guile/tests/trace/$t.scm || echo "$t FAILED"
 done
 ```
 
 - Each script exits with status 0 when every check passes and 1 otherwise.
-- All three were also run without `--no-auto-compile`, where Guile compiles
+- All four were also run without `--no-auto-compile`, where Guile compiles
   every file first, and pass that way too.
 - `test-trace-macro.scm` prints the node-count table from §4.9.
+- `test-trace-grad.scm` prints the largest gradient error and the XOR loss
+  curve.
 - SRFI-64 writes one `.log` per script to the current directory. Running from
   a scratch directory with an absolute `-L` path keeps the logs out of the tree.
 
@@ -103,8 +120,9 @@ done
   vector of Scheme numbers or booleans. It is used only by eager mode and the
   reference interpreter.
 - The user ops are:
-  `add sub mul matmul relu neg sum gt lt where equal-to logical-and logical-or
-  logical-not trace-print`, plus `bool`. They are defined once in
+  `add sub mul div matmul transpose reshape expand relu neg sum gt lt where
+  equal-to logical-and logical-or logical-not trace-print`, plus `bool` and
+  `grad`. They are defined once in
   `symbolic.scm`, and the mode is the `current-tracer` parameter:
   - `#f`: eager mode. The op is computed with the reference kernel.
   - a recorder: tracing mode. If any operand is symbolic, the op appends a node
@@ -119,12 +137,17 @@ done
   cannot drift apart. The interpreter also checks every node's declared output
   type against what it computed.
 
-S-Expr op names: `add sub mul matmul relu neg greater less equal and or not
-where reduce_sum print`.
+S-Expr op names: `add sub mul div matmul transpose reshape expand relu neg
+greater less equal and or not where reduce_sum print loop`.
 
 - `sum` is emitted as `reduce_sum` with `(axes (ints …))` and
   `(keepdims (int 0|1))` attributes. Empty `axes` means all axes.
 - `print` carries a `(label (string …))` attribute.
+- `reshape` / `expand` carry `(shape (ints …))`.
+- `loop` (host loops, §4.14) carries `body` (the body graph's S-Expr text),
+  `trip_count` and `state_count`.
+- Every node whose op has a Core ATen counterpart also carries
+  `(aten (string "aten::…"))` (§4.17). Kernels ignore it.
 - Segments are named `trace`, `trace.t`, `trace.t.f`, …, after their path in
   the tree.
 
@@ -233,6 +256,9 @@ the cache reuse the emitted text.
 | `branch-merges` | `where` joins from rewritten conditionals |
 | `logic-merges` | `and` / `or` nodes from rewritten `and` / `or` |
 | `loop-breaks` | rewritten branches resolved by a break because they re-entered themselves (§4.8) |
+| `host-loops` | `loop` nodes emitted (§4.14) |
+| `loop-body-traces` | host-loop iterations traced |
+| `loop-body-hits` | host-loop iterations whose body graph equalled the previous one |
 | `output-warnings` | tracing runs that wrote to the output port |
 | `strict-warnings` | strict-mode reports |
 | `executor-calls` | executor invocations |
@@ -354,10 +380,10 @@ walker.
 | `(if c a b)` | `(%branch site c (λ () a) (λ () b))` | both arms traced, results joined with `where` |
 | `(if c a)`, `when`, `unless` | `%branch` marked as a statement | both arms traced, result unspecified |
 | `cond` (`else`, `=>`, test-only clauses) | a `%branch` chain, one site per clause | one `where` per clause; `=>` receives the symbolic condition |
-| `and`, `or` | `%and` / `%or` chains | rest evaluated assuming no short-circuit, combined with the `and` / `or` op; operands must be bool |
+| `and`, `or` | `%and` / `%or` chains | no short-circuit: the rest is evaluated too, combined with the `and` / `or` op (§4.15); operands must be bool |
 | `case` (`=>`, `else`, `else =>`) | `(%case site key clauses else)` | each clause tests `equal(key, d)` per datum, OR-ed, then a `%branch` chain |
-| `do` | named-let loop whose test is a `%branch` | static trip count unrolls; a symbolic test is a data-dependent loop (§4.8) |
-| named `let` | `((letrec ((name (%covered (λ …)))) name) init …)`, body walked | conditionals inside follow their own rows; recursion through a symbolic branch → §4.8 |
+| `do` | `(%loop site (λ (loop v …) (%branch site test …)) init …)` | static trip count: unrolled, or a host loop beyond `#:max-unroll` (§4.14); a symbolic test is a data-dependent loop (§4.8) |
+| named `let` | `(%loop site (λ (name v …) body′) init …)` | same as `do`; conditionals inside follow their own rows |
 | `lambda`, `case-lambda`, `(define (f …) …)` | body walked, procedure marked covered | — |
 | `let`, `let*`, `letrec`, `letrec*`, `let-values`, `let*-values`, `define`, `set!`, `begin`, `parameterize`, `delay`, `delay-force` | inner expressions walked | — |
 | `quote`, `quasiquote`, `(trace-opaque form)` | left as is | — |
@@ -507,7 +533,10 @@ These callees are covered and never reported:
 - procedures created inside a traced body: `lambda`, `case-lambda`, internal
   `define`, named `let`;
 - the structural procedures (`list`, `cons`, `car`, `vector-ref`, `apply`,
-  `map`, `for-each`, …), which only move values.
+  `map`, `for-each`, …), which only move values;
+- ordinary procedures declared with `(trace-pure proc)`: the user's statement
+  that `proc` has no `if` on tensor values. `trace-pure` returns `proc`, so
+  `(define f (trace-pure (lambda …)))` also works.
 
 For the higher-order ones (`map`, `for-each`, `apply`), the procedure argument
 is checked instead.
@@ -545,7 +574,197 @@ miss:
 If the prefix does not match, the tracer warns, counts a `retrace-divergence`,
 replaces the tree with the fresh trace, and restarts the call.
 
-### 4.14 What the tests check
+### 4.14 Loop unroll limit and host loops
+
+`do` and named `let` expand to `(%loop site (lambda (self v …) body) init …)`
+(`loop.scm`). One call of the lambda is one iteration; it continues by calling
+`self`.
+
+- **Eager mode:** ordinary named-let recursion.
+- **Tracing, at most `#:max-unroll` iterations** (a `trace-function` /
+  `traced-lambda*` option, default 64; `#f` never stops unrolling): the loop
+  is unrolled into the graph.
+- **Tracing, more iterations, with tensors among the loop variables:** the
+  loop instance signals its entry. The unrolled iterations are dropped, by
+  restoring the recorder, and the loop becomes a host loop.
+
+A host loop works in three steps:
+
+1. **Probe the iterations.** Each iteration's body is traced once more into a
+   scratch recorder, on fresh symbolic loop variables. Static loop variables
+   (the counter) keep their concrete values, so the Scheme control runs as
+   usual, and `self` returns a "continue" token instead of recursing. The
+   result is one small graph per iteration:
+   - inputs `s0…` are the tensor loop variables;
+   - inputs `x0…` are values from outside the loop, such as weights;
+   - outputs are the next values of the tensor loop variables.
+
+   Names are canonicalised, so two iterations that do the same tensor work
+   produce identical text.
+2. **Emit `loop` nodes.** Consecutive identical bodies are run-length encoded.
+   Each run becomes one `loop` node in the main graph: inputs are the state
+   plus the outside values, outputs are the new state, and the attributes are
+   `body` (the text), `trip_count` and `state_count`.
+3. **Trace the exit iteration** into the main graph, on the last `loop` node's
+   outputs.
+
+At run time the executor runs a `loop` node by executing its body graph
+`trip_count` times. The reference interpreter parses each distinct body text
+once and caches it (`interp-body-cache-stats`).
+
+What the test of a 100-step `do` (limit 64) measures:
+
+- the graph is `loop reduce_sum`, one `loop` node with `trip_count 100`;
+- `loop-body-hits` is 99: the bodies of iterations 2 to 100 matched the cached
+  body;
+- the body graph is parsed once and reused for the other 99 iterations;
+- a second call is a trace-cache hit that runs one graph and reuses the parsed
+  body 100 times.
+
+If the counter enters the tensor computation (`(add acc i)`), the bodies
+differ, so every iteration is its own run (`loop-body-hits` 0). The result is
+still correct.
+
+Requirements:
+
+- the loop continues only by a tail call to `self`;
+- tensor loop variables keep their dtype and shape;
+- the body takes no graph break.
+
+### 4.15 `and` / `or` on symbolic conditions: no short-circuit
+
+When the first operand of `and` / `or` is a symbolic tensor, its truth is not
+known at trace time, so short-circuiting is impossible:
+
+- **Both sides are evaluated.** The rest of the `and` (or `or`) is evaluated
+  too, under the assumption that it is reached, and the result is the
+  elementwise `and` / `or` tensor op of the two bool values.
+- **`where` selects at run time.** When the result is an `if` test, the `if`
+  becomes `where(c, then, else)`, and both arms are always computed.
+
+This is the usual vectorised-select semantics. It is safe in the forward pass:
+an arm that would fail or produce `inf` / `NaN` where it is not selected is
+computed anyway, but `where` discards those positions.
+
+**The backward pass is not automatically safe.** The gradient of
+`where(c, a, b)` towards `a` is `where(c, g, 0)`, which is zero where `a` was
+not selected. If `a = f(x)` and `f'(x)` is infinite there (`1/x` at `x = 0`),
+the chain rule computes `0 · inf = NaN`. The NaN reaches `x`'s gradient even
+though that position never influenced the output.
+
+The usual remedy is the **double where**: wrap the derivative itself in a
+second `where`, so the non-finite local derivative never meets the zero. §4.16
+implements this inside the gradient transform, so user code does not need the
+manual pattern of sanitising the input with an extra `where` (as is common in
+JAX code). The tests check it for `where(x > 0, 1/x, 0)` at `x = 0`, and for
+`1/x` inside a rewritten `if` whose condition is false.
+
+### 4.16 Reverse-mode autodiff
+
+`(grad loss wrt)` is called inside a traced function, on a symbolic one-element
+`loss` and a symbolic tensor or list of them. It returns their gradients as
+symbolic tensors appended to the graph being traced, so the traced function
+can return loss, gradients and updated parameters together as one graph.
+`(value-and-grad f)` wraps `f` as a traced function returning
+`(loss gradient …)` for every tensor argument.
+
+**Gradient rules** live in `ops.scm`, one pure function per op:
+
+```scheme
+(rule emit shape ins out g attrs)  ; -> list of input gradients (#f: none)
+```
+
+- `emit` creates a backward node.
+- `shape` gives a value's shape.
+- `ins` / `out` are the forward values, `g` the output gradient.
+
+Rules exist for `add sub mul div neg matmul transpose reshape expand relu
+reduce_sum where print`. The comparison and logical ops have no gradient.
+`loop` has no rule, so differentiating through a host loop is an error; loops
+under `#:max-unroll` are unrolled and differentiable.
+
+**The transform** works as follows:
+
+1. It finds the nodes of the current segment that are forward-reachable from
+   `wrt`.
+2. It seeds `loss` with 1 and walks those nodes in reverse topological order,
+   applying each rule.
+3. Elementwise ops return gradients at the output shape, which are reduced to
+   the input shape with `sum-to-shape` (broadcasting).
+4. Gradients reaching one value from several uses are added.
+5. A `wrt` that does not influence the loss gets a zero gradient.
+
+Forward values the backward nodes do not read, and forward nodes nothing
+needs, are removed by the segment's DCE. For example, `grad(sum(x·x), x)`
+alone leaves no `reduce_sum` in the graph.
+
+**Double where.** A gradient carries the `where` conditions it passed through
+as masks `(c, side)`:
+
+- At each elementwise op, the local gradients are wrapped in
+  `where(c, local, 0)` (or `where(c, 0, local)`) before reduction and
+  accumulation.
+- Elementwise masks follow values through elementwise ops of unchanged shape.
+- Scalar masks (the rank-0 condition of a rewritten `if`) hold for every
+  position and follow values through every op.
+
+**Graph breaks.** The walk covers the current segment. If the loss depends on
+a value computed in an earlier segment (before a graph break), `grad` refuses
+with an error instead of silently treating that value as a constant.
+Differentiating across breaks would mean saving each segment's inputs and
+chaining the per-segment gradients. It is left out of the prototype, and
+functions must not break before `grad`. Conditionals rewritten by the macro
+never break.
+
+**Checked** against central finite differences in double precision
+(`h = 1e-5`, relative error `|a − n| / max(|a|, |n|, 1e-3)`):
+
+- every op, including broadcasting and `sum` with axes and keepdims;
+- a traced `if` (both sides);
+- `case` inside a loop (three branches);
+- an MLP loss.
+
+The largest error measured is 1.4e-9.
+
+**Training.** A traced XOR step contains the forward pass of a 2-8-1 ReLU MLP,
+the MSE loss, `grad` and the SGD update (lr 0.1). It is traced once, into a
+35-node graph. Each of the 1001 steps is then a cache hit that runs exactly
+one graph. The loss goes from 0.866 to below 1e-6 by step 400.
+
+### 4.17 Op names and PyTorch Core ATen
+
+| Prototype op (S-Expr) | User function | Core ATen | Notes |
+|---|---|---|---|
+| `add` | `add` | `aten::add.Tensor` | `alpha` = 1 |
+| `sub` | `sub` | `aten::sub.Tensor` | `alpha` = 1 |
+| `mul` | `mul` | `aten::mul.Tensor` | |
+| `div` | `div` | `aten::div.Tensor` | true division |
+| `neg` | `neg` | `aten::neg` | |
+| `matmul` | `matmul` | `aten::mm` | 2-D only; general `aten::matmul` is not Core ATen (it decomposes) |
+| `transpose` | `transpose` | `aten::permute` | dims `(1 0)`; `aten::t` / `transpose.int` are not Core ATen |
+| `reshape` | `reshape` | `aten::view` | contiguous data assumed; `aten::reshape` decomposes to `view` |
+| `expand` | `expand` | `aten::expand` | |
+| `relu` | `relu` | `aten::relu` | |
+| `reduce_sum` | `sum` | `aten::sum.dim_IntList` | empty `axes` = all dims |
+| `greater` | `gt` | `aten::gt.Tensor` | scalar operands are 0-d tensors here |
+| `less` | `lt` | `aten::lt.Tensor` | |
+| `equal` | `equal-to` | `aten::eq.Tensor` | |
+| `and` | `logical-and` | `aten::logical_and` | |
+| `or` | `logical-or` | `aten::logical_or` | |
+| `not` | `logical-not` | `aten::logical_not` | |
+| `where` | `where` | `aten::where.self` | |
+| `print` | `trace-print` | **none** | an effect; PyTorch has no ATen print op |
+| `loop` | (host loops) | **none** | control flow; the nearest PyTorch constructs are higher-order ops such as `while_loop` / `scan`, not ATen operators |
+| parameters (constants) | — | **none as an op** | graph constants (`get_attr` / lifted constants in an exported program) |
+
+The emitted graphs carry the ATen name on every node that has one.
+
+The names follow the Core ATen IR operator set as published for PyTorch 2.x.
+They were not cross-checked against the operator subset migrated into
+`third_party/native-torch/`, which `design/native-torch-migration.md` governs.
+Checking them is a separate task.
+
+### 4.18 What the tests check
 
 Every traced result is compared with the same computation written
 independently in plain Scheme over nested lists.
@@ -573,7 +792,7 @@ independently in plain Scheme over nested lists.
 - output capture and `trace-print`;
 - retrace-on-miss: same tree shape, cache hits, no divergence.
 
-**`test-trace-forms.scm` (36):**
+**`test-trace-forms.scm` (46):**
 
 - `and`, `or`, and with nested or, or with nested and, `logical-not` of `and`;
 - a non-bool operand of `and` is an error with the location;
@@ -596,9 +815,40 @@ independently in plain Scheme over nested lists.
   - `map` over a plain procedure reports that procedure, once;
   - off by default;
   - can be enabled with the `strict-tracing` parameter;
+- host loops:
+  - a 100-step `do` (limit 64) matches plain Scheme, emits one `loop` node,
+    and iterations 2 to 100 match the cached body;
+  - the body graph is parsed once per text, and the second call is one
+    cached graph;
+  - a 10-step `do` stays unrolled;
+  - a named `let` with `#:max-unroll 8`;
+  - bodies that change per iteration give one run each;
+  - `#:max-unroll #f` always unrolls;
+- `trace-pure` silences strict mode for that procedure only;
 - portability: no module except `compat.scm` uses prompts, void ports,
   procedure properties, hash tables, `syntax-case`, `syntax-source`,
   `syntax-local-binding`, `datum->syntax`, `eval-when`, `catch` or `throw`.
+
+**`test-trace-grad.scm` (33):**
+
+- finite-difference gradient checks:
+  - `add` (plus a broadcast bias), `sub`, `mul`, `div`, `neg`, `matmul`,
+    `relu`;
+  - `sum`: all axes, axis 0, axis 1 with keepdims;
+  - `where`, `transpose`, `reshape`, `expand`;
+  - comparison and logical ops carry no gradient;
+- composites: traced `if` (both sides), `case` in a loop (3 branches), MLP
+  loss;
+- double where:
+  - `where(x > 0, 1/x, 0)` at `x = 0` gives a finite, exact gradient;
+  - `1/x` in a false `if` arm gives 0, not NaN;
+- DCE keeps only what the backward pass needs;
+- ATen attributes on every node;
+- `grad` across a graph break is refused;
+- XOR:
+  - loss below 0.05;
+  - traced once, then 1000 cache hits;
+  - one graph per step.
 
 Measured numbers for the `bool` loop test (6 inputs), and the macro version:
 
@@ -674,13 +924,41 @@ Measured numbers for the `bool` loop test (6 inputs), and the macro version:
 - **Unrewindable continuations.** On Guile, a `bool` reached through a C frame
   cannot be resumed.
 
+### Loops
+
+- **Tail calls only.** A host loop must continue only by a tail call to its
+  `self`, keep the dtype and shape of its tensor variables, and take no graph
+  break in the body. Each violation is an error with the loop's location.
+- **Every iteration is traced at trace time.** Probing runs the Scheme body of
+  every iteration once, to follow the static control and compare bodies.
+  Cached calls afterwards run no Scheme code.
+- **Effects in the body.** A `print` inside a host-loop body prints every
+  iteration at run time, as it should. But DCE treats a `loop` node as pure, so
+  a loop whose outputs are unused is dropped together with its prints.
+- **Unbounded body cache.** The interpreter's body cache keeps every distinct
+  body text for the life of the process.
+- **Executors must implement `loop`.** Any executor other than the reference
+  interpreter has to implement the `loop` node.
+
+### Autodiff
+
+- **No graph breaks before `grad`.** Gradients are taken within one segment
+  (§4.16). `grad` must be called while tracing; `value-and-grad` provides that.
+- **Loss and ops.** The loss must have one element. There are no gradients
+  through `loop` nodes (host loops) or the comparison and logical ops.
+- **Only `where` gets the double-where treatment**, and only for gradients
+  flowing through it. A user op with an infinite derivative that is not under
+  a `where` still produces `inf` / `NaN`, as in any framework.
+- **Higher-order derivatives** (`grad` of a gradient) are untested.
+
 ### General
 
 - **Cache misses are slow.** A miss rebuilds full paths, and partial graphs
   export every defined value.
-- **One output per function.** The traced function must return one tensor, or
-  a Scheme scalar that gets lifted to a constant. Joins can return lists, but
-  the final result cannot.
+- **Results.** A traced function returns tensors, or lists or vectors of them.
+  - Scheme numbers and booleans in the result become constant tensors.
+  - Other data (symbols, strings) is returned as traced.
+  - Multi-resume (continuation) joins only single-tensor results.
 - **Static shapes only**, as in S-Expr v0.
 - **Small op set:**
   - `matmul` is 2-D only;
@@ -697,7 +975,9 @@ Measured numbers for the `bool` loop test (6 inputs), and the macro version:
 ## 6. Porting guide
 
 The prototype is meant to be borrowed. Everything a port must re-implement is
-the interface of `compat.scm`. The rest is either portable R7RS or mechanical
+the interface of `compat.scm`. `loop.scm`, `autodiff.scm` and the rest use only
+compat, R7RS and SRFI 1/9 (plus the mechanical items of §6.3); the
+compat-boundary test in `test-trace-forms.scm` covers them. The rest is either portable R7RS or mechanical
 translation (§6.3).
 
 ### 6.1 Run-time interface
