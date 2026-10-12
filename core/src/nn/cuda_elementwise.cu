@@ -707,6 +707,122 @@ __global__ void flash_attention_kernel(const float* __restrict__ q,
   for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
 }
 
+// Chunked-prefill flash attention: one warp per (query position, query head).
+// The n queries are the chunk at absolute positions [start, start+n); query
+// blockIdx.x == iq has absolute position p = start + iq and attends over
+// [start_key, p] where start_key = max(0, p - window + 1). That range is split
+// into two sources read in one online-softmax pass:
+//   - [start_key, start): prior context already resident in the KV cache, slot
+//     j % n_slots;
+//   - [start, p]: the current chunk's own K/V in the batch buffer, index j-start.
+// The chunk's cache append is deferred until after every layer (including the
+// shared donors) has read it, so the cache still holds the prior context while
+// this kernel runs. For start == 0 the prior range is empty and the accumulation
+// order over the batch keys is identical to flash_attention_kernel (bit-identical).
+__global__ void flash_attention_chunk_kernel(
+    const float* __restrict__ q, const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, uint64_t start, uint64_t n_slots,
+    int n_heads_q, int n_heads_kv, int head_dim, uint64_t sliding_window,
+    float scale, float* __restrict__ out) {
+  extern __shared__ float s_sh[];  // [n_heads_q * FA_BK]
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;  // warp == query head
+  const int iq = blockIdx.x;       // query position within the chunk (0-based)
+  if (h >= n_heads_q) return;
+  const int kv_h = h * n_heads_kv / n_heads_q;
+  const uint64_t p = start + (uint64_t)iq;  // absolute query position
+  const float* qrow = q + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  float* tile = s_sh + h * FA_BK;
+
+  float acc[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  float m = -1e30f, l = 0.0f;
+
+  const uint64_t start_key =
+      (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+
+  for (uint64_t j0 = start_key; j0 < p + 1; j0 += FA_BK) {
+    const uint64_t jend = (p + 1 < j0 + FA_BK) ? (p + 1) : (j0 + FA_BK);
+    const int jj_count = int(jend - j0);
+
+    // 1. warp-cooperative q·k dot per key; cache (prior) vs batch (chunk) source.
+    for (int jj = 0; jj < jj_count; ++jj) {
+      const uint64_t j = j0 + (uint64_t)jj;
+      const float* krow;
+      if (j < start) {
+        const uint64_t slot = j % n_slots;
+        krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+      } else {
+        const uint64_t bi = j - start;
+        krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+      }
+      float dot = 0.0f;
+      for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        dot += __shfl_down_sync(0xffffffffu, dot, o);
+      if (lane == 0) tile[jj] = dot * scale;
+    }
+    __syncwarp();
+
+    // 2. tile max (every key is unmasked, so a live tile is never all -1e30).
+    float tile_max = -1e30f;
+    for (int jj = lane; jj < jj_count; jj += 32)
+      tile_max = fmaxf(tile_max, tile[jj]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, o));
+    tile_max = __shfl_sync(0xffffffffu, tile_max, 0);
+
+    // 3. online-softmax rescale (m == -1e30f on the first tile => expf(-inf)=0).
+    const float m_new = fmaxf(m, tile_max);
+    const float rescale = expf(m - m_new);
+
+    // 4. exp once, store p back into tile; warp-reduce the tile sum.
+    float tile_sum = 0.0f;
+    for (int jj = lane; jj < jj_count; jj += 32) {
+      const float pv = expf(tile[jj] - m_new);
+      tile[jj] = pv;
+      tile_sum += pv;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, o);
+    tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0);
+    l = l * rescale + tile_sum;
+
+    // 5. V-weighted accumulate: acc[d] = acc[d]*rescale + sum_jj tile[jj]*v[j,d].
+    __syncwarp();
+    int di = 0;
+    for (int d = lane; d < head_dim; d += 32, ++di) {
+      float a = acc[di] * rescale;
+      for (int jj = 0; jj < jj_count; ++jj) {
+        const uint64_t j = j0 + (uint64_t)jj;
+        const float* vrow;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        } else {
+          const uint64_t bi = j - start;
+          vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        }
+        a += tile[jj] * vrow[d];
+      }
+      acc[di] = a;
+    }
+    m = m_new;
+    __syncwarp();
+  }
+
+  // Finalize: out[d] = acc[d] / l.
+  const float inv = 1.0f / l;
+  float* orow = out + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  int di = 0;
+  for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
+}
+
 // --- device state (scratch + weight cache) ----------------------------------
 
 struct DeviceWeight {
@@ -1561,6 +1677,27 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
   flash_attention_kernel<<<n_q, n_heads_q * 32, smem, cur_stream()>>>(
       q, k, v, n_kv, n_heads_q, n_heads_kv, head_dim, sliding_window, scale,
       out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool flash_attention_chunk_dev(const float* q, const float* k_batch,
+                               const float* v_batch, const float* k_cache,
+                               const float* v_cache, uint64_t start,
+                               uint64_t n_slots, int n, int n_heads_q,
+                               int n_heads_kv, int head_dim,
+                               uint64_t sliding_window, float scale,
+                               float* out) {
+  if (!available()) return false;
+  if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
+    return false;
+  if (!q || !k_batch || !v_batch || !k_cache || !v_cache || !out) return false;
+  if (n_heads_q % n_heads_kv != 0) return false;
+  if (head_dim % 32 != 0 || head_dim > 512) return false;
+  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
+  flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
+      n_heads_kv, head_dim, sliding_window, scale, out);
   return cudaGetLastError() == cudaSuccess;
 }
 

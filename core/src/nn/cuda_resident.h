@@ -131,6 +131,24 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
                          int head_dim, uint64_t sliding_window, float scale,
                          float* out);
 
+// Chunked-prefill flash attention: n queries at absolute positions
+// [start, start+n) each attend over [start_key, p] where start_key = max(0,
+// p - window + 1). Keys in [start_key, start) are prior context read from the
+// KV cache (slot j % n_slots); keys in [start, p] are the current chunk's own
+// K/V read from the batch buffer (batch index j - start). One online-softmax
+// pass covers both sources; the caller defers the chunk's cache append until
+// after every layer (including shared donors) has read it, so the cache still
+// holds the prior context here. For start == 0 the prior range is empty and the
+// result is bit-identical to flash_attention_dev. q is [n, n_heads_q, head_dim];
+// k_batch/v_batch are [n, n_heads_kv, head_dim] (fp16-rounded f32); k_cache/
+// v_cache are [n_slots, n_heads_kv, head_dim]. out is [n, n_heads_q, head_dim].
+bool flash_attention_chunk_dev(const float* q, const float* k_batch,
+                               const float* v_batch, const float* k_cache,
+                               const float* v_cache, uint64_t start,
+                               uint64_t n_slots, int n, int n_heads_q,
+                               int n_heads_kv, int head_dim,
+                               uint64_t sliding_window, float scale, float* out);
+
 // Per-layer embedding combine: y[i] = (proj[i] + ple[i] * ple_scale) * combine_scale.
 // `ple` is the caller-offset device pointer into the full per-layer embedding
 // row (i.e. already advanced by `layer * per_layer_input`). Mirrors

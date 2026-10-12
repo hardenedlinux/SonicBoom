@@ -97,6 +97,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::FlashAttention;
   if (name == "flash_attention_shared")
     return OpKind::FlashAttentionShared;
+  if (name == "kv_append_batched")
+    return OpKind::KvAppendBatched;
   if (name == "matvec_f32_batched")
     return OpKind::MatvecF32Batched;
   if (name == "matvec_bf16_batched")
@@ -148,6 +150,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::RopeBatched: return "rope_batched";
     case OpKind::FlashAttention: return "flash_attention";
     case OpKind::FlashAttentionShared: return "flash_attention_shared";
+    case OpKind::KvAppendBatched: return "kv_append_batched";
     case OpKind::MatvecF32Batched: return "matvec_f32_batched";
     case OpKind::MatvecBf16Batched: return "matvec_bf16_batched";
     case OpKind::LayerCombineBatched: return "layer_combine_batched";

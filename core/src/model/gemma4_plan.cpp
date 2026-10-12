@@ -389,6 +389,10 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   const uint32_t donor_swa_layer = n_kv - 2;
   const uint32_t donor_global_layer = n_kv - 1;
   TensorId donor_swa_k{}, donor_swa_v{}, donor_global_k{}, donor_global_v{};
+  // The fp16-rounded K/V of each KV layer, kept alive past the layer loop so the
+  // deferred cache append can run after every layer (see the KvAppendBatched
+  // nodes emitted below).
+  std::vector<TensorId> kv_k(n_kv), kv_v(n_kv);
 
   TensorId residual = inp;
   for (uint32_t l = 0; l < block_count; ++l) {
@@ -434,6 +438,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
                                  {layer_a(l)});
       attn = b.node(OpKind::FlashAttention, {q, kc, vc, start_pos}, "attn" + suff,
                     shape2(n, qw), {layer_a(l), batch_a(n)});
+      kv_k[l] = kc;
+      kv_v[l] = vc;
       if (l == donor_swa_layer) {
         donor_swa_k = kc;
         donor_swa_v = vc;
@@ -445,7 +451,7 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       const uint32_t donor = cfg.kv_donor_layer(l);
       const TensorId dk = (donor == donor_swa_layer) ? donor_swa_k : donor_global_k;
       const TensorId dv = (donor == donor_swa_layer) ? donor_swa_v : donor_global_v;
-      attn = b.node(OpKind::FlashAttentionShared, {q, dk, dv}, "attn" + suff,
+      attn = b.node(OpKind::FlashAttentionShared, {q, dk, dv, start_pos}, "attn" + suff,
                     shape2(n, qw), {layer_a(l), batch_a(n)});
     }
 
@@ -498,6 +504,16 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     else
       out = x3;
     residual = out;
+  }
+
+  // Defer the KV-cache append to after every layer: a shared layer's attention
+  // reads its donor's *prior* cache, so the donor's own chunk must not overwrite
+  // it until all layers have consumed it. This is what lets a chunk that wraps
+  // the SWA ring (start_pos >= sliding_window) still attend over the prior
+  // window. The output is a dummy scalar — the append is a cache side effect.
+  for (uint32_t l = 0; l < n_kv; ++l) {
+    b.node(OpKind::KvAppendBatched, {kv_k[l], kv_v[l], start_pos},
+           "kv_append" + std::to_string(l), {}, {layer_a(l), batch_a(n)});
   }
 
   for (auto& t : b.g.tensors)
@@ -616,7 +632,7 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
 
     planner::Graph pgraph = build_gemma4_prefill_graph(m, n);
     auto pplan = planner::plan_execution(pgraph, *snap, cost);
-    if (!pplan) return 0;
+    if (!pplan) { std::cerr << "[prefill-spine] plan failed: " << pplan.error().message << "\n"; return 0; }
 
     // The prefill backend is bound to the prefill graph (for node lookup) but
     // shares the decode backend's KV cache: FlashAttention fills it, and the
@@ -631,9 +647,10 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     in.push_back(encode_tokens(prompt));
     in.push_back(encode_i64(start_pos));
     auto res = prefill_exec.execute(*pplan, *snap, in);
-    if (!res || res->outputs.empty()) return 0;
+    if (!res) { std::cerr << "[prefill-spine] execute failed: " << res.error().message << "\n"; return 0; }
+    if (res->outputs.empty()) { std::cerr << "[prefill-spine] no outputs\n"; return 0; }
     const sx::Bytes& hidden_b = res->outputs[0];
-    if (hidden_b.size() < uint64_t(d) * n * sizeof(float)) return 0;
+    if (hidden_b.size() < uint64_t(d) * n * sizeof(float)) { std::cerr << "[prefill-spine] hidden too small: " << hidden_b.size() << " < " << uint64_t(d)*n*sizeof(float) << "\n"; return 0; }
     std::span<const float> hf(reinterpret_cast<const float*>(hidden_b.data()),
                               uint64_t(d) * n);
     std::vector<float> hidden(d);
@@ -943,65 +960,106 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 
   int64_t first = -1;
   if (use_prefill) {
-    // One batched graph pass over the prompt through the CUDA spine, then sample
-    // tokens[0] from the final hidden column's lm-head logits (same arithmetic as
-    // the CUDA spine's lm-head). The prefill graph runs device-resident end-to-end
-    // through the batched *_dev kernels; the prefill backend shares the decode
-    // backend's KV cache so FlashAttention fills it and the decode loop below
-    // reads it.
+    // Chunked device-resident prefill: the prompt is processed in segments of
+    // `chunk` tokens (the SWA ring size, so a segment is a wrap-free run and the
+    // batched kernels' consecutive-slot assumption holds). Each segment runs the
+    // batched prefill graph; within a segment the attention reads the segment's
+    // own K/V from the batch buffer plus the prior context from the shared KV
+    // cache, and the cache append is deferred until every layer — including the
+    // shared donors — has read the prior window, so a segment that wraps the SWA
+    // ring still attends correctly. Only the last segment's final hidden column
+    // feeds lm_head.
     const uint64_t n = prompt.size();
-    for (uint32_t l = 0; l < m.config.n_layer_kv(); ++l) {
-      const LayerConfig& lc = m.config.layer_config(l);
-      const uint64_t n_slots = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx;
-      if (n_slots == 0 || (start_pos % n_slots) + n > n_slots) {
-        std::cerr << "[prefill-cuda] n=" << n << " exceeds SWA ring at layer " << l
-                  << " (n_slots=" << n_slots << ")\n";
+    const uint64_t chunk = m.config.sliding_window;
+    if (chunk == 0) { std::cerr << "[prefill-cuda] sliding_window == 0\n"; return 0; }
+
+    // One prefill runtime per distinct segment size (usually just `chunk`; the
+    // final segment may be shorter). Each is bound to its own graph but shares
+    // the decode backend's KV cache, so prior segments' context is visible.
+    struct PrefillSegment {
+      planner::Graph graph;
+      planner::ExecutionPlan plan;
+      std::unique_ptr<planner::SonicBackend> cpu;
+      std::unique_ptr<planner::SonicCudaBackend> cuda;
+      std::unique_ptr<planner::RuntimeExecutor> exec;
+    };
+    std::map<uint64_t, std::unique_ptr<PrefillSegment>> segments;
+
+    auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
+      auto it = segments.find(nseg);
+      if (it != segments.end())
+        return it->second.get();
+      auto seg = std::make_unique<PrefillSegment>();
+      seg->graph = build_gemma4_prefill_graph(m, nseg);
+      auto pplan = planner::plan_execution(seg->graph, *snap, cost);
+      if (!pplan) {
+        std::cerr << "[prefill-cuda] n=" << nseg << " plan failed\n";
+        return nullptr;
+      }
+      seg->plan = std::move(*pplan);
+      seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
+      seg->cuda = std::make_unique<planner::SonicCudaBackend>(m, seg->graph, n_ctx);
+      seg->cuda->share_caches(cuda_backend);
+      seg->exec = std::make_unique<planner::RuntimeExecutor>(
+          std::map<planner::BackendTag, planner::Backend*>{
+              {planner::BackendTag::Sonic, seg->cuda.get()}});
+      for (const auto& task : seg->plan.tasks) {
+        if (task.kind != planner::TaskKind::Compute)
+          continue;
+        const planner::MemorySpace* ms = nullptr;
+        if (task.memory_space)
+          ms = seg->plan.find_memory_space(*task.memory_space);
+        if (!ms || ms->kind == planner::MemoryKind::Host)
+          seg->exec->set_task_backend(task.id, seg->cpu.get());
+      }
+      PrefillSegment* raw = seg.get();
+      segments.emplace(nseg, std::move(seg));
+      return raw;
+    };
+
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    for (uint64_t off = 0; off < n; off += chunk) {
+      const uint64_t nseg = std::min(chunk, n - off);
+      const uint64_t pos = start_pos + off;
+      PrefillSegment* seg = segment_for(nseg);
+      if (!seg)
+        return 0;
+
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_tokens(prompt.subspan(off, nseg)));
+      in.push_back(encode_i64(pos));
+      auto res = seg->exec->execute(seg->plan, *snap, in);
+      if (!res) {
+        std::cerr << "[prefill-cuda] segment off=" << off << " execute failed: "
+                  << res.error().message << "\n";
         return 0;
       }
-    }
+      if (res->outputs.empty()) {
+        std::cerr << "[prefill-cuda] segment off=" << off << " no outputs\n";
+        return 0;
+      }
 
-    planner::Graph pgraph = build_gemma4_prefill_graph(m, n);
-    auto pplan = planner::plan_execution(pgraph, *snap, cost);
-    if (!pplan) { std::cerr << "[prefill-cuda] n=" << n << " plan failed\n"; return 0; }
-
-    planner::SonicBackend prefill_cpu_backend(m, pgraph);
-    planner::SonicCudaBackend prefill_backend(m, pgraph, n_ctx);
-    prefill_backend.share_caches(cuda_backend);
-    planner::RuntimeExecutor prefill_exec(
-        std::map<planner::BackendTag, planner::Backend*>{
-            {planner::BackendTag::Sonic, &prefill_backend}});
-    for (const auto& task : pplan->tasks) {
-      if (task.kind != planner::TaskKind::Compute)
-        continue;
-      const planner::MemorySpace* ms = nullptr;
-      if (task.memory_space)
-        ms = pplan->find_memory_space(*task.memory_space);
-      if (!ms || ms->kind == planner::MemoryKind::Host)
-        prefill_exec.set_task_backend(task.id, &prefill_cpu_backend);
+      if (off + nseg == n) {
+        // Final segment: its last hidden column is the prompt's final state.
+        const sx::Bytes& hidden_b = res->outputs[0];
+        if (hidden_b.size() < uint64_t(d) * nseg * sizeof(float)) {
+          std::cerr << "[prefill-cuda] n=" << n << " hidden too small: "
+                    << hidden_b.size() << " < " << uint64_t(d) * nseg * sizeof(float)
+                    << "\n";
+          return 0;
+        }
+        std::span<const float> hf(reinterpret_cast<const float*>(hidden_b.data()),
+                                  uint64_t(d) * nseg);
+        std::vector<float> hidden(d);
+        for (uint32_t k = 0; k < d; ++k)
+          hidden[k] = hf[k * nseg + (nseg - 1)];
+        if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) {
+          std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n";
+          return 0;
+        }
+        first = nn::argmax(logits);
+      }
     }
-
-    std::vector<sx::Bytes> in;
-    in.push_back(encode_tokens(prompt));
-    in.push_back(encode_i64(start_pos));
-    const auto t_pf0 = std::chrono::steady_clock::now();
-    auto res = prefill_exec.execute(*pplan, *snap, in);
-    if (!res) { std::cerr << "[prefill-cuda] n=" << n << " execute failed: "
-                          << res.error().message << "\n"; return 0; }
-    if (res->outputs.empty()) { std::cerr << "[prefill-cuda] n=" << n << " no outputs\n"; return 0; }
-    const sx::Bytes& hidden_b = res->outputs[0];
-    if (hidden_b.size() < uint64_t(d) * n * sizeof(float)) {
-      std::cerr << "[prefill-cuda] n=" << n << " hidden too small: " << hidden_b.size()
-                << " < " << uint64_t(d) * n * sizeof(float) << "\n";
-      return 0;
-    }
-    std::span<const float> hf(reinterpret_cast<const float*>(hidden_b.data()),
-                              uint64_t(d) * n);
-    std::vector<float> hidden(d);
-    for (uint32_t k = 0; k < d; ++k) hidden[k] = hf[k * n + (n - 1)];
-    if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) {
-      std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n"; return 0;
-    }
-    first = nn::argmax(logits);
     if (gen_timing) {
       using ms = std::chrono::duration<double, std::milli>;
       const double pf_ms = ms(std::chrono::steady_clock::now() - t_pf0).count();

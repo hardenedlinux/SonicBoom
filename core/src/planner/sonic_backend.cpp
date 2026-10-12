@@ -481,27 +481,38 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::FlashAttention: {
-      // KV layer: append the n fp16-rounded K/V rows to this layer's cache at
-      // slots (start_pos + c) % n_slots, then full-sequence causal SDPA.
-      // inputs: {q, kc, vc, start_pos} in [n, dim] position-major.
+      // KV layer: full-sequence causal SDPA over this chunk's fp16-rounded K/V
+      // (no append — the append is the deferred KvAppendBatched node). The CPU
+      // prefill runs a single wrap-free chunk (start_pos == 0, n <= ring), so
+      // there is no prior cache to attend over. inputs: {q, kc, vc, start_pos}.
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      const uint64_t start = read_i64(inputs[3]);
+      int64_t nb = 0;
+      attr_i(*node, "batch", nb);
+      const uint64_t n = uint64_t(nb);
+      ok = nn::scaled_dot_product_attention(f32(inputs[0]), n, f32(inputs[1]),
+                                            f32(inputs[2]), n,
+                                            lc.n_heads_q, lc.n_heads_kv,
+                                            lc.head_dim, true, lc.sliding_window,
+                                            0.0f, 1.0f, f32_mut(out));
+      break;
+    }
+    case OpKind::KvAppendBatched: {
+      // Deferred cache append: copy the chunk's n fp16-rounded K/V rows into the
+      // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
+      const uint64_t start = read_i64(inputs[2]);
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
       KvCache& cache = (*caches_)[uint32_t(layer)];
       const size_t row = (size_t)cache.n_heads_kv * cache.head_dim;
-      std::span<const float> k = f32(inputs[1]);
-      std::span<const float> v = f32(inputs[2]);
+      std::span<const float> k = f32(inputs[0]);
+      std::span<const float> v = f32(inputs[1]);
       for (uint64_t c = 0; c < n; ++c) {
         const size_t slot = (size_t)((start + c) % cache.n_slots) * row;
         std::copy_n(k.data() + c * row, row, cache.k.begin() + slot);
         std::copy_n(v.data() + c * row, row, cache.v.begin() + slot);
       }
-      ok = nn::scaled_dot_product_attention(f32(inputs[0]), n, k, v, n,
-                                            lc.n_heads_q, lc.n_heads_kv,
-                                            lc.head_dim, true, lc.sliding_window,
-                                            0.0f, 1.0f, f32_mut(out));
+      ok = true;
       break;
     }
     case OpKind::FlashAttentionShared: {
@@ -584,6 +595,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
   if (!ok)
     return std::unexpected(fail("Sonic kernel failed for node '" + node->name +
                                 "'"));
+
+  // Side-effect-only nodes (KvAppendBatched) have an orphaned dummy output the
+  // planner drops from task.outputs; return zero outputs to match the task's
+  // declared output count (mirrors the CUDA backend's identical handling).
+  if (task.outputs.empty())
+    return std::vector<TensorValue>{};
 
   std::vector<TensorValue> res;
   res.push_back(TensorValue::from_host(std::move(out)));

@@ -80,8 +80,9 @@ enum class OpKind : uint8_t {
   RmsNormCols,             // nn::rms_norm per column over [dim, n]
   RmsNormHeadsBatched,     // nn::rms_norm_heads per position over [n, dim]
   RopeBatched,             // nn::rope_neox_heads per position over [n, dim]
-  FlashAttention,          // append n KV rows + nn::scaled_dot_product_attention
-  FlashAttentionShared,    // donor nn::scaled_dot_product_attention (no append)
+  FlashAttention,          // chunked flash attention over prior cache + current batch
+  FlashAttentionShared,    // donor chunked flash attention (no append)
+  KvAppendBatched,         // append n KV rows to the cache (deferred to after all layers)
   MatvecF32Batched,        // nn::matvec_f32 per column
   MatvecBf16Batched,       // nn::matvec_bf16 per column (bf16 activation)
   LayerCombineBatched,     // nn::layer_combine per column

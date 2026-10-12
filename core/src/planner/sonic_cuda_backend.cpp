@@ -610,31 +610,53 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::FlashAttention: {
+      // Chunked attention over prior cache + current batch (no append — the
+      // append is the deferred KvAppendBatched node). inputs: {q, kc, vc,
+      // start_pos}. For a single chunk at start_pos == 0 the prior range is
+      // empty and this is bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t start = read_i64(in[3]);
       KvCacheDev& cache = (*caches_)[uint32_t(layer)];
-      const int row_elems = int(cache.n_heads_kv * cache.head_dim);
-      if (!cache.k_buf || !cache.v_buf ||
-          !nn::cuda::kv_append_batched_dev(
-              dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[1]),
-              dev(in[2]), start, cache.n_slots, row_elems, int(nb))) {
-        ok = false;
-        break;
-      }
-      ok = nn::cuda::flash_attention_dev(
-          dev(in[0]), dev(in[1]), dev(in[2]), int(nb), int(nb),
+      ok = nn::cuda::flash_attention_chunk_dev(
+          dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
+          dev_mut(cache.v_buf.id), start, cache.n_slots, int(nb),
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, 1.0f, out);
       break;
     }
     case OpKind::FlashAttentionShared: {
+      // Shared layer: chunked attention over the donor's prior cache + the
+      // donor's current-chunk K/V (no append). inputs: {q, dk, dv, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      ok = nn::cuda::flash_attention_dev(
-          dev(in[0]), dev(in[1]), dev(in[2]), int(nb), int(nb),
-          int(lc.n_heads_q), int(lc.n_heads_kv), int(lc.head_dim),
+      const uint64_t start = read_i64(in[3]);
+      const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
+      const KvCacheDev& cache = (*caches_)[donor];
+      ok = nn::cuda::flash_attention_chunk_dev(
+          dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
+          dev_mut(cache.v_buf.id), start, cache.n_slots, int(nb),
+          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, 1.0f, out);
+      break;
+    }
+    case OpKind::KvAppendBatched: {
+      // Deferred cache append: copy the chunk's n fp16-rounded K/V rows into the
+      // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
+      int64_t nb = 0;
+      attr_i(*node, "batch", nb);
+      const uint64_t start = read_i64(in[2]);
+      KvCacheDev& cache = (*caches_)[uint32_t(layer)];
+      const int row_elems = int(cache.n_heads_kv * cache.head_dim);
+      if (!cache.k_buf || !cache.v_buf ||
+          !nn::cuda::kv_append_batched_dev(
+              dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[0]),
+              dev(in[1]), start, cache.n_slots, row_elems, int(nb))) {
+        ok = false;
+        break;
+      }
+      // The append is a cache side effect; the dummy scalar output is never read,
+      // so it is left unwritten (a host write to the device handle would fault).
       break;
     }
     case OpKind::MatvecF32Batched: {
@@ -698,6 +720,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     device::release(out_handle, out_bytes);
     return std::unexpected(fail("Sonic CUDA kernel failed for node '" + node->name +
                                 "'"));
+  }
+
+  // A side-effect-only node (KvAppendBatched) has an orphaned dummy output that
+  // the planner drops from task.outputs, so return zero outputs to match the
+  // task's declared output count. The output buffer was allocated but is never
+  // consumed; release it rather than leak it.
+  if (task.outputs.empty()) {
+    device::release(out_handle, out_bytes);
+    return std::vector<TensorValue>{};
   }
 
   std::vector<TensorValue> res;

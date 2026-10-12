@@ -238,7 +238,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // unchanged on flat batched buffers.
       OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
       OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
-      OpKind::FlashAttention,   OpKind::FlashAttentionShared,
+      OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
       OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
       OpKind::LayerCombineBatched,
   };
@@ -292,7 +292,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // on flat batched buffers; the rest are the batched *_dev kernels.
         OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
         OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
-        OpKind::FlashAttention,   OpKind::FlashAttentionShared,
+        OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
         OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
         OpKind::LayerCombineBatched,
     };
