@@ -85,6 +85,32 @@ sx::Attribute attr_f(const char* name, double v) { return sx::Attribute{name, v}
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Model-agnostic KV-cache geometry (Section C). Extracts the cache-relevant
+// facts from the Gemma 4 config into a planner::KvCacheSpec, keeping the
+// Gemma-specific per-layer mapping (layer_config / kv_donor_layer) inside the
+// model layer. The CUDA backend then allocates and indexes its cache from the
+// spec alone.
+// ---------------------------------------------------------------------------
+planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
+  planner::KvCacheSpec spec;
+  spec.n_layers = cfg.n_layer_kv();
+  spec.chunk = cfg.sliding_window;
+  spec.layers.reserve(spec.n_layers);
+  for (uint32_t l = 0; l < spec.n_layers; ++l) {
+    const LayerConfig& lc = cfg.layer_config(l);
+    planner::KvCacheSpec::Layer e;
+    e.kv_heads = lc.n_heads_kv;
+    e.head_dim = lc.head_dim;
+    e.window = lc.sliding_window;
+    spec.layers.push_back(e);
+  }
+  spec.kv_source_layer.reserve(cfg.block_count);
+  for (uint32_t l = 0; l < cfg.block_count; ++l)
+    spec.kv_source_layer.push_back(cfg.kv_donor_layer(l));
+  return spec;
+}
+
+// ---------------------------------------------------------------------------
 // Plan emitter. Mirrors forward()/lm_head in exec.cpp — the same per-stage
 // arithmetic, re-expressed as a static acyclic graph of transformer OpKind
 // nodes. The graph is stateless (acyclic): the multi-token KV cache lives in the
@@ -747,7 +773,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (!plan) return 0;
 
   planner::SonicBackend cpu_backend(m, graph);
-  planner::SonicCudaBackend cuda_backend(m, graph, n_ctx);
+  planner::SonicCudaBackend cuda_backend(kv_cache_spec(m.config), graph, n_ctx);
+  cuda_backend.bind_model(m);
   planner::RuntimeExecutor exec(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, &cuda_backend}});
@@ -1011,7 +1038,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   planner::SonicBackend cpu_backend(m, graph);
   const auto t_bk = std::chrono::steady_clock::now();
   if (nvtx_enabled()) nvtxRangePushA("prefill:backend_construct");
-  planner::SonicCudaBackend cuda_backend(m, graph, n_ctx);
+  planner::SonicCudaBackend cuda_backend(kv_cache_spec(m.config), graph, n_ctx);
+  cuda_backend.bind_model(m);
   if (nvtx_enabled()) nvtxRangePop();
   if (phase_timing) {
     using ms = std::chrono::duration<double, std::milli>;
@@ -1101,7 +1129,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       }
       seg->plan = std::move(*pplan);
       seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
-      seg->cuda = std::make_unique<planner::SonicCudaBackend>(m, seg->graph, n_ctx);
+      seg->cuda = std::make_unique<planner::SonicCudaBackend>(
+          kv_cache_spec(m.config), seg->graph, n_ctx);
+      seg->cuda->bind_model(m);
       seg->cuda->share_caches(cuda_backend);
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{

@@ -43,10 +43,18 @@ namespace sonicboom::planner {
 
 class SonicCudaBackend : public Backend {
 public:
-  // Both `model` and `graph` must outlive the backend. `n_ctx` sizes the
-  // per-KV-layer decode cache (see SonicBackend).
-  SonicCudaBackend(const model::Gemma4Model& model, const Graph& graph,
+  // `spec` describes the KV-cache geometry (copied into the backend) and `graph`
+  // must outlive the backend. `n_ctx` sizes the per-KV-layer decode cache (see
+  // SonicBackend). The compute model is bound separately via bind_model() — the
+  // constructor no longer reads a Gemma4Model for cache geometry (Section C).
+  SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
                    uint64_t n_ctx = 0);
+
+  // Bind the compute model the backend reads weights / per-layer config from.
+  // Required before execute(); the pointer is stored (the model must outlive the
+  // backend). Decoupled from the constructor so cache geometry (KvCacheSpec) and
+  // compute (model) are independent inputs.
+  void bind_model(const model::Gemma4Model& model) { model_ = &model; }
 
   ~SonicCudaBackend() override;
 
@@ -127,7 +135,8 @@ public:
   void publish_cache(KvCacheSession& session) const;
 
 private:
-  const model::Gemma4Model& model_;
+  const model::Gemma4Model* model_ = nullptr;  // compute model (weights/config), bound via bind_model()
+  KvCacheSpec spec_;                           // KV-cache geometry (owned copy)
   const Graph& graph_;
   // index == KV layer (0 .. n_layer_kv-1). Shared across the decode backend and
   // a prefill backend bound to a different graph (see share_caches).

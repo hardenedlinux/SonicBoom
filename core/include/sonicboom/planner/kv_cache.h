@@ -46,6 +46,30 @@ struct KvCacheDev {
   uint64_t head_dim = 0;
 };
 
+// Static KV-cache geometry the CUDA backend needs to allocate and index the
+// per-layer device cache (Section C de-Gemma decoupling). The model layer builds
+// this from its own model facts (see model::kv_cache_spec); the backend consumes
+// only this spec, so cache allocation/indexing is model-agnostic and no longer
+// reads Gemma4Config directly. Small enough to store by value in the backend.
+struct KvCacheSpec {
+  // One KV-cache layer's geometry (n_heads_kv / head_dim / ring window).
+  struct Layer {
+    uint32_t kv_heads = 0;
+    uint32_t head_dim = 0;
+    uint64_t window = 0;  // 0 = global (full n_ctx), else fixed ring size
+  };
+
+  uint32_t n_layers = 0;      // number of distinct KV-cache layers (n_layer_kv)
+  std::vector<Layer> layers;  // indexed by KV-cache layer (0 .. n_layers-1)
+
+  // The KV-cache layer each transformer layer reads. Indexed by transformer
+  // layer (0 .. block_count-1); value is a KV-cache layer index. Identity for a
+  // KV layer, the donor's index for a shared-KV layer.
+  std::vector<uint32_t> kv_source_layer;
+
+  uint64_t chunk = 0;  // max prefill segment (SWA ring size; 0 = no window)
+};
+
 // Persistent KV-cache session for prefix reuse. `caches` owns the per-layer
 // device buffers (shared across the prefill/decode backends through the
 // shared_ptr); `filled_tokens` records the token id at each prefilled position

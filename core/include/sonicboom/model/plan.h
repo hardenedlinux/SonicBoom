@@ -77,6 +77,12 @@ enum class WeightSlot : uint8_t {
 // generate loop so the oracle arithmetic stays bit-identical.
 planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy);
 
+// Build the model-agnostic KV-cache geometry spec from the Gemma 4 config
+// (Section C de-Gemma decoupling). Keeps the Gemma-specific per-layer mapping
+// (layer_config / kv_donor_layer) inside the model layer; the CUDA backend only
+// ever sees the resulting planner::KvCacheSpec, never Gemma4Config.
+planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg);
+
 // Expand the whole-prompt prefill (mirrors build_gemma4_graph per block) into a
 // static, acyclic planner::Graph over [dim, n] / [n, dim] batched tensors, where
 // n is the prompt length. Every node is pinned to BackendTag::Sonic; the batched

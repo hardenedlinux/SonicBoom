@@ -129,15 +129,15 @@ class CudaStepProgram final : public hal::StepProgram {
 
 } // namespace
 
-SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
-                                   const Graph& graph, uint64_t n_ctx)
-    : model_(model), graph_(graph), n_ctx_(n_ctx) {
+SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
+                                   uint64_t n_ctx)
+    : spec_(spec), graph_(graph), n_ctx_(n_ctx) {
   ensure_caches(n_ctx);
   token_buf_ = g_alloc.allocate(sizeof(float));   // persistent current-token slot
   pos_buf_ = g_alloc.allocate(sizeof(uint64_t));  // persistent position slot
   // Prefill chunk token-id slot: sized for the largest chunk (the SWA window),
   // so any segment (<= sliding_window tokens) stages into it in place.
-  const uint64_t chunk = model_.config.sliding_window;
+  const uint64_t chunk = spec_.chunk;
   if (chunk > 0)
     tokens_buf_ = g_alloc.allocate(chunk * sizeof(uint64_t));
   if (pos_buf_) {
@@ -168,7 +168,7 @@ bool SonicCudaBackend::set_pos(uint64_t pos) {
 
 bool SonicCudaBackend::set_prefill_tokens(std::span<const uint64_t> tokens) {
   if (!tokens_buf_ || tokens.empty()) return false;
-  const uint64_t chunk = model_.config.sliding_window;
+  const uint64_t chunk = spec_.chunk;
   if (tokens.size() > chunk) return false;  // a segment never exceeds the window
   return g_alloc.copy_to_device(tokens_buf_, tokens.data(),
                                 tokens.size() * sizeof(uint64_t));
@@ -177,7 +177,7 @@ bool SonicCudaBackend::set_prefill_tokens(std::span<const uint64_t> tokens) {
 bool SonicCudaBackend::stage_prefill_tokens(hal::StepProgram& prog,
                                             std::span<const uint64_t> tokens) {
   if (!tokens_buf_ || tokens.empty()) return false;
-  const uint64_t chunk = model_.config.sliding_window;
+  const uint64_t chunk = spec_.chunk;
   if (tokens.size() > chunk) return false;  // a segment never exceeds the window
   return prog.stage_upload(tokens_buf_, tokens.data(),
                            tokens.size() * sizeof(uint64_t));
@@ -213,16 +213,16 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
 }
 
 void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
-  const uint32_t n_kv = model_.config.n_layer_kv();
+  const uint32_t n_kv = spec_.n_layers;
   auto* raw = new std::vector<KvCacheDev>();
   raw->resize(n_kv);
   for (uint32_t l = 0; l < n_kv; ++l) {
-    const model::LayerConfig& lc = model_.config.layer_config(l);
+    const KvCacheSpec::Layer& sl = spec_.layers[l];
     KvCacheDev& c = (*raw)[l];
-    c.n_heads_kv = lc.n_heads_kv;
-    c.head_dim = lc.head_dim;
+    c.n_heads_kv = sl.kv_heads;
+    c.head_dim = sl.head_dim;
     // SWA layers are a fixed-size ring; global layers the full decode length.
-    c.n_slots = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx;
+    c.n_slots = (sl.window > 0) ? sl.window : n_ctx;
     c.bytes = c.n_slots * c.n_heads_kv * c.head_dim * sizeof(float);
     c.k_buf = g_alloc.allocate(c.bytes);
     c.v_buf = g_alloc.allocate(c.bytes);
@@ -268,7 +268,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   if (!out_td)
     return std::unexpected(fail("Sonic CUDA node output tensor is unknown"));
 
-  const auto& cfg = model_.config;
+  if (!model_)
+    return std::unexpected(fail("Sonic CUDA backend has no bound model"));
+
+  const auto& cfg = model_->config;
   const uint32_t d = cfg.embedding_length;
   const uint32_t per = cfg.per_layer_input;
   const float eps = cfg.rms_epsilon;
@@ -282,7 +285,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   attr_f(*node, "scale", scale_d);
 
   const model::BlockWeights& block =
-      model_.weights.blocks[layer >= 0 ? uint32_t(layer) : 0];
+      model_->weights.blocks[layer >= 0 ? uint32_t(layer) : 0];
   const model::LayerConfig& lc = cfg.layer_config(layer >= 0 ? uint32_t(layer) : 0);
 
   auto fweight = [&](model::WeightSlot s) -> std::span<const float> {
@@ -296,9 +299,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       case model::WeightSlot::PostNorm: return block.post_norm;
       case model::WeightSlot::InpGate: return block.inp_gate;
       case model::WeightSlot::Proj: return block.proj;
-      case model::WeightSlot::PerLayerProjNorm: return model_.weights.per_layer_proj_norm;
-      case model::WeightSlot::OutputNorm: return model_.weights.output_norm;
-      case model::WeightSlot::RopeFreqs: return model_.weights.rope_freqs;
+      case model::WeightSlot::PerLayerProjNorm: return model_->weights.per_layer_proj_norm;
+      case model::WeightSlot::OutputNorm: return model_->weights.output_norm;
+      case model::WeightSlot::RopeFreqs: return model_->weights.rope_freqs;
       default: return {};
     }
   };
@@ -313,7 +316,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       case model::WeightSlot::FfnGate: return block.ffn_gate;
       case model::WeightSlot::FfnUp: return block.ffn_up;
       case model::WeightSlot::FfnDown: return block.ffn_down;
-      case model::WeightSlot::TokenEmbd: return model_.weights.token_embd;
+      case model::WeightSlot::TokenEmbd: return model_->weights.token_embd;
       default: return kEmpty;
     }
   };
@@ -355,7 +358,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::Rope: {
       const std::span<const float> ff =
           lc.attention == model::AttentionKind::Global
-              ? model_.weights.rope_freqs
+              ? model_->weights.rope_freqs
               : std::span<const float>{};
       if (!device::device_copy(in[0].device.handle, out_handle, out_bytes)) {
         ok = false;
@@ -379,7 +382,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // slot `pos % n_slots` (computed in-kernel from pos_buf_), then run
       // incremental decode attention over it. inputs: {q (RoPE'd f32, device),
       // kc (device), vc (device)}; the position comes from the device slot.
-      KvCacheDev& cache = (*caches_)[uint32_t(layer)];
+      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       if (!cache.k_buf || !cache.v_buf ||
@@ -400,7 +403,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::AttentionShared: {
       // Shared layer (24..41): attend over the donor KV layer's cache (no
       // append). inputs: {q (device)}; the position comes from the device slot.
-      const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
+      const uint32_t donor = spec_.kv_source_layer[uint32_t(layer)];
       const KvCacheDev& cache = (*caches_)[donor];
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       ok = nn::cuda::decode_attention_dev(
@@ -463,7 +466,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::MatvecBf16: {
       const uint64_t layer_base = (uint64_t(layer) * per) * d;
       const std::span<const uint16_t> W =
-          model_.weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
+          model_->weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
       const int cols = int(in[0].device.size_bytes / sizeof(float));
       // The CPU path rounds the activation through bf16 before the dot; do the
       // same on a scratch copy so the shared `inp` tensor is left untouched.
@@ -524,14 +527,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      ok = nn::cuda::matvec_bf16_dev(model_.weights.per_layer_model_proj, cols,
+      ok = nn::cuda::matvec_bf16_dev(model_->weights.per_layer_model_proj, cols,
                                      reinterpret_cast<const float*>(xtmp), out,
                                      total_per);
       device::release(xtmp, xbytes);
       if (!ok) break;
       ok = nn::cuda::scale_dev(out, 1.0f / std::sqrt(float(d)), out, total_per);
       if (!ok) break;
-      ok = nn::cuda::rms_norm_heads_dev(model_.weights.per_layer_proj_norm, out,
+      ok = nn::cuda::rms_norm_heads_dev(model_->weights.per_layer_proj_norm, out,
                                         eps, out, int(per), total_per / int(per));
       if (!ok) break;
       ok = nn::cuda::layer_combine_dev(out, dev(in[1]), std::sqrt(float(per)),
@@ -557,11 +560,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
         // gather the token's row zero-copy (no per-token H2D).
         ok = quant::cuda::gather_f32_mapped_dev_row(
-            model_.weights.per_layer_token_embd, tok_dev, out);
+            model_->weights.per_layer_token_embd, tok_dev, out);
       } else {
         // token_embd is the tied lm_head, already resident (the logits matvec
         // uploads it once): gather straight from the device weight, no H2D.
-        ok = quant::cuda::gather_f32_resident_dev_row(model_.weights.token_embd,
+        ok = quant::cuda::gather_f32_resident_dev_row(model_->weights.token_embd,
                                                       tok_dev, out);
       }
       break;
@@ -593,10 +596,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (!tokens_dev) { ok = false; break; }
       if (slot == model::WeightSlot::PerLayerTokenEmbd)
         ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
-            model_.weights.per_layer_token_embd, tokens_dev, int(nb), out);
+            model_->weights.per_layer_token_embd, tokens_dev, int(nb), out);
       else
         ok = quant::cuda::gather_f32_resident_dev_batched_ids(
-            model_.weights.token_embd, tokens_dev, int(nb), out);
+            model_->weights.token_embd, tokens_dev, int(nb), out);
       break;
     }
     case OpKind::RmsNormCols: {
@@ -637,7 +640,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_i(*node, "batch", nb);
       const std::span<const float> ff =
           lc.attention == model::AttentionKind::Global
-              ? model_.weights.rope_freqs
+              ? model_->weights.rope_freqs
               : std::span<const float>{};
       if (!device::device_copy(in[0].device.handle, out_handle, out_bytes)) {
         ok = false;
@@ -655,7 +658,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // empty and this is bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      KvCacheDev& cache = (*caches_)[uint32_t(layer)];
+      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
@@ -668,7 +671,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // donor's current-chunk K/V (no append). inputs: {q, dk, dv, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
+      const uint32_t donor = spec_.kv_source_layer[uint32_t(layer)];
       const KvCacheDev& cache = (*caches_)[donor];
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
@@ -682,7 +685,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      KvCacheDev& cache = (*caches_)[uint32_t(layer)];
+      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       if (!cache.k_buf || !cache.v_buf ||
           !nn::cuda::kv_append_batched_dev_pos(
@@ -712,7 +715,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const int n = int(nb);
       const uint64_t layer_base = (uint64_t(layer) * per) * d;
       const std::span<const uint16_t> W =
-          model_.weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
+          model_->weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
       const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
       const int rows = out_n / n;
       // The CPU path rounds the activation through bf16 before the dot; do the
