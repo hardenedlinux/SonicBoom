@@ -174,6 +174,45 @@ SonicBoom's single straight-line spine beats llama.cpp's scheduler at equal
 threads; the CPU path is the numerical oracle for the CUDA path, not a perf
 target.
 
+### 1.4 Prefill (prompt processing) — host-bound, ~85–100× behind llama.cpp
+
+Prompt-processing throughput (pp, tokens/sec) of the one-shot batched prefill
+(`generate_prefill_spine_cuda` → `SonicCudaBackend::prefill`), at a fixed prompt
+length, vs `llama-bench -p <n> -n 0 -ngl 99`:
+
+| prompt | SonicBoom CUDA pp | llama.cpp CUDA pp | ratio |
+|---|---|---|---|
+| 128 | ~20.4 tok/s | 1745.5 tok/s | 0.012× |
+| 512 | ~19.8 tok/s | 2019.0 tok/s | 0.010× |
+| 2048 | **not supported** | 2014.2 tok/s | — |
+
+(`tools/baseline/prefill_bench --prompt N --reps 3`, marginal pp — the ~constant
+per-call plan/graph overhead is subtracted via a 1-token reference; llama-bench
+`-r 3 -n 0 -ngl 99`.)
+
+**pp2048 is not supported.** The one-shot prefill requires the prompt to land in a
+straight, wrap-free run of every KV cache, and the SWA layers are a 512-slot ring
+(`sliding_window == 512`), so `n > 512` is rejected — the batched prefill has no
+ring-wrap handling (llama.cpp's chunked/ubatch prefill does).
+
+**Root cause — the prefill is not actually batched.** `matmul_f32` with `n > 1`
+does *not* launch a batched GEMM: it loops over the `n` columns, gathering each
+into a scratch buffer, running the single-column q8_1 gemv (the decode kernel),
+and scattering back (`gather_col → gemv → scatter_col`). So the prefill is `n ×`
+the decode path plus gather/scatter, with no batching parallelism. On top of that
+the transposes, column-wise rms-norms, and per-layer gates run on the *host*
+through the thread pool (per-position scalar matvecs). The GPU is nearly idle: at
+n=128 the batched-matmul GPU kernel time is ~114 ms of the ~6387 ms prefill
+(`cuda-matvec-prof`), the rest is host thread-pool work (`threadpool-prof`: 83 s
+work / 16.8 s handshake summed across workers).
+
+**Reading.** Prefill is ~85–100× behind llama.cpp — a far larger gap than decode
+(1.02×). It is a host-bound + column-loop gap, not a kernel gap: the same
+single-column q8_1 gemv that makes decode competitive is reused verbatim for
+prefill, where it serializes the prompt. The fix is a real batched quantized GEMM
+(or cuBLAS) plus moving the host-side per-position work to the device; deferred
+(measure-only item, see §5).
+
 ## 2. Per-kernel GPU time (decode @ depth 512, CUDA Graphs ON, post-Phase-3)
 
 nsys `gpukernsum` of the decode spine — GPU kernel-time share by family:
@@ -274,6 +313,13 @@ The decode step is now dominated by a single family: **gemv q8_1 dp4a = 64.4% of
 GPU time**. Everything below is ranked by the project's implementation precedence
 (MLIR > graph optimization > hand-written kernels), but the top lever happens to
 be hand-written because the K-quant format is SonicBoom-owned.
+
+**New top lever — prefill (§1.4).** The one-shot prefill runs ~20 tok/s vs
+llama.cpp's ~2000 tok/s (~85–100×), host-bound with a per-column (non-batched)
+matmul, and it caps out at `n = 512` (SWA ring-wrap). That gap dwarfs every
+decode lever below and is the first thing to fix for any long-prompt workload;
+it is a measure-only finding for now (the fix is a real batched quantized GEMM /
+cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
 
 1. **手写 (hand-written) — the q8_1 gemv is the floor and the lever.** The gemv
    is 64% and is already the full llama.cpp mmvq port (q8_1 int8 activation +
