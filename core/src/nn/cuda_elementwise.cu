@@ -927,6 +927,304 @@ __global__ void flash_attention_chunk_pos_kernel(
   for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
 }
 
+// ---------------------------------------------------------------------------
+// Tiled tensor-core flash attention (fp16 mma.m16n8k16) for chunked prefill.
+//
+// Replaces flash_attention_chunk_pos_kernel's one-warp-per-(position, head)
+// scalar-fp32 walk (which re-reads K/V from global memory once per position and
+// dots in scalar fp32) with a block-per-(KV head x QB-query-segment) tile:
+//   - K and V are loaded into shared memory once per BK-key tile and reused by
+//     every query head and every query position in the block;
+//   - the q·k^T and p·v products use fp16 tensor cores (m16n8k16) with fp32
+//     accumulation, so the per-position scalar dot becomes a matmul;
+//   - the [n_q, n_kv] score matrix is still never materialized (online softmax);
+//   - the ring slot j % n_slots is computed once per key load, not per dot.
+//
+// Block layout: blockIdx.y == KV head, blockIdx.x == QB-query segment (chunk
+// relative). Each warp owns one m-tile (16 queries of one query head): with GQA
+// query heads per KV head and QB/16 m-tiles per head there are GQA*(QB/16) m-
+// tiles. NW warps per m-tile split the head_dim for the p·v product only
+// (NW=1 for head_dim=256, NW=2 for head_dim=512) so the fp32 output accumulator
+// stays at 16*(head_dim/NW)/32 = 128 floats/thread; with NW>1 each warp
+// redundantly computes the full q·k^T + softmax (the score matrix is only 16x16
+// per sub-tile) and skips any cross-warp reduction. Q is converted to fp16 in
+// registers (round-to-nearest), matching the fp16-rounded K/V the caller already
+// staged via cast_fp16; the running max / sum / output stay fp32.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ uint32_t fa_pack2(float x, float y) {
+  __half2 h = __floats2half2_rn(x, y);
+  return *reinterpret_cast<uint32_t*>(&h);
+}
+
+// D(16x8 f32) += A(16x16 f16) x B(16x8 f16) — mma.m16n8k16.row.col.
+__device__ __forceinline__ void fa_mma(float c[4], const uint32_t a[4],
+                                       const uint32_t b[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// A-fragment (16x16 fp16) from the global Q buffer: rows = query positions
+// qr..qr+15 (chunk-relative), cols = dim k0..k0+15, for query head hq. Rows
+// beyond the chunk (>= n) are zero-filled so they read no OOB memory (their
+// output is never written).
+__device__ __forceinline__ void fa_load_q(uint32_t a[4], const float* __restrict__ q,
+                                          int hq, int n_heads_q, int head_dim,
+                                          int qr, int k0, int n) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const size_t row_stride = (size_t)n_heads_q * head_dim;
+  const int r0 = qr + g;
+  const int r1 = qr + g + 8;
+  const bool v0 = r0 < n;
+  const bool v1 = r1 < n;
+  const float* p0 = q + (size_t)r0 * row_stride + (size_t)hq * head_dim + k0;
+  const float* p1 = q + (size_t)r1 * row_stride + (size_t)hq * head_dim + k0;
+  a[0] = fa_pack2(v0 ? p0[t * 2] : 0.0f, v0 ? p0[t * 2 + 1] : 0.0f);
+  a[1] = fa_pack2(v1 ? p1[t * 2] : 0.0f, v1 ? p1[t * 2 + 1] : 0.0f);
+  a[2] = fa_pack2(v0 ? p0[t * 2 + 8] : 0.0f, v0 ? p0[t * 2 + 9] : 0.0f);
+  a[3] = fa_pack2(v1 ? p1[t * 2 + 8] : 0.0f, v1 ? p1[t * 2 + 9] : 0.0f);
+}
+
+// B-fragment (16x8 fp16) from the K tile [BK][head_dim]: the n-dimension is keys
+// key_off..key_off+7 (g in the fragment), the k-dimension is head_dim k0..k0+15.
+__device__ __forceinline__ void fa_load_k(uint32_t b[2], const __half* __restrict__ k_tile,
+                                          int head_dim, int k0, int key_off) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const __half* p = k_tile + (key_off + g) * head_dim + k0;
+  b[0] = *reinterpret_cast<const uint32_t*>(p + t * 2);
+  b[1] = *reinterpret_cast<const uint32_t*>(p + t * 2 + 8);
+}
+
+// B-fragment (16x8 fp16) from the transposed V tile [head_dim][v_stride]: the
+// n-dimension is head_dim n0..n0+7 (g), the k-dimension is keys key_off..+15.
+__device__ __forceinline__ void fa_load_v(uint32_t b[2], const __half* __restrict__ v_tile,
+                                          int v_stride, int n0, int key_off) {
+  const int lane = threadIdx.x & 31;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const __half* p = v_tile + (n0 + g) * v_stride + key_off;
+  b[0] = *reinterpret_cast<const uint32_t*>(p + t * 2);
+  b[1] = *reinterpret_cast<const uint32_t*>(p + t * 2 + 8);
+}
+
+// Butterfly max / sum over the 4 lanes of this thread's fragment group (the
+// t = lane&3 lanes that collectively hold a 16-key row). width=4 segments the
+// warp into the {4g..4g+3} groups.
+__device__ __forceinline__ float fa_rmax4(float x) {
+  x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1, 4));
+  x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2, 4));
+  return x;
+}
+__device__ __forceinline__ float fa_rsum4(float x) {
+  x += __shfl_xor_sync(0xffffffffu, x, 1, 4);
+  x += __shfl_xor_sync(0xffffffffu, x, 2, 4);
+  return x;
+}
+
+template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+__global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
+    flash_attention_tiled_kernel(
+        const float* __restrict__ q, const float* __restrict__ k_batch,
+        const float* __restrict__ v_batch, const float* __restrict__ k_cache,
+        const float* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
+        uint64_t n_slots, int n_heads_q, int n_heads_kv, int n,
+        uint64_t sliding_window, float scale, float* __restrict__ out) {
+  constexpr int V_STRIDE = BK + 2;  // pad the transposed V tile against bank conflicts
+  constexpr int N_TILES = HEAD_DIM / NW / 8;  // p·v n-tiles in this warp's dim slice
+  extern __shared__ __half smem[];
+  __half* k_tile = smem;                    // [BK][HEAD_DIM]
+  __half* v_tile = smem + BK * HEAD_DIM;    // [HEAD_DIM][V_STRIDE] (transposed)
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;              // [0, NW*GQA*(QB/16))
+  const int unit = warp / NW;                     // one (head, m-tile) unit
+  const int head_idx = unit / (QB / 16);          // 0..GQA-1
+  const int m_tile = unit % (QB / 16);            // 0..QB/16-1
+  const int dim_slice = warp % NW;                // head_dim slice for p·v
+  const int hq = blockIdx.y * GQA + head_idx;     // global query head
+  const int qr = blockIdx.x * QB + m_tile * 16;   // chunk-relative query base
+  const int dim0 = dim_slice * (HEAD_DIM / NW);
+
+  const int g = lane >> 2;  // fragment group 0..7
+  const int t = lane & 3;   // thread in group 0..3
+
+  const uint64_t start = *start_ptr;
+
+  // online-softmax state for the two rows this thread owns (g, g+8).
+  float m[2] = {-1e30f, -1e30f};
+  float l[2] = {0.0f, 0.0f};
+  float o[N_TILES][4];
+  #pragma unroll
+  for (int i = 0; i < N_TILES; ++i)
+    o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
+
+  const uint64_t abs_pb = start + (uint64_t)blockIdx.x * QB;
+  const int n_blk = (n - blockIdx.x * QB < QB) ? (n - blockIdx.x * QB) : QB;
+  const uint64_t key_end = abs_pb + (uint64_t)n_blk - 1;  // last query (absolute)
+  // key_start: earliest key any query in this segment attends.
+  const uint64_t key_start =
+      (sliding_window > 0 && abs_pb >= sliding_window)
+          ? (abs_pb - sliding_window + 1)
+          : 0;
+  // Align the key-tile start down to a BK multiple so tile boundaries are global
+  // (absolute-position) aligned, independent of how the prompt is split into
+  // chunks. Otherwise the online-softmax rescaling points would shift with the
+  // chunking, and prefix reuse would no longer reproduce the full prefill
+  // bit-for-bit (the earlier keys a block loads before its earliest window are
+  // masked and contribute 0, so the extra aligned tiles are no-ops).
+  const uint64_t j0_start = (key_start / (uint64_t)BK) * (uint64_t)BK;
+
+  const uint64_t p0 = start + (uint64_t)(qr + g);      // row g absolute position
+  const uint64_t p1 = start + (uint64_t)(qr + g + 8);  // row g+8 absolute position
+  const uint64_t low0 = (sliding_window > 0 && p0 >= sliding_window)
+                            ? (p0 - sliding_window + 1)
+                            : 0;
+  const uint64_t low1 = (sliding_window > 0 && p1 >= sliding_window)
+                            ? (p1 - sliding_window + 1)
+                            : 0;
+
+  for (uint64_t j0 = j0_start; j0 <= key_end; j0 += BK) {
+    // ---- cooperative K/V tile load into smem (whole block) ----------------
+    for (int idx = threadIdx.x; idx < BK * HEAD_DIM; idx += blockDim.x) {
+      const int kk = idx / HEAD_DIM;
+      const int d = idx % HEAD_DIM;
+      const uint64_t j = j0 + (uint64_t)kk;
+      float kv = 0.0f;
+      if (j <= key_end) {
+        const float* row;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          row = k_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+        } else {
+          const uint64_t bi = j - start;
+          row = k_batch + (bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+        }
+        kv = row[d];
+      }
+      k_tile[kk * HEAD_DIM + d] = __float2half_rn(kv);
+    }
+    for (int idx = threadIdx.x; idx < BK * HEAD_DIM; idx += blockDim.x) {
+      const int kk = idx / HEAD_DIM;
+      const int d = idx % HEAD_DIM;
+      const uint64_t j = j0 + (uint64_t)kk;
+      float vv = 0.0f;
+      if (j <= key_end) {
+        const float* row;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          row = v_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+        } else {
+          const uint64_t bi = j - start;
+          row = v_batch + (bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+        }
+        vv = row[d];
+      }
+      v_tile[d * V_STRIDE + kk] = __float2half_rn(vv);
+    }
+    __syncthreads();
+
+    // ---- this warp's m-tile over the 16-key sub-tiles of the K tile -------
+    for (int key_off = 0; key_off < BK; key_off += 16) {
+      // 1. q·k^T over the full head_dim: S[16 queries][16 keys].
+      float s0[4] = {0.f, 0.f, 0.f, 0.f}, s1[4] = {0.f, 0.f, 0.f, 0.f};
+      for (int k0 = 0; k0 < HEAD_DIM; k0 += 16) {
+        uint32_t aq[4];
+        fa_load_q(aq, q, hq, n_heads_q, HEAD_DIM, qr, k0, n);
+        uint32_t bk[2];
+        fa_load_k(bk, k_tile, HEAD_DIM, k0, key_off);
+        fa_mma(s0, aq, bk);
+        fa_load_k(bk, k_tile, HEAD_DIM, k0, key_off + 8);
+        fa_mma(s1, aq, bk);
+      }
+
+      // 2. scale + causal/window mask. Keys jb, jb+1 (s0) and jb+8, jb+9 (s1).
+      const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
+      s0[0] = (jb > p0 || jb < low0) ? -1e30f : s0[0] * scale;
+      s0[1] = (jb + 1 > p0 || jb + 1 < low0) ? -1e30f : s0[1] * scale;
+      s1[0] = (jb + 8 > p0 || jb + 8 < low0) ? -1e30f : s1[0] * scale;
+      s1[1] = (jb + 9 > p0 || jb + 9 < low0) ? -1e30f : s1[1] * scale;
+      s0[2] = (jb > p1 || jb < low1) ? -1e30f : s0[2] * scale;
+      s0[3] = (jb + 1 > p1 || jb + 1 < low1) ? -1e30f : s0[3] * scale;
+      s1[2] = (jb + 8 > p1 || jb + 8 < low1) ? -1e30f : s1[2] * scale;
+      s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
+
+      // 3. online-softmax: row max over the 16 keys (reduce over the group).
+      const float mx0 = fa_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
+      const float mx1 = fa_rmax4(fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3])));
+      const float m_new0 = fmaxf(m[0], mx0);
+      const float m_new1 = fmaxf(m[1], mx1);
+      const float rs0 = expf(m[0] - m_new0);
+      const float rs1 = expf(m[1] - m_new1);
+
+      const float p00 = (s0[0] > -1e29f) ? expf(s0[0] - m_new0) : 0.0f;
+      const float p01 = (s0[1] > -1e29f) ? expf(s0[1] - m_new0) : 0.0f;
+      const float p08 = (s1[0] > -1e29f) ? expf(s1[0] - m_new0) : 0.0f;
+      const float p09 = (s1[1] > -1e29f) ? expf(s1[1] - m_new0) : 0.0f;
+      const float p10 = (s0[2] > -1e29f) ? expf(s0[2] - m_new1) : 0.0f;
+      const float p11 = (s0[3] > -1e29f) ? expf(s0[3] - m_new1) : 0.0f;
+      const float p18 = (s1[2] > -1e29f) ? expf(s1[2] - m_new1) : 0.0f;
+      const float p19 = (s1[3] > -1e29f) ? expf(s1[3] - m_new1) : 0.0f;
+
+      const float sum0 = fa_rsum4(p00 + p01 + p08 + p09);
+      const float sum1 = fa_rsum4(p10 + p11 + p18 + p19);
+      l[0] = l[0] * rs0 + sum0;
+      l[1] = l[1] * rs1 + sum1;
+
+      // 4. rescale the output accumulator, then p·v on this warp's dim slice.
+      #pragma unroll
+      for (int i = 0; i < N_TILES; ++i) {
+        o[i][0] *= rs0;
+        o[i][1] *= rs0;
+        o[i][2] *= rs1;
+        o[i][3] *= rs1;
+      }
+      uint32_t ap[4];
+      ap[0] = fa_pack2(p00, p01);
+      ap[1] = fa_pack2(p10, p11);
+      ap[2] = fa_pack2(p08, p09);
+      ap[3] = fa_pack2(p18, p19);
+      #pragma unroll
+      for (int i = 0; i < N_TILES; ++i) {
+        uint32_t bv[2];
+        fa_load_v(bv, v_tile, V_STRIDE, dim0 + i * 8, key_off);
+        fa_mma(o[i], ap, bv);
+      }
+      m[0] = m_new0;
+      m[1] = m_new1;
+    }
+    __syncthreads();
+  }
+
+  // ---- finalize: out[d] = o[d] / l, written only for in-chunk rows --------
+  const float inv0 = 1.0f / l[0];
+  const float inv1 = 1.0f / l[1];
+  const int iq0 = qr + g;
+  const int iq1 = qr + g + 8;
+  if (iq0 < n) {
+    float* orow = out + ((size_t)iq0 * n_heads_q + hq) * HEAD_DIM + dim0;
+    #pragma unroll
+    for (int i = 0; i < N_TILES; ++i) {
+      orow[i * 8 + t * 2] = o[i][0] * inv0;
+      orow[i * 8 + t * 2 + 1] = o[i][1] * inv0;
+    }
+  }
+  if (iq1 < n) {
+    float* orow = out + ((size_t)iq1 * n_heads_q + hq) * HEAD_DIM + dim0;
+    #pragma unroll
+    for (int i = 0; i < N_TILES; ++i) {
+      orow[i * 8 + t * 2] = o[i][2] * inv1;
+      orow[i * 8 + t * 2 + 1] = o[i][3] * inv1;
+    }
+  }
+}
+
 // --- device state (scratch + weight cache) ----------------------------------
 
 struct DeviceWeight {
@@ -1845,6 +2143,29 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
+template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+bool launch_tiled_flash_attention(const float* q, const float* k_batch,
+                                  const float* v_batch, const float* k_cache,
+                                  const float* v_cache, const uint64_t* start,
+                                  uint64_t n_slots, int n, int n_heads_q,
+                                  int n_heads_kv, uint64_t sliding_window,
+                                  float scale, float* out) {
+  constexpr int threads = NW * GQA * (QB / 16) * 32;
+  constexpr int smem_bytes = HEAD_DIM * (2 * BK + 2) * (int)sizeof(__half);
+  auto kfn = flash_attention_tiled_kernel<HEAD_DIM, BK, NW, QB, GQA>;
+  static bool configured = false;
+  if (!configured) {
+    cudaFuncSetAttribute((const void*)kfn,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+    configured = true;
+  }
+  const int grid_x = (n + QB - 1) / QB;
+  kfn<<<dim3(grid_x, n_heads_kv), threads, smem_bytes, cur_stream()>>>(
+      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q, n_heads_kv,
+      n, sliding_window, scale, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    const float* v_batch, const float* k_cache,
                                    const float* v_cache, const uint64_t* start,
@@ -1860,6 +2181,19 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (n_heads_q % n_heads_kv != 0) return false;
   if (head_dim % 32 != 0 || head_dim > 512) return false;
   if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+
+  // Tiled tensor-core path: Gemma's GQA=4 with the SWA head (256) or the global
+  // head (512). Anything else keeps the scalar-fp32 kernel.
+  const int gqa = n_heads_q / n_heads_kv;
+  if (gqa == 4 && head_dim == 256)
+    return launch_tiled_flash_attention<256, 64, 1, 32, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (gqa == 4 && head_dim == 512)
+    return launch_tiled_flash_attention<512, 32, 2, 16, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
       q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
