@@ -81,6 +81,18 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
 bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols,
                  std::span<const float> x, std::span<float> y);
 
+// Batched dense matvec (the prefill shape): Y[r*n+c] = sum_i W[r*cols+i] *
+// X[i*n+c]. X is host row-major [cols, n] (n innermost), Y is host row-major
+// [rows, n]. Every n (including n == 1, which packs one real column plus 127
+// zero pads) routes to cuBLAS via fixed-width 128-column blocks, so a column's
+// numerics are identical across batch sizes and offsets — the property
+// prefix-cache reuse depends on. Uploads X, copies Y back. Same failure
+// semantics as matvec_f32/bf16.
+bool matmul_f32(std::span<const float> W, uint64_t cols, std::span<const float> X,
+                std::span<float> Y, uint64_t n);
+bool matmul_bf16(std::span<const uint16_t> W, uint64_t cols,
+                 std::span<const float> X, std::span<float> Y, uint64_t n);
+
 // Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
 // tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
 // never materialized. q is [n_q, n_heads_q, head_dim]; k/v are [n_kv, n_heads_kv,

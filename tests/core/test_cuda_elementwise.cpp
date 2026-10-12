@@ -197,6 +197,83 @@ void test_matvec_bf16(std::mt19937& rng) {
   check_cmp("cuda::matvec_bf16 matches CPU", y, yr);
 }
 
+// Fixed-width cuBLAS batch-invariance (Phase C Step 3): the same activation
+// column must produce a bitwise-identical output regardless of the batch size it
+// is packed into or its column offset within that batch. Prefix-cache reuse
+// splits a prompt at arbitrary non-512-aligned boundaries, so a position lands
+// in differently-sized segments between a full prefill and a reuse continuation;
+// the fixed 128-column blocks are what make those two paths write identical KV.
+void test_matmul_f32_batch_invariant(std::mt19937& rng) {
+  const uint64_t cols = 256, rows = 128;
+  std::vector<float> W(cols * rows);
+  for (auto& v : W) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  const uint64_t nref = 512;
+  std::vector<float> Xref(cols * nref), Yref(rows * nref);
+  for (auto& v : Xref) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  check(sbnn::cuda::matmul_f32(W, cols, Xref, Yref, nref),
+        "cuda::matmul_f32 (n=512) returns true");
+
+  const int ns[] = {1, 2, 37, 96, 128, 129, 512};
+  const int probes[] = {0, 1, 127, 128, 255, 511};
+  const int offs[] = {0, 1, 63, 127, 128, 255, 511};
+  int ndiff = 0;
+  for (int n : ns)
+    for (int j : probes)
+      for (int off : offs) {
+        if (off >= n) continue;
+        std::vector<float> X(cols * n, 0.0f), Y(rows * n);
+        for (uint64_t k = 0; k < cols; ++k) X[k * n + off] = Xref[k * nref + j];
+        check(sbnn::cuda::matmul_f32(W, cols, X, Y, uint64_t(n)),
+              "cuda::matmul_f32 returns true");
+        for (uint64_t r = 0; r < rows; ++r)
+          if (std::bit_cast<uint32_t>(Y[r * n + off]) !=
+              std::bit_cast<uint32_t>(Yref[r * nref + j])) {
+            if (ndiff < 4)
+              std::cerr << "    f32 n=" << n << " probe=" << j << " off=" << off
+                        << " row=" << r << "\n";
+            ++ndiff;
+          }
+      }
+  check(ndiff == 0, "cuda::matmul_f32 batch-invariant (bitwise across n/offset)");
+}
+
+void test_matmul_bf16_batch_invariant(std::mt19937& rng) {
+  const uint64_t cols = 256, rows = 128;
+  std::vector<uint16_t> W(cols * rows);
+  for (auto& v : W)
+    v = f32_to_bf16(std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng));
+
+  const uint64_t nref = 512;
+  std::vector<float> Xref(cols * nref), Yref(rows * nref);
+  for (auto& v : Xref) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  check(sbnn::cuda::matmul_bf16(W, cols, Xref, Yref, nref),
+        "cuda::matmul_bf16 (n=512) returns true");
+
+  const int ns[] = {1, 2, 37, 96, 128, 129, 512};
+  const int probes[] = {0, 1, 127, 128, 255, 511};
+  const int offs[] = {0, 1, 63, 127, 128, 255, 511};
+  int ndiff = 0;
+  for (int n : ns)
+    for (int j : probes)
+      for (int off : offs) {
+        if (off >= n) continue;
+        std::vector<float> X(cols * n, 0.0f), Y(rows * n);
+        for (uint64_t k = 0; k < cols; ++k) X[k * n + off] = Xref[k * nref + j];
+        check(sbnn::cuda::matmul_bf16(W, cols, X, Y, uint64_t(n)),
+              "cuda::matmul_bf16 returns true");
+        for (uint64_t r = 0; r < rows; ++r)
+          if (std::bit_cast<uint32_t>(Y[r * n + off]) !=
+              std::bit_cast<uint32_t>(Yref[r * nref + j])) {
+            if (ndiff < 4)
+              std::cerr << "    bf16 n=" << n << " probe=" << j << " off=" << off
+                        << " row=" << r << "\n";
+            ++ndiff;
+          }
+      }
+  check(ndiff == 0, "cuda::matmul_bf16 batch-invariant (bitwise across n/offset)");
+}
+
 void test_flash_attention(std::mt19937& rng) {
   // GQA prefill: n_heads_q=8, n_heads_kv=2 (group=4). Compare the CUDA flash
   // attention against the CPU full-SDPA reference (scaled_dot_product_attention).
@@ -274,6 +351,8 @@ int main() {
   test_rope_heads(rng);
   test_matvec_f32(rng);
   test_matvec_bf16(rng);
+  test_matmul_f32_batch_invariant(rng);
+  test_matmul_bf16_batch_invariant(rng);
   test_flash_attention(rng);
 
   if (g_failures == 0) {

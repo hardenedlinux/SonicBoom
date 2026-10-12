@@ -21,6 +21,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +30,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 // CUDA kernels for the native-transformer elementwise / norm / RoPE ops and the
@@ -1279,6 +1281,10 @@ void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k
 size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
+void* g_xpack = nullptr;        // repacked activation column-block for the cuBLAS dense matvec ([cols, 128])
+size_t g_xpack_bytes = 0;
+void* g_outpack = nullptr;      // padded output column-block ([rows, 128])
+size_t g_outpack_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
 
 bool g_available_checked = false;
@@ -1509,6 +1515,53 @@ __global__ void gemv_bf16_batched(const uint16_t* __restrict__ W,
   float acc = 0.0f;
   for (int i = 0; i < cols; ++i) acc += bf16_to_float(wrow[i]) * x[(size_t)i * ncols + c];
   y[idx] = acc;
+}
+
+// Fixed column-block width for the cuBLAS dense matvec (Phase C Step 3). Every
+// cuBLAS call is shaped (m=128, k=cols, lda=ldc=128) regardless of the batch n,
+// so the per-column numerics are independent of both n and the column offset —
+// the property prefix-cache reuse relies on (the chunker splits full and reuse
+// prefills into differently-sized segments at the same 512-aligned boundaries).
+constexpr int kDenseCublasWidth = 128;
+
+// Repack a [cols, ncols] activation slice (columns [c0, c0+chunk_n)) into a
+// tight [cols, 128] block, zero-filling the trailing padding columns. Every
+// chunk of the same activation lands at the same stride (128), so the GEMM shape
+// (m, k, lda) is identical across chunks and across n values.
+__global__ void pack_f32_chunk_kernel(const float* __restrict__ x,
+                                      float* __restrict__ dst, int cols,
+                                      int ncols, int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = cols * kDenseCublasWidth;
+  if (idx >= total) return;
+  const int row = idx / kDenseCublasWidth;
+  const int p = idx - row * kDenseCublasWidth;
+  dst[idx] = (p < chunk_n) ? x[(size_t)row * ncols + (c0 + p)] : 0.0f;
+}
+
+__global__ void pack_bf16_chunk_kernel(const float* __restrict__ x,
+                                       uint16_t* __restrict__ dst, int cols,
+                                       int ncols, int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = cols * kDenseCublasWidth;
+  if (idx >= total) return;
+  const int row = idx / kDenseCublasWidth;
+  const int p = idx - row * kDenseCublasWidth;
+  dst[idx] = (p < chunk_n) ? float_to_bf16(x[(size_t)row * ncols + (c0 + p)])
+                           : uint16_t(0);
+}
+
+// Copy the first `chunk_n` columns of a [rows, 128] result block back into the
+// [rows, ncols] output at column offset c0 (the padding columns are dropped).
+__global__ void copyback_chunk_kernel(const float* __restrict__ src,
+                                      float* __restrict__ dst, int rows,
+                                      int ncols, int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * chunk_n;
+  if (idx >= total) return;
+  const int r = idx / chunk_n;
+  const int p = idx - r * chunk_n;
+  dst[(size_t)r * ncols + (c0 + p)] = src[(size_t)r * kDenseCublasWidth + p];
 }
 
 // Append n consecutive rows into the flat KV cache. Each thread copies one
@@ -1841,6 +1894,51 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(y.data(), d_y, rows * sizeof(float), cudaMemcpyDeviceToHost) ==
          cudaSuccess;
+}
+
+// Batched dense matvec (the prefill shape): Y[r*n+c] = sum_i W[r*cols+i] *
+// X[i*n+c]. X is host row-major [cols, n] (n innermost), Y is host row-major
+// [rows, n]. Uploads X, runs the device batched matvec (cuBLAS fixed-width
+// blocks for every n, including n == 1), and copies Y back. Same
+// contracts/failure semantics as matvec_f32.
+bool matmul_f32(std::span<const float> W, uint64_t cols, std::span<const float> X,
+                std::span<float> Y, uint64_t n) {
+  if (!available()) return false;
+  if (cols == 0 || n == 0 || X.size() < cols * n || Y.size() < n) return false;
+  const uint64_t rows = Y.size() / n;
+  if (rows == 0 || W.size() < cols * rows) return false;
+  void* d_x = grow_scratch(g_dx, g_dx_bytes, cols * n * sizeof(float));
+  void* d_y = grow_scratch(g_dy, g_dy_bytes, rows * n * sizeof(float));
+  if (!d_x || !d_y) return false;
+  if (cudaMemcpy(d_x, X.data(), cols * n * sizeof(float), cudaMemcpyHostToDevice) !=
+      cudaSuccess)
+    return false;
+  if (!matvec_f32_batched_dev(W, int(cols), static_cast<const float*>(d_x),
+                              static_cast<float*>(d_y), int(rows), int(n)))
+    return false;
+  return cudaMemcpy(Y.data(), d_y, rows * n * sizeof(float),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+// bf16 twin of matmul_f32 (W is raw uint16_t bf16). The activation is rounded
+// through bf16 inside the cuBLAS path's repack, matching the prefill spine.
+bool matmul_bf16(std::span<const uint16_t> W, uint64_t cols,
+                 std::span<const float> X, std::span<float> Y, uint64_t n) {
+  if (!available()) return false;
+  if (cols == 0 || n == 0 || X.size() < cols * n || Y.size() < n) return false;
+  const uint64_t rows = Y.size() / n;
+  if (rows == 0 || W.size() < cols * rows) return false;
+  void* d_x = grow_scratch(g_dx, g_dx_bytes, cols * n * sizeof(float));
+  void* d_y = grow_scratch(g_dy, g_dy_bytes, rows * n * sizeof(float));
+  if (!d_x || !d_y) return false;
+  if (cudaMemcpy(d_x, X.data(), cols * n * sizeof(float), cudaMemcpyHostToDevice) !=
+      cudaSuccess)
+    return false;
+  if (!matvec_bf16_batched_dev(W, int(cols), static_cast<const float*>(d_x),
+                               static_cast<float*>(d_y), int(rows), int(n)))
+    return false;
+  return cudaMemcpy(Y.data(), d_y, rows * n * sizeof(float),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 bool flash_attention(std::span<const float> q, uint64_t n_q,
@@ -2319,6 +2417,120 @@ bool transpose_dev(const float* src, float* dst, int dim, int ncols, bool forwar
   return cudaGetLastError() == cudaSuccess;
 }
 
+// cuBLAS path for the batched dense projection (Phase C Step 3). On by default;
+// SONICBOOM_DENSE_CUBLAS=0 restores the per-(row,col) gemv for A/B measurement.
+bool dense_cublas_enabled() noexcept {
+  if (std::getenv("SONICBOOM_DENSE_CUBLAS") == nullptr) return true;
+  return std::string_view(std::getenv("SONICBOOM_DENSE_CUBLAS")) != "0";
+}
+
+// n (batch) threshold at or above which the cuBLAS path is used. This must be 1,
+// not 2: a prefix-reuse suffix whose start_pos leaves exactly one token before
+// the next chunk boundary splits into a 1-column segment (gemma4_plan.cpp:1187),
+// and that lone column must be reduced by the SAME cuBLAS kernel as the n >= 2
+// segment the full prefill computes it in — the per-(row,col) gemv has a
+// different reduction order and would make the reused KV diverge. The decode
+// spine's single-column path is a different entry point (matvec_f32, not the
+// batched one) and is unaffected. The fixed-width 128-column blocking makes the
+// cuBLAS per-column numerics independent of n (including n == 1, which packs one
+// real column plus 127 zero pads into the same (m=128, n=rows, k=cols) shape).
+constexpr int kDenseCublasMinN = 1;
+int dense_cublas_min_n() {
+  static int v = [] {
+    if (const char* e = std::getenv("SONICBOOM_DENSE_CUBLAS_MIN_N")) {
+      const int x = std::atoi(e);
+      if (x > 0) return x;
+    }
+    return kDenseCublasMinN;
+  }();
+  return v;
+}
+
+// Fixed workspace so cuBLAS never lazily allocates inside a CUDA Graph capture
+// (stream capture forbids host-side allocations). Ample for a single 128-column
+// fp32/bf16 GEMM with fp32 accumulate.
+constexpr size_t kDenseCublasWorkspaceBytes = 4 * 1024 * 1024;
+
+// Lazily create the process-wide cuBLAS handle for the dense projections, bound
+// to CUBLAS_DEFAULT_MATH (full fp32 Sgemm, no TF32 tensor ops; bf16 GemmEx uses
+// CUBLAS_COMPUTE_32F tensor cores explicitly and is unaffected). Returns nullptr
+// on failure (the caller falls back to the per-(row,col) gemv).
+cublasHandle_t dense_cublas_handle() {
+  static cublasHandle_t h = nullptr;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!h) {
+    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
+      h = nullptr;
+      return nullptr;
+    }
+    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
+    void* ws = nullptr;
+    if (cudaMalloc(&ws, kDenseCublasWorkspaceBytes) == cudaSuccess)
+      cublasSetWorkspace(h, ws, kDenseCublasWorkspaceBytes);
+  }
+  return h;
+}
+
+// Blocked cuBLAS matvec for the dense f32 projection. x is [cols, ncols], y is
+// [rows, ncols] (ncols innermost); W is [rows, cols] row-major on device. The n
+// columns are repacked into fixed-width 128-column blocks so every cuBLAS call
+// has shape (m=128, n=rows, k=cols, lda=ldc=128) — the same per-column numerics
+// regardless of n or column offset.
+bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
+                           int rows, int ncols) {
+  cublasHandle_t h = dense_cublas_handle();
+  if (!h) return false;
+  float* xpack = static_cast<float*>(grow_scratch(
+      g_xpack, g_xpack_bytes, (size_t)cols * kDenseCublasWidth * sizeof(float)));
+  float* outpack = static_cast<float*>(grow_scratch(
+      g_outpack, g_outpack_bytes, (size_t)rows * kDenseCublasWidth * sizeof(float)));
+  if (!xpack || !outpack) return false;
+
+  cublasSetStream(h, cur_stream());
+  const float alpha = 1.0f, beta = 0.0f;
+  for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
+    const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
+    pack_f32_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                            cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
+    const cublasStatus_t st = cublasSgemm(
+        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
+        kDenseCublasWidth, d_w, cols, &beta, outpack, kDenseCublasWidth);
+    if (st != CUBLAS_STATUS_SUCCESS) return false;
+    copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+        outpack, y, rows, ncols, c0, chunk_n);
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
+                            float* y, int rows, int ncols) {
+  cublasHandle_t h = dense_cublas_handle();
+  if (!h) return false;
+  uint16_t* xpack = static_cast<uint16_t*>(grow_scratch(
+      g_xpack, g_xpack_bytes,
+      (size_t)cols * kDenseCublasWidth * sizeof(uint16_t)));
+  float* outpack = static_cast<float*>(grow_scratch(
+      g_outpack, g_outpack_bytes, (size_t)rows * kDenseCublasWidth * sizeof(float)));
+  if (!xpack || !outpack) return false;
+
+  cublasSetStream(h, cur_stream());
+  const float alpha = 1.0f, beta = 0.0f;
+  for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
+    const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
+    pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                             cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
+    const cublasStatus_t st = cublasGemmEx(
+        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
+        CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
+        CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) return false;
+    copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+        outpack, y, rows, ncols, c0, chunk_n);
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
                             float* y, int rows, int ncols) {
   if (!available()) return false;
@@ -2327,6 +2539,9 @@ bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
   const float* d_w = static_cast<const float*>(
       upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
   if (!d_w) return false;
+  if (dense_cublas_enabled() && ncols >= dense_cublas_min_n() &&
+      matvec_f32_cublas_dev(d_w, cols, x, y, rows, ncols))
+    return true;
   const int total = rows * ncols;
   gemv_dense_f32_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
       d_w, x, y, cols, rows, ncols);
@@ -2341,6 +2556,9 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
   const uint16_t* d_w = static_cast<const uint16_t*>(
       upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
+  if (dense_cublas_enabled() && ncols >= dense_cublas_min_n() &&
+      matvec_bf16_cublas_dev(d_w, cols, x, y, rows, ncols))
+    return true;
   const int total = rows * ncols;
   gemv_bf16_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
       d_w, x, y, cols, rows, ncols);
