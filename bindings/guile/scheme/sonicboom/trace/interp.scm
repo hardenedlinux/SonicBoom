@@ -125,6 +125,20 @@ alist (output-name . ctensor) in the graph's output order."
            (x (error "interp: bad output form" x)))
          (field graph 'outputs))))
 
+;; Parsed documents of the last few texts, keyed by the string object (the
+;; tracer hands the executor the same emitted string on every cached call).
+(define %doc-cache '())
+(define (parse-text text)
+  (let ((hit (assq text %doc-cache)))
+    (if hit
+        (cdr hit)
+        (let ((doc (call-with-input-string text read)))
+          (set! %doc-cache (cons (cons text doc)
+                                 (if (> (length %doc-cache) 31)
+                                     (take %doc-cache 31)
+                                     %doc-cache)))
+          doc))))
+
 (define (interpret-sexpr-text text inputs)
   "Parse TEXT (one S-Expr v0.1 document) and evaluate it; see interpret-sexpr."
-  (interpret-sexpr (call-with-input-string text read) inputs))
+  (interpret-sexpr (parse-text text) inputs))

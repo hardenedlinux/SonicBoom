@@ -351,19 +351,53 @@ earlier segments or the call's arguments."
 
 ;;; --- calls ----------------------------------------------------------------------------------
 
-(define (arg-name i) (string-append "arg" (number->string i)))
+;;; Arguments. A tensor argument becomes the graph input "arg<i>"; a list or
+;;; vector argument is walked and each tensor in it becomes "arg<i>.<k>" (k in
+;;; depth-first order), so parameter lists and optimizer state can be passed
+;;; as structures. Everything else in an argument is static: part of the
+;;; cache key and passed to the procedure as is.
+
+(define (arg-tensors args)
+  "Alist (input-name . ctensor) of every tensor in ARGS."
+  (append-map
+   (lambda (a i)
+     (let ((base (string-append "arg" (number->string i))))
+       (if (ctensor? a)
+           (list (cons base a))
+           (let ((k 0) (acc '()))
+             (let walk ((x a))
+               (cond ((ctensor? x)
+                      (set! acc (cons (cons (string-append base "." (number->string k)) x)
+                                      acc))
+                      (set! k (+ k 1)))
+                     ((pair? x) (walk (car x)) (walk (cdr x)))
+                     ((vector? x) (for-each walk (vector->list x)))))
+             (reverse acc)))))
+   args (iota (length args))))
+
+(define (map-tensors f args)
+  "ARGS with each tensor replaced by (F name tensor), names as in arg-tensors."
+  (map (lambda (a i)
+         (let ((base (string-append "arg" (number->string i))))
+           (if (ctensor? a)
+               (f base a)
+               (let ((k 0))
+                 (let walk ((x a))
+                   (cond ((ctensor? x)
+                          (let ((r (f (string-append base "." (number->string k)) x)))
+                            (set! k (+ k 1))
+                            r))
+                         ((pair? x) (let* ((h (walk (car x))) (t (walk (cdr x)))) (cons h t)))
+                         ((vector? x) (list->vector (map walk (vector->list x))))
+                         (else x)))))))
+       args (iota (length args))))
 
 (define (signature args)
-  (map (lambda (a)
-         (if (ctensor? a)
-             (list 'tensor (ctensor-dtype a) (ctensor-shape a))
-             (list 'static a)))
-       args))
+  (map-tensors (lambda (name t) (list 'tensor (ctensor-dtype t) (ctensor-shape t))) args))
 
 (define (reset-env! st args)
   (let ((env (make-table)))
-    (for-each (lambda (a i) (when (ctensor? a) (table-set! env (arg-name i) a)))
-              args (iota (length args)))
+    (for-each (lambda (p) (table-set! env (car p) (cdr p))) (arg-tensors args))
     (set-tstate-env! st env)))
 
 (define (rebuild-env! st path args)
@@ -509,12 +543,9 @@ extended?)."
                (else (restart #t)))))))))
 
 (define (fresh-trace st args)
-  (let ((sym-args (map (lambda (a i)
-                         (if (ctensor? a)
-                             (make-sym (arg-name i) (ctensor-dtype a)
-                                       (ctensor-shape a))
-                             a))
-                       args (iota (length args)))))
+  (let ((sym-args (map-tensors (lambda (name t)
+                                 (make-sym name (ctensor-dtype t) (ctensor-shape t)))
+                               args)))
     (trace-segment st (segment-recorder st '())
                    (lambda () (list 'done (apply (tstate-proc st) sym-args))))))
 
@@ -555,11 +586,9 @@ extended?)."
          (entries (table-ref (tstate-trees st) sig '()))
          (gvals (guard-values st))
          (entry (find-entry entries gvals)))
-    (for-each (lambda (a i)
-                (when (ctensor? a)
-                  (register-type! ctx (arg-name i) (ctensor-dtype a)
-                                  (ctensor-shape a))))
-              args (iota (length args)))
+    (for-each (lambda (p)
+                (register-type! ctx (car p) (ctensor-dtype (cdr p)) (ctensor-shape (cdr p))))
+              (arg-tensors args))
     (let ((fresh? (not entry)))
       (when fresh?
         (stat! st 'traces)

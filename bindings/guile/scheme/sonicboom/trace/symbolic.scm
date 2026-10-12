@@ -45,7 +45,9 @@
             ;; ops
             add sub mul matmul relu neg sum gt lt where bool trace-print
             equal-to logical-and logical-or logical-not
-            div transpose reshape expand apply-op))
+            div transpose permute reshape expand apply-op
+            texp tlog ttanh tsqrt gelu amax mean bmm
+            index-select index-add gather scatter-add concat slice))
 
 ;;; --- symbolic tensor ------------------------------------------------------------
 
@@ -232,7 +234,34 @@ concrete operands become an inline parameter of the current segment."
 (define (logical-or a b) (apply-op 'or (list a b) '()))
 (define (logical-not x) (apply-op 'not (list x) '()))
 (define (div a b) (apply-op 'div (list a b) '()))
-(define (transpose x) (apply-op 'transpose (list x) '()))
+(define (permute x dims) (apply-op 'permute (list x) `((dims (ints ,@dims)))))
+(define (transpose x)
+  "Swap the last two axes."
+  (let ((r (length (shape-of x))))
+    (permute x (append (iota (- r 2)) (list (- r 1) (- r 2))))))
+;; t-prefixed so that R7RS exp / log / sqrt on numbers stay unshadowed
+(define (texp x) (apply-op 'exp (list x) '()))
+(define (tlog x) (apply-op 'log (list x) '()))
+(define (ttanh x) (apply-op 'tanh (list x) '()))
+(define (tsqrt x) (apply-op 'sqrt (list x) '()))
+(define (gelu x) (apply-op 'gelu (list x) '()))
+(define* (amax x #:key (axes '()) (keepdims #f))
+  (apply-op 'reduce_max (list x)
+            `((axes (ints ,@axes)) (keepdims (int ,(if keepdims 1 0))))))
+(define* (mean x #:key (axes '()) (keepdims #f))
+  (apply-op 'reduce_mean (list x)
+            `((axes (ints ,@axes)) (keepdims (int ,(if keepdims 1 0))))))
+(define (bmm a b) (apply-op 'bmm (list a b) '()))
+(define (index-select x axis index)
+  (apply-op 'index_select (list x index) `((axis (int ,axis)))))
+(define (index-add base axis index src)
+  (apply-op 'index_add (list base index src) `((axis (int ,axis)))))
+(define (gather x axis index) (apply-op 'gather (list x index) `((axis (int ,axis)))))
+(define (scatter-add base axis index src)
+  (apply-op 'scatter_add (list base index src) `((axis (int ,axis)))))
+(define (concat xs axis) (apply-op 'concat xs `((axis (int ,axis)))))
+(define (slice x axis start end)
+  (apply-op 'slice (list x) `((axis (int ,axis)) (start (int ,start)) (end (int ,end)))))
 (define (reshape x shape) (apply-op 'reshape (list x) `((shape (ints ,@shape)))))
 (define (expand x shape) (apply-op 'expand (list x) `((shape (ints ,@shape)))))
 
@@ -269,4 +298,5 @@ by aborting to %break-tag with X; the tracer resumes with #t or #f."
 (for-each covered-procedure!
           (list add sub mul matmul relu neg sum gt lt where bool trace-print
                 equal-to logical-and logical-or logical-not
-                div transpose reshape expand))
+                div transpose permute reshape expand texp tlog ttanh tsqrt gelu
+                amax mean bmm index-select index-add gather scatter-add concat slice))

@@ -21,7 +21,9 @@
              (sonicboom trace symbolic)
              (sonicboom trace tracer)
              (sonicboom trace macro)
-             (sonicboom trace autodiff))
+             (sonicboom trace autodiff)
+             (sonicboom trace layers)
+             (sonicboom trace optim))
 
 (define (t x) (list->ctensor x))
 (define (stat f key) (assq-ref (trace-stats f) key))
@@ -32,7 +34,9 @@
 ;;; --- finite differences ----------------------------------------------------------
 
 (define %h 1e-5)
-(define %max-rel 0.0)
+(define %max-rel 0.0)       ; all checks
+(define %max-rel-new 0.0)   ; checks of the Transformer ops section
+(define %in-new-section #f)
 
 (define (perturb tensor i delta)
   (let ((v (vector-copy (ctensor-data tensor))))
@@ -52,6 +56,8 @@
          (iota (ctensor-numel x)))))
 
 (define (rel-error a n) (/ (abs (- a n)) (max (abs a) (abs n) 1e-3)))
+(define (close-list? a b)
+  (and (= (length a) (length b)) (every (lambda (x y) (< (abs (- x y)) 1e-9)) a b)))
 
 (define (grad-ok? loss-fn args which)
   "Analytic gradients (value-and-grad of LOSS-FN) agree with finite
@@ -67,6 +73,8 @@ differences for the argument positions WHICH."
                     (numeric (numeric-grad loss-fn args k))
                     (errs (map rel-error analytic numeric)))
                (set! %max-rel (apply max %max-rel errs))
+               (when %in-new-section
+                 (set! %max-rel-new (apply max %max-rel-new errs)))
                (every (lambda (e) (< e 1e-4)) errs)))
            which)))
 
@@ -199,6 +207,110 @@ differences for the argument positions WHICH."
       #f)
     (lambda (key . args) (string-contains (format #f "~a" args) "graph break"))))
 
+;;; --- Transformer ops ------------------------------------------------------------------
+
+(set! %in-new-section #t)
+
+(define (i64 xs) (make-ctensor 'int64 (list (length xs)) xs))
+(define x34 (t '((0.3 -1.2 0.8 2.1) (1.5 0.2 -0.7 0.4) (-0.9 1.1 0.6 -0.2))))
+(define pos34 (t '((0.3 1.2 0.8 2.1) (1.5 0.2 0.7 0.4) (0.9 1.1 0.6 0.2))))
+(define a234 (make-ctensor 'float32 '(2 3 4)
+                           (map (lambda (i) (* 0.1 (- (modulo (* 7 i) 13) 6))) (iota 24))))
+(define b245 (make-ctensor 'float32 '(2 4 5)
+                           (map (lambda (i) (* 0.1 (- (modulo (* 5 i) 11) 5))) (iota 40))))
+
+(test-assert "grad texp"   (grad-ok? (lambda (x) (weighted (texp x))) (list x34) '(0)))
+(test-assert "grad tlog"   (grad-ok? (lambda (x) (weighted (tlog x))) (list pos34) '(0)))
+(test-assert "grad ttanh"  (grad-ok? (lambda (x) (weighted (ttanh x))) (list x34) '(0)))
+(test-assert "grad tsqrt"  (grad-ok? (lambda (x) (weighted (tsqrt x))) (list pos34) '(0)))
+(test-assert "grad gelu (tanh approximation)"
+  (grad-ok? (lambda (x) (weighted (gelu x))) (list x34) '(0)))
+(test-assert "grad amax (axis 1)"
+  (grad-ok? (lambda (x) (weighted (amax x #:axes '(1)))) (list x34) '(0)))
+(test-assert "grad amax (axis 0, keepdims)"
+  (grad-ok? (lambda (x) (weighted (amax x #:axes '(0) #:keepdims #t))) (list x34) '(0)))
+(test-assert "grad mean (all)"
+  (grad-ok? (lambda (x) (mul (mean x) (mean x))) (list x34) '(0)))
+(test-assert "grad mean (axis 1)"
+  (grad-ok? (lambda (x) (weighted (mean x #:axes '(1)))) (list x34) '(0)))
+(test-assert "grad softmax"     (grad-ok? (lambda (x) (weighted (softmax x 1))) (list x34) '(0)))
+(test-assert "grad log-softmax" (grad-ok? (lambda (x) (weighted (log-softmax x 1))) (list x34) '(0)))
+(test-assert "grad index-select / embedding (repeated ids accumulate)"
+  (grad-ok? (lambda (e ids) (weighted (embedding e ids))) (list x34 (i64 '(2 0 2 1 2))) '(0)))
+(test-assert "grad gather (axis 1)"
+  (grad-ok? (lambda (x ix) (weighted (gather x 1 ix)))
+            (list x34 (make-ctensor 'int64 '(3 2) '(0 3 2 2 1 0))) '(0)))
+(test-assert "grad index-add (base and source)"
+  (grad-ok? (lambda (b s ix) (weighted (index-add b 0 ix s)))
+            (list x34 (t '((1.0 2.0 3.0 4.0) (0.5 0.5 0.5 0.5))) (i64 '(2 2)))
+            '(0 1)))
+(test-assert "grad scatter-add (base and source)"
+  (grad-ok? (lambda (b s ix) (weighted (scatter-add b 1 ix s)))
+            (list x34 (t '((1.0 2.0) (3.0 4.0) (5.0 6.0)))
+                  (make-ctensor 'int64 '(3 2) '(0 0 3 1 2 2)))
+            '(0 1)))
+(test-assert "grad concat (axis 0)"
+  (grad-ok? (lambda (a b) (weighted (concat (list a b a) 0))) (list x34 pos34) '(0 1)))
+(test-assert "grad concat (axis 1)"
+  (grad-ok? (lambda (a b) (weighted (concat (list a b) 1))) (list x34 pos34) '(0 1)))
+(test-assert "grad slice"
+  (grad-ok? (lambda (x) (weighted (slice x 1 1 3))) (list x34) '(0)))
+(test-assert "grad bmm (3-D)" (grad-ok? (lambda (a b) (weighted (bmm a b))) (list a234 b245) '(0 1)))
+(test-assert "grad permute (3-D)"
+  (grad-ok? (lambda (a) (weighted (permute a '(1 0 2)))) (list a234) '(0)))
+(test-assert "grad layer-norm (x, gamma, beta)"
+  (grad-ok? (lambda (x g b) (weighted (layer-norm x g b)))
+            (list x34 (t '(1.0 0.5 -0.3 2.0)) (t '(0.1 0.0 -0.2 0.3))) '(0 1 2)))
+(test-assert "grad rms-norm (x, gamma)"
+  (grad-ok? (lambda (x g) (weighted (rms-norm x g))) (list x34 (t '(1.0 0.5 -0.3 2.0))) '(0 1)))
+(test-assert "grad cross-entropy (logits)"
+  (grad-ok? (lambda (x y) (cross-entropy x y)) (list x34 (i64 '(3 0 1))) '(0)))
+(test-assert "index arguments get no gradient (zeros)"
+  (let ((r ((value-and-grad (lambda (e ids) (sum (embedding e ids)))) x34 (i64 '(1 1)))))
+    (every zero? (ctensor->list (caddr r)))))
+
+(test-assert "log-softmax subtracts the max: huge logits stay finite and exact"
+  (let ((r (ctensor->list ((trace-function (lambda (x) (log-softmax x 0)))
+                           (t '(1000.0 1001.0 1002.0))))))
+    (every (lambda (a b) (< (abs (- a b)) 1e-9))
+           r (let ((lse (+ 1002.0 (log (+ (exp -2.0) (exp -1.0) 1.0)))))
+               (map (lambda (v) (- v lse)) '(1000.0 1001.0 1002.0))))))
+
+(test-assert "softmax rows sum to 1"
+  (every (lambda (row) (< (abs (- 1.0 (apply + row))) 1e-12))
+         (ctensor->nested ((trace-function (lambda (x) (softmax x 1))) x34))))
+
+(set! %in-new-section #f)
+
+;;; --- optimizers ---------------------------------------------------------------------
+
+(define (plain-adam p g m v t lr b1 b2 eps)
+  ;; one Adam step on plain numbers, t = steps already taken
+  (let* ((t1 (+ t 1)) (m* (+ (* b1 m) (* (- 1 b1) g))) (v* (+ (* b2 v) (* (- 1 b2) g g)))
+         (mh (/ m* (- 1 (expt b1 t1)))) (vh (/ v* (- 1 (expt b2 t1)))))
+    (list (- p (* lr (/ mh (+ (sqrt vh) eps)))) m* v*)))
+
+(define-traced (adam-step p ms vs t)
+  ;; minimise sum(p^2): gradient 2p
+  (let* ((loss (sum (mul (car p) (car p))))
+         (gs (grad loss p)))
+    (adam-update p gs ms vs t #:lr 0.1)))
+
+(let* ((p0 '(1.0 -2.0 0.5))
+       (r1 (adam-step (list (t p0)) (list (t '(0.0 0.0 0.0))) (list (t '(0.0 0.0 0.0)))
+                      (scalar->ctensor 0.0 'float32)))
+       (r2 (apply adam-step r1))
+       (expect (let* ((s1 (map (lambda (p) (plain-adam p (* 2 p) 0 0 0 0.1 0.9 0.999 1e-8)) p0))
+                      (s2 (map (lambda (s) (plain-adam (car s) (* 2 (car s)) (cadr s) (caddr s)
+                                                       1 0.1 0.9 0.999 1e-8))
+                               s1)))
+                 (map car s2))))
+  (test-assert "Adam: two traced steps match a plain-Scheme Adam"
+    (close-list? expect (ctensor->list (car (car r2)))))
+  (test-equal "Adam: the step counter is a tensor input/output (no retrace)"
+    '(2.0 1 1) (list (ctensor-item (cadddr r2)) (stat adam-step 'traces)
+                     (stat adam-step 'cache-hits))))
+
 ;;; --- XOR training -------------------------------------------------------------------
 
 (define seed 12345)
@@ -232,7 +344,7 @@ differences for the argument positions WHICH."
           (reverse acc)
           (loop (+ step 1) (cdr r) acc)))))
 
-(format #t "~%max relative gradient error: ~,3e~%" %max-rel)
+(format #t "~%max relative gradient error: ~,3e (Transformer ops: ~,3e)~%" %max-rel %max-rel-new)
 (format #t "XOR loss (step: loss):~%")
 (for-each (lambda (p) (format #t "  ~4d: ~,6f~%" (car p) (cdr p))) curve)
 

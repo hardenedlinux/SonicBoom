@@ -48,8 +48,21 @@ On top of either mechanism:
   counterpart carries it as an `aten` attribute (§4.17);
 - **DCE**: each emitted segment is pruned once, working back from its outputs.
 
-A traced function may return a tensor or a structure (lists, vectors) of
-tensors; the graph then has one output per tensor.
+A traced function may take lists or vectors of tensors as arguments (each
+tensor becomes a graph input `arg<i>.<k>`), and may return a tensor or a
+structure of tensors; the graph then has one output per tensor. That is what a
+training step needs: parameter lists and optimizer state in, loss and updated
+state out.
+
+The op set now covers a small Transformer:
+
+- embedding (`index-select`), `bmm`, `permute`, `softmax` / `log-softmax`,
+  `layer-norm` / `rms-norm`, `gelu`, `cross-entropy`, `concat` / `slice`;
+- every op has a gradient rule;
+- `optim.scm` provides SGD and Adam.
+
+A one-layer character-level Transformer trains with Adam as one traced graph
+per step (§4.19).
 
 Every implementation-specific mechanism sits in one module, `compat.scm`.
 
@@ -71,6 +84,9 @@ bindings/guile/scheme/sonicboom/trace/
                                             guards, retrace-on-miss, output capture
   loop.scm      (sonicboom trace loop)      %loop: unrolling with a limit, host loops
   autodiff.scm  (sonicboom trace autodiff)  reverse-mode grad on the traced graph
+  layers.scm    (sonicboom trace layers)    softmax, log-softmax, layer/rms norm,
+                                            cross-entropy, embedding, linear, causal mask
+  optim.scm     (sonicboom trace optim)     sgd-update, adam-init, adam-update
   macro.scm     (sonicboom trace macro)     syntax-rules walker, %branch/%and/%or/%case,
                                             strict mode (%call)
 bindings/guile/tests/trace/
@@ -78,8 +94,9 @@ bindings/guile/tests/trace/
   test-trace-macro.scm   if/cond/when/unless, guards, effects, retrace     (40 checks)
   test-trace-forms.scm   and/or/case/do/named let/cond =>, nesting, host
                          loops, strict mode, compat boundary               (46 checks)
-  test-trace-grad.scm    gradients vs finite differences, double where,
-                         ATen attributes, XOR training                     (33 checks)
+  test-trace-grad.scm    gradients vs finite differences (all ops), double
+                         where, ATen attributes, Adam, XOR training        (61 checks)
+  test-trace-transformer.scm  1-layer char Transformer trained with Adam     (6 checks)
 ```
 
 None of these modules imports `(sonicboom ffi)`, `(sonicboom tensor)` or any
@@ -88,25 +105,30 @@ directories and this document was changed.
 
 `compat` imports no other prototype module. The modules that need a mechanism
 from it (`dce`, `interp`, `symbolic`, `tracer`, `loop`, `autodiff`, `macro`)
-import it. `tensor`, `ops` and `graph` need none.
+import it. `tensor`, `ops`, `graph`, `layers` and `optim` need none.
 
 ## 3. Running the tests
 
 From the repository root, with Guile 3.0.9+ (`apt install guile-3.0`):
 
 ```sh
-for t in test-trace test-trace-macro test-trace-forms test-trace-grad; do
+for t in test-trace test-trace-macro test-trace-forms test-trace-grad \
+         test-trace-transformer; do
   guile --no-auto-compile -L bindings/guile/scheme \
       bindings/guile/tests/trace/$t.scm || echo "$t FAILED"
 done
 ```
 
 - Each script exits with status 0 when every check passes and 1 otherwise.
-- All four were also run without `--no-auto-compile`, where Guile compiles
+- All five were also run without `--no-auto-compile`, where Guile compiles
   every file first, and pass that way too.
+- `test-trace-transformer.scm` takes about a minute interpreted (300 training
+  steps through the reference interpreter) and about 10 s compiled.
 - `test-trace-macro.scm` prints the node-count table from §4.9.
 - `test-trace-grad.scm` prints the largest gradient error and the XOR loss
   curve.
+- `test-trace-transformer.scm` prints the loss every 50 steps and the size of
+  the step graph.
 - SRFI-64 writes one `.log` per script to the current directory. Running from
   a scratch directory with an absolute `-L` path keeps the logs out of the tree.
 
@@ -120,9 +142,14 @@ done
   vector of Scheme numbers or booleans. It is used only by eager mode and the
   reference interpreter.
 - The user ops are:
-  `add sub mul div matmul transpose reshape expand relu neg sum gt lt where
-  equal-to logical-and logical-or logical-not trace-print`, plus `bool` and
-  `grad`. They are defined once in
+  `add sub mul div matmul bmm permute transpose reshape expand relu gelu neg
+  texp tlog ttanh tsqrt sum mean amax gt lt where equal-to logical-and
+  logical-or logical-not index-select index-add gather scatter-add concat slice
+  trace-print`, plus `bool` and `grad`.
+  - `texp tlog ttanh tsqrt` carry a `t` prefix so that importing them does not
+    shadow R7RS `exp` / `log` / `sqrt` on numbers.
+  - Composites in `layers.scm`: `softmax`, `log-softmax`, `layer-norm`,
+    `rms-norm`, `cross-entropy`, `embedding`, `linear`, `causal-mask`. They are defined once in
   `symbolic.scm`, and the mode is the `current-tracer` parameter:
   - `#f`: eager mode. The op is computed with the reference kernel.
   - a recorder: tracing mode. If any operand is symbolic, the op appends a node
@@ -137,13 +164,18 @@ done
   cannot drift apart. The interpreter also checks every node's declared output
   type against what it computed.
 
-S-Expr op names: `add sub mul div matmul transpose reshape expand relu neg
-greater less equal and or not where reduce_sum print loop`.
+S-Expr op names: `add sub mul div matmul bmm permute reshape expand relu gelu
+neg exp log tanh sqrt reduce_sum reduce_mean reduce_max greater less equal and
+or not where index_select index_add gather scatter_add concat slice print
+loop`.
 
 - `sum` is emitted as `reduce_sum` with `(axes (ints …))` and
   `(keepdims (int 0|1))` attributes. Empty `axes` means all axes.
 - `print` carries a `(label (string …))` attribute.
-- `reshape` / `expand` carry `(shape (ints …))`.
+- `reshape` / `expand` carry `(shape (ints …))`; `permute` `(dims (ints …))`.
+- `index_select`, `index_add`, `gather`, `scatter_add` and `concat` carry
+  `(axis (int …))`; `slice` carries `axis` / `start` / `end`.
+- `concat` takes any number of inputs.
 - `loop` (host loops, §4.14) carries `body` (the body graph's S-Expr text),
   `trip_count` and `state_count`.
 - Every node whose op has a Core ATen counterpart also carries
@@ -678,8 +710,21 @@ can return loss, gradients and updated parameters together as one graph.
 - `shape` gives a value's shape.
 - `ins` / `out` are the forward values, `g` the output gradient.
 
-Rules exist for `add sub mul div neg matmul transpose reshape expand relu
-reduce_sum where print`. The comparison and logical ops have no gradient.
+Rules exist for every op:
+
+- `add sub mul div neg relu gelu exp log tanh sqrt` (elementwise);
+- `matmul bmm permute reshape expand`;
+- `reduce_sum reduce_mean reduce_max` (the maximum's gradient goes to every
+  position equal to it);
+- `where`;
+- `index_select` ↔ `index_add` and `gather` ↔ `scatter_add`, each the other's
+  backward;
+- `concat` ↔ `slice` (the backward of `slice` concatenates zero blocks);
+- `print`.
+
+The comparison and logical ops have no gradient, and integer index inputs get
+none. Zero blocks needed by the backward rules (`index_add` / `scatter_add`
+bases, `slice` padding) are inline constant parameters.
 `loop` has no rule, so differentiating through a host loop is an error; loops
 under `#:max-unroll` are unrolled and differentiable.
 
@@ -712,8 +757,8 @@ as masks `(c, side)`:
 a value computed in an earlier segment (before a graph break), `grad` refuses
 with an error instead of silently treating that value as a constant.
 Differentiating across breaks would mean saving each segment's inputs and
-chaining the per-segment gradients. It is left out of the prototype, and
-functions must not break before `grad`. Conditionals rewritten by the macro
+chaining the per-segment gradients; §4.20 is a design draft. It is left out of
+the prototype, and functions must not break before `grad`. Conditionals rewritten by the macro
 never break.
 
 **Checked** against central finite differences in double precision
@@ -731,40 +776,242 @@ the MSE loss, `grad` and the SGD update (lr 0.1). It is traced once, into a
 35-node graph. Each of the 1001 steps is then a cache hit that runs exactly
 one graph. The loss goes from 0.866 to below 1e-6 by step 400.
 
-### 4.17 Op names and PyTorch Core ATen
+### 4.17 Op names, PyTorch Core ATen, and what native-torch has
 
-| Prototype op (S-Expr) | User function | Core ATen | Notes |
-|---|---|---|---|
-| `add` | `add` | `aten::add.Tensor` | `alpha` = 1 |
-| `sub` | `sub` | `aten::sub.Tensor` | `alpha` = 1 |
-| `mul` | `mul` | `aten::mul.Tensor` | |
-| `div` | `div` | `aten::div.Tensor` | true division |
-| `neg` | `neg` | `aten::neg` | |
-| `matmul` | `matmul` | `aten::mm` | 2-D only; general `aten::matmul` is not Core ATen (it decomposes) |
-| `transpose` | `transpose` | `aten::permute` | dims `(1 0)`; `aten::t` / `transpose.int` are not Core ATen |
-| `reshape` | `reshape` | `aten::view` | contiguous data assumed; `aten::reshape` decomposes to `view` |
-| `expand` | `expand` | `aten::expand` | |
-| `relu` | `relu` | `aten::relu` | |
-| `reduce_sum` | `sum` | `aten::sum.dim_IntList` | empty `axes` = all dims |
-| `greater` | `gt` | `aten::gt.Tensor` | scalar operands are 0-d tensors here |
-| `less` | `lt` | `aten::lt.Tensor` | |
-| `equal` | `equal-to` | `aten::eq.Tensor` | |
-| `and` | `logical-and` | `aten::logical_and` | |
-| `or` | `logical-or` | `aten::logical_or` | |
-| `not` | `logical-not` | `aten::logical_not` | |
-| `where` | `where` | `aten::where.self` | |
-| `print` | `trace-print` | **none** | an effect; PyTorch has no ATen print op |
-| `loop` | (host loops) | **none** | control flow; the nearest PyTorch constructs are higher-order ops such as `while_loop` / `scan`, not ATen operators |
-| parameters (constants) | — | **none as an op** | graph constants (`get_attr` / lifted constants in an exported program) |
+Each prototype op that has a Core ATen counterpart is emitted with
+`(aten (string "…"))`.
 
-The emitted graphs carry the ATen name on every node that has one.
+The **native-torch** column records what `third_party/native-torch/` has for
+that ATen op. It was established by reading source only, without compiling:
 
-The names follow the Core ATen IR operator set as published for PyTorch 2.x.
-They were not cross-checked against the operator subset migrated into
-`third_party/native-torch/`, which `design/native-torch-migration.md` governs.
-Checking them is a separate task.
+| Value | Meaning |
+|---|---|
+| **kernel** | The op's schema is in the migrated `native_functions.yaml`. Its dispatch covers CPU: a `CPU` key, a `Composite*` key, a `structured_delegate` to such an op, or a `ufunc_inner_loop` whose CPU kernel SonicCross generates. The named kernel is defined in a source the native-torch build compiles (`native/*.cpp`, `native/cpu/*.cpp`, `native/transformers/*.cpp`, globbed by `third_party/native-torch/CMakeLists.txt`). |
+| **schema only** | The schema is present, but there is no CPU-capable kernel. |
+| **absent** | No schema. |
 
-### 4.18 What the tests check
+| Prototype op (S-Expr) | User function | Core ATen | native-torch | Where the kernel is | Notes |
+|---|---|---|---|---|---|
+| `add` | `add` | `aten::add.Tensor` | kernel, **executed** | ufunc `add.out` → generated `UfuncCPU_add` | `alpha` = 1 |
+| `sub` | `sub` | `aten::sub.Tensor` | kernel | `sub_out`, BinaryOps.cpp | |
+| `mul` | `mul` | `aten::mul.Tensor` | kernel, **executed** | `mul_out`, BinaryOps.cpp | |
+| `div` | `div` | `aten::div.Tensor` | kernel | `div_out`, BinaryOps.cpp | true division |
+| `neg` | `neg` | `aten::neg` | kernel | `neg_out` (macro), UnaryOps.cpp | |
+| `matmul` | `matmul` | `aten::mm` | kernel | `mm_out_cpu`, LinearAlgebra.cpp | 2-D; non-BLAS gemm path (BLAS guarded out, gap G-5) |
+| `bmm` | `bmm` | `aten::bmm` | kernel | `bmm_out_cpu`, LinearAlgebra.cpp | 3-D |
+| `permute` | `permute`, `transpose` | `aten::permute` | kernel | `permute` (CompositeExplicitAutograd), TensorShape.cpp | `transpose` = swap the last two axes |
+| `reshape` | `reshape` | `aten::view` | kernel | `view`, TensorShape.cpp | contiguous data assumed |
+| `expand` | `expand` | `aten::expand` | kernel | `expand` (CompositeExplicit), TensorShape.cpp | |
+| `relu` | `relu` | `aten::relu` | kernel, **executed** | `relu`, Activation.cpp | |
+| `gelu` | `gelu` | `aten::gelu` | kernel | `gelu_out_cpu`, Activation.cpp | `approximate='tanh'` |
+| `exp` | `texp` | `aten::exp` | kernel | `exp_out` (macro), UnaryOps.cpp + cpu/UnaryOpsKernel.cpp | |
+| `log` | `tlog` | `aten::log` | kernel | `log_out` (macro), same | |
+| `tanh` | `ttanh` | `aten::tanh` | kernel | `tanh_out` (macro), same | |
+| `sqrt` | `tsqrt` | `aten::sqrt` | kernel | `sqrt_out` (macro), same | |
+| `reduce_sum` | `sum` | `aten::sum.dim_IntList` | kernel, **executed** | `sum_out`, ReduceOps.cpp | empty `axes` = all dims |
+| `reduce_mean` | `mean` | `aten::mean.dim` | kernel | `mean_out`, ReduceOps.cpp | |
+| `reduce_max` | `amax` | `aten::amax` | kernel | `amax_out`, ReduceOps.cpp | gradient to every tied maximum (ATen splits it) |
+| `greater` | `gt` | `aten::gt.Tensor` | kernel | `gt_Tensor_out` (macro), BinaryOps.cpp | |
+| `less` | `lt` | `aten::lt.Tensor` | kernel | `lt_Tensor_out` (macro), BinaryOps.cpp | |
+| `equal` | `equal-to` | `aten::eq.Tensor` | kernel | `eq_Tensor_out` (macro), BinaryOps.cpp | |
+| `and` | `logical-and` | `aten::logical_and` | kernel | `logical_and`, BinaryOps.cpp | |
+| `or` | `logical-or` | `aten::logical_or` | kernel | `logical_or`, BinaryOps.cpp | |
+| `not` | `logical-not` | `aten::logical_not` | kernel | `logical_not`, UnaryOps.cpp | |
+| `where` | `where` | `aten::where.self` | kernel | `where`, TensorCompare.cpp | |
+| `index_select` | `index-select`, `embedding` | `aten::index_select` | kernel | `index_select_cpu_`, TensorAdvancedIndexing.cpp | `aten::embedding` (also kernel, Embedding.cpp) decomposes to it |
+| `index_add` | `index-add` | `aten::index_add` | kernel | `index_add_cpu_out`, TensorAdvancedIndexing.cpp | the backward of `index_select` |
+| `gather` | `gather` | `aten::gather` | kernel | `gather_out`, TensorAdvancedIndexing.cpp | |
+| `scatter_add` | `scatter-add` | `aten::scatter_add` | kernel | `scatter_add`, TensorAdvancedIndexing.cpp | the backward of `gather` |
+| `concat` | `concat` | `aten::cat` | kernel | `cat_out_cpu`, TensorShape.cpp | |
+| `slice` | `slice` | `aten::slice.Tensor` | kernel | `slice` (CompositeExplicit), TensorShape.cpp | step 1 |
+| `print` | `trace-print` | **none** | absent | — | an effect; PyTorch has no ATen print op |
+| `loop` | (host loops) | **none** | absent | — | control flow; `while_loop` / `scan` are higher-order ops, not in `native_functions.yaml` |
+| parameters (constants) | — | **none as an op** | — | — | graph constants |
+
+The composites are emitted as their primitive nodes. ATen has a single op for
+each of them, all with a CPU kernel in native-torch:
+
+| Composite | Single ATen op | Kernel |
+|---|---|---|
+| `softmax` | `aten::_softmax` | `softmax_cpu_out` |
+| `log-softmax` | `aten::_log_softmax` | `log_softmax_cpu_out` |
+| `layer-norm` | `aten::native_layer_norm` | `layer_norm_cpu` |
+| `rms-norm` | `aten::rms_norm` | CompositeImplicit, layer_norm.cpp |
+| `cross-entropy` | `aten::cross_entropy_loss` → `nll_loss_forward` | `nll_loss_forward_out_cpu` |
+
+These are fusion targets for a native executor.
+
+**Audit result:**
+
+- **No mapped op is "schema only".**
+- **Absent:** `print` and `loop`, plus graph constants.
+
+**Caveats:**
+
+- **"kernel" means the source is present and compiled, not that it has run.**
+  Only `add`, `mul`, `relu` and `sum` (with `ones` / `full`) are executed and
+  checked by `numeric_proof` (manifest §22.E / §23).
+- **Gap G-1 (manifest §23).** `libsonicboom.so` links `aten_core` without
+  `--whole-archive`, so its op registrations are currently dropped. Until that
+  is fixed, a "kernel" op is not reachable through the dispatcher from the
+  shared library, whatever this table says.
+- **Macro-defined kernels.** For ops marked "(macro)", the kernel is defined
+  through a helper macro (`CREATE_UNARY_TORCH_IMPL_FUNC`,
+  `CREATE_COMPARISON_SCALAR_TENSOR_IMPL_FUNC`). Each was checked at its
+  definition line. Their CPU stubs are registered in `native/cpu/*.cpp`
+  (compiled with `CPU_CAPABILITY=DEFAULT`).
+
+The audit used only the yaml entry and the definition sites of the named
+kernels; no other part of native-torch was read.
+
+### 4.18 Optimizers
+
+`optim.scm` has three procedures, called inside a traced training step after
+`grad`:
+
+- `(sgd-update params grads #:lr …)` returns `p − lr·g` for each parameter.
+- `(adam-init params)` returns zero first and second moments, and the step
+  counter `t = 0` as a rank-0 float tensor.
+- `(adam-update params grads ms vs t #:lr #:beta1 #:beta2 #:eps)` returns
+  `(params' ms' vs' t+1)`.
+
+The bias corrections `1 − βᵗ⁺¹` are computed in the graph as
+`1 − exp((t+1)·log β)`. The step counter is a tensor input and output, so every
+step has the same signature and runs the same graph. A Scheme counter would be
+a static argument and force a retrace every step.
+
+The state structures (lists of tensors) are ordinary arguments and results of
+the traced step.
+
+Checked against a plain-Scheme Adam over two steps, and SGD still trains XOR
+in `test-trace-grad.scm`.
+
+### 4.19 Milestone: a one-layer character Transformer
+
+`test-trace-transformer.scm` builds this model:
+
+- a pre-norm block: embedding plus learned positions, then layer norm, then
+  2-head causal self-attention;
+- the attention computes `q`, `k`, `v` as `[H T 8]` via `reshape` + `permute`,
+  scores with `bmm`, applies `where(mask, scores, −1e9)` with a constant
+  lower-triangular mask, then `softmax` and `bmm`;
+- a residual connection, then layer norm, then an MLP 16→32→16 with GELU,
+  then another residual;
+- a final layer norm and a projection to the vocabulary.
+
+Its dimensions are d_model 16 and sequence length 8. The training text is
+`"hello world. "` × 30 (390 characters), so the vocabulary is its 9
+characters.
+
+One `define-traced` training step does forward, `cross-entropy`, `grad` over
+the 18 parameter tensors, and `adam-update` (lr 0.01).
+
+Measured over 300 steps, each on an 8-character window that advances by 5
+characters per step:
+
+| step | loss | mean over the previous 50 steps |
+|---|---|---|
+| 0 | 2.4200 | — |
+| 50 | 0.1803 | 0.7168 |
+| 100 | 0.4507 | 0.2525 |
+| 150 | 0.1009 | 0.1801 |
+| 200 | 0.1223 | 0.1696 |
+| 250 | 0.1269 | 0.2203 |
+| 300 | 0.0172 | 0.1790 |
+
+The initial loss is ln 9 ≈ 2.20 plus noise from the initialisation. The
+remaining mean of about 0.17 is mostly irreducible: the first positions of
+each window see only one or two characters (causal), so their next character
+is ambiguous.
+
+The run was traced once, and all 300 later steps were cache hits. That is 301
+executor calls, one graph each. The step graph has **536 nodes**: forward,
+backward and the Adam update together.
+
+A forward-only check confirms the causal mask: changing the last input token
+leaves every earlier position's logits unchanged.
+
+### 4.20 Design draft: differentiating across graph breaks
+
+Not implemented. `grad` refuses when the loss depends on a value from before a
+graph break (§4.16). This is how it could work on the trace tree.
+
+**Segments as functions.** A traced call that went through breaks ran a path
+`S₀ → S₁ → … → Sₙ` of tree segments. Segment `Sᵢ` is a pure function from its
+inputs to its outputs:
+
+- its inputs (`cseg-inputs`) are function arguments and values exported by
+  earlier segments;
+- its outputs (`cseg-outputs`) are its condition (for a branch) and the values
+  later segments read.
+
+The branch conditions are boolean and have no gradient. So, along the path
+actually taken, the whole function is the composition of the segment
+functions, and the chain rule applies segment by segment.
+
+**Backward along the path, in reverse.** The loss is in the leaf `Sₙ`. For
+`i = n … 0`:
+
+1. **Seed.** For every output `o` of `Sᵢ` that is the loss or that a later
+   segment reads, take the accumulated cotangent `ḡ(o)`:
+   - 1 for the loss;
+   - the sum of the cotangents later segments sent back to `o`;
+   - zero for the condition.
+2. **Build `Sᵢ′`.** Run the existing single-segment transform on `Sᵢ`'s nodes
+   with those seeds, and with respect to `Sᵢ`'s inputs.
+3. **Hand the cotangents back.** The cotangents of `Sᵢ`'s inputs that come
+   from earlier segments are passed to their producers. Those that are
+   function arguments (or `wrt`) are accumulated into the result.
+
+Each `Sᵢ′` is an ordinary S-Expr graph. It is cached in the tree next to `Sᵢ`
+and keyed the same way, so a cache-hit call runs `S₀ … Sₙ` forward and then
+`Sₙ′ … S₀′` backward without tracing.
+
+**What each segment must save.** `Sᵢ′` reads `Sᵢ`'s inputs, and those
+intermediate values of `Sᵢ` that its rules read.
+
+- **Recompute.** The simplest correct choice: save only each segment's
+  inputs, the values in the call environment that `run-segment!` already
+  holds. `Sᵢ′` then starts by re-running `Sᵢ`'s forward nodes (they are pure),
+  which is what `Sᵢ′` already contains before DCE.
+- **Checkpoint.** Alternatively, extend `Sᵢ`'s outputs with the activations
+  `Sᵢ′` reads, so the forward run exports them. DCE then decides
+  automatically what has to cross the boundary. This trades memory for
+  recomputation, like activation checkpointing.
+
+Either way, the call environment kept by the replay (one table per call) is
+exactly the "saved inputs" store. It must stay alive until the backward pass
+finishes, rather than being reset on the next call.
+
+**Relation to the continuations.**
+
+- **The backward pass needs no continuation.** It needs only the path taken
+  and the cached segment graphs. Continuations are used, as now, only to
+  *trace* new forward segments: at a break, and when a cache miss resumes a
+  stored `k`. Each time a new segment appears, its `Sᵢ′` is traced at that
+  point, with the single-segment transform.
+- **`grad` becomes a request, not an immediate transform.** `grad` inside the
+  traced body cannot see segments that do not exist yet: the code after a
+  break runs in a resumed continuation, in a later segment. So `grad` would
+  return placeholder symbols, and record "differentiate loss L w.r.t. W".
+  - When the leaf is reached, the tracer runs the reverse sweep above.
+  - The placeholders become outputs of the backward chain.
+  - Placeholders consumed by later forward code in the same call (for example
+    an optimizer update) need one more segment after the backward chain. That
+    is a natural extension of the tree: a leaf followed by a gradient segment
+    and an update segment.
+- **Multi-resume and the macro join remove the need in the common case.** A
+  `where` join keeps the whole computation in one segment, so the existing
+  transform already covers it. Only true graph breaks (`bool` in uncovered
+  code, data-dependent loops) need the chain.
+- **Data-dependent loops.** A `do` loop with a symbolic exit test produces one
+  segment per iteration (§4.8), so its backward chain has one `Sᵢ′` per
+  iteration. That is backpropagation through time over the trace tree. The
+  number of saved environments grows with the trip count.
+- **Retrace-on-miss** changes nothing: segments are renamed into the cached
+  tree, and their `Sᵢ′` with them.
+
+### 4.21 What the tests check
 
 Every traced result is compared with the same computation written
 independently in plain Scheme over nested lists.
@@ -829,7 +1076,7 @@ independently in plain Scheme over nested lists.
   procedure properties, hash tables, `syntax-case`, `syntax-source`,
   `syntax-local-binding`, `datum->syntax`, `eval-when`, `catch` or `throw`.
 
-**`test-trace-grad.scm` (33):**
+**`test-trace-grad.scm` (61):**
 
 - finite-difference gradient checks:
   - `add` (plus a broadcast bias), `sub`, `mul`, `div`, `neg`, `matmul`,
@@ -845,10 +1092,36 @@ independently in plain Scheme over nested lists.
 - DCE keeps only what the backward pass needs;
 - ATen attributes on every node;
 - `grad` across a graph break is refused;
+- Transformer ops, each against finite differences:
+  - `texp tlog ttanh tsqrt gelu`;
+  - `amax` (axis, keepdims), `mean` (all, axis);
+  - `softmax`, `log-softmax`;
+  - `index-select` / `embedding` (repeated ids accumulate);
+  - `gather`, `index-add`, `scatter-add` (base and source);
+  - `concat` (axes 0 and 1), `slice`;
+  - `bmm`, 3-D `permute`;
+  - `layer-norm` (x, gamma, beta), `rms-norm` (x, gamma);
+  - `cross-entropy`;
+- index arguments get zero gradient;
+- `log-softmax` on logits around 1000 is finite and exact;
+- `softmax` rows sum to 1;
+- Adam: two traced steps equal a plain-Scheme Adam, and the step counter is a
+  tensor (no retrace);
 - XOR:
   - loss below 0.05;
   - traced once, then 1000 cache hits;
   - one graph per step.
+
+**`test-trace-transformer.scm` (6):**
+
+- the causal mask;
+- loss below a third of the initial loss, and below 0.5;
+- traced once, then 300 cache hits;
+- one graph per step;
+- the step graph contains forward, backward and update ops.
+
+The largest relative gradient error measured is 5.8e-9, for the Transformer
+ops as well as the older ones.
 
 Measured numbers for the `bool` loop test (6 inputs), and the macro version:
 
@@ -950,6 +1223,13 @@ Measured numbers for the `bool` loop test (6 inputs), and the macro version:
   flowing through it. A user op with an infinite derivative that is not under
   a `where` still produces `inf` / `NaN`, as in any framework.
 - **Higher-order derivatives** (`grad` of a gradient) are untested.
+- **`amax` ties.** The gradient of `amax` goes to every tied maximum; ATen
+  divides it among them.
+- **Large zero constants.** The backward of `index_select`, `gather` and
+  `slice` puts inline zero constants (the size of the input) into the graph.
+  That is fine at prototype sizes, but would need a `zeros` op for real
+  models.
+- **Float dtypes only.** Gradient rules assume float tensors.
 
 ### General
 
@@ -961,7 +1241,8 @@ Measured numbers for the `bool` loop test (6 inputs), and the macro version:
   - Multi-resume (continuation) joins only single-tensor results.
 - **Static shapes only**, as in S-Expr v0.
 - **Small op set:**
-  - `matmul` is 2-D only;
+  - `matmul` is 2-D and `bmm` 3-D only;
+  - `slice` has step 1 only;
   - broadcasting follows NumPy rules;
   - Scheme reals stand in for float32;
   - `NaN` and `inf` are not representable in the emitted text;
