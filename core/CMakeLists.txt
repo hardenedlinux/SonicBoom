@@ -136,7 +136,7 @@ target_link_libraries(sonicboom PRIVATE
 # direct cudart use self-documenting.
 if(SONICBOOM_USE_CUDA)
   target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_CUDA=1)
-  target_link_libraries(sonicboom PRIVATE CUDA::cudart nvToolsExt)
+  target_link_libraries(sonicboom PRIVATE CUDA::cudart CUDA::cublas nvToolsExt)
   # SonicBoom-owned CUDA K-quant matvec kernel (dequantize-on-the-fly gemv).
   # Compiled with nvcc (enable_language(CUDA) + CMAKE_CUDA_ARCHITECTURES=86 are
   # set in the root CMakeLists), statically linked into libsonicboom.so like the

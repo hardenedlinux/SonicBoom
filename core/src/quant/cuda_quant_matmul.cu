@@ -22,6 +22,7 @@
 
 #include "ggml_derived/mmvq_q8_1.cuh"
 
+#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -36,6 +37,7 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <string_view>
 #include <unordered_map>
 
 // CUDA dequantize-on-the-fly gemv for Q3_K/Q4_K/Q5_K weights @ f32 activation.
@@ -473,6 +475,22 @@ void* g_gather_out = nullptr;
 size_t g_gather_out_bytes = 0;
 void* g_tokens = nullptr;
 size_t g_tokens_bytes = 0;
+// fp16 dequant scratch for the cuBLAS batched matmul (C.1): the dequantized
+// weight (row-major [rows, cols]) and the fp16 activation ([cols, n], n
+// innermost). Reused across layers, sized to the largest weight/activation seen.
+void* g_wf16 = nullptr;
+size_t g_wf16_bytes = 0;
+void* g_xf16 = nullptr;
+size_t g_xf16_bytes = 0;
+
+// Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
+// created lazily and the workspace is set so cublasGemmEx is stream-capturable
+// into the prefill CUDA Graph (B.1). The handle is never destroyed (lives for
+// the process lifetime, like g_cache); the workspace is freed by clear_cache().
+std::mutex g_cublas_mutex;
+cublasHandle_t g_cublas_handle = nullptr;
+void* g_cublas_workspace = nullptr;
+constexpr size_t kCublasWorkspaceBytes = 16 * 1024 * 1024;  // ample for fp16 GEMM
 
 // Zero-copy per_layer_token_embd gather (Phase 3.2 B3): the packed tensor is
 // pinned + mapped in place (cudaHostRegisterMapped) once, so the gather kernel
@@ -820,6 +838,95 @@ bool launch_gather_batched(const uint8_t* w, const uint64_t* rows, QuantType typ
   return cudaGetLastError() == cudaSuccess;
 }
 
+// --- fp16 dequantization for the cuBLAS batched matmul (C.1) ----------------
+//
+// Full-tensor dequantize to fp16, one thread per output element. The flat
+// element index idx == b * 256 + l (b = super-block, l = element within it)
+// maps exactly to the row-major [rows, cols] layout cuBLAS consumes: the packed
+// weight is [rows][blocks_per_row] blocks and each block covers 256 contiguous
+// columns, so out[r*cols + c] == dequant(block (r*blocks_per_row + c/256),
+// element c%256). The per-element arithmetic is identical to gather_*_K_batched
+// (and the scalar reference), only the output is rounded to fp16.
+
+__global__ void dequant_q3_K_f16(const uint8_t* __restrict__ w,
+                                 __half* __restrict__ out, int64_t numel) {
+  const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel) return;
+  const int64_t b = idx >> 8;
+  const int l = int(idx & 255);
+  const uint8_t* blk = w + b * 110;
+  const uint8_t* hm = blk;
+  const uint8_t* q = blk + 32;
+  const float d = half_to_float(ld_u16(blk + 108));
+  int8_t scales[16];
+  unpack_q3_K_scales(blk + 96, scales);
+
+  const int m = l >> 7;
+  const int r = l & 127;
+  const int j = r >> 5;
+  const int l2 = r & 31;
+  const int qv = int((q[m * 32 + l2] >> (j << 1)) & 3);
+  const int hmset = (hm[l2] & (1 << (j + (m << 2)))) ? 0 : 4;
+  const int sidx = (m << 3) + (j << 1) + (l2 >> 4);
+  out[idx] = __float2half_rn(d * float(scales[sidx] - 32) * float(qv - hmset));
+}
+
+__global__ void dequant_q4_K_f16(const uint8_t* __restrict__ w,
+                                 __half* __restrict__ out, int64_t numel) {
+  const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel) return;
+  const int64_t b = idx >> 8;
+  const int l = int(idx & 255);
+  const uint8_t* blk = w + b * 144;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* q = blk + 16;
+
+  const int j = l >> 6;
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qb = q[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int v = low ? (qb & 0xF) : (qb >> 4);
+  out[idx] = __float2half_rn(d * float(sc) * float(v) - dmin * float(mi));
+}
+
+__global__ void dequant_q5_K_f16(const uint8_t* __restrict__ w,
+                                 __half* __restrict__ out, int64_t numel) {
+  const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel) return;
+  const int64_t b = idx >> 8;
+  const int l = int(idx & 255);
+  const uint8_t* blk = w + b * 176;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* qh = blk + 16;
+  const uint8_t* ql = blk + 48;
+
+  const int j = l >> 6;
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qlb = ql[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int qhbit = (j << 1) + (low ? 0 : 1);
+  const int v = (low ? (qlb & 0xF) : (qlb >> 4)) +
+                ((qh[l2] & (1 << qhbit)) ? 16 : 0);
+  out[idx] = __float2half_rn(d * float(sc) * float(v) - dmin * float(mi));
+}
+
+// f32 -> fp16 (round-to-nearest), elementwise, for the activation operand.
+__global__ void cast_f32_f16(const float* __restrict__ x, __half* __restrict__ y,
+                             int64_t n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = __float2half_rn(x[i]);
+}
+
 } // namespace
 
 bool available() noexcept {
@@ -837,6 +944,18 @@ void clear_cache() {
   g_cache.clear();
   if (g_ple_mapped.host) cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
   g_ple_mapped = {};
+  // cuBLAS handle + workspace (C.1): destroy so a later lazy create starts fresh.
+  {
+    std::lock_guard<std::mutex> blk(g_cublas_mutex);
+    if (g_cublas_handle) {
+      cublasDestroy(g_cublas_handle);
+      g_cublas_handle = nullptr;
+    }
+    if (g_cublas_workspace) {
+      cudaFree(g_cublas_workspace);
+      g_cublas_workspace = nullptr;
+    }
+  }
 }
 
 // Blocks-per-row threshold above which the cooperative warp-per-row (_coop)
@@ -919,6 +1038,47 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
 // cost is negligible.
 bool q8_1_enabled() noexcept {
   return std::getenv("SONICBOOM_GEMV_F32") == nullptr;
+}
+
+// cuBLAS fp16 path for the batched prefill matmul (C.1). On by default; the
+// threshold is n >= kCublasMinN. SONICBOOM_CUBLAS=0 disables it and restores the
+// dp4a batched path for A/B measurement. Also requires q8_1_enabled() (the fp32
+// fallback is the CPU-matching differential path and must not be routed through
+// fp16 tensor cores).
+bool cublas_enabled() noexcept {
+  if (std::getenv("SONICBOOM_CUBLAS") == nullptr) return true;
+  return std::string_view(std::getenv("SONICBOOM_CUBLAS")) != "0";
+}
+
+// n (batch) threshold above which the cuBLAS fp16 path is used. Below it the
+// dp4a batched path wins (the fp16 dequant + upload overhead is not amortized
+// over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
+constexpr int kCublasMinN = 32;
+int cublas_min_n() {
+  static int v = [] {
+    if (const char* e = std::getenv("SONICBOOM_CUBLAS_MIN_N")) {
+      const int x = std::atoi(e);
+      if (x > 0) return x;
+    }
+    return kCublasMinN;
+  }();
+  return v;
+}
+
+// Lazily create the process-wide cuBLAS handle and its stream-capture workspace.
+// Returns nullptr on failure (the caller falls back to the dp4a batched path).
+cublasHandle_t cublas_handle() {
+  std::lock_guard<std::mutex> lk(g_cublas_mutex);
+  if (!g_cublas_handle) {
+    if (cublasCreate(&g_cublas_handle) != CUBLAS_STATUS_SUCCESS) {
+      g_cublas_handle = nullptr;
+      return nullptr;
+    }
+    if (cudaMalloc(&g_cublas_workspace, kCublasWorkspaceBytes) == cudaSuccess)
+      cublasSetWorkspace(g_cublas_handle, g_cublas_workspace,
+                         kCublasWorkspaceBytes);
+  }
+  return g_cublas_handle;
 }
 
 // The warp-per-row dp4a gemv against a *pre-quantized* q8_1 activation. Shared
@@ -1210,6 +1370,65 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // and keeps prefill/decode quantization consistent. The fp32 fallback
 // (SONICBOOM_GEMV_F32=1) keeps the n× gather/gemv/scatter loop. n == 1 falls
 // back to the single-column path.
+// cuBLAS fp16 batched matmul (C.1): Y = W @ X for X [cols, n] (n innermost),
+// Y [rows, n]. Dequantize W's packed blocks to fp16 (row-major [rows, cols])
+// into a reusable scratch buffer, convert X to fp16, then one cublasGemmEx
+// (fp16 in, fp32 out, CUBLAS_COMPUTE_32F → tensor cores on SM_86). The
+// dequantize/convert run once and are amortized over all n columns, and the
+// tensor-core GEMM is far cheaper than the dp4a per-column gemv it replaces.
+//
+// cuBLAS is column-major; the storage layouts are chosen so the GEMM needs no
+// transpose. W fp16 == column-major [cols, rows] (== row-major [rows, cols]);
+// X == column-major [n, cols] (== row-major [cols, n]); Y == column-major
+// [n, rows] (== row-major [rows, n]). Then Y'[p,r] = sum_c X'[p,c] W'[c,r] =
+// sum_c X[c,p] W[r,c] = Y[r,p], i.e. C = A @ B with A = X' (m=n, k=cols,
+// lda=n) and B = W' (k=cols, n=rows, ldb=cols).
+bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
+                           int n) {
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+
+  // 1. Dequantize W -> fp16 into reusable scratch (row-major [rows, cols]).
+  __half* wf = static_cast<__half*>(
+      grow_scratch(g_wf16, g_wf16_bytes, rows * cols * sizeof(__half)));
+  if (!wf) return false;
+  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  if (!wp) return false;
+  const int64_t numel = int64_t(rows * cols);
+  const dim3 dgrid((numel + 255) / 256);
+  switch (W.type()) {
+    case QuantType::Q3_K:
+      dequant_q3_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
+      break;
+    case QuantType::Q4_K:
+      dequant_q4_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
+      break;
+    case QuantType::Q5_K:
+      dequant_q5_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
+      break;
+    default:
+      return false;
+  }
+
+  // 2. Convert X f32 -> fp16 (same [cols, n] n-innermost layout).
+  __half* xf = static_cast<__half*>(
+      grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
+  if (!xf) return false;
+  const int64_t xn = int64_t(cols) * n;
+  cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
+
+  // 3. cuBLAS tensor-core GEMM on the current stream.
+  cublasHandle_t h = cublas_handle();
+  if (!h) return false;
+  cublasSetStream(h, cur_stream());
+  const float alpha = 1.0f, beta = 0.0f;
+  const cublasStatus_t st = cublasGemmEx(
+      h, CUBLAS_OP_N, CUBLAS_OP_N, n, int(rows), int(cols), &alpha, xf,
+      CUDA_R_16F, n, wf, CUDA_R_16F, int(cols), &beta, Y, CUDA_R_32F, n,
+      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
+}
+
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
@@ -1219,6 +1438,11 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t rows = W.dims()[1];
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
+
+  // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
+  // fp32 fallback is the CPU-matching differential path and must stay fp32.
+  if (q8_1_enabled() && cublas_enabled() && n >= cublas_min_n())
+    return matmul_f16_cublas_dev(W, X, Y, n);
 
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
