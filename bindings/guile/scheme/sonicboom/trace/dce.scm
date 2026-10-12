@@ -3,13 +3,14 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; One backward pass from the segment's outputs. Every op in the prototype is
-;;; pure, so a node is live iff one of its outputs is live; a parameter is live
+;;; One backward pass from the segment's outputs. A node is live iff it is
+;;; effectful (e.g. `print`) or one of its outputs is live; a parameter is live
 ;;; iff a live node or a graph output references it.
 
 (define-module (sonicboom trace dce)
   #:use-module (srfi srfi-1)
   #:use-module (sonicboom trace graph)
+  #:use-module (sonicboom trace ops)
   #:export (eliminate-dead-nodes))
 
 (define (eliminate-dead-nodes nodes params outputs)
@@ -20,8 +21,9 @@ their original order."
     (for-each (lambda (o) (hash-set! live o #t)) outputs)
     (let ((kept
            (fold (lambda (n acc)
-                   (if (any (lambda (o) (hash-ref live o #f))
-                            (gnode-output-names n))
+                   (if (or (op-effectful? (gnode-op n))
+                           (any (lambda (o) (hash-ref live o #f))
+                                (gnode-output-names n)))
                        (begin
                          (for-each (lambda (i) (hash-set! live i #t))
                                    (gnode-inputs n))

@@ -15,7 +15,7 @@
 (define-module (sonicboom trace ops)
   #:use-module (srfi srfi-1)
   #:use-module (sonicboom trace tensor)
-  #:export (op-known? op-arity op-type op-kernel attr-ref
+  #:export (op-known? op-arity op-type op-kernel op-effectful? attr-ref
             broadcast-shapes))
 
 ;;; --- attributes ---------------------------------------------------------------
@@ -202,6 +202,15 @@
                                (ctensor-ref (caddr ts) (caddr js))))))
     (make-ctensor (car type) (cdr type) out)))
 
+;; print: identity on the value, writes "label: nested-values" as an effect.
+(define (print-kernel ts attrs)
+  (let ((t (car ts)) (port (current-output-port)))
+    (display (attr-ref attrs 'label "print") port)
+    (display ": " port)
+    (write (ctensor->nested t) port)
+    (newline port)
+    t))
+
 ;;; --- table ------------------------------------------------------------------------
 
 ;; name -> (arity type-rule kernel)
@@ -215,7 +224,13 @@
     (relu      1 ,(unary-type 'relu)          ,(unary-kernel relu))
     (neg       1 ,(unary-type 'neg)           ,(unary-kernel -))
     (reduce_sum 1 ,reduce-type                ,reduce-kernel)
-    (where     3 ,where-type                  ,where-kernel)))
+    (where     3 ,where-type                  ,where-kernel)
+    (print     1 ,(lambda (types attrs) (car types)) ,print-kernel)))
+
+;; Ops whose kernel has an effect: always recorded while tracing and never
+;; removed by DCE.
+(define %effectful-ops '(print))
+(define (op-effectful? op) (and (memq op %effectful-ops) #t))
 
 (define (entry op)
   (or (assq-ref %ops op) (error "unsupported op" op)))

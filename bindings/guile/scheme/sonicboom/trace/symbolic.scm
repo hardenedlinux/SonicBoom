@@ -28,9 +28,11 @@
             make-sym sym? sym-name sym-dtype sym-shape
             shape-of dtype-of
             ;; mode
-            current-tracer tracing? %break-tag
+            current-tracer tracing? %break-tag %branch-assumptions
+            %unbound-guard
             ;; tracing context / recorder (used by the tracer)
             make-trace-context trace-context? trace-context-types
+            trace-context-counters context-count!
             fresh-name! register-type!
             make-recorder recorder? recorder-context recorder-nodes
             recorder-params recorder-count recorder-assumptions
@@ -38,7 +40,7 @@
             set-recorder-nodes! set-recorder-params! set-recorder-count!
             as-value record-node!
             ;; ops
-            add sub mul matmul relu neg sum gt lt where bool))
+            add sub mul matmul relu neg sum gt lt where bool trace-print))
 
 ;;; --- symbolic tensor ------------------------------------------------------------
 
@@ -69,6 +71,15 @@
 ;; Prompt tag used by `bool` to suspend tracing.
 (define %break-tag (make-prompt-tag 'sonicboom-trace-break))
 
+;; Guard value of a free variable that is not bound when the traced
+;; procedure is called (see (sonicboom trace macro)).
+(define %unbound-guard (list 'unbound))
+
+;; Condition values fixed by an enclosing macro-rewritten `if` (%branch) while
+;; it traces one of its arms: alist name -> boolean. A parameter rather than
+;; recorder state, so that a continuation captured inside an arm restores it.
+(define %branch-assumptions (make-parameter '()))
+
 ;;; --- tracing context ------------------------------------------------------------
 
 ;; Shared by every recorder of one traced function: a name counter (so values
@@ -76,14 +87,19 @@
 ;; type of every value name ever introduced, and the per-side node budget used
 ;; by speculative (multi-resume) tracing.
 (define-record-type <trace-context>
-  (%make-trace-context next-id types max-side-nodes)
+  (%make-trace-context next-id types max-side-nodes counters)
   trace-context?
   (next-id trace-context-next-id set-trace-context-next-id!)
   (types trace-context-types)               ; hash: name -> (dtype . shape)
-  (max-side-nodes trace-context-max-side-nodes))
+  (max-side-nodes trace-context-max-side-nodes)
+  (counters trace-context-counters))        ; hash: event -> count
 
 (define (make-trace-context max-side-nodes)
-  (%make-trace-context 0 (make-hash-table) max-side-nodes))
+  (%make-trace-context 0 (make-hash-table) max-side-nodes (make-hash-table)))
+
+(define (context-count! ctx key)
+  (let ((h (trace-context-counters ctx)))
+    (hash-set! h key (+ 1 (hash-ref h key 0)))))
 
 (define (fresh-name! ctx prefix)
   (let ((n (trace-context-next-id ctx)))
@@ -161,7 +177,9 @@ concrete operands become an inline parameter of the current segment."
 (define (apply-op op args attrs)
   (let ((rec (current-tracer))
         (dt (ref-dtype args)))
-    (cond ((not (any sym? args))
+    (cond ((not (or (any sym? args)
+                    ;; an effect must happen at run time, not at trace time
+                    (and rec (op-effectful? op))))
            (op-kernel op (map (lambda (a) (lift a dt)) args) attrs))
           ((not rec)
            (error "symbolic tensor used outside of tracing" op))
@@ -178,6 +196,13 @@ concrete operands become an inline parameter of the current segment."
 (define (gt a b) (apply-op 'greater (list a b) '()))
 (define (lt a b) (apply-op 'less (list a b) '()))
 (define (where c x y) (apply-op 'where (list c x y) '()))
+
+(define* (trace-print x #:optional (label "trace-print"))
+  "Print X (as LABEL: nested values) to current-output-port and return it. In
+eager mode this prints immediately; while tracing it records an effectful
+`print` node, so the value is printed every time the graph runs, not when it
+is traced. DCE never removes it."
+  (apply-op 'print (list x) `((label (string ,label)))))
 
 (define* (sum x #:key (axes '()) (keepdims #f))
   "Sum over AXES (all axes when empty). Recorded as reduce_sum."
@@ -197,6 +222,7 @@ by aborting to %break-tag with X; the tracer resumes with #t or #f."
            (error "bool: tensor has more than one element" (sym-shape x)))
          (let ((rec (current-tracer)))
            (unless rec (error "bool: symbolic tensor outside of tracing"))
-           (let ((a (assoc (sym-name x) (recorder-assumptions rec))))
+           (let ((a (or (assoc (sym-name x) (%branch-assumptions))
+                        (assoc (sym-name x) (recorder-assumptions rec)))))
              (if a (cdr a) (abort-to-prompt %break-tag x)))))
         (else (error "bool: not a tensor" x))))
