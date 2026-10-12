@@ -343,6 +343,19 @@ cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
      below the Q4_K 160 GB/s DRAM floor, so Q3_K remains instruction-bound (the
      150 GB/s / DRAM≥70% target was not met — bit-unpack still dominates). Bit-exact
      (err unchanged). End-to-end +3.6% (64-step) / +4.5% (depth-512).
+   - **Item 2 — small-matrix gemv (attn_k/attn_v, 512 rows): measured, no cheap
+     win.** attn_k/attn_v run at ~53/~72 GB/s (well below the FFN shapes) because
+     512 warps fill only ~53% of the 20 SMs. Two options were tried:
+     * multi-warp-per-row / split-K was implemented and **reverted as a net loss**
+       (attn_k 53→44.5, attn_v 72→60 GB/s): Q3_K is instruction-bound (the split-K
+       `__shfl` reduction + ~2 µs reduce kernel exceed the latency-hiding gain) and
+       bpr=10 caps the split at 5 warps/row (2560 warps, far short of saturation).
+       Recorded as do-not-retry.
+     * row-concat of q/k/v into one gemv is the remaining lever (the three
+       projections are separate `QuantizedMatmul` nodes reading the same
+       activation), but it needs planner fusion + output slicing + a mixed
+       Q3_K/Q4_K kernel — estimated ~1.2% e2e (q+k) to ~4.4% e2e (q+k+v). Deferred
+       as a follow-up, not a do-not-retry.
    Neither limiter is the L1/LSU data path a cooperative shared-memory tiling
    would relieve, so that rewrite is a do-not-retry on the q8_1 path (conditions:
    `lg_throttle` ~0.5%, DRAM ~78%, `long_scoreboard` ~60%). The do-not-retry list
