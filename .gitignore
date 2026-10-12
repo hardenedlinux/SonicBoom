@@ -69,6 +69,7 @@ tools/baseline/sonicboom_dump
 tools/baseline/attention_bench
 tools/baseline/gemv_bench
 tools/baseline/longctx_bench
+tools/baseline/mmq_minn_bench
 tools/baseline/prefill_bench
 tools/baseline/prefix_cache_bench
 tools/baseline/prefix_cache_isolate
