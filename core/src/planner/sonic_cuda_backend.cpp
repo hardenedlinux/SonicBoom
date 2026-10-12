@@ -94,22 +94,6 @@ float* dev_mut(uint64_t handle) {
   return reinterpret_cast<float*>(handle);
 }
 
-// Decode a little-endian 64-bit scalar graph input (start_pos). The prefill
-// graph's Int64 inputs stay host (the transfer scheduler moves Float32 only), so
-// the batched ops read them straight out of the host TensorValue bytes.
-uint64_t read_i64(const TensorValue& v) {
-  uint64_t x = 0;
-  std::memcpy(&x, v.host.data(), sizeof(x));
-  return x;
-}
-
-// The n token ids of the prefill graph's Int64[n] input, as a host span. The
-// bytes are the little-endian uint64 per token encoded by encode_tokens.
-std::span<const uint64_t> read_tokens(const TensorValue& v) {
-  return {reinterpret_cast<const uint64_t*>(v.host.data()),
-          v.host.size() / sizeof(uint64_t)};
-}
-
 // The device allocator backing this backend's persistent buffers. Stateless: it
 // delegates to the process-wide device pool, so a single shared instance serves
 // all backends (mirrors the pool's global free-list).
@@ -139,6 +123,11 @@ SonicCudaBackend::SonicCudaBackend(const model::Gemma4Model& model,
   ensure_caches(n_ctx);
   token_buf_ = g_alloc.allocate(sizeof(float));   // persistent current-token slot
   pos_buf_ = g_alloc.allocate(sizeof(uint64_t));  // persistent position slot
+  // Prefill chunk token-id slot: sized for the largest chunk (the SWA window),
+  // so any segment (<= sliding_window tokens) stages into it in place.
+  const uint64_t chunk = model_.config.sliding_window;
+  if (chunk > 0)
+    tokens_buf_ = g_alloc.allocate(chunk * sizeof(uint64_t));
   if (pos_buf_) {
     const uint64_t zero = 0;
     g_alloc.copy_to_device(pos_buf_, &zero, sizeof(uint64_t));  // defensive: pos starts at 0
@@ -151,6 +140,7 @@ SonicCudaBackend::~SonicCudaBackend() {
   caches_.reset();
   if (token_buf_) g_alloc.deallocate(token_buf_);
   if (pos_buf_) g_alloc.deallocate(pos_buf_);
+  if (tokens_buf_) g_alloc.deallocate(tokens_buf_);
 }
 
 bool SonicCudaBackend::seed_token(uint64_t token) {
@@ -162,6 +152,14 @@ bool SonicCudaBackend::seed_token(uint64_t token) {
 bool SonicCudaBackend::set_pos(uint64_t pos) {
   if (!pos_buf_) return false;
   return g_alloc.copy_to_device(pos_buf_, &pos, sizeof(uint64_t));
+}
+
+bool SonicCudaBackend::set_prefill_tokens(std::span<const uint64_t> tokens) {
+  if (!tokens_buf_ || tokens.empty()) return false;
+  const uint64_t chunk = model_.config.sliding_window;
+  if (tokens.size() > chunk) return false;  // a segment never exceeds the window
+  return g_alloc.copy_to_device(tokens_buf_, tokens.data(),
+                                tokens.size() * sizeof(uint64_t));
 }
 
 bool SonicCudaBackend::read_token(float* host) const {
@@ -548,15 +546,21 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     // Each mirrors the CPU SonicBackend's batched case, dispatching to the
     // batched *_dev kernels. Activations are [dim, n] column-major (n innermost)
     // or [n, dim] position-major after a Transpose. The Int64 graph inputs
-    // (tokens, start_pos) stay host and are read straight from the input values.
+    // (tokens, start_pos) are read from the persistent device slots tokens_buf_ /
+    // pos_buf_ (staged by the spine before execute/replay), so a whole segment is
+    // capturable into a CUDA Graph (no host value baked into a launch argument
+    // and no synchronous H2D token upload).
     case OpKind::EmbeddingBatched: {
-      const std::span<const uint64_t> tokens = read_tokens(in[0]);
+      int64_t nb = 0;
+      attr_i(*node, "batch", nb);
+      const uint64_t* tokens_dev = reinterpret_cast<const uint64_t*>(tokens_buf_.id);
+      if (!tokens_dev) { ok = false; break; }
       if (slot == model::WeightSlot::PerLayerTokenEmbd)
-        ok = quant::cuda::gather_f32_mapped_dev_batched(
-            model_.weights.per_layer_token_embd, tokens, out);
+        ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
+            model_.weights.per_layer_token_embd, tokens_dev, int(nb), out);
       else
-        ok = quant::cuda::gather_f32_resident_dev_batched(
-            model_.weights.token_embd, tokens, out);
+        ok = quant::cuda::gather_f32_resident_dev_batched_ids(
+            model_.weights.token_embd, tokens_dev, int(nb), out);
       break;
     }
     case OpKind::RmsNormCols: {
@@ -595,7 +599,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::RopeBatched: {
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint64_t start = read_i64(in[1]);
       const std::span<const float> ff =
           lc.attention == model::AttentionKind::Global
               ? model_.weights.rope_freqs
@@ -604,9 +607,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      ok = nn::cuda::rope_neox_heads_batched_dev(
+      ok = nn::cuda::rope_neox_heads_batched_dev_pos(
           out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
-          start, lc.rope_base, 1.0f, ff);
+          reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
       break;
     }
     case OpKind::FlashAttention: {
@@ -616,13 +619,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // empty and this is bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint64_t start = read_i64(in[3]);
       KvCacheDev& cache = (*caches_)[uint32_t(layer)];
-      ok = nn::cuda::flash_attention_chunk_dev(
+      ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
-          dev_mut(cache.v_buf.id), start, cache.n_slots, int(nb),
-          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, 1.0f, out);
+          dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
+          cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
+          int(cache.head_dim), lc.sliding_window, 1.0f, out);
       break;
     }
     case OpKind::FlashAttentionShared: {
@@ -630,14 +632,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // donor's current-chunk K/V (no append). inputs: {q, dk, dv, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint64_t start = read_i64(in[3]);
       const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
       const KvCacheDev& cache = (*caches_)[donor];
-      ok = nn::cuda::flash_attention_chunk_dev(
+      ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
-          dev_mut(cache.v_buf.id), start, cache.n_slots, int(nb),
-          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, 1.0f, out);
+          dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
+          cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
+          int(cache.head_dim), lc.sliding_window, 1.0f, out);
       break;
     }
     case OpKind::KvAppendBatched: {
@@ -645,13 +646,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint64_t start = read_i64(in[2]);
       KvCacheDev& cache = (*caches_)[uint32_t(layer)];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       if (!cache.k_buf || !cache.v_buf ||
-          !nn::cuda::kv_append_batched_dev(
+          !nn::cuda::kv_append_batched_dev_pos(
               dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[0]),
-              dev(in[1]), start, cache.n_slots, row_elems, int(nb))) {
+              dev(in[1]), reinterpret_cast<const uint64_t*>(pos_buf_.id),
+              cache.n_slots, row_elems, int(nb))) {
         ok = false;
         break;
       }

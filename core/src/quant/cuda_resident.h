@@ -118,4 +118,15 @@ bool gather_f32_resident_dev_batched(const QuantizedTensor& W,
 bool gather_f32_mapped_dev_batched(const QuantizedTensor& W,
                                    std::span<const uint64_t> tokens, float* out);
 
+// Device-token variants (CUDA Graphs for chunked prefill): the n token ids are
+// read from a persistent DEVICE buffer (`token_ids_dev`, [n] uint64) at kernel
+// time instead of being uploaded from a host span via a synchronous cudaMemcpy
+// (which cannot be recorded into a graph). out is [width, n] column-major.
+bool gather_f32_resident_dev_batched_ids(const QuantizedTensor& W,
+                                         const uint64_t* token_ids_dev, int n,
+                                         float* out);
+bool gather_f32_mapped_dev_batched_ids(const QuantizedTensor& W,
+                                       const uint64_t* token_ids_dev, int n,
+                                       float* out);
+
 } // namespace sonicboom::quant::cuda

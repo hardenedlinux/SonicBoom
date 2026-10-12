@@ -36,6 +36,7 @@
 #include <sonicboom/planner/graph.h>
 
 #include <memory>
+#include <span>
 
 namespace sonicboom::planner {
 
@@ -66,7 +67,15 @@ public:
   // (uint64_t). The decode loop calls this once per step before execute(); the
   // RoPE, KV-append and attention kernels read it in-kernel, so the position is
   // an input to a capturable graph rather than a per-kernel launch argument.
+  // The prefill path stages the chunk's absolute start position the same way.
   bool set_pos(uint64_t pos);
+
+  // Stage a chunk's token ids into the persistent device-resident `tokens_buf_`
+  // slot (n <= sliding_window, [n] uint64). The batched embedding gather reads
+  // them in-kernel, so the chunk's ids are a graph input rather than a host
+  // value baked into a synchronous H2D memcpy at capture time (CUDA Graphs for
+  // chunked prefill).
+  bool set_prefill_tokens(std::span<const uint64_t> tokens);
 
   // Download the current token id from the persistent device-resident `token_buf_`
   // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
@@ -120,6 +129,7 @@ private:
   std::shared_ptr<std::vector<KvCacheDev>> caches_;
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
+  hal::Buffer tokens_buf_;          // persistent device buffer: prefill chunk token ids ([chunk] uint64)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
 
   void ensure_caches(uint64_t n_ctx);

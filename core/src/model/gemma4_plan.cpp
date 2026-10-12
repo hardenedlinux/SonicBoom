@@ -975,13 +975,17 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 
     // One prefill runtime per distinct segment size (usually just `chunk`; the
     // final segment may be shorter). Each is bound to its own graph but shares
-    // the decode backend's KV cache, so prior segments' context is visible.
+    // the decode backend's KV cache, so prior segments' context is visible. The
+    // full-chunk segment is also captured into a CUDA Graph (prog) and replayed
+    // per segment; the final (possibly shorter) segment runs uncaptured so its
+    // hidden column reaches the host through the executor's output path.
     struct PrefillSegment {
       planner::Graph graph;
       planner::ExecutionPlan plan;
       std::unique_ptr<planner::SonicBackend> cpu;
       std::unique_ptr<planner::SonicCudaBackend> cuda;
       std::unique_ptr<planner::RuntimeExecutor> exec;
+      std::unique_ptr<hal::StepProgram> prog;
     };
     std::map<uint64_t, std::unique_ptr<PrefillSegment>> segments;
 
@@ -1017,14 +1021,68 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
       return raw;
     };
 
+    // CUDA Graph capture of the full-chunk segment (HAL record_step), replayed
+    // per non-final segment so the ~420 per-segment device-op launches collapse
+    // into one graph launch. The final segment (possibly a shorter tail) runs
+    // uncaptured so its hidden column reaches the host via the executor output.
+    // Opt-out via SONICBOOM_CUDA_GRAPHS=0; a capture failure leaves `prog` null
+    // and falls back to the per-segment dispatch path (pure launch-overhead
+    // optimization, no numerics change).
+    const bool use_graphs =
+        std::getenv("SONICBOOM_CUDA_GRAPHS") == nullptr ||
+        std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
+    // Capture only when there is at least one non-final full-chunk segment to
+    // replay (n > chunk); a single segment is always final and runs uncaptured.
+    if (use_graphs && n > chunk) {
+      PrefillSegment* full = segment_for(chunk);
+      if (full) {
+        const std::span<const uint64_t> first_chunk = prompt.subspan(0, chunk);
+        full->cuda->set_prefill_tokens(first_chunk);
+        full->cuda->set_pos(start_pos);
+        std::vector<sx::Bytes> in;
+        in.push_back(encode_tokens(first_chunk));
+        in.push_back(encode_i64(start_pos));
+        auto res = full->exec->execute(full->plan, *snap, in);
+        if (res) {
+          full->cuda->synchronize();
+          full->prog = full->cuda->record_step([&]() {
+            std::vector<sx::Bytes> cin;
+            cin.push_back(encode_tokens(first_chunk));
+            cin.push_back(encode_i64(start_pos));
+            auto cres = full->exec->execute(full->plan, *snap, cin);
+            return cres.has_value();
+          });
+        }
+      }
+    }
+
     const auto t_pf0 = std::chrono::steady_clock::now();
     for (uint64_t off = 0; off < n; off += chunk) {
       const uint64_t nseg = std::min(chunk, n - off);
       const uint64_t pos = start_pos + off;
+      const bool is_final = (off + nseg == n);
       PrefillSegment* seg = segment_for(nseg);
       if (!seg)
         return 0;
 
+      if (seg->prog && !is_final) {
+        // Replay the captured full-chunk graph: stage this segment's token ids
+        // and start position into the persistent device slots, then launch the
+        // graph. The next segment's staging (a synchronous H2D on the legacy
+        // default stream) drains this replay before it reads the appended cache.
+        seg->cuda->set_prefill_tokens(prompt.subspan(off, nseg));
+        seg->cuda->set_pos(pos);
+        if (!seg->prog->replay()) {
+          std::cerr << "[prefill-cuda] segment off=" << off
+                    << " graph replay failed\n";
+          return 0;
+        }
+        continue;
+      }
+
+      // Uncached (final segment, or capture fell back): full executor dispatch.
+      seg->cuda->set_prefill_tokens(prompt.subspan(off, nseg));
+      seg->cuda->set_pos(pos);
       std::vector<sx::Bytes> in;
       in.push_back(encode_tokens(prompt.subspan(off, nseg)));
       in.push_back(encode_i64(pos));
@@ -1039,7 +1097,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
         return 0;
       }
 
-      if (off + nseg == n) {
+      if (is_final) {
         // Final segment: its last hidden column is the prompt's final state.
         const sx::Bytes& hidden_b = res->outputs[0];
         if (hidden_b.size() < uint64_t(d) * nseg * sizeof(float)) {

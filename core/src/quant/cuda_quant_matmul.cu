@@ -1541,4 +1541,59 @@ bool gather_f32_mapped_dev_batched(const QuantizedTensor& W,
                                int(width), int(blocks_per_row), n, out);
 }
 
+// Device-token variants (CUDA Graphs for chunked prefill): read the n token ids
+// straight from a persistent device buffer, skipping the synchronous cudaMemcpy
+// H2D that the host-span variants perform (that copy cannot be recorded into a
+// graph). The caller stages the ids into the device buffer between replays.
+bool gather_f32_resident_dev_batched_ids(const QuantizedTensor& W,
+                                         const uint64_t* token_ids_dev, int n,
+                                         float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  if (n <= 0 || !token_ids_dev || !out) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return launch_gather_batched(static_cast<const uint8_t*>(d_w), token_ids_dev,
+                               W.type(), int(width), int(blocks_per_row), n, out);
+}
+
+bool gather_f32_mapped_dev_batched_ids(const QuantizedTensor& W,
+                                       const uint64_t* token_ids_dev, int n,
+                                       float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  if (n <= 0 || !token_ids_dev || !out) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    const void* src = W.data().data();
+    const size_t bytes = W.byte_size();
+    if (g_ple_mapped.host != src || g_ple_mapped.bytes != bytes) {
+      if (g_ple_mapped.host)
+        cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+      g_ple_mapped = {};
+      void* h = const_cast<void*>(src);
+      if (cudaHostRegister(h, bytes, cudaHostRegisterMapped) != cudaSuccess)
+        return false;
+      void* dev = nullptr;
+      if (cudaHostGetDevicePointer(&dev, h, 0) != cudaSuccess) {
+        cudaHostUnregister(h);
+        return false;
+      }
+      g_ple_mapped = {dev, src, bytes};
+    }
+    d_w = g_ple_mapped.dev;
+  }
+  return launch_gather_batched(static_cast<const uint8_t*>(d_w), token_ids_dev,
+                               W.type(), int(width), int(blocks_per_row), n, out);
+}
+
 } // namespace sonicboom::quant::cuda

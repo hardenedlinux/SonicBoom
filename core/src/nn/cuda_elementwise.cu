@@ -823,6 +823,110 @@ __global__ void flash_attention_chunk_kernel(
   for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
 }
 
+// Device-position variant of flash_attention_chunk_kernel: `start` is a DEVICE
+// uint64_t read in-kernel, so the chunk's absolute start position is an input to
+// a capturable CUDA Graph rather than a value baked into the node at capture
+// time. Identical numerics otherwise (the launch config is fixed by n/head
+// shapes, never by start).
+__global__ void flash_attention_chunk_pos_kernel(
+    const float* __restrict__ q, const float* __restrict__ k_batch,
+    const float* __restrict__ v_batch, const float* __restrict__ k_cache,
+    const float* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
+    uint64_t n_slots, int n_heads_q, int n_heads_kv, int head_dim,
+    uint64_t sliding_window, float scale, float* __restrict__ out) {
+  extern __shared__ float s_sh[];  // [n_heads_q * FA_BK]
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;  // warp == query head
+  const int iq = blockIdx.x;       // query position within the chunk (0-based)
+  if (h >= n_heads_q) return;
+  const int kv_h = h * n_heads_kv / n_heads_q;
+  const uint64_t start = *start_ptr;
+  const uint64_t p = start + (uint64_t)iq;  // absolute query position
+  const float* qrow = q + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  float* tile = s_sh + h * FA_BK;
+
+  float acc[16];
+  #pragma unroll
+  for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  float m = -1e30f, l = 0.0f;
+
+  const uint64_t start_key =
+      (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+
+  for (uint64_t j0 = start_key; j0 < p + 1; j0 += FA_BK) {
+    const uint64_t jend = (p + 1 < j0 + FA_BK) ? (p + 1) : (j0 + FA_BK);
+    const int jj_count = int(jend - j0);
+
+    for (int jj = 0; jj < jj_count; ++jj) {
+      const uint64_t j = j0 + (uint64_t)jj;
+      const float* krow;
+      if (j < start) {
+        const uint64_t slot = j % n_slots;
+        krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+      } else {
+        const uint64_t bi = j - start;
+        krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+      }
+      float dot = 0.0f;
+      for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1)
+        dot += __shfl_down_sync(0xffffffffu, dot, o);
+      if (lane == 0) tile[jj] = dot * scale;
+    }
+    __syncwarp();
+
+    float tile_max = -1e30f;
+    for (int jj = lane; jj < jj_count; jj += 32)
+      tile_max = fmaxf(tile_max, tile[jj]);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_max = fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, o));
+    tile_max = __shfl_sync(0xffffffffu, tile_max, 0);
+
+    const float m_new = fmaxf(m, tile_max);
+    const float rescale = expf(m - m_new);
+
+    float tile_sum = 0.0f;
+    for (int jj = lane; jj < jj_count; jj += 32) {
+      const float pv = expf(tile[jj] - m_new);
+      tile[jj] = pv;
+      tile_sum += pv;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, o);
+    tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0);
+    l = l * rescale + tile_sum;
+
+    __syncwarp();
+    int di = 0;
+    for (int d = lane; d < head_dim; d += 32, ++di) {
+      float a = acc[di] * rescale;
+      for (int jj = 0; jj < jj_count; ++jj) {
+        const uint64_t j = j0 + (uint64_t)jj;
+        const float* vrow;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        } else {
+          const uint64_t bi = j - start;
+          vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        }
+        a += tile[jj] * vrow[d];
+      }
+      acc[di] = a;
+    }
+    m = m_new;
+    __syncwarp();
+  }
+
+  const float inv = 1.0f / l;
+  float* orow = out + ((uint64_t)iq * n_heads_q + h) * head_dim;
+  int di = 0;
+  for (int d = lane; d < head_dim; d += 32, ++di) orow[d] = acc[di] * inv;
+}
+
 // --- device state (scratch + weight cache) ----------------------------------
 
 struct DeviceWeight {
@@ -1013,6 +1117,30 @@ __global__ void rope_neox_heads_batched_kernel(float* __restrict__ x, int n,
   x[i + half] = x0 * s + x1 * c;
 }
 
+// Device-position variant of rope_neox_heads_batched_kernel: `start_pos` is a
+// DEVICE uint64_t read in-kernel, so the chunk's start position is an input to a
+// capturable CUDA Graph rather than a value baked into the node at capture time.
+__global__ void rope_neox_heads_batched_pos_kernel(
+    float* __restrict__ x, int n, int head_dim, int heads_per_pos,
+    const uint64_t* __restrict__ start_pos, float freq_scale, float log_base,
+    const float* __restrict__ freq_factors) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int half = head_dim >> 1;
+  const int off = i % head_dim;
+  if (off >= half) return;
+  const uint64_t pos = *start_pos + (uint64_t)(i / (heads_per_pos * head_dim));
+  float theta = freq_scale * float(pos) *
+                expf(-2.0f * float(off) / float(head_dim) * log_base);
+  if (freq_factors) theta /= freq_factors[off];
+  const float c = cosf(theta);
+  const float s = sinf(theta);
+  const float x0 = x[i];
+  const float x1 = x[i + half];
+  x[i] = x0 * c - x1 * s;
+  x[i + half] = x0 * s + x1 * c;
+}
+
 // Tiled transpose of a [rows, cols] row-major matrix -> [cols, rows]:
 // dst[c*rows + r] = src[r*cols + c]. Same +1-pad tile as the K-quant matmul's
 // transpose_tiled, kept here so the prefill Transpose op has no quant-file
@@ -1073,6 +1201,22 @@ __global__ void kv_append_batched_kernel(float* __restrict__ dst,
   const int row = idx / row_elems;
   const int e = idx - row * row_elems;
   const uint64_t slot = (start_pos + (uint64_t)row) % n_slots;
+  dst[slot * (uint64_t)row_elems + (uint64_t)e] = src[idx];
+}
+
+// Device-position variant of kv_append_batched_kernel: `start_pos` is a DEVICE
+// uint64_t read in-kernel (CUDA Graphs for chunked prefill).
+__global__ void kv_append_batched_pos_kernel(float* __restrict__ dst,
+                                             const float* __restrict__ src,
+                                             const uint64_t* __restrict__ start_pos,
+                                             uint64_t n_slots, int row_elems,
+                                             int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_elems * n;
+  if (idx >= total) return;
+  const int row = idx / row_elems;
+  const int e = idx - row * row_elems;
+  const uint64_t slot = (*start_pos + (uint64_t)row) % n_slots;
   dst[slot * (uint64_t)row_elems + (uint64_t)e] = src[idx];
 }
 
@@ -1701,6 +1845,28 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
+                                   const float* v_batch, const float* k_cache,
+                                   const float* v_cache, const uint64_t* start,
+                                   uint64_t n_slots, int n, int n_heads_q,
+                                   int n_heads_kv, int head_dim,
+                                   uint64_t sliding_window, float scale,
+                                   float* out) {
+  if (!available()) return false;
+  if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
+    return false;
+  if (!q || !k_batch || !v_batch || !k_cache || !v_cache || !start || !out)
+    return false;
+  if (n_heads_q % n_heads_kv != 0) return false;
+  if (head_dim % 32 != 0 || head_dim > 512) return false;
+  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
+  flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
+      n_heads_kv, head_dim, sliding_window, scale, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
                        float combine_scale, float* y, int n) {
   if (!available()) return false;
@@ -1751,6 +1917,29 @@ bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
   }
   const float log_base = std::log(base);
   rope_neox_heads_batched_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
+      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
+                                     int n_pos, const uint64_t* start_pos,
+                                     float base, float freq_scale,
+                                     std::span<const float> freq_factors) {
+  if (!available()) return false;
+  if (head_dim <= 0 || heads_per_pos <= 0 || n_pos <= 0 || !x || !start_pos)
+    return false;
+  const int n = head_dim * heads_per_pos * n_pos;
+  const int half = head_dim >> 1;
+  if ((head_dim & 1) != 0) return false;
+  if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
+  const float* d_ff = nullptr;
+  if (!freq_factors.empty()) {
+    d_ff = static_cast<const float*>(
+        upload_bytes(freq_factors.data(), half * sizeof(float)));
+    if (!d_ff) return false;
+  }
+  const float log_base = std::log(base);
+  rope_neox_heads_batched_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
       x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1810,6 +1999,21 @@ bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
   kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
       dst_k, src_k, start_pos, n_slots, row_elems, n);
   kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+      dst_v, src_v, start_pos, n_slots, row_elems, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
+                               const float* src_v, const uint64_t* start_pos,
+                               uint64_t n_slots, int row_elems, int n) {
+  if (!available()) return false;
+  if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
+      !start_pos || n_slots == 0)
+    return false;
+  const int grid = grid_for(row_elems * n);
+  kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
+      dst_k, src_k, start_pos, n_slots, row_elems, n);
+  kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
       dst_v, src_v, start_pos, n_slots, row_elems, n);
   return cudaGetLastError() == cudaSuccess;
 }

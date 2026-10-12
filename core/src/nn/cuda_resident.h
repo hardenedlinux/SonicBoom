@@ -149,6 +149,18 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
                                int n_heads_kv, int head_dim,
                                uint64_t sliding_window, float scale, float* out);
 
+// Device-position variant of flash_attention_chunk_dev: `start` is a DEVICE
+// uint64_t read in-kernel, so the chunk's absolute start position is a graph
+// input rather than a value baked into the node at capture time (CUDA Graphs for
+// chunked prefill). The launch config is fixed by n/head shapes, never by start.
+bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
+                                   const float* v_batch, const float* k_cache,
+                                   const float* v_cache, const uint64_t* start,
+                                   uint64_t n_slots, int n, int n_heads_q,
+                                   int n_heads_kv, int head_dim,
+                                   uint64_t sliding_window, float scale,
+                                   float* out);
+
 // Per-layer embedding combine: y[i] = (proj[i] + ple[i] * ple_scale) * combine_scale.
 // `ple` is the caller-offset device pointer into the full per-layer embedding
 // row (i.e. already advanced by `layer * per_layer_input`). Mirrors
@@ -184,6 +196,13 @@ bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
                                  float freq_scale,
                                  std::span<const float> freq_factors);
 
+// Device-position variant of rope_neox_heads_batched_dev: `start_pos` is a DEVICE
+// uint64_t read in-kernel (CUDA Graphs for chunked prefill).
+bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
+                                     int n_pos, const uint64_t* start_pos,
+                                     float base, float freq_scale,
+                                     std::span<const float> freq_factors);
+
 // Tiled transpose of a column-major buffer. forward=true: src [dim, ncols] ->
 // dst [ncols, dim] (dst[c*dim+k] = src[k*ncols+c]); forward=false: src
 // [ncols, dim] -> dst [dim, ncols] (dst[k*ncols+c] = src[c*dim+k]).
@@ -204,5 +223,11 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
 bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
                            const float* src_v, uint64_t start_pos,
                            uint64_t n_slots, int row_elems, int n);
+
+// Device-position variant of kv_append_batched_dev: `start_pos` is a DEVICE
+// uint64_t read in-kernel (CUDA Graphs for chunked prefill).
+bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
+                               const float* src_v, const uint64_t* start_pos,
+                               uint64_t n_slots, int row_elems, int n);
 
 } // namespace sonicboom::nn::cuda
