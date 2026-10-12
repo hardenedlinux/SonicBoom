@@ -398,13 +398,15 @@ __global__ void rms_norm_fused_kernel(const float* __restrict__ x,
     y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
 }
 
-// Per-head rms_norm fused (T4): one block per head. Thread 0 computes the
-// sequential double sum-of-squares in ascending index order (bit-identical to
-// the CPU rms_norm_heads in norm.cpp), derives inv = 1/sqrtf(float(sum/head_dim)
-// + eps), and the whole block applies the normalization. Replaces the
-// sum + inv + apply three-kernel launch (and its g_head_sum/g_head_inv device
-// scratch buffers); the apply is elementwise so spreading it across the block
-// does not change the result.
+// Per-head rms_norm fused (T4): one block per head. The sum-of-squares is a
+// block-wide parallel reduction (each thread accumulates a strided slice of the
+// head, then warp + block tree-reduce) instead of thread 0 serializing the whole
+// head_dim — the serial form left the other 255 threads idle and was bound by
+// the single thread's dependent double-add chain. The double accumulation and
+// the fp32 rounding at inv = 1/sqrtf(float(sum/head_dim)+eps) keep the result
+// within the fp32 tolerance of the CPU rms_norm_heads reference (the reordering
+// is far below the fp32 rounding applied to sum/head_dim). The apply is
+// elementwise so spreading it across the block does not change the result.
 __global__ void rms_heads_fused_kernel(const float* __restrict__ x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
@@ -412,18 +414,28 @@ __global__ void rms_heads_fused_kernel(const float* __restrict__ x,
   const int h = blockIdx.x;
   const float* __restrict__ xh = x + (size_t)h * head_dim;
   float* __restrict__ yh = y + (size_t)h * head_dim;
+  const int tid = threadIdx.x;
+  double s = 0.0;
+  for (int i = tid; i < head_dim; i += blockDim.x) {
+    const float v = xh[i];
+    s += double(v * v);
+  }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  __shared__ double warp_part[32];
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (lane == 0) warp_part[warp] = s;
+  __syncthreads();
   __shared__ float inv;
-  if (threadIdx.x == 0) {
-    double s = 0.0;
-    for (int i = 0; i < head_dim; ++i) {
-      const float v = xh[i];
-      s += double(v * v);
-    }
-    inv = 1.0f / sqrtf(float(s / double(head_dim)) + eps);
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
+    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(head_dim)) + eps);
   }
   __syncthreads();
   const float iv = inv;
-  for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
+  for (int i = tid; i < head_dim; i += blockDim.x)
     yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
 }
 
@@ -1350,39 +1362,52 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
 
 // --- batched prefill kernels (the decode kernels generalized to n columns) ---
 
-// Strided-column rms_norm: one block per column c. The per-column reduction is
-// the same parallel double sum-of-squares as rms_norm_fused_kernel (warp
-// shuffle + shared block reduce), so each column matches the decode rms_norm_dev
-// to fp32 rounding. The column elements are strided (stride ncols), so the
-// loads are not coalesced; prefill is a one-shot pass where the K-quant matmuls
-// dominate, so this is accepted.
+// Column rms_norm over a [dim, ncols] row-major activation (the batched prefill
+// layout): normalizes each of the `ncols` columns over the `dim` rows. The
+// previous form was one block per column with threads spanning dim, reading
+// x[k*ncols+c] at stride ncols — every warp touched one cache line per lane, so
+// the pass ran far above the memory-bound floor. This form makes consecutive
+// lanes own consecutive columns (coalesced loads/stores) and splits the dim
+// reduction across the 32 warps of a block (each warp sums a contiguous dim
+// slice), then combines the per-slice partials in shared memory. Grid is
+// (ncols+31)/32 blocks of 1024 threads; each block covers 32 columns. The double
+// accumulation and fp32 rounding at inv keep each column within the fp32
+// tolerance of the decode rms_norm_dev reference (the reorder is far below the
+// fp32 rounding applied to sum/dim).
 __global__ void rms_norm_cols_kernel(const float* __restrict__ x,
                                      const float* __restrict__ weight, int dim,
                                      int ncols, float eps,
                                      float* __restrict__ y) {
-  const int c = blockIdx.x;
-  const int tid = threadIdx.x;
+  const int warp = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int nwarps = blockDim.x >> 5;
+  const int c = blockIdx.x * 32 + lane;
+  const bool valid = c < ncols;
+  // contiguous dim slice owned by this warp
+  const int chunk = (dim + nwarps - 1) / nwarps;
+  const int k0 = warp * chunk;
+  const int k1 = (k0 + chunk < dim) ? (k0 + chunk) : dim;
   double s = 0.0;
-  for (int k = tid; k < dim; k += blockDim.x) {
-    const float v = x[(size_t)k * ncols + c];
-    s += double(v * v);
+  if (valid) {
+    for (int k = k0; k < k1; ++k) {
+      const float v = x[(size_t)k * ncols + c];
+      s += double(v * v);
+    }
   }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
+  // combine this warp's partial per-column sum across the dim-slice warps.
+  __shared__ double warp_part[32][32];  // [nwarps][32 columns]
+  warp_part[warp][lane] = s;
   __syncthreads();
-  __shared__ float inv;
+  __shared__ float inv[32];
   if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(dim)) + eps);
+    double t = warp_part[0][lane];
+    for (int w = 1; w < nwarps; ++w) t += warp_part[w][lane];
+    inv[lane] = 1.0f / sqrtf(float(t / double(dim)) + eps);
   }
   __syncthreads();
-  const float iv = inv;
-  for (int k = tid; k < dim; k += blockDim.x) {
+  if (!valid) return;
+  const float iv = inv[lane];
+  for (int k = k0; k < k1; ++k) {
     const size_t idx = (size_t)k * ncols + c;
     y[idx] = weight ? x[idx] * iv * weight[k] : x[idx] * iv;
   }
@@ -2229,7 +2254,7 @@ bool rms_norm_cols_dev(std::span<const float> weight, const float* x, float eps,
     d_w = static_cast<const float*>(upload_bytes(weight.data(), dim * sizeof(float)));
     if (!d_w) return false;
   }
-  rms_norm_cols_kernel<<<ncols, 1024, 0, cur_stream()>>>(x, d_w, dim, ncols, eps, y);
+  rms_norm_cols_kernel<<<(ncols + 31) / 32, 1024, 0, cur_stream()>>>(x, d_w, dim, ncols, eps, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
