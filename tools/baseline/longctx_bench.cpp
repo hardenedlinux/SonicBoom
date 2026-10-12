@@ -20,7 +20,7 @@
 // and read the `steady … tok/s` line (the `depth`-step decode averaged, first
 // step excluded). That is what benchmark.md §1.2 uses.
 //
-// Usage: longctx_bench [--depth N] [--steps N] [--token id]
+// Usage: longctx_bench [--depth N] [--steps N] [--token id] [--n-ctx N]
 // Build: tools/baseline/build_longctx_bench.sh
 
 #include <sonicboom/gguf/reader.h>
@@ -43,10 +43,12 @@ int main(int argc, char** argv) {
   uint64_t depth = 512;
   uint64_t steps = 64;
   uint64_t seed = 2;
+  uint64_t n_ctx = 0;  // 0 = default (depth + steps)
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--depth")) depth = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--steps")) steps = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--token")) seed = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--n-ctx")) n_ctx = atoll(argv[++i]);
   }
 
   std::string path;
@@ -72,11 +74,13 @@ int main(int argc, char** argv) {
     sbmodel::generate_spine_cuda(*m, seed, 0, warm, 0);
   }
 
-  // Pin n_ctx to the full decode length for BOTH runs. Otherwise the warm run
-  // (n tokens) and the full run (n+steps tokens) size the global-layer KV cache
-  // and the split-KV chunk (= n_ctx/40) differently, so the first `depth` steps
-  // are not timing-identical and the subtraction over/under-counts the tail.
-  const uint64_t ctx = depth + steps;
+  // Pin n_ctx to the full decode length for BOTH runs (or an explicit --n-ctx).
+  // Otherwise the warm run (n tokens) and the full run (n+steps tokens) size the
+  // global-layer KV cache and the split-KV chunk (= n_ctx/40) differently, so
+  // the first `depth` steps are not timing-identical and the subtraction
+  // over/under-counts the tail. --n-ctx overrides to probe the chunk-size
+  // dependence at a fixed depth (the n_ctx sensitivity sweep).
+  const uint64_t ctx = n_ctx ? n_ctx : (depth + steps);
 
   auto run_decode = [&](uint64_t n, double* secs) -> uint64_t {
     std::vector<int64_t> toks(n, -1);

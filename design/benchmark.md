@@ -6,7 +6,8 @@
 **Status: v1 performance complete through Step 4.** CUDA decode is at
 llama.cpp parity on the 64-step protocol (1.02×) and at long context (1.02× at
 depth 512, 0.97× at depth 2048). The remaining gap is one dominated kernel (the
-q8_1 gemv) plus a small attention growth at depth ≥ 2048, not architecture.
+q8_1 gemv); the attention growth at depth ≥ 2048 was traced to split-KV chunk
+serialization at large n_ctx and fixed with a `kMaxChunk` cap (§1.2.1).
 
 ## Scope
 
@@ -114,6 +115,52 @@ the global layers span the full window, while gemv q8_1 (14.9 ms, ~66%) is
 unchanged. llama.cpp has no such penalty at these depths, so the long-context
 gap widens slowly with depth — this is the same sublinear attention growth §2
 quantifies, now visible end-to-end.
+
+### 1.2.1 n_ctx sensitivity at fixed depth (split-KV chunk serialization)
+
+The depth-2048 penalty (0.97×) prompted a sweep of `n_ctx` at a **fixed depth
+512** (`n_ctx = 2048/8192/32768`), isolating the attention chunk-size dependence.
+Split-KV attention computes `chunk = ceil(window/target_chunks)` with
+`target_chunks = sm_count()*4/n_heads_kv ≈ 40`; for global layers `window =
+n_ctx`, so **chunk grows linearly with n_ctx** (52 → 205 → 820) while the current
+depth stays 512. The active split blocks collapse from 20 (n_ctx 2048) to 2
+(n_ctx 32768), serializing the whole 512-key window onto one block per KV head.
+
+| n_ctx | chunk | active split blocks | split (ms) | steady tok/s |
+|---|---|---|---|---|
+| 2048 | 52 | 20 | 1.95 | 45.19 |
+| 8192 | 205 | 6 | 9.32 | 41.24 |
+| 32768 | 820 | 2 | 20.36 | 38.49 |
+
+(depth 511, graphs-OFF `nsys nvtxkernsum` for the split; `SONICBOOM_GEN_TIMING=1`
+for the steady tok/s.) The growth is real and pathological — split 1.95→20.36 ms
+(10×) and tok/s 45.19→38.49 (−15%) as n_ctx 2048→32768 — confirming the
+chunk-serialization hypothesis that the depth-2048 §2 sweep had prematurely
+refuted (its `n_ctx=2048` held chunk ≤ 52, never reaching the serialization
+regime that appears at `n_ctx ≥ 8192`).
+
+**Fix.** Cap `chunk` at `kMaxChunk = 16` so the grid scales with `window`:
+`ceil(window/chunk)*n_heads_kv` blocks, with blocks beyond the current `n_keys`
+early-exiting. At depth 512 this keeps 32 active chunks (64 blocks, ~3.2/SM) for
+*any* n_ctx, matching the SWA layers' parallelism (chunk 13 → 80 blocks). A cap
+of 32 is a wave-fill local minimum (16 chunks → 32 blocks, 1.6/SM) and measured
+~2.4× slower split (3.20 vs 1.29 ms at depth 512), so 16 was chosen.
+
+After the fix (`chunk = 16`):
+
+| n_ctx | split (ms) | attention split+merge (ms) | steady tok/s |
+|---|---|---|---|
+| 2048 | 2.72 | 3.21 | 46.40 |
+| 8192 | 2.72 | 3.22 | 46.29 |
+| 32768 | 2.73 | 3.23 | 46.35 |
+
+The split is now **flat (~2.72 ms)** and tok/s **flat (~46.3)** across n_ctx — the
+pathological serialization is gone. The residual split (~2.72 ms at depth 511) is
+~1.4 ms above the n_ctx=576 baseline (1.29 ms, chunk 15 → 70 blocks) but does *not*
+grow with n_ctx — a memory/cache effect of the larger KV cache, ≤6% of the step,
+not a serialization bottleneck.
+
+Reproduce: `SONICBOOM_GEN_TIMING=1 tools/baseline/longctx_bench --depth 512 --steps 1 --n-ctx {2048,8192,32768}`.
 
 ### 1.3 CPU decode (reference)
 

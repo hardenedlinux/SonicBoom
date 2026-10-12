@@ -1365,8 +1365,23 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   const int group_q = n_heads_q / n_heads_kv;
   const uint64_t target_chunks =
       std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
-  const uint64_t chunk =
-      std::max<uint64_t>(1, (window + target_chunks - 1) / target_chunks);
+  // chunk = ceil(window / target_chunks), but capped so a large n_ctx does not
+  // serialize the whole KV sequence onto one block. Without the cap chunk grows
+  // linearly with n_ctx (820 at n_ctx=32768), so at a short depth only one block
+  // per KV head stays active and the split kernel becomes latency-bound
+  // (measured split 1.95 -> 9.32 -> 20.36 ms at n_ctx 2048/8192/32768). Capping
+  // lets the grid scale with window instead — ceil(window/chunk)*n_heads_kv —
+  // with blocks beyond the current n_keys early-exiting (see the split kernel).
+  // The cap is sized for the SWA window (512): chunk 16 keeps depth-512
+  // attention at 32 active chunks (64 blocks, ~3.2/SM) for any n_ctx, matching
+  // the SWA layers' parallelism (chunk 13 -> 80 blocks). A cap of 32 is a
+  // wave-fill local minimum (16 chunks -> 32 blocks, 1.6/SM) and measured
+  // ~2.4x slower split (3.20 vs 1.29 ms at depth 512). The trade-off of the
+  // smaller chunk is a larger partial buffer (n_chunks*8*322 floats) and a
+  // longer merge loop at full depth, both negligible at the SWA depth.
+  constexpr uint64_t kMaxChunk = 16;
+  const uint64_t chunk = std::max<uint64_t>(
+      1, std::min((window + target_chunks - 1) / target_chunks, kMaxChunk));
   const uint64_t n_chunks = (window + chunk - 1) / chunk;
 
   const size_t partial_floats =
