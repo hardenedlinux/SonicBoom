@@ -420,7 +420,7 @@
                   (filter-map (lambda (w) (and (string-contains src w) (list m w)))
                               %guile-specific)))
               '("tensor" "ops" "graph" "dce" "interp" "symbolic" "tracer" "macro"
-                "loop" "autodiff" "layers" "optim")))
+                "loop" "autodiff" "layers" "optim" "validate")))
 
 (define failures (test-runner-fail-count (test-runner-current)))
 (test-end "sonicboom-trace-forms")

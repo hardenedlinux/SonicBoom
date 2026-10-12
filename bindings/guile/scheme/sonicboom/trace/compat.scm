@@ -27,6 +27,10 @@
 ;;;   %structural-procedures                   procedures that only move values
 ;;;   %higher-order-procedures                 ... of which these call a procedure
 ;;;   %unbound-guard                           marker for unbound guard names
+;;;   (read-located port)                      read one datum, recording positions
+;;;   (datum-position datum)                   (line . column), 1-based, or #f
+;;;   (call-with-error-message thunk handler)  run THUNK; on any error call
+;;;                                            (HANDLER message-string)
 ;;;
 ;;; Expansion time (syntax hooks used by the portable syntax-rules walker)
 ;;;   (%site form)                             source location of FORM, as a
@@ -44,6 +48,7 @@
             make-table table-ref table-set! table-count table->alist
             %structural-procedures %higher-order-procedures
             %unbound-guard %global-guard
+            read-located datum-position call-with-error-message
             %site %maybe-call %free-variable-guards))
 
 ;;; --- delimited control -----------------------------------------------------------
@@ -104,6 +109,30 @@
   (append %higher-order-procedures
           (list list cons car cdr caar cadr cdar cddr caddr cdddr list-ref
                 list-tail vector vector-ref append reverse length values)))
+
+;;; --- source positions and error messages (validator) ------------------------------
+;;; Guile's reader records line/column for every pair it reads. Portable
+;;; fallback: plain `read`, and datum-position always #f (locations are then
+;;; given only as document paths, e.g. "nodes[3]").
+
+(define (read-located port) (read port))
+
+(define (datum-position d)
+  (and (pair? d)
+       (let ((props (source-properties d)))
+         (and (assq 'line props)
+              (cons (+ 1 (cdr (assq 'line props))) (+ 1 (cdr (assq 'column props))))))))
+
+(define (call-with-error-message thunk handler)
+  (catch #t
+    thunk
+    (lambda (key . args)
+      (handler
+       (let ((p (open-output-string)))
+         (if (and (= 4 (length args)) (string? (cadr args)) (list? (caddr args)))
+             (display (apply format #f (cadr args) (caddr args)) p)
+             (begin (display key p) (display ": " p) (write args p)))
+         (get-output-string p))))))
 
 ;;; --- guards ----------------------------------------------------------------------------------
 

@@ -87,6 +87,8 @@ bindings/guile/scheme/sonicboom/trace/
   layers.scm    (sonicboom trace layers)    softmax, log-softmax, layer/rms norm,
                                             cross-entropy, embedding, linear, causal mask
   optim.scm     (sonicboom trace optim)     sgd-update, adam-init, adam-update
+  validate.scm  (sonicboom trace validate)  S-Expr v0.2 draft validator
+                                            (design/s-expr-v0.2-draft.md)
   macro.scm     (sonicboom trace macro)     syntax-rules walker, %branch/%and/%or/%case,
                                             strict mode (%call)
 bindings/guile/tests/trace/
@@ -97,6 +99,9 @@ bindings/guile/tests/trace/
   test-trace-grad.scm    gradients vs finite differences (all ops), double
                          where, ATen attributes, Adam, XOR training        (61 checks)
   test-trace-transformer.scm  1-layer char Transformer trained with Adam     (6 checks)
+  test-trace-validate.scm  every graph of the files above validated against
+                         the v0.2 draft, draft examples, counterexamples   (38 checks)
+  validate-graphs.scm    helper: run a test file under a validating executor
 ```
 
 None of these modules imports `(sonicboom ffi)`, `(sonicboom tensor)` or any
@@ -104,8 +109,8 @@ other module that loads `libsonicboom.so`. No file outside the trace
 directories and this document was changed.
 
 `compat` imports no other prototype module. The modules that need a mechanism
-from it (`dce`, `interp`, `symbolic`, `tracer`, `loop`, `autodiff`, `macro`)
-import it. `tensor`, `ops`, `graph`, `layers` and `optim` need none.
+from it (`dce`, `interp`, `symbolic`, `tracer`, `loop`, `autodiff`, `macro`,
+`validate`) import it. `tensor`, `ops`, `graph`, `layers` and `optim` need none.
 
 ## 3. Running the tests
 
@@ -113,14 +118,14 @@ From the repository root, with Guile 3.0.9+ (`apt install guile-3.0`):
 
 ```sh
 for t in test-trace test-trace-macro test-trace-forms test-trace-grad \
-         test-trace-transformer; do
+         test-trace-transformer test-trace-validate; do
   guile --no-auto-compile -L bindings/guile/scheme \
       bindings/guile/tests/trace/$t.scm || echo "$t FAILED"
 done
 ```
 
 - Each script exits with status 0 when every check passes and 1 otherwise.
-- All five were also run without `--no-auto-compile`, where Guile compiles
+- All six were also run without `--no-auto-compile`, where Guile compiles
   every file first, and pass that way too.
 - `test-trace-transformer.scm` takes about a minute interpreted (300 training
   steps through the reference interpreter) and about 10 s compiled.
@@ -129,6 +134,9 @@ done
   curve.
 - `test-trace-transformer.scm` prints the loss every 50 steps and the size of
   the step graph.
+- `test-trace-validate.scm` re-runs the other five files, each in a
+  subprocess, under a validating executor (about one minute more), and prints
+  how many distinct graphs each produced and validated.
 - SRFI-64 writes one `.log` per script to the current directory. Running from
   a scratch directory with an absolute `-L` path keeps the logs out of the tree.
 
@@ -851,10 +859,19 @@ These are fusion targets for a native executor.
 - **"kernel" means the source is present and compiled, not that it has run.**
   Only `add`, `mul`, `relu` and `sum` (with `ones` / `full`) are executed and
   checked by `numeric_proof` (manifest §22.E / §23).
-- **Gap G-1 (manifest §23).** `libsonicboom.so` links `aten_core` without
-  `--whole-archive`, so its op registrations are currently dropped. Until that
-  is fixed, a "kernel" op is not reachable through the dispatcher from the
-  shared library, whatever this table says.
+- **Gap G-1: recorded as unfixed in the migration doc, but
+  `core/CMakeLists.txt` already has whole-archive; needs local verification
+  with `nm`.**
+  - Manifest §23 lists G-1: `libsonicboom.so` linking `aten_core` without
+    `--whole-archive`, which would drop the static op registrations.
+  - The current `core/CMakeLists.txt` (line 129, added in commit `2eb51f6`)
+    links `"-Wl,--whole-archive" aten_core c10 "-Wl,--no-whole-archive"`.
+  - Whether the registrations are now present in the built shared library has
+    not been checked here, since nothing was built. Verify locally with
+    `nm -C libsonicboom.so | grep -c TorchLibraryInit`, which §23 compares
+    against the 4 of `numeric_proof`.
+  - Until that is confirmed, treat "reachable through the dispatcher from
+    `libsonicboom.so`" as unverified, rather than as either broken or fixed.
 - **Macro-defined kernels.** For ops marked "(macro)", the kernel is defined
   through a helper macro (`CREATE_UNARY_TORCH_IMPL_FUNC`,
   `CREATE_COMPARISON_SCALAR_TENSOR_IMPL_FUNC`). Each was checked at its
