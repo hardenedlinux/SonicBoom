@@ -109,6 +109,18 @@ class CudaStepProgram final : public hal::StepProgram {
   bool sync() override { return graph_.sync(); }
   bool valid() const override { return graph_.valid(); }
 
+  // Async H2D on the graph's stream, ordered before the next replay(). Unlike
+  // the device pool's synchronous cudaMemcpy (which lands on the legacy default
+  // stream and therefore blocks for every other stream's in-flight work), this
+  // never synchronizes the host with the device: the host enqueues staging +
+  // replay back-to-back and the GPU serializes them on one stream.
+  bool stage_upload(const hal::Buffer& dst, const void* host,
+                    uint64_t bytes) override {
+    if (dst.id == 0 || (!host && bytes != 0)) return false;
+    return cudaMemcpyAsync(reinterpret_cast<void*>(dst.id), host, bytes,
+                           cudaMemcpyHostToDevice, graph_.stream()) == cudaSuccess;
+  }
+
   sonicboom::cuda::GraphStep& graph() { return graph_; }
 
  private:
@@ -160,6 +172,20 @@ bool SonicCudaBackend::set_prefill_tokens(std::span<const uint64_t> tokens) {
   if (tokens.size() > chunk) return false;  // a segment never exceeds the window
   return g_alloc.copy_to_device(tokens_buf_, tokens.data(),
                                 tokens.size() * sizeof(uint64_t));
+}
+
+bool SonicCudaBackend::stage_prefill_tokens(hal::StepProgram& prog,
+                                            std::span<const uint64_t> tokens) {
+  if (!tokens_buf_ || tokens.empty()) return false;
+  const uint64_t chunk = model_.config.sliding_window;
+  if (tokens.size() > chunk) return false;  // a segment never exceeds the window
+  return prog.stage_upload(tokens_buf_, tokens.data(),
+                           tokens.size() * sizeof(uint64_t));
+}
+
+bool SonicCudaBackend::stage_pos(hal::StepProgram& prog, uint64_t pos) {
+  if (!pos_buf_) return false;
+  return prog.stage_upload(pos_buf_, &pos, sizeof(uint64_t));
 }
 
 bool SonicCudaBackend::read_token(float* host) const {

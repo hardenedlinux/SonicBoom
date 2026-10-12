@@ -78,6 +78,15 @@ public:
   // chunked prefill).
   bool set_prefill_tokens(std::span<const uint64_t> tokens);
 
+  // Async staging of a chunk's token ids / start position onto a StepProgram's
+  // own stream (ordered before its next replay). These are the host-non-blocking
+  // forms of set_prefill_tokens / set_pos, used by the chunked-prefill replay
+  // loop so the host enqueues staging + replay for every segment without waiting
+  // on the device between segments. Returns false on failure.
+  bool stage_prefill_tokens(hal::StepProgram& prog,
+                            std::span<const uint64_t> tokens);
+  bool stage_pos(hal::StepProgram& prog, uint64_t pos);
+
   // Download the current token id from the persistent device-resident `token_buf_`
   // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
   // argmax result without the executor's host-output path (which is a synchronous

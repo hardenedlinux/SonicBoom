@@ -958,27 +958,66 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const bool dump_logits = std::getenv("SONICBOOM_DUMP_LOGITS") != nullptr;
   const char* dump_logits_file = std::getenv("SONICBOOM_DUMP_LOGITS_FILE");
+  // Host-side phase breakdown for the prefill host-overhead investigation (step
+  // 1). Opt-in via SONICBOOM_PREFILL_PHASE_TIMING: each Phase prints its wall ms
+  // on destruction and (when SONICBOOM_NVTX is set) brackets the region with an
+  // NVTX range of the same name so nsys attributes cudaMalloc/cudaMemcpy/
+  // cudaLaunchKernel host time to the phase. Measurement only — OFF by default.
+  const bool phase_timing = std::getenv("SONICBOOM_PREFILL_PHASE_TIMING") != nullptr;
+  struct Phase {
+    const char* name;
+    bool report;
+    std::chrono::steady_clock::time_point t0;
+    Phase(const char* n, bool rep)
+        : name(n), report(rep), t0(std::chrono::steady_clock::now()) {
+      if (nvtx_enabled()) nvtxRangePushA(n);
+    }
+    ~Phase() {
+      if (nvtx_enabled()) nvtxRangePop();
+      if (report) {
+        using ms = std::chrono::duration<double, std::milli>;
+        std::cerr << "[phase] " << name << " "
+                  << ms(std::chrono::steady_clock::now() - t0).count() << " ms\n";
+      }
+    }
+  };
   // Non-greedy (Softcap output) when dumping logits: argmax(softcapped) ==
   // argmax(raw), so the token stream is unchanged while the per-step logits
   // become reachable for the isolation measurement.
-  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/!dump_logits);
-  // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
-  // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
-  // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
-  if (quant::cuda::q8_1_enabled()) {
-    planner::quantize_once_pass(graph);
-    planner::fuse_rms_norm_quantize_pass(graph);
-    planner::fuse_gelu_mul_quantize_pass(graph);
+  planner::Graph graph;
+  {
+    Phase _p("prefill:build_decode_graph", phase_timing);
+    graph = build_gemma4_graph(m, /*greedy=*/!dump_logits);
+    // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
+    // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
+    // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
+    if (quant::cuda::q8_1_enabled()) {
+      planner::quantize_once_pass(graph);
+      planner::fuse_rms_norm_quantize_pass(graph);
+      planner::fuse_gelu_mul_quantize_pass(graph);
+    }
   }
 
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return 0;
   planner::AnalyticalCpuCostModel cost(*snap);
-  auto plan = planner::plan_execution(graph, *snap, cost);
+  std::expected<planner::ExecutionPlan, planner::PlannerError> plan;
+  {
+    Phase _p("prefill:plan_execution", phase_timing);
+    plan = planner::plan_execution(graph, *snap, cost);
+  }
   if (!plan) return 0;
 
   planner::SonicBackend cpu_backend(m, graph);
+  const auto t_bk = std::chrono::steady_clock::now();
+  if (nvtx_enabled()) nvtxRangePushA("prefill:backend_construct");
   planner::SonicCudaBackend cuda_backend(m, graph, n_ctx);
+  if (nvtx_enabled()) nvtxRangePop();
+  if (phase_timing) {
+    using ms = std::chrono::duration<double, std::milli>;
+    std::cerr << "[phase] prefill:backend_construct "
+              << ms(std::chrono::steady_clock::now() - t_bk).count() << " ms\n";
+  }
   // Prefix reuse: adopt the session's persistent cache if it has one, otherwise
   // publish this backend's fresh cache into the session (first call) so it
   // survives this run. The prefill segment backends then share it transitively
@@ -1047,8 +1086,15 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       if (it != segments.end())
         return it->second.get();
       auto seg = std::make_unique<PrefillSegment>();
-      seg->graph = build_gemma4_prefill_graph(m, nseg);
-      auto pplan = planner::plan_execution(seg->graph, *snap, cost);
+      {
+        Phase _b("prefill:segment_build_graph", phase_timing);
+        seg->graph = build_gemma4_prefill_graph(m, nseg);
+      }
+      std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
+      {
+        Phase _p("prefill:segment_plan", phase_timing);
+        pplan = planner::plan_execution(seg->graph, *snap, cost);
+      }
       if (!pplan) {
         std::cerr << "[prefill-cuda] n=" << nseg << " plan failed\n";
         return nullptr;
@@ -1095,6 +1141,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // reused cache. Reuse therefore runs uncaptured (correctness over the
     // launch-overhead win, which only matters for long prompts).
     if (use_graphs && n > chunk && start_pos == 0) {
+      Phase _cap("prefill:capture_graph", phase_timing);
       PrefillSegment* full = segment_for(chunk);
       if (full) {
         const std::span<const uint64_t> first_chunk = prompt.subspan(0, chunk);
@@ -1103,22 +1150,30 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         std::vector<sx::Bytes> in;
         in.push_back(encode_tokens(first_chunk));
         in.push_back(encode_i64(start_pos));
-        auto res = full->exec->execute(full->plan, *snap, in);
+        std::expected<planner::ExecutionResult, planner::RuntimeError> res;
+        {
+          Phase _w("prefill:capture_warmup", phase_timing);
+          res = full->exec->execute(full->plan, *snap, in);
+        }
         if (res) {
           full->cuda->synchronize();
-          full->prog = full->cuda->record_step([&]() {
-            std::vector<sx::Bytes> cin;
-            cin.push_back(encode_tokens(first_chunk));
-            cin.push_back(encode_i64(start_pos));
-            auto cres = full->exec->execute(full->plan, *snap, cin);
-            return cres.has_value();
-          });
+          {
+            Phase _r("prefill:capture_record", phase_timing);
+            full->prog = full->cuda->record_step([&]() {
+              std::vector<sx::Bytes> cin;
+              cin.push_back(encode_tokens(first_chunk));
+              cin.push_back(encode_i64(start_pos));
+              auto cres = full->exec->execute(full->plan, *snap, cin);
+              return cres.has_value();
+            });
+          }
         }
       }
     }
 
     const auto t_pf0 = std::chrono::steady_clock::now();
     for (uint64_t off = 0; off < n; ) {
+      Phase _seg("prefill:segment", phase_timing);
       const uint64_t pos = start_pos + off;
       uint64_t nseg = std::min(chunk, n - off);
       // Align the segment boundary to an absolute multiple of `chunk` so a
@@ -1139,11 +1194,14 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
 
       if (seg->prog && !is_final) {
         // Replay the captured full-chunk graph: stage this segment's token ids
-        // and start position into the persistent device slots, then launch the
-        // graph. The next segment's staging (a synchronous H2D on the legacy
-        // default stream) drains this replay before it reads the appended cache.
-        seg->cuda->set_prefill_tokens(prompt.subspan(off, nseg));
-        seg->cuda->set_pos(pos);
+        // and start position into the persistent device slots on the program's
+        // own stream (async H2D, ordered before the replay), then launch the
+        // graph on that same stream. Staging + replay both live on the program's
+        // non-default stream, so consecutive segments serialize on the GPU while
+        // the host never blocks (a synchronous H2D on the legacy default stream
+        // would wait for every prior replay — the original per-segment host stall).
+        seg->cuda->stage_prefill_tokens(*seg->prog, prompt.subspan(off, nseg));
+        seg->cuda->stage_pos(*seg->prog, pos);
         if (!seg->prog->replay()) {
           std::cerr << "[prefill-cuda] segment off=" << off
                     << " graph replay failed\n";

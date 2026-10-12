@@ -16,6 +16,7 @@
 
 #include <sonicboom/planner/backend.h>
 
+#include <cstring>
 #include <functional>
 #include <utility>
 
@@ -39,6 +40,14 @@ class CpuStepProgram final : public hal::StepProgram {
   bool replay() override { return step_ ? step_() : false; }
   bool sync() override { return true; }  // replay() is already synchronous
   bool valid() const override { return static_cast<bool>(step_); }
+
+  // The CPU backend's buffers are host memory, so staging is a plain copy.
+  bool stage_upload(const hal::Buffer& dst, const void* host,
+                    uint64_t bytes) override {
+    if (dst.id == 0 || (!host && bytes != 0)) return false;
+    if (bytes != 0) std::memcpy(reinterpret_cast<void*>(dst.id), host, bytes);
+    return true;
+  }
 
  private:
   std::function<bool()> step_;

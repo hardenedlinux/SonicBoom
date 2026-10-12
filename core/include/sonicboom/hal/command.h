@@ -25,6 +25,10 @@
 //   - CPU:  a recorded task list re-executed in order per replay;
 //   - Vulkan (community): a recorded vk::CommandBuffer re-submitted per replay.
 
+#include <sonicboom/hal/buffer.h>
+
+#include <cstdint>
+
 namespace sonicboom::hal {
 
 // A pre-recorded, re-playable step owned by the backend.
@@ -40,6 +44,17 @@ class StepProgram {
 
   // True when the program is valid and replay-able.
   virtual bool valid() const = 0;
+
+  // Stage host data into a device buffer on the program's own stream (async
+  // where the backend supports it), ordered before the next replay(). This is
+  // the async complement to Allocator::copy_to_device: it uploads a replayed
+  // step's per-replay inputs (e.g. a prefill chunk's token ids / start position)
+  // without a host-blocking synchronous H2D, so the host can enqueue staging +
+  // replay back-to-back and never wait on the device. The CUDA backend maps it
+  // to cudaMemcpyAsync on the graph stream; the CPU backend (whose buffers are
+  // host memory) copies directly. Returns false on failure.
+  virtual bool stage_upload(const Buffer& dst, const void* host,
+                            uint64_t bytes) = 0;
 };
 
 }  // namespace sonicboom::hal
