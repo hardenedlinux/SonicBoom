@@ -90,6 +90,17 @@
       (unless (numeric? d) (error "op: numeric operands required" op d))
       (cons (or result-dtype d) (broadcast-shapes* (map cdr types))))))
 
+(define (compare-type op)
+  (lambda (types attrs)
+    (same-dtype op types)
+    (cons 'bool (broadcast-shapes* (map cdr types)))))
+
+(define (logical-type op)
+  (lambda (types attrs)
+    (unless (eq? 'bool (same-dtype op types))
+      (error "op: bool operands required" op (map car types)))
+    (cons 'bool (broadcast-shapes* (map cdr types)))))
+
 (define (unary-type op)
   (lambda (types attrs)
     (let ((d (car (car types))))
@@ -147,6 +158,19 @@
         (lambda (i js)
           (vector-set! out i (apply f (map ctensor-ref ts js)))))
       (make-ctensor (car type) (cdr type) out))))
+
+(define (typed-binary-kernel type-rule f)
+  (lambda (ts attrs)
+    (let* ((type (type-rule (map (lambda (t) (cons (ctensor-dtype t) (ctensor-shape t)))
+                                 ts)
+                            attrs))
+           (out (make-vector (shape-numel (cdr type)))))
+      (for-each-broadcast (cdr type) (map ctensor-shape ts)
+        (lambda (i js)
+          (vector-set! out i (apply f (map ctensor-ref ts js)))))
+      (make-ctensor (car type) (cdr type) out))))
+
+(define (same-value? a b) (if (boolean? a) (eq? a b) (= a b)))
 
 (define (unary-kernel f)
   (lambda (ts attrs)
@@ -225,6 +249,10 @@
     (neg       1 ,(unary-type 'neg)           ,(unary-kernel -))
     (reduce_sum 1 ,reduce-type                ,reduce-kernel)
     (where     3 ,where-type                  ,where-kernel)
+    (equal     2 ,(compare-type 'equal)       ,(typed-binary-kernel (compare-type 'equal) same-value?))
+    (and       2 ,(logical-type 'and)         ,(typed-binary-kernel (logical-type 'and) (lambda (a b) (and a b))))
+    (or        2 ,(logical-type 'or)          ,(typed-binary-kernel (logical-type 'or) (lambda (a b) (or a b))))
+    (not       1 ,(logical-type 'not)         ,(typed-binary-kernel (logical-type 'not) not))
     (print     1 ,(lambda (types attrs) (car types)) ,print-kernel)))
 
 ;; Ops whose kernel has an effect: always recorded while tracing and never

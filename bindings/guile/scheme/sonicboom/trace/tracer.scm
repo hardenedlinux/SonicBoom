@@ -33,11 +33,15 @@
 ;;; outputs. While user code is being traced, current-output-port is a
 ;;; recording port; anything written there is reported as a trace-time side
 ;;; effect.
+;;;
+;;; Prompts, output capture, non-local exits, tables and procedure tags come
+;;; from (sonicboom trace compat).
 
 (define-module (sonicboom trace tracer)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
+  #:use-module (sonicboom trace compat)
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace graph)
   #:use-module (sonicboom trace dce)
@@ -45,6 +49,7 @@
   #:use-module (sonicboom trace interp)
   #:export (current-executor trace-function traced-function?
             trace-stats trace-segments trace-tree trace-warnings
+            trace-strict-warnings
             trace->sexpr))
 
 ;;; --- executor -----------------------------------------------------------------
@@ -101,13 +106,13 @@
   (executor  tstate-executor)
   (retrace?  tstate-retrace?)
   (guards    tstate-guards)                   ; alist name -> thunk
-  (trees     tstate-trees)                    ; hash: signature -> (entry ...)
-  (env       tstate-env set-tstate-env!)      ; hash: name -> ctensor (per call)
-  (stats     tstate-stats)                    ; hash: counter -> integer
+  (trees     tstate-trees)                    ; table: signature -> (entry ...)
+  (env       tstate-env set-tstate-env!)      ; table: name -> ctensor (per call)
+  (stats     tstate-stats)                    ; table: counter -> integer
   (warnings  tstate-warnings set-tstate-warnings!))
 
 (define (stat! st key)
-  (hash-set! (tstate-stats st) key (+ 1 (hash-ref (tstate-stats st) key 0))))
+  (table-set! (tstate-stats st) key (+ 1 (table-ref (tstate-stats st) key 0))))
 
 ;;; --- segments --------------------------------------------------------------------
 
@@ -125,7 +130,7 @@ values referenced but not defined by what survives."
              (ins (remove (lambda (n) (member n defs)) refs))
              (types (trace-context-types (tstate-ctx st)))
              (typed (map (lambda (n)
-                           (let ((t (or (hash-ref types n #f)
+                           (let ((t (or (table-ref types n #f)
                                         (error "trace: untyped value" n))))
                              (list n (car t) (cdr t))))
                          ins)))
@@ -143,17 +148,16 @@ outputs there."
   (let* ((env (tstate-env st))
          (exec (or (tstate-executor st) (current-executor)))
          (ins (map (lambda (n)
-                     (cons n (or (hash-ref env n #f)
+                     (cons n (or (table-ref env n #f)
                                  (error "trace: no concrete value for" n))))
                    (cseg-inputs cs))))
-    (for-each (lambda (r) (hash-set! env (car r) (cdr r)))
+    (for-each (lambda (r) (table-set! env (car r) (cdr r)))
               (exec (cseg-text cs) ins))))
 
 (define (run-segment-silently! st cs)
   ;; Executions that only rebuild concrete values (at a graph break, or after
   ;; a cache miss) must not repeat the effects (`print`) of the real run.
-  (parameterize ((current-output-port (%make-void-port "w")))
-    (run-segment! st cs)))
+  (call-with-output-suppressed (lambda () (run-segment! st cs))))
 
 (define (full-segment st n)
   "N's segment with every value it defines as an output."
@@ -177,25 +181,27 @@ outputs there."
 (define (warn! st text)
   (stat! st 'output-warnings)
   (set-tstate-warnings! st (append (tstate-warnings st) (list text)))
-  (format (current-error-port)
-          "sonicboom-trace: warning: output while tracing is a trace-time side \
-effect and is not replayed by the cached graph (use trace-print): ~s~%"
-          text))
+  (trace-warn (string-append
+         "sonicboom-trace: warning: output while tracing is a trace-time side "
+         "effect and is not replayed by the cached graph (use trace-print): "
+         (let ((p (open-output-string))) (write text p) (get-output-string p)))))
 
 ;; BODY returns (done <value>) when the traced procedure returns. The tracer
 ;; and output-port bindings are established outside the prompt, so a
 ;; continuation re-entered under another run-prompt records into that run's
 ;; recorder and port.
 (define (run-prompt st rec body)
-  (let* ((port (open-output-string))
-         (r (parameterize ((current-tracer rec)
-                           (current-output-port port))
-              (call-with-prompt %break-tag
-                body
-                (lambda (k c) (list 'break k c)))))
-         (out (get-output-string port)))
-    (unless (string-null? out) (warn! st out))
-    r))
+  (call-with-values
+      (lambda ()
+        (call-with-output-captured
+         (lambda ()
+           (parameterize ((current-tracer rec))
+             (%call-with-prompt %break-tag
+               body
+               (lambda (k c) (list 'break k c)))))))
+    (lambda (r out)
+      (unless (string-null? out) (warn! st out))
+      r)))
 
 (define (leaf rec out)
   (make-tnode 'leaf (reverse (recorder-nodes rec)) (reverse (recorder-params rec))
@@ -207,7 +213,7 @@ effect and is not replayed by the cached graph (use trace-print): ~s~%"
   "Trace BODY to completion without graph breaks. Returns (recorder . output)
 or #f if the side needs a break that cannot be merged or exceeds the node
 budget."
-  (catch 'sonicboom-trace-speculation-overflow
+  (%catch-signal 'sonicboom-trace-speculation-overflow
     (lambda ()
       (match (run-prompt st rec body)
         (('done out) (cons rec (as-value rec out #f)))
@@ -227,7 +233,7 @@ Returns (recorder . output) or #f."
               (let ((ot (cdr t)) (of (cdr f)))
                 (and (eq? (sym-dtype ot) (sym-dtype of))
                      (equal? (sym-shape ot) (sym-shape of))
-                     (catch 'sonicboom-trace-speculation-overflow
+                     (%catch-signal 'sonicboom-trace-speculation-overflow
                        (lambda ()
                          (let ((m (join-sides rec (car t) (car f) c ot of)))
                            (stat! st 'merges)
@@ -277,7 +283,7 @@ Returns (recorder . output) or #f."
               st "partial" nodes params
               (delete-duplicates (cons name (append-map gnode-output-names nodes))))))
     (run-segment-silently! st cs)
-    (let* ((v (truth (hash-ref (tstate-env st) name)))
+    (let* ((v (truth (table-ref (tstate-env st) name)))
            ;; retrace-on-miss never re-enters K after this call, so does not
            ;; keep it (nor the stack segment it holds) alive in the cache.
            (node (make-tnode 'branch nodes params name
@@ -319,8 +325,8 @@ earlier segments or the call's arguments."
        args))
 
 (define (reset-env! st args)
-  (let ((env (make-hash-table)))
-    (for-each (lambda (a i) (when (ctensor? a) (hash-set! env (arg-name i) a)))
+  (let ((env (make-table)))
+    (for-each (lambda (a i) (when (ctensor? a) (table-set! env (arg-name i) a)))
               args (iota (length args)))
     (set-tstate-env! st env)))
 
@@ -332,7 +338,7 @@ earlier segments or the call's arguments."
 (define (path-assumptions st walk node v)
   (map (lambda (n)
          (cons (tnode-key n)
-               (if (eq? n node) v (truth (hash-ref (tstate-env st) (tnode-key n))))))
+               (if (eq? n node) v (truth (table-ref (tstate-env st) (tnode-key n))))))
        walk))
 
 (define (extend! st entry node v path args)
@@ -356,9 +362,9 @@ Returns the new child."
 ;;; grafted suffix refers to the cached prefix values.
 
 (define (match-segments! renames old new)
-  "Extend RENAMES (hash new-name -> old-name) by matching tnode NEW against OLD
+  "Extend RENAMES (table new-name -> old-name) by matching tnode NEW against OLD
 position by position. Returns #f on any structural difference."
-  (define (rn x) (hash-ref renames x x))
+  (define (rn x) (table-ref renames x x))
   (and (eq? (tnode-kind old) (tnode-kind new))
        (= (length (tnode-nodes old)) (length (tnode-nodes new)))
        (= (length (tnode-params old)) (length (tnode-params new)))
@@ -366,7 +372,7 @@ position by position. Returns #f on any structural difference."
                 (and (eq? (gparam-dtype po) (gparam-dtype pn))
                      (equal? (gparam-shape po) (gparam-shape pn))
                      (equal? (gparam-values po) (gparam-values pn))
-                     (begin (hash-set! renames (gparam-name pn) (gparam-name po))
+                     (begin (table-set! renames (gparam-name pn) (gparam-name po))
                             #t)))
               (tnode-params old) (tnode-params new))
        (every (lambda (no nn)
@@ -375,14 +381,14 @@ position by position. Returns #f on any structural difference."
                      (equal? (gnode-inputs no) (map rn (gnode-inputs nn)))
                      (= (length (gnode-outputs no)) (length (gnode-outputs nn)))
                      (begin
-                       (for-each (lambda (o n) (hash-set! renames (car n) (car o)))
+                       (for-each (lambda (o n) (table-set! renames (car n) (car o)))
                                  (gnode-outputs no) (gnode-outputs nn))
                        #t)))
               (tnode-nodes old) (tnode-nodes new))
        (equal? (tnode-key old) (rn (tnode-key new)))))
 
 (define (rename-tree renames n)
-  (define (rn x) (hash-ref renames x x))
+  (define (rn x) (table-ref renames x x))
   (make-tnode (tnode-kind n)
               (map (lambda (g)
                      (make-gnode (gnode-op g) (map rn (gnode-inputs g))
@@ -408,7 +414,7 @@ replaced by the fresh trace and the caller restarts from the root)."
   (reset-env! st args)
   (let* ((fresh (fresh-trace st args))
          (walk (append path (list node)))
-         (renames (make-hash-table))
+         (renames (make-table))
          (graft
           ;; Walk the cached path and the fresh chain together.
           (let loop ((olds walk) (new fresh))
@@ -430,9 +436,9 @@ replaced by the fresh trace and the caller restarts from the root)."
            graft)
           (else
            (stat! st 'retrace-divergences)
-           (format (current-error-port)
-                   "sonicboom-trace: warning: retrace did not reproduce the \
-cached prefix (unguarded state?); replacing the cached tree~%")
+           (trace-warn (string-append
+                  "sonicboom-trace: warning: retrace did not reproduce the "
+                  "cached prefix (unguarded state?); replacing the cached tree"))
            (set-entry-root! entry fresh)
            (analyze! st fresh "trace")
            #f))))
@@ -444,7 +450,7 @@ extended?)."
     (reset-env! st args)
     (let loop ((node (entry-root entry)) (path '()) (extended? extended?))
       (run-segment! st (tnode-compiled node))
-      (let ((v (hash-ref (tstate-env st) (tnode-key node))))
+      (let ((v (table-ref (tstate-env st) (tnode-key node))))
         (if (eq? (tnode-kind node) 'leaf)
             (values v extended?)
             (let* ((b (truth v))
@@ -503,7 +509,7 @@ extended?)."
   (stat! st 'calls)
   (let* ((ctx (tstate-ctx st))
          (sig (signature args))
-         (entries (hash-ref (tstate-trees st) sig '()))
+         (entries (table-ref (tstate-trees st) sig '()))
          (gvals (guard-values st))
          (entry (find-entry entries gvals)))
     (for-each (lambda (a i)
@@ -520,7 +526,7 @@ extended?)."
           (set! entry (make-entry (map (lambda (g) (cons (car g) (snapshot (cdr g))))
                                        gvals)
                                   root))
-          (hash-set! (tstate-trees st) sig (append entries (list entry)))
+          (table-set! (tstate-trees st) sig (append entries (list entry)))
           (analyze! st root "trace")))
       (call-with-values (lambda () (replay st entry args))
         (lambda (result extended?)
@@ -531,7 +537,7 @@ extended?)."
 
 (define* (trace-function proc #:key (multi-resume? #f) (max-side-nodes 16)
                          (max-depth 3) (executor #f) (retrace-on-miss? #f)
-                         (guards '()))
+                         (guards '()) (strict? 'default))
   "Return a procedure that runs PROC through the tracer. Tensor arguments are
 ctensors (they become symbolic inputs \"arg<i>\"); other arguments are static
 and part of the cache key. GUARDS is an alist (name . thunk): the thunks'
@@ -541,24 +547,26 @@ asserts that PROC has no side effects after its `bool` points, allowing a
 branch to be resolved inside the graph when each side records at most
 MAX-SIDE-NODES nodes and branches nest at most MAX-DEPTH deep.
 RETRACE-ON-MISS? traces PROC again from the start on a cache miss instead of
-re-entering a stored continuation (and stores none). EXECUTOR overrides
+re-entering a stored continuation (and stores none). STRICT? reports
+symbolic tensors passed to procedures the macro walker did not cover
+('default follows the strict-tracing parameter). EXECUTOR overrides
 `current-executor`."
-  (let* ((st (make-tstate proc (make-trace-context max-side-nodes) multi-resume?
-                          max-depth executor retrace-on-miss? guards
-                          (make-hash-table) #f (make-hash-table) '()))
+  (let* ((st (make-tstate proc (make-trace-context max-side-nodes strict?)
+                          multi-resume? max-depth executor retrace-on-miss? guards
+                          (make-table) #f (make-table) '()))
          (wrapper (lambda args
                     (if (or (any sym? args) (tracing?))
                         (apply proc args)    ; called while tracing: inline
                         (traced-call st args)))))
-    (set-procedure-property! wrapper 'sonicboom-trace st)
+    (procedure-tag! wrapper 'sonicboom-trace st)
     wrapper))
 
 (define (traced-function? f)
-  (and (procedure? f) (tstate? (procedure-property f 'sonicboom-trace))))
+  (tstate? (procedure-tag f 'sonicboom-trace)))
 
 (define (state-of f)
   (if (traced-function? f)
-      (procedure-property f 'sonicboom-trace)
+      (procedure-tag f 'sonicboom-trace)
       (error "not a traced function" f)))
 
 (define (trace-stats f)
@@ -567,14 +575,24 @@ nothing), traces (fresh traces + cache-miss re-entries or retraces),
 guard-misses (fresh traces caused by a changed guard value), retraces,
 retrace-divergences, segments-traced, graph-breaks, merges (continuation
 multi-resume joins), branch-merges (macro-rewritten ifs joined with where),
-output-warnings, executor-calls."
+logic-merges (and/or on symbolic conditions), loop-breaks (symbolic branches
+re-entered recursively, i.e. data-dependent loops, resolved by a graph
+break), output-warnings, strict-warnings, executor-calls."
   (let* ((st (state-of f))
          (h (tstate-stats st))
          (c (trace-context-counters (tstate-ctx st))))
-    (map (lambda (k) (cons k (hash-ref h k (hash-ref c k 0))))
+    (map (lambda (k)
+           (cons k (if (eq? k 'strict-warnings)
+                       (length (trace-context-notes (tstate-ctx st)))
+                       (table-ref h k (table-ref c k 0)))))
          '(calls cache-hits traces guard-misses retraces retrace-divergences
-           segments-traced graph-breaks merges branch-merges output-warnings
-           executor-calls))))
+           segments-traced graph-breaks merges branch-merges logic-merges
+           loop-breaks output-warnings strict-warnings executor-calls))))
+
+(define (trace-strict-warnings f)
+  "Strict-mode reports of F: one string per procedure that received a
+symbolic tensor without being covered by the macro walker."
+  (trace-context-notes (tstate-ctx (state-of f))))
 
 (define (trace-warnings f)
   "Text written to current-output-port while F was being traced, one string
@@ -586,7 +604,7 @@ per tracing run that wrote something."
                 (map (lambda (e) (cons (cons (car p) (entry-guard-values e))
                                        (entry-root e)))
                      (cdr p)))
-              (hash-map->list cons (tstate-trees (state-of f)))))
+              (table->alist (tstate-trees (state-of f)))))
 
 (define (trace-segments f)
   "List of (label . S-Expr text) for every cached segment of F, depth first.
@@ -601,7 +619,7 @@ Labels are paths: \"trace\", \"trace.t\", \"trace.t.f\", ..."
 (define (data-guards guard-values)
   ;; Procedure-valued guards (compared by identity) and unbound names are part
   ;; of the key but would only clutter the view.
-  (filter (lambda (g) (not (or (procedure? (cdr g)) (macro? (cdr g))
+  (filter (lambda (g) (not (or (procedure? (cdr g))
                                (eq? (cdr g) %unbound-guard))))
           guard-values))
 

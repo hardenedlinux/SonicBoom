@@ -21,6 +21,7 @@
 (define-module (sonicboom trace symbolic)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (sonicboom trace compat)
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace ops)
   #:use-module (sonicboom trace graph)
@@ -29,10 +30,11 @@
             shape-of dtype-of
             ;; mode
             current-tracer tracing? %break-tag %branch-assumptions
-            %unbound-guard
+            strict-tracing covered-procedure! covered-procedure?
             ;; tracing context / recorder (used by the tracer)
             make-trace-context trace-context? trace-context-types
             trace-context-counters context-count!
+            trace-context-strict trace-context-notes add-context-note!
             fresh-name! register-type!
             make-recorder recorder? recorder-context recorder-nodes
             recorder-params recorder-count recorder-assumptions
@@ -40,7 +42,8 @@
             set-recorder-nodes! set-recorder-params! set-recorder-count!
             as-value record-node!
             ;; ops
-            add sub mul matmul relu neg sum gt lt where bool trace-print))
+            add sub mul matmul relu neg sum gt lt where bool trace-print
+            equal-to logical-and logical-or logical-not))
 
 ;;; --- symbolic tensor ------------------------------------------------------------
 
@@ -69,11 +72,21 @@
 (define (tracing?) (and (current-tracer) #t))
 
 ;; Prompt tag used by `bool` to suspend tracing.
-(define %break-tag (make-prompt-tag 'sonicboom-trace-break))
+(define %break-tag (%make-prompt-tag 'sonicboom-trace-break))
 
-;; Guard value of a free variable that is not bound when the traced
-;; procedure is called (see (sonicboom trace macro)).
-(define %unbound-guard (list 'unbound))
+;; Default for traced functions created without #:strict?: when true, passing
+;; a symbolic tensor to a procedure the macro walker did not cover is
+;; reported (see %call in (sonicboom trace macro)).
+(define strict-tracing (make-parameter #f))
+
+;; Procedures known not to hide a core `if` on a symbolic tensor: the tensor
+;; ops below, procedures created inside a define-traced body, traced
+;; functions (checked separately by the tracer).
+(define (covered-procedure! proc)
+  (procedure-tag! proc 'sonicboom-trace-covered #t)
+  proc)
+(define (covered-procedure? proc)
+  (and (procedure-tag proc 'sonicboom-trace-covered) #t))
 
 ;; Condition values fixed by an enclosing macro-rewritten `if` (%branch) while
 ;; it traces one of its arms: alist name -> boolean. A parameter rather than
@@ -86,20 +99,27 @@
 ;; recorded on different resumptions of a continuation never collide), the
 ;; type of every value name ever introduced, and the per-side node budget used
 ;; by speculative (multi-resume) tracing.
+;; STRICT is #t, #f or 'default (follow the strict-tracing parameter); NOTES
+;; collects strict-mode reports.
 (define-record-type <trace-context>
-  (%make-trace-context next-id types max-side-nodes counters)
+  (%make-trace-context next-id types max-side-nodes counters strict notes)
   trace-context?
   (next-id trace-context-next-id set-trace-context-next-id!)
-  (types trace-context-types)               ; hash: name -> (dtype . shape)
+  (types trace-context-types)               ; table: name -> (dtype . shape)
   (max-side-nodes trace-context-max-side-nodes)
-  (counters trace-context-counters))        ; hash: event -> count
+  (counters trace-context-counters)         ; table: event -> count
+  (strict trace-context-strict)
+  (notes trace-context-notes set-trace-context-notes!))
 
-(define (make-trace-context max-side-nodes)
-  (%make-trace-context 0 (make-hash-table) max-side-nodes (make-hash-table)))
+(define* (make-trace-context max-side-nodes #:optional (strict 'default))
+  (%make-trace-context 0 (make-table) max-side-nodes (make-table) strict '()))
 
 (define (context-count! ctx key)
   (let ((h (trace-context-counters ctx)))
-    (hash-set! h key (+ 1 (hash-ref h key 0)))))
+    (table-set! h key (+ 1 (table-ref h key 0)))))
+
+(define (add-context-note! ctx note)
+  (set-trace-context-notes! ctx (append (trace-context-notes ctx) (list note))))
 
 (define (fresh-name! ctx prefix)
   (let ((n (trace-context-next-id ctx)))
@@ -107,7 +127,7 @@
     (string-append prefix (number->string n))))
 
 (define (register-type! ctx name dtype shape)
-  (hash-set! (trace-context-types ctx) name (cons dtype shape)))
+  (table-set! (trace-context-types ctx) name (cons dtype shape)))
 
 ;; A recorder is the state of one segment being traced. NODES and PARAMS are
 ;; kept in reverse order as shared-tail lists, so copying a recorder for a
@@ -163,7 +183,7 @@ concrete operands become an inline parameter of the current segment."
     (let ((base (recorder-spec-base rec)))
       (when (and base (> (- (recorder-count rec) base)
                          (trace-context-max-side-nodes ctx)))
-        (throw 'sonicboom-trace-speculation-overflow)))
+        (%raise-signal 'sonicboom-trace-speculation-overflow)))
     (make-sym name (car type) (cdr type))))
 
 ;;; --- op front end -------------------------------------------------------------
@@ -196,6 +216,10 @@ concrete operands become an inline parameter of the current segment."
 (define (gt a b) (apply-op 'greater (list a b) '()))
 (define (lt a b) (apply-op 'less (list a b) '()))
 (define (where c x y) (apply-op 'where (list c x y) '()))
+(define (equal-to a b) (apply-op 'equal (list a b) '()))
+(define (logical-and a b) (apply-op 'and (list a b) '()))
+(define (logical-or a b) (apply-op 'or (list a b) '()))
+(define (logical-not x) (apply-op 'not (list x) '()))
 
 (define* (trace-print x #:optional (label "trace-print"))
   "Print X (as LABEL: nested values) to current-output-port and return it. In
@@ -224,5 +248,9 @@ by aborting to %break-tag with X; the tracer resumes with #t or #f."
            (unless rec (error "bool: symbolic tensor outside of tracing"))
            (let ((a (or (assoc (sym-name x) (%branch-assumptions))
                         (assoc (sym-name x) (recorder-assumptions rec)))))
-             (if a (cdr a) (abort-to-prompt %break-tag x)))))
+             (if a (cdr a) (%abort-to-prompt %break-tag x)))))
         (else (error "bool: not a tensor" x))))
+
+(for-each covered-procedure!
+          (list add sub mul matmul relu neg sum gt lt where bool trace-print
+                equal-to logical-and logical-or logical-not))

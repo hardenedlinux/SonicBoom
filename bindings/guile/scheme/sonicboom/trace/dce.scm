@@ -9,6 +9,7 @@
 
 (define-module (sonicboom trace dce)
   #:use-module (srfi srfi-1)
+  #:use-module (sonicboom trace compat)
   #:use-module (sonicboom trace graph)
   #:use-module (sonicboom trace ops)
   #:export (eliminate-dead-nodes))
@@ -17,19 +18,19 @@
   "NODES in topological order, PARAMS a list of gparams, OUTPUTS the value
 names that must survive. Returns (values live-nodes live-params), both in
 their original order."
-  (let ((live (make-hash-table)))
-    (for-each (lambda (o) (hash-set! live o #t)) outputs)
+  (let ((live (make-table)))
+    (for-each (lambda (o) (table-set! live o #t)) outputs)
     (let ((kept
            (fold (lambda (n acc)
                    (if (or (op-effectful? (gnode-op n))
-                           (any (lambda (o) (hash-ref live o #f))
+                           (any (lambda (o) (table-ref live o #f))
                                 (gnode-output-names n)))
                        (begin
-                         (for-each (lambda (i) (hash-set! live i #t))
+                         (for-each (lambda (i) (table-set! live i #t))
                                    (gnode-inputs n))
                          (cons n acc))
                        acc))
                  '()
                  (reverse nodes))))
       (values kept
-              (filter (lambda (p) (hash-ref live (gparam-name p) #f)) params)))))
+              (filter (lambda (p) (table-ref live (gparam-name p) #f)) params)))))

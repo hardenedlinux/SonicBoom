@@ -13,6 +13,7 @@
 
 (define-module (sonicboom trace interp)
   #:use-module (srfi srfi-1)
+  #:use-module (sonicboom trace compat)
   #:use-module (ice-9 match)
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace ops)
@@ -44,12 +45,12 @@ alist (output-name . ctensor) in the graph's output order."
     (('sonicboom-s-expr ('version 0 1) ('graph . _)) #t)
     (_ (error "interp: not a sonicboom-s-expr v0.1 document")))
   (let ((graph (caddr doc))
-        (env (make-hash-table)))
+        (env (make-table)))
     (define (define! name t)
-      (when (hash-ref env name #f) (error "interp: value defined twice" name))
-      (hash-set! env name t))
+      (when (table-ref env name #f) (error "interp: value defined twice" name))
+      (table-set! env name t))
     (define (lookup name)
-      (or (hash-ref env name #f)
+      (or (table-ref env name #f)
           (error "interp: value used before definition" name)))
     (for-each
      (match-lambda

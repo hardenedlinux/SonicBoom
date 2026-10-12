@@ -2,7 +2,8 @@
 
 Status: **research prototype**. It is pure Guile 3.0 and does not depend on
 `libsonicboom.so`. It is not built or tested by CMake/ctest; whether to add it
-to ctest is a separate decision.
+to ctest is a separate decision. It is written so that other Scheme
+implementations can borrow and port it (§6).
 
 ## 1. What it is
 
@@ -10,29 +11,36 @@ A tracer that turns a Scheme function written against a small tensor op set
 into S-Expr v0.1 graphs (`design/s-expr-v0-spec.md`). Data-dependent control
 flow is handled at two levels:
 
-- **Syntactic branches (preferred).** `define-traced` / `traced-lambda` rewrite
-  the body's `if` / `cond` / `when` / `unless` into `%branch`. On a symbolic
-  condition, `%branch` traces both arms and joins them with a `where` node at
-  the `if`. No continuation is involved, and the graph grows linearly in the
-  number of `if`s.
-- **Continuations (fallback).** For `if`s the macro cannot see, the user calls
-  `bool`, which suspends tracing with `abort-to-prompt`. Three mechanisms work
-  on that suspension:
+- **Surface rewriting (preferred).** `define-traced` / `traced-lambda` run the
+  body through a code walker written only in `syntax-rules`. It rewrites these
+  R7RS control forms so that a symbolic condition is resolved inside the graph:
+  `if`, `when`, `unless`, `cond` (including `=>`), `and`, `or`, `case`, `do`,
+  named `let`.
+  - Conditionals trace both arms and join them with `where`.
+  - `and` / `or` become logical tensor ops.
+  - Nothing is suspended, and the graph grows linearly in the number of
+    conditionals.
+- **Continuations (fallback).** Where the rewrite cannot reach (macros defined
+  elsewhere, ordinary procedures called from the body), the user decides with
+  `bool`. `bool` suspends tracing with a delimited continuation. Three
+  mechanisms work on that suspension:
   - **graph break**: run the partial graph on a pluggable executor and resume
-    the continuation with the concrete value;
-  - **trace-tree cache**: later calls follow cached segments and only trace
-    again for a branch value not seen before;
-  - **multi-resume**: resume the continuation with both `#t` and `#f` and join
-    the two results with `where`.
+    with the concrete value;
+  - **trace-tree cache**: later calls follow cached segments and trace again
+    only for unseen branch values;
+  - **multi-resume**: resume with both values and join with `where`.
 
 On top of either mechanism:
 
 - **guards**: the traced function's free variables are part of the cache key;
 - **side-effect checks**: output written while tracing is captured and
   reported, and `trace-print` provides run-time printing;
-- **conservative mode** (`#:retrace-on-miss?`): on a cache miss, trace again
-  from the start instead of resuming a stored continuation;
+- **conservative mode** (`#:retrace-on-miss?`);
+- **strict mode**: reports symbolic tensors reaching procedures the rewrite
+  does not cover;
 - **DCE**: each emitted segment is pruned once, working back from its outputs.
+
+Every implementation-specific mechanism sits in one module, `compat.scm`.
 
 The prototype exists to test the ideas, not to provide a runtime. Graphs are run
 by a reference interpreter written in Scheme.
@@ -41,6 +49,7 @@ by a reference interpreter written in Scheme.
 
 ```text
 bindings/guile/scheme/sonicboom/trace/
+  compat.scm    (sonicboom trace compat)    ALL implementation-specific mechanisms (§6)
   tensor.scm    (sonicboom trace tensor)    concrete reference tensors ("ctensor")
   ops.scm       (sonicboom trace ops)       op table: type rule + reference kernel per op
   graph.scm     (sonicboom trace graph)     node/parameter records, S-Expr v0.1 emission
@@ -49,35 +58,40 @@ bindings/guile/scheme/sonicboom/trace/
   symbolic.scm  (sonicboom trace symbolic)  symbolic tensors, tracing mode, user ops, `bool`
   tracer.scm    (sonicboom trace tracer)    prompts, graph breaks, trace tree, multi-resume,
                                             guards, retrace-on-miss, output capture
-  macro.scm     (sonicboom trace macro)     define-traced / traced-lambda, %branch
+  macro.scm     (sonicboom trace macro)     syntax-rules walker, %branch/%and/%or/%case,
+                                            strict mode (%call)
 bindings/guile/tests/trace/
-  test-trace.scm         continuation mechanism, S-Expr, DCE, cache (49 checks)
-  test-trace-macro.scm   macro branches, guards, effects, retrace-on-miss (40 checks)
+  test-trace.scm         continuation mechanism, S-Expr, DCE, cache        (49 checks)
+  test-trace-macro.scm   if/cond/when/unless, guards, effects, retrace     (40 checks)
+  test-trace-forms.scm   and/or/case/do/named let/cond =>, nesting,
+                         strict mode, compat boundary                      (36 checks)
 ```
 
 None of these modules imports `(sonicboom ffi)`, `(sonicboom tensor)` or any
 other module that loads `libsonicboom.so`. No file outside the trace
 directories and this document was changed.
 
+`compat` imports no other prototype module. The modules that need a mechanism
+from it (`dce`, `interp`, `symbolic`, `tracer`, `macro`) import it. `tensor`,
+`ops` and `graph` need none.
+
 ## 3. Running the tests
 
 From the repository root, with Guile 3.0.9+ (`apt install guile-3.0`):
 
 ```sh
-guile --no-auto-compile -L bindings/guile/scheme \
-    bindings/guile/tests/trace/test-trace.scm
-guile --no-auto-compile -L bindings/guile/scheme \
-    bindings/guile/tests/trace/test-trace-macro.scm
+for t in test-trace test-trace-macro test-trace-forms; do
+  guile --no-auto-compile -L bindings/guile/scheme \
+      bindings/guile/tests/trace/$t.scm || echo "$t FAILED"
+done
 ```
 
 - Each script exits with status 0 when every check passes and 1 otherwise.
-- Both scripts were also run without `--no-auto-compile`, where Guile compiles
-  every file before running it, and pass that way too. This matters for
-  `macro.scm`, which does work at expansion time.
-- `test-trace-macro.scm` prints the node-count table from §4.7 to stdout.
-- SRFI-64 writes `sonicboom-trace.log` / `sonicboom-trace-macro.log` to the
-  current directory. Running from a scratch directory with an absolute `-L`
-  path keeps those logs out of the tree.
+- All three were also run without `--no-auto-compile`, where Guile compiles
+  every file first, and pass that way too.
+- `test-trace-macro.scm` prints the node-count table from §4.9.
+- SRFI-64 writes one `.log` per script to the current directory. Running from
+  a scratch directory with an absolute `-L` path keeps the logs out of the tree.
 
 ## 4. Design
 
@@ -88,73 +102,73 @@ guile --no-auto-compile -L bindings/guile/scheme \
 - A **ctensor** (concrete tensor) holds a dtype, a shape and a flat row-major
   vector of Scheme numbers or booleans. It is used only by eager mode and the
   reference interpreter.
-- The user ops are `add sub mul matmul relu neg sum gt lt where trace-print`,
-  plus `bool`. They are defined once in `symbolic.scm`, and the mode is the
-  `current-tracer` parameter:
+- The user ops are:
+  `add sub mul matmul relu neg sum gt lt where equal-to logical-and logical-or
+  logical-not trace-print`, plus `bool`. They are defined once in
+  `symbolic.scm`, and the mode is the `current-tracer` parameter:
   - `#f`: eager mode. The op is computed with the reference kernel.
   - a recorder: tracing mode. If any operand is symbolic, the op appends a node
     and returns a new symbolic tensor. If every operand is concrete, a pure op
-    is still computed, which gives constant folding for free. Effectful ops
-    (`print`) are always recorded. Concrete operands of a recorded node become
-    inline `(parameter … (data :values …))` entries.
+    is still computed (constant folding). Effectful ops (`print`) are always
+    recorded. Concrete operands of a recorded node become inline
+    `(parameter … (data :values …))` entries.
 - The tracer switches mode with `parameterize`. `(tracing?)` reports the
   current mode.
 - Shapes and dtypes come from the type rule in `ops.scm`. The interpreter uses
   the kernel from the same table entry, so traced types and computed types
-  cannot drift apart. The interpreter also checks that every node's declared
-  output type matches what it computed.
+  cannot drift apart. The interpreter also checks every node's declared output
+  type against what it computed.
 
-S-Expr op names: `add sub mul matmul relu neg greater less where reduce_sum
-print`. `sum` is emitted as `reduce_sum` with `(axes (ints …))` and
-`(keepdims (int 0|1))` attributes. Empty `axes` means all axes. `print` carries
-a `(label (string …))` attribute. Segments are named `trace`, `trace.t`,
-`trace.t.f`, …, after their path in the tree.
+S-Expr op names: `add sub mul matmul relu neg greater less equal and or not
+where reduce_sum print`.
 
-### 4.2 Graph break with `call-with-prompt` / `abort-to-prompt`
+- `sum` is emitted as `reduce_sum` with `(axes (ints …))` and
+  `(keepdims (int 0|1))` attributes. Empty `axes` means all axes.
+- `print` carries a `(label (string …))` attribute.
+- Segments are named `trace`, `trace.t`, `trace.t.f`, …, after their path in
+  the tree.
+
+### 4.2 Graph break with delimited continuations
 
 `bool` forces a concrete decision. If the argument is a symbolic tensor and
-neither the current path nor an enclosing `%branch` arm has already fixed its
-value, it calls `(abort-to-prompt %break-tag x)`.
+neither the current path nor an enclosing rewritten form has already fixed its
+value, it calls `(%abort-to-prompt %break-tag x)`.
 
 The tracer runs the user function as:
 
 ```scheme
-(parameterize ((current-tracer rec)
-               (current-output-port recording-port))
-  (call-with-prompt %break-tag body handler))
+(call-with-output-captured
+  (lambda ()
+    (parameterize ((current-tracer rec))
+      (%call-with-prompt %break-tag body handler))))
 ```
 
-The handler receives the continuation `k` and the condition. The recorder `rec`
-holds the partial graph recorded so far. The handler then does one of two
-things:
+The `%`-prefixed procedures come from compat. The handler receives the
+continuation `k` and the condition. The recorder `rec` holds the partial graph
+recorded so far. The handler then does one of two things:
 
 1. **Multi-resume** (§4.4) if enabled and possible.
 2. **Graph break** otherwise.
    - It emits the current segment as an S-Expr v0.1 document. The outputs are
-     the condition plus every value the segment defines, because at this point
-     it cannot know which of them the continuation will read.
-   - It runs that document on the executor, with output silenced so `print`
+     the condition plus every value the segment defines, because it cannot yet
+     know which of them the continuation will read.
+   - It runs that document on the executor with output suppressed, so `print`
      nodes do not fire twice, and stores the results in the call's concrete
      environment.
    - It records a branch node holding the segment, the condition name and `k`.
-   - It resumes `(k v)` under a new prompt with a fresh recorder, so the rest
-     of the function becomes the next segment.
+   - It resumes `(k v)` under a new prompt with a fresh recorder.
 
-Why the `parameterize` sits outside the prompt: a Guile partial continuation
-captures only the dynamic bindings between the prompt and the abort. Bindings
-outside the prompt come from wherever the continuation is resumed. So when `k`
-is resumed, the user's ops record into the new recorder and print into the new
-recording port, while any `parameterize` the user code set up inside is
-restored. This was checked on Guile 3.0.9.
+The tracer and output bindings sit outside the prompt. A partial continuation
+captures only the dynamic bindings between the prompt and the abort, so a
+resumed `k` records into the new recorder and port, while any `parameterize`
+inside the user code is restored.
 
-The captured stack segment is only the user function's frames between that
-prompt and `bool`; the tracer's and the caller's frames are outside it. It does
-not grow across repeated resumptions, because each new abort captures from the
-new prompt. Cache-hit calls run no user code and touch no continuation.
+The captured segment is only the user function's frames between the prompt
+and `bool`. It does not grow across resumptions. Cache-hit calls run no user
+code and touch no continuation.
 
-A recorder carries **assumptions**: a map from condition name to the boolean
-taken on the current path. A second `bool` on the same condition along the
-same path returns the known value without breaking again.
+A recorder carries **assumptions** (condition name → boolean on the current
+path). A second `bool` on the same condition returns the known value.
 
 `(executor text inputs) → outputs` is the pluggable executor interface. `text`
 is the S-Expr text, `inputs` and `outputs` are alists of `(name . ctensor)`. The
@@ -170,7 +184,7 @@ is and are part of the cache key. The cache key is:
 
 - the **signature**: one `(tensor dtype shape)` or `(static value)` entry per
   argument;
-- the **guard values** (§4.8).
+- the **guard values** (§4.10).
 
 Each key owns one trace tree:
 
@@ -182,18 +196,15 @@ Each key owns one trace tree:
 On a call:
 
 1. **No tree for this key.** Trace from the start, then run the tree.
-2. **Tree exists.** Run segments from the root. At each branch, read the
-   condition and follow the matching child.
+2. **Tree exists.** Run segments from the root, following the child that
+   matches each condition.
 3. **No child for this value (cache miss).** Silently rebuild every concrete
-   value on the path, because a later break in the new suffix may read any of
-   them. Then one of:
-   - resume the stored continuation of that branch with the new value, so only
-     the new suffix is traced;
-   - in retrace-on-miss mode, trace again from the start (§4.10).
+   value on the path, then one of:
+   - resume the stored continuation with the new value;
+   - in retrace-on-miss mode, trace again from the start (§4.13).
 
-Value names come from one counter per traced function. This keeps names unique
-across all resumptions of all continuations, so segments traced at different
-times can refer to each other by name.
+Value names come from one counter per traced function, so segments traced at
+different times can refer to each other by name.
 
 After the tree changes, `analyze!` recomputes each segment bottom-up:
 
@@ -219,43 +230,40 @@ the cache reuse the emitted text.
 | `segments-traced` | segments traced |
 | `graph-breaks` | graph breaks taken |
 | `merges` | continuation multi-resume joins |
-| `branch-merges` | macro `if` joins (`where` nodes from `%branch`) |
+| `branch-merges` | `where` joins from rewritten conditionals |
+| `logic-merges` | `and` / `or` nodes from rewritten `and` / `or` |
+| `loop-breaks` | rewritten branches resolved by a break because they re-entered themselves (§4.8) |
 | `output-warnings` | tracing runs that wrote to the output port |
+| `strict-warnings` | strict-mode reports |
 | `executor-calls` | executor invocations |
 
-Three functions let you inspect a traced function:
+Four functions let you inspect a traced function:
 
 - `trace-tree` returns each tree with its signature and data guard values;
 - `trace-segments` returns each segment's S-Expr text;
-- `trace-warnings` returns the output captured while tracing.
+- `trace-warnings` returns the output captured while tracing;
+- `trace-strict-warnings` returns the strict-mode reports.
 
 ### 4.4 Multi-resume (continuation)
 
 With `#:multi-resume? #t`, the handler first tries `try-merge`:
 
-- It resumes `(k #t)` and `(k #f)` under **speculative** recorders. These are
-  O(1) copies of the current recorder, because node lists are shared-tail
-  lists, and each copy has the matching assumption added.
-- Each side runs until the function returns. A side may itself hit a `bool`.
-  In that case it tries a nested merge, up to `#:max-depth` levels deep. A side
-  never takes a graph break: if it needs one, the speculation fails.
-- A side that records more than `#:max-side-nodes` nodes throws, which ends
-  that speculation.
+- It resumes `(k #t)` and `(k #f)` under speculative recorders. These are O(1)
+  copies, because node lists are shared-tail lists.
+- Each side runs until the function returns. Nested `bool`s try nested merges,
+  up to `#:max-depth` levels deep.
+- A side that needs a break, or that records more than `#:max-side-nodes`
+  nodes, fails the speculation.
 - If both sides finish and their results have the same dtype and shape, the
   recorder becomes prefix + `#t` side + `#f` side + `where(c, out_t, out_f)`.
-  If both sides return the same value, no `where` node is added. This is a leaf
-  of the tree, with no break.
 - Otherwise the handler falls back to a graph break. The same `k` is still
-  valid, because a delimited continuation can be resumed more than once.
+  valid.
 
-The condition must have dtype `bool`. A `bool` on a numeric tensor always
-breaks.
-
-Because a delimited continuation runs to the end of the function, each side
-re-traces everything after the `if`. §4.7 shows the cost.
+A delimited continuation runs to the end of the function, so each side
+re-traces everything after the `if` (§4.9).
 
 `#:multi-resume? #t` is the user's statement that the code after each `bool`
-point has no Scheme-level side effects. The tracer cannot check this.
+point has no Scheme-level side effects.
 
 ### 4.5 DCE
 
@@ -266,79 +274,156 @@ point has no Scheme-level side effects. The tracer cannot check this.
 
 DCE runs on every emitted segment:
 
-- partial graphs at a break, whose outputs are all defined values, so it only
-  drops unused parameters;
-- cached segments, whose outputs are the minimal set from §4.3;
-- merged segments, from multi-resume and from `%branch`.
+- partial graphs at a break;
+- cached segments;
+- merged segments.
 
-### 4.6 Syntactic branches: `define-traced` / `traced-lambda`
+### 4.6 Why surface macros
+
+Data-dependent control flow is rewritten **at the surface**: on the forms the
+user wrote, by a `syntax-rules` walker, before the implementation's expander
+and compiler see them. This was chosen for these reasons:
+
+- **Portability.** `syntax-rules` is the one macro system every R7RS Scheme
+  shares. The walker, the output forms and the run-time procedures (`%branch`,
+  `%and`, `%or`, `%case`, `%call`) are plain R7RS plus SRFI 1/9. Another
+  implementation can take `macro.scm` almost as is. Only three small expansion
+  hooks in `compat.scm` (§6.2) touch the host expander, and each has a
+  portable fallback.
+- **Independence from the host compiler.** The rewrite does not rely on any
+  implementation's expanded or intermediate representation, its node types,
+  or its optimisation passes. Those differ between implementations and
+  between releases of one implementation.
+- **Predictable, reviewable coverage.** What is rewritten is exactly the set of
+  standard forms written literally in the body (§4.7). A reader can tell from
+  the source which `if`s are traced into the graph.
+- **Recursion and loops stay visible.** Named `let` and `do` are recognised as
+  written, so a loop with a static trip count unrolls, and a loop whose trip
+  count depends on the data is detected at run time (§4.8).
+
+The cost is coverage. A surface rewrite cannot see:
+
+- **Macros defined elsewhere.** Their expansions use the core `if`. The walker
+  leaves such macro uses exactly as written.
+- **Procedures called from the body** that were not themselves defined with
+  `define-traced`. Their `if`s are core `if`s.
+
+In both places a symbolic tensor reaching a core `if` is taken as a true value,
+without any error. The fallback chain for these cases:
+
+1. **`bool`.** Writing `(bool c)` at such a point forces a decision through the
+   continuation mechanism (§4.2–§4.4): a graph break, or a multi-resume join.
+   It is always correct.
+2. **Strict mode** (§4.12) reports at trace time every procedure that receives
+   a symbolic tensor without being covered, so the uncovered `if`s can be found
+   and fixed, either by defining the procedure with `define-traced` or by
+   adding `bool`.
+3. **`trace-opaque`** marks a form the walker must leave alone, which is the
+   explicit way to keep a core `if`.
+
+### 4.7 The walker
 
 ```scheme
-(define-traced (f x n) [#:option value …] body …)
-(traced-lambda formals [#:option value …] body …)   ; options as trace-function
+(define-traced (f x n) body …)
+(define-traced* (option …) (f x n) body …)     ; options as trace-function
+(traced-lambda formals body …)
+(traced-lambda* (option …) formals body …)
 ```
 
-Both expand to `(trace-function (lambda formals body′) #:guards … options …)`.
+All four expand to:
 
-**The rewrite.** `body′` is `body` inside a `let-syntax` that rebinds `if`,
-`cond`, `when` and `unless` in the user's own syntactic context. The
-`let-syntax` uses `datum->syntax` on the macro keyword, so the keywords written
-in the body are captured. Each use becomes:
+```scheme
+(trace-function (lambda formals body′)
+                #:guards (%free-variable-guards formals body …)
+                option …)
+```
 
-| Written in the body | Becomes |
+**How it walks.** `body′` comes from a continuation-passing `syntax-rules`
+walker.
+- `(%walk form k)` rewrites `form` and passes the result to the continuation
+  macro `k`.
+- Standard forms are matched as `syntax-rules` literals, so a form is
+  recognised only if its keyword is the standard binding.
+- Binding forms are walked according to their shape, so binding lists and
+  formals are never mistaken for calls.
+
+**What each form becomes:**
+
+| Form | Rewritten to | On a symbolic condition |
+|---|---|---|
+| `(if c a b)` | `(%branch site c (λ () a) (λ () b))` | both arms traced, results joined with `where` |
+| `(if c a)`, `when`, `unless` | `%branch` marked as a statement | both arms traced, result unspecified |
+| `cond` (`else`, `=>`, test-only clauses) | a `%branch` chain, one site per clause | one `where` per clause; `=>` receives the symbolic condition |
+| `and`, `or` | `%and` / `%or` chains | rest evaluated assuming no short-circuit, combined with the `and` / `or` op; operands must be bool |
+| `case` (`=>`, `else`, `else =>`) | `(%case site key clauses else)` | each clause tests `equal(key, d)` per datum, OR-ed, then a `%branch` chain |
+| `do` | named-let loop whose test is a `%branch` | static trip count unrolls; a symbolic test is a data-dependent loop (§4.8) |
+| named `let` | `((letrec ((name (%covered (λ …)))) name) init …)`, body walked | conditionals inside follow their own rows; recursion through a symbolic branch → §4.8 |
+| `lambda`, `case-lambda`, `(define (f …) …)` | body walked, procedure marked covered | — |
+| `let`, `let*`, `letrec`, `letrec*`, `let-values`, `let*-values`, `define`, `set!`, `begin`, `parameterize`, `delay`, `delay-force` | inner expressions walked | — |
+| `quote`, `quasiquote`, `(trace-opaque form)` | left as is | — |
+| a call `(f arg …)` | `(%call f arg′ …)` | strict-mode check (§4.12) |
+| any other macro use | left exactly as written, arguments included | — |
+
+`%branch`, `%and`, `%or` and `%case` look at the value of the test or key:
+
+- **A concrete ctensor:** decided by its single element.
+- **Any other non-symbolic value:** R7RS semantics exactly. `(and 1 n)`,
+  `(case n ((3 4) => …))`, `(do ((i 0 (+ i 1))) ((= i n) s))` behave as usual.
+  This is tested.
+- **Symbolic, while tracing:** the condition must be a one-element `bool`
+  tensor, otherwise an error is raised with the form's location.
+
+**Joining arm results** (a symbolic `%branch`):
+
+| Arm results | Join |
 |---|---|
-| `(if test then else)` | `(%branch 'loc test (lambda () then) (lambda () else))` |
-| one-armed `if`, `when`, `unless` | the same, with an empty arm, marked as a statement |
-| `cond` (including `else` and `=>`) | a chain of `%branch` calls |
+| the same object | that object |
+| two tensors | identical dtype and shape required, then `where(c, a, b)` |
+| a tensor and a Scheme scalar | the scalar becomes a rank-0 constant of the tensor's dtype, then `where` |
+| two different Scheme scalars | rank-0 constants, then `where` |
+| pairs, lists or vectors | joined element by element |
+| equal non-tensor values | kept |
+| anything else | error with the location |
 
-`loc` is the form's `syntax-source` (file, line, column). Macros defined
-elsewhere, and `and`/`or`/`case`/`do`, still expand to the core `if` and are
-not rewritten.
+Each arm runs with the condition fixed in `%branch-assumptions`. That is a
+parameter, so a continuation captured inside an arm restores it.
 
-**`%branch` at run time:**
+**Distinguishing calls from macro uses.** For a form whose head is not a
+standard keyword, the walker emits `(%maybe-call %call original walked)`.
 
-- **The test is a ctensor:** branch on its truth value (one element).
-- **The test is any other non-symbolic value:** ordinary Scheme `if`
-  semantics, so static loop counters and `(= i n)` work unchanged.
-- **The test is a symbolic tensor while tracing:** it must be a one-element
-  `bool` tensor, otherwise an error with the location is raised.
-  - If the condition is already known (an enclosing arm or the current path
-    fixed it), only that arm runs.
-  - Otherwise both thunks run. Each runs with the condition fixed in
-    `%branch-assumptions`, which is a parameter, so a continuation captured
-    inside an arm restores it. The two results are then joined:
+- If the head names a variable, the compat hook expands this to the walked
+  call.
+- If the head names a macro or core syntax, the hook expands it to the
+  original form. Unknown macros are therefore never broken by the rewrite, and
+  their arguments are not rewritten.
 
-    | Arm results | Join |
-    |---|---|
-    | the same object | that object |
-    | two tensors | identical dtype and shape required, then `where(c, a, b)` |
-    | a tensor and a Scheme number or boolean | the scalar becomes a rank-0 constant of the tensor's dtype, then `where` (it broadcasts) |
-    | two Scheme numbers or booleans | rank-0 constants (`float32` / `bool`), then `where` |
-    | pairs/lists and vectors | joined element by element |
-    | equal non-tensor values | kept |
-    | anything else | error |
+**Sites.** `(%site form)` is the form's source location, a file/line/column
+alist (compat). It is used in error messages and as the branch identity in
+§4.8. Clauses of one `cond` / `case` / `and` / `or` get distinct sites,
+`#(site marker)`.
 
-    Errors read `traced if at <file>:<line>:<col>: …`, and a dtype/shape
-    mismatch reports both arms.
-  - Statement forms (one-armed `if`, `when`, `unless`) trace both arms and
-    return unspecified.
+### 4.8 Data-dependent loops
 
-The arms are thunks, so the code after the `if` runs once, on the joined
-value. No prompt, abort or continuation is involved, and the graph grows
-linearly (§4.7).
+A loop whose exit test is symbolic, written with `do`, named `let` or plain
+recursion, cannot be unrolled: tracing both arms of the exit test would recurse
+forever. `%branch` (and `%and` / `%or`) keep a parameter of the sites whose
+join is in progress.
 
-**Fallback.** An `if` the rewrite cannot see is still a core `if`. Put `bool`
-on its test to get the continuation mechanism of §4.2–§4.4:
+1. When a site is re-entered from inside its own join, the inner call signals.
+2. The outer call catches the signal and drops what its join recorded,
+   restoring the recorder's node lists.
+3. It counts a `loop-break` and resolves the condition with `bool`, which is a
+   graph break.
 
-```scheme
-(define-syntax my-if (syntax-rules () ((_ c a b) (if c a b))))
-(define-traced (f x) (my-if (bool (gt (sum x) 0.0)) …))
-```
+The loop therefore produces one segment per iteration in the trace tree, and
+different trip counts become different paths, each cached. A loop with a
+static trip count (`(= i n)` on a Scheme counter) never reaches this, because
+its test is concrete.
 
-Without `bool`, a core `if` on a symbolic tensor treats the record as true.
-That is the prototype's main hazard (§5).
+Detection is per site, so only genuine re-entry triggers it. An `if` evaluated
+as a loop argument completes before the recursive call.
 
-### 4.7 Node counts: syntactic join vs continuation multi-resume
+### 4.9 Node counts: syntactic join vs continuation multi-resume
 
 The test is `if` inside a loop with a static iteration count n, traced into one
 graph with no graph break. Node counts are the total number of nodes in the
@@ -351,171 +436,171 @@ emitted graph, measured by `test-trace-macro.scm`:
 | 3 | 21 | 49 |
 | 4 | 28 | 105 |
 
-- **Macro:** each iteration adds `reduce_sum greater mul sub neg add where`,
-  so the count is 7n.
-- **Continuation multi-resume:** each side re-traces the remaining iterations,
-  so T(n) = 2·T(n−1) + 7, that is 7·(2ⁿ − 1): exponential. The 49 at n = 3 is
-  the figure from the first version of this prototype.
+- **Macro:** linear, 7n.
+- **Continuation multi-resume:** T(n) = 2·T(n−1) + 7 = 7·(2ⁿ − 1), because each
+  side re-traces the rest of the function.
 
-### 4.8 Guards on free variables
+### 4.10 Guards on free variables
 
-A cached graph bakes in every value it closed over, for example
-`(mul x k)` → parameter `k = 2.0`. `traced-lambda` therefore makes the body's
-free variables guards. The guard values at call time are part of the cache key,
-and a change causes a fresh trace (counted in `guard-misses`). Going back to an
-earlier value hits the earlier trace again.
+A cached graph bakes in every value it closed over. The guard values at call
+time are part of the cache key, and a change causes a fresh trace (counted in
+`guard-misses`). Going back to an earlier value hits the earlier trace again.
 
-Free variables are found by walking every identifier in the body:
+`(%free-variable-guards formals body …)` is a compat hook. In Guile it:
 
-- **Outer lexicals.** At expansion time, `syntax-local-binding` reports
-  `lexical` for them. Each becomes a guard thunk `(lambda () v)`.
-- **Module-level names** (`global`). Each is looked up in the defining module
-  when the function is called. Doing it at call time matters: when a file is
-  compiled, its later top-level definitions are not bound yet while it is being
-  expanded, so an expansion-time check would miss them.
-- **Unbound names** read as a fixed marker and never cause a miss. Most of them
-  are names bound inside the body itself.
-- **Macros, core syntax and the formals** are skipped.
+- walks the body's identifiers;
+- asks `syntax-local-binding` which ones are outer lexicals, and guards those
+  with `(lambda () v)`;
+- guards module-level names by looking them up in the defining module at call
+  time. A compiled file is expanded before its later top-level definitions are
+  bound, so an expansion-time check would miss them.
 
-A name bound inside the body that shadows an outer binding adds an extra guard
-on the outer one, which can cause an unnecessary retrace but never a missing
-check.
+Unbound names read as a fixed marker and never cause a miss.
 
 How guard values are compared:
 
 | Value | Snapshot | Comparison |
 |---|---|---|
 | numbers | as is | `eqv?` |
-| strings, pairs, vectors | copied when the trace is stored | structurally, so in-place mutation is detected |
-| procedures, records (ctensors), everything else | as is | identity |
+| strings, pairs, vectors | copied when the trace is stored | structurally |
+| procedures, records | as is | identity |
 
 `trace-tree` lists the data guards, leaving out procedures and unbound names.
+`trace-function` also takes `#:guards` (an alist of `(name . thunk)`).
 
-`trace-function` also takes `#:guards` (an alist of `(name . thunk)`) for
-callers that build traced functions without the macro.
-
-### 4.9 Side effects
+### 4.11 Side effects
 
 - **Output while tracing.** While user code is traced, including speculative
-  multi-resume sides and both `%branch` arms, `current-output-port` is a fresh
-  string port. If anything was written, the tracer:
+  sides and both arms of rewritten conditionals, `current-output-port` is
+  captured. If anything was written, the tracer:
   - prints a warning to `current-error-port`;
   - records the text (`trace-warnings`);
   - counts it (`output-warnings`).
 
-  The text is not passed through, and it will not reappear on cached calls.
+  The text is not passed through.
 - **`trace-print`.** `(trace-print x [label])` returns `x` and prints
   `label: values`.
   - In eager mode it prints immediately.
-  - While tracing it records an effectful `print` node, so it prints at run
-    time with run-time values, once per call. DCE keeps it even when its result
-    is unused.
-  - Executions that only rebuild values (partial graphs at a break, path
-    rebuilds after a miss) run with output silenced, so a call prints each
-    `print` once.
-- **Conservative mode.** `#:retrace-on-miss? #t` (§4.10).
+  - While tracing it records an effectful `print` node, which prints at run
+    time, once per call, and is kept by DCE.
+  - Executions that only rebuild values run with output suppressed.
+- **Conservative mode.** `#:retrace-on-miss? #t` (§4.13).
 
-### 4.10 Retrace on miss
+### 4.12 Strict mode
 
-With `#:retrace-on-miss? #t`, branch nodes keep no continuation. A cache miss
-does not resume a stored `k`:
+`(traced-lambda* (#:strict? #t) …)`, or `(parameterize ((strict-tracing #t)) …)`
+as the default for traced functions created without `#:strict?`.
 
-1. Trace the function again from the start on the current inputs. The new
-   trace follows the same path up to the new branch value, using only
-   within-call continuations at its graph breaks.
-2. Match the new trace's prefix segments node by node against the cached path:
-   same ops, attributes, parameter values and input structure. This yields a
+Every call in a traced body goes through `%call`. While tracing in strict mode,
+if an argument carries a symbolic tensor (directly, or inside a list or vector
+up to depth 2) and the callee is not covered, it reports the callee once per
+traced function:
+
+- on `current-error-port`;
+- in `trace-strict-warnings`;
+- in the `strict-warnings` counter.
+
+These callees are covered and never reported:
+
+- the tensor ops and `bool`;
+- traced functions;
+- procedures created inside a traced body: `lambda`, `case-lambda`, internal
+  `define`, named `let`;
+- the structural procedures (`list`, `cons`, `car`, `vector-ref`, `apply`,
+  `map`, `for-each`, …), which only move values.
+
+For the higher-order ones (`map`, `for-each`, `apply`), the procedure argument
+is checked instead.
+
+Example: `plain-abs` is defined with an ordinary `define` and an ordinary `if`:
+
+```scheme
+(define (plain-abs x) (if (gt (sum x) 0.0) x (neg x)))          ; plain define
+(define-traced (traced-abs x) (if (gt (sum x) 0.0) x (neg x)))
+(define f (traced-lambda* (#:strict? #t) (x)
+            (add (plain-abs x) (traced-abs x))))
+(f #<ctensor ((-1.0 2.0) (-3.0 -4.0))>)
+;; => ((0.0 0.0) (0.0 0.0))     ; expected 2·|x|: plain-abs returned x
+;; stderr:
+;; sonicboom-trace: strict: procedure plain-abs received a symbolic tensor but
+;; is not defined with define-traced/traced-lambda: a core `if` inside it takes
+;; the tensor as true (define it with define-traced, or decide with bool)
+```
+
+Strict mode only reports. It cannot see whether the callee actually contains
+an `if`, so it can report procedures that are harmless, such as a helper that
+only does arithmetic. It cannot see symbolic tensors smuggled through mutable
+state.
+
+### 4.13 Retrace on miss
+
+With `#:retrace-on-miss? #t`, branch nodes keep no continuation. On a cache
+miss:
+
+1. Trace again from the start on the current inputs.
+2. Match the new prefix against the cached path, node by node, which gives a
    renaming from the new value names to the cached ones.
-3. Rename the new suffix and graft it under the cached branch.
+3. Graft the renamed new suffix under the cached branch.
 
-So the cache keeps the same tree as the continuation mode. The test checks this
-for `if` inside a loop. Each miss re-runs the user's Scheme code from the start
-(`segments-traced` is higher), and no stack segment stays alive in the cache.
+If the prefix does not match, the tracer warns, counts a `retrace-divergence`,
+replaces the tree with the fresh trace, and restarts the call.
 
-If the prefix does not match, which means some state the guards do not cover
-changed, the tracer:
-
-- warns;
-- counts it in `retrace-divergences`;
-- replaces that tree with the fresh trace;
-- restarts the call from the root.
-
-### 4.11 What the tests check
+### 4.14 What the tests check
 
 Every traced result is compared with the same computation written
-independently in plain Scheme over nested lists, not with the prototype's
-kernels.
+independently in plain Scheme over nested lists.
 
-**`test-trace.scm` (49 checks):**
+**`test-trace.scm` (49):**
 
-- **No branch** (`relu(matmul(x, w) + b)`, with bias broadcast):
-  - node order and types in the emitted text;
-  - the interpreter run on the text;
-  - the traced call;
-  - the second call hits the cache.
-- **DCE:** dead nodes and unused constant parameters are removed.
-- **Single data-dependent `if`, without multi-resume:**
-  - the first call breaks once;
-  - the same branch value hits the cache;
-  - a new branch value resumes the stored continuation, tracing exactly one new
-    segment with no new break;
-  - both children are then cached;
-  - each segment is pruned (`reduce_sum greater` / `mul` / `sub`).
-- **Single `if` with multi-resume:**
-  - one segment `reduce_sum greater mul sub where`, with no breaks;
-  - both branch values are served by the same graph;
-  - a budget of 0 falls back to a break.
-- **`if` inside a loop** (3 iterations, static loop count), checked over 6
-  inputs that take different paths:
-  - with breaks: paths are 3 branches deep, repeated inputs all hit the cache,
-    and a different static argument gets its own tree;
-  - full multi-resume: one graph, no breaks;
-  - tight budget: a mix of breaks and merges.
-- **Misc:**
-  - a repeated `bool` on the same condition causes only one break;
-  - the executor can be plugged in by keyword and by parameter;
-  - a traced function called while another is being traced is inlined;
-  - `matmul` followed by `if`;
-  - eager mode;
-  - `bool` on a tensor with more than one element is an error.
+- S-Expr structure and round trip;
+- DCE;
+- single `if` with graph breaks:
+  - cache hit on the same branch value;
+  - continuation re-entry on a new value, tracing exactly one new segment;
+  - per-segment pruning;
+- multi-resume;
+- `bool`-based `if` in a loop under the three modes;
+- assumptions, the pluggable executor, inlining of nested traced functions,
+  eager mode, errors.
 
-**`test-trace-macro.scm` (40 checks):**
+**`test-trace-macro.scm` (40):**
 
-- **Macro `if` inside a loop**, over the same 6 inputs:
-  - one trace, no break, 3 `where` joins;
-  - later calls hit the cache;
-  - the graph is the loop unrolled;
-  - the node-count table: linear 7n for the macro, 49 at n = 3 for the
-    continuation version, superlinear growth for the continuation version.
-- **`cond`, `when`, `unless`, nesting and returned values:**
-  - three-arm `cond`;
-  - `when`/`unless`/`if` with concrete tests keep Scheme semantics;
-  - Scheme numbers in arms become constants joined by `where`;
-  - lists of tensors are joined element by element;
-  - nested `if`s.
-- **Errors:**
-  - arms with different shapes give an error naming `test-trace-macro.scm:<line>`;
-  - a non-bool symbolic condition is an error.
-- **Fallback:** an `if` inside a macro defined outside the body, written with
-  `bool`, takes a graph break and resumes the continuation on the miss.
-- **Guards:**
-  - changing a closure's free variable gives a fresh trace and correct
-    results, and going back to the old value hits the first trace;
-  - a module variable changed with `set!` is detected;
-  - only data variables are listed in the key.
-- **Side effects:**
-  - `display` while tracing is captured, warned once, and not written;
-  - `trace-print` prints once per call with run-time values and survives DCE;
-  - `trace-print` across a break and a miss still prints once per call;
-  - `trace-print` in eager mode prints immediately.
-- **Retrace on miss:**
-  - single `if` and `if` inside a loop give correct results;
-  - the grafted tree has the same shape as the continuation version;
-  - later calls hit the cache;
-  - more segments are traced (prefixes re-traced), with no divergence.
+- macro `if` in a loop: one graph, 7n nodes, and the node-count table;
+- `cond`, `when`, `unless`, nested `if`, joins of numbers and lists;
+- errors with `file:line`;
+- the fallback through a foreign macro with `bool`;
+- closure and module-variable guards;
+- output capture and `trace-print`;
+- retrace-on-miss: same tree shape, cache hits, no divergence.
 
-These are the measured numbers for the `bool` loop test with the 6 inputs, from
-`trace-stats` and the segment node counts:
+**`test-trace-forms.scm` (36):**
+
+- `and`, `or`, and with nested or, or with nested and, `logical-not` of `and`;
+- a non-bool operand of `and` is an error with the location;
+- `case` with numeric datums, `=>`, `else`, `else =>`;
+- `case` with no `else` is an error;
+- `case` inside a loop (static count, 8 joins, no break);
+- `do` with a static count and a symbolic step (unrolled);
+- `do` with a symbolic exit test: correct trip counts, `loop-breaks`, cache hits;
+- named `let` with a symbolic exit test;
+- named `let` around `do` around `cond =>` (one graph);
+- `cond =>` receiving the symbolic condition;
+- `cond =>` around `case` around `if` of `and`;
+- R7RS semantics of every rewritten form on concrete values;
+- `trace-opaque`;
+- strict mode:
+  - a plain helper is reported, and its wrong result shown;
+  - the same helper with `define-traced` is silent and correct;
+  - ops, internal define, named `let` and `map` over a covered lambda are
+    silent;
+  - `map` over a plain procedure reports that procedure, once;
+  - off by default;
+  - can be enabled with the `strict-tracing` parameter;
+- portability: no module except `compat.scm` uses prompts, void ports,
+  procedure properties, hash tables, `syntax-case`, `syntax-source`,
+  `syntax-local-binding`, `datum->syntax`, `eval-when`, `catch` or `throw`.
+
+Measured numbers for the `bool` loop test (6 inputs), and the macro version:
 
 | Mode | traces | breaks | merges | segments (nodes each) |
 |---|---|---|---|---|
@@ -526,91 +611,167 @@ These are the measured numbers for the `bool` loop test with the 6 inputs, from
 
 ## 5. Limitations
 
-### Syntactic branches
+### Surface rewriting
 
-- **A core `if` on a symbolic tensor is silently wrong.** Only `if` / `cond` /
-  `when` / `unless` written literally in a `define-traced` / `traced-lambda`
-  body are rewritten. Code that reaches a core `if` sees the symbolic tensor as
-  a true value without any error. This covers:
-  - `and`, `or`, `case`, `do`;
-  - macros defined elsewhere;
-  - procedures called from the body;
-  - plain `trace-function` procedures.
-
-  Such code must use `bool`, which falls back to continuations.
-- **Both arms always run while tracing**, including their side effects. Arms
-  are traced, not executed, but Scheme-level effects in them happen once per
-  arm.
-- **Statement forms on a symbolic test** (`when`, `unless`, one-armed `if`)
-  record both arms' nodes. A `trace-print` inside one prints whichever way the
-  condition goes.
-- **Joins are value-level.** Two arms that return the same tensor need no
-  join. Otherwise every tensor-valued leaf of the result is selected with
-  `where`, even if most of the arm work is shared. There is no CSE across arms.
-- **Scheme numbers become tensors after a join.** Two different Scheme numbers
-  from the arms become a rank-0 tensor, so code that then uses the result as a
-  Scheme number fails.
+- **Uncovered core `if`s.** Only standard forms written literally in a traced
+  body are rewritten. Macros defined elsewhere (left untouched) and procedures
+  not defined with `define-traced` see a symbolic tensor as true in a core
+  `if`. Use `bool` there. Strict mode reports the procedures; it cannot report
+  foreign macro uses, which are left as written.
+- **`quasiquote` is not walked**, so conditionals inside `unquote` are core
+  `if`s.
+- **Both arms run while tracing**, including Scheme-level effects in them.
+  - Statement forms (`when`, `unless`, one-armed `if`) on a symbolic test keep
+    both arms' nodes, so a `trace-print` inside one prints whichever way the
+    condition goes.
+  - The same holds for `do` result expressions.
+- **`and` / `or` on a symbolic condition** require bool operands and become
+  logical ops: `(and c x)` with a non-bool `x` is an error, not R7RS's "x or
+  #f".
+- **`case` on a symbolic key:**
+  - only number datums (or booleans for a bool key) can match, compared with
+    `=`;
+  - other datums never match;
+  - a `case` without `else` cannot produce a value.
+- **Joins are value-level.** Every tensor-valued leaf of an arm result is
+  selected with `where`. There is no CSE across arms. Two different Scheme
+  numbers from the arms become a rank-0 tensor.
+- **Data-dependent loops cost one extra iteration per break.** Detecting
+  re-entry traces part of an iteration, which is dropped. If a graph break
+  happened inside the dropped part, its nodes stay in that segment (dead, and
+  removed by DCE, but `print` nodes among them would remain).
+- **Bodies are walked before expansion.** Keywords are matched by binding
+  (`syntax-rules` literals), so a keyword shadowed by a local binding is
+  correctly not rewritten. But a form produced *later* by the expansion of a
+  local `define-syntax` inside the body is not walked.
 
 ### Guards
 
 - **Guards cover the body's direct free variables only.**
-  - State read inside called procedures, through accessors, or through
-    mutable objects held in a guarded variable is not guarded, unless the
-    variable itself is a pair, vector or string, which are snapshotted.
-  - Records, including ctensors, compare by identity, so mutating a ctensor's
-    data vector in place is not detected.
-  - Procedures compare by identity, so redefining a helper does invalidate the
-    cache, but a helper that reads changed state does not.
-- **Over-guarding.** A body-internal name that shadows an outer binding adds
-  an unnecessary guard.
-- **Calls inside a trace.** A traced function called while another is being
-  traced is inlined, and its own guards are not added to the caller's key.
+  - State read inside called procedures or through mutable objects is not
+    guarded, except pairs, vectors and strings held directly in a guarded
+    variable, which are snapshotted.
+  - Records, including ctensors, and procedures compare by identity.
+- **Calls inside a trace.** A traced function called while another is traced
+  is inlined, and its own guards are not added to the caller's key.
+- **Portability.** Without the compat guard hook (§6.2) there are no automatic
+  guards. Pass `#:guards` explicitly.
 
 ### Effects
 
-- **Only output to `current-output-port` is detected.** Ports opened by the
-  user, `current-error-port`, `set!` and any other mutation are not.
-- **`trace-print` on a merged path** (multi-resume or `%branch`) prints on both
-  sides at run time, because `where` only selects values.
-- **Retrace divergence.** When it happens the tree is replaced and the call
-  restarts from the root, so `print` nodes in the already-executed prefix can
-  fire twice in that call.
+- **Only output to `current-output-port` is detected.** Other ports, `set!`
+  and mutation are not.
+- **`trace-print` on a merged path** prints on both sides at run time.
+- **Retrace divergence.** A divergence restarts the call, so `print` nodes in
+  the already-run prefix can fire twice in that call.
 
 ### Continuations
 
-- **Multi-resume duplicates the whole rest of the function** and grows
-  exponentially (§4.7). The budget and depth limits contain it. Prefer the
-  macro.
-- **Stored continuations assume purity.** Re-entering a stored continuation on
-  a miss assumes the Scheme code between `bool` points depends only on the
-  cache key: signature, guards and branch values. `#:retrace-on-miss? #t`
-  avoids re-entering old continuations, at the cost of re-running user code
-  from the start.
-- **Unrewindable continuations.** If `bool` is reached through a C frame (for
-  example a Scheme callback passed to a C-implemented primitive), Guile cannot
-  resume the continuation. Plain Scheme loops, `map`, named `let` and `do` are
-  fine.
+- **Multi-resume grows exponentially** (§4.9). Prefer the macro.
+- **Stored continuations assume purity.** Re-entering one assumes the code
+  between `bool` points depends only on the cache key. `#:retrace-on-miss? #t`
+  avoids re-entering old continuations.
+- **Unrewindable continuations.** On Guile, a `bool` reached through a C frame
+  cannot be resumed.
 
 ### General
 
-- **Cache misses are slow.** A miss replays the whole path with full outputs to
-  rebuild the concrete environment. Partial graphs at a break export every
-  defined value. Both choices are simple, not efficient.
+- **Cache misses are slow.** A miss rebuilds full paths, and partial graphs
+  export every defined value.
 - **One output per function.** The traced function must return one tensor, or
-  a Scheme number or boolean that gets lifted to a constant. A `%branch` join
-  can return lists, but the function's final result must still be one value.
-- **Static shapes only**, as in S-Expr v0. Each new input shape or static
-  argument gets a new tree.
+  a Scheme scalar that gets lifted to a constant. Joins can return lists, but
+  the final result cannot.
+- **Static shapes only**, as in S-Expr v0.
 - **Small op set:**
   - `matmul` is 2-D only;
   - broadcasting follows NumPy rules;
-  - Scheme reals stand in for float32 (no rounding to binary32), so numerics
-    are not float32-exact;
+  - Scheme reals stand in for float32;
   - `NaN` and `inf` are not representable in the emitted text;
-  - the op table is the prototype's own, not SonicBoom's operator registry.
-- **Branch condition dtype.** Conditions must be `bool` tensors, both for
-  `%branch` and for multi-resume. A `bool` on a numeric tensor always breaks.
-- **Not thread-safe.** Each traced function keeps per-call mutable state.
+  - the op table is the prototype's own.
+- **Conditions must be one-element `bool` tensors.** A `bool` on a numeric
+  tensor always breaks.
+- **Not thread-safe.**
 - **No native execution.** Wiring to `libsonicboom.so` would mean an executor
-  that hands each segment's text to the native S-Expr runtime. The executor
-  interface is designed for that, but it is not done here.
+  that hands each segment's text to the native S-Expr runtime.
+
+## 6. Porting guide
+
+The prototype is meant to be borrowed. Everything a port must re-implement is
+the interface of `compat.scm`. The rest is either portable R7RS or mechanical
+translation (§6.3).
+
+### 6.1 Run-time interface
+
+| compat | Contract | Guile | Port to |
+|---|---|---|---|
+| `(%make-prompt-tag name)` | a fresh tag | `make-prompt-tag` | SRFI 226 / Racket: `make-continuation-prompt-tag` |
+| `(%call-with-prompt tag thunk handler)` | run `thunk`; on abort, call `(handler k v …)` with the composable continuation up to this prompt; `k` must be re-enterable more than once | `call-with-prompt` | SRFI 226 / Racket: `call-with-continuation-prompt` with a handler; shift/reset: see below |
+| `(%abort-to-prompt tag v …)` | capture up to the prompt and abort to its handler; returns what `k` is later called with | `abort-to-prompt` | SRFI 226 / Racket: `(call-with-composable-continuation (λ (k) (abort-current-continuation tag k v …)) tag)` |
+| `(%raise-signal tag d …)` / `(%catch-signal tag thunk handler)` | non-local exit by tag; the handler runs after unwinding | `throw` / `catch` | R7RS `raise` of a tagged record + `guard` |
+| `(call-with-output-captured thunk)` | `(values result text)` of what `thunk` wrote to `current-output-port` | string port + `parameterize` | the same in R7RS (`open-output-string`, `parameterize`) |
+| `(call-with-output-suppressed thunk)` | run `thunk`, discarding its output | void port | a string port that is dropped |
+| `(trace-warn msg)` | one line on `current-error-port` | `display` | R7RS |
+| `(procedure-tag! p key v)`, `(procedure-tag p key)` | attach data to a procedure object | procedure properties | a weak `eq?` table (SRFI 124/125, R6RS `make-weak-eq-hashtable`); a plain `eq?` table if leaking is acceptable |
+| `(procedure-label p)` | a name for messages | `procedure-name` | the implementation's procedure-name facility, or `p` itself |
+| `make-table`, `table-ref`, `table-set!`, `table-count`, `table->alist` | `equal?`-keyed mutable table | Guile hash tables | SRFI 69 / SRFI 125 / R6RS hashtables |
+| `%structural-procedures`, `%higher-order-procedures` | procedure objects that only move values (strict mode) | core plus SRFI-1 `map` / `for-each` | the implementation's own procedure objects |
+| `%unbound-guard`, `(%global-guard module name)` | guard support | module lookup | whatever §6.2's guard hook needs |
+
+**Delimited control requirements.**
+
+- `k` is a *composable* (delimited) continuation that is called several times:
+  - on a graph-break resume;
+  - on a later cache miss;
+  - twice per multi-resume.
+- The tracer calls `k` inside a new `%call-with-prompt`, and an abort during
+  `(k v)` must reach that new prompt.
+- Dynamic bindings (`parameterize`) made outside the prompt must come from the
+  resumption site; those made between prompt and abort must be restored. Both
+  SRFI 226 and Racket give exactly this.
+
+**On top of shift/reset only.** For example `reset`/`shift` from an
+implementation's partial-continuation library, or a library over native
+one-shot continuations.
+
+- Emulate a single prompt tag (the tracer uses only `%break-tag`) by tagging
+  the results of `reset`:
+  - normal return → `(value . v)`;
+  - abort → `(abort k v …)`.
+- `%call-with-prompt` dispatches on the tag.
+- A resumed `k` that aborts again returns an `abort` record from its own
+  implicit `reset`. The wrapper handed to the handler must then re-abort to the
+  current `reset`, composing the two continuations. This is the standard
+  encoding of prompts with abort in terms of `shift`/`reset`.
+
+**Do not build this on full `call/cc`.** Every capture would copy the whole
+stack up to the top level, rather than only the user function's frames between
+the prompt and `bool`, and re-entry would need `dynamic-wind`-level care.
+
+### 6.2 Expansion-time hooks
+
+The walker in `macro.scm` is pure `syntax-rules`. It calls exactly three
+macros from compat; in Guile they use `syntax-case`.
+
+| Hook | Guile | Portable fallback | What is lost |
+|---|---|---|---|
+| `(%site form)` | `syntax-source` → `'((filename …) (line …) (column …))` | `(syntax-rules () ((_ f) 'f))`: the quoted form | `file:line:col` in messages; two textually identical conditionals in one function then share a loop-detection site, so a re-entry could be reported falsely and fall back to a break (still correct) |
+| `(%maybe-call call original walked)` | `syntax-local-binding` on the head: variable → `(call . walked)`, otherwise `original` | `(syntax-rules () ((_ c o (h . a)) (c h . a)))`: always a call | foreign macro uses inside a traced body break; wrap them in `(trace-opaque …)`. Implementations that can ask whether an identifier is bound as syntax (for example Racket's `syntax-local-value`) can implement the Guile behaviour |
+| `(%free-variable-guards formals body …)` | `syntax-local-binding` + call-time module lookup | `(syntax-rules () ((_ . _) '()))` | automatic guards; pass `#:guards` explicitly |
+
+### 6.3 Mechanical translations
+
+These are not mechanisms, only library spelling:
+
+- **Modules.** `define-module` / `#:use-module` → `define-library` / `import`.
+- **Keyword arguments.** `define*` with `#:key` / `#:optional`, and option
+  keywords like `#:strict?`, become an option alist or plain optional
+  arguments. In `traced-lambda*` the options are passed through to
+  `trace-function` unchanged, so only that procedure's signature changes.
+- **Pattern matching.** `(ice-9 match)` → Wright/Shinn `match`, which is
+  available for most implementations.
+- **SRFIs and small helpers.** SRFI 1 (`fold`, `iota`, `any`, `every`,
+  `filter-map`, …), SRFI 9 records (R7RS `define-record-type`), SRFI 28
+  `format` (`~a` / `~s`), SRFI 13/130 string procedures (`string-join`,
+  `string-contains`), and `assq-ref` / `assoc-ref` / `acons` (two-line
+  helpers).
+- **Tests.** SRFI 64 tests; `current-source-location` in one test is Guile's.

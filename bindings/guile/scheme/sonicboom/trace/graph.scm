@@ -71,7 +71,7 @@ in topological order."
   "Render a document datum as text: one graph section per line group, one
 input/output/parameter/node per line. `write` gives strings for names, symbols
 for vocabulary, and floats with a decimal point or exponent."
-  (define (w x) (call-with-output-string (lambda (p) (write x p))))
+  (define (w x) (let ((p (open-output-string))) (write x p) (get-output-string p)))
   (define (section head items)
     (if (null? items)
         (string-append "    (" (symbol->string head) ")")
