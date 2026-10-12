@@ -3,9 +3,10 @@
 **Test date: 2026-10-12** (final v1-performance state; development spanned
 2026-10-06 → 2026-10-12). Supersedes the 2026-10-07 v0 baseline.
 
-**Status: v1 performance complete through Step 4.** CUDA decode is now at
-llama.cpp parity on the 64-step protocol (1.02×) and ~0.87× at long context
-(depth 512). The remaining gap is one dominated kernel, not architecture.
+**Status: v1 performance complete through Step 4.** CUDA decode is at
+llama.cpp parity on the 64-step protocol (1.02×) and at long context (1.02× at
+depth 512, 0.97× at depth 2048). The remaining gap is one dominated kernel (the
+q8_1 gemv) plus a small attention growth at depth ≥ 2048, not architecture.
 
 ## Scope
 
@@ -19,8 +20,12 @@ llama.cpp parity on the 64-step protocol (1.02×) and ~0.87× at long context
   *baseline only* (not an oracle); SonicBoom's reference is its own CPU path.
 - **Protocol:** 64-step steady decode = `test_generate` at
   `SONICBOOM_GEN_STEPS=64` (single seed + N greedy steps, no tokenizer, no nsys,
-  idle GPU). Long context = `tools/baseline/longctx_bench` (warm to `depth`, then
-  time the tail) and `llama-bench -p 1 -n 64 -ngl 99`.
+  idle GPU). Long context = the runtime's single-run steady metric
+  (`SONICBOOM_GEN_TIMING=1`, "steady tok/s") over a `depth`-step decode at
+  `n_ctx = depth`, compared against `llama-bench -p <depth> -n 64 -ngl 99`
+  (whose `n_ctx = depth + 64`). Both sides must run at the **same n_ctx** — the
+  earlier `-p 1 -n 64` baseline silently measured at `n_ctx = 65`, not the
+  stated depth.
 
 ## Environment (recorded separately per v1 rules)
 
@@ -82,17 +87,33 @@ behavior invariant (~36.3 tok/s, ±0), as intended.
 
 ### 1.2 Long context (steady decode at a fixed KV depth)
 
-| depth | SonicBoom CUDA | llama.cpp CUDA | ratio |
-|---|---|---|---|
-| 512 | 34.55 tok/s | 39.87 tok/s | **0.87×** |
-| 2048 | 34.78 tok/s | 37.56 tok/s | 0.93× |
+| depth | n_ctx | SonicBoom CUDA | llama.cpp CUDA | ratio |
+|---|---|---|---|---|
+| 512 | 576 | 45.95 tok/s (21.76 ms/step) | 45.23 tok/s (22.11 ms/step) | **1.02×** |
+| 2048 | 2112 | 44.02 tok/s (22.71 ms/step) | 45.25 tok/s (22.10 ms/step) | 0.97× |
 
-SonicBoom is flat from 512→2048 (global attention is <1% of the step after the
-split-KV rewrite). Measured at the pre-CUDA-Graphs/pre-T1-T5 commit
-(`6867b2f`); the later CUDA Graphs work pushed depth-512 to ≈34.8 tok/s. The
-long-context gap to llama.cpp (≈13% at 512) is the gemv + full-SWA attention,
-which the T1–T5 fusions do not remove (they target the elementwise/quantize
-glue, a smaller share at depth 512).
+Re-measured post-T1-T5 with CUDA Graphs ON on an idle GPU, at matching n_ctx
+(the 2026-10-07 table above — 34.55/34.78 vs 39.87/37.56 — was measured at
+`n_ctx = 65`, i.e. depth 1 not 512/2048, and is **stale**; it understated both
+sides and, because llama.cpp's n_ctx also shrank, misstated the ratio).
+
+**Method.** SonicBoom = the runtime's single-run steady metric
+(`SONICBOOM_GEN_TIMING=1`, "steady tok/s", first step excluded) over a
+`depth`-step decode at `n_ctx = depth` — the *same* decode llama-bench's
+`tg64` measures, but averaged over the whole depth range rather than a 64-step
+tail (the `longctx_bench` subtraction is thermal-fragile at depth 2048: two
+~47 s decodes subtract to a ~1.3 s tail, so a 0.4% GPU-clock drift becomes a
+12% tail error). llama.cpp = `llama-bench -p <depth> -n 64 -ngl 99`, whose
+`n_ctx = n_prompt + n_gen = depth + 64`; its `tg64` is flat (45.23→45.25)
+because its decode is not attention-bound at these depths.
+
+**Reading.** SonicBoom now *leads* llama.cpp at depth 512 (1.02×) and trails
+slightly at 2048 (0.97×). The 512→2048 penalty is ~4.6% (21.76→22.71 ms/step)
+and is **essentially all attention**: the split kernel grows 1.29→2.36 ms as
+the global layers span the full window, while gemv q8_1 (14.9 ms, ~66%) is
+unchanged. llama.cpp has no such penalty at these depths, so the long-context
+gap widens slowly with depth — this is the same sublinear attention growth §2
+quantifies, now visible end-to-end.
 
 ### 1.3 CPU decode (reference)
 
@@ -240,12 +261,13 @@ be hand-written because the K-quant format is SonicBoom-owned.
 SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
   SONICBOOM_GEN_STEPS=64 ./build/tests/core/test_generate
 
-# long-context steady decode (SonicBoom)
-tools/baseline/longctx_bench --depth 512 --steps 64
+# long-context steady decode (SonicBoom; read the "steady tok/s" line)
+SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
+  SONICBOOM_GEN_TIMING=1 tools/baseline/longctx_bench --depth 512 --steps 1
 
-# baseline (llama.cpp)
+# baseline (llama.cpp; n_ctx = depth + 64)
 $LLAMA_ROOT/build-cuda/bin/llama-bench \
-  -m models/gemma-4-E4B-it-Q3_K_M.gguf -p 1 -n 64 -ngl 99 -r 2
+  -m models/gemma-4-E4B-it-Q3_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
 
 # full correctness suite
 ctest --test-dir build

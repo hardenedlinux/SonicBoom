@@ -11,6 +11,15 @@
 // decode means the first `depth` steps are bit-identical between the two runs,
 // so their time cancels exactly.
 //
+// CAVEAT — subtraction is thermal-fragile at large depth. At depth 2048 the two
+// decodes are ~47 s each, and the ~1.3 s tail is ~2.7% of each total; a ~0.4%
+// GPU-thermal drift between the second run (hotter) and the first inflates the
+// tail by ~12% (measured 50.4 tok/s here vs 44.0 tok/s steady). Prefer the
+// runtime's own single-run steady metric instead:
+//   SONICBOOM_GEN_TIMING=1 ./tools/baseline/longctx_bench --depth 2048 --steps 1
+// and read the `steady … tok/s` line (the `depth`-step decode averaged, first
+// step excluded). That is what benchmark.md §1.2 uses.
+//
 // Usage: longctx_bench [--depth N] [--steps N] [--token id]
 // Build: tools/baseline/build_longctx_bench.sh
 
@@ -63,10 +72,16 @@ int main(int argc, char** argv) {
     sbmodel::generate_spine_cuda(*m, seed, 0, warm, 0);
   }
 
+  // Pin n_ctx to the full decode length for BOTH runs. Otherwise the warm run
+  // (n tokens) and the full run (n+steps tokens) size the global-layer KV cache
+  // and the split-KV chunk (= n_ctx/40) differently, so the first `depth` steps
+  // are not timing-identical and the subtraction over/under-counts the tail.
+  const uint64_t ctx = depth + steps;
+
   auto run_decode = [&](uint64_t n, double* secs) -> uint64_t {
     std::vector<int64_t> toks(n, -1);
     const auto t0 = std::chrono::steady_clock::now();
-    const uint64_t done = sbmodel::generate_spine_cuda(*m, seed, 0, toks, 0);
+    const uint64_t done = sbmodel::generate_spine_cuda(*m, seed, 0, toks, ctx);
     const auto t1 = std::chrono::steady_clock::now();
     *secs = std::chrono::duration<double>(t1 - t0).count();
     return done;
