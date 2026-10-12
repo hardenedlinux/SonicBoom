@@ -287,6 +287,14 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Add,            OpKind::LayerCombine,
         OpKind::PerLayerInput,  OpKind::Slice,      OpKind::Embedding,
         OpKind::Argmax,
+        // Phase 7 batched prefill operators (device-resident, Phase 7a). The
+        // elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused unchanged
+        // on flat batched buffers; the rest are the batched *_dev kernels.
+        OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
+        OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
+        OpKind::FlashAttention,   OpKind::FlashAttentionShared,
+        OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
+        OpKind::LayerCombineBatched,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

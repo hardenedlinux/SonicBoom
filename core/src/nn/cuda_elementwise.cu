@@ -830,6 +830,136 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
 }
 
+// --- batched prefill kernels (the decode kernels generalized to n columns) ---
+
+// Strided-column rms_norm: one block per column c. The per-column reduction is
+// the same parallel double sum-of-squares as rms_norm_fused_kernel (warp
+// shuffle + shared block reduce), so each column matches the decode rms_norm_dev
+// to fp32 rounding. The column elements are strided (stride ncols), so the
+// loads are not coalesced; prefill is a one-shot pass where the K-quant matmuls
+// dominate, so this is accepted.
+__global__ void rms_norm_cols_kernel(const float* __restrict__ x,
+                                     const float* __restrict__ weight, int dim,
+                                     int ncols, float eps,
+                                     float* __restrict__ y) {
+  const int c = blockIdx.x;
+  const int tid = threadIdx.x;
+  double s = 0.0;
+  for (int k = tid; k < dim; k += blockDim.x) {
+    const float v = x[(size_t)k * ncols + c];
+    s += double(v * v);
+  }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  __shared__ double warp_part[32];
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (lane == 0) warp_part[warp] = s;
+  __syncthreads();
+  __shared__ float inv;
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
+    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(dim)) + eps);
+  }
+  __syncthreads();
+  const float iv = inv;
+  for (int k = tid; k < dim; k += blockDim.x) {
+    const size_t idx = (size_t)k * ncols + c;
+    y[idx] = weight ? x[idx] * iv * weight[k] : x[idx] * iv;
+  }
+}
+
+// Batched multi-head RoPE: like rope_neox_heads_kernel but the absolute position
+// is per-position — pos = start_pos + i / (heads_per_pos * head_dim) — so one
+// launch rotates every position of a [n_pos, heads_per_pos*head_dim] buffer. The
+// per-element rotation (off = i % head_dim, paired with off + head_dim/2) is
+// unchanged from the single-position kernel.
+__global__ void rope_neox_heads_batched_kernel(float* __restrict__ x, int n,
+                                               int head_dim, int heads_per_pos,
+                                               uint64_t start_pos, float freq_scale,
+                                               float log_base,
+                                               const float* __restrict__ freq_factors) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const int half = head_dim >> 1;
+  const int off = i % head_dim;
+  if (off >= half) return;
+  const uint64_t pos = start_pos + (uint64_t)(i / (heads_per_pos * head_dim));
+  float theta = freq_scale * float(pos) *
+                expf(-2.0f * float(off) / float(head_dim) * log_base);
+  if (freq_factors) theta /= freq_factors[off];
+  const float c = cosf(theta);
+  const float s = sinf(theta);
+  const float x0 = x[i];
+  const float x1 = x[i + half];
+  x[i] = x0 * c - x1 * s;
+  x[i + half] = x0 * s + x1 * c;
+}
+
+// Tiled transpose of a [rows, cols] row-major matrix -> [cols, rows]:
+// dst[c*rows + r] = src[r*cols + c]. Same +1-pad tile as the K-quant matmul's
+// transpose_tiled, kept here so the prefill Transpose op has no quant-file
+// dependency.
+__global__ void transpose_tiled_dev(const float* __restrict__ src,
+                                    float* __restrict__ dst, int rows, int cols) {
+  __shared__ float tile[32][33];
+  int x = blockIdx.x * 32 + threadIdx.x;
+  int y = blockIdx.y * 32 + threadIdx.y;
+  if (x < cols && y < rows) tile[threadIdx.y][threadIdx.x] = src[(size_t)y * cols + x];
+  __syncthreads();
+  x = blockIdx.y * 32 + threadIdx.x;
+  y = blockIdx.x * 32 + threadIdx.y;
+  if (x < rows && y < cols) dst[(size_t)y * rows + x] = tile[threadIdx.x][threadIdx.y];
+}
+
+// Dense gemv over n columns: one thread per (row, col) pair. Consecutive threads
+// span columns, so the activation loads x[i*ncols + c] are coalesced and the
+// weight row W[row*cols + i] is broadcast across ncols threads.
+__global__ void gemv_dense_f32_batched(const float* __restrict__ W,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ y, int cols, int rows,
+                                       int ncols) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * ncols) return;
+  const int row = idx / ncols;
+  const int c = idx - row * ncols;
+  const float* wrow = W + (size_t)row * cols;
+  float acc = 0.0f;
+  for (int i = 0; i < cols; ++i) acc += wrow[i] * x[(size_t)i * ncols + c];
+  y[idx] = acc;
+}
+
+__global__ void gemv_bf16_batched(const uint16_t* __restrict__ W,
+                                  const float* __restrict__ x,
+                                  float* __restrict__ y, int cols, int rows,
+                                  int ncols) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * ncols) return;
+  const int row = idx / ncols;
+  const int c = idx - row * ncols;
+  const uint16_t* wrow = W + (size_t)row * cols;
+  float acc = 0.0f;
+  for (int i = 0; i < cols; ++i) acc += bf16_to_float(wrow[i]) * x[(size_t)i * ncols + c];
+  y[idx] = acc;
+}
+
+// Append n consecutive rows into the flat KV cache. Each thread copies one
+// element of one row; the slot is (start_pos + row) % n_slots (a wrap-free run,
+// so consecutive). src is [n, row_elems] position-major.
+__global__ void kv_append_batched_kernel(float* __restrict__ dst,
+                                         const float* __restrict__ src,
+                                         uint64_t start_pos, uint64_t n_slots,
+                                         int row_elems, int n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = row_elems * n;
+  if (idx >= total) return;
+  const int row = idx / row_elems;
+  const int e = idx - row * row_elems;
+  const uint64_t slot = (start_pos + (uint64_t)row) % n_slots;
+  dst[slot * (uint64_t)row_elems + (uint64_t)e] = src[idx];
+}
+
 } // namespace
 
 bool available() noexcept {
@@ -1447,6 +1577,103 @@ bool argmax_dev(const float* x, int n, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !out) return false;
   argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// --- batched prefill entry points -------------------------------------------
+
+bool rms_norm_cols_dev(std::span<const float> weight, const float* x, float eps,
+                       float* y, int dim, int ncols) {
+  if (!available()) return false;
+  if (dim <= 0 || ncols <= 0 || !x || !y) return false;
+  if (!weight.empty() && weight.size() < (size_t)dim) return false;
+  const float* d_w = nullptr;
+  if (!weight.empty()) {
+    d_w = static_cast<const float*>(upload_bytes(weight.data(), dim * sizeof(float)));
+    if (!d_w) return false;
+  }
+  rms_norm_cols_kernel<<<ncols, 1024, 0, cur_stream()>>>(x, d_w, dim, ncols, eps, y);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
+                                 int n_pos, uint64_t start_pos, float base,
+                                 float freq_scale,
+                                 std::span<const float> freq_factors) {
+  if (!available()) return false;
+  if (head_dim <= 0 || heads_per_pos <= 0 || n_pos <= 0 || !x) return false;
+  const int n = head_dim * heads_per_pos * n_pos;
+  const int half = head_dim >> 1;
+  if ((head_dim & 1) != 0) return false;
+  if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
+  const float* d_ff = nullptr;
+  if (!freq_factors.empty()) {
+    d_ff = static_cast<const float*>(
+        upload_bytes(freq_factors.data(), half * sizeof(float)));
+    if (!d_ff) return false;
+  }
+  const float log_base = std::log(base);
+  rope_neox_heads_batched_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
+      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool transpose_dev(const float* src, float* dst, int dim, int ncols, bool forward) {
+  if (!available()) return false;
+  if (dim <= 0 || ncols <= 0 || !src || !dst) return false;
+  const dim3 tblock(32, 32);
+  if (forward) {
+    // src [dim, ncols] -> dst [ncols, dim]
+    const dim3 tgrid((ncols + 31) / 32, (dim + 31) / 32);
+    transpose_tiled_dev<<<tgrid, tblock, 0, cur_stream()>>>(src, dst, dim, ncols);
+  } else {
+    // src [ncols, dim] -> dst [dim, ncols]
+    const dim3 tgrid((dim + 31) / 32, (ncols + 31) / 32);
+    transpose_tiled_dev<<<tgrid, tblock, 0, cur_stream()>>>(src, dst, ncols, dim);
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
+                            float* y, int rows, int ncols) {
+  if (!available()) return false;
+  if (cols <= 0 || rows <= 0 || ncols <= 0 || !x || !y) return false;
+  if (W.size() < (size_t)cols * (size_t)rows) return false;
+  const float* d_w = static_cast<const float*>(
+      upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
+  if (!d_w) return false;
+  const int total = rows * ncols;
+  gemv_dense_f32_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
+      d_w, x, y, cols, rows, ncols);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
+                             float* y, int rows, int ncols) {
+  if (!available()) return false;
+  if (cols <= 0 || rows <= 0 || ncols <= 0 || !x || !y) return false;
+  if (W.size() < (size_t)cols * (size_t)rows) return false;
+  const uint16_t* d_w = static_cast<const uint16_t*>(
+      upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
+  if (!d_w) return false;
+  const int total = rows * ncols;
+  gemv_bf16_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
+      d_w, x, y, cols, rows, ncols);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
+                           const float* src_v, uint64_t start_pos,
+                           uint64_t n_slots, int row_elems, int n) {
+  if (!available()) return false;
+  if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
+      n_slots == 0)
+    return false;
+  const int grid = grid_for(row_elems * n);
+  kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+      dst_k, src_k, start_pos, n_slots, row_elems, n);
+  kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+      dst_v, src_v, start_pos, n_slots, row_elems, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

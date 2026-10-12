@@ -35,6 +35,8 @@
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/graph.h>
 
+#include <memory>
+
 namespace sonicboom::planner {
 
 class SonicCudaBackend : public Backend {
@@ -87,19 +89,13 @@ public:
   std::unique_ptr<hal::StepProgram> record_step(
       std::function<bool()> step_fn) override;
 
-  // Batched prefill (host-orchestrated CUDA): process `tokens[0..n-1]` in one
-  // pass — batched f32-activation K-quant matmul (quant::cuda::matmul_f32,
-  // matching the CUDA spine's matvec_f32_dev) + flash attention
-  // (nn::cuda::flash_attention, n_q == n_kv == n) — filling the per-KV-layer
-  // device caches at slots `(start_pos + p) % n_slots`, exactly as n CUDA spine
-  // decode steps would. Writes the final hidden state (embedding_length floats)
-  // to `out_hidden` on the host. The elementwise norm/RoPE/gate steps reuse the
-  // CPU nn::* references (their arithmetic is fp16-erased before cache write and
-  // within fp32 tolerance elsewhere), so only the two heavy kernels are on the
-  // device. Requires n >= 1 and no SWA ring wrap (n <= every sliding-window
-  // layer's window) and start_pos + n <= n_ctx for global layers.
-  bool prefill(std::span<const uint64_t> tokens, uint64_t start_pos,
-               std::span<float> out_hidden);
+  // Share another backend's KV cache (same session). The prefill graph's
+  // FlashAttention nodes fill the cache that the decode graph's Attention nodes
+  // then read, so the prefill backend and decode backend must reference the same
+  // cache. Both backends stay bound to their own Graph (for node lookup); only
+  // the per-KV-layer device cache is shared. The last owner frees the device
+  // buffers (the shared_ptr holds a device-buffer-freeing deleter).
+  void share_caches(const SonicCudaBackend& other);
 
 private:
   // One KV layer's persistent device-resident decode cache (mirrors
@@ -119,7 +115,9 @@ private:
 
   const model::Gemma4Model& model_;
   const Graph& graph_;
-  std::vector<KvCacheDev> caches_;  // index == KV layer (0 .. n_layer_kv-1)
+  // index == KV layer (0 .. n_layer_kv-1). Shared across the decode backend and
+  // a prefill backend bound to a different graph (see share_caches).
+  std::shared_ptr<std::vector<KvCacheDev>> caches_;
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)

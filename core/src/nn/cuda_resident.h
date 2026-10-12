@@ -143,4 +143,48 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
 
+// --- batched prefill primitives (the decode *_dev kernels generalized to an
+// n dimension; decode is n == 1). Activations are [dim, ncols] column-major
+// (ncols innermost) except where noted. Each mirrors the CPU batched prefill
+// op (SonicBackend) and, for ncols == 1, the corresponding single-token *_dev
+// kernel above. ------------------------------------------------------------
+
+// Strided-column rms_norm over [dim, ncols]: for each column c,
+//   y[k*ncols+c] = (x[k*ncols+c] / sqrt(mean_k(x[k*ncols+c]^2) + eps)) * weight[k]
+// (weight empty => unit). Same per-column reduction algorithm as rms_norm_dev
+// (parallel double sum-of-squares + shared reduce), so each column matches the
+// decode rms_norm_dev to fp32 rounding.
+bool rms_norm_cols_dev(std::span<const float> weight, const float* x, float eps,
+                       float* y, int dim, int ncols);
+
+// Multi-head NEOX RoPE over a batched [n_pos, heads_per_pos*head_dim] buffer
+// (position-major, flat), with per-position absolute position
+// pos = start_pos + (i / (heads_per_pos*head_dim)). Mirrors rope_neox_heads_dev
+// applied per position; the decode path is n_pos == 1.
+bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
+                                 int n_pos, uint64_t start_pos, float base,
+                                 float freq_scale,
+                                 std::span<const float> freq_factors);
+
+// Tiled transpose of a column-major buffer. forward=true: src [dim, ncols] ->
+// dst [ncols, dim] (dst[c*dim+k] = src[k*ncols+c]); forward=false: src
+// [ncols, dim] -> dst [dim, ncols] (dst[k*ncols+c] = src[c*dim+k]).
+bool transpose_dev(const float* src, float* dst, int dim, int ncols, bool forward);
+
+// Dense gemv over ncols columns: y[r*ncols+c] = sum_i W[r*cols+i] * x[i*ncols+c].
+// x is [cols, ncols], y is [rows, ncols] (ncols innermost); W row-major. The
+// decode matvec_f32_dev / matvec_bf16_dev are the ncols == 1 case.
+bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
+                            float* y, int rows, int ncols);
+bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
+                             float* y, int rows, int ncols);
+
+// Append n consecutive token rows (row_elems floats each) into the flat KV cache
+// at slots (start_pos + p) % n_slots. src_k/src_v are [n, row_elems]
+// position-major. Mirrors kv_append_dev (the n == 1 case); prefill guarantees a
+// wrap-free run so the slots are consecutive.
+bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
+                           const float* src_v, uint64_t start_pos,
+                           uint64_t n_slots, int row_elems, int n);
+
 } // namespace sonicboom::nn::cuda

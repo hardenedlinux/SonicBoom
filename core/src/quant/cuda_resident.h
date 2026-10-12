@@ -106,4 +106,16 @@ bool gather_f32_mapped_dev(const QuantizedTensor& W, int64_t token, float* out);
 bool gather_f32_mapped_dev_row(const QuantizedTensor& W, const float* token_dev,
                                float* out);
 
+// Batched (prefill) embedding gather: out[k*n + c] = W[k][tokens[c]] for
+// k in [0, width), c in [0, n). `out` is [width, n] column-major (n innermost).
+// The resident variant reads rows straight from the cached device weight (for
+// token_embd, already resident via the logits matvec); the mapped variant
+// pin+maps W in place (for the ~1.5 GiB per_layer_token_embd). Both upload the
+// n token ids once and gather every column in one launch; the single-row
+// gather_*_dev / _row entries above are the n == 1 case.
+bool gather_f32_resident_dev_batched(const QuantizedTensor& W,
+                                     std::span<const uint64_t> tokens, float* out);
+bool gather_f32_mapped_dev_batched(const QuantizedTensor& W,
+                                   std::span<const uint64_t> tokens, float* out);
+
 } // namespace sonicboom::quant::cuda

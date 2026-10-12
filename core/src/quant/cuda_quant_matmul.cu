@@ -471,6 +471,8 @@ void* g_gather = nullptr;
 size_t g_gather_bytes = 0;
 void* g_gather_out = nullptr;
 size_t g_gather_out_bytes = 0;
+void* g_tokens = nullptr;
+size_t g_tokens_bytes = 0;
 
 // Zero-copy per_layer_token_embd gather (Phase 3.2 B3): the packed tensor is
 // pinned + mapped in place (cudaHostRegisterMapped) once, so the gather kernel
@@ -691,6 +693,126 @@ bool launch_gather_row(const uint8_t* w, int64_t row_host, const float* row_dev,
       break;
     case QuantType::Q5_K:
       gather_q5_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
+      break;
+    default:
+      return false;
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// --- batched embedding gather (prefill) --------------------------------------
+//
+// The n-token prefill preamble dequantizes token_embd[tokens[c]] and
+// per_layer_token_embd[tokens[c]] for c in [0, n) in one launch per weight.
+// One thread per (k, c) element: blockIdx.y selects the column c (and thus the
+// token), threads across x cover the width. The dequant arithmetic is identical
+// to gather_*_K_row, so each column is bit-identical to the n == 1 gather.
+
+__global__ void gather_q3_K_batched(const uint8_t* __restrict__ w,
+                                    const uint64_t* __restrict__ rows,
+                                    float* __restrict__ out, int blocks_per_row,
+                                    int n) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (k >= width) return;
+  const int c = blockIdx.y;
+  if (c >= n) return;
+  const int64_t row = (int64_t)rows[c];
+  const int b = k >> 8;
+  const int l = k & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 110;
+  const uint8_t* hm = blk;
+  const uint8_t* q = blk + 32;
+  const float d = half_to_float(ld_u16(blk + 108));
+  int8_t scales[16];
+  unpack_q3_K_scales(blk + 96, scales);
+
+  const int m = l >> 7;
+  const int r = l & 127;
+  const int j = r >> 5;
+  const int l2 = r & 31;
+  const int qv = int((q[m * 32 + l2] >> (j << 1)) & 3);
+  const int hmset = (hm[l2] & (1 << (j + (m << 2)))) ? 0 : 4;
+  const int sidx = (m << 3) + (j << 1) + (l2 >> 4);
+  out[k * n + c] = d * float(scales[sidx] - 32) * float(qv - hmset);
+}
+
+__global__ void gather_q4_K_batched(const uint8_t* __restrict__ w,
+                                    const uint64_t* __restrict__ rows,
+                                    float* __restrict__ out, int blocks_per_row,
+                                    int n) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (k >= width) return;
+  const int c = blockIdx.y;
+  if (c >= n) return;
+  const int64_t row = (int64_t)rows[c];
+  const int b = k >> 8;
+  const int l = k & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 144;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* q = blk + 16;
+
+  const int j = l >> 6;
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qb = q[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int v = low ? (qb & 0xF) : (qb >> 4);
+  out[k * n + c] = d * float(sc) * float(v) - dmin * float(mi);
+}
+
+__global__ void gather_q5_K_batched(const uint8_t* __restrict__ w,
+                                    const uint64_t* __restrict__ rows,
+                                    float* __restrict__ out, int blocks_per_row,
+                                    int n) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (k >= width) return;
+  const int c = blockIdx.y;
+  if (c >= n) return;
+  const int64_t row = (int64_t)rows[c];
+  const int b = k >> 8;
+  const int l = k & 255;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 176;
+  const float d = half_to_float(ld_u16(blk + 0));
+  const float dmin = half_to_float(ld_u16(blk + 2));
+  const uint8_t* scales = blk + 4;
+  const uint8_t* qh = blk + 16;
+  const uint8_t* ql = blk + 48;
+
+  const int j = l >> 6;
+  const int r = l & 63;
+  const int low = (r < 32) ? 1 : 0;
+  const int l2 = r & 31;
+  const uint8_t qlb = ql[j * 32 + l2];
+  uint8_t sc, mi;
+  get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
+  const int qhbit = (j << 1) + (low ? 0 : 1);
+  const int v = (low ? (qlb & 0xF) : (qlb >> 4)) +
+                ((qh[l2] & (1 << qhbit)) ? 16 : 0);
+  out[k * n + c] = d * float(sc) * float(v) - dmin * float(mi);
+}
+
+// Launch the batched gather for n token ids (`rows`, device uint64_t[n]) of a
+// device-resident packed tensor `w`. grid.y == n (one column per token),
+// grid.x covers the width. Shared by the resident and mapped variants.
+bool launch_gather_batched(const uint8_t* w, const uint64_t* rows, QuantType type,
+                           int width, int blocks_per_row, int n, float* out) {
+  const dim3 grid((width + 255) / 256, n);
+  switch (type) {
+    case QuantType::Q3_K:
+      gather_q3_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
+      break;
+    case QuantType::Q4_K:
+      gather_q4_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
+      break;
+    case QuantType::Q5_K:
+      gather_q5_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     default:
       return false;
@@ -1340,6 +1462,83 @@ bool gather_f32_mapped_dev_row(const QuantizedTensor& W, const float* token_dev,
   return launch_gather_row(static_cast<const uint8_t*>(d_w), /*row_host=*/0,
                            token_dev, W.type(), int(width), int(blocks_per_row),
                            out);
+}
+
+// Batched (prefill) embedding gather, resident variant: dequantize the n token
+// rows of a device-resident packed tensor (token_embd, already resident via the
+// logits matvec) to device f32 in one launch. `tokens` is a host span of n token
+// ids, uploaded once to a device scratch; `out` is [width, n] column-major
+// (n innermost). Mirrors gather_f32_resident_dev (the n == 1 case).
+bool gather_f32_resident_dev_batched(const QuantizedTensor& W,
+                                     std::span<const uint64_t> tokens, float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint64_t vocab = W.dims()[1];
+  const int n = int(tokens.size());
+  if (n <= 0 || !out) return false;
+  for (uint64_t t : tokens)
+    if (t >= vocab) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  void* d_rows = grow_scratch(g_tokens, g_tokens_bytes, size_t(n) * sizeof(uint64_t));
+  if (!d_rows) return false;
+  if (cudaMemcpy(d_rows, tokens.data(), size_t(n) * sizeof(uint64_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  return launch_gather_batched(static_cast<const uint8_t*>(d_w),
+                               static_cast<const uint64_t*>(d_rows), W.type(),
+                               int(width), int(blocks_per_row), n, out);
+}
+
+// Batched (prefill) embedding gather, mapped variant: like the resident variant
+// but reads rows straight out of the pin+mapped host tensor (per_layer_token_embd,
+// ~1.5 GiB and not kept resident). Mirrors gather_f32_mapped_dev (n == 1).
+bool gather_f32_mapped_dev_batched(const QuantizedTensor& W,
+                                   std::span<const uint64_t> tokens, float* out) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t width = W.dims()[0];
+  const uint64_t vocab = W.dims()[1];
+  const int n = int(tokens.size());
+  if (n <= 0 || !out) return false;
+  for (uint64_t t : tokens)
+    if (t >= vocab) return false;
+  const uint32_t blocks_per_row = uint32_t(width / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_cache_mutex);
+    const void* src = W.data().data();
+    const size_t bytes = W.byte_size();
+    if (g_ple_mapped.host != src || g_ple_mapped.bytes != bytes) {
+      if (g_ple_mapped.host)
+        cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
+      g_ple_mapped = {};
+      void* h = const_cast<void*>(src);
+      if (cudaHostRegister(h, bytes, cudaHostRegisterMapped) != cudaSuccess)
+        return false;
+      void* dev = nullptr;
+      if (cudaHostGetDevicePointer(&dev, h, 0) != cudaSuccess) {
+        cudaHostUnregister(h);
+        return false;
+      }
+      g_ple_mapped = {dev, src, bytes};
+    }
+    d_w = g_ple_mapped.dev;
+  }
+  void* d_rows = grow_scratch(g_tokens, g_tokens_bytes, size_t(n) * sizeof(uint64_t));
+  if (!d_rows) return false;
+  if (cudaMemcpy(d_rows, tokens.data(), size_t(n) * sizeof(uint64_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  return launch_gather_batched(static_cast<const uint8_t*>(d_w),
+                               static_cast<const uint64_t*>(d_rows), W.type(),
+                               int(width), int(blocks_per_row), n, out);
 }
 
 } // namespace sonicboom::quant::cuda

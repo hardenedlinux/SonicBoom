@@ -900,6 +900,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
+  const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
   // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
   // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
@@ -942,12 +943,72 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 
   int64_t first = -1;
   if (use_prefill) {
-    // One batched pass over the prompt, then sample tokens[0] from the final
-    // hidden state's lm-head logits (same arithmetic as the CUDA spine's lm-head).
+    // One batched graph pass over the prompt through the CUDA spine, then sample
+    // tokens[0] from the final hidden column's lm-head logits (same arithmetic as
+    // the CUDA spine's lm-head). The prefill graph runs device-resident end-to-end
+    // through the batched *_dev kernels; the prefill backend shares the decode
+    // backend's KV cache so FlashAttention fills it and the decode loop below
+    // reads it.
+    const uint64_t n = prompt.size();
+    for (uint32_t l = 0; l < m.config.n_layer_kv(); ++l) {
+      const LayerConfig& lc = m.config.layer_config(l);
+      const uint64_t n_slots = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx;
+      if (n_slots == 0 || (start_pos % n_slots) + n > n_slots) {
+        std::cerr << "[prefill-cuda] n=" << n << " exceeds SWA ring at layer " << l
+                  << " (n_slots=" << n_slots << ")\n";
+        return 0;
+      }
+    }
+
+    planner::Graph pgraph = build_gemma4_prefill_graph(m, n);
+    auto pplan = planner::plan_execution(pgraph, *snap, cost);
+    if (!pplan) { std::cerr << "[prefill-cuda] n=" << n << " plan failed\n"; return 0; }
+
+    planner::SonicBackend prefill_cpu_backend(m, pgraph);
+    planner::SonicCudaBackend prefill_backend(m, pgraph, n_ctx);
+    prefill_backend.share_caches(cuda_backend);
+    planner::RuntimeExecutor prefill_exec(
+        std::map<planner::BackendTag, planner::Backend*>{
+            {planner::BackendTag::Sonic, &prefill_backend}});
+    for (const auto& task : pplan->tasks) {
+      if (task.kind != planner::TaskKind::Compute)
+        continue;
+      const planner::MemorySpace* ms = nullptr;
+      if (task.memory_space)
+        ms = pplan->find_memory_space(*task.memory_space);
+      if (!ms || ms->kind == planner::MemoryKind::Host)
+        prefill_exec.set_task_backend(task.id, &prefill_cpu_backend);
+    }
+
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_tokens(prompt));
+    in.push_back(encode_i64(start_pos));
+    const auto t_pf0 = std::chrono::steady_clock::now();
+    auto res = prefill_exec.execute(*pplan, *snap, in);
+    if (!res) { std::cerr << "[prefill-cuda] n=" << n << " execute failed: "
+                          << res.error().message << "\n"; return 0; }
+    if (res->outputs.empty()) { std::cerr << "[prefill-cuda] n=" << n << " no outputs\n"; return 0; }
+    const sx::Bytes& hidden_b = res->outputs[0];
+    if (hidden_b.size() < uint64_t(d) * n * sizeof(float)) {
+      std::cerr << "[prefill-cuda] n=" << n << " hidden too small: " << hidden_b.size()
+                << " < " << uint64_t(d) * n * sizeof(float) << "\n";
+      return 0;
+    }
+    std::span<const float> hf(reinterpret_cast<const float*>(hidden_b.data()),
+                              uint64_t(d) * n);
     std::vector<float> hidden(d);
-    if (!cuda_backend.prefill(prompt, start_pos, hidden)) return 0;
-    if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) return 0;
+    for (uint32_t k = 0; k < d; ++k) hidden[k] = hf[k * n + (n - 1)];
+    if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) {
+      std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n"; return 0;
+    }
     first = nn::argmax(logits);
+    if (gen_timing) {
+      using ms = std::chrono::duration<double, std::milli>;
+      const double pf_ms = ms(std::chrono::steady_clock::now() - t_pf0).count();
+      const double pp_tps = pf_ms > 0.0 ? double(n) * 1000.0 / pf_ms : 0.0;
+      std::cerr << "[prefill-cuda] n=" << n << " prefill " << pf_ms << " ms ("
+                << pp_tps << " tok/s)\n";
+    }
   } else {
     // Reference: feed the prompt one token at a time through the CUDA spine
     // (greedy graph -> per-token argmax output), keeping the final token's index.

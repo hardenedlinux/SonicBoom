@@ -73,6 +73,15 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
   //    path: they are read directly by the backends, never transferred.
   std::map<uint32_t, TensorValue> values;  // TensorId -> runtime value
   std::map<BufferId, uint64_t> allocated;  // buffer -> device handle (Allocate)
+  // tensor -> last task that requires it alive (from the memory planner's
+  // lifetimes). The device pool reuses a buffer only after it is released, so a
+  // device-resident activation is returned to the pool as soon as its last
+  // consumer has read it — keeping the peak device working set bounded instead of
+  // holding every intermediate until the end of the step (which overflows the
+  // device for a batched prefill graph, whose activations are [d, n]).
+  std::map<uint32_t, TaskId> last_use;
+  for (const auto& lt : plan.lifetimes)
+    last_use[lt.tensor.value] = lt.last_required;
   std::size_t in_i = 0;
   for (const auto& t : plan.tensors)
     if (t.is_graph_input)
@@ -137,6 +146,27 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
               Phase::Execution));
         for (std::size_t k = 0; k < task->outputs.size(); ++k)
           values[task->outputs[k].value] = std::move((*res)[k]);
+
+        // Release an input's device buffer once this task is its last consumer,
+        // so a dead activation's memory is reused by later tasks. Graph outputs
+        // and constants are skipped (constants are baked, outputs are collected
+        // at the end); a tensor whose last consumer is a Transfer task is left
+        // for that task's own release.
+        for (TensorId in : task->inputs) {
+          const auto* td = plan.find_tensor(in);
+          if (!td || td->is_constant || td->is_graph_output)
+            continue;
+          auto lu = last_use.find(in.value);
+          if (lu == last_use.end() || lu->second != tid)
+            continue;
+          auto v = values.find(in.value);
+          if (v == values.end() || !v->second.on_device)
+            continue;
+          device::release(v->second.device.handle, v->second.device.size_bytes);
+          v->second.on_device = false;
+          v->second.device.handle = 0;
+          v->second.device.size_bytes = 0;
+        }
         break;
       }
       case TaskKind::Transfer: {
