@@ -342,7 +342,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::RmsNorm: {
-      ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n);
+      int64_t nb = 0, dim_i = 0;
+      if (attr_i(*node, "batch", nb)) {
+        // Row norm over [n, dim]: reuse the per-head norm with a single
+        // `dim_i`-wide head per row (position), so each row is normalized
+        // independently with the full-width weight.
+        attr_i(*node, "dim", dim_i);
+        ok = nn::cuda::rms_norm_heads_dev(fweight(slot), dev(in[0]), eps, out,
+                                          int(dim_i), int(nb));
+      } else {
+        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n);
+      }
       break;
     }
     case OpKind::RmsNormHeads: {
@@ -364,9 +374,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      ok = nn::cuda::rope_neox_heads_dev_pos(
-          out, int(lc.head_dim), out_n / int(lc.head_dim),
-          reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        ok = nn::cuda::rope_neox_heads_batched_dev_pos(
+            out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
+            reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
+      } else {
+        ok = nn::cuda::rope_neox_heads_dev_pos(
+            out, int(lc.head_dim), out_n / int(lc.head_dim),
+            reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
+      }
       break;
     }
     case OpKind::CastFp16: {
@@ -419,7 +436,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::QuantizedMatmul: {
-      ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb))
+        ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
+      else
+        ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
       break;
     }
     case OpKind::Quantize: {
@@ -459,15 +480,29 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::MatvecF32: {
-      const int cols = int(in[0].device.size_bytes / sizeof(float));
-      ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const int n = int(nb);
+        const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
+        const int rows = out_n / n;
+        ok = nn::cuda::matvec_f32_batched_dev(fweight(slot), cols, dev(in[0]), out,
+                                              rows, n);
+      } else {
+        const int cols = int(in[0].device.size_bytes / sizeof(float));
+        ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);
+      }
       break;
     }
     case OpKind::MatvecBf16: {
       const uint64_t layer_base = (uint64_t(layer) * per) * d;
       const std::span<const uint16_t> W =
           model_->weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
-      const int cols = int(in[0].device.size_bytes / sizeof(float));
+      int64_t nb = 0;
+      const bool batched = attr_i(*node, "batch", nb);
+      const int n = int(nb);
+      const int cols =
+          int(in[0].device.size_bytes / sizeof(float) / uint64_t(batched ? n : 1));
+      const int rows = batched ? out_n / n : out_n;
       // The CPU path rounds the activation through bf16 before the dot; do the
       // same on a scratch copy so the shared `inp` tensor is left untouched.
       const uint64_t xbytes = in[0].device.size_bytes;
@@ -477,13 +512,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         break;
       }
       if (!device::device_copy(in[0].device.handle, xtmp, xbytes) ||
-          !nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols)) {
+          !nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols * (batched ? n : 1))) {
         device::release(xtmp, xbytes);
         ok = false;
         break;
       }
-      ok = nn::cuda::matvec_bf16_dev(W, cols, reinterpret_cast<const float*>(xtmp),
-                                     out, out_n);
+      if (batched)
+        ok = nn::cuda::matvec_bf16_batched_dev(
+            W, cols, reinterpret_cast<const float*>(xtmp), out, rows, n);
+      else
+        ok = nn::cuda::matvec_bf16_dev(W, cols, reinterpret_cast<const float*>(xtmp),
+                                       out, out_n);
       device::release(xtmp, xbytes);
       break;
     }
@@ -503,8 +542,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const uint64_t col = uint64_t(layer) * per;
       const float ple_scale = std::sqrt(float(per));
       const float combine_scale = 1.0f / std::sqrt(2.0f);
-      ok = nn::cuda::layer_combine_dev(dev(in[0]), dev(in[1]) + col, ple_scale,
-                                       combine_scale, out, int(per));
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        // ple_row is [n, total_per] position-major, so this layer's slice is
+        // strided by total_per (not contiguous like the [total_per, n] layout).
+        const int total_per =
+            int(in[1].device.size_bytes / sizeof(float) / uint64_t(nb));
+        ok = nn::cuda::layer_combine_batched_dev(
+            dev(in[0]), dev(in[1]), ple_scale, combine_scale, out, int(per),
+            int(nb), int(col), total_per);
+      } else {
+        ok = nn::cuda::layer_combine_dev(dev(in[0]), dev(in[1]) + col, ple_scale,
+                                         combine_scale, out, int(per));
+      }
       break;
     }
     case OpKind::PerLayerInput: {
@@ -550,22 +600,37 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::Embedding: {
-      // Token embedding gather on the device: dequantize the token's row of
-      // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device f32.
-      // The token id is read from the persistent device buffer `token_buf_`
-      // (Phase 3.2 B4), not the host graph input, so the next token id never
-      // round-trips through the host.
-      const float* tok_dev = dev_mut(token_buf_.id);
-      if (slot == model::WeightSlot::PerLayerTokenEmbd) {
-        // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
-        // gather the token's row zero-copy (no per-token H2D).
-        ok = quant::cuda::gather_f32_mapped_dev_row(
-            model_->weights.per_layer_token_embd, tok_dev, out);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        // Batched: gather n token rows (prefill), ids read from the persistent
+        // device slot tokens_buf_.
+        const uint64_t* tokens_dev =
+            reinterpret_cast<const uint64_t*>(tokens_buf_.id);
+        if (!tokens_dev) { ok = false; break; }
+        if (slot == model::WeightSlot::PerLayerTokenEmbd)
+          ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
+              model_->weights.per_layer_token_embd, tokens_dev, int(nb), out);
+        else
+          ok = quant::cuda::gather_f32_resident_dev_batched_ids(
+              model_->weights.token_embd, tokens_dev, int(nb), out);
       } else {
-        // token_embd is the tied lm_head, already resident (the logits matvec
-        // uploads it once): gather straight from the device weight, no H2D.
-        ok = quant::cuda::gather_f32_resident_dev_row(model_->weights.token_embd,
-                                                      tok_dev, out);
+        // Token embedding gather on the device: dequantize the token's row of
+        // token_embd (Q3_K) / per_layer_token_embd (Q4_K) straight to device
+        // f32. The token id is read from the persistent device buffer
+        // `token_buf_` (Phase 3.2 B4), not the host graph input, so the next
+        // token id never round-trips through the host.
+        const float* tok_dev = dev_mut(token_buf_.id);
+        if (slot == model::WeightSlot::PerLayerTokenEmbd) {
+          // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
+          // gather the token's row zero-copy (no per-token H2D).
+          ok = quant::cuda::gather_f32_mapped_dev_row(
+              model_->weights.per_layer_token_embd, tok_dev, out);
+        } else {
+          // token_embd is the tied lm_head, already resident (the logits matvec
+          // uploads it once): gather straight from the device weight, no H2D.
+          ok = quant::cuda::gather_f32_resident_dev_row(model_->weights.token_embd,
+                                                        tok_dev, out);
+        }
       }
       break;
     }
@@ -581,72 +646,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = device::device_copy(out_handle, token_buf_.id, sizeof(float));
       break;
     }
-    // --- batched prefill ops (Phase 7 / Section C.3) --------------------------
-    // Each mirrors the CPU SonicBackend's batched case, dispatching to the
-    // batched *_dev kernels. Activations are [n, dim] position-major (dim
-    // innermost). The Int64 graph inputs (tokens, start_pos) are read from the
-    // persistent device slots tokens_buf_ / pos_buf_ (staged by the spine before
-    // execute/replay), so a whole segment is capturable into a CUDA Graph (no
-    // host value baked into a launch argument and no synchronous H2D upload).
-    case OpKind::EmbeddingBatched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t* tokens_dev = reinterpret_cast<const uint64_t*>(tokens_buf_.id);
-      if (!tokens_dev) { ok = false; break; }
-      if (slot == model::WeightSlot::PerLayerTokenEmbd)
-        ok = quant::cuda::gather_f32_mapped_dev_batched_ids(
-            model_->weights.per_layer_token_embd, tokens_dev, int(nb), out);
-      else
-        ok = quant::cuda::gather_f32_resident_dev_batched_ids(
-            model_->weights.token_embd, tokens_dev, int(nb), out);
-      break;
-    }
-    case OpKind::RmsNormRows: {
-      int64_t dim_i = 0, nb = 0;
-      attr_i(*node, "dim", dim_i);
-      attr_i(*node, "batch", nb);
-      // Row norm over [n, dim]: reuse the per-head norm with a single
-      // `dim_i`-wide head per row (position), so each row is normalized
-      // independently with the full-width weight.
-      ok = nn::cuda::rms_norm_heads_dev(fweight(slot), dev(in[0]), eps, out,
-                                        int(dim_i), int(nb));
-      break;
-    }
-    case OpKind::QuantizedMatmulBatched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
-      break;
-    }
-    case OpKind::RmsNormHeadsBatched: {
-      std::span<const float> w;
-      if (slot == model::WeightSlot::AttnQNorm)
-        w = block.attn_q_norm;
-      else if (slot == model::WeightSlot::AttnKNorm)
-        w = block.attn_k_norm;
-      ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out,
-                                        int(lc.head_dim), out_n / int(lc.head_dim));
-      break;
-    }
-    case OpKind::RopeBatched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const std::span<const float> ff =
-          lc.attention == model::AttentionKind::Global
-              ? model_->weights.rope_freqs
-              : std::span<const float>{};
-      if (!device::device_copy(in[0].device.handle, out_handle, out_bytes)) {
-        ok = false;
-        break;
-      }
-      ok = nn::cuda::rope_neox_heads_batched_dev_pos(
-          out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
-          reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
-      break;
-    }
+    // --- inherently-batched prefill ops (Phase 7 / Section C.3) ---------------
+    // FlashAttention/FlashAttentionShared/KvAppend have no per-token decode twin;
+    // they always carry the `batch` attribute and run the chunked *_dev kernels.
+    // Activations are [n, dim] position-major (dim innermost). The Int64 graph
+    // inputs (tokens, start_pos) are read from the persistent device slots
+    // tokens_buf_ / pos_buf_ (staged by the spine before execute/replay), so a
+    // whole segment is capturable into a CUDA Graph (no host value baked into a
+    // launch argument and no synchronous H2D upload).
     case OpKind::FlashAttention: {
       // Chunked attention over prior cache + current batch (no append — the
-      // append is the deferred KvAppendBatched node). inputs: {q, kc, vc,
+      // append is the deferred KvAppend node). inputs: {q, kc, vc,
       // start_pos}. For a single chunk at start_pos == 0 the prior range is
       // empty and this is bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
@@ -673,7 +683,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           int(cache.head_dim), lc.sliding_window, 1.0f, out);
       break;
     }
-    case OpKind::KvAppendBatched: {
+    case OpKind::KvAppend: {
       // Deferred cache append: copy the chunk's n fp16-rounded K/V rows into the
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       int64_t nb = 0;
@@ -692,59 +702,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // so it is left unwritten (a host write to the device handle would fault).
       break;
     }
-    case OpKind::MatvecF32Batched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const int n = int(nb);
-      const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
-      const int rows = out_n / n;
-      ok = nn::cuda::matvec_f32_batched_dev(fweight(slot), cols, dev(in[0]), out,
-                                            rows, n);
-      break;
-    }
-    case OpKind::MatvecBf16Batched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const int n = int(nb);
-      const uint64_t layer_base = (uint64_t(layer) * per) * d;
-      const std::span<const uint16_t> W =
-          model_->weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
-      const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
-      const int rows = out_n / n;
-      // The CPU path rounds the activation through bf16 before the dot; do the
-      // same on a scratch copy so the shared `inp` tensor is left untouched.
-      const uint64_t xbytes = in[0].device.size_bytes;
-      uint64_t xtmp = device::acquire(xbytes);
-      if (!xtmp) {
-        ok = false;
-        break;
-      }
-      if (!device::device_copy(in[0].device.handle, xtmp, xbytes) ||
-          !nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols * n)) {
-        device::release(xtmp, xbytes);
-        ok = false;
-        break;
-      }
-      ok = nn::cuda::matvec_bf16_batched_dev(
-          W, cols, reinterpret_cast<const float*>(xtmp), out, rows, n);
-      device::release(xtmp, xbytes);
-      break;
-    }
-    case OpKind::LayerCombineBatched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      // ple_row is [n, total_per] position-major, so this layer's slice is
-      // strided by total_per (not contiguous like the [total_per, n] layout).
-      const int col = int(layer) * int(per);
-      const int total_per =
-          int(in[1].device.size_bytes / sizeof(float) / uint64_t(nb));
-      const float ple_scale = std::sqrt(float(per));
-      const float combine_scale = 1.0f / std::sqrt(2.0f);
-      ok = nn::cuda::layer_combine_batched_dev(
-          dev(in[0]), dev(in[1]), ple_scale, combine_scale, out, int(per),
-          int(nb), col, total_per);
-      break;
-    }
     default:
       // Softcap is placed on the CPU SonicBackend (no *_dev kernel); hitting it
       // here means the placement pass routed a host-only op to the device.
@@ -759,7 +716,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                 "'"));
   }
 
-  // A side-effect-only node (KvAppendBatched) has an orphaned dummy output that
+  // A side-effect-only node (KvAppend) has an orphaned dummy output that
   // the planner drops from task.outputs, so return zero outputs to match the
   // task's declared output count. The output buffer was allocated but is never
   // consumed; release it rather than leak it.

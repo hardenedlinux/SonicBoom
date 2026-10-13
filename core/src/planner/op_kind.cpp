@@ -81,28 +81,12 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::PerLayerInput;
   if (name == "slice")
     return OpKind::Slice;
-  if (name == "embedding_batched")
-    return OpKind::EmbeddingBatched;
-  if (name == "quantized_matmul_batched")
-    return OpKind::QuantizedMatmulBatched;
-  if (name == "rms_norm_rows")
-    return OpKind::RmsNormRows;
-  if (name == "rms_norm_heads_batched")
-    return OpKind::RmsNormHeadsBatched;
-  if (name == "rope_batched")
-    return OpKind::RopeBatched;
   if (name == "flash_attention")
     return OpKind::FlashAttention;
   if (name == "flash_attention_shared")
     return OpKind::FlashAttentionShared;
-  if (name == "kv_append_batched")
-    return OpKind::KvAppendBatched;
-  if (name == "matvec_f32_batched")
-    return OpKind::MatvecF32Batched;
-  if (name == "matvec_bf16_batched")
-    return OpKind::MatvecBf16Batched;
-  if (name == "layer_combine_batched")
-    return OpKind::LayerCombineBatched;
+  if (name == "kv_append")
+    return OpKind::KvAppend;
   return std::nullopt;
 }
 
@@ -140,17 +124,9 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::LayerCombine: return "layer_combine";
     case OpKind::PerLayerInput: return "per_layer_input";
     case OpKind::Slice: return "slice";
-    case OpKind::EmbeddingBatched: return "embedding_batched";
-    case OpKind::QuantizedMatmulBatched: return "quantized_matmul_batched";
-    case OpKind::RmsNormRows: return "rms_norm_rows";
-    case OpKind::RmsNormHeadsBatched: return "rms_norm_heads_batched";
-    case OpKind::RopeBatched: return "rope_batched";
     case OpKind::FlashAttention: return "flash_attention";
     case OpKind::FlashAttentionShared: return "flash_attention_shared";
-    case OpKind::KvAppendBatched: return "kv_append_batched";
-    case OpKind::MatvecF32Batched: return "matvec_f32_batched";
-    case OpKind::MatvecBf16Batched: return "matvec_bf16_batched";
-    case OpKind::LayerCombineBatched: return "layer_combine_batched";
+    case OpKind::KvAppend: return "kv_append";
   }
   return "?";
 }

@@ -231,16 +231,14 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
       OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
       OpKind::LayerCombine,    OpKind::PerLayerInput, OpKind::Slice,
-      // Phase 7 batched prefill operators: executed on the CPU by the
-      // SonicBackend (looping the per-token nn::*/quant::* kernels over the batch
-      // dim). Declared here so the planner's capability check accepts the prefill
-      // graph. The elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused
-      // unchanged on flat batched buffers.
-      OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched,
-      OpKind::RmsNormRows,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
-      OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
-      OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
-      OpKind::LayerCombineBatched,
+      // Phase 7 chunked prefill operators: FlashAttention/FlashAttentionShared
+      // (chunked SDPA) and KvAppend (deferred cache append) have no per-token
+      // decode twin; declared here so the planner's capability check accepts the
+      // prefill graph. The rest of the prefill graph reuses the per-token
+      // OpKinds above, carrying a `batch` attribute the SonicBackend loops over
+      // the batch dim (the elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are
+      // reused unchanged on the flat batched buffers).
+      OpKind::FlashAttention, OpKind::FlashAttentionShared, OpKind::KvAppend,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the
@@ -287,14 +285,13 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Add,            OpKind::LayerCombine,
         OpKind::PerLayerInput,  OpKind::Slice,      OpKind::Embedding,
         OpKind::Argmax,
-        // Phase 7 batched prefill operators (device-resident, Phase 7a). The
-        // elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused unchanged
-        // on flat batched buffers; the rest are the batched *_dev kernels.
-        OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched,
-        OpKind::RmsNormRows,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
-        OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
-        OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
-        OpKind::LayerCombineBatched,
+        // Phase 7 chunked prefill operators (device-resident): FlashAttention /
+        // FlashAttentionShared (chunked SDPA) and KvAppend (deferred cache
+        // append) have no per-token decode twin. The rest of the prefill graph
+        // reuses the per-token OpKinds above with a `batch` attribute, dispatched
+        // to the batched *_dev kernels; the elementwise ops are reused unchanged
+        // on flat batched buffers.
+        OpKind::FlashAttention, OpKind::FlashAttentionShared, OpKind::KvAppend,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

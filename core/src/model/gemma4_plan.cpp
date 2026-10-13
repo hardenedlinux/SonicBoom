@@ -72,7 +72,8 @@ sx::Bytes encode_i64(uint64_t v) {
 }
 
 // Encode the prompt token ids as a little-endian 64-bit-per-token buffer (the
-// prefill graph's `tokens` Int64[n] input, decoded back by EmbeddingBatched).
+// prefill graph's `tokens` Int64[n] input, decoded back by the batched
+// Embedding node).
 sx::Bytes encode_tokens(std::span<const uint64_t> tokens) {
   sx::Bytes b(tokens.size() * sizeof(uint64_t));
   std::memcpy(b.data(), tokens.data(), b.size());
@@ -328,17 +329,20 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 // block, but on [n, dim] position-major batched tensors (n == the prompt
 // length, dim innermost) so the whole prompt is processed in one graph pass
 // through the spine. The batch size n and per-node `dim` are baked into node
-// attributes; the elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) reuse
-// their per-token OpKind on the flat batched buffers. C.3 removed the [dim, n]
-// column-major layout and its Transpose nodes: every batched matmul/gather/norm
-// writes [n, dim] directly, so the attention path (which always consumed
-// [n, dim]) no longer needs a data-movement transpose on either side of it.
-// FlashAttention appends the n fp16-rounded K/V rows to the per-layer cache and
-// runs full-sequence causal SDPA; FlashAttentionShared attends over the donor
-// layer's fp16-rounded K/V graph tensors (no append), so the memory planner
-// keeps those alive across layers 24..41 via ordinary tensor liveness. Graph
-// inputs are `tokens` (Int64 [n]) and `start_pos` (Int64); the graph output is
-// the final residual [n, dim].
+// attributes; the per-token OpKinds (Embedding, QuantizedMatmul, RmsNorm,
+// RmsNormHeads, Rope, MatvecF32, MatvecBf16, LayerCombine) carry the `batch`
+// attribute and the SonicBackend loops their per-token kernel over the batch
+// dim, while the elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) are reused
+// unchanged on the flat batched buffers. C.3 removed the [dim, n] column-major
+// layout and its Transpose nodes: every batched matmul/gather/norm writes
+// [n, dim] directly, so the attention path (which always consumed [n, dim]) no
+// longer needs a data-movement transpose on either side of it. FlashAttention
+// runs full-sequence causal SDPA over prior cache + the current chunk's n
+// fp16-rounded K/V rows (no append — the deferred KvAppend node does that);
+// FlashAttentionShared attends over the donor layer's fp16-rounded K/V graph
+// tensors, so the memory planner keeps those alive across layers 24..41 via
+// ordinary tensor liveness. Graph inputs are `tokens` (Int64 [n]) and
+// `start_pos` (Int64); the graph output is the final residual [n, dim].
 // ---------------------------------------------------------------------------
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   using namespace planner;
@@ -405,11 +409,11 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     return std::vector<int64_t>{int64_t(r), int64_t(c)};
   };
 
-  const TensorId embd = b.node(OpKind::EmbeddingBatched, {tokens}, "embd",
+  const TensorId embd = b.node(OpKind::Embedding, {tokens}, "embd",
                                shape2(n, d), {slot(WeightSlot::TokenEmbd), batch_a(n)});
   const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", shape2(n, d),
                               {attr_f("scale", std::sqrt(float(d)))});
-  const TensorId ple_row = b.node(OpKind::EmbeddingBatched, {tokens}, "ple_row",
+  const TensorId ple_row = b.node(OpKind::Embedding, {tokens}, "ple_row",
                                   shape2(n, total_per),
                                   {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
 
@@ -419,8 +423,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   const uint32_t donor_global_layer = n_kv - 1;
   TensorId donor_swa_k{}, donor_swa_v{}, donor_global_k{}, donor_global_v{};
   // The fp16-rounded K/V of each KV layer, kept alive past the layer loop so the
-  // deferred cache append can run after every layer (see the KvAppendBatched
-  // nodes emitted below).
+  // deferred cache append can run after every layer (see the KvAppend nodes
+  // emitted below).
   std::vector<TensorId> kv_k(n_kv), kv_v(n_kv);
 
   TensorId residual = inp;
@@ -434,28 +438,28 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     const std::string suff = std::to_string(l);
 
     // --- attention ---------------------------------------------------------
-    TensorId h = b.node(OpKind::RmsNormRows, {residual}, "h" + suff, shape2(n, d),
+    TensorId h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::AttnNorm), batch_a(n), dim_a(d)});
-    TensorId q = b.node(OpKind::QuantizedMatmulBatched, {h}, "q" + suff,
+    TensorId q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff,
                         shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n)});
-    q = b.node(OpKind::RmsNormHeadsBatched, {q}, "qn" + suff, shape2(n, qw),
+    q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, shape2(n, qw),
                {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
-    q = b.node(OpKind::RopeBatched, {q, start_pos}, "qr" + suff, shape2(n, qw),
+    q = b.node(OpKind::Rope, {q, start_pos}, "qr" + suff, shape2(n, qw),
                {layer_a(l), batch_a(n)});
 
     TensorId attn;
     if (cfg.has_kv(l)) {
-      TensorId k = b.node(OpKind::QuantizedMatmulBatched, {h}, "k" + suff,
+      TensorId k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff,
                           shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n)});
-      k = b.node(OpKind::RmsNormHeadsBatched, {k}, "kn" + suff, shape2(n, kvw),
+      k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, shape2(n, kvw),
                  {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
-      k = b.node(OpKind::RopeBatched, {k, start_pos}, "kr" + suff, shape2(n, kvw),
+      k = b.node(OpKind::Rope, {k, start_pos}, "kr" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
-      TensorId v = b.node(OpKind::QuantizedMatmulBatched, {h}, "v" + suff,
+      TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
                           shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n)});
-      v = b.node(OpKind::RmsNormHeadsBatched, {v}, "vn" + suff, shape2(n, kvw),
+      v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});  // V norm: unit weight
       const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
@@ -478,43 +482,43 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
                     shape2(n, qw), {layer_a(l), batch_a(n)});
     }
 
-    TensorId ap = b.node(OpKind::QuantizedMatmulBatched, {attn}, "ap" + suff,
+    TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
                          shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n)});
-    TensorId o = b.node(OpKind::RmsNormRows, {ap}, "o" + suff, shape2(n, d),
+    TensorId o = b.node(OpKind::RmsNorm, {ap}, "o" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n), dim_a(d)});
     TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(n, d), {layer_a(l)});
 
     // --- gated feed-forward ------------------------------------------------
-    TensorId f = b.node(OpKind::RmsNormRows, {x1}, "f" + suff, shape2(n, d),
+    TensorId f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::FfnNorm), batch_a(n), dim_a(d)});
-    TensorId up = b.node(OpKind::QuantizedMatmulBatched, {f}, "up" + suff, shape2(n, ff),
+    TensorId up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, shape2(n, ff),
                          {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n)});
-    TensorId gate = b.node(OpKind::QuantizedMatmulBatched, {f}, "gate" + suff, shape2(n, ff),
+    TensorId gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, shape2(n, ff),
                            {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n)});
     gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff), {layer_a(l)});
     TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
-    TensorId fo = b.node(OpKind::QuantizedMatmulBatched, {fh}, "fo" + suff, shape2(n, d),
+    TensorId fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n)});
-    TensorId f2 = b.node(OpKind::RmsNormRows, {fo}, "f2" + suff, shape2(n, d),
+    TensorId f2 = b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n), dim_a(d)});
     TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(n, d), {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
-    TensorId proj = b.node(OpKind::MatvecBf16Batched, {inp}, "proj" + suff, shape2(n, per),
+    TensorId proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, shape2(n, per),
                            {layer_a(l), batch_a(n)});
     proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
                   {attr_f("scale", proj_scale)});
-    proj = b.node(OpKind::RmsNormRows, {proj}, "projn" + suff, shape2(n, per),
+    proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, shape2(n, per),
                   {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
-    TensorId ple = b.node(OpKind::LayerCombineBatched, {proj, ple_row}, "ple" + suff,
+    TensorId ple = b.node(OpKind::LayerCombine, {proj, ple_row}, "ple" + suff,
                           shape2(n, per), {layer_a(l), batch_a(n)});
-    TensorId g0 = b.node(OpKind::MatvecF32Batched, {x2}, "g0" + suff, shape2(n, per),
+    TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, shape2(n, per),
                          {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
     g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});
     g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(n, per), {layer_a(l)});
-    TensorId g1 = b.node(OpKind::MatvecF32Batched, {g0}, "g1" + suff, shape2(n, d),
+    TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::Proj), batch_a(n)});
-    TensorId g2 = b.node(OpKind::RmsNormRows, {g1}, "g2" + suff, shape2(n, d),
+    TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::PostNorm), batch_a(n), dim_a(d)});
     TensorId x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(n, d), {layer_a(l)});
 
@@ -533,7 +537,7 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   // the SWA ring (start_pos >= sliding_window) still attend over the prior
   // window. The output is a dummy scalar — the append is a cache side effect.
   for (uint32_t l = 0; l < n_kv; ++l) {
-    b.node(OpKind::KvAppendBatched, {kv_k[l], kv_v[l], start_pos},
+    b.node(OpKind::KvAppend, {kv_k[l], kv_v[l], start_pos},
            "kv_append" + std::to_string(l), {}, {layer_a(l), batch_a(n)});
   }
 
@@ -1173,7 +1177,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // into one graph launch. Capture only when there is at least one non-final
     // full-chunk segment (n > chunk); a single segment is always final and runs
     // uncaptured. The capture warm-up runs the full-chunk segment once and its
-    // deferred KvAppendBatched overwrites the shared KV cache — safe only when
+    // deferred KvAppend overwrites the shared KV cache — safe only when
     // the cache is empty before the run (start_pos == 0, a fresh full prefill).
     // A prefix-reuse suffix (start_pos > 0) already holds the shared prefix in
     // the cache, and the warm-up append would clobber the prefix positions the

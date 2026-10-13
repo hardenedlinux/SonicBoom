@@ -198,12 +198,27 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
 
   switch (node->op) {
     case OpKind::Embedding: {
-      const uint64_t tok = read_i64(inputs[0]);
       const quant::QuantizedTensor& W =
           slot == model::WeightSlot::PerLayerTokenEmbd
               ? model_.weights.per_layer_token_embd
               : model_.weights.token_embd;
-      ok = nn::embedding_f32(W, tok, f32_mut(out));
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        // Batched: inputs[0] is the Int64 [n] token-id buffer (prefill).
+        const uint64_t n = uint64_t(nb);
+        std::span<float> o = f32_mut(out);  // [n, dim] position-major
+        const uint64_t dim = n ? o.size() / n : 0;
+        std::vector<float> row(dim);
+        for (uint64_t c = 0; c < n; ++c) {
+          uint64_t tok = 0;
+          std::memcpy(&tok, inputs[0].data() + c * sizeof(uint64_t), sizeof(uint64_t));
+          if (!nn::embedding_f32(W, tok, row)) { ok = false; break; }
+          for (uint64_t k = 0; k < dim; ++k) o[c * dim + k] = row[k];
+        }
+      } else {
+        const uint64_t tok = read_i64(inputs[0]);
+        ok = nn::embedding_f32(W, tok, f32_mut(out));
+      }
       break;
     }
     case OpKind::Scale: {
@@ -211,7 +226,24 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::RmsNorm: {
-      ok = nn::rms_norm(f32(inputs[0]), fweight(slot), eps, f32_mut(out));
+      int64_t nb = 0, dim_i = 0;
+      if (attr_i(*node, "batch", nb)) {
+        // Batched row norm over [n, dim]: normalize each position with the
+        // full-width weight (dim baked in as a node attribute by the emitter).
+        attr_i(*node, "dim", dim_i);
+        const uint64_t n = uint64_t(nb), dim = uint64_t(dim_i);
+        std::span<const float> x = f32(inputs[0]);
+        std::span<float> o = f32_mut(out);
+        std::span<const float> w = fweight(slot);
+        for (uint64_t c = 0; c < n; ++c) {
+          if (!nn::rms_norm(x.subspan(c * dim, dim), w, eps, o.subspan(c * dim, dim))) {
+            ok = false;
+            break;
+          }
+        }
+      } else {
+        ok = nn::rms_norm(f32(inputs[0]), fweight(slot), eps, f32_mut(out));
+      }
       break;
     }
     case OpKind::RmsNormHeads: {
@@ -224,7 +256,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<float> o = f32_mut(out);
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
-      ok = nn::rms_norm_heads(o, w, lc.head_dim, eps);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const uint64_t n = uint64_t(nb);
+        const uint64_t dim = n ? x.size() / n : 0;
+        for (uint64_t c = 0; c < n; ++c) {
+          if (!nn::rms_norm_heads(o.subspan(c * dim, dim), w, lc.head_dim, eps)) {
+            ok = false;
+            break;
+          }
+        }
+      } else {
+        ok = nn::rms_norm_heads(o, w, lc.head_dim, eps);
+      }
       break;
     }
     case OpKind::Rope: {
@@ -237,7 +281,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<float> o = f32_mut(out);
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
-      ok = nn::rope_neox_heads(o, lc.head_dim, pos, lc.rope_base, 1.0f, ff);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const uint64_t n = uint64_t(nb);
+        const uint64_t dim = n ? x.size() / n : 0;
+        for (uint64_t c = 0; c < n; ++c) {
+          if (!nn::rope_neox_heads(o.subspan(c * dim, dim), lc.head_dim, pos + c,
+                                   lc.rope_base, 1.0f, ff)) {
+            ok = false;
+            break;
+          }
+        }
+      } else {
+        ok = nn::rope_neox_heads(o, lc.head_dim, pos, lc.rope_base, 1.0f, ff);
+      }
       break;
     }
     case OpKind::CastFp16: {
@@ -287,14 +344,35 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::QuantizedMatmul: {
-      ok = quant::matvec(qweight(slot), f32(inputs[0]), f32_mut(out),
-                         quant::MatmulBackend::CpuQ8K);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb))
+        ok = quant::matmul_f32_q8_K(qweight(slot), f32(inputs[0]), f32_mut(out),
+                                    uint64_t(nb));
+      else
+        ok = quant::matvec(qweight(slot), f32(inputs[0]), f32_mut(out),
+                           quant::MatmulBackend::CpuQ8K);
       break;
     }
     case OpKind::MatvecF32: {
       std::span<const float> W = fweight(slot);
       std::span<const float> x = f32(inputs[0]);
-      ok = nn::matvec_f32(W, x.size(), x, f32_mut(out));
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const uint64_t n = uint64_t(nb);
+        std::span<float> o = f32_mut(out);  // [n, rows]
+        const uint64_t dim = n ? x.size() / n : 0;
+        const uint64_t rows = n ? o.size() / n : 0;
+        std::vector<float> y(rows);
+        for (uint64_t c = 0; c < n; ++c) {
+          if (!nn::matvec_f32(W, dim, x.subspan(c * dim, dim), y)) {
+            ok = false;
+            break;
+          }
+          for (uint64_t r = 0; r < rows; ++r) o[c * rows + r] = y[r];
+        }
+      } else {
+        ok = nn::matvec_f32(W, x.size(), x, f32_mut(out));
+      }
       break;
     }
     case OpKind::MatvecBf16: {
@@ -305,10 +383,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       // before the dot; reproduce that rounding so the projection matches the
       // baseline (Phase 5D finding).
       std::span<const float> x = f32(inputs[0]);
-      std::vector<float> x_bf16(x.size());
-      for (size_t i = 0; i < x.size(); ++i)
-        x_bf16[i] = bf16_to_f32(f32_to_bf16(x[i]));
-      ok = nn::matvec_bf16(W, x.size(), x_bf16, f32_mut(out));
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const uint64_t n = uint64_t(nb);
+        std::span<float> o = f32_mut(out);  // [n, per]
+        std::vector<float> x_bf16(d), y(per);
+        for (uint64_t c = 0; c < n; ++c) {
+          for (uint32_t k = 0; k < d; ++k)
+            x_bf16[k] = bf16_to_f32(f32_to_bf16(x[c * d + k]));
+          if (!nn::matvec_bf16(W, d, x_bf16, y)) { ok = false; break; }
+          for (uint32_t r = 0; r < per; ++r) o[c * per + r] = y[r];
+        }
+      } else {
+        std::vector<float> x_bf16(x.size());
+        for (size_t i = 0; i < x.size(); ++i)
+          x_bf16[i] = bf16_to_f32(f32_to_bf16(x[i]));
+        ok = nn::matvec_bf16(W, x.size(), x_bf16, f32_mut(out));
+      }
       break;
     }
     case OpKind::GeluFp16: {
@@ -327,9 +418,28 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       const uint64_t col = uint64_t(layer) * per;
       const float ple_scale = std::sqrt(float(per));
       const float combine_scale = 1.0f / std::sqrt(2.0f);
-      ok = nn::layer_combine(f32(inputs[0]),
-                             f32(inputs[1]).subspan(col, per), ple_scale,
-                             combine_scale, f32_mut(out));
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        const uint64_t n = uint64_t(nb);
+        std::span<const float> proj = f32(inputs[0]);     // [n, per]
+        std::span<const float> ple_row = f32(inputs[1]);  // [n, total_per]
+        std::span<float> o = f32_mut(out);                // [n, per]
+        const uint64_t total_per = n ? ple_row.size() / n : 0;
+        std::vector<float> p(per), pl(per), y(per);
+        for (uint64_t c = 0; c < n; ++c) {
+          for (uint32_t k = 0; k < per; ++k) p[k] = proj[c * per + k];
+          for (uint32_t k = 0; k < per; ++k) pl[k] = ple_row[c * total_per + col + k];
+          if (!nn::layer_combine(p, pl, ple_scale, combine_scale, y)) {
+            ok = false;
+            break;
+          }
+          for (uint32_t k = 0; k < per; ++k) o[c * per + k] = y[k];
+        }
+      } else {
+        ok = nn::layer_combine(f32(inputs[0]),
+                               f32(inputs[1]).subspan(col, per), ple_scale,
+                               combine_scale, f32_mut(out));
+      }
       break;
     }
     case OpKind::PerLayerInput: {
@@ -375,96 +485,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = nn::softcap(f32(inputs[0]), float(scale_d), f32_mut(out));
       break;
     }
-    case OpKind::EmbeddingBatched: {
-      const quant::QuantizedTensor& W =
-          slot == model::WeightSlot::PerLayerTokenEmbd
-              ? model_.weights.per_layer_token_embd
-              : model_.weights.token_embd;
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<float> o = f32_mut(out);  // [n, dim] position-major
-      const uint64_t dim = n ? o.size() / n : 0;
-      std::vector<float> row(dim);
-      for (uint64_t c = 0; c < n; ++c) {
-        uint64_t tok = 0;
-        std::memcpy(&tok, inputs[0].data() + c * sizeof(uint64_t), sizeof(uint64_t));
-        if (!nn::embedding_f32(W, tok, row)) { ok = false; break; }
-        for (uint64_t k = 0; k < dim; ++k) o[c * dim + k] = row[k];
-      }
-      break;
-    }
-    case OpKind::QuantizedMatmulBatched: {
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      ok = quant::matmul_f32_q8_K(qweight(slot), f32(inputs[0]), f32_mut(out),
-                                  uint64_t(nb));
-      break;
-    }
-    case OpKind::RmsNormRows: {
-      int64_t nb = 0, dim_i = 0;
-      attr_i(*node, "batch", nb);
-      attr_i(*node, "dim", dim_i);
-      const uint64_t n = uint64_t(nb), dim = uint64_t(dim_i);
-      std::span<const float> x = f32(inputs[0]);
-      std::span<float> o = f32_mut(out);
-      std::span<const float> w = fweight(slot);
-      for (uint64_t c = 0; c < n; ++c) {
-        if (!nn::rms_norm(x.subspan(c * dim, dim), w, eps, o.subspan(c * dim, dim))) {
-          ok = false;
-          break;
-        }
-      }
-      break;
-    }
-    case OpKind::RmsNormHeadsBatched: {
-      const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      std::span<const float> w;
-      if (slot == model::WeightSlot::AttnQNorm)
-        w = block.attn_q_norm;
-      else if (slot == model::WeightSlot::AttnKNorm)
-        w = block.attn_k_norm;
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<float> o = f32_mut(out);
-      std::span<const float> x = f32(inputs[0]);
-      std::copy(x.begin(), x.end(), o.begin());
-      const uint64_t dim = n ? x.size() / n : 0;
-      for (uint64_t c = 0; c < n; ++c) {
-        if (!nn::rms_norm_heads(o.subspan(c * dim, dim), w, lc.head_dim, eps)) {
-          ok = false;
-          break;
-        }
-      }
-      break;
-    }
-    case OpKind::RopeBatched: {
-      const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      const uint64_t start = read_i64(inputs[1]);
-      const std::span<const float> ff =
-          lc.attention == model::AttentionKind::Global
-              ? model_.weights.rope_freqs
-              : std::span<const float>{};
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<float> o = f32_mut(out);
-      std::span<const float> x = f32(inputs[0]);
-      std::copy(x.begin(), x.end(), o.begin());
-      const uint64_t dim = n ? x.size() / n : 0;
-      for (uint64_t c = 0; c < n; ++c) {
-        if (!nn::rope_neox_heads(o.subspan(c * dim, dim), lc.head_dim, start + c,
-                                 lc.rope_base, 1.0f, ff)) {
-          ok = false;
-          break;
-        }
-      }
-      break;
-    }
     case OpKind::FlashAttention: {
       // KV layer: full-sequence causal SDPA over this chunk's fp16-rounded K/V
-      // (no append — the append is the deferred KvAppendBatched node). The CPU
+      // (no append — the append is the deferred KvAppend node). The CPU
       // prefill runs a single wrap-free chunk (start_pos == 0, n <= ring), so
       // there is no prior cache to attend over. inputs: {q, kc, vc, start_pos}.
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
@@ -478,7 +501,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
                                             0.0f, 1.0f, f32_mut(out));
       break;
     }
-    case OpKind::KvAppendBatched: {
+    case OpKind::KvAppend: {
       // Deferred cache append: copy the chunk's n fp16-rounded K/V rows into the
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       const uint64_t start = read_i64(inputs[2]);
@@ -511,66 +534,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
                                             0.0f, 1.0f, f32_mut(out));
       break;
     }
-    case OpKind::MatvecF32Batched: {
-      std::span<const float> W = fweight(slot);
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<const float> x = f32(inputs[0]);  // [n, dim]
-      std::span<float> o = f32_mut(out);          // [n, rows]
-      const uint64_t dim = n ? x.size() / n : 0;
-      const uint64_t rows = n ? o.size() / n : 0;
-      std::vector<float> y(rows);
-      for (uint64_t c = 0; c < n; ++c) {
-        if (!nn::matvec_f32(W, dim, x.subspan(c * dim, dim), y)) {
-          ok = false;
-          break;
-        }
-        for (uint64_t r = 0; r < rows; ++r) o[c * rows + r] = y[r];
-      }
-      break;
-    }
-    case OpKind::MatvecBf16Batched: {
-      const uint64_t layer_base = (uint64_t(layer) * per) * d;
-      const std::span<const uint16_t> W = model_.weights.per_layer_model_proj.subspan(
-          layer_base, uint64_t(per) * d);
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<const float> x = f32(inputs[0]);  // [n, d]
-      std::span<float> o = f32_mut(out);          // [n, per]
-      std::vector<float> x_bf16(d), y(per);
-      for (uint64_t c = 0; c < n; ++c) {
-        for (uint32_t k = 0; k < d; ++k)
-          x_bf16[k] = bf16_to_f32(f32_to_bf16(x[c * d + k]));
-        if (!nn::matvec_bf16(W, d, x_bf16, y)) { ok = false; break; }
-        for (uint32_t r = 0; r < per; ++r) o[c * per + r] = y[r];
-      }
-      break;
-    }
-    case OpKind::LayerCombineBatched: {
-      const uint64_t col = uint64_t(layer) * per;
-      const float ple_scale = std::sqrt(float(per));
-      const float combine_scale = 1.0f / std::sqrt(2.0f);
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      std::span<const float> proj = f32(inputs[0]);     // [n, per]
-      std::span<const float> ple_row = f32(inputs[1]);  // [n, total_per]
-      std::span<float> o = f32_mut(out);                // [n, per]
-      const uint64_t total_per = n ? ple_row.size() / n : 0;
-      std::vector<float> p(per), pl(per), y(per);
-      for (uint64_t c = 0; c < n; ++c) {
-        for (uint32_t k = 0; k < per; ++k) p[k] = proj[c * per + k];
-        for (uint32_t k = 0; k < per; ++k) pl[k] = ple_row[c * total_per + col + k];
-        if (!nn::layer_combine(p, pl, ple_scale, combine_scale, y)) {
-          ok = false;
-          break;
-        }
-        for (uint32_t k = 0; k < per; ++k) o[c * per + k] = y[k];
-      }
-      break;
-    }
     default:
       ok = false;
       break;
@@ -580,7 +543,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
     return std::unexpected(fail("Sonic kernel failed for node '" + node->name +
                                 "'"));
 
-  // Side-effect-only nodes (KvAppendBatched) have an orphaned dummy output the
+  // Side-effect-only nodes (KvAppend) have an orphaned dummy output the
   // planner drops from task.outputs; return zero outputs to match the task's
   // declared output count (mirrors the CUDA backend's identical handling).
   if (task.outputs.empty())
