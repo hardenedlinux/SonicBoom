@@ -68,7 +68,6 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::GeluFp16:
     case OpKind::Rope:
     case OpKind::Attention:
-    case OpKind::AttentionShared:
     case OpKind::GqaBroadcast:
     case OpKind::Embedding:
     case OpKind::MatvecF32:
@@ -78,8 +77,6 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::CastFp16:
     case OpKind::Softcap:
     case OpKind::Argmax:
-    case OpKind::LayerCombine:
-    case OpKind::PerLayerInput:
     case OpKind::Slice:
       return BackendTag::Sonic;
     default:

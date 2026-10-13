@@ -177,6 +177,13 @@ bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_sc
                                float combine_scale, float* y, int per, int n,
                                int col, int total_per);
 
+// Strided row slice (Section C.5): y[r*length + k] = x[offset + r*stride + k]
+// for r in [0, rows), k in [0, length). Extracts a layer's per-layer-embedding
+// column from each position of a [n, total_per] row. One thread per output
+// element.
+bool slice_strided_dev(const float* x, float* y, int rows, int length, int offset,
+                       int stride);
+
 // Greedy argmax over a device f32 vector: writes the index (as a float) to
 // out[0]. Ties are broken toward the lowest index, exactly mirroring
 // nn::argmax. Requires n > 0 and a non-null x/out.

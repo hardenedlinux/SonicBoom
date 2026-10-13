@@ -105,9 +105,6 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
     e.window = lc.sliding_window;
     spec.layers.push_back(e);
   }
-  spec.kv_source_layer.reserve(cfg.block_count);
-  for (uint32_t l = 0; l < cfg.block_count; ++l)
-    spec.kv_source_layer.push_back(cfg.kv_donor_layer(l));
   return spec;
 }
 
@@ -117,9 +114,9 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
 // nodes. The graph is stateless (acyclic): the multi-token KV cache lives in the
 // SonicBackend, keyed by layer. The `Attention` node appends its RoPE'd fp16 K
 // and normed fp16 V to the layer's cache and attends over the accumulated keys;
-// the `AttentionShared` node (layers 24..41) attends over its donor layer's
-// (22 SWA / 23 global) cache. The residual stream is the *scaled* l_out of the
-// previous block.
+// a shared-KV layer (24..41) omits the K/V inputs and attends over its donor
+// layer's (22 SWA / 23 global) cache, selected by the node's `kv_source_layer`
+// attribute. The residual stream is the *scaled* l_out of the previous block.
 // ---------------------------------------------------------------------------
 planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   using namespace planner;
@@ -180,11 +177,14 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
+  auto kv_src = [&cfg](uint32_t l) {
+    return attr_i("kv_source_layer", int64_t(cfg.kv_donor_layer(l)));
+  };
 
   // Preamble: the shared token embedding (scaled), and the full per-layer token
-  // embedding row (dequantized once; each block's LayerCombine slices its `per`
-  // elements). Both are deterministic, so hoisting them out of the block loop is
-  // bit-identical to exec.cpp recomputing them per block.
+  // embedding row (dequantized once; each block slices its `per`-element column
+  // out of the combined `ple_all`). Both are deterministic, so hoisting them out
+  // of the block loop is bit-identical to exec.cpp recomputing them per block.
   const TensorId embd = b.node(OpKind::Embedding, {token_id}, "embd", {int64_t(d)},
                                {slot(WeightSlot::TokenEmbd)});
   const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", {int64_t(d)},
@@ -196,10 +196,30 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   // Hoisted per-layer input (Phase 2.3a): one full-width 2560→10752 bf16 gemv +
   // scale + segmented rms_norm + combine per token, done once over [total_per].
   // Each block's gate then slices its [per] segment instead of recomputing the
-  // 2560→256 projection. Backends fold the proj_scale (1/sqrt(d)), segmented
-  // rms_norm (shared per_layer_proj_norm), and combine (1/sqrt(2)) into this op.
-  const TensorId ple_all = b.node(OpKind::PerLayerInput, {inp, ple_row}, "ple_all",
+  // 2560→256 projection. Decomposed (C.5) into the general ops below: a
+  // full-width MatvecBf16 (offset 0, rows total_per) + Scale(1/sqrt(d)) +
+  // RmsNormHeads(dim == per, weight == per_layer_proj_norm) + the combine
+  // (proj + ple*sqrt(per)) / sqrt(2) as Scale/Add/Scale.
+  const float proj_scale = 1.0f / std::sqrt(float(d));
+  const float ple_scale = std::sqrt(float(per));
+  const float combine_scale = 1.0f / std::sqrt(2.0f);
+  TensorId ple_all = b.node(OpKind::MatvecBf16, {inp}, "ple_proj",
+                            {int64_t(total_per)},
+                            {attr_i("offset", int64_t(0)),
+                             attr_i("rows", int64_t(total_per))});
+  ple_all = b.node(OpKind::Scale, {ple_all}, "ple_projs", {int64_t(total_per)},
+                   {attr_f("scale", double(proj_scale))});
+  ple_all = b.node(OpKind::RmsNormHeads, {ple_all}, "ple_projn",
+                   {int64_t(total_per)},
+                   {layer_a(0), slot(WeightSlot::PerLayerProjNorm),
+                    attr_i("dim", int64_t(per))});
+  const TensorId ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
+                                {int64_t(total_per)},
+                                {attr_f("scale", double(ple_scale))});
+  const TensorId ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
                                   {int64_t(total_per)}, {});
+  ple_all = b.node(OpKind::Scale, {ple_add}, "ple_all", {int64_t(total_per)},
+                   {attr_f("scale", double(combine_scale))});
 
   TensorId residual = inp;
   for (uint32_t l = 0; l < block_count; ++l) {
@@ -240,10 +260,10 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
       attn = b.node(OpKind::Attention, {q, kc, vc, pos}, "attn" + suff,
-                    {int64_t(qw)}, {layer_a(l)});
+                    {int64_t(qw)}, {layer_a(l), kv_src(l)});
     } else {
-      attn = b.node(OpKind::AttentionShared, {q, pos}, "attn" + suff,
-                    {int64_t(qw)}, {layer_a(l)});
+      attn = b.node(OpKind::Attention, {q, pos}, "attn" + suff,
+                    {int64_t(qw)}, {layer_a(l), kv_src(l)});
     }
 
     TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
@@ -330,7 +350,7 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 // length, dim innermost) so the whole prompt is processed in one graph pass
 // through the spine. The batch size n and per-node `dim` are baked into node
 // attributes; the per-token OpKinds (Embedding, QuantizedMatmul, RmsNorm,
-// RmsNormHeads, Rope, MatvecF32, MatvecBf16, LayerCombine) carry the `batch`
+// RmsNormHeads, Rope, MatvecF32, MatvecBf16, Slice) carry the `batch`
 // attribute and the SonicBackend loops their per-token kernel over the batch
 // dim, while the elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) are reused
 // unchanged on the flat batched buffers. C.3 removed the [dim, n] column-major
@@ -338,9 +358,10 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 // [n, dim] directly, so the attention path (which always consumed [n, dim]) no
 // longer needs a data-movement transpose on either side of it. FlashAttention
 // runs full-sequence causal SDPA over prior cache + the current chunk's n
-// fp16-rounded K/V rows (no append — the deferred KvAppend node does that);
-// FlashAttentionShared attends over the donor layer's fp16-rounded K/V graph
-// tensors, so the memory planner keeps those alive across layers 24..41 via
+// fp16-rounded K/V rows (no append — the deferred KvAppend node does that); a
+// shared-KV layer passes its donor's fp16-rounded K/V graph tensors instead of
+// its own, and the node's `kv_source_layer` attribute selects the donor cache,
+// so the memory planner keeps the donor K/V alive across layers 24..41 via
 // ordinary tensor liveness. Graph inputs are `tokens` (Int64 [n]) and
 // `start_pos` (Int64); the graph output is the final residual [n, dim].
 // ---------------------------------------------------------------------------
@@ -403,6 +424,9 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
+  auto kv_src = [&cfg](uint32_t l) {
+    return attr_i("kv_source_layer", int64_t(cfg.kv_donor_layer(l)));
+  };
   auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
   // The fused mmq quantize's activation scale layout follows the consuming
@@ -474,7 +498,7 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
       attn = b.node(OpKind::FlashAttention, {q, kc, vc, start_pos}, "attn" + suff,
-                    shape2(n, qw), {layer_a(l), batch_a(n)});
+                    shape2(n, qw), {layer_a(l), batch_a(n), kv_src(l)});
       kv_k[l] = kc;
       kv_v[l] = vc;
       if (l == donor_swa_layer) {
@@ -488,8 +512,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       const uint32_t donor = cfg.kv_donor_layer(l);
       const TensorId dk = (donor == donor_swa_layer) ? donor_swa_k : donor_global_k;
       const TensorId dv = (donor == donor_swa_layer) ? donor_swa_v : donor_global_v;
-      attn = b.node(OpKind::FlashAttentionShared, {q, dk, dv, start_pos}, "attn" + suff,
-                    shape2(n, qw), {layer_a(l), batch_a(n)});
+      attn = b.node(OpKind::FlashAttention, {q, dk, dv, start_pos}, "attn" + suff,
+                    shape2(n, qw), {layer_a(l), batch_a(n), kv_src(l)});
     }
 
     TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
@@ -519,13 +543,28 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 
     // --- per-layer gate ----------------------------------------------------
     TensorId proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, shape2(n, per),
-                           {layer_a(l), batch_a(n)});
+                           {layer_a(l), batch_a(n),
+                            attr_i("offset", int64_t(l) * per),
+                            attr_i("rows", int64_t(per))});
     proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
                   {attr_f("scale", proj_scale)});
     proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, shape2(n, per),
                   {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
-    TensorId ple = b.node(OpKind::LayerCombine, {proj, ple_row}, "ple" + suff,
-                          shape2(n, per), {layer_a(l), batch_a(n)});
+    // Layer combine (C.5): ple = (projn + ple_row[:, l*per:(l+1)*per] * sqrt(per))
+    // / sqrt(2), decomposed into a strided Slice of the per-layer embedding row
+    // + Scale/Add/Scale.
+    const TensorId ple_col = b.node(OpKind::Slice, {ple_row}, "ple_col" + suff,
+                                    shape2(n, per),
+                                    {attr_i("offset", int64_t(l) * per),
+                                     attr_i("length", int64_t(per)),
+                                     attr_i("stride", int64_t(total_per))});
+    const TensorId ple_scaled = b.node(OpKind::Scale, {ple_col}, "ple_scaled" + suff,
+                                       shape2(n, per),
+                                       {attr_f("scale", double(std::sqrt(float(per))))});
+    const TensorId ple_sum = b.node(OpKind::Add, {proj, ple_scaled}, "ple_sum" + suff,
+                                    shape2(n, per), {});
+    TensorId ple = b.node(OpKind::Scale, {ple_sum}, "ple" + suff, shape2(n, per),
+                          {attr_f("scale", 1.0 / std::sqrt(2.0))});
     TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, shape2(n, per),
                          {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
     g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});

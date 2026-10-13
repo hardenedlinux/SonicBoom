@@ -226,19 +226,19 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // static planner's capability check accepts a Gemma 4 decode graph.
       OpKind::QuantizedMatmul, OpKind::RmsNorm,      OpKind::RmsNormHeads,
       OpKind::GeluFp16,        OpKind::Rope,         OpKind::Attention,
-      OpKind::AttentionShared, OpKind::GqaBroadcast, OpKind::Embedding,
+      OpKind::GqaBroadcast, OpKind::Embedding,
       OpKind::MatvecF32,
       OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
       OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
-      OpKind::LayerCombine,    OpKind::PerLayerInput, OpKind::Slice,
-      // Phase 7 chunked prefill operators: FlashAttention/FlashAttentionShared
-      // (chunked SDPA) and KvAppend (deferred cache append) have no per-token
-      // decode twin; declared here so the planner's capability check accepts the
-      // prefill graph. The rest of the prefill graph reuses the per-token
-      // OpKinds above, carrying a `batch` attribute the SonicBackend loops over
-      // the batch dim (the elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are
-      // reused unchanged on the flat batched buffers).
-      OpKind::FlashAttention, OpKind::FlashAttentionShared, OpKind::KvAppend,
+      OpKind::Slice,
+      // Phase 7 chunked prefill operators: FlashAttention (chunked SDPA) and
+      // KvAppend (deferred cache append) have no per-token decode twin; declared
+      // here so the planner's capability check accepts the prefill graph. The
+      // rest of the prefill graph reuses the per-token OpKinds above, carrying a
+      // `batch` attribute the SonicBackend loops over the batch dim (the
+      // elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are reused unchanged on
+      // the flat batched buffers).
+      OpKind::FlashAttention, OpKind::KvAppend,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the
@@ -276,22 +276,21 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
     gpu.capability.supported_ops = {
         OpKind::Scale,          OpKind::RmsNorm,    OpKind::RmsNormHeads,
         OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,
-        OpKind::AttentionShared, OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
+        OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
-        OpKind::Add,            OpKind::LayerCombine,
-        OpKind::PerLayerInput,  OpKind::Slice,      OpKind::Embedding,
+        OpKind::Add,            OpKind::Slice,      OpKind::Embedding,
         OpKind::Argmax,
-        // Phase 7 chunked prefill operators (device-resident): FlashAttention /
-        // FlashAttentionShared (chunked SDPA) and KvAppend (deferred cache
-        // append) have no per-token decode twin. The rest of the prefill graph
-        // reuses the per-token OpKinds above with a `batch` attribute, dispatched
-        // to the batched *_dev kernels; the elementwise ops are reused unchanged
-        // on flat batched buffers.
-        OpKind::FlashAttention, OpKind::FlashAttentionShared, OpKind::KvAppend,
+        // Phase 7 chunked prefill operators (device-resident): FlashAttention
+        // (chunked SDPA) and KvAppend (deferred cache append) have no per-token
+        // decode twin. The rest of the prefill graph reuses the per-token
+        // OpKinds above with a `batch` attribute, dispatched to the batched
+        // *_dev kernels; the elementwise ops are reused unchanged on flat batched
+        // buffers.
+        OpKind::FlashAttention, OpKind::KvAppend,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

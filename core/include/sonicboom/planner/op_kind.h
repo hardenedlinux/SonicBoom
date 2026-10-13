@@ -21,7 +21,7 @@
 // analysis); `Softmax` is a native-torch-routed operator (no MLIR lowering);
 // `WholeGraph` is a task-granularity marker for the single whole-graph compute
 // task the v0 compiler emits, not a node-level operator. The transformer
-// operators (QuantizedMatmul .. LayerCombine) are the Phase 6 node vocabulary
+// operators (QuantizedMatmul .. Slice) are the Phase 6 node vocabulary
 // emitted by the Gemma 4 plan emitter and dispatched by the SonicBackend.
 
 #include <cstdint>
@@ -54,24 +54,22 @@ enum class OpKind : uint8_t {
   RmsNormHeads,     // nn::rms_norm_heads (per-head, in place)
   GeluFp16,         // nn::gelu_fp16
   Rope,             // nn::rope_neox_heads (multi-head NEOX RoPE)
-  Attention,        // nn::decode_attention (incremental KV-cache SDPA, appends)
-  AttentionShared,  // nn::decode_attention over a donor layer's cache (no append)
+  Attention,        // nn::decode_attention (incremental KV-cache SDPA); appends
+                    // iff kc/vc inputs are present, attends the kv_source_layer cache
   GqaBroadcast,     // nn::gqa_broadcast (n_k == 1 donor-V spread)
   Embedding,        // nn::embedding_f32
   MatvecF32,        // nn::matvec_f32 (dense f32 gate/proj matvec)
-  MatvecBf16,       // nn::matvec_bf16 (dense bf16 per-layer projection)
+  MatvecBf16,       // nn::matvec_bf16 (dense bf16 projection; attrs offset/rows)
   Mul,              // nn::mul
   Scale,            // nn::scale
   CastFp16,         // nn::cast_fp16
   Softcap,          // final-logit softcapping sc * tanh(x / sc)
   Argmax,           // nn::argmax
-  LayerCombine,     // nn::layer_combine
-  PerLayerInput,    // hoisted full-width per-layer input (bf16 gemv + scale + seg rms + combine)
-  Slice,            // contiguous sub-span copy (attrs: offset, length)
+  Slice,            // sub-span copy (attrs: offset, length, optional stride)
 
   // Transformer operators — chunked prefill (Phase 7 / Section C.3). The
   // per-token OpKinds above (Embedding, QuantizedMatmul, RmsNorm, RmsNormHeads,
-  // Rope, MatvecF32, MatvecBf16, LayerCombine) carry an optional `batch`
+  // Rope, MatvecF32, MatvecBf16, Slice) carry an optional `batch`
   // attribute (n == the prompt length); when present the SonicBackend loops the
   // same per-token kernel over the [n, dim] position-major batch (dim
   // innermost), otherwise it runs the single-token decode path. The batch size
@@ -81,7 +79,7 @@ enum class OpKind : uint8_t {
   // directly, so the attention path (which always consumed [n, dim]) no longer
   // needs a data-movement transpose on either side of it.
   FlashAttention,        // chunked flash attention over prior cache + current batch
-  FlashAttentionShared,  // donor chunked flash attention (no append)
+                         // (kv_source_layer selects the cache: own or donor)
   KvAppend,              // append n KV rows to the cache (deferred to after all layers)
 };
 

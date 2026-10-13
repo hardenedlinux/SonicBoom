@@ -247,12 +247,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::RmsNormHeads: {
+      // Per-head (or per-segment) rms_norm. The segment width is the node's
+      // `dim` attribute (defaults to the layer's head_dim); the weight is the
+      // node's `slot` (empty => unit), so this also covers the model-wide
+      // per-layer projection norm (slot == PerLayerProjNorm, dim == per).
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      std::span<const float> w;
-      if (slot == model::WeightSlot::AttnQNorm)
-        w = block.attn_q_norm;
-      else if (slot == model::WeightSlot::AttnKNorm)
-        w = block.attn_k_norm;
+      const std::span<const float> w = fweight(slot);
+      int64_t dim_i = lc.head_dim;
+      attr_i(*node, "dim", dim_i);
+      const uint64_t head_dim = uint64_t(dim_i);
       std::span<float> o = f32_mut(out);
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
@@ -261,13 +264,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
         const uint64_t n = uint64_t(nb);
         const uint64_t dim = n ? x.size() / n : 0;
         for (uint64_t c = 0; c < n; ++c) {
-          if (!nn::rms_norm_heads(o.subspan(c * dim, dim), w, lc.head_dim, eps)) {
+          if (!nn::rms_norm_heads(o.subspan(c * dim, dim), w, head_dim, eps)) {
             ok = false;
             break;
           }
         }
       } else {
-        ok = nn::rms_norm_heads(o, w, lc.head_dim, eps);
+        ok = nn::rms_norm_heads(o, w, head_dim, eps);
       }
       break;
     }
@@ -306,31 +309,26 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::Attention: {
-      // KV layer: append the fp16-rounded K/V to this layer's cache at slot
-      // `pos % n_slots`, then run incremental decode attention over the cache.
-      // inputs: {q (RoPE'd f32), kc (fp16 K), vc (fp16 V), pos}.
+      // Attends over the KV-cache layer named by the node's `kv_source_layer`
+      // attribute (identity for a KV layer, the donor for a shared-KV layer).
+      // A KV layer appends its fp16-rounded K/V to the cache at slot
+      // `pos % n_slots` before attending (inputs {q, kc, vc, pos}); a shared
+      // layer omits K/V and does not append (inputs {q, pos}).
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      const uint64_t pos = read_i64(inputs[3]);
-      KvCache& cache = (*caches_)[uint32_t(layer)];
-      const size_t row = (size_t)cache.n_heads_kv * cache.head_dim;
-      const size_t slot = (size_t)(pos % cache.n_slots) * row;
-      std::span<const float> kc = f32(inputs[1]);
-      std::span<const float> vc = f32(inputs[2]);
-      std::copy_n(kc.begin(), row, cache.k.begin() + slot);
-      std::copy_n(vc.begin(), row, cache.v.begin() + slot);
-      ok = nn::decode_attention(f32(inputs[0]), cache.k, cache.v, pos,
-                                cache.n_slots, lc.n_heads_q, cache.n_heads_kv,
-                                cache.head_dim, lc.sliding_window, 1.0f,
-                                f32_mut(out));
-      break;
-    }
-    case OpKind::AttentionShared: {
-      // Shared layer (24..41): attend over the donor KV layer's cache (no
-      // append). inputs: {q (RoPE'd f32), pos}.
-      const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      const uint64_t pos = read_i64(inputs[1]);
-      const uint32_t donor = cfg.kv_donor_layer(uint32_t(layer));
-      const KvCache& cache = (*caches_)[donor];
+      int64_t ksrc = layer;
+      attr_i(*node, "kv_source_layer", ksrc);
+      const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
+      const bool append = inputs.size() >= 4;
+      const uint64_t pos = read_i64(append ? inputs[3] : inputs[1]);
+      KvCache& cache = (*caches_)[cache_layer];
+      if (append) {
+        const size_t row = (size_t)cache.n_heads_kv * cache.head_dim;
+        const size_t slot = (size_t)(pos % cache.n_slots) * row;
+        std::span<const float> kc = f32(inputs[1]);
+        std::span<const float> vc = f32(inputs[2]);
+        std::copy_n(kc.begin(), row, cache.k.begin() + slot);
+        std::copy_n(vc.begin(), row, cache.v.begin() + slot);
+      }
       ok = nn::decode_attention(f32(inputs[0]), cache.k, cache.v, pos,
                                 cache.n_slots, lc.n_heads_q, cache.n_heads_kv,
                                 cache.head_dim, lc.sliding_window, 1.0f,
@@ -376,9 +374,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::MatvecBf16: {
-      const uint64_t layer_base = (uint64_t(layer) * per) * d;
+      // Dense bf16 projection against a slice of per_layer_model_proj, named by
+      // `offset` (start row) and `rows` (output width). The default (offset ==
+      // layer*per, rows == per) is the per-layer projection; the hoisted
+      // full-width projection uses offset == 0, rows == total_per.
+      int64_t offset = (layer >= 0 ? int64_t(layer) : 0) * per;
+      int64_t rows_i = per;
+      attr_i(*node, "offset", offset);
+      attr_i(*node, "rows", rows_i);
+      const uint32_t rows = uint32_t(rows_i);
       const std::span<const uint16_t> W = model_.weights.per_layer_model_proj.subspan(
-          layer_base, uint64_t(per) * d);
+          uint64_t(offset) * d, uint64_t(rows) * d);
       // llama.cpp packs the f32 activation to bf16 (the weight's vec_dot_type)
       // before the dot; reproduce that rounding so the projection matches the
       // baseline (Phase 5D finding).
@@ -386,13 +392,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       if (attr_i(*node, "batch", nb)) {
         const uint64_t n = uint64_t(nb);
-        std::span<float> o = f32_mut(out);  // [n, per]
-        std::vector<float> x_bf16(d), y(per);
+        std::span<float> o = f32_mut(out);  // [n, rows]
+        std::vector<float> x_bf16(d), y(rows);
         for (uint64_t c = 0; c < n; ++c) {
           for (uint32_t k = 0; k < d; ++k)
             x_bf16[k] = bf16_to_f32(f32_to_bf16(x[c * d + k]));
           if (!nn::matvec_bf16(W, d, x_bf16, y)) { ok = false; break; }
-          for (uint32_t r = 0; r < per; ++r) o[c * per + r] = y[r];
+          for (uint32_t r = 0; r < rows; ++r) o[c * rows + r] = y[r];
         }
       } else {
         std::vector<float> x_bf16(x.size());
@@ -414,71 +420,34 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = nn::add(f32(inputs[0]), f32(inputs[1]), f32_mut(out));
       break;
     }
-    case OpKind::LayerCombine: {
-      const uint64_t col = uint64_t(layer) * per;
-      const float ple_scale = std::sqrt(float(per));
-      const float combine_scale = 1.0f / std::sqrt(2.0f);
-      int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
-        const uint64_t n = uint64_t(nb);
-        std::span<const float> proj = f32(inputs[0]);     // [n, per]
-        std::span<const float> ple_row = f32(inputs[1]);  // [n, total_per]
-        std::span<float> o = f32_mut(out);                // [n, per]
-        const uint64_t total_per = n ? ple_row.size() / n : 0;
-        std::vector<float> p(per), pl(per), y(per);
-        for (uint64_t c = 0; c < n; ++c) {
-          for (uint32_t k = 0; k < per; ++k) p[k] = proj[c * per + k];
-          for (uint32_t k = 0; k < per; ++k) pl[k] = ple_row[c * total_per + col + k];
-          if (!nn::layer_combine(p, pl, ple_scale, combine_scale, y)) {
-            ok = false;
-            break;
-          }
-          for (uint32_t k = 0; k < per; ++k) o[c * per + k] = y[k];
-        }
-      } else {
-        ok = nn::layer_combine(f32(inputs[0]),
-                               f32(inputs[1]).subspan(col, per), ple_scale,
-                               combine_scale, f32_mut(out));
-      }
-      break;
-    }
-    case OpKind::PerLayerInput: {
-      // inputs: {inp [d], ple_row [total_per]}; output: [total_per]. One
-      // full-width bf16 projection per token (replaces the per-block 2560→256
-      // slices), then scale, segmented rms_norm, and combine over [total_per].
-      const uint32_t total_per = cfg.block_count * per;
-      std::span<const float> inp = f32(inputs[0]);
-      std::span<const float> ple_row = f32(inputs[1]);
-      std::vector<float> x_bf16(d);
-      for (uint32_t i = 0; i < d; ++i)
-        x_bf16[i] = bf16_to_f32(f32_to_bf16(inp[i]));
-      std::vector<float> proj(total_per);
-      ok = nn::matvec_bf16(model_.weights.per_layer_model_proj, d, x_bf16, proj);
-      if (!ok) break;
-      ok = nn::scale(proj, 1.0f / std::sqrt(float(d)), proj);
-      if (!ok) break;
-      if (!nn::rms_norm_heads(proj, model_.weights.per_layer_proj_norm, per, eps)) {
-        ok = false;
-        break;
-      }
-      ok = nn::layer_combine(proj, ple_row, std::sqrt(float(per)),
-                             1.0f / std::sqrt(2.0f), f32_mut(out));
-      break;
-    }
     case OpKind::Slice: {
-      int64_t offset = 0, length = 0;
+      // Sub-span copy. `offset`/`length` name the contiguous span; when `stride`
+      // is present it is a strided row slice over `rows` rows of `length`
+      // elements each (rows == o.size() / length), used to extract a layer's
+      // per-layer-embedding column from a [n, total_per] row.
+      int64_t offset = 0, length = 0, stride = 0;
       attr_i(*node, "offset", offset);
       attr_i(*node, "length", length);
+      attr_i(*node, "stride", stride);
       const std::span<const float> x = f32(inputs[0]);
       std::span<float> o = f32_mut(out);
-      if (offset < 0 || length < 0 ||
-          uint64_t(offset) + uint64_t(length) > x.size() ||
-          o.size() < uint64_t(length)) {
-        ok = false;
-        break;
+      ok = (offset >= 0 && length >= 0);
+      if (!ok) break;
+      const uint64_t len = uint64_t(length);
+      if (stride > 0) {
+        ok = (o.size() % len == 0);
+        if (!ok) break;
+        const uint64_t rows = o.size() / len;
+        for (uint64_t r = 0; r < rows; ++r) {
+          const uint64_t src = uint64_t(offset) + r * uint64_t(stride);
+          if (src + len > x.size()) { ok = false; break; }
+          std::copy_n(x.begin() + src, len, o.begin() + r * len);
+        }
+      } else {
+        ok = (uint64_t(offset) + len <= x.size() && o.size() >= len);
+        if (!ok) break;
+        std::copy_n(x.begin() + offset, len, o.begin());
       }
-      std::copy_n(x.begin() + offset, uint64_t(length), o.begin());
-      ok = true;
       break;
     }
     case OpKind::Softcap: {
@@ -486,10 +455,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       break;
     }
     case OpKind::FlashAttention: {
-      // KV layer: full-sequence causal SDPA over this chunk's fp16-rounded K/V
-      // (no append — the append is the deferred KvAppend node). The CPU
-      // prefill runs a single wrap-free chunk (start_pos == 0, n <= ring), so
-      // there is no prior cache to attend over. inputs: {q, kc, vc, start_pos}.
+      // Full-sequence causal SDPA over this chunk's fp16-rounded K/V (no append
+      // — the append is the deferred KvAppend node). For a shared-KV layer the
+      // graph passes the donor layer's K/V tensors (the `kv_source_layer`
+      // attribute is unused here because the CPU prefill never reads the cache).
+      // The CPU prefill runs a single wrap-free chunk (start_pos == 0, n <=
+      // ring), so there is no prior cache to attend over.
+      // inputs: {q, kc/dk, vc/dv, start_pos}.
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
@@ -518,20 +490,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
         std::copy_n(v.data() + c * row, row, cache.v.begin() + slot);
       }
       ok = true;
-      break;
-    }
-    case OpKind::FlashAttentionShared: {
-      // Shared layer (24..41): full-sequence causal SDPA over the donor layer's
-      // fp16-rounded K/V graph tensors (no cache append). inputs: {q, dk, dv}.
-      const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint64_t n = uint64_t(nb);
-      ok = nn::scaled_dot_product_attention(f32(inputs[0]), n, f32(inputs[1]),
-                                            f32(inputs[2]), n,
-                                            lc.n_heads_q, lc.n_heads_kv,
-                                            lc.head_dim, true, lc.sliding_window,
-                                            0.0f, 1.0f, f32_mut(out));
       break;
     }
     default:

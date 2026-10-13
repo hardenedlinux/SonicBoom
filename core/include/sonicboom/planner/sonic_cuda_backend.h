@@ -61,8 +61,7 @@ public:
   DeviceKind kind() const noexcept override { return DeviceKind::GPU; }
 
   // Non-const: the backend holds per-session state (the device-resident KV
-  // cache) that an Attention/AttentionShared task appends to / reads across
-  // decode steps.
+  // cache) that an Attention task appends to / reads across decode steps.
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 

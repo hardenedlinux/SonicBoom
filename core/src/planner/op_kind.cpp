@@ -55,8 +55,6 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Rope;
   if (name == "attention")
     return OpKind::Attention;
-  if (name == "attention_shared")
-    return OpKind::AttentionShared;
   if (name == "gqa_broadcast")
     return OpKind::GqaBroadcast;
   if (name == "embedding")
@@ -75,16 +73,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Softcap;
   if (name == "argmax")
     return OpKind::Argmax;
-  if (name == "layer_combine")
-    return OpKind::LayerCombine;
-  if (name == "per_layer_input")
-    return OpKind::PerLayerInput;
   if (name == "slice")
     return OpKind::Slice;
   if (name == "flash_attention")
     return OpKind::FlashAttention;
-  if (name == "flash_attention_shared")
-    return OpKind::FlashAttentionShared;
   if (name == "kv_append")
     return OpKind::KvAppend;
   return std::nullopt;
@@ -111,7 +103,6 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::GeluFp16: return "gelu_fp16";
     case OpKind::Rope: return "rope";
     case OpKind::Attention: return "attention";
-    case OpKind::AttentionShared: return "attention_shared";
     case OpKind::GqaBroadcast: return "gqa_broadcast";
     case OpKind::Embedding: return "embedding";
     case OpKind::MatvecF32: return "matvec_f32";
@@ -121,11 +112,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::CastFp16: return "cast_fp16";
     case OpKind::Softcap: return "softcap";
     case OpKind::Argmax: return "argmax";
-    case OpKind::LayerCombine: return "layer_combine";
-    case OpKind::PerLayerInput: return "per_layer_input";
     case OpKind::Slice: return "slice";
     case OpKind::FlashAttention: return "flash_attention";
-    case OpKind::FlashAttentionShared: return "flash_attention_shared";
     case OpKind::KvAppend: return "kv_append";
   }
   return "?";

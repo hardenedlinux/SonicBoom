@@ -2360,6 +2360,30 @@ bool argmax_dev(const float* x, int n, float* out) {
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Strided row slice (Section C.5): copies `rows` contiguous `length`-element
+// rows out of a position-major source, y[r*length + k] = x[offset + r*stride + k].
+// Used to extract a layer's per-layer-embedding column [offset, offset+length)
+// from each of the n positions of the full [n, total_per] row. One thread per
+// output element.
+__global__ void slice_strided_kernel(const float* __restrict__ x,
+                                     float* __restrict__ y, int rows, int length,
+                                     int offset, int stride) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * length) return;
+  const int r = i / length;
+  const int k = i - r * length;
+  y[i] = x[(size_t)offset + (size_t)r * stride + k];
+}
+
+bool slice_strided_dev(const float* x, float* y, int rows, int length, int offset,
+                       int stride) {
+  if (!available()) return false;
+  if (rows <= 0 || length <= 0 || stride <= 0 || !x || !y) return false;
+  slice_strided_kernel<<<grid_for(rows * length), 256, 0, cur_stream()>>>(
+      x, y, rows, length, offset, stride);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 // --- batched prefill entry points -------------------------------------------
 
 bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,

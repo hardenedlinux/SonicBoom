@@ -356,13 +356,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::RmsNormHeads: {
-      std::span<const float> w;
-      if (slot == model::WeightSlot::AttnQNorm)
-        w = block.attn_q_norm;
-      else if (slot == model::WeightSlot::AttnKNorm)
-        w = block.attn_k_norm;
-      ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(lc.head_dim),
-                                        out_n / int(lc.head_dim));
+      // Per-head (or per-segment) rms_norm. The segment width is the node's
+      // `dim` attribute (defaults to the layer's head_dim); the weight is the
+      // node's `slot` (empty => unit), so this also covers the model-wide
+      // per-layer projection norm (slot == PerLayerProjNorm, dim == per).
+      const std::span<const float> w = fweight(slot);
+      int64_t dim_i = lc.head_dim;
+      attr_i(*node, "dim", dim_i);
+      ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
+                                        out_n / int(dim_i));
       break;
     }
     case OpKind::Rope: {
@@ -395,34 +397,28 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::Attention: {
-      // KV layer: append the fp16-rounded K/V to this layer's device cache at
-      // slot `pos % n_slots` (computed in-kernel from pos_buf_), then run
-      // incremental decode attention over it. inputs: {q (RoPE'd f32, device),
-      // kc (device), vc (device)}; the position comes from the device slot.
-      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
+      // Attends over the KV-cache layer named by the node's `kv_source_layer`
+      // attribute (identity for a KV layer, the donor for a shared-KV layer).
+      // A KV layer appends its fp16-rounded K/V to the cache at slot
+      // `pos % n_slots` (computed in-kernel from pos_buf_) before attending
+      // (inputs {q, kc, vc}); a shared layer omits K/V and does not append
+      // (inputs {q}). The position comes from the device slot.
+      int64_t ksrc = layer;
+      attr_i(*node, "kv_source_layer", ksrc);
+      const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
+      KvCacheDev& cache = (*caches_)[cache_layer];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
-      if (!cache.k_buf || !cache.v_buf ||
-          !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
-                                   dev(in[1]), dev(in[2]),
-                                   reinterpret_cast<const uint64_t*>(pos_buf_.id),
-                                   cache.n_slots, row_elems)) {
-        ok = false;
-        break;
+      if (in.size() >= 4) {
+        if (!cache.k_buf || !cache.v_buf ||
+            !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
+                                     dev(in[1]), dev(in[2]),
+                                     reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                                     cache.n_slots, row_elems)) {
+          ok = false;
+          break;
+        }
       }
-      ok = nn::cuda::decode_attention_dev(
-          dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
-          reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
-          int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, 1.0f, out);
-      break;
-    }
-    case OpKind::AttentionShared: {
-      // Shared layer (24..41): attend over the donor KV layer's cache (no
-      // append). inputs: {q (device)}; the position comes from the device slot.
-      const uint32_t donor = spec_.kv_source_layer[uint32_t(layer)];
-      const KvCacheDev& cache = (*caches_)[donor];
-      const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       ok = nn::cuda::decode_attention_dev(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
@@ -528,15 +524,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::MatvecBf16: {
-      const uint64_t layer_base = (uint64_t(layer) * per) * d;
+      // Dense bf16 projection against a slice of per_layer_model_proj, named by
+      // `offset` (start row) and `rows` (output width). The default (offset ==
+      // layer*per, rows == per) is the per-layer projection; the hoisted
+      // full-width projection uses offset == 0, rows == total_per.
+      int64_t offset = (layer >= 0 ? int64_t(layer) : 0) * per;
+      int64_t rows_i = per;
+      attr_i(*node, "offset", offset);
+      attr_i(*node, "rows", rows_i);
+      const uint32_t rows = uint32_t(rows_i);
       const std::span<const uint16_t> W =
-          model_->weights.per_layer_model_proj.subspan(layer_base, uint64_t(per) * d);
+          model_->weights.per_layer_model_proj.subspan(uint64_t(offset) * d,
+                                                       uint64_t(rows) * d);
       int64_t nb = 0;
       const bool batched = attr_i(*node, "batch", nb);
       const int n = int(nb);
       const int cols =
           int(in[0].device.size_bytes / sizeof(float) / uint64_t(batched ? n : 1));
-      const int rows = batched ? out_n / n : out_n;
       // The CPU path rounds the activation through bf16 before the dot; do the
       // same on a scratch copy so the shared `inp` tensor is left untouched.
       const uint64_t xbytes = in[0].device.size_bytes;
@@ -553,7 +557,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       }
       if (batched)
         ok = nn::cuda::matvec_bf16_batched_dev(
-            W, cols, reinterpret_cast<const float*>(xtmp), out, rows, n);
+            W, cols, reinterpret_cast<const float*>(xtmp), out, int(rows), n);
       else
         ok = nn::cuda::matvec_bf16_dev(W, cols, reinterpret_cast<const float*>(xtmp),
                                        out, out_n);
@@ -572,65 +576,24 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = nn::cuda::add_dev(dev(in[0]), dev(in[1]), out, out_n);
       break;
     }
-    case OpKind::LayerCombine: {
-      const uint64_t col = uint64_t(layer) * per;
-      const float ple_scale = std::sqrt(float(per));
-      const float combine_scale = 1.0f / std::sqrt(2.0f);
-      int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
-        // ple_row is [n, total_per] position-major, so this layer's slice is
-        // strided by total_per (not contiguous like the [total_per, n] layout).
-        const int total_per =
-            int(in[1].device.size_bytes / sizeof(float) / uint64_t(nb));
-        ok = nn::cuda::layer_combine_batched_dev(
-            dev(in[0]), dev(in[1]), ple_scale, combine_scale, out, int(per),
-            int(nb), int(col), total_per);
-      } else {
-        ok = nn::cuda::layer_combine_dev(dev(in[0]), dev(in[1]) + col, ple_scale,
-                                         combine_scale, out, int(per));
-      }
-      break;
-    }
-    case OpKind::PerLayerInput: {
-      // inputs: {inp [d] (device), ple_row [total_per] (device)}; output
-      // [total_per]. One full-width bf16 gemv + scale + segmented rms_norm +
-      // combine per token (Phase 2.3a). In-place steps are safe: each kernel
-      // reads element i before writing it, and the rms reduction is a separate
-      // launch before the apply.
-      const int total_per = out_n;
-      const int cols = int(in[0].device.size_bytes / sizeof(float));  // d
-      const uint64_t xbytes = in[0].device.size_bytes;
-      uint64_t xtmp = device::acquire(xbytes);
-      if (!xtmp) {
-        ok = false;
-        break;
-      }
-      if (!device::device_copy(in[0].device.handle, xtmp, xbytes) ||
-          !nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols)) {
-        device::release(xtmp, xbytes);
-        ok = false;
-        break;
-      }
-      ok = nn::cuda::matvec_bf16_dev(model_->weights.per_layer_model_proj, cols,
-                                     reinterpret_cast<const float*>(xtmp), out,
-                                     total_per);
-      device::release(xtmp, xbytes);
-      if (!ok) break;
-      ok = nn::cuda::scale_dev(out, 1.0f / std::sqrt(float(d)), out, total_per);
-      if (!ok) break;
-      ok = nn::cuda::rms_norm_heads_dev(model_->weights.per_layer_proj_norm, out,
-                                        eps, out, int(per), total_per / int(per));
-      if (!ok) break;
-      ok = nn::cuda::layer_combine_dev(out, dev(in[1]), std::sqrt(float(per)),
-                                       1.0f / std::sqrt(2.0f), out, total_per);
-      break;
-    }
     case OpKind::Slice: {
-      int64_t offset = 0, length = 0;
+      // Sub-span copy. `offset`/`length` name the contiguous span; when `stride`
+      // is present it is a strided row slice over `rows` rows of `length`
+      // elements each (rows == out_n / length), used to extract a layer's
+      // per-layer-embedding column from a [n, total_per] row.
+      int64_t offset = 0, length = 0, stride = 0;
       attr_i(*node, "offset", offset);
       attr_i(*node, "length", length);
-      const uint64_t src = in[0].device.handle + uint64_t(offset) * sizeof(float);
-      ok = device::device_copy(src, out_handle, uint64_t(length) * sizeof(float));
+      attr_i(*node, "stride", stride);
+      if (stride > 0) {
+        const int len = int(length);
+        ok = (len > 0 && out_n % len == 0) &&
+             nn::cuda::slice_strided_dev(dev(in[0]), out, out_n / len, len,
+                                         int(offset), int(stride));
+      } else {
+        const uint64_t src = in[0].device.handle + uint64_t(offset) * sizeof(float);
+        ok = device::device_copy(src, out_handle, uint64_t(length) * sizeof(float));
+      }
       break;
     }
     case OpKind::Embedding: {
@@ -681,7 +644,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     // --- inherently-batched prefill ops (Phase 7 / Section C.3) ---------------
-    // FlashAttention/FlashAttentionShared/KvAppend have no per-token decode twin;
+    // FlashAttention/KvAppend have no per-token decode twin;
     // they always carry the `batch` attribute and run the chunked *_dev kernels.
     // Activations are [n, dim] position-major (dim innermost). The Int64 graph
     // inputs (tokens, start_pos) are read from the persistent device slots
@@ -690,26 +653,18 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     // launch argument and no synchronous H2D upload).
     case OpKind::FlashAttention: {
       // Chunked attention over prior cache + current batch (no append — the
-      // append is the deferred KvAppend node). inputs: {q, kc, vc,
-      // start_pos}. For a single chunk at start_pos == 0 the prior range is
-      // empty and this is bit-identical to the old intra-batch flash attention.
+      // append is the deferred KvAppend node). The cache read is the layer named
+      // by the node's `kv_source_layer` attribute (identity for a KV layer, the
+      // donor for a shared-KV layer); a shared layer passes its donor's K/V
+      // graph tensors as inputs. inputs: {q, kc/dk, vc/dv, start_pos}. For a
+      // single chunk at start_pos == 0 the prior range is empty and this is
+      // bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
-      ok = nn::cuda::flash_attention_chunk_dev_pos(
-          dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
-          dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
-          cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
-          int(cache.head_dim), lc.sliding_window, 1.0f, out);
-      break;
-    }
-    case OpKind::FlashAttentionShared: {
-      // Shared layer: chunked attention over the donor's prior cache + the
-      // donor's current-chunk K/V (no append). inputs: {q, dk, dv, start_pos}.
-      int64_t nb = 0;
-      attr_i(*node, "batch", nb);
-      const uint32_t donor = spec_.kv_source_layer[uint32_t(layer)];
-      const KvCacheDev& cache = (*caches_)[donor];
+      int64_t ksrc = layer;
+      attr_i(*node, "kv_source_layer", ksrc);
+      const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
+      KvCacheDev& cache = (*caches_)[cache_layer];
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
@@ -722,7 +677,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      KvCacheDev& cache = (*caches_)[spec_.kv_source_layer[uint32_t(layer)]];
+      KvCacheDev& cache = (*caches_)[uint32_t(layer)];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       if (!cache.k_buf || !cache.v_buf ||
           !nn::cuda::kv_append_batched_dev_pos(

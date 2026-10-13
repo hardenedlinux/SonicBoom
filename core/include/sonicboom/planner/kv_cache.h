@@ -62,10 +62,10 @@ struct KvCacheSpec {
   uint32_t n_layers = 0;      // number of distinct KV-cache layers (n_layer_kv)
   std::vector<Layer> layers;  // indexed by KV-cache layer (0 .. n_layers-1)
 
-  // The KV-cache layer each transformer layer reads. Indexed by transformer
-  // layer (0 .. block_count-1); value is a KV-cache layer index. Identity for a
-  // KV layer, the donor's index for a shared-KV layer.
-  std::vector<uint32_t> kv_source_layer;
+  // The KV-cache layer each transformer layer reads is carried as a per-node
+  // `kv_source_layer` attribute on the Attention/FlashAttention node (identity
+  // for a KV layer, the donor's index for a shared-KV layer); the backend
+  // reads it straight from the node, so the spec stays model-agnostic.
 
   uint64_t chunk = 0;  // max prefill segment (SWA ring size; 0 = no window)
 };
