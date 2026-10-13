@@ -25,6 +25,10 @@
 #include <sonicboom/capi.h>
 
 #include <sonicboom/autograd.h>
+#include <sonicboom/gguf/reader.h>
+#include <sonicboom/model/config.h>
+#include <sonicboom/model/loader.h>
+#include <sonicboom/model/plan.h>
 #include <sonicboom/runtime.h>
 #include <sonicboom/scalar_type.h>
 #include <sonicboom/sx/exec.h>
@@ -34,6 +38,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -70,6 +75,33 @@ struct sb_tensor {
 
 struct sb_tape {
   sonicboom::Tape tape;
+};
+
+namespace model = sonicboom::model;
+namespace gguf = sonicboom::gguf;
+
+// The GGUF reader owns the byte buffer every Gemma4Model weight span borrows
+// from, so the model and its reader travel together in one heap object. Both
+// the model handle and every session hold a shared_ptr to this bundle, so the
+// buffer outlives the last consumer regardless of free order (a garbage-
+// collected binding frees in no guaranteed order).
+struct sb_llm_bundle {
+  // gguf::Reader is move-only with a private default constructor, so the
+  // bundle takes the reader in and owns it for the model's lifetime.
+  explicit sb_llm_bundle(gguf::Reader&& r) : reader(std::move(r)) {}
+  gguf::Reader reader;
+  model::Gemma4Model model;
+};
+
+struct sb_llm_model {
+  std::shared_ptr<sb_llm_bundle> bundle;
+};
+
+struct sb_llm_session {
+  std::shared_ptr<sb_llm_bundle> bundle;
+  uint64_t n_ctx = 0;
+  std::vector<sb_token> prompt;       // current prompt (decode continues from it)
+  std::vector<sb_token> prev_prompt;  // previous prompt, for reuse reporting
 };
 
 namespace {
@@ -608,6 +640,250 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
                     ("export: " + r.error().message).c_str());
           return SB_ERR_INTERNAL;
         }
+        return SB_OK;
+      },
+      err_out);
+}
+
+// --- Inference (minimal LLM surface) ----------------------------------------
+
+sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!gguf_path || !model_out)
+          return fail_arg(err_out);
+        *model_out = nullptr;
+
+        auto reader = gguf::Reader::load(std::string(gguf_path));
+        if (!reader) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, reader.error().message.c_str());
+          return SB_ERR_WEIGHT;
+        }
+
+        // Move the reader into a heap bundle first (its buffer address is then
+        // stable), then bind the model against it so every weight span borrows
+        // the bundle's buffer.
+        auto bundle = std::make_shared<sb_llm_bundle>(std::move(*reader));
+
+        auto arch = model::detect_arch(bundle->reader);
+        if (arch && *arch != model::ModelArch::Gemma4) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "model architecture not supported for inference (Gemma 4 only)");
+          return SB_ERR_UNSUPPORTED;
+        }
+
+        auto m = model::load_gemma4(bundle->reader);
+        if (!m) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, m.error().c_str());
+          return SB_ERR_WEIGHT;
+        }
+        bundle->model = std::move(*m);
+
+        auto *h = new (std::nothrow) sb_llm_model();
+        if (!h) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
+          return SB_ERR_INTERNAL;
+        }
+        h->bundle = std::move(bundle);
+        *model_out = h;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_llm_model_free(sb_llm_model *model) { delete model; }
+
+namespace {
+
+// Parse a space/tab/newline/comma-separated list of decimal token ids. Returns
+// false (and sets *err on a non-numeric token) on failure.
+bool parse_token_ids(const char *text, size_t len, std::vector<sb_token> &out,
+                     const char **err) {
+  const char *p = text;
+  const char *end = text + len;
+  while (p < end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
+                       *p == ','))
+      ++p;
+    if (p >= end)
+      break;
+    char *np = nullptr;
+    long long v = std::strtoll(p, &np, 10);
+    if (np == p) {
+      *err = "tokenize: non-numeric token";
+      return false;
+    }
+    out.push_back(static_cast<sb_token>(v));
+    p = np;
+  }
+  return true;
+}
+
+} // namespace
+
+sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
+                          sb_token *out, size_t cap, size_t *n_out,
+                          sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!model || !text || !n_out)
+          return fail_arg(err_out);
+
+        std::vector<sb_token> toks;
+        const char *perr = nullptr;
+        if (!parse_token_ids(text, len, toks, &perr)) {
+          set_error(err_out, SB_ERRKIND_PARSE_SYNTAX, perr);
+          return SB_ERR_PARSE;
+        }
+
+        *n_out = toks.size();
+        if (cap < toks.size())
+          return SB_ERR_BINDING;  // two-call sizing: *n_out holds the needed count
+        if (!toks.empty())
+          std::memcpy(out, toks.data(), toks.size() * sizeof(sb_token));
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
+                            size_t n, char *out, size_t cap, size_t *len_out,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!model || !len_out)
+          return fail_arg(err_out);
+        if (n > 0 && !tokens)
+          return fail_arg(err_out);
+
+        std::string s;
+        for (size_t i = 0; i < n; ++i) {
+          if (i)
+            s += ' ';
+          s += std::to_string(static_cast<int64_t>(tokens[i]));
+        }
+
+        // cap must hold the text plus a NUL terminator.
+        *len_out = s.size();
+        if (cap <= s.size())
+          return SB_ERR_BINDING;
+        if (!s.empty())
+          std::memcpy(out, s.data(), s.size());
+        out[s.size()] = '\0';
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
+                             sb_llm_session **session_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!model || !session_out)
+          return fail_arg(err_out);
+        *session_out = nullptr;
+
+        auto *h = new (std::nothrow) sb_llm_session();
+        if (!h) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
+          return SB_ERR_INTERNAL;
+        }
+        h->bundle = model->bundle;  // keep the model (and its buffer) alive
+        h->n_ctx = n_ctx;
+        *session_out = h;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_llm_session_free(sb_llm_session *session) { delete session; }
+
+sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
+                         size_t n, uint64_t *n_reused_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!session)
+          return fail_arg(err_out);
+        if (n > 0 && !tokens)
+          return fail_arg(err_out);
+
+        // Longest common prefix with the previous prompt (informational).
+        const size_t common =
+            [&]() -> size_t {
+          size_t k = 0;
+          const size_t lim =
+              n < session->prev_prompt.size() ? n : session->prev_prompt.size();
+          while (k < lim && session->prev_prompt[k] == tokens[k])
+            ++k;
+          return k;
+        }();
+        if (n_reused_out)
+          *n_reused_out = static_cast<uint64_t>(common);
+
+        session->prev_prompt = session->prompt;
+        session->prompt.assign(tokens, tokens + n);
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling,
+                        sb_llm_token_cb cb, void *user, uint32_t *n_out,
+                        sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!session || !sampling || !n_out)
+          return fail_arg(err_out);
+        *n_out = 0;
+
+        if (session->prompt.empty()) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "no prompt (call sb_llm_prefill first)");
+          return SB_ERR_BINDING;
+        }
+
+        // Only greedy argmax is implemented; a requested sampling mode returns
+        // unsupported rather than silently decoding greedily.
+        if (sampling->temperature > 0.0f ||
+            (sampling->top_p > 0.0f && sampling->top_p < 1.0f) ||
+            sampling->top_k != 0) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "sampling not supported (greedy temperature 0 only)");
+          return SB_ERR_UNSUPPORTED;
+        }
+
+        const uint32_t max_tokens = sampling->max_tokens;
+        if (max_tokens == 0)
+          return SB_OK;
+
+        const model::Gemma4Model &m = session->bundle->model;
+        std::vector<int64_t> tokens(max_tokens);
+        uint64_t produced = 0;
+        if (session->prompt.size() == 1) {
+          // A single-token prompt is a seed: decode directly (the exact path the
+          // golden-token test exercises).
+          produced = model::generate_spine(m, uint64_t(session->prompt[0]), 0,
+                                           tokens, session->n_ctx);
+        } else {
+          std::vector<uint64_t> prompt(session->prompt.begin(),
+                                       session->prompt.end());
+          produced = model::generate_prefill_spine(m, prompt, 0, tokens,
+                                                   session->n_ctx, true);
+        }
+
+        uint32_t n = static_cast<uint32_t>(produced);
+        if (n > max_tokens)
+          n = max_tokens;
+        if (cb) {
+          for (uint32_t i = 0; i < n; ++i) {
+            if (cb(user, static_cast<sb_token>(tokens[i]))) {
+              n = i;  // aborted before tokens[i]; report i produced
+              break;
+            }
+          }
+        }
+        *n_out = n;
         return SB_OK;
       },
       err_out);

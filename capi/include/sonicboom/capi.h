@@ -50,6 +50,7 @@ typedef enum sb_status {
   SB_ERR_BINDING = 4,  /* input/output buffer size or type mismatch           */
   SB_ERR_RUNTIME = 5,  /* the JITted function failed or was unavailable       */
   SB_ERR_INTERNAL = 6, /* invalid argument to the C API, or unexpected error  */
+  SB_ERR_UNSUPPORTED = 7, /* a requested feature this build/backend lacks     */
 } sb_status;
 
 /* Error categories (the `message` carries the human-readable detail). */
@@ -234,6 +235,79 @@ sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
 sb_status sb_export_model(const char *sx_text, size_t sx_len,
                           const char *const *names, const sb_tensor *const *params,
                           size_t count, const char *dir, sb_error **err_out);
+
+/* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
+/* A thin facade over the Layer 2 model loader + planner spine, exposing the
+ * smallest inference set the first binding (Guile) needs: model load/free,
+ * session new/free, tokenize/detokenize, prefill, and greedy decode with a
+ * per-token callback. The scope is intentionally minimal (v1 wrap-up):
+ *  - decode runs one whole greedy generation per call (the CPU planner spine
+ *    has no step-wise persistent session yet); a single-token prompt is a seed
+ *    and decodes directly, a longer prompt prefills then decodes;
+ *  - sampling is greedy-only (temperature 0); non-greedy returns
+ *    SB_ERR_UNSUPPORTED;
+ *  - tokenize/detokenize are raw-token-ID passthrough (the core has no
+ *    BPE/SentencePiece tokenizer yet);
+ *  - only Gemma 4 models load; a Qwen2 GGUF returns SB_ERR_UNSUPPORTED.
+ * These gaps are recorded in the post-v1 list (design/benchmark.md). */
+
+typedef struct sb_llm_model sb_llm_model;
+typedef struct sb_llm_session sb_llm_session;
+typedef int32_t sb_token;   /* a vocabulary index */
+
+/* Sampling parameters for one decode call. temperature 0 == greedy argmax (the
+ * only mode implemented today; temperature > 0, 0 < top_p < 1, or top_k > 0
+ * return SB_ERR_UNSUPPORTED). max_tokens caps the output length. */
+typedef struct sb_llm_sampling {
+  size_t struct_size;
+  float temperature;
+  float top_p;
+  uint32_t top_k;
+  uint64_t seed;
+  uint32_t max_tokens;
+} sb_llm_sampling;
+
+/* Per-token callback: called synchronously on the calling thread, once per
+ * produced token, in generation order. Return 0 to continue, non-zero to stop
+ * the decode early. `user` is passed through untouched. */
+typedef int (*sb_llm_token_cb)(void *user, sb_token token);
+
+/* Load a GGUF model for inference. The model owns its backing buffer; a
+ * session keeps the model alive after sb_llm_model_free. */
+sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
+                            sb_error **err_out);
+void sb_llm_model_free(sb_llm_model *model);
+
+/* Tokenize/detokenize as raw token IDs (no BPE/SentencePiece tokenizer in the
+ * core). tokenize parses a space/comma-separated list of decimal ids in `text`;
+ * detokenize renders `tokens` as space-separated decimals (NUL-terminated). Both
+ * use two-call sizing: pass `out` NULL or `cap` too small to get the needed
+ * count in *n_out / *len_out (and SB_ERR_BINDING). */
+sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
+                          sb_token *out, size_t cap, size_t *n_out, sb_error **err_out);
+sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
+                            size_t n, char *out, size_t cap, size_t *len_out,
+                            sb_error **err_out);
+
+/* Create a session (a prompt/token history + n_ctx). The session holds a
+ * reference to the model, so the model handle may be freed first. */
+sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
+                             sb_llm_session **session_out, sb_error **err_out);
+void sb_llm_session_free(sb_llm_session *session);
+
+/* Set the session's prompt to tokens[0..n). *n_reused_out receives the length
+ * of the longest common prefix with the previous prompt (informational: the CPU
+ * decode path re-prefills rather than reusing KV slots; KV reuse is the CUDA
+ * prefix-cache path, post-v1). */
+sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens, size_t n,
+                         uint64_t *n_reused_out, sb_error **err_out);
+
+/* Decode up to sampling->max_tokens tokens from the session's prompt, invoking
+ * cb for each (abort on a non-zero return). *n_out receives the count produced.
+ * Requires a non-empty prompt (sb_llm_prefill first). */
+sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling,
+                        sb_llm_token_cb cb, void *user, uint32_t *n_out,
+                        sb_error **err_out);
 
 #ifdef __cplusplus
 } /* extern "C" */

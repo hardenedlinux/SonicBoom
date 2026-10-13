@@ -32,13 +32,15 @@
 (define SB_ERR_BINDING 4)
 (define SB_ERR_RUNTIME 5)
 (define SB_ERR_INTERNAL 6)
+(define SB_ERR_UNSUPPORTED 7)
 
 (define (sb-status-ok? status) (= status SB_OK))
 
 (define *status-names*
   `((,SB_OK . "ok") (,SB_ERR_PARSE . "parse") (,SB_ERR_WEIGHT . "weight")
     (,SB_ERR_COMPILE . "compile") (,SB_ERR_BINDING . "binding")
-    (,SB_ERR_RUNTIME . "runtime") (,SB_ERR_INTERNAL . "internal")))
+    (,SB_ERR_RUNTIME . "runtime") (,SB_ERR_INTERNAL . "internal")
+    (,SB_ERR_UNSUPPORTED . "unsupported")))
 
 (define (sb-status->message status)
   (or (assq-ref *status-names* status) "unknown"))
@@ -116,7 +118,22 @@ library search path?")))
                (sb_grad . ,(foreign-proc "sb_grad" int (list '* '* '* '*)))
                ;; export: graph text + named trained tensors → artifact dir
                (sb_export_model . ,(foreign-proc "sb_export_model" int
-                                                 (list '* size_t '* '* size_t '* '*))))))
+                                                 (list '* size_t '* '* size_t '* '*)))
+               ;; inference (minimal LLM surface) — see capi.h sb_llm_*
+               (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
+                                                   (list '* '* '*)))
+               (sb_llm_model_free . ,(foreign-proc "sb_llm_model_free" void (list '*)))
+               (sb_llm_tokenize . ,(foreign-proc "sb_llm_tokenize" int
+                                                 (list '* '* size_t '* size_t '* '*)))
+               (sb_llm_detokenize . ,(foreign-proc "sb_llm_detokenize" int
+                                                   (list '* '* size_t '* size_t '* '*)))
+               (sb_llm_session_new . ,(foreign-proc "sb_llm_session_new" int
+                                                    (list '* uint64 '* '*)))
+               (sb_llm_session_free . ,(foreign-proc "sb_llm_session_free" void (list '*)))
+               (sb_llm_prefill . ,(foreign-proc "sb_llm_prefill" int
+                                                (list '* '* size_t '* '*)))
+               (sb_llm_decode . ,(foreign-proc "sb_llm_decode" int
+                                               (list '* '* '* '* '* '*))))))
         (%procs table)
         table)))
 

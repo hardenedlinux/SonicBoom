@@ -48,6 +48,20 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-train.scm)
 
+  # guile-inference drives the minimal LLM C ABI (sb_llm_*) through
+  # (sonicboom inference): load-model / make-session / generate. It loads the
+  # real Gemma 4 GGUF (skipping cleanly when absent) and checks the generated
+  # token stream against the golden decode tokens.
+  add_test(
+    NAME guile-inference
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            SONICBOOM_SRC_DIR=${CMAKE_SOURCE_DIR}
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-inference.scm)
+
   # guile-cpp-e2e: the full training → export → independent C++ load loop. The
   # Guile exporter (train + sb_export_model) writes an artifact, then the C++
   # loader (test_e2e_load, built in tests/core) reloads it and checks its
