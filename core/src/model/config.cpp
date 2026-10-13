@@ -22,14 +22,28 @@ bool Gemma4Config::valid() const noexcept {
   if (block_count == 0) return false;
   if (embedding_length == 0 || feed_forward_length == 0) return false;
   if (head_count == 0 || head_count_kv == 0) return false;
-  if (head_dim_global == 0 || head_dim_swa == 0) return false;
+  // head_dim_global is the universal head dim (every layer uses it unless SWA
+  // overrides it). head_dim_swa is only required when at least one layer is SWA.
+  if (head_dim_global == 0) return false;
   if (head_count % head_count_kv != 0) return false;  // GQA grouping must be exact
   // The contiguous query width of a sliding-window layer is
   // head_count * head_dim_swa, which must match the embedding length's attention
   // projection only structurally here (shapes are checked by the loader).
-  if (sliding_window_pattern.size() != block_count) return false;
+  //
+  // sliding_window_pattern is optional (Section C.6): empty means every layer is
+  // global (a model without sliding-window attention, e.g. Qwen2.5). When present
+  // it must cover every block. Any SWA layer then requires the SWA head dim, the
+  // window, and the SWA rope base to be set.
+  bool any_swa = false;
+  for (bool v : sliding_window_pattern)
+    if (v) { any_swa = true; break; }
+  if (!sliding_window_pattern.empty() &&
+      sliding_window_pattern.size() != block_count)
+    return false;
+  if (any_swa && (head_dim_swa == 0 || sliding_window == 0)) return false;
   if (rms_epsilon < 0.0f) return false;
-  if (rope_base <= 0.0f || rope_base_swa <= 0.0f) return false;
+  if (rope_base <= 0.0f) return false;
+  if (any_swa && rope_base_swa <= 0.0f) return false;
   if (shared_kv_layers >= block_count) return false;  // need >= 1 KV layer
   return true;
 }

@@ -2152,8 +2152,8 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
                           float scale, float* out) {
   if (!available()) return false;
-  if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || !q || !k_cache ||
-      !v_cache || !out || !pos || n_slots == 0 || window == 0)
+  if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || head_dim > 512 ||
+      !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0)
     return false;
 
   // Split-KV: n_chunks × n_kv_heads blocks each compute a per-head partial over
@@ -2226,7 +2226,7 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
     return false;
   if (n_heads_q % n_heads_kv != 0) return false;
   if (head_dim % 32 != 0 || head_dim > 512) return false;
-  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   flash_attention_kernel<<<n_q, n_heads_q * 32, smem, cur_stream()>>>(
       q, k, v, n_kv, n_heads_q, n_heads_kv, head_dim, sliding_window, scale,
@@ -2247,7 +2247,7 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   if (!q || !k_batch || !v_batch || !k_cache || !v_cache || !out) return false;
   if (n_heads_q % n_heads_kv != 0) return false;
   if (head_dim % 32 != 0 || head_dim > 512) return false;
-  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
       q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
@@ -2297,7 +2297,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     return false;
   if (n_heads_q % n_heads_kv != 0) return false;
   if (head_dim % 32 != 0 || head_dim > 512) return false;
-  if (n_heads_q > 32) return false;  // one warp per query head (Gemma: 8)
+  if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
 
   // Tiled tensor-core path: Gemma's GQA=4 with the SWA head (256) or the global
   // head (512). Anything else keeps the scalar-fp32 kernel.
