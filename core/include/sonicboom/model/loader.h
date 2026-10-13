@@ -44,4 +44,18 @@ struct Gemma4Model {
 // shapes). Never throws; never reads past the reader's buffer.
 std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r);
 
+// Read `general.architecture` and map it to a ModelArch. Returns an error when
+// the metadata is absent or names an architecture SonicBoom does not yet model.
+// The string values are the GGUF conventions: "gemma4" and "qwen2" (Qwen2.5
+// files also report "qwen2").
+std::expected<ModelArch, std::string> detect_arch(const gguf::Reader& r);
+
+// Read and validate the model config (metadata + token_embd vocab) for the
+// architecture `detect_arch` reports. Gemma 4 reads gemma4.*; Qwen2 reads
+// qwen2.* and derives head_dim_global = embedding_length / head_count with every
+// Gemma-only field (SWA head dim/window/rope, per-layer input, softcap, shared
+// KV) zeroed. This is the arch-generic entry point a generalized loader uses;
+// it binds no weights and produces no execution plan.
+std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r);
+
 } // namespace sonicboom::model

@@ -74,6 +74,13 @@ std::optional<std::vector<bool>> read_bool_array(const gguf::Reader& r,
   return out;
 }
 
+std::optional<std::string_view> read_string(const gguf::Reader& r,
+                                            std::string_view key) {
+  const gguf::Value* v = r.find(key);
+  if (!v || v->type != gguf::ValueType::String) return std::nullopt;
+  return std::string_view(v->s);
+}
+
 // Tensor binding with exact type + shape validation. All errors accumulate into
 // `errs` (a newline-joined string) so a single load reports every mismatch.
 bool dims_match(const std::vector<uint64_t>& got,
@@ -192,11 +199,10 @@ std::optional<std::span<const uint16_t>> bind_bf16(const gguf::Reader& r,
 
 } // namespace
 
-std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
-  Gemma4Model m;
+std::expected<Gemma4Config, std::string> load_gemma4_config(const gguf::Reader& r) {
+  Gemma4Config c;
+  c.arch = ModelArch::Gemma4;
 
-  // --- config (metadata) ---------------------------------------------------
-  Gemma4Config& c = m.config;
   const auto block_count = read_u64(r, "gemma4.block_count");
   const auto embd_len = read_u64(r, "gemma4.embedding_length");
   const auto ff_len = read_u64(r, "gemma4.feed_forward_length");
@@ -260,7 +266,110 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   c.shared_kv_layers = uint32_t(*shared_kv);
   c.sliding_window_pattern = std::move(*pattern);
 
+  // token_embd.shape[1] defines vocab_size (shared with the weight binder).
+  {
+    const gguf::TensorInfo* t = r.tensor("token_embd.weight");
+    if (!t || t->dims.size() != 2 || t->dims[0] != c.embedding_length ||
+        t->dims[1] == 0) {
+      return std::unexpected(std::string("token_embd.weight absent or malformed"));
+    }
+    c.vocab_size = t->dims[1];
+  }
+
   if (!c.valid()) return std::unexpected(std::string("inconsistent config"));
+  return c;
+}
+
+std::expected<Gemma4Config, std::string> load_qwen2_config(const gguf::Reader& r) {
+  Gemma4Config c;
+  c.arch = ModelArch::Qwen2;
+
+  const auto block_count = read_u64(r, "qwen2.block_count");
+  const auto context_len = read_u64(r, "qwen2.context_length");
+  const auto embd_len = read_u64(r, "qwen2.embedding_length");
+  const auto ff_len = read_u64(r, "qwen2.feed_forward_length");
+  const auto head_count = read_u64(r, "qwen2.attention.head_count");
+  const auto head_count_kv = read_u64(r, "qwen2.attention.head_count_kv");
+  const auto rms_eps = read_f64(r, "qwen2.attention.layer_norm_rms_epsilon");
+  const auto freq_base = read_f64(r, "qwen2.rope.freq_base");
+
+  std::string errs;
+  auto need = [&](bool ok, const char* what) {
+    if (!ok) {
+      errs += "missing/invalid metadata: ";
+      errs += what;
+      errs += "\n";
+    }
+  };
+  need(block_count && *block_count > 0, "qwen2.block_count");
+  need(context_len && *context_len > 0, "qwen2.context_length");
+  need(embd_len && *embd_len > 0, "qwen2.embedding_length");
+  need(ff_len && *ff_len > 0, "qwen2.feed_forward_length");
+  need(head_count && *head_count > 0, "qwen2.attention.head_count");
+  need(head_count_kv && *head_count_kv > 0, "qwen2.attention.head_count_kv");
+  need(rms_eps && *rms_eps >= 0.0, "qwen2.attention.layer_norm_rms_epsilon");
+  need(freq_base && *freq_base > 0.0, "qwen2.rope.freq_base");
+
+  if (!errs.empty()) return std::unexpected(std::move(errs));
+
+  c.block_count = uint32_t(*block_count);
+  c.context_length = *context_len;
+  c.embedding_length = uint32_t(*embd_len);
+  c.feed_forward_length = uint32_t(*ff_len);
+  c.head_count = uint32_t(*head_count);
+  c.head_count_kv = uint32_t(*head_count_kv);
+  c.head_dim_global = c.embedding_length / c.head_count;  // 896 / 14 == 64
+  c.head_dim_swa = 0;              // no sliding-window attention
+  c.per_layer_input = 0;           // no per-layer embedding input
+  c.sliding_window = 0;
+  c.rms_epsilon = float(*rms_eps);
+  c.final_logit_softcapping = 0.0f;  // no logit softcap
+  c.rope_base = float(*freq_base);
+  c.rope_base_swa = 0.0f;
+  c.shared_kv_layers = 0;          // no shared KV
+  c.sliding_window_pattern.clear();  // every layer is global
+
+  // token_embd.shape[1] defines vocab_size (shared with the weight binder).
+  {
+    const gguf::TensorInfo* t = r.tensor("token_embd.weight");
+    if (!t || t->dims.size() != 2 || t->dims[0] != c.embedding_length ||
+        t->dims[1] == 0) {
+      return std::unexpected(std::string("token_embd.weight absent or malformed"));
+    }
+    c.vocab_size = t->dims[1];
+  }
+
+  if (!c.valid()) return std::unexpected(std::string("inconsistent config"));
+  return c;
+}
+
+std::expected<ModelArch, std::string> detect_arch(const gguf::Reader& r) {
+  const auto a = read_string(r, "general.architecture");
+  if (!a) return std::unexpected(std::string("missing general.architecture"));
+  if (*a == "gemma4") return ModelArch::Gemma4;
+  if (*a == "qwen2") return ModelArch::Qwen2;
+  return std::unexpected("unknown architecture: " + std::string(*a));
+}
+
+std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r) {
+  const auto arch = detect_arch(r);
+  if (!arch) return std::unexpected(std::move(arch.error()));
+  switch (*arch) {
+    case ModelArch::Gemma4: return load_gemma4_config(r);
+    case ModelArch::Qwen2:  return load_qwen2_config(r);
+  }
+  return std::unexpected(std::string("unknown architecture"));
+}
+
+std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
+  Gemma4Model m;
+
+  auto cfg = load_gemma4_config(r);
+  if (!cfg) return std::unexpected(std::move(cfg.error()));
+  m.config = std::move(*cfg);
+
+  // --- config (already loaded above) ---------------------------------------
+  Gemma4Config& c = m.config;
 
   // --- weights -------------------------------------------------------------
   Gemma4Weights& w = m.weights;
@@ -268,14 +377,9 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   const uint32_t ff = c.feed_forward_length;
   const uint64_t per_layer_dim = uint64_t(c.block_count) * c.per_layer_input;
 
-  // token_embd.shape[1] also defines vocab_size.
-  {
-    const gguf::TensorInfo* t = r.tensor("token_embd.weight");
-    if (!t || t->dims.size() != 2 || t->dims[0] != d || t->dims[1] == 0) {
-      return std::unexpected(std::string("token_embd.weight absent or malformed"));
-    }
-    c.vocab_size = t->dims[1];
-  }
+  // vocab_size was set by load_gemma4_config (token_embd dims[1]); the weight
+  // binders below re-validate that same tensor's type/shape against the config.
+  std::string errs;
   if (auto q = bind_quant(r, "token_embd.weight", {kQ3K}, {d, c.vocab_size}, errs))
     w.token_embd = *q;
   if (auto q = bind_quant(r, "per_layer_token_embd.weight", {kQ4K},
