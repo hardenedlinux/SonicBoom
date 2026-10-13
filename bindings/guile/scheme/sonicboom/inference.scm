@@ -5,16 +5,17 @@
 ;;;
 ;;; The (sonicboom inference) module binds the minimal LLM C ABI (capi.h
 ;;; sb_llm_*) through (sonicboom ffi), which is the only path Guile uses to
-;;; reach libsonicboom.so. It exposes load-model / make-session / generate — a
-;;; raw-token-ID inference loop (no tokenizer, greedy decode) sufficient to
-;;; reproduce the golden token stream against the C++ spine.
+;;; reach libsonicboom.so. It exposes load-model / make-session / generate —
+;;; a greedy-decode inference loop over the GGUF built-in tokenizer.
 ;;;
 ;;;   Guile → (sonicboom inference) → (sonicboom ffi) → libsonicboom.so
 ;;;
 ;;; Handles are foreign pointers. Freeing is explicit (free-model!/free-session!)
 ;;; so a test owns its lifetime deterministically; the session holds a C++
 ;;; shared_ptr to the model so a freed model handle does not dangle a live
-;;; session. No tokenizer: prompts are lists of vocabulary indices.
+;;; session. Two entry points:
+;;;   - generate         string -> string   (tokenize + decode + detokenize)
+;;;   - generate-tokens  token-ids -> token-ids  (the raw token-ID loop)
 
 (define-module (sonicboom inference)
   #:use-module (sonicboom ffi)
@@ -22,7 +23,8 @@
   #:use-module (rnrs bytevectors)
   #:export (load-model free-model!
             make-session free-session!
-            prefill! generate))
+            prefill! tokenize detokenize
+            generate generate-tokens))
 
 ;;; --- helpers ----------------------------------------------------------------
 
@@ -41,6 +43,13 @@
         (bytevector-s32-native-set! bv (* i 4) (car ts))
         (loop (cdr ts) (+ i 1))))
     bv))
+
+;; A native-endian int32 bytevector of N elements → a list of token ids.
+(define (s32-bv->list bv n)
+  (let loop ((i 0) (acc '()))
+    (if (< i n)
+        (loop (+ i 1) (cons (bytevector-s32-native-ref bv (* i 4)) acc))
+        (reverse acc))))
 
 ;; sb_llm_sampling as a native-layout bytevector (x86-64; see capi.h):
 ;;   struct_size u64@0, temperature f32@8, top_p f32@12, top_k u32@16,
@@ -84,6 +93,50 @@
 (define (free-session! session)
   ((proc 'sb_llm_session_free) session))
 
+;;; --- tokenize / detokenize --------------------------------------------------
+
+(define (tokenize model text)
+  "Encode TEXT (a UTF-8 string) into a list of token ids (<bos> prepended,
+  matching llama-tokenize)."
+  (let* ((bv (string->utf8 text))
+         (len (bytevector-length bv))
+         (n-slot (make-bytevector 8 0))          ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *n_out, returns SB_ERR_BINDING.
+    (let ((st ((proc 'sb_llm_tokenize) model (bytevector->pointer bv) len
+               %null-pointer 0 (bytevector->pointer n-slot) (slot-ptr err-slot))))
+      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+        (sb-check! st err-slot "tokenize")))
+    (let* ((n (bytevector-u64-native-ref n-slot 0))
+           (out (make-bytevector (* n 4) 0))
+           (st ((proc 'sb_llm_tokenize) model (bytevector->pointer bv) len
+                 (bytevector->pointer out) n (bytevector->pointer n-slot)
+                 (slot-ptr err-slot))))
+      (sb-check! st err-slot "tokenize")
+      (s32-bv->list out n))))
+
+(define (detokenize model tokens)
+  "Decode TOKENS (a list of token ids) back to a UTF-8 string."
+  (let* ((n (length tokens))
+         (in (tokens->bv tokens))
+         (len-slot (make-bytevector 8 0))        ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *len_out (the text length, no NUL).
+    (let ((st ((proc 'sb_llm_detokenize) model (bytevector->pointer in) n
+               %null-pointer 0 (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+        (sb-check! st err-slot "detokenize")))
+    (let* ((m (bytevector-u64-native-ref len-slot 0))
+           (out (make-bytevector (+ m 1) 0))     ; +1 for the NUL terminator
+           (st ((proc 'sb_llm_detokenize) model (bytevector->pointer in) n
+                 (bytevector->pointer out) (+ m 1) (bytevector->pointer len-slot)
+                 (slot-ptr err-slot))))
+      (sb-check! st err-slot "detokenize")
+      ;; Decode exactly the m text bytes the C ABI wrote (it also NUL-terminated
+      ;; out[m], which is why cap is m+1); pointer->string reads the length we
+      ;; give it rather than scanning for the NUL.
+      (pointer->string (bytevector->pointer out) m "UTF-8"))))
+
 ;;; --- prefill / generate -----------------------------------------------------
 
 (define (prefill! session tokens)
@@ -98,7 +151,7 @@ tokens reused from the previous prompt (informational)."
     (sb-check! st err-slot "prefill")
     (bytevector-u64-native-ref reused-slot 0)))
 
-(define (generate session prompt max-tokens)
+(define (generate-tokens session prompt max-tokens)
   "Prefill PROMPT (a list of token ids) and greedily decode up to MAX-TOKENS
 tokens. Returns the list of produced token ids."
   (prefill! session prompt)
@@ -115,3 +168,9 @@ tokens. Returns the list of produced token ids."
               (slot-ptr err-slot))))
     (sb-check! st err-slot "decode")
     (reverse tokens)))
+
+(define (generate model session prompt max-tokens)
+  "Tokenize PROMPT (a UTF-8 string), prefill, greedily decode up to MAX-TOKENS
+tokens, and detokenize. Returns the generated text."
+  (detokenize model
+              (generate-tokens session (tokenize model prompt) max-tokens)))

@@ -52,6 +52,16 @@ core/src/quant/ggml_derived/vec_dot_qK_q8K.h
       - dot_q4_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q4_K_q8_K_generic)
       - dot_q5_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q5_K_q8_K_generic)
 
+core/src/vocab/ggml_derived/bpe_tokenizer.h
+    Gemma-4 SPM-style BPE tokenize + detokenize. Ported from:
+      - llm_tokenizer_bpe_session (symbol-chain BPE merge, <0xNN> byte fallback,
+        ▁-space escape/unescape, gemma-4 newline special case)  ← llama.cpp/src/llama-vocab.cpp
+      - apply_token_type_overrides (EOG -> control, gemma-4 </s> reset)
+                                                                 ← llama.cpp/src/llama-vocab.cpp
+      - detokenize (remove_special, token_to_piece, clean_spaces)
+                                                                 ← llama.cpp/src/llama-vocab.cpp
+      - unicode_len_utf8, newline-run regex split               ← llama.cpp/src/unicode.cpp
+
 tests/core/ggml_baseline.h
     Verbatim transcription of ggml dequantize_row_q3/q4/q5_K + get_scale_min_k4.
     (Already carries its own attribution header.)

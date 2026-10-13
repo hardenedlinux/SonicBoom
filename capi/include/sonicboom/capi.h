@@ -246,8 +246,8 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
  *    and decodes directly, a longer prompt prefills then decodes;
  *  - sampling is greedy-only (temperature 0); non-greedy returns
  *    SB_ERR_UNSUPPORTED;
- *  - tokenize/detokenize are raw-token-ID passthrough (the core has no
- *    BPE/SentencePiece tokenizer yet);
+ *  - tokenize/detokenize use the GGUF built-in vocabulary (SPM-style BPE for
+ *    Gemma 4, ▁-space escape, <0xNN> byte fallback), matching llama-tokenize;
  *  - only Gemma 4 models load; a Qwen2 GGUF returns SB_ERR_UNSUPPORTED.
  * These gaps are recorded in the post-v1 list (design/benchmark.md). */
 
@@ -278,11 +278,12 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
                             sb_error **err_out);
 void sb_llm_model_free(sb_llm_model *model);
 
-/* Tokenize/detokenize as raw token IDs (no BPE/SentencePiece tokenizer in the
- * core). tokenize parses a space/comma-separated list of decimal ids in `text`;
- * detokenize renders `tokens` as space-separated decimals (NUL-terminated). Both
- * use two-call sizing: pass `out` NULL or `cap` too small to get the needed
- * count in *n_out / *len_out (and SB_ERR_BINDING). */
+/* Tokenize/detokenize with the model's GGUF built-in vocabulary (SPM-style BPE
+ * for Gemma 4). tokenize encodes `text` (UTF-8, `len` bytes) into token ids
+ * with <bos> prepended (llama-tokenize add_special); detokenize renders `tokens`
+ * back to UTF-8 (NUL-terminated), stripping control tokens and undoing ▁/byte
+ * escapes. Both use two-call sizing: pass `out` NULL or `cap` too small to get
+ * the needed count in *n_out / *len_out (and SB_ERR_BINDING). */
 sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
                           sb_token *out, size_t cap, size_t *n_out, sb_error **err_out);
 sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,

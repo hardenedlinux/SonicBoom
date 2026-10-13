@@ -1,11 +1,18 @@
-;;; SonicBoom — Guile inference binding golden-token test
+;;; SonicBoom — Guile inference binding test
 ;;;
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; Loads the Gemma 4 GGUF through (sonicboom inference), seeds token 2, and
-;;; greedily decodes 4 tokens, asserting they match the C++ spine golden decode
-;;; stream {236761 107 236769 236776} (the same tokens test_generate checks).
+;;; Loads the Gemma 4 GGUF through (sonicboom inference) and checks three
+;;; things:
+;;;
+;;;   1. generate-tokens (the token-ID entry point) seeds token 2 and greedily
+;;;      decodes 4 tokens, matching the C++ spine golden decode stream
+;;;      {236761 107 236769 236776} (the same tokens test_generate checks).
+;;;   2. generate (string -> string) tokenizes, decodes, and detokenizes back to
+;;;      a non-empty string.
+;;;   3. tokenize / detokenize round-trip through the two-call C ABI sizing path.
+;;;
 ;;; Skips cleanly when the GGUF is absent, so the suite is green on machines
 ;;; without the model.
 
@@ -30,14 +37,24 @@
 
 (let ((path (find-model)))
   (if (not path)
-      (test-skip 1)
-      (test-equal "generate reproduces the golden decode stream"
-        '(236761 107 236769 236776)
-        (let* ((model (load-model path))
-               (sess  (make-session model 512))
-               (out   (generate sess '(2) 4)))
-          (free-session! sess)
-          (free-model! model)
-          out))))
+      (test-skip 3)
+      (let* ((model (load-model path))
+             (sess1 (make-session model 512)))
+        (test-equal "generate-tokens reproduces the golden decode stream"
+          '(236761 107 236769 236776)
+          (generate-tokens sess1 '(2) 4))
+        (free-session! sess1)
+
+        (let ((sess2 (make-session model 512)))
+          (test-assert "generate (string -> string) returns text"
+            (let ((s (generate model sess2 "Hello" 4)))
+              (and (string? s) (> (string-length s) 0))))
+          (free-session! sess2))
+
+        (test-equal "tokenize / detokenize round-trip"
+          "Hello, world!"
+          (detokenize model (tokenize model "Hello, world!")))
+
+        (free-model! model))))
 
 (test-end "sonicboom-inference")

@@ -20,6 +20,7 @@
             run-s-expr
             sb-status-ok?
             sb-status->message
+            SB_ERR_BINDING
             ;; low-level FFI plumbing exposed for the training module
             proc make-slot slot-ptr slot-ref capture-error))
 

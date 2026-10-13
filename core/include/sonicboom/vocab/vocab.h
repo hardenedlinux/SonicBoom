@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#pragma once
+
+// GGUF vocabulary (tokenizer) for the LLM inference surface.
+//
+// `Vocab` is the Layer 2 tokenizer representation: a token -> piece table, the
+// BPE merge ranks, and the tokenizer flags needed to reproduce llama.cpp's
+// tokenize/detokenize for a Gemma-4 (SPM-style BPE) model. It owns no weights,
+// no device state, and exposes no native-torch / ATen / c10 types.
+//
+// The BPE/detokenize *algorithms* live in core/src/vocab/ggml_derived/ (MIT,
+// derived from ggml); this header and core/src/vocab/vocab.cpp only carry the
+// SonicBoom-owned data layout and the GGUF loading glue.
+
+#include <cstdint>
+#include <expected>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace sonicboom::gguf {
+class Reader;
+}
+
+namespace sonicboom::vocab {
+
+// Token type ids, matching GGUF tokenizer.ggml.token_type and llama.cpp's
+// LLAMA_TOKEN_TYPE values. `type` in a loaded Vocab is the *effective* type:
+// llama.cpp post-processing promotes a handful of control-looking tokens (e.g.
+// "<eos>", "<|tool_response>") to control so they are stripped on detokenize.
+enum class TokenType : uint8_t {
+  Normal = 1,
+  Unknown = 2,
+  Control = 3,
+  UserDefined = 4,
+  Unused = 5,
+  Byte = 6,
+};
+
+struct Vocab {
+  std::vector<std::string> tokens;  // id -> piece text (▁-escaped)
+  std::vector<TokenType> type;      // id -> effective type
+
+  std::unordered_map<std::string, int32_t> token_to_id;
+
+  // BPE merge ranks: (left, right) -> rank (lower merges first). The pair hash
+  // mirrors llama.cpp's pair_hash.
+  struct PairHash {
+    size_t operator()(const std::pair<std::string, std::string>& p) const noexcept {
+      return std::hash<std::string>{}(p.first) ^
+             (std::hash<std::string>{}(p.second) << 1);
+    }
+  };
+  std::unordered_map<std::pair<std::string, std::string>, int32_t, PairHash>
+      bpe_ranks;
+
+  int32_t bos = -1;
+  int32_t eos = -1;
+  int32_t unk = -1;
+
+  bool add_bos = false;
+  bool add_eos = false;
+  bool add_space_prefix = false;
+  bool clean_spaces = true;
+  bool escape_whitespaces = true;
+
+  bool empty() const noexcept { return tokens.empty(); }
+};
+
+// Load the tokenizer from a GGUF reader. Returns an error string when the
+// file has no tokenizer (or a malformed one). Gemma-4 force-enables add_bos
+// like llama.cpp (its prompt always starts with <bos>).
+std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader);
+
+// tokenize: text -> token ids. When add_bos is set the <bos> token is prepended
+// (matching llama-tokenize's default), so a Gemma prompt round-trips through
+// detokenize().
+std::vector<int32_t> tokenize(const Vocab& v, std::string_view text);
+
+// detokenize: token ids -> text. Strips control/unknown tokens (including
+// <bos>), unescapes ▁ to space, expands <0xNN> byte tokens, and applies the
+// clean-up-tokenization-spaces pass. detokenize(tokenize(x)) == x for normal
+// text.
+std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n);
+
+}  // namespace sonicboom::vocab

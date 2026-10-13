@@ -55,6 +55,12 @@ file(GLOB_RECURSE SONICBOOM_AUTOGRAD_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_GGUF_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf/*.cpp)
 
+# Tokenizer vocabulary (core/src/vocab/). Layer 2 data layout + GGUF loading
+# glue; the BPE/detokenize algorithms are header-only, MIT-derived from ggml
+# (core/src/vocab/ggml_derived/bpe_tokenizer.h). No ggml runtime dependency.
+file(GLOB_RECURSE SONICBOOM_VOCAB_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/vocab/*.cpp)
+
 # Quantized weight representation + reference dequantization (core/src/quant/).
 # Backend-neutral storage semantics and the Q3_K/Q4_K/Q5_K scalar reference
 # kernels. No ggml, llama.cpp, MLIR, or device backend; pure C++23.
@@ -95,6 +101,7 @@ add_library(sonicboom SHARED
   ${SONICBOOM_PLANNER_SOURCES}
   ${SONICBOOM_AUTOGRAD_SOURCES}
   ${SONICBOOM_GGUF_SOURCES}
+  ${SONICBOOM_VOCAB_SOURCES}
   ${SONICBOOM_QUANT_SOURCES}
   ${SONICBOOM_NN_SOURCES}
   ${SONICBOOM_MODEL_SOURCES}

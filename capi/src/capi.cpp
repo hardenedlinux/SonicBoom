@@ -37,6 +37,7 @@
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
+#include <sonicboom/vocab/vocab.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +84,7 @@ namespace model = sonicboom::model;
 namespace gguf = sonicboom::gguf;
 namespace planner = sonicboom::planner;
 namespace quant = sonicboom::quant;
+namespace vocab = sonicboom::vocab;
 
 // The GGUF reader owns the byte buffer every Gemma4Model weight span borrows
 // from, so the model and its reader travel together in one heap object. Both
@@ -95,6 +97,7 @@ struct sb_llm_bundle {
   explicit sb_llm_bundle(gguf::Reader&& r) : reader(std::move(r)) {}
   gguf::Reader reader;
   model::Gemma4Model model;
+  vocab::Vocab vocab;  // loaded from tokenizer.ggml.* on model load
 };
 
 struct sb_llm_model {
@@ -693,6 +696,13 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
         }
         bundle->model = std::move(*m);
 
+        auto v = vocab::load_vocab(bundle->reader);
+        if (!v) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, v.error().c_str());
+          return SB_ERR_WEIGHT;
+        }
+        bundle->vocab = std::move(*v);
+
         auto *h = new (std::nothrow) sb_llm_model();
         if (!h) {
           set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
@@ -707,34 +717,6 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
 
 void sb_llm_model_free(sb_llm_model *model) { delete model; }
 
-namespace {
-
-// Parse a space/tab/newline/comma-separated list of decimal token ids. Returns
-// false (and sets *err on a non-numeric token) on failure.
-bool parse_token_ids(const char *text, size_t len, std::vector<sb_token> &out,
-                     const char **err) {
-  const char *p = text;
-  const char *end = text + len;
-  while (p < end) {
-    while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' ||
-                       *p == ','))
-      ++p;
-    if (p >= end)
-      break;
-    char *np = nullptr;
-    long long v = std::strtoll(p, &np, 10);
-    if (np == p) {
-      *err = "tokenize: non-numeric token";
-      return false;
-    }
-    out.push_back(static_cast<sb_token>(v));
-    p = np;
-  }
-  return true;
-}
-
-} // namespace
-
 sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
                           sb_token *out, size_t cap, size_t *n_out,
                           sb_error **err_out) {
@@ -743,12 +725,8 @@ sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t le
         if (!model || !text || !n_out)
           return fail_arg(err_out);
 
-        std::vector<sb_token> toks;
-        const char *perr = nullptr;
-        if (!parse_token_ids(text, len, toks, &perr)) {
-          set_error(err_out, SB_ERRKIND_PARSE_SYNTAX, perr);
-          return SB_ERR_PARSE;
-        }
+        const std::vector<int32_t> toks =
+            vocab::tokenize(model->bundle->vocab, std::string_view(text, len));
 
         *n_out = toks.size();
         if (cap < toks.size())
@@ -770,12 +748,7 @@ sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
         if (n > 0 && !tokens)
           return fail_arg(err_out);
 
-        std::string s;
-        for (size_t i = 0; i < n; ++i) {
-          if (i)
-            s += ' ';
-          s += std::to_string(static_cast<int64_t>(tokens[i]));
-        }
+        const std::string s = vocab::detokenize(model->bundle->vocab, tokens, n);
 
         // cap must hold the text plus a NUL terminator.
         *len_out = s.size();
