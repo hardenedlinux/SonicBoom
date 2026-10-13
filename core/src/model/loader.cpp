@@ -16,7 +16,12 @@
 
 #include <sonicboom/model/loader.h>
 
+#include "../quant/foreign_dequant.h"
+#include "../quant/ggml_derived/quantize_q5_k.h"
+
 #include <cstdint>
+#include <cstdio>
+#include <map>
 #include <string>
 #include <string_view>
 
@@ -31,6 +36,18 @@ constexpr uint32_t kBF16 = 30;
 constexpr uint32_t kQ3K = 11;
 constexpr uint32_t kQ4K = 12;
 constexpr uint32_t kQ5K = 13;
+constexpr uint32_t kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8, kF16 = 1, kQ6K = 14;
+
+std::string dims_string(const std::vector<uint64_t>& dims) {
+  std::string out = "[";
+  for (size_t i=0;i<dims.size();++i) { if(i) out += ", "; out += std::to_string(dims[i]); }
+  return out + "]";
+}
+
+const char* foreign_type_name(uint32_t id) {
+  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; case kQ5_0:return "q5_0"; case kQ8_0:return "q8_0"; case kQ6K:return "q6_K"; }
+  return "unknown";
+}
 
 // Metadata readers: every value is widened losslessly by the reader's Value.
 std::optional<uint64_t> read_u64(const gguf::Reader& r, std::string_view key) {
@@ -96,7 +113,9 @@ bool dims_match(const std::vector<uint64_t>& got,
 std::optional<quant::QuantizedTensor> bind_quant(
     const gguf::Reader& r, std::string_view name,
     std::initializer_list<uint32_t> expect_types,
-    std::initializer_list<uint64_t> dims, std::string& errs) {
+    std::initializer_list<uint64_t> dims, std::string& errs,
+    std::vector<std::vector<uint8_t>>& owned,
+    std::map<uint32_t,uint64_t>& converted) {
   const gguf::TensorInfo* t = r.tensor(name);
   if (!t) {
     errs += "missing tensor: ";
@@ -107,9 +126,16 @@ std::optional<quant::QuantizedTensor> bind_quant(
   bool type_ok = false;
   for (uint32_t et : expect_types)
     if (t->type == et) type_ok = true;
-  if (!type_ok || !dims_match(t->dims, dims)) {
+  const bool shape_ok = dims_match(t->dims, dims);
+  const bool native_quant_ok = quant::quant_type_from_ggml(t->type).has_value();
+  const bool foreign_ok = !quant::quant_type_from_ggml(t->type) &&
+      (t->type == kF16 || t->type == kQ4_0 || t->type == kQ5_0 ||
+       t->type == kQ8_0 || t->type == kQ6K) &&
+      !t->dims.empty() && t->dims[0] % 256 == 0;
+  if ((!type_ok && !native_quant_ok && !foreign_ok) || !shape_ok) {
     errs += "tensor type/shape mismatch: ";
-    errs += name;
+    errs += name; errs += " (ggml type "; errs += std::to_string(t->type);
+    errs += ", dims "; errs += dims_string(t->dims); errs += ")";
     errs += "\n";
     return std::nullopt;
   }
@@ -121,9 +147,26 @@ std::optional<quant::QuantizedTensor> bind_quant(
     return std::nullopt;
   }
   auto qt = quant::quantized_tensor_from_gguf(t->type, t->dims, *data);
+  if (!qt && foreign_ok) {
+    auto f32 = quant::dequant_foreign_to_f32(t->type,
+        reinterpret_cast<const uint8_t*>(data->data()), t->n_elements);
+    if (!f32) {
+      errs += "cannot convert tensor "; errs += name; errs += " (ggml type ";
+      errs += std::to_string(t->type); errs += ", dims "; errs += dims_string(t->dims);
+      errs += "): "; errs += f32.error(); errs += "\n";
+      return std::nullopt;
+    }
+    auto bytes = quant::quantize_f32_to_q5_k(f32->data(), f32->size());
+    owned.push_back(std::move(bytes));
+    auto& buffer = owned.back();
+    qt.emplace(quant::QuantType::Q5_K, t->dims,
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(buffer.data()), buffer.size()));
+    ++converted[t->type];
+  }
   if (!qt || !qt->valid()) {
     errs += "quantized tensor invalid: ";
-    errs += name;
+    errs += name; errs += " (ggml type "; errs += std::to_string(t->type);
+    errs += ", dims "; errs += dims_string(t->dims); errs += ")";
     errs += "\n";
     return std::nullopt;
   }
@@ -380,10 +423,11 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   // vocab_size was set by load_gemma4_config (token_embd dims[1]); the weight
   // binders below re-validate that same tensor's type/shape against the config.
   std::string errs;
-  if (auto q = bind_quant(r, "token_embd.weight", {kQ3K}, {d, c.vocab_size}, errs))
+  std::map<uint32_t,uint64_t> converted;
+  if (auto q = bind_quant(r, "token_embd.weight", {kQ3K}, {d, c.vocab_size}, errs, m.owned_quant_buffers, converted))
     w.token_embd = *q;
   if (auto q = bind_quant(r, "per_layer_token_embd.weight", {kQ4K},
-                          {per_layer_dim, c.vocab_size}, errs))
+                          {per_layer_dim, c.vocab_size}, errs, m.owned_quant_buffers, converted))
     w.per_layer_token_embd = *q;
   if (auto s = bind_f32(r, "per_layer_proj_norm.weight", c.per_layer_input, errs))
     w.per_layer_proj_norm = *s;
@@ -421,21 +465,21 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
       bw.post_ffw_norm = *s;
     if (auto s = bind_f32(r, p + "post_norm.weight", d, errs))
       bw.post_norm = *s;
-    if (auto q = bind_quant(r, p + "attn_q.weight", {kQ3K}, {d, q_width}, errs))
+    if (auto q = bind_quant(r, p + "attn_q.weight", {kQ3K}, {d, q_width}, errs, m.owned_quant_buffers, converted))
       bw.attn_q = *q;
-    if (auto q = bind_quant(r, p + "attn_k.weight", {kQ3K}, {d, kv_width}, errs))
+    if (auto q = bind_quant(r, p + "attn_k.weight", {kQ3K}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
       bw.attn_k = *q;
     // attn_v / ffn_down are mixed-precision (Unsloth Q3_K_M): q5_K in the first
     // two blocks, q4_K elsewhere — both are supported, so accept either.
-    if (auto q = bind_quant(r, p + "attn_v.weight", {kQ5K, kQ4K}, {d, kv_width}, errs))
+    if (auto q = bind_quant(r, p + "attn_v.weight", {kQ5K, kQ4K}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
       bw.attn_v = *q;
-    if (auto q = bind_quant(r, p + "attn_output.weight", {kQ4K}, {q_width, d}, errs))
+    if (auto q = bind_quant(r, p + "attn_output.weight", {kQ4K}, {q_width, d}, errs, m.owned_quant_buffers, converted))
       bw.attn_output = *q;
-    if (auto q = bind_quant(r, p + "ffn_gate.weight", {kQ3K}, {d, ff}, errs))
+    if (auto q = bind_quant(r, p + "ffn_gate.weight", {kQ3K}, {d, ff}, errs, m.owned_quant_buffers, converted))
       bw.ffn_gate = *q;
-    if (auto q = bind_quant(r, p + "ffn_up.weight", {kQ3K}, {d, ff}, errs))
+    if (auto q = bind_quant(r, p + "ffn_up.weight", {kQ3K}, {d, ff}, errs, m.owned_quant_buffers, converted))
       bw.ffn_up = *q;
-    if (auto q = bind_quant(r, p + "ffn_down.weight", {kQ5K, kQ4K}, {ff, d}, errs))
+    if (auto q = bind_quant(r, p + "ffn_down.weight", {kQ5K, kQ4K}, {ff, d}, errs, m.owned_quant_buffers, converted))
       bw.ffn_down = *q;
     // Per-layer embedding gating (f32): inp_gate [d, per], proj [per, d]. Bound
     // and shape-validated; the gating arithmetic is unresolved (not consumed).
@@ -450,6 +494,18 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   }
 
   if (!errs.empty()) return std::unexpected(std::move(errs));
+
+  if (!converted.empty()) {
+    uint64_t total=0; for (const auto& [id,count] : converted) total+=count;
+    std::fprintf(stderr,"sonicboom: converted %llu tensors to Q5_K at load time (types: ",
+                 static_cast<unsigned long long>(total));
+    bool first=true;
+    for (const auto& [id,count] : converted) {
+      std::fprintf(stderr,"%s%s x%llu",first?"":", ",foreign_type_name(id),
+                   static_cast<unsigned long long>(count)); first=false;
+    }
+    std::fprintf(stderr,"); native kernels pending\n");
+  }
 
   // --- execution plan ------------------------------------------------------
   m.plan.clear();

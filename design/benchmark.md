@@ -445,3 +445,31 @@ $LLAMA_ROOT/build-cuda/bin/llama-bench \
 # full correctness suite
 ctest --test-dir build
 ```
+
+## GGUF load-time quant fallback validation (2026-10-14)
+
+The user-provided `models/gemma-4-E4B-it-Q4_K_M.gguf` is the Unsloth Q4_K_M
+quantization. Its SHA-256, supplied by the user and verified locally, is
+`85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87`. The
+GGUF is local validation data and is not part of the repository.
+
+Loading converts 42 `q6_K` tensors to Q5_K:
+
+```text
+sonicboom: converted 42 tensors to Q5_K at load time (types: q6_K x42); native kernels pending
+```
+
+On the RTX 3050, `test_generate` completed its 64-token CUDA run at **51.526
+tok/s**. The standalone load-plus-generation measurement was **34.631 s** for
+Reader, model weights, vocabulary, and setup, followed by **51.501 tok/s** for
+tg64. Generated text was coherent; the prompt requested the derivative of
+`f(x) = x^2`, and the output gave a solution using the power rule. The CUDA
+prefill benchmark (`--prompt 512 --reps 3`) reported **446.850 ms** for 512
+tokens, **1145.8 tok/s wall**, and **1670.8 tok/s marginal** (best of 3).
+
+The Q3_K_M unchanged-path golden token sequence remained
+`236761 107 236769 236776`. After the final loader adjustment allowing
+already-supported Q3_K/Q4_K/Q5_K blocks in a Q4_K_M file, the rebuilt
+`test_generate` passed its 64-token run and the full CTest run passed **53/53**
+tests. `test_prefix_cache` passed all 11 cases, and
+`test_cuda_elementwise` passed its batch invariance checks.

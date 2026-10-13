@@ -17,6 +17,7 @@
 #pragma once
 
 #include <expected>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,8 @@ struct Gemma4Model {
   Gemma4Config config;
   Gemma4Weights weights;
   std::vector<LayerConfig> plan;  // one per block, index == layer
+  // Owns converted Q5_K bytes referenced by weight QuantizedTensors.
+  std::vector<std::vector<uint8_t>> owned_quant_buffers;
 };
 
 // Load and validate `r` as a Gemma 4 E4B model. Returns an error string when
