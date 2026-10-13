@@ -743,6 +743,121 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
 // CPU SonicBackend. Greedy argmax is identical to generate_spine.
 // ---------------------------------------------------------------------------
 #ifdef SONICBOOM_USE_CUDA
+
+// ---------------------------------------------------------------------------
+// Persistent CUDA spine decode runtime (Section C.2). The greedy decode
+// graph/plan/backends and the captured decode-step program persist across
+// generate/prefill calls so a later call only stages device-resident params
+// (pos / token / start_pos) and replays — no plan rebuild or re-capture per
+// call. Keyed by (model, n_ctx); the model must outlive the cache (the
+// backends hold a raw model pointer). Prefill segments stay per-call: their
+// capture is ~0.8% neutral (see "prefill-cuda-graph-neutral") but a captured
+// 512-token segment graph costs ~190 MiB that is never freed when cached, and
+// keying by (n_ctx, n) would exhaust the device across prefix_cache's 11
+// distinct n_ctx values. The decode cache self-corrects across reuse (each
+// step overwrites the slot the next step reads), so caching it is safe.
+// ---------------------------------------------------------------------------
+struct DecodeRuntime {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  planner::ResourceSnapshot snap;
+  std::unique_ptr<planner::SonicBackend> cpu;         // host boundary tasks
+  std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+  std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+};
+
+static std::map<std::pair<const Gemma4Model*, uint64_t>,
+                std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
+
+static bool cuda_graphs_enabled() {
+  const char* e = std::getenv("SONICBOOM_CUDA_GRAPHS");
+  return e == nullptr || std::string_view(e) != "0";
+}
+
+// Route host-memory-space compute tasks (Embedding / Softcap) to the CPU backend
+// and leave device-memory-space tasks on the CUDA backend. Shared by the decode
+// and prefill runtimes so each executor gets the same placement overrides.
+static void route_host_tasks(planner::RuntimeExecutor& exec,
+                             const planner::ExecutionPlan& plan,
+                             planner::SonicBackend& cpu) {
+  for (const auto& task : plan.tasks) {
+    if (task.kind != planner::TaskKind::Compute)
+      continue;
+    const planner::MemorySpace* ms = nullptr;
+    if (task.memory_space)
+      ms = plan.find_memory_space(*task.memory_space);
+    if (!ms || ms->kind == planner::MemoryKind::Host)
+      exec.set_task_backend(task.id, &cpu);
+  }
+}
+
+// Build (or fetch) the cached greedy decode runtime for (m, n_ctx). The first
+// call builds the graph + quantize passes + plan + backends and captures one
+// decode step (HAL record_step); later calls return the same runtime. The
+// capture reads token/pos from the device slots, so it is replay-agnostic to the
+// real start token/position (the caller re-seeds/re-stages before each replay).
+// Returns nullptr on a build/plan failure (the caller falls back to 0).
+static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
+  auto key = std::make_pair(&m, n_ctx);
+  auto it = g_decode_runtimes.find(key);
+  if (it != g_decode_runtimes.end())
+    return it->second.get();
+
+  auto rt = std::make_unique<DecodeRuntime>();
+  rt->graph = build_gemma4_graph(m, /*greedy=*/true);
+  if (quant::cuda::q8_1_enabled()) {
+    planner::quantize_once_pass(rt->graph);
+    planner::fuse_rms_norm_quantize_pass(rt->graph);
+    planner::fuse_gelu_mul_quantize_pass(rt->graph);
+  }
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap)
+    return nullptr;
+  rt->snap = std::move(*snap);
+  {
+    planner::AnalyticalCpuCostModel cost(rt->snap);
+    auto plan = planner::plan_execution(rt->graph, rt->snap, cost);
+    if (!plan)
+      return nullptr;
+    rt->plan = std::move(*plan);
+  }
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx);
+  rt->cuda->bind_model(m);
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+
+  // Capture the greedy decode step once (the warm-up run allocates every pooled
+  // device buffer and weight-upload so the capture pass only records).
+  if (cuda_graphs_enabled()) {
+    rt->cuda->seed_token(0);
+    rt->cuda->set_pos(0);
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_i64(0));
+    in.push_back(encode_i64(0));
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (res) {
+      rt->cuda->synchronize();
+      rt->cuda->seed_token(0);
+      rt->prog = rt->cuda->record_step([&]() {
+        std::vector<sx::Bytes> cin;
+        cin.push_back(encode_i64(0));
+        cin.push_back(encode_i64(0));
+        auto cres = rt->exec->execute(rt->plan, rt->snap, cin);
+        return cres.has_value();
+      });
+    }
+  }
+
+  DecodeRuntime* raw = rt.get();
+  g_decode_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx) {
@@ -751,47 +866,11 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const auto t_plan0 = std::chrono::steady_clock::now();
-  planner::Graph graph = build_gemma4_graph(m, /*greedy=*/true);
-  // T1 quantize-once: extract the activation quantize from each K-quant gemv
-  // into a shared explicit Quantize node (CUDA-only; the CPU reference keeps the
-  // unfused QuantizedMatmul path with its q8_K semantics). Gated on q8_1 so the
-  // SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
-  if (quant::cuda::q8_1_enabled()) {
-    planner::quantize_once_pass(graph);
-    // T3: fold each rms_norm -> quantize pair into one RmsNormQuantize kernel so
-    // the f32 normalized activation is never materialized.
-    planner::fuse_rms_norm_quantize_pass(graph);
-    // T5: fold Quantize(Mul(GeluFp16(gate), up)) into one GeluMulQuantize kernel
-    // so the f32 gelu and fh intermediates are never materialized.
-    planner::fuse_gelu_mul_quantize_pass(graph);
-  }
-
-  auto snap = planner::CpuResourceProvider::snapshot();
-  if (!snap) return 0;
-  planner::AnalyticalCpuCostModel cost(*snap);
-  auto plan = planner::plan_execution(graph, *snap, cost);
-  if (!plan) return 0;
-
-  planner::SonicBackend cpu_backend(m, graph);
-  planner::SonicCudaBackend cuda_backend(kv_cache_spec(m.config), graph, n_ctx);
-  cuda_backend.bind_model(m);
-  planner::RuntimeExecutor exec(
-      std::map<planner::BackendTag, planner::Backend*>{
-          {planner::BackendTag::Sonic, &cuda_backend}});
-
-  // Route host-memory-space compute tasks (Softcap, in sampling mode) to the
-  // CPU SonicBackend; device-memory-space tasks keep the default CUDA backend.
-  // The transfer scheduler has already emitted the H2D/D2H tasks that move their
-  // operands across the boundary.
-  for (const auto& task : plan->tasks) {
-    if (task.kind != planner::TaskKind::Compute)
-      continue;
-    const planner::MemorySpace* ms = nullptr;
-    if (task.memory_space)
-      ms = plan->find_memory_space(*task.memory_space);
-    if (!ms || ms->kind == planner::MemoryKind::Host)
-      exec.set_task_backend(task.id, &cpu_backend);
-  }
+  // C.2: the greedy decode graph/plan/backends and the captured decode step are
+  // cached per (model, n_ctx); the first call builds + captures, later calls
+  // only re-seed/re-stage the device params and replay.
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt) return 0;
 
   const auto t_loop0 = std::chrono::steady_clock::now();
   auto t_first = t_loop0;
@@ -799,65 +878,25 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   uint64_t pos = start_pos;
   uint64_t step = 0;
 
-  // Seed the device-resident token-id slot (Phase 3.2 B4). Argmax overwrites it
-  // in place each step, and the Embedding gather reads it back on the device, so
-  // the token id never round-trips through the host.
-  cuda_backend.seed_token(start_token);
+  // Seed the device-resident token-id slot (Phase 3.2 B4). The cached capture was
+  // warmed with a placeholder token, so every call re-seeds the real start token.
+  rt->cuda->seed_token(start_token);
 
-  // --- CUDA Graph capture (HAL record_step) ----------------------------------
-  // Replace the ~2600 per-step device-op launches (each a host-side launch call)
-  // with a single pre-recorded program (a cudaGraphLaunch inside the CUDA
-  // backend's record_step). Opt-out via SONICBOOM_CUDA_GRAPHS=0; any capture
-  // failure returns nullptr and falls back to the per-step dispatch path below,
-  // so the graph is a pure launch-overhead optimization with no numerics change.
-  // The CUDA stream / graph machinery lives behind SonicCudaBackend::record_step;
-  // this spine never touches it.
-  const bool use_graphs =
-      std::getenv("SONICBOOM_CUDA_GRAPHS") == nullptr ||
-      std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
-  std::unique_ptr<hal::StepProgram> step_prog;
-  if (use_graphs) {
-    // Warm one real step so every device-pool buffer, kernel scratch buffer and
-    // weight upload is allocated before capture (cudaMalloc / synchronous
-    // cudaMemcpy cannot be recorded into a graph). The capture pass only records.
-    {
-      std::vector<sx::Bytes> in;
-      in.push_back(encode_i64(token));
-      in.push_back(encode_i64(pos));
-      cuda_backend.set_pos(pos);
-      auto res = exec.execute(*plan, *snap, in);
-      if (res) {
-        cuda_backend.synchronize();
-        // The warm step's Argmax overwrote the token slot; reset it so the first
-        // replay gathers the same start token the warm step did (the warm K/V
-        // append at this position is overwritten by the first replay's append).
-        cuda_backend.seed_token(start_token);
-        step_prog = cuda_backend.record_step([&]() {
-          std::vector<sx::Bytes> cin;
-          cin.push_back(encode_i64(token));
-          cin.push_back(encode_i64(pos));
-          auto cres = exec.execute(*plan, *snap, cin);
-          return cres.has_value();
-        });
-      }
-    }
-  }
-
-  if (step_prog) {
-    // Replay the captured step: stage the position, launch the graph, read the
-    // winning token back from the persistent device slot. The synchronous D2H
+  if (rt->prog) {
+    // Replay the cached captured step: stage the position, launch the graph, read
+    // the winning token back from the persistent device slot. The synchronous D2H
     // read also drains the graph stream before the next step.
     for (; step < tokens.size(); ++step) {
       const std::string step_name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
-      cuda_backend.set_pos(pos);
-      if (!step_prog->replay()) {
+      rt->cuda->set_pos(pos);
+      if (!rt->prog->replay()) {
         if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[spine] step " << step << " graph replay failed\n";
         break;
       }
       float next_f = -1.0f;
-      cuda_backend.read_token(&next_f);
+      rt->cuda->read_token(&next_f);
       if (nvtx_enabled()) nvtxRangePop();
       const int64_t next = int64_t(next_f);
       if (next < 0) break;
@@ -867,7 +906,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       if (step == 0) t_first = std::chrono::steady_clock::now();
     }
   } else {
-    // Fallback: per-step executor dispatch (the pre-graph decode path).
+    // Fallback: per-step executor dispatch (capture disabled or failed).
     for (; step < tokens.size(); ++step) {
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(token));
@@ -875,13 +914,13 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
 
       // Stage the position into the device slot read by RoPE / KV-append /
       // attention (Phase 3.2 B4 / CUDA Graphs): the kernels read it in-kernel.
-      cuda_backend.set_pos(pos);
+      rt->cuda->set_pos(pos);
 
       // NVTX step marker: brackets one decode step so nsys can isolate the
       // steady-state per-token window (instead of dividing whole-run totals).
       const std::string step_name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
-      auto res = exec.execute(*plan, *snap, in);
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
       if (nvtx_enabled()) nvtxRangePop();
       if (!res || res->outputs.empty()) {
         if (!res)
@@ -1008,66 +1047,59 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       }
     }
   };
-  // Non-greedy (Softcap output) when dumping logits: argmax(softcapped) ==
-  // argmax(raw), so the token stream is unchanged while the per-step logits
-  // become reachable for the isolation measurement.
-  planner::Graph graph;
-  {
+  // Decode runtime. The normal path reuses the cached greedy runtime (and its
+  // captured decode step) keyed by (model, n_ctx); the logit-dump path builds a
+  // non-greedy throwaway runtime because it must reach the full softcapped logits
+  // on the host (argmax(softcapped) == argmax(raw), so only measurement differs).
+  DecodeRuntime* rt = nullptr;
+  std::unique_ptr<DecodeRuntime> dump_rt;
+  if (!dump_logits) {
+    Phase _p("prefill:get_decode_runtime", phase_timing);
+    rt = get_decode_runtime(m, n_ctx);
+    if (!rt) return 0;
+  } else {
     Phase _p("prefill:build_decode_graph", phase_timing);
-    graph = build_gemma4_graph(m, /*greedy=*/!dump_logits);
-    // T1 quantize-once (CUDA decode): shared explicit Quantize nodes for the
-    // K-quant gemvs, CSE-merged per activation (see generate_spine_cuda). Gated on
-    // q8_1 so the SONICBOOM_GEMV_F32 fp32 fallback stays reachable.
+    dump_rt = std::make_unique<DecodeRuntime>();
+    dump_rt->graph = build_gemma4_graph(m, /*greedy=*/false);
     if (quant::cuda::q8_1_enabled()) {
-      planner::quantize_once_pass(graph);
-      planner::fuse_rms_norm_quantize_pass(graph);
-      planner::fuse_gelu_mul_quantize_pass(graph);
+      planner::quantize_once_pass(dump_rt->graph);
+      planner::fuse_rms_norm_quantize_pass(dump_rt->graph);
+      planner::fuse_gelu_mul_quantize_pass(dump_rt->graph);
     }
+    auto s = planner::CpuResourceProvider::snapshot();
+    if (!s) return 0;
+    dump_rt->snap = std::move(*s);
+    {
+      Phase _pp("prefill:plan_execution", phase_timing);
+      planner::AnalyticalCpuCostModel cost(dump_rt->snap);
+      auto p = planner::plan_execution(dump_rt->graph, dump_rt->snap, cost);
+      if (!p) return 0;
+      dump_rt->plan = std::move(*p);
+    }
+    dump_rt->cpu = std::make_unique<planner::SonicBackend>(m, dump_rt->graph);
+    dump_rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), dump_rt->graph, n_ctx);
+    dump_rt->cuda->bind_model(m);
+    dump_rt->exec = std::make_unique<planner::RuntimeExecutor>(
+        std::map<planner::BackendTag, planner::Backend*>{
+            {planner::BackendTag::Sonic, dump_rt->cuda.get()}});
+    route_host_tasks(*dump_rt->exec, dump_rt->plan, *dump_rt->cpu);
+    rt = dump_rt.get();
   }
+  const planner::ResourceSnapshot& snap = rt->snap;
+  // Cost model for planning the per-call prefill segment graphs (Section C.2
+  // keeps the decode runtime cached but plans prefill segments fresh each call).
+  planner::AnalyticalCpuCostModel cost(snap);
 
-  auto snap = planner::CpuResourceProvider::snapshot();
-  if (!snap) return 0;
-  planner::AnalyticalCpuCostModel cost(*snap);
-  std::expected<planner::ExecutionPlan, planner::PlannerError> plan;
-  {
-    Phase _p("prefill:plan_execution", phase_timing);
-    plan = planner::plan_execution(graph, *snap, cost);
-  }
-  if (!plan) return 0;
-
-  planner::SonicBackend cpu_backend(m, graph);
-  const auto t_bk = std::chrono::steady_clock::now();
-  if (nvtx_enabled()) nvtxRangePushA("prefill:backend_construct");
-  planner::SonicCudaBackend cuda_backend(kv_cache_spec(m.config), graph, n_ctx);
-  cuda_backend.bind_model(m);
-  if (nvtx_enabled()) nvtxRangePop();
-  if (phase_timing) {
-    using ms = std::chrono::duration<double, std::milli>;
-    std::cerr << "[phase] prefill:backend_construct "
-              << ms(std::chrono::steady_clock::now() - t_bk).count() << " ms\n";
-  }
   // Prefix reuse: adopt the session's persistent cache if it has one, otherwise
   // publish this backend's fresh cache into the session (first call) so it
   // survives this run. The prefill segment backends then share it transitively
-  // via share_caches(cuda_backend).
+  // via share_caches(*rt->cuda).
   if (session) {
     if (session->caches)
-      cuda_backend.share_caches(*session);
+      rt->cuda->share_caches(*session);
     else
-      cuda_backend.publish_cache(*session);
-  }
-  planner::RuntimeExecutor exec(
-      std::map<planner::BackendTag, planner::Backend*>{
-          {planner::BackendTag::Sonic, &cuda_backend}});
-
-  for (const auto& task : plan->tasks) {
-    if (task.kind != planner::TaskKind::Compute)
-      continue;
-    const planner::MemorySpace* ms = nullptr;
-    if (task.memory_space)
-      ms = plan->find_memory_space(*task.memory_space);
-    if (!ms || ms->kind == planner::MemoryKind::Host)
-      exec.set_task_backend(task.id, &cpu_backend);
+      rt->cuda->publish_cache(*session);
   }
 
   const uint64_t vocab = m.config.vocab_size;
@@ -1093,12 +1125,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     const uint64_t chunk = m.config.sliding_window;
     if (chunk == 0) { std::cerr << "[prefill-cuda] sliding_window == 0\n"; return 0; }
 
-    // One prefill runtime per distinct segment size (usually just `chunk`; the
+    // One prefill segment per distinct segment size (usually just `chunk`; the
     // final segment may be shorter). Each is bound to its own graph but shares
     // the decode backend's KV cache, so prior segments' context is visible. The
-    // full-chunk segment is also captured into a CUDA Graph (prog) and replayed
-    // per segment; the final (possibly shorter) segment runs uncaptured so its
-    // hidden column reaches the host through the executor's output path.
+    // full-chunk segment is captured into a CUDA Graph (prog) and replayed per
+    // non-final segment; the final (possibly shorter) segment runs uncaptured so
+    // its hidden column reaches the host through the executor's output path.
     struct PrefillSegment {
       planner::Graph graph;
       planner::ExecutionPlan plan;
@@ -1108,7 +1140,6 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       std::unique_ptr<hal::StepProgram> prog;
     };
     std::map<uint64_t, std::unique_ptr<PrefillSegment>> segments;
-
     auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
       auto it = segments.find(nseg);
       if (it != segments.end())
@@ -1121,7 +1152,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
       {
         Phase _p("prefill:segment_plan", phase_timing);
-        pplan = planner::plan_execution(seg->graph, *snap, cost);
+        pplan = planner::plan_execution(seg->graph, snap, cost);
       }
       if (!pplan) {
         std::cerr << "[prefill-cuda] n=" << nseg << " plan failed\n";
@@ -1132,19 +1163,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       seg->cuda = std::make_unique<planner::SonicCudaBackend>(
           kv_cache_spec(m.config), seg->graph, n_ctx);
       seg->cuda->bind_model(m);
-      seg->cuda->share_caches(cuda_backend);
+      seg->cuda->share_caches(*rt->cuda);
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{
               {planner::BackendTag::Sonic, seg->cuda.get()}});
-      for (const auto& task : seg->plan.tasks) {
-        if (task.kind != planner::TaskKind::Compute)
-          continue;
-        const planner::MemorySpace* ms = nullptr;
-        if (task.memory_space)
-          ms = seg->plan.find_memory_space(*task.memory_space);
-        if (!ms || ms->kind == planner::MemoryKind::Host)
-          seg->exec->set_task_backend(task.id, seg->cpu.get());
-      }
+      route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
       PrefillSegment* raw = seg.get();
       segments.emplace(nseg, std::move(seg));
       return raw;
@@ -1152,24 +1175,18 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
 
     // CUDA Graph capture of the full-chunk segment (HAL record_step), replayed
     // per non-final segment so the ~420 per-segment device-op launches collapse
-    // into one graph launch. The final segment (possibly a shorter tail) runs
-    // uncaptured so its hidden column reaches the host via the executor output.
-    // Opt-out via SONICBOOM_CUDA_GRAPHS=0; a capture failure leaves `prog` null
-    // and falls back to the per-segment dispatch path (pure launch-overhead
-    // optimization, no numerics change).
-    const bool use_graphs =
-        std::getenv("SONICBOOM_CUDA_GRAPHS") == nullptr ||
-        std::string_view(std::getenv("SONICBOOM_CUDA_GRAPHS")) != "0";
-    // Capture only when there is at least one non-final full-chunk segment to
-    // replay (n > chunk); a single segment is always final and runs uncaptured.
-    // The capture's warm-up run executes the full-chunk segment once and its
-    // deferred KvAppendBatched overwrites the shared KV cache. That is safe only
-    // when the cache is empty before the run (start_pos == 0, a fresh full
-    // prefill). For a prefix-reuse suffix (start_pos > 0) the cache already
-    // holds the shared prefix, and the warm-up append would clobber the prefix
-    // positions the suffix's first segment still attends over, corrupting the
-    // reused cache. Reuse therefore runs uncaptured (correctness over the
-    // launch-overhead win, which only matters for long prompts).
+    // into one graph launch. Capture only when there is at least one non-final
+    // full-chunk segment (n > chunk); a single segment is always final and runs
+    // uncaptured. The capture warm-up runs the full-chunk segment once and its
+    // deferred KvAppendBatched overwrites the shared KV cache — safe only when
+    // the cache is empty before the run (start_pos == 0, a fresh full prefill).
+    // A prefix-reuse suffix (start_pos > 0) already holds the shared prefix in
+    // the cache, and the warm-up append would clobber the prefix positions the
+    // suffix's first segment still attends over, so reuse runs uncaptured
+    // (correctness over the launch-overhead win, which only matters for long
+    // prompts). Opt-out via SONICBOOM_CUDA_GRAPHS=0; a capture failure leaves
+    // `prog` null and falls back to per-segment dispatch.
+    const bool use_graphs = cuda_graphs_enabled();
     if (use_graphs && n > chunk && start_pos == 0) {
       Phase _cap("prefill:capture_graph", phase_timing);
       PrefillSegment* full = segment_for(chunk);
@@ -1183,7 +1200,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         std::expected<planner::ExecutionResult, planner::RuntimeError> res;
         {
           Phase _w("prefill:capture_warmup", phase_timing);
-          res = full->exec->execute(full->plan, *snap, in);
+          res = full->exec->execute(full->plan, snap, in);
         }
         if (res) {
           full->cuda->synchronize();
@@ -1193,7 +1210,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
               std::vector<sx::Bytes> cin;
               cin.push_back(encode_tokens(first_chunk));
               cin.push_back(encode_i64(start_pos));
-              auto cres = full->exec->execute(full->plan, *snap, cin);
+              auto cres = full->exec->execute(full->plan, snap, cin);
               return cres.has_value();
             });
           }
@@ -1222,7 +1239,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       if (!seg)
         return 0;
 
-      if (seg->prog && !is_final) {
+      if (!is_final && seg->prog) {
         // Replay the captured full-chunk graph: stage this segment's token ids
         // and start position into the persistent device slots on the program's
         // own stream (async H2D, ordered before the replay), then launch the
@@ -1241,13 +1258,14 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         continue;
       }
 
-      // Uncached (final segment, or capture fell back): full executor dispatch.
+      // Uncached (final segment, or capture disabled/fell back): the cache was
+      // already shared at segment creation (segment_for), so just dispatch.
       seg->cuda->set_prefill_tokens(prompt.subspan(off, nseg));
       seg->cuda->set_pos(pos);
       std::vector<sx::Bytes> in;
       in.push_back(encode_tokens(prompt.subspan(off, nseg)));
       in.push_back(encode_i64(pos));
-      auto res = seg->exec->execute(seg->plan, *snap, in);
+      auto res = seg->exec->execute(seg->plan, snap, in);
       if (!res) {
         std::cerr << "[prefill-cuda] segment off=" << off << " execute failed: "
                   << res.error().message << "\n";
@@ -1301,12 +1319,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     float last_argmax = -1.0f;
     std::vector<float> last_capped;  // softcapped logits of the final prompt token
     for (uint64_t p : prompt) {
-      cuda_backend.seed_token(p);
-      cuda_backend.set_pos(pos);
+      rt->cuda->seed_token(p);
+      rt->cuda->set_pos(pos);
       std::vector<sx::Bytes> in;
       in.push_back(encode_i64(p));
       in.push_back(encode_i64(pos));
-      auto res = exec.execute(*plan, *snap, in);
+      auto res = rt->exec->execute(rt->plan, snap, in);
       if (!res || res->outputs.empty()) return 0;
       const sx::Bytes& lo = res->outputs[0];
       if (dump_logits) {
@@ -1331,42 +1349,68 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
+  step = 1;  // tokens[0] is `first`; the decode loop continues from index 1
   // The decode loop below reads the next token id from the device slot, which the
   // reference path already left at `first`; the prefill path never ran an
-  // Embedding/Argmax step, so seed it explicitly (Phase 3.2 B4).
-  cuda_backend.seed_token(token);
+  // Embedding/Argmax step, so seed it explicitly (Phase 3.2 B4). The cached
+  // decode runtime's capture is warmed with a placeholder token, so every call
+  // re-seeds the real one (C.2: no re-capture per call).
+  rt->cuda->seed_token(token);
 
-  // Decode the remaining tokens with the same planner/backend/cache.
-  for (step = 1; step < tokens.size(); ++step) {
-    cuda_backend.set_pos(pos);
-    std::vector<sx::Bytes> in;
-    in.push_back(encode_i64(token));
-    in.push_back(encode_i64(pos));
-    auto res = exec.execute(*plan, *snap, in);
-    if (!res || res->outputs.empty()) {
-      if (!res)
-        std::cerr << "[prefill-spine-cuda] step " << step << " execute failed: "
-                  << res.error().message << "\n";
-      else
-        std::cerr << "[prefill-spine-cuda] step " << step << " no outputs\n";
-      break;
-    }
-    const sx::Bytes& lo = res->outputs[0];
-    int64_t next;
-    if (dump_logits) {
-      if (lo.size() < vocab * sizeof(float)) break;
-      std::span<const float> lf(reinterpret_cast<const float*>(lo.data()), vocab);
-      next = nn::argmax(lf);
+  // Decode the remaining tokens with the same planner/backend/cache. When the
+  // cached greedy decode step is captured (and we are not dumping logits, which
+  // needs the full softcapped vector rather than the argmax scalar), replay it
+  // per step: stage the position, launch the graph, read the winning token back
+  // from the persistent device slot (the synchronous D2H also drains the graph
+  // stream). Otherwise fall back to per-step executor dispatch.
+  if (!dump_logits && rt->prog) {
+    for (; step < tokens.size(); ++step) {
+      rt->cuda->set_pos(pos);
+      if (!rt->prog->replay()) {
+        std::cerr << "[prefill-spine-cuda] step " << step
+                  << " graph replay failed\n";
+        break;
+      }
+      float next_f = -1.0f;
+      rt->cuda->read_token(&next_f);
+      const int64_t next = int64_t(next_f);
       if (next < 0) break;
-      dump_logits_top2(dump_logits_file, step, pos, lf);
-    } else {
-      if (lo.size() < sizeof(float)) break;
-      next = int64_t(*reinterpret_cast<const float*>(lo.data()));
-      if (next < 0) break;
+      tokens[step] = next;
+      token = static_cast<uint64_t>(next);
+      ++pos;
     }
-    tokens[step] = next;
-    token = static_cast<uint64_t>(next);
-    ++pos;
+  } else {
+    for (; step < tokens.size(); ++step) {
+      rt->cuda->set_pos(pos);
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+      auto res = rt->exec->execute(rt->plan, snap, in);
+      if (!res || res->outputs.empty()) {
+        if (!res)
+          std::cerr << "[prefill-spine-cuda] step " << step << " execute failed: "
+                    << res.error().message << "\n";
+        else
+          std::cerr << "[prefill-spine-cuda] step " << step << " no outputs\n";
+        break;
+      }
+      const sx::Bytes& lo = res->outputs[0];
+      int64_t next;
+      if (dump_logits) {
+        if (lo.size() < vocab * sizeof(float)) break;
+        std::span<const float> lf(reinterpret_cast<const float*>(lo.data()), vocab);
+        next = nn::argmax(lf);
+        if (next < 0) break;
+        dump_logits_top2(dump_logits_file, step, pos, lf);
+      } else {
+        if (lo.size() < sizeof(float)) break;
+        next = int64_t(*reinterpret_cast<const float*>(lo.data()));
+        if (next < 0) break;
+      }
+      tokens[step] = next;
+      token = static_cast<uint64_t>(next);
+      ++pos;
+    }
   }
   return step;
 }

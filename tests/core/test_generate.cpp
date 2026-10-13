@@ -271,7 +271,10 @@ int main() {
   } else {
     double spine_cuda_tps = 0.0;
     std::vector<int64_t> warmup(1, -1);
-    sbmodel::generate_spine_cuda(*m, seed, 0, warmup);
+    // C.2: pass the same n_ctx as the timed call so the warm-up and timed runs
+    // hit the same cached (model, n_ctx) decode runtime — the warm-up pays the
+    // graph/plan/capture cost and the timed run only re-seeds and replays.
+    sbmodel::generate_spine_cuda(*m, seed, 0, warmup, /*n_ctx=*/steps);
 
     std::vector<int64_t> spine_cuda_tokens(steps, -1);
     const auto t0 = std::chrono::steady_clock::now();
