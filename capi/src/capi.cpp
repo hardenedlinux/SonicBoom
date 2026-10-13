@@ -29,6 +29,8 @@
 #include <sonicboom/model/config.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/planner/kv_cache.h>
+#include <sonicboom/quant/quantized_matmul.h>
 #include <sonicboom/runtime.h>
 #include <sonicboom/scalar_type.h>
 #include <sonicboom/sx/exec.h>
@@ -79,6 +81,8 @@ struct sb_tape {
 
 namespace model = sonicboom::model;
 namespace gguf = sonicboom::gguf;
+namespace planner = sonicboom::planner;
+namespace quant = sonicboom::quant;
 
 // The GGUF reader owns the byte buffer every Gemma4Model weight span borrows
 // from, so the model and its reader travel together in one heap object. Both
@@ -102,6 +106,15 @@ struct sb_llm_session {
   uint64_t n_ctx = 0;
   std::vector<sb_token> prompt;       // current prompt (decode continues from it)
   std::vector<sb_token> prev_prompt;  // previous prompt, for reuse reporting
+
+  // CUDA fast-path session state (item 2 rewire): the device KV cache persists
+  // in `kv` across prefill/decode calls, so decode continues token-by-token
+  // without re-running the prefill. Unused on the CPU fallback.
+  planner::KvCacheSession kv;         // persistent KV cache + token history
+  uint64_t token = 0;                 // current decode token (CUDA path)
+  uint64_t pos = 0;                   // next decode position (CUDA path)
+  int64_t pending = -1;               // first token from prefill, awaiting emit
+  bool prefill_done = false;          // a CUDA prefill has run
 };
 
 namespace {
@@ -791,6 +804,7 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
         }
         h->bundle = model->bundle;  // keep the model (and its buffer) alive
         h->n_ctx = n_ctx;
+        h->kv.n_ctx = n_ctx;  // size the persistent KV cache to this session's window
         *session_out = h;
         return SB_OK;
       },
@@ -823,6 +837,30 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
 
         session->prev_prompt = session->prompt;
         session->prompt.assign(tokens, tokens + n);
+
+        // CUDA fast path: prefill the prompt device-resident (chunked prefill +
+        // prefix reuse via the persistent KvCacheSession), sampling only the
+        // first continuation token; sb_llm_decode then continues token-by-token
+        // over the same cache without re-running the prefill. The CPU path
+        // (no device) defers all compute to sb_llm_decode as before.
+        session->prefill_done = false;
+        session->pending = -1;
+        if (quant::cuda_available() && n > 0) {
+          const model::Gemma4Model &m = session->bundle->model;
+          std::vector<uint64_t> prompt(tokens, tokens + n);
+          std::vector<int64_t> first(1, -1);
+          const uint64_t done = model::generate_prefill_spine_cuda_prefix(
+              m, prompt, /*start_pos=*/0, first, session->kv,
+              /*use_prefill=*/true);
+          if (done == 0 || first[0] < 0) {
+            set_error(err_out, SB_ERRKIND_INTERNAL, "CUDA prefill failed");
+            return SB_ERR_INTERNAL;
+          }
+          session->token = static_cast<uint64_t>(first[0]);
+          session->pos = n;
+          session->pending = first[0];
+          session->prefill_done = true;
+        }
         return SB_OK;
       },
       err_out);
@@ -858,6 +896,42 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
           return SB_OK;
 
         const model::Gemma4Model &m = session->bundle->model;
+
+        // CUDA fast path: the prefill already filled the persistent KV cache and
+        // sampled the first token. Emit it, then decode the rest one step at a
+        // time — each step advances the same persistent cache, so this never
+        // re-runs the prefill or the whole generation.
+        if (session->prefill_done && quant::cuda_available()) {
+          const uint64_t n_ctx = session->n_ctx;
+          uint32_t n = 0;
+          if (session->pending >= 0) {
+            if (cb && cb(user, static_cast<sb_token>(session->pending))) {
+              *n_out = 0;  // aborted before the first token
+              return SB_OK;
+            }
+            session->pending = -1;
+            n = 1;
+          }
+          while (n < max_tokens) {
+            std::vector<int64_t> one(1, -1);
+            const uint64_t done = model::generate_spine_cuda(
+                m, session->token, session->pos, one, n_ctx);
+            if (done == 0 || one[0] < 0)
+              break;  // decode step failed
+            session->token = static_cast<uint64_t>(one[0]);
+            ++session->pos;
+            if (cb && cb(user, static_cast<sb_token>(one[0]))) {
+              *n_out = n;  // aborted before one[0]; report n produced
+              return SB_OK;
+            }
+            ++n;
+          }
+          *n_out = n;
+          return SB_OK;
+        }
+
+        // CPU fallback (no CUDA device, or a prefill that did not run the CUDA
+        // path): the original full-generation loop over the CPU spine.
         std::vector<int64_t> tokens(max_tokens);
         uint64_t produced = 0;
         if (session->prompt.size() == 1) {
