@@ -16,9 +16,14 @@
 
 #include <sonicboom/quant/dequant.h>
 
+#include "foreign_dequant.h"
+
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <expected>
+#include <string>
+#include <vector>
 
 // Reference dequantization of the ggml block-quantized formats Q3_K, Q4_K,
 // Q5_K. The reconstruction formulas and block layouts below are confirmed
@@ -246,6 +251,69 @@ bool dequantize_row_f32(const QuantizedTensor& t, uint64_t row, float* out,
       return true;
   }
   return false;
+}
+
+std::expected<std::vector<float>, std::string> dequant_foreign_to_f32(
+    uint32_t ggml_type_id, const uint8_t* data, uint64_t n_elems) {
+  if (n_elems && !data) return std::unexpected("null tensor data");
+  std::vector<float> out(n_elems);
+  if (ggml_type_id == 1) {
+    if (n_elems > SIZE_MAX / 2) return std::unexpected("tensor too large");
+    for (uint64_t i = 0; i < n_elems; ++i)
+      out[i] = half_to_float(uint16_t(data[2*i]) | (uint16_t(data[2*i+1]) << 8));
+    return out;
+  }
+  const uint64_t block = ggml_type_id == 14 ? 256 : 32;
+  if (ggml_type_id != 2 && ggml_type_id != 6 && ggml_type_id != 8 && ggml_type_id != 14)
+    return std::unexpected("unsupported ggml type id");
+  if (n_elems % block) return std::unexpected("element count is not block aligned");
+  const uint64_t nblocks = n_elems / block;
+  const uint64_t bytes_per_block = ggml_type_id == 2 ? 18 :
+      ggml_type_id == 6 ? 22 : ggml_type_id == 8 ? 34 : 210;
+  if (nblocks && bytes_per_block > SIZE_MAX / nblocks)
+    return std::unexpected("tensor too large");
+  for (uint64_t b = 0; b < nblocks; ++b) {
+    const uint8_t* p = data + b * bytes_per_block;
+    const float d = half_to_float(uint16_t(p[0]) | (uint16_t(p[1]) << 8));
+    if (ggml_type_id == 2) {
+      for (int j = 0; j < 16; ++j) {
+        out[b*32+j] = (int(p[2+j] & 15)-8)*d;
+        out[b*32+j+16] = (int(p[2+j] >> 4)-8)*d;
+      }
+    } else if (ggml_type_id == 6) {
+      uint32_t qh = uint32_t(p[2]) | (uint32_t(p[3])<<8) |
+                    (uint32_t(p[4])<<16) | (uint32_t(p[5])<<24);
+      for (int j = 0; j < 16; ++j) {
+        int x0 = (p[6+j]&15) | (((qh >> j)&1)<<4);
+        int x1 = (p[6+j]>>4) | (((qh >> (j+12))&1)<<4);
+        out[b*32+j] = (x0-16)*d;
+        out[b*32+j+16] = (x1-16)*d;
+      }
+    } else if (ggml_type_id == 8) {
+      for (int j = 0; j < 32; ++j)
+        out[b*32+j] = float(int8_t(p[2+j]))*d;
+    } else {
+      const uint8_t* ql = p;
+      const uint8_t* qh = p+128;
+      const int8_t* scales = reinterpret_cast<const int8_t*>(p+192);
+      const float dk = half_to_float(uint16_t(p[208]) | (uint16_t(p[209])<<8));
+      for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+          const int is = l/16;
+          const int8_t q1 = int8_t((ql[l]&15) | (((qh[l]>>0)&3)<<4))-32;
+          const int8_t q2 = int8_t((ql[l+32]&15) | (((qh[l]>>2)&3)<<4))-32;
+          const int8_t q3 = int8_t((ql[l]>>4) | (((qh[l]>>4)&3)<<4))-32;
+          const int8_t q4 = int8_t((ql[l+32]>>4) | (((qh[l]>>6)&3)<<4))-32;
+          out[b*256+n+l] = dk*scales[is+0]*q1;
+          out[b*256+n+l+32] = dk*scales[is+2]*q2;
+          out[b*256+n+l+64] = dk*scales[is+4]*q3;
+          out[b*256+n+l+96] = dk*scales[is+6]*q4;
+        }
+        ql += 64; qh += 32; scales += 8;
+      }
+    }
+  }
+  return out;
 }
 
 } // namespace sonicboom::quant

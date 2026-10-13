@@ -31,6 +31,9 @@
 
 #include <sonicboom/gguf/reader.h>
 
+#include "../../core/src/quant/foreign_dequant.h"
+#include "../../core/src/quant/ggml_derived/quantize_q5_k.h"
+
 #include "ggml_baseline.h"
 
 #include <array>
@@ -38,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <cmath>
 #include <random>
 #include <string>
 #include <vector>
@@ -526,6 +530,57 @@ void test_differential_model() {
   check(mismatches == 0, "model differential: bit-exact vs ggml baseline");
 }
 
+void test_foreign_dequant() {
+  auto check_formula = [&](uint32_t type, std::vector<uint8_t> bytes,
+                           uint64_t n, auto formula, const char* label) {
+    auto got = sbquant::dequant_foreign_to_f32(type, bytes.data(), n);
+    check(bool(got), label);
+    if (!got) return;
+    auto want = formula(bytes);
+    check(got->size()==want.size(), label);
+    for(size_t i=0;i<want.size();++i) if((*got)[i]!=want[i]) { std::cerr<<"  first formula diff at "<<i<<": got "<<(*got)[i]<<" want "<<want[i]<<"\n"; check(false,label); break; }
+  };
+  auto half=[](uint16_t h) { // test-side binary16 conversion
+    const bool neg=h&0x8000; const int e=(h>>10)&31; const int m=h&1023;
+    float v=e==0?std::ldexp(float(m),-24):e==31?INFINITY:std::ldexp(float(1024+m),e-25);
+    return neg?-v:v;
+  };
+  {
+    std::vector<uint8_t>b(36); for(int z=0;z<2;++z){b[z*18]=0x00;b[z*18+1]=0x3c; for(int j=0;j<16;++j)b[z*18+2+j]=uint8_t(j*13+0xA5);}
+    check_formula(2,b,64,[&](const auto&x){std::vector<float>v(64);for(int z=0;z<2;++z){float d=half(uint16_t(x[z*18])|uint16_t(x[z*18+1])<<8);for(int j=0;j<16;++j){v[z*32+j]=(int(x[z*18+2+j]&15)-8)*d;v[z*32+j+16]=(int(x[z*18+2+j]>>4)-8)*d;}}return v;},"q4_0 two-block formula");
+  }
+  {
+    std::vector<uint8_t>b(44);for(int z=0;z<2;++z){int o=z*22;b[o]=0x00;b[o+1]=0x3c;for(int j=0;j<4;++j)b[o+2+j]=uint8_t(0x91+j*17);for(int j=0;j<16;++j)b[o+6+j]=uint8_t(j*19+0x6b);}
+    check_formula(6,b,64,[&](const auto&x){std::vector<float>v(64);for(int z=0;z<2;++z){int o=z*22;float d=half(uint16_t(x[o])|uint16_t(x[o+1])<<8);uint32_t qh=uint32_t(x[o+2])|uint32_t(x[o+3])<<8|uint32_t(x[o+4])<<16|uint32_t(x[o+5])<<24;for(int j=0;j<16;++j){int a=(x[o+6+j]&15)|(((qh>>j)&1)<<4),c=(x[o+6+j]>>4)|(((qh>>(j+12))&1)<<4);v[z*32+j]=(a-16)*d;v[z*32+j+16]=(c-16)*d;}}return v;},"q5_0 two-block formula");
+  }
+  {
+    std::vector<uint8_t>b(68);for(int z=0;z<2;++z){int o=z*34;b[o]=0x00;b[o+1]=0x3c;for(int j=0;j<32;++j)b[o+2+j]=uint8_t(int8_t(j*7-111));}
+    check_formula(8,b,64,[&](const auto&x){std::vector<float>v(64);for(int z=0;z<2;++z){int o=z*34;float d=half(uint16_t(x[o])|uint16_t(x[o+1])<<8);for(int j=0;j<32;++j)v[z*32+j]=float(int8_t(x[o+2+j]))*d;}return v;},"q8_0 two-block formula");
+  }
+  {
+    std::vector<uint8_t>b(420);for(int z=0;z<2;++z){int o=z*210;for(int j=0;j<128;++j)b[o+j]=uint8_t(j*11+3);for(int j=0;j<64;++j)b[o+128+j]=uint8_t(j*7+0x95);for(int j=0;j<16;++j)b[o+192+j]=uint8_t(int8_t(j*13-91));b[o+208]=0x00;b[o+209]=0x3c;}
+    check_formula(14,b,512,[&](const auto&x){std::vector<float>v(512);for(int z=0;z<2;++z){int o=z*210;float d=half(uint16_t(x[o+208])|uint16_t(x[o+209])<<8);for(int n=0;n<256;n+=128)for(int l=0;l<32;++l){int qi=n/2,hi=n/4,si=n/16,is=l/16;int8_t q1=int8_t((x[o+qi+l]&15)|(((x[o+128+hi+l]>>0)&3)<<4))-32,q2=int8_t((x[o+qi+l+32]&15)|(((x[o+128+hi+l]>>2)&3)<<4))-32,q3=int8_t((x[o+qi+l]>>4)|(((x[o+128+hi+l]>>4)&3)<<4))-32,q4=int8_t((x[o+qi+l+32]>>4)|(((x[o+128+hi+l]>>6)&3)<<4))-32;auto s=reinterpret_cast<const int8_t*>(x.data()+o+192+si);v[z*256+n+l]=d*s[is]*q1;v[z*256+n+l+32]=d*s[is+2]*q2;v[z*256+n+l+64]=d*s[is+4]*q3;v[z*256+n+l+96]=d*s[is+6]*q4;}}return v;},"q6_K two-block formula");
+  }
+  const uint16_t h[8]={0x0000,0x3c00,0xc000,0x0001,0x03ff,0x8000,0x7c00,0xfc00};
+  std::vector<uint8_t> bytes;for(auto v:h){bytes.push_back(v&255);bytes.push_back(v>>8);}
+  auto f=sbquant::dequant_foreign_to_f32(1,bytes.data(),8);
+  check(bool(f)&&(*f)[0]==0&&(*f)[1]==1&&(*f)[2]==-2&&(*f)[3]==std::ldexp(1.0f,-24)&&(*f)[4]==std::ldexp(1023.0f,-24)&&std::signbit((*f)[5])&&std::isinf((*f)[6])&&std::isinf((*f)[7]),"f16 known halves, subnormal and negative zero");
+}
+
+void test_q5k_quantize_roundtrip() {
+  std::mt19937 rng(1234); std::normal_distribution<float> dist(0.0f,1.0f);
+  std::vector<float> src(4096); for(float& x:src)x=dist(rng);
+  src[0] = 100.0f;
+  auto a=sbquant::quantize_f32_to_q5_k(src.data(),src.size());
+  auto b=sbquant::quantize_f32_to_q5_k(src.data(),src.size());
+  check(a==b,"q5_K quantizer byte-identical on repeated runs");
+  std::vector<float> reconstructed(src.size());
+  sbquant::dequantize_q5_K(std::span<const std::byte>(reinterpret_cast<const std::byte*>(a.data()),a.size()),src.size()/256,reconstructed.data());
+  float max_x=0,max_err=0;for(size_t i=0;i<src.size();++i){max_x=std::max(max_x,std::fabs(src[i]));max_err=std::max(max_err,std::fabs(src[i]-reconstructed[i]));}
+  if(max_err>0.02f*max_x) std::cerr<<"  q5_K max abs error="<<max_err<<" max|x|="<<max_x<<"\n";
+  check(max_err<=0.02f*max_x,"q5_K quantize round trip max error <= 2% max|x|");
+}
+
 } // namespace
 
 int main() {
@@ -538,6 +593,8 @@ int main() {
   test_validation();
   test_differential_random();
   test_differential_model();
+  test_foreign_dequant();
+  test_q5k_quantize_roundtrip();
 
   if (g_failures == 0) {
     std::cout << "test_dequant OK\n";

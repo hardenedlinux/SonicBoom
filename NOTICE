@@ -52,6 +52,13 @@ core/src/quant/ggml_derived/vec_dot_qK_q8K.h
       - dot_q4_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q4_K_q8_K_generic)
       - dot_q5_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q5_K_q8_K_generic)
 
+core/src/quant/ggml_derived/quantize_q5_k.cpp
+    Q5_K reference quantizer. Ported from:
+      - quantize_row_q5_K_ref    ← ggml/src/ggml-quants.c
+      - make_qkx2_quants         ← ggml/src/ggml-quants.c
+      - nearest_int, get_scale_min_k4, binary16 conversions
+                                ← ggml/src/ggml-quants.c / ggml-common.h
+
 core/src/vocab/ggml_derived/bpe_tokenizer.h
     Gemma-4 SPM-style BPE tokenize + detokenize. Ported from:
       - llm_tokenizer_bpe_session (symbol-chain BPE merge, <0xNN> byte fallback,
