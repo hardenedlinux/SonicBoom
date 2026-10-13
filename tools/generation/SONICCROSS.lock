@@ -13,7 +13,7 @@ pytorch_commit     = 41ffbc4a994e058af9fe00ed5caba73fc1033359
 pytorch_version    = 2.14.1a0
 
 # SonicCross — the build-time torchgen replacement that produced the baseline.
-soniccross_version = v0.0.1
+soniccross_version = v0.0.2
 soniccross_commit  = e3acee5afede1b63074f1aa6f9622c90eb3b0bd4
 
 # Generation input snapshot (no full PyTorch checkout required).
