@@ -225,7 +225,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // (nn::*/quant::* kernels), not by the MLIR lowering. Declared here so the
       // static planner's capability check accepts a Gemma 4 decode graph.
       OpKind::QuantizedMatmul, OpKind::RmsNorm,      OpKind::RmsNormHeads,
-      OpKind::GeluFp16,        OpKind::Rope,         OpKind::Attention,
+      OpKind::GeluFp16,        OpKind::Silu,         OpKind::Rope,
+      OpKind::Attention,
       OpKind::GqaBroadcast, OpKind::Embedding,
       OpKind::MatvecF32,
       OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
@@ -281,7 +282,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
         OpKind::MatvecF32,
-        OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Mul,
+        OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Silu,
+        OpKind::Mul,
         OpKind::Add,            OpKind::Slice,      OpKind::Embedding,
         OpKind::Argmax,
         // Phase 7 chunked prefill operators (device-resident): FlashAttention

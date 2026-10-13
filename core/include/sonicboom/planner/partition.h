@@ -66,6 +66,7 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::RmsNorm:
     case OpKind::RmsNormHeads:
     case OpKind::GeluFp16:
+    case OpKind::Silu:
     case OpKind::Rope:
     case OpKind::Attention:
     case OpKind::GqaBroadcast:

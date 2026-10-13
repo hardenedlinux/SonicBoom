@@ -51,6 +51,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::RmsNormHeads;
   if (name == "gelu_fp16")
     return OpKind::GeluFp16;
+  if (name == "silu")
+    return OpKind::Silu;
   if (name == "rope")
     return OpKind::Rope;
   if (name == "attention")
@@ -101,6 +103,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::RmsNorm: return "rms_norm";
     case OpKind::RmsNormHeads: return "rms_norm_heads";
     case OpKind::GeluFp16: return "gelu_fp16";
+    case OpKind::Silu: return "silu";
     case OpKind::Rope: return "rope";
     case OpKind::Attention: return "attention";
     case OpKind::GqaBroadcast: return "gqa_broadcast";

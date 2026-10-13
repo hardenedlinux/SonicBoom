@@ -50,6 +50,9 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
 // GGML_GELU_FP16 tanh-GELU (fp16 round-trip), elementwise. x/y may alias.
 bool gelu_fp16_dev(const float* x, float* y, int n);
 
+// SiLU (SwiGLU) elementwise: y[i] = x[i] / (1 + exp(-x[i])). x/y may alias.
+bool silu_dev(const float* x, float* y, int n);
+
 bool mul_dev(const float* a, const float* b, float* y, int n);
 bool add_dev(const float* a, const float* b, float* y, int n);
 bool scale_dev(const float* x, float s, float* y, int n);

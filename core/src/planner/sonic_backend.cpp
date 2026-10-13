@@ -329,9 +329,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
         std::copy_n(kc.begin(), row, cache.k.begin() + slot);
         std::copy_n(vc.begin(), row, cache.v.begin() + slot);
       }
+      double attn_scale = 1.0;
+      attr_f(*node, "scale", attn_scale);
       ok = nn::decode_attention(f32(inputs[0]), cache.k, cache.v, pos,
                                 cache.n_slots, lc.n_heads_q, cache.n_heads_kv,
-                                cache.head_dim, lc.sliding_window, 1.0f,
+                                cache.head_dim, lc.sliding_window, float(attn_scale),
                                 f32_mut(out));
       break;
     }
@@ -412,6 +414,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = nn::gelu_fp16(f32(inputs[0]), f32_mut(out));
       break;
     }
+    case OpKind::Silu: {
+      ok = nn::silu(f32(inputs[0]), f32_mut(out));
+      break;
+    }
     case OpKind::Mul: {
       ok = nn::mul(f32(inputs[0]), f32(inputs[1]), f32_mut(out));
       break;
@@ -466,11 +472,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
+      double attn_scale = 1.0;
+      attr_f(*node, "scale", attn_scale);
       ok = nn::scaled_dot_product_attention(f32(inputs[0]), n, f32(inputs[1]),
                                             f32(inputs[2]), n,
                                             lc.n_heads_q, lc.n_heads_kv,
                                             lc.head_dim, true, lc.sliding_window,
-                                            0.0f, 1.0f, f32_mut(out));
+                                            0.0f, float(attn_scale), f32_mut(out));
       break;
     }
     case OpKind::KvAppend: {

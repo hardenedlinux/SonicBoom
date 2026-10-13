@@ -53,6 +53,7 @@ enum class OpKind : uint8_t {
   RmsNorm,          // nn::rms_norm
   RmsNormHeads,     // nn::rms_norm_heads (per-head, in place)
   GeluFp16,         // nn::gelu_fp16
+  Silu,             // nn::silu (SwiGLU gate, Qwen2)
   Rope,             // nn::rope_neox_heads (multi-head NEOX RoPE)
   Attention,        // nn::decode_attention (incremental KV-cache SDPA); appends
                     // iff kc/vc inputs are present, attends the kv_source_layer cache

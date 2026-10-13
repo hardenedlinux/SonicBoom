@@ -30,6 +30,14 @@ namespace sonicboom::model {
 
 enum class AttentionKind : uint8_t { SlidingWindow, Global };
 
+// The transformer architecture the config describes (Section C.6 / Qwen
+// generality). Distinguishes Gemma 4's specific block (per-layer embedding
+// gate, Q/K per-head norm, post-attn/post-ffn norms, GELU, attention scale 1.0)
+// from the standard decoder block (SwiGLU SiLU, no Q/K norm, no post-norms,
+// attention scale 1/sqrt(head_dim)). Both are carried by the same config/weight
+// containers; the plan emitter branches on this value.
+enum class ModelArch : uint8_t { Gemma4, Qwen2 };
+
 // The per-layer configuration that differs between the two attention kinds.
 // n_heads_q / n_heads_kv are constant (8 / 2); head_dim and rope_base flip
 // between the sliding-window (256, 10000) and global (512, 1e6) layers.
@@ -44,6 +52,7 @@ struct LayerConfig {
 };
 
 struct Gemma4Config {
+  ModelArch arch = ModelArch::Gemma4;
   uint32_t block_count = 0;
   uint64_t vocab_size = 0;
   uint32_t embedding_length = 0;      // 2560

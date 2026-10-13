@@ -141,6 +141,17 @@ __global__ void gelu_fp16_kernel(const float* __restrict__ x, float* __restrict_
   y[i] = out;
 }
 
+__global__ void silu_kernel(const float* __restrict__ x, float* __restrict__ y,
+                            int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float v = x[i];
+  // x / (1 + exp(-x)); matches nn::silu / ggml_silu. expf (not __expf) so the
+  // f32 result agrees with the CPU reference on the values Qwen's SwiGLU gate
+  // takes.
+  y[i] = v / (1.0f + expf(-v));
+}
+
 __global__ void mul_kernel(const float* __restrict__ a, const float* __restrict__ b,
                            float* __restrict__ y, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2007,6 +2018,13 @@ bool gelu_fp16_dev(const float* x, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
   gelu_fp16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool silu_dev(const float* x, float* y, int n) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !y) return false;
+  silu_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

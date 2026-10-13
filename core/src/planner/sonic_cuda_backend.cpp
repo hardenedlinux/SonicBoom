@@ -419,11 +419,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           break;
         }
       }
+      double attn_scale = 1.0;
+      attr_f(*node, "scale", attn_scale);
       ok = nn::cuda::decode_attention_dev(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, 1.0f, out);
+          lc.sliding_window, float(attn_scale), out);
       break;
     }
     case OpKind::GqaBroadcast: {
@@ -568,6 +570,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = nn::cuda::gelu_fp16_dev(dev(in[0]), out, out_n);
       break;
     }
+    case OpKind::Silu: {
+      ok = nn::cuda::silu_dev(dev(in[0]), out, out_n);
+      break;
+    }
     case OpKind::Mul: {
       ok = nn::cuda::mul_dev(dev(in[0]), dev(in[1]), out, out_n);
       break;
@@ -665,11 +671,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_i(*node, "kv_source_layer", ksrc);
       const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
       KvCacheDev& cache = (*caches_)[cache_layer];
+      double attn_scale = 1.0;
+      attr_f(*node, "scale", attn_scale);
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
           cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
-          int(cache.head_dim), lc.sliding_window, 1.0f, out);
+          int(cache.head_dim), lc.sliding_window, float(attn_scale), out);
       break;
     }
     case OpKind::KvAppend: {
