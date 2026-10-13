@@ -3,11 +3,12 @@
 **Test date: 2026-10-12** (final v1-performance state; development spanned
 2026-10-06 → 2026-10-12). Supersedes the 2026-10-07 v0 baseline.
 
-**Status: v1 performance complete through Step 4.** CUDA decode is at
-llama.cpp parity on the 64-step protocol (1.02×) and at long context (1.02× at
-depth 512, 0.97× at depth 2048). The remaining gap is one dominated kernel (the
-q8_1 gemv); the attention growth at depth ≥ 2048 was traced to split-KV chunk
-serialization at large n_ctx and fixed with a `kMaxChunk` cap (§1.2.1).
+**Status: v1 complete.** CUDA decode is **ahead** of llama.cpp on the 64-step
+protocol (1.14×) and at long context (1.11× at depth 512, 1.04× at depth 2048);
+the chunked batched prefill is ~0.53–0.59× llama.cpp (§1.4). The remaining decode
+gap is one dominated kernel (the q8_1 gemv); the attention growth at depth ≥ 2048
+was traced to split-KV chunk serialization at large n_ctx and fixed with a
+`kMaxChunk` cap (§1.2.1).
 
 ## Scope
 
@@ -75,8 +76,10 @@ Note the driver (13.2) is ahead of the nvcc toolkit (12.0); the build targets
 **Reading.** The v0→v1 CUDA decode path gained **10.1×** (4.33 → 43.6 tok/s).
 The big levers were the q8_1 dp4a gemv (2.2), the dense-gemv rewrite (2.3), the
 resident-forward path (3.2), and split-KV attention (3.4); CUDA Graphs and the
-T1–T5 fusions are the tail. At the end SonicBoom CUDA is **1.02× llama.cpp** on
-the 64-step protocol.
+T1–T5 fusions are the tail. At the end of T5 SonicBoom CUDA was **1.02×
+llama.cpp** on the 64-step protocol; the release number (re-measured on HEAD,
+idle GPU) is **51.65 tok/s (1.14× llama.cpp)** — the post-T5 device-resident
+position-major layout + fused-quantize work (§1.4) also sped up decode.
 
 **Caveat on absolute values:** the T1→T2 absolute jump (37.0 → 42.4) is *not* a
 step gain — the two commits were measured in different sessions with different
@@ -90,8 +93,8 @@ behavior invariant (~36.3 tok/s, ±0), as intended.
 
 | depth | n_ctx | SonicBoom CUDA | llama.cpp CUDA | ratio |
 |---|---|---|---|---|
-| 512 | 576 | 45.95 tok/s (21.76 ms/step) | 45.23 tok/s (22.11 ms/step) | **1.02×** |
-| 2048 | 2112 | 44.02 tok/s (22.71 ms/step) | 45.25 tok/s (22.10 ms/step) | 0.97× |
+| 512 | 576 | 49.96 tok/s (20.02 ms/step) | 45.20 tok/s (22.12 ms/step) | **1.11×** |
+| 2048 | 2112 | 47.13 tok/s (21.22 ms/step) | 45.21 tok/s (22.12 ms/step) | **1.04×** |
 
 Re-measured post-T1-T5 with CUDA Graphs ON on an idle GPU, at matching n_ctx
 (the 2026-10-07 table above — 34.55/34.78 vs 39.87/37.56 — was measured at
@@ -105,21 +108,22 @@ sides and, because llama.cpp's n_ctx also shrank, misstated the ratio).
 tail (the `longctx_bench` subtraction is thermal-fragile at depth 2048: two
 ~47 s decodes subtract to a ~1.3 s tail, so a 0.4% GPU-clock drift becomes a
 12% tail error). llama.cpp = `llama-bench -p <depth> -n 64 -ngl 99`, whose
-`n_ctx = n_prompt + n_gen = depth + 64`; its `tg64` is flat (45.23→45.25)
+`n_ctx = n_prompt + n_gen = depth + 64`; its `tg64` is flat (45.20→45.21)
 because its decode is not attention-bound at these depths.
 
-**Reading.** SonicBoom now *leads* llama.cpp at depth 512 (1.02×) and trails
-slightly at 2048 (0.97×). The 512→2048 penalty is ~4.6% (21.76→22.71 ms/step)
-and is **essentially all attention**: the split kernel grows 1.29→2.36 ms as
-the global layers span the full window, while gemv q8_1 (14.9 ms, ~66%) is
-unchanged. llama.cpp has no such penalty at these depths, so the long-context
-gap widens slowly with depth — this is the same sublinear attention growth §2
-quantifies, now visible end-to-end.
+**Reading.** SonicBoom now *leads* llama.cpp at both depths (1.11× at 512,
+1.04× at 2048). The 512→2048 penalty is ~6.0% (20.02→21.22 ms/step) and is
+**essentially all attention**: the split kernel grows 1.29→2.36 ms as the
+global layers span the full window, while gemv q8_1 (~14.9 ms, ~64%) is
+unchanged. llama.cpp has no such penalty at these depths (its `tg64` is flat
+45.20→45.21), so the long-context lead narrows slowly with depth — the same
+sublinear attention growth §2 quantifies, now visible end-to-end.
 
 ### 1.2.1 n_ctx sensitivity at fixed depth (split-KV chunk serialization)
 
-The depth-2048 penalty (0.97×) prompted a sweep of `n_ctx` at a **fixed depth
-512** (`n_ctx = 2048/8192/32768`), isolating the attention chunk-size dependence.
+The 512→2048 slowdown (the §1.2 penalty) prompted a sweep of `n_ctx` at a
+**fixed depth 512** (`n_ctx = 2048/8192/32768`), isolating the attention
+chunk-size dependence.
 Split-KV attention computes `chunk = ceil(window/target_chunks)` with
 `target_chunks = sm_count()*4/n_heads_kv ≈ 40`; for global layers `window =
 n_ctx`, so **chunk grows linearly with n_ctx** (52 → 205 → 820) while the current
@@ -174,44 +178,39 @@ SonicBoom's single straight-line spine beats llama.cpp's scheduler at equal
 threads; the CPU path is the numerical oracle for the CUDA path, not a perf
 target.
 
-### 1.4 Prefill (prompt processing) — host-bound, ~85–100× behind llama.cpp
+### 1.4 Prefill (prompt processing) — chunked + batched, ~0.5–0.6× llama.cpp
 
-Prompt-processing throughput (pp, tokens/sec) of the one-shot batched prefill
-(`generate_prefill_spine_cuda` → `SonicCudaBackend::prefill`), at a fixed prompt
-length, vs `llama-bench -p <n> -n 0 -ngl 99`:
+Prompt-processing throughput (pp, tokens/sec) of the device-resident chunked
+prefill (`generate_prefill_spine_cuda` → `SonicCudaBackend::prefill`, chunked at
+n > 512), at a fixed prompt length, vs `llama-bench -p <n> -n 0 -ngl 99`:
 
 | prompt | SonicBoom CUDA pp | llama.cpp CUDA pp | ratio |
 |---|---|---|---|
-| 128 | ~20.4 tok/s | 1745.5 tok/s | 0.012× |
-| 512 | ~19.8 tok/s | 2019.0 tok/s | 0.010× |
-| 2048 | **not supported** | 2014.2 tok/s | — |
+| 512 | 1148 tok/s (445.9 ms) | 1949 tok/s | 0.59× |
+| 2048 | 1058 tok/s (1935.2 ms) | 1993 tok/s | 0.53× |
+| 4100 | 1051 tok/s (3901.0 ms) | 1944 tok/s | 0.54× |
 
-(`tools/baseline/prefill_bench --prompt N --reps 3`, marginal pp — the ~constant
-per-call plan/graph overhead is subtracted via a 1-token reference; llama-bench
-`-r 3 -n 0 -ngl 99`.)
+(`tools/baseline/prefill_bench --prompt N --reps 3`, wall pp; llama-bench
+`-r 1 -n 0 -ngl 99`, build `43fe9c642`.)
 
-**pp2048 is not supported.** The one-shot prefill requires the prompt to land in a
-straight, wrap-free run of every KV cache, and the SWA layers are a 512-slot ring
-(`sliding_window == 512`), so `n > 512` is rejected — the batched prefill has no
-ring-wrap handling (llama.cpp's chunked/ubatch prefill does).
+**Chunked prefill.** n > 512 is handled by chunked prefill (B.2): the prompt is
+prefilled in ≤512-token chunks, each landing in a wrap-free SWA run, with the KV
+cache advanced chunk-by-chunk. This lifts the old one-shot prefill's n ≤ 512
+(SWA ring) constraint.
 
-**Root cause — the prefill is not actually batched.** `matmul_f32` with `n > 1`
-does *not* launch a batched GEMM: it loops over the `n` columns, gathering each
-into a scratch buffer, running the single-column q8_1 gemv (the decode kernel),
-and scattering back (`gather_col → gemv → scatter_col`). So the prefill is `n ×`
-the decode path plus gather/scatter, with no batching parallelism. On top of that
-the transposes, column-wise rms-norms, and per-layer gates run on the *host*
-through the thread pool (per-position scalar matvecs). The GPU is nearly idle: at
-n=128 the batched-matmul GPU kernel time is ~114 ms of the ~6387 ms prefill
-(`cuda-matvec-prof`), the rest is host thread-pool work (`threadpool-prof`: 83 s
-work / 16.8 s handshake summed across workers).
+**What fixed it.** The prefill is now a real batched quantized matmul: dequant +
+cuBLAS fp16 batched GEMM for the K-quant projections (C.1), MMQ int8 tensor-core
+matmul (C.2), position-major `[n, dim]` activations so the fused rms-norm/quantize
+runs column-parallel without transposes (C.3), and mmq fused-quantize kernels
+(C.4). The old path looped `gather_col → gemv → scatter_col` per column with
+host-side transposes/norms/gates; the GPU was nearly idle. That column-loop and
+host-bound path is gone.
 
-**Reading.** Prefill is ~85–100× behind llama.cpp — a far larger gap than decode
-(1.02×). It is a host-bound + column-loop gap, not a kernel gap: the same
-single-column q8_1 gemv that makes decode competitive is reused verbatim for
-prefill, where it serializes the prompt. The fix is a real batched quantized GEMM
-(or cuBLAS) plus moving the host-side per-position work to the device; deferred
-(measure-only item, see §5).
+**Reading.** Prefill is now ~0.53–0.59× llama.cpp (was 0.010–0.012×): the wall pp
+is roughly flat at ~1050–1150 tok/s across 512–4100 (the ~constant per-call
+plan/graph overhead dominates at small n). The residual gap is kernel efficiency
+in the batched K-quant matmul (MMQ int8 / cuBLAS fp16) versus llama.cpp's tuned
+q*_K batched GEMM — not the host-bound column-loop of v0.
 
 ## 2. Per-kernel GPU time (decode @ depth 512, CUDA Graphs ON, post-Phase-3)
 
@@ -314,12 +313,11 @@ GPU time**. Everything below is ranked by the project's implementation precedenc
 (MLIR > graph optimization > hand-written kernels), but the top lever happens to
 be hand-written because the K-quant format is SonicBoom-owned.
 
-**New top lever — prefill (§1.4).** The one-shot prefill runs ~20 tok/s vs
-llama.cpp's ~2000 tok/s (~85–100×), host-bound with a per-column (non-batched)
-matmul, and it caps out at `n = 512` (SWA ring-wrap). That gap dwarfs every
-decode lever below and is the first thing to fix for any long-prompt workload;
-it is a measure-only finding for now (the fix is a real batched quantized GEMM /
-cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
+**Prefill (§1.4) — now ~0.53–0.59× llama.cpp (was 0.010–0.012×).** The chunked
+device-resident batched prefill runs ~1050–1150 tok/s vs llama.cpp's
+~1950–1990 tok/s, no longer the host-bound per-column gap of v0. The residual
+prefill gap is kernel efficiency in the batched K-quant matmul (MMQ int8 /
+cuBLAS fp16); decode's q8_1 gemv (§1.1) is again the top lever below.
 
 1. **手写 (hand-written) — the q8_1 gemv is the floor and the lever.** The gemv
    is 64% and is already the full llama.cpp mmvq port (q8_1 int8 activation +
@@ -379,26 +377,28 @@ cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
 ## v1 release
 
 SonicBoom v1 (wrapped 2026-10-13) closes the performance scope on Gemma 4
-E4B-It Q3_K_M: CUDA decode at llama.cpp parity, a correct-but-host-bound
-prefill path, and prefix-cache KV reuse that makes long-prefix continuation
-cheap. This section is the release-time summary of the numbers, the baseline,
-and the reproduction environment; the per-section detail is above.
+E4B-It Q3_K_M: CUDA decode ahead of llama.cpp, a chunked batched prefill path
+at ~0.5× llama.cpp, and prefix-cache KV reuse that makes long-prefix
+continuation cheap. This section is the release-time summary of the numbers, the
+baseline, and the reproduction environment; the per-section detail is above.
 
-**Decode (CUDA).** 43.6 tok/s on the 64-step steady protocol — **1.02×
-llama.cpp** (42.63 tok/s, `tg64`/`ngl 99`, same GGUF + machine). Long-context
-steady decode: **1.02×** at depth 512 (45.95 vs 45.23 tok/s) and **0.97×** at
-depth 2048 (44.02 vs 45.25 tok/s). The step is GPU-bound (~31 ms/step at depth
-512); the q8_1 dp4a gemv holds 64% of GPU time (§1.1, §1.2, §2).
+**Decode (CUDA).** 51.65 tok/s on the 64-step steady protocol — **1.14×
+llama.cpp** (45.20 tok/s, `tg64`/`ngl 99`, same GGUF + machine). Long-context
+steady decode: **1.11×** at depth 512 (49.96 vs 45.20 tok/s) and **1.04×** at
+depth 2048 (47.13 vs 45.21 tok/s). The step is GPU-bound; the q8_1 dp4a gemv
+holds ~64% of GPU time (§1.1, §1.2, §2).
 
-**Prefill (CUDA).** ~20 tok/s vs llama.cpp ~2000 tok/s (**0.010–0.012×**) at
-pp128/512 — host-bound and per-column (not batched); pp2048 unsupported (SWA
-ring = 512). The batched prefill reproduces the per-token path token-for-token
-(§1.4).
+**Prefill (CUDA).** Chunked device-resident batched prefill: `pp512` 445.9 ms /
+1148 tok/s, `pp2048` 1935.2 ms / 1058 tok/s, `pp4100` 3901.0 ms / 1051 tok/s
+vs llama.cpp ~1949/1993/1944 tok/s (**0.53–0.59×**) — a real batched quantized
+matmul (MMQ int8 tensor-core + cuBLAS fp16), no longer the host-bound
+per-column path of v0. The batched prefill reproduces the per-token path
+token-for-token (§1.4).
 
 **Prefix reuse (CUDA).** `generate_prefill_spine_cuda_prefix` matches the
 shared prompt prefix against the token history and prefills only the suffix.
-First-token latency at prefix 4000 + 100 new: **1113.7 ms reuse vs 14825 ms
-full prefill → 13.3×**. Reuse continuation is token-identical to the full
+First-token latency at prefix 4000 + 100 new: **502.6 ms reuse vs 3903.1 ms
+full prefill → 7.8×**. Reuse continuation is token-identical to the full
 prefill over 32 tokens at every acceptance prefix (512/600/1000/1040/3584/
 3600/3996/4000/4095/4097 +100, and 4000 +600); `test_prefix_cache` 11/11.
 
@@ -426,9 +426,6 @@ Recorded at v1 wrap-up; none of these block the release.
   Q6_K quant types and attention q/k/v biases SonicBoom does not yet model.
 - **CUDA plugin split — deferred (#58).** Splitting the CUDA backend into a
   runtime-loadable plugin (Step 4 Deliverable 2) awaits an amendment decision.
-- **Prefill batching + SWA ring-wrap.** A real batched quantized GEMM (or
-  cuBLAS) plus device-side norms/gates, then SWA ring-wrap handling for
-  n > 512 — the prefill gap (§1.4) is measure-only at v1.
 
 ## Reproduce
 
