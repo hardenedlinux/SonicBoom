@@ -1484,6 +1484,207 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   return cudaGetLastError() == cudaSuccess;
 }
 
+// MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
+// internal quantize. W is the Q*_K weight [cols, rows]; y_q8 is [cols/128][n]
+// (index blk*n + token); Y is [n, rows] position-major (the tensor-core matmul's
+// native output — no transpose, matching matmul_mmq_dev's C.3a path).
+bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
+                       float* Y, int n) {
+  if (!available() || !W.valid() || W.dims().size() != 2 || !y_q8 || !Y || n <= 0)
+    return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  const int ir = int(rows);
+  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
+  if (blocks_per_row == 0) return false;
+
+  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  if (!wp) return false;
+
+  const int* yq = reinterpret_cast<const int*>(y_q8);
+  bool ok = false;
+  switch (W.type()) {
+    case QuantType::Q3_K:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q3_K>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
+    case QuantType::Q4_K:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q4_K>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
+    case QuantType::Q5_K:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q5_K>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
+    default:
+      return false;
+  }
+  if (!ok) return false;
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// --- MMQ batched/fused prefill quantize (C.4, position-major) ---------------
+
+// Quantize one 128-element block (32 lanes) to block_q8_1_mmq, bit-identical to
+// ggml_derived/mmq.cuh's quantize_mmq_q8_1: each lane owns a 4-float (float4)
+// slot, amax is an fmaxf butterfly and the DS4 `sum` is the exact
+// (s0+s4)+(s2+s6)+((s1+s5)+(s3+s7)) shuffle-xor tree. The fused kernels below
+// route one 128-element block per warp so the lane mapping matches the unfused
+// quantize, making the fused and unfused mmq paths write identical bytes (the
+// prefix-cache full-vs-reuse test depends on this). The caller must have all 32
+// lanes of the warp active (full shuffle mask).
+template <int ds>  // mmq::D4 (Q3_K) or mmq::DS4 (Q4_K/Q5_K)
+__device__ __forceinline__ void quantize_mmq_q8_1_block(
+    const float (&f)[4], int blk, int token, int n, int lane,
+    mmq::block_q8_1_mmq* __restrict__ y) {
+  float amax = fabsf(f[0]);
+  amax = fmaxf(amax, fabsf(f[1]));
+  amax = fmaxf(amax, fabsf(f[2]));
+  amax = fmaxf(amax, fabsf(f[3]));
+#pragma unroll
+  for (int offset = 4; offset > 0; offset >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset, 32));
+
+  float sum = 0.0f;
+  if constexpr (ds == mmq::DS4) {
+    sum = f[0] + f[1] + f[2] + f[3];
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1)
+      sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
+  }
+
+  const float d_inv = 127.0f / amax;
+  const float d = 1.0f / d_inv;
+
+  char4 q;
+  q.x = roundf(f[0] * d_inv);
+  q.y = roundf(f[1] * d_inv);
+  q.z = roundf(f[2] * d_inv);
+  q.w = roundf(f[3] * d_inv);
+
+  mmq::block_q8_1_mmq& yb = y[(size_t)blk * n + token];
+  reinterpret_cast<char4*>(yb.qs)[lane] = q;
+
+  if (lane % 8 == 0) {
+    const int sub = lane >> 3;
+    if constexpr (ds == mmq::DS4) yb.ds4[sub] = make_half2(d, sum);
+    else                          yb.d4[sub]  = d;
+  }
+}
+
+// rms_norm -> block_q8_1_mmq fused (C.4, position-major). One block per token:
+// the per-row sum-of-squares reduction mirrors nn::cuda::rms_norm_dev (thread t
+// reads x[t], x[t+blockDim], …, warp shuffle + shared reduce), so `inv` is
+// bit-identical; the quantize is delegated to quantize_mmq_q8_1_block (above),
+// which is bit-identical to mmq::quantize_activation for both D4 and DS4.
+template <int ds>  // mmq::D4 (Q3_K) or mmq::DS4 (Q4_K/Q5_K)
+__global__ void __launch_bounds__(1024) rms_norm_quantize_mmq_q8_1_kernel(
+    const float* __restrict__ x, const float* __restrict__ weight, int dim,
+    int n, float eps, mmq::block_q8_1_mmq* __restrict__ y) {
+  const int token = blockIdx.x;
+  const int tid = threadIdx.x;
+  const float* xrow = x + (size_t)token * dim;
+
+  double s = 0.0;
+  for (int k = tid; k < dim; k += blockDim.x) {
+    const float v = xrow[k];
+    s += double(v * v);
+  }
+  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+  __shared__ double warp_part[32];
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  if (lane == 0) warp_part[warp] = s;
+  __syncthreads();
+  __shared__ float inv;
+  if (warp == 0) {
+    const int nwarps = (blockDim.x + 31) >> 5;
+    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
+    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
+    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(dim)) + eps);
+  }
+  __syncthreads();
+  const float iv = inv;
+
+  // Quantize: one 128-element block per warp, each lane owning a float4, so the
+  // butterfly in quantize_mmq_q8_1_block matches quantize_mmq_q8_1 exactly.
+  const int nwarps = (blockDim.x + 31) >> 5;
+  const int nblocks = dim / 128;
+  for (int blk = warp; blk < nblocks; blk += nwarps) {
+    const int base = blk * 128 + lane * 4;
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float v = xrow[base + k];
+      f[k] = weight ? v * iv * weight[base + k] : v * iv;
+    }
+    quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
+  }
+}
+
+bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* x,
+                                    float eps, BlockQ8_1Mmq* yq, int dim, int n,
+                                    int ds) {
+  if (!available() || !x || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0) return false;
+  if (!weight.empty() && weight.size() < (size_t)dim) return false;
+  const float* d_w = nullptr;
+  if (!weight.empty()) {
+    d_w = static_cast<const float*>(upload_bytes(weight.data(), dim * sizeof(float)));
+    if (!d_w) return false;
+  }
+  auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  if (ds == mmq::DS4)
+    rms_norm_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 1024, 0, cur_stream()>>>(
+        x, d_w, dim, n, eps, y);
+  else
+    rms_norm_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 1024, 0, cur_stream()>>>(
+        x, d_w, dim, n, eps, y);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// gelu×up -> block_q8_1_mmq fused (C.4, position-major): one 128-element block per
+// warp, each lane computing gelu_fp16(gate) * up over its float4 and quantizing via
+// quantize_mmq_q8_1_block (bit-identical to mmq::quantize_activation) — the f32 gelu
+// and product intermediates are never materialized.
+template <int ds>
+__global__ void gelu_mul_quantize_mmq_q8_1_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up, int dim, int n,
+    mmq::block_q8_1_mmq* __restrict__ y) {
+  const int token = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nwarps = (blockDim.x + 31) >> 5;
+  const float* grow = gate + (size_t)token * dim;
+  const float* urow = up + (size_t)token * dim;
+  const int nblocks = dim / 128;
+  for (int blk = warp; blk < nblocks; blk += nwarps) {
+    const int base = blk * 128 + lane * 4;
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k)
+      f[k] = gelu_fp16(grow[base + k]) * urow[base + k];
+    quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
+  }
+}
+
+bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds) {
+  if (!available() || !gate || !up || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0)
+    return false;
+  auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  if (ds == mmq::DS4)
+    gelu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  else
+    gelu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;

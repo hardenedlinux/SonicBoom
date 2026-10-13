@@ -19,9 +19,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sonicboom::planner {
@@ -40,6 +42,32 @@ uint32_t max_node_id(const Graph& g) {
   for (const auto& n : g.nodes)
     m = std::max(m, n.id.value);
   return m;
+}
+
+// Reads an Int attribute by name, mirroring the CUDA backend's attr_i so the
+// passes and the executor agree on the attr encoding (sx::AttrValueKind::Int).
+bool attr_i(const GraphNodeDesc& n, std::string_view name, int64_t& out) {
+  for (const auto& a : n.attributes)
+    if (a.name == name && a.kind() == sx::AttrValueKind::Int) {
+      out = std::get<int64_t>(a.value);
+      return true;
+    }
+  return false;
+}
+
+// block_q8_1_mmq size in bytes (144: a 16-byte scale union + 128 int8 quants;
+// matches the static_assert on quant::cuda::BlockQ8_1Mmq) and the matmul's
+// J_max (= I == 128) tail over-read guard, so the pass can size-check the f32
+// output tensor it reuses as the mmq activation buffer.
+constexpr size_t kMmqBlockBytes = 144;
+constexpr size_t kMmqTailGuardBlocks = 128;
+
+// Whether a `size_bytes` f32 buffer covers the mmq activation buffer for a
+// [n, dim] position-major input: (dim/128)*n blocks of data + the J_max tail
+// guard, 144 bytes each. dim must be a multiple of 128 (the kernels enforce it).
+bool mmq_q8_fits(int dim, int n, uint64_t size_bytes) {
+  const size_t blocks = (size_t(dim) / 128) * size_t(n) + kMmqTailGuardBlocks;
+  return size_bytes >= blocks * kMmqBlockBytes;
 }
 
 } // namespace
@@ -263,6 +291,197 @@ void fuse_gelu_mul_quantize_pass(Graph& g) {
         node.outputs = q.outputs;
         node.name = op_kind_name(OpKind::GeluMulQuantize);
       }
+    }
+    out_nodes.push_back(std::move(node));
+  }
+
+  g.nodes = std::move(out_nodes);
+
+  g.tensors.erase(
+      std::remove_if(g.tensors.begin(), g.tensors.end(),
+                     [&](const TensorDesc& t) { return dead.count(t.id.value) != 0; }),
+      g.tensors.end());
+}
+
+void fuse_rms_norm_mmq_pass(Graph& g) {
+  // Consumer node indices per tensor.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> consumers;
+  for (uint32_t i = 0; i < g.nodes.size(); ++i)
+    for (const TensorId& in : g.nodes[i].inputs)
+      consumers[in.value].push_back(i);
+
+  // norm node index -> its QuantizedMatmul consumer indices, plus the shared
+  // `ds`. Fused only when every consumer is a batched QuantizedMatmul sharing
+  // one `ds` (a mixed-precision norm like attn_norm -> q/k(D4) + v(DS4) is left
+  // unfused), and the f32 output buffer also covers the mmq activation's tail
+  // guard (mmq_q8_fits).
+  std::unordered_map<uint32_t, std::vector<uint32_t>> matmul_of_rms;
+  std::unordered_map<uint32_t, int64_t> ds_of_rms;
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& node = g.nodes[i];
+    if (node.op != OpKind::RmsNorm || node.inputs.size() != 1 ||
+        node.outputs.empty())
+      continue;
+    int64_t nb = 0, dim = 0;
+    if (!attr_i(node, "batch", nb) || !attr_i(node, "dim", dim) || nb <= 0 ||
+        dim <= 0)
+      continue;
+    const uint32_t out = node.outputs[0].value;
+    auto cit = consumers.find(out);
+    if (cit == consumers.end() || cit->second.empty())
+      continue;
+
+    int64_t ds = -1;
+    std::vector<uint32_t> matmuls;
+    bool ok = true;
+    for (uint32_t c : cit->second) {
+      const GraphNodeDesc& cn = g.nodes[c];
+      if (cn.op != OpKind::QuantizedMatmul || cn.inputs.size() != 1) {
+        ok = false;
+        break;
+      }
+      int64_t cnb = 0, cds = 0;
+      if (!attr_i(cn, "batch", cnb) || cnb != nb || !attr_i(cn, "ds", cds)) {
+        ok = false;
+        break;
+      }
+      if (ds == -1)
+        ds = cds;
+      else if (ds != cds) {
+        ok = false;
+        break;
+      }
+      matmuls.push_back(c);
+    }
+    if (!ok)
+      continue;
+
+    const TensorDesc* ot = g.find_tensor(node.outputs[0]);
+    if (!ot || !mmq_q8_fits(int(dim), int(nb), ot->size_bytes))
+      continue;
+
+    matmul_of_rms[i] = std::move(matmuls);
+    ds_of_rms[i] = ds;
+  }
+
+  if (matmul_of_rms.empty())
+    return;
+
+  std::unordered_set<uint32_t> to_q8;
+  for (const auto& [nidx, cs] : matmul_of_rms)
+    for (uint32_t c : cs)
+      to_q8.insert(c);
+
+  // In-place rewrite: no node is added or removed, only op kind / name / attrs
+  // change, so the topological order (and the producer/consumer tensor ids) is
+  // untouched.
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    GraphNodeDesc& node = g.nodes[i];
+    if (matmul_of_rms.count(i)) {
+      node.op = OpKind::RmsNormQuantize;
+      node.name = op_kind_name(OpKind::RmsNormQuantize);
+      node.attributes.push_back(sx::Attribute{"ds", ds_of_rms[i]});
+    } else if (to_q8.count(i)) {
+      node.op = OpKind::QuantizedMatmulQ8;
+      node.name = op_kind_name(OpKind::QuantizedMatmulQ8);
+    }
+  }
+}
+
+void fuse_gelu_mul_mmq_pass(Graph& g) {
+  std::unordered_map<uint32_t, uint32_t> producer;
+  for (uint32_t i = 0; i < g.nodes.size(); ++i)
+    for (const TensorId& o : g.nodes[i].outputs)
+      producer[o.value] = i;
+
+  std::unordered_map<uint32_t, uint32_t> consumers;
+  for (const GraphNodeDesc& node : g.nodes)
+    for (const TensorId& in : node.inputs)
+      ++consumers[in.value];
+
+  // For each batched QuantizedMatmul (the FFN down projection) whose input fh
+  // is produced by Mul(gelu, up) and whose gelu comes from a single-use
+  // GeluFp16(gate), fold the three nodes into GeluMulQuantize(gate, up) +
+  // QuantizedMatmulQ8. Keys are gelu node indices.
+  std::unordered_map<uint32_t, uint32_t> matmul_of_gelu;
+  std::unordered_map<uint32_t, uint32_t> mul_of_gelu;
+  std::unordered_map<uint32_t, int64_t> batch_of_gelu;
+  std::unordered_map<uint32_t, int64_t> dim_of_gelu;
+  std::unordered_map<uint32_t, int64_t> ds_of_gelu;
+  std::unordered_set<uint32_t> fused_mul;
+  std::unordered_set<uint32_t> to_q8;
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& node = g.nodes[i];
+    if (node.op != OpKind::QuantizedMatmul || node.inputs.size() != 1)
+      continue;
+    int64_t nb = 0, dim = 0, ds = 0;
+    if (!attr_i(node, "batch", nb) || !attr_i(node, "dim", dim) ||
+        !attr_i(node, "ds", ds) || nb <= 0 || dim <= 0)
+      continue;
+    const uint32_t fh = node.inputs[0].value;
+    auto mit = producer.find(fh);
+    if (mit == producer.end())
+      continue;
+    const GraphNodeDesc& mul = g.nodes[mit->second];
+    if (mul.op != OpKind::Mul || mul.inputs.size() != 2)
+      continue;
+    if (consumers[fh] != 1)
+      continue;  // the gelu*up product has another reader
+    const uint32_t gelu_t = mul.inputs[0].value;
+    auto git = producer.find(gelu_t);
+    if (git == producer.end())
+      continue;
+    const GraphNodeDesc& gelu = g.nodes[git->second];
+    if (gelu.op != OpKind::GeluFp16 || gelu.inputs.size() != 1)
+      continue;
+    if (consumers[gelu_t] != 1)
+      continue;  // the gelu output has another reader
+    const TensorDesc* ft = g.find_tensor(mul.outputs[0]);
+    if (!ft || !mmq_q8_fits(int(dim), int(nb), ft->size_bytes))
+      continue;
+    matmul_of_gelu[git->second] = i;
+    mul_of_gelu[git->second] = mit->second;
+    batch_of_gelu[git->second] = nb;
+    dim_of_gelu[git->second] = dim;
+    ds_of_gelu[git->second] = ds;
+    fused_mul.insert(mit->second);
+    to_q8.insert(i);
+  }
+
+  if (matmul_of_gelu.empty())
+    return;
+
+  // Dead tensors: the gelu f32 output (folded away); the mul's f32 output is
+  // reused as the GeluMulQuantize q8 buffer, so it stays.
+  std::unordered_set<uint32_t> dead;
+  for (const auto& [gidx, midx] : mul_of_gelu)
+    for (const TensorId& o : g.nodes[gidx].outputs)
+      dead.insert(o.value);
+
+  // Rebuild: the Mul node is dropped (folded into its producer's GeluMulQuantize).
+  // The GeluFp16 node keeps its position (its gate input is produced earlier),
+  // so the order stays topological.
+  std::vector<GraphNodeDesc> out_nodes;
+  out_nodes.reserve(g.nodes.size());
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    GraphNodeDesc node = g.nodes[i];
+    if (node.op == OpKind::Mul && fused_mul.count(i)) {
+      continue;  // folded into the GeluMulQuantize
+    }
+    if (matmul_of_gelu.count(i)) {
+      const GraphNodeDesc& mul = g.nodes[mul_of_gelu[i]];
+      node.op = OpKind::GeluMulQuantize;
+      node.name = op_kind_name(OpKind::GeluMulQuantize);
+      node.inputs = {node.inputs[0], mul.inputs[1]};
+      node.outputs = mul.outputs;  // reuse the mul's f32 output as the q8 buffer
+      node.attributes.push_back(sx::Attribute{"batch", batch_of_gelu[i]});
+      node.attributes.push_back(sx::Attribute{"dim", dim_of_gelu[i]});
+      node.attributes.push_back(sx::Attribute{"ds", ds_of_gelu[i]});
+    } else if (to_q8.count(i)) {
+      node.op = OpKind::QuantizedMatmulQ8;
+      node.name = op_kind_name(OpKind::QuantizedMatmulQ8);
     }
     out_nodes.push_back(std::move(node));
   }

@@ -405,6 +405,13 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
   auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
+  // The fused mmq quantize's activation scale layout follows the consuming
+  // matmul's weight type: Q3_K -> D4 (float scales), Q4_K/Q5_K -> DS4 (half2).
+  // Baked here (not in the planner pass) because only the emitter knows the
+  // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
+  auto ds_a = [](quant::QuantType qt) {
+    return attr_i("ds", (qt == quant::QuantType::Q3_K) ? int64_t(0) : int64_t(1));
+  };
   auto shape2 = [](uint64_t r, uint64_t c) {
     return std::vector<int64_t>{int64_t(r), int64_t(c)};
   };
@@ -441,7 +448,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     TensorId h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::AttnNorm), batch_a(n), dim_a(d)});
     TensorId q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff,
-                        shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n)});
+                        shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n),
+                        dim_a(d), ds_a(m.weights.blocks[l].attn_q.type())});
     q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, shape2(n, qw),
                {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
     q = b.node(OpKind::Rope, {q, start_pos}, "qr" + suff, shape2(n, qw),
@@ -450,7 +458,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     TensorId attn;
     if (cfg.has_kv(l)) {
       TensorId k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff,
-                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n)});
+                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n),
+                          dim_a(d), ds_a(m.weights.blocks[l].attn_k.type())});
       k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, shape2(n, kvw),
                  {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
       k = b.node(OpKind::Rope, {k, start_pos}, "kr" + suff, shape2(n, kvw),
@@ -458,7 +467,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
       TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
-                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n)});
+                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n),
+                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type())});
       v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});  // V norm: unit weight
       const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
@@ -483,7 +493,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     }
 
     TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
-                         shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n)});
+                         shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n),
+                         dim_a(qw), ds_a(m.weights.blocks[l].attn_output.type())});
     TensorId o = b.node(OpKind::RmsNorm, {ap}, "o" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n), dim_a(d)});
     TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(n, d), {layer_a(l)});
@@ -492,13 +503,16 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     TensorId f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::FfnNorm), batch_a(n), dim_a(d)});
     TensorId up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, shape2(n, ff),
-                         {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n)});
+                         {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n),
+                         dim_a(d), ds_a(m.weights.blocks[l].ffn_up.type())});
     TensorId gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, shape2(n, ff),
-                           {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n)});
+                           {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n),
+                           dim_a(d), ds_a(m.weights.blocks[l].ffn_gate.type())});
     gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff), {layer_a(l)});
     TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
     TensorId fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, shape2(n, d),
-                         {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n)});
+                         {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n),
+                         dim_a(ff), ds_a(m.weights.blocks[l].ffn_down.type())});
     TensorId f2 = b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n), dim_a(d)});
     TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(n, d), {layer_a(l)});
@@ -1147,6 +1161,15 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
         seg->graph = build_gemma4_prefill_graph(m, nseg);
+        // C.4: fold the mmq activation quantize into the norm/gelu kernels when
+        // the mmq tensor-core path is active for this segment (same conditions
+        // the batched matmul uses, so fused and unfused positions never disagree
+        // about which kernel a position runs).
+        if (quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+            nseg >= uint64_t(quant::cuda::mmq_min_n())) {
+          planner::fuse_rms_norm_mmq_pass(seg->graph);
+          planner::fuse_gelu_mul_mmq_pass(seg->graph);
+        }
       }
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
       {

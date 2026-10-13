@@ -47,6 +47,16 @@ bool available() noexcept;
 // stays reachable.
 bool q8_1_enabled() noexcept;
 
+// MMQ int8-tensor-core batched prefill matmul selection (C.2). SONICBOOM_MMQ=0
+// disables it and restores the cuBLAS fp16 path at n >= cublas_min_n();
+// SONICBOOM_MMQ_MIN_N sets the batch threshold (default 2, so the per-position
+// numerics stay batch-independent — see mmq_min_n). The prefill fusion pass
+// (C.4) gates on the same conditions the matmul uses, so the fused
+// q8_1-mmq-consumed path and the unfused matmul never disagree about which
+// kernel a position runs.
+bool mmq_enabled() noexcept;
+int mmq_min_n();
+
 // y = W @ x for a single-column activation, computed on the device. W's packed
 // bytes are uploaded on first use and cached keyed by (data pointer, byte
 // size), so repeated calls with the same weight reuse the device copy. x and y

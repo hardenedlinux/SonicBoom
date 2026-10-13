@@ -454,29 +454,63 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::QuantizedMatmulQ8: {
-      // K-quant gemv against a pre-quantized q8_1 activation (T1): no internal
+      // K-quant matmul against a pre-quantized activation: the decode path
+      // (no `batch`) consumes a q8_1 (32-elem block) activation via gemv; the
+      // prefill path (`batch` present) consumes a block_q8_1_mmq (128-elem
+      // block) activation via the int8-tensor-core matmul. No internal
       // quantize; blocks_per_row / num_rows come from the weight.
-      ok = quant::cuda::gemv_q8_1_dev(
-          qweight(slot), reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])),
-          out);
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb))
+        ok = quant::cuda::matmul_mmq_q8_dev(
+            qweight(slot),
+            reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
+            int(nb));
+      else
+        ok = quant::cuda::gemv_q8_1_dev(
+            qweight(slot),
+            reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])), out);
       break;
     }
     case OpKind::RmsNormQuantize: {
-      // rms_norm + q8_1 quantize fused (T3): the norm weight is keyed by `slot`
-      // (AttnNorm / FfnNorm / OutputNorm); the output is the q8_1 activation
-      // packed into an f32-sized buffer (same superset convention as Quantize).
-      ok = quant::cuda::rms_norm_quantize_q8_1_dev(
-          fweight(slot), dev(in[0]), eps,
-          reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      // rms_norm + quantize fused (T3): the norm weight is keyed by `slot`
+      // (AttnNorm / FfnNorm / OutputNorm); the output is the quantized
+      // activation packed into an f32-sized buffer (same superset convention as
+      // Quantize). The decode path (no `batch`) emits a q8_1 (32-elem block)
+      // activation; the prefill path (`batch` + `dim` + `ds`) emits a
+      // block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
+      int64_t nb = 0, dim_i = 0, ds_i = 0;
+      if (attr_i(*node, "batch", nb)) {
+        attr_i(*node, "dim", dim_i);
+        attr_i(*node, "ds", ds_i);
+        ok = quant::cuda::rms_norm_quantize_mmq_q8_1_dev(
+            fweight(slot), dev(in[0]), eps,
+            reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
+            int(ds_i));
+      } else {
+        ok = quant::cuda::rms_norm_quantize_q8_1_dev(
+            fweight(slot), dev(in[0]), eps,
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      }
       break;
     }
     case OpKind::GeluMulQuantize: {
-      // gelu_fp16(gate) * up, q8_1-quantized in one kernel (T5). Inputs are the
-      // gate/up projection outputs (device f32); the output is the q8_1
-      // activation for the down-projection gemv.
-      ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
-          dev(in[0]), dev(in[1]),
-          reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      // gelu_fp16(gate) * up, quantized in one kernel (T5). Inputs are the
+      // gate/up projection outputs (device f32); the output is the quantized
+      // activation for the down-projection matmul. Decode (no `batch`) emits
+      // q8_1; prefill (`batch` + `dim` + `ds`) emits block_q8_1_mmq.
+      int64_t nb = 0, dim_i = 0, ds_i = 0;
+      if (attr_i(*node, "batch", nb)) {
+        attr_i(*node, "dim", dim_i);
+        attr_i(*node, "ds", ds_i);
+        ok = quant::cuda::gelu_mul_quantize_mmq_q8_1_dev(
+            dev(in[0]), dev(in[1]),
+            reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
+            int(ds_i));
+      } else {
+        ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]),
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      }
       break;
     }
     case OpKind::MatvecF32: {

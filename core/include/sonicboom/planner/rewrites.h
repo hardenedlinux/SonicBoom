@@ -59,4 +59,30 @@ void fuse_rms_norm_quantize_pass(Graph& g);
 // tensor. Must run after quantize_once_pass (and after fuse_rms_norm_quantize_pass).
 void fuse_gelu_mul_quantize_pass(Graph& g);
 
+// C.4 prefill (mmq) rms_norm fusion. The prefill graph has no Quantize nodes —
+// each batched QuantizedMatmul quantizes its activation internally (block_q8_1_mmq,
+// 128-elem). This pass folds an RmsNorm(batch, dim) whose output is consumed
+// *only* by batched QuantizedMatmul nodes that all share one `ds` (activation
+// scale layout) into a single RmsNormQuantize(batch, dim, ds) node, and rewrites
+// each consumer to QuantizedMatmulQ8 (which reads the pre-quantized mmq blocks
+// with no internal quantize). The norm is then computed+quantized once instead of
+// once per consumer, and the f32 normalized activation is never materialized. The
+// RmsNormQuantize output reuses the RmsNorm's f32 output tensor (a strict superset
+// of the mmq blocks when the fusion's size gate passes). Fused only when the f32
+// output buffer also covers the mmq activation's J_max tail guard
+// (mmq_q8_blocks(dim, n) * 144 bytes <= size_bytes). Gate on q8_1_enabled &&
+// mmq_enabled at the call site, and on n >= mmq_min_n via the caller's nseg gate.
+void fuse_rms_norm_mmq_pass(Graph& g);
+
+// C.4 prefill (mmq) gelu×up fusion. The gated FFN down-projection
+// QuantizedMatmul(fh) internally quantizes fh = gelu_fp16(gate) * up. When the
+// gelu and the mul product are each single-use, the GeluFp16 + Mul +
+// QuantizedMatmul triple is replaced by one GeluMulQuantize(batch, dim=ff, ds)
+// node (computes quantize_mmq(gelu_fp16(gate) * up) in one kernel) plus a
+// QuantizedMatmulQ8 consuming it — the f32 gelu and fh intermediates are never
+// materialized. The GeluMulQuantize reuses the Mul's f32 output tensor (a
+// superset of the mmq blocks), and inherits `dim`/`ds` from the down-projection
+// matmul's attributes. Run after fuse_rms_norm_mmq_pass.
+void fuse_gelu_mul_mmq_pass(Graph& g);
+
 } // namespace sonicboom::planner

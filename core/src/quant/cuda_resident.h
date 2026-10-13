@@ -76,6 +76,48 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y);
 // n == 1 falls back to matvec_f32_dev. No host copies.
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 
+// --- MMQ int8-tensor-core batched/fused prefill ops (C.2/C.4) ---------------
+
+// block_q8_1_mmq activation block — the mmq int8-tensor-core matmul's input. A
+// 128-element block: four 32-element scales (float d4 for Q3_K weights / half2
+// ds4 for Q4_K,Q5_K, both 16 bytes) + 128 int8 quants; 144 bytes total. POD
+// mirror of ggml_derived/mmq.cuh's block_q8_1_mmq so host-side callers can size
+// the buffer without including the .cuh.
+struct BlockQ8_1Mmq {
+  float d4[4];     // scale union (ds4 occupies the same 16 bytes for Q4/Q5)
+  int8_t qs[128];
+};
+static_assert(sizeof(BlockQ8_1Mmq) == 144, "BlockQ8_1Mmq must be 144 bytes");
+
+// Activation scale layout for the mmq quantize: D4 = float d4 (Q3_K weights),
+// DS4 = half2 ds4 (Q4_K/Q5_K weights), matching the consuming matmul's weight
+// type. Passed as an int so the header stays CUDA-free.
+inline constexpr int MmqDsD4 = 0;
+inline constexpr int MmqDsDS4 = 1;
+
+// rms_norm + block_q8_1_mmq quantize fused (C.4, position-major): yq =
+// q8_1_mmq(rms_norm(X)). X is [n, dim] position-major (dim innermost); yq is
+// [dim/128][n] block_q8_1_mmq (index blk*n + token). `weight` is the per-element
+// norm weight (host span of dim floats, empty => unit). Device in/out, no host
+// copies. dim must be a multiple of 128.
+bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* x,
+                                    float eps, BlockQ8_1Mmq* yq, int dim, int n,
+                                    int ds);
+
+// gelu_fp16(gate)*up + block_q8_1_mmq quantize fused (C.4, position-major).
+// gate/up are [n, dim] position-major; yq is [dim/128][n] block_q8_1_mmq. The
+// f32 gelu/product intermediates are never materialized. Device in/out. dim must
+// be a multiple of 128.
+bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds);
+
+// K-quant matmul consuming a pre-quantized block_q8_1_mmq activation (no internal
+// quantize). W is the Q*_K weight [cols, rows]; yq is [cols/128][n] block_q8_1_mmq
+// (index blk*n + token); Y is [n, rows] position-major. The caller sized yq with
+// the J_max tail guard (see mmq_q8_blocks). Device in/out, no host copies.
+bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
+                       int n);
+
 // Dequantize a single row (token `token`) of a 2-D quantized embedding matrix
 // to device f32: out[k] = W[k][token] for k in [0, width). W has GGUF shape
 // [width, vocab]; `token` selects the row. `out` must hold `width` floats (the
