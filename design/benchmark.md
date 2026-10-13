@@ -376,6 +376,60 @@ cuBLAS plus device-side norms and gates, and lifting the SWA wrap constraint).
    and dead-computation/invariant hoisting. They are below the gemv rewrite in
    payoff.
 
+## v1 release
+
+SonicBoom v1 (wrapped 2026-10-13) closes the performance scope on Gemma 4
+E4B-It Q3_K_M: CUDA decode at llama.cpp parity, a correct-but-host-bound
+prefill path, and prefix-cache KV reuse that makes long-prefix continuation
+cheap. This section is the release-time summary of the numbers, the baseline,
+and the reproduction environment; the per-section detail is above.
+
+**Decode (CUDA).** 43.6 tok/s on the 64-step steady protocol — **1.02×
+llama.cpp** (42.63 tok/s, `tg64`/`ngl 99`, same GGUF + machine). Long-context
+steady decode: **1.02×** at depth 512 (45.95 vs 45.23 tok/s) and **0.97×** at
+depth 2048 (44.02 vs 45.25 tok/s). The step is GPU-bound (~31 ms/step at depth
+512); the q8_1 dp4a gemv holds 64% of GPU time (§1.1, §1.2, §2).
+
+**Prefill (CUDA).** ~20 tok/s vs llama.cpp ~2000 tok/s (**0.010–0.012×**) at
+pp128/512 — host-bound and per-column (not batched); pp2048 unsupported (SWA
+ring = 512). The batched prefill reproduces the per-token path token-for-token
+(§1.4).
+
+**Prefix reuse (CUDA).** `generate_prefill_spine_cuda_prefix` matches the
+shared prompt prefix against the token history and prefills only the suffix.
+First-token latency at prefix 4000 + 100 new: **1113.7 ms reuse vs 14825 ms
+full prefill → 13.3×**. Reuse continuation is token-identical to the full
+prefill over 32 tokens at every acceptance prefix (512/600/1000/1040/3584/
+3600/3996/4000/4095/4097 +100, and 4000 +600); `test_prefix_cache` 11/11.
+
+**Baseline (llama.cpp).** local checkout HEAD **`43fe9c642`**, CUDA build
+(`build-cuda/bin`); the dev-time *baseline only* (not an oracle).
+
+**Environment.** NVIDIA RTX 3050 (8 GiB, sm_86); driver **595.84** (CUDA
+13.2); nvcc **12.0** (C++20 host); g++-13 / C++23 core; Linux 6.8. See
+§Environment for the full table.
+
+**Reproduce.** `## Reproduce` (below) has the exact command lines for the
+64-step decode, long-context decode, llama.cpp baseline, and the full suite.
+
+## post-v1 (deferred / blocked)
+
+Recorded at v1 wrap-up; none of these block the release.
+
+- **Qwen2 decode — blocked.** The arch-generic loader (`detect_arch` +
+  `load_config`) reads a Qwen2.5 GGUF (`general.architecture` == "qwen2") and
+  derives a Qwen2 `Gemma4Config`; `test_qwen2_config` asserts the frozen 0.5B
+  facts (24 blocks, d 896, ff 4864, 14/2 heads, head_dim 64, context 32768,
+  vocab 151936, rope 1e6, no SWA/shared-KV/per-layer-input/softcap). Weight
+  binding, the Qwen plan builder (decode + prefill), and end-to-end Qwen2
+  decode verification are **deferred/blocked**: Qwen2.5 Q4_K_M uses Q5_0/Q8_0/
+  Q6_K quant types and attention q/k/v biases SonicBoom does not yet model.
+- **CUDA plugin split — deferred (#58).** Splitting the CUDA backend into a
+  runtime-loadable plugin (Step 4 Deliverable 2) awaits an amendment decision.
+- **Prefill batching + SWA ring-wrap.** A real batched quantized GEMM (or
+  cuBLAS) plus device-side norms/gates, then SWA ring-wrap handling for
+  n > 512 — the prefill gap (§1.4) is measure-only at v1.
+
 ## Reproduce
 
 ```sh
