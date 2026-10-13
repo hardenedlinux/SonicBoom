@@ -367,7 +367,7 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
 // (T register accumulators), so the weight's DRAM traffic is amortized over the
 // batch instead of re-read once per column. `y` is the q8_1 activation laid out
 // position-major: [pos * blocks_per_row + b] * (QK_K / QK8_1) blocks. `dst` is
-// [num_rows, n] with n innermost (matches the [rows, n] prefill layout).
+// [n, num_rows] position-major (matches the [n, rows] prefill layout).
 
 constexpr int GEMV_BATCH_T = 8;
 
@@ -403,7 +403,7 @@ __global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
   }
@@ -441,7 +441,7 @@ __global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
   }
@@ -479,7 +479,7 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)row * n + (p0 + t)] = s;
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
       }
     }
   }

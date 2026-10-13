@@ -383,14 +383,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
-      std::span<float> o = f32_mut(out);  // [dim, n] column-major
+      std::span<float> o = f32_mut(out);  // [n, dim] position-major
       const uint64_t dim = n ? o.size() / n : 0;
       std::vector<float> row(dim);
       for (uint64_t c = 0; c < n; ++c) {
         uint64_t tok = 0;
         std::memcpy(&tok, inputs[0].data() + c * sizeof(uint64_t), sizeof(uint64_t));
         if (!nn::embedding_f32(W, tok, row)) { ok = false; break; }
-        for (uint64_t k = 0; k < dim; ++k) o[k * n + c] = row[k];
+        for (uint64_t k = 0; k < dim; ++k) o[c * dim + k] = row[k];
       }
       break;
     }
@@ -401,25 +401,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
                                   uint64_t(nb));
       break;
     }
-    case OpKind::Transpose: {
-      int64_t nb = 0, dim_i = 0, dir_i = 0;
-      attr_i(*node, "batch", nb);
-      attr_i(*node, "dim", dim_i);
-      attr_i(*node, "dir", dir_i);
-      const uint64_t n = uint64_t(nb), dim = uint64_t(dim_i);
-      std::span<const float> x = f32(inputs[0]);
-      std::span<float> o = f32_mut(out);
-      if (dir_i == 0) {  // [dim, n] -> [n, dim]
-        for (uint64_t c = 0; c < n; ++c)
-          for (uint64_t k = 0; k < dim; ++k) o[c * dim + k] = x[k * n + c];
-      } else {  // [n, dim] -> [dim, n]
-        for (uint64_t c = 0; c < n; ++c)
-          for (uint64_t k = 0; k < dim; ++k) o[k * n + c] = x[c * dim + k];
-      }
-      ok = true;
-      break;
-    }
-    case OpKind::RmsNormCols: {
+    case OpKind::RmsNormRows: {
       int64_t nb = 0, dim_i = 0;
       attr_i(*node, "batch", nb);
       attr_i(*node, "dim", dim_i);
@@ -427,11 +409,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<const float> x = f32(inputs[0]);
       std::span<float> o = f32_mut(out);
       std::span<const float> w = fweight(slot);
-      std::vector<float> col(dim);
       for (uint64_t c = 0; c < n; ++c) {
-        for (uint64_t k = 0; k < dim; ++k) col[k] = x[k * n + c];
-        if (!nn::rms_norm(col, w, eps, col)) { ok = false; break; }
-        for (uint64_t k = 0; k < dim; ++k) o[k * n + c] = col[k];
+        if (!nn::rms_norm(x.subspan(c * dim, dim), w, eps, o.subspan(c * dim, dim))) {
+          ok = false;
+          break;
+        }
       }
       break;
     }
@@ -534,15 +516,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
-      std::span<const float> x = f32(inputs[0]);
-      std::span<float> o = f32_mut(out);
+      std::span<const float> x = f32(inputs[0]);  // [n, dim]
+      std::span<float> o = f32_mut(out);          // [n, rows]
       const uint64_t dim = n ? x.size() / n : 0;
-      std::vector<float> col(dim);
-      std::vector<float> y(n ? o.size() / n : 0);
+      const uint64_t rows = n ? o.size() / n : 0;
+      std::vector<float> y(rows);
       for (uint64_t c = 0; c < n; ++c) {
-        for (uint64_t k = 0; k < dim; ++k) col[k] = x[k * n + c];
-        if (!nn::matvec_f32(W, dim, col, y)) { ok = false; break; }
-        for (uint64_t r = 0; r < y.size(); ++r) o[r * n + c] = y[r];
+        if (!nn::matvec_f32(W, dim, x.subspan(c * dim, dim), y)) {
+          ok = false;
+          break;
+        }
+        for (uint64_t r = 0; r < rows; ++r) o[c * rows + r] = y[r];
       }
       break;
     }
@@ -553,15 +537,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
-      std::span<const float> x = f32(inputs[0]);
-      std::span<float> o = f32_mut(out);
-      std::vector<float> col(d), x_bf16(d), y(per);
+      std::span<const float> x = f32(inputs[0]);  // [n, d]
+      std::span<float> o = f32_mut(out);          // [n, per]
+      std::vector<float> x_bf16(d), y(per);
       for (uint64_t c = 0; c < n; ++c) {
-        for (uint32_t k = 0; k < d; ++k) col[k] = x[k * n + c];
         for (uint32_t k = 0; k < d; ++k)
-          x_bf16[k] = bf16_to_f32(f32_to_bf16(col[k]));
+          x_bf16[k] = bf16_to_f32(f32_to_bf16(x[c * d + k]));
         if (!nn::matvec_bf16(W, d, x_bf16, y)) { ok = false; break; }
-        for (uint32_t r = 0; r < per; ++r) o[r * n + c] = y[r];
+        for (uint32_t r = 0; r < per; ++r) o[c * per + r] = y[r];
       }
       break;
     }
@@ -572,18 +555,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       const uint64_t n = uint64_t(nb);
-      std::span<const float> proj = f32(inputs[0]);
-      std::span<const float> ple_row = f32(inputs[1]);
-      std::span<float> o = f32_mut(out);
+      std::span<const float> proj = f32(inputs[0]);     // [n, per]
+      std::span<const float> ple_row = f32(inputs[1]);  // [n, total_per]
+      std::span<float> o = f32_mut(out);                // [n, per]
+      const uint64_t total_per = n ? ple_row.size() / n : 0;
       std::vector<float> p(per), pl(per), y(per);
       for (uint64_t c = 0; c < n; ++c) {
-        for (uint32_t k = 0; k < per; ++k) p[k] = proj[k * n + c];
-        for (uint32_t k = 0; k < per; ++k) pl[k] = ple_row[(col + k) * n + c];
+        for (uint32_t k = 0; k < per; ++k) p[k] = proj[c * per + k];
+        for (uint32_t k = 0; k < per; ++k) pl[k] = ple_row[c * total_per + col + k];
         if (!nn::layer_combine(p, pl, ple_scale, combine_scale, y)) {
           ok = false;
           break;
         }
-        for (uint32_t k = 0; k < per; ++k) o[k * n + c] = y[k];
+        for (uint32_t k = 0; k < per; ++k) o[c * per + k] = y[k];
       }
       break;
     }

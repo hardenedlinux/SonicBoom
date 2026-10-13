@@ -85,10 +85,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::EmbeddingBatched;
   if (name == "quantized_matmul_batched")
     return OpKind::QuantizedMatmulBatched;
-  if (name == "transpose")
-    return OpKind::Transpose;
-  if (name == "rms_norm_cols")
-    return OpKind::RmsNormCols;
+  if (name == "rms_norm_rows")
+    return OpKind::RmsNormRows;
   if (name == "rms_norm_heads_batched")
     return OpKind::RmsNormHeadsBatched;
   if (name == "rope_batched")
@@ -144,8 +142,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Slice: return "slice";
     case OpKind::EmbeddingBatched: return "embedding_batched";
     case OpKind::QuantizedMatmulBatched: return "quantized_matmul_batched";
-    case OpKind::Transpose: return "transpose";
-    case OpKind::RmsNormCols: return "rms_norm_cols";
+    case OpKind::RmsNormRows: return "rms_norm_rows";
     case OpKind::RmsNormHeadsBatched: return "rms_norm_heads_batched";
     case OpKind::RopeBatched: return "rope_batched";
     case OpKind::FlashAttention: return "flash_attention";

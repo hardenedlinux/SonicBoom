@@ -370,9 +370,9 @@ bool validate_matmul(const QuantizedTensor& W, uint64_t n, uint64_t x_elems,
   return true;
 }
 
-// Streaming f32 dot: Y = W @ Xa where Xa is a [cols, n] row-major matrix of the
-// raw f32 activation. Used only by the plain-f32 mode (matmul_f32); the q8_K
-// mode uses the fused fixed-point dot instead.
+// Streaming f32 dot: Y = W @ Xa where Xa is [n, cols] position-major and Y is
+// [n, rows] position-major. Used only by the plain-f32 mode (matmul_f32); the
+// q8_K mode uses the fused fixed-point dot instead.
 void dot_stream(const QuantizedTensor& W, const float* Xa, uint64_t cols,
                 uint64_t rows, uint64_t n, float* Y) {
   const uint32_t block_size = W.block_size();
@@ -382,20 +382,19 @@ void dot_stream(const QuantizedTensor& W, const float* Xa, uint64_t cols,
   const std::byte* data = W.data().data();
   std::vector<float> scratch(block_size);
 
-  for (uint64_t r = 0; r < rows; ++r) {
-    float* yr = Y + r * n;
-    for (uint64_t c = 0; c < n; ++c) yr[c] = 0.0f;
+  for (uint64_t i = 0; i < rows * n; ++i) Y[i] = 0.0f;
 
+  for (uint64_t r = 0; r < rows; ++r) {
     for (uint64_t b = 0; b < blocks_per_row; ++b) {
       const uint64_t block_idx = r * blocks_per_row + b;
       const std::byte* block_ptr = data + block_idx * bytes_per_block;
       dequantize_block(W.type(), {block_ptr, bytes_per_block}, scratch.data());
 
-      const float* xb = Xa + b * block_size * n;
-      for (uint64_t j = 0; j < block_size; ++j) {
-        const float w = scratch[j];
-        const float* xrow = xb + j * n;
-        for (uint64_t c = 0; c < n; ++c) yr[c] += w * xrow[c];
+      const uint64_t k0 = b * block_size;
+      for (uint64_t c = 0; c < n; ++c) {
+        const float* xc = Xa + c * cols + k0;
+        float* yc = Y + c * rows;
+        for (uint64_t j = 0; j < block_size; ++j) yc[r] += scratch[j] * xc[j];
       }
     }
   }
@@ -456,20 +455,20 @@ bool matmul_f32_q8_K(const QuantizedTensor& W, std::span<const float> X,
   const uint64_t blocks_per_row = cols / W.block_size();  // exact (valid())
   const std::byte* data = W.data().data();
 
-  // Quantize the activation to q8_K per column (llama.cpp quantizes the
+  // Quantize the activation to q8_K per position (llama.cpp quantizes the
   // activation per-column, so the batch dimension is independent here too), then
   // dot each weight row against it with the fused fixed-point inner product.
   std::vector<Q8KBlock> act_blocks(blocks_per_row);
   std::vector<float> col(cols);
 
-  // Rows are mutually independent (each writes only Y[r*n+c]), so the row loop
-  // splits across the thread pool. The per-row arithmetic is unchanged — only
-  // which worker runs a row differs — so this stays bit-exact with the
+  // Rows are mutually independent (each writes only Y[c*rows+r]), so the row
+  // loop splits across the thread pool. The per-row arithmetic is unchanged —
+  // only which worker runs a row differs — so this stays bit-exact with the
   // single-threaded path and deterministic for any worker count.
   ThreadPool& pool = ThreadPool::instance();
 
   for (uint64_t c = 0; c < n; ++c) {
-    for (uint64_t k = 0; k < cols; ++k) col[k] = X[k * n + c];
+    for (uint64_t k = 0; k < cols; ++k) col[k] = X[c * cols + k];
     quantize_q8_K_blocks(col.data(), blocks_per_row, act_blocks.data());
 
     pool.parallel_for(0, rows, [&](uint64_t r_begin, uint64_t r_end) {
@@ -483,7 +482,7 @@ bool matmul_f32_q8_K(const QuantizedTensor& W, std::span<const float> X,
           block_dot(block_ptr, act_blocks[b], sums, sumf);
         }
         for (int l = 0; l < 8; ++l) sumf += sums[l];
-        Y[r * n + c] = sumf;
+        Y[c * rows + r] = sumf;
       }
     });
   }

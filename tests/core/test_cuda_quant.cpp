@@ -132,12 +132,12 @@ void test_one_type(sbquant::QuantType type, const char* name,
   test_one_shape(type, name, 64, 256 * 40, 1e-1, rng);
 }
 
-// Batched (prefill) matmul, fp32 differential path: Y = W @ X for n columns,
-// compared against the CPU matmul_f32 reference (X/Y row-major with n innermost).
-// main() sets SONICBOOM_GEMV_F32=1, so this exercises the fp32 fallback (the n×
-// gather/gemv/scatter loop) — the exact dequant arithmetic, compared at the fp32
-// tolerances below. The q8_1 batched path (the default) is covered separately by
-// test_batched_q8_1, bit-exact against the per-column q8_1 matvec.
+// Batched (prefill) matmul, fp32 differential path: Y = W @ X for n positions,
+// compared against the CPU matmul_f32 reference (X [n, cols], Y [n, rows]
+// position-major). main() sets SONICBOOM_GEMV_F32=1, so this exercises the fp32
+// fallback (the n× gemv/copy loop) — the exact dequant arithmetic, compared at
+// the fp32 tolerances below. The q8_1 batched path (the default) is covered
+// separately by test_batched_q8_1, bit-exact against the per-position q8_1 matvec.
 void test_batched(sbquant::QuantType type, const char* name, uint64_t rows,
                   uint64_t cols, uint64_t n, double tol, std::mt19937& rng) {
   // Same keepalive as test_one_shape: keep each weight's backing buffer alive so
@@ -178,13 +178,11 @@ void test_batched_type(sbquant::QuantType type, const char* name,
 }
 
 // q8_1 batched matmul (the decode/prefill default), checked bit-exact against
-// the per-column q8_1 matvec. Unlike test_batched, this runs with
-// SONICBOOM_GEMV_F32 *unset* so matmul_f32 takes the transpose -> quantize_q8_1
-// -> batched warp-per-row path. That path must be bit-identical to n calls of
-// matvec_f32 (same quantize_q8_1, same vec_dot, same __shfl reduction order);
-// any divergence here means the transpose or the position-major q8_1 layout is
-// wrong (a swapped transpose grid silently produced garbage, so this is the
-// guard that catches it).
+// the per-position q8_1 matvec. Unlike test_batched, this runs with
+// SONICBOOM_GEMV_F32 *unset* so matmul_f32 takes the quantize_q8_1 -> batched
+// warp-per-row path. That path must be bit-identical to n calls of matvec_f32
+// (same quantize_q8_1, same vec_dot, same __shfl reduction order); any
+// divergence here means the position-major q8_1 layout is wrong.
 void test_batched_q8_1(sbquant::QuantType type, const char* name, uint64_t rows,
                        uint64_t cols, uint64_t n, std::mt19937& rng) {
   static std::vector<std::vector<std::byte>> keepalive;
@@ -205,12 +203,12 @@ void test_batched_q8_1(sbquant::QuantType type, const char* name, uint64_t rows,
 
   for (uint64_t c = 0; c < n; ++c) {
     std::vector<float> xc(cols), yc(rows);
-    for (uint64_t k = 0; k < cols; ++k) xc[k] = X[k * n + c];
+    for (uint64_t k = 0; k < cols; ++k) xc[k] = X[c * cols + k];
     if (!sbquant::cuda::matvec_f32(W, xc, yc)) {
       check(false, "cuda::matvec_f32 (q8_1 single-col) returns true");
       return;
     }
-    for (uint64_t r = 0; r < rows; ++r) Yr[r * n + c] = yc[r];
+    for (uint64_t r = 0; r < rows; ++r) Yr[c * rows + r] = yc[r];
   }
 
   size_t ndiff = 0;

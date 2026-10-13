@@ -69,23 +69,26 @@ enum class OpKind : uint8_t {
   PerLayerInput,    // hoisted full-width per-layer input (bf16 gemv + scale + seg rms + combine)
   Slice,            // contiguous sub-span copy (attrs: offset, length)
 
-  // Transformer operators — batched prefill (Phase 7). Mirrors the per-token
-  // vocabulary on [dim, n] (column-major) / [n, dim] (position-major) batched
-  // tensors; each loops over the batch dim calling the same kernel the per-token
-  // OpKind uses. The batch size n (and `dim` where needed) is baked into the
-  // node attributes by the prefill graph emitter.
-  EmbeddingBatched,        // nn::embedding_f32 per token -> [dim, n]
-  QuantizedMatmulBatched,  // quant::matmul_f32_q8_K(W, X, Y, n)
-  Transpose,               // [dim,n] <-> [n,dim] (attr: dir)
-  RmsNormCols,             // nn::rms_norm per column over [dim, n]
+  // Transformer operators — batched prefill (Phase 7 / Section C.3). Mirrors
+  // the per-token vocabulary on [n, dim] position-major batched tensors (n ==
+  // the prompt length, dim innermost); each loops over the batch dim calling
+  // the same kernel the per-token OpKind uses. The batch size n (and `dim`
+  // where needed) is baked into the node attributes by the prefill graph
+  // emitter. Position-major (C.3) removed the [dim,n] column-major layout and
+  // its Transpose nodes: every batched matmul/gather/norm writes [n, dim]
+  // directly, so the attention path (which always consumed [n, dim]) no longer
+  // needs a data-movement transpose on either side of it.
+  EmbeddingBatched,        // nn::embedding_f32 per token -> [n, dim]
+  QuantizedMatmulBatched,  // quant::matmul_f32_q8_K(W, X, Y, n) -> [n, dim]
+  RmsNormRows,             // nn::rms_norm per row over [n, dim]
   RmsNormHeadsBatched,     // nn::rms_norm_heads per position over [n, dim]
   RopeBatched,             // nn::rope_neox_heads per position over [n, dim]
   FlashAttention,          // chunked flash attention over prior cache + current batch
   FlashAttentionShared,    // donor chunked flash attention (no append)
   KvAppendBatched,         // append n KV rows to the cache (deferred to after all layers)
-  MatvecF32Batched,        // nn::matvec_f32 per column
-  MatvecBf16Batched,       // nn::matvec_bf16 per column (bf16 activation)
-  LayerCombineBatched,     // nn::layer_combine per column
+  MatvecF32Batched,        // nn::matvec_f32 per position -> [n, dim]
+  MatvecBf16Batched,       // nn::matvec_bf16 per position (bf16 activation) -> [n, dim]
+  LayerCombineBatched,     // nn::layer_combine per position
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

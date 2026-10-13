@@ -121,7 +121,7 @@ void test_matvec_one_type(sbquant::QuantType type, const char* name,
 void test_matmul_one_type(sbquant::QuantType type, std::mt19937& rng) {
   const uint64_t rows = 3;
   const uint64_t cols = 256 * 2;  // 2 blocks per row
-  const uint64_t n = 4;           // batch columns (prefill)
+  const uint64_t n = 4;           // batch positions (prefill)
 
   auto bytes = build_weight(type, rows, cols, rng);
   sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
@@ -133,14 +133,15 @@ void test_matmul_one_type(sbquant::QuantType type, std::mt19937& rng) {
   check(ok, "matmul_f32 returns true for a valid weight");
 
   // Naive reference: dequantize the whole weight, then plain matmul.
+  // X is [n, cols] and Y is [n, rows] position-major.
   const uint64_t total = rows * cols;
   std::vector<float> wf(total);
   sbquant::dequantize_f32(W, wf.data(), wf.size());
   for (uint64_t r = 0; r < rows; ++r) {
     for (uint64_t c = 0; c < n; ++c) {
       float acc = 0.0f;
-      for (uint64_t k = 0; k < cols; ++k) acc += wf[r * cols + k] * X[k * n + c];
-      Y_ref[r * n + c] = acc;
+      for (uint64_t k = 0; k < cols; ++k) acc += wf[r * cols + k] * X[c * cols + k];
+      Y_ref[c * rows + r] = acc;
     }
   }
 

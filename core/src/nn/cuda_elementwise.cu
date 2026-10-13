@@ -1418,57 +1418,6 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
 
 // --- batched prefill kernels (the decode kernels generalized to n columns) ---
 
-// Column rms_norm over a [dim, ncols] row-major activation (the batched prefill
-// layout): normalizes each of the `ncols` columns over the `dim` rows. The
-// previous form was one block per column with threads spanning dim, reading
-// x[k*ncols+c] at stride ncols — every warp touched one cache line per lane, so
-// the pass ran far above the memory-bound floor. This form makes consecutive
-// lanes own consecutive columns (coalesced loads/stores) and splits the dim
-// reduction across the 32 warps of a block (each warp sums a contiguous dim
-// slice), then combines the per-slice partials in shared memory. Grid is
-// (ncols+31)/32 blocks of 1024 threads; each block covers 32 columns. The double
-// accumulation and fp32 rounding at inv keep each column within the fp32
-// tolerance of the decode rms_norm_dev reference (the reorder is far below the
-// fp32 rounding applied to sum/dim).
-__global__ void rms_norm_cols_kernel(const float* __restrict__ x,
-                                     const float* __restrict__ weight, int dim,
-                                     int ncols, float eps,
-                                     float* __restrict__ y) {
-  const int warp = threadIdx.x >> 5;
-  const int lane = threadIdx.x & 31;
-  const int nwarps = blockDim.x >> 5;
-  const int c = blockIdx.x * 32 + lane;
-  const bool valid = c < ncols;
-  // contiguous dim slice owned by this warp
-  const int chunk = (dim + nwarps - 1) / nwarps;
-  const int k0 = warp * chunk;
-  const int k1 = (k0 + chunk < dim) ? (k0 + chunk) : dim;
-  double s = 0.0;
-  if (valid) {
-    for (int k = k0; k < k1; ++k) {
-      const float v = x[(size_t)k * ncols + c];
-      s += double(v * v);
-    }
-  }
-  // combine this warp's partial per-column sum across the dim-slice warps.
-  __shared__ double warp_part[32][32];  // [nwarps][32 columns]
-  warp_part[warp][lane] = s;
-  __syncthreads();
-  __shared__ float inv[32];
-  if (warp == 0) {
-    double t = warp_part[0][lane];
-    for (int w = 1; w < nwarps; ++w) t += warp_part[w][lane];
-    inv[lane] = 1.0f / sqrtf(float(t / double(dim)) + eps);
-  }
-  __syncthreads();
-  if (!valid) return;
-  const float iv = inv[lane];
-  for (int k = k0; k < k1; ++k) {
-    const size_t idx = (size_t)k * ncols + c;
-    y[idx] = weight ? x[idx] * iv * weight[k] : x[idx] * iv;
-  }
-}
-
 // Batched multi-head RoPE: like rope_neox_heads_kernel but the absolute position
 // is per-position — pos = start_pos + i / (heads_per_pos * head_dim) — so one
 // launch rotates every position of a [n_pos, heads_per_pos*head_dim] buffer. The
@@ -1520,36 +1469,22 @@ __global__ void rope_neox_heads_batched_pos_kernel(
   x[i + half] = x0 * s + x1 * c;
 }
 
-// Tiled transpose of a [rows, cols] row-major matrix -> [cols, rows]:
-// dst[c*rows + r] = src[r*cols + c]. Same +1-pad tile as the K-quant matmul's
-// transpose_tiled, kept here so the prefill Transpose op has no quant-file
-// dependency.
-__global__ void transpose_tiled_dev(const float* __restrict__ src,
-                                    float* __restrict__ dst, int rows, int cols) {
-  __shared__ float tile[32][33];
-  int x = blockIdx.x * 32 + threadIdx.x;
-  int y = blockIdx.y * 32 + threadIdx.y;
-  if (x < cols && y < rows) tile[threadIdx.y][threadIdx.x] = src[(size_t)y * cols + x];
-  __syncthreads();
-  x = blockIdx.y * 32 + threadIdx.x;
-  y = blockIdx.x * 32 + threadIdx.y;
-  if (x < rows && y < cols) dst[(size_t)y * rows + x] = tile[threadIdx.x][threadIdx.y];
-}
-
-// Dense gemv over n columns: one thread per (row, col) pair. Consecutive threads
-// span columns, so the activation loads x[i*ncols + c] are coalesced and the
-// weight row W[row*cols + i] is broadcast across ncols threads.
+// Dense batched gemv (position-major): one thread per (position, row) pair.
+// Consecutive threads span output rows within a position, so the activation
+// vector x[c*cols + i] is broadcast across the `rows` threads of a position and
+// the weight row W[row*cols + i] is streamed per row.
 __global__ void gemv_dense_f32_batched(const float* __restrict__ W,
                                        const float* __restrict__ x,
                                        float* __restrict__ y, int cols, int rows,
                                        int ncols) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= rows * ncols) return;
-  const int row = idx / ncols;
-  const int c = idx - row * ncols;
-  const float* wrow = W + (size_t)row * cols;
+  const int c = idx / rows;
+  const int r = idx - c * rows;
+  const float* wrow = W + (size_t)r * cols;
+  const float* xrow = x + (size_t)c * cols;
   float acc = 0.0f;
-  for (int i = 0; i < cols; ++i) acc += wrow[i] * x[(size_t)i * ncols + c];
+  for (int i = 0; i < cols; ++i) acc += wrow[i] * xrow[i];
   y[idx] = acc;
 }
 
@@ -1559,11 +1494,12 @@ __global__ void gemv_bf16_batched(const uint16_t* __restrict__ W,
                                   int ncols) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= rows * ncols) return;
-  const int row = idx / ncols;
-  const int c = idx - row * ncols;
-  const uint16_t* wrow = W + (size_t)row * cols;
+  const int c = idx / rows;
+  const int r = idx - c * rows;
+  const uint16_t* wrow = W + (size_t)r * cols;
+  const float* xrow = x + (size_t)c * cols;
   float acc = 0.0f;
-  for (int i = 0; i < cols; ++i) acc += bf16_to_float(wrow[i]) * x[(size_t)i * ncols + c];
+  for (int i = 0; i < cols; ++i) acc += bf16_to_float(wrow[i]) * xrow[i];
   y[idx] = acc;
 }
 
@@ -1574,19 +1510,20 @@ __global__ void gemv_bf16_batched(const uint16_t* __restrict__ W,
 // prefills into differently-sized segments at the same 512-aligned boundaries).
 constexpr int kDenseCublasWidth = 128;
 
-// Repack a [cols, ncols] activation slice (columns [c0, c0+chunk_n)) into a
-// tight [cols, 128] block, zero-filling the trailing padding columns. Every
-// chunk of the same activation lands at the same stride (128), so the GEMM shape
-// (m, k, lda) is identical across chunks and across n values.
+// Repack a [ncols, cols] position-major activation slice (positions [c0,
+// c0+chunk_n)) into the column-major [cols, 128] block cuBLAS consumes
+// (xpack[i*128 + p] == x[c0+p, i]), zero-filling the trailing padding positions.
+// Every chunk lands at the same stride (128), so the GEMM shape (m, k, lda) is
+// identical across chunks and across n values.
 __global__ void pack_f32_chunk_kernel(const float* __restrict__ x,
                                       float* __restrict__ dst, int cols,
                                       int ncols, int c0, int chunk_n) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = cols * kDenseCublasWidth;
   if (idx >= total) return;
-  const int row = idx / kDenseCublasWidth;
-  const int p = idx - row * kDenseCublasWidth;
-  dst[idx] = (p < chunk_n) ? x[(size_t)row * ncols + (c0 + p)] : 0.0f;
+  const int p = idx % kDenseCublasWidth;
+  const int i = idx / kDenseCublasWidth;
+  dst[idx] = (p < chunk_n) ? x[(size_t)(c0 + p) * cols + i] : 0.0f;
 }
 
 __global__ void pack_bf16_chunk_kernel(const float* __restrict__ x,
@@ -1595,23 +1532,25 @@ __global__ void pack_bf16_chunk_kernel(const float* __restrict__ x,
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = cols * kDenseCublasWidth;
   if (idx >= total) return;
-  const int row = idx / kDenseCublasWidth;
-  const int p = idx - row * kDenseCublasWidth;
-  dst[idx] = (p < chunk_n) ? float_to_bf16(x[(size_t)row * ncols + (c0 + p)])
+  const int p = idx % kDenseCublasWidth;
+  const int i = idx / kDenseCublasWidth;
+  dst[idx] = (p < chunk_n) ? float_to_bf16(x[(size_t)(c0 + p) * cols + i])
                            : uint16_t(0);
 }
 
-// Copy the first `chunk_n` columns of a [rows, 128] result block back into the
-// [rows, ncols] output at column offset c0 (the padding columns are dropped).
+// Copy the first `chunk_n` positions of a [rows, 128] result block back into the
+// [ncols, rows] position-major output at position offset c0 (the padding
+// positions are dropped). src is column-major [128, rows] as cuBLAS wrote it, so
+// src[p + r*128] == y[c0+p, r].
 __global__ void copyback_chunk_kernel(const float* __restrict__ src,
                                       float* __restrict__ dst, int rows,
                                       int ncols, int c0, int chunk_n) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const int total = rows * chunk_n;
+  const int total = chunk_n * rows;
   if (idx >= total) return;
-  const int r = idx / chunk_n;
-  const int p = idx - r * chunk_n;
-  dst[(size_t)r * ncols + (c0 + p)] = src[(size_t)r * kDenseCublasWidth + p];
+  const int p = idx / rows;
+  const int r = idx - p * rows;
+  dst[(size_t)(c0 + p) * rows + r] = src[p + (size_t)r * kDenseCublasWidth];
 }
 
 // Append n consecutive rows into the flat KV cache. Each thread copies one
@@ -1946,9 +1885,9 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
          cudaSuccess;
 }
 
-// Batched dense matvec (the prefill shape): Y[r*n+c] = sum_i W[r*cols+i] *
-// X[i*n+c]. X is host row-major [cols, n] (n innermost), Y is host row-major
-// [rows, n]. Uploads X, runs the device batched matvec (cuBLAS fixed-width
+// Batched dense matvec (the prefill shape): Y[c*rows+r] = sum_i W[r*cols+i] *
+// X[c*cols+i]. X is host position-major [n, cols], Y is host position-major
+// [n, rows]. Uploads X, runs the device batched matvec (cuBLAS fixed-width
 // blocks for every n, including n == 1), and copies Y back. Same
 // contracts/failure semantics as matvec_f32.
 bool matmul_f32(std::span<const float> W, uint64_t cols, std::span<const float> X,
@@ -2388,6 +2327,32 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Batched (position-major) layer combine: proj/y are [n, per], ple is
+// [n, total_per], and the layer's slice is read with a total_per stride (the
+// per-layer embedding row is position-major, so each position's per-slice is
+// strided, not contiguous). One thread per (position, per) output element.
+__global__ void layer_combine_strided_kernel(const float* __restrict__ proj,
+                                             const float* __restrict__ ple,
+                                             float ple_scale, float combine_scale,
+                                             float* __restrict__ y, int per,
+                                             int n, int col, int total_per) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n * per) return;
+  const int c = i / per;
+  const int k = i - c * per;
+  y[i] = (proj[i] + ple[(size_t)c * total_per + col + k] * ple_scale) * combine_scale;
+}
+
+bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_scale,
+                               float combine_scale, float* y, int per, int n,
+                               int col, int total_per) {
+  if (!available()) return false;
+  if (per <= 0 || n <= 0 || total_per <= 0 || !proj || !ple || !y) return false;
+  layer_combine_strided_kernel<<<grid_for(n * per), 256, 0, cur_stream()>>>(
+      proj, ple, ple_scale, combine_scale, y, per, n, col, total_per);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool argmax_dev(const float* x, int n, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !out) return false;
@@ -2396,20 +2361,6 @@ bool argmax_dev(const float* x, int n, float* out) {
 }
 
 // --- batched prefill entry points -------------------------------------------
-
-bool rms_norm_cols_dev(std::span<const float> weight, const float* x, float eps,
-                       float* y, int dim, int ncols) {
-  if (!available()) return false;
-  if (dim <= 0 || ncols <= 0 || !x || !y) return false;
-  if (!weight.empty() && weight.size() < (size_t)dim) return false;
-  const float* d_w = nullptr;
-  if (!weight.empty()) {
-    d_w = static_cast<const float*>(upload_bytes(weight.data(), dim * sizeof(float)));
-    if (!d_w) return false;
-  }
-  rms_norm_cols_kernel<<<(ncols + 31) / 32, 1024, 0, cur_stream()>>>(x, d_w, dim, ncols, eps, y);
-  return cudaGetLastError() == cudaSuccess;
-}
 
 bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
                                  int n_pos, uint64_t start_pos, float base,
@@ -2453,22 +2404,6 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
   const float log_base = std::log(base);
   rope_neox_heads_batched_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
       x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
-  return cudaGetLastError() == cudaSuccess;
-}
-
-bool transpose_dev(const float* src, float* dst, int dim, int ncols, bool forward) {
-  if (!available()) return false;
-  if (dim <= 0 || ncols <= 0 || !src || !dst) return false;
-  const dim3 tblock(32, 32);
-  if (forward) {
-    // src [dim, ncols] -> dst [ncols, dim]
-    const dim3 tgrid((ncols + 31) / 32, (dim + 31) / 32);
-    transpose_tiled_dev<<<tgrid, tblock, 0, cur_stream()>>>(src, dst, dim, ncols);
-  } else {
-    // src [ncols, dim] -> dst [dim, ncols]
-    const dim3 tgrid((dim + 31) / 32, (ncols + 31) / 32);
-    transpose_tiled_dev<<<tgrid, tblock, 0, cur_stream()>>>(src, dst, ncols, dim);
-  }
   return cudaGetLastError() == cudaSuccess;
 }
 

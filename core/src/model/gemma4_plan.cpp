@@ -324,17 +324,21 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 }
 
 // ---------------------------------------------------------------------------
-// Prefill graph emitter (Phase 7). Mirrors build_gemma4_graph per block, but on
-// [dim, n] column-major / [n, dim] position-major batched tensors (n == the
-// prompt length) so the whole prompt is processed in one graph pass through the
-// spine. The batch size n and per-node `dim` are baked into node attributes; the
-// elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) reuse their per-token
-// OpKind on the flat batched buffers. FlashAttention appends the n fp16-rounded
-// K/V rows to the per-layer cache and runs full-sequence causal SDPA;
-// FlashAttentionShared attends over the donor layer's fp16-rounded K/V graph
-// tensors (no append), so the memory planner keeps those alive across layers
-// 24..41 via ordinary tensor liveness. Graph inputs are `tokens` (Int64 [n]) and
-// `start_pos` (Int64); the graph output is the final residual [dim, n].
+// Prefill graph emitter (Phase 7 / Section C.3). Mirrors build_gemma4_graph per
+// block, but on [n, dim] position-major batched tensors (n == the prompt
+// length, dim innermost) so the whole prompt is processed in one graph pass
+// through the spine. The batch size n and per-node `dim` are baked into node
+// attributes; the elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) reuse
+// their per-token OpKind on the flat batched buffers. C.3 removed the [dim, n]
+// column-major layout and its Transpose nodes: every batched matmul/gather/norm
+// writes [n, dim] directly, so the attention path (which always consumed
+// [n, dim]) no longer needs a data-movement transpose on either side of it.
+// FlashAttention appends the n fp16-rounded K/V rows to the per-layer cache and
+// runs full-sequence causal SDPA; FlashAttentionShared attends over the donor
+// layer's fp16-rounded K/V graph tensors (no append), so the memory planner
+// keeps those alive across layers 24..41 via ordinary tensor liveness. Graph
+// inputs are `tokens` (Int64 [n]) and `start_pos` (Int64); the graph output is
+// the final residual [n, dim].
 // ---------------------------------------------------------------------------
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   using namespace planner;
@@ -397,17 +401,16 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
   auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
-  auto dir_a = [](int64_t v) { return attr_i("dir", v); };
   auto shape2 = [](uint64_t r, uint64_t c) {
     return std::vector<int64_t>{int64_t(r), int64_t(c)};
   };
 
   const TensorId embd = b.node(OpKind::EmbeddingBatched, {tokens}, "embd",
-                               shape2(d, n), {slot(WeightSlot::TokenEmbd), batch_a(n)});
-  const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", shape2(d, n),
+                               shape2(n, d), {slot(WeightSlot::TokenEmbd), batch_a(n)});
+  const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", shape2(n, d),
                               {attr_f("scale", std::sqrt(float(d)))});
   const TensorId ple_row = b.node(OpKind::EmbeddingBatched, {tokens}, "ple_row",
-                                  shape2(total_per, n),
+                                  shape2(n, total_per),
                                   {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
 
   const float proj_scale = 1.0f / std::sqrt(float(d));
@@ -431,12 +434,10 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     const std::string suff = std::to_string(l);
 
     // --- attention ---------------------------------------------------------
-    TensorId h = b.node(OpKind::RmsNormCols, {residual}, "h" + suff, shape2(d, n),
+    TensorId h = b.node(OpKind::RmsNormRows, {residual}, "h" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::AttnNorm), batch_a(n), dim_a(d)});
-    TensorId q_col = b.node(OpKind::QuantizedMatmulBatched, {h}, "q_col" + suff,
-                            shape2(qw, n), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n)});
-    TensorId q = b.node(OpKind::Transpose, {q_col}, "q" + suff, shape2(n, qw),
-                        {batch_a(n), dim_a(qw), dir_a(0)});
+    TensorId q = b.node(OpKind::QuantizedMatmulBatched, {h}, "q" + suff,
+                        shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n)});
     q = b.node(OpKind::RmsNormHeadsBatched, {q}, "qn" + suff, shape2(n, qw),
                {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
     q = b.node(OpKind::RopeBatched, {q, start_pos}, "qr" + suff, shape2(n, qw),
@@ -444,20 +445,16 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 
     TensorId attn;
     if (cfg.has_kv(l)) {
-      TensorId k_col = b.node(OpKind::QuantizedMatmulBatched, {h}, "k_col" + suff,
-                              shape2(kvw, n), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n)});
-      TensorId k = b.node(OpKind::Transpose, {k_col}, "k" + suff, shape2(n, kvw),
-                          {batch_a(n), dim_a(kvw), dir_a(0)});
+      TensorId k = b.node(OpKind::QuantizedMatmulBatched, {h}, "k" + suff,
+                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n)});
       k = b.node(OpKind::RmsNormHeadsBatched, {k}, "kn" + suff, shape2(n, kvw),
                  {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
       k = b.node(OpKind::RopeBatched, {k, start_pos}, "kr" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
-      TensorId v_col = b.node(OpKind::QuantizedMatmulBatched, {h}, "v_col" + suff,
-                              shape2(kvw, n), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n)});
-      TensorId v = b.node(OpKind::Transpose, {v_col}, "v" + suff, shape2(n, kvw),
-                          {batch_a(n), dim_a(kvw), dir_a(0)});
+      TensorId v = b.node(OpKind::QuantizedMatmulBatched, {h}, "v" + suff,
+                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n)});
       v = b.node(OpKind::RmsNormHeadsBatched, {v}, "vn" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});  // V norm: unit weight
       const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
@@ -481,51 +478,49 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
                     shape2(n, qw), {layer_a(l), batch_a(n)});
     }
 
-    TensorId attn_col = b.node(OpKind::Transpose, {attn}, "attn_col" + suff,
-                               shape2(qw, n), {batch_a(n), dim_a(qw), dir_a(1)});
-    TensorId ap = b.node(OpKind::QuantizedMatmulBatched, {attn_col}, "ap" + suff,
-                         shape2(d, n), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n)});
-    TensorId o = b.node(OpKind::RmsNormCols, {ap}, "o" + suff, shape2(d, n),
+    TensorId ap = b.node(OpKind::QuantizedMatmulBatched, {attn}, "ap" + suff,
+                         shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n)});
+    TensorId o = b.node(OpKind::RmsNormRows, {ap}, "o" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n), dim_a(d)});
-    TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(d, n), {layer_a(l)});
+    TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(n, d), {layer_a(l)});
 
     // --- gated feed-forward ------------------------------------------------
-    TensorId f = b.node(OpKind::RmsNormCols, {x1}, "f" + suff, shape2(d, n),
+    TensorId f = b.node(OpKind::RmsNormRows, {x1}, "f" + suff, shape2(n, d),
                         {layer_a(l), slot(WeightSlot::FfnNorm), batch_a(n), dim_a(d)});
-    TensorId up = b.node(OpKind::QuantizedMatmulBatched, {f}, "up" + suff, shape2(ff, n),
+    TensorId up = b.node(OpKind::QuantizedMatmulBatched, {f}, "up" + suff, shape2(n, ff),
                          {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n)});
-    TensorId gate = b.node(OpKind::QuantizedMatmulBatched, {f}, "gate" + suff, shape2(ff, n),
+    TensorId gate = b.node(OpKind::QuantizedMatmulBatched, {f}, "gate" + suff, shape2(n, ff),
                            {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n)});
-    gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(ff, n), {layer_a(l)});
-    TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(ff, n), {layer_a(l)});
-    TensorId fo = b.node(OpKind::QuantizedMatmulBatched, {fh}, "fo" + suff, shape2(d, n),
+    gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff), {layer_a(l)});
+    TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
+    TensorId fo = b.node(OpKind::QuantizedMatmulBatched, {fh}, "fo" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n)});
-    TensorId f2 = b.node(OpKind::RmsNormCols, {fo}, "f2" + suff, shape2(d, n),
+    TensorId f2 = b.node(OpKind::RmsNormRows, {fo}, "f2" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n), dim_a(d)});
-    TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(d, n), {layer_a(l)});
+    TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(n, d), {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
-    TensorId proj = b.node(OpKind::MatvecBf16Batched, {inp}, "proj" + suff, shape2(per, n),
+    TensorId proj = b.node(OpKind::MatvecBf16Batched, {inp}, "proj" + suff, shape2(n, per),
                            {layer_a(l), batch_a(n)});
-    proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(per, n),
+    proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
                   {attr_f("scale", proj_scale)});
-    proj = b.node(OpKind::RmsNormCols, {proj}, "projn" + suff, shape2(per, n),
+    proj = b.node(OpKind::RmsNormRows, {proj}, "projn" + suff, shape2(n, per),
                   {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
     TensorId ple = b.node(OpKind::LayerCombineBatched, {proj, ple_row}, "ple" + suff,
-                          shape2(per, n), {layer_a(l), batch_a(n)});
-    TensorId g0 = b.node(OpKind::MatvecF32Batched, {x2}, "g0" + suff, shape2(per, n),
+                          shape2(n, per), {layer_a(l), batch_a(n)});
+    TensorId g0 = b.node(OpKind::MatvecF32Batched, {x2}, "g0" + suff, shape2(n, per),
                          {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
-    g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(per, n), {layer_a(l)});
-    g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(per, n), {layer_a(l)});
-    TensorId g1 = b.node(OpKind::MatvecF32Batched, {g0}, "g1" + suff, shape2(d, n),
+    g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});
+    g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(n, per), {layer_a(l)});
+    TensorId g1 = b.node(OpKind::MatvecF32Batched, {g0}, "g1" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::Proj), batch_a(n)});
-    TensorId g2 = b.node(OpKind::RmsNormCols, {g1}, "g2" + suff, shape2(d, n),
+    TensorId g2 = b.node(OpKind::RmsNormRows, {g1}, "g2" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::PostNorm), batch_a(n), dim_a(d)});
-    TensorId x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(d, n), {layer_a(l)});
+    TensorId x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(n, d), {layer_a(l)});
 
     TensorId out;
     if (!m.weights.blocks[l].layer_output_scale.empty())
-      out = b.node(OpKind::Scale, {x3}, "out" + suff, shape2(d, n),
+      out = b.node(OpKind::Scale, {x3}, "out" + suff, shape2(n, d),
                    {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
     else
       out = x3;
@@ -680,7 +675,7 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     std::span<const float> hf(reinterpret_cast<const float*>(hidden_b.data()),
                               uint64_t(d) * n);
     std::vector<float> hidden(d);
-    for (uint32_t k = 0; k < d; ++k) hidden[k] = hf[k * n + (n - 1)];
+    for (uint32_t k = 0; k < d; ++k) hidden[k] = hf[(n - 1) * d + k];
     if (!lm_head(m, hidden, logits, quant::MatmulBackend::CpuQ8K)) return 0;
   } else {
     // Reference: feed the prompt one token at a time through the per-token
@@ -1289,7 +1284,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                   uint64_t(d) * nseg);
         std::vector<float> hidden(d);
         for (uint32_t k = 0; k < d; ++k)
-          hidden[k] = hf[k * nseg + (nseg - 1)];
+          hidden[k] = hf[(nseg - 1) * d + k];
         if (!lm_head(m, hidden, logits, quant::MatmulBackend::Cuda)) {
           std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n";
           return 0;

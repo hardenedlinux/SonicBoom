@@ -236,8 +236,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // dim). Declared here so the planner's capability check accepts the prefill
       // graph. The elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused
       // unchanged on flat batched buffers.
-      OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
-      OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
+      OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched,
+      OpKind::RmsNormRows,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
       OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
       OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
       OpKind::LayerCombineBatched,
@@ -290,8 +290,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // Phase 7 batched prefill operators (device-resident, Phase 7a). The
         // elementwise ops (Scale/Add/Mul/GeluFp16/CastFp16) are reused unchanged
         // on flat batched buffers; the rest are the batched *_dev kernels.
-        OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched, OpKind::Transpose,
-        OpKind::RmsNormCols,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
+        OpKind::EmbeddingBatched, OpKind::QuantizedMatmulBatched,
+        OpKind::RmsNormRows,      OpKind::RmsNormHeadsBatched,  OpKind::RopeBatched,
         OpKind::FlashAttention,   OpKind::FlashAttentionShared, OpKind::KvAppendBatched,
         OpKind::MatvecF32Batched, OpKind::MatvecBf16Batched,
         OpKind::LayerCombineBatched,

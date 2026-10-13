@@ -168,24 +168,24 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
 bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
                        float combine_scale, float* y, int n);
 
+// Batched (position-major) per-layer embedding combine. proj/y are [n, per];
+// `ple` is the full [n, total_per] per-layer embedding row (NOT caller-offset —
+// the layer offset is `col`), read with a total_per stride:
+//   y[c*per+k] = (proj[c*per+k] + ple[c*total_per + col + k] * ple_scale) * combine_scale
+// The decode path's contiguous combine is layer_combine_dev (the n == 1 case).
+bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_scale,
+                               float combine_scale, float* y, int per, int n,
+                               int col, int total_per);
+
 // Greedy argmax over a device f32 vector: writes the index (as a float) to
 // out[0]. Ties are broken toward the lowest index, exactly mirroring
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
 
 // --- batched prefill primitives (the decode *_dev kernels generalized to an
-// n dimension; decode is n == 1). Activations are [dim, ncols] column-major
-// (ncols innermost) except where noted. Each mirrors the CPU batched prefill
-// op (SonicBackend) and, for ncols == 1, the corresponding single-token *_dev
-// kernel above. ------------------------------------------------------------
-
-// Strided-column rms_norm over [dim, ncols]: for each column c,
-//   y[k*ncols+c] = (x[k*ncols+c] / sqrt(mean_k(x[k*ncols+c]^2) + eps)) * weight[k]
-// (weight empty => unit). Same per-column reduction algorithm as rms_norm_dev
-// (parallel double sum-of-squares + shared reduce), so each column matches the
-// decode rms_norm_dev to fp32 rounding.
-bool rms_norm_cols_dev(std::span<const float> weight, const float* x, float eps,
-                       float* y, int dim, int ncols);
+// n dimension; decode is n == 1). Activations are [n, dim] position-major
+// (dim innermost). Each mirrors the CPU batched prefill op (SonicBackend) and,
+// for n == 1, the corresponding single-token *_dev kernel above. -------------
 
 // Multi-head NEOX RoPE over a batched [n_pos, heads_per_pos*head_dim] buffer
 // (position-major, flat), with per-position absolute position
@@ -203,14 +203,11 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
                                      float base, float freq_scale,
                                      std::span<const float> freq_factors);
 
-// Tiled transpose of a column-major buffer. forward=true: src [dim, ncols] ->
-// dst [ncols, dim] (dst[c*dim+k] = src[k*ncols+c]); forward=false: src
-// [ncols, dim] -> dst [dim, ncols] (dst[k*ncols+c] = src[c*dim+k]).
-bool transpose_dev(const float* src, float* dst, int dim, int ncols, bool forward);
-
-// Dense gemv over ncols columns: y[r*ncols+c] = sum_i W[r*cols+i] * x[i*ncols+c].
-// x is [cols, ncols], y is [rows, ncols] (ncols innermost); W row-major. The
-// decode matvec_f32_dev / matvec_bf16_dev are the ncols == 1 case.
+// Dense batched matvec (position-major): y[c*rows+r] = sum_i W[r*cols+i] *
+// x[c*cols+i]. x is [ncols, cols], y is [ncols, rows] (dim innermost); W
+// row-major. The decode matvec_f32_dev / matvec_bf16_dev are the ncols == 1
+// case. Every ncols (including 1) routes to cuBLAS via fixed-width 128-position
+// blocks, so a position's numerics are identical across batch sizes and offsets.
 bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
                             float* y, int rows, int ncols);
 bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,

@@ -198,11 +198,11 @@ void test_matvec_bf16(std::mt19937& rng) {
 }
 
 // Fixed-width cuBLAS batch-invariance (Phase C Step 3): the same activation
-// column must produce a bitwise-identical output regardless of the batch size it
-// is packed into or its column offset within that batch. Prefix-cache reuse
+// position must produce a bitwise-identical output regardless of the batch size
+// it is packed into or its position offset within that batch. Prefix-cache reuse
 // splits a prompt at arbitrary non-512-aligned boundaries, so a position lands
 // in differently-sized segments between a full prefill and a reuse continuation;
-// the fixed 128-column blocks are what make those two paths write identical KV.
+// the fixed 128-position blocks are what make those two paths write identical KV.
 void test_matmul_f32_batch_invariant(std::mt19937& rng) {
   const uint64_t cols = 256, rows = 128;
   std::vector<float> W(cols * rows);
@@ -223,12 +223,12 @@ void test_matmul_f32_batch_invariant(std::mt19937& rng) {
       for (int off : offs) {
         if (off >= n) continue;
         std::vector<float> X(cols * n, 0.0f), Y(rows * n);
-        for (uint64_t k = 0; k < cols; ++k) X[k * n + off] = Xref[k * nref + j];
+        for (uint64_t k = 0; k < cols; ++k) X[off * cols + k] = Xref[j * cols + k];
         check(sbnn::cuda::matmul_f32(W, cols, X, Y, uint64_t(n)),
               "cuda::matmul_f32 returns true");
         for (uint64_t r = 0; r < rows; ++r)
-          if (std::bit_cast<uint32_t>(Y[r * n + off]) !=
-              std::bit_cast<uint32_t>(Yref[r * nref + j])) {
+          if (std::bit_cast<uint32_t>(Y[off * rows + r]) !=
+              std::bit_cast<uint32_t>(Yref[j * rows + r])) {
             if (ndiff < 4)
               std::cerr << "    f32 n=" << n << " probe=" << j << " off=" << off
                         << " row=" << r << "\n";
@@ -259,12 +259,12 @@ void test_matmul_bf16_batch_invariant(std::mt19937& rng) {
       for (int off : offs) {
         if (off >= n) continue;
         std::vector<float> X(cols * n, 0.0f), Y(rows * n);
-        for (uint64_t k = 0; k < cols; ++k) X[k * n + off] = Xref[k * nref + j];
+        for (uint64_t k = 0; k < cols; ++k) X[off * cols + k] = Xref[j * cols + k];
         check(sbnn::cuda::matmul_bf16(W, cols, X, Y, uint64_t(n)),
               "cuda::matmul_bf16 returns true");
         for (uint64_t r = 0; r < rows; ++r)
-          if (std::bit_cast<uint32_t>(Y[r * n + off]) !=
-              std::bit_cast<uint32_t>(Yref[r * nref + j])) {
+          if (std::bit_cast<uint32_t>(Y[off * rows + r]) !=
+              std::bit_cast<uint32_t>(Yref[j * rows + r])) {
             if (ndiff < 4)
               std::cerr << "    bf16 n=" << n << " probe=" << j << " off=" << off
                         << " row=" << r << "\n";

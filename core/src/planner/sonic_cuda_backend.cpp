@@ -581,14 +581,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = device::device_copy(out_handle, token_buf_.id, sizeof(float));
       break;
     }
-    // --- batched prefill ops (Phase 7a) --------------------------------------
+    // --- batched prefill ops (Phase 7 / Section C.3) --------------------------
     // Each mirrors the CPU SonicBackend's batched case, dispatching to the
-    // batched *_dev kernels. Activations are [dim, n] column-major (n innermost)
-    // or [n, dim] position-major after a Transpose. The Int64 graph inputs
-    // (tokens, start_pos) are read from the persistent device slots tokens_buf_ /
-    // pos_buf_ (staged by the spine before execute/replay), so a whole segment is
-    // capturable into a CUDA Graph (no host value baked into a launch argument
-    // and no synchronous H2D token upload).
+    // batched *_dev kernels. Activations are [n, dim] position-major (dim
+    // innermost). The Int64 graph inputs (tokens, start_pos) are read from the
+    // persistent device slots tokens_buf_ / pos_buf_ (staged by the spine before
+    // execute/replay), so a whole segment is capturable into a CUDA Graph (no
+    // host value baked into a launch argument and no synchronous H2D upload).
     case OpKind::EmbeddingBatched: {
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
@@ -602,27 +601,21 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             model_->weights.token_embd, tokens_dev, int(nb), out);
       break;
     }
-    case OpKind::RmsNormCols: {
+    case OpKind::RmsNormRows: {
       int64_t dim_i = 0, nb = 0;
       attr_i(*node, "dim", dim_i);
       attr_i(*node, "batch", nb);
-      ok = nn::cuda::rms_norm_cols_dev(fweight(slot), dev(in[0]), eps, out,
-                                       int(dim_i), int(nb));
+      // Row norm over [n, dim]: reuse the per-head norm with a single
+      // `dim_i`-wide head per row (position), so each row is normalized
+      // independently with the full-width weight.
+      ok = nn::cuda::rms_norm_heads_dev(fweight(slot), dev(in[0]), eps, out,
+                                        int(dim_i), int(nb));
       break;
     }
     case OpKind::QuantizedMatmulBatched: {
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
       ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
-      break;
-    }
-    case OpKind::Transpose: {
-      int64_t dim_i = 0, nb = 0, dir_i = 0;
-      attr_i(*node, "dim", dim_i);
-      attr_i(*node, "batch", nb);
-      attr_i(*node, "dir", dir_i);
-      ok = nn::cuda::transpose_dev(dev(in[0]), out, int(dim_i), int(nb),
-                                   dir_i == 0);
       break;
     }
     case OpKind::RmsNormHeadsBatched: {
@@ -740,12 +733,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::LayerCombineBatched: {
       int64_t nb = 0;
       attr_i(*node, "batch", nb);
-      const uint64_t col = uint64_t(layer) * per;
+      // ple_row is [n, total_per] position-major, so this layer's slice is
+      // strided by total_per (not contiguous like the [total_per, n] layout).
+      const int col = int(layer) * int(per);
+      const int total_per =
+          int(in[1].device.size_bytes / sizeof(float) / uint64_t(nb));
       const float ple_scale = std::sqrt(float(per));
       const float combine_scale = 1.0f / std::sqrt(2.0f);
-      ok = nn::cuda::layer_combine_dev(
-          dev(in[0]), dev(in[1]) + col * uint64_t(nb), ple_scale, combine_scale,
-          out, out_n);
+      ok = nn::cuda::layer_combine_batched_dev(
+          dev(in[0]), dev(in[1]), ple_scale, combine_scale, out, int(per),
+          int(nb), col, total_per);
       break;
     }
     default:

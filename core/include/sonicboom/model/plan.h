@@ -84,13 +84,14 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy);
 planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg);
 
 // Expand the whole-prompt prefill (mirrors build_gemma4_graph per block) into a
-// static, acyclic planner::Graph over [dim, n] / [n, dim] batched tensors, where
-// n is the prompt length. Every node is pinned to BackendTag::Sonic; the batched
-// OpKinds (EmbeddingBatched .. LayerCombineBatched) are dispatched by the
-// SonicBackend looping the same per-token kernels the decode graph uses, so the
-// prefill is bit-identical to n single-token decode steps. Graph inputs are
-// `tokens` (Int64 [n]) and `start_pos` (Int64); the graph output is the final
-// residual [dim, n] (the caller extracts column n-1 and runs lm_head).
+// static, acyclic planner::Graph over [n, dim] position-major batched tensors,
+// where n is the prompt length and dim is innermost. Every node is pinned to
+// BackendTag::Sonic; the batched OpKinds (EmbeddingBatched .. LayerCombineBatched)
+// are dispatched by the SonicBackend looping the same per-token kernels the
+// decode graph uses, so the prefill is bit-identical to n single-token decode
+// steps. Graph inputs are `tokens` (Int64 [n]) and `start_pos` (Int64); the graph
+// output is the final residual [n, dim] (the caller extracts row n-1 and runs
+// lm_head).
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n);
 
 // Autoregressive greedy decode through the spine: build the graph once, plan it

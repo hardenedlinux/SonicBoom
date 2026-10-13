@@ -466,8 +466,6 @@ void* g_dy = nullptr;
 size_t g_dy_bytes = 0;
 void* g_q8 = nullptr;
 size_t g_q8_bytes = 0;
-void* g_col = nullptr;
-size_t g_col_bytes = 0;
 void* g_row = nullptr;
 size_t g_row_bytes = 0;
 void* g_gather = nullptr;
@@ -477,21 +475,17 @@ size_t g_gather_out_bytes = 0;
 void* g_tokens = nullptr;
 size_t g_tokens_bytes = 0;
 // fp16 dequant scratch for the cuBLAS batched matmul (C.1): the dequantized
-// weight (row-major [rows, cols]) and the fp16 activation ([cols, n], n
-// innermost). Reused across layers, sized to the largest weight/activation seen.
+// weight (row-major [rows, cols]) and the fp16 activation ([n, cols],
+// position-major). Reused across layers, sized to the largest weight/activation
+// seen.
 void* g_wf16 = nullptr;
 size_t g_wf16_bytes = 0;
 void* g_xf16 = nullptr;
 size_t g_xf16_bytes = 0;
-// MMQ int8 tensor-core scratch (C.2): the transposed activation Xt [n, cols],
-// the block_q8_1_mmq quantized activation [K/128][n] (+ J_max tail over-read),
-// and the column-major [rows, n] matmul result. Reused across layers.
-void* g_mmq_xt = nullptr;
-size_t g_mmq_xt_bytes = 0;
+// MMQ int8 tensor-core scratch (C.2): the block_q8_1_mmq quantized activation
+// [K/128][n] (+ J_max tail over-read). Reused across layers.
 void* g_mmq_q8 = nullptr;
 size_t g_mmq_q8_bytes = 0;
-void* g_mmq_dst = nullptr;
-size_t g_mmq_dst_bytes = 0;
 
 // Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
 // created lazily and the workspace is set so cublasGemmEx is stream-capturable
@@ -581,37 +575,6 @@ struct ProfDump {
                    g_prof_calls, g_prof_kernel_ms, g_prof_copy_ms);
   }
 } g_prof_dump;
-
-// Batched-matmul column gather/scatter: the K-quant gemv kernels take a
-// contiguous single-column activation, so the prefill matmul gathers column c
-// (X[i*n + c]) into a contiguous buffer, runs the gemv, and scatters the row
-// result back (Y[r*n + c]).
-__global__ void gather_col(const float* __restrict__ X, float* __restrict__ dst,
-                           int cols, int n, int c) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < cols) dst[i] = X[(size_t)i * n + c];
-}
-__global__ void scatter_col(const float* __restrict__ src, float* __restrict__ Y,
-                            int rows, int n, int c) {
-  const int r = blockIdx.x * blockDim.x + threadIdx.x;
-  if (r < rows) Y[(size_t)r * n + c] = src[r];
-}
-
-// Tiled transpose of a [rows, cols] row-major matrix -> [cols, rows]: dst[c*rows +
-// r] = src[r*cols + c]. Used by the batched matmul to turn the [cols, n]
-// column-major activation into [n, cols] position-major so each position's
-// q8_1 blocks are contiguous (quantize_q8_1 needs 32-element contiguous runs).
-__global__ void transpose_tiled(const float* __restrict__ src, float* __restrict__ dst,
-                                int rows, int cols) {
-  __shared__ float tile[32][33];  // +1 pad to avoid shared-memory bank conflicts
-  int x = blockIdx.x * 32 + threadIdx.x;
-  int y = blockIdx.y * 32 + threadIdx.y;
-  if (x < cols && y < rows) tile[threadIdx.y][threadIdx.x] = src[(size_t)y * cols + x];
-  __syncthreads();
-  x = blockIdx.y * 32 + threadIdx.x;
-  y = blockIdx.x * 32 + threadIdx.y;
-  if (x < rows && y < cols) dst[(size_t)y * rows + x] = tile[threadIdx.x][threadIdx.y];
-}
 
 // --- single-row embedding gather --------------------------------------------
 //
@@ -762,7 +725,7 @@ __global__ void gather_q3_K_batched(const uint8_t* __restrict__ w,
   const int qv = int((q[m * 32 + l2] >> (j << 1)) & 3);
   const int hmset = (hm[l2] & (1 << (j + (m << 2)))) ? 0 : 4;
   const int sidx = (m << 3) + (j << 1) + (l2 >> 4);
-  out[k * n + c] = d * float(scales[sidx] - 32) * float(qv - hmset);
+  out[(size_t)c * width + k] = d * float(scales[sidx] - 32) * float(qv - hmset);
 }
 
 __global__ void gather_q4_K_batched(const uint8_t* __restrict__ w,
@@ -791,7 +754,7 @@ __global__ void gather_q4_K_batched(const uint8_t* __restrict__ w,
   uint8_t sc, mi;
   get_scale_min_k4((j << 1) + (low ? 0 : 1), scales, sc, mi);
   const int v = low ? (qb & 0xF) : (qb >> 4);
-  out[k * n + c] = d * float(sc) * float(v) - dmin * float(mi);
+  out[(size_t)c * width + k] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
 __global__ void gather_q5_K_batched(const uint8_t* __restrict__ w,
@@ -823,7 +786,7 @@ __global__ void gather_q5_K_batched(const uint8_t* __restrict__ w,
   const int qhbit = (j << 1) + (low ? 0 : 1);
   const int v = (low ? (qlb & 0xF) : (qlb >> 4)) +
                 ((qh[l2] & (1 << qhbit)) ? 16 : 0);
-  out[k * n + c] = d * float(sc) * float(v) - dmin * float(mi);
+  out[(size_t)c * width + k] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
 // Launch the batched gather for n token ids (`rows`, device uint64_t[n]) of a
@@ -1147,7 +1110,7 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
 
 // Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
 // position's blocks contiguous). One warp per output row; each weight block is
-// reused across a tile of T positions. dst is [num_rows, n] (n innermost).
+// reused across a tile of T positions. dst is [n, num_rows] (position-major).
 void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
                               const q8_1::block_q8_1* xq, float* yp,
                               int blocks_per_row, int num_rows, int n) {
@@ -1420,12 +1383,11 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // dequantize/convert run once and are amortized over all n columns, and the
 // tensor-core GEMM is far cheaper than the dp4a per-column gemv it replaces.
 //
-// cuBLAS is column-major; the storage layouts are chosen so the GEMM needs no
-// transpose. W fp16 == column-major [cols, rows] (== row-major [rows, cols]);
-// X == column-major [n, cols] (== row-major [cols, n]); Y == column-major
-// [n, rows] (== row-major [rows, n]). Then Y'[p,r] = sum_c X'[p,c] W'[c,r] =
-// sum_c X[c,p] W[r,c] = Y[r,p], i.e. C = A @ B with A = X' (m=n, k=cols,
-// lda=n) and B = W' (k=cols, n=rows, ldb=cols).
+// cuBLAS is column-major. With position-major X == row-major [n, cols] (==
+// column-major [cols, n]) and W fp16 == row-major [rows, cols] (== column-major
+// [cols, rows]), the GEMM writes Y [n, rows] directly with A = W^T (op=T,
+// lda=cols), B = X (op=N, ldb=cols), C = Y (m=rows, n=n, ldc=rows):
+//   Y[c, r] = sum_k W[r,k] X[c,k].
 bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
                            int n) {
   const uint64_t cols = W.dims()[0];
@@ -1453,32 +1415,33 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
       return false;
   }
 
-  // 2. Convert X f32 -> fp16 (same [cols, n] n-innermost layout).
+  // 2. Convert X f32 -> fp16 (position-major [n, cols], flat element count).
   __half* xf = static_cast<__half*>(
       grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
   if (!xf) return false;
   const int64_t xn = int64_t(cols) * n;
   cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
 
-  // 3. cuBLAS tensor-core GEMM on the current stream.
+  // 3. cuBLAS tensor-core GEMM on the current stream: C = W^T @ X.
   cublasHandle_t h = cublas_handle();
   if (!h) return false;
   cublasSetStream(h, cur_stream());
   const float alpha = 1.0f, beta = 0.0f;
   const cublasStatus_t st = cublasGemmEx(
-      h, CUBLAS_OP_N, CUBLAS_OP_N, n, int(rows), int(cols), &alpha, xf,
-      CUDA_R_16F, n, wf, CUDA_R_16F, int(cols), &beta, Y, CUDA_R_32F, n,
-      CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+      h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), n, int(cols), &alpha, wf,
+      CUDA_R_16F, int(cols), xf, CUDA_R_16F, int(cols), &beta, Y, CUDA_R_32F,
+      int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
   return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
 }
 
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
 // shared memory as int8 and multiplies against a block_q8_1_mmq activation via
-// m16n8k16/m16n8k32 tensor cores. X is [cols, n] (n innermost); the kernel needs
-// the activation transposed to [n, cols] (for contiguous 128-element q8_1
-// blocks) and writes the result column-major [rows, n], so one transpose on
-// either side of the kernel. Q3_K uses a float d4 activation scale layout
-// (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's vec_dot path.
+// m16n8k16/m16n8k32 tensor cores. X is [n, cols] position-major, which is
+// already the layout quantize_activation needs (each position's 128-element
+// q8_1 blocks contiguous), and mul_mat_q natively writes dst [n, rows] — so no
+// transpose on either side of the kernel (C.3a). Q3_K uses a float d4 activation
+// scale layout (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's
+// vec_dot path.
 bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
@@ -1488,53 +1451,36 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
 
-  // 1. Xt[n, cols] = X[cols, n]^T (each position's 128-element blocks contiguous).
-  float* xt = static_cast<float*>(
-      grow_scratch(g_mmq_xt, g_mmq_xt_bytes, cols * (size_t)n * sizeof(float)));
-  if (!xt) return false;
-  const dim3 tblock(32, 32);
-  transpose_tiled<<<dim3((n + 31) / 32, (ic + 31) / 32), tblock, 0, cur_stream()>>>(
-      X, xt, ic, n);
-
-  // 2. Quantize Xt -> block_q8_1_mmq [K/128][n] (+ J_max tail over-read guard).
+  // 1. Quantize X [n, cols] -> block_q8_1_mmq [K/128][n] (+ J_max tail guard).
   mmq::block_q8_1_mmq* y_q8 = static_cast<mmq::block_q8_1_mmq*>(
       grow_scratch(g_mmq_q8, g_mmq_q8_bytes,
                    mmq::mmq_q8_blocks(ic, n) * sizeof(mmq::block_q8_1_mmq)));
   if (!y_q8) return false;
 
-  // 3. Column-major [rows, n] result.
-  float* mmq_dst = static_cast<float*>(
-      grow_scratch(g_mmq_dst, g_mmq_dst_bytes, rows * (size_t)n * sizeof(float)));
-  if (!mmq_dst) return false;
-
   bool ok = false;
   switch (W.type()) {
     case QuantType::Q3_K:
-      mmq::quantize_activation<mmq::D4>(xt, y_q8, ic, n, cur_stream());
+      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
       ok = mmq::mul_mat_q<mmq::MMQ_Q3_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          mmq_dst, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, cur_stream());
       break;
     case QuantType::Q4_K:
-      mmq::quantize_activation<mmq::DS4>(xt, y_q8, ic, n, cur_stream());
+      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
       ok = mmq::mul_mat_q<mmq::MMQ_Q4_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          mmq_dst, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, cur_stream());
       break;
     case QuantType::Q5_K:
-      mmq::quantize_activation<mmq::DS4>(xt, y_q8, ic, n, cur_stream());
+      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
       ok = mmq::mul_mat_q<mmq::MMQ_Q5_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          mmq_dst, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, cur_stream());
       break;
     default:
       return false;
   }
   if (!ok) return false;
-
-  // 4. Y[rows, n] = transpose of mmq_dst (column-major [rows, n]).
-  transpose_tiled<<<dim3((ir + 31) / 32, (n + 31) / 32), tblock, 0, cur_stream()>>>(
-      mmq_dst, Y, n, ir);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1568,40 +1514,31 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const int ic = int(cols), ir = int(rows);
 
   if (q8_1_enabled()) {
-    // 1. Xt[n, cols] = X[cols, n]^T (each position contiguous).
-    float* xt = static_cast<float*>(
-        grow_scratch(g_col, g_col_bytes, cols * (size_t)n * sizeof(float)));
-    if (!xt) return false;
-    const dim3 tblock(32, 32);
-    // transpose_tiled reads src[rows=ic, cols=n]: blockIdx.x tiles cols (n),
-    // blockIdx.y tiles rows (ic).
-    const dim3 tgrid((n + 31) / 32, (ic + 31) / 32);
-    transpose_tiled<<<tgrid, tblock, 0, cur_stream()>>>(X, xt, ic, n);
-
-    // 2. Quantize each of the n positions to q8_1 (n * blocks_per_row * 8 blocks).
+    // X is [n, cols] position-major, so each position's 32-element q8_1 blocks
+    // are already contiguous — no transpose before quantization (C.3a).
     const size_t nblocks = (size_t)blocks_per_row * (q8_1::QK_K / q8_1::QK8_1);
     q8_1::block_q8_1* xq = static_cast<q8_1::block_q8_1*>(grow_scratch(
         g_q8, g_q8_bytes, nblocks * (size_t)n * sizeof(q8_1::block_q8_1)));
     if (!xq) return false;
     q8_1::quantize_q8_1<<<(nblocks * n + 255) / 256, 256, 0, cur_stream()>>>(
-        xt, xq, int(nblocks * n));
+        X, xq, int(nblocks * n));
 
-    // 3. Batched warp-per-row gemv -> Y[rows, n].
+    // Batched warp-per-row gemv -> Y[n, rows] (position-major).
     launch_gemv_q8_1_batched(W.type(), wp, xq, Y, int(blocks_per_row), ir, n);
     return cudaGetLastError() == cudaSuccess;
   }
 
-  // fp32 fallback (differential testing against the CPU reference): the n×
-  // gather/gemv/scatter loop, unchanged.
-  float* col = static_cast<float*>(
-      grow_scratch(g_col, g_col_bytes, cols * sizeof(float)));
+  // fp32 fallback (differential testing against the CPU reference): each
+  // position is contiguous in X [n, cols], so the gemv reads the position's
+  // row in place and the result is copied back contiguously to Y [n, rows].
   float* row = static_cast<float*>(
       grow_scratch(g_row, g_row_bytes, rows * sizeof(float)));
-  if (!col || !row) return false;
+  if (!row) return false;
   for (int c = 0; c < n; ++c) {
-    gather_col<<<(ic + 255) / 256, 256, 0, cur_stream()>>>(X, col, ic, n, c);
-    launch_gemv(W.type(), wp, col, row, int(blocks_per_row), ir);
-    scatter_col<<<(ir + 255) / 256, 256, 0, cur_stream()>>>(row, Y, ir, n, c);
+    launch_gemv(W.type(), wp, X + (size_t)c * ic, row, int(blocks_per_row), ir);
+    if (cudaMemcpyAsync(Y + (size_t)c * ir, row, rows * sizeof(float),
+                        cudaMemcpyDeviceToDevice, cur_stream()) != cudaSuccess)
+      return false;
   }
   return cudaGetLastError() == cudaSuccess;
 }
