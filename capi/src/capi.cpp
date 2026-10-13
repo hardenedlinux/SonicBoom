@@ -808,8 +808,11 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         if (n_reused_out)
           *n_reused_out = static_cast<uint64_t>(common);
 
-        session->prev_prompt = session->prompt;
+        // Update the stored prompt first, then remember it as the previous
+        // prompt: prev_prompt must hold the prompt that was *just* prefilled so
+        // the next call compares against it (not the one before last).
         session->prompt.assign(tokens, tokens + n);
+        session->prev_prompt = session->prompt;
 
         // CUDA fast path: prefill the prompt device-resident (chunked prefill +
         // prefix reuse via the persistent KvCacheSession), sampling only the
