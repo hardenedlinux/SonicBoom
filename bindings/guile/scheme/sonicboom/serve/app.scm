@@ -44,7 +44,7 @@
              (ice-9 threads)
              (ice-9 match)
              (sonicboom serve backend)
-             (sonicboom serve mock-backend)
+             (sonicboom serve real-backend)
              (sonicboom serve engine)
              (sonicboom serve sessions)
              (sonicboom serve chat-template)
@@ -56,7 +56,8 @@
 
 (define options
   (getopt-long (command-line)
-               '((host (value #t)) (port (value #t)) (queue (value #t))
+               '((host (value #t)) (port (value #t)) (model (value #t))
+                 (model-id (value #t)) (queue (value #t))
                  (max-sessions (value #t)) (token-budget (value #t))
                  (context-length (value #t)) (step-delay (value #t))
                  (prefill-delay (value #t)) (runtime-dir (value #t)))))
@@ -83,19 +84,17 @@
 (sse-install!)
 
 ;;; ---------------------------------------------------------------------------
-;;; The engine: two mock models, one per chat template family
+;;; The engine: one real Gemma 4 model loaded through libsonicboom's C ABI.
 
-(define backend (make-mock-backend))
-
-(define (mock-model id family)
-  (load-model backend `((id . ,id) (family . ,family)
-                        (context-length . ,(option 'context-length 8192))
-                        (step-delay . ,(option 'step-delay 0))
-                        (prefill-delay . ,(option 'prefill-delay 0)))))
+(define backend (make-real-backend))
+(define model-path (option 'model "models/gemma-4-E4B-it-Q3_K_M.gguf"))
+(define model-id (option 'model-id "gemma-4-E4B-it-Q3_K_M"))
+(define model
+  (load-model backend `((id . ,model-id) (path . ,model-path)
+                        (context-length . ,(option 'context-length 512)))))
 
 (define engine
-  (make-engine (list (mock-model "sonicboom-mock-gemma" 'gemma)
-                     (mock-model "sonicboom-mock-qwen" 'qwen))
+  (make-engine (list model)
                #:queue-limit queue-limit
                #:max-sessions (option 'max-sessions 4)
                #:token-budget (option 'token-budget 32768)))

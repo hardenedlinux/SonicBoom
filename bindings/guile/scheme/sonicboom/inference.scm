@@ -151,10 +151,11 @@ tokens reused from the previous prompt (informational)."
     (sb-check! st err-slot "prefill")
     (bytevector-u64-native-ref reused-slot 0)))
 
-(define (generate-tokens session prompt max-tokens)
+(define* (generate-tokens session prompt max-tokens #:optional (prefill? #t))
   "Prefill PROMPT (a list of token ids) and greedily decode up to MAX-TOKENS
-tokens. Returns the list of produced token ids."
-  (prefill! session prompt)
+tokens. Returns the list of produced token ids. When PREFILL? is false, decode
+from the prompt already held by SESSION."
+  (when prefill? (prefill! session prompt))
   (let* ((tokens '())
          (cb (lambda (user token)
                (set! tokens (cons token tokens))
