@@ -36,7 +36,7 @@ constexpr uint32_t kBF16 = 30;
 constexpr uint32_t kQ3K = 11;
 constexpr uint32_t kQ4K = 12;
 constexpr uint32_t kQ5K = 13;
-constexpr uint32_t kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8, kF16 = 1, kQ6K = 14;
+constexpr uint32_t kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8, kF16 = 1;
 
 std::string dims_string(const std::vector<uint64_t>& dims) {
   std::string out = "[";
@@ -45,7 +45,7 @@ std::string dims_string(const std::vector<uint64_t>& dims) {
 }
 
 const char* foreign_type_name(uint32_t id) {
-  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; case kQ5_0:return "q5_0"; case kQ8_0:return "q8_0"; case kQ6K:return "q6_K"; }
+  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; case kQ5_0:return "q5_0"; case kQ8_0:return "q8_0"; }
   return "unknown";
 }
 
@@ -130,7 +130,7 @@ std::optional<quant::QuantizedTensor> bind_quant(
   const bool native_quant_ok = quant::quant_type_from_ggml(t->type).has_value();
   const bool foreign_ok = !quant::quant_type_from_ggml(t->type) &&
       (t->type == kF16 || t->type == kQ4_0 || t->type == kQ5_0 ||
-       t->type == kQ8_0 || t->type == kQ6K) &&
+       t->type == kQ8_0) &&
       !t->dims.empty() && t->dims[0] % 256 == 0;
   if ((!type_ok && !native_quant_ok && !foreign_ok) || !shape_ok) {
     errs += "tensor type/shape mismatch: ";

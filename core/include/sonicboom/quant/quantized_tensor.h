@@ -42,14 +42,15 @@ enum class QuantType : uint8_t {
   Q3_K,
   Q4_K,
   Q5_K,
+  Q6_K,
 };
 
 struct QuantTypeInfo {
   QuantType type;
   const char* name;          // "q3_K" etc.
-  uint32_t ggml_type_id;     // id in the GGUF/ggml type table (11 / 12 / 13)
+  uint32_t ggml_type_id;     // id in the GGUF/ggml type table
   uint32_t block_size;       // elements per super-block (256 for the K-quants)
-  uint32_t bytes_per_block;  // serialized bytes per block (110 / 144 / 176)
+  uint32_t bytes_per_block;  // serialized bytes per block
 };
 
 // Size/geometry entry for a supported format, or nullptr for unknown ids.

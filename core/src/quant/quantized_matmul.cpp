@@ -60,6 +60,7 @@ using ggml_derived::Q8KBlock;
 using ggml_derived::dot_q3_K_block;
 using ggml_derived::dot_q4_K_block;
 using ggml_derived::dot_q5_K_block;
+using ggml_derived::dot_q6_K_block;
 using ggml_derived::quantize_q8_K_blocks;
 
 // IEEE 754 binary16 -> binary32. Bit-identical to ggml's GGML_FP16_TO_FP32 for
@@ -105,6 +106,7 @@ void dequantize_block(QuantType type, std::span<const std::byte> block,
     case QuantType::Q3_K: dequantize_q3_K(block, 1, out); break;
     case QuantType::Q4_K: dequantize_q4_K(block, 1, out); break;
     case QuantType::Q5_K: dequantize_q5_K(block, 1, out); break;
+    case QuantType::Q6_K: dequantize_q6_K(block, 1, out); break;
   }
 }
 
@@ -412,6 +414,7 @@ BlockDotFn block_dot_for(QuantType type) {
       case QuantType::Q3_K: return dot_q3_K_block_avx2;
       case QuantType::Q4_K: return dot_q4_K_block_avx2;
       case QuantType::Q5_K: return dot_q5_K_block_avx2;
+      case QuantType::Q6_K: return dot_q6_K_block;
     }
     return nullptr;
   }
@@ -419,6 +422,7 @@ BlockDotFn block_dot_for(QuantType type) {
     case QuantType::Q3_K: return dot_q3_K_block;
     case QuantType::Q4_K: return dot_q4_K_block;
     case QuantType::Q5_K: return dot_q5_K_block;
+    case QuantType::Q6_K: return dot_q6_K_block;
   }
   return nullptr;
 }

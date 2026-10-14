@@ -16,7 +16,7 @@
 //
 // ---------------------------------------------------------------------------
 // Derived from ggml (llama.cpp), MIT-licensed. The int8-tensor-core "mmq"
-// quantized matmul below (Q3_K / Q4_K / Q5_K shared-memory tiled dequant into
+// quantized matmul below (Q3_K / Q4_K / Q5_K / Q6_K shared-memory tiled dequant into
 // int8 + mma) is ported from the following upstream sources:
 //
 //   ggml/src/ggml-cuda/mma.cuh                — tile<> + load_ldmatrix + mma
@@ -24,7 +24,7 @@
 //                                                process_tile, mul_mat_q,
 //                                                write_back_mma
 //   ggml/src/ggml-cuda/mmq-config-ampere.cuh  — J set (fallback = false)
-//   ggml/src/ggml-cuda/mmq-load-tiles.cuh     — load_tiles_q3/q4/q5_K,
+//   ggml/src/ggml-cuda/mmq-load-tiles.cuh     — load_tiles_q3/q4/q5/q6_K,
 //                                                unpack_scales_q45_K
 //   ggml/src/ggml-cuda/mmq-vec-dot.cuh        — vec_dot_q8_0_16_q8_1_mma,
 //                                                vec_dot_q8_1_q8_1_mma
@@ -80,6 +80,7 @@ constexpr int QI4_K         = 32;
 constexpr int QR4_K         = 2;
 constexpr int QI5_K         = 32;
 constexpr int QR5_K         = 2;
+constexpr int QI6_K         = 32;
 constexpr int VDR_Q3_K_Q8_1_MMQ = 2;
 constexpr int MMQ_TILE_NE_K = 32;
 constexpr int MMQ_TILE_Y_K  = 36;
@@ -92,11 +93,13 @@ constexpr int CUDA_QUANTIZE_BLOCK_SIZE_MMQ = 128;
 // Shared-memory stride (in int32 units) of one row of the weight tile.
 // Q3_K: 2*32 qs int32 + 16 float dequant scales + 4 pad = 84.
 // Q4_K/Q5_K: 2*32 qs int32 + 8 half2 dequant scales + 4 pad = 76.
+// Q6_K: 2*32 qs int32 + 1 float d + 4 int32 packed signed scales + 7 pad = 76.
 constexpr int SRAM_STRIDE_Q3_K = 2*MMQ_TILE_NE_K + 16 + 4;
 constexpr int SRAM_STRIDE_Q8_1 = 2*MMQ_TILE_NE_K +  8 + 4;
+constexpr int SRAM_STRIDE_Q6_K = 2*MMQ_TILE_NE_K + 1 + 4 + 7;
 
-enum MMQType { MMQ_Q3_K = 0, MMQ_Q4_K = 1, MMQ_Q5_K = 2 };
-enum DsLayout { D4 = 0, DS4 = 1 };
+enum MMQType { MMQ_Q3_K = 0, MMQ_Q4_K = 1, MMQ_Q5_K = 2, MMQ_Q6_K = 3 };
+enum DsLayout { D4 = 0, DS4 = 1, D4_Q8_1 = 2 };
 
 __host__ __device__ constexpr int PAD(int x, int n) { return ((x) + (n) - 1) / (n) * (n); }
 
@@ -124,6 +127,14 @@ struct block_q5_K {
   uint8_t qs[128];
 };
 static_assert(sizeof(block_q5_K) == 176, "block_q5_K must be 176 bytes");
+
+struct block_q6_K {
+  uint8_t ql[128];
+  uint8_t qh[64];
+  int8_t scales[16];
+  half d;
+};
+static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
 
 struct block_q8_1_mmq {
   union { float d4[4]; half2 ds4[4]; };
@@ -191,6 +202,14 @@ __device__ __forceinline__ void load_ldmatrix(tile<16, 8>& t, const int* xs0, in
   const int* xs = xs0 + (threadIdx.x % t.I) * stride + (threadIdx.x / t.I) * (t.J / 2);
   asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0,%1,%2,%3}, [%4];"
                : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+               : "l"(xs));
+}
+
+__device__ __forceinline__ void load_ldmatrix(tile<16, 4>& t, const int* xs0, int stride) {
+  int* xi = t.x;
+  const int* xs = xs0 + (threadIdx.x % 16) * stride;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0,%1}, [%2];"
+               : "=r"(xi[0]), "=r"(xi[1])
                : "l"(xs));
 }
 
@@ -349,14 +368,61 @@ __device__ __forceinline__ void load_tiles_q5_K(const char* x, int* x_tile, int 
   }
 }
 
+template <int J>
+__device__ __forceinline__ void load_tiles_q6_K(const char* x, int* x_tile,
+                                                 int kbx0, int stride) {
+  constexpr int sram_stride = SRAM_STRIDE_Q6_K;
+  int* x_qs = x_tile;
+  float* x_df = reinterpret_cast<float*>(x_qs + 2 * MMQ_TILE_NE_K);
+  int* x_sc = reinterpret_cast<int*>(x_df + 1);
+  constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_K);
+  constexpr int nrows = WARP_SIZE / threads_per_row;
+  const int txi = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += nrows * NWARPS) {
+    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows + threadIdx.x / threads_per_row);
+    const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
+    const int ql = get_int_b2(bxi->ql, txi);
+    const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+    const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+    const int qh = get_int_b2(bxi->qh, (QI6_K / 4) * (txi / (QI6_K / 2)) + txi % (QI6_K / 4));
+    const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
+    const int qh1 = (qh >> ((txi & 0x08) >> 2)) & 0x30303030;
+    const int kq0 = 2 * txi - txi % (QI6_K / 2);
+    const int kq1 = kq0 + QI6_K / 2;
+    x_qs[i * sram_stride + kq0] = __vsub4(ql0 | qh0, 0x20202020);
+    x_qs[i * sram_stride + kq1] = __vsub4(ql1 | qh1, 0x20202020);
+  }
+
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += NWARPS * WARP_SIZE) {
+    const int i = (i0 + threadIdx.y * WARP_SIZE + threadIdx.x) % I;
+    const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
+    x_df[i * sram_stride] = float(bxi->d);
+  }
+
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += NWARPS * (WARP_SIZE / 4)) {
+    const int i = (i0 + threadIdx.y * (WARP_SIZE / 4) + threadIdx.x / 4) % I;
+    const block_q6_K* bxi = reinterpret_cast<const block_q6_K*>(x) + kbx0 + i * stride;
+    const int scale_word = threadIdx.x % 4;
+    // block_q6_K is 210 bytes, so every other block starts 2 mod 4. Use the
+    // two-byte-aligned loader for its packed scale words instead of get_int_b4.
+    x_sc[i * sram_stride + scale_word] = get_int_b2(bxi->scales, scale_word);
+  }
+}
+
 template <int Type, int J>
 __device__ __forceinline__ void load_tiles(const char* x, int* x_tile, int kbx0, int stride) {
   if constexpr (Type == MMQ_Q3_K) {
     load_tiles_q3_K<J>(x, x_tile, kbx0, stride);
   } else if constexpr (Type == MMQ_Q4_K) {
     load_tiles_q4_K<J>(x, x_tile, kbx0, stride);
-  } else {
+  } else if constexpr (Type == MMQ_Q5_K) {
     load_tiles_q5_K<J>(x, x_tile, kbx0, stride);
+  } else {
+    load_tiles_q6_K<J>(x, x_tile, kbx0, stride);
   }
 }
 
@@ -499,10 +565,93 @@ __device__ __forceinline__ void vec_dot_q8_1_q8_1_mma(const int* x, const int* y
   }
 }
 
+template <int J>
+__device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(const int* x, const int* y,
+                                                        float* sum, int k00) {
+  typedef tile<16, 4> tile_A;
+  typedef tile<8, 4> tile_B;
+  typedef tile<16, 8> tile_C;
+  constexpr int sram_stride = SRAM_STRIDE_Q6_K;
+  constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
+  constexpr int ntx = rows_per_warp / tile_C::I;
+  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+  const int* x_qs = x;
+  const float* x_df = reinterpret_cast<const float*>(x_qs + 2 * MMQ_TILE_NE_K);
+  const int* x_sc = reinterpret_cast<const int*>(x_df + 1);
+  const int* y_qs = y + 4;
+  const float* y_df = reinterpret_cast<const float*>(y);
+  const int i0 = (threadIdx.y / ntx) * (ntx * tile_A::I);
+  tile_A A[ntx][8];
+  int scA[ntx][tile_C::ne / 2][8];
+  float dA[ntx][tile_C::ne / 2];
+
+#pragma unroll
+  for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
+      const int k0 = k00 + k01;
+      load_ldmatrix(A[n][k01 / 4 + 0], x_qs + (i0 + n * tile_A::I) * sram_stride + k0, sram_stride);
+      load_ldmatrix(A[n][k01 / 4 + 1], x_qs + (i0 + n * tile_A::I) * sram_stride + k0 + tile_A::J, sram_stride);
+    }
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 16) {
+      const int k0 = k00 + k01;
+#pragma unroll
+      for (int l = 0; l < tile_C::ne / 2; ++l) {
+        const int i = i0 + n * tile_C::I + tile_C::get_i(2 * l);
+        const int packed = x_sc[i * sram_stride + k0 / 16];
+        const int8_t* sc = reinterpret_cast<const int8_t*>(&packed);
+#pragma unroll
+        for (int ksc = 0; ksc < 4; ++ksc) scA[n][l][k01 / 4 + ksc] = sc[ksc];
+      }
+    }
+#pragma unroll
+    for (int l = 0; l < tile_C::ne / 2; ++l) {
+      const int i = i0 + n * tile_C::I + tile_C::get_i(2 * l);
+      dA[n][l] = x_df[i * sram_stride];
+    }
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < J; j0 += ntx * tile_C::J) {
+    float tmp[ntx][tile_C::ne] = {};
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 8) {
+      tile_B B[2];
+      float dB[tile_C::ne / 2];
+      load_generic(B[0], y_qs + j0 * MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+      load_generic(B[1], y_qs + j0 * MMQ_TILE_Y_K + k01 + tile_B::J, MMQ_TILE_Y_K);
+#pragma unroll
+      for (int l = 0; l < tile_C::ne / 2; ++l) {
+        const int j = j0 + tile_C::get_j(l);
+        dB[l] = y_df[j * MMQ_TILE_Y_K + k01 / QI8_1];
+      }
+#pragma unroll
+      for (int n = 0; n < ntx; ++n) {
+        tile_C C[2];
+        mma(C[0], A[n][k01 / 4 + 0], B[0]);
+        mma(C[1], A[n][k01 / 4 + 1], B[1]);
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l)
+          tmp[n][l] += (C[0].x[l] * scA[n][l / 2][k01 / 4 + 0] +
+                        C[1].x[l] * scA[n][l / 2][k01 / 4 + 1]) * dB[l % 2];
+      }
+    }
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+      for (int l = 0; l < tile_C::ne; ++l)
+        sum[(j0 / tile_C::J + n) * tile_C::ne + l] += tmp[n][l] * dA[n][l / 2];
+    }
+  }
+}
+
 template <int Type, int J>
 __device__ __forceinline__ void vec_dot(const int* x, const int* y, float* sum, int k00) {
   if constexpr (Type == MMQ_Q3_K) {
     vec_dot_q8_0_16_q8_1_mma<J>(x, y, sum, k00);
+  } else if constexpr (Type == MMQ_Q6_K) {
+    vec_dot_q6_K_q8_1_mma<J>(x, y, sum, k00);
   } else {
     vec_dot_q8_1_q8_1_mma<J>(x, y, sum, k00);
   }
@@ -533,7 +682,7 @@ __device__ __forceinline__ void write_back_mma(const float* sum, float* dst, int
 
 // --- activation quantization to block_q8_1_mmq (ggml quantize.cu) ---------
 
-template <int ds>  // D4 (Q3_K) or DS4 (Q4_K/Q5_K)
+template <int ds>  // D4 (ggml), D4_Q8_1 (Q6 fallback), or DS4 (Q4_K/Q5_K)
 __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* __restrict__ y,
                                   const int K, const int n) {
   constexpr int vals_per_scale = 32;
@@ -567,13 +716,22 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
     }
   }
 
-  const float d_inv = 127.0f / amax;
   char4 q;
-  q.x = roundf(xi.x*d_inv);
-  q.y = roundf(xi.y*d_inv);
-  q.z = roundf(xi.z*d_inv);
-  q.w = roundf(xi.w*d_inv);
-  const float d = 1.0f / d_inv;
+  float d;
+  if constexpr (ds == D4_Q8_1) {
+    d = amax / 127.0f;
+    q.x = roundf(xi.x / d);
+    q.y = roundf(xi.y / d);
+    q.z = roundf(xi.z / d);
+    q.w = roundf(xi.w / d);
+  } else {
+    const float d_inv = 127.0f / amax;
+    q.x = roundf(xi.x * d_inv);
+    q.y = roundf(xi.y * d_inv);
+    q.z = roundf(xi.z * d_inv);
+    q.w = roundf(xi.w * d_inv);
+    d = 1.0f / d_inv;
+  }
 
   const int64_t ib = k_block*n + blockIdx.x;
   char4* yqs4 = (char4*)y[ib].qs;
@@ -675,7 +833,8 @@ __host__ inline int select_J(int n) {
 template <int Type, int J>
 __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
                                int M, int n, int blocks_per_row, cudaStream_t stream) {
-  constexpr int sram_stride = (Type == MMQ_Q3_K) ? SRAM_STRIDE_Q3_K : SRAM_STRIDE_Q8_1;
+  constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
+                              Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
   cudaFuncSetAttribute((const void*)mul_mat_q<Type, J>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);

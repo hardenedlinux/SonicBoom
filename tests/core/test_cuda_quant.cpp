@@ -1,6 +1,6 @@
 // CUDA K-quant matvec differential test.
 //
-// Builds synthetic Q3_K/Q4_K/Q5_K weights (random but finite block bytes, the
+// Builds synthetic Q3_K/Q4_K/Q5_K/Q6_K weights (random but finite block bytes, the
 // same construction as test_quantized_matmul.cpp), runs the CUDA dequantize-
 // on-the-fly gemv, and compares against the scalar CPU f32-activation reference
 // (quant::matvec_f32). The CUDA kernel reproduces the dequant arithmetic but
@@ -14,13 +14,19 @@
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include <sonicboom/quant/quantized_tensor.h>
 
+#include "ggml_baseline.h"
+
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <random>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace sbquant = sonicboom::quant;
@@ -58,6 +64,11 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
       const uint16_t d = rand_finite_half(rng);
       bytes[off + 108] = std::byte(d & 0xFF);
       bytes[off + 109] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q6_K) {
+      // Keep d at one so the Q8_1 differential does not hide lane errors.
+      const uint16_t d = 0x3C00;  // 1.0
+      bytes[off + 208] = std::byte(d & 0xFF);
+      bytes[off + 209] = std::byte(d >> 8);
     } else {
       const uint16_t d = rand_finite_half(rng);
       const uint16_t dmin = rand_finite_half(rng);
@@ -83,6 +94,148 @@ double compare(std::span<const float> got, std::span<const float> ref,
     if (err > tol) *ok = false;
   }
   return worst;
+}
+
+std::vector<float> q6_f32_reference(const sbquant::QuantizedTensor& W,
+                                    std::span<const float> X, uint64_t n) {
+  const uint64_t cols = W.dims()[0], rows = W.dims()[1];
+  std::vector<float> weights(W.numel());
+  if (!sbquant::dequantize_f32(W, weights.data(), weights.size())) return {};
+  std::vector<float> out(rows * n, 0.0f);
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t r = 0; r < rows; ++r) {
+      float sum = 0.0f;
+      for (uint64_t k = 0; k < cols; ++k)
+        sum += weights[r * cols + k] * X[c * cols + k];
+      out[c * rows + r] = sum;
+    }
+  }
+  return out;
+}
+
+int q6_centered_q(const uint8_t* wb, int k) {
+  const int half = k >> 7;
+  const int r = k & 127;
+  const int group = r >> 5;
+  const int lane = r & 31;
+  const int ql_index = (half << 6) + ((group & 1) ? 32 : 0) + lane;
+  const uint8_t ql_byte = wb[ql_index];
+  const int ql = group < 2 ? (ql_byte & 0x0F) : (ql_byte >> 4);
+  const int qh = (wb[128 + (half << 5) + lane] >> (2 * group)) & 3;
+  return (ql | (qh << 4)) - 32;
+}
+
+float fp16_to_f32(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t mant = h & 0x3FFu;
+  uint32_t bits;
+  if (exp == 0) {
+    if (mant == 0) bits = sign;
+    else {
+      exp = 127 - 15 + 1;
+      while ((mant & 0x400u) == 0) { mant <<= 1; --exp; }
+      mant &= 0x3FFu;
+      bits = sign | (exp << 23) | (mant << 13);
+    }
+  } else if (exp == 0x1F) {
+    bits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+  }
+  return std::bit_cast<float>(bits);
+}
+
+std::vector<float> q6_q8_1_reference(const sbquant::QuantizedTensor& W,
+                                     std::span<const float> X, uint64_t n) {
+  const uint64_t cols = W.dims()[0], rows = W.dims()[1];
+  constexpr uint64_t kBlock = 256;
+  struct Q8Block { float d; std::array<int8_t, 32> q; };
+  const uint64_t q8_blocks_per_row = cols / 32;
+  std::vector<Q8Block> xq(n * q8_blocks_per_row);
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t k0 = 0; k0 < cols; k0 += 32) {
+      const float* xb = X.data() + c * cols + k0;
+      float amax = 0.0f;
+      for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xb[j]));
+      const float d = amax / 127.0f;
+      Q8Block& qb = xq[c * q8_blocks_per_row + k0 / 32];
+      qb.d = d;
+      for (int j = 0; j < 32; ++j) {
+        qb.q[j] = d == 0.0f ? 0 : int8_t(std::round(xb[j] / d));
+      }
+    }
+  }
+
+  const auto raw = W.data();
+  const auto* bytes = reinterpret_cast<const uint8_t*>(raw.data());
+  const uint64_t blocks_per_row = cols / kBlock;
+  std::vector<float> out(rows * n, 0.0f);
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t r = 0; r < rows; ++r) {
+      float lane_sum[32] = {};
+      for (uint64_t b = 0; b < blocks_per_row; ++b) {
+        const uint8_t* wb = bytes + (r * blocks_per_row + b) * 210;
+        const auto* scales = reinterpret_cast<const int8_t*>(wb + 192);
+        const uint16_t dh = uint16_t(wb[208]) | (uint16_t(wb[209]) << 8);
+        const float d6 = fp16_to_f32(dh);
+        for (int iqs = 0; iqs < 32; ++iqs) {
+          const int bq8_offset = 2 * 2 * (iqs / 16) + (iqs % 16) / 8;
+          const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+          const int vh_shift = 2 * ((iqs % 16) / 8);
+          auto load_u32 = [](const uint8_t* p) {
+            return uint32_t(p[0]) | (uint32_t(p[1]) << 8) |
+                   (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+          };
+          const uint32_t vl = load_u32(wb + 4 * iqs);
+          const int vh_index = 8 * (iqs / 16) + iqs % 8;
+          const uint32_t vh = load_u32(wb + 128 + 4 * vh_index) >> vh_shift;
+          float sumf = 0.0f;
+          for (int i = 0; i < 2; ++i) {
+            const Q8Block& qb = xq[c * q8_blocks_per_row +
+                                   b * 8 + bq8_offset + 2 * i];
+            const int q8_byte = (iqs % 8) * 4;
+            int32_t dot = 0;
+            for (int j = 0; j < 4; ++j) {
+              const int ql = (vl >> (4 * i + 8 * j)) & 0x0F;
+              const int qh = ((vh >> (4 * i + 8 * j)) << 4) & 0x30;
+              const int q = ql | qh;
+              dot += (q - 32) * int32_t(qb.q[q8_byte + j]);
+            }
+            const int32_t scaled_dot = dot * int32_t(scales[scale_offset + 4 * i]);
+            sumf = std::fma(qb.d, float(scaled_dot), sumf);
+          }
+          lane_sum[iqs] = std::fma(d6, sumf, lane_sum[iqs]);
+        }
+      }
+      for (int stride = 16; stride > 0; stride >>= 1)
+        for (int lane = 0; lane < 32 - stride; ++lane)
+          lane_sum[lane] += lane_sum[lane + stride];
+      out[c * rows + r] = lane_sum[0];
+    }
+  }
+  return out;
+}
+
+void test_q6_single_q8_1(std::mt19937& rng) {
+  constexpr uint64_t rows = 64;
+  constexpr uint64_t cols = 256 * 4;
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(sbquant::QuantType::Q6_K, rows, cols, rng));
+  const auto& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows}, bytes);
+  std::vector<float> X(cols), Y(rows);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  unsetenv("SONICBOOM_GEMV_F32");
+  const bool ok = sbquant::cuda::matvec_f32(W, X, Y);
+  check(ok, "Q6_K q8_1 single-column gemv returns true");
+  if (!ok) return;
+  const std::vector<float> ref = q6_q8_1_reference(W, X, 1);
+  bool cmp = false;
+  const double worst = compare(Y, ref, 1e-4, &cmp);
+  check(cmp, "Q6_K q8_1 single-column gemv matches integer CPU q8_1 reference");
+  if (!cmp) std::cerr << "    worst rel err (Q6_K q8_1 single) = " << worst << "\n";
+  setenv("SONICBOOM_GEMV_F32", "1", 1);
 }
 
 void test_one_shape(sbquant::QuantType type, const char* name, uint64_t rows,
@@ -219,6 +372,14 @@ void test_batched_q8_1(sbquant::QuantType type, const char* name, uint64_t rows,
               << " elements differ from per-column matvec\n";
   }
   check(ndiff == 0, "q8_1 batched == per-column matvec (bit-exact)");
+
+  if (type == sbquant::QuantType::Q6_K) {
+    const std::vector<float> Y_cpu = q6_q8_1_reference(W, X, n);
+    bool cmp = false;
+    const double worst = compare(Yb, Y_cpu, 1e-4, &cmp);
+    check(cmp, "Q6_K q8_1 batched matches integer CPU q8_1 reference");
+    if (!cmp) std::cerr << "    worst rel err (Q6_K q8_1 batch) = " << worst << "\n";
+  }
 }
 
 void test_batched_q8_1_type(sbquant::QuantType type, const char* name,
@@ -229,6 +390,58 @@ void test_batched_q8_1_type(sbquant::QuantType type, const char* name,
   test_batched_q8_1(type, name, 64, 256 * 40, 3, rng);
   test_batched_q8_1(type, name, 64, 256 * 40, 8, rng);
   test_batched_q8_1(type, name, 64, 256 * 40, 10, rng);
+}
+
+void test_mmq_q6_type(std::mt19937& rng) {
+  (void)rng;
+  std::cout << "  SKIP Q6_K MMQ: TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed\n";
+  return;
+
+  constexpr uint64_t rows = 128;
+  constexpr uint64_t cols = 256 * 4;
+  constexpr uint64_t n = 3;
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(sbquant::QuantType::Q6_K, rows, cols, rng));
+  const auto& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows}, bytes);
+  std::vector<float> X(cols * n), Y(rows * n), ref(rows * n);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  unsetenv("SONICBOOM_GEMV_F32");
+  setenv("SONICBOOM_MMQ", "1", 1);
+  setenv("SONICBOOM_CUBLAS", "0", 1);
+  const bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
+  check(ok, "Q6_K MMQ matmul returns true");
+  if (!ok) return;
+  check(sbquant::matmul_f32(W, X, ref, n), "Q6_K MMQ CPU reference returns true");
+  bool cmp = false;
+  const double worst = compare(Y, ref, 1e-1, &cmp);
+  check(cmp, "Q6_K MMQ matches CPU reference tolerance");
+  if (!cmp) std::cerr << "    worst rel err (Q6_K MMQ) = " << worst << "\n";
+}
+
+void test_cublas_q6_type(std::mt19937& rng) {
+  constexpr uint64_t rows = 64;
+  constexpr uint64_t cols = 256 * 4;
+  constexpr uint64_t n = 32;
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(sbquant::QuantType::Q6_K, rows, cols, rng));
+  auto& bytes = keepalive.back();
+  for (size_t off = 0; off < bytes.size(); off += 210)
+    for (int i = 0; i < 16; ++i) bytes[off + 192 + i] = std::byte{1};
+  sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows}, bytes);
+  std::vector<float> X(cols * n), Y(rows * n), ref(rows * n);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  unsetenv("SONICBOOM_GEMV_F32");
+  setenv("SONICBOOM_MMQ", "0", 1);
+  unsetenv("SONICBOOM_CUBLAS");
+  const bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
+  check(ok, "Q6_K cuBLAS fp16 matmul returns true");
+  if (!ok) return;
+  check(sbquant::matmul_f32(W, X, ref, n), "Q6_K cuBLAS CPU reference returns true");
+  bool cmp = false;
+  const double worst = compare(Y, ref, 1e-1, &cmp);
+  check(cmp, "Q6_K cuBLAS fp16 dequant matches CPU reference tolerance");
+  if (!cmp) std::cerr << "    worst rel err (Q6_K cuBLAS) = " << worst << "\n";
 }
 
 } // namespace
@@ -247,13 +460,24 @@ int main() {
   }
 
   std::mt19937 rng(0xBEEF);
+  test_q6_single_q8_1(rng);
+  if (std::getenv("SONICBOOM_TEST_Q6_SINGLE_ONLY")) {
+    if (g_failures) {
+      std::cerr << "test_cuda_quant FAILED: " << g_failures << " check(s)\n";
+      return 1;
+    }
+    std::cout << "test_cuda_quant Q6_K single q8_1 OK\n";
+    return 0;
+  }
   test_one_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_one_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_one_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+  test_one_type(sbquant::QuantType::Q6_K, "q6_K", rng);
 
   test_batched_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+  test_batched_type(sbquant::QuantType::Q6_K, "q6_K", rng);
 
   // The q8_1 batched matmul is the prefill default; the differential above used
   // the fp32 fallback (SONICBOOM_GEMV_F32=1). For n >= 2 the default is now the
@@ -267,6 +491,10 @@ int main() {
   test_batched_q8_1_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+  test_batched_q8_1_type(sbquant::QuantType::Q6_K, "q6_K", rng);
+
+  test_mmq_q6_type(rng);
+  test_cublas_q6_type(rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";

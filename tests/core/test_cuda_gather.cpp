@@ -16,7 +16,7 @@
 
 // CUDA single-row gather differential test (Phase 3.2 B5).
 //
-// Builds synthetic Q3_K/Q4_K/Q5_K embedding weights (random-but-finite block
+// Builds synthetic Q3_K/Q4_K/Q5_K/Q6_K embedding weights (random-but-finite block
 // bytes, the same construction as test_cuda_quant.cpp) and, for random rows,
 // compares the device gather (quant::cuda::gather_f32, the host-in/out wrapper
 // around gather_f32_dev) against the CPU reference quant::dequantize_row_f32.
@@ -74,6 +74,10 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
       const uint16_t d = rand_finite_half(rng);
       bytes[off + 108] = std::byte(d & 0xFF);
       bytes[off + 109] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q6_K) {
+      const uint16_t d = rand_finite_half(rng);
+      bytes[off + 208] = std::byte(d & 0xFF);
+      bytes[off + 209] = std::byte(d >> 8);
     } else {
       const uint16_t d = rand_finite_half(rng);
       const uint16_t dmin = rand_finite_half(rng);
@@ -138,6 +142,7 @@ int main() {
   test_gather_type(sbquant::QuantType::Q3_K, "q3_K", /*rows=*/64, /*cols=*/256 * 5, rng);
   test_gather_type(sbquant::QuantType::Q4_K, "q4_K", /*rows=*/64, /*cols=*/256 * 5, rng);
   test_gather_type(sbquant::QuantType::Q5_K, "q5_K", /*rows=*/64, /*cols=*/256 * 5, rng);
+  test_gather_type(sbquant::QuantType::Q6_K, "q6_K", /*rows=*/64, /*cols=*/256 * 5, rng);
 
   // A larger width (40 blocks/row, matching the big FFN down-projection) to
   // confirm the bit-exactness holds independent of row span.

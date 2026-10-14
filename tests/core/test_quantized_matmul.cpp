@@ -10,6 +10,8 @@
 #include <sonicboom/quant/quantized_matmul.h>
 #include <sonicboom/quant/quantized_tensor.h>
 
+#include "ggml_baseline.h"
+
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -18,6 +20,7 @@
 #include <vector>
 
 namespace sbquant = sonicboom::quant;
+namespace baseline = ggml_baseline;
 
 namespace {
 
@@ -63,6 +66,10 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
       const uint16_t d = rand_finite_half(rng);
       bytes[off + 108] = std::byte(d & 0xFF);
       bytes[off + 109] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q6_K) {
+      const uint16_t d = rand_finite_half(rng);
+      bytes[off + 208] = std::byte(d & 0xFF);
+      bytes[off + 209] = std::byte(d >> 8);
     } else {
       // q4_K/q5_K: d at 0, dmin at 2.
       const uint16_t d = rand_finite_half(rng);
@@ -74,6 +81,25 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
     }
   }
   return bytes;
+}
+
+void test_q6k_q8k_dot_against_baseline(std::mt19937& rng) {
+  constexpr uint64_t rows = 3;
+  constexpr uint64_t cols = 512;
+  auto bytes = build_weight(sbquant::QuantType::Q6_K, rows, cols, rng);
+  sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows}, bytes);
+  std::vector<float> x(cols), got(rows), want(rows);
+  for (float& v : x) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  check(sbquant::matvec_f32_q8_K(W, x, got), "Q6_K q8_K CPU matvec returns true");
+  std::vector<baseline::block_q8_K> q8(cols / 256);
+  baseline::quantize_row_q8_K_ref(x.data(), q8.data(), cols);
+  for (uint64_t r = 0; r < rows; ++r) {
+    const auto* q6 = reinterpret_cast<const baseline::block_q6_K*>(bytes.data()) + r * 2;
+    want[r] = baseline::vec_dot_q6_K_q8_K_generic(q6, q8.data(), cols);
+  }
+  for (uint64_t r = 0; r < rows; ++r)
+    check(std::fabs(got[r] - want[r]) <= 1e-5f * std::max(1.0f, std::fabs(want[r])),
+          "Q6_K CPU vec_dot matches ggml_baseline");
 }
 
 // Naive reference: dequantize the whole weight to f32, then plain matvec.
@@ -190,9 +216,12 @@ int main() {
   test_matvec_one_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_matvec_one_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_matvec_one_type(sbquant::QuantType::Q5_K, "q5_K", rng);
+  test_matvec_one_type(sbquant::QuantType::Q6_K, "q6_K", rng);
   test_matmul_one_type(sbquant::QuantType::Q3_K, rng);
   test_matmul_one_type(sbquant::QuantType::Q4_K, rng);
   test_matmul_one_type(sbquant::QuantType::Q5_K, rng);
+  test_matmul_one_type(sbquant::QuantType::Q6_K, rng);
+  test_q6k_q8k_dot_against_baseline(rng);
   test_validation();
 
   if (g_failures == 0) {

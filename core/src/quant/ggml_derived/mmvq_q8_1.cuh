@@ -16,12 +16,12 @@
 //
 // ---------------------------------------------------------------------------
 // Derived from ggml (llama.cpp), MIT-licensed. The q8_1 mmvq kernels below
-// (quantize_q8_1, vec_dot_q3/q4/q5_K_q8_1, gemv_q3/q4/q5_K_q8_1, get_int_b2,
+// (quantize_q8_1, vec_dot_q3/q4/q5/q6_K_q8_1, gemv_q3/q4/q5/q6_K_q8_1, get_int_b2,
 // get_int_b4, and the block_q8_1 layout) are ported from the following
 // upstream sources:
 //
-//   ggml/src/ggml-cuda/vecdotq.cuh  — vec_dot_q3/q4/q5_K_q8_1 (mmvq impls)
-//   ggml/src/ggml-cuda/mmvq.cu      — mul_mat_vec_q3/q4/q5_K_q8_1 (warp gemv)
+//   ggml/src/ggml-cuda/vecdotq.cuh  — vec_dot_q3/q4/q5/q6_K_q8_1 (mmvq impls)
+//   ggml/src/ggml-cuda/mmvq.cu      — mul_mat_vec_q3/q4/q5/q6_K_q8_1 (warp gemv)
 //   ggml/src/ggml-cuda/quantize.cu  — quantize_q8_1
 //
 // Upstream commit: llama.cpp 43fe9c64281ef735046adc025e9e7559a1f659a5
@@ -101,6 +101,8 @@ constexpr int QI8_1 = QK8_1 / 4;                    // 8 int32 groups per block
 constexpr int QR3_K = 4, QI3_K = QK_K / (4 * QR3_K);  // 4, 16
 constexpr int QR4_K = 2;                              // 8x32-elem blocks/row
 constexpr int QR5_K = 2;                              // 8x32-elem blocks/row
+constexpr int QR6_K = 2;
+constexpr int QI6_K = QK_K / (4 * QR6_K);
 
 struct block_q8_1 {
   float d;        // amax / 127 (kept fp32; llama.cpp packs d+s into a half2)
@@ -297,6 +299,36 @@ __device__ __forceinline__ float vec_dot_q5_K_q8_1(const uint8_t* wb,
   return d * sumf_d - dmin * sumf_m;
 }
 
+__device__ __forceinline__ float vec_dot_q6_K_q8_1(const uint8_t* wb,
+                                                   const block_q8_1* yb, int iqs) {
+  const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) +
+                        (iqs % (QI6_K / 2)) / (QI6_K / 4);
+  const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) +
+                           (iqs % (QI6_K / 2)) / (QI6_K / 8);
+  const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+  const int vl = get_int_b2(wb, iqs);
+  const int vh = get_int_b2(wb + 128,
+      (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+  const int8_t* scales = reinterpret_cast<const int8_t*>(wb + 192) + scale_offset;
+  const float d = half_to_float(ld_u16(wb + 208));
+  int u[QR6_K];
+  float d8[QR6_K];
+  #pragma unroll
+  for (int i = 0; i < QR6_K; ++i) {
+    u[i] = get_int_b4(yb[bq8_offset + 2 * i].qs, iqs % QI8_1);
+    d8[i] = yb[bq8_offset + 2 * i].d;
+  }
+  float sum = 0.0f;
+  #pragma unroll
+  for (int i = 0; i < QR6_K; ++i) {
+    const int ql = (vl >> (4 * i)) & 0x0F0F0F0F;
+    const int qh = ((vh >> (4 * i)) << 4) & 0x30303030;
+    const int q = __vsubss4(ql | qh, 0x20202020);
+    sum += d8[i] * (__dp4a(q, u[i], 0) * scales[4 * i]);
+  }
+  return d * sum;
+}
+
 // --- warp-per-row mmvq kernels ---------------------------------------------
 
 __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
@@ -353,6 +385,25 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
     const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 176;
     const block_q8_1* yb = y + (size_t)b * (QK_K / QK8_1);
     sum += vec_dot_q5_K_q8_1(wb, yb, iqs);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[row] = sum;
+}
+
+__global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
+                               const block_q8_1* __restrict__ y,
+                               float* __restrict__ dst, int blocks_per_row,
+                               int num_rows) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
+  float sum = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
+    const block_q8_1* yb = y + (size_t)b * (QK_K / QK8_1);
+    sum += vec_dot_q6_K_q8_1(wb, yb, iqs);
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
@@ -470,6 +521,42 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
           const block_q8_1* yb =
               y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
           sum[t] += vec_dot_q5_K_q8_1(wb, yb, iqs);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
+template <int T>
+__global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
+                                       const block_q8_1* __restrict__ y,
+                                       float* __restrict__ dst,
+                                       int blocks_per_row, int num_rows, int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb = y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          sum[t] += vec_dot_q6_K_q8_1(wb, yb, iqs);
         }
       }
     }

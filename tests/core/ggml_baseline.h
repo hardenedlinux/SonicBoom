@@ -19,7 +19,9 @@
 #pragma once
 
 #include <bit>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace ggml_baseline {
 
@@ -67,9 +69,23 @@ typedef struct {
   uint8_t qs[GGML_BASELINE_QK_K / 2];
 } block_q5_K;
 
+typedef struct {
+  uint8_t ql[128];
+  uint8_t qh[64];
+  int8_t scales[16];
+  ggml_half d;
+} block_q6_K;
+
 static_assert(sizeof(block_q3_K) == 110, "q3_K block size");
 static_assert(sizeof(block_q4_K) == 144, "q4_K block size");
 static_assert(sizeof(block_q5_K) == 176, "q5_K block size");
+static_assert(sizeof(block_q6_K) == 210, "q6_K block size");
+
+typedef struct {
+  float d;
+  int8_t qs[GGML_BASELINE_QK_K];
+  int16_t bsums[GGML_BASELINE_QK_K / 16];
+} block_q8_K;
 
 static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
   if (j < 4) {
@@ -173,6 +189,94 @@ static inline void dequantize_row_q5_K(const block_q5_K* x, float* y, int64_t k)
       u2 <<= 2;
     }
   }
+}
+
+static inline void dequantize_row_q6_K(const block_q6_K* x, float* y, int64_t k) {
+  const int nb = k / GGML_BASELINE_QK_K;
+  for (int i = 0; i < nb; ++i) {
+    const float d = baseline_half_to_float(x[i].d);
+    const uint8_t* ql = x[i].ql;
+    const uint8_t* qh = x[i].qh;
+    const int8_t* sc = x[i].scales;
+    for (int n = 0; n < GGML_BASELINE_QK_K; n += 128) {
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        const int8_t q1 = int8_t((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        const int8_t q2 = int8_t((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        const int8_t q3 = int8_t((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        const int8_t q4 = int8_t((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        y[l] = d * sc[is + 0] * q1;
+        y[l + 32] = d * sc[is + 2] * q2;
+        y[l + 64] = d * sc[is + 4] * q3;
+        y[l + 96] = d * sc[is + 6] * q4;
+      }
+      y += 128;
+      ql += 64;
+      qh += 32;
+      sc += 8;
+    }
+  }
+}
+
+static inline void quantize_row_q8_K_ref(const float* x, block_q8_K* y, int64_t k) {
+  const int nb = int(k / GGML_BASELINE_QK_K);
+  for (int b = 0; b < nb; ++b) {
+    float amax = 0.0f, signed_max = 0.0f;
+    for (int j = 0; j < GGML_BASELINE_QK_K; ++j) {
+      const float ax = std::fabs(x[b * GGML_BASELINE_QK_K + j]);
+      if (ax > amax) { amax = ax; signed_max = x[b * GGML_BASELINE_QK_K + j]; }
+    }
+    const float iscale = amax == 0.0f ? 0.0f : -127.0f / signed_max;
+    y[b].d = iscale == 0.0f ? 0.0f : 1.0f / iscale;
+    for (int j = 0; j < GGML_BASELINE_QK_K; ++j) {
+      const float v = iscale * x[b * GGML_BASELINE_QK_K + j] + 12582912.0f;
+      const int q = iscale == 0.0f ? 0 : (int(std::bit_cast<uint32_t>(v) & 0x007fffffu) - 0x00400000);
+      y[b].qs[j] = int8_t(q);
+    }
+    for (int j = 0; j < GGML_BASELINE_QK_K / 16; ++j) {
+      int sum = 0;
+      for (int l = 0; l < 16; ++l) sum += y[b].qs[j * 16 + l];
+      y[b].bsums[j] = int16_t(sum);
+    }
+  }
+}
+
+static inline float vec_dot_q6_K_q8_K_generic(const block_q6_K* x,
+                                               const block_q8_K* y,
+                                               int64_t n) {
+  const int nb = int(n / GGML_BASELINE_QK_K);
+  float sums[8] = {};
+  float sumf = 0.0f;
+  for (int i = 0; i < nb; ++i) {
+    int8_t aux8[GGML_BASELINE_QK_K];
+    int32_t aux32[8] = {};
+    const uint8_t* ql = x[i].ql;
+    const uint8_t* qh = x[i].qh;
+    const int8_t* q8 = y[i].qs;
+    int8_t* a = aux8;
+    for (int j = 0; j < GGML_BASELINE_QK_K; j += 128) {
+      for (int l = 0; l < 32; ++l) {
+        a[l] = int8_t((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        a[l + 32] = int8_t((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        a[l + 64] = int8_t((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        a[l + 96] = int8_t((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+      }
+      a += 128; ql += 64; qh += 32;
+    }
+    a = aux8;
+    int is = 0;
+    for (int j = 0; j < GGML_BASELINE_QK_K / 16; ++j) {
+      const int scale = x[i].scales[is++];
+      for (int l = 0; l < 8; ++l) aux32[l] += scale * int16_t(q8[l] * a[l]);
+      q8 += 8; a += 8;
+      for (int l = 0; l < 8; ++l) aux32[l] += scale * int16_t(q8[l] * a[l]);
+      q8 += 8; a += 8;
+    }
+    const float d = baseline_half_to_float(x[i].d) * y[i].d;
+    for (int l = 0; l < 8; ++l) sums[l] += d * float(aux32[l]);
+  }
+  for (float v : sums) sumf += v;
+  return sumf;
 }
 
 } // namespace ggml_baseline

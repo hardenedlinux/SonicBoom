@@ -26,6 +26,7 @@ static constexpr QuantTypeInfo kTypeInfo[] = {
     {QuantType::Q3_K, "q3_K", 11, 256, 110},
     {QuantType::Q4_K, "q4_K", 12, 256, 144},
     {QuantType::Q5_K, "q5_K", 13, 256, 176},
+    {QuantType::Q6_K, "q6_K", 14, 256, 210},
 };
 
 const QuantTypeInfo* quant_type_info(QuantType type) {

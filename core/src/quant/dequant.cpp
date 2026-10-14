@@ -209,6 +209,35 @@ void dequantize_q5_K(std::span<const std::byte> blocks, uint64_t n_blocks,
   }
 }
 
+void dequantize_q6_K(std::span<const std::byte> blocks, uint64_t n_blocks,
+                     float* out) {
+  const std::byte* p = blocks.data();
+  for (uint64_t b = 0; b < n_blocks; ++b) {
+    const uint8_t* ql = reinterpret_cast<const uint8_t*>(p);
+    const uint8_t* qh = ql + 128;
+    const int8_t* scales = reinterpret_cast<const int8_t*>(ql + 192);
+    const float d = half_to_float(load_u16_le(p + 208));
+    for (int n = 0; n < 256; n += 128) {
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        const int8_t q1 = int8_t((ql[l] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        const int8_t q2 = int8_t((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        const int8_t q3 = int8_t((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+        const int8_t q4 = int8_t((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        out[l + 0] = d * scales[is + 0] * q1;
+        out[l + 32] = d * scales[is + 2] * q2;
+        out[l + 64] = d * scales[is + 4] * q3;
+        out[l + 96] = d * scales[is + 6] * q4;
+      }
+      out += 128;
+      ql += 64;
+      qh += 32;
+      scales += 8;
+    }
+    p += 210;
+  }
+}
+
 bool dequantize_f32(const QuantizedTensor& t, float* out, uint64_t out_capacity) {
   if (!t.valid()) return false;
   if (out_capacity < t.numel()) return false;
@@ -221,6 +250,9 @@ bool dequantize_f32(const QuantizedTensor& t, float* out, uint64_t out_capacity)
       return true;
     case QuantType::Q5_K:
       dequantize_q5_K(t.data(), t.num_blocks(), out);
+      return true;
+    case QuantType::Q6_K:
+      dequantize_q6_K(t.data(), t.num_blocks(), out);
       return true;
   }
   return false;
@@ -248,6 +280,9 @@ bool dequantize_row_f32(const QuantizedTensor& t, uint64_t row, float* out,
       return true;
     case QuantType::Q5_K:
       dequantize_q5_K(blocks, blocks_per_row, out);
+      return true;
+    case QuantType::Q6_K:
+      dequantize_q6_K(blocks, blocks_per_row, out);
       return true;
   }
   return false;

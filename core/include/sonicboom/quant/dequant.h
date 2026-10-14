@@ -59,5 +59,6 @@ bool dequantize_row_f32(const QuantizedTensor& t, uint64_t row, float* out,
 void dequantize_q3_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 void dequantize_q4_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 void dequantize_q5_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
+void dequantize_q6_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 
 } // namespace sonicboom::quant

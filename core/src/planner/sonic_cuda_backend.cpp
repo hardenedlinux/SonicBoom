@@ -435,10 +435,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::QuantizedMatmul: {
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb))
+      if (attr_i(*node, "batch", nb)) {
         ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
-      else
+      } else {
         ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
+      }
       break;
     }
     case OpKind::Quantize: {
@@ -458,15 +459,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // block) activation via the int8-tensor-core matmul. No internal
       // quantize; blocks_per_row / num_rows come from the weight.
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb))
+      if (attr_i(*node, "batch", nb)) {
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
             int(nb));
-      else
+      } else {
         ok = quant::cuda::gemv_q8_1_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])), out);
+      }
       break;
     }
     case OpKind::RmsNormQuantize: {

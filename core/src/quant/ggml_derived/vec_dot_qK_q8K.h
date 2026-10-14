@@ -21,7 +21,7 @@
 // following upstream sources:
 //
 //   ggml/src/ggml-quants.c  — nearest_int, quantize_row_q8_K_ref,
-//                             ggml_vec_dot_q3/q4/q5_K_q8_K_generic
+//                             ggml_vec_dot_q3/q4/q5/q6_K_q8_K_generic
 //   ggml/src/ggml-quants.h  — block_q8_K layout
 //
 // Upstream commit: llama.cpp 43fe9c64281ef735046adc025e9e7559a1f659a5
@@ -356,6 +356,47 @@ inline void dot_q5_K_block(const std::byte* wp, const Q8KBlock& q8, float sums[8
   for (int l = 0; l < 8; ++l) sums[l] += dq * float(aux32[l]);
   const float dminq = dmin * q8.d;
   sumf -= dminq * float(sumi);
+}
+
+inline void dot_q6_K_block(const std::byte* wp, const Q8KBlock& q8,
+                           float sums[8], float& sumf) {
+  const uint8_t* ql = reinterpret_cast<const uint8_t*>(wp);
+  const uint8_t* qh = ql + 128;
+  const int8_t* scales = reinterpret_cast<const int8_t*>(ql + 192);
+  const float d = half_to_float(load_u16_le(wp + 208));
+
+  int8_t aux8[256];
+  int8_t* a = aux8;
+  for (int j = 0; j < 256; j += 128) {
+    for (int l = 0; l < 32; ++l) {
+      a[l + 0] = int8_t((ql[l + 0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+      a[l + 32] = int8_t((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+      a[l + 64] = int8_t((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+      a[l + 96] = int8_t((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+    }
+    a += 128;
+    ql += 64;
+    qh += 32;
+  }
+
+  int32_t aux32[8] = {};
+  int16_t aux16[8];
+  const int8_t* q8s = q8.qs;
+  a = aux8;
+  int is = 0;
+  for (int j = 0; j < 16; ++j) {
+    const int scale = scales[is++];
+    for (int l = 0; l < 8; ++l) aux16[l] = int16_t(q8s[l] * a[l]);
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+    q8s += 8; a += 8;
+    for (int l = 0; l < 8; ++l) aux16[l] = int16_t(q8s[l] * a[l]);
+    for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
+    q8s += 8; a += 8;
+  }
+
+  const float dq = d * q8.d;
+  for (int l = 0; l < 8; ++l) sums[l] += dq * float(aux32[l]);
+  (void)sumf;
 }
 
 } // namespace sonicboom::quant::ggml_derived

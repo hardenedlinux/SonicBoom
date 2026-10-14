@@ -116,6 +116,21 @@ __device__ inline void get_scale_min_k4(int j, const uint8_t* scales, uint8_t& d
   }
 }
 
+__device__ inline float dequant_q6_K_value(const uint8_t* blk, int l) {
+  const int n = l >> 7;
+  const int r = l & 127;
+  const int group = r >> 5;
+  const int lane = r & 31;
+  const int qlo = (n << 6) + ((group & 1) ? 32 : 0) + lane;
+  const uint8_t qbyte = blk[qlo];
+  const int low = group < 2;
+  const int q = (low ? int(qbyte & 0x0F) : int(qbyte >> 4)) |
+                (((blk[128 + (n << 5) + lane] >> (2 * group)) & 3) << 4);
+  const int8_t* scales = reinterpret_cast<const int8_t*>(blk + 192);
+  const float d = half_to_float(ld_u16(blk + 208));
+  return d * scales[n * 8 + group * 2 + (lane >> 4)] * (q - 32);
+}
+
 // Unpack the q3_K 12-byte scales block into 16 int8 values.
 __device__ inline void unpack_q3_K_scales(const uint8_t* src, int8_t* scales) {
   const uint32_t a0 = ld_u32(src + 0);
@@ -311,6 +326,19 @@ __global__ void gemv_q5_K_base(const uint8_t* __restrict__ w, const float* __res
   atomicAdd(&y[row], s);
 }
 
+__global__ void gemv_q6_K_base(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                               float* __restrict__ y, int blocks_per_row, int num_blocks) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= num_blocks) return;
+  const int row = i / blocks_per_row;
+  const int b = i % blocks_per_row;
+  const uint8_t* blk = w + (size_t)i * 210;
+  const float* xb = x + (size_t)b * 256;
+  float sum = 0.0f;
+  for (int l = 0; l < 256; ++l) sum += dequant_q6_K_value(blk, l) * xb[l];
+  atomicAdd(&y[row], sum);
+}
+
 __global__ void gemv_q3_K_coop(const uint8_t* __restrict__ w, const float* __restrict__ x,
                                float* __restrict__ y, int blocks_per_row, int num_rows) {
   const int lane = threadIdx.x;   // 0..31
@@ -438,6 +466,26 @@ __global__ void gemv_q5_K_coop(const uint8_t* __restrict__ w, const float* __res
 }
 
 
+__global__ void gemv_q6_K_coop(const uint8_t* __restrict__ w, const float* __restrict__ x,
+                               float* __restrict__ y, int blocks_per_row, int num_rows) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int slice = lane & 15;
+  const int first_block = lane >> 4;
+  float sum = 0.0f;
+  for (int b = first_block; b < blocks_per_row; b += 2) {
+    const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 210;
+    const float* xb = x + (size_t)b * 256 + slice * 16;
+    #pragma unroll
+    for (int k = 0; k < 16; ++k)
+      sum += dequant_q6_K_value(blk, slice * 16 + k) * xb[k];
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) y[row] = sum;
+}
+
 // --- device weight cache + scratch -----------------------------------------
 
 struct DeviceWeight {
@@ -486,6 +534,8 @@ size_t g_xf16_bytes = 0;
 // [K/128][n] (+ J_max tail over-read). Reused across layers.
 void* g_mmq_q8 = nullptr;
 size_t g_mmq_q8_bytes = 0;
+void* g_mmq_q6_x_f32 = nullptr;
+size_t g_mmq_q6_x_f32_bytes = 0;
 
 // Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
 // created lazily and the workspace is set so cublasGemmEx is stream-capturable
@@ -666,6 +716,17 @@ __global__ void gather_q5_K_row(const uint8_t* __restrict__ w, int64_t row_host,
   out[i] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
+__global__ void gather_q6_K_row(const uint8_t* __restrict__ w, int64_t row_host,
+                                const float* __restrict__ row_dev,
+                                float* __restrict__ out, int blocks_per_row) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= blocks_per_row * 256) return;
+  const int64_t row = row_dev ? (int64_t)row_dev[0] : row_host;
+  const int b = i >> 8;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 210;
+  out[i] = dequant_q6_K_value(blk, i & 255);
+}
+
 // Launch the single-row gather kernel for `row` of a device-resident packed
 // tensor. `w` points at the packed tensor start on the device. The row is either
 // `row_host` (a host value baked into the launch) or, when `row_dev` is non-null,
@@ -684,6 +745,9 @@ bool launch_gather_row(const uint8_t* w, int64_t row_host, const float* row_dev,
       break;
     case QuantType::Q5_K:
       gather_q5_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
+      break;
+    case QuantType::Q6_K:
+      gather_q6_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     default:
       return false;
@@ -789,6 +853,21 @@ __global__ void gather_q5_K_batched(const uint8_t* __restrict__ w,
   out[(size_t)c * width + k] = d * float(sc) * float(v) - dmin * float(mi);
 }
 
+__global__ void gather_q6_K_batched(const uint8_t* __restrict__ w,
+                                    const uint64_t* __restrict__ rows,
+                                    float* __restrict__ out, int blocks_per_row,
+                                    int n) {
+  const int k = blockIdx.x * blockDim.x + threadIdx.x;
+  const int width = blocks_per_row * 256;
+  if (k >= width) return;
+  const int c = blockIdx.y;
+  if (c >= n) return;
+  const int64_t row = (int64_t)rows[c];
+  const int b = k >> 8;
+  const uint8_t* blk = w + ((size_t)row * blocks_per_row + b) * 210;
+  out[(size_t)c * width + k] = dequant_q6_K_value(blk, k & 255);
+}
+
 // Launch the batched gather for n token ids (`rows`, device uint64_t[n]) of a
 // device-resident packed tensor `w`. grid.y == n (one column per token),
 // grid.x covers the width. Shared by the resident and mapped variants.
@@ -804,6 +883,9 @@ bool launch_gather_batched(const uint8_t* w, const uint64_t* rows, QuantType typ
       break;
     case QuantType::Q5_K:
       gather_q5_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
+      break;
+    case QuantType::Q6_K:
+      gather_q6_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     default:
       return false;
@@ -893,11 +975,34 @@ __global__ void dequant_q5_K_f16(const uint8_t* __restrict__ w,
   out[idx] = __float2half_rn(d * float(sc) * float(v) - dmin * float(mi));
 }
 
+__global__ void dequant_q6_K_f16(const uint8_t* __restrict__ w,
+                                 __half* __restrict__ out, int64_t numel) {
+  const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= numel) return;
+  const int64_t b = idx >> 8;
+  out[idx] = __float2half_rn(dequant_q6_K_value(w + b * 210, int(idx & 255)));
+}
+
 // f32 -> fp16 (round-to-nearest), elementwise, for the activation operand.
 __global__ void cast_f32_f16(const float* __restrict__ x, __half* __restrict__ y,
                              int64_t n) {
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] = __float2half_rn(x[i]);
+}
+
+// Recover the Q6 fallback activation from D4 MMQ blocks. The Q6 prefill plan
+// selects D4_Q8_1, so d4 holds one float scale per 32 quantized values.
+__global__ void dequant_mmq_q8_1_d4(const mmq::block_q8_1_mmq* __restrict__ q,
+                                    float* __restrict__ x, int cols, int n) {
+  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const int64_t total = (int64_t)cols * n;
+  if (i >= total) return;
+  const int token = int(i / cols);
+  const int k = int(i % cols);
+  const int block = k / 128;
+  const int offset = k % 128;
+  const mmq::block_q8_1_mmq& qb = q[(int64_t)block * n + token];
+  x[i] = float(qb.qs[offset]) * qb.d4[offset / 32];
 }
 
 } // namespace
@@ -977,6 +1082,9 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
       case QuantType::Q5_K:
         gemv_q5_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
+      case QuantType::Q6_K:
+        gemv_q6_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
+        break;
     }
   } else {
     // Zero-fill on the current stream so the base (atomic-accumulate) gemv is
@@ -995,6 +1103,9 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
         break;
       case QuantType::Q5_K:
         gemv_q5_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
+        break;
+      case QuantType::Q6_K:
+        gemv_q6_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
     }
   }
@@ -1105,6 +1216,9 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
     case QuantType::Q5_K:
       q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
+    case QuantType::Q6_K:
+      q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      break;
   }
 }
 
@@ -1128,6 +1242,10 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
       break;
     case QuantType::Q5_K:
       q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, n);
+      break;
+    case QuantType::Q6_K:
+      q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
   }
@@ -1411,6 +1529,9 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
     case QuantType::Q5_K:
       dequant_q5_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
+    case QuantType::Q6_K:
+      dequant_q6_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
+      break;
     default:
       return false;
   }
@@ -1441,12 +1562,18 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
 // q8_1 blocks contiguous), and mul_mat_q natively writes dst [n, rows] — so no
 // transpose on either side of the kernel (C.3a). Q3_K uses a float d4 activation
 // scale layout (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's
-// vec_dot path.
+// vec_dot path. Q6_K uses D4 (float activation scales); its signed per-16-value
+// weight scales remain separate from the block's fp16 d, matching ggml's
+// Q6_K MMQ tile layout.
 bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   const int ic = int(cols), ir = int(rows);
   const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
+
+  // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
+  if (W.type() == QuantType::Q6_K)
+    return matmul_f16_cublas_dev(W, X, Y, n);
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -1498,6 +1625,18 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
 
+  if (W.type() == QuantType::Q6_K) {
+    // Keep the Q6_K MMQ weight kernel disabled; use D4 activation + fp16 cuBLAS.
+    float* X = static_cast<float*>(grow_scratch(
+        g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
+    if (!X) return false;
+    const int64_t nx = int64_t(cols) * n;
+    dequant_mmq_q8_1_d4<<<(nx + 255) / 256, 256, 0, cur_stream()>>>(
+        reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), X, int(cols), n);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    return matmul_f16_cublas_dev(W, X, Y, n);
+  }
+
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
 
@@ -1519,6 +1658,11 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
+    case QuantType::Q6_K:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q6_K>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
     default:
       return false;
   }
@@ -1536,7 +1680,7 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
 // quantize, making the fused and unfused mmq paths write identical bytes (the
 // prefix-cache full-vs-reuse test depends on this). The caller must have all 32
 // lanes of the warp active (full shuffle mask).
-template <int ds>  // mmq::D4 (Q3_K) or mmq::DS4 (Q4_K/Q5_K)
+template <int ds>  // mmq::D4 (Q3_K/Q6_K) or mmq::DS4 (Q4_K/Q5_K)
 __device__ __forceinline__ void quantize_mmq_q8_1_block(
     const float (&f)[4], int blk, int token, int n, int lane,
     mmq::block_q8_1_mmq* __restrict__ y) {
@@ -1556,14 +1700,22 @@ __device__ __forceinline__ void quantize_mmq_q8_1_block(
       sum += __shfl_xor_sync(0xffffffffu, sum, offset, 32);
   }
 
-  const float d_inv = 127.0f / amax;
-  const float d = 1.0f / d_inv;
-
   char4 q;
-  q.x = roundf(f[0] * d_inv);
-  q.y = roundf(f[1] * d_inv);
-  q.z = roundf(f[2] * d_inv);
-  q.w = roundf(f[3] * d_inv);
+  float d;
+  if constexpr (ds == mmq::D4_Q8_1) {
+    d = amax / 127.0f;
+    q.x = roundf(f[0] / d);
+    q.y = roundf(f[1] / d);
+    q.z = roundf(f[2] / d);
+    q.w = roundf(f[3] / d);
+  } else {
+    const float d_inv = 127.0f / amax;
+    d = 1.0f / d_inv;
+    q.x = roundf(f[0] * d_inv);
+    q.y = roundf(f[1] * d_inv);
+    q.z = roundf(f[2] * d_inv);
+    q.w = roundf(f[3] * d_inv);
+  }
 
   mmq::block_q8_1_mmq& yb = y[(size_t)blk * n + token];
   reinterpret_cast<char4*>(yb.qs)[lane] = q;
@@ -1580,7 +1732,7 @@ __device__ __forceinline__ void quantize_mmq_q8_1_block(
 // reads x[t], x[t+blockDim], …, warp shuffle + shared reduce), so `inv` is
 // bit-identical; the quantize is delegated to quantize_mmq_q8_1_block (above),
 // which is bit-identical to mmq::quantize_activation for both D4 and DS4.
-template <int ds>  // mmq::D4 (Q3_K) or mmq::DS4 (Q4_K/Q5_K)
+template <int ds>  // mmq::D4 (Q3_K/Q6_K) or mmq::DS4 (Q4_K/Q5_K)
 __global__ void __launch_bounds__(1024) rms_norm_quantize_mmq_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int dim,
     int n, float eps, mmq::block_q8_1_mmq* __restrict__ y) {
@@ -1639,6 +1791,9 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
   if (ds == mmq::DS4)
     rms_norm_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 1024, 0, cur_stream()>>>(
         x, d_w, dim, n, eps, y);
+  else if (ds == mmq::D4_Q8_1)
+    rms_norm_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 1024, 0, cur_stream()>>>(
+        x, d_w, dim, n, eps, y);
   else
     rms_norm_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 1024, 0, cur_stream()>>>(
         x, d_w, dim, n, eps, y);
@@ -1679,6 +1834,9 @@ bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   if (ds == mmq::DS4)
     gelu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
+  else if (ds == mmq::D4_Q8_1)
+    gelu_mul_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
   else
     gelu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
@@ -1700,8 +1858,14 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // 256→434/336, 512→458/396, 2048→324/286), so it is selected for all
   // n >= mmq_min_n(); cuBLAS stays reachable via SONICBOOM_MMQ=0. Only when
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
-  if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n())
+  if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() &&
+      W.type() != QuantType::Q6_K)
     return matmul_mmq_dev(W, X, Y, n);
+
+  // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
+  if (W.type() == QuantType::Q6_K && q8_1_enabled() && mmq_enabled() &&
+      n >= mmq_min_n() && cublas_enabled() && n >= cublas_min_n())
+    return matmul_f16_cublas_dev(W, X, Y, n);
 
   // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.

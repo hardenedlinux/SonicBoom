@@ -77,6 +77,7 @@ bool matvec_f32(const QuantizedTensor& W, std::span<const float> x,
 bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
                 std::span<float> Y, uint64_t n);
 
+
 // Single-row gather on the device (host in/out): out[k] = dequantized
 // W[k][token] for k in [0, W.dims()[0]). The CUDA twin of
 // <sonicboom/quant/dequant.h> dequantize_row_f32 — same block layouts and

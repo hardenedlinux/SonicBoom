@@ -503,6 +503,12 @@ void test_differential_model() {
             reinterpret_cast<const baseline::block_q5_K*>(sub.data()), ref.data(),
             int64_t(n_blocks * 256));
         break;
+      case sbquant::QuantType::Q6_K:
+        sbquant::dequantize_q6_K(sub, n_blocks, mine.data());
+        baseline::dequantize_row_q6_K(
+            reinterpret_cast<const baseline::block_q6_K*>(sub.data()), ref.data(),
+            int64_t(n_blocks * 256));
+        break;
     }
 
     for (uint64_t i = 0; i < n_blocks * 256; ++i)
@@ -528,6 +534,27 @@ void test_differential_model() {
             << blocks_checked << " blocks compared\n";
   check(tensors_checked >= 3, "model differential: sampled >= 3 tensors");
   check(mismatches == 0, "model differential: bit-exact vs ggml baseline");
+}
+
+void test_q6k_quanttype_reference() {
+  std::mt19937 rng(0x6A6B);
+  std::vector<std::byte> bytes(2 * 210);
+  for (auto& v : bytes) v = std::byte(uint8_t(rng()));
+  for (size_t b = 0; b < 2; ++b) {
+    const uint16_t d = 0x2C00;  // finite 1/16 scale
+    bytes[b * 210 + 208] = std::byte(d & 0xff);
+    bytes[b * 210 + 209] = std::byte(d >> 8);
+  }
+  auto mapped = sbquant::quantized_tensor_from_gguf(14, {512}, bytes);
+  check(mapped && mapped->type() == sbquant::QuantType::Q6_K && mapped->valid(),
+        "ggml Q6_K id maps to a valid QuantType tensor");
+  if (!mapped) return;
+  std::vector<float> got(512), ref(512);
+  check(sbquant::dequantize_f32(*mapped, got.data(), got.size()),
+        "Q6_K QuantType path dequantizes");
+  baseline::dequantize_row_q6_K(
+      reinterpret_cast<const baseline::block_q6_K*>(bytes.data()), ref.data(), 512);
+  check(got == ref, "Q6_K QuantType path matches ggml baseline");
 }
 
 void test_foreign_dequant() {
@@ -593,6 +620,7 @@ int main() {
   test_validation();
   test_differential_random();
   test_differential_model();
+  test_q6k_quanttype_reference();
   test_foreign_dequant();
   test_q5k_quantize_roundtrip();
 
