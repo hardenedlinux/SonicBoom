@@ -1204,41 +1204,21 @@ cublasHandle_t cublas_handle() {
 void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
                                      const q8_1::block_q8_1* xq, float* yp,
                                      int blocks_per_row, int num_rows) {
+  const dim3 block(32, 8);
+  const dim3 grid(1, (num_rows + 7) / 8);
   switch (qt) {
     case QuantType::Q3_K:
-      {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
       q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
-      }
-    case QuantType::Q4_K: {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
+    case QuantType::Q4_K:
       q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
-    }
-    case QuantType::Q5_K: {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
+    case QuantType::Q5_K:
       q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
-    }
-    case QuantType::Q6_K: {
-      // sm_86 uses ggml's generic MMVQ config: 4 warps, VDR=1. ggml packs
-      // four rows per block when the K loop has fewer than four Q6_K blocks.
-      constexpr int nwarps = 4;
-      const int rows_per_block = blocks_per_row < nwarps ? nwarps : 1;
-      const dim3 block(32, nwarps);
-      const dim3 grid((num_rows + rows_per_block - 1) / rows_per_block);
-      if (rows_per_block == nwarps)
-        q8_1::gemv_q6_K_q8_1<4, 4><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows);
-      else
-        q8_1::gemv_q6_K_q8_1<4, 1><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows);
+    case QuantType::Q6_K:
+      q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
-    }
   }
 }
 
@@ -1248,47 +1228,26 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
 void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
                               const q8_1::block_q8_1* xq, float* yp,
                               int blocks_per_row, int num_rows, int n) {
+  const dim3 block(32, 8);
+  const dim3 grid(1, (num_rows + 7) / 8);
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
-      {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
       q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
-      }
-    case QuantType::Q4_K: {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
+    case QuantType::Q4_K:
       q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
-    }
-    case QuantType::Q5_K: {
-      const dim3 block(32, 8);
-      const dim3 grid(1, (num_rows + 7) / 8);
+    case QuantType::Q5_K:
       q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
-    }
-    case QuantType::Q6_K: {
-      // Match sm_86's generic config for the actual output-column count.
-      const int nwarps = n <= 4 ? 4 : (n <= 8 ? 2 : 1);
-      const int rows_per_block = nwarps == 1 ? 1 : 2;
-      const dim3 block(32, nwarps);
-      const dim3 grid((num_rows + rows_per_block - 1) / rows_per_block);
-      if (nwarps == 4)
-        q8_1::gemv_q6_K_q8_1_batched<T, 4, 2>
-            <<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, n);
-      else if (nwarps == 2)
-        q8_1::gemv_q6_K_q8_1_batched<T, 2, 2>
-            <<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, n);
-      else
-        q8_1::gemv_q6_K_q8_1_batched<T, 1, 1>
-            <<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, n);
+    case QuantType::Q6_K:
+      q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, n);
       break;
-    }
   }
 }
 

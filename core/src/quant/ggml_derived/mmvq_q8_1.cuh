@@ -391,43 +391,23 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
   if (lane == 0) dst[row] = sum;
 }
 
-template <int NWARPS, int ROWS_PER_BLOCK>
 __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
                                int num_rows) {
   const int lane = threadIdx.x;
-  const int warp = threadIdx.y;
-  float sum[ROWS_PER_BLOCK] = {};
-  for (int b = warp; b < blocks_per_row; b += NWARPS) {
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
+  float sum = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
     const block_q8_1* yb = y + (size_t)b * (QK_K / QK8_1);
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
-      const int row = blockIdx.x * ROWS_PER_BLOCK + r;
-      if (row < num_rows) {
-        const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
-        sum[r] += vec_dot_q6_K_q8_1(wb, yb, lane);  // Q6_K VDR=1.
-      }
-    }
+    sum += vec_dot_q6_K_q8_1(wb, yb, iqs);
   }
-
-  __shared__ float partial[ROWS_PER_BLOCK][NWARPS][32];
   #pragma unroll
-  for (int r = 0; r < ROWS_PER_BLOCK; ++r)
-    partial[r][warp][lane] = sum[r];
-  __syncthreads();
-  if (warp == 0) {
-    #pragma unroll
-    for (int r = 0; r < ROWS_PER_BLOCK; ++r) {
-      float total = partial[r][0][lane];
-      #pragma unroll
-      for (int wk = 1; wk < NWARPS; ++wk) total += partial[r][wk][lane];
-      #pragma unroll
-      for (int o = 16; o > 0; o >>= 1) total += __shfl_down_sync(0xffffffffu, total, o);
-      const int row = blockIdx.x * ROWS_PER_BLOCK + r;
-      if (lane == 0 && row < num_rows) dst[row] = total;
-    }
-  }
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[row] = sum;
 }
 
 // --- batched warp-per-row mmvq (prefill) ------------------------------------
@@ -556,58 +536,39 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
   }
 }
 
-template <int T, int NWARPS, int ROWS_PER_BLOCK>
+template <int T>
 __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
                                        int blocks_per_row, int num_rows, int n) {
   const int lane = threadIdx.x;
-  const int warp = threadIdx.y;
-  const int row_slot = warp % ROWS_PER_BLOCK;
-  const int warp_group = warp / ROWS_PER_BLOCK;
-  const int warps_per_row = NWARPS / ROWS_PER_BLOCK;
-  const int row = blockIdx.x * ROWS_PER_BLOCK + row_slot;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane;  // Q6_K MMVQ uses VDR_Q6_K_Q8_1_MMVQ = 1.
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
-    float sum[T][ROWS_PER_BLOCK][4] = {};
+    float sum[T];
     #pragma unroll
-    for (int q = warp_group; q < 4; q += warps_per_row) {
-      for (int b = q; b < blocks_per_row; b += 4) {
-        if (row < num_rows) {
-          const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
-          #pragma unroll
-          for (int t = 0; t < T; ++t) {
-            if (t < nt) {
-              const block_q8_1* yb = y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
-              sum[t][row_slot][q] += vec_dot_q6_K_q8_1(wb, yb, lane);
-            }
-          }
-        }
-      }
-    }
-
-    __shared__ float partial[T][ROWS_PER_BLOCK][4][32];
-    #pragma unroll
-    for (int t = 0; t < T; ++t)
-      for (int q = warp_group; q < 4; q += warps_per_row)
-        partial[t][row_slot][q][lane] = sum[t][row_slot][q];
-    __syncthreads();
-
-    if (warp_group == 0) {
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
       #pragma unroll
       for (int t = 0; t < T; ++t) {
         if (t < nt) {
-            float total = partial[t][row_slot][0][lane];
-            #pragma unroll
-            for (int q = 1; q < 4; ++q) total += partial[t][row_slot][q][lane];
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) total += __shfl_down_sync(0xffffffffu, total, o);
-            if (lane == 0 && row < num_rows)
-              dst[(size_t)(p0 + t) * num_rows + row] = total;
+          const block_q8_1* yb = y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          sum[t] += vec_dot_q6_K_q8_1(wb, yb, iqs);
         }
       }
     }
-    __syncthreads();
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+      }
+    }
   }
 }
 

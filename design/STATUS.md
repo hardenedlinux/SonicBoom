@@ -53,4 +53,3 @@ Tok/s; ratios are SonicBoom / llama.cpp. llama.cpp checkout: `43fe9c64281`.
 3. Attention split/merge.
 4. Q6_K MMQ.
 5. Reduce shared-library size.
-- Q6_K MMVQ launch config: Q4_K_M depth-0 tg64 49.34 → 45.79 tok/s (before → after).
