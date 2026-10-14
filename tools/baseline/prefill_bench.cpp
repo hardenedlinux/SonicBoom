@@ -7,15 +7,13 @@
 // single decode token, so the timed region is prefill + lm-head sample (no
 // autoregressive decode).
 //
-// The prefill path requires the prompt to land in a straight, wrap-free run of
-// each KV cache (SWA ring n_slots == sliding_window == 512, global n_slots ==
-// n_ctx), so N <= 512. N > 512 returns 0 (prefill rejected) — pp2048 is not
-// supported by the current one-shot prefill; llama.cpp handles it via chunked
-// (ubatch) prefill.
+// Uses the persistent prefix-session entry point, which chunks prompts larger
+// than the 512-token SWA window and supports pp512/pp2048/pp4100.
 //
-// Plan overhead isolation: generate_prefill_spine_cuda rebuilds the decode graph
-// + plan and re-allocates the CUDA backend's KV caches on every call, all of
-// which is ~constant in N. It is subtracted by also timing a 1-token prompt
+// Plan overhead isolation: generate_prefill_spine_cuda_prefix rebuilds the
+// decode graph + plan and re-allocates the CUDA backend's KV caches on every
+// call, all of which is ~constant in N. It is subtracted by also timing a
+// 1-token prompt
 // (same per-call overhead) and reporting the marginal pp:
 //   pp_marginal = (N-1) / (time(N) - time(1)).
 //
@@ -25,6 +23,7 @@
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/planner/kv_cache.h>
 
 #include <chrono>
 #include <cstdint>
@@ -37,6 +36,7 @@
 
 namespace sbgguf = sonicboom::gguf;
 namespace sbmodel = sonicboom::model;
+namespace sbplanner = sonicboom::planner;
 
 int main(int argc, char** argv) {
   uint64_t n = 512;
@@ -73,9 +73,10 @@ int main(int argc, char** argv) {
 
   auto run = [&](const std::vector<uint64_t>& prompt) -> uint64_t {
     std::vector<int64_t> toks(1, -1);
-    // n_ctx = prompt + 1 decode token; global layers need start_pos+n <= n_ctx.
-    return sbmodel::generate_prefill_spine_cuda(*m, prompt, 0, toks,
-                                                prompt.size() + 1);
+    sbplanner::KvCacheSession session;
+    session.n_ctx = prompt.size() + toks.size();
+    return sbmodel::generate_prefill_spine_cuda_prefix(
+        *m, prompt, 0, toks, session, true);
   };
 
   auto best = [&](const std::vector<uint64_t>& prompt, bool* ok) -> double {
@@ -99,7 +100,7 @@ int main(int argc, char** argv) {
   bool ok = true;
   best(prompt, &ok);
   if (!ok) {
-    fprintf(stderr, "prefill rejected at --prompt %llu (SWA wrap-free constraint: N>512)\n",
+    fprintf(stderr, "prefill rejected at --prompt %llu\n",
             (unsigned long long)n);
     return 1;
   }

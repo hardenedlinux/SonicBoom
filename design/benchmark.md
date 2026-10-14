@@ -473,3 +473,34 @@ already-supported Q3_K/Q4_K/Q5_K blocks in a Q4_K_M file, the rebuilt
 `test_generate` passed its 64-token run and the full CTest run passed **53/53**
 tests. `test_prefix_cache` passed all 11 cases, and
 `test_cuda_elementwise` passed its batch invariance checks.
+
+## Q4_K_M (native Q6_K) (2026-10-14)
+
+The validation file is the user-provided Unsloth quantization at
+`models/gemma-4-E4B-it-Q4_K_M.gguf`, SHA-256
+`85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87`.
+Q6_K is native; loading emitted no `sonicboom: converted ...` summary. The
+Q6_K MMQ weight kernel remains disabled. Q6_K prefill uses D4_Q8_1 activation
+scales followed by fp16 dequantization and cuBLAS; decode uses the q8_1 MMVQ
+kernel. A 64-token prompt asking for the derivative of `f(x) = x^2` generated
+a coherent answer using the power rule with default `SONICBOOM_MMQ=1`.
+
+| Measurement | SonicBoom CUDA | llama.cpp CUDA | Ratio |
+|---|---:|---:|---:|
+| tg64, depth 0 | 49.34 tok/s | 55.01 tok/s | 0.90x |
+| tg64, depth 512 (n_ctx 576) | 48.29 tok/s | 55.01 tok/s | 0.88x |
+| tg64, depth 2048 (n_ctx 2112) | 46.30 tok/s | 55.01 tok/s | 0.84x |
+| pp512 | 1082.6 tok/s (472.950 ms) | 2048.02 tok/s | 0.53x |
+| pp2048 | 989.2 tok/s (2070.286 ms) | 2084.09 tok/s | 0.47x |
+| pp4100 | 986.6 tok/s (4155.569 ms) | 2035.26 tok/s | 0.48x |
+
+SonicBoom decode used `longctx_bench` with `SONICBOOM_GEN_TIMING=1`; the
+steady-rate output excludes plan setup and the first decode step. For depth
+512/2048, `n_ctx` was pinned to 576/2112. Prefill is the chunked prefix-session
+path; `prefill_bench` reports wall throughput and uses three repetitions (best
+run). llama.cpp is checkout `43fe9c642`; decode used `llama-bench -p 512/2048
+-n 64 -ngl 99 -r 1`, and prefill used `-p 512/2048/4100 -n 0 -ngl 99 -r 1`.
+
+The measured load sequence was 4.243 s in `Reader::load`, 0.269 ms in
+`load_gemma4`, and 0.213 s in vocabulary loading (4.456 s total). The GGUF
+remains local validation data and is not part of the repository.
