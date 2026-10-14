@@ -24,10 +24,10 @@ was traced to split-KV chunk serialization at large n_ctx and fixed with a
   `SONICBOOM_GEN_STEPS=64` (single seed + N greedy steps, no tokenizer, no nsys,
   idle GPU). Long context = the runtime's single-run steady metric
   (`SONICBOOM_GEN_TIMING=1`, "steady tok/s") over a `depth`-step decode at
-  `n_ctx = depth`, compared against `llama-bench -p <depth> -n 64 -ngl 99`
-  (whose `n_ctx = depth + 64`). Both sides must run at the **same n_ctx** — the
-  earlier `-p 1 -n 64` baseline silently measured at `n_ctx = 65`, not the
-  stated depth.
+  `n_ctx = depth`, compared against
+  `llama-bench -p 0 -n 64 -d <depth> -ngl 99` (depth is set with `-d`). Both
+  sides must run at the **same depth** — the earlier `-p 1 -n 64` baseline
+  silently measured at depth 1, not the stated depth.
 
 ## Environment (recorded separately per v1 rules)
 
@@ -71,7 +71,7 @@ Note the driver (13.2) is ahead of the nvcc toolkit (12.0); the build targets
 | **T3** rms_norm+quantize fusion | **42.7** | |
 | **T4** per-head rms_norm single-pass | **43.4** | |
 | **T5** gelu×up→q8_1 fusion | **43.6** | **final** |
-| llama.cpp (tg64, ngl 99) | 42.63 | same protocol |
+| llama.cpp (tg64, depth 0, ngl 99) | 45.22 | `llama-bench -p 0 -n 64 -d 0` |
 
 **Reading.** The v0→v1 CUDA decode path gained **10.1×** (4.33 → 43.6 tok/s).
 The big levers were the q8_1 dp4a gemv (2.2), the dense-gemv rewrite (2.3), the
@@ -93,8 +93,8 @@ behavior invariant (~36.3 tok/s, ±0), as intended.
 
 | depth | n_ctx | SonicBoom CUDA | llama.cpp CUDA | ratio |
 |---|---|---|---|---|
-| 512 | 576 | 49.96 tok/s (20.02 ms/step) | 45.20 tok/s (22.12 ms/step) | **1.11×** |
-| 2048 | 2112 | 47.13 tok/s (21.22 ms/step) | 45.21 tok/s (22.12 ms/step) | **1.04×** |
+| 512 | 576 | 49.96 tok/s (20.02 ms/step) | 44.76 tok/s (22.34 ms/step) | **1.12×** |
+| 2048 | 2112 | 47.13 tok/s (21.22 ms/step) | 44.08 tok/s (22.69 ms/step) | **1.07×** |
 
 Re-measured post-T1-T5 with CUDA Graphs ON on an idle GPU, at matching n_ctx
 (the 2026-10-07 table above — 34.55/34.78 vs 39.87/37.56 — was measured at
@@ -107,16 +107,15 @@ sides and, because llama.cpp's n_ctx also shrank, misstated the ratio).
 `tg64` measures, but averaged over the whole depth range rather than a 64-step
 tail (the `longctx_bench` subtraction is thermal-fragile at depth 2048: two
 ~47 s decodes subtract to a ~1.3 s tail, so a 0.4% GPU-clock drift becomes a
-12% tail error). llama.cpp = `llama-bench -p <depth> -n 64 -ngl 99`, whose
-`n_ctx = n_prompt + n_gen = depth + 64`; its `tg64` is flat (45.20→45.21)
-because its decode is not attention-bound at these depths.
+12% tail error). llama.cpp = `llama-bench -p 0 -n 64 -d <depth> -ngl 99`,
+with its depth set by `-d`; its `tg64` changed from 44.76 to 44.08 tok/s over
+depths 512→2048.
 
-**Reading.** SonicBoom now *leads* llama.cpp at both depths (1.11× at 512,
-1.04× at 2048). The 512→2048 penalty is ~6.0% (20.02→21.22 ms/step) and is
+**Reading.** SonicBoom now *leads* llama.cpp at both depths (1.12× at 512,
+1.07× at 2048). The 512→2048 penalty is ~6.0% (20.02→21.22 ms/step) and is
 **essentially all attention**: the split kernel grows 1.29→2.36 ms as the
 global layers span the full window, while gemv q8_1 (~14.9 ms, ~64%) is
-unchanged. llama.cpp has no such penalty at these depths (its `tg64` is flat
-45.20→45.21), so the long-context lead narrows slowly with depth — the same
+unchanged. llama.cpp also slows modestly over these depths (44.76→44.08), so the long-context lead narrows slowly with depth — the same
 sublinear attention growth §2 quantifies, now visible end-to-end.
 
 ### 1.2.1 n_ctx sensitivity at fixed depth (split-KV chunk serialization)
@@ -383,9 +382,9 @@ continuation cheap. This section is the release-time summary of the numbers, the
 baseline, and the reproduction environment; the per-section detail is above.
 
 **Decode (CUDA).** 51.65 tok/s on the 64-step steady protocol — **1.14×
-llama.cpp** (45.20 tok/s, `tg64`/`ngl 99`, same GGUF + machine). Long-context
-steady decode: **1.11×** at depth 512 (49.96 vs 45.20 tok/s) and **1.04×** at
-depth 2048 (47.13 vs 45.21 tok/s). The step is GPU-bound; the q8_1 dp4a gemv
+llama.cpp** (45.22 tok/s, `tg64`/`ngl 99`, same GGUF + machine). Long-context
+steady decode: **1.12×** at depth 512 (49.96 vs 44.76 tok/s) and **1.07×** at
+depth 2048 (47.13 vs 44.08 tok/s). The step is GPU-bound; the q8_1 dp4a gemv
 holds ~64% of GPU time (§1.1, §1.2, §2).
 
 **Prefill (CUDA).** Chunked device-resident batched prefill: `pp512` 445.9 ms /
@@ -487,9 +486,9 @@ a coherent answer using the power rule with default `SONICBOOM_MMQ=1`.
 
 | Measurement | SonicBoom CUDA | llama.cpp CUDA | Ratio |
 |---|---:|---:|---:|
-| tg64, depth 0 | 49.34 tok/s | 55.01 tok/s | 0.90x |
-| tg64, depth 512 (n_ctx 576) | 48.29 tok/s | 55.01 tok/s | 0.88x |
-| tg64, depth 2048 (n_ctx 2112) | 46.30 tok/s | 55.01 tok/s | 0.84x |
+| tg64, depth 0 | 49.34 tok/s | 54.99 tok/s | 0.90x |
+| tg64, depth 512 (n_ctx 576) | 48.29 tok/s | 54.30 tok/s | 0.89x |
+| tg64, depth 2048 (n_ctx 2112) | 46.30 tok/s | 53.32 tok/s | 0.87x |
 | pp512 | 1082.6 tok/s (472.950 ms) | 2048.02 tok/s | 0.53x |
 | pp2048 | 989.2 tok/s (2070.286 ms) | 2084.09 tok/s | 0.47x |
 | pp4100 | 986.6 tok/s (4155.569 ms) | 2035.26 tok/s | 0.48x |
@@ -498,8 +497,9 @@ SonicBoom decode used `longctx_bench` with `SONICBOOM_GEN_TIMING=1`; the
 steady-rate output excludes plan setup and the first decode step. For depth
 512/2048, `n_ctx` was pinned to 576/2112. Prefill is the chunked prefix-session
 path; `prefill_bench` reports wall throughput and uses three repetitions (best
-run). llama.cpp is checkout `43fe9c642`; decode used `llama-bench -p 512/2048
--n 64 -ngl 99 -r 1`, and prefill used `-p 512/2048/4100 -n 0 -ngl 99 -r 1`.
+run). llama.cpp is checkout `43fe9c642`; decode used
+`llama-bench -p 0 -n 64 -d 0,512,2048 -ngl 99 -r 1`; prefill used
+`-p 512/2048/4100 -n 0 -ngl 99 -r 1`.
 
 The measured load sequence was 4.243 s in `Reader::load`, 0.269 ms in
 `load_gemma4`, and 0.213 s in vocabulary loading (4.456 s total). The GGUF
