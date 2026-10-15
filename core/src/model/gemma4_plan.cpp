@@ -83,6 +83,60 @@ sx::Bytes encode_tokens(std::span<const uint64_t> tokens) {
 sx::Attribute attr_i(const char* name, int64_t v) { return sx::Attribute{name, v}; }
 sx::Attribute attr_f(const char* name, double v) { return sx::Attribute{name, v}; }
 
+// Which generic pieces of the transformer block an architecture uses. This is
+// the ONE architecture-conditional in SonicBoom: the emitter (together with the
+// loader) is the model-specific front end, so an architecture's structural
+// differences are expressed here and nowhere else — the planner, the
+// partitioning seam, and both backends stay model-agnostic, and every field
+// below selects between existing generic OpKinds/attributes rather than
+// introducing a model-specific one.
+//
+// Gemma 4 turns every field on except the projection biases and the untied
+// output; Qwen2 turns on the projection bias, the SiLU gate, the attention
+// temperature, and the untied output, and leaves the rest off.
+struct BlockProfile {
+  bool embd_scale = false;     // token embedding × sqrt(d)
+  bool qk_norm = false;        // per-head RMSNorm on Q and K
+  bool v_norm = false;         // unit-weight per-head RMSNorm on V
+  bool proj_bias = false;      // Q/K/V projections carry a bias
+  bool attn_out_bias = false;  // attention output projection carries a bias
+  bool post_attn_norm = false; // norm between the attn projection and its residual
+  bool post_ffw_norm = false;  // norm between the FFN down-projection and its residual
+  bool silu_ffn = false;       // SiLU (Qwen2) vs fp16 GELU (Gemma 4) gate
+  bool per_layer_input = false; // per-layer embedding gate + its whole block
+  bool layer_scale = false;    // whole-block output scale
+  bool kv_shared = false;      // some layers attend over another layer's KV cache
+  bool softcap = false;        // logit softcapping
+  bool tied_output = false;    // lm head reuses the token embedding
+  float attn_scale = 1.0f;     // logit temperature (1.0 with Q/K RMSNorm)
+};
+
+BlockProfile profile_for(const Gemma4Config& cfg) {
+  BlockProfile p;
+  switch (cfg.arch) {
+    case ModelArch::Gemma4:
+      p.embd_scale = true;
+      p.qk_norm = true;
+      p.v_norm = true;
+      p.post_attn_norm = true;
+      p.post_ffw_norm = true;
+      p.per_layer_input = cfg.per_layer_input > 0;
+      p.layer_scale = true;
+      p.kv_shared = cfg.shared_kv_layers > 0;
+      p.softcap = cfg.final_logit_softcapping > 0.0f;
+      p.tied_output = true;
+      p.attn_scale = 1.0f;  // Q/K are unit-normed, so the dot product is a cosine
+      break;
+    case ModelArch::Qwen2:
+      p.proj_bias = true;
+      p.silu_ffn = true;
+      p.tied_output = false;
+      p.attn_scale = 1.0f / std::sqrt(float(cfg.head_dim_global));
+      break;
+  }
+  return p;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -175,23 +229,33 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   const TensorId pos = b.tensor("pos", {}, sx::DType::Int64, /*is_in=*/true);
   b.g.inputs = {token_id, pos};
 
+  const BlockProfile prof = profile_for(cfg);
+
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
   auto kv_src = [&cfg](uint32_t l) {
     return attr_i("kv_source_layer", int64_t(cfg.kv_donor_layer(l)));
   };
+  // The attention temperature is emitted only when it is not the identity, so a
+  // model whose Q/K are unit-normed (Gemma 4) gets a byte-identical graph to the
+  // one before the generalization.
+  auto attn_attrs = [&](uint32_t l) {
+    std::vector<sx::Attribute> a = {layer_a(l), kv_src(l)};
+    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    return a;
+  };
 
-  // Preamble: the shared token embedding (scaled), and the full per-layer token
+  // Preamble: the shared token embedding (scaled where the architecture scales
+  // it), and — only for a model with per-layer inputs — the full per-layer token
   // embedding row (dequantized once; each block slices its `per`-element column
   // out of the combined `ple_all`). Both are deterministic, so hoisting them out
   // of the block loop is bit-identical to exec.cpp recomputing them per block.
   const TensorId embd = b.node(OpKind::Embedding, {token_id}, "embd", {int64_t(d)},
                                {slot(WeightSlot::TokenEmbd)});
-  const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", {int64_t(d)},
-                              {attr_f("scale", std::sqrt(float(d)))});
-  const TensorId ple_row = b.node(OpKind::Embedding, {token_id}, "ple_row",
-                                  {int64_t(total_per)},
-                                  {slot(WeightSlot::PerLayerTokenEmbd)});
+  const TensorId inp = prof.embd_scale
+                           ? b.node(OpKind::Scale, {embd}, "inp", {int64_t(d)},
+                                    {attr_f("scale", std::sqrt(float(d)))})
+                           : embd;
 
   // Hoisted per-layer input (Phase 2.3a): one full-width 2560→10752 bf16 gemv +
   // scale + segmented rms_norm + combine per token, done once over [total_per].
@@ -199,27 +263,34 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   // 2560→256 projection. Decomposed (C.5) into the general ops below: a
   // full-width MatvecBf16 (offset 0, rows total_per) + Scale(1/sqrt(d)) +
   // RmsNormHeads(dim == per, weight == per_layer_proj_norm) + the combine
-  // (proj + ple*sqrt(per)) / sqrt(2) as Scale/Add/Scale.
-  const float proj_scale = 1.0f / std::sqrt(float(d));
-  const float ple_scale = std::sqrt(float(per));
-  const float combine_scale = 1.0f / std::sqrt(2.0f);
-  TensorId ple_all = b.node(OpKind::MatvecBf16, {inp}, "ple_proj",
-                            {int64_t(total_per)},
-                            {attr_i("offset", int64_t(0)),
-                             attr_i("rows", int64_t(total_per))});
-  ple_all = b.node(OpKind::Scale, {ple_all}, "ple_projs", {int64_t(total_per)},
-                   {attr_f("scale", double(proj_scale))});
-  ple_all = b.node(OpKind::RmsNormHeads, {ple_all}, "ple_projn",
-                   {int64_t(total_per)},
-                   {layer_a(0), slot(WeightSlot::PerLayerProjNorm),
-                    attr_i("dim", int64_t(per))});
-  const TensorId ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
-                                {int64_t(total_per)},
-                                {attr_f("scale", double(ple_scale))});
-  const TensorId ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
-                                  {int64_t(total_per)}, {});
-  ple_all = b.node(OpKind::Scale, {ple_add}, "ple_all", {int64_t(total_per)},
-                   {attr_f("scale", double(combine_scale))});
+  // (proj + ple*sqrt(per)) / sqrt(2) as Scale/Add/Scale. A model without
+  // per-layer inputs (Qwen2) emits none of this and runs the block alone.
+  TensorId ple_all{};
+  if (prof.per_layer_input) {
+    const TensorId ple_row = b.node(OpKind::Embedding, {token_id}, "ple_row",
+                                    {int64_t(total_per)},
+                                    {slot(WeightSlot::PerLayerTokenEmbd)});
+    const float proj_scale = 1.0f / std::sqrt(float(d));
+    const float ple_scale = std::sqrt(float(per));
+    const float combine_scale = 1.0f / std::sqrt(2.0f);
+    ple_all = b.node(OpKind::MatvecBf16, {inp}, "ple_proj",
+                     {int64_t(total_per)},
+                     {attr_i("offset", int64_t(0)),
+                      attr_i("rows", int64_t(total_per))});
+    ple_all = b.node(OpKind::Scale, {ple_all}, "ple_projs", {int64_t(total_per)},
+                     {attr_f("scale", double(proj_scale))});
+    ple_all = b.node(OpKind::RmsNormHeads, {ple_all}, "ple_projn",
+                     {int64_t(total_per)},
+                     {layer_a(0), slot(WeightSlot::PerLayerProjNorm),
+                      attr_i("dim", int64_t(per))});
+    const TensorId ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
+                                  {int64_t(total_per)},
+                                  {attr_f("scale", double(ple_scale))});
+    const TensorId ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
+                                    {int64_t(total_per)}, {});
+    ple_all = b.node(OpKind::Scale, {ple_add}, "ple_all", {int64_t(total_per)},
+                     {attr_f("scale", double(combine_scale))});
+  }
 
   TensorId residual = inp;
   for (uint32_t l = 0; l < block_count; ++l) {
@@ -240,8 +311,12 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                         {layer_a(l), slot(WeightSlot::AttnNorm)});
     TensorId q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
                         {layer_a(l), slot(WeightSlot::AttnQ)});
-    q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, {int64_t(qw)},
-               {layer_a(l), slot(WeightSlot::AttnQNorm)});
+    if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
+      q = b.node(OpKind::AddBias, {q}, "qb" + suff, {int64_t(qw)},
+                 {layer_a(l), slot(WeightSlot::AttnQBias)});
+    if (prof.qk_norm)
+      q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, {int64_t(qw)},
+                 {layer_a(l), slot(WeightSlot::AttnQNorm)});
     q = b.node(OpKind::Rope, {q, pos}, "qr" + suff, {int64_t(qw)}, {layer_a(l)});
 
     TensorId attn;
@@ -250,26 +325,39 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                           {layer_a(l), slot(WeightSlot::AttnK)});
       TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
                           {layer_a(l), slot(WeightSlot::AttnV)});
-      k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, {int64_t(kvw)},
-                 {layer_a(l), slot(WeightSlot::AttnKNorm)});
-      v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, {int64_t(kvw)},
-                 {layer_a(l)});  // V norm: unit weight
+      if (prof.proj_bias) {
+        k = b.node(OpKind::AddBias, {k}, "kb" + suff, {int64_t(kvw)},
+                   {layer_a(l), slot(WeightSlot::AttnKBias)});
+        v = b.node(OpKind::AddBias, {v}, "vb" + suff, {int64_t(kvw)},
+                   {layer_a(l), slot(WeightSlot::AttnVBias)});
+      }
+      if (prof.qk_norm)
+        k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, {int64_t(kvw)},
+                   {layer_a(l), slot(WeightSlot::AttnKNorm)});
+      if (prof.v_norm)
+        v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, {int64_t(kvw)},
+                   {layer_a(l)});  // V norm: unit weight
       const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
       k = b.node(OpKind::Rope, {k, pos}, "kr" + suff, {int64_t(kvw)}, {layer_a(l)});
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
       attn = b.node(OpKind::Attention, {q, kc, vc, pos}, "attn" + suff,
-                    {int64_t(qw)}, {layer_a(l), kv_src(l)});
+                    {int64_t(qw)}, attn_attrs(l));
     } else {
       attn = b.node(OpKind::Attention, {q, pos}, "attn" + suff,
-                    {int64_t(qw)}, {layer_a(l), kv_src(l)});
+                    {int64_t(qw)}, attn_attrs(l));
     }
 
     TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
                          {layer_a(l), slot(WeightSlot::AttnOutput)});
-    TensorId o = b.node(OpKind::RmsNorm, {ap}, "o" + suff, {int64_t(d)},
-                        {layer_a(l), slot(WeightSlot::PostAttentionNorm)});
+    if (prof.attn_out_bias)
+      ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, {int64_t(d)},
+                  {layer_a(l), slot(WeightSlot::AttnOutputBias)});
+    TensorId o = prof.post_attn_norm
+                     ? b.node(OpKind::RmsNorm, {ap}, "o" + suff, {int64_t(d)},
+                              {layer_a(l), slot(WeightSlot::PostAttentionNorm)})
+                     : ap;
     TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, {int64_t(d)},
                          {layer_a(l)});
 
@@ -280,36 +368,45 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                          {layer_a(l), slot(WeightSlot::FfnUp)});
     TensorId gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
                            {layer_a(l), slot(WeightSlot::FfnGate)});
-    gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)}, {layer_a(l)});
+    gate = prof.silu_ffn
+               ? b.node(OpKind::Silu, {gate}, "silu" + suff, {int64_t(ff)}, {layer_a(l)})
+               : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)},
+                        {layer_a(l)});
     TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
                          {layer_a(l)});
     TensorId fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
                          {layer_a(l), slot(WeightSlot::FfnDown)});
-    TensorId f2 = b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::PostFfwNorm)});
+    TensorId f2 = prof.post_ffw_norm
+                      ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
+                               {layer_a(l), slot(WeightSlot::PostFfwNorm)})
+                      : fo;
     TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, {int64_t(d)},
                          {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
     // The per-layer input (proj/scale/rms/combine) was hoisted to the preamble;
-    // each block slices its [per] segment of ple_all.
-    TensorId ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
-                          {attr_i("offset", int64_t(l) * per),
-                           attr_i("length", int64_t(per))});
-    TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
-                         {layer_a(l), slot(WeightSlot::InpGate)});
-    g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, {int64_t(per)}, {layer_a(l)});
-    g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, {int64_t(per)}, {layer_a(l)});
-    TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::Proj)});
-    TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::PostNorm)});
-    TensorId x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, {int64_t(d)},
-                         {layer_a(l)});
+    // each block slices its [per] segment of ple_all. A model without per-layer
+    // inputs (Qwen2) ends the block here.
+    TensorId x3 = x2;
+    if (prof.per_layer_input) {
+      TensorId ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
+                            {attr_i("offset", int64_t(l) * per),
+                             attr_i("length", int64_t(per))});
+      TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
+                           {layer_a(l), slot(WeightSlot::InpGate)});
+      g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, {int64_t(per)}, {layer_a(l)});
+      g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, {int64_t(per)}, {layer_a(l)});
+      TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, {int64_t(d)},
+                           {layer_a(l), slot(WeightSlot::Proj)});
+      TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, {int64_t(d)},
+                           {layer_a(l), slot(WeightSlot::PostNorm)});
+      x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, {int64_t(d)},
+                  {layer_a(l)});
+    }
 
     // --- whole-block output scale ------------------------------------------
     TensorId out;
-    if (!m.weights.blocks[l].layer_output_scale.empty())
+    if (prof.layer_scale && !m.weights.blocks[l].layer_output_scale.empty())
       out = b.node(OpKind::Scale, {x3}, "out" + suff, {int64_t(d)},
                    {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
     else
@@ -321,7 +418,8 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   TensorId hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
                        {slot(WeightSlot::OutputNorm)});
   TensorId logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
-                           {slot(WeightSlot::TokenEmbd)});
+                           {slot(prof.tied_output ? WeightSlot::TokenEmbd
+                                                  : WeightSlot::Output)});
 
   // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
   // change argmax — skip it and reduce the [vocab] logits to a single index on
@@ -331,9 +429,11 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   TensorId out;
   if (greedy) {
     out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)}, {});
-  } else {
+  } else if (prof.softcap) {
     out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(vocab)},
                  {attr_f("scale", double(cfg.final_logit_softcapping))});
+  } else {
+    out = logits;  // no softcapping: the raw logits are the graph output
   }
 
   for (auto& t : b.g.tensors)
@@ -447,13 +547,27 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     return std::vector<int64_t>{int64_t(r), int64_t(c)};
   };
 
+  const BlockProfile prof = profile_for(cfg);
+  // The attention temperature is emitted only when it is not the identity (see
+  // build_gemma4_graph).
+  auto attn_attrs = [&](uint32_t l) {
+    std::vector<sx::Attribute> a = {layer_a(l), batch_a(n), kv_src(l)};
+    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    return a;
+  };
+
   const TensorId embd = b.node(OpKind::Embedding, {tokens}, "embd",
                                shape2(n, d), {slot(WeightSlot::TokenEmbd), batch_a(n)});
-  const TensorId inp = b.node(OpKind::Scale, {embd}, "inp", shape2(n, d),
-                              {attr_f("scale", std::sqrt(float(d)))});
-  const TensorId ple_row = b.node(OpKind::Embedding, {tokens}, "ple_row",
-                                  shape2(n, total_per),
-                                  {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
+  const TensorId inp = prof.embd_scale
+                           ? b.node(OpKind::Scale, {embd}, "inp", shape2(n, d),
+                                    {attr_f("scale", std::sqrt(float(d)))})
+                           : embd;
+  // Only a model with per-layer inputs (Gemma 4) reads the per-layer embedding
+  // row; the whole gate — including this gather — is skipped otherwise.
+  TensorId ple_row{};
+  if (prof.per_layer_input)
+    ple_row = b.node(OpKind::Embedding, {tokens}, "ple_row", shape2(n, total_per),
+                     {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
 
   const float proj_scale = 1.0f / std::sqrt(float(d));
   const uint32_t n_kv = cfg.n_layer_kv();
@@ -481,8 +595,12 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     TensorId q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff,
                         shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n),
                         dim_a(d), ds_a(m.weights.blocks[l].attn_q.type())});
-    q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, shape2(n, qw),
-               {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
+    if (prof.proj_bias)
+      q = b.node(OpKind::AddBias, {q}, "qb" + suff, shape2(n, qw),
+                 {layer_a(l), slot(WeightSlot::AttnQBias), batch_a(n)});
+    if (prof.qk_norm)
+      q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, shape2(n, qw),
+                 {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
     q = b.node(OpKind::Rope, {q, start_pos}, "qr" + suff, shape2(n, qw),
                {layer_a(l), batch_a(n)});
 
@@ -491,21 +609,29 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       TensorId k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff,
                           shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n),
                           dim_a(d), ds_a(m.weights.blocks[l].attn_k.type())});
-      k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, shape2(n, kvw),
-                 {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
+      TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
+                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n),
+                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type())});
+      if (prof.proj_bias) {
+        k = b.node(OpKind::AddBias, {k}, "kb" + suff, shape2(n, kvw),
+                   {layer_a(l), slot(WeightSlot::AttnKBias), batch_a(n)});
+        v = b.node(OpKind::AddBias, {v}, "vb" + suff, shape2(n, kvw),
+                   {layer_a(l), slot(WeightSlot::AttnVBias), batch_a(n)});
+      }
+      if (prof.qk_norm)
+        k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, shape2(n, kvw),
+                   {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
+      if (prof.v_norm)
+        v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, shape2(n, kvw),
+                   {layer_a(l), batch_a(n)});  // V norm: unit weight
+      const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
+                                 {layer_a(l)});
       k = b.node(OpKind::Rope, {k, start_pos}, "kr" + suff, shape2(n, kvw),
                  {layer_a(l), batch_a(n)});
       const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
-      TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
-                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n),
-                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type())});
-      v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, shape2(n, kvw),
-                 {layer_a(l), batch_a(n)});  // V norm: unit weight
-      const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
-                                 {layer_a(l)});
       attn = b.node(OpKind::FlashAttention, {q, kc, vc, start_pos}, "attn" + suff,
-                    shape2(n, qw), {layer_a(l), batch_a(n), kv_src(l)});
+                    shape2(n, qw), attn_attrs(l));
       kv_k[l] = kc;
       kv_v[l] = vc;
       if (l == donor_swa_layer) {
@@ -520,14 +646,20 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
       const TensorId dk = (donor == donor_swa_layer) ? donor_swa_k : donor_global_k;
       const TensorId dv = (donor == donor_swa_layer) ? donor_swa_v : donor_global_v;
       attn = b.node(OpKind::FlashAttention, {q, dk, dv, start_pos}, "attn" + suff,
-                    shape2(n, qw), {layer_a(l), batch_a(n), kv_src(l)});
+                    shape2(n, qw), attn_attrs(l));
     }
 
     TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
                          shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n),
                          dim_a(qw), ds_a(m.weights.blocks[l].attn_output.type())});
-    TensorId o = b.node(OpKind::RmsNorm, {ap}, "o" + suff, shape2(n, d),
-                        {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n), dim_a(d)});
+    if (prof.attn_out_bias)
+      ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, shape2(n, d),
+                  {layer_a(l), slot(WeightSlot::AttnOutputBias), batch_a(n)});
+    TensorId o = prof.post_attn_norm
+                     ? b.node(OpKind::RmsNorm, {ap}, "o" + suff, shape2(n, d),
+                              {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n),
+                               dim_a(d)})
+                     : ap;
     TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(n, d), {layer_a(l)});
 
     // --- gated feed-forward ------------------------------------------------
@@ -539,51 +671,60 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
     TensorId gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, shape2(n, ff),
                            {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n),
                            dim_a(d), ds_a(m.weights.blocks[l].ffn_gate.type())});
-    gate = b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff), {layer_a(l)});
+    gate = prof.silu_ffn
+               ? b.node(OpKind::Silu, {gate}, "silu" + suff, shape2(n, ff), {layer_a(l)})
+               : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff),
+                        {layer_a(l)});
     TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
     TensorId fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n),
                          dim_a(ff), ds_a(m.weights.blocks[l].ffn_down.type())});
-    TensorId f2 = b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
-                         {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n), dim_a(d)});
+    TensorId f2 = prof.post_ffw_norm
+                      ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
+                               {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n),
+                                dim_a(d)})
+                      : fo;
     TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(n, d), {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
-    TensorId proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, shape2(n, per),
-                           {layer_a(l), batch_a(n),
-                            attr_i("offset", int64_t(l) * per),
-                            attr_i("rows", int64_t(per))});
-    proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
-                  {attr_f("scale", proj_scale)});
-    proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, shape2(n, per),
-                  {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
-    // Layer combine (C.5): ple = (projn + ple_row[:, l*per:(l+1)*per] * sqrt(per))
-    // / sqrt(2), decomposed into a strided Slice of the per-layer embedding row
-    // + Scale/Add/Scale.
-    const TensorId ple_col = b.node(OpKind::Slice, {ple_row}, "ple_col" + suff,
-                                    shape2(n, per),
-                                    {attr_i("offset", int64_t(l) * per),
-                                     attr_i("length", int64_t(per)),
-                                     attr_i("stride", int64_t(total_per))});
-    const TensorId ple_scaled = b.node(OpKind::Scale, {ple_col}, "ple_scaled" + suff,
-                                       shape2(n, per),
-                                       {attr_f("scale", double(std::sqrt(float(per))))});
-    const TensorId ple_sum = b.node(OpKind::Add, {proj, ple_scaled}, "ple_sum" + suff,
-                                    shape2(n, per), {});
-    TensorId ple = b.node(OpKind::Scale, {ple_sum}, "ple" + suff, shape2(n, per),
-                          {attr_f("scale", 1.0 / std::sqrt(2.0))});
-    TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, shape2(n, per),
-                         {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
-    g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});
-    g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(n, per), {layer_a(l)});
-    TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, shape2(n, d),
-                         {layer_a(l), slot(WeightSlot::Proj), batch_a(n)});
-    TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, shape2(n, d),
-                         {layer_a(l), slot(WeightSlot::PostNorm), batch_a(n), dim_a(d)});
-    TensorId x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(n, d), {layer_a(l)});
+    TensorId x3 = x2;
+    if (prof.per_layer_input) {
+      TensorId proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, shape2(n, per),
+                             {layer_a(l), batch_a(n),
+                              attr_i("offset", int64_t(l) * per),
+                              attr_i("rows", int64_t(per))});
+      proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
+                    {attr_f("scale", proj_scale)});
+      proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, shape2(n, per),
+                    {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
+      // Layer combine (C.5): ple = (projn + ple_row[:, l*per:(l+1)*per] * sqrt(per))
+      // / sqrt(2), decomposed into a strided Slice of the per-layer embedding row
+      // + Scale/Add/Scale.
+      const TensorId ple_col = b.node(OpKind::Slice, {ple_row}, "ple_col" + suff,
+                                      shape2(n, per),
+                                      {attr_i("offset", int64_t(l) * per),
+                                       attr_i("length", int64_t(per)),
+                                       attr_i("stride", int64_t(total_per))});
+      const TensorId ple_scaled = b.node(OpKind::Scale, {ple_col}, "ple_scaled" + suff,
+                                         shape2(n, per),
+                                         {attr_f("scale", double(std::sqrt(float(per))))});
+      const TensorId ple_sum = b.node(OpKind::Add, {proj, ple_scaled}, "ple_sum" + suff,
+                                      shape2(n, per), {});
+      TensorId ple = b.node(OpKind::Scale, {ple_sum}, "ple" + suff, shape2(n, per),
+                            {attr_f("scale", 1.0 / std::sqrt(2.0))});
+      TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, shape2(n, per),
+                           {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
+      g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});
+      g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(n, per), {layer_a(l)});
+      TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, shape2(n, d),
+                           {layer_a(l), slot(WeightSlot::Proj), batch_a(n)});
+      TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, shape2(n, d),
+                           {layer_a(l), slot(WeightSlot::PostNorm), batch_a(n), dim_a(d)});
+      x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(n, d), {layer_a(l)});
+    }
 
     TensorId out;
-    if (!m.weights.blocks[l].layer_output_scale.empty())
+    if (prof.layer_scale && !m.weights.blocks[l].layer_output_scale.empty())
       out = b.node(OpKind::Scale, {x3}, "out" + suff, shape2(n, d),
                    {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
     else

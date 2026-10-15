@@ -229,7 +229,8 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       OpKind::Attention,
       OpKind::GqaBroadcast, OpKind::Embedding,
       OpKind::MatvecF32,
-      OpKind::MatvecBf16,      OpKind::Mul,          OpKind::Scale,
+      OpKind::MatvecBf16,      OpKind::AddBias,      OpKind::Mul,
+      OpKind::Scale,
       OpKind::CastFp16,        OpKind::Softcap,      OpKind::Argmax,
       OpKind::Slice,
       // Phase 7 chunked prefill operators: FlashAttention (chunked SDPA) and

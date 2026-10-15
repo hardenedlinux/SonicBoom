@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_generate test_prefix_cache test_vocab)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -34,6 +34,11 @@ target_compile_definitions(test_gemma4 PRIVATE
 # test_qwen2_config loads the Qwen2.5 GGUF (skips cleanly when absent); same
 # repository-root requirement for locating models/.
 target_compile_definitions(test_qwen2_config PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_qwen2_generate (Qwen2 prefill + greedy decode vs the llama.cpp golden
+# streams) needs the repository root to locate models/ and tests/data/qwen2/.
+target_compile_definitions(test_qwen2_generate PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # test_generate (autoregressive decode + CUDA-vs-oracle agreement + timing) also

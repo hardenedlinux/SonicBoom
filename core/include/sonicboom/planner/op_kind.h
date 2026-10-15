@@ -61,6 +61,10 @@ enum class OpKind : uint8_t {
   Embedding,        // nn::embedding_f32
   MatvecF32,        // nn::matvec_f32 (dense f32 gate/proj matvec)
   MatvecBf16,       // nn::matvec_bf16 (dense bf16 projection; attrs offset/rows)
+  AddBias,          // nn::add_bias (optional projection bias; `slot` names the
+                    // [width] vector). Generic: any linear layer whose
+                    // architecture carries a bias emits it right after the
+                    // matmul (Qwen2's Q/K/V and output projections do).
   Mul,              // nn::mul
   Scale,            // nn::scale
   CastFp16,         // nn::cast_fp16

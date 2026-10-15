@@ -63,6 +63,18 @@ enum class WeightSlot : uint8_t {
   InpGate,
   Proj,
   LayerOutputScale,
+  // Optional linear-layer biases, f32 [width]. An architecture either carries
+  // them (Qwen2's Q/K/V) or does not (Gemma 4); the loader binds what the file
+  // has and the emitter emits an AddBias node only for a bound span, so an
+  // absent bias costs nothing. Added after the original slots so a slot's
+  // numeric value never moves.
+  AttnQBias,
+  AttnKBias,
+  AttnVBias,
+  AttnOutputBias,
+  // The untied output projection (lm head); empty when the model ties its
+  // embedding and output weights, in which case the emitter reuses TokenEmbd.
+  Output,
 };
 
 // Expand the 42-block Gemma 4 single-token decode (mirrors forward()/lm_head in

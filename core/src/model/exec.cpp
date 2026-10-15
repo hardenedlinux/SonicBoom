@@ -481,10 +481,16 @@ bool forward_traced(const Gemma4Model& m, uint64_t token_id, uint64_t pos,
     trace("h_nextn", h);
     trace("result_norm", h);
     std::vector<float> logits(m.config.vocab_size);
-    if (!quant::matvec(m.weights.token_embd, h, logits, backend)) return false;
+    // Untied output projection when the file carries one (Qwen2), else the
+    // weight-tied token embedding (Gemma 4).
+    const quant::QuantizedTensor& lm =
+        m.weights.output.numel() == 0 ? m.weights.token_embd : m.weights.output;
+    if (!quant::matvec(lm, h, logits, backend)) return false;
     const float sc = m.config.final_logit_softcapping;
-    const float inv_sc = 1.0f / sc;  // ggml_scale(cur, 1/sc) multiplies by this
-    for (float& l : logits) l = sc * std::tanh(l * inv_sc);
+    if (sc > 0.0f) {  // otherwise the logits pass through unscaled (Qwen2)
+      const float inv_sc = 1.0f / sc;  // ggml_scale(cur, 1/sc) multiplies by this
+      for (float& l : logits) l = sc * std::tanh(l * inv_sc);
+    }
     trace("result_output", logits);
   }
 
@@ -503,13 +509,19 @@ bool lm_head(const Gemma4Model& m, std::span<const float> hidden,
   if (!rms_norm_d(use_cuda, hidden, m.weights.output_norm, m.config.rms_epsilon, h))
     return false;
 
-  // logit = token_embd @ h (weight-tied output, q3_K; q8_K-fused dot), then the
-  // final-logit softcapping: 30 * tanh(logit / 30).
-  if (!quant::matvec(m.weights.token_embd, h, logits, backend)) return false;
+  // logit = W @ h, W = the untied output projection when the file has one
+  // (Qwen2's "output.weight") else the weight-tied token embedding (Gemma 4's
+  // q3_K head), followed — only where the architecture softcaps — by the
+  // final-logit softcapping 30 * tanh(logit / 30).
+  const quant::QuantizedTensor& lm =
+      m.weights.output.numel() == 0 ? m.weights.token_embd : m.weights.output;
+  if (!quant::matvec(lm, h, logits, backend)) return false;
   const float sc = m.config.final_logit_softcapping;
-  const float inv_sc = 1.0f / sc;  // ggml_scale(cur, 1/sc) multiplies by this
-  for (size_t i = 0; i < m.config.vocab_size; ++i)
-    logits[i] = sc * std::tanh(logits[i] * inv_sc);
+  if (sc > 0.0f) {
+    const float inv_sc = 1.0f / sc;  // ggml_scale(cur, 1/sc) multiplies by this
+    for (size_t i = 0; i < m.config.vocab_size; ++i)
+      logits[i] = sc * std::tanh(logits[i] * inv_sc);
+  }
   return true;
 }
 

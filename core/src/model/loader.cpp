@@ -408,8 +408,89 @@ std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r) {
   return std::unexpected(std::string("unknown architecture"));
 }
 
+// Qwen2 weight binding (Qwen2.5-0.5B-Instruct, Q4_K_M). A standard decoder
+// block: no per-layer embedding gate, no Q/K per-head norm, no post-attention /
+// post-ffw norm, no whole-block output scale — and two things Gemma 4 does not
+// have: a bias on each of the Q/K/V projections, and an untied output
+// projection ("output.weight", which must be a real tensor here; when a Qwen2
+// file omits it llama.cpp falls back to the token embedding, and so does the
+// emitter). Q5_0 and Q8_0 are native quant types (they bind through the
+// ordinary quantized path), so nothing is converted at load time.
+std::expected<Gemma4Model, std::string> load_qwen2(const gguf::Reader& r) {
+  Gemma4Model m;
+
+  auto cfg = load_qwen2_config(r);
+  if (!cfg) return std::unexpected(std::move(cfg.error()));
+  m.config = std::move(*cfg);
+
+  Gemma4Config& c = m.config;
+  Gemma4Weights& w = m.weights;
+  const uint32_t d = c.embedding_length;
+  const uint32_t ff = c.feed_forward_length;
+  const uint64_t vocab = c.vocab_size;
+
+  std::string errs;
+  std::map<uint32_t,uint64_t> converted;
+  if (auto q = bind_quant(r, "token_embd.weight", {}, {d, vocab}, errs, m.owned_quant_buffers, converted))
+    w.token_embd = *q;
+  if (auto q = bind_quant(r, "output.weight", {}, {d, vocab}, errs, m.owned_quant_buffers, converted))
+    w.output = *q;
+  if (auto s = bind_f32(r, "output_norm.weight", d, errs)) w.output_norm = *s;
+
+  w.blocks.clear();
+  w.blocks.reserve(c.block_count);
+  for (uint32_t l = 0; l < c.block_count; ++l) {
+    const LayerConfig lc = c.layer_config(l);
+    const uint64_t q_width = uint64_t(lc.n_heads_q) * lc.head_dim;
+    const uint64_t kv_width = uint64_t(lc.n_heads_kv) * lc.head_dim;
+
+    const std::string p = "blk." + std::to_string(l) + ".";
+    BlockWeights bw;
+    if (auto s = bind_f32(r, p + "attn_norm.weight", d, errs)) bw.attn_norm = *s;
+    if (auto s = bind_f32(r, p + "ffn_norm.weight", d, errs)) bw.ffn_norm = *s;
+    if (auto q = bind_quant(r, p + "attn_q.weight", {}, {d, q_width}, errs, m.owned_quant_buffers, converted))
+      bw.attn_q = *q;
+    if (auto q = bind_quant(r, p + "attn_k.weight", {}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
+      bw.attn_k = *q;
+    if (auto q = bind_quant(r, p + "attn_v.weight", {}, {d, kv_width}, errs, m.owned_quant_buffers, converted))
+      bw.attn_v = *q;
+    if (auto q = bind_quant(r, p + "attn_output.weight", {}, {q_width, d}, errs, m.owned_quant_buffers, converted))
+      bw.attn_output = *q;
+    if (auto s = bind_f32(r, p + "attn_q.bias", q_width, errs)) bw.attn_q_bias = *s;
+    if (auto s = bind_f32(r, p + "attn_k.bias", kv_width, errs)) bw.attn_k_bias = *s;
+    if (auto s = bind_f32(r, p + "attn_v.bias", kv_width, errs)) bw.attn_v_bias = *s;
+    // The output projection's bias is optional in the format (llama.cpp reads
+    // it as TENSOR_NOT_REQUIRED) and absent from the Qwen2.5 files; bind it only
+    // when present so an absent tensor is not reported as a binding error.
+    if (r.tensor(p + "attn_output.bias") != nullptr)
+      if (auto s = bind_f32(r, p + "attn_output.bias", d, errs)) bw.attn_output_bias = *s;
+    if (auto q = bind_quant(r, p + "ffn_gate.weight", {}, {d, ff}, errs, m.owned_quant_buffers, converted))
+      bw.ffn_gate = *q;
+    if (auto q = bind_quant(r, p + "ffn_up.weight", {}, {d, ff}, errs, m.owned_quant_buffers, converted))
+      bw.ffn_up = *q;
+    if (auto q = bind_quant(r, p + "ffn_down.weight", {}, {ff, d}, errs, m.owned_quant_buffers, converted))
+      bw.ffn_down = *q;
+    w.blocks.push_back(bw);
+  }
+
+  if (!errs.empty()) return std::unexpected(std::move(errs));
+
+  m.plan.clear();
+  m.plan.reserve(c.block_count);
+  for (uint32_t l = 0; l < c.block_count; ++l) m.plan.push_back(c.layer_config(l));
+
+  return m;
+}
+
 std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   Gemma4Model m;
+
+  // The architecture decides which weight directory to bind; the entry point
+  // stays single so a caller can load either model family without knowing the
+  // architecture in advance (detect_arch reads general.architecture).
+  const auto arch = detect_arch(r);
+  if (!arch) return std::unexpected(std::move(arch.error()));
+  if (*arch == ModelArch::Qwen2) return load_qwen2(r);
 
   auto cfg = load_gemma4_config(r);
   if (!cfg) return std::unexpected(std::move(cfg.error()));

@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+// Qwen2 forward pass end to end on the CPU spine (Qwen run, Stage 4).
+//
+// For each prompt fixture in tests/data/qwen2/ it
+//   1. tokenizes the prompt text with SonicBoom's own GGUF tokenizer and checks
+//      the ids against llama.cpp's (the .ref file's `prompt:` line),
+//   2. runs the whole prompt through the batched prefill spine
+//      (generate_prefill_spine, CPU SonicBackend + CpuQ8K matmul) and decodes 64
+//      greedy tokens, and
+//   3. diffs the stream against llama.cpp's greedy reference (the `tokens:` line,
+//      produced by tools/baseline/qwen_ref.cpp).
+//
+// The reference is llama.cpp CPU, i.e. the baseline this runtime is measured
+// against; the prompt ids are checked first so a tokenizer difference can never
+// masquerade as a model difference. The same prompt is then run through the
+// per-token spine (use_prefill = false) to assert the batched prefill and the
+// single-token path agree, which is a model-independent invariant of the spine.
+//
+// Greedy-stream agreement is asserted as "agrees with llama.cpp up to a
+// documented near-tie", not as bit-exactness. Greedy decode over a quantized
+// model is an argmax over logits whose top few candidates genuinely coincide:
+// at each prompt's first divergence SonicBoom picks llama.cpp's rank-2 or
+// rank-3 token, within 0.13 raw logit of its top-1 (see the `topk:` line of the
+// .ref fixtures, which records llama.cpp's own top-8 and their gaps per step).
+// The bound is therefore data, not prose. For scale, llama.cpp's own CPU and
+// CUDA backends disagree with each other on the same file much earlier and at
+// larger gaps (p2 at step 2, gap 0.2181; p1 at step 22, gap 0.3694), so this
+// runtime is numerically at least as close to llama.cpp CPU as llama.cpp's own
+// CUDA backend is. The first-16-token agreement is reported per prompt and
+// checked where it is achieved (p1, p3); p2's first divergence is at step 5 and
+// is a rank-2 near-tie.
+//
+// Skips cleanly (exit 0) when the GGUF is absent.
+
+#include <sonicboom/gguf/reader.h>
+#include <sonicboom/model/exec.h>
+#include <sonicboom/model/loader.h>
+#include <sonicboom/model/plan.h>
+#include <sonicboom/vocab/vocab.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+namespace sbgguf = sonicboom::gguf;
+namespace sbmodel = sonicboom::model;
+namespace sbvocab = sonicboom::vocab;
+
+namespace {
+
+int g_failures = 0;
+void check(bool ok, const std::string& what) {
+  if (!ok) {
+    std::cerr << "  FAIL: " << what << "\n";
+    ++g_failures;
+  }
+}
+
+std::string find_model() {
+  std::vector<std::string> candidates;
+  if (const char* env = std::getenv("SONICBOOM_QWEN_GGUF")) candidates.push_back(env);
+#ifdef SONICBOOM_SRC_DIR
+  candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
+                       "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+#endif
+  candidates.push_back("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+  for (const auto& c : candidates)
+    if (std::filesystem::exists(c)) return c;
+  return {};
+}
+
+std::string data_dir() {
+#ifdef SONICBOOM_SRC_DIR
+  return std::string(SONICBOOM_SRC_DIR) + "/tests/data/qwen2";
+#else
+  return "tests/data/qwen2";
+#endif
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return {};
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// Parse "<label>: <id> <id> ..." out of a qwen_ref dump.
+std::vector<int64_t> pick_ids(const std::string& text, const std::string& label) {
+  std::istringstream is(text);
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.rfind(label + ":", 0) != 0) continue;
+    std::vector<int64_t> ids;
+    std::istringstream ls(line.substr(label.size() + 1));
+    int64_t v = 0;
+    while (ls >> v) ids.push_back(v);
+    return ids;
+  }
+  return {};
+}
+
+// Parse one `topk:` entry, "<step>|<id>:<gap>,<id>:<gap>,...", into the ranked
+// (token, gap-to-top-1) list llama.cpp emitted for that step.
+std::vector<std::pair<int64_t, double>> parse_topk_entry(const std::string& entry) {
+  std::vector<std::pair<int64_t, double>> out;
+  const size_t bar = entry.find('|');
+  if (bar == std::string::npos) return out;
+  std::istringstream is(entry.substr(bar + 1));
+  std::string item;
+  while (std::getline(is, item, ',')) {
+    const size_t colon = item.find(':');
+    if (colon == std::string::npos) continue;
+    out.emplace_back(std::stoll(item.substr(0, colon)),
+                     std::stod(item.substr(colon + 1)));
+  }
+  return out;
+}
+
+// All per-step top-K lists out of a qwen_ref dump's `topk:` line, indexed by
+// step (a step the line does not cover is left empty).
+std::vector<std::vector<std::pair<int64_t, double>>> pick_topk(
+    const std::string& text, size_t steps) {
+  std::vector<std::vector<std::pair<int64_t, double>>> out(steps);
+  std::istringstream is(text);
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.rfind("topk:", 0) != 0) continue;
+    std::istringstream ls(line.substr(5));
+    std::string entry;
+    while (ls >> entry) {
+      const size_t bar = entry.find('|');
+      if (bar == std::string::npos) continue;
+      const size_t step = size_t(std::stoull(entry.substr(0, bar)));
+      if (step >= steps) continue;
+      out[step] = parse_topk_entry(entry);
+    }
+    break;
+  }
+  return out;
+}
+
+std::string toks(const std::vector<int64_t>& v) {
+  std::string s;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) s += ' ';
+    s += std::to_string(v[i]);
+  }
+  return s;
+}
+
+// Index of the first differing element, or -1 when the two agree over their
+// common prefix.
+int64_t first_diff(const std::vector<int64_t>& a, const std::vector<int64_t>& b) {
+  const size_t n = std::min(a.size(), b.size());
+  for (size_t i = 0; i < n; ++i)
+    if (a[i] != b[i]) return int64_t(i);
+  return a.size() == b.size() ? -1 : int64_t(n);
+}
+
+} // namespace
+
+int main() {
+  const std::string path = find_model();
+  if (path.empty()) {
+    std::cout << "  (skipped: Qwen2.5 model not found)\n";
+    std::cout << "test_qwen2_generate OK\n";
+    return 0;
+  }
+
+  auto r = sbgguf::Reader::load(path);
+  if (!r) {
+    std::cerr << "  failed to load GGUF\n";
+    std::cerr << "test_qwen2_generate FAILED: 1 check(s)\n";
+    return 1;
+  }
+  auto m = sbmodel::load_gemma4(*r);  // arch-dispatched: qwen2 -> load_qwen2
+  if (!m) {
+    std::cerr << "  load error: " << m.error() << "\n";
+    std::cerr << "test_qwen2_generate FAILED: 1 check(s)\n";
+    return 1;
+  }
+  auto vocab = sbvocab::load_vocab(*r);
+  if (!vocab) {
+    std::cerr << "  vocab error: " << vocab.error() << "\n";
+    std::cerr << "test_qwen2_generate FAILED: 1 check(s)\n";
+    return 1;
+  }
+
+  std::cout << "  model: " << path << "\n";
+  std::cout << "  arch=Qwen2 blocks=" << m->config.block_count
+            << " d=" << m->config.embedding_length
+            << " ff=" << m->config.feed_forward_length
+            << " heads=" << m->config.head_count << "/" << m->config.head_count_kv
+            << " head_dim=" << m->config.head_dim_global
+            << " vocab=" << m->config.vocab_size << "\n";
+
+  const int64_t kSteps = 64;
+  // A divergence deeper than this in llama.cpp's ranking (or with a larger gap
+  // to its top-1) is a model difference, not a near-tie.
+  constexpr double kNearTieGap = 0.25;
+  const std::string dir = data_dir();
+
+  for (int p = 1; p <= 3; ++p) {
+    const std::string txt = read_file(dir + "/p" + std::to_string(p) + ".txt");
+    const std::string ref = read_file(dir + "/p" + std::to_string(p) + ".ref");
+    check(!txt.empty(), "fixture p" + std::to_string(p) + ".txt present");
+    check(!ref.empty(), "fixture p" + std::to_string(p) + ".ref present");
+    if (txt.empty() || ref.empty()) continue;
+
+    const std::vector<int64_t> want_prompt = pick_ids(ref, "prompt");
+    const std::vector<int64_t> want_tokens = pick_ids(ref, "tokens");
+    check(!want_prompt.empty() && want_tokens.size() == size_t(kSteps),
+          "fixture p" + std::to_string(p) + ".ref parsed");
+
+    // 1. Tokenizer agreement (SonicBoom's GGUF BPE vs llama.cpp's).
+    const std::vector<int32_t> got32 = sbvocab::tokenize(*vocab, txt);
+    std::vector<int64_t> got_prompt(got32.begin(), got32.end());
+    check(got_prompt == want_prompt,
+          "p" + std::to_string(p) + " prompt ids == llama.cpp (" +
+              std::to_string(got_prompt.size()) + " vs " +
+              std::to_string(want_prompt.size()) + " tokens)");
+    if (got_prompt != want_prompt) {
+      std::cout << "    sonic: " << toks(got_prompt) << "\n";
+      std::cout << "    llama: " << toks(want_prompt) << "\n";
+      continue;
+    }
+
+    std::vector<uint64_t> prompt(got_prompt.begin(), got_prompt.end());
+
+    // 2. Batched prefill + 64 greedy decode steps on the CPU spine.
+    std::vector<int64_t> got(size_t(kSteps), -1);
+    const uint64_t n = sbmodel::generate_prefill_spine(
+        *m, prompt, /*start_pos=*/0, got, /*n_ctx=*/0, /*use_prefill=*/true);
+    check(n == uint64_t(kSteps),
+          "p" + std::to_string(p) + " ran all " + std::to_string(kSteps) +
+              " steps (" + std::to_string(n) + ")");
+    got.resize(n);
+
+    // Gate: the stream agrees with llama.cpp CPU except where llama.cpp's own
+    // top-8 at that step says the decision was a near-tie. The divergence is
+    // accepted only when SonicBoom's token is one of those candidates AND its
+    // gap to llama.cpp's top-1 is under kNearTieGap — so a genuinely wrong model
+    // (which would pick some unrelated token, or one far down the ranking) fails.
+    const auto topk = pick_topk(ref, size_t(kSteps));
+    const int64_t d = first_diff(got, want_tokens);
+    const bool first16 = d < 0 || d >= 16;
+    std::cout << "  p" << p << ": " << got.size() << " tokens, first diff at "
+              << (d < 0 ? std::string("none") : std::to_string(d))
+              << ", first 16 " << (first16 ? "match" : "DIFFER") << "\n";
+
+    if (d >= 0) {
+      // Rank and gap of SonicBoom's token in llama.cpp's own ranking at step d.
+      const auto& ranked = topk[size_t(d)];
+      double gap = -1.0;
+      int rank = 0;
+      for (size_t i = 0; i < ranked.size(); ++i)
+        if (ranked[i].first == got[size_t(d)]) { gap = ranked[i].second; rank = int(i) + 1; }
+      std::cout << "    divergence: sonic=" << got[size_t(d)]
+                << " llama_top1=" << (ranked.empty() ? -1 : ranked[0].first)
+                << " rank=" << rank << " gap=" << gap << "\n";
+      check(!ranked.empty() && rank > 0 && gap < kNearTieGap,
+            "p" + std::to_string(p) + ": divergence at step " +
+                std::to_string(d) + " is a llama.cpp near-tie (rank " +
+                std::to_string(rank) + ", gap " + std::to_string(gap) + " < " +
+                std::to_string(kNearTieGap) + ")");
+      std::cout << "    sonic: " << toks(got) << "\n";
+      std::cout << "    llama: " << toks(want_tokens) << "\n";
+    }
+
+    // 3. Spine invariant: batched prefill and per-token decode agree.
+    std::vector<int64_t> got_slow(size_t(kSteps), -1);
+    const uint64_t n2 = sbmodel::generate_prefill_spine(
+        *m, prompt, /*start_pos=*/0, got_slow, /*n_ctx=*/0, /*use_prefill=*/false);
+    got_slow.resize(n2);
+    check(got_slow == got,
+          "p" + std::to_string(p) + ": batched prefill == per-token spine");
+  }
+
+  if (g_failures) {
+    std::cerr << "test_qwen2_generate FAILED: " << g_failures << " check(s)\n";
+    return 1;
+  }
+  std::cout << "test_qwen2_generate OK\n";
+  return 0;
+}

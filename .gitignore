@@ -73,6 +73,7 @@ tools/baseline/mmq_minn_bench
 tools/baseline/prefill_bench
 tools/baseline/prefix_cache_bench
 tools/baseline/prefix_cache_isolate
+tools/baseline/qwen_ref
 tools/baseline/tokenize_text
 tools/baseline/real_prompt.txt
 *.dump

@@ -81,6 +81,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::FlashAttention;
   if (name == "kv_append")
     return OpKind::KvAppend;
+  if (name == "add_bias")
+    return OpKind::AddBias;
   return std::nullopt;
 }
 
@@ -110,6 +112,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Embedding: return "embedding";
     case OpKind::MatvecF32: return "matvec_f32";
     case OpKind::MatvecBf16: return "matvec_bf16";
+    case OpKind::AddBias: return "add_bias";
     case OpKind::Mul: return "mul";
     case OpKind::Scale: return "scale";
     case OpKind::CastFp16: return "cast_fp16";

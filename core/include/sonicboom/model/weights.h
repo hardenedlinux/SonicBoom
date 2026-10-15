@@ -61,6 +61,12 @@ struct BlockWeights {
   quant::QuantizedTensor attn_k;      // [embedding_length, n_heads_kv*head_dim]
   quant::QuantizedTensor attn_v;      // [embedding_length, n_heads_kv*head_dim]
   quant::QuantizedTensor attn_output; // [n_heads_q*head_dim, embedding_length]
+  // Optional projection biases (empty when the architecture has none, as Gemma
+  // 4 does). Qwen2 carries the Q/K/V ones.
+  std::span<const float> attn_q_bias;      // [n_heads_q*head_dim]
+  std::span<const float> attn_k_bias;      // [n_heads_kv*head_dim]
+  std::span<const float> attn_v_bias;      // [n_heads_kv*head_dim]
+  std::span<const float> attn_output_bias; // [embedding_length]
   quant::QuantizedTensor ffn_gate;    // [embedding_length, ff]
   quant::QuantizedTensor ffn_up;      // [embedding_length, ff]
   quant::QuantizedTensor ffn_down;    // [ff, embedding_length]
@@ -76,6 +82,10 @@ struct Gemma4Weights {
   std::span<const uint16_t> per_layer_model_proj;  // bf16 [embedding_length, block_count*per_layer_input]
   std::span<const float> output_norm;           // [embedding_length]
   std::span<const float> rope_freqs;            // [256] (precomputed RoPE table)
+
+  // The lm head. Empty when the model ties its output to the token embedding
+  // (Gemma 4), in which case the emitter falls back to token_embd.
+  quant::QuantizedTensor output;                // [embedding_length, vocab]
 
   std::vector<BlockWeights> blocks;  // size == block_count
 

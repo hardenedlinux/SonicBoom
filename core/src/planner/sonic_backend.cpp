@@ -166,6 +166,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       case model::WeightSlot::PostAttentionNorm: return block.post_attention_norm;
       case model::WeightSlot::PostFfwNorm: return block.post_ffw_norm;
       case model::WeightSlot::PostNorm: return block.post_norm;
+      case model::WeightSlot::AttnQBias: return block.attn_q_bias;
+      case model::WeightSlot::AttnKBias: return block.attn_k_bias;
+      case model::WeightSlot::AttnVBias: return block.attn_v_bias;
+      case model::WeightSlot::AttnOutputBias: return block.attn_output_bias;
       case model::WeightSlot::InpGate: return block.inp_gate;
       case model::WeightSlot::Proj: return block.proj;
       case model::WeightSlot::LayerOutputScale: return block.layer_output_scale;
@@ -189,6 +193,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       case model::WeightSlot::FfnDown: return block.ffn_down;
       case model::WeightSlot::TokenEmbd: return model_.weights.token_embd;
       case model::WeightSlot::PerLayerTokenEmbd: return model_.weights.per_layer_token_embd;
+      case model::WeightSlot::Output: return model_.weights.output;
       default: return kEmpty;
     }
   };
@@ -416,6 +421,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
     }
     case OpKind::Silu: {
       ok = nn::silu(f32(inputs[0]), f32_mut(out));
+      break;
+    }
+    case OpKind::AddBias: {
+      // inputs[0] is the projection output ([width] when decoding, [n, width]
+      // when prefilling); the bias is a [width] weight vector broadcast over the
+      // rows. A bias the architecture does not carry is never emitted, so an
+      // empty span here is a plan/emit mismatch, not a benign no-op.
+      const std::span<const float> b = fweight(slot);
+      ok = !b.empty() && nn::add_bias(f32(inputs[0]), b, f32_mut(out));
       break;
     }
     case OpKind::Mul: {

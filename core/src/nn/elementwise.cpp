@@ -38,6 +38,15 @@ bool add(std::span<const float> a, std::span<const float> b, std::span<float> y)
   return true;
 }
 
+bool add_bias(std::span<const float> x, std::span<const float> bias,
+              std::span<float> y) {
+  if (bias.empty() || x.size() % bias.size() != 0 || y.size() < x.size())
+    return false;
+  const size_t w = bias.size();
+  for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] + bias[i % w];
+  return true;
+}
+
 bool axpy(std::span<const float> a, float alpha, std::span<float> y) {
   if (y.size() < a.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) y[i] += alpha * a[i];

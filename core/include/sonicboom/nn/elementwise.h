@@ -33,6 +33,14 @@ bool scale(std::span<const float> x, float s, std::span<float> y);
 // y[i] = a[i] + b[i]. Requires a.size() == b.size() and y.size() >= a.size().
 bool add(std::span<const float> a, std::span<const float> b, std::span<float> y);
 
+// y[i] = x[i] + bias[i % bias.size()]: broadcast a bias vector over the rows of
+// a [rows, bias.size()] buffer (a plain vector when rows == 1). This is the
+// optional bias a linear projection may carry, e.g. Qwen2's Q/K/V projections.
+// Requires a non-empty bias, an `x` whose size is a whole multiple of it, and
+// y.size() >= x.size().
+bool add_bias(std::span<const float> x, std::span<const float> bias,
+              std::span<float> y);
+
 // In-place residual accumulate: y[i] += alpha * a[i]. `a` and `y` may alias.
 // Requires y.size() >= a.size().
 bool axpy(std::span<const float> a, float alpha, std::span<float> y);
