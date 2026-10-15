@@ -74,6 +74,8 @@ the same GGUF file on the same machine.
 |---|---|
 | GPU | NVIDIA GeForce RTX 3050, 8 GB, compute 8.6 |
 | Driver / CUDA | 595.84 (CUDA 13.2 driver API); nvcc 12.0.140 |
+| CPU | AMD Ryzen 5 5500 (6C/12T, Zen 3), PCIe 3.0 |
+| RAM | 32 GB DDR4-2400, single channel |
 | Host | Linux 6.8, x86-64, g++-13 |
 | Model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
 | llama.cpp | commit `43fe9c64281`, CUDA build, `llama-bench -ngl 99` |
@@ -88,7 +90,7 @@ and the full history are in [`design/benchmark.md`](design/benchmark.md).
 
 ### Requirements
 
-- Linux x86-64, g++-13, CMake, Ninja
+- Linux x86-64, g++-13, CMake, Ninja (optional), libyaml-dev
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU. v0.0.1 is built and tested
   for **sm_86** only (RTX 30-series).
 - GNU Guile 3.0
