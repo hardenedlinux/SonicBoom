@@ -92,7 +92,20 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader);
 // tokenize: text -> token ids. When add_bos is set the <bos> token is prepended
 // (matching llama-tokenize's default), so a Gemma prompt round-trips through
 // detokenize().
-std::vector<int32_t> tokenize(const Vocab& v, std::string_view text);
+//
+// parse_special is opt-in and defaults off. With it on, occurrences of the
+// vocabulary's CONTROL / USER_DEFINED pieces are emitted as their own token id
+// instead of being BPE'd as text — so a chat template's turn markers become
+// single tokens. It is a text-to-control-token channel: only parse markers the
+// caller generated itself, never the user's text. With the flag off the output
+// is byte-identical to the text-only tokenizer.
+//
+// add_special (on by default, llama.cpp's flag of the same name) wraps the text
+// in the vocabulary's framework tokens: <bos> in front when add_bos is set,
+// <eos> after when add_eos is. A caller that tokenizes a prompt piece by piece
+// passes it for the first piece only, so <bos> is added exactly once.
+std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
+                              bool parse_special = false, bool add_special = true);
 
 // detokenize: token ids -> text. Strips control/unknown tokens (including
 // <bos>), unescapes ▁ to space, expands <0xNN> byte tokens, and applies the

@@ -126,6 +126,8 @@ library search path?")))
                (sb_llm_model_free . ,(foreign-proc "sb_llm_model_free" void (list '*)))
                (sb_llm_tokenize . ,(foreign-proc "sb_llm_tokenize" int
                                                  (list '* '* size_t '* size_t '* '*)))
+               (sb_llm_tokenize_ex . ,(foreign-proc "sb_llm_tokenize_ex" int
+                                                    (list '* '* size_t int '* size_t '* '*)))
                (sb_llm_detokenize . ,(foreign-proc "sb_llm_detokenize" int
                                                    (list '* '* size_t '* size_t '* '*)))
                (sb_llm_session_new . ,(foreign-proc "sb_llm_session_new" int

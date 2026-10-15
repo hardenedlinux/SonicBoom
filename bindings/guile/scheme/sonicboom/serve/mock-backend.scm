@@ -111,11 +111,15 @@ a small model answers in a predictable way so that the tests can check it.")
 ;;; ---------------------------------------------------------------------------
 ;;; Tokenizer
 
-(define (mock-tokenize model text)
+;; TEXT -> tokens, with special matching on or off. With SPECIAL? #f nothing is
+;; matched, so every character is a character token — a control marker spelled
+;; out in the text stays text.
+(define (mock-tokenize-flags model text special?)
   (let ((specials (mm-specials model))
         (n (string-length text)))
     (define (special-at i)
-      (and (char=? (string-ref text i) #\<)
+      (and special?
+           (char=? (string-ref text i) #\<)
            (let lp ((k 0))
              (cond ((= k (vector-length specials)) #f)
                    ((string-prefix? (vector-ref specials k) text 0
@@ -128,6 +132,16 @@ a small model answers in a predictable way so that the tests can check it.")
           (match (special-at i)
             (#f (lp (1+ i) (cons (+ char-base (char->integer (string-ref text i))) out)))
             (k (lp (+ i (string-length (vector-ref specials k))) (cons k out))))))))
+
+(define (mock-tokenize model text)
+  (mock-tokenize-flags model text #t))
+
+;; Like the real backend: the template's own markers ('special segments) are
+;; their whole tokens; the message text is always text.
+(define (mock-tokenize-chat model segments)
+  (append-map (lambda (seg)
+                (mock-tokenize-flags model (cdr seg) (eq? (car seg) 'special)))
+              segments))
 
 (define (token->string model t)
   (if (< t char-base)
@@ -156,12 +170,12 @@ a small model answers in a predictable way so that the tests can check it.")
 
 (define (user-turn-open family)
   (case family
-    ((gemma) "<start_of_turn>user\n")
+    ((gemma) "<|turn>user\n")
     ((qwen) "<|im_start|>user\n")))
 
 (define (turn-close family)
   (case family
-    ((gemma) "<end_of_turn>")
+    ((gemma) "<turn|>")
     ((qwen) "<|im_end|>")))
 
 (define (last-line text)
@@ -335,8 +349,8 @@ a small model answers in a predictable way so that the tests can check it.")
     t))
 
 (define (mock-render-chat model messages tools tool-choice)
-  (render-chat-template (mm-family model) messages
-                        #:tools tools #:tool-choice tool-choice))
+  (render-chat-template-segments (mm-family model) messages
+                                 #:tools tools #:tool-choice tool-choice))
 
 (define (mock-stats model)
   (with-mutex (mm-lock model)
@@ -350,6 +364,7 @@ a small model answers in a predictable way so that the tests can check it.")
                 #:tokenize mock-tokenize
                 #:detokenize mock-detokenize
                 #:render-chat mock-render-chat
+                #:tokenize-chat mock-tokenize-chat
                 #:create-session mock-create-session
                 #:free-session mock-free-session
                 #:fork-session mock-fork-session

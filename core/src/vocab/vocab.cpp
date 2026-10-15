@@ -122,8 +122,9 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
   return v;
 }
 
-std::vector<int32_t> tokenize(const Vocab& v, std::string_view text) {
-  return ggml_bpe::tokenize(v, text);
+std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
+                              bool parse_special, bool add_special) {
+  return ggml_bpe::tokenize(v, text, parse_special, add_special);
 }
 
 std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n) {

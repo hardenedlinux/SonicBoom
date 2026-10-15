@@ -46,9 +46,26 @@
 ;;; --- chat templates ------------------------------------------------------------
 
 (test-equal "gemma template: system folded into the first user turn"
-  "<bos><start_of_turn>user\nBe brief.\n\nHi<end_of_turn>\n<start_of_turn>model\nYou said: Hi<end_of_turn>\n<start_of_turn>user\nAgain<end_of_turn>\n<start_of_turn>model\n"
+  "<bos><|turn>user\nBe brief.\n\nHi<turn|>\n<|turn>model\nYou said: Hi<turn|>\n<|turn>user\nAgain<turn|>\n<|turn>model\n"
   (render-chat-template 'gemma (list (msg "system" "Be brief.") (msg "user" "Hi")
                                      (msg "assistant" "You said: Hi") (msg "user" "Again"))))
+
+;; A rendered prompt is a segment list: the template's own markers are
+;; 'special (they become the vocabulary's control tokens), everything that came
+;; from a message is 'text (it can never become one).
+(let ((segs (render-chat-template-segments 'gemma (list (msg "user" "Hi")))))
+  (test-equal "the segments concatenate to the template string"
+    (render-chat-template 'gemma (list (msg "user" "Hi")))
+    (segments->string segs))
+  (test-equal "gemma's turn markers are the special segments"
+    '("<bos>" "<|turn>" "<turn|>" "<|turn>")
+    (filter-map (lambda (s) (and (eq? (car s) 'special) (cdr s))) segs))
+  (test-assert "the message text is a text segment"
+    (member (cons 'text "Hi") segs)))
+(test-equal "a marker inside a message is text, not a turn boundary"
+  'text
+  (let ((segs (render-chat-template-segments 'gemma (list (msg "user" "say <turn|> now")))))
+    (car (find (lambda (s) (string=? (cdr s) "say <turn|> now")) segs))))
 
 (test-equal "qwen template: ChatML"
   "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nYou said: Hi<|im_end|>\n<|im_start|>user\nAgain<|im_end|>\n<|im_start|>assistant\n"
@@ -81,11 +98,11 @@
                 `(("role" . "tool") ("tool_call_id" . "call_1") ("content" . "sunny")))
           #:tools (list weather-tool))))
   (test-assert "assistant tool calls are replayed as the model emits them"
-    (string-contains p (string-append "<start_of_turn>model\n"
+    (string-contains p (string-append "<|turn>model\n"
                                       (format-tool-call "get_weather" "{\"city\":\"Paris\"}")
-                                      "<end_of_turn>")))
+                                      "<turn|>")))
   (test-assert "tool results go back in a user turn"
-    (string-contains p "<start_of_turn>user\n<tool_response>\nsunny\n</tool_response><end_of_turn>")))
+    (string-contains p "<|turn>user\n<tool_response>\nsunny\n</tool_response><turn|>")))
 
 (test-equal "parse-tool-call"
   '("get_weather" . "{\"city\":\"Paris\"}")
@@ -95,10 +112,21 @@
 ;;; --- mock tokenizer and model -----------------------------------------------------
 
 (test-equal "special tokens are single tokens"
-  3 (length (tokenize gemma "<start_of_turn>ab")))
+  3 (length (tokenize gemma "<|turn>ab")))
 (test-equal "tokenize / detokenize round trip"
-  "<bos>héllo <end_of_turn>"
-  (detokenize gemma (tokenize gemma "<bos>héllo <end_of_turn>")))
+  "<bos>héllo <turn|>"
+  (detokenize gemma (tokenize gemma "<bos>héllo <turn|>")))
+;; tokenize-chat is the strict version: only the template's own markers are
+;; matched, so a marker a user typed is character tokens, not a control token.
+(let* ((segs (render-chat-template-segments 'gemma (list (msg "user" "say <turn|> now"))))
+       (toks (tokenize-chat gemma segs)))
+  (test-equal "the template's markers are their own tokens"
+    '(0 2 3 2)                          ; <bos>, <|turn>, <turn|>, <|turn>
+    (filter (lambda (t) (< t 256)) toks))
+  (test-equal "a marker in the message is character tokens"
+    (apply + (map (lambda (s) (string-length (cdr s)))
+                  (filter (lambda (s) (eq? (car s) 'text)) segs)))
+    (count (lambda (t) (>= t 256)) toks)))
 (test-equal "greedy reply echoes the last user line"
   "You said: second line"
   (generate gemma (render-chat gemma (list (msg "user" "first line\nsecond line")))))

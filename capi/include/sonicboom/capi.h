@@ -286,6 +286,24 @@ void sb_llm_model_free(sb_llm_model *model);
  * the needed count in *n_out / *len_out (and SB_ERR_BINDING). */
 sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
                           sb_token *out, size_t cap, size_t *n_out, sb_error **err_out);
+
+/* sb_llm_tokenize_ex flags. SB_TOKENIZE_ADD_SPECIAL (prepend <bos>) is what
+ * sb_llm_tokenize does; a caller that tokenizes a prompt piece by piece turns
+ * it on for the first piece only, so <bos> is added exactly once. */
+#define SB_TOKENIZE_PARSE_SPECIAL 1
+#define SB_TOKENIZE_ADD_SPECIAL 2
+
+/* sb_llm_tokenize with flags. With SB_TOKENIZE_PARSE_SPECIAL, a CONTROL /
+ * USER_DEFINED piece of the vocabulary (e.g. Gemma 4's "<|turn>", "<turn|>")
+ * occurring verbatim in `text` becomes that one token instead of being encoded
+ * as text. This turns text into control structure, so it must only be used on
+ * text the caller itself generated (a chat template's turn markers): a user
+ * message containing "<turn|>" would otherwise become a real turn boundary
+ * (prompt injection). sb_llm_tokenize is this with SB_TOKENIZE_ADD_SPECIAL
+ * alone, byte for byte. */
+sb_status sb_llm_tokenize_ex(const sb_llm_model *model, const char *text, size_t len,
+                             int flags, sb_token *out, size_t cap,
+                             size_t *n_out, sb_error **err_out);
 sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
                             size_t n, char *out, size_t cap, size_t *len_out,
                             sb_error **err_out);

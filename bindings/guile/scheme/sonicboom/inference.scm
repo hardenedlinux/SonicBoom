@@ -23,9 +23,10 @@
   #:use-module (sonicboom ffi)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
+  #:use-module (ice-9 optargs)
   #:export (load-model free-model!
             make-session free-session!
-            prefill! tokenize detokenize
+            prefill! tokenize tokenize-segments detokenize
             generate generate-tokens generate-stream))
 
 ;;; --- helpers ----------------------------------------------------------------
@@ -108,25 +109,65 @@
 
 ;;; --- tokenize / detokenize --------------------------------------------------
 
-(define (tokenize model text)
-  "Encode TEXT (a UTF-8 string) into a list of token ids (<bos> prepended,
-  matching llama-tokenize)."
+;; sb_llm_tokenize_ex flags, from capi.h.
+(define sb-tokenize-parse-special 1)
+(define sb-tokenize-add-special 2)
+
+;; The two-call sizing path over sb_llm_tokenize_ex: TEXT with the given FLAGS.
+(define (tokenize-flags model text flags)
   (let* ((bv (string->utf8 text))
          (len (bytevector-length bv))
          (n-slot (make-bytevector 8 0))          ; size_t
-         (err-slot (make-slot)))
+         (err-slot (make-slot))
+         (fn (proc 'sb_llm_tokenize_ex))
+         (head (list model (bytevector->pointer bv) len flags)))
     ;; Sizing call (cap 0): fills *n_out, returns SB_ERR_BINDING.
-    (let ((st ((proc 'sb_llm_tokenize) model (bytevector->pointer bv) len
-               %null-pointer 0 (bytevector->pointer n-slot) (slot-ptr err-slot))))
+    (let ((st (apply fn (append head
+                                (list %null-pointer 0
+                                      (bytevector->pointer n-slot)
+                                      (slot-ptr err-slot))))))
       (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
         (sb-check! st err-slot "tokenize")))
     (let* ((n (bytevector-u64-native-ref n-slot 0))
            (out (make-bytevector (* n 4) 0))
-           (st ((proc 'sb_llm_tokenize) model (bytevector->pointer bv) len
-                 (bytevector->pointer out) n (bytevector->pointer n-slot)
-                 (slot-ptr err-slot))))
+           (st (apply fn (append head
+                                 (list (bytevector->pointer out) n
+                                       (bytevector->pointer n-slot)
+                                       (slot-ptr err-slot))))))
       (sb-check! st err-slot "tokenize")
       (s32-bv->list out n))))
+
+(define* (tokenize model text #:key (special? #f))
+  "Encode TEXT (a UTF-8 string) into a list of token ids (<bos> prepended,
+  matching llama-tokenize).
+
+  With #:special? #t, control pieces of the model's vocabulary (e.g. <|turn>,
+  <turn|>) that occur verbatim in TEXT become their own token instead of being
+  BPE'd as text — what a chat template's turn markers need. It is off by
+  default: special parsing turns text into control structure, so it must only be
+  used on text the caller generated itself, never on a user's message."
+  (tokenize-flags model text
+                  (logior sb-tokenize-add-special
+                               (if special? sb-tokenize-parse-special 0))))
+
+(define (tokenize-segments model segments)
+  "Tokenize a rendered chat prompt given as SEGMENTS: a list of (kind . text)
+with kind 'text or 'special (see (sonicboom serve chat-template)). A 'special
+segment is tokenized with special parsing, so a turn marker spelled out in it
+becomes the vocabulary's one control token; a 'text segment is tokenized as
+plain text, so a marker that came from a user's message stays text. <bos> is
+added once, by the first segment's call."
+  (let ((parts (if (null? segments) (list (cons 'text "")) segments)))
+    (let lp ((rest parts) (first? #t) (out '()))
+      (if (null? rest)
+          (apply append (reverse out))
+          (let* ((seg (car rest))
+                 (flags (logior
+                         (if (eq? (car seg) 'special)
+                             sb-tokenize-parse-special 0)
+                         (if first? sb-tokenize-add-special 0))))
+            (lp (cdr rest) #f
+                (cons (tokenize-flags model (cdr seg) flags) out)))))))
 
 (define (detokenize-bytes model tokens)
   "Decode TOKENS (a list of token ids) to its UTF-8 bytes, as a bytevector. The

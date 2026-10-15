@@ -255,7 +255,8 @@ pointers and are freed explicitly.
 - `load-model path`, `free-model! model` — load a GGUF
 - `make-session model n-ctx`, `free-session! session` — a session holds a token history and a context window
 - `prefill! session tokens` — set the session's prompt; returns how many leading tokens were reused from the previous prompt (at most `length - 1`: the last token is always re-processed, its activation being what produces the next-token logits)
-- `tokenize model text` — UTF-8 text to token ids (a `<bos>` is prepended)
+- `tokenize model text #:special?` — UTF-8 text to token ids (a `<bos>` is prepended); `#:special? #t` also matches the vocabulary's control pieces (`<|turn>`, `<turn|>`) verbatim, one token each
+- `tokenize-segments model segments` — a rendered chat prompt as `(kind . text)` segments: `'special` segments are tokenized with `#:special? #t`, `'text` segments never are; `<bos>` is added once, by the first segment
 - `detokenize model tokens` — token ids back to text
 - `generate model session prompt max-tokens` — tokenize, prefill, decode greedily, detokenize
 - `generate-tokens session prompt max-tokens #:prefill?` — the same, returning token ids; `#:prefill? #f` continues from what the session holds
@@ -322,10 +323,17 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
   token.** `sb_llm_prefill` reuses at most `n - 1` tokens and re-prefills the
   final one, so the prefill suffix is never empty: an identical repeat of a
   prompt succeeds and reports `n_reused = n - 1`.
-- **The Gemma turn markers are not single special tokens**: `<start_of_turn>`
-  tokenizes into six subword pieces. The text round-trips, so the rendered
-  prompt reads the same as llama.cpp's chat template, but it is not the same
-  token ids.
+- **Control-token parsing is opt-in, and the server turns it on only for the
+  template's own markers.** Gemma 4's turn markers are `<|turn>` and `<turn|>`
+  (not the `<start_of_turn>`/`<end_of_turn>` spelling, which is not in this
+  vocabulary); by default `tokenize` treats them as ordinary text, so a message
+  that spells one out stays text and cannot forge a turn boundary. The chat
+  template renders a *segment* list in which its own markers are `'special` and
+  every message is `'text`; `tokenize-segments` parses the first and never the
+  second, which is what makes the injection impossible while the markers become
+  the vocabulary's single control tokens (`<|turn>` = 105, `<turn|>` = 106 —
+  the same id as the model's eos). `sb_llm_tokenize` keeps its old text-only
+  behaviour, byte for byte; the new flag lives in `sb_llm_tokenize_ex`.
 - Python is not used anywhere in the binding.
 
 ## Tests
@@ -339,6 +347,6 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
 | `tests/test-executable.scm` | compile-once, reuse, lifetime, the cache |
 | `tests/test-trace-lower.scm` | lowering coverage, and the runtime matching the reference interpreter |
 | `tests/trace/test-trace-forms.scm` | the tracer's forms and graph breaks |
-| `tests/test-inference.scm` | the LLM C ABI: golden decode, round-trips, prefix reuse, streaming |
+| `tests/test-inference.scm` | the LLM C ABI: golden decode, round-trips, prefix reuse, streaming, opt-in control-token parsing |
 | `tests/test-e2e-export.scm` + `tests/run-e2e.sh` | train → export → an independent C++ loader |
 | `tests/serve/*` | the HTTP server, over HTTP/SSE/WebSocket and as units |

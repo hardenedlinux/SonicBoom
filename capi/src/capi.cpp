@@ -717,16 +717,18 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
 
 void sb_llm_model_free(sb_llm_model *model) { delete model; }
 
-sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
-                          sb_token *out, size_t cap, size_t *n_out,
-                          sb_error **err_out) {
+sb_status sb_llm_tokenize_ex(const sb_llm_model *model, const char *text, size_t len,
+                             int flags, sb_token *out, size_t cap,
+                             size_t *n_out, sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
         if (!model || !text || !n_out)
           return fail_arg(err_out);
 
-        const std::vector<int32_t> toks =
-            vocab::tokenize(model->bundle->vocab, std::string_view(text, len));
+        const std::vector<int32_t> toks = vocab::tokenize(
+            model->bundle->vocab, std::string_view(text, len),
+            (flags & SB_TOKENIZE_PARSE_SPECIAL) != 0,
+            (flags & SB_TOKENIZE_ADD_SPECIAL) != 0);
 
         *n_out = toks.size();
         if (cap < toks.size())
@@ -736,6 +738,14 @@ sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t le
         return SB_OK;
       },
       err_out);
+}
+
+sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
+                          sb_token *out, size_t cap, size_t *n_out,
+                          sb_error **err_out) {
+  // Text only: a control marker inside `text` stays text.
+  return sb_llm_tokenize_ex(model, text, len, SB_TOKENIZE_ADD_SPECIAL, out, cap,
+                            n_out, err_out);
 }
 
 sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,

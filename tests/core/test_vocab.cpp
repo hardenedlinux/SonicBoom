@@ -23,15 +23,22 @@
 //      commit 43fe9c64281ef735046adc025e9e7559a1f659a5, add_special=true).
 //   2. detokenize(tokenize(x)) == x  (round-trip; <bos> is control and is
 //      stripped, ▁/byte escapes are undone).
+//
+// Then the opt-in special parsing (the `parse_special` / `add_special`
+// parameters, checked against the same driver with TOKENIZE_PARSE_SPECIAL=1):
+// a chat template's own turn markers become the vocabulary's single control
+// tokens, while the same characters inside ordinary text stay text.
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/vocab/vocab.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sbgguf = sonicboom::gguf;
@@ -122,6 +129,34 @@ const std::vector<Sample> kSamples = {
      {2, 1475, 236770, 255968, 1475, 236778, 255968, 1475, 236800}},
 };
 
+// Special parsing. `off` is what the text-only tokenizer gives (and what every
+// caller got before the parameter existed); `on` is the same text with
+// parse_special, i.e. with the pieces of the vocabulary's CONTROL set matched
+// longest-first. Both columns are llama-tokenize's, run through the same driver
+// with TOKENIZE_PARSE_SPECIAL unset / set.
+//
+// Gemma 4's own turn markers are "<|turn>" (105) and "<turn|>" (106, which is
+// also the model's eos); they exist nowhere else in this vocabulary, so the
+// "<start_of_turn>" / "<end_of_turn>" spelling is not a special token at all.
+struct SpecialSample {
+  std::string text;
+  std::vector<int32_t> off;
+  std::vector<int32_t> on;
+};
+
+const std::vector<SpecialSample> kSpecialSamples = {
+    // A rendered Gemma turn: two markers around the text.
+    {"<|turn>user\nHello, world!<turn|>\n<|turn>model\n",
+     {2, 236820, 236909, 887, 236813, 2364, 107, 9259, 236764, 1902, 200322,
+      887, 111038, 107, 236820, 236909, 887, 236813, 4368, 107},
+     {2, 105, 2364, 107, 9259, 236764, 1902, 236888, 106, 107, 105, 4368, 107}},
+    // The same characters inside a message: with special parsing they are a
+    // turn boundary (which is why it is opt-in — see the tool/server tests).
+    {"say <turn|> now",
+     {2, 30468, 655, 887, 111038, 1492},
+     {2, 30468, 236743, 106, 1492}},
+};
+
 }  // namespace
 
 int main() {
@@ -169,8 +204,44 @@ int main() {
     }
   }
 
+  // The markers the chat template renders must be control tokens of this
+  // vocabulary, or special parsing would not turn them into one id each.
+  for (const auto& [piece, id] : std::vector<std::pair<std::string, int32_t>>{
+           {"<|turn>", 105}, {"<turn|>", 106}, {"<bos>", 2}}) {
+    check(id < static_cast<int32_t>(v->tokens.size()) && v->tokens[id] == piece,
+          "the vocabulary does not spell token " + std::to_string(id) + " as " +
+              piece);
+    check(id < static_cast<int32_t>(v->type.size()) &&
+              v->type[id] == sbvocab::TokenType::Control,
+          "token " + piece + " is not control-typed");
+  }
+
+  for (size_t i = 0; i < kSpecialSamples.size(); ++i) {
+    const SpecialSample& s = kSpecialSamples[i];
+    const std::string tag = "special sample " + std::to_string(i);
+
+    // Default arguments: text only, exactly as before the parameter existed.
+    const std::vector<int32_t> off = sbvocab::tokenize(*v, s.text);
+    check(off == s.off, tag + ": tokenize(x) is not the text-only encoding");
+
+    const std::vector<int32_t> on = sbvocab::tokenize(*v, s.text, true);
+    check(on == s.on, tag + ": parse_special ids differ from llama-tokenize");
+    // The parsed markers are the vocabulary's own ids, one token each.
+    check(std::count(on.begin(), on.end(), 105) ==
+              std::count(s.on.begin(), s.on.end(), 105),
+          tag + ": <|turn> was not parsed as one token");
+    check(std::count(off.begin(), off.end(), 106) == 0,
+          tag + ": a marker in plain text became the end-of-turn token");
+
+    // add_special=False: no <bos> wrapper (a piece-wise tokenize adds it once).
+    std::vector<int32_t> bare = sbvocab::tokenize(*v, s.text, true, false);
+    check(bare == std::vector<int32_t>(s.on.begin() + 1, s.on.end()),
+          tag + ": add_special=false did not drop the <bos>");
+  }
+
   if (g_failures == 0) {
-    std::cout << "test_vocab OK (" << kSamples.size() << " samples)\n";
+    std::cout << "test_vocab OK (" << kSamples.size() << " samples, "
+              << kSpecialSamples.size() << " special)\n";
     return 0;
   }
   std::cerr << "test_vocab FAILED: " << g_failures << " check(s)\n";

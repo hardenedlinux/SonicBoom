@@ -5,9 +5,11 @@
 ;;;
 ;;; No Jinja: each model family has its template as a Scheme procedure.
 ;;;
-;;;   gemma  <bos><start_of_turn>user\n...<end_of_turn>\n<start_of_turn>model\n
-;;;          No system role: the system text (and the tools block) opens the
-;;;          first user turn. The assistant role is `model'.
+;;;   gemma  <bos><|turn>user\n...<turn|>\n<|turn>model\n
+;;;          Gemma 4's own turn tokens (<|turn>, <turn|>), which are control
+;;;          tokens of its vocabulary. No system role: the system text (and the
+;;;          tools block) opens the first user turn. The assistant role is
+;;;          `model'.
 ;;;   qwen   ChatML: <|im_start|>ROLE\n...<|im_end|>\n, with the Qwen2.5 tool
 ;;;          convention (a # Tools section in the system turn).
 ;;;
@@ -21,13 +23,26 @@
 ;;; An assistant message is rendered exactly as the model generated it (the
 ;;; content, then the tool calls via format-tool-call), so a follow-up request
 ;;; that carries the previous reply shares its tokens with the cached session.
+;;;
+;;; A rendered prompt is a list of SEGMENTS, each (kind . text) with
+;;;   'special  a turn marker of the template (or <bos>): tokenized with
+;;;             special parsing, so it becomes the vocabulary's one control
+;;;             token;
+;;;   'text     text that came from a message, or SonicBoom's own wording:
+;;;             tokenized as plain text, so a marker a user typed into a
+;;;             message stays text and cannot forge a turn boundary.
+;;; render-chat-template returns the concatenated string (for logs and tests);
+;;; render-chat-template-segments returns the segments, which is what a backend
+;;; has to tokenize (see (sonicboom serve backend) tokenize-chat). The
+;;; model-level wrapper the service calls, render-chat-segments, lives in
+;;; (sonicboom serve backend) — the two names differ so a module can import both.
 
 (define-module (sonicboom serve chat-template)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-11)
   #:use-module (ice-9 match)
   #:use-module (json)
-  #:export (render-chat-template
+  #:export (render-chat-template render-chat-template-segments segments->string
             template-special-tokens template-eos-strings
             tool-call-open tool-call-close
             format-tool-call parse-tool-call json-normalize
@@ -36,19 +51,26 @@
 (define tool-call-open "<tool_call>")
 (define tool-call-close "</tool_call>")
 
-;; Special tokens of each family (the tokenizer keeps them whole), and the
-;; ones that end an assistant turn.
+;; --- segments ---------------------------------------------------------------
+
+(define (seg kind text) (cons kind text))
+(define (segments->string segments) (string-concatenate (map cdr segments)))
+
+;; Special pieces of each family (the tokenizer keeps them whole when it parses
+;; them), and the ones that end an assistant turn. A family's eos string must
+;; be one of its special pieces — the end-of-turn marker is the model's own
+;; control token, and only special parsing turns it into that one id.
 (define (template-special-tokens family)
   (append
    (case family
-     ((gemma) '("<bos>" "<eos>" "<start_of_turn>" "<end_of_turn>"))
+     ((gemma) '("<bos>" "<eos>" "<|turn>" "<turn|>"))
      ((qwen) '("<|endoftext|>" "<|im_start|>" "<|im_end|>"))
      (else (error "unknown chat template family" family)))
    (list tool-call-open tool-call-close)))
 
 (define (template-eos-strings family)
   (case family
-    ((gemma) '("<end_of_turn>" "<eos>"))
+    ((gemma) '("<turn|>" "<eos>"))
     ((qwen) '("<|im_end|>" "<|endoftext|>"))
     (else (error "unknown chat template family" family))))
 
@@ -189,15 +211,19 @@
                         ((('user . text) . more)
                          (cons (cons 'user (string-append preamble "\n\n" text)) more))
                         (_ (cons (cons 'user preamble) turns))))))
-      (string-append
-       "<bos>"
-       (string-concatenate
-        (map (match-lambda
-               ((r . text)
-                (string-append "<start_of_turn>" (if (eq? r 'user) "user" "model") "\n"
-                               text "<end_of_turn>\n")))
-             turns))
-       (if add-generation-prompt? "<start_of_turn>model\n" "")))))
+      (append
+       (list (seg 'special "<bos>"))
+       (append-map (match-lambda
+                     ((r . text)
+                      (list (seg 'special "<|turn>")
+                            (seg 'text (if (eq? r 'user) "user\n" "model\n"))
+                            (seg 'text text)
+                            (seg 'special "<turn|>")
+                            (seg 'text "\n"))))
+                   turns)
+       (if add-generation-prompt?
+           (list (seg 'special "<|turn>") (seg 'text "model\n"))
+           '())))))
 
 (define (render-qwen messages tools tool-choice add-generation-prompt?)
   (let-values (((system rest) (split-system messages)))
@@ -206,25 +232,39 @@
                            (list system
                                  (if (null? tools) "" (tools-block tools tool-choice))))
                    "\n\n")))
-      (string-append
+      (append
        (if (string-null? system)
-           ""
-           (string-append "<|im_start|>system\n" system "<|im_end|>\n"))
-       (string-concatenate
-        (map (match-lambda
-               ((r . text)
-                (string-append "<|im_start|>" (if (eq? r 'user) "user" "assistant") "\n"
-                               text "<|im_end|>\n")))
-             (group-turns rest)))
-       (if add-generation-prompt? "<|im_start|>assistant\n" "")))))
+           '()
+           (list (seg 'special "<|im_start|>") (seg 'text "system\n")
+                 (seg 'text system) (seg 'special "<|im_end|>") (seg 'text "\n")))
+       (append-map (match-lambda
+                     ((r . text)
+                      (list (seg 'special "<|im_start|>")
+                            (seg 'text (if (eq? r 'user) "user\n" "assistant\n"))
+                            (seg 'text text)
+                            (seg 'special "<|im_end|>")
+                            (seg 'text "\n"))))
+                   (group-turns rest))
+       (if add-generation-prompt?
+           (list (seg 'special "<|im_start|>") (seg 'text "assistant\n"))
+           '())))))
 
 ;; tools: list of tool objects; tool-choice: "none", "auto", "required" or a
 ;; function name. With "none" the tools are not shown to the model at all.
-(define* (render-chat-template family messages #:key (tools '())
-                               (tool-choice "auto")
-                               (add-generation-prompt? #t))
+(define* (render-chat-template-segments family messages #:key (tools '())
+                                        (tool-choice "auto")
+                                        (add-generation-prompt? #t))
   (let ((tools (if (equal? tool-choice "none") '() tools)))
     (case family
       ((gemma) (render-gemma messages tools tool-choice add-generation-prompt?))
       ((qwen) (render-qwen messages tools tool-choice add-generation-prompt?))
       (else (error "unknown chat template family" family)))))
+
+;; The same prompt as one string (the segments concatenated).
+(define* (render-chat-template family messages #:key (tools '())
+                               (tool-choice "auto")
+                               (add-generation-prompt? #t))
+  (segments->string
+   (render-chat-template-segments family messages #:tools tools
+                                  #:tool-choice tool-choice
+                                  #:add-generation-prompt? add-generation-prompt?)))

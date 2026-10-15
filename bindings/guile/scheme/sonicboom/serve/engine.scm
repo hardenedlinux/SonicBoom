@@ -208,10 +208,11 @@
          (model (or (engine-model engine id) (throw 'model-not-found id)))
          (pool (engine-pool engine id))
          (tools (chat-request-tools request))
-         (prompt (render-chat model (chat-request-messages request)
-                              #:tools tools
-                              #:tool-choice (chat-request-tool-choice request)))
-         (prompt-tokens (tokenize model prompt))
+         (prompt-segments
+          (render-chat-segments model (chat-request-messages request)
+                                #:tools tools
+                                #:tool-choice (chat-request-tool-choice request)))
+         (prompt-tokens (tokenize-chat model prompt-segments))
          (n-prompt (length prompt-tokens))
          (ctx (model-context-length model))
          (eos (model-eos-tokens model))

@@ -32,9 +32,14 @@
          (context-length (or (assq-ref config 'context-length) 8192))
          (handle (inference:load-model path))
          ;; TODO: Read tokenizer.chat_template and EOS IDs from GGUF metadata.
-         ;; This service currently serves Gemma 4 with its native turn tokens.
-         (eos (append (cdr (inference:tokenize handle "<end_of_turn>"))
-                      (cdr (inference:tokenize handle "<eos>")))))
+         ;; This service currently serves Gemma 4 with its native turn tokens:
+         ;; the family's end-of-turn markers, tokenized with special parsing so
+         ;; each is the vocabulary's own control token (Gemma 4's "<turn|>" is
+         ;; both the turn marker and the model's eos id). Without that, they
+         ;; would come out as subword pieces and never match a sampled token.
+         (eos (append-map (lambda (s)
+                            (cdr (inference:tokenize handle s #:special? #t)))
+                          (template-eos-strings 'gemma))))
     (make-real-model id handle context-length (delete-duplicates eos))))
 
 (define (real-model-info model)
@@ -44,7 +49,14 @@
     (eos-tokens . ,(real-model-eos-tokens model))))
 
 (define (real-render-chat model messages tools tool-choice)
-  (render-chat-template 'gemma messages #:tools tools #:tool-choice tool-choice))
+  (render-chat-template-segments 'gemma messages
+                                 #:tools tools #:tool-choice tool-choice))
+
+;; The template's own markers ('special segments) are parsed as the vocabulary's
+;; control tokens; everything else — the message text, including a "<turn|>" a
+;; user typed — is tokenized as text, so it stays text.
+(define (real-tokenize-chat model segments)
+  (inference:tokenize-segments (real-model-handle model) segments))
 
 (define (real-create-session model)
   (make-real-session model
@@ -79,6 +91,7 @@
    #:detokenize (lambda (model tokens)
                   (inference:detokenize (real-model-handle model) tokens))
    #:render-chat real-render-chat
+   #:tokenize-chat real-tokenize-chat
    #:create-session real-create-session
    #:free-session real-free-session
    #:prefill real-prefill

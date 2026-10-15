@@ -65,10 +65,17 @@ int main(int argc, char** argv) {
   const llama_vocab* vocab = llama_model_get_vocab(model);
 
   if (max_tokens <= 0) max_tokens = 1 << 20;
+  // TOKENIZE_PARSE_SPECIAL=1 turns on llama.cpp's parse_special: occurrences of
+  // the vocab's CONTROL / USER_DEFINED pieces (e.g. "<|turn>", "<turn|>") are
+  // emitted as their own token id instead of being BPE'd as text. Off by
+  // default, matching the golden ids recorded for the tokenizer tests.
+  const char* ps = std::getenv("TOKENIZE_PARSE_SPECIAL");
+  const bool parse_special = ps && *ps && std::strcmp(ps, "0") != 0;
+
   std::vector<llama_token> tokens((size_t)max_tokens);
   const int32_t n = llama_tokenize(vocab, text.c_str(), (int32_t)text.size(),
                                    tokens.data(), max_tokens,
-                                   /*add_special=*/true, /*parse_special=*/false);
+                                   /*add_special=*/true, parse_special);
   if (n < 0) {
     std::fprintf(stderr, "tokenize failed (need %d tokens)\n", -n);
     llama_model_free(model);

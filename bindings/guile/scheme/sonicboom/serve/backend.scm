@@ -12,7 +12,8 @@
 ;;;   load-model   config alist           -> model
 ;;;   tokenize     model string           -> list of token ids
 ;;;   detokenize   model token-ids        -> string
-;;;   render-chat  model messages tools tool-choice -> prompt string
+;;;   render-chat  model messages tools tool-choice -> prompt segments
+;;;   tokenize-chat model segments        -> list of token ids (optional)
 ;;;   create-session / free-session
 ;;;   fork-session session n             -> a new session holding the first n
 ;;;                                         tokens of session (optional)
@@ -37,12 +38,13 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
+  #:use-module (sonicboom serve chat-template)
   #:export (make-backend backend? backend-name
 
             load-model model? model-backend model-handle
             model-id model-family model-context-length model-eos-tokens
             model-info model-sampling?
-            tokenize detokenize render-chat
+            tokenize detokenize render-chat render-chat-segments tokenize-chat
             create-session free-session fork-session can-fork?
             session? session-model session-handle
             prefill step backend-stats
@@ -58,6 +60,7 @@
 
 (define-record-type <backend>
   (%make-backend name load-model model-info tokenize detokenize render-chat
+                 tokenize-chat
                  create-session free-session fork-session prefill step stats
                  sampling?)
   backend?
@@ -67,6 +70,7 @@
   (tokenize %backend-tokenize)
   (detokenize %backend-detokenize)
   (render-chat %backend-render-chat)
+  (tokenize-chat %backend-tokenize-chat)
   (create-session %backend-create-session)
   (free-session %backend-free-session)
   (fork-session %backend-fork-session)
@@ -84,7 +88,12 @@
 ;;   model-info     (model)                        -> alist, see model-info
 ;;   tokenize       (model string)                 -> token ids
 ;;   detokenize     (model token-ids)              -> string
-;;   render-chat    (model messages tools tool-choice) -> string
+;;   render-chat    (model messages tools tool-choice) -> segments
+;;   tokenize-chat  (model segments)               -> token ids (optional)
+;;                  The default tokenizes the segments concatenated, i.e. plain
+;;                  text throughout: a backend that owns a real tokenizer
+;;                  instead parses the markers it rendered itself (the 'special
+;;                  segments) and treats the message text as text.
 ;;   create-session (model)                        -> session handle
 ;;   free-session   (session)                      -> unspecified
 ;;   fork-session   (session n)                    -> session handle, or #f
@@ -103,6 +112,7 @@
                        (tokenize (required 'tokenize))
                        (detokenize (required 'detokenize))
                        (render-chat (required 'render-chat))
+                       (tokenize-chat #f)
                        (create-session (required 'create-session))
                        (free-session (required 'free-session))
                        (fork-session #f)
@@ -111,6 +121,7 @@
                        (stats (lambda (model) '()))
                        (sampling? #f))
   (%make-backend name load-model model-info tokenize detokenize render-chat
+                 tokenize-chat
                  create-session free-session fork-session prefill step stats
                  sampling?))
 
@@ -153,9 +164,28 @@
 ;; messages: list of message alists in the OpenAI shape, already decoded from
 ;; JSON (role, content, tool_calls, tool_call_id, name). tools: list of tool
 ;; alists or '(). tool-choice: "none", "auto", "required" or a function name.
-(define* (render-chat model messages #:key (tools '()) (tool-choice "auto"))
+;; Returns the prompt as a segment list: (kind . text) with kind 'special for
+;; the template's own turn markers and 'text for everything that came from a
+;; message (see (sonicboom serve chat-template)).
+(define* (render-chat-segments model messages #:key (tools '()) (tool-choice "auto"))
   ((%backend-render-chat (model-backend model))
    (model-handle model) messages tools tool-choice))
+
+;; The same rendered prompt as one string (for logs and tests).
+(define* (render-chat model messages #:key (tools '()) (tool-choice "auto"))
+  (segments->string
+   (render-chat-segments model messages #:tools tools #:tool-choice tool-choice)))
+
+;; A rendered prompt's tokens. A backend that owns a real tokenizer tokenizes
+;; the rendered segments itself — the 'special ones with special parsing, the
+;; rest as text — so a turn marker is one control token while a marker inside a
+;; user's message stays text. Without one, the segments are concatenated and
+;; tokenized as plain text, which is what every prompt used to be.
+(define (tokenize-chat model segments)
+  (let ((proc (%backend-tokenize-chat (model-backend model))))
+    (if proc
+        (proc (model-handle model) segments)
+        (tokenize model (segments->string segments)))))
 
 (define-record-type <session>
   (%make-session model handle)

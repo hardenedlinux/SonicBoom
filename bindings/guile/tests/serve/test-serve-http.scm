@@ -324,7 +324,7 @@
                                               (msg "user" "First question"))))))
        (second (cdr (chat (request gemma (list (msg "system" system-prompt)
                                                (msg "user" "Second question"))))))
-       ;; <bos> <start_of_turn> u s e r \n, the system text, \n \n
+       ;; <bos> <|turn> u s e r \n, the system text, \n \n
        (shared (+ 7 (string-length system-prompt) 2))
        (reply (jref second "choices" 0 "message" "content"))
        (third (cdr (chat (request gemma (list (msg "system" system-prompt)

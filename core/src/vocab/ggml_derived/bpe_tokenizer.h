@@ -244,17 +244,15 @@ void tokenize_word(const Vocab& v, const std::string& word,
 
 }  // namespace
 
-// text -> token ids (prepends <bos> when add_bos, matching llama-tokenize).
-inline std::vector<int32_t> tokenize(const Vocab& v, std::string_view text) {
-  std::vector<int32_t> out;
-  if (v.add_bos && v.bos >= 0) out.push_back(v.bos);
-
-  std::string escaped(text);
+// One raw (unescaped) span -> tokens: ▁-escape, then the gemma4 pre-tokenizer
+// "[^\n]+|[\n]+" — split into newline / non-newline runs. \n (0x0A) is a single
+// byte and never a UTF-8 continuation byte, so a byte-level split is equivalent
+// to the code-point split in llama.cpp — and then BPE each run.
+inline void tokenize_span(const Vocab& v, std::string_view span,
+                          std::vector<int32_t>& out) {
+  std::string escaped(span);
   if (v.escape_whitespaces) escape_whitespace(escaped);
 
-  // Pre-tokenizer for gemma4: "[^\n]+|[\n]+" — split into newline / non-newline
-  // runs. \n (0x0A) is a single byte and never a UTF-8 continuation byte, so a
-  // byte-level split is equivalent to the code-point split in llama.cpp.
   size_t i = 0;
   while (i < escaped.size()) {
     const bool nl = escaped[i] == '\n';
@@ -263,8 +261,76 @@ inline std::vector<int32_t> tokenize(const Vocab& v, std::string_view text) {
     tokenize_word(v, std::string(escaped.data() + i, j - i), out);
     i = j;
   }
+}
 
-  if (v.add_eos && v.eos >= 0) out.push_back(v.eos);
+// The vocabulary's special pieces: CONTROL and USER_DEFINED tokens, longest
+// piece first — llama.cpp's cache_special_tokens order (it sorts the same two
+// types by text length), so that matching at a position is longest-match.
+inline std::vector<int32_t> special_token_ids(const Vocab& v) {
+  std::vector<int32_t> ids;
+  for (size_t i = 0; i < v.tokens.size(); ++i) {
+    const TokenType t = v.type[i];
+    if (t == TokenType::Control || t == TokenType::UserDefined)
+      ids.push_back(static_cast<int32_t>(i));
+  }
+  std::stable_sort(ids.begin(), ids.end(), [&v](int32_t a, int32_t b) {
+    return v.tokens[a].size() > v.tokens[b].size();
+  });
+  return ids;
+}
+
+// text -> token ids (prepends <bos> when add_bos, matching llama-tokenize).
+//
+// `parse_special` is opt-in. When set, the text is first split at exact
+// occurrences of the vocabulary's CONTROL / USER_DEFINED pieces (longest match
+// at every position): each match contributes its own id directly and the spans
+// between matches are tokenized as usual. It is off by default because it is a
+// text-to-control-token channel — with it on, a message that merely *contains*
+// "<turn|>" becomes a real turn boundary. Callers parse the markers they
+// generated themselves (the chat template) and never the user's text.
+//
+// llama.cpp keeps matching USER_DEFINED pieces when parse_special is false;
+// SonicBoom does not, so with the flag off the output is exactly what the
+// text-only tokenizer produced before this parameter existed.
+//
+// `add_special` is llama.cpp's flag of the same name: it wraps the text in the
+// vocabulary's framework tokens (<bos> / <eos>, when the vocab asks for them).
+// A caller that tokenizes a prompt piece by piece passes it for the first piece
+// only, so <bos> is added exactly once.
+inline std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
+                                     bool parse_special = false,
+                                     bool add_special = true) {
+  std::vector<int32_t> out;
+  if (add_special && v.add_bos && v.bos >= 0) out.push_back(v.bos);
+
+  if (!parse_special) {
+    tokenize_span(v, text, out);
+  } else {
+    const std::vector<int32_t> specials = special_token_ids(v);
+    size_t start = 0, i = 0;
+    while (i < text.size()) {
+      int32_t hit = -1;
+      for (const int32_t id : specials) {
+        const std::string& piece = v.tokens[id];
+        if (piece.size() <= text.size() - i &&
+            text.compare(i, piece.size(), piece) == 0) {
+          hit = id;
+          break;  // longest piece first
+        }
+      }
+      if (hit < 0) {
+        ++i;
+        continue;
+      }
+      if (i > start) tokenize_span(v, text.substr(start, i - start), out);
+      out.push_back(hit);
+      i += v.tokens[hit].size();
+      start = i;
+    }
+    if (start < text.size()) tokenize_span(v, text.substr(start), out);
+  }
+
+  if (add_special && v.add_eos && v.eos >= 0) out.push_back(v.eos);
   return out;
 }
 
