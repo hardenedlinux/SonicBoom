@@ -504,3 +504,47 @@ run). llama.cpp is checkout `43fe9c642`; decode used
 The measured load sequence was 4.243 s in `Reader::load`, 0.269 ms in
 `load_gemma4`, and 0.213 s in vocabulary loading (4.456 s total). The GGUF
 remains local validation data and is not part of the repository.
+
+## Qwen2.5-0.5B-Instruct Q4_K_M (2026-10-16)
+
+SonicBoom's second verified model family. The file is the Qwen2.5-0.5B-Instruct
+Q4_K_M GGUF (local validation data, not part of the repository), SHA-256
+`74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`; it reports
+`general.architecture = qwen2` (d 896, 24 blocks, 14/2 heads, head_dim 64, rope
+1e6, no sliding window, tied output embedding). Numbers below are measurement
+only — nothing was tuned for this model. Same machine, same CUDA spine, same
+tools as the Gemma numbers above (`longctx_bench`, `prefill_bench`,
+`prefix_cache_bench`); llama.cpp is the same checkout, `43fe9c642`.
+
+| Measurement | SonicBoom CUDA | llama.cpp CUDA | Ratio |
+|---|---:|---:|---:|
+| tg64, depth 0 | 255.7 tok/s (250.3 ms) | 307.89 ± 1.43 tok/s | 0.83x |
+| tg64, depth 512 | 224.2 tok/s (285.5 ms) | 304.10 ± 3.67 tok/s | 0.74x |
+| pp512 | 4036.6 tok/s (126.84 ms) | 14505.81 ± 1063.36 tok/s | 0.28x |
+| prefix reuse, 512 + 64 | 68.4 ms first token (full: 299.3 ms) | — | 4.4x vs own full prefill |
+
+Method. Decode is `longctx_bench`, which subtracts an incremental warm decode
+from the full one; at depth 512 the three runs agreed to 0.3% (224.48 / 223.81 /
+224.16 tok/s), so the tail number is reported there rather than the
+whole-range steady average (257.9 tok/s over a 513-step decode, i.e. averaged
+from depth 0 — that figure answers "how fast is a long decode", not "how fast is
+a decode at depth 512"). Prefill is `prefill_bench --prompt 512 --reps 3` (best
+of 3), the chunked prefix-session path: 126.840 ms of 512 tokens = 4036.6 tok/s
+wall, 4665.3 tok/s marginal (the N=1 baseline in the same run was 17.308 ms).
+llama.cpp used `-p 0 -n 64 -ngl 99 -r 10` / `-d 512` / `-p 512 -n 0 -r 10`.
+The reuse number is `prefix_cache_bench --prefix 512 --new 64 --steps 4
+--reps 3` over a real token file: reusing a resident 512-token prefix and
+prefilling 64 new tokens takes 68.4 ms to the first token against 299.3 ms for a
+full 576-token prefill, and the greedy continuation after reuse matches the full
+prefill's for all four steps. llama-bench has no prefix-reuse measurement, so
+the reuse row is against SonicBoom's own full prefill.
+
+Reading. Decode is 0.74–0.83× llama.cpp on this file, and the depth-0 → depth-512
+gap (255.7 → 224.2 tok/s, −12%) is attention at 512 keys, since Qwen2 has no
+sliding window and the whole prefix is attended. Prefill is 0.28×: at 512 tokens
+the batched K-quant matmul is the same bottleneck as in §1.4, and this file's
+`ffn_down` is Q6_K, whose MMQ weight kernel is still disabled (see the Q6_K
+entries above) — Q6_K prefill goes through D4_Q8_1 activation scales, fp16
+dequantization and cuBLAS. The reuse path is the strongest result here (4.4×
+TTFT): Qwen2 has no SWA ring, so a resident prefix is a plain KV slice and
+needs no wrap handling.
