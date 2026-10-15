@@ -1422,7 +1422,7 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
 // explicit Quantize node whose output is shared by several gemvs.
 bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
   if (!available() || !x || !yq || nblocks <= 0) return false;
-  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
       x, reinterpret_cast<q8_1::block_q8_1*>(yq), nblocks);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1578,7 +1578,7 @@ bool launch_gemv_q8_1(QuantType qt, const uint8_t* wp, const float* xp, float* y
       grow_scratch(g_q8, g_q8_bytes, nblocks * sizeof(q8_1::block_q8_1)));
   if (!d_q8) return false;
 
-  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
 
   launch_gemv_q8_1_from_quantized(qt, wp, d_q8, yp, blocks_per_row, num_rows);
   return cudaGetLastError() == cudaSuccess;
@@ -2073,7 +2073,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
     q8_1::block_q8_1* xq = static_cast<q8_1::block_q8_1*>(grow_scratch(
         g_q8, g_q8_bytes, nblocks * (size_t)n * sizeof(q8_1::block_q8_1)));
     if (!xq) return false;
-    q8_1::quantize_q8_1<<<(nblocks * n + 255) / 256, 256, 0, cur_stream()>>>(
+    q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(int(nblocks * n)), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
         X, xq, int(nblocks * n));
 
     // Batched warp-per-row gemv -> Y[n, rows] (position-major).

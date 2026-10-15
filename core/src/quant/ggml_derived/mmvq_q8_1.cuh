@@ -124,21 +124,35 @@ __device__ __forceinline__ int get_int_b4(const void* x, int i) {
   return static_cast<const int*>(x)[i];
 }
 
-// One thread per 32-element block; amax/127 quantization (== llama.cpp's
-// quantize_q8_1, which warp-reduces over the same 32 elements).
+// Threads per launch block for quantize_q8_1 (multiple of the warp size).
+inline constexpr int kQuantizeBlockThreads = 256;
+inline constexpr int kQuantizeWarpsPerBlock = kQuantizeBlockThreads / 32;
+
+// One WARP per 32-element block: lane `k` loads x[block*32 + k], a butterfly
+// shuffle reduces the block amax, and each lane quantizes its own element.
+// Same amax/127 quantization as llama.cpp's quantize_q8_1 (a warp reduction —
+// max is order-independent, so this is bit-identical to the serial scan it
+// replaces). The parallelism is per *element* rather than per block, which is
+// what makes a decode row (896 elements = 28 blocks, one wave of work at the
+// old one-thread-per-block mapping) short instead of latency-bound.
 __global__ void quantize_q8_1(const float* __restrict__ x,
                               block_q8_1* __restrict__ y, int nblocks) {
-  const int ib = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ib = blockIdx.x * kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
   if (ib >= nblocks) return;
-  const float* xb = x + (size_t)ib * 32;
-  float amax = 0.0f;
+  const int lane = threadIdx.x & 31;
+  const float xi = x[(size_t)ib * 32 + lane];
+  float amax = fabsf(xi);
   #pragma unroll
-  for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(xb[k]));
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
   const float d = amax / 127.0f;
-  y[ib].d = d;
-  #pragma unroll
-  for (int k = 0; k < 32; ++k)
-    y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(xb[k] / d));
+  if (lane == 0) y[ib].d = d;
+  y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(xi / d));
+}
+
+// Launch geometry for the warp-per-block mapping above.
+inline int quantize_q8_1_grid(int nblocks) {
+  return (nblocks + kQuantizeWarpsPerBlock - 1) / kQuantizeWarpsPerBlock;
 }
 
 // --- dot products (ported from llama.cpp vecdotq.cuh) ----------------------
