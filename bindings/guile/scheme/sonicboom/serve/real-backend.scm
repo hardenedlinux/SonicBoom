@@ -12,11 +12,12 @@
   #:export (make-real-backend))
 
 (define-record-type <real-model>
-  (make-real-model id handle context-length eos-tokens)
+  (make-real-model id handle context-length family eos-tokens)
   real-model?
   (id real-model-id)
   (handle real-model-handle)
   (context-length real-model-context-length)
+  (family real-model-family)
   (eos-tokens real-model-eos-tokens))
 
 (define-record-type <real-session>
@@ -26,30 +27,47 @@
   (handle real-session-handle)
   (history real-session-history set-real-session-history!))
 
+;; The GGUF architecture the C ABI reports ("gemma4", "qwen2") -> the chat
+;; template family. This is the ONE place the two names are matched: everything
+;; downstream (prompt formatting, turn markers, stop tokens) is driven by the
+;; family the loaded model selected, not by the file name or a flag.
+(define (family-for-arch arch)
+  (cond ((string=? arch "gemma4") 'gemma)
+        ((string=? arch "qwen2") 'qwen)
+        (else (error "no chat template for this model architecture" arch))))
+
 (define (load-real-model config)
   (let* ((path (assq-ref config 'path))
          (id (or (assq-ref config 'id) path))
          (context-length (or (assq-ref config 'context-length) 8192))
          (handle (inference:load-model path))
-         ;; TODO: Read tokenizer.chat_template and EOS IDs from GGUF metadata.
-         ;; This service currently serves Gemma 4 with its native turn tokens:
-         ;; the family's end-of-turn markers, tokenized with special parsing so
-         ;; each is the vocabulary's own control token (Gemma 4's "<turn|>" is
-         ;; both the turn marker and the model's eos id). Without that, they
-         ;; would come out as subword pieces and never match a sampled token.
-         (eos (append-map (lambda (s)
-                            (cdr (inference:tokenize handle s #:special? #t)))
-                          (template-eos-strings 'gemma))))
-    (make-real-model id handle context-length (delete-duplicates eos))))
+         (arch (inference:model-arch handle))
+         (family (family-for-arch arch))
+         ;; Stop tokens, two sources, unioned:
+         ;;  - the model's own eos ids, read from its metadata (Gemma 4: <turn|>,
+         ;;    Qwen2: <|im_end|>), which is what generation must stop on;
+         ;;  - the family template's end-of-turn markers. They are the same
+         ;;    control token for these two families, and the union keeps the
+         ;;    turn-end guarantee if a model's metadata ever names something
+         ;;    else.
+         ;; Either way the markers go through the tokenizer's special parsing,
+         ;; so each becomes the vocabulary's own control token; as plain text
+         ;; they would be subword pieces and never match a sampled token.
+         (eos (append
+               (inference:model-eos handle)
+               (append-map (lambda (s)
+                             (cdr (inference:tokenize handle s #:special? #t)))
+                           (template-eos-strings family)))))
+    (make-real-model id handle context-length family (delete-duplicates eos))))
 
 (define (real-model-info model)
   `((id . ,(real-model-id model))
-    (family . gemma)
+    (family . ,(real-model-family model))
     (context-length . ,(real-model-context-length model))
     (eos-tokens . ,(real-model-eos-tokens model))))
 
 (define (real-render-chat model messages tools tool-choice)
-  (render-chat-template-segments 'gemma messages
+  (render-chat-template-segments (real-model-family model) messages
                                  #:tools tools #:tool-choice tool-choice))
 
 ;; The template's own markers ('special segments) are parsed as the vocabulary's

@@ -246,9 +246,13 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
  *    and decodes directly, a longer prompt prefills then decodes;
  *  - sampling is greedy-only (temperature 0); non-greedy returns
  *    SB_ERR_UNSUPPORTED;
- *  - tokenize/detokenize use the GGUF built-in vocabulary (SPM-style BPE for
- *    Gemma 4, ▁-space escape, <0xNN> byte fallback), matching llama-tokenize;
- *  - only Gemma 4 models load; a Qwen2 GGUF returns SB_ERR_UNSUPPORTED.
+ *  - tokenize/detokenize use the model's GGUF built-in vocabulary (SPM-style
+ *    BPE for Gemma 4, byte-level BPE for Qwen2), matching llama-tokenize;
+ *  - the architectures SonicBoom models load (Gemma 4, Qwen2); anything else
+ *    returns SB_ERR_UNSUPPORTED. Which one loaded is readable with
+ *    sb_llm_model_arch, and the model's own stop tokens with sb_llm_model_eos —
+ *    a caller that formats prompts per family takes both from the model rather
+ *    than assuming.
  * These gaps are recorded in the post-v1 list (design/benchmark.md). */
 
 typedef struct sb_llm_model sb_llm_model;
@@ -277,6 +281,21 @@ typedef int (*sb_llm_token_cb)(void *user, sb_token token);
 sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
                             sb_error **err_out);
 void sb_llm_model_free(sb_llm_model *model);
+
+/* The loaded model's architecture, exactly as its GGUF declares it in
+ * `general.architecture` ("gemma4", "qwen2", ...). A caller that must format
+ * prompts, pick turn markers or otherwise behave differently per family reads
+ * this from the model instead of guessing from the file name. Two-call sizing
+ * like the other string out-params; *len_out excludes the NUL. */
+sb_status sb_llm_model_arch(const sb_llm_model *model, char *out, size_t cap,
+                            size_t *len_out, sb_error **err_out);
+
+/* The model's end-of-sequence token id(s) as its GGUF declares them
+ * (`tokenizer.ggml.eos_token_id`, plus `tokenizer.ggml.eos_token_ids` when the
+ * model lists several). *n_out receives the count; none declared gives 0.
+ * Two-call sizing: pass out NULL or cap too small for the count. */
+sb_status sb_llm_model_eos(const sb_llm_model *model, sb_token *out, size_t cap,
+                           size_t *n_out, sb_error **err_out);
 
 /* Tokenize/detokenize with the model's GGUF built-in vocabulary (SPM-style BPE
  * for Gemma 4). tokenize encodes `text` (UTF-8, `len` bytes) into token ids

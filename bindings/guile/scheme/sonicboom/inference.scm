@@ -24,7 +24,7 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
-  #:export (load-model free-model!
+  #:export (load-model free-model! model-arch model-eos
             make-session free-session!
             prefill! tokenize tokenize-segments detokenize
             generate generate-tokens generate-stream))
@@ -82,7 +82,8 @@
 ;;; --- model ------------------------------------------------------------------
 
 (define (load-model path)
-  "Load a Gemma 4 GGUF and return an opaque model handle."
+  "Load a GGUF (a model family SonicBoom supports) and return an opaque model
+handle."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
          (st ((proc 'sb_llm_model_load) (string->pointer path)
@@ -92,6 +93,42 @@
 
 (define (free-model! model)
   ((proc 'sb_llm_model_free) model))
+
+;; The model's architecture, as its GGUF declares it in general.architecture
+;; ("gemma4", "qwen2", ...). Who formats the prompt reads this from the model
+;; rather than guessing the family from the file name.
+(define (model-arch model)
+  (let* ((len-slot (make-bytevector 8 0))       ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *len_out (the length, no NUL).
+    (let ((st ((proc 'sb_llm_model_arch) model %null-pointer 0
+               (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+        (sb-check! st err-slot "model-arch")))
+    (let* ((m (bytevector-u64-native-ref len-slot 0))
+           (out (make-bytevector (+ m 1) 0))    ; +1 for the NUL terminator
+           (st ((proc 'sb_llm_model_arch) model (bytevector->pointer out) (+ m 1)
+                (bytevector->pointer len-slot) (slot-ptr err-slot))))
+      (sb-check! st err-slot "model-arch")
+      (utf8->string (bytevector-range out 0 m)))))
+
+;; The model's own end-of-sequence token ids (a possibly empty list), straight
+;; from its metadata: what generation has to stop on, per model rather than per
+;; family.
+(define (model-eos model)
+  (let* ((n-slot (make-bytevector 8 0))        ; size_t
+         (err-slot (make-slot)))
+    ;; Sizing call (cap 0): fills *n_out (the count).
+    (let ((st ((proc 'sb_llm_model_eos) model %null-pointer 0
+               (bytevector->pointer n-slot) (slot-ptr err-slot))))
+      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+        (sb-check! st err-slot "model-eos")))
+    (let* ((n (bytevector-u64-native-ref n-slot 0))
+           (bv (make-bytevector (* n 4) 0))
+           (st ((proc 'sb_llm_model_eos) model (bytevector->pointer bv) n
+                (bytevector->pointer n-slot) (slot-ptr err-slot))))
+      (sb-check! st err-slot "model-eos")
+      (s32-bv->list bv n))))
 
 ;;; --- session ----------------------------------------------------------------
 

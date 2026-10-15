@@ -32,7 +32,7 @@
   #:use-module (sonicboom serve sessions)
   #:use-module (sonicboom serve chat-template)
   #:export (make-engine engine? engine-models engine-model-ids engine-model
-            engine-pool engine-queue-limit
+            engine-model-families engine-pool engine-queue-limit
 
             make-chat-request chat-request?
             chat-request-model chat-request-messages chat-request-tools
@@ -112,6 +112,12 @@
 
 (define (engine-model engine id)
   (match (assoc id (engine-models engine)) ((_ . (m . _)) m) (#f #f)))
+
+;; (id . family) per served model, in serving order: the family each model
+;; selected from its architecture, for /v1/models.
+(define (engine-model-families engine)
+  (map (lambda (id) (cons id (model-family (engine-model engine id))))
+       (engine-model-ids engine)))
 
 (define (engine-pool engine id)
   (match (assoc id (engine-models engine)) ((_ . (_ . p)) p) (#f #f)))

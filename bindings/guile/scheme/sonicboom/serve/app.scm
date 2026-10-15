@@ -193,13 +193,14 @@
 
 (get "/v1/models" #:mime 'json
   (lambda (rc)
-    (:mime rc (models-object (engine-model-ids engine) start-time))))
+    (:mime rc (models-object (engine-model-families engine) start-time))))
 
 (get "/v1/models/:id"
   (lambda (rc)
-    (let ((id (params rc "id")))
-      (if (engine-model engine id)
-          (json-emit 200 (model-object id start-time))
+    (let* ((id (params rc "id"))
+           (model (engine-model engine id)))
+      (if model
+          (json-emit 200 (model-object id (model-family model) start-time))
           (apply error-emit (classify 'model-not-found (list id)))))))
 
 (post "/v1/chat/completions"

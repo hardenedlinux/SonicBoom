@@ -124,6 +124,10 @@ library search path?")))
                (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
                                                    (list '* '* '*)))
                (sb_llm_model_free . ,(foreign-proc "sb_llm_model_free" void (list '*)))
+               (sb_llm_model_arch . ,(foreign-proc "sb_llm_model_arch" int
+                                                   (list '* '* size_t '* '*)))
+               (sb_llm_model_eos . ,(foreign-proc "sb_llm_model_eos" int
+                                                  (list '* '* size_t '* '*)))
                (sb_llm_tokenize . ,(foreign-proc "sb_llm_tokenize" int
                                                  (list '* '* size_t '* size_t '* '*)))
                (sb_llm_tokenize_ex . ,(foreign-proc "sb_llm_tokenize_ex" int

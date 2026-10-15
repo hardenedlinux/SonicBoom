@@ -256,9 +256,17 @@
                                              ("function" . (("arguments" . ,(substring args i j))))))))
                        out)))))))
 
-(define (model-object id created)
-  `(("id" . ,id) ("object" . "model") ("created" . ,created) ("owned_by" . "sonicboom")))
+;; `family` is the chat-template family the loaded model selected (the serving
+;; backend reads the GGUF architecture and maps it — see real-backend's
+;; family-for-arch). It is not part of the OpenAI schema, but it tells a client
+;; which prompt format and which stop tokens this model expects instead of
+;; leaving it to infer the family from the file name.
+(define (model-object id family created)
+  `(("id" . ,id) ("object" . "model") ("created" . ,created)
+    ("owned_by" . "sonicboom") ("family" . ,(symbol->string family))))
 
-(define (models-object ids created)
+;; `models` is an (id . family) alist, in serving order.
+(define (models-object models created)
   `(("object" . "list")
-    ("data" . ,(list->vector (map (lambda (id) (model-object id created)) ids)))))
+    ("data" . ,(list->vector
+                (map (lambda (m) (model-object (car m) (cdr m) created)) models)))))

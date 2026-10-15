@@ -682,10 +682,14 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
         // the bundle's buffer.
         auto bundle = std::make_shared<sb_llm_bundle>(std::move(*reader));
 
+        // The architectures SonicBoom models (Gemma 4, Qwen2) load through the
+        // same arch-generic loader; `detect_arch` rejects anything else, so the
+        // check here is "does SonicBoom know this architecture at all", not a
+        // family list. `general.architecture` stays readable through
+        // sb_llm_model_arch for a caller that has to format prompts per family.
         auto arch = model::detect_arch(bundle->reader);
-        if (arch && *arch != model::ModelArch::Gemma4) {
-          set_error(err_out, SB_ERRKIND_INTERNAL,
-                    "model architecture not supported for inference (Gemma 4 only)");
+        if (!arch) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, arch.error().c_str());
           return SB_ERR_UNSUPPORTED;
         }
 
@@ -716,6 +720,67 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
 }
 
 void sb_llm_model_free(sb_llm_model *model) { delete model; }
+
+sb_status sb_llm_model_arch(const sb_llm_model *model, char *out, size_t cap,
+                            size_t *len_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!model || !len_out)
+          return fail_arg(err_out);
+        const gguf::Value *v = model->bundle->reader.find("general.architecture");
+        const std::string s =
+            (v && v->type == gguf::ValueType::String) ? v->s : std::string();
+        *len_out = s.size();
+        if (cap <= s.size())
+          return SB_ERR_BINDING;  // two-call sizing: *len_out holds the length
+        if (!s.empty())
+          std::memcpy(out, s.data(), s.size());
+        out[s.size()] = '\0';
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_llm_model_eos(const sb_llm_model *model, sb_token *out, size_t cap,
+                           size_t *n_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!model || !n_out)
+          return fail_arg(err_out);
+
+        // `tokenizer.ggml.eos_token_id` is the single id most models declare;
+        // `tokenizer.ggml.eos_token_ids` is the array form for a model with
+        // several. Both are read; a model that declares neither has none.
+        std::vector<int32_t> eos;
+        auto push = [&](const gguf::Value &v) {
+          if (v.type == gguf::ValueType::Array) {
+            if (v.elem_type == gguf::ValueType::Int32 ||
+                v.elem_type == gguf::ValueType::UInt32)
+              for (const auto &e : v.elems)
+                eos.push_back(int32_t(e.type == gguf::ValueType::UInt32
+                                          ? e.u : uint64_t(e.i)));
+          } else if (v.type == gguf::ValueType::Int32 ||
+                     v.type == gguf::ValueType::UInt32) {
+            eos.push_back(
+                int32_t(v.type == gguf::ValueType::UInt32 ? v.u : uint64_t(v.i)));
+          }
+        };
+        if (const gguf::Value *v =
+                model->bundle->reader.find("tokenizer.ggml.eos_token_id"))
+          push(*v);
+        if (const gguf::Value *v =
+                model->bundle->reader.find("tokenizer.ggml.eos_token_ids"))
+          push(*v);
+
+        *n_out = eos.size();
+        if (cap < eos.size())
+          return SB_ERR_BINDING;  // two-call sizing: *n_out holds the count
+        if (!eos.empty())
+          std::memcpy(out, eos.data(), eos.size() * sizeof(sb_token));
+        return SB_OK;
+      },
+      err_out);
+}
 
 sb_status sb_llm_tokenize_ex(const sb_llm_model *model, const char *text, size_t len,
                              int flags, sb_token *out, size_t cap,
