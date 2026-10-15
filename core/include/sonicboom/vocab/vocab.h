@@ -20,8 +20,19 @@
 //
 // `Vocab` is the Layer 2 tokenizer representation: a token -> piece table, the
 // BPE merge ranks, and the tokenizer flags needed to reproduce llama.cpp's
-// tokenize/detokenize for a Gemma-4 (SPM-style BPE) model. It owns no weights,
-// no device state, and exposes no native-torch / ATen / c10 types.
+// tokenize/detokenize. It owns no weights, no device state, and exposes no
+// native-torch / ATen / c10 types.
+//
+// Two vocabulary kinds share it, selected from the GGUF's
+// tokenizer.ggml.model / tokenizer.ggml.pre:
+//
+//   Gemma4     — SPM-style BPE over ▁-escaped text (tokenizer.ggml.model=gemma4)
+//   Gpt2Qwen2  — byte-level BPE with the qwen2 pre-tokenizer regex
+//                (tokenizer.ggml.model=gpt2, tokenizer.ggml.pre=qwen2)
+//
+// Everything else about the two — merge ranks, token types, special-token
+// handling, the bos/eos contract — is the same data, which is why the kind is
+// one enum field and not two types.
 //
 // The BPE/detokenize *algorithms* live in core/src/vocab/ggml_derived/ (MIT,
 // derived from ggml); this header and core/src/vocab/vocab.cpp only carry the
@@ -54,9 +65,19 @@ enum class TokenType : uint8_t {
   Byte = 6,
 };
 
+// Which pre-tokenizer the vocabulary uses. The two kinds differ in how a piece
+// of text is cut into words and how a word's bytes are spelled in the merge
+// tables; the merge tables themselves and the detokenize rules are common.
+enum class TokenizerKind : uint8_t {
+  Gemma4 = 0,    // SPM-style BPE: ▁-escaped input, <0xNN> byte fallback
+  Gpt2Qwen2 = 1, // byte-level BPE with the qwen2 pre-tokenizer regex
+};
+
 struct Vocab {
   std::vector<std::string> tokens;  // id -> piece text (▁-escaped)
   std::vector<TokenType> type;      // id -> effective type
+
+  TokenizerKind kind = TokenizerKind::Gemma4;
 
   std::unordered_map<std::string, int32_t> token_to_id;
 
@@ -84,13 +105,15 @@ struct Vocab {
   bool empty() const noexcept { return tokens.empty(); }
 };
 
-// Load the tokenizer from a GGUF reader. Returns an error string when the
-// file has no tokenizer (or a malformed one). Gemma-4 force-enables add_bos
-// like llama.cpp (its prompt always starts with <bos>).
+// Load the tokenizer from a GGUF reader. Returns an error string when the file
+// has no tokenizer, or one whose model / pre-tokenizer is not supported (the
+// error names the value that was found). Gemma-4 force-enables add_bos like
+// llama.cpp (its prompt always starts with <bos>); other architectures take
+// add_bos from the file.
 std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader);
 
 // tokenize: text -> token ids. When add_bos is set the <bos> token is prepended
-// (matching llama-tokenize's default), so a Gemma prompt round-trips through
+// (matching llama-tokenize's default), so a prompt round-trips through
 // detokenize().
 //
 // parse_special is opt-in and defaults off. With it on, occurrences of the

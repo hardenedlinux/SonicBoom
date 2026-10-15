@@ -74,14 +74,37 @@ core/src/quant/ggml_derived/quantize_q5_k.cpp
                                 ← ggml/src/ggml-quants.c / ggml-common.h
 
 core/src/vocab/ggml_derived/bpe_tokenizer.h
-    Gemma-4 SPM-style BPE tokenize + detokenize. Ported from:
+    SPM-style BPE tokenize + detokenize, and the symbol-chain BPE merge shared
+    by both vocabulary kinds. Ported from:
       - llm_tokenizer_bpe_session (symbol-chain BPE merge, <0xNN> byte fallback,
         ▁-space escape/unescape, gemma-4 newline special case)  ← llama.cpp/src/llama-vocab.cpp
       - apply_token_type_overrides (EOG -> control, gemma-4 </s> reset)
                                                                  ← llama.cpp/src/llama-vocab.cpp
-      - detokenize (remove_special, token_to_piece, clean_spaces)
+      - detokenize (remove_special, token_to_piece, clean_spaces, and the
+        byte-level branch for vocabularies that do not escape whitespace)
                                                                  ← llama.cpp/src/llama-vocab.cpp
       - unicode_len_utf8, newline-run regex split               ← llama.cpp/src/unicode.cpp
+
+core/src/vocab/ggml_derived/gpt2_bpe_tokenizer.h
+    Byte-level BPE pre-tokenizer, qwen2 pattern. Ported from:
+      - unicode_regex_split_custom_qwen2 (the matcher for the qwen2 regex)
+                                                                 ← llama.cpp/src/unicode.cpp
+
+core/src/vocab/ggml_derived/unicode_cpt_flags.h
+    Unicode codepoint classes (\p{L} / \p{N}) and the whitespace set the
+    pre-tokenizer regexes split on. Transcribed from:
+      - unicode_ranges_flags, unicode_set_whitespace   ← llama.cpp/src/unicode-data.cpp
+      - unicode_cpt_flags_from_cpt                     ← llama.cpp/src/unicode.cpp
+    (Adaptation: stored as maximal runs queried by binary search, instead of
+     upstream's 0x110000-entry array expanded at load.)
+
+core/src/vocab/ggml_derived/unicode_byte_map.h
+    UTF-8 <-> codepoint conversion and the GPT-2 byte-level byte<->codepoint
+    maps. Ported from:
+      - unicode_cpt_to_utf8, unicode_cpt_from_utf8, unicode_cpts_from_utf8,
+        unicode_byte_to_utf8_map, unicode_utf8_to_byte_map,
+        unicode_byte_encoding_process                  ← llama.cpp/src/unicode.cpp
+      - llama_decode_text                              ← llama.cpp/src/llama-vocab.cpp
 
 tests/core/ggml_baseline.h
     Verbatim transcription of ggml dequantize_row_q3/q4/q5_K + get_scale_min_k4,

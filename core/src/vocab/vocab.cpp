@@ -19,6 +19,7 @@
 #include <sonicboom/gguf/reader.h>
 
 #include "ggml_derived/bpe_tokenizer.h"
+#include "ggml_derived/gpt2_bpe_tokenizer.h"
 
 namespace sonicboom::vocab {
 
@@ -59,8 +60,26 @@ bool opt_bool(const gguf::Reader& reader, std::string_view key, bool dflt) {
 
 std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
   const Value* model = reader.find("tokenizer.ggml.model");
-  if (!model || model->s != "gemma4") {
-    return std::unexpected("unsupported tokenizer model (expected 'gemma4')");
+  if (!model) {
+    return std::unexpected("tokenizer.ggml.model missing");
+  }
+
+  Vocab v;
+  if (model->s == "gemma4") {
+    v.kind = TokenizerKind::Gemma4;
+  } else if (model->s == "gpt2") {
+    // A gpt2 model is byte-level BPE; the pre-tokenizer decides how its words
+    // are cut. Only the qwen2 pattern is implemented.
+    const Value* pre = reader.find("tokenizer.ggml.pre");
+    const std::string pre_s = pre ? pre->s : std::string();
+    if (pre_s != "qwen2") {
+      return std::unexpected("unsupported gpt2 pre-tokenizer '" + pre_s +
+                             "' (expected 'qwen2')");
+    }
+    v.kind = TokenizerKind::Gpt2Qwen2;
+  } else {
+    return std::unexpected("unsupported tokenizer model '" + model->s +
+                           "' (expected 'gemma4' or 'gpt2')");
   }
 
   const Value* tokens = reader.find("tokenizer.ggml.tokens");
@@ -74,7 +93,6 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
     return std::unexpected("tokenizer.ggml.merges missing or not a string array");
   }
 
-  Vocab v;
   const size_t n = tokens->elems.size();
   v.tokens.resize(n);
   v.type.assign(n, TokenType::Normal);
@@ -112,22 +130,40 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
   v.add_eos = opt_bool(reader, "tokenizer.ggml.add_eos_token", false);
   v.add_space_prefix = opt_bool(reader, "tokenizer.ggml.add_space_prefix", false);
 
-  // Gemma-4 fixed configuration (llama.cpp): spaces are escaped to ▁, spaces
-  // are cleaned up on detokenize, and add_bos is force-enabled.
-  v.escape_whitespaces = true;
-  v.clean_spaces = true;
-  if (!v.add_bos) v.add_bos = true;
+  if (v.kind == TokenizerKind::Gemma4) {
+    // Gemma-4 fixed configuration (llama.cpp): spaces are escaped to ▁, spaces
+    // are cleaned up on detokenize, and add_bos is force-enabled.
+    v.escape_whitespaces = true;
+    v.clean_spaces = true;
+    if (!v.add_bos) v.add_bos = true;
+  } else {
+    // gpt2 / qwen2 (llama.cpp): the piece text is byte-level encoded, so it is
+    // not ▁-escaped, and the qwen2 pre-tokenizer turns the clean-up pass off.
+    // add_bos keeps whatever the file said — a Qwen2 prompt does not start with
+    // a framework token.
+    v.escape_whitespaces = false;
+    v.clean_spaces = false;
+  }
 
+  // llama.cpp's post-load override is not model-specific: the same
+  // end-of-generation list is promoted to control for every vocabulary (and,
+  // for the vocabularies that have a <|tool_response>, "</s>" is demoted back).
   ggml_bpe::apply_token_type_overrides(v);
   return v;
 }
 
 std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
                               bool parse_special, bool add_special) {
+  if (v.kind == TokenizerKind::Gpt2Qwen2) {
+    return ggml_gpt2::tokenize(v, text, parse_special, add_special);
+  }
   return ggml_bpe::tokenize(v, text, parse_special, add_special);
 }
 
 std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n) {
+  if (v.kind == TokenizerKind::Gpt2Qwen2) {
+    return ggml_gpt2::detokenize(v, tokens, n);
+  }
   return ggml_bpe::detokenize(v, tokens, n);
 }
 

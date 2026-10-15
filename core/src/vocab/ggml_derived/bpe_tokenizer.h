@@ -49,6 +49,8 @@
 
 #include <sonicboom/vocab/vocab.h>
 
+#include "unicode_byte_map.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
@@ -131,7 +133,11 @@ inline void apply_token_type_overrides(Vocab& v) {
 
 // --- BPE tokenize -----------------------------------------------------------
 
-namespace {
+// The symbol-chain BPE merge below is shared by both vocabulary kinds: the
+// gemma4 SPM-style one and the gpt2 byte-level one in gpt2_bpe_tokenizer.h.
+// They differ in two places only, both selected by `byte_encoded` — whether the
+// gemma4 newline special case applies, and what the fallback is for a symbol
+// that is not in the vocabulary.
 
 struct Symbol {
   int32_t prev = -1;
@@ -155,8 +161,8 @@ struct BigramCmp {
 
 using BigramQueue = std::priority_queue<Bigram, std::vector<Bigram>, BigramCmp>;
 
-void add_new_bigram(const Vocab& v, const std::vector<Symbol>& symbols,
-                    BigramQueue& queue, int32_t left, int32_t right) {
+inline void add_new_bigram(const Vocab& v, const std::vector<Symbol>& symbols,
+                           BigramQueue& queue, int32_t left, int32_t right) {
   if (left == -1 || right == -1) return;
   std::string left_token(symbols[left].text, symbols[left].n);
   std::string right_token(symbols[right].text, symbols[right].n);
@@ -170,8 +176,11 @@ void add_new_bigram(const Vocab& v, const std::vector<Symbol>& symbols,
   queue.push(std::move(bigram));
 }
 
-void tokenize_word(const Vocab& v, const std::string& word,
-                   std::vector<int32_t>& out) {
+// BPE one word. `word` is already in the form the vocabulary's merge tables
+// use: ▁-escaped for the SPM-style vocabularies, byte-level encoded for the
+// GPT-2-style ones.
+inline void tokenize_word(const Vocab& v, const std::string& word,
+                          std::vector<int32_t>& out, bool byte_encoded) {
   std::vector<Symbol> symbols;
   symbols.reserve(word.size());
   BigramQueue queue;
@@ -179,7 +188,7 @@ void tokenize_word(const Vocab& v, const std::string& word,
   size_t offset = 0;
   // gemma4 fix (llama.cpp PR #21343): a run of newlines that is itself a token
   // is emitted as one token instead of byte-falling-back per byte.
-  if (word.find_first_not_of('\n') == std::string::npos) {
+  if (!byte_encoded && word.find_first_not_of('\n') == std::string::npos) {
     auto it = v.token_to_id.find(word);
     if (it != v.token_to_id.end()) {
       out.push_back(it->second);
@@ -230,6 +239,13 @@ void tokenize_word(const Vocab& v, const std::string& word,
     auto it = v.token_to_id.find(str);
     if (it != v.token_to_id.end()) {
       out.push_back(it->second);
+    } else if (byte_encoded) {
+      // Byte-level BPE (gpt2 / qwen2): a symbol the merge loop could not extend
+      // is spelled one byte at a time, and every byte has its own entry.
+      for (size_t j = 0; j < str.size(); ++j) {
+        auto bit = v.token_to_id.find(std::string(1, str[j]));
+        if (bit != v.token_to_id.end()) out.push_back(bit->second);
+      }
     } else {
       // non-byte-encoded BPE (gemma4): byte fallback uses <0xNN> uppercase hex
       for (size_t j = 0; j < str.size(); ++j) {
@@ -241,8 +257,6 @@ void tokenize_word(const Vocab& v, const std::string& word,
     }
   }
 }
-
-}  // namespace
 
 // One raw (unescaped) span -> tokens: ▁-escape, then the gemma4 pre-tokenizer
 // "[^\n]+|[\n]+" — split into newline / non-newline runs. \n (0x0A) is a single
@@ -258,7 +272,7 @@ inline void tokenize_span(const Vocab& v, std::string_view span,
     const bool nl = escaped[i] == '\n';
     size_t j = i;
     while (j < escaped.size() && (escaped[j] == '\n') == nl) ++j;
-    tokenize_word(v, std::string(escaped.data() + i, j - i), out);
+    tokenize_word(v, std::string(escaped.data() + i, j - i), out, /*byte_encoded=*/false);
     i = j;
   }
 }
@@ -412,7 +426,21 @@ inline std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n) {
       piece = v.tokens[t];
     } else {  // Normal
       piece = v.tokens[t];
-      if (v.escape_whitespaces) unescape_whitespace(piece);
+      if (v.escape_whitespaces) {
+        unescape_whitespace(piece);
+      } else {
+        // Byte-level vocabulary: the stored piece is the byte-encoded spelling,
+        // so map it back through the byte table (llama.cpp llama_decode_text).
+        // A codepoint outside the table cannot occur in a vocabulary written by
+        // the same encoder; upstream prints a placeholder for it, and so does
+        // the fallback here.
+        std::string decoded;
+        if (ggml_unicode::byte_decode(piece, decoded)) {
+          piece = std::move(decoded);
+        } else {
+          piece = "[UNK_BYTE_0x" + piece + "]";
+        }
+      }
     }
 
     if (remove_space && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);

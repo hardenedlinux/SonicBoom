@@ -28,6 +28,11 @@
 // parameters, checked against the same driver with TOKENIZE_PARSE_SPECIAL=1):
 // a chat template's own turn markers become the vocabulary's single control
 // tokens, while the same characters inside ordinary text stay text.
+//
+// The second half of the file does the same for the Qwen2 vocabulary
+// (tokenizer.ggml.model=gpt2, tokenizer.ggml.pre=qwen2 — byte-level BPE) over
+// 34 samples, so both tokenizer kinds are pinned to llama.cpp. It skips on its
+// own when that GGUF is absent (SONICBOOM_QWEN_GGUF).
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/vocab/vocab.h>
@@ -157,14 +162,235 @@ const std::vector<SpecialSample> kSpecialSamples = {
      {2, 30468, 236743, 106, 1492}},
 };
 
+// --- Qwen2 (byte-level BPE) -------------------------------------------------
+//
+// The second vocabulary kind, checked the same way: against llama.cpp's
+// tokenizer on the same GGUF (tools/baseline/tokenize_text; TOKENIZE_PARSE_SPECIAL
+// unset and set). The samples cover each alternative of the qwen2
+// pre-tokenizer — contractions, a letter run with its optional leading space,
+// per-digit number splits, punctuation runs with trailing newlines, whitespace
+// runs — plus CJK, emoji, code, and bytes that a byte-level vocabulary spells
+// as a codepoint.
+
+struct QwenSample {
+  std::string text;
+  std::vector<int32_t> off;  // tokenize(x), parse_special = false
+  std::vector<int32_t> on;   // tokenize(x, /*parse_special=*/true)
+};
+
+const std::vector<QwenSample> kQwenSamples = {
+    {"Hello, world!",
+     {9707, 11, 1879, 0},
+     {9707, 11, 1879, 0}},
+    {"What's the weather like today? It's sunny.",
+     {3838, 594, 279, 9104, 1075, 3351, 30, 1084, 594, 39698, 13},
+     {3838, 594, 279, 9104, 1075, 3351, 30, 1084, 594, 39698, 13}},
+    {"don't can't we've he'll I'm you're they'd",
+     {15007, 944, 646, 944, 582, 3003, 566, 3278, 358, 2776, 498, 2299, 807, 4172},
+     {15007, 944, 646, 944, 582, 3003, 566, 3278, 358, 2776, 498, 2299, 807, 4172}},
+    {"The quick brown fox jumps over the lazy dog.",
+     {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13},
+     {785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13}},
+    {"numbers 1234567890 and 3.14 and 2,000,000",
+     {37378, 220, 16, 17, 18, 19, 20, 21, 22, 23, 24, 15, 323, 220, 18, 13, 16, 19, 323, 220, 17, 11, 15, 15, 15, 11, 15, 15, 15},
+     {37378, 220, 16, 17, 18, 19, 20, 21, 22, 23, 24, 15, 323, 220, 18, 13, 16, 19, 323, 220, 17, 11, 15, 15, 15, 11, 15, 15, 15}},
+    {"def fib(n):\n    return n if n < 2 else fib(n-1) + fib(n-2)\n",
+     {750, 15801, 1445, 982, 262, 470, 308, 421, 308, 366, 220, 17, 770, 15801, 1445, 12, 16, 8, 488, 15801, 1445, 12, 17, 340},
+     {750, 15801, 1445, 982, 262, 470, 308, 421, 308, 366, 220, 17, 770, 15801, 1445, 12, 16, 8, 488, 15801, 1445, 12, 17, 340}},
+    {"int main() {\n    printf(\"hello\\n\");\n    return 0;\n}\n",
+     {396, 1887, 368, 341, 262, 4100, 445, 14990, 1699, 797, 262, 470, 220, 15, 280, 532},
+     {396, 1887, 368, 341, 262, 4100, 445, 14990, 1699, 797, 262, 470, 220, 15, 280, 532}},
+    {"你好，世界！",
+     {108386, 3837, 99489, 6313},
+     {108386, 3837, 99489, 6313}},
+    {"今天天气真不错，我们去公园散步吧。",
+     {100644, 104307, 88051, 100832, 3837, 97639, 85336, 102077, 111261, 100003, 1773},
+     {100644, 104307, 88051, 100832, 3837, 97639, 85336, 102077, 111261, 100003, 1773}},
+    {"   leading and    multiple    spaces   ",
+     {256, 6388, 323, 262, 5248, 262, 12621, 262},
+     {256, 6388, 323, 262, 5248, 262, 12621, 262}},
+    {"trailing spaces at the end   ",
+     {376, 14277, 12621, 518, 279, 835, 262},
+     {376, 14277, 12621, 518, 279, 835, 262}},
+    {"a\tb\tc",
+     {64, 2233, 1444},
+     {64, 2233, 1444}},
+    {"line one\nline two\n",
+     {1056, 825, 198, 1056, 1378, 198},
+     {1056, 825, 198, 1056, 1378, 198}},
+    {"\n",
+     {198},
+     {198}},
+    {"http://example.com/path?q=1&r=2#frag",
+     {1254, 1110, 8687, 905, 50976, 43782, 28, 16, 60617, 28, 17, 2, 33198},
+     {1254, 1110, 8687, 905, 50976, 43782, 28, 16, 60617, 28, 17, 2, 33198}},
+    {"user@example.com and $(whoami) and ${HOME}",
+     {872, 35487, 905, 323, 4930, 14623, 10606, 8, 323, 3570, 27546, 92},
+     {872, 35487, 905, 323, 4930, 14623, 10606, 8, 323, 3570, 27546, 92}},
+    {"The result is 42. But 3.14159 is pi, 100% sure.",
+     {785, 1102, 374, 220, 19, 17, 13, 1988, 220, 18, 13, 16, 19, 16, 20, 24, 374, 8938, 11, 220, 16, 15, 15, 4, 2704, 13},
+     {785, 1102, 374, 220, 19, 17, 13, 1988, 220, 18, 13, 16, 19, 16, 20, 24, 374, 8938, 11, 220, 16, 15, 15, 4, 2704, 13}},
+    {"She said: \"Its not what I asked for!\"",
+     {7941, 1053, 25, 330, 36120, 537, 1128, 358, 4588, 369, 8958},
+     {7941, 1053, 25, 330, 36120, 537, 1128, 358, 4588, 369, 8958}},
+    {"(parens) [brackets] {braces} <angles>",
+     {1295, 546, 4412, 8, 508, 1323, 18382, 60, 314, 1323, 2434, 92, 366, 17248, 29},
+     {1295, 546, 4412, 8, 508, 1323, 18382, 60, 314, 1323, 2434, 92, 366, 17248, 29}},
+    {"  ",
+     {256},
+     {256}},
+    {" ",
+     {220},
+     {220}},
+    {"café naïve résumé — em dash … ellipsis",
+     {924, 58858, 94880, 586, 9333, 1242, 963, 1959, 976, 23911, 4593, 25607, 47402},
+     {924, 58858, 94880, 586, 9333, 1242, 963, 1959, 976, 23911, 4593, 25607, 47402}},
+    {"emoji 😀🎉🚀 in the middle",
+     {37523, 90316, 144841, 145836, 304, 279, 6149},
+     {37523, 90316, 144841, 145836, 304, 279, 6149}},
+    {"日本語のテキストと 漢字 が混ざる文",
+     {101059, 102819, 15767, 56833, 61803, 70534, 19182, 6567, 120, 95, 18600, 220, 28195, 100235, 74594, 29269, 16744},
+     {101059, 102819, 15767, 56833, 61803, 70534, 19182, 6567, 120, 95, 18600, 220, 28195, 100235, 74594, 29269, 16744}},
+    {"SELECT * FROM users WHERE id = 1 ORDER BY name;",
+     {4858, 353, 4295, 3847, 5288, 877, 284, 220, 16, 15520, 7710, 829, 26},
+     {4858, 353, 4295, 3847, 5288, 877, 284, 220, 16, 15520, 7710, 829, 26}},
+    {"#!/bin/bash\nset -euo pipefail\necho \"done\"",
+     {8701, 6863, 17148, 198, 746, 481, 20128, 78, 13647, 18403, 198, 3047, 330, 10438, 1},
+     {8701, 6863, 17148, 198, 746, 481, 20128, 78, 13647, 18403, 198, 3047, 330, 10438, 1}},
+    {"<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant",
+     {27, 91, 318, 4906, 91, 29, 872, 198, 9707, 86932, 91, 318, 6213, 91, 397, 27, 91, 318, 4906, 91, 29, 77091},
+     {151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091}},
+    {"say <|endoftext|> now",
+     {36790, 82639, 8691, 723, 427, 91, 29, 1431},
+     {36790, 220, 151643, 1431}},
+    {"x=1;y=2;z=x+y*3-4/2",
+     {87, 28, 16, 70863, 28, 17, 96712, 25387, 43010, 9, 18, 12, 19, 14, 17},
+     {87, 28, 16, 70863, 28, 17, 96712, 25387, 43010, 9, 18, 12, 19, 14, 17}},
+    {"AaBbCcDdEeFfGg 0123456789 !@#$%^&*()",
+     {32, 64, 33, 65, 97754, 35, 67, 36, 68, 37, 69, 38, 70, 220, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 753, 31, 48077, 45899, 5, 9, 368},
+     {32, 64, 33, 65, 97754, 35, 67, 36, 68, 37, 69, 38, 70, 220, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 753, 31, 48077, 45899, 5, 9, 368}},
+    {"multiple\nnewlines\n\n\nhere",
+     {35673, 198, 931, 7969, 1406, 6739},
+     {35673, 198, 931, 7969, 1406, 6739}},
+    {"punct!!!!and???and...and,,,and;;;",
+     {79, 19931, 17085, 437, 33015, 437, 1112, 437, 60723, 437, 36328},
+     {79, 19931, 17085, 437, 33015, 437, 1112, 437, 60723, 437, 36328}},
+    {"MiXeD CaSe TeXt AND CamelCaseIdentifiers",
+     {41887, 55, 68, 35, 14413, 1514, 2655, 55, 83, 3567, 68154, 4207, 28301, 11836},
+     {41887, 55, 68, 35, 14413, 1514, 2655, 55, 83, 3567, 68154, 4207, 28301, 11836}},
+    {"ChineseEnglishMixed中文English123",
+     {44923, 22574, 86433, 104811, 22574, 16, 17, 18},
+     {44923, 22574, 86433, 104811, 22574, 16, 17, 18}},
+};
+
+int g_qwen_samples = 0;
+
+std::string find_qwen_model() {
+  std::vector<std::string> candidates;
+  if (const char* env = std::getenv("SONICBOOM_QWEN_GGUF"))
+    candidates.push_back(env);
+#ifdef SONICBOOM_SRC_DIR
+  candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
+                       "/models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+#endif
+  candidates.push_back("models/qwen2.5-0.5b-instruct-q4_k_m.gguf");
+  for (const auto& c : candidates)
+    if (std::filesystem::exists(c)) return c;
+  return {};
+}
+
+void run_qwen() {
+  const std::string path = find_qwen_model();
+  if (path.empty()) {
+    std::cout << "  (skipped: Qwen2 model not found)\n";
+    return;
+  }
+  auto r = sbgguf::Reader::load(path);
+  if (!r) {
+    check(false, "failed to load the Qwen2 GGUF");
+    return;
+  }
+  auto v = sbvocab::load_vocab(*r);
+  if (!v) {
+    check(false, "load_vocab failed on the Qwen2 GGUF: " + v.error());
+    return;
+  }
+
+  // The loader must pick the byte-level pre-tokenizer, and Qwen2 asks for no
+  // <bos>: a prompt is not wrapped in a framework token.
+  check(v->kind == sbvocab::TokenizerKind::Gpt2Qwen2,
+        "the Qwen2 vocabulary did not select the byte-level BPE tokenizer");
+  check(!v->add_bos, "the Qwen2 vocabulary has add_bos set");
+
+  size_t differing = 0;
+  for (size_t i = 0; i < kQwenSamples.size(); ++i) {
+    const QwenSample& s = kQwenSamples[i];
+    const std::string tag = "qwen sample " + std::to_string(i);
+
+    // 1. tokenize matches llama-tokenize, with and without special parsing.
+    const std::vector<int32_t> off = sbvocab::tokenize(*v, s.text);
+    if (off != s.off) {
+      check(false, tag + ": tokenize mismatch");
+      std::cerr << "    got  ";
+      for (int32_t t : off) std::cerr << t << " ";
+      std::cerr << "\n    want ";
+      for (int32_t t : s.off) std::cerr << t << " ";
+      std::cerr << "\n";
+    }
+    const std::vector<int32_t> on = sbvocab::tokenize(*v, s.text, true);
+    if (on != s.on) {
+      check(false, tag + ": parse_special mismatch");
+      std::cerr << "    got  ";
+      for (int32_t t : on) std::cerr << t << " ";
+      std::cerr << "\n    want ";
+      for (int32_t t : s.on) std::cerr << t << " ";
+      std::cerr << "\n";
+    }
+    if (s.off != s.on) ++differing;
+
+    // 2. detokenize(tokenize(x)) == x, through the byte-level decoder.
+    const std::string back = sbvocab::detokenize(*v, off.data(), off.size());
+    if (back != s.text) {
+      check(false, tag + ": round-trip mismatch");
+      std::cerr << "    got  \"" << back << "\"\n    want \"" << s.text
+                << "\"\n";
+    }
+    ++g_qwen_samples;
+  }
+
+  // The ChatML markers must be control-typed tokens of this vocabulary, or
+  // special parsing would not turn them into one id each.
+  for (const auto& [piece, id] : std::vector<std::pair<std::string, int32_t>>{
+           {"<|im_start|>", 151644},
+           {"<|im_end|>", 151645},
+           {"<|endoftext|>", 151643}}) {
+    check(id < static_cast<int32_t>(v->tokens.size()) && v->tokens[id] == piece,
+          "the vocabulary does not spell token " + std::to_string(id) + " as " +
+              piece);
+    check(id < static_cast<int32_t>(v->type.size()) &&
+              v->type[id] == sbvocab::TokenType::Control,
+          "token " + piece + " is not control-typed");
+  }
+
+  // The opt-in flag has to be observable, or the samples above would pass
+  // without exercising the special-token partition at all.
+  check(differing >= 2,
+        "no Qwen sample distinguishes parse_special from plain tokenization");
+
+  std::cout << "  Qwen2: " << g_qwen_samples << " samples, " << differing
+            << " of them with special markers\n";
+}
 }  // namespace
 
 int main() {
+  // Independent of the Gemma half: each runs when its own GGUF is present.
+  run_qwen();
+
   const std::string path = find_model();
   if (path.empty()) {
     std::cout << "  (skipped: Gemma 4 model not found)\n";
     std::cout << "test_vocab OK\n";
-    return 0;
+    return g_failures == 0 ? 0 : 1;
   }
 
   auto r = sbgguf::Reader::load(path);
@@ -240,8 +466,9 @@ int main() {
   }
 
   if (g_failures == 0) {
-    std::cout << "test_vocab OK (" << kSamples.size() << " samples, "
-              << kSpecialSamples.size() << " special)\n";
+    std::cout << "test_vocab OK (" << kSamples.size() << " Gemma samples, "
+              << kSpecialSamples.size() << " special, " << g_qwen_samples
+              << " Qwen2)\n";
     return 0;
   }
   std::cerr << "test_vocab FAILED: " << g_failures << " check(s)\n";
