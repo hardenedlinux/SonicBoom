@@ -355,4 +355,6 @@ a small model answers in a predictable way so that the tests can check it.")
                 #:fork-session mock-fork-session
                 #:prefill mock-prefill
                 #:step mock-step
-                #:stats mock-stats))
+                #:stats mock-stats
+                ;; mock-step honors the sampler's temperature / top-p / top-k.
+                #:sampling? #t))

@@ -41,7 +41,7 @@
 
             load-model model? model-backend model-handle
             model-id model-family model-context-length model-eos-tokens
-            model-info
+            model-info model-sampling?
             tokenize detokenize render-chat
             create-session free-session fork-session can-fork?
             session? session-model session-handle
@@ -58,7 +58,8 @@
 
 (define-record-type <backend>
   (%make-backend name load-model model-info tokenize detokenize render-chat
-                 create-session free-session fork-session prefill step stats)
+                 create-session free-session fork-session prefill step stats
+                 sampling?)
   backend?
   (name backend-name)
   (load-model %backend-load-model)
@@ -71,7 +72,8 @@
   (fork-session %backend-fork-session)
   (prefill %backend-prefill)
   (step %backend-step)
-  (stats %backend-stats))
+  (stats %backend-stats)
+  (sampling? backend-sampling?))
 
 (define (required who)
   (lambda _ (error "backend procedure not provided:" who)))
@@ -90,6 +92,11 @@
 ;;   prefill        (session token-ids)            -> reused count
 ;;   step           (session sampler constraint)   -> token id
 ;;   stats          (model)                        -> alist (optional)
+;; The sampling? capability says whether `step` honors the sampler's
+;; temperature / top-p / top-k. A greedy-only backend (the libsonicboom one:
+;; the core's decode accepts temperature 0, top-p 1, top-k 0 only) reports #f,
+;; and the HTTP layer then rejects an explicit sampling request instead of
+;; silently decoding greedily. It defaults to #f, so a backend has to claim it.
 (define* (make-backend #:key (name "backend")
                        (load-model (required 'load-model))
                        (model-info (required 'model-info))
@@ -101,9 +108,11 @@
                        (fork-session #f)
                        (prefill (required 'prefill))
                        (step (required 'step))
-                       (stats (lambda (model) '())))
+                       (stats (lambda (model) '()))
+                       (sampling? #f))
   (%make-backend name load-model model-info tokenize detokenize render-chat
-                 create-session free-session fork-session prefill step stats))
+                 create-session free-session fork-session prefill step stats
+                 sampling?))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Models and sessions
@@ -126,6 +135,10 @@
 (define (model-family model) (info-ref model 'family))
 (define (model-context-length model) (info-ref model 'context-length))
 (define (model-eos-tokens model) (info-ref model 'eos-tokens))
+
+;; Whether this model's backend can sample (see make-backend's sampling?).
+(define (model-sampling? model)
+  (backend-sampling? (model-backend model)))
 
 (define (load-model backend config)
   (let ((handle ((%backend-load-model backend) config)))

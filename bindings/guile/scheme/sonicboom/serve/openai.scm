@@ -18,6 +18,7 @@
   #:use-module (sonicboom serve engine)
   #:use-module (sonicboom serve chat-template)
   #:export (parse-chat-request
+            check-greedy-body
             openai-error-object raise-openai-error
             completion-object chunk-object usage-chunk-object
             role-delta content-delta tool-call-deltas finish-delta
@@ -156,6 +157,26 @@
                                #:seed seed)
             (eq? stream #t)
             include-usage)))
+
+;; A greedy-only backend cannot honor a sampling request, so an explicit one is
+;; rejected instead of silently decoding greedily (the core's decode wants
+;; temperature 0, top-p 1, top-k 0 and returns SB_ERR_UNSUPPORTED otherwise).
+;; A parameter that is absent means "the backend's default", which for a
+;; greedy-only backend is greedy — so the common OpenAI client that leaves
+;; temperature at its default still works, while one that asks for sampling is
+;; told so. BODY is the raw request object, before parse-chat-request's
+;; defaults, so "absent" is still visible here. Call it after
+;; parse-chat-request: that is what vets the parameter types.
+(define (check-greedy-body body)
+  (let ((t (ref body "temperature"))
+        (p (ref body "top_p"))
+        (k (ref body "top_k")))
+    (when (and (number? t) (not (zero? t)))
+      (invalid "this backend decodes greedily; temperature must be 0" "temperature"))
+    (when (and (number? p) (not (= p 1)))
+      (invalid "this backend decodes greedily; top_p must be 1" "top_p"))
+    (when (and (number? k) (not (zero? k)))
+      (invalid "this backend decodes greedily; top_k must be 0" "top_k"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Responses

@@ -147,9 +147,14 @@
 (define (admit body)
   (call-with-values (lambda () (parse-chat-request body))
     (lambda (request stream? include-usage?)
-      (unless (engine-model engine (chat-request-model request))
-        (throw 'model-not-found (chat-request-model request)))
-      (values request stream? include-usage? (engine-admit! engine)))))
+      (let ((model (engine-model engine (chat-request-model request))))
+        (unless model
+          (throw 'model-not-found (chat-request-model request)))
+        ;; The libsonicboom backend decodes greedily only; an explicit
+        ;; sampling request is a 400, not a silent fallback.
+        (unless (model-sampling? model)
+          (check-greedy-body body))
+        (values request stream? include-usage? (engine-admit! engine))))))
 
 ;; Run an admitted request, sending its chunks through send-obj (returns #f
 ;; once the client is gone). Ends with "[DONE]" through send-text.
