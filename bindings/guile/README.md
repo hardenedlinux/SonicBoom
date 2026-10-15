@@ -254,7 +254,7 @@ pointers and are freed explicitly.
 
 - `load-model path`, `free-model! model` — load a GGUF
 - `make-session model n-ctx`, `free-session! session` — a session holds a token history and a context window
-- `prefill! session tokens` — set the session's prompt; returns how many tokens were reused from the previous prompt
+- `prefill! session tokens` — set the session's prompt; returns how many leading tokens were reused from the previous prompt (at most `length - 1`: the last token is always re-processed, its activation being what produces the next-token logits)
 - `tokenize model text` — UTF-8 text to token ids (a `<bos>` is prepended)
 - `detokenize model tokens` — token ids back to text
 - `generate model session prompt max-tokens` — tokenize, prefill, decode greedily, detokenize
@@ -318,9 +318,10 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
   the whole text and looks across token boundaries, so streaming must
   re-detokenize the prefix (which `generate-stream` does; that is O(tokens²)
   per call).
-- **A prompt already resident in a session's KV cache in full fails** in
-  `sb_llm_prefill` ("CUDA prefill failed"); the CUDA prefill has an empty
-  suffix and returns 0, which the C ABI reads as an internal error.
+- **A prompt already resident in a session's KV cache is reused down to its last
+  token.** `sb_llm_prefill` reuses at most `n - 1` tokens and re-prefills the
+  final one, so the prefill suffix is never empty: an identical repeat of a
+  prompt succeeds and reports `n_reused = n - 1`.
 - **The Gemma turn markers are not single special tokens**: `<start_of_turn>`
   tokenizes into six subword pieces. The text round-trips, so the rendered
   prompt reads the same as llama.cpp's chat template, but it is not the same

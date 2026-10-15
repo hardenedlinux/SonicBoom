@@ -1493,13 +1493,25 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             uint64_t start_pos,
                                             std::span<int64_t> tokens,
                                             planner::KvCacheSession& session,
-                                            bool use_prefill) {
+                                            bool use_prefill,
+                                            uint64_t* n_reused_out) {
+  if (n_reused_out) *n_reused_out = 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
 
   // Prefix reuse only anchors at position 0 (the session's token history is a
   // contiguous run from 0); a non-zero start_pos disables reuse.
-  const uint64_t prefix_len =
+  uint64_t prefix_len =
       (start_pos == 0) ? session.common_prefix_len(prompt) : 0;
+
+  // A prompt the session already holds in full leaves an empty suffix, and
+  // prefilling nothing produces no logits at all (the backend returns 0, which
+  // the C ABI reads as a failure). The activation of the *last* prompt token is
+  // what yields the next-token logits, so that token always has to be
+  // processed: keep all but it resident and prefill it as a one-token suffix.
+  // The reported reuse count stays honest — this is exactly what was reused.
+  if (prefix_len == prompt.size())
+    prefix_len = prompt.size() - 1;
+  if (n_reused_out) *n_reused_out = prefix_len;
 
   // The cache size is the session's n_ctx (pre-set by the caller for its largest
   // request); the first call sizes it from its own prompt when session.n_ctx is
@@ -1534,7 +1546,9 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model&,
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
                                             std::span<const uint64_t>, uint64_t,
                                             std::span<int64_t>,
-                                            planner::KvCacheSession&, bool) {
+                                            planner::KvCacheSession&, bool,
+                                            uint64_t* n_reused_out) {
+  if (n_reused_out) *n_reused_out = 0;
   return 0;  // built without CUDA: no device prefill is available
 }
 #endif

@@ -167,11 +167,19 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 // (returns 0). The capability is generic — it knows nothing about Gemma's layer
 // structure, only the session's token history and the backend-owned slot
 // geometry.
+//
+// A prompt that the session already holds in full has no new suffix to prefill,
+// and prefilling nothing yields no logits. The last token is therefore always
+// processed: the reuse is capped at prompt.size()-1 and that token is prefilled
+// as a one-token suffix, which produces exactly the logits a full prefill would.
+// `n_reused_out` (optional) reports the prefix actually reused, so the count is
+// prompt.size()-1 in that case and the matched prefix length otherwise.
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint64_t> prompt,
                                             uint64_t start_pos,
                                             std::span<int64_t> tokens,
                                             planner::KvCacheSession& session,
-                                            bool use_prefill = true);
+                                            bool use_prefill = true,
+                                            uint64_t* n_reused_out = nullptr);
 
 } // namespace sonicboom::model

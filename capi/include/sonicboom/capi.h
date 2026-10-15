@@ -297,9 +297,11 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
 void sb_llm_session_free(sb_llm_session *session);
 
 /* Set the session's prompt to tokens[0..n). *n_reused_out receives the length
- * of the longest common prefix with the previous prompt (informational: the CPU
- * decode path re-prefills rather than reusing KV slots; KV reuse is the CUDA
- * prefix-cache path, post-v1). */
+ * of leading tokens reused from the previous prompt's KV state. The last prompt
+ * token is always processed — its activation is what produces the next-token
+ * logits — so the count is at most n-1, even when the whole prompt is already
+ * resident. (The CPU decode path re-prefills rather than reusing KV slots; KV
+ * reuse is the CUDA prefix-cache path.) */
 sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens, size_t n,
                          uint64_t *n_reused_out, sb_error **err_out);
 

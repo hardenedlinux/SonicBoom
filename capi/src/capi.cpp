@@ -805,8 +805,14 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
             ++k;
           return k;
         }();
-        if (n_reused_out)
-          *n_reused_out = static_cast<uint64_t>(common);
+        // The last prompt token is always (re)processed: its activation is what
+        // produces the next-token logits, so even a prompt the session holds in
+        // full can reuse at most n-1 tokens. This is the count for the CPU path,
+        // which re-prefills everything; the CUDA path below overwrites it with
+        // the prefix it actually kept.
+        uint64_t reused = static_cast<uint64_t>(common);
+        if (n > 0 && reused == n) reused = n - 1;
+        if (n_reused_out) *n_reused_out = reused;
 
         // Update the stored prompt first, then remember it as the previous
         // prompt: prev_prompt must hold the prompt that was *just* prefilled so
@@ -827,7 +833,7 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
           std::vector<int64_t> first(1, -1);
           const uint64_t done = model::generate_prefill_spine_cuda_prefix(
               m, prompt, /*start_pos=*/0, first, session->kv,
-              /*use_prefill=*/true);
+              /*use_prefill=*/true, &reused);
           if (done == 0 || first[0] < 0) {
             set_error(err_out, SB_ERRKIND_INTERNAL, "CUDA prefill failed");
             return SB_ERR_INTERNAL;

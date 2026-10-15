@@ -20,7 +20,9 @@
 // reproduce the full prefill's greedy continuation token-for-token. The matrix
 // covers the C.4 acceptance prefixes (512 / 600 / 1000 / 1040 / 3584 / 3600 /
 // 3996 / 4000 / 4095 / 4097, each +100 new) plus a +600 new case whose suffix
-// exceeds the sliding window (single segment over the SWA ring).
+// exceeds the sliding window (single segment over the SWA ring) and a
+// fully-reused case (+0 new: the prompt is already resident, so it is reused up
+// to len-1 and the last token is re-prefilled).
 //
 // Loads the Gemma 4 model and the token fixture (skips cleanly when either is
 // absent) and gates on a real CUDA device via quant::cuda_available().
@@ -142,11 +144,14 @@ int main() {
 
   const uint64_t steps = env_u64("SONICBOOM_PREFIX_CACHE_STEPS", 32);
 
+  // new_n == 0 is the fully-reused case: the prompt is what the session already
+  // holds, so the reuse is capped at len-1 (the last token is re-prefilled to
+  // produce the next-token logits) rather than leaving an empty suffix.
   struct Case { uint64_t prefix; uint64_t new_n; };
   const Case kCases[] = {
       {512, 100}, {600, 100},   {1000, 100}, {1040, 100},
       {3584, 100}, {3600, 100}, {3996, 100}, {4000, 100},
-      {4095, 100}, {4097, 100}, {4000, 600},
+      {4095, 100}, {4097, 100}, {4000, 600},  {512, 0},
   };
 
   for (const Case& c : kCases) {
@@ -175,11 +180,14 @@ int main() {
       continue;
     }
     std::vector<int64_t> reuse_toks(steps, -1);
+    uint64_t reused = 0;
     const uint64_t reuse_done = sbmodel::generate_prefill_spine_cuda_prefix(
-        *m, full, 0, reuse_toks, session, true);
+        *m, full, 0, reuse_toks, session, true, &reused);
     reuse_toks.resize(reuse_done);
 
     check(full_done == reuse_done, "same step count as full prefill");
+    check(reused == (c.new_n == 0 ? c.prefix - 1 : c.prefix),
+          "reuse count is the shared prefix (len-1 when fully reused)");
 
     if (full_toks == reuse_toks) {
       std::cout << "  prefix=" << c.prefix << " new=" << c.new_n

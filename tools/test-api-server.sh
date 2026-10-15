@@ -20,11 +20,10 @@
 # that the prefix cache is exercised on every request (the pool then takes over
 # its one session past the shared prefix instead of opening a new one).
 #
-# Known core limitation, checked last: a prompt that is *entirely* resident in
-# the session's KV cache makes sb_llm_prefill fail — the CUDA prefill has an
-# empty suffix and returns 0, which capi.cpp:831 reads as an internal error
-# (core/src/model/gemma4_plan.cpp:1512-1518). The check reports it rather than
-# failing, so the script stays useful on both sides of a fix.
+# A prompt that is *entirely* resident in the session's KV cache is handled too,
+# and is checked last: the prefill reuses all but the prompt's last token and
+# re-prefills that one (its activation is what produces the next-token logits),
+# so the repeat succeeds and reports cached_tokens == prompt_tokens - 1.
 
 set -u
 
@@ -146,9 +145,10 @@ fi
 # --- the same request, streamed ----------------------------------------------
 
 # A filler request first: with one pooled session the SSE request below would
-# otherwise repeat the prompt that is still resident in the KV cache, which is
-# the fully-reused case the core cannot do yet (see the last check). The filler
-# prompt is different, so the SSE prefill only shares a few prefix tokens.
+# otherwise repeat the prompt that is still resident in the KV cache. The filler
+# prompt is different, so the SSE prefill shares only a few prefix tokens and
+# exercises the ordinary partial-reuse path; the fully-reused case is the last
+# check.
 jpost "$base/v1/chat/completions" "$(ask 'zqz' 1)"
 
 sse=$tmp/sse.txt
@@ -237,17 +237,20 @@ else
   bad "the second turn of the reuse check failed ($code)"
 fi
 
-# --- a fully reused prompt (known core limitation) ---------------------------
+# --- a fully reused prompt ---------------------------------------------------
 
 # The same request again: the session already holds this prompt in full, so the
-# prefill has an empty suffix.
+# prefill reuses all but the last token and re-prefills that one.
 jpost "$base/v1/chat/completions" "$turn2"
 if [ "$code" = 200 ]; then
-  ok "an identical repeat reuses the whole prompt"
+  p3=$(num "$body" prompt_tokens); c3=$(num "$body" cached_tokens)
+  if [ "$c3" = "$((p3 - 1))" ]; then
+    ok "an identical repeat is reused down to its last token ($c3 of $p3)"
+  else
+    bad "an identical repeat reused $c3 of $p3 tokens (expected $((p3 - 1)))"
+  fi
 else
-  note "a fully reused prompt fails in the core (HTTP $code: $(msg "$body"))"
-  note "  sb_llm_prefill -> an empty prefill suffix -> done == 0 -> SB_ERR_INTERNAL"
-  note "  core/src/model/gemma4_plan.cpp:1512, capi/src/capi.cpp:831"
+  bad "an identical repeat of a resident prompt failed (HTTP $code: $(msg "$body"))"
 fi
 
 echo

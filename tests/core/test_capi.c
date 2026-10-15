@@ -28,6 +28,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_failures = 0;
@@ -200,11 +201,68 @@ static void test_error_slot_reuse(void) {
   sb_error_free(err);
 }
 
+/* A prompt the session already holds in full must not fail: sb_llm_prefill
+ * re-prefills the last token (its activation is what produces the next-token
+ * logits) and reports n-1 reused tokens. Needs the Gemma 4 GGUF, so it skips
+ * cleanly when SONICBOOM_GEMMA_GGUF is unset, like the model-backed tests. */
+static void test_llm_prefill_full_reuse(void) {
+  const char *path = getenv("SONICBOOM_GEMMA_GGUF");
+  FILE *f = path ? fopen(path, "rb") : NULL;
+  if (!f) {
+    printf("  (skipped: SONICBOOM_GEMMA_GGUF not set or unreadable)\n");
+    return;
+  }
+  fclose(f);
+
+  sb_llm_model *model = NULL;
+  sb_llm_session *session = NULL;
+  sb_error *err = NULL;
+  sb_token tok[64];
+  size_t n = 0;
+  const char *text = "The quick brown fox jumps over the lazy dog";
+
+  if (sb_llm_model_load(path, &model, &err) != SB_OK) {
+    check(0, "llm: model load succeeds");
+    sb_error_free(err);
+    return;
+  }
+  if (sb_llm_session_new(model, 512, &session, &err) != SB_OK) {
+    check(0, "llm: session created");
+    sb_error_free(err);
+    sb_llm_model_free(model);
+    return;
+  }
+  if (sb_llm_tokenize(model, text, strlen(text), tok, 64, &n, &err) != SB_OK ||
+      n < 2) {
+    check(0, "llm: prompt tokenized");
+    sb_error_free(err);
+    sb_llm_session_free(session);
+    sb_llm_model_free(model);
+    return;
+  }
+
+  uint64_t reused = 12345;
+  check(sb_llm_prefill(session, tok, n, &reused, &err) == SB_OK,
+        "llm: first prefill succeeds");
+  check(reused == 0, "llm: the first prefill reuses nothing");
+
+  /* The same prompt again: fully resident, so the reuse is capped at n-1. */
+  reused = 12345;
+  check(sb_llm_prefill(session, tok, n, &reused, &err) == SB_OK,
+        "llm: a fully reused prompt prefills successfully");
+  check(reused == n - 1, "llm: a fully reused prompt reports n-1 reused");
+  sb_error_free(err);
+
+  sb_llm_session_free(session);
+  sb_llm_model_free(model);
+}
+
 int main(void) {
   test_end_to_end();
   test_binding_error();
   test_parse_error();
   test_error_slot_reuse();
+  test_llm_prefill_full_reuse();
 
   if (g_failures == 0) {
     printf("test_capi OK (C ABI parse/compile/bind/execute/retrieve/release)\n");
