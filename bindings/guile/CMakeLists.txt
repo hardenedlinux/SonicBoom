@@ -48,6 +48,18 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-train.scm)
 
+  # guile-trace-lower lowers a traced forward graph onto the S-Expr v0.1
+  # vocabulary and executes it through libsonicboom.so (`run-s-expr`); same
+  # shared-library dependency as guile-nn.
+  add_test(
+    NAME guile-trace-lower
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-trace-lower.scm)
+
   # guile-inference drives the minimal LLM C ABI (sb_llm_*) through
   # (sonicboom inference): load-model / make-session / generate. It loads the
   # real Gemma 4 GGUF (skipping cleanly when absent) and checks the generated
