@@ -72,6 +72,18 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-trace-lower.scm)
 
+  # guile-nn-trace runs a `sequential` model through both
+  # routes — the emitted-text forward pass and the traced/lowered one — and
+  # checks that they agree; same shared-library dependency as guile-nn.
+  add_test(
+    NAME guile-nn-trace
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-nn-trace.scm)
+
   # guile-inference drives the minimal LLM C ABI (sb_llm_*) through
   # (sonicboom inference): load-model / make-session / generate. It loads the
   # real Gemma 4 GGUF (skipping cleanly when absent) and checks the generated
