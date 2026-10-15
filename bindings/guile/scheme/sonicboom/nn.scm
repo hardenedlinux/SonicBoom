@@ -17,6 +17,7 @@
   #:use-module (ice-9 optargs)
   #:use-module (sonicboom tensor)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom executable)
   #:export (layer? layer-kind layer-name layer-parameters layer-parameter-ref
             model? model-layers model-parameters model-parameter-ref
             model-graph-text linear relu sequential model-forward))
@@ -215,8 +216,12 @@ Returns the output tensor. Only float32 is supported in v0."
   (call-with-values
       (lambda () (build-graph "x" 'float32 (tensor-shape x) (model-layers model)))
     (lambda (text out-dims)
+      ;; The graph text is a pure function of the model's layer structure and
+      ;; the input shape, so the compiled executable is reused across forward
+      ;; passes (see (sonicboom executable)); disable with
+      ;; `executable-cache-enabled` to compile per call.
       (call-with-values
-          (lambda () (run-s-expr text (tensor->bytevector x)))
+          (lambda () (run-s-expr/cached text (tensor->bytevector x)))
         (lambda (out-bv err)
           (if err
               (error "model-forward:" err)

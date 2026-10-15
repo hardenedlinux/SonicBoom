@@ -28,6 +28,7 @@
   #:use-module (sonicboom trace tracer)
   #:use-module (sonicboom trace graph)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom executable)
   #:export (trace-graph traced->s-expr run-traced))
 
 ;;; --- document datum accessors ------------------------------------------------
@@ -200,8 +201,8 @@ ctensor. The S-Expr C ABI binds exactly one input and returns one output."
     (let ((x (assoc-ref inputs (car in-names))))
       (unless x (error "run-traced: missing input" (car in-names)))
       (let ((ty (graph-output-type g (car out-names))))
-        (call-with-values (lambda () (run-s-expr (traced->s-expr graph)
-                                                 (ctensor->f32-bytes x)))
+        (call-with-values (lambda () (run-s-expr/cached (traced->s-expr graph)
+                                                        (ctensor->f32-bytes x)))
           (lambda (bv err)
             (if err
                 (error "run-traced:" err)
