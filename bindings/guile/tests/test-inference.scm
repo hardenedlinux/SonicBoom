@@ -15,12 +15,17 @@
 ;;;   4. prefix-reuse bookkeeping on one session: a fresh first prefill reports
 ;;;      0 reused; extending by 100 new tokens reports 4000; a prompt whose
 ;;;      first token already differs reports 0.
+;;;   5. generate-stream: one callback per produced token, chunks that
+;;;      concatenate to exactly generate's output, the same token ids as
+;;;      generate-tokens, and a callback exception that stops the decode.
 ;;;
 ;;; Skips cleanly when the GGUF is absent, so the suite is green on machines
-;;; without the model.
+;;; without the model. The generate-stream chunk-boundary checks need no model
+;;; and always run.
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
+             (rnrs bytevectors)
              (sonicboom inference))
 
 (define (find-model)
@@ -40,7 +45,7 @@
 
 (let ((path (find-model)))
   (if (not path)
-      (test-skip 6)
+      (test-skip 11)
       (let* ((model (load-model path))
              (sess1 (make-session model 512)))
         (test-equal "generate-tokens reproduces the golden decode stream"
@@ -53,6 +58,48 @@
             (let ((s (generate model sess2 "Hello" 4)))
               (and (string? s) (> (string-length s) 0))))
           (free-session! sess2))
+
+        ;; Streaming. One decode per session: generate-stream's own run, and a
+        ;; separate generate / generate-tokens run of the same prompt for the
+        ;; reference (greedy decode is deterministic, so they see the same
+        ;; tokens).
+        (let* ((prompt (tokenize model "Hello"))
+               (chunks '())
+               (sess (make-session model 512))
+               (ids (generate-stream model sess prompt 8
+                                     (lambda (tok chunk)
+                                       (set! chunks (cons (cons tok chunk) chunks))))))
+          (free-session! sess)
+          (let ((ref-tokens (make-session model 512))
+                (ref-text (make-session model 512)))
+            (test-equal "generate-stream produces the same token ids as generate-tokens"
+              (generate-tokens ref-tokens prompt 8)
+              ids)
+            (test-equal "the concatenated chunks are exactly generate's output"
+              (generate model ref-text "Hello" 8)
+              (apply string-append (map cdr (reverse chunks))))
+            (free-session! ref-tokens)
+            (free-session! ref-text))
+          ;; A final flush call (token #f) only happens when the last token left
+          ;; a character half-arrived; for this prompt there is none, so the
+          ;; callback saw exactly one call per token, in order.
+          (test-equal "the callback sees exactly one call per produced token, in order"
+            ids (map car (reverse chunks)))
+          ;; A callback exception must stop the decode and come back out here,
+          ;; rather than unwinding through the decoder's frame.
+          (let ((seen 0)
+                (sess2 (make-session model 512)))
+            (test-assert "an exception from the callback stops the decode and propagates"
+              (catch #t
+                (lambda ()
+                  (generate-stream model sess2 prompt 20
+                                   (lambda (tok chunk)
+                                     (set! seen (+ seen 1))
+                                     (when (>= seen 3) (error "stop here"))))
+                  #f)
+                (lambda (key . args) #t)))
+            (test-equal "the decode stopped at the failing token" 3 seen)
+            (free-session! sess2)))
 
         (test-equal "tokenize / detokenize round-trip"
           "Hello, world!"
@@ -77,5 +124,32 @@
           (free-session! sess3))
 
         (free-model! model))))
+
+;;; --- chunk boundaries, without a model --------------------------------------
+;;; generate-stream holds a chunk back until its last character has fully
+;;; arrived, which is the whole point of the buffering. No natural prompt above
+;;; happened to split a character across two tokens, so the boundary rule itself
+;;; is checked directly — it is the one piece of streaming that can be pinned
+;;; down exactly. (Reached through the module, since it is an internal rule, not
+;;; part of the inference API.)
+
+(let ((prefix (module-ref (resolve-module '(sonicboom inference))
+                          'utf8-complete-prefix)))
+  (test-equal "an empty buffer emits nothing"
+    0 (prefix (make-bytevector 0 0) 0))
+  (test-equal "ASCII ends on a boundary"
+    2 (prefix #vu8(104 105) 2))
+  (test-equal "a pending 2-byte lead is held back"
+    1 (prefix #vu8(104 195) 2))
+  (test-equal "a completed 2-byte character is emitted"
+    3 (prefix #vu8(104 195 169) 3))
+  (test-equal "a completed 3-byte character is emitted"
+    3 (prefix #vu8(226 130 172) 3))
+  (test-equal "a pending 4-byte lead is held back"
+    1 (prefix #vu8(10 240 159) 3))
+  (test-equal "a completed 4-byte character is emitted"
+    5 (prefix #vu8(10 240 159 152 128) 5))
+  (test-equal "ASCII followed by a partial character emits only the ASCII"
+    3 (prefix #vu8(97 98 99 226 130) 5)))
 
 (test-end "sonicboom-inference")
