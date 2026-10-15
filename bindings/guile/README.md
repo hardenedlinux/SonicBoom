@@ -252,11 +252,18 @@ A GGUF language model through the minimal LLM C ABI: the built-in tokenizer,
 a session, prefill with prefix reuse, and greedy decode. Handles are foreign
 pointers and are freed explicitly.
 
+Nothing here is tied to one model family. The GGUF's architecture string
+selects the plan, the vocabulary decides which pieces are control tokens, and
+the model's own metadata supplies the turn-marker ids and the end-of-turn
+tokens — so a Gemma 4 and a Qwen2 GGUF both run through this same interface.
+
 - `load-model path`, `free-model! model` — load a GGUF
+- `model-arch model` — the GGUF's `general.architecture` (`"gemma4"`, `"qwen2"`, …): the string the loader and planner dispatch on
+- `model-eos model` — the model's end-of-turn token ids from its metadata (`tokenizer.ggml.eos_token_id`, plus the `tokenizer.ggml.eos_token_ids` array when a model lists more than one). Stop on these, not on a hard-coded token.
 - `make-session model n-ctx`, `free-session! session` — a session holds a token history and a context window
 - `prefill! session tokens` — set the session's prompt; returns how many leading tokens were reused from the previous prompt (at most `length - 1`: the last token is always re-processed, its activation being what produces the next-token logits)
-- `tokenize model text #:special?` — UTF-8 text to token ids (a `<bos>` is prepended); `#:special? #t` also matches the vocabulary's control pieces (`<|turn>`, `<turn|>`) verbatim, one token each
-- `tokenize-segments model segments` — a rendered chat prompt as `(kind . text)` segments: `'special` segments are tokenized with `#:special? #t`, `'text` segments never are; `<bos>` is added once, by the first segment
+- `tokenize model text #:special?` — UTF-8 text to token ids (the vocabulary's BOS is prepended when it asks for one); `#:special? #t` also matches the vocabulary's control pieces (`<|turn>`, `<turn|>` for Gemma; `<|im_start|>`, `<|im_end|>` for Qwen2) verbatim, one token each
+- `tokenize-segments model segments` — a rendered chat prompt as `(kind . text)` segments: `'special` segments are tokenized with `#:special? #t`, `'text` segments never are; BOS is added once, by the first segment
 - `detokenize model tokens` — token ids back to text
 - `generate model session prompt max-tokens` — tokenize, prefill, decode greedily, detokenize
 - `generate-tokens session prompt max-tokens #:prefill?` — the same, returning token ids; `#:prefill? #f` continues from what the session holds
@@ -283,11 +290,21 @@ OpenAI chat-completions shape:
 
 ```sh
 tools/run-api-server.scm            # or: PORT=8000 tools/run-api-server.scm
-tools/test-api-server.sh            # curl smoke test against the real model
+tools/test-api-server.sh            # curl smoke test against the real models
 ```
 
 `/health`, `/v1/models`, `/v1/models/:id`, `/v1/chat/completions` (JSON and
 SSE), `/v1/ws/chat` (WebSocket) and `/sonicboom/stats`.
+
+The chat format comes from the loaded model's architecture, not from a flag:
+`gemma4` renders Gemma's `<|turn>…` turns, `qwen2` renders ChatML, and a reply
+ends on the model's own end-of-turn tokens. An architecture with no template is
+refused at load time. `/v1/models` reports the family each model selected.
+
+`tools/test-api-server.sh` takes the GGUFs to test — defaulting to the Gemma and
+Qwen files under `models/` when both are present — and runs the whole suite
+once per model, so the binding is smoke-tested model-agnostically instead of
+against a single file.
 
 ## Limitations
 

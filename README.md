@@ -15,8 +15,9 @@ them: a graph planner, and behind it an MLIR compiler tier. Those layers are
 what llama.cpp's architecture does not have, and they are where SonicBoom keeps
 improving.
 
-> **Status: v0.0.1.** One model is verified end to end: Gemma 4 E4B-it
-> (Q3_K_M GGUF) on CUDA sm_86. Read [Scope of v0.0.1](#scope-of-v001) before
+> **Status: v0.0.1.** Two model families are verified end to end — Gemma 4
+> E4B-it (Q3_K_M) and Qwen2.5-0.5B-Instruct (Q4_K_M) — on CUDA sm_86, both
+> checked against llama.cpp. Read [Scope of v0.0.1](#scope-of-v001) before
 > trying it.
 
 ---
@@ -84,6 +85,32 @@ The comparison is against llama.cpp at the commit above. Newer llama.cpp
 versions may be faster or slower. Exact command lines, per-kernel breakdowns
 and the full history are in [`design/benchmark.md`](design/benchmark.md).
 
+### Qwen2.5-0.5B-Instruct Q4_K_M
+
+A second architecture on the same machine, the same runtime and the same
+llama.cpp commit.
+
+| | SonicBoom | llama.cpp | |
+|---|---:|---:|---:|
+| **Decode**, 64-step steady state | 255.7 tok/s | 307.89 ± 1.43 tok/s | 0.83× |
+| Decode at depth 512 | 224.2 tok/s | 304.10 ± 3.67 tok/s | 0.74× |
+| Prefill, 512 tokens | 4036.6 tok/s (126.84 ms) | 14505.81 ± 1063.36 tok/s | 0.28× |
+| **Time to first token, 512-token prefix + 64 new tokens** | **68.4 ms** with prefix reuse | | 4.4× faster than a full prefill (299.3 ms) |
+
+Here SonicBoom is behind on both decode and prefill. The depth-0 → depth-512
+decode drop (255.7 → 224.2, −12%) is attention over all 512 keys: Qwen2 has no
+sliding window for the Gemma ring to wrap. The prefill gap is the batched
+K-quant matmul, plus this file's Q6_K `ffn_down` adding its fp16-dequant
+fallback on top. Prefix reuse transfers unchanged and is the strongest result —
+with no ring buffer, a resident prefix is a plain KV slice. Reuse is against
+SonicBoom's own full prefill; llama-bench has no reuse measurement.
+
+The Qwen2 model is also where the tokenizer, the ChatML template and the
+architecture-driven chat-format selection were exercised. Its greedy token
+stream agrees with llama.cpp except at llama.cpp's own near-ties, where a
+different prefill batch geometry flips the last-place logits (first divergent
+step and top-1/top-2 margin recorded in `design/benchmark.md`).
+
 ---
 
 ## Quick start
@@ -143,6 +170,10 @@ curl -L -o models/gemma-4-E4B-it-Q3_K_M.gguf \
 echo "0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4  models/gemma-4-E4B-it-Q3_K_M.gguf" | sha256sum -c
 ```
 
+Any GGUF the runtime supports runs the same way — for instance
+`qwen2.5-0.5b-instruct-q4_k_m.gguf`, the other verified model (both files and
+their checksums are in [Scope of v0.0.1](#scope-of-v001)).
+
 Then start Guile:
 
 ```sh
@@ -183,18 +214,39 @@ Tests that need the model skip themselves when the GGUF is not present.
 v0.0.1 is a working runtime, not a drop-in replacement for llama.cpp. Its
 limits:
 
-- **One verified model:** Gemma 4 E4B-it, Q3_K_M. The model-specific code has
-  been decoupled from the planner and backend, and a Qwen2 config loader is in
-  place. Qwen2 decode is blocked on the quant formats below.
-- **Quant formats:** Q3_K, Q4_K and Q5_K only. Most Q4_K_M files you download
-  also contain Q6_K, Q8_0 or Q5_0 tensors, so they will not load yet.
+- **Two verified model families:** Gemma 4 E4B-it Q3_K_M and Qwen2.5-0.5B-Instruct
+  Q4_K_M. Both run end to end — load, tokenize, prefill and decode on CPU and
+  CUDA, prefix reuse, OpenAI-compatible serving — and both are checked against
+  llama.cpp on the same hardware.
+
+  | | file | sha256 |
+  |---|---|---|
+  | Gemma 4 E4B-it | `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes) | `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4` |
+  | Qwen2.5-0.5B-Instruct | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes) | `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` |
+
+  The GGUF's architecture string selects the plan and the chat format. There is
+  no `if (arch == ...)` in the planner or the backends, and no model-specific
+  code outside the GGUF loader and the plan emitter — the Qwen2 differences
+  (a SiLU-gated FFN, full attention with no sliding window, a bias on each
+  Q/K/V projection, an attention scale) are all generic ops and attributes, and
+  the fallback to the token embedding when a file omits `output.weight` is
+  generic too.
+- **Quant formats:** Q3_K, Q4_K, Q5_K, Q6_K, Q5_0 and Q8_0. `f16` and `q4_0`
+  tensors are converted to Q5_K at load time, which requires the row length to
+  be a multiple of 256; anything else is refused rather than converted. Q6_K
+  loads and decodes natively, but its prefill does not use the int8 tensor-core
+  weight kernel yet — it dequantizes to fp16 and uses cuBLAS, so a Q6_K
+  `ffn_down` makes prefill slower than the same shape in Q4_K.
 - **GPU:** CUDA on sm_86. Other architectures need `CMAKE_CUDA_ARCHITECTURES`
   changed and have not been tested. A CPU path exists but is a reference
   implementation, not a fast one.
 - **Sampling:** greedy only. `temperature`, `top_p` and `top_k` return
   `SB_ERR_UNSUPPORTED`.
-- **No chat template:** `generate` takes raw text, so you have to format chat
-  turns yourself.
+- **Chat template:** the serving layer picks the format from the loaded
+  architecture — Gemma's `<|turn>…` turn markers, or Qwen2's ChatML — and takes
+  the end-of-turn tokens from the model's metadata. `generate` itself still
+  takes raw text, so a caller that does not go through the server formats its
+  own turns.
 
 ---
 
@@ -207,8 +259,8 @@ license. They live in `ggml_derived/` directories, with the details in
 | | Lines of code |
 |---|---:|
 | ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 2,820 |
-| SonicBoom core total (`core/src`, `core/include`) | 19,706 |
-| **Derived share** | **~14.3%** |
+| SonicBoom core total (`core/src`, `core/include`) | 19,953 |
+| **Derived share** | **~14.1%** |
 
 *Counted with `cloc` 1.98. These are code lines only, excluding blanks and
 comments. The C ABI, the Guile bindings and the dependencies are not
@@ -246,7 +298,9 @@ What follows from this design:
 
 - **Planner gains carry over to every model.** A pass written once applies to
   any architecture that is lowered into the planner, with no new kernel
-  required. Gemma 4 support is already decoupled from the planner and backend.
+  required. Gemma 4 and Qwen2 both run through the same planner and backends,
+  with the architecture differences expressed as generic ops and attributes
+  rather than model-specific code.
 - **The kernels are no longer the limit.** With identical kernels, the
   runtime is already ahead of llama.cpp. Decode is still below the GPU's memory
   bandwidth limit for this model. Speculative decoding fits in as one more graph
@@ -341,15 +395,17 @@ Two routes share this core:
 
 ## Roadmap
 
-- **Formats and models:** Q6_K, Q8_0 and Q5_0, then Qwen as the second model
-  family
+- **Formats and models:** Q6_K, Q8_0 and Q5_0 are native and Qwen2 is a second
+  verified family; next are further families (Llama, Mistral) and the quant
+  formats they ship with
 - **Speed:** prefill parity with llama.cpp; speculative decoding, aiming for
   an average decode rate around 100 tok/s on the same RTX 3050
 - **Compiler:** MLIR GPU code generation for fused elementwise and norm
   chains
 - **Research route:** connect the Guile tracer to the core and compile traced
   graphs through the C ABI
-- **Usability:** sampling and chat templates
+- **Usability:** sampling — the runtime is still greedy only — on top of the
+  chat templates the serving layer now selects per model
 - **Scale:** larger MoE models with expert offload
 - **Beyond LLMs:** diffusion models, with a converter for existing ComfyUI
   workflows
