@@ -20,6 +20,7 @@
 
 #include <sonicboom/quant/dequant.h>
 
+#include "ggml_derived/legacy_quants_q5_0_q8_0.h"
 #include "ggml_derived/vec_dot_qK_q8K.h"
 
 #ifdef SONICBOOM_USE_CUDA
@@ -107,6 +108,8 @@ void dequantize_block(QuantType type, std::span<const std::byte> block,
     case QuantType::Q4_K: dequantize_q4_K(block, 1, out); break;
     case QuantType::Q5_K: dequantize_q5_K(block, 1, out); break;
     case QuantType::Q6_K: dequantize_q6_K(block, 1, out); break;
+    case QuantType::Q5_0: dequantize_q5_0(block, 1, out); break;
+    case QuantType::Q8_0: dequantize_q8_0(block, 1, out); break;
   }
 }
 
@@ -405,6 +408,42 @@ void dot_stream(const QuantizedTensor& W, const float* Xa, uint64_t cols,
 // Select the fused block-dot for the weight's quant type.
 using BlockDotFn = void (*)(const std::byte*, const Q8KBlock&, float[8], float&);
 
+// --- legacy 32-element formats (Q5_0 / Q8_0) ------------------------------
+//
+// ggml's activation type for these formats is q8_0, not q8_K, so they get their
+// own activation quantization and their own fused dots (the ggml-derived
+// scalar kernels). Everything else follows matmul_f32_q8_K: the batch column is
+// quantized per position, then rows are split across the thread pool, so the
+// arithmetic is worker-count independent.
+void matmul_legacy_q8_0(const QuantizedTensor& W, const float* Xa,
+                        uint64_t cols, uint64_t rows, uint64_t n, float* Y) {
+  const uint64_t blocks_per_row = cols / ggml_derived::QK8_0;  // exact (valid())
+  const uint64_t row_bytes = blocks_per_row * W.bytes_per_block();
+  const std::byte* data = W.data().data();
+  const bool is_q8_0 = W.type() == QuantType::Q8_0;
+
+  std::vector<ggml_derived::block_q8_0> act_blocks(blocks_per_row);
+  std::vector<float> col(cols);
+
+  ThreadPool& pool = ThreadPool::instance();
+
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t k = 0; k < cols; ++k) col[k] = Xa[c * cols + k];
+    ggml_derived::quantize_q8_0(col.data(), cols, act_blocks.data());
+
+    pool.parallel_for(0, rows, [&](uint64_t r_begin, uint64_t r_end) {
+      for (uint64_t r = r_begin; r < r_end; ++r) {
+        const std::byte* wrow = data + r * row_bytes;
+        Y[c * rows + r] =
+            is_q8_0 ? ggml_derived::vec_dot_q8_0_q8_0(wrow, act_blocks.data(),
+                                                       blocks_per_row)
+                    : ggml_derived::vec_dot_q5_0_q8_0(wrow, act_blocks.data(),
+                                                      blocks_per_row);
+      }
+    });
+  }
+}
+
 BlockDotFn block_dot_for(QuantType type) {
   // Runtime dispatch: AVX2 kernels are bit-exact with the scalar reference, so
   // the only behavioural difference is speed. Guard with __builtin_cpu_supports
@@ -451,6 +490,13 @@ bool matmul_f32_q8_K(const QuantizedTensor& W, std::span<const float> X,
                      std::span<float> Y, uint64_t n) {
   uint64_t cols, rows;
   if (!validate_matmul(W, n, X.size(), Y.size(), &cols, &rows)) return false;
+
+  // The legacy formats take ggml's q8_0 activation rather than q8_K; the
+  // arithmetic is still llama.cpp's, just with 32-element blocks.
+  if (is_legacy_quant(W.type())) {
+    matmul_legacy_q8_0(W, X.data(), cols, rows, n, Y.data());
+    return true;
+  }
 
   const BlockDotFn block_dot = block_dot_for(W.type());
   if (block_dot == nullptr) return false;

@@ -70,6 +70,16 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
       const uint16_t d = rand_finite_half(rng);
       bytes[off + 208] = std::byte(d & 0xFF);
       bytes[off + 209] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q5_0) {
+      // q5_0: d at 0, qh at 2..5, qs at 6..21. qh stays random.
+      const uint16_t d = rand_finite_half(rng);
+      bytes[off + 0] = std::byte(d & 0xFF);
+      bytes[off + 1] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q8_0) {
+      // q8_0: d at 0, int8 qs at 2..33. qs stays random.
+      const uint16_t d = rand_finite_half(rng);
+      bytes[off + 0] = std::byte(d & 0xFF);
+      bytes[off + 1] = std::byte(d >> 8);
     } else {
       // q4_K/q5_K: d at 0, dmin at 2.
       const uint16_t d = rand_finite_half(rng);
@@ -175,6 +185,127 @@ void test_matmul_one_type(sbquant::QuantType type, std::mt19937& rng) {
   check(exact, "matmul_f32 == naive reference");
 }
 
+// Legacy Q5_0 / Q8_0 blocks hold 32 elements and, per llama.cpp's type_traits,
+// take a *q8_0* activation (vec_dot_type = Q8_0) rather than the K-quants'
+// q8_K. matmul_f32_q8_K — the CPU path the inference spine uses — therefore
+// requantizes the activation to q8_0 before the dot, so for these types it is
+// not bit-exact against a plain f32 dot. (The plain f32 entries, matvec_f32 /
+// matmul_f32, are bit-exact; test_matvec_one_type / test_matmul_one_type cover
+// them, and dot_stream's legacy dequantize_block cases with them.)
+//
+// The contract the directive specifies is fp32 tolerance, and the achievable
+// tolerance is derivable: one q8_0 activation step contributes at most
+// |w_k| * (amax_x / 254) to the error of an output element. The test computes
+// that bound from the dequantized weight and checks against it, plus a small
+// accumulation slack, instead of guessing a relative epsilon.
+void legacy_error_bound(const sbquant::QuantizedTensor& W, std::span<const float> x,
+                        std::span<float> bound) {
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  std::vector<float> wf(rows * cols);
+  sbquant::dequantize_f32(W, wf.data(), wf.size());
+
+  float amax = 0.0f;
+  for (float v : x) amax = std::max(amax, std::fabs(v));
+  const float half_step = amax / 254.0f;  // (amax/127) / 2
+
+  for (uint64_t r = 0; r < rows; ++r) {
+    double acc = 0.0;
+    for (uint64_t k = 0; k < cols; ++k)
+      acc += double(std::fabs(wf[r * cols + k])) * double(half_step);
+    bound[r] = float(acc) + 1e-5f;
+  }
+}
+
+void test_legacy_matvec_tolerance(sbquant::QuantType type, const char* name,
+                                  std::mt19937& rng) {
+  const uint64_t rows = 3;
+  const uint64_t cols = 256 * 3;  // 24 blocks of 32 per row
+  auto bytes = build_weight(type, rows, cols, rng);
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+  if (!W.valid()) {
+    check(false, "legacy build_weight produced an invalid tensor");
+    return;
+  }
+
+  std::vector<float> x(cols), y(rows), y_ref(rows), bound(rows);
+  for (auto& v : x) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  check(sbquant::matmul_f32_q8_K(W, x, y, 1),
+        "legacy matvec_f32_q8_K returns true");
+  naive_matvec(W, x, y_ref);
+  legacy_error_bound(W, x, bound);
+
+  for (uint64_t r = 0; r < rows; ++r) {
+    const float err = std::fabs(y[r] - y_ref[r]);
+    if (err > bound[r])
+      std::cerr << "  " << name << " row " << r << ": err " << err << " > bound "
+                << bound[r] << "\n";
+    check(err <= bound[r],
+          "legacy matvec_f32_q8_K within the q8_0 activation error bound");
+  }
+}
+
+void test_legacy_matmul_tolerance(sbquant::QuantType type, const char* name,
+                                  std::mt19937& rng) {
+  const uint64_t rows = 3;
+  const uint64_t cols = 256 * 2;  // 16 blocks of 32 per row
+  const uint64_t n = 4;
+
+  auto bytes = build_weight(type, rows, cols, rng);
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+  if (!W.valid()) {
+    check(false, "legacy build_weight produced an invalid tensor");
+    return;
+  }
+
+  std::vector<float> X(cols * n), Y(rows * n), Y_ref(rows * n);
+  for (auto& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  check(sbquant::matmul_f32_q8_K(W, X, Y, n),
+        "legacy matmul_f32_q8_K returns true");
+
+  const uint64_t total = rows * cols;
+  std::vector<float> wf(total);
+  sbquant::dequantize_f32(W, wf.data(), wf.size());
+  for (uint64_t r = 0; r < rows; ++r) {
+    for (uint64_t c = 0; c < n; ++c) {
+      float acc = 0.0f;
+      for (uint64_t k = 0; k < cols; ++k)
+        acc += wf[r * cols + k] * X[c * cols + k];
+      Y_ref[c * rows + r] = acc;
+    }
+  }
+
+  for (uint64_t c = 0; c < n; ++c) {
+    std::span<const float> xc(X.data() + c * cols, cols);
+    std::vector<float> bound(rows);
+    legacy_error_bound(W, xc, bound);
+    for (uint64_t r = 0; r < rows; ++r) {
+      const float err = std::fabs(Y[c * rows + r] - Y_ref[c * rows + r]);
+      if (err > bound[r])
+        std::cerr << "  " << name << " col " << c << " row " << r << ": err "
+                  << err << " > bound " << bound[r] << "\n";
+      check(err <= bound[r],
+            "legacy matmul_f32_q8_K within the q8_0 activation error bound");
+    }
+  }
+}
+
+// Every block of each legacy type must also survive the loader's ggml-id
+// mapping and be accepted by valid() at the shapes Qwen2 uses (cols a multiple
+// of 32, not of 256 for the small attention projections).
+void test_legacy_shapes() {
+  for (uint64_t cols : {128ull, 896ull, 4864ull}) {
+    for (auto type : {sbquant::QuantType::Q5_0, sbquant::QuantType::Q8_0}) {
+      const sbquant::QuantTypeInfo* info = sbquant::quant_type_info(type);
+      std::vector<std::byte> bytes(cols * info->bytes_per_block / info->block_size);
+      sbquant::QuantizedTensor W(type, {cols, 1}, bytes);
+      check(W.valid(), "legacy tensor valid at the Qwen2 projection shapes");
+    }
+  }
+}
+
 void test_validation() {
   // Non-2-D weight is rejected.
   {
@@ -222,6 +353,18 @@ int main() {
   test_matmul_one_type(sbquant::QuantType::Q5_K, rng);
   test_matmul_one_type(sbquant::QuantType::Q6_K, rng);
   test_q6k_q8k_dot_against_baseline(rng);
+  // The plain f32 entries are bit-exact for the legacy types too (dot_stream
+  // dequantizes each block and does a plain f32 dot), so they share the K-quant
+  // exactness checks; the q8_0-activation entry gets its own bounded check.
+  test_matvec_one_type(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_matvec_one_type(sbquant::QuantType::Q8_0, "q8_0", rng);
+  test_matmul_one_type(sbquant::QuantType::Q5_0, rng);
+  test_matmul_one_type(sbquant::QuantType::Q8_0, rng);
+  test_legacy_matvec_tolerance(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_legacy_matvec_tolerance(sbquant::QuantType::Q8_0, "q8_0", rng);
+  test_legacy_matmul_tolerance(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_legacy_matmul_tolerance(sbquant::QuantType::Q8_0, "q8_0", rng);
+  test_legacy_shapes();
   test_validation();
 
   if (g_failures == 0) {

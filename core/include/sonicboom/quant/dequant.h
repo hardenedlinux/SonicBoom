@@ -53,12 +53,15 @@ bool dequantize_row_f32(const QuantizedTensor& t, uint64_t row, float* out,
 
 // Lower-level block-stream dequantizers. Each consumes exactly
 // `n_blocks * bytes_per_block()` bytes and emits `n_blocks * block_size()`
-// floats (256 per block). The caller guarantees the span is large enough and
-// `n_blocks` is the exact ceil(numel/block_size) — the tensor-level
-// `dequantize_f32` enforces this; kernels using these directly must too.
+// floats (256 per block for the K-quants, 32 for Q5_0/Q8_0). The caller
+// guarantees the span is large enough and `n_blocks` is the exact
+// ceil(numel/block_size) — the tensor-level `dequantize_f32` enforces this;
+// kernels using these directly must too.
 void dequantize_q3_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 void dequantize_q4_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 void dequantize_q5_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 void dequantize_q6_K(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
+void dequantize_q5_0(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
+void dequantize_q8_0(std::span<const std::byte> blocks, uint64_t n_blocks, float* out);
 
 } // namespace sonicboom::quant

@@ -206,16 +206,17 @@ license. They live in `ggml_derived/` directories, with the details in
 
 | | Lines of code |
 |---|---:|
-| ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 1,395 |
-| SonicBoom core total (`core/src`, `core/include`) | 17,674 |
-| **Derived share** | **~7.9%** |
+| ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 2,059 |
+| SonicBoom core total (`core/src`, `core/include`) | 18,914 |
+| **Derived share** | **~10.9%** |
 
 *Counted with `cloc` 1.98. These are code lines only, excluding blanks and
 comments. The C ABI, the Guile bindings and the dependencies are not
 counted.*
 
 **Ported:** quantized matrix multiply (MMVQ for decode, MMQ for prefill),
-q8_1 activation quantization, and the BPE tokenizer.
+q8_1 activation quantization, the legacy Q5_0/Q8_0 block formats, and the BPE
+tokenizer.
 
 **SonicBoom's own:** everything else. That includes the planner and graph
 passes, operator fusion, CUDA Graph capture and replay, the device-resident KV

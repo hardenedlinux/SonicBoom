@@ -36,7 +36,7 @@ constexpr uint32_t kBF16 = 30;
 constexpr uint32_t kQ3K = 11;
 constexpr uint32_t kQ4K = 12;
 constexpr uint32_t kQ5K = 13;
-constexpr uint32_t kQ4_0 = 2, kQ5_0 = 6, kQ8_0 = 8, kF16 = 1;
+constexpr uint32_t kQ4_0 = 2, kF16 = 1;
 
 std::string dims_string(const std::vector<uint64_t>& dims) {
   std::string out = "[";
@@ -44,8 +44,11 @@ std::string dims_string(const std::vector<uint64_t>& dims) {
   return out + "]";
 }
 
+// Types with no native kernel, converted to Q5_K at load time. Q5_0/Q8_0 used
+// to be here; they are native now (QuantType::Q5_0 / Q8_0), so they bind
+// through the ordinary quantized path and are never rewritten.
 const char* foreign_type_name(uint32_t id) {
-  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; case kQ5_0:return "q5_0"; case kQ8_0:return "q8_0"; }
+  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; }
   return "unknown";
 }
 
@@ -128,9 +131,10 @@ std::optional<quant::QuantizedTensor> bind_quant(
     if (t->type == et) type_ok = true;
   const bool shape_ok = dims_match(t->dims, dims);
   const bool native_quant_ok = quant::quant_type_from_ggml(t->type).has_value();
+  // The `% 256` test is the Q5_K super-block geometry the conversion targets,
+  // so only types that are still foreign are considered here at all.
   const bool foreign_ok = !quant::quant_type_from_ggml(t->type) &&
-      (t->type == kF16 || t->type == kQ4_0 || t->type == kQ5_0 ||
-       t->type == kQ8_0) &&
+      (t->type == kF16 || t->type == kQ4_0) &&
       !t->dims.empty() && t->dims[0] % 256 == 0;
   if ((!type_ok && !native_quant_ok && !foreign_ok) || !shape_ok) {
     errs += "tensor type/shape mismatch: ";

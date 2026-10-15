@@ -67,6 +67,13 @@ __device__ inline uint16_t ld_u16(const uint8_t* p) {
   return uint16_t(p[0]) | (uint16_t(p[1]) << 8);
 }
 
+// Alignment-agnostic 32-bit load. The legacy block layouts put their quant
+// arrays at a 2-byte offset (q8_0) or a 6-byte offset (q5_0), so a plain
+// reinterpret_cast<const int*> would be misaligned.
+__device__ inline uint32_t ld_u32(const uint8_t* p) {
+  return uint32_t(ld_u16(p)) | (uint32_t(ld_u16(p + 2)) << 16);
+}
+
 // IEEE 754 binary16 -> binary32 (identical to ggml's GGML_FP16_TO_FP32).
 __device__ inline float half_to_float(uint16_t h) {
   const uint32_t sign = uint32_t(h & 0x8000u) << 16;
@@ -329,6 +336,63 @@ __device__ __forceinline__ float vec_dot_q6_K_q8_1(const uint8_t* wb,
   return d * sum;
 }
 
+// --- legacy 32-element blocks (Q5_0 / Q8_0) --------------------------------
+//
+// A legacy block is exactly one q8_1 activation block wide, so these dots take
+// no `iqs` slice index: each call consumes the whole 32-element block pair
+// (the K-quant dots above each cover one 16-element slice of a 256-element
+// super-block instead). Both dots are integer dp4a products of the aligned
+// 4-byte groups, scaled by the two block scales.
+//
+// q5_0 stores weight elements 0..15 in the low nibbles of qs[16] and 16..31 in
+// the high nibbles; bit j of the little-endian 4-byte qh word is element j's
+// 5th bit. As in ggml the 5-bit field is biased: value = 5bit - 16, so the
+// correction -16 * sum(q8) is folded in through the same sum-of-quants dp4a
+// trick that vec_dot_q4_K_q8_1 uses for its -dmin term.
+//
+// Layouts: q5_0 = {fp16 d; uint8 qh[4]; uint8 qs[16]}, q8_0 = {fp16 d; int8 qs[32]}.
+
+__device__ __forceinline__ float vec_dot_q8_0_q8_1(const uint8_t* wb,
+                                                   const block_q8_1* yb) {
+  int sumi = 0;
+  #pragma unroll
+  for (int i = 0; i < 8; ++i)
+    sumi = __dp4a(int(ld_u32(wb + 2 + 4 * i)), get_int_b4(yb->qs, i), sumi);
+  return half_to_float(ld_u16(wb)) * yb->d * float(sumi);
+}
+
+__device__ __forceinline__ float vec_dot_q5_0_q8_1(const uint8_t* wb,
+                                                   const block_q8_1* yb) {
+  const uint32_t xh = ld_u32(wb + 2);  // 5th bits of elements 0..31
+  int sumi = 0, sumu = 0;
+  #pragma unroll
+  for (int g = 0; g < 4; ++g) {
+    const uint32_t nib = ld_u32(wb + 6 + 4 * g);
+    // Low nibbles -> elements 4g..4g+3; 5th bits are xh bits 4g..4g+3.
+    const uint32_t lo = xh >> (4 * g);
+    int vi = int(nib & 0x0F0F0F0Fu);
+    vi |= int((lo << 4) & 0x00000010u);
+    vi |= int((lo << 11) & 0x00001000u);
+    vi |= int((lo << 18) & 0x00100000u);
+    vi |= int((lo << 25) & 0x10000000u);
+    // High nibbles -> elements 16+4g..19+4g; 5th bits are the next four.
+    const uint32_t hi = xh >> (4 * g + 16);
+    int wi = int((nib >> 4) & 0x0F0F0F0Fu);
+    wi |= int((hi << 4) & 0x00000010u);
+    wi |= int((hi << 11) & 0x00001000u);
+    wi |= int((hi << 18) & 0x00100000u);
+    wi |= int((hi << 25) & 0x10000000u);
+
+    const int u0 = get_int_b4(yb->qs, g);      // elements 4g..4g+3
+    const int u1 = get_int_b4(yb->qs, 4 + g);  // elements 16+4g..19+4g
+    sumi = __dp4a(vi, u0, sumi);
+    sumi = __dp4a(wi, u1, sumi);
+    sumu = __dp4a(0x01010101, u0, sumu);
+    sumu = __dp4a(0x01010101, u1, sumu);
+  }
+  return half_to_float(ld_u16(wb)) * yb->d * float(sumi - 16 * sumu);
+}
+
 // --- warp-per-row mmvq kernels ---------------------------------------------
 
 __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
@@ -409,6 +473,60 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
   if (lane == 0) dst[row] = sum;
 }
+
+// Legacy mmvq. Because one weight block is one q8_1 block, a lane can simply
+// consume whole blocks (stride 32 lanes) instead of a fixed 16-element slice of
+// a 256-element super-block; the activation index is then the flat block index
+// `b`, with the tile offset folded in for the batched form.
+
+#define SONICBOOM_DEFINE_LEGACY_MMVQ(suffix, blkbytes, dot)                       \
+  __global__ void gemv_##suffix##_q8_1(const uint8_t* __restrict__ w,             \
+                                       const block_q8_1* __restrict__ y,          \
+                                       float* __restrict__ dst, int blocks_per_row, \
+                                       int num_rows) {                            \
+    const int lane = threadIdx.x;                                                 \
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
+    if (row >= num_rows) return;                                                  \
+    float sum = 0.0f;                                                             \
+    for (int b = lane; b < blocks_per_row; b += 32) {                             \
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * blkbytes;      \
+      sum += dot(wb, y + b);                                                      \
+    }                                                                             \
+    _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                            \
+        sum += __shfl_down_sync(0xffffffffu, sum, o);                             \
+    if (lane == 0) dst[row] = sum;                                                \
+  }                                                                               \
+  template <int T>                                                                \
+  __global__ void gemv_##suffix##_q8_1_batched(                                   \
+      const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,            \
+      float* __restrict__ dst, int blocks_per_row, int num_rows, int n) {         \
+    const int lane = threadIdx.x;                                                 \
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
+    if (row >= num_rows) return;                                                  \
+    for (int p0 = 0; p0 < n; p0 += T) {                                           \
+      const int nt = (n - p0 < T) ? (n - p0) : T;                                 \
+      float sum[T];                                                               \
+      _Pragma("unroll") for (int t = 0; t < T; ++t) sum[t] = 0.0f;                \
+      for (int b = lane; b < blocks_per_row; b += 32) {                           \
+        const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * blkbytes;    \
+        _Pragma("unroll") for (int t = 0; t < T; ++t)                             \
+            if (t < nt) sum[t] += dot(                                            \
+                wb, y + (size_t)(p0 + t) * blocks_per_row + b);                   \
+      }                                                                           \
+      _Pragma("unroll") for (int t = 0; t < T; ++t) {                             \
+        if (t < nt) {                                                             \
+          float s = sum[t];                                                       \
+          _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                      \
+              s += __shfl_down_sync(0xffffffffu, s, o);                           \
+          if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;              \
+        }                                                                         \
+      }                                                                           \
+    }                                                                             \
+  }
+
+SONICBOOM_DEFINE_LEGACY_MMVQ(q5_0, 22, vec_dot_q5_0_q8_1)
+SONICBOOM_DEFINE_LEGACY_MMVQ(q8_0, 34, vec_dot_q8_0_q8_1)
+#undef SONICBOOM_DEFINE_LEGACY_MMVQ
 
 // --- batched warp-per-row mmvq (prefill) ------------------------------------
 //

@@ -20,13 +20,16 @@
 
 namespace sonicboom::quant {
 
-// Supported block-quantized formats. Geometry mirrors the ggml type table:
-// all K-quants use a 256-element super-block.
+// Supported block-quantized formats. Geometry mirrors the ggml type table: the
+// K-quants use a 256-element super-block (110/144/176/210 bytes per block), the
+// legacy Q5_0/Q8_0 formats a 32-element block (2 + 4 + 16 and 2 + 32 bytes).
 static constexpr QuantTypeInfo kTypeInfo[] = {
     {QuantType::Q3_K, "q3_K", 11, 256, 110},
     {QuantType::Q4_K, "q4_K", 12, 256, 144},
     {QuantType::Q5_K, "q5_K", 13, 256, 176},
     {QuantType::Q6_K, "q6_K", 14, 256, 210},
+    {QuantType::Q5_0, "q5_0", 6, 32, 22},
+    {QuantType::Q8_0, "q8_0", 8, 32, 34},
 };
 
 const QuantTypeInfo* quant_type_info(QuantType type) {

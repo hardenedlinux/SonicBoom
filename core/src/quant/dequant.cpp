@@ -17,6 +17,7 @@
 #include <sonicboom/quant/dequant.h>
 
 #include "foreign_dequant.h"
+#include "ggml_derived/legacy_quants_q5_0_q8_0.h"
 
 #include <bit>
 #include <cstdint>
@@ -209,6 +210,18 @@ void dequantize_q5_K(std::span<const std::byte> blocks, uint64_t n_blocks,
   }
 }
 
+// The legacy 32-element formats are small enough that the portable ggml-derived
+// scalar kernels are used directly, with no SonicBoom-local re-implementation.
+void dequantize_q5_0(std::span<const std::byte> blocks, uint64_t n_blocks,
+                     float* out) {
+  ggml_derived::dequantize_q5_0(blocks, n_blocks, out);
+}
+
+void dequantize_q8_0(std::span<const std::byte> blocks, uint64_t n_blocks,
+                     float* out) {
+  ggml_derived::dequantize_q8_0(blocks, n_blocks, out);
+}
+
 void dequantize_q6_K(std::span<const std::byte> blocks, uint64_t n_blocks,
                      float* out) {
   const std::byte* p = blocks.data();
@@ -254,6 +267,12 @@ bool dequantize_f32(const QuantizedTensor& t, float* out, uint64_t out_capacity)
     case QuantType::Q6_K:
       dequantize_q6_K(t.data(), t.num_blocks(), out);
       return true;
+    case QuantType::Q5_0:
+      dequantize_q5_0(t.data(), t.num_blocks(), out);
+      return true;
+    case QuantType::Q8_0:
+      dequantize_q8_0(t.data(), t.num_blocks(), out);
+      return true;
   }
   return false;
 }
@@ -283,6 +302,12 @@ bool dequantize_row_f32(const QuantizedTensor& t, uint64_t row, float* out,
       return true;
     case QuantType::Q6_K:
       dequantize_q6_K(blocks, blocks_per_row, out);
+      return true;
+    case QuantType::Q5_0:
+      dequantize_q5_0(blocks, blocks_per_row, out);
+      return true;
+    case QuantType::Q8_0:
+      dequantize_q8_0(blocks, blocks_per_row, out);
       return true;
   }
   return false;

@@ -431,11 +431,14 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
   // The fused mmq quantize's activation scale layout follows the consuming
   // matmul's weight type: Q3_K -> ggml D4, Q6_K -> Q8_1-compatible D4, and
-  // Q4_K/Q5_K -> DS4 (half2 scales).
+  // Q4_K/Q5_K -> DS4 (half2 scales). The legacy 32-element formats have no mmq
+  // scale layout at all and emit -1, which the C.4 planner passes read as
+  // "never fold a quantize into this matmul".
   // Baked here (not in the planner pass) because only the emitter knows the
   // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
   auto ds_a = [](quant::QuantType qt) {
-    const int64_t ds = qt == quant::QuantType::Q3_K ? 0
+    const int64_t ds = quant::is_legacy_quant(qt) ? -1
+                       : qt == quant::QuantType::Q3_K ? 0
                        : qt == quant::QuantType::Q6_K ? 2
                                                        : 1;
     return attr_i("ds", ds);

@@ -69,6 +69,13 @@ std::vector<std::byte> build_weight(sbquant::QuantType type, uint64_t rows,
       const uint16_t d = 0x3C00;  // 1.0
       bytes[off + 208] = std::byte(d & 0xFF);
       bytes[off + 209] = std::byte(d >> 8);
+    } else if (type == sbquant::QuantType::Q5_0 || type == sbquant::QuantType::Q8_0) {
+      // Legacy 32-element blocks: a single fp16 scale at offset 0; qh/qs stay
+      // random. d = 1.0 keeps the dequantized magnitudes sane so the fp32
+      // differential is not dominated by one huge block.
+      const uint16_t d = 0x3C00;  // 1.0
+      bytes[off + 0] = std::byte(d & 0xFF);
+      bytes[off + 1] = std::byte(d >> 8);
     } else {
       const uint16_t d = rand_finite_half(rng);
       const uint16_t dmin = rand_finite_half(rng);
@@ -392,6 +399,141 @@ void test_batched_q8_1_type(sbquant::QuantType type, const char* name,
   test_batched_q8_1(type, name, 64, 256 * 40, 10, rng);
 }
 
+// Legacy Q5_0 / Q8_0 (Stage 2). Two differences from the K-quant cases above
+// rule out reusing test_one_shape / test_batched directly:
+//   * ggml's activation type for a 32-element weight block is q8_0, so the CPU
+//     matvec_f32_q8_K requantizes the activation to int8 and is only a bounded
+//     approximation, unusable at test_one_shape's fp32 differential tolerance;
+//   * the CUDA fp32 gemv (SONICBOOM_GEMV_F32=1) does exact dequant * f32
+//     arithmetic, which the dense dequantize-then-dot reference reproduces
+//     exactly up to accumulation order.
+// So: diff the fp32 kernels against the dense f32 reference here, and diff the
+// q8_1 kernels bit-exactly against the per-column q8_1 matvec (both legs share
+// quantize_q8_1, the vec_dot and the __shfl reduction order).
+void test_legacy_f32_gemv_shape(sbquant::QuantType type, const char* name,
+                                uint64_t rows, uint64_t cols, double tol,
+                                std::mt19937& rng) {
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+  if (!W.valid()) {
+    check(false, "legacy gemv: build_weight produced an invalid tensor");
+    return;
+  }
+
+  std::vector<float> x(cols), y(rows);
+  for (float& v : x) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  setenv("SONICBOOM_GEMV_F32", "1", 1);
+  const bool ok = sbquant::cuda::matvec_f32(W, x, y);
+  check(ok, "legacy cuda::matvec_f32 (fp32) returns true");
+  if (!ok) return;
+
+  const std::vector<float> ref = q6_f32_reference(W, x, 1);
+  if (ref.size() != rows) {
+    check(false, "legacy fp32 reference dequantize failed");
+    return;
+  }
+  bool cmp = false;
+  const double worst = compare(y, ref, tol, &cmp);
+  check(cmp, "legacy cuda fp32 gemv matches dequant-then-f32 reference");
+  if (!cmp)
+    std::cerr << "    worst rel err (" << name << " fp32 gemv, bpr "
+              << cols / 32 << ") = " << worst << "\n";
+}
+
+void test_legacy_type(sbquant::QuantType type, const char* name,
+                      std::mt19937& rng) {
+  // 8 blocks/row < kCoopMinBlocksPerRow -> one-thread-per-block (atomicAdd) gemv.
+  test_legacy_f32_gemv_shape(type, name, 64, 32 * 8, 1e-3, rng);
+  // 64 blocks/row -> cooperative warp-per-row gemv (same fp32 arithmetic, a
+  // different reduction order, hence the looser tolerance).
+  test_legacy_f32_gemv_shape(type, name, 64, 32 * 64, 1e-1, rng);
+}
+
+void test_legacy_batched_q8_1_type(sbquant::QuantType type, const char* name,
+                                   std::mt19937& rng) {
+  // n == 1 exercises the single-column q8_1 fallback; 3/8/10 the partial-tile,
+  // full-tile and multi-tile paths of the batched kernel. Both shapes run the
+  // warp-per-row q8_1 kernels (no blocks-per-row dispatch there).
+  test_batched_q8_1(type, name, 64, 32 * 32, 1, rng);
+  test_batched_q8_1(type, name, 64, 32 * 32, 3, rng);
+  test_batched_q8_1(type, name, 64, 32 * 320, 3, rng);
+  test_batched_q8_1(type, name, 64, 32 * 320, 8, rng);
+  test_batched_q8_1(type, name, 64, 32 * 320, 10, rng);
+}
+
+// The cuBLAS path rounds both operands to fp16 before an fp32 GEMM, so a fixed
+// relative epsilon is the wrong yardstick: the error is bounded by the operand
+// rounding, i.e. each |w_k x_k| contributes at most 2 * 2^-11 of its own
+// magnitude. Compute that bound from the dequantized weight and check against
+// it (mirroring the q8_0-activation bound in test_quantized_matmul.cpp). A
+// fixed epsilon only holds for the Q6_K test because that one forces its block
+// scales to 1, keeping the magnitudes small.
+void compare_fp16_bound(std::span<const float> got, std::span<const float> ref,
+                        const sbquant::QuantizedTensor& W,
+                        std::span<const float> X, uint64_t n, const char* name,
+                        const char* what) {
+  const uint64_t cols = W.dims()[0], rows = W.dims()[1];
+  std::vector<float> wf(W.numel());
+  if (!sbquant::dequantize_f32(W, wf.data(), wf.size())) {
+    check(false, "cuBLAS fp16 bound: dequantize failed");
+    return;
+  }
+  constexpr double kRound = 2.0 * 4.8828125e-4;  // 2 * 2^-11 (both operands)
+  size_t bad = 0;
+  double worst = 0.0;
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t r = 0; r < rows; ++r) {
+      double mag = 0.0;
+      for (uint64_t k = 0; k < cols; ++k)
+        mag += std::fabs(double(wf[r * cols + k]) * double(X[c * cols + k]));
+      const double bound = kRound * mag + 1e-3;
+      const double err =
+          std::fabs(double(got[c * rows + r]) - double(ref[c * rows + r]));
+      if (err > bound) ++bad;
+      worst = std::max(worst, err / std::max(bound, 1e-12));
+    }
+  }
+  check(bad == 0, what);
+  if (bad)
+    std::cerr << "    " << name << ": " << bad
+              << " elements over the fp16 bound, worst ratio " << worst << "\n";
+}
+
+// n >= cublas_min_n() routes a legacy weight down the f16 cuBLAS path
+// (matmul_f16_cublas_dev's Q5_0/Q8_0 dequant cases), since mmq covers the
+// K-quants only.
+void test_legacy_cublas_type(sbquant::QuantType type, const char* name,
+                             std::mt19937& rng) {
+  constexpr uint64_t rows = 64;
+  constexpr uint64_t cols = 32 * 64;
+  constexpr uint64_t n = 32;
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+
+  std::vector<float> X(cols * n), Y(rows * n);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  unsetenv("SONICBOOM_GEMV_F32");
+  setenv("SONICBOOM_MMQ", "0", 1);
+  unsetenv("SONICBOOM_CUBLAS");
+  const bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
+  check(ok, "legacy cuBLAS fp16 matmul returns true");
+  if (!ok) return;
+
+  const std::vector<float> ref = q6_f32_reference(W, X, n);
+  if (ref.size() != rows * n) {
+    check(false, "legacy cuBLAS reference dequantize failed");
+    return;
+  }
+  compare_fp16_bound(Y, ref, W, X, n, name,
+                     "legacy cuBLAS fp16 dequant within the fp16 bound");
+}
+
 void test_mmq_q6_type(std::mt19937& rng) {
   (void)rng;
   std::cout << "  SKIP Q6_K MMQ: TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed\n";
@@ -473,6 +615,8 @@ int main() {
   test_one_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_one_type(sbquant::QuantType::Q5_K, "q5_K", rng);
   test_one_type(sbquant::QuantType::Q6_K, "q6_K", rng);
+  test_legacy_type(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_legacy_type(sbquant::QuantType::Q8_0, "q8_0", rng);
 
   test_batched_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_type(sbquant::QuantType::Q4_K, "q4_K", rng);
@@ -492,9 +636,13 @@ int main() {
   test_batched_q8_1_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q5_K, "q5_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q6_K, "q6_K", rng);
+  test_legacy_batched_q8_1_type(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_legacy_batched_q8_1_type(sbquant::QuantType::Q8_0, "q8_0", rng);
 
   test_mmq_q6_type(rng);
   test_cublas_q6_type(rng);
+  test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
+  test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";

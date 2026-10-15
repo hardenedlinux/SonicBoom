@@ -38,12 +38,25 @@ namespace sonicboom::quant {
 // Quantized weight formats SonicBoom can dequantize/execute. A SonicBoom-owned
 // semantic enum; it does not alias the ggml type table even though the ids in
 // `QuantTypeInfo::ggml_type_id` match it for the gguf→quant bridge.
+//
+// Two block families are covered: the K-quants (256-element super-blocks with
+// 6-bit sub-scales) and the "legacy" formats Q5_0/Q8_0 (32-element blocks with
+// a single fp16 scale), which is what Qwen2.5 Q4_K_M uses for every projection
+// except ffn_down.
 enum class QuantType : uint8_t {
   Q3_K,
   Q4_K,
   Q5_K,
   Q6_K,
+  Q5_0,
+  Q8_0,
 };
+
+// True for the 32-element legacy formats, whose activation type is q8_0 rather
+// than the K-quants' q8_K (ggml's type traits make the same split).
+constexpr bool is_legacy_quant(QuantType type) {
+  return type == QuantType::Q5_0 || type == QuantType::Q8_0;
+}
 
 struct QuantTypeInfo {
   QuantType type;

@@ -557,6 +557,49 @@ void test_q6k_quanttype_reference() {
   check(got == ref, "Q6_K QuantType path matches ggml baseline");
 }
 
+// Native Q5_0 / Q8_0 (Stage 2). Synthetic blocks with a finite scale so the
+// arithmetic is exercised end to end, compared bit-for-bit against the
+// ggml-baseline dequantizers in ggml_baseline.h.
+void test_legacy_quanttype_reference() {
+  std::mt19937 rng(0x5A80);
+  for (uint32_t type : {6u, 8u}) {
+    const size_t bpb = type == 6 ? 22 : 34;
+    const uint64_t n_blocks = 4;
+    std::vector<std::byte> bytes(n_blocks * bpb);
+    for (auto& v : bytes) v = std::byte(uint8_t(rng()));
+    for (uint64_t b = 0; b < n_blocks; ++b) {
+      const uint16_t d = 0x2C00;  // finite 1/16 scale, as in the q6_K test
+      bytes[b * bpb + 0] = std::byte(d & 0xff);
+      bytes[b * bpb + 1] = std::byte(d >> 8);
+    }
+    const uint64_t n = n_blocks * 32;
+    const bool want_q5 = type == 6;
+    auto mapped = sbquant::quantized_tensor_from_gguf(type, {n}, bytes);
+    check(bool(mapped) && mapped->valid(),
+          "legacy ggml id maps to a valid QuantType tensor");
+    if (!mapped) continue;
+    check(mapped->type() ==
+              (want_q5 ? sbquant::QuantType::Q5_0 : sbquant::QuantType::Q8_0),
+          "legacy ggml id maps to the right QuantType");
+    check(mapped->block_size() == 32, "legacy block covers 32 elements");
+    check(mapped->bytes_per_block() == uint32_t(bpb), "legacy bytes per block");
+    check(mapped->num_blocks() == n_blocks, "legacy block count");
+
+    std::vector<float> got(n), ref(n);
+    check(sbquant::dequantize_f32(*mapped, got.data(), got.size()),
+          "legacy QuantType path dequantizes");
+    if (want_q5)
+      baseline::dequantize_row_q5_0(
+          reinterpret_cast<const baseline::block_q5_0*>(bytes.data()), ref.data(),
+          int64_t(n));
+    else
+      baseline::dequantize_row_q8_0(
+          reinterpret_cast<const baseline::block_q8_0*>(bytes.data()), ref.data(),
+          int64_t(n));
+    check(got == ref, "legacy QuantType path matches ggml baseline bit-exactly");
+  }
+}
+
 void test_foreign_dequant() {
   auto check_formula = [&](uint32_t type, std::vector<uint8_t> bytes,
                            uint64_t n, auto formula, const char* label) {
@@ -621,6 +664,7 @@ int main() {
   test_differential_random();
   test_differential_model();
   test_q6k_quanttype_reference();
+  test_legacy_quanttype_reference();
   test_foreign_dequant();
   test_q5k_quantize_roundtrip();
 

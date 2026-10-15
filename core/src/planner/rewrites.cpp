@@ -346,6 +346,12 @@ void fuse_rms_norm_mmq_pass(Graph& g) {
         ok = false;
         break;
       }
+      // ds < 0 marks a weight type with no mmq scale layout (the legacy
+      // 32-element block formats); such a matmul never fuses into mmq.
+      if (cds < 0) {
+        ok = false;
+        break;
+      }
       if (ds == -1)
         ds = cds;
       else if (ds != cds) {

@@ -57,6 +57,15 @@ core/src/quant/ggml_derived/vec_dot_qK_q8K.h
       - dot_q5_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q5_K_q8_K_generic)
       - dot_q6_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q6_K_q8_K_generic)
 
+core/src/quant/ggml_derived/legacy_quants_q5_0_q8_0.h
+    32-element legacy block formats Q5_0 / Q8_0 (CPU). Ported from:
+      - block_q5_0 / block_q8_0  ← ggml/src/ggml-common.h
+      - dequantize_row_q5_0 / dequantize_row_q8_0
+                                 ← ggml/src/ggml-quants.c
+      - quantize_row_q8_0_ref    ← ggml/src/ggml-quants.c
+      - ggml_vec_dot_q5_0_q8_0_generic / _q8_0_q8_0_generic
+                                 ← ggml/src/ggml-cpu/quants.c
+
 core/src/quant/ggml_derived/quantize_q5_k.cpp
     Q5_K reference quantizer. Ported from:
       - quantize_row_q5_K_ref    ← ggml/src/ggml-quants.c
@@ -75,7 +84,9 @@ core/src/vocab/ggml_derived/bpe_tokenizer.h
       - unicode_len_utf8, newline-run regex split               ← llama.cpp/src/unicode.cpp
 
 tests/core/ggml_baseline.h
-    Verbatim transcription of ggml dequantize_row_q3/q4/q5_K + get_scale_min_k4.
+    Verbatim transcription of ggml dequantize_row_q3/q4/q5_K + get_scale_min_k4,
+    and of block_q5_0/block_q8_0 + dequantize_row_q5_0/_q8_0 (the test-side
+    reference for the native legacy types).
     (Already carries its own attribution header.)
 
 ----------------------------------------------------------------------------

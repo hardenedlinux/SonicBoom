@@ -218,6 +218,52 @@ static inline void dequantize_row_q6_K(const block_q6_K* x, float* y, int64_t k)
   }
 }
 
+// Legacy 32-element formats (Q5_0 / Q8_0), ported from the same sources:
+//   ggml/src/ggml-common.h  — block_q5_0 / block_q8_0, QK5_0, QK8_0
+//   ggml/src/ggml-quants.c  — dequantize_row_q5_0 / _q8_0
+#define GGML_BASELINE_QK5_0 32
+#define GGML_BASELINE_QK8_0 32
+
+typedef struct {
+  uint16_t d;
+  uint8_t qh[4];
+  uint8_t qs[GGML_BASELINE_QK5_0 / 2];
+} block_q5_0;
+static_assert(sizeof(block_q5_0) == 2 + 4 + GGML_BASELINE_QK5_0 / 2, "q5_0 block size");
+
+typedef struct {
+  uint16_t d;
+  int8_t qs[GGML_BASELINE_QK8_0];
+} block_q8_0;
+static_assert(sizeof(block_q8_0) == 2 + GGML_BASELINE_QK8_0, "q8_0 block size");
+
+static inline void dequantize_row_q5_0(const block_q5_0* x, float* y, int64_t k) {
+  const int nb = int(k / GGML_BASELINE_QK5_0);
+  for (int i = 0; i < nb; ++i) {
+    const float d = baseline_half_to_float(x[i].d);
+    uint32_t qh;
+    memcpy(&qh, x[i].qh, sizeof(qh));
+    for (int j = 0; j < GGML_BASELINE_QK5_0 / 2; ++j) {
+      const uint8_t xh_0 = uint8_t(((qh >> j) << 4) & 0x10);
+      const uint8_t xh_1 = uint8_t((qh >> (j + 12)) & 0x10);
+      const int32_t x0 = int32_t((x[i].qs[j] & 0x0F) | xh_0) - 16;
+      const int32_t x1 = int32_t((x[i].qs[j] >> 4) | xh_1) - 16;
+      y[j + 0] = x0 * d;
+      y[j + GGML_BASELINE_QK5_0 / 2] = x1 * d;
+    }
+    y += GGML_BASELINE_QK5_0;
+  }
+}
+
+static inline void dequantize_row_q8_0(const block_q8_0* x, float* y, int64_t k) {
+  const int nb = int(k / GGML_BASELINE_QK8_0);
+  for (int i = 0; i < nb; ++i) {
+    const float d = baseline_half_to_float(x[i].d);
+    for (int j = 0; j < GGML_BASELINE_QK8_0; ++j) y[j] = x[i].qs[j] * d;
+    y += GGML_BASELINE_QK8_0;
+  }
+}
+
 static inline void quantize_row_q8_K_ref(const float* x, block_q8_K* y, int64_t k) {
   const int nb = int(k / GGML_BASELINE_QK_K);
   for (int b = 0; b < nb; ++b) {
