@@ -32,6 +32,7 @@
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/DenseSet.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/raw_ostream.h>
@@ -693,6 +694,35 @@ void record_external_data(Ctx& c) {
                       DictionaryAttr::get(&c.ctx, entries));
 }
 
+// A copy of `src` in a freshly allocated tensor of the same type.
+Value copy_tensor(Ctx& c, Value src) {
+  auto t = mlir::cast<RankedTensorType>(src.getType());
+  Value dst = empty_tensor(c, t);
+  return c.builder
+      .create<linalg::CopyOp>(c.loc, TypeRange{t}, ValueRange{src},
+                              ValueRange{dst})
+      .getResult(0);
+}
+
+// Whether a graph output needs a buffer of its own rather than the one it
+// already has.
+//
+// The bare-pointer ABI hands the JIT entry's returned pointer to the caller,
+// who frees it (exec.cpp). A value that *is* an operand buffer — a graph input,
+// or a parameter's constant/placeholder — or that *views* one (tensor.reshape)
+// has no allocation of its own to free, so returning it frees the caller's
+// input or the executable's weights. Those outputs are copied; a value produced
+// by a computing op already owns its buffer and is returned as is.
+bool output_needs_own_buffer(Value v) {
+  if (mlir::isa<BlockArgument>(v))     // a graph input
+    return true;
+  Operation* def = v.getDefiningOp();
+  if (!def)
+    return true;
+  return mlir::isa<tensor::ReshapeOp, tensor::ExpandShapeOp,
+                   tensor::CollapseShapeOp>(def);
+}
+
 // Lower one graph into a func.func inside the module. Returns "" on success or
 // an error message.
 std::string lower_graph(Ctx& c) {
@@ -754,11 +784,19 @@ std::string lower_graph(Ctx& c) {
       return err;
   }
 
+  // A parameter is not a computing op's result either: its value is a dense
+  // constant or a placeholder tensor, both owned by the module/executable.
+  llvm::DenseSet<llvm::StringRef> paramNames;
+  for (const auto& p : g.parameters)
+    paramNames.insert(p.name);
+
   SmallVector<Value> retVals;
   for (const auto& out : g.outputs) {
     Value v = c.values.lookup(llvm::StringRef(out));
     if (!v)
       return "graph output references undefined value '" + out + "'";
+    if (paramNames.contains(out) || output_needs_own_buffer(v))
+      v = copy_tensor(c, v);
     retVals.push_back(v);
   }
   c.builder.create<func::ReturnOp>(c.loc, retVals);

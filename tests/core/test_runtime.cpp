@@ -97,6 +97,45 @@ const char* TWO_REGIONS =
     "   (node relu (inputs \"t\")"
     "     (outputs (\"z\" (tensor float32 (shape 2 3))))))))";
 
+// view output: a single reshape whose operand is the graph input. Its result
+// bufferizes as a *view* of the caller's input buffer, so the lowering has to
+// hand back a copy — the ABI frees the pointer the entry returns (exec.cpp),
+// and for a view that pointer is the input's.
+const char* RESHAPE_INPUT =
+    "(sonicboom-s-expr (version 0 1) (graph (name \"reshape_input\")"
+    " (inputs (input \"x\" (tensor float32 (shape 2 3))))"
+    " (outputs (output \"z\"))"
+    " (parameters)"
+    " (nodes"
+    "   (node reshape (inputs \"x\")"
+    "     (outputs (\"z\" (tensor float32 (shape 3 2))))))))";
+
+// view output of a parameter: the reshape views the weight's own buffer, which
+// the executable owns.
+const char* RESHAPE_PARAM =
+    "(sonicboom-s-expr (version 0 1) (graph (name \"reshape_param\")"
+    " (inputs (input \"x\" (tensor float32 (shape 2 3))))"
+    " (outputs (output \"z\"))"
+    " (parameters"
+    "   (parameter \"w\" (tensor float32 (shape 2 3))"
+    "     (data :values 1.0 2.0 3.0 4.0 5.0 6.0)))"
+    " (nodes"
+    "   (node reshape (inputs \"w\")"
+    "     (outputs (\"z\" (tensor float32 (shape 3 2))))))))";
+
+// view output of a computed value: the reshape views the relu's result. The
+// values must be unchanged by the copy.
+const char* RELU_RESHAPE =
+    "(sonicboom-s-expr (version 0 1) (graph (name \"relu_reshape\")"
+    " (inputs (input \"x\" (tensor float32 (shape 2 3))))"
+    " (outputs (output \"z\"))"
+    " (parameters)"
+    " (nodes"
+    "   (node relu (inputs \"x\")"
+    "     (outputs (\"r\" (tensor float32 (shape 2 3)))))"
+    "   (node reshape (inputs \"r\")"
+    "     (outputs (\"z\" (tensor float32 (shape 3 2))))))))";
+
 // invalid graph: an operator outside the planner vocabulary.
 const char* UNKNOWN_OP =
     "(sonicboom-s-expr (version 0 1) (graph (name \"bad\")"
@@ -180,6 +219,66 @@ int main() {
       for (std::size_t i = 0; i < want.size(); ++i)
         check(std::fabs(got[i] - want[i]) <= 1e-4f,
               "two-regions: NT→MLIR→NT→MLIR value correct");
+    }
+  }
+
+  // --- view outputs: the ABI must return an owned buffer ---------------------
+  // Each graph below ends in a value that bufferizes as a view of an operand
+  // (a reshape of the input, of a parameter, of a computed tensor). Returning
+  // it directly would hand the caller a pointer it does not own and then
+  // std::free() it in exec.cpp; the lowering copies those outputs instead.
+  {
+    std::vector<float> in = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    const std::vector<float> first_in = in;
+
+    auto model = sb::Model::compile(RESHAPE_INPUT);
+    check(model.has_value(), "reshape-input: compiles");
+    if (!model)
+      return 1;
+    check(model->output_types().at(0).shape.dims ==
+              std::vector<int64_t>({3, 2}),
+          "reshape-input: output binding contract");
+
+    auto r = model->run({pack(in)});
+    check(r.has_value(), "reshape-input: run succeeds");
+    if (r) {
+      std::vector<float> got = unpack(r->at(0));
+      for (std::size_t i = 0; i < in.size(); ++i)
+        check(got[i] == first_in[i], "reshape-input: value correct");
+    }
+    check(in == first_in, "reshape-input: the input buffer was not written");
+  }
+
+  {
+    auto model = sb::Model::compile(RESHAPE_PARAM);
+    check(model.has_value(), "reshape-param: compiles");
+    if (!model)
+      return 1;
+    const std::vector<float> in = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    auto r = model->run({pack(in)});
+    check(r.has_value(), "reshape-param: run succeeds");
+    if (r) {
+      std::vector<float> got = unpack(r->at(0));
+      const std::vector<float> want = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+      for (std::size_t i = 0; i < want.size(); ++i)
+        check(got[i] == want[i], "reshape-param: value correct");
+    }
+  }
+
+  {
+    auto model = sb::Model::compile(RELU_RESHAPE);
+    check(model.has_value(), "relu-reshape: compiles");
+    if (!model)
+      return 1;
+    const std::vector<float> in = {-1.0f, 2.0f, -3.0f, 4.0f, -5.0f, 6.0f};
+    auto r = model->run({pack(in)});
+    check(r.has_value(), "relu-reshape: run succeeds");
+    if (r) {
+      std::vector<float> got = unpack(r->at(0));
+      const std::vector<float> want = {0.0f, 2.0f, 0.0f, 4.0f, 0.0f, 6.0f};
+      for (std::size_t i = 0; i < want.size(); ++i)
+        check(std::fabs(got[i] - want[i]) <= 1e-6f,
+              "relu-reshape: value correct");
     }
   }
 

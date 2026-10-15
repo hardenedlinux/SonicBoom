@@ -304,9 +304,11 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
 - **A rank-0 result cannot be expressed** — a reduction over every axis
   lowers to `reduce_mean` + `reshape`, and the reshape of a 0-element target
   shape is rejected.
-- **A graph output that is a *view* of a graph input double-frees**
-  (`core/src/sx/exec.cpp:389` frees the pointer the compiled entry returns).
-  Reachable as `(reshape input ...)` with nothing in between.
+- **A graph output is always a copy the caller owns.** The C ABI frees the
+  pointer the compiled entry returns (`core/src/sx/exec.cpp:389`), so an output
+  that would bufferize as a *view* — a `reshape` of the input, of a parameter,
+  or of a computed tensor — is copied into a fresh tensor before it is
+  returned. Non-view outputs are returned as they are, with no extra copy.
 - **The tracer names closed-over constants itself** (`c0`, `c2`, ...), so a
   traced graph does not carry the model's `"l1.weight"` names. Parameters are
   matched by shape and value, not by name.
