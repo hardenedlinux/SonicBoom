@@ -3,7 +3,7 @@
 # v0 is a generic interpreter: Layer 2 (SonicBoom) → Layer 1 (native-torch) →
 # Layer 0 (CPU). CPU-only for v0; CUDA is a deferred manifest amendment.
 
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.24)
 
 project(SonicBoom
   VERSION 0.0.0
@@ -35,8 +35,14 @@ option(SONICBOOM_USE_CUDA "Enable CUDA support (native-torch CUDA kernels)" OFF)
 option(SONICBOOM_USE_VULKAN "Enable the Vulkan backend stub (community scaffold)" OFF)
 
 if(SONICBOOM_USE_CUDA)
-  # RTX 3050 = compute capability 8.6 (sm_86).
-  set(CMAKE_CUDA_ARCHITECTURES 86)
+  # Default to the GPU detected at build time (native); override with
+  # -DCMAKE_CUDA_ARCHITECTURES=<arch>, required on GPU-less build machines.
+  # Must be set before enable_language(CUDA), which otherwise adopts the
+  # compiler default.
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA SM archs (native = detected GPU)")
+  endif()
+
   # native-torch headers (c10/util/intrusive_ptr.h) use C++20's operator<=>,
   # so .cu host compilation needs C++20 (nvcc 12.0's highest supported host
   # standard). This mirrors the C++23 the CPU native-torch TUs already compile
