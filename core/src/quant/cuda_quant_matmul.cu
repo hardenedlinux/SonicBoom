@@ -1431,18 +1431,19 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // sum-of-squares (double, warp-shuffle + shared reduction, matching
 // nn::cuda::rms_norm_dev's rms_sum_sq_kernel), derives
 // inv = 1/sqrtf(float(sum/n) + eps), then normalizes and quantizes to q8_1 in
-// the same pass — the f32 normalized activation is never materialized. Each
-// thread owns one 32-element q8_1 block (one thread per block, exactly as
-// quantize_q8_1), so the normalization + amax/127 quantization is bit-identical
-// to rms_norm_dev followed by quantize_q8_1_dev.
+// the same pass — the f32 normalized activation is never materialized. The
+// normalization + amax/127 quantization is bit-identical to rms_norm_dev
+// followed by quantize_q8_1_dev.
 //
 // The block is fixed at 1024 threads so the sum-of-squares accumulation order
 // (thread t reads x[t], x[t+1024], …) is identical to rms_norm_fused_kernel,
-// keeping `inv` bit-identical to the unfused path. The quantization loops are
-// deliberately *not* #pragma-unrolled: full unrolling keeps 32 loads in flight
-// per thread and pushes register usage past the 64-register/thread limit at
-// 1024 threads ("too many resources"), whereas the rolled loop needs only a
-// couple of live registers.
+// keeping `inv` bit-identical to the unfused path.
+//
+// Quantization is one warp per 32-element q8_1 block, one lane per element —
+// the same mapping as quantize_q8_1. Each lane computes its normalized value
+// once (kept in a register and reused by the amax butterfly), so the block
+// costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
+// thread runs a 32-iteration serial chain.
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
@@ -1468,22 +1469,19 @@ __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
   __syncthreads();
   const float iv = inv;
   const int nblocks = n / 32;
-  for (int ib = tid; ib < nblocks; ib += blockDim.x) {
-    const float* xb = x + (size_t)ib * 32;
-    const float* wb = weight ? weight + (size_t)ib * 32 : nullptr;
-    // amax pass (rolled): the normalized value is recomputed identically in the
-    // quantize pass below, so no per-block norm[] array is materialized.
-    float amax = 0.0f;
-    for (int k = 0; k < 32; ++k) {
-      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
-      amax = fmaxf(amax, fabsf(nv));
-    }
+  for (int ib = warp; ib < nblocks; ib += blockDim.x >> 5) {
+    const size_t base = (size_t)ib * 32;
+    const float xv = x[base + lane];
+    const float nv = weight ? xv * iv * weight[base + lane] : xv * iv;
+    // amax: same fmaxf(fabsf(nv)) fold as the per-thread serial scan, just
+    // butterfly-reduced across the lanes of the block's warp.
+    float amax = fmaxf(0.0f, fabsf(nv));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float d = amax / 127.0f;
-    y[ib].d = d;
-    for (int k = 0; k < 32; ++k) {
-      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
-      y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(nv / d));
-    }
+    if (lane == 0) y[ib].d = d;
+    y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(nv / d));
   }
 }
 
