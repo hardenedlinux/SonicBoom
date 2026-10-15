@@ -164,6 +164,13 @@ __global__ void add_kernel(const float* __restrict__ a, const float* __restrict_
   if (i < n) y[i] = a[i] + b[i];
 }
 
+__global__ void add_bias_kernel(const float* __restrict__ x,
+                                const float* __restrict__ bias, int bias_n,
+                                float* __restrict__ y, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = x[i] + bias[i % bias_n];
+}
+
 __global__ void scale_kernel(const float* __restrict__ x, float s,
                              float* __restrict__ y, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2039,6 +2046,19 @@ bool add_dev(const float* a, const float* b, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !a || !b || !y) return false;
   add_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n) {
+  if (!available()) return false;
+  const int bias_n = int(bias.size());
+  // Same contract as nn::add_bias: a whole number of bias rows, so `bias_n`
+  // divides `n`. A biasless architecture never emits this node.
+  if (bias_n <= 0 || n <= 0 || n % bias_n != 0 || !x || !y) return false;
+  const float* d_b = static_cast<const float*>(
+      upload_bytes(bias.data(), size_t(bias_n) * sizeof(float)));
+  if (!d_b) return false;
+  add_bias_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_b, bias_n, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

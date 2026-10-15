@@ -67,7 +67,11 @@ struct KvCacheSpec {
   // for a KV layer, the donor's index for a shared-KV layer); the backend
   // reads it straight from the node, so the spec stays model-agnostic.
 
-  uint64_t chunk = 0;  // max prefill segment (SWA ring size; 0 = no window)
+  // Max prefill segment. The model layer sets this to the sliding-window ring
+  // size where the model has one (a segment must be a wrap-free run inside the
+  // ring) and to a fixed default segment otherwise; the CUDA backend sizes its
+  // prefill token buffer from it and rejects a larger segment. Never 0.
+  uint64_t chunk = 0;
 };
 
 // Persistent KV-cache session for prefix reuse. `caches` owns the per-layer

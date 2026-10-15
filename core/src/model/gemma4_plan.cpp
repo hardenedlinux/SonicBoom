@@ -83,6 +83,13 @@ sx::Bytes encode_tokens(std::span<const uint64_t> tokens) {
 sx::Attribute attr_i(const char* name, int64_t v) { return sx::Attribute{name, v}; }
 sx::Attribute attr_f(const char* name, double v) { return sx::Attribute{name, v}; }
 
+// Device-prefill segment size for a model with no sliding window. The chunk
+// exists to keep a prefill segment a wrap-free run inside the KV ring; with no
+// window there is no ring to stay inside, so any positive value is correct and
+// the choice is a pure capacity/launch-geometry one (it only bounds the prefill
+// graph's token buffer). 512 matches the segment size the windowed models use.
+constexpr uint64_t kDefaultPrefillChunk = 512;
+
 // Which generic pieces of the transformer block an architecture uses. This is
 // the ONE architecture-conditional in SonicBoom: the emitter (together with the
 // loader) is the model-specific front end, so an architecture's structural
@@ -149,7 +156,11 @@ BlockProfile profile_for(const Gemma4Config& cfg) {
 planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
   planner::KvCacheSpec spec;
   spec.n_layers = cfg.n_layer_kv();
-  spec.chunk = cfg.sliding_window;
+  // Max prefill segment. A windowed model uses the ring size (so a segment never
+  // wraps the ring); a window-less model has no ring constraint, so it gets the
+  // fixed default segment instead of 0 — the backend sizes its prefill token
+  // buffer from this and rejects a segment larger than it.
+  spec.chunk = (cfg.sliding_window > 0) ? cfg.sliding_window : kDefaultPrefillChunk;
   spec.layers.reserve(spec.n_layers);
   for (uint32_t l = 0; l < spec.n_layers; ++l) {
     const LayerConfig& lc = cfg.layer_config(l);
@@ -1322,8 +1333,10 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // ring still attends correctly. Only the last segment's final hidden column
     // feeds lm_head.
     const uint64_t n = prompt.size();
-    const uint64_t chunk = m.config.sliding_window;
-    if (chunk == 0) { std::cerr << "[prefill-cuda] sliding_window == 0\n"; return 0; }
+    // Segment size == the KV spec's chunk (see kv_cache_spec): the ring size where
+    // the model has a window, else the fixed default segment.
+    const uint64_t chunk = (m.config.sliding_window > 0) ? m.config.sliding_window
+                                                        : kDefaultPrefillChunk;
 
     // One prefill segment per distinct segment size (usually just `chunk`; the
     // final segment may be shorter). Each is bound to its own graph but shares

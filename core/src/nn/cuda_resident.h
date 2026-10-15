@@ -55,6 +55,10 @@ bool silu_dev(const float* x, float* y, int n);
 
 bool mul_dev(const float* a, const float* b, float* y, int n);
 bool add_dev(const float* a, const float* b, float* y, int n);
+// y[i] = x[i] + bias[i % bias.size()]: a [width] bias broadcast over the rows of
+// a [rows, width] buffer (mirrors nn::add_bias). The bias is a host span, a
+// bound model weight, uploaded once and cached.
+bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n);
 bool scale_dev(const float* x, float s, float* y, int n);
 
 // In-place f32 -> fp16 -> f32 round-trip.

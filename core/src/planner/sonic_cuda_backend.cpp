@@ -297,6 +297,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       case model::WeightSlot::PostAttentionNorm: return block.post_attention_norm;
       case model::WeightSlot::PostFfwNorm: return block.post_ffw_norm;
       case model::WeightSlot::PostNorm: return block.post_norm;
+      case model::WeightSlot::AttnQBias: return block.attn_q_bias;
+      case model::WeightSlot::AttnKBias: return block.attn_k_bias;
+      case model::WeightSlot::AttnVBias: return block.attn_v_bias;
+      case model::WeightSlot::AttnOutputBias: return block.attn_output_bias;
       case model::WeightSlot::InpGate: return block.inp_gate;
       case model::WeightSlot::Proj: return block.proj;
       case model::WeightSlot::PerLayerProjNorm: return model_->weights.per_layer_proj_norm;
@@ -317,6 +321,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       case model::WeightSlot::FfnUp: return block.ffn_up;
       case model::WeightSlot::FfnDown: return block.ffn_down;
       case model::WeightSlot::TokenEmbd: return model_->weights.token_embd;
+      case model::WeightSlot::Output: return model_->weights.output;
       default: return kEmpty;
     }
   };
@@ -582,6 +587,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Add: {
       ok = nn::cuda::add_dev(dev(in[0]), dev(in[1]), out, out_n);
+      break;
+    }
+    case OpKind::AddBias: {
+      // A [width] bias broadcast over the rows of the projection output; `out_n`
+      // is [width] when decoding and [n, width] when prefilling, so one launch
+      // covers both. The bias is a bound model weight (host span, uploaded once).
+      const std::span<const float> b = fweight(slot);
+      ok = !b.empty() && nn::cuda::add_bias_dev(b, dev(in[0]), out, out_n);
       break;
     }
     case OpKind::Slice: {

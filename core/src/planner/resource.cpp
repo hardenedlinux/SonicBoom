@@ -285,7 +285,13 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Silu,
         OpKind::Mul,
-        OpKind::Add,            OpKind::Slice,      OpKind::Embedding,
+        OpKind::Add,
+        // A projection bias broadcast (add_bias_dev): a device-local elementwise
+        // op like Add.Placing it on the CPU would make the projection's bias
+        // upload an H2D transfer per step — which a CUDA Graph capture cannot
+        // record (and never usefully, since the bias is a fixed weight).
+        OpKind::AddBias,
+        OpKind::Slice,          OpKind::Embedding,
         OpKind::Argmax,
         // Phase 7 chunked prefill operators (device-resident): FlashAttention
         // (chunked SDPA) and KvAppend (deferred cache append) have no per-token

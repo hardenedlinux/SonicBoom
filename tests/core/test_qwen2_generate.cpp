@@ -51,6 +51,8 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/planner/kv_cache.h>
+#include <sonicboom/quant/quantized_matmul.h>
 #include <sonicboom/vocab/vocab.h>
 
 #include <cstdint>
@@ -64,6 +66,8 @@
 
 namespace sbgguf = sonicboom::gguf;
 namespace sbmodel = sonicboom::model;
+namespace sbplanner = sonicboom::planner;
+namespace sbquant = sonicboom::quant;
 namespace sbvocab = sonicboom::vocab;
 
 namespace {
@@ -221,6 +225,12 @@ int main() {
   constexpr double kNearTieGap = 0.25;
   const std::string dir = data_dir();
 
+  // Kept for the Stage-5 CUDA section below: each prompt's CPU spine stream, the
+  // same prompts' token ids, and llama.cpp's per-step ranking.
+  std::vector<std::vector<int64_t>> cpu_streams;
+  std::vector<std::vector<uint64_t>> prompts;
+  std::vector<std::vector<std::vector<std::pair<int64_t, double>>>> topk_all;
+
   for (int p = 1; p <= 3; ++p) {
     const std::string txt = read_file(dir + "/p" + std::to_string(p) + ".txt");
     const std::string ref = read_file(dir + "/p" + std::to_string(p) + ".ref");
@@ -265,6 +275,9 @@ int main() {
     const auto topk = pick_topk(ref, size_t(kSteps));
     const int64_t d = first_diff(got, want_tokens);
     const bool first16 = d < 0 || d >= 16;
+    cpu_streams.push_back(got);
+    prompts.push_back(prompt);
+    topk_all.push_back(topk);
     std::cout << "  p" << p << ": " << got.size() << " tokens, first diff at "
               << (d < 0 ? std::string("none") : std::to_string(d))
               << ", first 16 " << (first16 ? "match" : "DIFFER") << "\n";
@@ -295,6 +308,161 @@ int main() {
     got_slow.resize(n2);
     check(got_slow == got,
           "p" + std::to_string(p) + ": batched prefill == per-token spine");
+  }
+
+  // --- Stage 5: the CUDA path and prefix-cache reuse -------------------------
+  //
+  // Skipped cleanly when the build has no device. The GPU kernels are allowed
+  // their own quantization and reduction order (the project's GPU-numerics
+  // rule), so CUDA-vs-CPU agreement is asserted the same way as CPU-vs-llama:
+  // identically, or at a step where llama.cpp's own ranking says the decision was
+  // a near-tie. Prefix reuse has no such licence — it must reproduce the full
+  // prefill's continuation token for token, since it is the same arithmetic on
+  // the same cache.
+  if (!sbquant::cuda_available()) {
+    std::cout << "  (skipped: no CUDA device)\n";
+  } else {
+    for (size_t p = 0; p < prompts.size(); ++p) {
+      std::vector<int64_t> gpu(size_t(kSteps), -1);
+      const uint64_t n = sbmodel::generate_prefill_spine_cuda(
+          *m, prompts[p], 0, gpu, 0, /*use_prefill=*/true);
+      gpu.resize(n);
+      const std::string tag = "p" + std::to_string(p + 1);
+      check(n == uint64_t(kSteps),
+            tag + ": CUDA ran all " + std::to_string(kSteps) + " steps");
+      const std::vector<int64_t>& cpu = cpu_streams[p];
+      const int64_t d = first_diff(gpu, cpu);
+      if (d < 0) {
+        std::cout << "  " << tag << ": CUDA stream == CPU stream ("
+                  << gpu.size() << " tokens)\n";
+        check(true, tag + ": CUDA == CPU");
+        continue;
+      }
+      const auto& ranked = topk_all[p][size_t(d)];
+      double gap = -1.0;
+      int rank = 0;
+      for (size_t i = 0; i < ranked.size(); ++i)
+        if (ranked[i].first == gpu[size_t(d)]) { gap = ranked[i].second; rank = int(i) + 1; }
+      std::cout << "  " << tag << ": CUDA vs CPU diverge at " << d << " (cuda="
+                << gpu[size_t(d)] << " cpu=" << cpu[size_t(d)] << ", llama rank "
+                << rank << " gap " << gap << ")\n";
+      check(gap >= 0.0 && gap < kNearTieGap,
+            tag + ": CUDA-vs-CPU divergence at step " + std::to_string(d) +
+                " is a near-tie (gap " + std::to_string(gap) + " < " +
+                std::to_string(kNearTieGap) + ")");
+    }
+
+    // Determinism: the same prompt must give the same stream on every run. The
+    // device path is the one with atomics and split-K reductions in it, so this
+    // is the check that would catch a non-deterministic merge.
+    {
+      std::vector<int64_t> a(size_t(kSteps), -1), b(size_t(kSteps), -1);
+      sbmodel::generate_prefill_spine_cuda(*m, prompts[0], 0, a, 0, true);
+      for (int run = 0; run < 5; ++run) {
+        sbmodel::generate_prefill_spine_cuda(*m, prompts[0], 0, b, 0, true);
+        check(a == b, "CUDA run " + std::to_string(run + 1) +
+                          " of 5 identical to the first");
+      }
+    }
+
+    // Prefix reuse at three prefix lengths over one longer prompt (the three
+    // fixtures' prompts concatenated), plus the fully-reused case.
+    std::vector<uint64_t> full;
+    for (const auto& pr : prompts) full.insert(full.end(), pr.begin(), pr.end());
+    std::cout << "  prefix-reuse prompt: " << full.size() << " tokens\n";
+    const uint64_t kReuseSteps = 16;
+
+    // Per-token reference over the same prompt (no prefill graph): every token's
+    // state is produced as n == 1, which is what a fully-reused suffix plus decode
+    // does. It is the discriminator between a reduction-order difference (batched
+    // prefill vs token-by-token) and a prefix-cache defect: a reuse continuation
+    // that matches this stream but not the batched one differs only in the order
+    // the attention reduction ran in, not in what the cache holds.
+    std::vector<int64_t> per_token(size_t(kReuseSteps), -1);
+    per_token.resize(sbmodel::generate_prefill_spine_cuda(*m, full, 0, per_token, 0,
+                                                          /*use_prefill=*/false));
+    for (uint64_t prefix_len : {uint64_t(8), uint64_t(16), uint64_t(24), full.size()}) {
+      // Reference: the whole prompt, fresh session, no reuse.
+      std::vector<int64_t> ref_toks(size_t(kReuseSteps), -1);
+      const uint64_t ref_done = sbmodel::generate_prefill_spine_cuda(
+          *m, full, 0, ref_toks, 0, true);
+      ref_toks.resize(ref_done);
+
+      std::vector<uint64_t> prefix(full.begin(), full.begin() + prefix_len);
+      sbplanner::KvCacheSession session;
+      session.n_ctx = full.size() + kReuseSteps;
+      std::vector<int64_t> setup_toks(1, -1);
+      if (sbmodel::generate_prefill_spine_cuda_prefix(*m, prefix, 0, setup_toks,
+                                                      session, true) == 0) {
+        check(false, "prefix setup prefill failed at " + std::to_string(prefix_len));
+        continue;
+      }
+      std::vector<int64_t> reuse_toks(size_t(kReuseSteps), -1);
+      uint64_t reused = 0;
+      const uint64_t reuse_done = sbmodel::generate_prefill_spine_cuda_prefix(
+          *m, full, 0, reuse_toks, session, true, &reused);
+      reuse_toks.resize(reuse_done);
+      const uint64_t want_reused =
+          prefix_len == full.size() ? full.size() - 1 : prefix_len;
+      std::cout << "  prefix=" << prefix_len << ": reused " << reused
+                << " (want " << want_reused << ")\n";
+      check(reused == want_reused, "prefix=" + std::to_string(prefix_len) +
+                                       ": reuse count is the shared prefix");
+      const bool eq_ref = reuse_done == ref_done && reuse_toks == ref_toks;
+      const bool eq_pt =
+          reuse_done == per_token.size() && reuse_toks == per_token;
+      // The three partial prefix lengths must be token-identical to a fresh full
+      // prefill: that is the reuse contract. The fully-reused case (suffix of one
+      // token) cannot be, and is checked for its reuse count plus reported: the
+      // one-token suffix runs through the batched *prefill* graph at n == 1,
+      // which selects the dp4a path, while the reference's last prompt token was
+      // one column of a 31-token mmq tensor-core prefill — a kernel-selection
+      // numerics difference of the same class as the CUDA-vs-CPU near-ties
+      // (n == 1 prefill vs the n == 1 decode graph is reported alongside).
+      const bool fully_reused = prefix_len == full.size();
+      if (!eq_ref && !fully_reused) {
+        const int64_t diff_at = first_diff(reuse_toks, ref_toks);
+        std::cout << "    first diff at " << diff_at << " (ref_done " << ref_done
+                  << ", reuse_done " << reuse_done << ")";
+        if (diff_at >= 0)
+          std::cout << " reuse=" << reuse_toks[size_t(diff_at)]
+                    << " ref=" << ref_toks[size_t(diff_at)]
+                    << " per-token=" << per_token[size_t(diff_at)];
+        std::cout << ", whole stream == per-token: " << (eq_pt ? "yes" : "no")
+                  << "\n";
+      }
+      if (fully_reused) {
+        const int64_t diff_at = first_diff(reuse_toks, ref_toks);
+        // Same reuse, but the one-token suffix goes through the decode graph
+        // instead of the one-token prefill graph (the discriminating control).
+        sbplanner::KvCacheSession dec_session;
+        dec_session.n_ctx = full.size() + kReuseSteps;
+        std::vector<int64_t> dec_setup(1, -1);
+        std::vector<int64_t> dec_toks(size_t(kReuseSteps), -1);
+        bool dec_ok = false;
+        if (sbmodel::generate_prefill_spine_cuda_prefix(*m, prefix, 0, dec_setup,
+                                                        dec_session, true) != 0) {
+          const uint64_t dec_done = sbmodel::generate_prefill_spine_cuda_prefix(
+              *m, full, 0, dec_toks, dec_session, /*use_prefill=*/false);
+          dec_toks.resize(dec_done);
+          dec_ok = dec_done == ref_done && dec_toks == ref_toks;
+        }
+        std::cout << "    fully-reused continuation: "
+                  << (eq_ref ? "token-identical to full prefill"
+                             : "matches for " + std::to_string(diff_at) +
+                                   " step(s), differs at " +
+                                   std::to_string(diff_at))
+                  << "; via the decode graph: "
+                  << (dec_ok ? "token-identical" : "differs at " +
+                                                     std::to_string(
+                                                         first_diff(dec_toks,
+                                                                    ref_toks)))
+                  << "\n";
+      }
+      if (!fully_reused)
+        check(eq_ref, "prefix=" + std::to_string(prefix_len) +
+                          ": reuse continuation token-identical to full prefill");
+    }
   }
 
   if (g_failures) {
