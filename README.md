@@ -16,9 +16,9 @@ same, so the lead comes from the layers above them: a graph planner, and behind
 it an MLIR compiler tier. Those layers are what llama.cpp's architecture does
 not have, and they are where SonicBoom keeps improving.
 
-> **Status: v0.0.1.** Two model families are verified end to end — Gemma 4
+> **Status: v0.0.2.** Two model families are verified end to end — Gemma 4
 > E4B-it (Q3_K_M) and Qwen2.5-0.5B-Instruct (Q4_K_M) — on CUDA sm_86, both
-> checked against llama.cpp. Read [Scope of v0.0.1](#scope-of-v001) before
+> checked against llama.cpp. Read [Scope of v0.0.2](#scope-of-v002) before
 > trying it.
 
 ---
@@ -145,7 +145,7 @@ reporter's machine.
   it does not compile there as it stands. The port is a guard plus a NEON
   sibling of the same fixed-point kernel.
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
-  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.1 is built
+  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.2 is built
   and tested for **sm_86** only (RTX 30-series).
 - GNU Guile 3.0
 - [SonicCross](https://github.com/hardenedlinux/SonicCross), a required
@@ -222,7 +222,7 @@ echo "0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4  models/g
 
 Any GGUF the runtime supports runs the same way — for instance
 `qwen2.5-0.5b-instruct-q4_k_m.gguf`, the other verified model (both files and
-their checksums are in [Scope of v0.0.1](#scope-of-v001)).
+their checksums are in [Scope of v0.0.2](#scope-of-v002)).
 
 Then start Guile:
 
@@ -272,9 +272,9 @@ numbers from.
 
 ---
 
-## Scope of v0.0.1
+## Scope of v0.0.2
 
-v0.0.1 is a working runtime, not a drop-in replacement for llama.cpp. Its
+v0.0.2 is a working runtime, not a drop-in replacement for llama.cpp. Its
 limits:
 
 - **Two verified model families:** Gemma 4 E4B-it Q3_K_M and Qwen2.5-0.5B-Instruct
@@ -304,7 +304,9 @@ limits:
   GPU in the build machine) and is resolved at configure time; other
   architectures have not been tested. Whatever was compiled is reported by
   `sb_build_info()` / `tools/sb-report.sh`, so a binary never has to be taken on
-  trust about which SMs it contains. A CPU path exists but is a reference
+  trust about which SMs it contains. One community report ran on an RTX 4060 Ti
+  (Ada) with decode tokens identical to the sm_86 results, see
+  [Community results](#community-results). A CPU path exists but is a reference
   implementation, not a fast one.
 - **Sampling:** greedy only. `temperature`, `top_p` and `top_k` return
   `SB_ERR_UNSUPPORTED`.
