@@ -565,6 +565,20 @@ public:
   }
 };
 
+// fuse_silu_mul_quantize_pass (rewrites.cpp:319), as a Boom IR pass: the same
+// rewrite over the SwiGLU activation.
+class SiluMulQuantizePass
+    : public mlir::PassWrapper<SiluMulQuantizePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SiluMulQuantizePass)
+
+  void runOnOperation() override {
+    fuseActMulQuantize(getOperation(), planner::OpKind::Silu,
+                       planner::OpKind::SiluMulQuantize);
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -577,6 +591,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     pm.addPass(std::make_unique<QuantizeOncePass>());
     pm.addPass(std::make_unique<RmsNormQuantizePass>());
     pm.addPass(std::make_unique<GeluMulQuantizePass>());
+    pm.addPass(std::make_unique<SiluMulQuantizePass>());
     return;
   case planner::IrPassPhase::Prefill:
     return;
@@ -590,7 +605,6 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
 void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    planner::fuse_silu_mul_quantize_pass(g);
     planner::fuse_bias_into_gemv_pass(g);
     planner::fuse_residual_add_into_gemv_pass(g);
     return;
