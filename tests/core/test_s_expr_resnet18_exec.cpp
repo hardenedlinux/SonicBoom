@@ -73,9 +73,30 @@ std::vector<float> as_floats(const sx::Bytes& b) {
 
 } // namespace
 
+// The sidecar artifacts are generated, not committed (see .gitignore), so a
+// fresh checkout has the fixture document but no data. Exit with this code —
+// registered as CTest's SKIP_RETURN_CODE for this test — instead of failing.
+static constexpr int kSkipReturnCode = 77;
+
 int main() {
   const std::string design = std::string(SONICBOOM_SRC_DIR) + "/design";
   const std::string fixture = design + "/s-expr-v0-resnet18.example.sx";
+
+  // 0. Fixture gate: skip cleanly when the sidecars are absent.
+  for (const char* name :
+       {"resnet18.weights.bin", "resnet18.input.bin", "resnet18.reference.bin"}) {
+    const std::string path = design + "/" + name;
+    std::ifstream probe(path, std::ios::binary);
+    if (!probe) {
+      std::cout << "SKIP: " << path << " is missing\n"
+                << "      The ResNet-18 sidecars are generated, not committed.\n"
+                << "      Generate them from models/resnet18.onnx with:\n"
+                << "        models/.venv/bin/python "
+                   "tools/reference/gen_resnet18_reference.py\n"
+                << "      (writes design/resnet18.{weights,input,reference}.bin)\n";
+      return kSkipReturnCode;
+    }
+  }
 
   // 1. Parse the frozen fixture.
   std::ifstream in(fixture);

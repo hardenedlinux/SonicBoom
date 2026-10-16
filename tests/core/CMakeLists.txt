@@ -105,6 +105,15 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir test_s
   sb_add_cpp_test(${test_name})
 endforeach()
 
+# The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
+# input / reference sidecars under design/, and the importer's output under
+# build/import/), none of which is committed — see .gitignore. On a fresh
+# checkout they exit 77 with a message naming the file and the generator, so
+# CTest reports them as Skipped rather than Failed.
+set_tests_properties(
+  test_s_expr_resnet18_exec test_onnx_import_resnet18_exec
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 # C ABI test, compiled as C to prove <sonicboom/capi.h> is a genuine C header
 # and libsonicboom.so exports its entry points with C linkage. Links libm for
 # fabsf.

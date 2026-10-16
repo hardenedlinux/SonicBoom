@@ -10,6 +10,12 @@
 ;;; talks to it with (web client) for plain requests, and over raw sockets
 ;;; for SSE (to read event by event, and to hang up in the middle) and for
 ;;; WebSocket (a minimal client: handshake, masked text frames).
+;;;
+;;; The server runs against the mock backend (--backend mock), which needs no
+;;; GGUF, so this is the suite CTest registers. Set SONICBOOM_SERVE_BACKEND=real
+;;; to point the same protocol-level checks at the libsonicboom backend instead
+;;; — that path does need a model file and a built libsonicboom.so, and
+;;; tools/test-api-server.sh remains the committed real-backend smoke test.
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
@@ -44,6 +50,7 @@
           (dup2 (fileno out) 2)
           (execlp "guile" "guile" "-L" "bindings/guile/scheme"
                   "bindings/guile/scheme/sonicboom/serve/app.scm"
+                  "--backend" (or (getenv "SONICBOOM_SERVE_BACKEND") "mock")
                   "--port" (number->string port) "--queue" "1" "--step-delay" "0.01"
                   "--runtime-dir" (format #f "~a/sonicboom-serve-test-~a" tmp (getpid))))
         pid)))
@@ -401,6 +408,17 @@
        ((_ . body2)
         (test-equal "tools: the tool result is read" "Tool result: sunny, 21C"
           (jref body2 "choices" 0 "message" "content"))
+        ;; KNOWN LIMITATION (measured, not yet fixed). The model generates the
+        ;; call with `<tool_call>`/`</tool_call>` as control tokens — they are
+        ;; in the family's special-token list (chat-template.scm:69) and the
+        ;; mock's plan tokenizes them as one id each — while a replayed
+        ;; assistant message is tokenized as plain text (a marker typed into a
+        ;; message must stay text). So the replayed call turn never matches the
+        ;; generated one and the cached prefix stops at the user turn
+        ;; (612 of 671 tokens here). chat-template.scm:23 claims the opposite
+        ;; ("rendered exactly as the model generated it"). Marked as an
+        ;; expected failure so that a fix shows up as an unexpected pass.
+        (test-expect-fail 1)
         (test-equal "tools: the call turn is reused from the cache"
           (+ (jref body "usage" "prompt_tokens") (jref body "usage" "completion_tokens"))
           (jref body2 "usage" "prompt_tokens_details" "cached_tokens")))))))

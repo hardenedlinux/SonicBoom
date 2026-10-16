@@ -98,6 +98,32 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-inference.scm)
 
+  # guile-serve-http drives the OpenAI-compatible server (serve/app.scm) end to
+  # end — plain JSON, SSE over a raw socket, a WebSocket — against the mock
+  # backend (--backend mock), which needs no GGUF. This is the protocol-level
+  # suite; tools/test-api-server.sh is the real-backend smoke test. It needs
+  # GNU Artanis, so register it only when Artanis is importable.
+  execute_process(COMMAND ${GUILE_EXECUTABLE} --no-auto-compile -c
+                          "(use-modules (artanis env))"
+                  RESULT_VARIABLE GUILE_ARTANIS_RESULT
+                  OUTPUT_QUIET ERROR_QUIET)
+  if(GUILE_ARTANIS_RESULT EQUAL 0)
+    # The test spawns the server with a repository-relative path, so it must run
+    # from the repository root.
+    add_test(
+      NAME guile-serve-http
+      COMMAND ${CMAKE_COMMAND} -E env
+              GUILE_AUTO_COMPILE=0
+              LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+              ${GUILE_EXECUTABLE} --no-auto-compile
+              -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/serve/test-serve-http.scm)
+    set_tests_properties(guile-serve-http PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  else()
+    message(STATUS "GNU Artanis not found; skipping the guile-serve-http test")
+  endif()
+
   # guile-cpp-e2e: the full training → export → independent C++ load loop. The
   # Guile exporter (train + sb_export_model) writes an artifact, then the C++
   # loader (test_e2e_load, built in tests/core) reloads it and checks its

@@ -28,6 +28,8 @@
 ;;;
 ;;; Options
 ;;;   --host ADDR --port N            listen address (127.0.0.1:8000)
+;;;   --backend real|mock             libsonicboom C ABI (real) or the
+;;;                                   deterministic in-process mock (real)
 ;;;   --queue N                       requests allowed to wait (8)
 ;;;   --max-sessions N --token-budget N   session pool, per model (4, 32768)
 ;;;   --context-length N              of the mock models (8192)
@@ -45,6 +47,7 @@
              (ice-9 match)
              (sonicboom serve backend)
              (sonicboom serve real-backend)
+             (sonicboom serve mock-backend)
              (sonicboom serve engine)
              (sonicboom serve sessions)
              (sonicboom serve chat-template)
@@ -56,8 +59,8 @@
 
 (define options
   (getopt-long (command-line)
-               '((host (value #t)) (port (value #t)) (model (value #t))
-                 (model-id (value #t)) (queue (value #t))
+               '((host (value #t)) (port (value #t)) (backend (value #t))
+                 (model (value #t)) (model-id (value #t)) (queue (value #t))
                  (max-sessions (value #t)) (token-budget (value #t))
                  (context-length (value #t)) (step-delay (value #t))
                  (prefill-delay (value #t)) (runtime-dir (value #t)))))
@@ -84,17 +87,39 @@
 (sse-install!)
 
 ;;; ---------------------------------------------------------------------------
-;;; The engine: one real Gemma 4 model loaded through libsonicboom's C ABI.
+;;; The engine: one real Gemma 4 model loaded through libsonicboom's C ABI, or
+;;; (--backend mock) the deterministic in-process mock — one model per chat
+;;; template family, no GGUF needed. Both go through the same backend protocol,
+;;; so nothing below this point knows which one is in use.
 
-(define backend (make-real-backend))
+(define backend-name (option 'backend "real"))
+
+(define backend
+  (case (string->symbol backend-name)
+    ((real) (make-real-backend))
+    ((mock) (make-mock-backend))
+    (else (error "unknown backend (expected real or mock):" backend-name))))
+
+(define (mock-model id family)
+  (load-model backend `((id . ,id) (family . ,family)
+                        (context-length . ,(option 'context-length 8192))
+                        (step-delay . ,(option 'step-delay 0))
+                        (prefill-delay . ,(option 'prefill-delay 0)))))
+
 (define model-path (option 'model "models/gemma-4-E4B-it-Q3_K_M.gguf"))
 (define model-id (option 'model-id "gemma-4-E4B-it-Q3_K_M"))
-(define model
-  (load-model backend `((id . ,model-id) (path . ,model-path)
-                        (context-length . ,(option 'context-length 512)))))
+
+(define models
+  (case (string->symbol backend-name)
+    ((mock) (list (mock-model "sonicboom-mock-gemma" 'gemma)
+                  (mock-model "sonicboom-mock-qwen" 'qwen)))
+    (else
+     (list (load-model backend
+                       `((id . ,model-id) (path . ,model-path)
+                         (context-length . ,(option 'context-length 512))))))))
 
 (define engine
-  (make-engine (list model)
+  (make-engine models
                #:queue-limit queue-limit
                #:max-sessions (option 'max-sessions 4)
                #:token-budget (option 'token-budget 32768)))
