@@ -575,4 +575,90 @@ void fuse_bias_into_gemv_pass(Graph& g) {
       g.tensors.end());
 }
 
+void fuse_residual_add_into_gemv_pass(Graph& g) {
+  // Residual-add fusion. `Add(proj, residual)` where `proj` is a single-column
+  // QuantizedMatmulQ8 output with no other reader: the projection gains the
+  // residual as a second input (the executing backend adds it in the gemv
+  // epilogue, one launch instead of two) and takes over the Add's output tensor.
+  // The residual tensor keeps its buffer — the graph now reads it one node
+  // earlier, at the projection — so liveness only shortens.
+  std::unordered_map<uint32_t, uint32_t> consumers;
+  for (const GraphNodeDesc& node : g.nodes)
+    for (const TensorId& in : node.inputs)
+      ++consumers[in.value];
+
+  std::unordered_map<uint32_t, uint32_t> producer;
+  for (uint32_t i = 0; i < g.nodes.size(); ++i)
+    for (const TensorId& o : g.nodes[i].outputs)
+      producer[o.value] = i;
+
+  // Add node index -> (matmul node index, index of the residual operand).
+  std::unordered_map<uint32_t, uint32_t> matmul_of_add;
+  std::unordered_map<uint32_t, uint32_t> residual_of_add;
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& node = g.nodes[i];
+    if (node.op != OpKind::Add || node.inputs.size() != 2) continue;
+    int64_t add_batch = 0;
+    if (attr_i(node, "batch", add_batch)) continue;  // batched (prefill) form
+    // Either operand may be the projection (the emitter writes `Add(proj, res)`,
+    // but the pass does not depend on that order).
+    for (uint32_t s = 0; s < 2; ++s) {
+      const uint32_t proj = node.inputs[s].value;
+      auto pit = producer.find(proj);
+      if (pit == producer.end()) continue;
+      const GraphNodeDesc& m = g.nodes[pit->second];
+      if (m.op != OpKind::QuantizedMatmulQ8 || m.outputs.size() != 1) continue;
+      int64_t m_batch = 0;
+      if (attr_i(m, "batch", m_batch)) continue;  // no epilogue on the mmq path
+      if (consumers[proj] != 1) continue;         // the projection has another reader
+      matmul_of_add[i] = pit->second;
+      residual_of_add[i] = 1 - s;
+      break;
+    }
+  }
+
+  if (matmul_of_add.empty())
+    return;
+
+  // The matmul's own f32 output tensor is replaced by the Add's output tensor
+  // (same shape, one buffer either way), so it becomes dead.
+  std::unordered_set<uint32_t> dead;
+  for (const auto& [ai, mi] : matmul_of_add)
+    for (const TensorId& o : g.nodes[mi].outputs)
+      dead.insert(o.value);
+
+  std::unordered_map<uint32_t, uint32_t> add_of_matmul;  // matmul idx -> Add idx
+  for (const auto& [ai, mi] : matmul_of_add)
+    add_of_matmul[mi] = ai;
+
+  std::vector<GraphNodeDesc> out_nodes;
+  out_nodes.reserve(g.nodes.size());
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    if (matmul_of_add.count(i))
+      continue;  // folded into the matmul that produced its input
+    GraphNodeDesc node = g.nodes[i];
+    auto ait = add_of_matmul.find(i);
+    if (ait != add_of_matmul.end()) {
+      const uint32_t ai = ait->second;
+      const TensorId residual = g.nodes[ai].inputs[residual_of_add[ai]];
+      node.outputs = g.nodes[ai].outputs;  // take over the Add's output
+      // The residual becomes this node's last input, so the executor hands it to
+      // the backend; the attribute names its index for backends that want it
+      // explicitly.
+      node.inputs.push_back(residual);
+      node.attributes.push_back(
+          sx::Attribute{"add_input", int64_t(node.inputs.size() - 1)});
+    }
+    out_nodes.push_back(std::move(node));
+  }
+
+  g.nodes = std::move(out_nodes);
+
+  g.tensors.erase(
+      std::remove_if(g.tensors.begin(), g.tensors.end(),
+                     [&](const TensorDesc& t) { return dead.count(t.id.value) != 0; }),
+      g.tensors.end());
+}
+
 } // namespace sonicboom::planner

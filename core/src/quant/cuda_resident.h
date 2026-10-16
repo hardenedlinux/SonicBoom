@@ -76,8 +76,13 @@ bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
 // bias cost one launch. Only valid for the types gemv_bias_epilogue_supported()
 // accepts; asking for a bias on any other type fails the call (it never silently
 // drops the bias).
+//
+// `add` is an optional [num_rows] device epilogue operand (nullptr => none) — the
+// residual of an `Add(proj, residual)`, added after the bias in the same fp32
+// epilogue so the residual costs no separate launch. Same type restriction as
+// `bias`; a non-null `add` on an unsupported type fails the call.
 bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
-                   std::span<const float> bias = {});
+                   std::span<const float> bias = {}, const float* add = nullptr);
 
 // Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
 // gemv kernel carries the epilogue). Callers that must add a bias regardless use

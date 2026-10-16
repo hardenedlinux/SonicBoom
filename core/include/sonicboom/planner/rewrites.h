@@ -87,6 +87,20 @@ void fuse_rms_norm_mmq_pass(Graph& g);
 // what turns the projection into a QuantizedMatmulQ8.
 void fuse_bias_into_gemv_pass(Graph& g);
 
+// Residual-add fusion (decode). The residual add around a projection is emitted
+// as `Add(proj, residual)`. When `proj` is a single-column QuantizedMatmulQ8
+// output with no other reader, the residual becomes the matmul's second input
+// (named by the `add_input` attribute) and the matmul takes over the Add's output
+// tensor, so the Add node disappears. The executing backend adds the residual in
+// the gemv epilogue (one launch instead of two) where its kernel has the epilogue
+// for the weight's quant type, and falls back to a separate elementwise add
+// otherwise — the values are identical either way, since the residual is added
+// once to the row's fully reduced sum, in the same fp32 addition the separate
+// kernel performs. Run after fuse_bias_into_gemv_pass (so a projection with both
+// a bias and a residual folds in that order, which is the order the unfused
+// kernels apply them in).
+void fuse_residual_add_into_gemv_pass(Graph& g);
+
 // C.4 prefill (mmq) gelu×up fusion. The gated FFN down-projection
 // QuantizedMatmul(fh) internally quantizes fh = gelu_fp16(gate) * up. When the
 // gelu and the mul product are each single-use, the GeluFp16 + Mul +
