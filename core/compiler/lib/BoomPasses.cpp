@@ -244,6 +244,16 @@ std::optional<int64_t> nodeAttrInt(mlir::ArrayAttr nodeAttrs, llvm::StringRef na
   return std::nullopt;
 }
 
+// The IR name of an op kind's node. `buildNode` adds the dialect prefix (an op
+// is `boom.quantize`, not `quantize`), so a pass that matches a node by name
+// spells it through here rather than by hand — the Graph passes match on the
+// op kind, and the one thing a name match can get wrong is its spelling.
+std::string boomOpName(planner::OpKind kind) {
+  std::string name = "boom.";
+  name += planner::op_kind_name(kind);
+  return name;
+}
+
 //--- the passes -------------------------------------------------------------
 
 // quantize_once_pass (rewrites.cpp:79), as a Boom IR pass.
@@ -277,7 +287,8 @@ public:
       nodes.push_back(&node);
 
     for (mlir::Operation *node : nodes) {
-      if (node->getName().getStringRef() != "boom.quantized_matmul" ||
+      if (node->getName().getStringRef() !=
+              boomOpName(planner::OpKind::QuantizedMatmul) ||
           node->getNumOperands() != 1)
         continue;
 
@@ -384,14 +395,15 @@ public:
     // for the same reason.
     llvm::SmallVector<std::pair<mlir::Operation *, mlir::Operation *>> pairs;
     for (mlir::Operation &node : view.body()) {
-      if (node.getName().getStringRef() != "boom.quantize" ||
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::Quantize) ||
           node.getNumOperands() != 1)
         continue;
       const int64_t x = view.idOf(node.getOperand(0));
       auto producedBy = producer.find(x);
       if (producedBy == producer.end())
         continue;
-      if (producedBy->second->getName().getStringRef() != "boom.rms_norm")
+      if (producedBy->second->getName().getStringRef() !=
+          boomOpName(planner::OpKind::RmsNorm))
         continue;
       if (consumers[x] != 1)
         continue;
@@ -437,6 +449,122 @@ public:
   }
 };
 
+// fuse_act_mul_quantize_pass (rewrites.cpp:224), as a Boom IR pass: the shared
+// body of the gated-FFN activation×up → q8_1 fusions. The two activation
+// flavours (GeluFp16 for Gemma, Silu for SwiGLU models) differ only in which
+// activation op is matched and which fused op is emitted; the rewrite is
+// otherwise identical, so it is written once and parameterized — as it is on the
+// Graph side.
+//
+// The rewrite, unchanged: where a Quantize reads the product of a Mul whose
+// first operand is a single-reader activation node, the activation node becomes
+// one fused act_mul_quantize(gate, up) taking over the Quantize's output; the
+// activation's output and the act×up product stop being tensors of the graph.
+void fuseActMulQuantize(boom::GraphOp graph, planner::OpKind act,
+                        planner::OpKind fused) {
+  GraphEditor view(graph);
+  mlir::OpBuilder builder(view.ctx());
+  const mlir::Location loc = graph.getLoc();
+
+  llvm::DenseMap<int64_t, mlir::Operation *> producer;
+  llvm::DenseMap<int64_t, unsigned> consumers;
+  for (mlir::Operation &node : view.body()) {
+    for (int64_t id : GraphEditor::resultIds(node))
+      producer.insert({id, &node});
+    for (mlir::Value operand : node.getOperands())
+      ++consumers[view.idOf(operand)];
+  }
+
+  // The op kind's node name and its IR name differ by the dialect prefix, which
+  // is exactly the difference a name match has to get right: match on the
+  // latter, hand the former to buildNode (which adds the prefix itself).
+  const std::string actNode = boomOpName(act);
+  const llvm::StringRef fusedName = planner::op_kind_name(fused);
+
+  // The matches, keyed by the activation op: both reader counts have to be one,
+  // because the fusion removes both intermediate tensors (rewrites.cpp:235-269).
+  llvm::SmallVector<mlir::Operation *> acts;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> mulOfAct;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> quantizeOfAct;
+  for (mlir::Operation &node : view.body()) {
+    if (node.getName().getStringRef() != boomOpName(planner::OpKind::Quantize) ||
+        node.getNumOperands() != 1)
+      continue;
+    const int64_t fh = view.idOf(node.getOperand(0));
+    auto producedBy = producer.find(fh);
+    if (producedBy == producer.end())
+      continue;
+    mlir::Operation *mul = producedBy->second;
+    if (mul->getName().getStringRef() != boomOpName(planner::OpKind::Mul) ||
+        mul->getNumOperands() != 2)
+      continue;
+    if (consumers[fh] != 1)
+      continue; // the act*up product has another reader
+    const int64_t actT = view.idOf(mul->getOperand(0));
+    auto actProducer = producer.find(actT);
+    if (actProducer == producer.end())
+      continue;
+    mlir::Operation *a = actProducer->second;
+    if (a->getName().getStringRef() != actNode || a->getNumOperands() != 1)
+      continue;
+    if (consumers[actT] != 1)
+      continue; // the activation output has another reader
+    acts.push_back(a);
+    mulOfAct.insert({a, mul});
+    quantizeOfAct.insert({a, &node});
+  }
+
+  if (acts.empty())
+    return;
+
+  for (mlir::Operation *a : acts) {
+    mlir::Operation *mul = mulOfAct.lookup(a);
+    mlir::Operation *quantize = quantizeOfAct.lookup(a);
+
+    // The fused node, built where the activation was: the activation's id,
+    // attribute record and backend, the gate plus the Mul's up operand as
+    // inputs, and the Quantize's output (rewrites.cpp:296-301).
+    builder.setInsertionPoint(a);
+    mlir::Operation *node = buildNode(
+        builder, loc, fusedName, GraphEditor::nodeId(*a), fusedName,
+        a->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+        GraphEditor::resultIds(*quantize),
+        {a->getOperand(0), mul->getOperand(1)}, quantize->getResultTypes(),
+        a->getAttrOfType<mlir::StringAttr>("backend"));
+
+    // The tensors folded away: the activation's output and the act*up product.
+    // Their ids are read before their ops go.
+    llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*a));
+    for (int64_t id : GraphEditor::resultIds(*mul))
+      dead.push_back(id);
+
+    // The product's only reader, the Quantize, is gone; then the Mul that made
+    // it, then the activation, whose output the Mul was the last reader of.
+    quantize->replaceAllUsesWith(node);
+    view.noteReplaced(quantize, node);
+    quantize->erase();
+    mul->erase();
+    for (int64_t id : dead)
+      view.dropTensor(id);
+    a->erase();
+  }
+
+  view.commitTable();
+}
+
+// fuse_gelu_mul_quantize_pass (rewrites.cpp:315), as a Boom IR pass.
+class GeluMulQuantizePass
+    : public mlir::PassWrapper<GeluMulQuantizePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GeluMulQuantizePass)
+
+  void runOnOperation() override {
+    fuseActMulQuantize(getOperation(), planner::OpKind::GeluFp16,
+                       planner::OpKind::GeluMulQuantize);
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -448,6 +576,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
   case planner::IrPassPhase::Decode:
     pm.addPass(std::make_unique<QuantizeOncePass>());
     pm.addPass(std::make_unique<RmsNormQuantizePass>());
+    pm.addPass(std::make_unique<GeluMulQuantizePass>());
     return;
   case planner::IrPassPhase::Prefill:
     return;
@@ -461,7 +590,6 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
 void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    planner::fuse_gelu_mul_quantize_pass(g);
     planner::fuse_silu_mul_quantize_pass(g);
     planner::fuse_bias_into_gemv_pass(g);
     planner::fuse_residual_add_into_gemv_pass(g);
