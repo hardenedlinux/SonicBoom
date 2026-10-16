@@ -345,6 +345,98 @@ public:
   }
 };
 
+// fuse_rms_norm_quantize_pass (rewrites.cpp:143), as a Boom IR pass.
+//
+// The rewrite, unchanged: an RmsNorm whose normalized output has exactly one
+// reader, a Quantize node, becomes one rms_norm_quantize act — the Quantize
+// folds into its producer, and the f32 activation the pair carried between them
+// stops being a tensor of the graph. The fused node keeps the RmsNorm's
+// identity (its id, its attributes, its operands, its backend) and takes the
+// Quantize's output, so the matmuls that read the q8_1 activation read on.
+class RmsNormQuantizePass
+    : public mlir::PassWrapper<RmsNormQuantizePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RmsNormQuantizePass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    // The producer of each tensor, and how many operands read it: the two
+    // relations the match is stated in (rewrites.cpp:146-157). Every tensor in
+    // the graph has at most one producer; a graph input has none.
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    // The (RmsNorm, Quantize) pairs. A match needs the reader count on the
+    // RmsNorm's output to be exactly one: the fusion removes that f32 activation
+    // from the graph, so a second reader would need it to still exist
+    // (rewrites.cpp:159-176). Two Quantize nodes on one output cannot both match
+    // for the same reason.
+    llvm::SmallVector<std::pair<mlir::Operation *, mlir::Operation *>> pairs;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != "boom.quantize" ||
+          node.getNumOperands() != 1)
+        continue;
+      const int64_t x = view.idOf(node.getOperand(0));
+      auto producedBy = producer.find(x);
+      if (producedBy == producer.end())
+        continue;
+      if (producedBy->second->getName().getStringRef() != "boom.rms_norm")
+        continue;
+      if (consumers[x] != 1)
+        continue;
+      pairs.emplace_back(producedBy->second, &node);
+    }
+
+    if (pairs.empty())
+      return;
+
+    for (auto [rmsNorm, quantize] : pairs) {
+      // The fused node, built where the RmsNorm was: the same node id, the same
+      // attribute record, the same operands and backend, and the Quantize's
+      // result — the q8_1 activation, whose type and ids carry over
+      // (rewrites.cpp:198-205).
+      builder.setInsertionPoint(rmsNorm);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::RmsNormQuantize),
+          GraphEditor::nodeId(*rmsNorm),
+          planner::op_kind_name(planner::OpKind::RmsNormQuantize),
+          rmsNorm->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+          GraphEditor::resultIds(*quantize), rmsNorm->getOperands(),
+          quantize->getResultTypes(),
+          rmsNorm->getAttrOfType<mlir::StringAttr>("backend"));
+
+      // The activation's readers — the matmuls — now read the fused node, and
+      // the Quantize node goes away, folded into its producer. The id → value
+      // direction follows before the old node is erased.
+      quantize->replaceAllUsesWith(fused);
+      view.noteReplaced(quantize, fused);
+      quantize->erase();
+
+      // The f32 activation the pair carried is no longer a tensor of the graph:
+      // nothing reads it any more (its reader count was one, and that reader was
+      // the Quantize node just erased), and a table entry with no producer would
+      // turn it into a graph input (rewrites.cpp:212-217).
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*rmsNorm));
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      rmsNorm->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -355,6 +447,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
     pm.addPass(std::make_unique<QuantizeOncePass>());
+    pm.addPass(std::make_unique<RmsNormQuantizePass>());
     return;
   case planner::IrPassPhase::Prefill:
     return;
@@ -368,7 +461,6 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
 void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    planner::fuse_rms_norm_quantize_pass(g);
     planner::fuse_gelu_mul_quantize_pass(g);
     planner::fuse_silu_mul_quantize_pass(g);
     planner::fuse_bias_into_gemv_pass(g);
