@@ -136,6 +136,13 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
 bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
                                     BlockQ8_1Mmq* yq, int dim, int n, int ds);
 
+// silu(gate)*up + block_q8_1_mmq quantize fused (C.4, position-major, SwiGLU).
+// The Silu counterpart of the gelu fusion above: identical contract, identical
+// block mapping and quantizer, only the activation differs. dim must be a
+// multiple of 128.
+bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds);
+
 // K-quant matmul consuming a pre-quantized block_q8_1_mmq activation (no internal
 // quantize). W is the Q*_K weight [cols, rows]; yq is [cols/128][n] block_q8_1_mmq
 // (index blk*n + token); Y is [n, rows] position-major. The caller sized yq with

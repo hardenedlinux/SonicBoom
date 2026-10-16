@@ -123,4 +123,14 @@ void fuse_residual_add_into_gemv_pass(Graph& g);
 // matmul's attributes. Run after fuse_rms_norm_mmq_pass.
 void fuse_gelu_mul_mmq_pass(Graph& g);
 
+// C.4 prefill (mmq) silu×up fusion: the SwiGLU counterpart of
+// fuse_gelu_mul_mmq_pass. Where the gated FFN activates with Silu (Qwen2, Llama,
+// Mistral, …) the Silu + Mul + QuantizedMatmul triple folds into one
+// SiluMulQuantize(batch, dim=ff, ds) node plus a QuantizedMatmulQ8 — the f32
+// silu and product intermediates are never materialized. Identical conditions,
+// tensor reuse and attribute inheritance; the two passes are mutually exclusive
+// (a graph activates with one activation, never both). Run after
+// fuse_rms_norm_mmq_pass.
+void fuse_silu_mul_mmq_pass(Graph& g);
+
 } // namespace sonicboom::planner

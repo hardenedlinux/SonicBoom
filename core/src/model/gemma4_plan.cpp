@@ -542,14 +542,20 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
   // The fused mmq quantize's activation scale layout follows the consuming
   // matmul's weight type: Q3_K and the legacy 32-element formats Q5_0/Q8_0 ->
-  // ggml D4 (float scales), Q6_K -> Q8_1-compatible D4, and Q4_K/Q5_K -> DS4
-  // (half2 scales). Every format the mmq path executes therefore has a layout,
-  // so the C.4 planner passes may fold a quantize into any of them.
+  // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
+  // mmq path executes therefore has a layout, so the C.4 planner passes may
+  // fold a quantize into any of them.
+  // Q6_K gets -1: its mmq weight kernel is disabled (TODO(q6k-mmq)), so it has
+  // no mmq activation layout and must never be folded into a fused emitter —
+  // -1 is the "no layout" marker the C.4 passes skip on (see
+  // fuse_act_mul_mmq_pass / fuse_rms_norm_mmq_pass), which keeps the down
+  // projection on its dequant + cuBLAS route rather than quantizing its
+  // activation to int8.
   // Baked here (not in the planner pass) because only the emitter knows the
   // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
   auto ds_a = [](quant::QuantType qt) {
     const int64_t ds = (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
-                       : qt == quant::QuantType::Q6_K ? 2 : 0;
+                       : qt == quant::QuantType::Q6_K ? -1 : 0;
     return attr_i("ds", ds);
   };
   auto shape2 = [](uint64_t r, uint64_t c) {
@@ -1373,6 +1379,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
             nseg >= uint64_t(quant::cuda::mmq_min_n())) {
           planner::fuse_rms_norm_mmq_pass(seg->graph);
           planner::fuse_gelu_mul_mmq_pass(seg->graph);
+          planner::fuse_silu_mul_mmq_pass(seg->graph);
         }
       }
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;

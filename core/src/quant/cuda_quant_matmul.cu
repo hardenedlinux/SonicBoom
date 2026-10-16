@@ -2151,6 +2151,52 @@ bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// silu×up -> block_q8_1_mmq fused (C.4, position-major, SwiGLU): the Silu
+// counterpart of gelu_mul_quantize_mmq_q8_1 — same fusion, same block mapping,
+// same quantizer, only the activation differs (silu(g) = g/(1+expf(-g)), the
+// expression nn::cuda::silu uses, so the fused blocks are bit-identical to the
+// unfused silu + mul + the matmul's internal quantize).
+template <int ds>
+__global__ void silu_mul_quantize_mmq_q8_1_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up, int dim, int n,
+    mmq::block_q8_1_mmq* __restrict__ y) {
+  const int token = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nwarps = (blockDim.x + 31) >> 5;
+  const float* grow = gate + (size_t)token * dim;
+  const float* urow = up + (size_t)token * dim;
+  const int nblocks = dim / 128;
+  for (int blk = warp; blk < nblocks; blk += nwarps) {
+    const int base = blk * 128 + lane * 4;
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float g = grow[base + k];
+      f[k] = (g / (1.0f + expf(-g))) * urow[base + k];
+    }
+    quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
+  }
+}
+
+bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds) {
+  if (!available() || !gate || !up || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0)
+    return false;
+  auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  if (ds == mmq::DS4)
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  else if (ds == mmq::D4_Q8_1)
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  else
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
