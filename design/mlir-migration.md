@@ -6,11 +6,12 @@ citation. Statements that are inference rather than observation are marked
 **(inference)**.
 
 Scope of this document: replace the transitional `planner::OpKind` graph IR with
-an MLIR-based compiler IR, keeping the runtime unchanged in what it executes
-(binary blobs, hand-written kernels) and using the S-Expr text form as the new
-dialect's text form. The sections below first inventory what exists (1–5), then
-propose the target (6), the staged migration (7), the constraints that bound it
-(8), and the open questions for Roy (9).
+an MLIR-based compiler IR — the `boom` dialect, **Boom IR** — keeping the runtime
+unchanged in what it executes (binary blobs, hand-written kernels), with
+**Blade** (the user-facing S-expression interchange format) lowering into it. The
+sections below first inventory what exists (1–5), then propose the target (6),
+the staged migration (7), the constraints that bound it (8), and the design
+decisions (9).
 
 ---
 
@@ -21,12 +22,13 @@ propose the target (6), the staged migration (7), the constraints that bound it
 There are two hierarchies, and today they are layered conceptually but not in
 practice:
 
-- `sx::Document` — the frozen S-Expr v0.1 IR, defined in
+- `sx::Document` — the frozen Blade v0.1 IR, defined in
   `core/include/sonicboom/sx/ir.h:175-179`. It is the *specified* text format
-  (`design/s-expr-v0-spec.md`) and the input to the MLIR lowering path.
+  (`design/s-expr-v0-spec.md` — the file name stays) and the input to the MLIR
+  lowering path.
 - `planner::Graph` — the planner-facing graph IR, defined in
   `core/include/sonicboom/planner/graph.h:73-82`. Its header comment
-  (`graph.h:19-23`) states it "is a *view* over the frozen S-Expr v0.1 IR
+  (`graph.h:19-23`) states it "is a *view* over the frozen Blade v0.1 IR
   (`sx::Document`)".
 
 That comment is only true of one of the two front ends. There are two ways a
@@ -36,7 +38,7 @@ That comment is only true of one of the two front ends. There are two ways a
    `core/src/planner/graph_adapter.cpp:141-253`) converts an `sx::Document` into
    a `planner::Graph`, mapping op names through
    `op_kind_from_name(node.op_name)` (`graph_adapter.cpp:202`). This is the
-   ResNet-18 / S-Expr path.
+   ResNet-18 / Blade path.
 2. **Direct construction** by the model plan emitters in
    `core/src/model/gemma4_plan.cpp` (1732 lines) — a `Builder` that appends
    `GraphNodeDesc`s straight into the graph. Gemma 4 and Qwen2 never pass
@@ -52,7 +54,7 @@ That comment is only true of one of the two front ends. There are two ways a
   `is_graph_external`, plus `name`.
 - `GraphNodeDesc` (`graph.h:57-71`): `id`, `op` (an `OpKind`), `inputs`,
   `outputs` (tensor ids), `attributes` (a `std::vector<sx::Attribute>` — the
-  S-Expr attribute type, reused verbatim, `sx/ir.h:101-111`), `name`, and an
+  Blade attribute type, reused verbatim, `sx/ir.h:101-111`), `name`, and an
   optional `backend` override.
 - The `backend` override is the load-bearing part of the current design: the
   Gemma 4 emitter pins **every** node to `BackendTag::Sonic`
@@ -67,7 +69,7 @@ That comment is only true of one of the two front ends. There are two ways a
 `core/include/sonicboom/planner/op_kind.h:34-90`, 34 values. Two disjoint sets
 live in one enum:
 
-**Legacy S-Expr v0.1 set** (`op_kind.h:36-44`), the seven MLIR-lowerable ops plus
+**Legacy Blade v0.1 set** (`op_kind.h:36-44`), the seven MLIR-lowerable ops plus
 two markers:
 
 | OpKind | line | notes |
@@ -113,8 +115,8 @@ two markers:
 | `KvAppend` | :89 | deferred KV cache append |
 
 `op_kind_from_name` (`op_kind.h:94`) and `op_kind_name` (`op_kind.h:96`) are the
-string bridge; only the legacy names round-trip through S-Expr text
-(`graph_adapter.cpp:202`), so an S-Expr document cannot today name any
+string bridge; only the legacy names round-trip through Blade text
+(`graph_adapter.cpp:202`), so a Blade document cannot today name any
 transformer op. **(inference):** the transformer half of `OpKind` is an
 in-process C++ enum with no textual form at all.
 
@@ -288,11 +290,11 @@ precisely the class of thing a compiler IR exists to make visible.
 
 ---
 
-## 4. The S-Expr route
+## 4. The Blade route
 
 ### 4.1 The op set and planner
 
-The S-Expr path's operator vocabulary is exactly the seven lowerable ops plus
+The Blade path's operator vocabulary is exactly the seven lowerable ops plus
 two markers (`op_kind.h:36-44`). The lowering dispatch table is
 `lowerers()` at `core/src/sx/lowering.cpp:637-647`, registering `relu`, `add`,
 `reshape`, `conv`, `max_pool`, `reduce_mean`, `gemm`; `lower_node`
@@ -301,7 +303,9 @@ two markers (`op_kind.h:36-44`). The lowering dispatch table is
 
 The design intent is explicit in `design/s-expr-to-mlir-lowering.md:41`: "No
 custom SonicBoom dialect" is introduced — the lowering targets builtin + func +
-arith + tensor + linalg. `lowering.cpp:26` repeats this.
+arith + tensor + linalg. `lowering.cpp:26` repeats this. **(inference):** that
+statement scopes the *Blade route's* lowering, which stays custom-dialect-free;
+Boom IR (§6) is the compiler IR one layer below it, not a second text form.
 
 ### 4.2 How it reaches MLIR and runs
 
@@ -317,10 +321,10 @@ contexts (`:285-294`), lowers (`:306`), runs the pipeline (`:310`), builds an
 
 ### 4.3 Relationship to the production IR
 
-**(inference).** The S-Expr route and the production LLM path are two disjoint
+**(inference).** The Blade route and the production LLM path are two disjoint
 worlds today:
 
-- The S-Expr route lowers 7 ops to linalg and JITs them (`BackendTag::Mlir`,
+- The Blade route lowers 7 ops to linalg and JITs them (`BackendTag::Mlir`,
   `partition.h:40-44`).
 - The LLM path never enters `sx::Document`; its 25 transformer ops route to
   `BackendTag::Sonic` (`partition.h:57-84`) and are executed by hand-written
@@ -331,7 +335,7 @@ worlds today:
   unreachable for the transformer set today, because the emitter pins every
   node's backend at construction.
 
-**(inference):** the S-Expr route is the *existing proof* that SonicBoom can
+**(inference):** the Blade route is the *existing proof* that SonicBoom can
 lower and JIT, and the LLM path is the *existing proof* that hand-written
 kernels are where the performance is. The migration's central question is how to
 get one IR that does both.
@@ -437,7 +441,7 @@ backend did, not a description of the plan, and it is not serialized.
 
 ---
 
-## 6. Proposed `sonicboom` dialect
+## 6. Proposed `boom` dialect (Boom IR)
 
 ### 6.1 Ops
 
@@ -449,34 +453,35 @@ attributes mirror the `GraphNodeDesc` attributes it replaces.
 Ops fall into three tiers, by what they lower to:
 
 1. **High-level, lowered to a call into an existing hand-written kernel.**
-   Every one of the 25 transformer ops (§1.3): `sb.quantized_matmul`,
-   `sb.quantize`, `sb.quantized_matmul_q8`, `sb.rms_norm_quantize`,
-   `sb.gelu_mul_quantize`, `sb.silu_mul_quantize`, `sb.rms_norm`,
-   `sb.rms_norm_heads`, `sb.gelu_fp16`, `sb.silu`, `sb.rope`, `sb.attention`,
-   `sb.gqa_broadcast`, `sb.embedding`, `sb.matvec_f32`, `sb.matvec_bf16`,
-   `sb.add_bias`, `sb.mul`, `sb.scale`, `sb.cast_fp16`, `sb.softcap`,
-   `sb.argmax`, `sb.slice`, `sb.flash_attention`, `sb.kv_append`. The
+   Every one of the 25 transformer ops (§1.3): `boom.quantized_matmul`,
+   `boom.quantize`, `boom.quantized_matmul_q8`, `boom.rms_norm_quantize`,
+   `boom.gelu_mul_quantize`, `boom.silu_mul_quantize`, `boom.rms_norm`,
+   `boom.rms_norm_heads`, `boom.gelu_fp16`, `boom.silu`, `boom.rope`,
+   `boom.attention`, `boom.gqa_broadcast`, `boom.embedding`, `boom.matvec_f32`,
+   `boom.matvec_bf16`, `boom.add_bias`, `boom.mul`, `boom.scale`,
+   `boom.cast_fp16`, `boom.softcap`, `boom.argmax`, `boom.slice`,
+   `boom.flash_attention`, `boom.kv_append`. The
    distinction here is that these do **not** lower to linalg — they lower to a
    runtime call. **(inference):** keeping them high level is what preserves the
    current performance; lowering a K-quant gemv to linalg would discard the
    hand-written kernel that is the whole point.
-2. **High-level, lowered to linalg.** The seven legacy ops (`sb.conv`,
-   `sb.relu`, `sb.add`, `sb.max_pool`, `sb.reduce_mean`, `sb.reshape`,
-   `sb.gemm`), plus `sb.softmax` (which routes to native-torch, `partition.h:55-56`).
-   These reuse `lowerers()` (`lowering.cpp:637-647`) and the `exec.cpp`
-   pipeline unchanged.
-3. **Marker.** `sb.whole_graph` (`op_kind.h:44`).
+2. **High-level, lowered to linalg.** The seven legacy ops (`boom.conv`,
+   `boom.relu`, `boom.add`, `boom.max_pool`, `boom.reduce_mean`, `boom.reshape`,
+   `boom.gemm`), plus `boom.softmax` (which routes to native-torch,
+   `partition.h:55-56`). These reuse `lowerers()` (`lowering.cpp:637-647`) and
+   the `exec.cpp` pipeline unchanged.
+3. **Marker.** `boom.whole_graph` (`op_kind.h:44`).
 
 ### 6.2 Types
 
-- `!sb.tensor<shape x dtype>` — a ranked tensor type mirroring `TensorDesc::shape`
-  and `sx::DType` (`sx/ir.h:39-50`).
+- `!boom.tensor<shape x dtype>` — a ranked tensor type mirroring
+  `TensorDesc::shape` and `sx::DType` (`sx/ir.h:39-50`).
 - **Quantized types as first-class MLIR types.** This is the key change from
   `sx::DType`, which has no quantized members (`sx/ir.h:39-50`). The dialect
-  should define `!sb.q4_k`, `!sb.q5_k`, `!sb.q6_k`, `!sb.q5_0`, `!sb.q8_0` for
-  weights (mirroring `QuantType` at
+  should define `!boom.q4_k`, `!boom.q5_k`, `!boom.q6_k`, `!boom.q5_0`,
+  `!boom.q8_0` for weights (mirroring `QuantType` at
   `core/include/sonicboom/quant/quantized_tensor.h:46-53`, with block sizes from
-  `QuantTypeInfo` at `:61-67`) and `!sb.q8_1` for the activation layout the mmq
+  `QuantTypeInfo` at `:61-67`) and `!boom.q8_1` for the activation layout the mmq
   path consumes. **(inference):** making the quant type a *type* rather than the
   emitter-baked `ds` integer (`gemma4_plan.cpp:564-568`) is what lets the
   `ds`-consistency precondition of `fuse_rms_norm_mmq_pass`
@@ -489,10 +494,10 @@ Ops fall into three tiers, by what they lower to:
 The KV cache is invisible to the planner today (§3). In the dialect, KV must be
 a first-class effect rather than a side-channel:
 
-- `sb.kv_read` — read the prior cache for positions `< pos`; consumed by
-  `sb.attention` and `sb.flash_attention`.
-- `sb.kv_write` (replacing the deferred `sb.kv_append`, `op_kind.h:89`) — append
-  the current rows.
+- `boom.kv_read` — read the prior cache for positions `< pos`; consumed by
+  `boom.attention` and `boom.flash_attention`.
+- `boom.kv_write` (replacing the deferred `boom.kv_append`, `op_kind.h:89`) —
+  append the current rows.
 - The ring semantics (`j % n_slots`, `kv_cache.h:38`) and the
   slot-count/per-layer keying (`KvCacheDev`, `kv_cache.h:40-47`;
   `KvCacheSpec`, `:54-75`) should be attributes of the cache value, not baked
@@ -502,18 +507,26 @@ a first-class effect rather than a side-channel:
   the write from step *i* must be ordered before the read at step *i+1*. Today
   this ordering is implicit in "the loop runs the ops in order".
 
-### 6.4 S-Expr as the text form
+### 6.4 Blade lowers to Boom IR
 
-The dialect should be given a **text form equal to the S-Expr format**
-(`design/s-expr-v0-spec.md:76-114` for the grammar; `design/s-expr-v0.2-draft.md`
-for the in-progress v0.2). **(inference):** this is the natural choice for three
-reasons: (i) the format already exists and is frozen at v0.1; (ii) the Guile
-binding already emits canonical text (`bindings/guile/scheme/sonicboom/nn.scm:223`),
-so the round-trip test has a real producer and consumer on day one; (iii) it
-keeps the dialect's textual identity in SonicBoom's own hands rather than an
-MLIR-generic form. The transformer ops need names in the text form — the
-v0.1 grammar cannot name them today (§1.3), so extending the op name set is part
-of step (a), not a separate design.
+Blade and Boom IR are **two layers**, with a lowering between them (§9). Blade
+is the user-facing S-expression interchange format — what Guile emits, the ONNX
+importer produces, `model-export!` writes, and the file extension `.blade`
+names; Boom IR is the compiler IR the passes and the planner work on. They may
+share an S-expression reader, but they are separate grammars with separate
+versioning: Blade is stable and versioned (`design/s-expr-v0-spec.md:76-114` for
+the frozen v0.1 grammar; **Blade v0.2** for the in-progress increment list in
+`design/s-expr-v0.2-draft.md`, which keeps that file name), while Boom IR is
+internal and may change as the migration proceeds.
+
+**(inference):** the lowering between them is the natural place to keep the
+textual identity for three reasons: (i) the format already exists and is frozen
+at v0.1; (ii) the Guile binding already emits canonical text
+(`bindings/guile/scheme/sonicboom/nn.scm:223`), so the round-trip test has a
+real producer and consumer on day one; (iii) it keeps the user-facing identity
+in SonicBoom's own hands rather than an MLIR-generic form. The transformer ops
+need names in Blade — the v0.1 grammar cannot name them today (§1.3), so
+extending the op name set is part of step (a), not a separate design.
 
 ---
 
@@ -524,7 +537,7 @@ declared done. Steps are ordered so that each is independently revertible.
 
 ### (a) Dialect + bidirectional conversion
 
-Define the `sonicboom` dialect (§6) and a **bidirectional** conversion:
+Define the `boom` dialect (Boom IR, §6) and a **bidirectional** conversion:
 `OpKind` ↔ dialect. The round-trip test is the gate: for the Gemma 4 decode
 graph and the Qwen 2 decode graph, `OpKind → dialect → OpKind` must reproduce a
 graph that is `op`-wise and attribute-wise identical (this is checkable without
@@ -559,7 +572,7 @@ passes come after §6.2's quant types exist.
 
 Once every pass is a dialect pattern and the emitter builds the dialect directly,
 delete `planner::OpKind`, `GraphNodeDesc`, and `adapt_graph`'s `op_kind_from_name`
-bridge, and reduce the S-Expr route to the dialect's text form (§6.4).
+bridge, and reduce the Blade route to a lowering into Boom IR (§6.4).
 
 - **Gate:** all of §7.6, and the (b) diff is unchanged.
 
@@ -634,65 +647,49 @@ plan-diff record in (b) then reads.
 
 ---
 
-## 9. Risks and open questions for Roy
+## 9. Design decisions
 
-**Q1. Does the dialect carry the transformer ops as opaque high-level ops
-(calls into hand-written kernels), or does some of it lower to linalg/gpu?**
-*Recommended answer:* carry them as high-level ops in steps (a)–(d) and lower
-only the glue to codegen in step (e). The K-quant gemv, attention and
-flash-attention kernels are where the performance lives
-(`design/benchmark.md`; the hand-written kernels are named as the reference in
-`CLAUDE.md`); lowering them to linalg would discard that. The glue is where
-codegen has room to help, and it is exactly the region the v1 scope names.
-
-**Q2. What is the exact scope of the serialized execution-plan record, and is it
-in step (a) or (b)?**
-*Recommended answer:* build it in (b), before any pass is ported, and define
-"exactly" as the four-vector in §5.4 (kernel sequence, launch config, buffer
-identity, stream/effect ordering). Without it (c) is unfalsifiable.
-
-**Q3. Where do launch parameters live after the migration — in the emitter, the
-backend, or the IR?**
-*Recommended answer:* keep them in the backend/`.cu` wrappers for the
-hand-written kernels (they are kernel-specific tuning, and `design/tuning-parameters.md`
-already tracks them by `file:line`), and record them *on the plan* as an
-observable. Moving them into the IR would re-derive `design/tuning-parameters.md`
-in MLIR for no runtime benefit.
-
-**Q4. How does the KV cache become visible to the compiler without breaking the
-decode-step CUDA Graph capture, which relies on `pos`/token device slots and a
-`(model, n_ctx)`-keyed cache?**
-*Recommended answer:* model KV as dialect effects (§6.3) for *analysis and
-ordering*, but keep the physical cache a backend-resident ring keyed by layer
-(`kv_cache.h:38-47`) — the effect model describes the dependency, it does not
-have to own the storage. This is what makes the `kv_shared` /
-`kv_source_layer` routing (set by the emitter today) a checkable property
-instead of an emitter convention.
-
-**Q5. Is S-Expr v0.2 the dialect's text form, or a separate forward-compatible
-format?**
-*Recommended answer:* S-Expr *is* the text form (§6.4), and v0.2 suffices — the
-draft already exists (`design/s-expr-v0.2-draft.md`). Extending the op name set
-to cover the transformer ops is the only change required, and it is the thing
-the Guile binding's canonical emitter
-(`bindings/guile/scheme/sonicboom/nn.scm:223`) is already positioned to produce.
-
-**Q6. What happens to `BackendTag` and `route_op` once the dialect exists?**
-*Recommended answer:* `route_op` (`partition.h:53-88`) survives as the *default*
-routing rule, but the emitter should stop needing to pin every node
-(`gemma4_plan.cpp:229,521`) — once the dialect's ops lower to a known target,
-pinning every node is redundant. The migration should end with `BackendTag` an
-attribute of the dialect op's lowering, not a field on the graph node.
-
-**Q7. What is the fallback if a ported pass's pattern cannot reproduce a
-predicate's behaviour exactly?**
-*Recommended answer:* the pass stays unported and the predicate is re-expressed
-as an analysis (constraint §8.3) — not copied into the pattern. A predicate that
-cannot be re-expressed is evidence that the property it tests is not actually
-derivable from the IR, which is itself the finding to record.
-
-**Q8. Is the `WholeGraph` marker (`op_kind.h:44`) still meaningful in the
-dialect?**
-*Recommended answer:* keep it as `sb.whole_graph` for step (a) round-trip
-fidelity, then delete it in (d) — it is task granularity, and after (b) the plan
-record expresses task grouping directly.
+- **Transformer ops stay high-level Boom IR ops.** All 25 transformer ops
+  (§1.3) lower to calls into the hand-written kernels; only the glue — norms,
+  quantize, elementwise, residual adds, RoPE — additionally acquires a
+  linalg/GPU-codegen lowering, in step (e), with the hand-written kernel kept as
+  the reference. The K-quant gemv, attention and flash-attention kernels are
+  where the performance lives (`design/benchmark.md`; `CLAUDE.md` names the
+  hand-written kernels as the reference), so lowering them to linalg would
+  discard it.
+- **The execution-plan record and its diff test come before any pass is
+  ported.** They are built in step (b), on the four-vector in §5.4 — kernel
+  sequence, launch config, buffer identity, stream/effect ordering. Without them
+  step (c) is unfalsifiable.
+- **Launch parameters stay in the backend as a transitional choice.** Through
+  step (d) they remain kernel-specific tuning inside the backend and the `.cu`
+  wrappers, tracked by `design/tuning-parameters.md` and recorded *on the plan*
+  as an observable; **from step (e) they become a tuning-config attribute on
+  `boom` ops**, chosen by the autotuner / runtime JIT and recorded in the plan.
+  Moving them into the IR before the autotuner exists would only re-derive
+  `design/tuning-parameters.md` for no runtime benefit.
+- **The KV cache is modelled as dialect effects; its physical storage stays
+  backend-owned.** `boom.kv_read` / `boom.kv_write` effects (§6.3) give the
+  compiler the dependency to analyse and order, while the cache itself remains a
+  backend-resident ring keyed by layer (`kv_cache.h:38-47`) — the effect model
+  describes the dependency, it does not have to own the storage. This is what
+  makes the `kv_shared` / `kv_source_layer` routing (set by the emitter today) a
+  checkable property instead of an emitter convention.
+- **Blade and Boom IR are two layers, with a lowering between them.** Blade is
+  the user-facing S-expression interchange format — what Guile emits, the ONNX
+  importer produces, `model-export!` writes; extension `.blade` — and Boom IR is
+  the compiler IR. They may share an S-expression reader, but they are separate
+  grammars with separate versioning: Blade is stable and versioned, Boom IR is
+  internal and may change.
+- **`BackendTag` becomes an attribute of an op's lowering, not a graph-node
+  field.** `route_op` (`partition.h:53-88`) survives as the *default* routing
+  rule, and the emitter stops pinning every node (`gemma4_plan.cpp:229,521`).
+  Once the dialect's ops lower to a known target, pinning every node is
+  redundant.
+- **A predicate a pattern cannot reproduce exactly is re-expressed as an
+  analysis, never copied into the pattern.** A predicate that cannot be
+  re-expressed is evidence that the property it tests is not derivable from the
+  IR, which is itself the finding; the pass stays unported (constraint §8.3).
+- **`WholeGraph` survives step (a) and is deleted in step (d).** It is task
+  granularity, and step (a)'s round-trip gate needs it present for fidelity;
+  after (b) the plan record expresses task grouping directly.

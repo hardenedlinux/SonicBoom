@@ -1,8 +1,10 @@
-# SonicBoom S-Expr v0.2 — Draft
+Blade (formerly S-Expr) — user-facing format; lowers to Boom IR.
+
+# SonicBoom Blade v0.2 — Draft
 
 > Status: **DRAFT**, not frozen. Derived from the graphs the Guile tracing
 > prototype (`bindings/guile/scheme/sonicboom/trace/`) actually emits.
-> Base: [`s-expr-v0-spec.md`](s-expr-v0-spec.md) (v0.1, FROZEN). Everything in
+> Base: [`s-expr-v0-spec.md`](s-expr-v0-spec.md) (Blade v0.1, FROZEN). Everything in
 > v0.1 stays valid; this draft lists only the increments.
 > Checked by: `(sonicboom trace validate)` (§11).
 
@@ -185,7 +187,7 @@ Whether native-torch actually has a kernel for each name is recorded in
 (node loop
   (inputs <state>… <invariant>…)
   (outputs (<name> <type>)…)              ; one per state input
-  (attrs (body (string "<document>"))     ; a complete S-Expr document
+  (attrs (body (string "<document>"))     ; a complete Blade document
          (trip_count (int <n>))           ; n >= 0
          (state_count (int <k>))))        ; 0 <= k <= number of inputs
 ```
@@ -194,7 +196,7 @@ Whether native-torch actually has a kernel for each name is recorded in
 
 - **Inputs.** The first `k` inputs are the loop state; the rest are loop
   invariants (values from outside the loop, such as weights).
-- **The body.** `body` is a complete S-Expr document. Its inputs are named
+- **The body.** `body` is a complete Blade document. Its inputs are named
   `"s0"…"s<k-1>"` (the state) and `"x0"…` (the invariants), typed exactly as
   the node's inputs. Its outputs are the next state, in order and with the
   same types.
