@@ -9,8 +9,8 @@ stable C ABI, and GNU Guile is its first-class language. You load
 interpreter, no pip, and no wheel tree on the inference path.
 
 The first release targets local LLM inference on consumer GPUs. On a laptop
-RTX 3050 it **decodes 12–17% faster than llama.cpp, using the same quantized
-kernels** — 1.17× on Gemma 4 E4B-it Q3_K_M, 1.12× on Qwen2.5-0.5B-Instruct
+RTX 3050 it **decodes 12–18% faster than llama.cpp, using the same quantized
+kernels** — 1.18× on Gemma 4 E4B-it Q3_K_M, 1.12× on Qwen2.5-0.5B-Instruct
 Q4_K_M ([numbers](#numbers), same machine, medians of 3). The kernels are the
 same, so the lead comes from the layers above them: a graph planner, and behind
 it an MLIR compiler tier. Those layers are what llama.cpp's architecture does
@@ -60,22 +60,22 @@ the build that produced it.
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **52.6 tok/s** | 44.8 tok/s | **1.17×** |
-| Decode at KV depth 512 | **51.6 tok/s** | 44.2 tok/s | **1.17×** |
-| Prefill, 512-token prompt (marginal) | 1672 tok/s | 1999 tok/s | 0.84× |
-| Prefix reuse, 512-token prefix + 64 new | 212.9 ms to first token | — | — |
+| **Decode**, 64-step steady state | **52.7 tok/s** | 44.8 tok/s | **1.18×** |
+| Decode at KV depth 512 | **51.7 tok/s** | 44.2 tok/s | **1.17×** |
+| Prefill, 512-token prompt (marginal) | 1673 tok/s | 1997 tok/s | 0.84× |
+| Prefix reuse, 512-token prefix + 64 new | 212.2 ms to first token | — | — |
 
 **Qwen2.5-0.5B-Instruct Q4_K_M** (same machine, same session)
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **343.4 tok/s** | 307.7 tok/s | **1.12×** |
-| Decode at KV depth 512 | 296.4 tok/s | 303.9 tok/s | 0.98× |
-| Prefill, 512-token prompt (marginal) | 12790 tok/s | 14065 tok/s | 0.91× |
-| Prefix reuse, 512-token prefix + 64 new | 29.8 ms to first token | — | — |
+| **Decode**, 64-step steady state | **344.7 tok/s** | 307.9 tok/s | **1.12×** |
+| Decode at KV depth 512 | 296.5 tok/s | 304.1 tok/s | 0.97× |
+| Prefill, 512-token prompt (marginal) | 12765 tok/s | 14085 tok/s | 0.91× |
+| Prefix reuse, 512-token prefix + 64 new | 29.7 ms to first token | — | — |
 
 - **Decode is ahead on both families**, at depth 0 and at depth 512 on Gemma.
-  Qwen2 at depth 512 is level with llama.cpp: it has no sliding window, so all
+  Qwen2 at depth 512 is level with llama.cpp (0.97×): it has no sliding window, so all
   512 keys are attended while Gemma's ring buffer wraps.
 - **Prefill is behind** — 0.84× (Gemma) and 0.91× (Qwen). It is a real batched
   path (int8 tensor-core MMQ plus cuBLAS); closing the rest is on the roadmap.
@@ -333,7 +333,7 @@ passes, operator fusion, CUDA Graph capture and replay, the device-resident KV
 cache, split-KV flash decoding, tiled flash attention for prefill, chunked
 prefill, prefix-cache reuse, and batch-invariant dense GEMM.
 
-Decode uses the same quantized GEMV kernels as llama.cpp and is still 12–17%
+Decode uses the same quantized GEMV kernels as llama.cpp and is still 12–18%
 faster on the two models measured (see [Numbers](#numbers)). That difference
 comes from the runtime, not from the kernels.
 
