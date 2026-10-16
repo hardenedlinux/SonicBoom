@@ -1,5 +1,18 @@
 # SonicBoom benchmark — Gemma 4 E4B-It Q3_K_M
 
+> **Canonical numbers moved to `tools/bench.sh` (2026-10-16).** The document
+> below is the *history* of the v1 performance work: its numbers were collected
+> with harnesses that were re-derived per section, and several of them were
+> later found to be measured with a different warm-up or at a different depth
+> than the label claimed. They are kept because the per-kernel analysis, the
+> divergence records and the negative results are still what explains the
+> current design — **not** as a comparison table. Reproducible, same-session,
+> median-of-3 numbers are now produced only by `tools/bench.sh`, and the ones
+> current as of 2026-10-16 are in the README's [Numbers](../README.md#numbers)
+> section: Gemma 52.6 / 51.6 tok/s decode (1.17× llama.cpp), 1672 tok/s prefill
+> (0.84×), 212.9 ms prefix reuse; Qwen2.5-0.5B 343.4 / 296.4 tok/s (1.12× /
+> 0.98×), 12790 tok/s prefill (0.91×), 29.8 ms reuse.
+
 **Test date: 2026-10-12** (final v1-performance state; development spanned
 2026-10-06 → 2026-10-12). Supersedes the 2026-10-07 v0 baseline.
 

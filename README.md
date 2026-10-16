@@ -9,11 +9,12 @@ stable C ABI, and GNU Guile is its first-class language. You load
 interpreter, no pip, and no wheel tree on the inference path.
 
 The first release targets local LLM inference on consumer GPUs. On a laptop
-RTX 3050 it **decodes 14% faster than llama.cpp, using the same quantized
-kernels**. The kernels are the same, so the lead comes from the layers above
-them: a graph planner, and behind it an MLIR compiler tier. Those layers are
-what llama.cpp's architecture does not have, and they are where SonicBoom keeps
-improving.
+RTX 3050 it **decodes 12–17% faster than llama.cpp, using the same quantized
+kernels** — 1.17× on Gemma 4 E4B-it Q3_K_M, 1.12× on Qwen2.5-0.5B-Instruct
+Q4_K_M ([numbers](#numbers), same machine, medians of 3). The kernels are the
+same, so the lead comes from the layers above them: a graph planner, and behind
+it an MLIR compiler tier. Those layers are what llama.cpp's architecture does
+not have, and they are where SonicBoom keeps improving.
 
 > **Status: v0.0.1.** Two model families are verified end to end — Gemma 4
 > E4B-it (Q3_K_M) and Qwen2.5-0.5B-Instruct (Q4_K_M) — on CUDA sm_86, both
@@ -46,28 +47,47 @@ benchmark, not the limit of the project.
 
 ## Numbers
 
-Gemma 4 E4B-it Q3_K_M on an NVIDIA RTX 3050 (8 GB, sm_86). Both runtimes use
-the same GGUF file on the same machine.
+All numbers below are **medians of 3 process runs**, measured on the machine in
+[Benchmark conditions](#benchmark-conditions), with **both runtimes on the same
+GGUF file in the same session** — SonicBoom through
+[`tools/bench.sh`](tools/bench.sh), llama.cpp through `llama-bench -ngl 99`
+(commit `43fe9c64281`). Every claim in this section is bounded by that: one
+model, one GPU, one quant file. `tools/bench.sh` reprints the whole table on any
+machine, and [`tools/sb-report.sh`](tools/sb-report.sh) prints the hardware and
+the build that produced it.
 
-| | SonicBoom | llama.cpp | |
+**Gemma 4 E4B-it Q3_K_M** (RTX 3050 8 GB, sm_86)
+
+| metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **51.65 tok/s** | 45.20 tok/s | **1.14×** |
-| Decode at depth 512 | 49.96 tok/s | 45.20 tok/s | 1.11× |
-| Decode at depth 2048 | 47.13 tok/s | 45.21 tok/s | 1.04× |
-| Prefill, 512 tokens | 1148 tok/s | ~1949 tok/s | 0.59× |
-| Prefill, 2048 tokens | 1058 tok/s | ~1993 tok/s | 0.53× |
-| Prefill, 4100 tokens | 1051 tok/s | ~1944 tok/s | 0.54× |
-| **Time to first token, 4000-token prefix + 100 new tokens** | **502.6 ms** with prefix reuse | | 7.8× faster than a full prefill (3903 ms) |
+| **Decode**, 64-step steady state | **52.6 tok/s** | 44.8 tok/s | **1.17×** |
+| Decode at KV depth 512 | **51.6 tok/s** | 44.2 tok/s | **1.17×** |
+| Prefill, 512-token prompt (marginal) | 1672 tok/s | 1999 tok/s | 0.84× |
+| Prefix reuse, 512-token prefix + 64 new | 212.9 ms to first token | — | — |
 
-- **Decode is ahead.** Prefill is at roughly half of llama.cpp. It is a real
-  batched path (int8 tensor-core MMQ plus cuBLAS), and closing the rest of the
-  gap is on the roadmap.
-- **The public API is as fast as the C++ internals.** Measured through the
-  Guile binding, decode runs at 52.15 tok/s, a 4100-token prefill takes
-  3906.9 ms, and reuse TTFT is 505.2 ms. All three are within 1% of the C++
-  numbers.
-- **Exactness.** A prefix-reuse continuation matches a full prefill token for
-  token at every tested prefix length (`test_prefix_cache`, 11/11).
+**Qwen2.5-0.5B-Instruct Q4_K_M** (same machine, same session)
+
+| metric | SonicBoom | llama.cpp | ratio |
+|---|---:|---:|---:|
+| **Decode**, 64-step steady state | **343.4 tok/s** | 307.7 tok/s | **1.12×** |
+| Decode at KV depth 512 | 296.4 tok/s | 303.9 tok/s | 0.98× |
+| Prefill, 512-token prompt (marginal) | 12790 tok/s | 14065 tok/s | 0.91× |
+| Prefix reuse, 512-token prefix + 64 new | 29.8 ms to first token | — | — |
+
+- **Decode is ahead on both families**, at depth 0 and at depth 512 on Gemma.
+  Qwen2 at depth 512 is level with llama.cpp: it has no sliding window, so all
+  512 keys are attended while Gemma's ring buffer wraps.
+- **Prefill is behind** — 0.84× (Gemma) and 0.91× (Qwen). It is a real batched
+  path (int8 tensor-core MMQ plus cuBLAS); closing the rest is on the roadmap.
+- **Prefix reuse** has no llama.cpp counterpart (`llama-bench` cannot measure
+  it), so it is reported as first-token latency in milliseconds and nothing
+  else. The exactness claim beside it is a test, not a benchmark: a
+  prefix-reuse continuation is token-identical to a full prefill at every
+  tested prefix length (`test_prefix_cache`, 12/12).
+- Decode at 512/2048/4100-token depth, the per-kernel breakdowns, and the older
+  hand-rolled measurements are in [`design/benchmark.md`](design/benchmark.md);
+  they were taken on earlier code and on different harnesses, so they are
+  history, not a comparison.
 
 ### Benchmark conditions
 
@@ -77,39 +97,32 @@ the same GGUF file on the same machine.
 | Driver / CUDA | 595.84 (CUDA 13.2 driver API); nvcc 12.0.140 |
 | CPU | AMD Ryzen 5 5500 (6C/12T, Zen 3), PCIe 3.0 |
 | RAM | 32 GB DDR4-2400, single channel |
-| Host | Linux 6.8, x86-64, g++-13 |
-| Model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
+| Host | Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
+| Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
+| Qwen model | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes, sha256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`) |
 | llama.cpp | commit `43fe9c64281`, CUDA build, `llama-bench -ngl 99` |
+| SonicBoom build | `tools/sb-report.sh`: git commit, CUDA archs actually compiled, LLVM version |
 
-The comparison is against llama.cpp at the commit above. Newer llama.cpp
-versions may be faster or slower. Exact command lines, per-kernel breakdowns
-and the full history are in [`design/benchmark.md`](design/benchmark.md).
+The comparison is against llama.cpp at the commit above; newer versions may be
+faster or slower. The Qwen2 greedy token stream agrees with llama.cpp except at
+llama.cpp's own near-ties, where a different prefill batch geometry flips the
+last-place logits (first divergent step and top-1/top-2 margin recorded in
+`design/benchmark.md`).
 
-### Qwen2.5-0.5B-Instruct Q4_K_M
+### Community results
 
-A second architecture on the same machine, the same runtime and the same
-llama.cpp commit.
+Numbers from other people's hardware belong here, next to the command that
+produced them. To add a row, run both tools on your machine and paste the
+output into an issue or a PR:
 
-| | SonicBoom | llama.cpp | |
-|---|---:|---:|---:|
-| **Decode**, 64-step steady state | 255.7 tok/s | 307.89 ± 1.43 tok/s | 0.83× |
-| Decode at depth 512 | 224.2 tok/s | 304.10 ± 3.67 tok/s | 0.74× |
-| Prefill, 512 tokens | 4036.6 tok/s (126.84 ms) | 14505.81 ± 1063.36 tok/s | 0.28× |
-| **Time to first token, 512-token prefix + 64 new tokens** | **68.4 ms** with prefix reuse | | 4.4× faster than a full prefill (299.3 ms) |
+```sh
+tools/sb-report.sh          # hardware + the exact build (git commit, cuda archs)
+LLAMA_BENCH=... tools/bench.sh your-model.gguf --label your-model
+```
 
-Here SonicBoom is behind on both decode and prefill. The depth-0 → depth-512
-decode drop (255.7 → 224.2, −12%) is attention over all 512 keys: Qwen2 has no
-sliding window for the Gemma ring to wrap. The prefill gap is the batched
-K-quant matmul, plus this file's Q6_K `ffn_down` adding its fp16-dequant
-fallback on top. Prefix reuse transfers unchanged and is the strongest result —
-with no ring buffer, a resident prefix is a plain KV slice. Reuse is against
-SonicBoom's own full prefill; llama-bench has no reuse measurement.
-
-The Qwen2 model is also where the tokenizer, the ChatML template and the
-architecture-driven chat-format selection were exercised. Its greedy token
-stream agrees with llama.cpp except at llama.cpp's own near-ties, where a
-different prefill batch geometry flips the last-place logits (first divergent
-step and top-1/top-2 margin recorded in `design/benchmark.md`).
+`sb-report.sh --json` gives the same facts as one machine-readable object, so a
+result can carry its own conditions. Results are published as reported, with
+the reporter credited, and marked as not reproduced by us.
 
 ---
 
@@ -117,9 +130,14 @@ step and top-1/top-2 margin recorded in `design/benchmark.md`).
 
 ### Requirements
 
-- Linux x86-64, g++-13, CMake, Ninja (optional), libyaml-dev
-- CUDA toolkit 12.0 or newer and an NVIDIA GPU. v0.0.1 is built and tested
-  for **sm_86** only (RTX 30-series).
+- Linux x86-64, g++-13, CMake, Ninja (optional), libyaml-dev. The CPU
+  quantized-matmul kernels are AVX2 (with a scalar fallback); an aarch64 build
+  is not wired up yet — the AVX2 translation unit has no architecture guard, so
+  it does not compile there as it stands. The port is a guard plus a NEON
+  sibling of the same fixed-point kernel.
+- CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
+  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.1 is built
+  and tested for **sm_86** only (RTX 30-series).
 - GNU Guile 3.0
 - [SonicCross](https://github.com/hardenedlinux/SonicCross), a required
   build-time dependency (see below)
@@ -151,6 +169,7 @@ cd SonicBoom
 
 # One-time step: build the pinned LLVM/MLIR into build/llvm-mlir-install.
 # It is statically linked into libsonicboom.so and is not a runtime dependency.
+# The third_party/llvm-project submodule is only this script's input.
 tools/mlir/build-mlir.sh
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSONICBOOM_USE_CUDA=ON
@@ -158,6 +177,28 @@ cmake --build build -j
 ```
 
 The LLVM submodule is large, so the first clone and build take a while.
+
+An LLVM/MLIR already installed elsewhere can be used instead — the submodule
+stays empty and is not needed at all:
+
+```sh
+cmake -S . -B build -DSONICBOOM_USE_CUDA=ON \
+      -DMLIR_DIR=/opt/llvm/lib/cmake/mlir -DLLVM_DIR=/opt/llvm/lib/cmake/llvm
+```
+
+A different LLVM major is accepted with a warning, naming the version SonicBoom
+is tested against (23). `-DSONICBOOM_ENABLE_MLIR=OFF` builds without MLIR
+entirely, and the error message when MLIR is missing lists all three routes.
+
+Whatever was configured is compiled into the library and can be read back — from
+C with `sb_build_info()` (`capi/include/sonicboom/capi.h`), from Guile with
+`(build-info)` (`bindings/guile/README.md`), and from the command line with
+[`tools/sb-report.sh`](tools/sb-report.sh), which prints it beside the host, the
+GPU and the toolchain:
+
+```sh
+tools/sb-report.sh            # human-readable; --json for machines
+```
 
 ### Run (Guile)
 
@@ -205,7 +246,20 @@ The same functions are available from C through
 ctest --test-dir build --output-on-failure
 ```
 
-Tests that need the model skip themselves when the GGUF is not present.
+Tests that need the model skip themselves when the GGUF is not present, and the
+two ResNet-18 end-to-end tests skip (CTest `SKIP_RETURN_CODE 77`) when their
+generated sidecar artifacts are absent, which is the state of a fresh checkout.
+
+### Benchmark
+
+```sh
+LLAMA_BENCH=/path/to/llama-bench tools/bench.sh your-model.gguf
+tools/sb-report.sh        # the hardware and the build behind those numbers
+```
+
+Every metric is the median of 3 process runs and both runtimes are measured in
+the same session; `tools/bench.sh` is the only benchmark SonicBoom publishes
+numbers from.
 
 ---
 
@@ -237,8 +291,11 @@ limits:
   loads and decodes natively, but its prefill does not use the int8 tensor-core
   weight kernel yet — it dequantizes to fp16 and uses cuBLAS, so a Q6_K
   `ffn_down` makes prefill slower than the same shape in Q4_K.
-- **GPU:** CUDA on sm_86. Other architectures need `CMAKE_CUDA_ARCHITECTURES`
-  changed and have not been tested. A CPU path exists but is a reference
+- **GPU:** CUDA on sm_86. `CMAKE_CUDA_ARCHITECTURES` defaults to `native` (the
+  GPU in the build machine) and is resolved at configure time; other
+  architectures have not been tested. Whatever was compiled is reported by
+  `sb_build_info()` / `tools/sb-report.sh`, so a binary never has to be taken on
+  trust about which SMs it contains. A CPU path exists but is a reference
   implementation, not a fast one.
 - **Sampling:** greedy only. `temperature`, `top_p` and `top_k` return
   `SB_ERR_UNSUPPORTED`.
@@ -276,8 +333,9 @@ passes, operator fusion, CUDA Graph capture and replay, the device-resident KV
 cache, split-KV flash decoding, tiled flash attention for prefill, chunked
 prefill, prefix-cache reuse, and batch-invariant dense GEMM.
 
-Decode uses the same quantized GEMV kernels as llama.cpp and is still 14%
-faster. That difference comes from the runtime.
+Decode uses the same quantized GEMV kernels as llama.cpp and is still 12–17%
+faster on the two models measured (see [Numbers](#numbers)). That difference
+comes from the runtime, not from the kernels.
 
 ---
 
@@ -291,7 +349,7 @@ this order of preference:
 | Tier | What it does | Status |
 |---|---|---|
 | **1. MLIR compiler** | S-Expr graphs are lowered to MLIR (`linalg`) and compiled to native code. ResNet-18, imported from ONNX, runs through this path and matches the ONNX reference. | **Shipped on CPU** (LLVM JIT). GPU code generation is next. |
-| **2. Graph planner** | Rewrites the whole model before it runs: quantize-once, norm→quantize and activation→quantize fusion, dead-computation elimination, and CUDA Graph capture of the full decode step. | **Shipped**: this tier produces the 14% decode lead. |
+| **2. Graph planner** | Rewrites the whole model before it runs: quantize-once, norm→quantize and activation→quantize fusion, dead-computation elimination, and CUDA Graph capture of the full decode step. | **Shipped**: this tier produces the decode lead measured above. |
 | **3. Hand-written kernels** | Used only where the other tiers are not yet fast enough, for example the ported ggml MMQ/MMVQ kernels. | **Shipped** |
 
 What follows from this design:
@@ -309,6 +367,33 @@ What follows from this design:
   pinned LLVM. MLIR's GPU, SPIR-V/Vulkan and accelerator back ends are
   available to SonicBoom through the same S-Expr graphs, without a separate
   rewrite for each target.
+
+---
+
+## MLIR migration: a staged plan
+
+MLIR is already linked into `libsonicboom.so` and already carries a graph:
+S-Expr documents are lowered to `arith`/`func`/`linalg` and executed through the
+LLVM JIT, which is how ONNX-imported ResNet-18 runs. What is not yet generated
+are GPU kernels — those are still the hand-written CUDA ones. The migration is
+staged so that each step is independently useful and independently verifiable,
+and so that a generated kernel can always be checked against the hand-written
+one it replaces.
+
+| stage | what lands | done when |
+|---|---|---|
+| **0. Lowering (shipped)** | S-Expr → `arith`/`func`/`linalg`, executed on CPU through the LLVM JIT; ONNX ResNet-18 matches the ONNX reference | already the case |
+| **1. One GPU glue kernel** | A single fused region — norm + quantize — lowered `linalg → gpu → nvvm → cubin`, JIT-compiled at load and cached by shape signature | it runs inside the decode step and matches the hand-written kernel numerically within the documented tolerance, with the canonical `tools/bench.sh` metrics no worse |
+| **2. The glue set** | The rest of the between-kernel glue: activation→quantize, residual add, RoPE | each region replaces a kernel without moving the canonical numbers down |
+| **3. GPU-independent targeting** | The same lowering for a GPU the binary was not built for (compute capability discovered at run time), and for a second vendor through SPIR-V | a machine with a different GPU runs without a SonicBoom rebuild |
+| **4. Beyond LLM glue** | Whole-model lowering for the research route's traced graphs | a traced model runs on the same planner and backends as a built-in one |
+
+Ground rules that hold at every stage: generated code and the JIT live **behind**
+Layer 2 (no MLIR, LLVM, CUDA or native-torch type crosses the C ABI); the
+hand-written kernel remains the numerical and performance reference; and the
+gate is the canonical benchmark plus the existing test suite, because "it
+compiles" and "it is faster" are not the same claim. The pinned LLVM is 23 —
+a different major is a warning, not an error (see `CMakeLists.txt`).
 
 ---
 
