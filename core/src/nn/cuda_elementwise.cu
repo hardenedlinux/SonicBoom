@@ -2437,8 +2437,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (head_dim % 32 != 0 || head_dim > 512) return false;
   if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
 
-  // Tiled tensor-core path: Gemma's GQA=4 with the SWA head (256) or the global
-  // head (512). Anything else keeps the scalar-fp32 kernel.
+  // Tiled tensor-core path, selected by shape (head_dim, gqa): the tile config
+  // is a pure function of those two, so a shape either has an instantiation
+  // here or falls through to the scalar-fp32 warp kernel below (correct for
+  // every shape, just per-warp redundant on K/V and scalar on the dot). The
+  // block is NW*GQA*(QB/16) warps (<= 32 => <= 1024 threads) and its smem is
+  // sized in the launcher, which also raises the dynamic-smem attribute.
+  //   - Gemma-family: gqa 4, SWA head 256 / global head 512.
+  //   - SwiGLU families (Qwen2.5-0.5B, and the same 7:1 group ratio at the
+  //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
   if (gqa == 4 && head_dim == 256)
     return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
@@ -2446,6 +2453,10 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
         n_heads_kv, sliding_window, scale, out);
   if (gqa == 4 && head_dim == 512)
     return launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (gqa == 7 && head_dim == 64)
+    return launch_tiled_flash_attention<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
 
