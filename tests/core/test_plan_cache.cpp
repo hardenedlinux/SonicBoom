@@ -40,6 +40,11 @@
 //                             its record must agree with the cached one, minus
 //                             the final norm + lm_head launches the real path
 //                             appends to its last step.
+//   7. the offset is not a plan input — the same segment length at off=0 and
+//                             off=448 shares one entry (the phase log shows the
+//                             second call hitting, not rebuilding) and both
+//                             offsets produce the uncached tokens. The offset
+//                             reaches the kernels as an execute-time binding.
 //
 // Skips (exit 77) when there is no CUDA device or no model GGUF is present.
 
@@ -50,10 +55,14 @@
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -191,6 +200,34 @@ RunOut run_prefill(const sbmodel::Gemma4Model& m, uint64_t n, uint64_t off,
   return out;
 }
 
+// Run `fn` with stderr diverted to a temporary file and return what it wrote.
+// The planner's SONICBOOM_PREFILL_PHASE_TIMING lines go to stderr, and they are
+// the only place a cache *hit* is distinguishable from a rebuild — both produce
+// the same plan record, so the record alone cannot show that an entry was
+// shared.
+std::string capture_stderr(const std::function<void()>& fn) {
+  std::fflush(stderr);
+  const int saved = dup(fileno(stderr));
+  FILE* tmp = std::tmpfile();
+  if (saved < 0 || tmp == nullptr) return {};
+  dup2(fileno(tmp), fileno(stderr));
+  fn();
+  std::fflush(stderr);
+  dup2(saved, fileno(stderr));
+  close(saved);
+  std::fseek(tmp, 0, SEEK_SET);
+  std::string out;
+  char buf[4096];
+  std::size_t got = 0;
+  while ((got = std::fread(buf, 1, sizeof buf, tmp)) > 0) out.append(buf, got);
+  std::fclose(tmp);
+  return out;
+}
+
+bool has_line(const std::string& text, std::string_view needle) {
+  return text.find(needle) != std::string::npos;
+}
+
 void set_cache(bool on) {
   if (on)
     setenv("SONICBOOM_PLAN_CACHE", "1", 1);
@@ -314,6 +351,49 @@ void check_model(const ModelCase& c, const sbmodel::Gemma4Model& m) {
   } else {
     std::cout << "  agrees with record_prefill_plan (" << fresh_body.size()
               << " of " << body_a.size() << " lines)\n";
+  }
+
+  // 7. the execute offset is not part of the cache key. The n_ctx=1024 warm-up
+  //    above built the 64-token entry at off=0; a 64-token call at off=448 must
+  //    be served by it — same entry, no rebuild — and produce the tokens the
+  //    uncached path produces at that offset. The phase log is what shows the
+  //    hit: a rebuilt segment records the same plan, so the record cannot
+  //    distinguish the two.
+  const uint64_t OFF448 = 448;
+  set_cache(true);
+  setenv("SONICBOOM_PREFILL_PHASE_TIMING", "1", 1);
+  RunOut at0;
+  capture_stderr([&] { at0 = run_prefill(m, 64, OFF, 1024, 1, true); });
+  RunOut at448;
+  const std::string log448 =
+      capture_stderr([&] { at448 = run_prefill(m, 64, OFF448, 1024, 1, true); });
+  unsetenv("SONICBOOM_PREFILL_PHASE_TIMING");
+  if (!at0.ok || !at448.ok) {
+    fail(std::string(c.name) + ": 64-token prefill at off=0/off=448 failed");
+    return;
+  }
+  if (!has_line(log448, "segment_cache_hit") ||
+      has_line(log448, "segment_build_graph")) {
+    fail(std::string(c.name) +
+         ": off=448 did not reuse the off=0 entry (cache key depends on the offset)");
+  } else {
+    std::cout << "  off=448 reuses the off=0 entry (no rebuild)\n";
+  }
+  if (at0.plan != at448.plan) {
+    fail(std::string(c.name) + ": the plan records a different offset");
+    report_diff(split_lines(at0.plan), split_lines(at448.plan), "off=0", "off=448");
+  }
+  set_cache(false);
+  const RunOut at448_uncached = run_prefill(m, 64, OFF448, 1024, 1, false);
+  set_cache(true);
+  if (!at448_uncached.ok || at448_uncached.tokens != at448.tokens) {
+    fail(std::string(c.name) +
+         ": off=448 cached/uncached tokens differ\n    cached:   "
+         + toks_text(at448.tokens)
+         + "\n    uncached: " + toks_text(at448_uncached.tokens));
+  } else {
+    std::cout << "  off=448 tokens identical cache on/off ("
+              << at448.tokens.size() << " steps)\n";
   }
 }
 
