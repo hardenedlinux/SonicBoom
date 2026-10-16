@@ -489,6 +489,12 @@ Ops fall into three tiers, by what they lower to:
   `ds`-consistency precondition of `fuse_rms_norm_mmq_pass`
   (`rewrites.cpp:362-377`) become a real verifier check rather than a private
   predicate — this is the single highest-value part of the type design.
+- **The format's source is not in this document.** These types can be *spelled*
+  today, but no value in a converted graph carries one, because a weight is not a
+  graph tensor — it is a `(layer, slot)` attribute plus a `model.weights` lookup
+  (`design/weight-quant-format.md` §2). The Blade-side format field, its blast
+  radius over every reader of `size_bytes`, and the removal of the `ds` predicate
+  this section's **(inference)** points at are `design/weight-quant-format.md`.
 - A KV type for the cache-side effects (§6.3).
 
 ### 6.3 Effects: KV cache read/write
