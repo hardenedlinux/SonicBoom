@@ -26,6 +26,7 @@
 // float32 activations).
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -209,11 +210,29 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 // (position == step; only the shapes matter, not the tokens). `record_prefill_plan`
 // runs one batched pass over `n` tokens. Both return nullopt when the build has no
 // CUDA support, the model carries no weights, or the plan fails to build.
+//
+// `transform`, when given, is applied to the graph the emitter built — after the
+// graph-level fusion passes, before the execution plan is derived from it. It is
+// the seam for putting the planned graph through another representation and back
+// (the Boom IR round trip, design/mlir-migration.md §7a) and requiring the plan
+// that follows to be the same plan; it is not a place to change what runs.
+//
+// The overloads are overloads rather than one function with a defaulted
+// parameter because libsonicboom.so is consumed through its symbol table
+// (tools/plan_dump): a defaulted parameter would silently drop the existing
+// entry point.
+using GraphTransform = std::function<void(planner::Graph&)>;
+
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
                                                          uint64_t n_ctx,
                                                          uint64_t steps);
+std::optional<planner::PlanRunRecord> record_decode_plan(
+    const Gemma4Model& m, uint64_t n_ctx, uint64_t steps,
+    const GraphTransform& transform);
 std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
                                                           uint64_t n);
+std::optional<planner::PlanRunRecord> record_prefill_plan(
+    const Gemma4Model& m, uint64_t n, const GraphTransform& transform);
 
 // The device identity string the plan record's `device` line carries, e.g.
 // "NVIDIA GeForce RTX 3050 sm 20 cc 8.6"; "unknown" when the build has no CUDA

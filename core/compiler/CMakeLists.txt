@@ -79,7 +79,8 @@ add_custom_target(boom_incgen DEPENDS ${BOOM_GEN_FILES})
 add_library(sonicboom_compiler STATIC
   lib/BoomDialect.cpp
   lib/BoomTypes.cpp
-  lib/BoomVerify.cpp)
+  lib/BoomVerify.cpp
+  lib/BoomConversion.cpp)
 
 # Statically linked into libsonicboom.so once the runtime consumes Boom IR, and
 # already read from the tests next to it, so PIC now rather than as a later fix.

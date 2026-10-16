@@ -1023,8 +1023,9 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 // capture: a captured step replays as one graph launch and bypasses the
 // executor, so no per-step launches would be visible to record. Returns nullptr
 // on a build/plan failure (the caller falls back to 0).
-static std::unique_ptr<DecodeRuntime> build_decode_runtime(const Gemma4Model& m,
-                                                           uint64_t n_ctx) {
+static std::unique_ptr<DecodeRuntime> build_decode_runtime(
+    const Gemma4Model& m, uint64_t n_ctx,
+    const GraphTransform* transform = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
   rt->graph = build_gemma4_graph(m, /*greedy=*/true);
   if (quant::cuda::q8_1_enabled()) {
@@ -1035,6 +1036,9 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(const Gemma4Model& m,
     planner::fuse_bias_into_gemv_pass(rt->graph);
     planner::fuse_residual_add_into_gemv_pass(rt->graph);
   }
+  // After every graph-level pass, so the transform sees the graph the plan is
+  // actually derived from (plan.h: GraphTransform).
+  if (transform && *transform) (*transform)(rt->graph);
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap)
     return nullptr;
@@ -1254,10 +1258,16 @@ std::string cuda_device_identity() { return device_identity(); }
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
                                                          uint64_t n_ctx,
                                                          uint64_t steps) {
+  return record_decode_plan(m, n_ctx, steps, GraphTransform{});
+}
+
+std::optional<planner::PlanRunRecord> record_decode_plan(
+    const Gemma4Model& m, uint64_t n_ctx, uint64_t steps,
+    const GraphTransform& transform) {
   // Deliberately not get_decode_runtime: that runtime is captured, and a
   // captured step replays as a single graph launch with no executor walk, so
   // there would be no per-step kernels to record.
-  auto rt = build_decode_runtime(m, n_ctx);
+  auto rt = build_decode_runtime(m, n_ctx, &transform);
   if (!rt) return std::nullopt;
 
   planner::PlanRecorder rec;
@@ -1277,6 +1287,11 @@ std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
 
 std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
                                                           uint64_t n) {
+  return record_prefill_plan(m, n, GraphTransform{});
+}
+
+std::optional<planner::PlanRunRecord> record_prefill_plan(
+    const Gemma4Model& m, uint64_t n, const GraphTransform& transform) {
   if (n == 0) return std::nullopt;
   planner::Graph graph = build_gemma4_prefill_graph(m, n);
   // The same mmq fusion the prefill segments use, under the same conditions, so
@@ -1287,6 +1302,8 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
     planner::fuse_gelu_mul_mmq_pass(graph);
     planner::fuse_silu_mul_mmq_pass(graph);
   }
+  // After every graph-level pass (plan.h: GraphTransform).
+  if (transform) transform(graph);
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap) return std::nullopt;
   planner::AnalyticalCpuCostModel cost(*snap);
@@ -1336,8 +1353,20 @@ std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,
   return std::nullopt;  // built without CUDA: nothing launches
 }
 
+std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,
+                                                         uint64_t, uint64_t,
+                                                         const GraphTransform&) {
+  return std::nullopt;  // built without CUDA: nothing launches
+}
+
 std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
                                                           uint64_t) {
+  return std::nullopt;  // built without CUDA: nothing launches
+}
+
+std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
+                                                          uint64_t,
+                                                          const GraphTransform&) {
   return std::nullopt;  // built without CUDA: nothing launches
 }
 

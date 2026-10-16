@@ -138,4 +138,18 @@ if(SONICBOOM_ENABLE_MLIR)
   target_link_libraries(test_boom_dialect PRIVATE sonicboom sonicboom_compiler
                                                MLIRAsmParser)
   sb_add_cpp_test(test_boom_dialect)
+
+  # Boom IR conversion test (design/mlir-migration.md §7a): Graph -> Boom IR ->
+  # Graph over the real models, and the plan gate — the round-tripped graph, fed
+  # back through record_{decode,prefill}_plan's GraphTransform seam, must produce
+  # the golden plan (tests/data/plans/) byte for byte. Needs the repository root
+  # for those goldens and for models/, and exits 77 (Skipped) without a CUDA
+  # device or the model GGUFs, exactly as test_plan_record does.
+  add_executable(test_boom_conversion test_boom_conversion.cpp)
+  target_link_libraries(test_boom_conversion PRIVATE sonicboom sonicboom_compiler
+                                                    MLIRAsmParser)
+  target_compile_definitions(test_boom_conversion PRIVATE
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+  sb_add_cpp_test(test_boom_conversion)
+  set_tests_properties(test_boom_conversion PROPERTIES SKIP_RETURN_CODE 77)
 endif()
