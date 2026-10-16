@@ -221,5 +221,14 @@ int main(int argc, char** argv) {
   printf("  reuse   : %.3f ms (%llu new tokens prefilled, prefix reused)\n",
          t_reuse * 1000.0, (unsigned long long)new_n);
   printf("  speedup : %.1fx\n", t_reuse > 0.0 ? t_noreuse / t_reuse : 0.0);
+  // Machine-readable canonical result: first-token latency of a `new_n`-token
+  // continuation after a `prefix_n`-token shared prefix (reuse) vs the same
+  // continuation after a full re-prefill (no reuse). llama-bench has no
+  // prefix-reuse equivalent.
+  printf("RESULT prefix_cache prefix=%llu new=%llu reuse_ms=%.3f "
+         "noreuse_ms=%.3f speedup=%.2f\n",
+         (unsigned long long)prefix_n, (unsigned long long)new_n,
+         t_reuse * 1000.0, t_noreuse * 1000.0,
+         t_reuse > 0.0 ? t_noreuse / t_reuse : 0.0);
   return 0;
 }

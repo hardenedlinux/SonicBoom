@@ -115,8 +115,15 @@ int main(int argc, char** argv) {
   const double pp_marginal = dt > 0.0 ? double(n - 1) / dt : 0.0;
 
   printf("prefill --prompt %llu: %.3f ms (N=%llu) vs %.3f ms (N=1) | "
-         "pp_wall %.1f tok/s | pp_marginal %.1f tok/s (best of %llu, CUDA)\n",
+         "pp_marginal %.1f tok/s (CANONICAL) | pp_wall %.1f tok/s "
+         "(legacy: includes the per-call graph/plan rebuild + KV alloc) "
+         "(best of %llu, CUDA)\n",
          (unsigned long long)n, t_n * 1000.0, (unsigned long long)n,
-         t_1 * 1000.0, pp_wall, pp_marginal, (unsigned long long)reps);
+         t_1 * 1000.0, pp_marginal, pp_wall, (unsigned long long)reps);
+  // Canonical = pp_marginal: the marginal prefill cost per token, matching
+  // llama-bench `-p <n> -n 0` (which amortizes context/KV setup outside the
+  // timed region). pp_wall is reported for reference only.
+  printf("RESULT prefill prompt=%llu pp_marginal_tok_s=%.1f pp_wall_tok_s=%.1f\n",
+         (unsigned long long)n, pp_marginal, pp_wall);
   return 0;
 }

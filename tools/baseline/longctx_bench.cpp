@@ -68,12 +68,6 @@ int main(int argc, char** argv) {
   auto m = sbmodel::load_gemma4(*r);
   if (!m) { fprintf(stderr, "load_gemma4 error\n"); return 1; }
 
-  // Warm up the spine once (builds graph/plan caches, allocates device buffers).
-  {
-    std::vector<int64_t> warm(1, -1);
-    sbmodel::generate_spine_cuda(*m, seed, 0, warm, 0);
-  }
-
   // Pin n_ctx to the full decode length for BOTH runs (or an explicit --n-ctx).
   // Otherwise the warm run (n tokens) and the full run (n+steps tokens) size the
   // global-layer KV cache and the split-KV chunk (= n_ctx/40) differently, so
@@ -81,6 +75,17 @@ int main(int argc, char** argv) {
   // over/under-counts the tail. --n-ctx overrides to probe the chunk-size
   // dependence at a fixed depth (the n_ctx sensitivity sweep).
   const uint64_t ctx = n_ctx ? n_ctx : (depth + steps);
+
+  // Warm up at the EXACT n_ctx the timed runs use. The decode runtime (greedy
+  // graph + plan + CUDA-graph capture) is cached per (model, n_ctx); the
+  // subtraction below cancels the shared `depth` decode steps but NOT a one-time
+  // plan/capture triggered inside the timed region. Warming at n_ctx = 1 (a
+  // different cache key) used to leave that ~130 ms cost in the tail, which is
+  // exactly the depth-0 gap 52.6 -> 47.5 tok/s measured against test_generate.
+  {
+    std::vector<int64_t> warm(1, -1);
+    sbmodel::generate_spine_cuda(*m, seed, 0, warm, ctx);
+  }
 
   auto run_decode = [&](uint64_t n, double* secs) -> uint64_t {
     std::vector<int64_t> toks(n, -1);
@@ -103,5 +108,9 @@ int main(int argc, char** argv) {
          "(CUDA, seed %llu)\n",
          (unsigned long long)depth, (unsigned long long)tail_toks,
          tail_secs * 1000.0, tok_per_sec, (unsigned long long)seed);
+  // Machine-readable canonical result. `tok_s` is the steady-state decode rate
+  // at `depth` (llama-bench `-p 0 -n <steps> -d <depth>` semantics).
+  printf("RESULT longctx depth=%llu steps=%llu tok_s=%.3f\n",
+         (unsigned long long)depth, (unsigned long long)steps, tok_per_sec);
   return 0;
 }
