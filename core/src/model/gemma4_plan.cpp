@@ -551,22 +551,19 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   // fuse_act_mul_mmq_pass / fuse_rms_norm_mmq_pass), which keeps the down
   // projection on its dequant + cuBLAS route rather than quantizing its
   // activation to int8.
-  // The legacy 32-element formats get -1 too, for a measured reason rather than
-  // a missing kernel: their source is always a norm, and the D4 *norm*+quantize
-  // emitter is one 1024-thread block per row — its reduction leaves only
-  // dim/128 of its 32 warps with quantize work (7 warps at Qwen's d_model 896),
-  // so at prefill batch sizes it runs below a quarter of the bandwidth the
-  // standalone quantize reaches. Leaving those norms unfused (rms_norm plus the
-  // matmul's own quantize_mmq_q8_1<D4>, which produces the same bytes) measured
-  // +2.8% on Qwen pp512 with byte-identical tokens. Q3_K keeps D4 on purpose:
-  // Gemma's d_model 2560 leaves 20 warps with quantize work, where the same
-  // experiment measured the fusion flat, so the larger-dim case keeps it.
+  // `ds` answers one question only: does this weight type have an mmq activation
+  // layout the fused emitter can produce? Q6_K does not (above). Every other
+  // format does, including the legacy 32-element ones, whose D4 norm+quantize
+  // emitter is now bandwidth-bound at any d_model (its quantize phase uses the
+  // standalone quantizer's 128-thread/one-128-block-per-warp geometry — see
+  // rms_norm_quantize_mmq_q8_1_dev). It used to be keyed out by quant type as a
+  // proxy for "slow at small dim"; that was a property of the old emitter, not
+  // of the format, so the decision belongs to the emitter, not here.
   // Baked here (not in the planner pass) because only the emitter knows the
   // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
   auto ds_a = [](quant::QuantType qt) {
     const int64_t ds = (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
-                       : (qt == quant::QuantType::Q6_K || qt == quant::QuantType::Q5_0 ||
-                          qt == quant::QuantType::Q8_0) ? -1 : 0;
+                       : (qt == quant::QuantType::Q6_K) ? -1 : 0;
     return attr_i("ds", ds);
   };
   auto shape2 = [](uint64_t r, uint64_t c) {

@@ -555,6 +555,11 @@ void* g_mmq_q8 = nullptr;
 size_t g_mmq_q8_bytes = 0;
 void* g_mmq_q6_x_f32 = nullptr;
 size_t g_mmq_q6_x_f32_bytes = 0;
+// Fused rms_norm+quantize (C.4): one float per token, the per-row `inv` factor
+// produced by phase A and consumed by phase B of
+// rms_norm_quantize_mmq_q8_1_dev. Reused across layers.
+void* g_rms_inv = nullptr;
+size_t g_rms_inv_bytes = 0;
 
 // Process-wide cuBLAS handle + stream-capture workspace (C.1). The handle is
 // created lazily and the workspace is set so cublasGemmEx is stream-capturable
@@ -2035,15 +2040,30 @@ __device__ __forceinline__ void quantize_mmq_q8_1_block(
   }
 }
 
-// rms_norm -> block_q8_1_mmq fused (C.4, position-major). One block per token:
-// the per-row sum-of-squares reduction mirrors nn::cuda::rms_norm_dev (thread t
-// reads x[t], x[t+blockDim], …, warp shuffle + shared reduce), so `inv` is
-// bit-identical; the quantize is delegated to quantize_mmq_q8_1_block (above),
-// which is bit-identical to mmq::quantize_activation for both D4 and DS4.
-template <int ds>  // mmq::D4 (Q3_K/Q6_K) or mmq::DS4 (Q4_K/Q5_K)
-__global__ void __launch_bounds__(1024) rms_norm_quantize_mmq_q8_1_kernel(
-    const float* __restrict__ x, const float* __restrict__ weight, int dim,
-    int n, float eps, mmq::block_q8_1_mmq* __restrict__ y) {
+// rms_norm -> block_q8_1_mmq fused (C.4, position-major), split into two
+// kernels so both phases run in the geometry their standalone counterparts use,
+// at any `dim`. The single-kernel form used one 1024-thread block per token and
+// one 128-element block per warp for the quantize, which left only dim/128 of
+// its 32 warps with quantize work (7 of 32 at Qwen's d_model 896) and measured
+// 45 GB/s against the standalone quantize_mmq_q8_1's 226 GB/s; its 1024-thread
+// double-precision reduction also cost ~4x the 256-thread one below (fp64
+// shuffles/shared writes per row), which is what made the whole op slow at
+// small dim.
+//
+// Phase A computes the per-row `inv` with nn::cuda::rms_norm_heads_dev's
+// reduction verbatim — that is the norm the unfused prefill path runs for a
+// batched RmsNorm node (the plan's RmsNorm+QuantizedMatmul pair), so the fused
+// and unfused emitters write the same bytes; phase B carries the multiply and
+// the quantize in the standalone quantizer's geometry. Both are then
+// bandwidth-bound, and the byte-identity the prefix-cache reuse test needs is
+// between these two emitters, not between either of them and rms_norm_dev.
+
+// Phase A: the per-row `inv`. One 256-thread block per row, strided double
+// partials + warp shuffle + a warp-0 shared reduce — same tree and same fp32
+// rounding point as rms_heads_fused_kernel, so `inv` matches that kernel's.
+__global__ void __launch_bounds__(256) rms_norm_inv_kernel(
+    const float* __restrict__ x, int dim, float eps,
+    float* __restrict__ inv_out) {
   const int token = blockIdx.x;
   const int tid = threadIdx.x;
   const float* xrow = x + (size_t)token * dim;
@@ -2059,30 +2079,39 @@ __global__ void __launch_bounds__(1024) rms_norm_quantize_mmq_q8_1_kernel(
   const int warp = tid >> 5;
   if (lane == 0) warp_part[warp] = s;
   __syncthreads();
-  __shared__ float inv;
   if (warp == 0) {
     const int nwarps = (blockDim.x + 31) >> 5;
     double t = (lane < nwarps) ? warp_part[lane] : 0.0;
     for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(dim)) + eps);
+    if (lane == 0) inv_out[token] = 1.0f / sqrtf(float(t / double(dim)) + eps);
   }
-  __syncthreads();
-  const float iv = inv;
+}
 
-  // Quantize: one 128-element block per warp, each lane owning a float4, so the
-  // butterfly in quantize_mmq_q8_1_block matches quantize_mmq_q8_1 exactly.
-  const int nwarps = (blockDim.x + 31) >> 5;
-  const int nblocks = dim / 128;
-  for (int blk = warp; blk < nblocks; blk += nwarps) {
-    const int base = blk * 128 + lane * 4;
-    float f[4];
+// Phase B: apply `inv` (and the optional norm weight) and quantize. 128 threads
+// per block and one 128-element block per warp — mmq::quantize_activation's
+// geometry (grid (n, dim/512)), with the same lane-owned float4, so the blocks
+// written are the same bytes quantize_mmq_q8_1_block documents as bit-identical
+// to quantize_mmq_q8_1. Warps with no block left in the tail plane exit whole
+// (never a lane), keeping the amax/sum butterfly's shuffle masks full.
+template <int ds>  // mmq::D4 (Q3_K/Q5_0/Q8_0) or mmq::DS4 (Q4_K/Q5_K)
+__global__ void __launch_bounds__(128) scale_quantize_mmq_q8_1_kernel(
+    const float* __restrict__ x, const float* __restrict__ inv,
+    const float* __restrict__ weight, int dim, int n,
+    mmq::block_q8_1_mmq* __restrict__ y) {
+  const int lane = threadIdx.x & 31;
+  const int blk = (int)blockIdx.y * 4 + (threadIdx.x >> 5);
+  if (blk >= dim / 128) return;
+  const int token = blockIdx.x;
+  const int base = blk * 128 + lane * 4;
+  const float* xrow = x + (size_t)token * dim;
+  const float iv = inv[token];
+  float f[4];
 #pragma unroll
-    for (int k = 0; k < 4; ++k) {
-      const float v = xrow[base + k];
-      f[k] = weight ? v * iv * weight[base + k] : v * iv;
-    }
-    quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
+  for (int k = 0; k < 4; ++k) {
+    const float v = xrow[base + k];
+    f[k] = weight ? v * iv * weight[base + k] : v * iv;
   }
+  quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
 }
 
 bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* x,
@@ -2095,16 +2124,21 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
     d_w = static_cast<const float*>(upload_bytes(weight.data(), dim * sizeof(float)));
     if (!d_w) return false;
   }
+  float* inv = static_cast<float*>(
+      grow_scratch(g_rms_inv, g_rms_inv_bytes, (size_t)n * sizeof(float)));
+  if (!inv) return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  rms_norm_inv_kernel<<<n, 256, 0, cur_stream()>>>(x, dim, eps, inv);
+  const dim3 grid(n, (dim / 128 + 3) / 4);  // one 128-element block per warp
   if (ds == mmq::DS4)
-    rms_norm_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 1024, 0, cur_stream()>>>(
-        x, d_w, dim, n, eps, y);
+    scale_quantize_mmq_q8_1_kernel<mmq::DS4><<<grid, 128, 0, cur_stream()>>>(
+        x, inv, d_w, dim, n, y);
   else if (ds == mmq::D4_Q8_1)
-    rms_norm_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 1024, 0, cur_stream()>>>(
-        x, d_w, dim, n, eps, y);
+    scale_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<grid, 128, 0, cur_stream()>>>(
+        x, inv, d_w, dim, n, y);
   else
-    rms_norm_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 1024, 0, cur_stream()>>>(
-        x, d_w, dim, n, eps, y);
+    scale_quantize_mmq_q8_1_kernel<mmq::D4><<<grid, 128, 0, cur_stream()>>>(
+        x, inv, d_w, dim, n, y);
   return cudaGetLastError() == cudaSuccess;
 }
 
