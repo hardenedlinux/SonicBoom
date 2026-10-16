@@ -254,6 +254,26 @@ std::string boomOpName(planner::OpKind kind) {
   return name;
 }
 
+// block_q8_1_mmq size in bytes (144: a 16-byte scale union + 128 int8 quants)
+// and the mmq matmul's J_max (= I == 128) tail over-read guard — the two
+// constants mmq_q8_fits is stated over (rewrites.cpp:58-63).
+constexpr uint64_t kMmqBlockBytes = 144;
+constexpr uint64_t kMmqTailGuardBlocks = 128;
+
+// Whether the f32 buffer a norm output occupies covers the mmq activation
+// buffer for a [n, dim] position-major input: (dim/128, rounded up to an even
+// plane count)*n blocks of data + the J_max tail guard, 144 bytes each. The
+// even rounding is the zero pad plane the kernel's last 256-value K-iteration
+// reads when dim is not a multiple of 256 (mmq::mmq_q8_planes; a no-op for
+// K-quant weights). dim must be a multiple of 128 (the kernels enforce it).
+// Same arithmetic as rewrites.cpp:71, over the byte size the tensor table
+// records.
+bool mmqQ8Fits(int64_t dim, int64_t n, uint64_t sizeBytes) {
+  const uint64_t planes = uint64_t(dim) / 128 + ((uint64_t(dim) / 128) & 1);
+  const uint64_t blocks = planes * uint64_t(n) + kMmqTailGuardBlocks;
+  return sizeBytes >= blocks * kMmqBlockBytes;
+}
+
 //--- the passes -------------------------------------------------------------
 
 // quantize_once_pass (rewrites.cpp:79), as a Boom IR pass.
@@ -790,6 +810,174 @@ public:
   }
 };
 
+// fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
+// of the prefill pipeline.
+//
+// The rewrite, unchanged, and the one prefill pass that adds no node and drops
+// no tensor: a batched RmsNorm whose every consumer is a batched QuantizedMatmul
+// sharing one `ds` becomes a rms_norm_quantize carrying that `ds`, and those
+// matmuls become the q8_1-consuming quantized_matmul_q8 — the norm writes its
+// q8_1 activation straight into its own f32 output buffer, which is why the
+// tensor table (and the buffer it names) is untouched.
+//
+// A mixed-precision norm — say attn_norm feeding q/k/D4 and v/DS4 — is left
+// alone, as is a weight type with no mmq activation layout at all.
+//
+// TODO(weight-format): `ds` is an emitter-baked integer, the format predicate
+// is a private one here as it is in rewrites.cpp, and a `ds < 0` weight type is
+// a hard-coded "no mmq layout" answer. When weight formats enter the type
+// system these become type properties and the predicate goes away (see the
+// weight-format design note, design/weight-quant-format.md).
+class RmsNormMmqPass
+    : public mlir::PassWrapper<RmsNormMmqPass, mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RmsNormMmqPass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    // The consumers of each tensor, as ops (rewrites.cpp:324-328).
+    llvm::DenseMap<int64_t, llvm::SmallVector<mlir::Operation *>> consumers;
+    for (mlir::Operation &node : view.body())
+      for (mlir::Value operand : node.getOperands())
+        consumers[view.idOf(operand)].push_back(&node);
+
+    // The norm ops that fuse, with the shared `ds` and the matmuls they fuse
+    // with.
+    llvm::SmallVector<mlir::Operation *> norms;
+    llvm::DenseMap<mlir::Operation *, int64_t> dsOfNorm;
+    llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
+        matmulsOfNorm;
+
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::RmsNorm) ||
+          node.getNumOperands() != 1 || node.getNumResults() == 0)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      auto nb = nodeAttrInt(attrs, "batch");
+      auto dim = nodeAttrInt(attrs, "dim");
+      if (!nb || !dim || *nb <= 0 || *dim <= 0)
+        continue;
+      const int64_t out = GraphEditor::resultIds(node)[0];
+      auto found = consumers.find(out);
+      if (found == consumers.end() || found->second.empty())
+        continue;
+
+      int64_t ds = -1;
+      llvm::SmallVector<mlir::Operation *> matmuls;
+      bool ok = true;
+      for (mlir::Operation *consumer : found->second) {
+        if (consumer->getName().getStringRef() !=
+                boomOpName(planner::OpKind::QuantizedMatmul) ||
+            consumer->getNumOperands() != 1) {
+          ok = false;
+          break;
+        }
+        auto cAttrs = consumer->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        auto cnb = nodeAttrInt(cAttrs, "batch");
+        auto cds = nodeAttrInt(cAttrs, "ds");
+        if (!cnb || *cnb != *nb || !cds) {
+          ok = false;
+          break;
+        }
+        // ds < 0 marks a weight type with no mmq activation layout (Q6_K, whose
+        // mmq weight kernel is disabled); such a matmul never fuses into mmq.
+        if (*cds < 0) {
+          ok = false;
+          break;
+        }
+        if (ds == -1)
+          ds = *cds;
+        else if (ds != *cds) {
+          ok = false;
+          break;
+        }
+        matmuls.push_back(consumer);
+      }
+      if (!ok)
+        continue;
+
+      // The f32 norm output has to cover the mmq activation buffer, tail guard
+      // included (rewrites.cpp:383-385).
+      const boom::TensorDescAttr desc = view.desc(out);
+      if (!mmqQ8Fits(*dim, *nb, desc.getByteSize()))
+        continue;
+
+      norms.push_back(&node);
+      dsOfNorm.insert({&node, ds});
+      matmulsOfNorm.insert({&node, std::move(matmuls)});
+    }
+
+    if (norms.empty())
+      return;
+
+    // The norms first, so the matmuls below read the retyped activation.
+    for (mlir::Operation *norm : norms) {
+      const auto outType =
+          mlir::cast<boom::TensorType>(norm->getResult(0).getType());
+
+      // The `ds` the mmq activation layout is selected by, appended to the
+      // attribute record (rewrites.cpp:407).
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          norm->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      nodeAttrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "ds",
+          builder.getI64IntegerAttr(dsOfNorm.lookup(norm))));
+
+      // The norm's output is the q8_1 activation now: the same buffer, the same
+      // shape, read as q8_1 — so the value is retyped with it.
+      auto q8Type = boom::Q8_1Type::getChecked(
+          mlir::detail::getDefaultDiagnosticEmitFn(loc), view.ctx(),
+          outType.getShape());
+      if (!q8Type) {
+        signalPassFailure();
+        return;
+      }
+
+      builder.setInsertionPoint(norm);
+      mlir::Operation *fused = buildNode(
+          builder, loc,
+          planner::op_kind_name(planner::OpKind::RmsNormQuantize),
+          GraphEditor::nodeId(*norm),
+          planner::op_kind_name(planner::OpKind::RmsNormQuantize),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*norm),
+          norm->getOperands(), {q8Type},
+          norm->getAttrOfType<mlir::StringAttr>("backend"));
+
+      norm->replaceAllUsesWith(fused);
+      view.noteReplaced(norm, fused);
+      norm->erase();
+    }
+
+    // Then the consumers: the same nodes under the operator that reads the
+    // activation as q8_1 (rewrites.cpp:408-411).
+    for (auto &entry : matmulsOfNorm) {
+      for (mlir::Operation *consumer : entry.second) {
+        builder.setInsertionPoint(consumer);
+        mlir::Operation *q8 = buildNode(
+            builder, loc,
+            planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+            GraphEditor::nodeId(*consumer),
+            planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+            consumer->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+            GraphEditor::resultIds(*consumer), consumer->getOperands(),
+            consumer->getResultTypes(),
+            consumer->getAttrOfType<mlir::StringAttr>("backend"));
+        consumer->replaceAllUsesWith(q8);
+        view.noteReplaced(consumer, q8);
+        consumer->erase();
+      }
+    }
+
+    // No tensor changed: no append, no drop, and the table is written back
+    // unchanged. The pass changes what the graph *says*, not what it holds.
+    view.commitTable();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -807,6 +995,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
     return;
   case planner::IrPassPhase::Prefill:
+    pm.addPass(std::make_unique<RmsNormMmqPass>());
     return;
   }
 }
@@ -820,7 +1009,6 @@ void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   case planner::IrPassPhase::Decode:
     return; // every decode pass has been ported
   case planner::IrPassPhase::Prefill:
-    planner::fuse_rms_norm_mmq_pass(g);
     planner::fuse_gelu_mul_mmq_pass(g);
     planner::fuse_silu_mul_mmq_pass(g);
     return;
