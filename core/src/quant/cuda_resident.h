@@ -65,11 +65,36 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
                                 int n);
 
+// silu×up -> q8_1 fused (T5, SwiGLU): yq = quantize_q8_1(silu(gate) * up). The
+// Silu counterpart of gelu_mul_quantize_q8_1_dev (same fusion, same contract);
+// the two differ only in the activation. Device in/out, no host copies. n must
+// be a multiple of 32.
+bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
+                                int n);
+
 // The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
 // blocks_per_row / num_rows are derived from W, so the caller passes only the
 // weight and the q8_1 pointer.
-bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y);
+//
+// `bias` is an optional [num_rows] epilogue operand (a host weight span, empty =>
+// none) — the same [width] projection bias add_bias_dev would add over the gemv
+// output, added here to the row's reduced sum instead so the projection and its
+// bias cost one launch. Only valid for the types gemv_bias_epilogue_supported()
+// accepts; asking for a bias on any other type fails the call (it never silently
+// drops the bias).
+//
+// `add` is an optional [num_rows] device epilogue operand (nullptr => none) — the
+// residual of an `Add(proj, residual)`, added after the bias in the same fp32
+// epilogue so the residual costs no separate launch. Same type restriction as
+// `bias`; a non-null `add` on an unsupported type fails the call.
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
+                   std::span<const float> bias = {}, const float* add = nullptr);
+
+// Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
+// gemv kernel carries the epilogue). Callers that must add a bias regardless use
+// this to choose between the epilogue and a separate add_bias_dev.
+bool gemv_bias_epilogue_supported(QuantType qt);
 
 // Y = W @ X (batched, the prefill shape), device in/out. X is device
 // [cols, n] row-major (n innermost), Y is device [rows, n] (n innermost).
@@ -109,6 +134,13 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
 // f32 gelu/product intermediates are never materialized. Device in/out. dim must
 // be a multiple of 128.
 bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds);
+
+// silu(gate)*up + block_q8_1_mmq quantize fused (C.4, position-major, SwiGLU).
+// The Silu counterpart of the gelu fusion above: identical contract, identical
+// block mapping and quantizer, only the activation differs. dim must be a
+// multiple of 128.
+bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
                                     BlockQ8_1Mmq* yq, int dim, int n, int ds);
 
 // K-quant matmul consuming a pre-quantized block_q8_1_mmq activation (no internal

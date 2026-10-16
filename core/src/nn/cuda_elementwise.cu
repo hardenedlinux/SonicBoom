@@ -523,9 +523,18 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   if (c0 >= n_keys) return;  // neutral chunk: the merge only reads chunks < n_active
   const uint64_t cn = (c0 + chunk < n_keys) ? chunk : (n_keys - c0);
 
-  // Phase 1: one q·k dot per key, warp-cooperative.
+  // Slot of the chunk's first key: one 64-bit modulo per block (device division
+  // is a software routine, and doing it per key was a large part of this loop's
+  // cost), then a compare-and-reset step so every later key's slot is a single
+  // increment. Identical values to (start + c0 + j) % n_slots.
+  uint64_t slot = (start + c0) % n_slots;
+
+  // Phase 1: one q·k dot per key, warp-cooperative. Unrolled by 4 so several
+  // keys' K loads are in flight at once — the per-key warp reduction is a
+  // serialized shuffle chain, so a single-key loop pays a full L2/DRAM latency
+  // per key.
+  #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const uint64_t slot = (start + c0 + j) % n_slots;
     const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     float d = 0.0f;
     for (int i = lane; i < head_dim; i += 32) d += qrow[i] * krow[i];
@@ -533,6 +542,7 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
     for (int o = 16; o > 0; o >>= 1)
       d += __shfl_down_sync(0xffffffffu, d, o);
     if (lane == 0) srow[j] = d * scale;
+    if (++slot == n_slots) slot = 0;
   }
   __syncwarp();
 
@@ -557,23 +567,32 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   __syncwarp();
 
   // Phase 3: V-weighted sum over the chunk — each lane owns a strided slice of
-  // the output row's dims.
+  // the output row's dims. The accumulators are indexed by compile-time
+  // constants (the runtime bound becomes a predicate) so the row lives in
+  // registers instead of a dynamically-indexed local array, which the previous
+  // form spilled to local memory inside this loop.
   const int dims_per_lane = head_dim >> 5;  // head_dim/32, <= 16
   float acc[16];
 #pragma unroll
   for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  slot = (start + c0) % n_slots;
+  #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const uint64_t slot = (start + c0 + j) % n_slots;
     const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     const float p = srow[j];  // exp(score - local max)
-    for (int i = 0; i < dims_per_lane; ++i) acc[i] += p * vrow[lane + i * 32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      if (i < dims_per_lane) acc[i] += p * vrow[lane + i * 32];
+    if (++slot == n_slots) slot = 0;
   }
 
   // Write partial [m, l, o[0..head_dim-1]] for this head.
   float* pp = partial + chunk_idx * (uint64_t)n_heads_q * (head_dim + 2) +
               (uint64_t)h * (head_dim + 2);
   if (lane == 0) { pp[0] = m; pp[1] = l; }
-  for (int i = 0; i < dims_per_lane; ++i) pp[2 + lane + i * 32] = acc[i];
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    if (i < dims_per_lane) pp[2 + lane + i * 32] = acc[i];
 }
 
 // Merge the per-chunk partials in fixed order (flash-decoding online-softmax
@@ -1349,6 +1368,8 @@ void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k
 size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
+void* g_argmax_keys = nullptr;  // per-block packed argmax candidates (grid unsigned long long)
+size_t g_argmax_keys_bytes = 0;
 void* g_xpack = nullptr;        // repacked activation column-block for the cuBLAS dense matvec ([cols, 128])
 size_t g_xpack_bytes = 0;
 void* g_outpack = nullptr;      // padded output column-block ([rows, 128])
@@ -1432,6 +1453,85 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
     __syncthreads();
   }
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
+// Packed argmax candidate: value in the high word as a monotone unsigned key
+// (so an unsigned compare orders floats including +/-inf), index in the low word
+// as 0xFFFFFFFF - i (so the *largest* packed key is the largest value and, on a
+// tie, the smallest index). mi < 0 (no candidate: every value was NaN) maps to
+// low word 0, which the finalize turns back into -1.
+__device__ __forceinline__ unsigned long long argmax_key(float v, int mi) {
+  const unsigned bits = __float_as_uint(v);
+  const unsigned ord = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  const unsigned low = (mi < 0) ? 0u : (0xFFFFFFFFu - (unsigned)mi);
+  return ((unsigned long long)ord << 32) | low;
+}
+
+// Multi-block argmax. The single-block form above is latency-bound: one block
+// scans the whole row with a single 4 B load per thread in flight, which measures
+// ~47 us/step for a 152 k vocab. Each block here reduces a strided float4 slice
+// (grid sized from the row length and the SM count) to one packed key, and a
+// single-block finalize picks the winner. Per block the reduction is exactly the
+// single-block one (compare with >, first occurrence wins, so NaN never wins).
+__global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
+                                      unsigned long long* __restrict__ keys) {
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  const float4* x4 = reinterpret_cast<const float4*>(x);
+  const int n4 = n >> 2;
+  for (int i = blockIdx.x * blockDim.x + tid; i < n4;
+       i += gridDim.x * blockDim.x) {
+    const float4 v = x4[i];
+    if (v.x > mv) { mv = v.x; mi = 4 * i + 0; }
+    if (v.y > mv) { mv = v.y; mi = 4 * i + 1; }
+    if (v.z > mv) { mv = v.z; mi = 4 * i + 2; }
+    if (v.w > mv) { mv = v.w; mi = 4 * i + 3; }
+  }
+  // Row tail (n % 4): block 0 thread 0 sweeps the leftover elements, so the
+  // float4 path stays unconditional.
+  if (blockIdx.x == 0 && tid == 0)
+    for (int i = 4 * n4; i < n; ++i)
+      if (x[i] > mv) { mv = x[i]; mi = i; }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
+}
+
+__global__ void argmax_finalize_kernel(const unsigned long long* __restrict__ keys,
+                                       int n_keys, float* __restrict__ out) {
+  __shared__ unsigned long long s_key[256];
+  const int tid = threadIdx.x;
+  unsigned long long k = 0;
+  for (int i = tid; i < n_keys; i += blockDim.x) {
+    const unsigned long long c = keys[i];
+    k = c > k ? c : k;
+  }
+  s_key[tid] = k;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      const unsigned long long c = s_key[tid + s];
+      if (c > s_key[tid]) s_key[tid] = c;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const unsigned low = (unsigned)(s_key[0] & 0xFFFFFFFFull);
+    out[0] = (low == 0) ? -1.0f : float(0xFFFFFFFFu - low);
+  }
 }
 
 // --- batched prefill kernels (the decode kernels generalized to n columns) ---
@@ -2337,8 +2437,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (head_dim % 32 != 0 || head_dim > 512) return false;
   if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
 
-  // Tiled tensor-core path: Gemma's GQA=4 with the SWA head (256) or the global
-  // head (512). Anything else keeps the scalar-fp32 kernel.
+  // Tiled tensor-core path, selected by shape (head_dim, gqa): the tile config
+  // is a pure function of those two, so a shape either has an instantiation
+  // here or falls through to the scalar-fp32 warp kernel below (correct for
+  // every shape, just per-warp redundant on K/V and scalar on the dot). The
+  // block is NW*GQA*(QB/16) warps (<= 32 => <= 1024 threads) and its smem is
+  // sized in the launcher, which also raises the dynamic-smem attribute.
+  //   - Gemma-family: gqa 4, SWA head 256 / global head 512.
+  //   - SwiGLU families (Qwen2.5-0.5B, and the same 7:1 group ratio at the
+  //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
   if (gqa == 4 && head_dim == 256)
     return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
@@ -2346,6 +2453,10 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
         n_heads_kv, sliding_window, scale, out);
   if (gqa == 4 && head_dim == 512)
     return launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (gqa == 7 && head_dim == 64)
+    return launch_tiled_flash_attention<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
 
@@ -2394,7 +2505,22 @@ bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_sc
 bool argmax_dev(const float* x, int n, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !out) return false;
-  argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  // Enough float4s for at least two blocks, and a 16 B-aligned base (the pool
+  // allocations are, but the general case has to degrade gracefully).
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * sizeof(unsigned long long)));
+  if (!keys) return false;
+  argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
+  argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
 

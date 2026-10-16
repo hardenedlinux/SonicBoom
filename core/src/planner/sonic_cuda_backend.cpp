@@ -470,9 +470,46 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
             int(nb));
       } else {
-        ok = quant::cuda::gemv_q8_1_dev(
-            qweight(slot),
-            reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])), out);
+        const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
+        const auto& qw = qweight(slot);
+        const bool epilogue = quant::cuda::gemv_bias_epilogue_supported(qw.type());
+        // `bias_slot` is set by fuse_bias_into_gemv_pass: the projection's bias
+        // (a bound [rows] model weight) was folded into this matmul node by
+        // dropping the AddBias node that followed it. `add_input` is set by
+        // fuse_residual_add_into_gemv_pass: the residual of `Add(proj, residual)`
+        // became this matmul's second activation input when the Add node was
+        // dropped. The gemv epilogue adds both to the row's reduced sum (bias
+        // first, then the residual) — bit-identical to the separate kernels it
+        // replaces, since both add to the stored f32 output in that order. A type
+        // without the epilogue runs the gemv and then the plain elementwise
+        // kernels over the output (same values, more launches).
+        int64_t bias_slot = 0, add_idx = 0;
+        const bool has_bias = attr_i(*node, "bias_slot", bias_slot);
+        const bool has_add = attr_i(*node, "add_input", add_idx);
+        // The epilogue adds one bias element per output row; a bias that is
+        // shorter than the row (the AddBias broadcast form) goes through the
+        // separate kernel, which reproduces add_bias's i % bias_n indexing.
+        const std::span<const float> b =
+            has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
+                     : std::span<const float>{};
+        const bool bias_fused = has_bias && b.size() == size_t(out_n) && epilogue;
+        const float* add_p = has_add ? static_cast<const float*>(dev(in[add_idx]))
+                                     : nullptr;
+        const bool add_fused = add_p != nullptr && epilogue;
+        if (bias_fused || add_fused) {
+          ok = quant::cuda::gemv_q8_1_dev(
+              qw, xq, out, bias_fused ? b : std::span<const float>{},
+              add_fused ? add_p : nullptr);
+          if (ok && has_bias && !bias_fused && !b.empty())
+            ok = nn::cuda::add_bias_dev(b, out, out, out_n);
+          if (ok && has_add && !add_fused)
+            ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        } else {
+          ok = quant::cuda::gemv_q8_1_dev(qw, xq, out);
+          if (ok && has_bias && !b.empty())
+            ok = nn::cuda::add_bias_dev(b, out, out, out_n);
+          if (ok && has_add) ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        }
       }
       break;
     }
@@ -513,6 +550,27 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             int(ds_i));
       } else {
         ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]),
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      }
+      break;
+    }
+    case OpKind::SiluMulQuantize: {
+      // silu(gate) * up, quantized in one kernel (T5, SwiGLU). Exactly the
+      // Silu counterpart of GeluMulQuantize above. Decode (no `batch`) emits a
+      // q8_1 (32-elem block) activation; prefill (`batch` + `dim` + `ds`) emits
+      // a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation, the same
+      // two flavours the gelu fusion has.
+      int64_t nb = 0, dim_i = 0, ds_i = 0;
+      if (attr_i(*node, "batch", nb)) {
+        attr_i(*node, "dim", dim_i);
+        attr_i(*node, "ds", ds_i);
+        ok = quant::cuda::silu_mul_quantize_mmq_q8_1_dev(
+            dev(in[0]), dev(in[1]),
+            reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
+            int(ds_i));
+      } else {
+        ok = quant::cuda::silu_mul_quantize_q8_1_dev(
             dev(in[0]), dev(in[1]),
             reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
       }

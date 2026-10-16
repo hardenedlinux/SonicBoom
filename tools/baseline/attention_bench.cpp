@@ -85,14 +85,24 @@ struct Config {
   int head_dim;
   uint64_t sliding_window;
   std::vector<uint64_t> pos_list;
+  int n_heads_q = 8;   // Gemma 4 E4B default
+  int n_heads_kv = 2;
+  // Fixed split window (the graph's compile-time key budget). 0 => size from
+  // n_slots, i.e. exactly the current depth (bench-local optimum). A non-zero
+  // value reproduces the deployed config, where grid/smem/chunk are stable for
+  // CUDA Graph replay and only the active chunks grow with depth.
+  uint64_t window = 0;
 };
 
 void run(const Config& cfg) {
-  const int n_heads_q = 8, n_heads_kv = 2;
+  const int n_heads_q = cfg.n_heads_q, n_heads_kv = cfg.n_heads_kv;
   const auto& pos_list = cfg.pos_list;
 
-  std::printf("== %s (head_dim=%d, sliding_window=%llu) ==\n", cfg.name, cfg.head_dim,
-              (unsigned long long)cfg.sliding_window);
+  std::printf("== %s (head_dim=%d, sliding_window=%llu, n_heads_q=%d, "
+              "n_heads_kv=%d, group_q=%d, window=%llu) ==\n",
+              cfg.name, cfg.head_dim, (unsigned long long)cfg.sliding_window,
+              n_heads_q, n_heads_kv, n_heads_q / n_heads_kv,
+              (unsigned long long)cfg.window);
   std::printf("  %6s | %8s | %10s | %11s | %11s | %13s\n", "pos", "n_keys", "us/call",
               "max_abs", "rms", "worst_rel_err");
 
@@ -104,7 +114,11 @@ void run(const Config& cfg) {
     const uint64_t start =
         (cfg.sliding_window > 0 && pos >= cfg.sliding_window) ? pos - cfg.sliding_window + 1 : 0;
     const uint64_t n_keys = pos - start + 1;
-    const uint64_t n_slots = (cfg.sliding_window > 0) ? cfg.sliding_window : (pos + 1);
+    // Ring capacity. A fixed `window` (deployed config) sizes the cache and the
+    // split grid for the whole replay; 0 sizes both exactly to the depth.
+    const uint64_t win = cfg.window ? std::max(cfg.window, pos + 1) : 0;
+    const uint64_t n_slots = (cfg.sliding_window > 0) ? cfg.sliding_window
+                                                      : (win ? win : pos + 1);
 
     const uint64_t q_n = uint64_t(n_heads_q) * cfg.head_dim;
     const uint64_t kv_rows = n_slots * n_heads_kv;
@@ -124,17 +138,22 @@ void run(const Config& cfg) {
                            cfg.head_dim, cfg.sliding_window, 1.0f, ref);
 
     float *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr;
+    uint64_t* dpos = nullptr;
     cudaMalloc(&dq, q_n * sizeof(float));
     cudaMalloc(&dk, kv_n * sizeof(float));
     cudaMalloc(&dv, kv_n * sizeof(float));
     cudaMalloc(&dout, q_n * sizeof(float));
+    cudaMalloc(&dpos, sizeof(uint64_t));
     cudaMemcpy(dq, q.data(), q_n * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dk, k.data(), kv_n * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(dv, v.data(), kv_n * sizeof(float), cudaMemcpyHostToDevice);
+    // `pos` is device-resident (CUDA-Graph capturable), so stage it.
+    cudaMemcpy(dpos, &pos, sizeof(uint64_t), cudaMemcpyHostToDevice);
 
     auto call = [&]() {
-      sbcuda::decode_attention_dev(dq, dk, dv, pos, n_slots, n_heads_q, n_heads_kv,
-                                   cfg.head_dim, cfg.sliding_window, 1.0f, dout);
+      sbcuda::decode_attention_dev(dq, dk, dv, dpos, win ? win : n_slots, n_slots,
+                                   n_heads_q, n_heads_kv, cfg.head_dim,
+                                   cfg.sliding_window, 1.0f, dout);
     };
 
     // Warm up, then time one call to size the batch.
@@ -170,6 +189,7 @@ void run(const Config& cfg) {
     cudaFree(dk);
     cudaFree(dv);
     cudaFree(dout);
+    cudaFree(dpos);
   }
 
   cudaEventDestroy(e0);
@@ -187,5 +207,10 @@ int main() {
   // a post-wrap position; global: full-sequence decode out to 4096.
   run({"SWA", 256, 512, {32, 64, 128, 256, 511, 512, 513, 1000}});
   run({"global", 512, 0, {32, 64, 128, 256, 512, 1024, 2048, 4096}});
+  // Qwen2.5-0.5B global attention: 14 query heads / 2 KV heads, head_dim 64,
+  // no SWA, graph compiled for a fixed 4096-key window (so the grid is fixed and
+  // only the active chunks grow with depth, as in deployment).
+  run({"qwen-global", 64, 0, {32, 128, 512, 1024, 2048, 4096},
+       14, 2, 4096});
   return 0;
 }

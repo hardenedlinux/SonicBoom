@@ -592,6 +592,14 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
   return buf;
 }
 
+// The mmq kernels read whole 256-value K-iterations, so a row whose K is not a
+// multiple of 256 over-reads up to 4 legacy blocks (4*34 = 136 bytes) past its
+// last block. Those values enter the tail iteration's A tile, so they must be
+// finite: that iteration's activation scale is 0, but (C.x * dA) * 0 is still
+// NaN when dA is. An over-read into the next row is finite by construction; the
+// last row needs this zeroed tail pad (ggml pads weight rows the same way).
+constexpr size_t kWeightTailPad = 256;
+
 // Upload W's packed bytes to the device, caching by (data pointer, byte size)
 // so repeated calls with the same weight reuse the device copy.
 const void* upload_weight(const QuantizedTensor& W) {
@@ -603,8 +611,9 @@ const void* upload_weight(const QuantizedTensor& W) {
   if (it != g_cache.end()) return it->second.ptr;
 
   void* dptr = nullptr;
-  if (cudaMalloc(&dptr, bytes) != cudaSuccess) return nullptr;
-  if (cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+  if (cudaMalloc(&dptr, bytes + kWeightTailPad) != cudaSuccess) return nullptr;
+  if (cudaMemset(static_cast<char*>(dptr) + bytes, 0, kWeightTailPad) != cudaSuccess ||
+      cudaMemcpy(dptr, host, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
     cudaFree(dptr);
     return nullptr;
   }
@@ -1350,32 +1359,62 @@ cublasHandle_t cublas_handle() {
   return g_cublas_handle;
 }
 
+// Which quant types' gemv kernels carry the optional epilogue operands (`bias`
+// and `add`, the latter first, of the warp-per-row mmvq kernels). Types outside
+// this set run without an epilogue, so a caller that must add a bias or a
+// residual either falls back to a separate elementwise kernel or declines the
+// fusion.
+bool gemv_bias_epilogue_supported(QuantType qt) {
+  switch (qt) {
+    case QuantType::Q3_K:
+    case QuantType::Q4_K:
+    case QuantType::Q5_K:
+    case QuantType::Q5_0:
+    case QuantType::Q8_0:
+      return true;
+    case QuantType::Q6_K:  // owned elsewhere: no epilogue, see TODO(q6k-mmq)
+    default:
+      return false;
+  }
+}
+
 // The warp-per-row dp4a gemv against a *pre-quantized* q8_1 activation. Shared
 // by launch_gemv_q8_1 (quantize + gemv in one call) and gemv_q8_1_dev (the
 // quantize-once path, where the activation is already a q8_1 tensor).
+// `bias` (a bound weight) and `add` (a device activation: the residual of a
+// folded `Add(proj, residual)`) are the optional [num_rows] epilogue operands,
+// applied in that order; the caller must pass null for a type where
+// gemv_bias_epilogue_supported() is false.
 void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
                                      const q8_1::block_q8_1* xq, float* yp,
-                                     int blocks_per_row, int num_rows) {
+                                     int blocks_per_row, int num_rows,
+                                     const float* bias = nullptr,
+                                     const float* add = nullptr) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
   switch (qt) {
     case QuantType::Q3_K:
-      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q4_K:
-      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q5_K:
-      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q6_K:
       q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
     case QuantType::Q5_0:
-      q8_1::gemv_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q8_0:
-      q8_1::gemv_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
   }
 }
@@ -1422,7 +1461,7 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
 // explicit Quantize node whose output is shared by several gemvs.
 bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
   if (!available() || !x || !yq || nblocks <= 0) return false;
-  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
       x, reinterpret_cast<q8_1::block_q8_1*>(yq), nblocks);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -1431,18 +1470,19 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // sum-of-squares (double, warp-shuffle + shared reduction, matching
 // nn::cuda::rms_norm_dev's rms_sum_sq_kernel), derives
 // inv = 1/sqrtf(float(sum/n) + eps), then normalizes and quantizes to q8_1 in
-// the same pass — the f32 normalized activation is never materialized. Each
-// thread owns one 32-element q8_1 block (one thread per block, exactly as
-// quantize_q8_1), so the normalization + amax/127 quantization is bit-identical
-// to rms_norm_dev followed by quantize_q8_1_dev.
+// the same pass — the f32 normalized activation is never materialized. The
+// normalization + amax/127 quantization is bit-identical to rms_norm_dev
+// followed by quantize_q8_1_dev.
 //
 // The block is fixed at 1024 threads so the sum-of-squares accumulation order
 // (thread t reads x[t], x[t+1024], …) is identical to rms_norm_fused_kernel,
-// keeping `inv` bit-identical to the unfused path. The quantization loops are
-// deliberately *not* #pragma-unrolled: full unrolling keeps 32 loads in flight
-// per thread and pushes register usage past the 64-register/thread limit at
-// 1024 threads ("too many resources"), whereas the rolled loop needs only a
-// couple of live registers.
+// keeping `inv` bit-identical to the unfused path.
+//
+// Quantization is one warp per 32-element q8_1 block, one lane per element —
+// the same mapping as quantize_q8_1. Each lane computes its normalized value
+// once (kept in a register and reused by the amax butterfly), so the block
+// costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
+// thread runs a 32-iteration serial chain.
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
@@ -1468,22 +1508,19 @@ __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
   __syncthreads();
   const float iv = inv;
   const int nblocks = n / 32;
-  for (int ib = tid; ib < nblocks; ib += blockDim.x) {
-    const float* xb = x + (size_t)ib * 32;
-    const float* wb = weight ? weight + (size_t)ib * 32 : nullptr;
-    // amax pass (rolled): the normalized value is recomputed identically in the
-    // quantize pass below, so no per-block norm[] array is materialized.
-    float amax = 0.0f;
-    for (int k = 0; k < 32; ++k) {
-      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
-      amax = fmaxf(amax, fabsf(nv));
-    }
+  for (int ib = warp; ib < nblocks; ib += blockDim.x >> 5) {
+    const size_t base = (size_t)ib * 32;
+    const float xv = x[base + lane];
+    const float nv = weight ? xv * iv * weight[base + lane] : xv * iv;
+    // amax: same fmaxf(fabsf(nv)) fold as the per-thread serial scan, just
+    // butterfly-reduced across the lanes of the block's warp.
+    float amax = fmaxf(0.0f, fabsf(nv));
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
     const float d = amax / 127.0f;
-    y[ib].d = d;
-    for (int k = 0; k < 32; ++k) {
-      const float nv = wb ? xb[k] * iv * wb[k] : xb[k] * iv;
-      y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(nv / d));
-    }
+    if (lane == 0) y[ib].d = d;
+    y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(nv / d));
   }
 }
 
@@ -1539,9 +1576,53 @@ bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
   return cudaGetLastError() == cudaSuccess;
 }
 
+// silu×up -> q8_1 fused (T5, SwiGLU): the Silu counterpart of
+// gelu_mul_quantize_q8_1 — same fusion, same arithmetic, only the activation
+// differs. One warp per 32-element q8_1 block, lane per element (the mapping of
+// quantize_q8_1), so a row (ff 4864 = 152 blocks) fills the GPU instead of being
+// one thread's 32-iteration serial chain. Bit-identical to silu_dev + mul_dev +
+// quantize_q8_1_dev: silu and the product are pure functions of gate/up
+// recomputed identically, and amax is a max (order-independent), so the same
+// `d` and the same quants come out.
+__global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              int nblocks,
+                                              q8_1::block_q8_1* __restrict__ y) {
+  const int ib = blockIdx.x * q8_1::kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
+  if (ib >= nblocks) return;
+  const int lane = threadIdx.x & 31;
+  const size_t i = (size_t)ib * 32 + lane;
+  const float g = gate[i];
+  const float v = (g / (1.0f + expf(-g))) * up[i];  // == nn::silu(g) * up
+  float amax = fabsf(v);
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float d = amax / 127.0f;
+  if (lane == 0) y[ib].d = d;
+  y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(v / d));
+}
+
+bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
+                                int n) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+  const int nblocks = n / 32;
+  silu_mul_quantize_q8_1_kernel<<<q8_1::quantize_q8_1_grid(nblocks),
+                                  q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+      gate, up, nblocks, reinterpret_cast<q8_1::block_q8_1*>(yq));
+  return cudaGetLastError() == cudaSuccess;
+}
+
 // The K-quant gemv against a pre-quantized q8_1 activation — no internal
-// quantize. W is uploaded+cached exactly as matvec_f32_dev.
-bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y) {
+// quantize. W is uploaded+cached exactly as matvec_f32_dev. `bias` is the
+// optional [rows] projection bias and `add` the optional [rows] residual
+// activation, both folded into the gemv epilogue (see
+// gemv_bias_epilogue_supported: an unsupported type with a non-empty bias fails
+// rather than silently dropping it). `add` is a device activation (the residual
+// of `Add(proj, residual)`) already resident in the device pool; the caller
+// guarantees the epilogue supports the weight's type before passing it.
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
+                   std::span<const float> bias, const float* add) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
   const uint64_t cols = W.dims()[0];
@@ -1550,12 +1631,20 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y) {
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
 
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows || !gemv_bias_epilogue_supported(W.type())) return false;
+    d_bias = static_cast<const float*>(upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+  if (add && !gemv_bias_epilogue_supported(W.type())) return false;
+
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   launch_gemv_q8_1_from_quantized(
       W.type(), wp, reinterpret_cast<const q8_1::block_q8_1*>(xq), y,
-      int(blocks_per_row), int(rows));
+      int(blocks_per_row), int(rows), d_bias, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -1578,7 +1667,7 @@ bool launch_gemv_q8_1(QuantType qt, const uint8_t* wp, const float* xp, float* y
       grow_scratch(g_q8, g_q8_bytes, nblocks * sizeof(q8_1::block_q8_1)));
   if (!d_q8) return false;
 
-  q8_1::quantize_q8_1<<<(nblocks + 255) / 256, 256, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
 
   launch_gemv_q8_1_from_quantized(qt, wp, d_q8, yp, blocks_per_row, num_rows);
   return cudaGetLastError() == cudaSuccess;
@@ -1745,10 +1834,12 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
 // scale layout (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's
 // vec_dot path. Q6_K uses D4 (float activation scales); its signed per-16-value
 // weight scales remain separate from the block's fp16 d, matching ggml's
-// Q6_K MMQ tile layout.
+// Q6_K MMQ tile layout. The legacy 32-element formats Q5_0/Q8_0 also use the
+// D4 layout (ggml's MMQ_Q8_1_DS_LAYOUT_D4) with their own tile loaders.
 bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
+  if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
   const int ic = int(cols), ir = int(rows);
   const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
 
@@ -1764,6 +1855,11 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
       grow_scratch(g_mmq_q8, g_mmq_q8_bytes,
                    mmq::mmq_q8_blocks(ic, n) * sizeof(mmq::block_q8_1_mmq)));
   if (!y_q8) return false;
+
+  // 2. Zero the pad plane(s) a K that is not a multiple of MMQ_ITER_K (256)
+  // leaves: the last K-iteration reads a plane the quantizer never wrote. Runs
+  // before the quantize but touches none of its blocks. No-op when K % 256 == 0.
+  mmq::zero_pad_planes(y_q8, ic, n, cur_stream());
 
   bool ok = false;
   switch (W.type()) {
@@ -1785,6 +1881,20 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
+    // The legacy 32-element formats use the D4 float activation scale layout
+    // (ggml's MMQ_Q8_1_DS_LAYOUT_D4), same as Q3_K.
+    case QuantType::Q5_0:
+      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
+      ok = mmq::mul_mat_q<mmq::MMQ_Q5_0>(
+          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
+          Y, ir, n, blocks_per_row, cur_stream());
+      break;
+    case QuantType::Q8_0:
+      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
+      ok = mmq::mul_mat_q<mmq::MMQ_Q8_0>(
+          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
+          Y, ir, n, blocks_per_row, cur_stream());
+      break;
     default:
       return false;
   }
@@ -1802,6 +1912,7 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
     return false;
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
+  if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
   const int ir = int(rows);
   const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
@@ -1820,6 +1931,12 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
+
+  // A K that is not a multiple of MMQ_ITER_K (256) leaves an odd plane count; the
+  // last K-iteration reads one plane past what the fused emitter wrote, so zero
+  // it (no-op for K % 256 == 0, i.e. every K-quant weight).
+  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8),
+                       int(cols), n, cur_stream());
 
   const int* yq = reinterpret_cast<const int*>(y_q8);
   bool ok = false;
@@ -1841,6 +1958,16 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
       break;
     case QuantType::Q6_K:
       ok = mmq::mul_mat_q<mmq::MMQ_Q6_K>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
+    case QuantType::Q5_0:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q5_0>(
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
+          cur_stream());
+      break;
+    case QuantType::Q8_0:
+      ok = mmq::mul_mat_q<mmq::MMQ_Q8_0>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
@@ -2024,6 +2151,52 @@ bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// silu×up -> block_q8_1_mmq fused (C.4, position-major, SwiGLU): the Silu
+// counterpart of gelu_mul_quantize_mmq_q8_1 — same fusion, same block mapping,
+// same quantizer, only the activation differs (silu(g) = g/(1+expf(-g)), the
+// expression nn::cuda::silu uses, so the fused blocks are bit-identical to the
+// unfused silu + mul + the matmul's internal quantize).
+template <int ds>
+__global__ void silu_mul_quantize_mmq_q8_1_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up, int dim, int n,
+    mmq::block_q8_1_mmq* __restrict__ y) {
+  const int token = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int nwarps = (blockDim.x + 31) >> 5;
+  const float* grow = gate + (size_t)token * dim;
+  const float* urow = up + (size_t)token * dim;
+  const int nblocks = dim / 128;
+  for (int blk = warp; blk < nblocks; blk += nwarps) {
+    const int base = blk * 128 + lane * 4;
+    float f[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const float g = grow[base + k];
+      f[k] = (g / (1.0f + expf(-g))) * urow[base + k];
+    }
+    quantize_mmq_q8_1_block<ds>(f, blk, token, n, lane, y);
+  }
+}
+
+bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
+                                    BlockQ8_1Mmq* yq, int dim, int n, int ds) {
+  if (!available() || !gate || !up || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0)
+    return false;
+  auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  if (ds == mmq::DS4)
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  else if (ds == mmq::D4_Q8_1)
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  else
+    silu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
+        gate, up, dim, n, y);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
@@ -2039,13 +2212,12 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // 256→434/336, 512→458/396, 2048→324/286), so it is selected for all
   // n >= mmq_min_n(); cuBLAS stays reachable via SONICBOOM_MMQ=0. Only when
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
-  // The MMQ kernel tiles for the 256-element K-quant super-block, so it covers
-  // Q3_K/Q4_K/Q5_K only. Q6_K (TODO(q6k-mmq)) and the legacy 32-element formats
-  // (Q5_0/Q8_0) skip it and take the cuBLAS fp16 or dp4a batched path below —
-  // matmul_mmq_dev would reject them anyway, and returning its false here would
-  // fail the whole call instead of falling through.
-  const bool mmq_type =
-      W.type() != QuantType::Q6_K && !is_legacy_quant(W.type());
+  // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K)
+  // and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per 256-value
+  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the cuBLAS fp16 or dp4a
+  // batched path below — matmul_mmq_dev would reject it anyway, and returning its
+  // false here would fail the whole call instead of falling through.
+  const bool mmq_type = W.type() != QuantType::Q6_K;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
@@ -2073,7 +2245,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
     q8_1::block_q8_1* xq = static_cast<q8_1::block_q8_1*>(grow_scratch(
         g_q8, g_q8_bytes, nblocks * (size_t)n * sizeof(q8_1::block_q8_1)));
     if (!xq) return false;
-    q8_1::quantize_q8_1<<<(nblocks * n + 255) / 256, 256, 0, cur_stream()>>>(
+    q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(int(nblocks * n)), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
         X, xq, int(nblocks * n));
 
     // Batched warp-per-row gemv -> Y[n, rows] (position-major).

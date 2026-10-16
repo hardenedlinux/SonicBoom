@@ -59,6 +59,17 @@ void fuse_rms_norm_quantize_pass(Graph& g);
 // tensor. Must run after quantize_once_pass (and after fuse_rms_norm_quantize_pass).
 void fuse_gelu_mul_quantize_pass(Graph& g);
 
+// T5, SwiGLU variant. The same fusion as fuse_gelu_mul_quantize_pass with Silu
+// in place of GeluFp16: where the gated FFN activates with Silu (Qwen2, Llama,
+// Mistral, …), the triple Quantize(Mul(Silu(gate), up)) becomes one
+// SiluMulQuantize node. Mirrors the gelu pass exactly — same single-use
+// conditions, same output tensor (the Quantize's q8_1 buffer), same attribute
+// set (the node keeps the Silu node's attributes) — so it composes with the
+// same backend kernel plumbing. Must run after quantize_once_pass, and is the
+// mutually exclusive alternative to fuse_gelu_mul_quantize_pass (a graph
+// activates with one or the other, never both).
+void fuse_silu_mul_quantize_pass(Graph& g);
+
 // C.4 prefill (mmq) rms_norm fusion. The prefill graph has no Quantize nodes —
 // each batched QuantizedMatmul quantizes its activation internally (block_q8_1_mmq,
 // 128-elem). This pass folds an RmsNorm(batch, dim) whose output is consumed
@@ -74,6 +85,33 @@ void fuse_gelu_mul_quantize_pass(Graph& g);
 // mmq_enabled at the call site, and on n >= mmq_min_n via the caller's nseg gate.
 void fuse_rms_norm_mmq_pass(Graph& g);
 
+// Projection-bias fusion (decode). A projection bias is emitted as an AddBias
+// node over the projection's QuantizedMatmulQ8 output. When that output has no
+// other reader and the matmul is single-column (no `batch`), the bias is folded
+// into the matmul node as a `bias_slot` attribute carrying the bias weight slot:
+// the matmul takes over the AddBias's output tensor, the AddBias node is dropped,
+// and the buffer the matmul used to write is dead. The executing backend adds the
+// bias in the gemv epilogue (one launch instead of two) where its kernel has the
+// epilogue for the weight's quant type, and falls back to a separate add_bias
+// kernel otherwise — the values are identical either way, since the bias is added
+// once to the row's fully reduced sum. Run after quantize_once_pass, which is
+// what turns the projection into a QuantizedMatmulQ8.
+void fuse_bias_into_gemv_pass(Graph& g);
+
+// Residual-add fusion (decode). The residual add around a projection is emitted
+// as `Add(proj, residual)`. When `proj` is a single-column QuantizedMatmulQ8
+// output with no other reader, the residual becomes the matmul's second input
+// (named by the `add_input` attribute) and the matmul takes over the Add's output
+// tensor, so the Add node disappears. The executing backend adds the residual in
+// the gemv epilogue (one launch instead of two) where its kernel has the epilogue
+// for the weight's quant type, and falls back to a separate elementwise add
+// otherwise — the values are identical either way, since the residual is added
+// once to the row's fully reduced sum, in the same fp32 addition the separate
+// kernel performs. Run after fuse_bias_into_gemv_pass (so a projection with both
+// a bias and a residual folds in that order, which is the order the unfused
+// kernels apply them in).
+void fuse_residual_add_into_gemv_pass(Graph& g);
+
 // C.4 prefill (mmq) gelu×up fusion. The gated FFN down-projection
 // QuantizedMatmul(fh) internally quantizes fh = gelu_fp16(gate) * up. When the
 // gelu and the mul product are each single-use, the GeluFp16 + Mul +
@@ -84,5 +122,15 @@ void fuse_rms_norm_mmq_pass(Graph& g);
 // superset of the mmq blocks), and inherits `dim`/`ds` from the down-projection
 // matmul's attributes. Run after fuse_rms_norm_mmq_pass.
 void fuse_gelu_mul_mmq_pass(Graph& g);
+
+// C.4 prefill (mmq) silu×up fusion: the SwiGLU counterpart of
+// fuse_gelu_mul_mmq_pass. Where the gated FFN activates with Silu (Qwen2, Llama,
+// Mistral, …) the Silu + Mul + QuantizedMatmul triple folds into one
+// SiluMulQuantize(batch, dim=ff, ds) node plus a QuantizedMatmulQ8 — the f32
+// silu and product intermediates are never materialized. Identical conditions,
+// tensor reuse and attribute inheritance; the two passes are mutually exclusive
+// (a graph activates with one activation, never both). Run after
+// fuse_rms_norm_mmq_pass.
+void fuse_silu_mul_mmq_pass(Graph& g);
 
 } // namespace sonicboom::planner

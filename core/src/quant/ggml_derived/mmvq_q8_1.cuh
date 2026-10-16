@@ -124,21 +124,35 @@ __device__ __forceinline__ int get_int_b4(const void* x, int i) {
   return static_cast<const int*>(x)[i];
 }
 
-// One thread per 32-element block; amax/127 quantization (== llama.cpp's
-// quantize_q8_1, which warp-reduces over the same 32 elements).
+// Threads per launch block for quantize_q8_1 (multiple of the warp size).
+inline constexpr int kQuantizeBlockThreads = 256;
+inline constexpr int kQuantizeWarpsPerBlock = kQuantizeBlockThreads / 32;
+
+// One WARP per 32-element block: lane `k` loads x[block*32 + k], a butterfly
+// shuffle reduces the block amax, and each lane quantizes its own element.
+// Same amax/127 quantization as llama.cpp's quantize_q8_1 (a warp reduction —
+// max is order-independent, so this is bit-identical to the serial scan it
+// replaces). The parallelism is per *element* rather than per block, which is
+// what makes a decode row (896 elements = 28 blocks, one wave of work at the
+// old one-thread-per-block mapping) short instead of latency-bound.
 __global__ void quantize_q8_1(const float* __restrict__ x,
                               block_q8_1* __restrict__ y, int nblocks) {
-  const int ib = blockIdx.x * blockDim.x + threadIdx.x;
+  const int ib = blockIdx.x * kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
   if (ib >= nblocks) return;
-  const float* xb = x + (size_t)ib * 32;
-  float amax = 0.0f;
+  const int lane = threadIdx.x & 31;
+  const float xi = x[(size_t)ib * 32 + lane];
+  float amax = fabsf(xi);
   #pragma unroll
-  for (int k = 0; k < 32; ++k) amax = fmaxf(amax, fabsf(xb[k]));
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
   const float d = amax / 127.0f;
-  y[ib].d = d;
-  #pragma unroll
-  for (int k = 0; k < 32; ++k)
-    y[ib].qs[k] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(xb[k] / d));
+  if (lane == 0) y[ib].d = d;
+  y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(xi / d));
+}
+
+// Launch geometry for the warp-per-block mapping above.
+inline int quantize_q8_1_grid(int nblocks) {
+  return (nblocks + kQuantizeWarpsPerBlock - 1) / kQuantizeWarpsPerBlock;
 }
 
 // --- dot products (ported from llama.cpp vecdotq.cuh) ----------------------
@@ -394,11 +408,20 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const uint8_t* wb,
 }
 
 // --- warp-per-row mmvq kernels ---------------------------------------------
+//
+// Each kernel takes two optional [num_rows] epilogue operands (nullptr => plain
+// gemv): `bias` is a bound weight (host span, uploaded once) and `add` is a
+// device activation (the residual of an `Add(proj, residual)`). Both are added to
+// the row's fully reduced f32 sum, `bias` first and then `add`, which is exactly
+// what a following add_bias kernel and then an elementwise add would compute from
+// the stored output, so the fused and unfused orders are bit-identical.
+// gemv_q6_K_q8_1 has no epilogue (see gemv_bias_epilogue_supported).
 
 __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
-                               int num_rows) {
+                               int num_rows, const float* __restrict__ bias,
+                               const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -412,13 +435,19 @@ __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
-  if (lane == 0) dst[row] = sum;
+  if (lane == 0) {
+    float v = sum;
+    if (bias) v += bias[row];
+    if (add) v += add[row];
+    dst[row] = v;
+  }
 }
 
 __global__ void gemv_q4_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
-                               int num_rows) {
+                               int num_rows, const float* __restrict__ bias,
+                               const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -432,13 +461,19 @@ __global__ void gemv_q4_K_q8_1(const uint8_t* __restrict__ w,
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
-  if (lane == 0) dst[row] = sum;
+  if (lane == 0) {
+    float v = sum;
+    if (bias) v += bias[row];
+    if (add) v += add[row];
+    dst[row] = v;
+  }
 }
 
 __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
-                               int num_rows) {
+                               int num_rows, const float* __restrict__ bias,
+                               const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -452,7 +487,12 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
-  if (lane == 0) dst[row] = sum;
+  if (lane == 0) {
+    float v = sum;
+    if (bias) v += bias[row];
+    if (add) v += add[row];
+    dst[row] = v;
+  }
 }
 
 __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
@@ -478,12 +518,19 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
 // consume whole blocks (stride 32 lanes) instead of a fixed 16-element slice of
 // a 256-element super-block; the activation index is then the flat block index
 // `b`, with the tile offset folded in for the batched form.
+//
+// `bias` is an optional [num_rows] epilogue operand (nullptr => plain gemv).
+// It replaces a following add_bias kernel: the bias is added once to the row's
+// fully reduced f32 sum, exactly as add_bias adds it to the stored gemv output,
+// so the two orders are bit-identical.
 
 #define SONICBOOM_DEFINE_LEGACY_MMVQ(suffix, blkbytes, dot)                       \
   __global__ void gemv_##suffix##_q8_1(const uint8_t* __restrict__ w,             \
                                        const block_q8_1* __restrict__ y,          \
                                        float* __restrict__ dst, int blocks_per_row, \
-                                       int num_rows) {                            \
+                                       int num_rows,                              \
+                                       const float* __restrict__ bias,           \
+                                       const float* __restrict__ add) {           \
     const int lane = threadIdx.x;                                                 \
     const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
     if (row >= num_rows) return;                                                  \
@@ -494,7 +541,12 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
     }                                                                             \
     _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                            \
         sum += __shfl_down_sync(0xffffffffu, sum, o);                             \
-    if (lane == 0) dst[row] = sum;                                                \
+    if (lane == 0) {                                                              \
+      float v = sum;                                                              \
+      if (bias) v += bias[row];                                                   \
+      if (add) v += add[row];                                                     \
+      dst[row] = v;                                                               \
+    }                                                                             \
   }                                                                               \
   template <int T>                                                                \
   __global__ void gemv_##suffix##_q8_1_batched(                                   \

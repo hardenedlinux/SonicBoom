@@ -45,6 +45,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::RmsNormQuantize;
   if (name == "gelu_mul_quantize")
     return OpKind::GeluMulQuantize;
+  if (name == "silu_mul_quantize")
+    return OpKind::SiluMulQuantize;
   if (name == "rms_norm")
     return OpKind::RmsNorm;
   if (name == "rms_norm_heads")
@@ -102,6 +104,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::QuantizedMatmulQ8: return "quantized_matmul_q8";
     case OpKind::RmsNormQuantize: return "rms_norm_quantize";
     case OpKind::GeluMulQuantize: return "gelu_mul_quantize";
+    case OpKind::SiluMulQuantize: return "silu_mul_quantize";
     case OpKind::RmsNorm: return "rms_norm";
     case OpKind::RmsNormHeads: return "rms_norm_heads";
     case OpKind::GeluFp16: return "gelu_fp16";

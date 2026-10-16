@@ -541,17 +541,32 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
   auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
   // The fused mmq quantize's activation scale layout follows the consuming
-  // matmul's weight type: Q3_K -> ggml D4, Q6_K -> Q8_1-compatible D4, and
-  // Q4_K/Q5_K -> DS4 (half2 scales). The legacy 32-element formats have no mmq
-  // scale layout at all and emit -1, which the C.4 planner passes read as
-  // "never fold a quantize into this matmul".
+  // matmul's weight type: Q3_K and the legacy 32-element formats Q5_0/Q8_0 ->
+  // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
+  // mmq path executes therefore has a layout, so the C.4 planner passes may
+  // fold a quantize into any of them.
+  // Q6_K gets -1: its mmq weight kernel is disabled (TODO(q6k-mmq)), so it has
+  // no mmq activation layout and must never be folded into a fused emitter —
+  // -1 is the "no layout" marker the C.4 passes skip on (see
+  // fuse_act_mul_mmq_pass / fuse_rms_norm_mmq_pass), which keeps the down
+  // projection on its dequant + cuBLAS route rather than quantizing its
+  // activation to int8.
+  // The legacy 32-element formats get -1 too, for a measured reason rather than
+  // a missing kernel: their source is always a norm, and the D4 *norm*+quantize
+  // emitter is one 1024-thread block per row — its reduction leaves only
+  // dim/128 of its 32 warps with quantize work (7 warps at Qwen's d_model 896),
+  // so at prefill batch sizes it runs below a quarter of the bandwidth the
+  // standalone quantize reaches. Leaving those norms unfused (rms_norm plus the
+  // matmul's own quantize_mmq_q8_1<D4>, which produces the same bytes) measured
+  // +2.8% on Qwen pp512 with byte-identical tokens. Q3_K keeps D4 on purpose:
+  // Gemma's d_model 2560 leaves 20 warps with quantize work, where the same
+  // experiment measured the fusion flat, so the larger-dim case keeps it.
   // Baked here (not in the planner pass) because only the emitter knows the
   // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
   auto ds_a = [](quant::QuantType qt) {
-    const int64_t ds = quant::is_legacy_quant(qt) ? -1
-                       : qt == quant::QuantType::Q3_K ? 0
-                       : qt == quant::QuantType::Q6_K ? 2
-                                                       : 1;
+    const int64_t ds = (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
+                       : (qt == quant::QuantType::Q6_K || qt == quant::QuantType::Q5_0 ||
+                          qt == quant::QuantType::Q8_0) ? -1 : 0;
     return attr_i("ds", ds);
   };
   auto shape2 = [](uint64_t r, uint64_t c) {
@@ -1021,6 +1036,9 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
     planner::quantize_once_pass(rt->graph);
     planner::fuse_rms_norm_quantize_pass(rt->graph);
     planner::fuse_gelu_mul_quantize_pass(rt->graph);
+    planner::fuse_silu_mul_quantize_pass(rt->graph);
+    planner::fuse_bias_into_gemv_pass(rt->graph);
+    planner::fuse_residual_add_into_gemv_pass(rt->graph);
   }
   auto snap = planner::CpuResourceProvider::snapshot();
   if (!snap)
@@ -1276,6 +1294,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       planner::quantize_once_pass(dump_rt->graph);
       planner::fuse_rms_norm_quantize_pass(dump_rt->graph);
       planner::fuse_gelu_mul_quantize_pass(dump_rt->graph);
+      planner::fuse_silu_mul_quantize_pass(dump_rt->graph);
+      planner::fuse_bias_into_gemv_pass(dump_rt->graph);
+      planner::fuse_residual_add_into_gemv_pass(dump_rt->graph);
     }
     auto s = planner::CpuResourceProvider::snapshot();
     if (!s) return 0;
@@ -1369,6 +1390,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
             nseg >= uint64_t(quant::cuda::mmq_min_n())) {
           planner::fuse_rms_norm_mmq_pass(seg->graph);
           planner::fuse_gelu_mul_mmq_pass(seg->graph);
+          planner::fuse_silu_mul_mmq_pass(seg->graph);
         }
       }
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
