@@ -27,6 +27,7 @@
 #include <sonicboom/planner/ids.h>
 #include <sonicboom/planner/op_kind.h>
 #include <sonicboom/planner/partition.h>
+#include <sonicboom/sx/ir.h>
 
 #include <cstdint>
 #include <optional>
@@ -52,6 +53,13 @@ struct ComputeTaskDesc {
   std::vector<GraphNodeId> graph_nodes;
   JitEntryId jit_entry;
   BackendTag backend = BackendTag::Mlir;
+  // Graph attributes of the region this task represents, carried across the
+  // Graph→ExecutionPlan boundary. The plan is the unit handed to a backend, so
+  // an attribute the emitter or a rewrite pass attached has to travel with the
+  // task to survive the graph being dropped; without this the plan is not a
+  // self-contained description of what will execute. Empty for a merged region
+  // whose nodes disagree (see the planner's merge rule).
+  std::vector<sx::Attribute> attributes;
 };
 
 // Transfer payload: an explicit move of `bytes` of one tensor between two

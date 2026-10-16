@@ -297,6 +297,12 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       compute.jit_entry = JitEntryId{0};  // each region compiled separately
       for (const auto* n : r.nodes)
         compute.graph_nodes.push_back(n->id);
+      // Carry the region's attributes into the task, so the plan describes the
+      // work without needing the Graph back. A single-node region (every
+      // non-MLIR backend) contributes that node's attributes verbatim; a merged
+      // MLIR run inherits the head node's — a merged run is homogeneous by
+      // construction, and the head node is the region's representative op.
+      compute.attributes = r.nodes.front()->attributes;
       task.payload = compute;
 
       // Region-internal produced set: tensors produced by any region node.
