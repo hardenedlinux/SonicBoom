@@ -55,8 +55,12 @@
 # Measurement conditions: the GPU clock is pinned for the duration of the run
 # (`nvidia-smi -lgc`, released on exit with `-rgc`) — an unpinned clock drifts by
 # more than the effects being compared. `--gpu-clock MHZ` picks the value (the
-# device's max graphics clock by default) and `--no-lock-clocks` skips it. The
-# CPU governor is only *reported*; this script never changes a CPU setting.
+# device's max graphics clock by default) and `--no-lock-clocks` skips it. Pinning
+# needs root, so when it is not possible the run is *not* clock-homogeneous and
+# the number this script can give instead is the clock it actually ran at: the SM
+# clock is sampled once a second for the duration (plain `nvidia-smi`, no root)
+# and reported as min/median/max on exit. The CPU governor is only *reported*;
+# this script never changes a CPU setting.
 #
 # Usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]
 #        tools/bench.sh <model.gguf> --ab BASE_LIB CUR_LIB [--runs N] [--no-build]
@@ -138,8 +142,52 @@ fi
 
 CLOCK_LOCKED=""
 ab_tmp=""
+sm_samples=""
+sm_sampler_pid=""
+
+sm_clock_mhz() { # current SM clock in MHz, empty when unreadable
+  nvidia-smi --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/dev/null |
+    head -1 | tr -d ' '
+}
+
+# One reading a second for the whole run, in the background. The sampler is a
+# plain nvidia-smi query (no root, no device state change): the point is to have
+# a record of the clock the numbers were produced at, which is what an unlocked
+# run otherwise leaves unstated.
+start_sm_sampler() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  [ -n "$(sm_clock_mhz)" ] || return 0
+  sm_samples=$(mktemp "${TMPDIR:-/tmp}/sb-sm-clock.XXXXXX") || return 0
+  (
+    while :; do
+      nvidia-smi --query-gpu=clocks.sm,clocks.mem --format=csv,noheader,nounits \
+        2>/dev/null >> "$sm_samples" || true
+      sleep 1
+    done
+  ) &
+  sm_sampler_pid=$!
+}
+
+report_sm_clock() {
+  [ -n "$sm_sampler_pid" ] && kill "$sm_sampler_pid" 2>/dev/null
+  [ -n "$sm_samples" ] || return 0
+  # The last sample can land while the process is being torn down; it is one
+  # reading, so it is dropped rather than averaged over.
+  awk -F, '
+    NR>1 { n++; s=$1+0; if (n==1 || s<min) min=s; if (n==1 || s>max) max=s
+           v[n]=s; m=$2+0; if (n==1 || m<memmin) memmin=m; if (n==1 || m>memmax) memmax=m }
+    END {
+      if (n==0) exit
+      for (i=1;i<=n;i++) for (j=i+1;j<=n;j++) if (v[i]>v[j]) {t=v[i];v[i]=v[j];v[j]=t}
+      printf "gpu clock: SM %d-%d MHz (median %d) over %d samples, mem %d-%d MHz\n",
+             min, max, v[int((n+1)/2)], n, memmin, memmax
+    }' "$sm_samples"
+  rm -f "$sm_samples"
+  sm_samples=""
+}
 
 restore_clocks() {
+  report_sm_clock
   if [ -n "$CLOCK_LOCKED" ]; then
     nvidia-smi -rgc >/dev/null 2>&1 || true
     echo "gpu clock: released (nvidia-smi -rgc)" >&2
@@ -176,6 +224,14 @@ lock_clocks() {
   else
     echo "gpu clock: could not pin to ${CLOCK_MHZ} MHz — needs root, readings are unlocked"
     echo "           to pin it yourself: sudo nvidia-smi -lgc ${CLOCK_MHZ}"
+    # Without the pin the "same clock on both sides" property is not something
+    # this script enforced, so say what the clock actually is: what it reads at
+    # this moment, and (at exit) the range it ran over.
+    local now
+    now=$(sm_clock_mhz)
+    if [ -n "$now" ]; then
+      echo "           SM clock now ${now} MHz (idle); min/median/max over the run reported at exit"
+    fi
   fi
 }
 
@@ -194,6 +250,7 @@ report_governor() {
 }
 
 lock_clocks
+start_sm_sampler
 report_governor
 
 # --- helpers ---------------------------------------------------------------
