@@ -124,6 +124,15 @@ LLAMA_BENCH=... tools/bench.sh your-model.gguf --label your-model
 result can carry its own conditions. Results are published as reported, with
 the reporter credited, and marked as not reproduced by us.
 
+| GPU | Driver / CUDA | SonicBoom build | Model | SonicBoom decode | llama.cpp tg64 | Ratio | Decode tokens vs sm_86 golden | Reporter |
+|---|---|---|---|---:|---:|---:|---|---|
+| RTX 4060 Ti 16 GB (sm_89) | 550.163.01 / 12.4 | `1462b04` (sm_86 code, before tuning) | Gemma 4 E4B-it Q3_K_M | 73.6 tok/s | 78 tok/s | 0.94 | identical (64/64) | [@svenha](https://github.com/hardenedlinux/SonicBoom/issues/1) |
+
+The 4060 Ti row predates `tools/bench.sh` and the build-for-the-detected-GPU
+default: it measures sm_86 code running on Ada with `test_generate`, against
+llama.cpp `43fe9c64281` built for the card. Both numbers come from the
+reporter's machine.
+
 ---
 
 ## Quick start
