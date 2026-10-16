@@ -19,6 +19,7 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/cost_model.h>
+#include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/resource.h>
 #include <sonicboom/planner/rewrites.h>
@@ -1017,6 +1018,48 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
   }
 }
 
+// The decode graph's rewrite pipeline, in order (design/mlir-migration.md §2):
+// the six fusion passes that take the emitter's graph to the graph the plan is
+// derived from. There are two implementations of it — the Graph rewrites and
+// the Boom IR passes — and they are required to leave the same graph, which is
+// what the recorded plan goldens pin. Which one runs is the build and
+// SONICBOOM_IR_PASSES (planner/ir_passes.h); the IR pipeline runs here, as a
+// GraphTransform, so it stands in the same place in the pipeline as the
+// rewrites it replaces. The caller keeps the conditions under which the
+// pipeline runs at all — the quantized path being available is a property of
+// the device, not of either implementation.
+static void decode_rewrites(planner::Graph& g) {
+  if (planner::ir_passes_enabled()) {
+    const GraphTransform pipeline = [](planner::Graph& graph) {
+      planner::ir_pass_pipeline(graph, planner::IrPassPhase::Decode);
+    };
+    pipeline(g);
+    return;
+  }
+  planner::quantize_once_pass(g);
+  planner::fuse_rms_norm_quantize_pass(g);
+  planner::fuse_gelu_mul_quantize_pass(g);
+  planner::fuse_silu_mul_quantize_pass(g);
+  planner::fuse_bias_into_gemv_pass(g);
+  planner::fuse_residual_add_into_gemv_pass(g);
+}
+
+// The prefill graph's rewrite pipeline (C.4): the mmq fusions that fold the
+// activation quantize into the norm/gelu kernels. The same two
+// implementations as the decode pipeline above.
+static void prefill_rewrites(planner::Graph& g) {
+  if (planner::ir_passes_enabled()) {
+    const GraphTransform pipeline = [](planner::Graph& graph) {
+      planner::ir_pass_pipeline(graph, planner::IrPassPhase::Prefill);
+    };
+    pipeline(g);
+    return;
+  }
+  planner::fuse_rms_norm_mmq_pass(g);
+  planner::fuse_gelu_mul_mmq_pass(g);
+  planner::fuse_silu_mul_mmq_pass(g);
+}
+
 // Build the greedy decode graph, plan it, and wire up its backends — everything
 // a decode runtime is except the captured step. Split out of
 // get_decode_runtime so the plan recorder can run the very same plan *without*
@@ -1028,14 +1071,8 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const GraphTransform* transform = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
   rt->graph = build_gemma4_graph(m, /*greedy=*/true);
-  if (quant::cuda::q8_1_enabled()) {
-    planner::quantize_once_pass(rt->graph);
-    planner::fuse_rms_norm_quantize_pass(rt->graph);
-    planner::fuse_gelu_mul_quantize_pass(rt->graph);
-    planner::fuse_silu_mul_quantize_pass(rt->graph);
-    planner::fuse_bias_into_gemv_pass(rt->graph);
-    planner::fuse_residual_add_into_gemv_pass(rt->graph);
-  }
+  if (quant::cuda::q8_1_enabled())
+    decode_rewrites(rt->graph);
   // After every graph-level pass, so the transform sees the graph the plan is
   // actually derived from (plan.h: GraphTransform).
   if (transform && *transform) (*transform)(rt->graph);
@@ -1297,11 +1334,8 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
   // The same mmq fusion the prefill segments use, under the same conditions, so
   // the recorded steps are the ones a real prefill segment would run.
   if (quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
-      n >= uint64_t(quant::cuda::mmq_min_n())) {
-    planner::fuse_rms_norm_mmq_pass(graph);
-    planner::fuse_gelu_mul_mmq_pass(graph);
-    planner::fuse_silu_mul_mmq_pass(graph);
-  }
+      n >= uint64_t(quant::cuda::mmq_min_n()))
+    prefill_rewrites(graph);
   // After every graph-level pass (plan.h: GraphTransform).
   if (transform) transform(graph);
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -1466,14 +1500,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     Phase _p("prefill:build_decode_graph", phase_timing);
     dump_rt = std::make_unique<DecodeRuntime>();
     dump_rt->graph = build_gemma4_graph(m, /*greedy=*/false);
-    if (quant::cuda::q8_1_enabled()) {
-      planner::quantize_once_pass(dump_rt->graph);
-      planner::fuse_rms_norm_quantize_pass(dump_rt->graph);
-      planner::fuse_gelu_mul_quantize_pass(dump_rt->graph);
-      planner::fuse_silu_mul_quantize_pass(dump_rt->graph);
-      planner::fuse_bias_into_gemv_pass(dump_rt->graph);
-      planner::fuse_residual_add_into_gemv_pass(dump_rt->graph);
-    }
+    if (quant::cuda::q8_1_enabled())
+      decode_rewrites(dump_rt->graph);
     auto s = planner::CpuResourceProvider::snapshot();
     if (!s) return 0;
     dump_rt->snap = std::move(*s);
@@ -1563,11 +1591,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         // the batched matmul uses, so fused and unfused positions never disagree
         // about which kernel a position runs).
         if (quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
-            nseg >= uint64_t(quant::cuda::mmq_min_n())) {
-          planner::fuse_rms_norm_mmq_pass(seg->graph);
-          planner::fuse_gelu_mul_mmq_pass(seg->graph);
-          planner::fuse_silu_mul_mmq_pass(seg->graph);
-        }
+            nseg >= uint64_t(quant::cuda::mmq_min_n()))
+          prefill_rewrites(seg->graph);
       }
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
       {

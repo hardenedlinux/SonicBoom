@@ -42,6 +42,15 @@ list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
 list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/vulkan_backend.cpp)
 
+# ir_passes_stub.cpp stands in for the Boom IR pass pipeline in a build without
+# MLIR, where the compiler library that carries the real one is not built — and
+# the runtime side names the pipeline's entry points either way
+# (<sonicboom/planner/ir_passes.h>). Excluded from the unconditional planner glob
+# and re-added in the MLIR-off branch below, so a build with MLIR links exactly
+# one definition of them (the same arrangement as sonic_cuda_backend.cpp).
+list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/ir_passes_stub.cpp)
+
 # Minimal autograd (core/src/autograd/). Layer 2 only: it dispatches through
 # the nt:: adapter (no direct c10/ATen use), so it belongs to the same public
 # library surface as the planner/sx code above.
@@ -212,9 +221,18 @@ if(SONICBOOM_ENABLE_MLIR)
     LLVMX86AsmParser)
   target_include_directories(sonicboom PRIVATE ${MLIR_INCLUDE_DIRS})
 
-  # The compiler library: the Boom MLIR dialect (core/compiler/). A separate
-  # static library, deliberately not linked into sonicboom yet — nothing on the
-  # runtime path executes Boom IR in this phase, so the dialect's development
-  # cannot change what libsonicboom.so does.
+  # The compiler library: the Boom MLIR dialect and the Boom IR passes
+  # (core/compiler/). Still a separate static library, and linked into the
+  # runtime since the runtime grew a consumer for it: the IR rewrite pipeline the
+  # emitter can be switched to instead of the Graph rewrites
+  # (<sonicboom/planner/ir_passes.h>). PRIVATE, like MLIR itself — the passes are
+  # behind Layer 2, and no MLIR type reaches a public header.
   add_subdirectory(compiler)
+  target_link_libraries(sonicboom PRIVATE sonicboom_compiler)
+else()
+  # No compiler library to call into, and the runtime side still names the Boom
+  # IR pipeline's entry points: the stand-in holds those symbols and answers
+  # ir_passes_available() with no (see src/planner/ir_passes_stub.cpp).
+  target_sources(sonicboom PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/ir_passes_stub.cpp)
 endif()

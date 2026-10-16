@@ -1,12 +1,13 @@
 # SonicBoom compiler — the MLIR side of the project (design/mlir-migration.md
-# §6-§9). In this phase it holds one thing: the `boom` dialect, the IR the
-# planner's Graph is lifted into.
+# §6-§9): the `boom` dialect, the IR the planner's Graph is lifted into, and the
+# passes that rewrite that IR.
 #
-# Deliberately a SEPARATE library from `sonicboom` and NOT linked into
-# libsonicboom.so: nothing on the runtime path executes Boom IR yet, so the
-# dialect can be built, tested and iterated on without the executing runtime
-# changing with it. The dialect is added to the shared library only when
-# there is a runtime consumer for it (design §8.1).
+# Deliberately a SEPARATE library from `sonicboom`. It is linked into
+# libsonicboom.so, since the runtime grew a consumer for it: the Boom IR rewrite
+# pipeline (lib/BoomPasses.cpp), behind the switch in
+# <sonicboom/planner/ir_passes.h>. The switch is off by default, so the dialect
+# is linked into the runtime and not run by it unless the environment asks for
+# it (design §8.1).
 #
 # Only built when MLIR is enabled — the whole directory is MLIR.
 
@@ -80,7 +81,8 @@ add_library(sonicboom_compiler STATIC
   lib/BoomDialect.cpp
   lib/BoomTypes.cpp
   lib/BoomVerify.cpp
-  lib/BoomConversion.cpp)
+  lib/BoomConversion.cpp
+  lib/BoomPasses.cpp)
 
 # Statically linked into libsonicboom.so once the runtime consumes Boom IR, and
 # already read from the tests next to it, so PIC now rather than as a later fix.
@@ -112,8 +114,11 @@ target_include_directories(sonicboom_compiler PRIVATE
 
 # MLIRIR carries MLIRContext and the builtin dialect whose types the op
 # signatures use; MLIRSideEffectInterfaces carries the Resource/Effect bases the
-# KV-cache memory effects are defined with. Both bring MLIRSupport and LLVMSupport
-# with them, which is where SmallVector/DenseMap/StringSwitch come from.
+# KV-cache memory effects are defined with. MLIRPass is the pass infrastructure
+# (PassManager, PassWrapper) the Boom IR pipeline runs its passes through
+# (BoomPasses.cpp). All three bring MLIRSupport and LLVMSupport with them, which
+# is where SmallVector/DenseMap/StringSwitch come from.
 target_link_libraries(sonicboom_compiler PRIVATE
   MLIRIR
-  MLIRSideEffectInterfaces)
+  MLIRSideEffectInterfaces
+  MLIRPass)
