@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/graph.h>
@@ -213,5 +214,13 @@ std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
                                                          uint64_t steps);
 std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
                                                           uint64_t n);
+
+// The device identity string the plan record's `device` line carries, e.g.
+// "NVIDIA GeForce RTX 3050 sm 20 cc 8.6"; "unknown" when the build has no CUDA
+// support or no device is present. Exposed because part of the device path is
+// device-dependent (the decode-attention split-KV grid is sized from the SM
+// count), so anything that pins a device-produced artifact — a plan record, a
+// token-stream golden — has to be able to name the device it was taken on.
+std::string cuda_device_identity();
 
 } // namespace sonicboom::model

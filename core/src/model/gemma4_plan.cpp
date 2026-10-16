@@ -1249,6 +1249,8 @@ bool decode_step_through_executor(DecodeRuntime& rt, uint64_t token, uint64_t po
 }
 }  // namespace
 
+std::string cuda_device_identity() { return device_identity(); }
+
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
                                                          uint64_t n_ctx,
                                                          uint64_t steps) {
@@ -1338,6 +1340,8 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
                                                           uint64_t) {
   return std::nullopt;  // built without CUDA: nothing launches
 }
+
+std::string cuda_device_identity() { return "unknown"; }
 #endif
 
 // ---------------------------------------------------------------------------

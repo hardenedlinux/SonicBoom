@@ -46,6 +46,23 @@
 // is a rank-2 near-tie.
 //
 // Skips cleanly (exit 0) when the GGUF is absent.
+//
+// --- Golden token streams ---------------------------------------------------
+//
+// Beyond the llama.cpp near-tie check above, each prompt's stream is pinned
+// against a committed golden under tests/data/qwen2/pN.golden — SonicBoom's own
+// output, compared byte-for-byte (the same role kGolden plays for Gemma in
+// test_generate.cpp, but committed as data because these are 64-token streams).
+// The CPU line is the CPU spine's stream; the CUDA line is the device spine's,
+// recorded on the device named in the golden's `device` line. That line is part
+// of the golden and not decoration: the CUDA kernels are not device-invariant
+// (the decode-attention split-KV grid is sized from the SM count), so the CUDA
+// comparison is skipped — never passed vacuously — when this run's device is not
+// the one that recorded the golden. Regenerate with:
+//
+//     test_qwen2_generate --write-goldens
+//
+// and commit the result; a CLI-visible token change then shows up as a diff.
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/exec.h>
@@ -56,12 +73,14 @@
 #include <sonicboom/vocab/vocab.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sbgguf = sonicboom::gguf;
@@ -182,9 +201,69 @@ int64_t first_diff(const std::vector<int64_t>& a, const std::vector<int64_t>& b)
   return a.size() == b.size() ? -1 : int64_t(n);
 }
 
+// The remainder of the "<label> ..." line, or "" when the file has no such line.
+// The golden's token lines are compared as exactly this remainder, so the
+// comparison is a byte comparison of the stream text, not of parsed integers.
+std::string pick_line(const std::string& text, const std::string& label) {
+  std::istringstream is(text);
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.rfind(label + " ", 0) == 0) {
+      std::string rest = line.substr(label.size() + 1);
+      if (!rest.empty() && rest.back() == '\r') rest.pop_back();
+      return rest;
+    }
+  }
+  return {};
+}
+
+// The golden file's canonical text. Rendering it (rather than writing whatever
+// the run produced) is what makes the comparison a fixed point: --write-goldens
+// and the check below share this one function, so a golden can never be written
+// in a shape the check cannot read back.
+std::string render_golden(const std::string& model_file, const std::string& device,
+                          const std::vector<int64_t>& cpu,
+                          const std::vector<int64_t>& cuda) {
+  std::string s;
+  s += "# SonicBoom golden greedy token stream — test_qwen2_generate (batched\n";
+  s += "# prefill + decode). SonicBoom's own output, pinned so a token-stream\n";
+  s += "# change shows up as a diff. Regenerate with:\n";
+  s += "#     test_qwen2_generate --write-goldens\n";
+  s += "# The cuda line is device-specific (the device kernels are not\n";
+  s += "# device-invariant: the decode-attention split-KV grid is sized from the\n";
+  s += "# SM count), so it is only compared on the device that recorded it.\n";
+  s += "model " + model_file + "\n";
+  s += "device " + device + "\n";
+  s += "steps " + std::to_string(cpu.size()) + "\n";
+  s += "cpu " + toks(cpu) + "\n";
+  if (!cuda.empty()) s += "cuda " + toks(cuda) + "\n";
+  return s;
+}
+
+bool write_file(const std::string& path, const std::string& text) {
+  std::ofstream f(path, std::ios::binary);
+  if (!f) return false;
+  f << text;
+  return f.good();
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+  bool write_goldens = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string_view a = argv[i];
+    if (a == "--write-goldens") {
+      write_goldens = true;
+    } else if (a == "-h" || a == "--help") {
+      std::printf("usage: %s [--write-goldens]\n", argv[0]);
+      return 0;
+    } else {
+      std::fprintf(stderr, "%s: unknown option %s\n", argv[0], argv[i]);
+      return 2;
+    }
+  }
+
   const std::string path = find_model();
   if (path.empty()) {
     std::cout << "  (skipped: Qwen2.5 model not found)\n";
@@ -319,6 +398,11 @@ int main() {
   // a near-tie. Prefix reuse has no such licence — it must reproduce the full
   // prefill's continuation token for token, since it is the same arithmetic on
   // the same cache.
+  // Each prompt's device stream, in prompt order; left empty when there is no
+  // device, which is what tells the golden check below not to expect a `cuda`
+  // line to compare against.
+  std::vector<std::vector<int64_t>> cuda_streams;
+
   if (!sbquant::cuda_available()) {
     std::cout << "  (skipped: no CUDA device)\n";
   } else {
@@ -327,6 +411,7 @@ int main() {
       const uint64_t n = sbmodel::generate_prefill_spine_cuda(
           *m, prompts[p], 0, gpu, 0, /*use_prefill=*/true);
       gpu.resize(n);
+      cuda_streams.push_back(gpu);
       const std::string tag = "p" + std::to_string(p + 1);
       check(n == uint64_t(kSteps),
             tag + ": CUDA ran all " + std::to_string(kSteps) + " steps");
@@ -462,6 +547,53 @@ int main() {
       if (!fully_reused)
         check(eq_ref, "prefix=" + std::to_string(prefix_len) +
                           ": reuse continuation token-identical to full prefill");
+    }
+  }
+
+  // --- golden token streams (SonicBoom's own output, committed) --------------
+  //
+  // The check the rest of the file's near-tie reasoning exists to make cheap to
+  // change: once a stream is blessed, it must not move without the golden moving
+  // with it. Compared as text, so a reordered-but-equal stream still fails.
+  if (!cpu_streams.empty()) {
+    const std::string model_file = std::filesystem::path(path).filename().string();
+    const std::string dev = sbmodel::cuda_device_identity();
+    for (size_t p = 0; p < cpu_streams.size(); ++p) {
+      const std::string tag = "p" + std::to_string(p + 1);
+      const std::string gpath = dir + "/" + tag + ".golden";
+      const std::vector<int64_t> cuda =
+          p < cuda_streams.size() ? cuda_streams[p] : std::vector<int64_t>{};
+
+      if (write_goldens) {
+        if (!write_file(gpath, render_golden(model_file, dev, cpu_streams[p], cuda))) {
+          check(false, "cannot write golden " + gpath);
+        } else {
+          std::cout << "  wrote " << gpath << " (" << cpu_streams[p].size()
+                    << " cpu" << (cuda.empty() ? "" : " + cuda") << " tokens)\n";
+        }
+        continue;
+      }
+
+      const std::string golden = read_file(gpath);
+      check(!golden.empty(), tag + ".golden present");
+      if (golden.empty()) continue;
+
+      const std::string want_cpu = pick_line(golden, "cpu");
+      check(want_cpu == toks(cpu_streams[p]),
+            tag + ": CPU stream == golden " + tag + ".golden (byte-for-byte)");
+
+      const std::string want_cuda = pick_line(golden, "cuda");
+      if (want_cuda.empty()) {
+        std::cout << "  " << tag << ": golden has no cuda line\n";
+      } else if (cuda.empty()) {
+        std::cout << "  " << tag << ": CUDA comparison skipped (no device)\n";
+      } else if (pick_line(golden, "device") != dev) {
+        std::cout << "  " << tag << ": CUDA comparison skipped (golden recorded on '"
+                  << pick_line(golden, "device") << "', running on '" << dev << "')\n";
+      } else {
+        check(want_cuda == toks(cuda),
+              tag + ": CUDA stream == golden " + tag + ".golden (byte-for-byte)");
+      }
     }
   }
 
