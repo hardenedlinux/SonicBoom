@@ -282,6 +282,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
+        OpKind::SiluMulQuantize,
         OpKind::MatvecF32,
         OpKind::MatvecBf16,     OpKind::GeluFp16,   OpKind::Silu,
         OpKind::Mul,

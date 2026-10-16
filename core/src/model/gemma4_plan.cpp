@@ -1021,6 +1021,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
     planner::quantize_once_pass(rt->graph);
     planner::fuse_rms_norm_quantize_pass(rt->graph);
     planner::fuse_gelu_mul_quantize_pass(rt->graph);
+    planner::fuse_silu_mul_quantize_pass(rt->graph);
     planner::fuse_bias_into_gemv_pass(rt->graph);
     planner::fuse_residual_add_into_gemv_pass(rt->graph);
   }
@@ -1278,6 +1279,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       planner::quantize_once_pass(dump_rt->graph);
       planner::fuse_rms_norm_quantize_pass(dump_rt->graph);
       planner::fuse_gelu_mul_quantize_pass(dump_rt->graph);
+      planner::fuse_silu_mul_quantize_pass(dump_rt->graph);
       planner::fuse_bias_into_gemv_pass(dump_rt->graph);
       planner::fuse_residual_add_into_gemv_pass(dump_rt->graph);
     }

@@ -1567,6 +1567,43 @@ bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
   return cudaGetLastError() == cudaSuccess;
 }
 
+// silu×up -> q8_1 fused (T5, SwiGLU): the Silu counterpart of
+// gelu_mul_quantize_q8_1 — same fusion, same arithmetic, only the activation
+// differs. One warp per 32-element q8_1 block, lane per element (the mapping of
+// quantize_q8_1), so a row (ff 4864 = 152 blocks) fills the GPU instead of being
+// one thread's 32-iteration serial chain. Bit-identical to silu_dev + mul_dev +
+// quantize_q8_1_dev: silu and the product are pure functions of gate/up
+// recomputed identically, and amax is a max (order-independent), so the same
+// `d` and the same quants come out.
+__global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              int nblocks,
+                                              q8_1::block_q8_1* __restrict__ y) {
+  const int ib = blockIdx.x * q8_1::kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
+  if (ib >= nblocks) return;
+  const int lane = threadIdx.x & 31;
+  const size_t i = (size_t)ib * 32 + lane;
+  const float g = gate[i];
+  const float v = (g / (1.0f + expf(-g))) * up[i];  // == nn::silu(g) * up
+  float amax = fabsf(v);
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+  const float d = amax / 127.0f;
+  if (lane == 0) y[ib].d = d;
+  y[ib].qs[lane] = (d == 0.0f) ? int8_t(0) : int8_t(roundf(v / d));
+}
+
+bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
+                                int n) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+  const int nblocks = n / 32;
+  silu_mul_quantize_q8_1_kernel<<<q8_1::quantize_q8_1_grid(nblocks),
+                                  q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+      gate, up, nblocks, reinterpret_cast<q8_1::block_q8_1*>(yq));
+  return cudaGetLastError() == cudaSuccess;
+}
+
 // The K-quant gemv against a pre-quantized q8_1 activation — no internal
 // quantize. W is uploaded+cached exactly as matvec_f32_dev. `bias` is the
 // optional [rows] projection bias and `add` the optional [rows] residual

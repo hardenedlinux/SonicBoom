@@ -59,6 +59,17 @@ void fuse_rms_norm_quantize_pass(Graph& g);
 // tensor. Must run after quantize_once_pass (and after fuse_rms_norm_quantize_pass).
 void fuse_gelu_mul_quantize_pass(Graph& g);
 
+// T5, SwiGLU variant. The same fusion as fuse_gelu_mul_quantize_pass with Silu
+// in place of GeluFp16: where the gated FFN activates with Silu (Qwen2, Llama,
+// Mistral, …), the triple Quantize(Mul(Silu(gate), up)) becomes one
+// SiluMulQuantize node. Mirrors the gelu pass exactly — same single-use
+// conditions, same output tensor (the Quantize's q8_1 buffer), same attribute
+// set (the node keeps the Silu node's attributes) — so it composes with the
+// same backend kernel plumbing. Must run after quantize_once_pass, and is the
+// mutually exclusive alternative to fuse_gelu_mul_quantize_pass (a graph
+// activates with one or the other, never both).
+void fuse_silu_mul_quantize_pass(Graph& g);
+
 // C.4 prefill (mmq) rms_norm fusion. The prefill graph has no Quantize nodes —
 // each batched QuantizedMatmul quantizes its activation internally (block_q8_1_mmq,
 // 128-elem). This pass folds an RmsNorm(batch, dim) whose output is consumed

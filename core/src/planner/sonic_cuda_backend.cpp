@@ -555,6 +555,22 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       }
       break;
     }
+    case OpKind::SiluMulQuantize: {
+      // silu(gate) * up, quantized in one kernel (T5, SwiGLU). Exactly the
+      // Silu counterpart of GeluMulQuantize above. Decode only for now: the
+      // prefill graph keeps the unfused triple (there is no batched mmq
+      // variant), so a batched node here is a planner/backend mismatch and
+      // fails rather than silently quantizing the wrong way.
+      int64_t nb = 0;
+      if (attr_i(*node, "batch", nb)) {
+        ok = false;
+        break;
+      }
+      ok = quant::cuda::silu_mul_quantize_q8_1_dev(
+          dev(in[0]), dev(in[1]),
+          reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+      break;
+    }
     case OpKind::MatvecF32: {
       int64_t nb = 0;
       if (attr_i(*node, "batch", nb)) {
