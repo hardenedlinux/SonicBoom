@@ -74,6 +74,19 @@ void fuse_gelu_mul_quantize_pass(Graph& g);
 // mmq_enabled at the call site, and on n >= mmq_min_n via the caller's nseg gate.
 void fuse_rms_norm_mmq_pass(Graph& g);
 
+// Projection-bias fusion (decode). A projection bias is emitted as an AddBias
+// node over the projection's QuantizedMatmulQ8 output. When that output has no
+// other reader and the matmul is single-column (no `batch`), the bias is folded
+// into the matmul node as a `bias_slot` attribute carrying the bias weight slot:
+// the matmul takes over the AddBias's output tensor, the AddBias node is dropped,
+// and the buffer the matmul used to write is dead. The executing backend adds the
+// bias in the gemv epilogue (one launch instead of two) where its kernel has the
+// epilogue for the weight's quant type, and falls back to a separate add_bias
+// kernel otherwise — the values are identical either way, since the bias is added
+// once to the row's fully reduced sum. Run after quantize_once_pass, which is
+// what turns the projection into a QuantizedMatmulQ8.
+void fuse_bias_into_gemv_pass(Graph& g);
+
 // C.4 prefill (mmq) gelu×up fusion. The gated FFN down-projection
 // QuantizedMatmul(fh) internally quantizes fh = gelu_fp16(gate) * up. When the
 // gelu and the mul product are each single-use, the GeluFp16 + Mul +

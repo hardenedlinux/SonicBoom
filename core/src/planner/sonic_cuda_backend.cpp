@@ -470,9 +470,31 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
             int(nb));
       } else {
-        ok = quant::cuda::gemv_q8_1_dev(
-            qweight(slot),
-            reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0])), out);
+        const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
+        // `bias_slot` is set by fuse_bias_into_gemv_pass: the projection's bias
+        // (a bound [rows] model weight) was folded into this matmul node by
+        // dropping the AddBias node that followed it. The gemv epilogue adds it
+        // to the row's reduced sum — bit-identical to the separate add_bias it
+        // replaces. A type without the epilogue runs the gemv and then a plain
+        // add_bias_dev over the output (same values, two launches).
+        int64_t bias_slot = 0;
+        if (attr_i(*node, "bias_slot", bias_slot)) {
+          const std::span<const float> b =
+              fweight(static_cast<model::WeightSlot>(bias_slot));
+          const auto& qw = qweight(slot);
+          // The epilogue adds one bias element per output row; a bias that is
+          // shorter than the row (the AddBias broadcast form) goes through the
+          // separate kernel, which reproduces add_bias's i % bias_n indexing.
+          if (b.size() == size_t(out_n) &&
+              quant::cuda::gemv_bias_epilogue_supported(qw.type())) {
+            ok = quant::cuda::gemv_q8_1_dev(qw, xq, out, b);
+          } else {
+            ok = quant::cuda::gemv_q8_1_dev(qw, xq, out);
+            if (ok && !b.empty()) ok = nn::cuda::add_bias_dev(b, out, out, out_n);
+          }
+        } else {
+          ok = quant::cuda::gemv_q8_1_dev(qweight(slot), xq, out);
+        }
       }
       break;
     }

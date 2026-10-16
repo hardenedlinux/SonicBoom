@@ -500,4 +500,79 @@ void fuse_gelu_mul_mmq_pass(Graph& g) {
       g.tensors.end());
 }
 
+void fuse_bias_into_gemv_pass(Graph& g) {
+  // Consumer count per tensor: a projection whose output feeds anything besides
+  // the AddBias cannot take the bias over (that consumer would read the fused
+  // node's output tensor instead).
+  std::unordered_map<uint32_t, uint32_t> consumers;
+  for (const GraphNodeDesc& node : g.nodes)
+    for (const TensorId& in : node.inputs)
+      ++consumers[in.value];
+
+  std::unordered_map<uint32_t, uint32_t> producer;
+  for (uint32_t i = 0; i < g.nodes.size(); ++i)
+    for (const TensorId& o : g.nodes[i].outputs)
+      producer[o.value] = i;
+
+  // AddBias node index -> (matmul node index, bias weight slot). The AddBias
+  // indices are exactly the nodes the rewrite removes.
+  std::unordered_map<uint32_t, uint32_t> matmul_of_bias;
+  std::unordered_map<uint32_t, int64_t> slot_of_bias;
+
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& node = g.nodes[i];
+    if (node.op != OpKind::AddBias || node.inputs.size() != 1) continue;
+    int64_t bias_slot = 0;
+    if (!attr_i(node, "slot", bias_slot)) continue;
+    int64_t ab_batch = 0;
+    if (attr_i(node, "batch", ab_batch)) continue;  // batched (prefill) form
+    const uint32_t proj = node.inputs[0].value;
+    auto pit = producer.find(proj);
+    if (pit == producer.end()) continue;
+    const GraphNodeDesc& m = g.nodes[pit->second];
+    if (m.op != OpKind::QuantizedMatmulQ8 || m.outputs.size() != 1) continue;
+    int64_t m_batch = 0;
+    if (attr_i(m, "batch", m_batch)) continue;  // no epilogue on the mmq path
+    if (consumers[proj] != 1) continue;         // the projection has another reader
+    matmul_of_bias[i] = pit->second;
+    slot_of_bias[i] = bias_slot;
+  }
+
+  if (matmul_of_bias.empty())
+    return;
+
+  // The matmul's own f32 output tensor is replaced by the AddBias's output
+  // tensor (same shape, one buffer either way), so it becomes dead.
+  std::unordered_set<uint32_t> dead;
+  for (const auto& [bi, mi] : matmul_of_bias)
+    for (const TensorId& o : g.nodes[mi].outputs)
+      dead.insert(o.value);
+
+  std::unordered_map<uint32_t, uint32_t> bias_of_matmul;  // matmul idx -> AddBias idx
+  for (const auto& [bi, mi] : matmul_of_bias)
+    bias_of_matmul[mi] = bi;
+
+  std::vector<GraphNodeDesc> out_nodes;
+  out_nodes.reserve(g.nodes.size());
+  for (uint32_t i = 0; i < g.nodes.size(); ++i) {
+    if (matmul_of_bias.count(i))
+      continue;  // folded into the matmul that produced its input
+    GraphNodeDesc node = g.nodes[i];
+    auto bit = bias_of_matmul.find(i);
+    if (bit != bias_of_matmul.end()) {
+      const uint32_t bi = bit->second;
+      node.outputs = g.nodes[bi].outputs;  // take over the AddBias's output
+      node.attributes.push_back(sx::Attribute{"bias_slot", slot_of_bias[bi]});
+    }
+    out_nodes.push_back(std::move(node));
+  }
+
+  g.nodes = std::move(out_nodes);
+
+  g.tensors.erase(
+      std::remove_if(g.tensors.begin(), g.tensors.end(),
+                     [&](const TensorDesc& t) { return dead.count(t.id.value) != 0; }),
+      g.tensors.end());
+}
+
 } // namespace sonicboom::planner

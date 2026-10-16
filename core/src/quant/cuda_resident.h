@@ -69,7 +69,20 @@ bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
 // blocks_per_row / num_rows are derived from W, so the caller passes only the
 // weight and the q8_1 pointer.
-bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y);
+//
+// `bias` is an optional [num_rows] epilogue operand (a host weight span, empty =>
+// none) — the same [width] projection bias add_bias_dev would add over the gemv
+// output, added here to the row's reduced sum instead so the projection and its
+// bias cost one launch. Only valid for the types gemv_bias_epilogue_supported()
+// accepts; asking for a bias on any other type fails the call (it never silently
+// drops the bias).
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
+                   std::span<const float> bias = {});
+
+// Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
+// gemv kernel carries the epilogue). Callers that must add a bias regardless use
+// this to choose between the epilogue and a separate add_bias_dev.
+bool gemv_bias_epilogue_supported(QuantType qt);
 
 // Y = W @ X (batched, the prefill shape), device in/out. X is device
 // [cols, n] row-major (n innermost), Y is device [rows, n] (n innermost).

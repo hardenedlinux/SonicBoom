@@ -1350,32 +1350,53 @@ cublasHandle_t cublas_handle() {
   return g_cublas_handle;
 }
 
+// Which quant types' gemv kernels carry the optional bias epilogue (the `bias`
+// argument of the warp-per-row mmvq kernels). Types outside this set run without
+// an epilogue, so a caller that must add a bias either falls back to a separate
+// add_bias kernel or declines the fusion.
+bool gemv_bias_epilogue_supported(QuantType qt) {
+  switch (qt) {
+    case QuantType::Q3_K:
+    case QuantType::Q4_K:
+    case QuantType::Q5_K:
+    case QuantType::Q5_0:
+    case QuantType::Q8_0:
+      return true;
+    case QuantType::Q6_K:  // owned elsewhere: no epilogue, see TODO(q6k-mmq)
+    default:
+      return false;
+  }
+}
+
 // The warp-per-row dp4a gemv against a *pre-quantized* q8_1 activation. Shared
 // by launch_gemv_q8_1 (quantize + gemv in one call) and gemv_q8_1_dev (the
 // quantize-once path, where the activation is already a q8_1 tensor).
+// `bias` is the optional [num_rows] epilogue operand; the caller must pass null
+// for a type where gemv_bias_epilogue_supported() is false.
 void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
                                      const q8_1::block_q8_1* xq, float* yp,
-                                     int blocks_per_row, int num_rows) {
+                                     int blocks_per_row, int num_rows,
+                                     const float* bias = nullptr) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
   switch (qt) {
     case QuantType::Q3_K:
-      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, bias);
       break;
     case QuantType::Q4_K:
-      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, bias);
       break;
     case QuantType::Q5_K:
-      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, bias);
       break;
     case QuantType::Q6_K:
       q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
     case QuantType::Q5_0:
-      q8_1::gemv_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, bias);
       break;
     case QuantType::Q8_0:
-      q8_1::gemv_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows, bias);
       break;
   }
 }
@@ -1538,8 +1559,12 @@ bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
 }
 
 // The K-quant gemv against a pre-quantized q8_1 activation — no internal
-// quantize. W is uploaded+cached exactly as matvec_f32_dev.
-bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y) {
+// quantize. W is uploaded+cached exactly as matvec_f32_dev. `bias` is the
+// optional [rows] projection bias, folded into the gemv epilogue (see
+// gemv_bias_epilogue_supported: an unsupported type with a non-empty bias fails
+// rather than silently dropping it).
+bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
+                   std::span<const float> bias) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
   const uint64_t cols = W.dims()[0];
@@ -1548,12 +1573,19 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y) {
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
 
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows || !gemv_bias_epilogue_supported(W.type())) return false;
+    d_bias = static_cast<const float*>(upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   launch_gemv_q8_1_from_quantized(
       W.type(), wp, reinterpret_cast<const q8_1::block_q8_1*>(xq), y,
-      int(blocks_per_row), int(rows));
+      int(blocks_per_row), int(rows), d_bias);
   return cudaGetLastError() == cudaSuccess;
 }
 
