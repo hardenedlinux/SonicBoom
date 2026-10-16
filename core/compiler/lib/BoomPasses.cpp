@@ -978,6 +978,186 @@ public:
   }
 };
 
+// fuse_act_mul_mmq_pass (rewrites.cpp:421), as a Boom IR pass: the shared body
+// of the C.4 prefill activation×up → mmq fusions, parameterized by (activation
+// op, fused op) as it is on the Graph side.
+//
+// The rewrite, unchanged: where a batched QuantizedMatmul (the FFN down
+// projection) reads an fh produced by Mul(act, up) with a single-use activation
+// node, the activation becomes `fused`(gate, up) — taking over the Mul's f32
+// output buffer, which the kernel reads as q8_1 — carrying the batch/dim/ds the
+// matmul needs to select its kernel, and the matmul becomes the q8_1-consuming
+// quantized_matmul_q8. The activation's own output stops being a tensor of the
+// graph; the Mul's output stays, reused.
+//
+// TODO(weight-format): the `ds < 0` predicate, as in the rms_norm mmq pass.
+//
+// Returns false when a value cannot be retyped, which is a failure to report
+// rather than something to work around: the shared body has no pass to signal
+// through, so the wrapper does (an empty shape should not be reachable — it
+// would mean the graph cannot be represented as Boom IR at all).
+bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
+                   planner::OpKind fused) {
+  GraphEditor view(graph);
+  mlir::OpBuilder builder(view.ctx());
+  const mlir::Location loc = graph.getLoc();
+
+  const std::string actNode = boomOpName(act);
+  const llvm::StringRef fusedName = planner::op_kind_name(fused);
+
+  llvm::DenseMap<int64_t, mlir::Operation *> producer;
+  llvm::DenseMap<int64_t, unsigned> consumers;
+  for (mlir::Operation &node : view.body()) {
+    for (int64_t id : GraphEditor::resultIds(node))
+      producer.insert({id, &node});
+    for (mlir::Value operand : node.getOperands())
+      ++consumers[view.idOf(operand)];
+  }
+
+  // The matches, keyed by the activation op. The matmul is the batched
+  // QuantizedMatmul the fusion turns into its q8_1 form.
+  llvm::SmallVector<mlir::Operation *> acts;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> matmulOfAct;
+  llvm::DenseMap<mlir::Operation *, mlir::Operation *> mulOfAct;
+  llvm::DenseMap<mlir::Operation *, int64_t> batchOfAct;
+  llvm::DenseMap<mlir::Operation *, int64_t> dimOfAct;
+  llvm::DenseMap<mlir::Operation *, int64_t> dsOfAct;
+
+  for (mlir::Operation &node : view.body()) {
+    if (node.getName().getStringRef() !=
+            boomOpName(planner::OpKind::QuantizedMatmul) ||
+        node.getNumOperands() != 1)
+      continue;
+    auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+    auto nb = nodeAttrInt(attrs, "batch");
+    auto dim = nodeAttrInt(attrs, "dim");
+    auto ds = nodeAttrInt(attrs, "ds");
+    if (!nb || !dim || !ds || *nb <= 0 || *dim <= 0)
+      continue;
+    // ds < 0 marks a weight type with no mmq activation layout (Q6_K, whose mmq
+    // weight kernel is disabled); its activation must not be quantized, so the
+    // matmul keeps its internal (dequant + cuBLAS) path and never fuses.
+    if (*ds < 0)
+      continue;
+    const int64_t fh = view.idOf(node.getOperand(0));
+    auto mulOf = producer.find(fh);
+    if (mulOf == producer.end())
+      continue;
+    mlir::Operation *mul = mulOf->second;
+    if (mul->getName().getStringRef() != boomOpName(planner::OpKind::Mul) ||
+        mul->getNumOperands() != 2)
+      continue;
+    if (consumers[fh] != 1)
+      continue; // the act*up product has another reader
+    const int64_t actT = view.idOf(mul->getOperand(0));
+    auto actProducer = producer.find(actT);
+    if (actProducer == producer.end())
+      continue;
+    mlir::Operation *a = actProducer->second;
+    if (a->getName().getStringRef() != actNode || a->getNumOperands() != 1)
+      continue;
+    if (consumers[actT] != 1)
+      continue; // the activation output has another reader
+    // The Mul's f32 output is the buffer the fused node reuses as the q8_1
+    // activation, so it is that buffer the fit is checked against
+    // (rewrites.cpp:475-477).
+    const boom::TensorDescAttr ft = view.desc(GraphEditor::resultIds(*mul)[0]);
+    if (!mmqQ8Fits(*dim, *nb, ft.getByteSize()))
+      continue;
+
+    acts.push_back(a);
+    matmulOfAct.insert({a, &node});
+    mulOfAct.insert({a, mul});
+    batchOfAct.insert({a, *nb});
+    dimOfAct.insert({a, *dim});
+    dsOfAct.insert({a, *ds});
+  }
+
+  if (acts.empty())
+    return true;
+
+  llvm::SmallVector<mlir::Operation *> matmuls;
+  for (mlir::Operation *a : acts) {
+    mlir::Operation *mul = mulOfAct.lookup(a);
+
+    // The fused node, built where the activation was: its id and backend, the
+    // gate plus the Mul's up operand as inputs, and the Mul's output tensor —
+    // reused as the q8_1 activation buffer, so its shape is the value's and its
+    // table entry (f32, that shape) is what the verifier wants behind a q8_1
+    // value. The batch/dim/ds the matmul's kernel selection reads are appended
+    // in that order (rewrites.cpp:509-515).
+    llvm::SmallVector<mlir::Attribute> nodeAttrs(
+        a->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+    nodeAttrs.push_back(boom::NodeAttr::get(
+        view.ctx(), "batch", builder.getI64IntegerAttr(batchOfAct.lookup(a))));
+    nodeAttrs.push_back(boom::NodeAttr::get(
+        view.ctx(), "dim", builder.getI64IntegerAttr(dimOfAct.lookup(a))));
+    nodeAttrs.push_back(boom::NodeAttr::get(
+        view.ctx(), "ds", builder.getI64IntegerAttr(dsOfAct.lookup(a))));
+
+    const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*a));
+    const auto mulType = mlir::cast<boom::TensorType>(mul->getResult(0).getType());
+    auto q8Type = boom::Q8_1Type::getChecked(
+        mlir::detail::getDefaultDiagnosticEmitFn(loc), view.ctx(),
+        mulType.getShape());
+    if (!q8Type)
+      return false;
+
+    builder.setInsertionPoint(a);
+    mlir::Operation *fusedNode = buildNode(
+        builder, loc, fusedName, GraphEditor::nodeId(*a), fusedName,
+        builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*mul),
+        {a->getOperand(0), mul->getOperand(1)}, {q8Type},
+        a->getAttrOfType<mlir::StringAttr>("backend"));
+
+    // The Mul goes away: its readers — the matmul below — read the fused node,
+    // and its output tensor is that node's now. Then the activation goes too:
+    // the Mul was its only reader.
+    mul->replaceAllUsesWith(fusedNode);
+    view.noteReplaced(mul, fusedNode);
+    mul->erase();
+    for (int64_t id : dead)
+      view.dropTensor(id);
+    a->erase();
+
+    matmuls.push_back(matmulOfAct.lookup(a));
+  }
+
+  // The consumers last, so they read the retyped activation: the same nodes
+  // under the operator that reads it as q8_1 (rewrites.cpp:516-519).
+  for (mlir::Operation *consumer : matmuls) {
+    builder.setInsertionPoint(consumer);
+    mlir::Operation *q8 = buildNode(
+        builder, loc,
+        planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+        GraphEditor::nodeId(*consumer),
+        planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+        consumer->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+        GraphEditor::resultIds(*consumer), consumer->getOperands(),
+        consumer->getResultTypes(),
+        consumer->getAttrOfType<mlir::StringAttr>("backend"));
+    consumer->replaceAllUsesWith(q8);
+    view.noteReplaced(consumer, q8);
+    consumer->erase();
+  }
+
+  view.commitTable();
+  return true;
+}
+
+// fuse_gelu_mul_mmq_pass (rewrites.cpp:531), as a Boom IR pass.
+class GeluMulMmqPass
+    : public mlir::PassWrapper<GeluMulMmqPass, mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GeluMulMmqPass)
+
+  void runOnOperation() override {
+    if (!fuseActMulMmq(getOperation(), planner::OpKind::GeluFp16,
+                       planner::OpKind::GeluMulQuantize))
+      signalPassFailure();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -996,6 +1176,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     return;
   case planner::IrPassPhase::Prefill:
     pm.addPass(std::make_unique<RmsNormMmqPass>());
+    pm.addPass(std::make_unique<GeluMulMmqPass>());
     return;
   }
 }
@@ -1009,7 +1190,6 @@ void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   case planner::IrPassPhase::Decode:
     return; // every decode pass has been ported
   case planner::IrPassPhase::Prefill:
-    planner::fuse_gelu_mul_mmq_pass(g);
     planner::fuse_silu_mul_mmq_pass(g);
     return;
   }
