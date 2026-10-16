@@ -18,10 +18,13 @@
 
 #include "device_pool.h"
 
+#include <sonicboom/planner/plan_record.h>
+
 #include <cstddef>
 #include <cstring>
 #include <map>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -87,6 +90,45 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
     if (t.is_graph_input)
       values[t.id.value] = TensorValue::from_host(inputs[in_i++]);
 
+  // 4b. Optional execution record (plan_record.h). Off by default: with no
+  //     recorder installed this is one thread-local load and the loop is as it
+  //     was. The record is assembled here because this is the one place where
+  //     the plan's task descriptions, the plan's tensor/buffer assignments, and
+  //     the kernels the backend launches (through plan_hook.h) are all in scope
+  //     at once.
+  PlanRecorder* rec = recorder();
+  std::map<uint32_t, const BufferAllocation*> tensor_buffer;
+  uint32_t record_step = 0;
+  if (rec) {
+    for (const auto& ba : plan.allocations)
+      for (TensorId t : ba.assigned_tensors)
+        tensor_buffer.emplace(t.value, &ba);
+  }
+  // Record one tensor the current step touches, with its buffer's logical id
+  // and byte range. Constants are recorded too (role "const"): a quantized
+  // weight is a constant input, and its id/dtype are what identify the step's
+  // arithmetic.
+  auto note_tensor = [&](std::string_view io, uint32_t index, TensorId id) {
+    const TensorDesc* td = plan.find_tensor(id);
+    if (!td) return;
+    BufferRecord b;
+    b.index = index;
+    b.tensor = id.value;
+    b.role = td->is_constant     ? "const"
+             : td->is_graph_input ? "in_graph"
+             : td->is_graph_output ? "out_graph"
+                                   : std::string(io);
+    b.shape = shape_text(td->shape);
+    b.dtype = sx::dtype_name(td->dtype);
+    b.size_bytes = td->size_bytes;
+    if (auto it = tensor_buffer.find(id.value); it != tensor_buffer.end()) {
+      b.buffer = it->second->buffer.value;
+      b.offset = it->second->offset_bytes;
+      b.size_bytes = it->second->size_bytes;
+    }
+    rec->add_buffer(std::move(b));
+  };
+
   // 5. Walk execution_order: dispatch each task to its routed backend, handing
   //    intermediate tensors between tasks by TensorId. Transfer tasks move a
   //    value between host and device; the device buffers are pooled and returned
@@ -136,7 +178,22 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
           task_inputs.push_back(v->second);
         }
 
+        if (rec) {
+          const GraphNodeId head = compute->graph_nodes.empty()
+                                       ? GraphNodeId{0}
+                                       : compute->graph_nodes.front();
+          rec->begin_step(record_step++, tid.value, head.value,
+                          op_kind_name(compute->op),
+                          backend_tag_name(compute->backend), std::string_view(),
+                          compute->attributes, nullptr);
+          for (std::size_t k = 0; k < task->inputs.size(); ++k)
+            note_tensor("in", uint32_t(k), task->inputs[k]);
+          for (std::size_t k = 0; k < task->outputs.size(); ++k)
+            note_tensor("out", uint32_t(k), task->outputs[k]);
+        }
+
         auto res = backend->execute(*task, task_inputs);
+        if (rec) rec->end_step();  // before any early return, so the step closes
         if (!res)
           return std::unexpected(res.error());
         if (res->size() != task->outputs.size())

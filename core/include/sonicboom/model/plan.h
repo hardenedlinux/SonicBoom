@@ -26,11 +26,13 @@
 // float32 activations).
 
 #include <cstdint>
+#include <optional>
 #include <span>
 
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/graph.h>
 #include <sonicboom/planner/kv_cache.h>
+#include <sonicboom/planner/plan_record.h>
 
 namespace sonicboom::model {
 
@@ -193,5 +195,23 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             planner::KvCacheSession& session,
                                             bool use_prefill = true,
                                             uint64_t* n_reused_out = nullptr);
+
+// Build the model's plan and record what executing it does, step by step.
+//
+// These are the producers behind tools/plan_dump: given a loaded model and a
+// mode, they return a deterministic, serializable description of the executed
+// plan (see planner/plan_record.h). They deliberately build a *non-captured*
+// runtime: a CUDA-graph-captured decode step replays as a single graph launch
+// and never walks the executor, so nothing per-step would be observable.
+//
+// `record_decode_plan` runs `steps` greedy decode steps at positions 0.. steps-1
+// (position == step; only the shapes matter, not the tokens). `record_prefill_plan`
+// runs one batched pass over `n` tokens. Both return nullopt when the build has no
+// CUDA support, the model carries no weights, or the plan fails to build.
+std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
+                                                         uint64_t n_ctx,
+                                                         uint64_t steps);
+std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
+                                                          uint64_t n);
 
 } // namespace sonicboom::model

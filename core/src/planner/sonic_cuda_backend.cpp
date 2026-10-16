@@ -24,6 +24,7 @@
 #include <sonicboom/nn/norm.h>
 #include <sonicboom/nn/rope.h>
 #include <sonicboom/nn/cuda_elementwise.h>
+#include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
 #include "../nn/cuda_graph.h"
@@ -326,6 +327,30 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
   };
 
+  // Plan-record annotations (plan_record.h). OpKind names the operation but not
+  // the numeric format it ran in: the weight's quant type and the activation's
+  // layout are chosen from the node's attributes at dispatch time, so they are
+  // recorded here where both are resolved. Both are no-ops with recording off —
+  // a thread-local load, and no format-string work at all.
+  auto note_weight_quant = [&](const quant::QuantizedTensor& w) {
+    if (auto* r = recorder())
+      if (const auto* qi = quant::quant_type_info(w.type()))
+        r->set_weight_quant(qi->name);
+  };
+  auto note_activation_quant = [&](const char* layout) {
+    if (auto* r = recorder()) r->set_activation_quant(layout);
+  };
+  // Name the mmq activation's scale layout from the node's `ds` attribute
+  // (mmq::DsLayout: D4 = a float d4 for Q3_K weights, DS4 = a half2 ds4 for
+  // Q4_K/Q5_K, D4_Q8_1 = the q8_1-compatible pair).
+  auto mmq_activation = [](int64_t ds) -> const char* {
+    switch (ds) {
+      case 1: return "block_q8_1_mmq(ds4)";
+      case 2: return "block_q8_1_mmq(d4_q8_1)";
+      default: return "block_q8_1_mmq(d4)";
+    }
+  };
+
   // Allocate the device output buffer from the pool. Device activations never
   // reach this backend on the host, so every input is device-resident except the
   // Int64 `pos` scalar consumed by Rope.
@@ -440,6 +465,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::QuantizedMatmul: {
       int64_t nb = 0;
+      note_weight_quant(qweight(slot));
       if (attr_i(*node, "batch", nb)) {
         ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
       } else {
@@ -453,6 +479,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // output buffer is f32-sized (a superset of the q8_1 bytes), so the q8_1
       // blocks are packed into its front.
       const int n = int(in[0].device.size_bytes / sizeof(float));
+      // The 32-element q8_1 layout (no `batch`): the decode side's activation
+      // quantizer. The 128-element mmq layout appears under RmsNormQuantize &
+      // co. below.
+      note_activation_quant("q8_1");
       ok = quant::cuda::quantize_q8_1_dev(
           dev(in[0]), reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n / 32);
       break;
@@ -464,12 +494,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // block) activation via the int8-tensor-core matmul. No internal
       // quantize; blocks_per_row / num_rows come from the weight.
       int64_t nb = 0;
+      note_weight_quant(qweight(slot));
       if (attr_i(*node, "batch", nb)) {
+        int64_t ds_i = 0;
+        attr_i(*node, "ds", ds_i);
+        note_activation_quant(mmq_activation(ds_i));
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
             int(nb));
       } else {
+        note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
         const auto& qw = qweight(slot);
         const bool epilogue = quant::cuda::gemv_bias_epilogue_supported(qw.type());
@@ -524,11 +559,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (attr_i(*node, "batch", nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
+        note_activation_quant(mmq_activation(ds_i));
         ok = quant::cuda::rms_norm_quantize_mmq_q8_1_dev(
             fweight(slot), dev(in[0]), eps,
             reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
             int(ds_i));
       } else {
+        note_activation_quant("q8_1");
         ok = quant::cuda::rms_norm_quantize_q8_1_dev(
             fweight(slot), dev(in[0]), eps,
             reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
@@ -544,11 +581,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (attr_i(*node, "batch", nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
+        note_activation_quant(mmq_activation(ds_i));
         ok = quant::cuda::gelu_mul_quantize_mmq_q8_1_dev(
             dev(in[0]), dev(in[1]),
             reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
             int(ds_i));
       } else {
+        note_activation_quant("q8_1");
         ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
             dev(in[0]), dev(in[1]),
             reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
@@ -565,11 +604,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (attr_i(*node, "batch", nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
+        note_activation_quant(mmq_activation(ds_i));
         ok = quant::cuda::silu_mul_quantize_mmq_q8_1_dev(
             dev(in[0]), dev(in[1]),
             reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i), int(nb),
             int(ds_i));
       } else {
+        note_activation_quant("q8_1");
         ok = quant::cuda::silu_mul_quantize_q8_1_dev(
             dev(in[0]), dev(in[1]),
             reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
@@ -677,6 +718,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::Embedding: {
       int64_t nb = 0;
+      // The gathered table's format, per the `slot` the node names. token_embd
+      // (the tied lm_head) is a quantized table; the per-layer table is plain
+      // f32 and so has no quant type to record.
+      if (slot != model::WeightSlot::PerLayerTokenEmbd)
+        note_weight_quant(model_->weights.token_embd);
       if (attr_i(*node, "batch", nb)) {
         // Batched: gather n token rows (prefill), ids read from the persistent
         // device slot tokens_buf_.

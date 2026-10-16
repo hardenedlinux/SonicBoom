@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -55,6 +55,14 @@ target_compile_definitions(test_prefix_cache PRIVATE
 # same repository-root requirement for locating models/.
 target_compile_definitions(test_vocab PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_plan_record (execution-plan record determinism + committed goldens) needs
+# the repository root for models/ and tests/data/plans/. It exits 77 (CTest:
+# Skipped) when no CUDA device or no model GGUF is available — the record needs
+# a device, and the goldens are per model.
+target_compile_definitions(test_plan_record PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+set_tests_properties(test_plan_record PROPERTIES SKIP_RETURN_CODE 77)
 
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.

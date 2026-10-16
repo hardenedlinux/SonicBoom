@@ -28,6 +28,7 @@
 #include <sonicboom/sx/exec.h>
 
 #ifdef SONICBOOM_USE_CUDA
+#include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvToolsExt.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
@@ -35,6 +36,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -1015,18 +1017,14 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
   }
 }
 
-// Build (or fetch) the cached greedy decode runtime for (m, n_ctx). The first
-// call builds the graph + quantize passes + plan + backends and captures one
-// decode step (HAL record_step); later calls return the same runtime. The
-// capture reads token/pos from the device slots, so it is replay-agnostic to the
-// real start token/position (the caller re-seeds/re-stages before each replay).
-// Returns nullptr on a build/plan failure (the caller falls back to 0).
-static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
-  auto key = std::make_pair(&m, n_ctx);
-  auto it = g_decode_runtimes.find(key);
-  if (it != g_decode_runtimes.end())
-    return it->second.get();
-
+// Build the greedy decode graph, plan it, and wire up its backends — everything
+// a decode runtime is except the captured step. Split out of
+// get_decode_runtime so the plan recorder can run the very same plan *without*
+// capture: a captured step replays as one graph launch and bypasses the
+// executor, so no per-step launches would be visible to record. Returns nullptr
+// on a build/plan failure (the caller falls back to 0).
+static std::unique_ptr<DecodeRuntime> build_decode_runtime(const Gemma4Model& m,
+                                                           uint64_t n_ctx) {
   auto rt = std::make_unique<DecodeRuntime>();
   rt->graph = build_gemma4_graph(m, /*greedy=*/true);
   if (quant::cuda::q8_1_enabled()) {
@@ -1056,6 +1054,23 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
   route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
+// Build (or fetch) the cached greedy decode runtime for (m, n_ctx). The first
+// call builds the graph + quantize passes + plan + backends and captures one
+// decode step (HAL record_step); later calls return the same runtime. The
+// capture reads token/pos from the device slots, so it is replay-agnostic to the
+// real start token/position (the caller re-seeds/re-stages before each replay).
+// Returns nullptr on a build/plan failure (the caller falls back to 0).
+static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
+  auto key = std::make_pair(&m, n_ctx);
+  auto it = g_decode_runtimes.find(key);
+  if (it != g_decode_runtimes.end())
+    return it->second.get();
+
+  auto rt = build_decode_runtime(m, n_ctx);
+  if (!rt) return nullptr;
 
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
@@ -1187,10 +1202,141 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   }
   return step;
 }
+
+// RAII: install `rec` as this thread's plan recorder for the scope, so an early
+// return cannot leave a dangling recorder installed.
+namespace {
+struct RecorderScope {
+  explicit RecorderScope(planner::PlanRecorder* rec) { planner::set_thread_recorder(rec); }
+  ~RecorderScope() { planner::set_thread_recorder(nullptr); }
+  RecorderScope(const RecorderScope&) = delete;
+  RecorderScope& operator=(const RecorderScope&) = delete;
+};
+
+const char* arch_name(ModelArch a) {
+  return a == ModelArch::Gemma4 ? "gemma4" : "qwen2";
+}
+
+// The device a record was taken on, for the record's `device` line. Part of the
+// record is device-dependent (the decode-attention split-KV grid is sized from
+// the SM count), so a stored record has to carry which GPU produced it. Queried
+// here because this is the translation unit that owns the CUDA context.
+std::string device_identity() {
+  int dev = 0;
+  cudaDeviceProp p{};
+  if (cudaGetDevice(&dev) != cudaSuccess ||
+      cudaGetDeviceProperties(&p, dev) != cudaSuccess)
+    return "unknown";
+  char buf[288];
+  std::snprintf(buf, sizeof buf, "%s sm %d cc %d.%d", p.name,
+                p.multiProcessorCount, p.major, p.minor);
+  return buf;
+}
+
+// One decode step through the executor, with the same device-slot staging the
+// non-captured generate_spine_cuda loop does. Returns false when the step failed
+// (the caller stops and keeps whatever was recorded so far).
+bool decode_step_through_executor(DecodeRuntime& rt, uint64_t token, uint64_t pos,
+                                  int64_t* next_out) {
+  const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(pos)};
+  rt.cuda->set_pos(pos);
+  auto res = rt.exec->execute(rt.plan, rt.snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const sx::Bytes& arg = res->outputs[0];
+  if (arg.size() < sizeof(float)) return false;
+  *next_out = int64_t(*reinterpret_cast<const float*>(arg.data()));
+  return true;
+}
+}  // namespace
+
+std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
+                                                         uint64_t n_ctx,
+                                                         uint64_t steps) {
+  // Deliberately not get_decode_runtime: that runtime is captured, and a
+  // captured step replays as a single graph launch with no executor walk, so
+  // there would be no per-step kernels to record.
+  auto rt = build_decode_runtime(m, n_ctx);
+  if (!rt) return std::nullopt;
+
+  planner::PlanRecorder rec;
+  RecorderScope scope(&rec);
+  rec.set_run(arch_name(m.config.arch), "decode", n_ctx, steps, rt->plan.plan_id,
+              rt->plan.model_fingerprint, planner::backend_tag_name(
+                                              planner::BackendTag::Sonic));
+  rec.set_device(device_identity());
+
+  int64_t token = 0;
+  for (uint64_t step = 0; step < steps; ++step) {
+    if (!decode_step_through_executor(*rt, uint64_t(token), step, &token)) break;
+    if (token < 0) break;  // model-empty: no further step to record
+  }
+  return rec.finish();
+}
+
+std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
+                                                          uint64_t n) {
+  if (n == 0) return std::nullopt;
+  planner::Graph graph = build_gemma4_prefill_graph(m, n);
+  // The same mmq fusion the prefill segments use, under the same conditions, so
+  // the recorded steps are the ones a real prefill segment would run.
+  if (quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+      n >= uint64_t(quant::cuda::mmq_min_n())) {
+    planner::fuse_rms_norm_mmq_pass(graph);
+    planner::fuse_gelu_mul_mmq_pass(graph);
+    planner::fuse_silu_mul_mmq_pass(graph);
+  }
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap) return std::nullopt;
+  planner::AnalyticalCpuCostModel cost(*snap);
+  auto plan = planner::plan_execution(graph, *snap, cost);
+  if (!plan) return std::nullopt;
+
+  // A prefill segment is one batched pass over the whole [n, dim] activation, so
+  // it executes as a single step whose launches are the segment's kernels. The
+  // cache has to be large enough to hold the run without wrapping a sliding
+  // window: size it to the longest ring the model declares (and at least n), so
+  // the segment lands in a straight, wrap-free run exactly as a real one must.
+  uint64_t n_ctx = n;
+  for (uint32_t l = 0; l < m.config.n_layer_kv(); ++l)
+    n_ctx = std::max<uint64_t>(n_ctx, m.config.layer_config(l).sliding_window);
+  planner::SonicCudaBackend cuda(kv_cache_spec(m.config), graph, n_ctx);
+  cuda.bind_model(m);
+  planner::SonicBackend cpu(m, graph);
+  planner::RuntimeExecutor exec(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, &cuda}});
+  route_host_tasks(exec, *plan, cpu);
+
+  planner::PlanRecorder rec;
+  RecorderScope scope(&rec);
+  rec.set_run(arch_name(m.config.arch), "prefill", 0, n, plan->plan_id,
+              plan->model_fingerprint,
+              planner::backend_tag_name(planner::BackendTag::Sonic));
+  rec.set_device(device_identity());
+
+  // Token ids are staged into the device slot the batched Embedding reads; the
+  // ids themselves do not affect the plan (only the [n, dim] shapes do).
+  const std::vector<uint64_t> prompt(n, 0);
+  cuda.set_prefill_tokens(prompt);
+  cuda.set_pos(0);
+  const std::vector<sx::Bytes> in{encode_tokens(prompt), encode_i64(0)};
+  (void)exec.execute(*plan, *snap, in);
+  return rec.finish();
+}
 #else
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
                              std::span<int64_t>, uint64_t) {
   return 0;  // built without CUDA: no device spine is available
+}
+
+std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,
+                                                         uint64_t, uint64_t) {
+  return std::nullopt;  // built without CUDA: nothing launches
+}
+
+std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
+                                                          uint64_t) {
+  return std::nullopt;  // built without CUDA: nothing launches
 }
 #endif
 

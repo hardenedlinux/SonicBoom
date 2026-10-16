@@ -20,6 +20,8 @@
 
 #include "../nn/cuda_stream.h"
 
+#include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+
 #include "ggml_derived/mmvq_q8_1.cuh"
 #include "ggml_derived/mmq.cuh"
 
@@ -791,21 +793,27 @@ bool launch_gather_row(const uint8_t* w, int64_t row_host, const float* row_dev,
   const int grid = (width + 255) / 256;
   switch (type) {
     case QuantType::Q3_K:
+      SB_NOTE_LAUNCH(gather_q3_K_row, grid, 256, 0, cur_stream());
       gather_q3_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q4_K:
+      SB_NOTE_LAUNCH(gather_q4_K_row, grid, 256, 0, cur_stream());
       gather_q4_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q5_K:
+      SB_NOTE_LAUNCH(gather_q5_K_row, grid, 256, 0, cur_stream());
       gather_q5_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q6_K:
+      SB_NOTE_LAUNCH(gather_q6_K_row, grid, 256, 0, cur_stream());
       gather_q6_K_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q5_0:
+      SB_NOTE_LAUNCH(gather_q5_0_row, grid, 256, 0, cur_stream());
       gather_q5_0_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     case QuantType::Q8_0:
+      SB_NOTE_LAUNCH(gather_q8_0_row, grid, 256, 0, cur_stream());
       gather_q8_0_row<<<grid, 256, 0, cur_stream()>>>(w, row_host, row_dev, out, blocks_per_row);
       break;
     default:
@@ -965,21 +973,27 @@ bool launch_gather_batched(const uint8_t* w, const uint64_t* rows, QuantType typ
   const dim3 grid((width + 255) / 256, n);
   switch (type) {
     case QuantType::Q3_K:
+      SB_NOTE_LAUNCH(gather_q3_K_batched, grid, 256, 0, cur_stream());
       gather_q3_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     case QuantType::Q4_K:
+      SB_NOTE_LAUNCH(gather_q4_K_batched, grid, 256, 0, cur_stream());
       gather_q4_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     case QuantType::Q5_K:
+      SB_NOTE_LAUNCH(gather_q5_K_batched, grid, 256, 0, cur_stream());
       gather_q5_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     case QuantType::Q6_K:
+      SB_NOTE_LAUNCH(gather_q6_K_batched, grid, 256, 0, cur_stream());
       gather_q6_K_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     case QuantType::Q5_0:
+      SB_NOTE_LAUNCH(gather_q5_0_batched, grid, 256, 0, cur_stream());
       gather_q5_0_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     case QuantType::Q8_0:
+      SB_NOTE_LAUNCH(gather_q8_0_batched, grid, 256, 0, cur_stream());
       gather_q8_0_batched<<<grid, 256, 0, cur_stream()>>>(w, rows, out, blocks_per_row, n);
       break;
     default:
@@ -1228,21 +1242,27 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
     const dim3 grid(1, (num_rows + 7) / 8);
     switch (qt) {
       case QuantType::Q3_K:
+        SB_NOTE_LAUNCH(gemv_q3_K_coop, grid, block, 0, cur_stream());
         gemv_q3_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q4_K:
+        SB_NOTE_LAUNCH(gemv_q4_K_coop, grid, block, 0, cur_stream());
         gemv_q4_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q5_K:
+        SB_NOTE_LAUNCH(gemv_q5_K_coop, grid, block, 0, cur_stream());
         gemv_q5_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q6_K:
+        SB_NOTE_LAUNCH(gemv_q6_K_coop, grid, block, 0, cur_stream());
         gemv_q6_K_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q5_0:
+        SB_NOTE_LAUNCH(gemv_q5_0_coop, grid, block, 0, cur_stream());
         gemv_q5_0_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
       case QuantType::Q8_0:
+        SB_NOTE_LAUNCH(gemv_q8_0_coop, grid, block, 0, cur_stream());
         gemv_q8_0_coop<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_rows);
         break;
     }
@@ -1256,21 +1276,27 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
     const dim3 grid((num_blocks + 255) / 256);
     switch (qt) {
       case QuantType::Q3_K:
+        SB_NOTE_LAUNCH(gemv_q3_K_base, grid, block, 0, cur_stream());
         gemv_q3_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q4_K:
+        SB_NOTE_LAUNCH(gemv_q4_K_base, grid, block, 0, cur_stream());
         gemv_q4_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q5_K:
+        SB_NOTE_LAUNCH(gemv_q5_K_base, grid, block, 0, cur_stream());
         gemv_q5_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q6_K:
+        SB_NOTE_LAUNCH(gemv_q6_K_base, grid, block, 0, cur_stream());
         gemv_q6_K_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q5_0:
+        SB_NOTE_LAUNCH(gemv_q5_0_base, grid, block, 0, cur_stream());
         gemv_q5_0_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
       case QuantType::Q8_0:
+        SB_NOTE_LAUNCH(gemv_q8_0_base, grid, block, 0, cur_stream());
         gemv_q8_0_base<<<grid, block, 0, cur_stream()>>>(wp, xp, yp, blocks_per_row, num_blocks);
         break;
     }
@@ -1399,25 +1425,31 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
   const dim3 grid(1, (num_rows + 7) / 8);
   switch (qt) {
     case QuantType::Q3_K:
+      SB_NOTE_LAUNCH(q8_1::gemv_q3_K_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q4_K:
+      SB_NOTE_LAUNCH(q8_1::gemv_q4_K_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q5_K:
+      SB_NOTE_LAUNCH(q8_1::gemv_q5_K_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q6_K:
+      SB_NOTE_LAUNCH(q8_1::gemv_q6_K_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
       break;
     case QuantType::Q5_0:
+      SB_NOTE_LAUNCH(q8_1::gemv_q5_0_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q8_0:
+      SB_NOTE_LAUNCH(q8_1::gemv_q8_0_q8_1, grid, block, 0, cur_stream());
       q8_1::gemv_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
@@ -1435,26 +1467,44 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q4_K:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q5_K:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q6_K:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q5_0:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q8_0:
+      SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
+                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                        grid, block, 0, cur_stream());
       q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
           wp, xq, yp, blocks_per_row, num_rows, n);
       break;
@@ -1466,6 +1516,7 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
 // explicit Quantize node whose output is shared by several gemvs.
 bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
   if (!available() || !x || !yq || nblocks <= 0) return false;
+  SB_NOTE_LAUNCH(q8_1::quantize_q8_1, q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream());
   q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
       x, reinterpret_cast<q8_1::block_q8_1*>(yq), nblocks);
   return cudaGetLastError() == cudaSuccess;
@@ -1538,6 +1589,7 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
+  SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, 1, 1024, 0, cur_stream());
   rms_norm_quantize_q8_1_kernel<<<1, 1024, 0, cur_stream()>>>(
       x, d_w, n, eps, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
@@ -1576,6 +1628,7 @@ __global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
                                 int n) {
   if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+  SB_NOTE_LAUNCH(gelu_mul_quantize_q8_1_kernel, (n / 32 + 255) / 256, 256, 0, cur_stream());
   gelu_mul_quantize_q8_1_kernel<<<(n / 32 + 255) / 256, 256, 0, cur_stream()>>>(
       gate, up, n, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
@@ -1612,6 +1665,7 @@ bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
                                 int n) {
   if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
   const int nblocks = n / 32;
+  SB_NOTE_LAUNCH(silu_mul_quantize_q8_1_kernel, q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream());
   silu_mul_quantize_q8_1_kernel<<<q8_1::quantize_q8_1_grid(nblocks),
                                   q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
       gate, up, nblocks, reinterpret_cast<q8_1::block_q8_1*>(yq));
@@ -1672,6 +1726,7 @@ bool launch_gemv_q8_1(QuantType qt, const uint8_t* wp, const float* xp, float* y
       grow_scratch(g_q8, g_q8_bytes, nblocks * sizeof(q8_1::block_q8_1)));
   if (!d_q8) return false;
 
+  SB_NOTE_LAUNCH(q8_1::quantize_q8_1, q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream());
   q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(xp, d_q8, int(nblocks));
 
   launch_gemv_q8_1_from_quantized(qt, wp, d_q8, yp, blocks_per_row, num_rows);
@@ -1790,21 +1845,27 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   const dim3 dgrid((numel + 255) / 256);
   switch (W.type()) {
     case QuantType::Q3_K:
+      SB_NOTE_LAUNCH(dequant_q3_K_f16, dgrid, 256, 0, cur_stream());
       dequant_q3_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     case QuantType::Q4_K:
+      SB_NOTE_LAUNCH(dequant_q4_K_f16, dgrid, 256, 0, cur_stream());
       dequant_q4_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     case QuantType::Q5_K:
+      SB_NOTE_LAUNCH(dequant_q5_K_f16, dgrid, 256, 0, cur_stream());
       dequant_q5_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     case QuantType::Q6_K:
+      SB_NOTE_LAUNCH(dequant_q6_K_f16, dgrid, 256, 0, cur_stream());
       dequant_q6_K_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     case QuantType::Q5_0:
+      SB_NOTE_LAUNCH(dequant_q5_0_f16, dgrid, 256, 0, cur_stream());
       dequant_q5_0_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     case QuantType::Q8_0:
+      SB_NOTE_LAUNCH(dequant_q8_0_f16, dgrid, 256, 0, cur_stream());
       dequant_q8_0_f16<<<dgrid, 256, 0, cur_stream()>>>(wp, wf, numel);
       break;
     default:
@@ -1816,6 +1877,7 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
       grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
   if (!xf) return false;
   const int64_t xn = int64_t(cols) * n;
+  SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
   cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
 
   // 3. cuBLAS tensor-core GEMM on the current stream: C = W^T @ X.
@@ -1928,6 +1990,7 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
         g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
     if (!X) return false;
     const int64_t nx = int64_t(cols) * n;
+    SB_NOTE_LAUNCH(dequant_mmq_q8_1_d4, (nx + 255) / 256, 256, 0, cur_stream());
     dequant_mmq_q8_1_d4<<<(nx + 255) / 256, 256, 0, cur_stream()>>>(
         reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), X, int(cols), n);
     if (cudaGetLastError() != cudaSuccess) return false;
@@ -2128,17 +2191,22 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
       grow_scratch(g_rms_inv, g_rms_inv_bytes, (size_t)n * sizeof(float)));
   if (!inv) return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
+  SB_NOTE_LAUNCH(rms_norm_inv_kernel, n, 256, 0, cur_stream());
   rms_norm_inv_kernel<<<n, 256, 0, cur_stream()>>>(x, dim, eps, inv);
   const dim3 grid(n, (dim / 128 + 3) / 4);  // one 128-element block per warp
-  if (ds == mmq::DS4)
+  if (ds == mmq::DS4) {
+    SB_NOTE_LAUNCH_TP("scale_quantize_mmq_q8_1_kernel", "ds=ds4", grid, 128, 0, cur_stream());
     scale_quantize_mmq_q8_1_kernel<mmq::DS4><<<grid, 128, 0, cur_stream()>>>(
         x, inv, d_w, dim, n, y);
-  else if (ds == mmq::D4_Q8_1)
+  } else if (ds == mmq::D4_Q8_1) {
+    SB_NOTE_LAUNCH_TP("scale_quantize_mmq_q8_1_kernel", "ds=d4_q8_1", grid, 128, 0, cur_stream());
     scale_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<grid, 128, 0, cur_stream()>>>(
         x, inv, d_w, dim, n, y);
-  else
+  } else {
+    SB_NOTE_LAUNCH_TP("scale_quantize_mmq_q8_1_kernel", "ds=d4", grid, 128, 0, cur_stream());
     scale_quantize_mmq_q8_1_kernel<mmq::D4><<<grid, 128, 0, cur_stream()>>>(
         x, inv, d_w, dim, n, y);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2173,15 +2241,19 @@ bool gelu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   if (!available() || !gate || !up || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0)
     return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
-  if (ds == mmq::DS4)
+  if (ds == mmq::DS4) {
+    SB_NOTE_LAUNCH_TP("gelu_mul_quantize_mmq_q8_1_kernel", "ds=ds4", n, 256, 0, cur_stream());
     gelu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
-  else if (ds == mmq::D4_Q8_1)
+  } else if (ds == mmq::D4_Q8_1) {
+    SB_NOTE_LAUNCH_TP("gelu_mul_quantize_mmq_q8_1_kernel", "ds=d4_q8_1", n, 256, 0, cur_stream());
     gelu_mul_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
-  else
+  } else {
+    SB_NOTE_LAUNCH_TP("gelu_mul_quantize_mmq_q8_1_kernel", "ds=d4", n, 256, 0, cur_stream());
     gelu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2219,15 +2291,19 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   if (!available() || !gate || !up || !yq || dim <= 0 || n <= 0 || (dim & 127) != 0)
     return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
-  if (ds == mmq::DS4)
+  if (ds == mmq::DS4) {
+    SB_NOTE_LAUNCH_TP("silu_mul_quantize_mmq_q8_1_kernel", "ds=ds4", n, 256, 0, cur_stream());
     silu_mul_quantize_mmq_q8_1_kernel<mmq::DS4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
-  else if (ds == mmq::D4_Q8_1)
+  } else if (ds == mmq::D4_Q8_1) {
+    SB_NOTE_LAUNCH_TP("silu_mul_quantize_mmq_q8_1_kernel", "ds=d4_q8_1", n, 256, 0, cur_stream());
     silu_mul_quantize_mmq_q8_1_kernel<mmq::D4_Q8_1><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
-  else
+  } else {
+    SB_NOTE_LAUNCH_TP("silu_mul_quantize_mmq_q8_1_kernel", "ds=d4", n, 256, 0, cur_stream());
     silu_mul_quantize_mmq_q8_1_kernel<mmq::D4><<<n, 256, 0, cur_stream()>>>(
         gate, up, dim, n, y);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2279,6 +2355,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
     q8_1::block_q8_1* xq = static_cast<q8_1::block_q8_1*>(grow_scratch(
         g_q8, g_q8_bytes, nblocks * (size_t)n * sizeof(q8_1::block_q8_1)));
     if (!xq) return false;
+    SB_NOTE_LAUNCH(q8_1::quantize_q8_1, q8_1::quantize_q8_1_grid(int(nblocks * n)), q8_1::kQuantizeBlockThreads, 0, cur_stream());
     q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(int(nblocks * n)), q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
         X, xq, int(nblocks * n));
 

@@ -78,4 +78,8 @@ tools/baseline/tokenize_text
 tools/baseline/real_prompt.txt
 *.dump
 
+# plan-record tools (tools/build_plan_*.sh build them)
+tools/plan_dump
+tools/plan_diff
+
 *.log
