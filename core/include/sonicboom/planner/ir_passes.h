@@ -56,10 +56,23 @@ bool ir_passes_available();
 bool ir_passes_enabled();
 
 // Run `phase`'s rewrite pipeline over `graph` through Boom IR: the graph is
-// converted, the phase's landed passes run as MLIR passes, and the result is
-// converted back and handed to the passes whose port has not landed. The
-// pipeline therefore always implements the whole phase, whichever half a pass
-// currently lives in.
+// converted, the phase's passes run as MLIR passes, and the result is converted
+// back.
+//
+// Ablation: SONICBOOM_IR_PASS_DISABLE=<comma-separated pass names> skips those
+// passes for the run, one fusion at a time, so the plan diff can say what each
+// contributes. The names are the pass class names in BoomPasses.cpp —
+// QuantizeOncePass, RmsNormQuantizePass, GeluMulQuantizePass,
+// SiluMulQuantizePass, BiasIntoGemvPass, ResidualAddIntoGemvPass (decode) and
+// RmsNormMmqPass, GeluMulMmqPass, SiluMulMmqPass (prefill); a phase that does
+// not contain a named pass simply ignores it. A disabled pass can also remove a
+// later pass's fusion — the passes run in sequence over one graph, and the
+// Quantize nodes QuantizeOncePass inserts are what RmsNormQuantizePass and
+// GeluMulQuantizePass fold away — so a plan delta is read as what that pass and
+// the folds it feeds contribute, not as that pass alone. An unrecognized name
+// is reported on stderr with the valid names and disables nothing — a typo must
+// not pass for an ablation. The switch is read only here, so it has no effect
+// when ir_passes_enabled() is false.
 //
 // A conversion or pass failure is reported on stderr and leaves `graph` as it
 // was handed over — unfused, which is correct but not what the phase's pipeline

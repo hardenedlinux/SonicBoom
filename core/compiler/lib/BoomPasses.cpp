@@ -43,8 +43,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -1166,6 +1168,90 @@ public:
   }
 };
 
+//--- the per-pass disable switch --------------------------------------------
+
+// Ablation for one fusion at a time: the passes a run skips, named on the
+// command line (SONICBOOM_IR_PASS_DISABLE, see planner/ir_passes.h — the switch
+// is documented on the runtime side next to the pipeline choice, and read here,
+// where the passes and their names live).
+//
+// Skipping a pass leaves the graph as the pass before it would, so a later pass
+// sees what it is written to see. That is not the same as the later pass being
+// unaffected: the pipeline is a sequence over one graph, and QuantizeOncePass
+// inserts the Quantize nodes RmsNormQuantizePass and GeluMulQuantizePass fold
+// into their producer, so skipping it also removes those two folds (measured —
+// see the plan deltas in the run that landed this). A disabled pass is read as
+// "this pass and the folds it feeds", which is what the plan diff records.
+struct DisabledPasses {
+  bool quantize_once = false;
+  bool rms_norm_quantize = false;
+  bool gelu_mul_quantize = false;
+  bool silu_mul_quantize = false;
+  bool bias_into_gemv = false;
+  bool residual_add_into_gemv = false;
+  bool rms_norm_mmq = false;
+  bool gelu_mul_mmq = false;
+  bool silu_mul_mmq = false;
+};
+
+// The names the switch accepts: the pass class names, one table so the parser
+// and the error message cannot disagree about them.
+struct PassName {
+  const char *name;
+  bool DisabledPasses::*flag;
+};
+constexpr PassName kPassNames[] = {
+    {"QuantizeOncePass", &DisabledPasses::quantize_once},
+    {"RmsNormQuantizePass", &DisabledPasses::rms_norm_quantize},
+    {"GeluMulQuantizePass", &DisabledPasses::gelu_mul_quantize},
+    {"SiluMulQuantizePass", &DisabledPasses::silu_mul_quantize},
+    {"BiasIntoGemvPass", &DisabledPasses::bias_into_gemv},
+    {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
+    {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
+    {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
+    {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
+};
+
+// Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
+// the offending entry and the valid names, when the list is not a list of
+// passes — an unknown name is reported rather than ignored so a typo cannot
+// pass for an ablation.
+bool parseDisabledPasses(DisabledPasses &out) {
+  const char *env = std::getenv("SONICBOOM_IR_PASS_DISABLE");
+  if (env == nullptr || *env == '\0') return true;
+  const std::string_view list(env);
+  std::string unknown;
+  for (std::size_t pos = 0;;) {
+    const std::size_t comma = list.find(',', pos);
+    std::string_view name =
+        list.substr(pos, comma == std::string_view::npos ? comma : comma - pos);
+    while (!name.empty() && (name.front() == ' ' || name.front() == '\t'))
+      name.remove_prefix(1);
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\t'))
+      name.remove_suffix(1);
+    if (!name.empty()) {
+      bool matched = false;
+      for (const PassName &p : kPassNames) {
+        if (name == p.name) {
+          out.*(p.flag) = true;
+          matched = true;
+          break;
+        }
+      }
+      if (!matched && unknown.empty()) unknown = std::string(name);
+    }
+    if (comma == std::string_view::npos) break;
+    pos = comma + 1;
+  }
+  if (unknown.empty()) return true;
+  std::fprintf(stderr,
+               "SONICBOOM_IR_PASS_DISABLE: unknown pass '%s'; valid names are:",
+               unknown.c_str());
+  for (const PassName &p : kPassNames) std::fprintf(stderr, " %s", p.name);
+  std::fprintf(stderr, "\n");
+  return false;
+}
+
 //--- the pipeline -----------------------------------------------------------
 
 // A phase's passes, in the phase's execution order (design/mlir-migration.md
@@ -1174,19 +1260,25 @@ public:
 // now — the boundary the migration ran on is gone — and rewrites.cpp keeps the
 // passes the emitter's default path still runs.
 void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
+  DisabledPasses off;
+  // A rejected list disables nothing: running the phase with no passes would
+  // leave the graph unfused, and an ablation run would then report that as the
+  // effect of the pass it meant to skip.
+  if (!parseDisabledPasses(off)) off = DisabledPasses{};
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    pm.addPass(std::make_unique<QuantizeOncePass>());
-    pm.addPass(std::make_unique<RmsNormQuantizePass>());
-    pm.addPass(std::make_unique<GeluMulQuantizePass>());
-    pm.addPass(std::make_unique<SiluMulQuantizePass>());
-    pm.addPass(std::make_unique<BiasIntoGemvPass>());
-    pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
+    if (!off.quantize_once) pm.addPass(std::make_unique<QuantizeOncePass>());
+    if (!off.rms_norm_quantize) pm.addPass(std::make_unique<RmsNormQuantizePass>());
+    if (!off.gelu_mul_quantize) pm.addPass(std::make_unique<GeluMulQuantizePass>());
+    if (!off.silu_mul_quantize) pm.addPass(std::make_unique<SiluMulQuantizePass>());
+    if (!off.bias_into_gemv) pm.addPass(std::make_unique<BiasIntoGemvPass>());
+    if (!off.residual_add_into_gemv)
+      pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
     return;
   case planner::IrPassPhase::Prefill:
-    pm.addPass(std::make_unique<RmsNormMmqPass>());
-    pm.addPass(std::make_unique<GeluMulMmqPass>());
-    pm.addPass(std::make_unique<SiluMulMmqPass>());
+    if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());
+    if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
+    if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
     return;
   }
 }
