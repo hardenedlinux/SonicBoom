@@ -38,6 +38,12 @@
 // can be looked at. `--dump DIR` chooses where; the default is under the system
 // temp directory.
 //
+// A third, model-free property is the one refusal the conversion makes: a
+// vocabulary attribute (the names ODS declares) whose value is not an integer
+// or a float has no typed form, and is refused with a diagnostic rather than
+// dropped. That check is hand-built and runs before the gate, so a CPU-only
+// build still covers it.
+//
 // As in test_plan_record, the golden comparison is skipped — never the round
 // trip — when the recording device differs from the golden's, because part of
 // the plan is device-dependent. Skips (exit 77) when there is no CUDA device
@@ -73,6 +79,7 @@ namespace boom = sonicboom::compiler::boom;
 namespace sbgguf = sonicboom::gguf;
 namespace sbmodel = sonicboom::model;
 namespace sbplanner = sonicboom::planner;
+namespace sxs = sonicboom::sx;
 
 namespace {
 
@@ -276,6 +283,102 @@ std::string diffGraphs(const sbplanner::Graph& a, const sbplanner::Graph& b) {
   return {};
 }
 
+//--- the typed-attribute vocabulary's one refusal -----------------------------
+
+// `node_attrs` carries every attribute a node holds, in order and whatever its
+// kind; the *typed* view of them is the vocabulary ODS declares
+// (BoomVerify.cpp, boomTypedAttrNames), each member of which is an integer or a
+// float, because that is what the plan emitters and the fusion passes read. An
+// attribute in that vocabulary carrying anything else — a string, a bool, any
+// vector — has no typed form, and setting none would leave the op's typed
+// attribute disagreeing with the node_attrs entry the verifier compares it
+// against. So the conversion refuses it, naming the node and the attribute,
+// instead of dropping a value the runtime may read or emitting IR that fails
+// verification under a less specific message.
+//
+// No emitter writes such an attribute, so no model graph exercises this. It is
+// built by hand: one node, one input, one output, and one vocabulary attribute
+// whose *kind* is the only variable — the same graph with the same attribute
+// name and an integer value must convert. Nothing about it needs a model or a
+// device, so it runs before the gate in main.
+void checkAttrKindRefusal() {
+  // The graph, with `slot`'s value as the parameter. `slot` is a typed
+  // vocabulary name declared I64Attr (BoomOps.td).
+  auto graphWith = [](sxs::Attribute slot) {
+    sbplanner::Graph g;
+    g.name = "attr_kind";
+    g.tensors.resize(2);
+    g.tensors[0].id = sbplanner::TensorId{0};
+    g.tensors[0].shape = {4};
+    g.tensors[0].dtype = sxs::DType::Float32;
+    g.tensors[0].size_bytes = 16;
+    g.tensors[0].is_graph_input = true;
+    g.tensors[0].name = "x";
+    g.tensors[1].id = sbplanner::TensorId{1};
+    g.tensors[1].shape = {4};
+    g.tensors[1].dtype = sxs::DType::Float32;
+    g.tensors[1].size_bytes = 16;
+    g.tensors[1].is_graph_output = true;
+    g.tensors[1].name = "y";
+
+    sbplanner::GraphNodeDesc n;
+    n.id = sbplanner::GraphNodeId{0};
+    n.op = sbplanner::OpKind::Relu;
+    n.inputs = {sbplanner::TensorId{0}};
+    n.outputs = {sbplanner::TensorId{1}};
+    n.attributes = {std::move(slot)};
+    n.name = "relu0";
+    g.nodes = {std::move(n)};
+    g.inputs = {sbplanner::TensorId{0}};
+    g.outputs = {sbplanner::TensorId{1}};
+    return g;
+  };
+
+  mlir::MLIRContext context;
+  std::string diagnostics;
+  mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic& d) {
+    if (d.getSeverity() != mlir::DiagnosticSeverity::Error) return;
+    if (diagnostics.empty()) {
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      d.print(os);
+      diagnostics = os.str();
+    }
+  });
+
+  // The control: the same graph and attribute name, an integer value.
+  Trip control = roundTrip(graphWith(sxs::Attribute{"slot", int64_t(0)}), context);
+  if (!control.ok)
+    fail(std::string("attr-kind control (Int 'slot'): ") + control.error);
+  else if (const std::string d = diffGraphs(
+               graphWith(sxs::Attribute{"slot", int64_t(0)}), control.graph);
+           !d.empty())
+    fail("attr-kind control (Int 'slot'): round trip differs: " + d);
+  else
+    std::cout << "attr-kind control: Int 'slot' round-trips\n";
+
+  // The refusal: a vocabulary attribute whose value is not an integer or a
+  // float. The module must be empty and the diagnostic must name the node and
+  // the attribute — a refusal that says only "conversion failed" would leave a
+  // caller no way to find the attribute.
+  diagnostics.clear();
+  auto module = sbcompiler::graphToBoom(
+      graphWith(sxs::Attribute{"slot", std::string("0")}), &context);
+  if (module) {
+    fail("attr-kind refusal: a String-valued 'slot' converted instead of "
+         "being refused");
+  } else if (diagnostics.empty()) {
+    fail("attr-kind refusal: no diagnostic was emitted");
+  } else if (diagnostics.find("'slot'") == std::string::npos ||
+             diagnostics.find("relu0") == std::string::npos) {
+    fail("attr-kind refusal: the diagnostic names neither the node nor the "
+         "attribute: " + diagnostics);
+  } else {
+    std::cout << "attr-kind refusal: String-valued 'slot' refused — "
+              << diagnostics << "\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -294,6 +397,16 @@ int main(int argc, char** argv) {
   }
   if (dump_dir.empty())
     dump_dir = std::filesystem::temp_directory_path() / "sonicboom-boom-ir";
+
+  // The dialect-level check first: it needs no model and no device, so a
+  // CPU-only run still covers it. Its failures are reported before the gate
+  // below, so a skip never hides one.
+  checkAttrKindRefusal();
+  if (g_failures != 0) {
+    std::cerr << "boom-conversion: " << g_failures
+              << " dialect-level check(s) failed\n";
+    return 1;
+  }
 
   if (!sonicboom::quant::cuda_available()) {
     std::cout << "(skipped: no CUDA device — the plan gate needs one)\n";
