@@ -27,17 +27,42 @@
 # A/B mode — compare two builds of libsonicboom.so on the same canonical set:
 #
 #   tools/bench.sh <model.gguf> --ab BASE_LIB CUR_LIB [--runs N] [--no-build]
+#                                [--no-control [--control-runs K]] [--k X]
+#                                [--no-lock-clocks | --gpu-clock MHZ]
 #
 # BASE_LIB / CUR_LIB are libsonicboom.so paths (or the directories holding one).
 # Each library is staged into its own directory and selected with
 # LD_LIBRARY_PATH, so the same tools run against either. The two are run in
 # *alternating* order (A,B on odd repetitions; B,A on even), so a slow drift in
 # the machine — clocks, thermals, page cache — lands on both sides instead of on
-# whichever library happens to run second, and the reported deltas are
-# medians-of-N per side. `--runs` is per side, so `--runs 3` is 6 runs a metric.
+# whichever library happens to run second. `--runs` is per side, so `--runs 3`
+# is 6 runs a metric.
+#
+# Every row reports, per side, the median *and the sample standard deviation* of
+# its runs, plus the SD of the paired per-repetition deltas. A delta is only
+# meaningful next to that spread: a ±0.5% threshold is below this harness's own
+# noise, so it is not used here. Instead the noise floor is *measured*: the same
+# protocol with the *same* library on both sides, K pairs of it (`--control-runs`,
+# default 5). The gate for a metric is
+#
+#     |median(control deltas)| + X · SD(control deltas)      (X = --k, default 2)
+#
+# and every real delta is reported against it. That control is on by default —
+# a gate taken from a fixed number rather than from the harness's own spread is
+# the thing it replaces — and it re-runs the whole metric set, so it roughly
+# doubles the wall clock. `--no-control` skips it and reports spreads only.
+#
+# Measurement conditions: the GPU clock is pinned for the duration of the run
+# (`nvidia-smi -lgc`, released on exit with `-rgc`) — an unpinned clock drifts by
+# more than the effects being compared. `--gpu-clock MHZ` picks the value (the
+# device's max graphics clock by default) and `--no-lock-clocks` skips it. The
+# CPU governor is only *reported*; this script never changes a CPU setting.
 #
 # Usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]
 #        tools/bench.sh <model.gguf> --ab BASE_LIB CUR_LIB [--runs N] [--no-build]
+#                                             [--control | --no-control]
+#                                             [--control-runs K] [--k X]
+#                                             [--gpu-clock MHZ] [--no-lock-clocks]
 # Env:   LLAMA_BENCH=/path/to/llama-bench   (optional; enables the llama.cpp column)
 set -euo pipefail
 
@@ -49,22 +74,43 @@ LABEL=""
 GGUF=""
 AB_BASE=""
 AB_CUR=""
+CONTROL=1
+CONTROL_RUNS=5
+KSIGMA=2
+CLOCKS=1
+CLOCK_MHZ=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --label) LABEL="$2"; shift 2 ;;
     --runs)  RUNS="$2";  shift 2 ;;
     --no-build) BUILD=0; shift ;;
+    --control) CONTROL=1; shift ;;
+    --no-control) CONTROL=0; shift ;;
+    --control-runs) CONTROL_RUNS="$2"; shift 2 ;;
+    --k) KSIGMA="$2"; shift 2 ;;
+    --gpu-clock) CLOCK_MHZ="$2"; shift 2 ;;
+    --no-lock-clocks) CLOCKS=0; shift ;;
     --ab)
       AB_BASE="${2:-}"; AB_CUR="${3:-}"
       { [ -n "$AB_BASE" ] && [ -n "$AB_CUR" ]; } || {
         echo "usage: --ab BASE_LIB CUR_LIB" >&2; exit 2; }
       shift 3 ;;
-    -h|--help) sed -n '3,40p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,66p' "$0"; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *)  GGUF="$1"; shift ;;
   esac
 done
+
+# The counts drive the gates, so a non-numeric one is an error, not a default.
+for pair in "runs:$RUNS" "control-runs:$CONTROL_RUNS"; do
+  case "${pair#*:}" in
+    ''|*[!0-9]*) echo "${pair%%:*} must be a positive integer (got '${pair#*:}')" >&2; exit 2 ;;
+  esac
+  [ "${pair#*:}" -ge 1 ] || { echo "${pair%%:*} must be >= 1" >&2; exit 2; }
+done
+awk -v k="$KSIGMA" 'BEGIN{exit !(k ~ /^[0-9]+(\.[0-9]+)?$/)}' ||
+  { echo "--k must be a non-negative number (got '$KSIGMA')" >&2; exit 2; }
 
 if [ -z "$GGUF" ]; then
   echo "usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]" >&2
@@ -84,6 +130,72 @@ if [ "$BUILD" = 1 ]; then
   done
 fi
 
+# --- measurement conditions -------------------------------------------------
+# Pinned clocks, and a governor that is reported but never touched. The point of
+# the pin is not that a fixed clock is the "real" clock but that it is the *same*
+# clock across the two sides of a comparison; clocks move more than the effects
+# being compared.
+
+CLOCK_LOCKED=""
+ab_tmp=""
+
+restore_clocks() {
+  if [ -n "$CLOCK_LOCKED" ]; then
+    nvidia-smi -rgc >/dev/null 2>&1 || true
+    echo "gpu clock: released (nvidia-smi -rgc)" >&2
+  fi
+}
+cleanup() {
+  [ -n "$ab_tmp" ] && rm -rf "$ab_tmp"
+  restore_clocks
+  return 0
+}
+trap cleanup EXIT
+
+lock_clocks() {
+  if [ "$CLOCKS" != 1 ]; then
+    echo "gpu clock: not pinned (--no-lock-clocks: readings are unlocked)"
+    return 0
+  fi
+  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+    echo "gpu clock: no NVIDIA device visible — readings are unlocked"
+    return 0
+  fi
+  if [ -z "$CLOCK_MHZ" ]; then
+    CLOCK_MHZ=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits \
+                  2>/dev/null | head -1 | tr -d ' ')
+  fi
+  case "$CLOCK_MHZ" in
+    ''|*[!0-9]*)
+      echo "gpu clock: could not read clocks.max.gr — readings are unlocked"
+      return 0 ;;
+  esac
+  if nvidia-smi -lgc "$CLOCK_MHZ" >/dev/null 2>&1; then
+    CLOCK_LOCKED=1
+    echo "gpu clock: pinned to ${CLOCK_MHZ} MHz (nvidia-smi -lgc), released on exit"
+  else
+    echo "gpu clock: could not pin to ${CLOCK_MHZ} MHz — needs root, readings are unlocked"
+    echo "           to pin it yourself: sudo nvidia-smi -lgc ${CLOCK_MHZ}"
+  fi
+}
+
+report_governor() {
+  local f=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor g
+  if [ -r "$f" ]; then
+    g=$(cat "$f")
+    echo "cpu governor: $g"
+    if [ "$g" != performance ]; then
+      echo "           (not 'performance'; this script never changes it — if you want a"
+      echo "            quieter comparison: sudo cpupower frequency-set -g performance)"
+    fi
+  else
+    echo "cpu governor: no cpufreq interface — the CPU clock is governed by firmware"
+  fi
+}
+
+lock_clocks
+report_governor
+
 # --- helpers ---------------------------------------------------------------
 res_field() { # KEY ; RESULT line on stdin -> value of KEY
   awk -v k="$1" '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]==k){print a[2]; exit}}}'
@@ -94,14 +206,42 @@ median() { # numbers on stdin -> median
     if(NR==0){print "nan"} else if(NR%2){print a[(NR+1)/2]} else {printf "%.3f", (a[NR/2]+a[NR/2+1])/2}}'
 }
 
-bench_runs() { # KEY CMD... ; median of RUNS process runs of CMD's RESULT KEY
+# Sample standard deviation (n-1). "nan" below two samples, where a spread is
+# not defined rather than zero — the distinction matters, because the A/B gate
+# below is derived from it and a fake 0 would make the gate a point estimate.
+stdev() { # numbers on stdin -> standard deviation or "nan"
+  sort -n | awk '{a[NR]=$1; s+=$1} END{
+    if(NR<2){print "nan"; exit}
+    m=s/NR; t=0
+    for(i=1;i<=NR;i++) t+=(a[i]-m)^2
+    printf "%.4f", sqrt(t/(NR-1))}'
+}
+
+stats() { # numbers on stdin -> "<median> <stdev>"
+  local vals
+  vals=$(cat)
+  printf '%s %s' "$(printf '%s\n' "$vals" | median)" "$(printf '%s\n' "$vals" | stdev)"
+}
+
+# "52.5 ± 0.058" — a value with its spread, the form every row reports. %g, not
+# a fixed number of decimals: the metrics differ by three orders of magnitude
+# (52.5 tok/s against 1692 tok/s a step), and neither a fixed decimal count nor
+# an exponent suits both.
+pm() { # MEDIAN SD -> "M ± SD" / "n/a"
+  awk -v m="$1" -v s="$2" 'BEGIN{
+    if(m=="nan"||m=="n/a"){print "n/a"; exit}
+    if(s=="nan"||s=="n/a"){printf "%g", m; exit}
+    printf "%g ± %g", m, s}'
+}
+
+bench_stats() { # KEY CMD... ; "<median> <stdev>" of RUNS runs of CMD's RESULT KEY
   local key=$1; shift
   local vals="" v
   for ((i=1;i<=RUNS;i++)); do
     v=$("$@" 2>/dev/null | grep '^RESULT ' | res_field "$key") || v=""
     [ -n "$v" ] && vals="$vals$v\n"
   done
-  printf '%b' "$vals" | median
+  printf '%b' "$vals" | stats
 }
 
 ratio() { # SB LL -> "1.03x" or "n/a"
@@ -113,9 +253,9 @@ fmt() { # number|nan|n/a -> one decimal
   awk -v v="$1" 'BEGIN{ if(v=="nan"||v=="n/a") print v; else printf "%.1f", v }'
 }
 
-row() { # LABEL SB LL RATIO UNIT
-  printf '| %-14s | %10s %-5s | %10s %-5s | %6s |\n' \
-    "$1" "$(fmt "$2")" "$5" "$(fmt "$3")" "$5" "$4"
+row() { # LABEL SB_MEDIAN SB_SD LL RATIO UNIT
+  printf '| %-14s | %18s %-5s | %10s %-5s | %6s |\n' \
+    "$1" "$(pm "$2" "$3")" "$6" "$(fmt "$4")" "$6" "$5"
 }
 
 # --- A/B mode --------------------------------------------------------------
@@ -133,10 +273,14 @@ if [ -n "$AB_BASE" ]; then
   cur_so="$(resolve_lib "$AB_CUR")"
 
   ab_tmp="$(mktemp -d)"
-  trap 'rm -rf "$ab_tmp"' EXIT
   mkdir -p "$ab_tmp/base" "$ab_tmp/cur"
   cp -L "$base_so" "$ab_tmp/base/libsonicboom.so"
   cp -L "$cur_so"  "$ab_tmp/cur/libsonicboom.so"
+  # The control measures the base library against itself; a second directory
+  # rather than a second path, so the two sides are staged exactly like a real
+  # comparison (two files, two LD_LIBRARY_PATH roots).
+  mkdir -p "$ab_tmp/ctrl"
+  cp -L "$base_so" "$ab_tmp/ctrl/libsonicboom.so"
 
   ab_run() { # SIDE KEY CMD... ; one run against SIDE, KEY's RESULT value or ""
     local side=$1 key=$2; shift 2
@@ -144,44 +288,89 @@ if [ -n "$AB_BASE" ]; then
       | grep '^RESULT ' | res_field "$key" || true
   }
 
-  ab_metric() { # KEY CMD... -> "<base median> <cur median>", alternating order
-    local key=$1; shift
-    local base_vals="" cur_vals="" v
-    for ((i=1;i<=RUNS;i++)); do
+  # Alternating order (A,B on odd repetitions; B,A on even), so a slow drift in
+  # the machine lands on both sides. Sets MA / MB / MD:
+  #   MA, MB  "median stdev" per side       MD  "median stdev" of the paired
+  #                                             per-repetition deltas, in %
+  ab_pairs() { # SIDE_A SIDE_B REPS KEY CMD...
+    local sa=$1 sb=$2 reps=$3 key=$4; shift 4
+    local a_vals="" b_vals="" d_vals="" va vb d
+    for ((i=1;i<=reps;i++)); do
       if (( i % 2 )); then
-        v=$(ab_run base "$key" "$@"); [ -n "$v" ] && base_vals="$base_vals$v\n"
-        v=$(ab_run cur  "$key" "$@"); [ -n "$v" ] && cur_vals="$cur_vals$v\n"
+        va=$(ab_run "$sa" "$key" "$@"); vb=$(ab_run "$sb" "$key" "$@")
       else
-        v=$(ab_run cur  "$key" "$@"); [ -n "$v" ] && cur_vals="$cur_vals$v\n"
-        v=$(ab_run base "$key" "$@"); [ -n "$v" ] && base_vals="$base_vals$v\n"
+        vb=$(ab_run "$sb" "$key" "$@"); va=$(ab_run "$sa" "$key" "$@")
       fi
+      [ -n "$va" ] && a_vals="$a_vals$va\n"
+      [ -n "$vb" ] && b_vals="$b_vals$vb\n"
+      d=$(awk -v a="$va" -v b="$vb" 'BEGIN{
+        if(a==""||b==""||a+0==0) exit 1; printf "%.4f", (b-a)/a*100}' 2>/dev/null) || d=""
+      [ -n "$d" ] && d_vals="$d_vals$d\n"
     done
-    printf '%s %s\n' "$(printf '%b' "$base_vals" | median)" \
-                     "$(printf '%b' "$cur_vals" | median)"
+    MA="$(printf '%b' "$a_vals" | stats)"
+    MB="$(printf '%b' "$b_vals" | stats)"
+    MD="$(printf '%b' "$d_vals" | stats)"
   }
 
   delta_pct() { # BASE CUR -> "+1.23%" / "-0.45%" / "n/a"
     awk -v a="$1" -v b="$2" 'BEGIN{
-      if(a=="nan"||b=="nan"||a+0==0){print "n/a"} else {printf "%+.2f%%", (b-a)/a*100}}'
+      if(a=="nan"||b=="nan"||a=="n/a"||b=="n/a"||a+0==0){print "n/a"}
+      else {printf "%+.2f%%", (b-a)/a*100}}'
+  }
+
+  # The gate a metric's delta is judged against, from the control's paired
+  # deltas: |bias| + k·σ. The bias term matters — a harness that always reads the
+  # second side 0.3% faster has a 0.3% floor, not a zero one. "n/a" when the
+  # control could not produce a σ (fewer than two usable pairs).
+  gate_pct() { # "median stdev" of the control deltas -> "0.42" / "n/a"
+    awk -v m="${1%% *}" -v s="${1##* }" -v k="$KSIGMA" 'BEGIN{
+      if(m=="nan"||s=="nan"){print "n/a"; exit}
+      printf "%.3f", (m<0?-m:m) + k*s}'
+  }
+
+  # True when |delta| is inside the gate; "no gate" without a control.
+  verdict() { # DELTA_STRING GATE -> one word for the table
+    awk -v d="$1" -v g="$2" 'BEGIN{
+      if(d=="n/a"||d=="nan"){print "n/a"; exit}
+      if(g=="n/a"){print "no gate"; exit}
+      v=substr(d,1,length(d)-1)+0; v=(v<0?-v:v)
+      print (v<=g+0) ? "within" : "OUTSIDE"}'
   }
 
   ab_row() { # LABEL METRIC CMD...
     local label=$1 metric=$2; shift 2
-    local pair base cur
-    pair="$(ab_metric "$metric" "$@")"
-    base="${pair%% *}"; cur="${pair##* }"
-    printf '| %-14s | %12s | %12s | %8s |\n' "$label" "$(fmt "$base")" \
-      "$(fmt "$cur")" "$(delta_pct "$base" "$cur")"
+    local gate="n/a" b_med b_sd c_med c_sd d_med d_sd
+    if [ "$CONTROL" = 1 ]; then
+      ab_pairs ctrl ctrl "$CONTROL_RUNS" "$metric" "$@"
+      gate="$(gate_pct "$MD")"
+    fi
+    ab_pairs base cur "$RUNS" "$metric" "$@"
+    b_med="${MA%% *}"; b_sd="${MA##* }"
+    c_med="${MB%% *}"; c_sd="${MB##* }"
+    d_med="${MD%% *}"; d_sd="${MD##* }"
+    local dpct; dpct="$(delta_pct "$b_med" "$c_med")"
+    printf '| %-14s | %20s | %20s | %8s | %7s | %-9s |\n' "$label" \
+      "$(pm "$b_med" "$b_sd")" "$(pm "$c_med" "$c_sd")" "$dpct" \
+      "$(printf '%s' "$d_sd" | awk '{print ($1=="nan")?"n/a":sprintf("%.2f%%",$1)}')" \
+      "$(verdict "$dpct" "$gate")"
+    ROW_GATES="$ROW_GATES$label=$gate "
   }
 
   echo
   echo "==== $LABEL (A/B) ===="
   echo "base: $base_so"
   echo "cur:  $cur_so"
-  echo "median of $RUNS runs per side, alternating order; CUDA spine"
+  echo "median ± sd of $RUNS runs per side, alternating order; CUDA spine"
+  if [ "$CONTROL" = 1 ]; then
+    echo "control: $CONTROL_RUNS pairs of the base library against itself"
+    echo "gate:    |median(control delta)| + ${KSIGMA}σ(control delta), per metric"
+  else
+    echo "gate:    none (--no-control) — spreads only, no verdict"
+  fi
   echo
-  echo "| metric         |         base |          cur |    delta |"
-  echo "|----------------|--------------|--------------|----------|"
+  echo "| metric         |        base ± sd   |         cur ± sd   |    delta |  Δ sd   | verdict   |"
+  echo "|----------------|--------------------|--------------------|----------|---------|-----------|"
+  ROW_GATES=""
   TOKFILE=$(mktemp)
   seq 2 1000 | tr '\n' ' ' >"$TOKFILE"
   ab_row "tg64 (depth 0)" tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64
@@ -192,14 +381,18 @@ if [ -n "$AB_BASE" ]; then
          --prefix 512 --new 64 --steps 4 --reps 3 --tokens-file "$TOKFILE"
   rm -f "$TOKFILE"
   echo
-  echo "RESULT ab model=$LABEL base_so=$base_so cur_so=$cur_so"
+  echo "gates: ${ROW_GATES% }"
+  echo "RESULT ab model=$LABEL base_so=$base_so cur_so=$cur_so control=$CONTROL"
   exit 0
 fi
 
 # --- SonicBoom -------------------------------------------------------------
-sb_tg64=$(bench_runs tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
-sb_d512=$(bench_runs tok_s "$BASELINE/longctx_bench" --depth 512 --steps 64)
-sb_pp512=$(bench_runs pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt 512 --reps 3)
+# Each metric reports the median of RUNS runs *and* their spread: the median
+# alone cannot say whether a later comparison's difference is bigger than this
+# harness's own repeatability (see --control in the header).
+sb_tg64_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
+sb_d512_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 512 --steps 64)
+sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt 512 --reps 3)
 # prefix_cache_bench needs prompt token ids that are valid for the model under
 # test: real_prompt.tokens is a Gemma-vocab fixture, and feeding it to Qwen
 # (vocab 151936) indexes past the embedding table (CUDA kernel failure). Token
@@ -208,10 +401,15 @@ sb_pp512=$(bench_runs pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt 512 -
 # supported model's vocab.
 TOKFILE=$(mktemp)
 seq 2 1000 | tr '\n' ' ' >"$TOKFILE"
-sb_reuse=$(bench_runs reuse_ms "$BASELINE/prefix_cache_bench" \
-             --prefix 512 --new 64 --steps 4 --reps 3 \
-             --tokens-file "$TOKFILE")
+sb_reuse_stats=$(bench_stats reuse_ms "$BASELINE/prefix_cache_bench" \
+                   --prefix 512 --new 64 --steps 4 --reps 3 \
+                   --tokens-file "$TOKFILE")
 rm -f "$TOKFILE"
+
+sb_tg64="${sb_tg64_stats%% *}"; sb_tg64_sd="${sb_tg64_stats##* }"
+sb_d512="${sb_d512_stats%% *}"; sb_d512_sd="${sb_d512_stats##* }"
+sb_pp512="${sb_pp512_stats%% *}"; sb_pp512_sd="${sb_pp512_stats##* }"
+sb_reuse="${sb_reuse_stats%% *}"; sb_reuse_sd="${sb_reuse_stats##* }"
 
 # --- llama.cpp (optional) --------------------------------------------------
 ll_tg64="nan"; ll_d512="nan"; ll_pp512="nan"
@@ -245,13 +443,13 @@ fi
 # --- table -----------------------------------------------------------------
 echo
 echo "==== $LABEL ===="
-echo "median of $RUNS runs, CUDA spine, whole model in VRAM (llama.cpp -ngl 99)"
+echo "median ± sd of $RUNS runs, CUDA spine, whole model in VRAM (llama.cpp -ngl 99)"
 echo
-echo "| metric         | SonicBoom      | llama.cpp      |  ratio |"
-echo "|----------------|----------------|----------------|--------|"
-row "tg64 (depth 0)" "$sb_tg64" "$ll_tg64" "$(ratio "$sb_tg64" "$ll_tg64")" "tok/s"
-row "d512"           "$sb_d512" "$ll_d512" "$(ratio "$sb_d512" "$ll_d512")" "tok/s"
-row "pp512"          "$sb_pp512" "$ll_pp512" "$(ratio "$sb_pp512" "$ll_pp512")" "tok/s"
-row "reuse 512+64"   "$sb_reuse" "n/a" "n/a" "ms"
+echo "| metric         | SonicBoom          | llama.cpp      |  ratio |"
+echo "|----------------|--------------------|----------------|--------|"
+row "tg64 (depth 0)" "$sb_tg64" "$sb_tg64_sd" "$ll_tg64" "$(ratio "$sb_tg64" "$ll_tg64")" "tok/s"
+row "d512"           "$sb_d512" "$sb_d512_sd" "$ll_d512" "$(ratio "$sb_d512" "$ll_d512")" "tok/s"
+row "pp512"          "$sb_pp512" "$sb_pp512_sd" "$ll_pp512" "$(ratio "$sb_pp512" "$ll_pp512")" "tok/s"
+row "reuse 512+64"   "$sb_reuse" "$sb_reuse_sd" "n/a" "n/a" "ms"
 echo
 echo "RESULT bench model=$LABEL tg64=$sb_tg64 d512=$sb_d512 pp512=$sb_pp512 reuse_ms=$sb_reuse"
