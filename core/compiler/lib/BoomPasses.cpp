@@ -17,20 +17,15 @@
 // The planner's fusion passes, as MLIR passes over Boom IR
 // (design/mlir-migration.md §7c, step (c) of the migration).
 //
-// Each pass here is the port of one pass in planner/rewrites.cpp, in that
-// pass's place in its phase's order, with the same preconditions. What is
-// *not* copied is how it reads the graph: a pass here works through Boom IR —
-// ops, SSA values, the tensor table — and not through planner::Graph, which is
-// why it can be a pass at all. What is copied exactly is the result: the graph
-// this pipeline produces is the graph the Graph rewrites produce, tensor for
-// tensor and attribute for attribute, which is the whole acceptance criterion
-// (BoomConversion.h) and what tests/data/plans/*.plan pin.
-//
-// The split between the two implementations of a phase's pipeline is at the
-// boundary in addPortedPasses()/runUnportedPasses() below: everything before it
-// runs as Boom IR passes, everything after it still runs as the Graph rewrites
-// they were. A pass moves across with its port, in its own commit, and the
-// second list empties as the migration completes.
+// Every pass here is the port of one pass in planner/rewrites.cpp, in that
+// pass's place in its phase's order, with the same preconditions; between them
+// the two phases are ported in full. What is *not* copied is how a pass reads
+// the graph: a pass here works through Boom IR — ops, SSA values, the tensor
+// table — and not through planner::Graph, which is why it can be a pass at all.
+// What is copied exactly is the result: the graph this pipeline produces is the
+// graph the Graph rewrites produce, tensor for tensor and attribute for
+// attribute, which is the whole acceptance criterion (BoomConversion.h) and
+// what tests/data/plans/*.plan pin.
 
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomOps.h>
@@ -38,7 +33,6 @@
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/op_kind.h>
 #include <sonicboom/planner/partition.h>
-#include <sonicboom/planner/rewrites.h>
 
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -1158,13 +1152,28 @@ public:
   }
 };
 
+// fuse_silu_mul_mmq_pass (rewrites.cpp:535), as a Boom IR pass: the same
+// rewrite over the SwiGLU activation.
+class SiluMulMmqPass
+    : public mlir::PassWrapper<SiluMulMmqPass, mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SiluMulMmqPass)
+
+  void runOnOperation() override {
+    if (!fuseActMulMmq(getOperation(), planner::OpKind::Silu,
+                       planner::OpKind::SiluMulQuantize))
+      signalPassFailure();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
-// The phase's passes whose port has landed, in the phase's execution order
-// (design/mlir-migration.md §2). A pass arrives here from runUnportedPasses()
-// below in its own commit; the boundary between the two is the migration's only
-// state, and the two lists together are always the whole phase.
-void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
+// A phase's passes, in the phase's execution order (design/mlir-migration.md
+// §2): the port of each Graph rewrite in planner/rewrites.cpp, in that pass's
+// place in the order and with its preconditions. Both phases run entirely here
+// now — the boundary the migration ran on is gone — and rewrites.cpp keeps the
+// passes the emitter's default path still runs.
+void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
     pm.addPass(std::make_unique<QuantizeOncePass>());
@@ -1177,20 +1186,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
   case planner::IrPassPhase::Prefill:
     pm.addPass(std::make_unique<RmsNormMmqPass>());
     pm.addPass(std::make_unique<GeluMulMmqPass>());
-    return;
-  }
-}
-
-// The same pipeline's other half: the passes still implemented as the Graph
-// rewrites they were. They run on the graph the IR passes produced, so the
-// boundary is a graph either side can hold, and their order here is the order
-// the emitter used to call them in.
-void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
-  switch (phase) {
-  case planner::IrPassPhase::Decode:
-    return; // every decode pass has been ported
-  case planner::IrPassPhase::Prefill:
-    planner::fuse_silu_mul_mmq_pass(g);
+    pm.addPass(std::make_unique<SiluMulMmqPass>());
     return;
   }
 }
@@ -1207,8 +1203,7 @@ const char *phaseName(planner::IrPassPhase phase) {
 
 } // namespace
 
-// The pipeline itself: graph -> Boom IR -> the phase's passes -> graph -> the
-// passes still implemented as Graph rewrites.
+// The pipeline itself: graph -> Boom IR -> the phase's passes -> graph.
 void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
   mlir::MLIRContext context;
   context.getOrLoadDialect<boom::BoomDialect>();
@@ -1231,7 +1226,7 @@ void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
   // a state the dialect rejects fails here, naming that pass, rather than three
   // passes later.
   mlir::PassManager pm(&context);
-  addPortedPasses(pm, phase);
+  addPasses(pm, phase);
   if (mlir::failed(pm.run(graphOp))) {
     std::fprintf(stderr,
                  "ir_pass_pipeline(%s): a Boom IR pass failed (diagnostic "
@@ -1250,7 +1245,6 @@ void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
   }
 
   graph = std::move(*back);
-  runUnportedPasses(graph, phase);
 }
 
 } // namespace sonicboom::compiler
