@@ -523,9 +523,18 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   if (c0 >= n_keys) return;  // neutral chunk: the merge only reads chunks < n_active
   const uint64_t cn = (c0 + chunk < n_keys) ? chunk : (n_keys - c0);
 
-  // Phase 1: one q·k dot per key, warp-cooperative.
+  // Slot of the chunk's first key: one 64-bit modulo per block (device division
+  // is a software routine, and doing it per key was a large part of this loop's
+  // cost), then a compare-and-reset step so every later key's slot is a single
+  // increment. Identical values to (start + c0 + j) % n_slots.
+  uint64_t slot = (start + c0) % n_slots;
+
+  // Phase 1: one q·k dot per key, warp-cooperative. Unrolled by 4 so several
+  // keys' K loads are in flight at once — the per-key warp reduction is a
+  // serialized shuffle chain, so a single-key loop pays a full L2/DRAM latency
+  // per key.
+  #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const uint64_t slot = (start + c0 + j) % n_slots;
     const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     float d = 0.0f;
     for (int i = lane; i < head_dim; i += 32) d += qrow[i] * krow[i];
@@ -533,6 +542,7 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
     for (int o = 16; o > 0; o >>= 1)
       d += __shfl_down_sync(0xffffffffu, d, o);
     if (lane == 0) srow[j] = d * scale;
+    if (++slot == n_slots) slot = 0;
   }
   __syncwarp();
 
@@ -557,23 +567,32 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   __syncwarp();
 
   // Phase 3: V-weighted sum over the chunk — each lane owns a strided slice of
-  // the output row's dims.
+  // the output row's dims. The accumulators are indexed by compile-time
+  // constants (the runtime bound becomes a predicate) so the row lives in
+  // registers instead of a dynamically-indexed local array, which the previous
+  // form spilled to local memory inside this loop.
   const int dims_per_lane = head_dim >> 5;  // head_dim/32, <= 16
   float acc[16];
 #pragma unroll
   for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
+  slot = (start + c0) % n_slots;
+  #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const uint64_t slot = (start + c0 + j) % n_slots;
     const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     const float p = srow[j];  // exp(score - local max)
-    for (int i = 0; i < dims_per_lane; ++i) acc[i] += p * vrow[lane + i * 32];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+      if (i < dims_per_lane) acc[i] += p * vrow[lane + i * 32];
+    if (++slot == n_slots) slot = 0;
   }
 
   // Write partial [m, l, o[0..head_dim-1]] for this head.
   float* pp = partial + chunk_idx * (uint64_t)n_heads_q * (head_dim + 2) +
               (uint64_t)h * (head_dim + 2);
   if (lane == 0) { pp[0] = m; pp[1] = l; }
-  for (int i = 0; i < dims_per_lane; ++i) pp[2 + lane + i * 32] = acc[i];
+#pragma unroll
+  for (int i = 0; i < 16; ++i)
+    if (i < dims_per_lane) pp[2 + lane + i * 32] = acc[i];
 }
 
 // Merge the per-chunk partials in fixed order (flash-decoding online-softmax
