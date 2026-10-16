@@ -24,7 +24,9 @@
 //     type/attribute;
 //   * the construction-time verifiers reject what the runtime cannot execute (a
 //     negative dimension, an unknown dtype, a quantized shape that is not a
-//     whole number of blocks).
+//     whole number of blocks);
+//   * the quant-format set is quant::QuantType's table (quant/quantized_tensor.h)
+//     — same names, same block sizes, no second list to drift from it.
 //
 // The graph op's verifier is exercised by the conversion test, which builds
 // real graphs from real models; here there is nothing but the dialect.
@@ -37,12 +39,15 @@
 #include "mlir/IR/OperationSupport.h"
 
 #include "sonicboom/planner/op_kind.h"
+#include "sonicboom/quant/quantized_tensor.h"
 
+#include <cctype>
 #include <iostream>
 #include <string>
 
 namespace boom = sonicboom::compiler::boom;
 namespace planner = sonicboom::planner;
+namespace quant = sonicboom::quant;
 
 namespace {
 
@@ -137,6 +142,34 @@ int main() {
             boom::Q5_0Type::get(&context, {32}),
         "!boom.q5_0 round-trips through its assembly format");
 
+  // The format set is quant::QuantType's, not a second list that can drift from
+  // it (quant/quantized_tensor.h). For every format that table lists, the
+  // dialect must have a weight type whose mnemonic is the format name
+  // lowercased, which spells that same name and uses the table's block size.
+  // q3_K is in the table and was missing here; this is the check that catches
+  // the next one.
+  for (int i = int(quant::QuantType::Q3_K); i <= int(quant::QuantType::Q8_0);
+       ++i) {
+    const quant::QuantTypeInfo* info = quant::quant_type_info(quant::QuantType(i));
+    check(info != nullptr, "the QuantType table has an entry for index " +
+                               std::to_string(i));
+    if (!info) continue;
+    std::string mnemonic = info->name;
+    for (char& c : mnemonic) c = char(std::tolower(c));
+    // One block is a legal logical shape in every format.
+    const std::string text =
+        "!boom." + mnemonic + "<[" + std::to_string(info->block_size) + "]>";
+    mlir::Type parsed = mlir::parseType(text, &context);
+    check(bool(parsed), text + " is a type the dialect knows");
+    if (!parsed) continue;
+    check(boom::isBoomWeightQuantType(parsed), text + " is a weight quant type");
+    check(boom::boomQuantFormatName(parsed) == info->name,
+          text + " spells the format '" + std::string(info->name) + "'");
+    check(boom::boomQuantBlockSize(parsed) == int(info->block_size),
+          text + " uses the table's block size " +
+              std::to_string(info->block_size));
+  }
+
   //--- attributes: print, parse, identical ---------------------------------
 
   const auto desc = boom::TensorDescAttr::get(
@@ -181,6 +214,8 @@ int main() {
 
   // The block-contiguous dimension is the fastest-moving (last) one, so it is
   // the one that must be a whole number of blocks.
+  check(!boom::Q3KType::getChecked(emit_error, &context, {4096, 200}),
+        "a q3_K shape whose last dimension is not a multiple of 256 is rejected");
   check(!boom::Q4KType::getChecked(emit_error, &context, {2560, 200}),
         "a q4_K shape whose last dimension is not a multiple of 256 is rejected");
   check(!boom::Q4KType::getChecked(emit_error, &context, {}),

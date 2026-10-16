@@ -140,8 +140,8 @@ bool isAllSameShapeOp(llvm::StringRef opName) {
 // quantized ones.
 llvm::ArrayRef<int64_t> boomValueShape(Type type) {
   return llvm::TypeSwitch<Type, llvm::ArrayRef<int64_t>>(type)
-      .Case<TensorType, Q4KType, Q5KType, Q6KType, Q5_0Type, Q8_0Type, Q8_1Type>(
-          [](auto shaped) { return shaped.getShape(); })
+      .Case<TensorType, Q3KType, Q4KType, Q5KType, Q6KType, Q5_0Type, Q8_0Type,
+            Q8_1Type>([](auto shaped) { return shaped.getShape(); })
       .Default([](Type) { return llvm::ArrayRef<int64_t>(); });
 }
 

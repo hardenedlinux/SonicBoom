@@ -93,6 +93,12 @@ llvm::LogicalResult TensorType::verify(
   return llvm::success();
 }
 
+llvm::LogicalResult Q3KType::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
+    llvm::ArrayRef<int64_t> shape) {
+  return verifyQuantShape<Q3KType>(emitError, shape);
+}
+
 llvm::LogicalResult Q4KType::verify(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::ArrayRef<int64_t> shape) {
@@ -132,11 +138,13 @@ llvm::LogicalResult Q8_1Type::verify(
 //--- quant-format helpers ---------------------------------------------------
 
 bool isBoomWeightQuantType(mlir::Type type) {
-  return llvm::isa<Q4KType, Q5KType, Q6KType, Q5_0Type, Q8_0Type>(type);
+  return llvm::isa<Q3KType, Q4KType, Q5KType, Q6KType, Q5_0Type, Q8_0Type>(
+      type);
 }
 
 int boomQuantBlockSize(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, int>(type)
+      .Case<Q3KType>([](auto) { return Q3KType::blockSize(); })
       .Case<Q4KType>([](auto) { return Q4KType::blockSize(); })
       .Case<Q5KType>([](auto) { return Q5KType::blockSize(); })
       .Case<Q6KType>([](auto) { return Q6KType::blockSize(); })
@@ -148,6 +156,7 @@ int boomQuantBlockSize(mlir::Type type) {
 
 llvm::StringRef boomQuantFormatName(mlir::Type type) {
   return llvm::TypeSwitch<mlir::Type, llvm::StringRef>(type)
+      .Case<Q3KType>([](auto) { return Q3KType::formatName(); })
       .Case<Q4KType>([](auto) { return Q4KType::formatName(); })
       .Case<Q5KType>([](auto) { return Q5KType::formatName(); })
       .Case<Q6KType>([](auto) { return Q6KType::formatName(); })

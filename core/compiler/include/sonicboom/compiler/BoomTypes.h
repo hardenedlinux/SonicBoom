@@ -38,8 +38,8 @@ namespace sonicboom::compiler::boom {
 // anything else through their operand constraints; this is the same predicate
 // available to code that has a bare mlir::Type.
 inline bool isBoomValueType(mlir::Type type) {
-  return llvm::isa<TensorType, Q8_1Type, Q4KType, Q5KType, Q6KType, Q5_0Type,
-                   Q8_0Type>(type);
+  return llvm::isa<TensorType, Q8_1Type, Q3KType, Q4KType, Q5KType, Q6KType,
+                   Q5_0Type, Q8_0Type>(type);
 }
 
 // The quantized *weight* formats, in the order quant::QuantType lists them

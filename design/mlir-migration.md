@@ -478,11 +478,13 @@ Ops fall into three tiers, by what they lower to:
   `TensorDesc::shape` and `sx::DType` (`sx/ir.h:39-50`).
 - **Quantized types as first-class MLIR types.** This is the key change from
   `sx::DType`, which has no quantized members (`sx/ir.h:39-50`). The dialect
-  should define `!boom.q4_k`, `!boom.q5_k`, `!boom.q6_k`, `!boom.q5_0`,
-  `!boom.q8_0` for weights (mirroring `QuantType` at
+  should define `!boom.q3_k`, `!boom.q4_k`, `!boom.q5_k`, `!boom.q6_k`,
+  `!boom.q5_0`, `!boom.q8_0` for weights (mirroring `QuantType` at
   `core/include/sonicboom/quant/quantized_tensor.h:46-53`, with block sizes from
   `QuantTypeInfo` at `:61-67`) and `!boom.q8_1` for the activation layout the mmq
-  path consumes. **(inference):** making the quant type a *type* rather than the
+  path consumes. The set is `QuantType`'s, in its order, and that table is
+  authoritative: `test_boom_dialect` checks each of its entries against the
+  dialect's type of the same format name, so the two cannot drift apart again. **(inference):** making the quant type a *type* rather than the
   emitter-baked `ds` integer (`gemma4_plan.cpp:564-568`) is what lets the
   `ds`-consistency precondition of `fuse_rms_norm_mmq_pass`
   (`rewrites.cpp:362-377`) become a real verifier check rather than a private
