@@ -576,6 +576,13 @@ passes come after §6.2's quant types exist.
 
 - **Gate per pass:** the plan diff from (b) is unchanged, *plus* all of §7.6.
 
+**Status.** All nine passes are ported (§2's list), so every phase's pipeline now
+runs entirely through Boom IR. The IR pipeline is therefore what
+`libsonicboom.so` runs by default — the two implementations are required to
+leave the same graph, so this selects which one runs, not what the plan is.
+`SONICBOOM_IR_PASSES=0` selects the Graph rewrites the pipeline replaced, kept
+for differential comparison (`planner/ir_passes.h`).
+
 ### (d) Delete the `OpKind` IR
 
 Once every pass is a dialect pattern and the emitter builds the dialect directly,

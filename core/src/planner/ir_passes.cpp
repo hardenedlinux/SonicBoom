@@ -30,8 +30,12 @@ namespace sonicboom::planner {
 
 bool ir_passes_enabled() {
   if (!ir_passes_available()) return false;
+  // On by default: the Boom IR pipeline is the one libsonicboom.so runs.
+  // SONICBOOM_IR_PASSES=0 selects the Graph rewrites — the implementation the
+  // pipeline replaced, kept so the two can be compared from one environment
+  // and so a divergence can be attributed to one of them.
   const char *flag = std::getenv("SONICBOOM_IR_PASSES");
-  return flag != nullptr && *flag != '\0' && std::string_view(flag) != "0";
+  return flag == nullptr || std::string_view(flag) != "0";
 }
 
 } // namespace sonicboom::planner

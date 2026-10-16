@@ -44,13 +44,15 @@ enum class IrPassPhase { Decode, Prefill };
 // (SONICBOOM_ENABLE_MLIR; core/compiler/CMakeLists.txt).
 bool ir_passes_available();
 
-// Whether the runtime should derive the plan through Boom IR:
-// SONICBOOM_IR_PASSES set to anything but "0" (and the build has them). Read on
-// every call rather than cached — the flag is a live toggle, so a differential
-// test can turn it on and off inside one process and compare the two pipelines
-// over the same model, the same reason quant::cuda::q8_1_enabled reads its own
-// env flag live (cuda_quant_matmul.cu:1311). Off by default: the Graph rewrites
-// are what libsonicboom.so runs unless the environment asks otherwise.
+// Whether the runtime should derive the plan through Boom IR. On by default:
+// Boom IR is what libsonicboom.so runs, and SONICBOOM_IR_PASSES=0 selects the
+// Graph rewrites it replaced (the two leave the same graph, so the switch is
+// for comparing implementations, not for choosing a behavior). Also false when
+// the build has no compiler library. Read on every call rather than cached —
+// the flag is a live toggle, so a differential test can turn it on and off
+// inside one process and compare the two pipelines over the same model, the
+// same reason quant::cuda::q8_1_enabled reads its own env flag live
+// (cuda_quant_matmul.cu:1311).
 bool ir_passes_enabled();
 
 // Run `phase`'s rewrite pipeline over `graph` through Boom IR: the graph is
