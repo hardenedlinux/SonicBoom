@@ -579,6 +579,111 @@ public:
   }
 };
 
+// fuse_bias_into_gemv_pass (rewrites.cpp:539), as a Boom IR pass.
+//
+// The rewrite, unchanged: where an AddBias reads the single output of a
+// QuantizedMatmulQ8 and is itself the only reader of it, the projection takes
+// the AddBias's output tensor over and gains a `bias_slot` attribute naming the
+// bias to apply — the bias becomes an epilogue of the gemv instead of a
+// separate elementwise pass. The decode form only: a `batch` attribute on
+// either node means the batched (prefill) shape, and the mmq path has no
+// epilogue for it.
+class BiasIntoGemvPass
+    : public mlir::PassWrapper<BiasIntoGemvPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BiasIntoGemvPass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    // A projection whose output feeds anything besides the AddBias cannot take
+    // the bias over: that reader would read the fused node's output instead
+    // (rewrites.cpp:540-551).
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    // AddBias op -> (matmul op, bias slot). These AddBias ops are exactly the
+    // nodes the rewrite removes.
+    llvm::SmallVector<mlir::Operation *> biases;
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> matmulOfBias;
+    llvm::DenseMap<mlir::Operation *, int64_t> slotOfBias;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::AddBias) ||
+          node.getNumOperands() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      auto biasSlot = nodeAttrInt(attrs, "slot");
+      if (!biasSlot)
+        continue;
+      if (nodeAttrInt(attrs, "batch"))
+        continue; // batched (prefill) form
+      const int64_t proj = view.idOf(node.getOperand(0));
+      auto producedBy = producer.find(proj);
+      if (producedBy == producer.end())
+        continue;
+      mlir::Operation *m = producedBy->second;
+      if (m->getName().getStringRef() !=
+              boomOpName(planner::OpKind::QuantizedMatmulQ8) ||
+          m->getNumResults() != 1)
+        continue;
+      if (nodeAttrInt(m->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "batch"))
+        continue; // no epilogue on the mmq path
+      if (consumers[proj] != 1)
+        continue; // the projection has another reader
+      biases.push_back(&node);
+      matmulOfBias.insert({&node, m});
+      slotOfBias.insert({&node, *biasSlot});
+    }
+
+    if (biases.empty())
+      return;
+
+    for (mlir::Operation *addBias : biases) {
+      mlir::Operation *m = matmulOfBias.lookup(addBias);
+
+      // The matmul's attributes plus the bias it now applies, appended — the
+      // Graph pass push_backs onto the same ordered record (rewrites.cpp:601).
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          m->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      nodeAttrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "bias_slot",
+          builder.getI64IntegerAttr(slotOfBias.lookup(addBias))));
+
+      // The matmul keeps its identity and place and takes the AddBias's output;
+      // its own f32 output tensor — same shape, one buffer either way — stops
+      // being a tensor of the graph (rewrites.cpp:580-585).
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
+      builder.setInsertionPoint(m);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+          GraphEditor::nodeId(*m),
+          m->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*addBias),
+          m->getOperands(), addBias->getResultTypes(),
+          m->getAttrOfType<mlir::StringAttr>("backend"));
+
+      addBias->replaceAllUsesWith(node);
+      view.noteReplaced(addBias, node);
+      addBias->erase();
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      m->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -592,6 +697,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     pm.addPass(std::make_unique<RmsNormQuantizePass>());
     pm.addPass(std::make_unique<GeluMulQuantizePass>());
     pm.addPass(std::make_unique<SiluMulQuantizePass>());
+    pm.addPass(std::make_unique<BiasIntoGemvPass>());
     return;
   case planner::IrPassPhase::Prefill:
     return;
@@ -605,7 +711,6 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
 void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    planner::fuse_bias_into_gemv_pass(g);
     planner::fuse_residual_add_into_gemv_pass(g);
     return;
   case planner::IrPassPhase::Prefill:
