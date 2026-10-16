@@ -592,7 +592,7 @@ itself; the hand-written kernels remain the numerical and performance reference.
 | Gate | Definition |
 |---|---|
 | Gemma golden | the 64-step `[spine-cuda]` token line is bit-identical |
-| Qwen anchor | `test_qwen2_generate` anchor md5 matches `e202f2593c60f41929d3c753b3b8141f` |
+| Qwen anchor | `test_qwen2_generate` passes: the greedy stream matches the llama.cpp golden, divergences allowed only inside the test's near-tie margin |
 | Prefix cache | `test_prefix_cache` 12/12 |
 | Perf | `tools/bench.sh` medians-of-3 within ±0.5% |
 | Plan time | the `[cuda-timing] plan X ms` observable (`gemma4_plan.cpp:1177-1181`) does not regress |
