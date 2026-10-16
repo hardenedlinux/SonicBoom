@@ -684,6 +684,112 @@ public:
   }
 };
 
+// fuse_residual_add_into_gemv_pass (rewrites.cpp:614), as a Boom IR pass.
+//
+// The rewrite, unchanged: `Add(proj, residual)` where `proj` is the single-reader
+// output of a QuantizedMatmulQ8 becomes a projection of two inputs — the
+// residual appended as the last one, so the executor hands it to the backend —
+// taking over the Add's output. The residual keeps its buffer (the graph reads
+// it one node earlier, at the projection), so liveness only shortens. Either
+// operand may be the projection. Decode form only, as above.
+class ResidualAddIntoGemvPass
+    : public mlir::PassWrapper<ResidualAddIntoGemvPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ResidualAddIntoGemvPass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    // Add op -> (matmul op, the operand index the residual sits at). These Add
+    // ops are exactly the nodes the rewrite removes.
+    llvm::SmallVector<mlir::Operation *> adds;
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> matmulOfAdd;
+    llvm::DenseMap<mlir::Operation *, unsigned> residualOfAdd;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::Add) ||
+          node.getNumOperands() != 2)
+        continue;
+      if (nodeAttrInt(node.getAttrOfType<mlir::ArrayAttr>("node_attrs"), "batch"))
+        continue; // batched (prefill) form
+      for (unsigned s = 0; s < 2; ++s) {
+        const int64_t proj = view.idOf(node.getOperand(s));
+        auto producedBy = producer.find(proj);
+        if (producedBy == producer.end())
+          continue;
+        mlir::Operation *m = producedBy->second;
+        if (m->getName().getStringRef() !=
+                boomOpName(planner::OpKind::QuantizedMatmulQ8) ||
+            m->getNumResults() != 1)
+          continue;
+        if (nodeAttrInt(m->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "batch"))
+          continue; // no epilogue on the mmq path
+        if (consumers[proj] != 1)
+          continue; // the projection has another reader
+        adds.push_back(&node);
+        matmulOfAdd.insert({&node, m});
+        residualOfAdd.insert({&node, 1 - s});
+        break;
+      }
+    }
+
+    if (adds.empty())
+      return;
+
+    for (mlir::Operation *add : adds) {
+      mlir::Operation *m = matmulOfAdd.lookup(add);
+      const unsigned residual = residualOfAdd.lookup(add);
+
+      // The residual becomes the last input, so the executor hands it to the
+      // backend; the attribute names its index for backends that want it
+      // explicitly (rewrites.cpp:682-687).
+      llvm::SmallVector<mlir::Value> operands;
+      for (mlir::Value operand : m->getOperands())
+        operands.push_back(operand);
+      operands.push_back(add->getOperand(residual));
+
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          m->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      nodeAttrs.push_back(boom::NodeAttr::get(view.ctx(), "add_input",
+                                              builder.getI64IntegerAttr(
+                                                  m->getNumOperands())));
+
+      // The matmul keeps its identity and place and takes the Add's output; its
+      // own f32 output tensor becomes dead (rewrites.cpp:660-665).
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
+      builder.setInsertionPoint(m);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+          GraphEditor::nodeId(*m),
+          m->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*add), operands,
+          add->getResultTypes(),
+          m->getAttrOfType<mlir::StringAttr>("backend"));
+
+      add->replaceAllUsesWith(node);
+      view.noteReplaced(add, node);
+      add->erase();
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      m->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 //--- the pipeline -----------------------------------------------------------
 
 // The phase's passes whose port has landed, in the phase's execution order
@@ -698,6 +804,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     pm.addPass(std::make_unique<GeluMulQuantizePass>());
     pm.addPass(std::make_unique<SiluMulQuantizePass>());
     pm.addPass(std::make_unique<BiasIntoGemvPass>());
+    pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
     return;
   case planner::IrPassPhase::Prefill:
     return;
@@ -711,8 +818,7 @@ void addPortedPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
 void runUnportedPasses(planner::Graph &g, planner::IrPassPhase phase) {
   switch (phase) {
   case planner::IrPassPhase::Decode:
-    planner::fuse_residual_add_into_gemv_pass(g);
-    return;
+    return; // every decode pass has been ported
   case planner::IrPassPhase::Prefill:
     planner::fuse_rms_norm_mmq_pass(g);
     planner::fuse_gelu_mul_mmq_pass(g);
