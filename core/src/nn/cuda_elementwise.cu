@@ -1368,6 +1368,8 @@ void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k
 size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
+void* g_argmax_keys = nullptr;  // per-block packed argmax candidates (grid unsigned long long)
+size_t g_argmax_keys_bytes = 0;
 void* g_xpack = nullptr;        // repacked activation column-block for the cuBLAS dense matvec ([cols, 128])
 size_t g_xpack_bytes = 0;
 void* g_outpack = nullptr;      // padded output column-block ([rows, 128])
@@ -1451,6 +1453,85 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
     __syncthreads();
   }
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
+// Packed argmax candidate: value in the high word as a monotone unsigned key
+// (so an unsigned compare orders floats including +/-inf), index in the low word
+// as 0xFFFFFFFF - i (so the *largest* packed key is the largest value and, on a
+// tie, the smallest index). mi < 0 (no candidate: every value was NaN) maps to
+// low word 0, which the finalize turns back into -1.
+__device__ __forceinline__ unsigned long long argmax_key(float v, int mi) {
+  const unsigned bits = __float_as_uint(v);
+  const unsigned ord = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  const unsigned low = (mi < 0) ? 0u : (0xFFFFFFFFu - (unsigned)mi);
+  return ((unsigned long long)ord << 32) | low;
+}
+
+// Multi-block argmax. The single-block form above is latency-bound: one block
+// scans the whole row with a single 4 B load per thread in flight, which measures
+// ~47 us/step for a 152 k vocab. Each block here reduces a strided float4 slice
+// (grid sized from the row length and the SM count) to one packed key, and a
+// single-block finalize picks the winner. Per block the reduction is exactly the
+// single-block one (compare with >, first occurrence wins, so NaN never wins).
+__global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
+                                      unsigned long long* __restrict__ keys) {
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  const float4* x4 = reinterpret_cast<const float4*>(x);
+  const int n4 = n >> 2;
+  for (int i = blockIdx.x * blockDim.x + tid; i < n4;
+       i += gridDim.x * blockDim.x) {
+    const float4 v = x4[i];
+    if (v.x > mv) { mv = v.x; mi = 4 * i + 0; }
+    if (v.y > mv) { mv = v.y; mi = 4 * i + 1; }
+    if (v.z > mv) { mv = v.z; mi = 4 * i + 2; }
+    if (v.w > mv) { mv = v.w; mi = 4 * i + 3; }
+  }
+  // Row tail (n % 4): block 0 thread 0 sweeps the leftover elements, so the
+  // float4 path stays unconditional.
+  if (blockIdx.x == 0 && tid == 0)
+    for (int i = 4 * n4; i < n; ++i)
+      if (x[i] > mv) { mv = x[i]; mi = i; }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
+}
+
+__global__ void argmax_finalize_kernel(const unsigned long long* __restrict__ keys,
+                                       int n_keys, float* __restrict__ out) {
+  __shared__ unsigned long long s_key[256];
+  const int tid = threadIdx.x;
+  unsigned long long k = 0;
+  for (int i = tid; i < n_keys; i += blockDim.x) {
+    const unsigned long long c = keys[i];
+    k = c > k ? c : k;
+  }
+  s_key[tid] = k;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      const unsigned long long c = s_key[tid + s];
+      if (c > s_key[tid]) s_key[tid] = c;
+    }
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const unsigned low = (unsigned)(s_key[0] & 0xFFFFFFFFull);
+    out[0] = (low == 0) ? -1.0f : float(0xFFFFFFFFu - low);
+  }
 }
 
 // --- batched prefill kernels (the decode kernels generalized to n columns) ---
@@ -2413,7 +2494,22 @@ bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_sc
 bool argmax_dev(const float* x, int n, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !out) return false;
-  argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  // Enough float4s for at least two blocks, and a 16 B-aligned base (the pool
+  // allocations are, but the general case has to degrade gracefully).
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * sizeof(unsigned long long)));
+  if (!keys) return false;
+  argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
+  argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
 
