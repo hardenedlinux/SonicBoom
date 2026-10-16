@@ -63,10 +63,14 @@ constexpr size_t kMmqBlockBytes = 144;
 constexpr size_t kMmqTailGuardBlocks = 128;
 
 // Whether a `size_bytes` f32 buffer covers the mmq activation buffer for a
-// [n, dim] position-major input: (dim/128)*n blocks of data + the J_max tail
-// guard, 144 bytes each. dim must be a multiple of 128 (the kernels enforce it).
+// [n, dim] position-major input: (dim/128, rounded up to an even plane count)*n
+// blocks of data + the J_max tail guard, 144 bytes each. The even rounding is
+// the zero pad plane the kernel's last 256-value K-iteration reads when dim is
+// not a multiple of 256 (see mmq::mmq_q8_planes; a no-op for K-quant weights).
+// dim must be a multiple of 128 (the kernels enforce it).
 bool mmq_q8_fits(int dim, int n, uint64_t size_bytes) {
-  const size_t blocks = (size_t(dim) / 128) * size_t(n) + kMmqTailGuardBlocks;
+  const size_t planes = size_t(dim) / 128 + ((dim / 128) & 1);
+  const size_t blocks = planes * size_t(n) + kMmqTailGuardBlocks;
   return size_bytes >= blocks * kMmqBlockBytes;
 }
 

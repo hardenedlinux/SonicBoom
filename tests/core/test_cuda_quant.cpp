@@ -534,6 +534,76 @@ void test_legacy_cublas_type(sbquant::QuantType type, const char* name,
                      "legacy cuBLAS fp16 dequant within the fp16 bound");
 }
 
+// The legacy 32-element formats take the mmq int8 tensor-core path too. Its
+// error is the activation's per-32-value int8 quantization (the weight side is
+// exact for Q5_0/Q8_0, whose dequantized values are integers), so the yardstick
+// is the same mag-proportional bound as the cuBLAS test with the int8 activation
+// rounding coefficient: each |w_k x_k| contributes at most 2/127 of its own
+// magnitude. M must be a multiple of the MMQ row tile I == 128. The shared rng
+// stream feeds every test in main(), so this test draws from its own generator
+// and leaves the shared one untouched.
+void test_legacy_mmq_type(sbquant::QuantType type, const char* name,
+                          uint64_t rows, uint64_t cols, uint64_t n) {
+  std::mt19937 rng(0x1E9AC7u + unsigned(type));
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+
+  std::vector<float> X(cols * n), Y(rows * n);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  unsetenv("SONICBOOM_GEMV_F32");   // q8_1 active -> mmq for n >= mmq_min_n()
+  setenv("SONICBOOM_MMQ", "1", 1);  // ... and mmq not disabled
+  unsetenv("SONICBOOM_CUBLAS");
+  const bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
+  check(ok, "legacy mmq matmul returns true");
+  if (!ok) return;
+
+  const std::vector<float> ref = q6_f32_reference(W, X, n);
+  if (ref.size() != rows * n) {
+    check(false, "legacy mmq reference dequantize failed");
+    return;
+  }
+
+  std::vector<float> wf(W.numel());
+  if (!sbquant::dequantize_f32(W, wf.data(), wf.size())) {
+    check(false, "legacy mmq bound: dequantize failed");
+    return;
+  }
+  constexpr double kActQuant = 2.0 / 127.0;  // int8 activation rounding
+  size_t bad = 0;
+  double worst = 0.0;
+  double max_dev = 0.0;  // witness: the int8 path must deviate from fp32
+  for (uint64_t c = 0; c < n; ++c) {
+    for (uint64_t row = 0; row < rows; ++row) {
+      double mag = 0.0;
+      for (uint64_t k = 0; k < cols; ++k)
+        mag += std::fabs(double(wf[row * cols + k]) * double(X[c * cols + k]));
+      const double bound = kActQuant * mag + 1e-3;
+      const double err =
+          std::fabs(double(Y[c * rows + row]) - double(ref[c * rows + row]));
+      if (err > bound) ++bad;
+      worst = std::max(worst, err / std::max(bound, 1e-12));
+      max_dev = std::max(max_dev, err);
+    }
+  }
+  const std::string bound_what =
+      std::string("legacy mmq ") + name + " within the int8 activation bound";
+  check(bad == 0, bound_what.c_str());
+  // The bound above is loose enough that the fp32 fallback would also satisfy it.
+  // The int8 activation quantization must move the result well beyond fp32 noise,
+  // so falling below this floor means the mmq path never ran.
+  const std::string ran_what =
+      std::string("legacy mmq ") + name + " ran the int8 path (not fp32)";
+  check(max_dev > 1e-5, ran_what.c_str());
+  if (!(max_dev > 1e-5))
+    std::cerr << "    " << name << " mmq: max deviation " << max_dev << "\n";
+  std::cerr << "    legacy mmq " << name << " (M=" << rows << " K=" << cols
+            << " n=" << n << "): " << bad << " over the bound, worst ratio "
+            << worst << ", max dev " << max_dev << "\n";
+}
+
 void test_mmq_q6_type(std::mt19937& rng) {
   (void)rng;
   std::cout << "  SKIP Q6_K MMQ: TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed\n";
@@ -640,6 +710,15 @@ int main() {
   test_legacy_batched_q8_1_type(sbquant::QuantType::Q8_0, "q8_0", rng);
 
   test_mmq_q6_type(rng);
+  // Legacy mmq, K % MMQ_ITER_K == 0 (no pad plane) and K = 896 (one pad plane,
+  // the shape that caught the missing activation padding: 896 = 7*128 is an odd
+  // plane count, so the kernel's last 256-value K-iteration reads plane 7).
+  test_legacy_mmq_type(sbquant::QuantType::Q5_0, "q5_0", 128, 1024, 32);
+  test_legacy_mmq_type(sbquant::QuantType::Q8_0, "q8_0", 128, 1024, 32);
+  test_legacy_mmq_type(sbquant::QuantType::Q5_0, "q5_0/d896", 128, 896, 32);
+  test_legacy_mmq_type(sbquant::QuantType::Q8_0, "q8_0/d896", 128, 896, 32);
+  test_legacy_mmq_type(sbquant::QuantType::Q5_0, "q5_0/d896n512", 896, 896, 512);
+  test_legacy_mmq_type(sbquant::QuantType::Q8_0, "q8_0/d896n512", 896, 896, 512);
   test_cublas_q6_type(rng);
   test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);

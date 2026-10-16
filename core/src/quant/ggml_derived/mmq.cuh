@@ -25,9 +25,11 @@
 //                                                write_back_mma
 //   ggml/src/ggml-cuda/mmq-config-ampere.cuh  — J set (fallback = false)
 //   ggml/src/ggml-cuda/mmq-load-tiles.cuh     — load_tiles_q3/q4/q5/q6_K,
+//                                                load_tiles_q5_0/q8_0,
 //                                                unpack_scales_q45_K
 //   ggml/src/ggml-cuda/mmq-vec-dot.cuh        — vec_dot_q8_0_16_q8_1_mma,
-//                                                vec_dot_q8_1_q8_1_mma
+//                                                vec_dot_q8_1_q8_1_mma,
+//                                                vec_dot_q8_0_q8_1_mma
 //   ggml/src/ggml-cuda/quantize.cu            — quantize_mmq_q8_1
 //   ggml/src/ggml-cuda/vecdotq.cuh            — get_int_b2 / get_int_b4
 //
@@ -81,6 +83,12 @@ constexpr int QR4_K         = 2;
 constexpr int QI5_K         = 32;
 constexpr int QR5_K         = 2;
 constexpr int QI6_K         = 32;
+constexpr int QK5_0         = 32;
+constexpr int QI5_0         = 4;
+constexpr int QR5_0         = 2;
+constexpr int QK8_0         = 32;
+constexpr int QI8_0         = 8;
+constexpr int QR8_0         = 1;
 constexpr int VDR_Q3_K_Q8_1_MMQ = 2;
 constexpr int MMQ_TILE_NE_K = 32;
 constexpr int MMQ_TILE_Y_K  = 36;
@@ -93,12 +101,17 @@ constexpr int CUDA_QUANTIZE_BLOCK_SIZE_MMQ = 128;
 // Shared-memory stride (in int32 units) of one row of the weight tile.
 // Q3_K: 2*32 qs int32 + 16 float dequant scales + 4 pad = 84.
 // Q4_K/Q5_K: 2*32 qs int32 + 8 half2 dequant scales + 4 pad = 76.
+// Q5_0/Q8_0: 2*32 qs int32 + 8 float dequant scales + 4 pad = 76 (ggml's
+//   GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, whose value coincides with Q8_1's).
 // Q6_K: 2*32 qs int32 + 1 float d + 4 int32 packed signed scales + 7 pad = 76.
 constexpr int SRAM_STRIDE_Q3_K = 2*MMQ_TILE_NE_K + 16 + 4;
 constexpr int SRAM_STRIDE_Q8_1 = 2*MMQ_TILE_NE_K +  8 + 4;
+constexpr int SRAM_STRIDE_LEGACY_32 = 2*MMQ_TILE_NE_K + 2*MMQ_TILE_NE_K/QI8_0 + 4;
 constexpr int SRAM_STRIDE_Q6_K = 2*MMQ_TILE_NE_K + 1 + 4 + 7;
+static_assert(SRAM_STRIDE_LEGACY_32 % 8 == 4, "legacy-32 sram stride padding");
 
-enum MMQType { MMQ_Q3_K = 0, MMQ_Q4_K = 1, MMQ_Q5_K = 2, MMQ_Q6_K = 3 };
+enum MMQType { MMQ_Q3_K = 0, MMQ_Q4_K = 1, MMQ_Q5_K = 2, MMQ_Q6_K = 3,
+               MMQ_Q5_0 = 4, MMQ_Q8_0 = 5 };
 enum DsLayout { D4 = 0, DS4 = 1, D4_Q8_1 = 2 };
 
 __host__ __device__ constexpr int PAD(int x, int n) { return ((x) + (n) - 1) / (n) * (n); }
@@ -135,6 +148,20 @@ struct block_q6_K {
   half d;
 };
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
+
+// Legacy 32-element formats (one fp16 scale per 32 values, no min).
+struct block_q5_0 {
+  half d;
+  uint8_t qh[4];
+  uint8_t qs[QK5_0 / 2];
+};
+static_assert(sizeof(block_q5_0) == 22, "block_q5_0 must be 22 bytes");
+
+struct block_q8_0 {
+  half d;
+  int8_t qs[QK8_0];
+};
+static_assert(sizeof(block_q8_0) == 34, "block_q8_0 must be 34 bytes");
 
 struct block_q8_1_mmq {
   union { float d4[4]; half2 ds4[4]; };
@@ -413,6 +440,94 @@ __device__ __forceinline__ void load_tiles_q6_K(const char* x, int* x_tile,
   }
 }
 
+// Q5_0 (ggml mmq-load-tiles.cuh, Turing/Ampere MMA path). One 256-value K-block
+// is 8 ggml blocks of 32 values; block kbx owns sram ints [kbx*8, kbx*8+8) and
+// its scale lands in x_df[kbxd], kbxd == the block index within the row.
+template <int J>
+__device__ __forceinline__ void load_tiles_q5_0(const char* x, int* x_tile,
+                                                int kbx0, int stride) {
+  constexpr int sram_stride = SRAM_STRIDE_LEGACY_32;
+  int*   x_qs = (int*)x_tile;
+  float* x_df = (float*)(x_qs + 2*MMQ_TILE_NE_K);
+
+  constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_0);  // 32
+  constexpr int nrows = WARP_SIZE / threads_per_row;         // 1
+  const int txi  = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int kbx  = txi / QI5_0;
+  const int kqsx = txi % QI5_0;
+
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
+    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    const block_q5_0* bxi = (const block_q5_0*)x + kbx0 + i*stride + kbx;
+
+    const int ql = get_int_b2(bxi->qs, kqsx);            // 16 low nibbles
+    const int qh = get_int_b2(bxi->qh, 0) >> (4 * kqsx); // 4 high bits
+
+    int qs0 = (ql >>  0)   & 0x0F0F0F0F;
+    qs0    |= (qh <<  4)   & 0x00000010;
+    qs0    |= (qh << 11)   & 0x00001000;
+    qs0    |= (qh << 18)   & 0x00100000;
+    qs0    |= (qh << 25)   & 0x10000000;
+    qs0     = __vsub4(qs0, 0x10101010);                  // subtract 16
+
+    int qs1 = (ql >>  4)   & 0x0F0F0F0F;                 // 16 high nibbles
+    qs1    |= (qh >> 12)   & 0x00000010;
+    qs1    |= (qh >>  5)   & 0x00001000;
+    qs1    |= (qh <<  2)   & 0x00100000;
+    qs1    |= (qh <<  9)   & 0x10000000;
+    qs1     = __vsub4(qs1, 0x10101010);
+
+    x_qs[i*sram_stride + kbx*(2*QI5_0) + kqsx + 0]     = qs0;
+    x_qs[i*sram_stride + kbx*(2*QI5_0) + kqsx + QI5_0] = qs1;
+  }
+
+  constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI5_0;  // 8
+  constexpr int rows_per_warp = WARP_SIZE / blocks_per_tile_x_row;  // 4
+  const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
+    const int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+    const block_q5_0* bxi = (const block_q5_0*)x + kbx0 + i*stride + kbxd;
+    x_df[i*sram_stride + kbxd] = float(bxi->d);
+  }
+}
+
+// Q8_0 (ggml mmq-load-tiles.cuh, Turing/Ampere MMA path). Same row geometry as
+// Q5_0, but the two x_qs halves hold blocks [0,3] and [4,7] respectively, so a
+// k00 == MMQ_TILE_NE_K call reads the second half's ints.
+template <int J>
+__device__ __forceinline__ void load_tiles_q8_0(const char* x, int* x_tile,
+                                                int kbx0, int stride) {
+  constexpr int sram_stride = SRAM_STRIDE_LEGACY_32;
+  int*   x_qs = (int*)x_tile;
+  float* x_df = (float*)(x_qs + 2*MMQ_TILE_NE_K);
+
+  constexpr int threads_per_row = 32;  // MMQ_ITER_K/(4*QR8_0) would be 64
+  constexpr int nrows = WARP_SIZE / threads_per_row;  // 1
+  const int txi  = WARP_SIZE > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+  const int kbx  = txi / QI8_0;
+  const int kqsx = txi % QI8_0;
+
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += nrows*NWARPS) {
+    const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+    const block_q8_0* bxi = (const block_q8_0*)x + kbx0 + i*stride + kbx;
+    x_qs[i*sram_stride + 0              + txi] = get_int_b2(bxi[0].qs, kqsx);
+    x_qs[i*sram_stride + MMQ_TILE_NE_K  + txi] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+  }
+
+  constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;  // 8
+  constexpr int rows_per_warp = WARP_SIZE / blocks_per_tile_x_row;  // 4
+  const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+  for (int i0 = 0; i0 < I; i0 += NWARPS*rows_per_warp) {
+    const int i = i0 + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+    const block_q8_0* bxi = (const block_q8_0*)x + kbx0 + i*stride + kbxd;
+    x_df[i*sram_stride + kbxd] = float(bxi->d);
+  }
+}
+
 template <int Type, int J>
 __device__ __forceinline__ void load_tiles(const char* x, int* x_tile, int kbx0, int stride) {
   if constexpr (Type == MMQ_Q3_K) {
@@ -421,6 +536,10 @@ __device__ __forceinline__ void load_tiles(const char* x, int* x_tile, int kbx0,
     load_tiles_q4_K<J>(x, x_tile, kbx0, stride);
   } else if constexpr (Type == MMQ_Q5_K) {
     load_tiles_q5_K<J>(x, x_tile, kbx0, stride);
+  } else if constexpr (Type == MMQ_Q5_0) {
+    load_tiles_q5_0<J>(x, x_tile, kbx0, stride);
+  } else if constexpr (Type == MMQ_Q8_0) {
+    load_tiles_q8_0<J>(x, x_tile, kbx0, stride);
   } else {
     load_tiles_q6_K<J>(x, x_tile, kbx0, stride);
   }
@@ -646,12 +765,86 @@ __device__ __forceinline__ void vec_dot_q6_K_q8_1_mma(const int* x, const int* y
   }
 }
 
+// Q5_0 / Q8_0 weights -> activation quantized to block_q8_1_mmq with float
+// (D4) scales (ggml vec_dot_q8_0_q8_1_mma, ds_layout = MMQ_Q8_1_DS_LAYOUT_D4).
+// Same mma shape as the Q4_K/Q5_K path; the weight side contributes one float
+// scale per 32 values and no min term, and the activation side contributes one
+// float per 32 values instead of a half2 {d, s}.
+template <int J>
+__device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(const int* x, const int* y,
+                                                      float* sum, int k00) {
+  typedef tile<16, 8> tile_A;
+  typedef tile<8, 8> tile_B;
+  typedef tile<16, 8> tile_C;
+
+  constexpr int sram_stride = SRAM_STRIDE_LEGACY_32;
+  constexpr int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
+  constexpr int ntx = rows_per_warp / tile_C::I;
+
+  y += (threadIdx.y % ntx) * (tile_C::J * MMQ_TILE_Y_K);
+
+  const int*   x_qs = x;
+  const float* x_df = (const float*)x_qs + 2*MMQ_TILE_NE_K;
+  const int*   y_qs = y + 4;
+  const float* y_df = (const float*)y;
+
+  tile_A A[ntx][MMQ_TILE_NE_K/QI8_0];
+  float dA[ntx][tile_C::ne/2][MMQ_TILE_NE_K/QI8_0];
+
+  const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+#pragma unroll
+  for (int n = 0; n < ntx; ++n) {
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+      const int k0 = k00 + k01;
+      load_ldmatrix(A[n][k01/QI8_0], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+    }
+#pragma unroll
+    for (int l = 0; l < tile_C::ne/2; ++l) {
+      const int i = i0 + n*tile_A::I + tile_C::get_i(2*l);
+#pragma unroll
+      for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+        const int k0 = k00 + k01;
+        dA[n][l][k01/QI8_0] = x_df[i*sram_stride + k0/QI8_0];
+      }
+    }
+  }
+
+#pragma unroll
+  for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+#pragma unroll
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
+      tile_B B;
+      float dB[tile_C::ne/2];
+      load_generic(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+#pragma unroll
+      for (int l = 0; l < tile_C::ne/2; ++l) {
+        const int j = j0 + tile_C::get_j(l);
+        dB[l] = y_df[j*MMQ_TILE_Y_K + k01/QI8_1];
+      }
+#pragma unroll
+      for (int n = 0; n < ntx; ++n) {
+        tile_C C;
+        mma(C, A[n][k01/QI8_0], B);
+#pragma unroll
+        for (int l = 0; l < tile_C::ne; ++l) {
+          sum[(j0/tile_C::J + n)*tile_C::ne + l] +=
+              C.x[l]*dA[n][l/2][k01/QI8_0]*dB[l%2];
+        }
+      }
+    }
+  }
+}
+
 template <int Type, int J>
 __device__ __forceinline__ void vec_dot(const int* x, const int* y, float* sum, int k00) {
   if constexpr (Type == MMQ_Q3_K) {
     vec_dot_q8_0_16_q8_1_mma<J>(x, y, sum, k00);
   } else if constexpr (Type == MMQ_Q6_K) {
     vec_dot_q6_K_q8_1_mma<J>(x, y, sum, k00);
+  } else if constexpr (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) {
+    vec_dot_q8_0_q8_1_mma<J>(x, y, sum, k00);
   } else {
     vec_dot_q8_1_q8_1_mma<J>(x, y, sum, k00);
   }
@@ -748,6 +941,13 @@ __global__ void quantize_mmq_q8_1(const float* __restrict__ x, block_q8_1_mmq* _
 
 // --- matmul kernel (ggml mmq.cuh, non-stream-k, fallback = false) ---------
 
+// Values per weight block: 256 for the K-quants (QK_K), 32 for the legacy
+// 32-element formats. A 256-value iteration is therefore 1 weight block or 8.
+template <int Type>
+__host__ __device__ constexpr int qk_of() {
+  return (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? QK5_0 : QK_K;
+}
+
 template <int Type, int J>
 __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
                           float* __restrict__ dst,
@@ -758,7 +958,8 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
   int* tile_x = tile_y + PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS);
 
   constexpr int sz = (int)(sizeof(block_q8_1_mmq) / sizeof(int));  // 36
-  constexpr int blocks_per_iter = MMQ_ITER_K / QK_K;               // 1
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;   // 1 (K-quant) or 8 (legacy)
 
   const int jt = blockIdx.y;
   const int it = blockIdx.x;
@@ -774,7 +975,7 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
   for (int kb0 = 0; kb0 < blocks_per_row; kb0 += blocks_per_iter) {
     load_tiles<Type, J>(x, tile_x, offset_x + kb0, blocks_per_row);
     {
-      const int* by0 = y + offset_y + ncols_y * (kb0 * QK_K / QK8_1_MMQ) * sz;
+      const int* by0 = y + offset_y + ncols_y * (kb0 * qk / QK8_1_MMQ) * sz;
 #pragma unroll
       for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
         const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
@@ -785,7 +986,7 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
     vec_dot<Type, J>(tile_x, tile_y, sum, 0);
     __syncthreads();
     {
-      const int* by0 = y + offset_y + ncols_y * ((kb0 * QK_K / QK8_1_MMQ) * sz + sz);
+      const int* by0 = y + offset_y + ncols_y * ((kb0 * qk / QK8_1_MMQ) * sz + sz);
 #pragma unroll
       for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
         const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
@@ -802,10 +1003,38 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
 
 // --- host-side launchers (SonicBoom's own) ---------------------------------
 
-// Number of block_q8_1_mmq elements needed for a [K/128][n] activation buffer,
-// including J_max tail padding (over-read guard, mirrors ggml's src1 sizing).
+// Number of 128-value block planes an activation row must have for mul_mat_q:
+// the kernel always consumes whole 256-value K-iterations (two planes, see the
+// kb0 loop and the two vec_dot calls), so an *odd* plane count gets one trailing
+// zero plane. That plane's scale is 0, which zeroes the tail iteration's second
+// half whatever the weight-side over-read returns. ggml reaches the same state
+// by padding ne10 to MATRIX_ROW_PADDING (512) and zero-filling the pad in
+// quantize_mmq_q8_1. Even counts are unchanged, so the K-quant formats (their K
+// is always a multiple of 256, e.g. Gemma) keep today's exact layout.
+__host__ __device__ constexpr int mmq_q8_planes(int64_t K) {
+  const int64_t p = K / QK8_1_MMQ;
+  return int(p + (p & 1));
+}
+
+// Number of block_q8_1_mmq elements needed for a [K/128 -> padded][n] activation
+// buffer, including J_max tail padding (over-read guard, mirrors ggml's src1
+// sizing). K must be a multiple of 128 (the kernels and the plan enforce it).
 __host__ inline size_t mmq_q8_blocks(int K, int n) {
-  return (size_t)(K / QK8_1_MMQ) * n + I;  // I == J_max == 128
+  return (size_t)mmq_q8_planes(K) * n + I;  // I == J_max == 128
+}
+
+// Zero the trailing plane(s) mmq_q8_blocks adds over the planes a quantizer
+// writes. Only the legacy 32-element formats can need it (K not a multiple of
+// MMQ_ITER_K == 256); their D4 layout stores a float block scale, so a zeroed
+// block is a zero scale. No-op for a K that is a multiple of 256.
+__host__ inline void zero_pad_planes(const block_q8_1_mmq* y, int K, int n,
+                                     cudaStream_t stream) {
+  const int64_t used = K / QK8_1_MMQ;
+  const int64_t planes = mmq_q8_planes(K);
+  if (planes == used) return;
+  cudaMemsetAsync(const_cast<void*>(static_cast<const void*>(y) +
+                                     used * n * sizeof(block_q8_1_mmq)),
+                  0, size_t(planes - used) * n * sizeof(block_q8_1_mmq), stream);
 }
 
 // Quantize an already-transposed activation Xt [n, K] into block_q8_1_mmq.
@@ -834,7 +1063,9 @@ template <int Type, int J>
 __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
                                int M, int n, int blocks_per_row, cudaStream_t stream) {
   constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
-                              Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K : SRAM_STRIDE_Q8_1;
+                              Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
+                              (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
+                                                                    : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
   cudaFuncSetAttribute((const void*)mul_mat_q<Type, J>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
