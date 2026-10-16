@@ -62,14 +62,43 @@ target_compile_definitions(test_vocab PRIVATE
 # a device, and the goldens are per model.
 target_compile_definitions(test_plan_record PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-set_tests_properties(test_plan_record PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_plan_record
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
 
 # test_plan_cache (prefill segment cache: a hit must be indistinguishable from a
 # fresh build) needs the repository root for models/, and the same CUDA + GGUF
 # skip conditions as test_plan_record.
 target_compile_definitions(test_plan_cache PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-set_tests_properties(test_plan_cache PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(test_plan_cache
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
+# The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).
+#
+# The lock covers every test that allocates device memory. Two of them at once
+# do not fit on this device (8192 MiB): the measured peak of a single run is
+# 7726 MiB for test_prefix_cache, 4780 for test_plan_cache, 3784 for
+# test_plan_record and test_boom_conversion, 3370 for test_generate and 924 for
+# test_qwen2_generate (idle 242). `ctest -jN` runs tests in parallel by default
+# (the default is -j1 for `ctest` but -jN for a CI driver), and the two peaks are
+# not independent budgets: the run that gets there first sizes its device pools
+# against the memory that is free, so the second one's allocation comes out of
+# that, and whichever loses fails its own allocation — measured, `ctest -j4`
+# fails with "device buffer allocation failed" (test_prefix_cache,
+# guile-inference) and with kernel entry points returning failure on their
+# internal allocation (test_cuda_quant). It is not a wrong-answer failure, but a
+# nondeterministic one, so it is not something a gate can live with.
+#
+# That is also why the CUDA unit tests are in: they peak at only 334-380 MiB
+# (140 above idle) and pass on their own, but they fail beside a model test.
+# Being small does not make a test safe to co-schedule — only serializing the
+# GPU tests does.
+#
+# Deliberately not locked: the tests that read a GGUF on the host without
+# touching the device (test_gguf, test_dequant, test_gemma4, test_qwen2_config,
+# test_vocab), and everything else in the suite — CPU-only tests stay parallel.
+set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
+  PROPERTIES RESOURCE_LOCK gpu_vram)
 
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
@@ -93,6 +122,12 @@ if(SONICBOOM_USE_CUDA)
   add_executable(test_cuda_elementwise test_cuda_elementwise.cpp)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
+
+  # Small, but still GPU tests: they fail beside a model test (see "The GPU
+  # tests run one at a time" above).
+  set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
+                       test_cuda_elementwise
+    PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # Static execution planner tests (unit + integration). They include only
@@ -158,5 +193,8 @@ if(SONICBOOM_ENABLE_MLIR)
   target_compile_definitions(test_boom_conversion PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
   sb_add_cpp_test(test_boom_conversion)
-  set_tests_properties(test_boom_conversion PROPERTIES SKIP_RETURN_CODE 77)
+  # It loads both models onto the GPU for the plan gate, so it takes the same
+  # lock as the other model tests (see "The model tests run one at a time").
+  set_tests_properties(test_boom_conversion
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
 endif()

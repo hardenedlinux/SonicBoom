@@ -97,6 +97,11 @@ if(GUILE_EXECUTABLE)
             ${GUILE_EXECUTABLE} --no-auto-compile
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-inference.scm)
+    # It runs the model on the GPU, so it takes the same device lock as the C++
+    # model tests (tests/core/CMakeLists.txt): two of those at once do not fit
+    # on this device, and this one fails beside one of them with "device buffer
+    # allocation failed".
+    set_tests_properties(guile-inference PROPERTIES RESOURCE_LOCK gpu_vram)
 
   # guile-serve-http drives the OpenAI-compatible server (serve/app.scm) end to
   # end — plain JSON, SSE over a raw socket, a WebSocket — against the mock
