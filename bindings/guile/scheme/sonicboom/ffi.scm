@@ -15,9 +15,11 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-9)
+  #:use-module (json)
   #:use-module (ice-9 threads)
   #:export (libsonicboom-available?
             run-s-expr
+            build-info
             sb-status-ok?
             sb-status->message
             SB_ERR_BINDING
@@ -79,7 +81,8 @@ library search path?")))
 (define (ensure-procs)
   (or (%procs)
       (let ((table
-             `((sb_parse . ,(foreign-proc "sb_parse" int
+             `((sb_build_info . ,(foreign-proc "sb_build_info" '* (list)))
+               (sb_parse . ,(foreign-proc "sb_parse" int
                                           (list '* size_t '* '*)))
                (sb_compile . ,(foreign-proc "sb_compile" int
                                             (list '* '* '* '*)))
@@ -170,6 +173,37 @@ NULL the slot."
       ((proc 'sb_error_free) p)
       (slot-null! err-slot))
     msg))
+
+;;; --- build info -------------------------------------------------------------
+
+;;; The C ABI reports how libsonicboom.so was configured as a JSON object (see
+;;; sb_build_info in capi.h). It is JSON rather than a struct so the field set
+;;; can grow without breaking a caller; here it is decoded once and the string
+;;; keys are turned into symbols, so a caller writes
+;;;
+;;;   (assq-ref (build-info) 'git-commit)
+;;;   (assq-ref (assq-ref (build-info) 'cuda) 'archs)   ; => ("86")
+;;;
+;;; Nested objects (cuda, llvm) become alists too; arrays become lists.
+(define (json-key->symbol key) (string->symbol key))
+
+(define (normalize-json node)
+  (cond ((pair? node)                       ; a JSON object: ((key . value) ...)
+         (map (lambda (entry)
+                (cons (json-key->symbol (car entry))
+                      (normalize-json (cdr entry))))
+              node))
+        ((vector? node) (map normalize-json (vector->list node)))
+        (else node)))
+
+(define (build-info)
+  "How the loaded libsonicboom.so was built, as a symbol-keyed alist: git
+commit, build type, CUDA (enabled/archs/toolkit), LLVM (version/major/origin),
+and target platform. Signals an error if the library cannot be loaded."
+  (normalize-json
+   (with-input-from-string
+       (pointer->string ((proc 'sb_build_info)))
+     json->scm)))
 
 ;;; --- high-level execution ---------------------------------------------------
 

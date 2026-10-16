@@ -197,9 +197,32 @@ rarely needs it directly.
 
 - `proc name` — the C function for a symbol in `libsonicboom.so`
 - `run-s-expr text input-bv` — parse, execute and retrieve in one call
+- `build-info` — how the loaded `libsonicboom.so` was built (see below)
 - `libsonicboom-available?` — whether the library loaded at all
 - `sb-status-ok?`, `sb-status->message`, `SB_ERR_BINDING` — status handling
 - `make-slot`, `slot-ptr`, `slot-ref`, `capture-error` — out-parameter helpers
+
+### `(build-info)`
+
+```scheme
+(use-modules (sonicboom ffi))
+(assq-ref (build-info) 'git-commit)                  ;=> "84bb114"
+(assq-ref (assq-ref (build-info) 'cuda) 'archs)      ;=> ("86")
+```
+
+Returns how the loaded `libsonicboom.so` was built, as a symbol-keyed alist —
+so a benchmark result or a bug report can name the exact binary behind it:
+
+| key | value |
+| --- | --- |
+| `git-commit` | commit at configure time, with a `-dirty` suffix for a modified tree, or `"unknown"` outside a git checkout |
+| `build-type` | CMake `CMAKE_BUILD_TYPE` (`Release`, `Debug`, …) |
+| `cuda` | alist: `enabled` (boolean), `archs` (list, e.g. `("86")` — the SM archs nvcc really compiled, resolved from `native`/`all` at build time), `toolkit` (e.g. `"12.0"`) |
+| `llvm` | alist: `version` and `major` of the LLVM/MLIR linked in, `origin` (`"bundled"` for the install `tools/mlir/build-mlir.sh` produces in-tree, `"external"` for any other, `"none"` when built with `-DSONICBOOM_ENABLE_MLIR=OFF`) |
+| `platform` | target CPU the library was compiled for (`"x86_64"`), not the caller's machine |
+
+The underlying `sb_build_info()` C function (capi.h) returns the same thing as
+a JSON object; the field set may grow, so read by name rather than by position.
 
 ## (sonicboom trace ...) — the tracer
 

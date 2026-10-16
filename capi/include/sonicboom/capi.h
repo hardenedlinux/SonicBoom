@@ -110,6 +110,32 @@ const char *sb_error_message(const sb_error *err);
 sb_error_kind sb_error_get_kind(const sb_error *err);
 void sb_error_free(sb_error *err);
 
+/* --- Build info ------------------------------------------------------------ */
+
+/* A JSON object describing how this libsonicboom.so was built. Returns a static
+ * string, valid for the lifetime of the process; never NULL and never an error.
+ *
+ * It exists so that a benchmark result or a bug report can name the exact
+ * binary it came from: which commit, how it was configured, which CUDA
+ * architectures the binary really contains (CMake's CMAKE_CUDA_ARCHITECTURES
+ * may be the token `native`, which is resolved at build time), and which
+ * LLVM/MLIR is linked in. The field set may grow — parse by name, not by
+ * position.
+ *
+ * {"git_commit":"84bb114",
+ *  "build_type":"Release",
+ *  "cuda":{"enabled":true,"archs":["86"],"toolkit":"12.0"},
+ *  "llvm":{"version":"23.1.2","major":23,"origin":"external"},
+ *  "platform":"x86_64"}
+ *
+ * `git_commit` is "<rev>[-dirty]" at configure time, or "unknown" outside a git
+ * checkout. `cuda` is {"enabled":false,"archs":[],"toolkit":""} in a CPU-only
+ * build. `llvm.origin` is "bundled" for the install tools/mlir/build-mlir.sh
+ * produces inside the source tree and "external" for any other LLVM/MLIR;
+ * both are "" / "none" when MLIR is not linked (SONICBOOM_ENABLE_MLIR=OFF).
+ * `platform` is the target CPU the library was compiled for, not the builder's. */
+const char *sb_build_info(void);
+
 /* --- Parse ----------------------------------------------------------------- */
 
 /* Parse an S-Expr v0.1 document. `text` need not be NUL-terminated; `len` is

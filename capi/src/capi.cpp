@@ -230,6 +230,136 @@ uint64_t tensor_num_bytes(const sx::TensorType &t) {
 
 } // namespace
 
+// --- Build info -------------------------------------------------------------
+
+// The SB_BUILD_* macros are defined by capi/CMakeLists.txt with values resolved
+// at configure time in the top-level CMakeLists.txt. The fallbacks keep the file
+// compilable on its own (e.g. a syntax-only check) — a library built that way
+// reports the truth about its own ignorance rather than a plausible guess.
+
+#ifndef SB_BUILD_GIT
+#define SB_BUILD_GIT "unknown"
+#endif
+#ifndef SB_BUILD_TYPE
+#define SB_BUILD_TYPE ""
+#endif
+#ifndef SB_BUILD_CUDA_ENABLED
+#define SB_BUILD_CUDA_ENABLED 0
+#endif
+#ifndef SB_BUILD_CUDA_ARCHS
+#define SB_BUILD_CUDA_ARCHS ""
+#endif
+#ifndef SB_BUILD_CUDA_TOOLKIT
+#define SB_BUILD_CUDA_TOOLKIT ""
+#endif
+#ifndef SB_BUILD_LLVM_VERSION
+#define SB_BUILD_LLVM_VERSION "none"
+#endif
+#ifndef SB_BUILD_LLVM_MAJOR
+#define SB_BUILD_LLVM_MAJOR 0
+#endif
+#ifndef SB_BUILD_LLVM_ORIGIN
+#define SB_BUILD_LLVM_ORIGIN "none"
+#endif
+#ifndef SB_BUILD_PLATFORM
+#define SB_BUILD_PLATFORM "unknown"
+#endif
+
+namespace {
+
+// Append `"…"` with the characters JSON requires escaped. The build strings come
+// from CMake (a compiler's version, a path-derived origin) — none of them should
+// contain a quote or a control character, but a stray one must not produce a
+// document the caller's parser rejects.
+void append_json_string(std::string &out, const char *s) {
+  out.push_back('"');
+  for (const unsigned char *p = reinterpret_cast<const unsigned char *>(s);
+       p && *p; ++p) {
+    switch (*p) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (*p < 0x20) {
+          const char *hex = "0123456789abcdef";
+          out += "\\u00";
+          out.push_back(hex[*p >> 4]);
+          out.push_back(hex[*p & 0xf]);
+        } else {
+          out.push_back(static_cast<char>(*p));
+        }
+    }
+  }
+  out.push_back('"');
+}
+
+// Comma-separated "80,86" → a JSON array of strings. Empty → [].
+void append_json_arch_array(std::string &out, const char *csv) {
+  out.push_back('[');
+  if (csv && *csv) {
+    bool first = true;
+    std::string token;
+    for (const char *p = csv;; ++p) {
+      if (*p == ',' || *p == '\0') {
+        if (!first) out.push_back(',');
+        append_json_string(out, token.c_str());
+        first = false;
+        token.clear();
+        if (*p == '\0') break;
+      } else {
+        token.push_back(*p);
+      }
+    }
+  }
+  out.push_back(']');
+}
+
+std::string make_build_info() {
+  std::string out;
+  out.reserve(256);
+  out += "{\"git_commit\":";
+  append_json_string(out, SB_BUILD_GIT);
+  out += ",\"build_type\":";
+  append_json_string(out, SB_BUILD_TYPE);
+
+  out += ",\"cuda\":{\"enabled\":";
+  out += SB_BUILD_CUDA_ENABLED ? "true" : "false";
+  out += ",\"archs\":";
+  if (SB_BUILD_CUDA_ENABLED) {
+    append_json_arch_array(out, SB_BUILD_CUDA_ARCHS);
+  } else {
+    out += "[]";
+  }
+  out += ",\"toolkit\":";
+  append_json_string(out, SB_BUILD_CUDA_ENABLED ? SB_BUILD_CUDA_TOOLKIT : "");
+
+  out += "},\"llvm\":{\"version\":";
+  append_json_string(out, SB_BUILD_LLVM_VERSION);
+  out += ",\"major\":";
+  out += std::to_string(SB_BUILD_LLVM_MAJOR);
+  out += ",\"origin\":";
+  append_json_string(out, SB_BUILD_LLVM_ORIGIN);
+
+  out += "},\"platform\":";
+  append_json_string(out, SB_BUILD_PLATFORM);
+  out += "}";
+  return out;
+}
+
+} // namespace
+
+const char *sb_build_info(void) {
+  // Function-local static: built on first call, thread-safe since C++11, and
+  // valid for the rest of the process. No exception can escape — every input is
+  // a string literal baked in at configure time, so the allocation is the only
+  // thing that could throw, and returning the same stable pointer afterwards
+  // means a caller that retried would still get a usable string.
+  static const std::string info = make_build_info();
+  return info.c_str();
+}
+
 // --- Error inspection -------------------------------------------------------
 
 const char *sb_error_message(const sb_error *err) {
