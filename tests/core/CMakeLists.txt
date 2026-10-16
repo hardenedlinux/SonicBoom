@@ -128,3 +128,14 @@ set_tests_properties(
 add_executable(test_capi test_capi.c)
 target_link_libraries(test_capi PRIVATE sonicboom m)
 sb_add_cpp_test(test_capi)
+
+# Boom IR dialect test: op registration against planner::OpKind, the generated
+# assembly formats, the type verifiers. It links the compiler library
+# (sonicboom_compiler), which is built only when the MLIR path is enabled — and
+# it is a compiler-side test: nothing here runs Boom IR through the runtime.
+if(SONICBOOM_ENABLE_MLIR)
+  add_executable(test_boom_dialect test_boom_dialect.cpp)
+  target_link_libraries(test_boom_dialect PRIVATE sonicboom sonicboom_compiler
+                                               MLIRAsmParser)
+  sb_add_cpp_test(test_boom_dialect)
+endif()

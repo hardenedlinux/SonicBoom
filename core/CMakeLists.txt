@@ -211,4 +211,10 @@ if(SONICBOOM_ENABLE_MLIR)
     # the X86 target/desc/info libs come transitively via MLIRExecutionEngine.
     LLVMX86AsmParser)
   target_include_directories(sonicboom PRIVATE ${MLIR_INCLUDE_DIRS})
+
+  # The compiler library: the Boom MLIR dialect (core/compiler/). A separate
+  # static library, deliberately not linked into sonicboom yet — nothing on the
+  # runtime path executes Boom IR in this phase, so the dialect's development
+  # cannot change what libsonicboom.so does.
+  add_subdirectory(compiler)
 endif()
