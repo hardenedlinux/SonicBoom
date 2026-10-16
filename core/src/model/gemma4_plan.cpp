@@ -34,6 +34,7 @@
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -41,6 +42,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <list>
 #include <map>
 #include <memory>
 #include <string>
@@ -976,13 +978,69 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
 // generate/prefill calls so a later call only stages device-resident params
 // (pos / token / start_pos) and replays — no plan rebuild or re-capture per
 // call. Keyed by (model, n_ctx); the model must outlive the cache (the
-// backends hold a raw model pointer). Prefill segments stay per-call: their
-// capture is ~0.8% neutral (see "prefill-cuda-graph-neutral") but a captured
-// 512-token segment graph costs ~190 MiB that is never freed when cached, and
-// keying by (n_ctx, n) would exhaust the device across prefix_cache's 11
-// distinct n_ctx values. The decode cache self-corrects across reuse (each
-// step overwrites the slot the next step reads), so caching it is safe.
+// backends hold a raw model pointer). The decode cache self-corrects across
+// reuse (each step overwrites the slot the next step reads), so caching it is
+// safe.
+//
+// Prefill segments are cached the same way, minus their CUDA-graph capture:
+// a capture is ~0.8% neutral (see "prefill-cuda-graph-neutral") but a
+// captured 512-token segment graph costs ~190 MiB that is never freed when
+// cached, and replaying a stale capture would write through the device pointers
+// it baked in. So the plan side of a segment — graph, rewrites, execution plan,
+// backends, executor, all a pure function of (model, n_ctx, segment length,
+// planner environment) — is cached, and the capture stays per call.
 // ---------------------------------------------------------------------------
+
+// A prefill segment's build product. `cuda` holds the shared KV cache (adopted
+// via share_caches, re-adopted on every cache hit) plus three small persistent
+// slots (token 4 B, pos 8 B, segment token ids chunk*8 = 4096 B at the SWA
+// chunk); the plan itself owns no device memory — its buffers are logical and
+// the device pool allocates them per execute. The segment-build path also
+// allocates a full KV cache in the backend constructor, which share_caches then
+// discards, so the retained device cost of a cache entry is those 4 KiB.
+struct PrefillSegment {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  std::unique_ptr<planner::SonicBackend> cpu;
+  std::unique_ptr<planner::SonicCudaBackend> cuda;
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+};
+
+// The planner environment a plan is a function of. Everything else the prefill
+// segment build reads — the model, n_ctx, the resource snapshot, the cost
+// model, the segment length — is fixed per decode runtime except the segment
+// length, which is the cache key. A change in any of these switches changes the
+// graph the plan is derived from (the IR passes replace the Graph rewrites; the
+// q8_1/mmq gates decide whether the mmq fusions run at all), so they are part
+// of the key rather than assumed constant for the process.
+struct PlannerEnv {
+  bool ir_passes;
+  bool q8_1;
+  bool mmq;
+  int mmq_min_n;
+  friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
+};
+
+static PlannerEnv planner_env() {
+  return PlannerEnv{planner::ir_passes_enabled(), quant::cuda::q8_1_enabled(),
+                    quant::cuda::mmq_enabled(), quant::cuda::mmq_min_n()};
+}
+
+// SONICBOOM_PLAN_CACHE=0 disables the prefill segment cache (segments then go
+// back to being built per call), for A/B and for ruling the cache out of a
+// divergence. Any other value, including unset, keeps it on.
+static bool plan_cache_enabled() {
+  const char* e = std::getenv("SONICBOOM_PLAN_CACHE");
+  return e == nullptr || std::string_view(e) != "0";
+}
+
+// Cache cap. A single prefill call needs at most two distinct segment lengths
+// (the full chunk, then the final shorter remainder — the per-call map is keyed
+// by length, so two full-chunk segments share one entry), so two entries per
+// decode runtime are always enough for the call in flight and bound what a
+// multi-turn session accumulates.
+static constexpr std::size_t kMaxCachedSegments = 2;
+
 struct DecodeRuntime {
   planner::Graph graph;
   planner::ExecutionPlan plan;
@@ -991,6 +1049,12 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  // Prefill segments by length, most-recently used first, capped at
+  // kMaxCachedSegments.
+  std::list<std::pair<uint64_t, std::unique_ptr<PrefillSegment>>> prefills;
+  // The planner environment `prefills` was built under; a change clears it.
+  PlannerEnv prefill_env{};
+  bool prefill_env_set = false;
 };
 
 static std::map<std::pair<const Gemma4Model*, uint64_t>,
@@ -1523,8 +1587,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     rt = dump_rt.get();
   }
   const planner::ResourceSnapshot& snap = rt->snap;
-  // Cost model for planning the per-call prefill segment graphs (Section C.2
-  // keeps the decode runtime cached but plans prefill segments fresh each call).
+  // Cost model for planning a prefill segment graph the first time it is seen
+  // (Section C.2's decode runtime is cached; a segment is planned once and then
+  // reused from rt->prefills — see segment_for below).
   planner::AnalyticalCpuCostModel cost(snap);
 
   // Prefix reuse: adopt the session's persistent cache if it has one, otherwise
@@ -1569,19 +1634,43 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // full-chunk segment is captured into a CUDA Graph (prog) and replayed per
     // non-final segment; the final (possibly shorter) segment runs uncaptured so
     // its hidden column reaches the host through the executor's output path.
-    struct PrefillSegment {
-      planner::Graph graph;
-      planner::ExecutionPlan plan;
-      std::unique_ptr<planner::SonicBackend> cpu;
-      std::unique_ptr<planner::SonicCudaBackend> cuda;
-      std::unique_ptr<planner::RuntimeExecutor> exec;
-      std::unique_ptr<hal::StepProgram> prog;
-    };
-    std::map<uint64_t, std::unique_ptr<PrefillSegment>> segments;
+    //
+    // The segment build (graph + rewrites + plan + backends) is a pure function
+    // of (model, n_ctx, nseg, planner environment) and costs ~115 ms of planning
+    // per 512-token Gemma segment, so it is cached across calls in the decode
+    // runtime (see the DecodeRuntime note). The offset a segment is executed at
+    // is not part of it: pos reaches the kernels as an execute-time binding
+    // (set_pos + the `in` argument), and a plan records no position. The
+    // CUDA-graph capture stays per call — it must record against the KV cache in
+    // use now, and the replay path below is reachable only when a capture was
+    // made this call.
+    const PlannerEnv env_now = planner_env();
+    if (!rt->prefill_env_set || !(rt->prefill_env == env_now)) {
+      rt->prefills.clear();  // planner environment changed: every entry is stale
+      rt->prefill_env = env_now;
+      rt->prefill_env_set = true;
+    }
+    const bool cache_segments = plan_cache_enabled();
+    // Per-call owners: segments when the cache is off, and always the captured
+    // programs (a capture is deliberately not cached).
+    std::map<uint64_t, std::unique_ptr<PrefillSegment>> call_segments;
+    std::map<uint64_t, std::unique_ptr<hal::StepProgram>> progs;
     auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
-      auto it = segments.find(nseg);
-      if (it != segments.end())
-        return it->second.get();
+      if (cache_segments) {
+        auto it = std::find_if(
+            rt->prefills.begin(), rt->prefills.end(),
+            [nseg](const auto& e) { return e.first == nseg; });
+        if (it != rt->prefills.end()) {
+          Phase _h("prefill:segment_cache_hit", phase_timing);
+          PrefillSegment* hit = it->second.get();
+          rt->prefills.splice(rt->prefills.begin(), rt->prefills, it);  // LRU
+          // Re-adopt the runtime's KV cache: the entry may have been built (or
+          // last used) against a different session's cache, and a segment must
+          // never keep an old session's cache alive.
+          hit->cuda->share_caches(*rt->cuda);
+          return hit;
+        }
+      }
       auto seg = std::make_unique<PrefillSegment>();
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
@@ -1614,7 +1703,14 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
               {planner::BackendTag::Sonic, seg->cuda.get()}});
       route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
       PrefillSegment* raw = seg.get();
-      segments.emplace(nseg, std::move(seg));
+      if (cache_segments) {
+        rt->prefills.emplace_front(nseg, std::move(seg));
+        while (rt->prefills.size() > kMaxCachedSegments) rt->prefills.pop_back();
+      } else {
+        // Uncached: keep it alive for the rest of the call (a later segment of
+        // the same length must reuse it, not rebuild it).
+        call_segments.emplace(nseg, std::move(seg));
+      }
       return raw;
     };
 
@@ -1651,7 +1747,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
           full->cuda->synchronize();
           {
             Phase _r("prefill:capture_record", phase_timing);
-            full->prog = full->cuda->record_step([&]() {
+            progs[chunk] = full->cuda->record_step([&]() {
               std::vector<sx::Bytes> cin;
               cin.push_back(encode_tokens(first_chunk));
               cin.push_back(encode_i64(start_pos));
@@ -1684,7 +1780,10 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       if (!seg)
         return 0;
 
-      if (!is_final && seg->prog) {
+      auto prog_it = progs.find(nseg);
+      hal::StepProgram* prog =
+          (prog_it == progs.end()) ? nullptr : prog_it->second.get();
+      if (!is_final && prog) {
         // Replay the captured full-chunk graph: stage this segment's token ids
         // and start position into the persistent device slots on the program's
         // own stream (async H2D, ordered before the replay), then launch the
@@ -1692,9 +1791,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         // non-default stream, so consecutive segments serialize on the GPU while
         // the host never blocks (a synchronous H2D on the legacy default stream
         // would wait for every prior replay — the original per-segment host stall).
-        seg->cuda->stage_prefill_tokens(*seg->prog, prompt.subspan(off, nseg));
-        seg->cuda->stage_pos(*seg->prog, pos);
-        if (!seg->prog->replay()) {
+        seg->cuda->stage_prefill_tokens(*prog, prompt.subspan(off, nseg));
+        seg->cuda->stage_pos(*prog, pos);
+        if (!prog->replay()) {
           std::cerr << "[prefill-cuda] segment off=" << off
                     << " graph replay failed\n";
           return 0;
@@ -1703,8 +1802,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         continue;
       }
 
-      // Uncached (final segment, or capture disabled/fell back): the cache was
-      // already shared at segment creation (segment_for), so just dispatch.
+      // Uncached (final segment, or capture disabled/fell back). The KV cache
+      // is already shared — at build for a fresh segment, re-adopted on a cache
+      // hit — so only the per-position bindings are set here.
       seg->cuda->set_prefill_tokens(prompt.subspan(off, nseg));
       seg->cuda->set_pos(pos);
       std::vector<sx::Bytes> in;
