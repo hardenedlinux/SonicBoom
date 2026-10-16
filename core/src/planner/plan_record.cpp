@@ -190,6 +190,10 @@ void PlanRecorder::set_run(std::string_view model, std::string_view mode,
   run_.backend = backend;
 }
 
+void PlanRecorder::set_device(std::string_view device) {
+  run_.device = device;
+}
+
 PlanRunRecord PlanRecorder::finish() const {
   PlanRunRecord out = run_;
   out.steps = steps_;
@@ -210,6 +214,7 @@ std::string serialize_plan_run(const PlanRunRecord& run) {
   line("plan_id " + std::to_string(run.plan_id));
   line("model_fingerprint " + std::to_string(run.model_fingerprint));
   line("backend " + run.backend);
+  if (!run.device.empty()) line("device " + run.device);
   line("steps " + std::to_string(run.steps.size()));
 
   for (const StepRecord& st : run.steps) {

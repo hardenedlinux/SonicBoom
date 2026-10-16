@@ -119,6 +119,12 @@ struct PlanRunRecord {
   uint64_t plan_id = 0;
   uint64_t model_fingerprint = 0;
   std::string backend;  // the backend tag the device steps ran on
+  // The device the run was recorded on, e.g. "NVIDIA GeForce RTX 3050 sm 20 cc
+  // 8.6". Not decoration: part of the record *is* device-dependent — the
+  // decode-attention split-KV grid is sized from the device's SM count
+  // (nn::cuda::decode_attention) — so a caller comparing a record against a
+  // stored one must be able to tell that it was taken on a different GPU.
+  std::string device;
   std::vector<StepRecord> steps;
 };
 
@@ -150,6 +156,10 @@ class PlanRecorder {
   void set_run(std::string_view model, std::string_view mode, uint64_t n_ctx,
                uint64_t n, uint64_t plan_id, uint64_t model_fingerprint,
                std::string_view backend);
+
+  // The device this run was recorded on (set by the caller that owns the CUDA
+  // context; empty when unknown). See PlanRunRecord::device.
+  void set_device(std::string_view device);
 
   const std::vector<StepRecord>& steps() const noexcept { return steps_; }
   void clear();

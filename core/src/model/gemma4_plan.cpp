@@ -28,6 +28,7 @@
 #include <sonicboom/sx/exec.h>
 
 #ifdef SONICBOOM_USE_CUDA
+#include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvToolsExt.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
@@ -35,6 +36,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -1215,6 +1217,22 @@ const char* arch_name(ModelArch a) {
   return a == ModelArch::Gemma4 ? "gemma4" : "qwen2";
 }
 
+// The device a record was taken on, for the record's `device` line. Part of the
+// record is device-dependent (the decode-attention split-KV grid is sized from
+// the SM count), so a stored record has to carry which GPU produced it. Queried
+// here because this is the translation unit that owns the CUDA context.
+std::string device_identity() {
+  int dev = 0;
+  cudaDeviceProp p{};
+  if (cudaGetDevice(&dev) != cudaSuccess ||
+      cudaGetDeviceProperties(&p, dev) != cudaSuccess)
+    return "unknown";
+  char buf[288];
+  std::snprintf(buf, sizeof buf, "%s sm %d cc %d.%d", p.name,
+                p.multiProcessorCount, p.major, p.minor);
+  return buf;
+}
+
 // One decode step through the executor, with the same device-slot staging the
 // non-captured generate_spine_cuda loop does. Returns false when the step failed
 // (the caller stops and keeps whatever was recorded so far).
@@ -1245,6 +1263,7 @@ std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model& m,
   rec.set_run(arch_name(m.config.arch), "decode", n_ctx, steps, rt->plan.plan_id,
               rt->plan.model_fingerprint, planner::backend_tag_name(
                                               planner::BackendTag::Sonic));
+  rec.set_device(device_identity());
 
   int64_t token = 0;
   for (uint64_t step = 0; step < steps; ++step) {
@@ -1293,6 +1312,7 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
   rec.set_run(arch_name(m.config.arch), "prefill", 0, n, plan->plan_id,
               plan->model_fingerprint,
               planner::backend_tag_name(planner::BackendTag::Sonic));
+  rec.set_device(device_identity());
 
   // Token ids are staged into the device slot the batched Embedding reads; the
   // ids themselves do not affect the plan (only the [n, dim] shapes do).
