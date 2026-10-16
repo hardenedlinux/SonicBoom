@@ -97,14 +97,6 @@ std::string shape_text(std::span<const int64_t> shape) {
   return s;
 }
 
-bool recording_requested() noexcept {
-  static const bool on = [] {
-    const char* e = std::getenv("SONICBOOM_PLAN_RECORD");
-    return e != nullptr && *e != '\0' && std::string_view(e) != "0";
-  }();
-  return on;
-}
-
 // recorder() is defined inline in plan_record.h (one thread-local load).
 
 void set_thread_recorder(PlanRecorder* rec) noexcept {

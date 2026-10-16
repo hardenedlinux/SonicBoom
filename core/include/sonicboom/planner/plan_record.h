@@ -187,12 +187,12 @@ inline PlanRecorder* recorder() noexcept {
   return plan_detail::tls_recorder_storage;
 }
 
-// Install (or clear, with null) this thread's recorder.
+// Install (or clear, with null) this thread's recorder. This is the one opt-in
+// seam: the executor and every launch hook test recorder() and nothing else, so
+// a recorder installed here sees the whole run. A caller decides whether to
+// install one — the model layer's record_* entry points always do, so a tool
+// asking for a record does not also have to set an environment variable.
 void set_thread_recorder(PlanRecorder* rec) noexcept;
-
-// True when plan recording was requested through the environment
-// (SONICBOOM_PLAN_RECORD is set and not "0"). Read once.
-bool recording_requested() noexcept;
 
 // Deterministic text serialization. Stable ordering, no pointers or addresses.
 std::string serialize_plan_run(const PlanRunRecord& run);

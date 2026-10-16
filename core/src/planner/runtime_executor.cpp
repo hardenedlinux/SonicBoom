@@ -91,12 +91,12 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
       values[t.id.value] = TensorValue::from_host(inputs[in_i++]);
 
   // 4b. Optional execution record (plan_record.h). Off by default: with no
-  //     recorder installed — recording_requested() and recorder() both cheap —
-  //     nothing below runs and the loop is as it was. The record is assembled
-  //     here because this is the one place where the plan's task descriptions,
-  //     the plan's tensor/buffer assignments, and the kernels the backend
-  //     launches (through plan_hook.h) are all in scope at once.
-  PlanRecorder* rec = recording_requested() ? recorder() : nullptr;
+  //     recorder installed this is one thread-local load and the loop is as it
+  //     was. The record is assembled here because this is the one place where
+  //     the plan's task descriptions, the plan's tensor/buffer assignments, and
+  //     the kernels the backend launches (through plan_hook.h) are all in scope
+  //     at once.
+  PlanRecorder* rec = recorder();
   std::map<uint32_t, const BufferAllocation*> tensor_buffer;
   uint32_t record_step = 0;
   if (rec) {
