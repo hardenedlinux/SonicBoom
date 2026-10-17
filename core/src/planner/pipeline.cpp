@@ -16,11 +16,14 @@
 
 #include <sonicboom/planner/pipeline.h>
 
+#include "plan_timing.h"
+
 #include <sonicboom/planner/memory_planner.h>
 #include <sonicboom/planner/plan_validator.h>
 #include <sonicboom/planner/planner.h>
 #include <sonicboom/planner/transfer_scheduler.h>
 
+#include <cstdio>
 #include <utility>
 
 namespace sonicboom::planner {
@@ -28,23 +31,41 @@ namespace sonicboom::planner {
 std::expected<ExecutionPlan, PlannerError> plan_execution(
     const Graph& graph, const ResourceSnapshot& snapshot,
     const CostModel& cost_model) {
-  StaticPlanner planner(snapshot, cost_model);
-  auto plan = planner.plan(graph);
-  if (!plan)
-    return std::unexpected(plan.error());
+  detail::PlanTimer total("pipeline.total");
+  {
+    detail::PlanTimer t("pipeline.static");
+    StaticPlanner planner(snapshot, cost_model);
+    auto plan = planner.plan(graph);
+    if (!plan)
+      return std::unexpected(plan.error());
 
-  MemoryPlanner mem(cost_model);
-  if (auto r = mem.plan_memory(*plan); !r)
-    return std::unexpected(r.error());
+    if (detail::plan_timing_enabled())
+      std::fprintf(stderr, "[plan] counts nodes=%zu tensors=%zu tasks=%zu\n",
+                   graph.nodes.size(), plan->tensors.size(),
+                   plan->tasks.size());
 
-  TransferScheduler transfer(cost_model);
-  if (auto r = transfer.schedule(*plan); !r)
-    return std::unexpected(r.error());
+    {
+      detail::PlanTimer m("pipeline.memory");
+      MemoryPlanner mem(cost_model);
+      if (auto r = mem.plan_memory(*plan); !r)
+        return std::unexpected(r.error());
+    }
 
-  if (auto r = PlanValidator::validate(*plan); !r)
-    return std::unexpected(r.error());
+    {
+      detail::PlanTimer s("pipeline.transfer");
+      TransferScheduler transfer(cost_model);
+      if (auto r = transfer.schedule(*plan); !r)
+        return std::unexpected(r.error());
+    }
 
-  return std::move(*plan);
+    {
+      detail::PlanTimer v("pipeline.validate");
+      if (auto r = PlanValidator::validate(*plan); !r)
+        return std::unexpected(r.error());
+    }
+
+    return std::move(*plan);
+  }
 }
 
 } // namespace sonicboom::planner

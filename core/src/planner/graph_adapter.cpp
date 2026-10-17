@@ -29,6 +29,11 @@
 namespace sonicboom::planner {
 
 const TensorDesc* Graph::find_tensor(TensorId id) const noexcept {
+  // adapt_graph and the model emitters assign IDs densely in creation order, so
+  // the common case is a bounds check and one comparison. Hand-built test graphs
+  // may use sparse IDs; those still take the linear path.
+  if (id.value < tensors.size() && tensors[id.value].id == id)
+    return &tensors[id.value];
   for (const auto& t : tensors)
     if (t.id == id)
       return &t;
@@ -36,6 +41,8 @@ const TensorDesc* Graph::find_tensor(TensorId id) const noexcept {
 }
 
 const GraphNodeDesc* Graph::find_node(GraphNodeId id) const noexcept {
+  if (id.value < nodes.size() && nodes[id.value].id == id)
+    return &nodes[id.value];
   for (const auto& n : nodes)
     if (n.id == id)
       return &n;

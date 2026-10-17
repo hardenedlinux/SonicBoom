@@ -114,19 +114,28 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
     for (uint32_t p = 0; p < plan.execution_order.size(); ++p)
       position[plan.execution_order[p].value] = p;
 
+    // Producer/consumer edges in one pass over the tasks (O(tasks + edges))
+    // instead of rescanning every task for every tensor. Insertion order matches
+    // the old per-tensor scan: tasks in plan order, inputs in task order, and
+    // the producer is the last task that lists the tensor as an output.
+    std::unordered_map<uint32_t, TaskId> producers;
+    std::unordered_map<uint32_t, std::vector<TaskId>> consumers;
+    for (const auto& task : plan.tasks) {
+      if (task.kind != TaskKind::Compute)
+        continue;
+      for (TensorId o : task.outputs)
+        producers[o.value] = task.id;
+      for (TensorId i : task.inputs)
+        consumers[i.value].push_back(task.id);
+    }
+
     for (const auto& t : plan.tensors) {
       TensorLifetime lt;
       lt.tensor = t.id;
-      for (const auto& task : plan.tasks) {
-        if (task.kind != TaskKind::Compute)
-          continue;
-        for (TensorId o : task.outputs)
-          if (o == t.id)
-            lt.producer = task.id;
-        for (TensorId i : task.inputs)
-          if (i == t.id)
-            lt.consumers.push_back(task.id);
-      }
+      if (auto p = producers.find(t.id.value); p != producers.end())
+        lt.producer = p->second;
+      if (auto c = consumers.find(t.id.value); c != consumers.end())
+        lt.consumers = std::move(c->second);
 
       uint32_t first = UINT32_MAX, last = 0;
       auto consider = [&](TaskId id) {

@@ -17,9 +17,11 @@
 #include <sonicboom/planner/planner.h>
 
 #include "fingerprint.h"
+#include "plan_timing.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -82,6 +84,11 @@ bool supports_op(const Device& d, OpKind op) {
 
 std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     const Graph& graph) const {
+  auto timer = [](const char* phase) {
+    return std::make_unique<detail::PlanTimer>(phase);
+  };
+  auto t = timer("static.snapshot");
+
   // The snapshot must be internally consistent before anything is planned.
   if (auto v = validate_snapshot(snapshot_); !v)
     return std::unexpected(v.error());
@@ -121,6 +128,9 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       return {gpu, device_local};
     return {cpu, host};
   };
+
+  t.reset();
+  t = timer("static.capability");
 
   // Capability check: every operator and dtype must be executable on its
   // assigned device.
@@ -164,6 +174,9 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     }
   }
 
+  t.reset();
+  t = timer("static.header");
+
   ExecutionPlan plan;
   plan.schema_version = ExecutionPlan::kSchemaVersion;
   plan.model_fingerprint = model_fingerprint(graph);
@@ -198,6 +211,9 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     req.dtype = dtype;
     return cost_model_.estimate_compute(req, device);
   };
+
+  t.reset();
+  t = timer("static.tasks");
 
   double total_latency_us = 0.0;
   double min_confidence = 1.0;
@@ -277,6 +293,33 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     for (TensorId o : graph.outputs)
       graph_outputs.insert(o.value);
 
+    // Consumer counts, computed once over the whole graph, answer the per-region
+    // question "is this produced tensor consumed outside the region?" without
+    // rescanning every node for every region. A graph pinned to one backend is
+    // one region per node, so the old per-region scan was quadratic (~1.4k
+    // nodes → ~2M hash inserts per plan).
+    const size_t num_tensors = graph.tensors.size();
+    bool dense_ids = true;
+    for (size_t i = 0; i < num_tensors; ++i)
+      if (graph.tensors[i].id.value != i) {
+        dense_ids = false;
+        break;
+      }
+    std::unordered_map<uint32_t, size_t> sparse_index;  // only for sparse IDs
+    if (!dense_ids)
+      for (size_t i = 0; i < num_tensors; ++i)
+        sparse_index.emplace(graph.tensors[i].id.value, i);
+    auto tensor_index = [&](TensorId id) -> size_t {
+      if (dense_ids && id.value < num_tensors && graph.tensors[id.value].id == id)
+        return id.value;
+      auto it = sparse_index.find(id.value);
+      return it == sparse_index.end() ? num_tensors : it->second;
+    };
+    std::vector<uint32_t> consumer_count(num_tensors + 1, 0);
+    for (const auto& node : graph.nodes)
+      for (TensorId in : node.inputs)
+        ++consumer_count[tensor_index(in)];
+
     // 2. Emit one compute task per region.
     uint32_t next_task = 0;
     for (const Region& r : regions) {
@@ -306,35 +349,42 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       task.payload = compute;
 
       // Region-internal produced set: tensors produced by any region node.
-      std::unordered_set<uint32_t> produced;
-      std::unordered_set<uint32_t> region_nodes;
-      for (const auto* n : r.nodes) {
-        region_nodes.insert(n->id.value);
+      // Region membership is tiny (one node for every non-MLIR backend), so a
+      // flat vector with a linear scan beats a per-region hash set.
+      std::vector<uint32_t> produced;
+      for (const auto* n : r.nodes)
         for (TensorId o : n->outputs)
-          produced.insert(o.value);
-      }
+          produced.push_back(o.value);
+      auto is_produced = [&](TensorId id) {
+        return std::find(produced.begin(), produced.end(), id.value) !=
+               produced.end();
+      };
 
       // External inputs: node inputs not produced within the region, first-
       // reference order, deduplicated.
-      std::unordered_set<uint32_t> seen_in;
       for (const auto* n : r.nodes)
         for (TensorId in : n->inputs)
-          if (!produced.count(in.value) && seen_in.insert(in.value).second)
+          if (!is_produced(in) &&
+              std::find(task.inputs.begin(), task.inputs.end(), in) ==
+                  task.inputs.end())
             task.inputs.push_back(in);
 
       // External outputs: region-produced tensors that are graph outputs or are
       // consumed by a node outside the region, in node order then output order.
-      std::unordered_set<uint32_t> outside_consumers;
-      for (const auto& node : graph.nodes) {
-        if (region_nodes.count(node.id.value))
-          continue;
-        for (TensorId in : node.inputs)
-          outside_consumers.insert(in.value);
-      }
+      // "Consumed outside" is the graph-wide consumer count minus the region-
+      // internal uses.
       for (const auto* n : r.nodes)
-        for (TensorId o : n->outputs)
-          if (outside_consumers.count(o.value) || graph_outputs.count(o.value))
+        for (TensorId o : n->outputs) {
+          uint32_t internal_uses = 0;
+          for (const auto* m : r.nodes)
+            for (TensorId in : m->inputs)
+              if (in == o)
+                ++internal_uses;
+          const size_t oi = tensor_index(o);
+          if (graph_outputs.count(o.value) ||
+              (oi < num_tensors && consumer_count[oi] > internal_uses))
             task.outputs.push_back(o);
+        }
 
       // Dependencies: producers of the external inputs (strictly earlier).
       std::unordered_set<uint32_t> deps;

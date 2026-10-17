@@ -224,9 +224,16 @@ std::expected<void, PlannerError> PlanValidator::validate(
 
   // --- dependency DAG must be acyclic (Kahn's algorithm) -------------------
   {
+    // Reverse adjacency (dependency -> dependents) built once, so removing a
+    // node touches only its own dependents instead of rescanning every task for
+    // every removed node (which was quadratic on the ~1.4k-task segment plans).
     std::unordered_map<uint32_t, uint32_t> indegree;
-    for (const auto& t : plan.tasks)
+    std::unordered_map<uint32_t, std::vector<uint32_t>> dependents;
+    for (const auto& t : plan.tasks) {
       indegree.emplace(t.id.value, static_cast<uint32_t>(t.dependencies.size()));
+      for (TaskId dep : t.dependencies)
+        dependents[dep.value].push_back(t.id.value);
+    }
 
     uint32_t removed = 0;
     std::vector<uint32_t> zero;
@@ -240,10 +247,12 @@ std::expected<void, PlannerError> PlanValidator::validate(
       ++removed;
       // Removing `id` satisfies its dependents: every task `v` that lists `id`
       // as a dependency loses that incoming edge.
-      for (const auto& v : plan.tasks)
-        for (TaskId dep : v.dependencies)
-          if (dep.value == id && --indegree[v.id.value] == 0)
-            zero.push_back(v.id.value);
+      auto it = dependents.find(id);
+      if (it == dependents.end())
+        continue;
+      for (uint32_t v : it->second)
+        if (--indegree[v] == 0)
+          zero.push_back(v);
     }
     if (removed != plan.tasks.size())
       return std::unexpected(invalid("task dependency graph has a cycle"));

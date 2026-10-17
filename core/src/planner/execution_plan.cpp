@@ -32,7 +32,13 @@ const MemorySpace* ExecutionPlan::find_memory_space(MemorySpaceId id) const noex
   return nullptr;
 }
 
+// The planner allocates IDs densely and in creation order (tensors, tasks, and
+// buffers alike), so the fast path is a bounds check plus one comparison. Plans
+// assembled by hand or by a test with sparse IDs fall back to the linear scan,
+// keeping the lookup semantics (first match) unchanged.
 const TensorDesc* ExecutionPlan::find_tensor(TensorId id) const noexcept {
+  if (id.value < tensors.size() && tensors[id.value].id == id)
+    return &tensors[id.value];
   for (const auto& t : tensors)
     if (t.id == id)
       return &t;
@@ -40,6 +46,8 @@ const TensorDesc* ExecutionPlan::find_tensor(TensorId id) const noexcept {
 }
 
 const TaskDesc* ExecutionPlan::find_task(TaskId id) const noexcept {
+  if (id.value < tasks.size() && tasks[id.value].id == id)
+    return &tasks[id.value];
   for (const auto& t : tasks)
     if (t.id == id)
       return &t;
@@ -47,6 +55,8 @@ const TaskDesc* ExecutionPlan::find_task(TaskId id) const noexcept {
 }
 
 const BufferAllocation* ExecutionPlan::find_buffer(BufferId id) const noexcept {
+  if (id.value < allocations.size() && allocations[id.value].buffer == id)
+    return &allocations[id.value];
   for (const auto& b : allocations)
     if (b.buffer == id)
       return &b;
