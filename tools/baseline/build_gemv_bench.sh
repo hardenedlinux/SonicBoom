@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the standalone K-quant gemv microbenchmark against libsonicboom.so (the
 # SHARED core) + libcudart. Dev-time only: it reaches the internal
 # quant::cuda::matvec_f32_dev symbol via core/src/quant/cuda_resident.h, which is

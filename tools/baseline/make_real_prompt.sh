@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Generate a real-text prompt for the C.4 prefix-cache tests: concatenate a
 # fixed set of SonicBoom's own docs + source (deterministic order), tokenize it
 # with the llama.cpp tokenizer for the GGUF under test, and emit a

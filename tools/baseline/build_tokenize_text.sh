@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the real-text tokenizer against llama.cpp (baseline reference). Dev-time
 # only: links llama.cpp, not SonicBoom.
 set -euo pipefail

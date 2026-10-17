@@ -1,4 +1,7 @@
 #!/bin/bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 #
 # SonicBoom — smoke-test the OpenAI-compatible server against the real backend.
 #

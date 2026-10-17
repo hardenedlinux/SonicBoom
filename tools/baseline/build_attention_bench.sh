@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the standalone decode-attention microbenchmark against libsonicboom.so
 # (the SHARED core) + libcudart. Dev-time only: it reaches the internal
 # nn::cuda::decode_attention_dev symbol via core/src/nn/cuda_resident.h, which

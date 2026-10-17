@@ -1,4 +1,7 @@
 #!/bin/sh
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Orchestrates the Guile → C++ end-to-end loop:
 #   1. the Guile exporter trains a model and writes model.sx + weights.bin +
 #      expected.bin into a scratch directory,

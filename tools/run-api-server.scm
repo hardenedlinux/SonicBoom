@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
+
 root=$(cd "$(dirname "$0")/.." && pwd)
 export LD_LIBRARY_PATH="$root/build/core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec guile -L "$root/bindings/guile/scheme" \

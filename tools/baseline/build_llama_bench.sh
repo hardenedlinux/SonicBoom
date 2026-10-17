@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the llama.cpp CPU decode-throughput benchmark. Dev-time only: links
 # against the llama.cpp CPU-only build, not SonicBoom. See llama_bench.cpp.
 set -euo pipefail

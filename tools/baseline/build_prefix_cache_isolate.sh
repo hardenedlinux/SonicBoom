@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the prefix-cache isolation tool against libsonicboom.so + the CUDA
 # runtime (it reads device KV buffers through hal::Buffer::id with cudaMemcpy).
 # Dev-time only.

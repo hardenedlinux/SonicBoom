@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # ncu profile of the SonicBoom q8_1 K-quant gemv kernels (the default decode
 # path, 64% of GPU time), to decide whether the mmvq port is now DRAM-bound
 # (matmul floor -> stop) or still L1/LSU-bound (shared-memory tiling is the

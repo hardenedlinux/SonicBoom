@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build tools/plan_diff. It is a standalone text comparison and links nothing —
 # not even libsonicboom.so — so it builds anywhere and can be used to diff a plan
 # recorded on another machine.

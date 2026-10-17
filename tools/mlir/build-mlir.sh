@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # One-shot build + install of LLVM/MLIR (llvmorg-23.1.2) from the SonicBoom
 # submodule, for the MLIR infrastructure integration.
 #

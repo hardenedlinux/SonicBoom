@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the prefill throughput tool against libsonicboom.so.
 # Dev-time only (mirrors build_longctx_bench.sh: links the SHARED core + public
 # headers).

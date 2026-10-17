@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the Gemma 4 baseline dump tool against the llama.cpp CPU-only build.
 # This tool is dev-time only; it is NOT part of the SonicBoom CMake build and
 # adds no llama.cpp dependency to libsonicboom.so.

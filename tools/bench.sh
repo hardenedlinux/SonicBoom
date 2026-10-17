@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 #

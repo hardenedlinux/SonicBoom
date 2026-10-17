@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the SonicBoom-side dump tool against libsonicboom.so (the SHARED core).
 # It links only the published Layer 2 library and includes only <sonicboom/...>
 # public headers, mirroring how the tests are built.

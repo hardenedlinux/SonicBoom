@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build llama_bench against the llama.cpp CUDA build (build-cuda). Dev-time only.
 # Requires tools/baseline/build_llama_bench.sh's sibling build-cuda to exist (see
 # the llama.cpp CUDA build command at the bottom of this file).

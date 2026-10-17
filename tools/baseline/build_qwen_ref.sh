@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the llama.cpp greedy reference-token tool for the Qwen2 tests. Dev-time
 # only: links against the llama.cpp CPU-only build, not SonicBoom. See
 # qwen_ref.cpp.

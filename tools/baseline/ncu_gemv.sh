@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # ncu profile of the SonicBoom K-quant gemv kernels, to decide whether the
 # cooperative remap (gemv_q*_K_coop) is now compute-bound (dp4a viable) or still
 # L1/LSU-bound (dp4a dead end, same as the one-thread-per-block finding).

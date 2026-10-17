@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the mmq-vs-dp4a crossover microbenchmark against libsonicboom.so (the
 # SHARED core) + libcudart. Dev-time only: it reaches the public
 # quant::cuda::matmul_f32 entry point via <sonicboom/quant/quantized_matmul_cuda.h>,

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
 # Build the dump-comparison tool. This is a pure C++ tool with no llama.cpp or
 # SonicBoom dependency; it only reads the text dump format.
 set -euo pipefail
