@@ -26,6 +26,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
 #include <string>
@@ -90,6 +91,10 @@ nodeAttrs(mlir::MLIRContext *context, llvm::ArrayRef<sx::Attribute> attributes) 
 // is outside the frozen names or the shape's element count is not
 // representable — the table entry is what the round trip reads back, so a wrong
 // size there is a plan that differs from the graph it came from.
+//
+// A shape with a dynamic dimension (the graph's extent) has no extent-
+// independent byte count: the table entry records 0 here, and the lowering
+// computes the exact size when it binds the extent (BoomConversion.cpp).
 struct TensorForm {
   mlir::Type type;
   uint64_t size_bytes;
@@ -107,8 +112,12 @@ std::optional<TensorForm> tensorForm(mlir::MLIRContext *context,
                          << "', which is not one of the frozen sx::DType names";
     return std::nullopt;
   }
-  const sx::Shape sxShape{std::vector<int64_t>(shape.begin(), shape.end())};
-  const std::optional<int64_t> size = sx::tensor_byte_size(sx::TensorType{dtype, sxShape});
+  const bool dynamic = llvm::is_contained(shape, mlir::ShapedType::kDynamic);
+  const std::optional<int64_t> size =
+      dynamic ? std::optional<int64_t>(0)
+              : sx::tensor_byte_size(sx::TensorType{
+                    dtype, sx::Shape{std::vector<int64_t>(shape.begin(),
+                                                          shape.end())}});
   if (!size) {
     mlir::emitError(loc) << "tensor id " << id << " ('" << name
                          << "') has the shape " << shape

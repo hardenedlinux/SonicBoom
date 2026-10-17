@@ -44,6 +44,16 @@ struct TensorDesc {
   sx::DType dtype;
   uint64_t size_bytes = 0;
 
+  // Non-zero when the tensor's leading dimension is the graph's *dynamic
+  // extent* (the prefill segment length): the value here is the tensor's byte
+  // size per unit of that extent, so an execution bound to extent N occupies
+  // `dynamic_stride_bytes * N` bytes. `shape` and `size_bytes` remain the
+  // concretization at the extent the plan was built for (the shape class's
+  // maximum), so every consumer that only needs a bound is unchanged and the
+  // plan's buffers are sized for the largest member of the class. Zero for
+  // every static tensor — the decode graph included.
+  uint64_t dynamic_stride_bytes = 0;
+
   bool is_graph_input = false;
   bool is_graph_output = false;
   bool is_constant = false;  // a parameter (weight or inline constant)

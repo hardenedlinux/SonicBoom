@@ -57,7 +57,15 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const planner::Graph &graph,
 // `result_ids`, `node_name`, `node_id`, `node_attrs` and the optional `backend`
 // back out, and refuses (returning nullopt after a diagnostic) rather than
 // inventing a field the IR does not carry.
-std::optional<planner::Graph> boomToGraph(mlir::ModuleOp module);
+//
+// A dynamic dimension (`?`) is the graph's *extent*, the prefill segment size.
+// `dynamic_extent` binds it: every `?` becomes that value, and the tensor's
+// byte size is computed from the bound shape. The resulting TensorDesc records
+// the extent through dynamic_stride_bytes, so a later execution can bind a
+// smaller extent to the same plan. A module with a dynamic dimension and a zero
+// extent is refused (there is no concrete graph to plan).
+std::optional<planner::Graph> boomToGraph(mlir::ModuleOp module,
+                                          uint64_t dynamic_extent = 0);
 
 // The IR as text, for inspection and for diffing two conversions. The ops carry
 // no custom assembly format, so this is MLIR's generic form: verbose, but

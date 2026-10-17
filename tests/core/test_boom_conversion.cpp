@@ -379,6 +379,97 @@ void checkAttrKindRefusal() {
   }
 }
 
+//--- the dynamic extent -------------------------------------------------------
+
+// A tensor whose leading dimension is the graph's extent (the prefill segment
+// length) is written `?` and is bound at lowering. The same module must then
+// lower to the concrete sizes of whatever extent is bound — the byte size
+// affine in the extent, the per-unit stride unchanged — and refuse a module
+// with a dynamic dimension and no extent. Hand-built, so it also runs without
+// a model or a device.
+void checkDynamicExtent() {
+  auto graph = [] {
+    sbplanner::Graph g;
+    g.name = "dynamic";
+    g.tensors.resize(2);
+    for (int i = 0; i < 2; ++i) {
+      auto& t = g.tensors[i];
+      t.id = sbplanner::TensorId{uint32_t(i)};
+      t.shape = {4, 8};
+      t.dtype = sxs::DType::Float32;
+      t.size_bytes = 4 * 8 * 4;
+      t.dynamic_stride_bytes = 8 * 4;  // one [1, 8] row
+      t.name = i == 0 ? "x" : "y";
+      t.is_graph_input = i == 0;
+      t.is_graph_output = i == 1;
+    }
+    sbplanner::GraphNodeDesc n;
+    n.id = sbplanner::GraphNodeId{0};
+    n.op = sbplanner::OpKind::Relu;
+    n.inputs = {sbplanner::TensorId{0}};
+    n.outputs = {sbplanner::TensorId{1}};
+    n.name = "relu0";
+    g.nodes = {std::move(n)};
+    g.inputs = {sbplanner::TensorId{0}};
+    g.outputs = {sbplanner::TensorId{1}};
+    return g;
+  }();
+
+  mlir::MLIRContext context;
+  context.getOrLoadDialect<boom::BoomDialect>();
+  std::string diagnostics;
+  mlir::ScopedDiagnosticHandler handler(&context, [&](mlir::Diagnostic& d) {
+    if (d.getSeverity() != mlir::DiagnosticSeverity::Error) return;
+    if (diagnostics.empty()) {
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      d.print(os);
+      diagnostics = os.str();
+    }
+  });
+
+  auto module = sbcompiler::graphToBoom(graph, &context);
+  if (!module) {
+    fail("dynamic extent: graph -> Boom IR failed" +
+         (diagnostics.empty() ? "" : ": " + diagnostics));
+    return;
+  }
+  const std::string ir = sbcompiler::dumpBoom(module->getOperation());
+  if (ir.find("[?, 8]") == std::string::npos) {
+    fail("dynamic extent: the IR does not state the extent as `?`");
+    return;
+  }
+
+  for (uint64_t extent : {uint64_t(4), uint64_t(2), uint64_t(1)}) {
+    auto bound = sbcompiler::boomToGraph(*module, extent);
+    if (!bound) {
+      fail("dynamic extent: binding " + std::to_string(extent) +
+           " failed" + (diagnostics.empty() ? "" : ": " + diagnostics));
+      continue;
+    }
+    for (const auto& t : bound->tensors) {
+      if (t.shape != std::vector<int64_t>{int64_t(extent), 8} ||
+          t.size_bytes != extent * 32 || t.dynamic_stride_bytes != 32) {
+        fail("dynamic extent: binding " + std::to_string(extent) +
+             " gave tensor '" + t.name + "' shape " +
+             std::to_string(t.shape.empty() ? 0 : t.shape.front()) + "x? size " +
+             std::to_string(t.size_bytes) + " stride " +
+             std::to_string(t.dynamic_stride_bytes));
+        return;
+      }
+    }
+  }
+
+  diagnostics.clear();
+  if (sbcompiler::boomToGraph(*module)) {
+    fail("dynamic extent: an unbound module lowered instead of being refused");
+  } else if (diagnostics.empty()) {
+    fail("dynamic extent: the unbound refusal emitted no diagnostic");
+  } else {
+    std::cout << "dynamic extent: `?` binds to affine sizes, unbound refused\n";
+  }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -402,6 +493,7 @@ int main(int argc, char** argv) {
   // CPU-only run still covers it. Its failures are reported before the gate
   // below, so a skip never hides one.
   checkAttrKindRefusal();
+  checkDynamicExtent();
   if (g_failures != 0) {
     std::cerr << "boom-conversion: " << g_failures
               << " dialect-level check(s) failed\n";
@@ -473,6 +565,30 @@ int main(int argc, char** argv) {
     }
     write_file((dump_dir / (std::string(c.name) + ".boom.mlir")).string(),
                pre_trip.ir);
+
+    // The symbolic prefill: the same graph with the segment length emitted as
+    // the dynamic extent, bound at this n. It must be the concrete graph it
+    // binds to — every shape and byte size identical — with the tensors that
+    // carry the extent marked.
+    if (!decode) {
+      const sbplanner::Graph sym =
+          sbmodel::build_gemma4_prefill_graph(*model, c.n, /*symbolic=*/true);
+      if (sym.tensors.empty()) {
+        fail(std::string(c.name) + ": the symbolic prefill graph is empty");
+      } else if (const std::string d = diffGraphs(pre, sym); !d.empty()) {
+        fail(std::string(c.name) +
+             ": the symbolic prefill differs from the concrete graph: " + d);
+      } else if (std::none_of(sym.tensors.begin(), sym.tensors.end(),
+                              [](const sbplanner::TensorDesc& t) {
+                                return t.dynamic_stride_bytes != 0;
+                              })) {
+        fail(std::string(c.name) +
+             ": the symbolic prefill marks no dynamic tensor");
+      } else {
+        std::cout << "  symbolic prefill: identical to the concrete graph at n="
+                  << c.n << "\n";
+      }
+    }
 
     // 2. The plan the round-tripped graph yields. The transform runs inside the
     //    record path, after the passes, so `g` is replaced by the graph that

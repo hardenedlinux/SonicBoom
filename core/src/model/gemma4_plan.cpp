@@ -31,6 +31,8 @@
 #include <sonicboom/planner/sonic_cuda_backend.h>
 #include <sonicboom/sx/exec.h>
 
+#include "mlir/IR/BuiltinTypes.h"
+
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvToolsExt.h>
@@ -201,8 +203,9 @@ struct GraphIr {
 // Boom IR -> the graph the plan is derived from. A lowering that fails is
 // reported and leaves an empty graph, which fails the plan — there is
 // deliberately no fallback that would plan something else.
-planner::Graph lower_graph(mlir::ModuleOp module) {
-  auto graph = compiler::boomToGraph(module);
+planner::Graph lower_graph(mlir::ModuleOp module,
+                           uint64_t dynamic_extent = 0) {
+  auto graph = compiler::boomToGraph(module, dynamic_extent);
   if (!graph) {
     std::cerr << "[plan] Boom IR -> graph failed (diagnostic above)\n";
     return {};
@@ -215,12 +218,13 @@ planner::Graph lower_graph(mlir::ModuleOp module) {
 // available at all is a property of the device, not of the pipeline, so the
 // caller keeps it. A failed pass fails the plan rather than letting an unfused
 // graph be planned as if the phase had run.
-planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite) {
+planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite,
+                           uint64_t dynamic_extent = 0) {
   if (!ir.module)
     return {};
   if (rewrite && !compiler::runBoomPasses(*ir.module, phase))
     return {};
-  return lower_graph(*ir.module);
+  return lower_graph(*ir.module, dynamic_extent);
 }
 
 }  // namespace
@@ -500,7 +504,8 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
 // ordinary tensor liveness. Graph inputs are `tokens` (Int64 [n]) and
 // `start_pos` (Int64); the graph output is the final residual [n, dim].
 // ---------------------------------------------------------------------------
-GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n) {
+GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
+                        bool dynamic_extent = false) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -516,7 +521,10 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n) {
 
   // Graph inputs: the prompt token ids (Int64 [n]) and the absolute start
   // position (Int64 scalar).
-  const mlir::Value tokens = b.input("tokens", {int64_t(n)}, sx::DType::Int64);
+  const mlir::Value tokens = b.input(
+      "tokens",
+      {dynamic_extent ? mlir::ShapedType::kDynamic : int64_t(n)},
+      sx::DType::Int64);
   const mlir::Value start_pos = b.input("start_pos", {}, sx::DType::Int64);
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
@@ -552,8 +560,14 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n) {
                        : (qt == quant::QuantType::Q6_K) ? -1 : 0;
     return attr_i("ds", ds);
   };
-  auto shape2 = [](uint64_t r, uint64_t c) {
-    return std::vector<int64_t>{int64_t(r), int64_t(c)};
+  // Every activation is [n, width]. A symbolic segment emits the token
+  // dimension as `?` (the graph's dynamic extent) and leaves the width static:
+  // the shape function that makes this a valid graph is the verifier's
+  // shape-preserving rule plus the emitter's [n, width] layout, and the
+  // lowering binds `?` to the shape class's maximum (see boomToGraph).
+  auto shape2 = [dynamic_extent](uint64_t r, uint64_t c) {
+    return std::vector<int64_t>{
+        dynamic_extent ? mlir::ShapedType::kDynamic : int64_t(r), int64_t(c)};
   };
 
   const BlockProfile prof = profile_for(cfg);
@@ -758,11 +772,19 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n) {
 }
 
 // The prefill emitter's IR, lowered with no passes, like build_gemma4_graph.
-planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
-  GraphIr ir = emit_prefill_ir(m, n);
+// `symbolic` emits the token dimension as `?` and binds it to `n`, so the graph
+// is the same graph a concrete `n` produces plus the dynamic extent record a
+// smaller execution can bind (TensorDesc::dynamic_stride_bytes).
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
+                                          bool symbolic) {
+  GraphIr ir = emit_prefill_ir(m, n, symbolic);
   if (!ir.module)
     return {};
-  return lower_graph(*ir.module);
+  return lower_graph(*ir.module, symbolic ? n : 0);
+}
+
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
+  return build_gemma4_prefill_graph(m, n, /*symbolic=*/false);
 }
 
 // ---------------------------------------------------------------------------

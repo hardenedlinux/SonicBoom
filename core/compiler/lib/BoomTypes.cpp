@@ -20,6 +20,7 @@
 #include "sonicboom/compiler/BoomTypes.h"
 
 #include <llvm/ADT/TypeSwitch.h>
+#include <mlir/IR/BuiltinTypes.h>
 
 #include <cstddef>
 
@@ -32,14 +33,20 @@ namespace sonicboom::compiler::boom {
 
 namespace {
 
-// Every dimension is a static, non-negative extent. The runtime's Shape has the
-// same rule (sx/ir.h: "Static, non-negative dimensions").
+// Every dimension is a static, non-negative extent, or MLIR's `?` dynamic
+// marker (ShapedType::kDynamic). The dynamic axis is the graph's *extent* — the
+// prefill segment length — and it belongs to the vocabulary because the plan a
+// segment produces must be reusable across the lengths that share its kernel
+// selections. The runtime's Shape is static (sx/ir.h: "Static, non-negative
+// dimensions"); a dynamic dimension is bound to a concrete extent when the IR is
+// lowered (BoomConversion.cpp, boomToGraph).
 llvm::LogicalResult verifyDims(
     llvm::function_ref<mlir::InFlightDiagnostic()> emitError,
     llvm::ArrayRef<int64_t> shape) {
   for (int64_t d : shape)
-    if (d < 0)
-      return emitError() << "dimension " << d << " is negative";
+    if (d < 0 && d != mlir::ShapedType::kDynamic)
+      return emitError() << "dimension " << d
+                         << " is negative and is not the dynamic marker";
   return llvm::success();
 }
 
@@ -57,6 +64,12 @@ llvm::LogicalResult verifyQuantShape(
     return emitError() << "a " << QuantType::name
                        << " value must have at least one dimension";
   const int64_t block = QuantType::blockSize();
+  // The block-contiguous dimension is a property of the format, not of the
+  // graph's extent, so it can never be the dynamic axis.
+  if (shape.back() == mlir::ShapedType::kDynamic)
+    return emitError() << "the block-contiguous dimension of a "
+                       << QuantType::name << " is dynamic, but a block size "
+                       << "is a property of the format";
   if (shape.back() % block != 0)
     return emitError() << "the block-contiguous dimension of a "
                        << QuantType::name << " (" << shape.back()

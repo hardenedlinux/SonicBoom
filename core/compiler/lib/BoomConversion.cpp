@@ -27,6 +27,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Verifier.h"
 
 #include <sonicboom/planner/op_kind.h>
@@ -88,15 +89,22 @@ llvm::DenseSet<int64_t> q8_1Ids(const Graph &g) {
   return ids;
 }
 
+// A tensor's IR shape. A tensor whose leading dimension is the graph's dynamic
+// extent states it as `?`; the lowering binds it back to a concrete extent.
+std::vector<int64_t> irShape(const TensorDesc &t) {
+  std::vector<int64_t> shape = t.shape;
+  if (t.dynamic_stride_bytes != 0 && !shape.empty())
+    shape.front() = mlir::ShapedType::kDynamic;
+  return shape;
+}
+
 // The SSA type of a tensor: !boom.q8_1 when the graph declares it as the mmq
 // activation layout, !boom.tensor<shape, dtype> otherwise. Empty on a tensor no
 // Boom type can describe — an unknown dtype name, or a q8_1 shape that is not a
 // whole number of 32-element blocks — after diagnosing it.
 mlir::Type valueType(mlir::MLIRContext *context, mlir::Location loc,
-                     const TensorDesc &t, bool is_q8_1) {
-  // ArrayRef, not the vector: the generated getChecked is a concrete overload
-  // next to the base's catch-all template, and only an exact match picks it.
-  const llvm::ArrayRef<int64_t> shape(t.shape);
+                     const TensorDesc &t, llvm::ArrayRef<int64_t> shape,
+                     bool is_q8_1) {
   if (is_q8_1) {
     auto type = boom::Q8_1Type::getChecked(
         mlir::detail::getDefaultDiagnosticEmitFn(loc), context, shape);
@@ -141,13 +149,16 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
   mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(loc);
   builder.setInsertionPointToStart(module->getBody());
 
+  // The table entry of a dynamic tensor states its extent as `?` and has no
+  // bound byte size (its size is affine in the extent the lowering binds).
   llvm::SmallVector<mlir::Attribute> table;
   table.reserve(graph.tensors.size());
   for (const TensorDesc &t : graph.tensors) {
+    const std::vector<int64_t> shape = irShape(t);
     table.push_back(boom::TensorDescAttr::get(
-        context, raw(t.id), t.shape, sx::dtype_name(t.dtype), t.size_bytes,
-        t.is_graph_input, t.is_graph_output, t.is_constant, t.is_external,
-        t.name));
+        context, raw(t.id), shape, sx::dtype_name(t.dtype),
+        t.dynamic_stride_bytes != 0 ? 0 : t.size_bytes, t.is_graph_input,
+        t.is_graph_output, t.is_constant, t.is_external, t.name));
   }
 
   auto graphOp = boom::GraphOp::create(
@@ -181,7 +192,7 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
   llvm::DenseMap<int64_t, mlir::Value> valueOf;
   for (int64_t id : freeIds) {
     const TensorDesc *t = byId.at(id);
-    mlir::Type type = valueType(context, loc, *t, q8_1.count(id));
+    mlir::Type type = valueType(context, loc, *t, irShape(*t), q8_1.count(id));
     if (!type)
       return {};
     valueOf[id] = body->addArgument(type, loc);
@@ -208,7 +219,9 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
                              << raw(out) << ", which is not in the table";
         return {};
       }
-      mlir::Type type = valueType(context, loc, *it->second, q8_1.count(raw(out)));
+      mlir::Type type =
+          valueType(context, loc, *it->second, irShape(*it->second),
+                    q8_1.count(raw(out)));
       if (!type)
         return {};
       results.push_back(type);
@@ -237,7 +250,8 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
 
 //--- Boom IR -> Graph --------------------------------------------------------
 
-std::optional<Graph> boomToGraph(mlir::ModuleOp module) {
+std::optional<Graph> boomToGraph(mlir::ModuleOp module,
+                                 uint64_t dynamic_extent) {
   boom::GraphOp graphOp;
   for (boom::GraphOp candidate : module.getOps<boom::GraphOp>()) {
     if (graphOp) {
@@ -272,7 +286,49 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module) {
     t.id = tensorId(desc.getId());
     t.shape.assign(desc.getShape().begin(), desc.getShape().end());
     t.dtype = *dtype;
-    t.size_bytes = desc.getByteSize();
+
+    // Bind a dynamic extent. Only the leading dimension may be dynamic: the
+    // graph's extent is one scalar (the segment length), and every activation
+    // that carries it does so as row 0 of a position-major shape. Binding is
+    // the shape function: a tensor's byte size is the bound byte size of its
+    // static per-extent shape, and the per-unit stride is that divided by the
+    // extent.
+    bool dynamic = false;
+    for (size_t axis = 0; axis < t.shape.size(); ++axis) {
+      if (t.shape[axis] != mlir::ShapedType::kDynamic)
+        continue;
+      if (axis != 0) {
+        graphOp.emitError()
+            << "tensor id " << desc.getId()
+            << " has a dynamic dimension at axis " << axis
+            << ", but only the leading dimension is the graph's extent";
+        return std::nullopt;
+      }
+      dynamic = true;
+    }
+    if (dynamic) {
+      if (dynamic_extent == 0) {
+        graphOp.emitError()
+            << "tensor id " << desc.getId()
+            << " has a dynamic leading dimension, but no extent was bound to "
+               "the graph";
+        return std::nullopt;
+      }
+      t.shape.front() = int64_t(dynamic_extent);
+      const std::optional<int64_t> size = sx::tensor_byte_size(sx::TensorType{
+          t.dtype, sx::Shape{t.shape}});
+      if (!size || *size <= 0 || *size % int64_t(dynamic_extent) != 0) {
+        graphOp.emitError()
+            << "tensor id " << desc.getId() << " has the bound shape " << t.shape
+            << ", whose byte size is not a whole multiple of the extent "
+            << dynamic_extent;
+        return std::nullopt;
+      }
+      t.size_bytes = uint64_t(*size);
+      t.dynamic_stride_bytes = uint64_t(*size) / dynamic_extent;
+    } else {
+      t.size_bytes = desc.getByteSize();
+    }
     t.is_graph_input = desc.getIsInput();
     t.is_graph_output = desc.getIsOutput();
     t.is_constant = desc.getIsConstant();

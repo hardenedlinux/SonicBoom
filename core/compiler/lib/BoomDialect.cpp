@@ -27,6 +27,7 @@
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"  // interleaveComma (printDimList)
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -66,16 +67,23 @@ void BoomDialect::initialize() {
 
 namespace sonicboom::compiler::boom {
 
-// `[4096, 2048]`, or `[]` for a scalar. Printed and parsed by hand rather than
-// through a parameter's default, because ArrayRef<int64_t> has no
-// FieldParser/printer in MLIR (the EmitC array type writes the same helper).
-// Defined inside the namespace the generated parse/print bodies call them from
-// — the file's `using namespace` is not a declaration, so a definition at file
-// scope would declare a different, global function.
+// `[4096, 2048]`, `[?, 2048]` for a dynamic leading extent, or `[]` for a
+// scalar. Printed and parsed by hand rather than through a parameter's default,
+// because ArrayRef<int64_t> has no FieldParser/printer in MLIR (the EmitC array
+// type writes the same helper). Defined inside the namespace the generated
+// parse/print bodies call them from — the file's `using namespace` is not a
+// declaration, so a definition at file scope would declare a different, global
+// function.
 mlir::LogicalResult parseDimList(mlir::AsmParser &parser,
                                  llvm::SmallVector<int64_t> &dims) {
   return parser.parseCommaSeparatedList(mlir::AsmParser::Delimiter::Square,
                                         [&]() -> mlir::ParseResult {
+                                          if (parser.parseOptionalQuestion()
+                                                  .succeeded()) {
+                                            dims.push_back(
+                                                mlir::ShapedType::kDynamic);
+                                            return mlir::success();
+                                          }
                                           int64_t dim = 0;
                                           if (parser.parseInteger(dim))
                                             return mlir::failure();
@@ -86,7 +94,12 @@ mlir::LogicalResult parseDimList(mlir::AsmParser &parser,
 
 void printDimList(mlir::AsmPrinter &printer, llvm::ArrayRef<int64_t> dims) {
   printer << '[';
-  llvm::interleaveComma(dims, printer);
+  llvm::interleaveComma(dims, printer, [&](int64_t dim) {
+    if (dim == mlir::ShapedType::kDynamic)
+      printer << '?';
+    else
+      printer << dim;
+  });
   printer << ']';
 }
 

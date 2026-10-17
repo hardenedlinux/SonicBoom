@@ -110,6 +110,14 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg);
 // lm_head).
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n);
 
+// The same graph with the token dimension emitted as the Boom dynamic extent
+// (`?`) and bound to `n` at lowering: every tensor that carries the segment
+// length is marked with TensorDesc::dynamic_stride_bytes, so one plan can
+// execute a smaller segment by binding the actual length. `n` is the extent
+// the plan is planned and its buffers sized at; run no larger than it.
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
+                                          bool symbolic);
+
 // Autoregressive greedy decode through the spine: build the graph once, plan it
 // once (StaticPlanner + MemoryPlanner + TransferScheduler + PlanValidator), then
 // run each step through the RuntimeExecutor with a SonicBackend (CpuQ8K, the
