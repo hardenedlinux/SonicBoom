@@ -88,13 +88,19 @@ if [ -f "$LIB" ]; then
           (cond ((list? v) (string-join (map fmt v) ","))
                 ((boolean? v) (if v "true" "false"))
                 (else (format #f "~a" v))))
-        (for-each (lambda (kv)
-                    (if (pair? (cdr kv))
-                        (for-each (lambda (kv2)
-                                    (format #t "build.~a.~a=~a~%" (car kv) (car kv2) (fmt (cdr kv2))))
-                                  (cdr kv))
-                        (format #t "build.~a=~a~%" (car kv) (fmt (cdr kv)))))
-                  (build-info))' 2>/dev/null)"
+        ;; A load failure is the most actionable line in the report: print
+        ;; the dynamic-linker/exception text instead of exiting with no output.
+        (catch #t
+          (lambda ()
+            (for-each (lambda (kv)
+                        (if (pair? (cdr kv))
+                            (for-each (lambda (kv2)
+                                        (format #t "build.~a.~a=~a~%" (car kv) (car kv2) (fmt (cdr kv2))))
+                                      (cdr kv))
+                            (format #t "build.~a=~a~%" (car kv) (fmt (cdr kv)))))
+                      (build-info)))
+          (lambda (key . args)
+            (format #t "build.load_error=~a~%" (exception-text key args))))' 2>/dev/null)"
     if [ -n "$info" ]; then
       while IFS='=' read -r k v; do [ -n "$k" ] && emit "$k" "$v"; done <<<"$info"
     else

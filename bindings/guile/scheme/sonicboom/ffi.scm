@@ -18,6 +18,8 @@
   #:use-module (json)
   #:use-module (ice-9 threads)
   #:export (libsonicboom-available?
+            library-load-error
+            exception-text
             run-s-expr
             build-info
             sb-status-ok?
@@ -54,12 +56,44 @@
 
 (define %lib (make-parameter #f))       ; #f = not yet attempted; 'unavailable
 (define %lib-mutex (make-mutex))
+;; Why the last dynamic-link failed, for callers that want to report it rather
+;; than just say "could not load". #f until a load is attempted.
+(define %lib-error (make-parameter #f))
+
+(define (library-load-error)
+  "The dynamic-linker/exception text from the failed load of
+libsonicboom.so, or #f if no load has been attempted or it succeeded."
+  (%lib-error))
+
+(define (exception-text key args)
+  "A one-line, human-readable rendering of a caught exception from its
+`catch` key and args (the exception object itself is not needed). This is
+what the dynamic loader's failure looks like: a misc-error whose message is
+the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
+  (cond
+    ((eq? key 'system-error)
+     (format #f "~a (errno ~a)" (cadr args) (car args)))
+    ((and (eq? key 'misc-error) (>= (length args) 3)
+          (string? (list-ref args 1)) (list? (list-ref args 2)))
+     (let* ((message (list-ref args 0))
+            (fmt (list-ref args 1))
+            (irritants (list-ref args 2))
+            (rendered (catch #t
+                        (lambda () (apply format #f fmt irritants))
+                        (lambda ignored fmt))))
+       (if message (format #f "~a: ~a" message rendered) rendered)))
+    (else (format #f "~a: ~s" key args))))
 
 (define (libsonicboom-available?)
   (unless (%lib)
     (lock-mutex %lib-mutex)
     (unless (%lib)
-      (let ((handle (false-if-exception (dynamic-link "libsonicboom.so"))))
+      (let ((handle
+             (catch #t
+               (lambda () (dynamic-link "libsonicboom.so"))
+               (lambda (key . args)
+                 (%lib-error (exception-text key args))
+                 #f))))
         (%lib (or handle 'unavailable))))
     (unlock-mutex %lib-mutex))
   (let ((h (%lib)))
@@ -67,8 +101,10 @@
 
 (define (ensure-lib)
   (unless (libsonicboom-available?)
-    (error "libsonicboom.so could not be loaded; is it built and on the \
-library search path?")))
+    (error (string-append
+            "libsonicboom.so could not be loaded"
+            (if (%lib-error) (string-append ": " (%lib-error)) "")
+            "; is it built and on the library search path?"))))
 
 ;;; --- foreign procedure table (populated on first use) -----------------------
 

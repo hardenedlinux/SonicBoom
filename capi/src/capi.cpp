@@ -321,6 +321,8 @@ std::string make_build_info() {
   out.reserve(256);
   out += "{\"git_commit\":";
   append_json_string(out, SB_BUILD_GIT);
+  out += ",\"git_tag\":";
+  append_json_string(out, SB_BUILD_GIT_TAG);
   out += ",\"build_type\":";
   append_json_string(out, SB_BUILD_TYPE);
 

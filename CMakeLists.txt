@@ -144,6 +144,7 @@ endif()
 # compiled into the library, so a benchmark result or a bug report can name the
 # exact binary. See capi/include/sonicboom/capi.h.
 set(SONICBOOM_BUILD_GIT "unknown")
+set(SONICBOOM_BUILD_GIT_TAG "unknown")
 find_package(Git QUIET)
 if(GIT_FOUND)
   execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
@@ -159,6 +160,16 @@ if(GIT_FOUND)
                     OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
     if(_sb_git_dirty)
       set(SONICBOOM_BUILD_GIT "${SONICBOOM_BUILD_GIT}-dirty")
+    endif()
+    # The tag is the human name of the same revision (`git describe` adds the
+    # commit distance when HEAD is past the last tag); a bare commit cannot say
+    # which release a build belongs to.
+    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                    OUTPUT_VARIABLE _sb_git_tag OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE _sb_tag_rc)
+    if(_sb_tag_rc EQUAL 0 AND _sb_git_tag)
+      set(SONICBOOM_BUILD_GIT_TAG "${_sb_git_tag}")
     endif()
   endif()
 endif()

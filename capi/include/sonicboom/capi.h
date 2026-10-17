@@ -122,14 +122,15 @@ void sb_error_free(sb_error *err);
  * LLVM/MLIR is linked in. The field set may grow — parse by name, not by
  * position.
  *
- * {"git_commit":"84bb114",
+ * {"git_commit":"84bb114","git_tag":"v0.3-12-g84bb114",
  *  "build_type":"Release",
  *  "cuda":{"enabled":true,"archs":["86"],"toolkit":"12.0"},
  *  "llvm":{"version":"23.1.2","major":23,"origin":"external"},
  *  "platform":"x86_64"}
  *
  * `git_commit` is "<rev>[-dirty]" at configure time, or "unknown" outside a git
- * checkout. `cuda` is {"enabled":false,"archs":[],"toolkit":""} in a CPU-only
+ * checkout. `git_tag` is `git describe --tags --always --dirty` at configure
+ * time: the release name of that revision. `cuda` is {"enabled":false,"archs":[],"toolkit":""} in a CPU-only
  * build. `llvm.origin` is "bundled" for the install tools/mlir/build-mlir.sh
  * produces inside the source tree and "external" for any other LLVM/MLIR.
  * (MLIR is a required dependency, so `llvm` is always a real version/origin;
