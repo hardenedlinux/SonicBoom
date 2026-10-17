@@ -128,6 +128,17 @@ public:
     maxTensorId_ = std::max(maxTensorId_, desc.getId());
   }
 
+  // Replace a tensor's declared byte size, keeping every other field. A fused
+  // op writes a compact quantized activation into a buffer the emitter declared
+  // as the f32 tensor it was derived from; once every reader of that buffer
+  // takes the quantized view, the declaration can be the quantized size.
+  void setTensorSize(int64_t id, uint64_t sizeBytes) {
+    const boom::TensorDescAttr d = descs_.lookup(id);
+    descs_[id] = boom::TensorDescAttr::get(
+        ctx_, id, d.getShape(), d.getDtype(), sizeBytes, d.getIsInput(),
+        d.getIsOutput(), d.getIsConstant(), d.getIsExternal(), d.getName());
+  }
+
   // Drop a tensor from the table. Only for a tensor nothing references any more:
   // a table entry with no producer that is still read would turn into a block
   // argument, and the graph's arity would change under it (the verifier catches
@@ -273,6 +284,27 @@ bool mmqQ8Fits(int64_t dim, int64_t n, uint64_t sizeBytes) {
   return sizeBytes >= blocks * kMmqBlockBytes;
 }
 
+// The one q8_1 block the decode-side activation quantizer writes: an fp32
+// scale and 32 int8 quants (quant/cuda_resident.h BlockQ8_1; the compiler does
+// not include the CUDA headers, so the two constants are restated here).
+constexpr uint64_t kQ8_1BlockBytes = 36;
+
+// The bytes a q8_1 activation of `shape` occupies: 32-element blocks, 36 bytes
+// each. Every dimension the emitters produce is a multiple of 32.
+uint64_t q8_1ActivationBytes(llvm::ArrayRef<int64_t> shape) {
+  uint64_t elements = 1;
+  for (int64_t d : shape)
+    elements *= uint64_t(d);
+  return (elements / 32) * kQ8_1BlockBytes;
+}
+
+// The bytes an mmq q8_1 activation for [n, dim] occupies: the same blocks
+// mmqQ8Fits requires, guard included.
+uint64_t mmqActivationBytes(int64_t dim, int64_t n) {
+  const uint64_t planes = uint64_t(dim) / 128 + ((uint64_t(dim) / 128) & 1);
+  return (planes * uint64_t(n) + kMmqTailGuardBlocks) * kMmqBlockBytes;
+}
+
 //--- the passes -------------------------------------------------------------
 
 // quantize_once_pass (rewrites.cpp:79), as a Boom IR pass.
@@ -316,14 +348,14 @@ public:
       auto seen = q8Of.find(x);
       if (seen == q8Of.end()) {
         // First use of this activation: the shared Quantize node. Its output
-        // mirrors the input's f32 shape and size — a superset of the q8_1 bytes,
-        // so the executor and the planner treat it as an ordinary f32
-        // intermediate; only the CUDA kernels read the buffer as q8_1
-        // (rewrites.cpp:105-120).
+        // keeps the input's shape and dtype (the CUDA kernels read the buffer
+        // as q8_1; nothing else reads it), and is sized as the q8_1 blocks it
+        // holds rather than as its f32 superset (rewrites.cpp:105-120).
         const boom::TensorDescAttr xt = view.desc(x);
         const int64_t qid = view.nextTensorId();
         view.appendTensor(boom::TensorDescAttr::get(
-            view.ctx(), qid, xt.getShape(), xt.getDtype(), xt.getByteSize(),
+            view.ctx(), qid, xt.getShape(), xt.getDtype(),
+            q8_1ActivationBytes(xt.getShape()),
             /*is_input=*/false, /*is_output=*/false, /*is_constant=*/false,
             /*is_external=*/false, ("q8_" + xt.getName()).str()));
 
@@ -848,6 +880,8 @@ public:
     // with.
     llvm::SmallVector<mlir::Operation *> norms;
     llvm::DenseMap<mlir::Operation *, int64_t> dsOfNorm;
+    llvm::DenseMap<mlir::Operation *, int64_t> outOfNorm;
+    llvm::DenseMap<mlir::Operation *, uint64_t> q8BytesOfNorm;
     llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
         matmulsOfNorm;
 
@@ -907,6 +941,8 @@ public:
 
       norms.push_back(&node);
       dsOfNorm.insert({&node, ds});
+      outOfNorm.insert({&node, out});
+      q8BytesOfNorm.insert({&node, mmqActivationBytes(*dim, *nb)});
       matmulsOfNorm.insert({&node, std::move(matmuls)});
     }
 
@@ -949,6 +985,10 @@ public:
       norm->replaceAllUsesWith(fused);
       view.noteReplaced(norm, fused);
       norm->erase();
+
+      // The buffer now holds q8_1 blocks only: declare the mmq activation size
+      // (the f32 superset is no longer read by anyone).
+      view.setTensorSize(outOfNorm.lookup(norm), q8BytesOfNorm.lookup(norm));
     }
 
     // Then the consumers: the same nodes under the operator that reads the
@@ -1095,6 +1135,7 @@ bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
         view.ctx(), "ds", builder.getI64IntegerAttr(dsOfAct.lookup(a))));
 
     const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*a));
+    const int64_t fhId = GraphEditor::resultIds(*mul)[0];
     const auto mulType = mlir::cast<boom::TensorType>(mul->getResult(0).getType());
     auto q8Type = boom::Q8_1Type::getChecked(
         mlir::detail::getDefaultDiagnosticEmitFn(loc), view.ctx(),
@@ -1118,6 +1159,11 @@ bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
     for (int64_t id : dead)
       view.dropTensor(id);
     a->erase();
+
+    // The Mul's buffer holds q8_1 blocks only now: declare the mmq activation
+    // size in place of the f32 superset.
+    view.setTensorSize(fhId, mmqActivationBytes(dimOfAct.lookup(a),
+                                                batchOfAct.lookup(a)));
 
     matmuls.push_back(matmulOfAct.lookup(a));
   }

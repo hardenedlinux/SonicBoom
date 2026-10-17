@@ -4,8 +4,8 @@ model qwen2
 mode prefill
 n_ctx 0
 n 8
-plan_id 13422087493224069640
-model_fingerprint 7013479207719985175
+plan_id 10236171699351001171
+model_fingerprint 17163295507327037867
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6
 steps 517
@@ -23,7 +23,7 @@ step 1 task 1 node 1 op rms_norm_quantize backend sonic stream s0
   attr layer 0
   attr slot 7
   buf in 0 t2 buffer b2 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t3 buffer b3 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t3 buffer b3 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -33,7 +33,7 @@ step 2 task 2 node 2 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 0
   attr slot 14
-  buf in 0 t3 buffer b3 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t3 buffer b3 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t4 buffer b4 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -57,7 +57,7 @@ step 5 task 5 node 5 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 0
   attr slot 15
-  buf in 0 t3 buffer b3 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t3 buffer b3 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t7 buffer b7 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -67,7 +67,7 @@ step 6 task 6 node 6 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 0
   attr slot 16
-  buf in 0 t3 buffer b3 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t3 buffer b3 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t8 buffer b8 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -135,7 +135,7 @@ step 15 task 15 node 15 op rms_norm_quantize backend sonic stream s0
   attr layer 0
   attr slot 8
   buf in 0 t16 buffer b16 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t17 buffer b17 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t17 buffer b17 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -145,7 +145,7 @@ step 16 task 16 node 16 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 0
   attr slot 19
-  buf in 0 t17 buffer b17 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t17 buffer b17 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t18 buffer b18 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -155,7 +155,7 @@ step 17 task 17 node 17 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 0
   attr slot 18
-  buf in 0 t17 buffer b17 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t17 buffer b17 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t19 buffer b19 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -194,7 +194,7 @@ step 22 task 22 node 22 op rms_norm_quantize backend sonic stream s0
   attr layer 1
   attr slot 7
   buf in 0 t23 buffer b23 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t24 buffer b24 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t24 buffer b24 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -204,7 +204,7 @@ step 23 task 23 node 23 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 1
   attr slot 14
-  buf in 0 t24 buffer b24 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t24 buffer b24 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t25 buffer b25 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -228,7 +228,7 @@ step 26 task 26 node 26 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 1
   attr slot 15
-  buf in 0 t24 buffer b24 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t24 buffer b24 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t28 buffer b28 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -238,7 +238,7 @@ step 27 task 27 node 27 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 1
   attr slot 16
-  buf in 0 t24 buffer b24 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t24 buffer b24 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t29 buffer b29 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -306,7 +306,7 @@ step 36 task 36 node 36 op rms_norm_quantize backend sonic stream s0
   attr layer 1
   attr slot 8
   buf in 0 t37 buffer b37 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t38 buffer b38 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t38 buffer b38 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -316,7 +316,7 @@ step 37 task 37 node 37 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 1
   attr slot 19
-  buf in 0 t38 buffer b38 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t38 buffer b38 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t39 buffer b39 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -326,7 +326,7 @@ step 38 task 38 node 38 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 1
   attr slot 18
-  buf in 0 t38 buffer b38 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t38 buffer b38 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t40 buffer b40 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -365,7 +365,7 @@ step 43 task 43 node 43 op rms_norm_quantize backend sonic stream s0
   attr layer 2
   attr slot 7
   buf in 0 t44 buffer b44 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t45 buffer b45 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t45 buffer b45 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -375,7 +375,7 @@ step 44 task 44 node 44 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 2
   attr slot 14
-  buf in 0 t45 buffer b45 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t45 buffer b45 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t46 buffer b46 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -399,7 +399,7 @@ step 47 task 47 node 47 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 2
   attr slot 15
-  buf in 0 t45 buffer b45 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t45 buffer b45 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t49 buffer b49 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -409,7 +409,7 @@ step 48 task 48 node 48 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 2
   attr slot 16
-  buf in 0 t45 buffer b45 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t45 buffer b45 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t50 buffer b50 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -477,7 +477,7 @@ step 57 task 57 node 57 op rms_norm_quantize backend sonic stream s0
   attr layer 2
   attr slot 8
   buf in 0 t58 buffer b58 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t59 buffer b59 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t59 buffer b59 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -487,7 +487,7 @@ step 58 task 58 node 58 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 2
   attr slot 19
-  buf in 0 t59 buffer b59 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t59 buffer b59 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t60 buffer b60 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -497,7 +497,7 @@ step 59 task 59 node 59 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 2
   attr slot 18
-  buf in 0 t59 buffer b59 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t59 buffer b59 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t61 buffer b61 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -508,7 +508,7 @@ step 60 task 60 node 60 op silu_mul_quantize backend sonic stream s0
   attr layer 2
   buf in 0 t61 buffer b61 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t60 buffer b60 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t63 buffer b62 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t63 buffer b62 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 61 task 61 node 62 op quantized_matmul_q8 backend sonic
@@ -517,7 +517,7 @@ step 61 task 61 node 62 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 2
   attr slot 20
-  buf in 0 t63 buffer b62 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t63 buffer b62 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t64 buffer b63 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -534,7 +534,7 @@ step 63 task 63 node 64 op rms_norm_quantize backend sonic stream s0
   attr layer 3
   attr slot 7
   buf in 0 t65 buffer b64 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t66 buffer b65 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t66 buffer b65 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -544,7 +544,7 @@ step 64 task 64 node 65 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 3
   attr slot 14
-  buf in 0 t66 buffer b65 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t66 buffer b65 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t67 buffer b66 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -568,7 +568,7 @@ step 67 task 67 node 68 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 3
   attr slot 15
-  buf in 0 t66 buffer b65 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t66 buffer b65 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t70 buffer b69 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -578,7 +578,7 @@ step 68 task 68 node 69 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 3
   attr slot 16
-  buf in 0 t66 buffer b65 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t66 buffer b65 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t71 buffer b70 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -646,7 +646,7 @@ step 77 task 77 node 78 op rms_norm_quantize backend sonic stream s0
   attr layer 3
   attr slot 8
   buf in 0 t79 buffer b78 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t80 buffer b79 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t80 buffer b79 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -656,7 +656,7 @@ step 78 task 78 node 79 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 3
   attr slot 19
-  buf in 0 t80 buffer b79 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t80 buffer b79 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t81 buffer b80 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -666,7 +666,7 @@ step 79 task 79 node 80 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 3
   attr slot 18
-  buf in 0 t80 buffer b79 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t80 buffer b79 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t82 buffer b81 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -705,7 +705,7 @@ step 84 task 84 node 85 op rms_norm_quantize backend sonic stream s0
   attr layer 4
   attr slot 7
   buf in 0 t86 buffer b85 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t87 buffer b86 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t87 buffer b86 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -715,7 +715,7 @@ step 85 task 85 node 86 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 4
   attr slot 14
-  buf in 0 t87 buffer b86 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t87 buffer b86 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t88 buffer b87 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -739,7 +739,7 @@ step 88 task 88 node 89 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 4
   attr slot 15
-  buf in 0 t87 buffer b86 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t87 buffer b86 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t91 buffer b90 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -749,7 +749,7 @@ step 89 task 89 node 90 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 4
   attr slot 16
-  buf in 0 t87 buffer b86 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t87 buffer b86 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t92 buffer b91 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -817,7 +817,7 @@ step 98 task 98 node 99 op rms_norm_quantize backend sonic stream s0
   attr layer 4
   attr slot 8
   buf in 0 t100 buffer b99 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t101 buffer b100 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t101 buffer b100 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -827,7 +827,7 @@ step 99 task 99 node 100 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 4
   attr slot 19
-  buf in 0 t101 buffer b100 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t101 buffer b100 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t102 buffer b101 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -837,7 +837,7 @@ step 100 task 100 node 101 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 4
   attr slot 18
-  buf in 0 t101 buffer b100 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t101 buffer b100 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t103 buffer b102 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -848,7 +848,7 @@ step 101 task 101 node 102 op silu_mul_quantize backend sonic stream s0
   attr layer 4
   buf in 0 t103 buffer b102 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t102 buffer b101 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t105 buffer b103 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t105 buffer b103 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 102 task 102 node 104 op quantized_matmul_q8 backend sonic
@@ -857,7 +857,7 @@ step 102 task 102 node 104 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 4
   attr slot 20
-  buf in 0 t105 buffer b103 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t105 buffer b103 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t106 buffer b104 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -874,7 +874,7 @@ step 104 task 104 node 106 op rms_norm_quantize backend sonic stream s0
   attr layer 5
   attr slot 7
   buf in 0 t107 buffer b105 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t108 buffer b106 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t108 buffer b106 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -884,7 +884,7 @@ step 105 task 105 node 107 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 5
   attr slot 14
-  buf in 0 t108 buffer b106 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t108 buffer b106 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t109 buffer b107 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -908,7 +908,7 @@ step 108 task 108 node 110 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 5
   attr slot 15
-  buf in 0 t108 buffer b106 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t108 buffer b106 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t112 buffer b110 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -918,7 +918,7 @@ step 109 task 109 node 111 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 5
   attr slot 16
-  buf in 0 t108 buffer b106 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t108 buffer b106 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t113 buffer b111 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -986,7 +986,7 @@ step 118 task 118 node 120 op rms_norm_quantize backend sonic stream s0
   attr layer 5
   attr slot 8
   buf in 0 t121 buffer b119 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t122 buffer b120 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t122 buffer b120 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -996,7 +996,7 @@ step 119 task 119 node 121 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 5
   attr slot 19
-  buf in 0 t122 buffer b120 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t122 buffer b120 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t123 buffer b121 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1006,7 +1006,7 @@ step 120 task 120 node 122 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 5
   attr slot 18
-  buf in 0 t122 buffer b120 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t122 buffer b120 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t124 buffer b122 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1017,7 +1017,7 @@ step 121 task 121 node 123 op silu_mul_quantize backend sonic stream s0
   attr layer 5
   buf in 0 t124 buffer b122 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t123 buffer b121 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t126 buffer b123 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t126 buffer b123 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 122 task 122 node 125 op quantized_matmul_q8 backend sonic
@@ -1026,7 +1026,7 @@ step 122 task 122 node 125 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 5
   attr slot 20
-  buf in 0 t126 buffer b123 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t126 buffer b123 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t127 buffer b124 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -1043,7 +1043,7 @@ step 124 task 124 node 127 op rms_norm_quantize backend sonic stream s0
   attr layer 6
   attr slot 7
   buf in 0 t128 buffer b125 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t129 buffer b126 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t129 buffer b126 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1053,7 +1053,7 @@ step 125 task 125 node 128 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 6
   attr slot 14
-  buf in 0 t129 buffer b126 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t129 buffer b126 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t130 buffer b127 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1077,7 +1077,7 @@ step 128 task 128 node 131 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 6
   attr slot 15
-  buf in 0 t129 buffer b126 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t129 buffer b126 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t133 buffer b130 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1087,7 +1087,7 @@ step 129 task 129 node 132 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 6
   attr slot 16
-  buf in 0 t129 buffer b126 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t129 buffer b126 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t134 buffer b131 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -1155,7 +1155,7 @@ step 138 task 138 node 141 op rms_norm_quantize backend sonic stream s0
   attr layer 6
   attr slot 8
   buf in 0 t142 buffer b139 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t143 buffer b140 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t143 buffer b140 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1165,7 +1165,7 @@ step 139 task 139 node 142 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 6
   attr slot 19
-  buf in 0 t143 buffer b140 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t143 buffer b140 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t144 buffer b141 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1175,7 +1175,7 @@ step 140 task 140 node 143 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 6
   attr slot 18
-  buf in 0 t143 buffer b140 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t143 buffer b140 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t145 buffer b142 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1214,7 +1214,7 @@ step 145 task 145 node 148 op rms_norm_quantize backend sonic stream s0
   attr layer 7
   attr slot 7
   buf in 0 t149 buffer b146 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t150 buffer b147 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t150 buffer b147 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1224,7 +1224,7 @@ step 146 task 146 node 149 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 7
   attr slot 14
-  buf in 0 t150 buffer b147 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t150 buffer b147 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t151 buffer b148 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1248,7 +1248,7 @@ step 149 task 149 node 152 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 7
   attr slot 15
-  buf in 0 t150 buffer b147 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t150 buffer b147 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t154 buffer b151 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1258,7 +1258,7 @@ step 150 task 150 node 153 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 7
   attr slot 16
-  buf in 0 t150 buffer b147 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t150 buffer b147 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t155 buffer b152 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -1326,7 +1326,7 @@ step 159 task 159 node 162 op rms_norm_quantize backend sonic stream s0
   attr layer 7
   attr slot 8
   buf in 0 t163 buffer b160 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t164 buffer b161 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t164 buffer b161 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1336,7 +1336,7 @@ step 160 task 160 node 163 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 7
   attr slot 19
-  buf in 0 t164 buffer b161 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t164 buffer b161 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t165 buffer b162 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1346,7 +1346,7 @@ step 161 task 161 node 164 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 7
   attr slot 18
-  buf in 0 t164 buffer b161 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t164 buffer b161 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t166 buffer b163 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1385,7 +1385,7 @@ step 166 task 166 node 169 op rms_norm_quantize backend sonic stream s0
   attr layer 8
   attr slot 7
   buf in 0 t170 buffer b167 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t171 buffer b168 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t171 buffer b168 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1395,7 +1395,7 @@ step 167 task 167 node 170 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 8
   attr slot 14
-  buf in 0 t171 buffer b168 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t171 buffer b168 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t172 buffer b169 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1419,7 +1419,7 @@ step 170 task 170 node 173 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 8
   attr slot 15
-  buf in 0 t171 buffer b168 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t171 buffer b168 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t175 buffer b172 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1429,7 +1429,7 @@ step 171 task 171 node 174 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 8
   attr slot 16
-  buf in 0 t171 buffer b168 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t171 buffer b168 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t176 buffer b173 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -1497,7 +1497,7 @@ step 180 task 180 node 183 op rms_norm_quantize backend sonic stream s0
   attr layer 8
   attr slot 8
   buf in 0 t184 buffer b181 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t185 buffer b182 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t185 buffer b182 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1507,7 +1507,7 @@ step 181 task 181 node 184 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 8
   attr slot 19
-  buf in 0 t185 buffer b182 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t185 buffer b182 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t186 buffer b183 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1517,7 +1517,7 @@ step 182 task 182 node 185 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 8
   attr slot 18
-  buf in 0 t185 buffer b182 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t185 buffer b182 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t187 buffer b184 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1556,7 +1556,7 @@ step 187 task 187 node 190 op rms_norm_quantize backend sonic stream s0
   attr layer 9
   attr slot 7
   buf in 0 t191 buffer b188 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t192 buffer b189 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t192 buffer b189 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1566,7 +1566,7 @@ step 188 task 188 node 191 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 9
   attr slot 14
-  buf in 0 t192 buffer b189 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t192 buffer b189 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t193 buffer b190 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1590,7 +1590,7 @@ step 191 task 191 node 194 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 9
   attr slot 15
-  buf in 0 t192 buffer b189 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t192 buffer b189 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t196 buffer b193 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1600,7 +1600,7 @@ step 192 task 192 node 195 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 9
   attr slot 16
-  buf in 0 t192 buffer b189 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t192 buffer b189 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t197 buffer b194 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -1668,7 +1668,7 @@ step 201 task 201 node 204 op rms_norm_quantize backend sonic stream s0
   attr layer 9
   attr slot 8
   buf in 0 t205 buffer b202 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t206 buffer b203 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t206 buffer b203 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1678,7 +1678,7 @@ step 202 task 202 node 205 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 9
   attr slot 19
-  buf in 0 t206 buffer b203 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t206 buffer b203 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t207 buffer b204 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1688,7 +1688,7 @@ step 203 task 203 node 206 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 9
   attr slot 18
-  buf in 0 t206 buffer b203 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t206 buffer b203 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t208 buffer b205 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1727,7 +1727,7 @@ step 208 task 208 node 211 op rms_norm_quantize backend sonic stream s0
   attr layer 10
   attr slot 7
   buf in 0 t212 buffer b209 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t213 buffer b210 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t213 buffer b210 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1737,7 +1737,7 @@ step 209 task 209 node 212 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 10
   attr slot 14
-  buf in 0 t213 buffer b210 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t213 buffer b210 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t214 buffer b211 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1761,7 +1761,7 @@ step 212 task 212 node 215 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 10
   attr slot 15
-  buf in 0 t213 buffer b210 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t213 buffer b210 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t217 buffer b214 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1771,7 +1771,7 @@ step 213 task 213 node 216 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 10
   attr slot 16
-  buf in 0 t213 buffer b210 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t213 buffer b210 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t218 buffer b215 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -1839,7 +1839,7 @@ step 222 task 222 node 225 op rms_norm_quantize backend sonic stream s0
   attr layer 10
   attr slot 8
   buf in 0 t226 buffer b223 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t227 buffer b224 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t227 buffer b224 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1849,7 +1849,7 @@ step 223 task 223 node 226 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 10
   attr slot 19
-  buf in 0 t227 buffer b224 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t227 buffer b224 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t228 buffer b225 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1859,7 +1859,7 @@ step 224 task 224 node 227 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 10
   attr slot 18
-  buf in 0 t227 buffer b224 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t227 buffer b224 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t229 buffer b226 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1898,7 +1898,7 @@ step 229 task 229 node 232 op rms_norm_quantize backend sonic stream s0
   attr layer 11
   attr slot 7
   buf in 0 t233 buffer b230 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t234 buffer b231 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t234 buffer b231 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -1908,7 +1908,7 @@ step 230 task 230 node 233 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 11
   attr slot 14
-  buf in 0 t234 buffer b231 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t234 buffer b231 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t235 buffer b232 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1932,7 +1932,7 @@ step 233 task 233 node 236 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 11
   attr slot 15
-  buf in 0 t234 buffer b231 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t234 buffer b231 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t238 buffer b235 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -1942,7 +1942,7 @@ step 234 task 234 node 237 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 11
   attr slot 16
-  buf in 0 t234 buffer b231 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t234 buffer b231 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t239 buffer b236 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2010,7 +2010,7 @@ step 243 task 243 node 246 op rms_norm_quantize backend sonic stream s0
   attr layer 11
   attr slot 8
   buf in 0 t247 buffer b244 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t248 buffer b245 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t248 buffer b245 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2020,7 +2020,7 @@ step 244 task 244 node 247 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 11
   attr slot 19
-  buf in 0 t248 buffer b245 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t248 buffer b245 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t249 buffer b246 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2030,7 +2030,7 @@ step 245 task 245 node 248 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 11
   attr slot 18
-  buf in 0 t248 buffer b245 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t248 buffer b245 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t250 buffer b247 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2041,7 +2041,7 @@ step 246 task 246 node 249 op silu_mul_quantize backend sonic stream s0
   attr layer 11
   buf in 0 t250 buffer b247 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t249 buffer b246 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t252 buffer b248 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t252 buffer b248 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 247 task 247 node 251 op quantized_matmul_q8 backend sonic
@@ -2050,7 +2050,7 @@ step 247 task 247 node 251 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 11
   attr slot 20
-  buf in 0 t252 buffer b248 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t252 buffer b248 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t253 buffer b249 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -2067,7 +2067,7 @@ step 249 task 249 node 253 op rms_norm_quantize backend sonic stream s0
   attr layer 12
   attr slot 7
   buf in 0 t254 buffer b250 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t255 buffer b251 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t255 buffer b251 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2077,7 +2077,7 @@ step 250 task 250 node 254 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 12
   attr slot 14
-  buf in 0 t255 buffer b251 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t255 buffer b251 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t256 buffer b252 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2101,7 +2101,7 @@ step 253 task 253 node 257 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 12
   attr slot 15
-  buf in 0 t255 buffer b251 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t255 buffer b251 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t259 buffer b255 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2111,7 +2111,7 @@ step 254 task 254 node 258 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 12
   attr slot 16
-  buf in 0 t255 buffer b251 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t255 buffer b251 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t260 buffer b256 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2179,7 +2179,7 @@ step 263 task 263 node 267 op rms_norm_quantize backend sonic stream s0
   attr layer 12
   attr slot 8
   buf in 0 t268 buffer b264 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t269 buffer b265 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t269 buffer b265 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2189,7 +2189,7 @@ step 264 task 264 node 268 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 12
   attr slot 19
-  buf in 0 t269 buffer b265 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t269 buffer b265 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t270 buffer b266 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2199,7 +2199,7 @@ step 265 task 265 node 269 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 12
   attr slot 18
-  buf in 0 t269 buffer b265 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t269 buffer b265 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t271 buffer b267 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2210,7 +2210,7 @@ step 266 task 266 node 270 op silu_mul_quantize backend sonic stream s0
   attr layer 12
   buf in 0 t271 buffer b267 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t270 buffer b266 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t273 buffer b268 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t273 buffer b268 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 267 task 267 node 272 op quantized_matmul_q8 backend sonic
@@ -2219,7 +2219,7 @@ step 267 task 267 node 272 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 12
   attr slot 20
-  buf in 0 t273 buffer b268 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t273 buffer b268 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t274 buffer b269 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -2236,7 +2236,7 @@ step 269 task 269 node 274 op rms_norm_quantize backend sonic stream s0
   attr layer 13
   attr slot 7
   buf in 0 t275 buffer b270 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t276 buffer b271 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t276 buffer b271 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2246,7 +2246,7 @@ step 270 task 270 node 275 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 13
   attr slot 14
-  buf in 0 t276 buffer b271 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t276 buffer b271 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t277 buffer b272 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2270,7 +2270,7 @@ step 273 task 273 node 278 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 13
   attr slot 15
-  buf in 0 t276 buffer b271 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t276 buffer b271 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t280 buffer b275 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2280,7 +2280,7 @@ step 274 task 274 node 279 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 13
   attr slot 16
-  buf in 0 t276 buffer b271 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t276 buffer b271 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t281 buffer b276 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -2348,7 +2348,7 @@ step 283 task 283 node 288 op rms_norm_quantize backend sonic stream s0
   attr layer 13
   attr slot 8
   buf in 0 t289 buffer b284 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t290 buffer b285 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t290 buffer b285 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2358,7 +2358,7 @@ step 284 task 284 node 289 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 13
   attr slot 19
-  buf in 0 t290 buffer b285 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t290 buffer b285 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t291 buffer b286 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2368,7 +2368,7 @@ step 285 task 285 node 290 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 13
   attr slot 18
-  buf in 0 t290 buffer b285 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t290 buffer b285 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t292 buffer b287 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2407,7 +2407,7 @@ step 290 task 290 node 295 op rms_norm_quantize backend sonic stream s0
   attr layer 14
   attr slot 7
   buf in 0 t296 buffer b291 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t297 buffer b292 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t297 buffer b292 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2417,7 +2417,7 @@ step 291 task 291 node 296 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 14
   attr slot 14
-  buf in 0 t297 buffer b292 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t297 buffer b292 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t298 buffer b293 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2441,7 +2441,7 @@ step 294 task 294 node 299 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 14
   attr slot 15
-  buf in 0 t297 buffer b292 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t297 buffer b292 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t301 buffer b296 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2451,7 +2451,7 @@ step 295 task 295 node 300 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 14
   attr slot 16
-  buf in 0 t297 buffer b292 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t297 buffer b292 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t302 buffer b297 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2519,7 +2519,7 @@ step 304 task 304 node 309 op rms_norm_quantize backend sonic stream s0
   attr layer 14
   attr slot 8
   buf in 0 t310 buffer b305 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t311 buffer b306 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t311 buffer b306 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2529,7 +2529,7 @@ step 305 task 305 node 310 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 14
   attr slot 19
-  buf in 0 t311 buffer b306 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t311 buffer b306 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t312 buffer b307 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2539,7 +2539,7 @@ step 306 task 306 node 311 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 14
   attr slot 18
-  buf in 0 t311 buffer b306 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t311 buffer b306 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t313 buffer b308 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2550,7 +2550,7 @@ step 307 task 307 node 312 op silu_mul_quantize backend sonic stream s0
   attr layer 14
   buf in 0 t313 buffer b308 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t312 buffer b307 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t315 buffer b309 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t315 buffer b309 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 308 task 308 node 314 op quantized_matmul_q8 backend sonic
@@ -2559,7 +2559,7 @@ step 308 task 308 node 314 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 14
   attr slot 20
-  buf in 0 t315 buffer b309 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t315 buffer b309 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t316 buffer b310 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -2576,7 +2576,7 @@ step 310 task 310 node 316 op rms_norm_quantize backend sonic stream s0
   attr layer 15
   attr slot 7
   buf in 0 t317 buffer b311 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t318 buffer b312 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t318 buffer b312 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2586,7 +2586,7 @@ step 311 task 311 node 317 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 15
   attr slot 14
-  buf in 0 t318 buffer b312 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t318 buffer b312 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t319 buffer b313 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2610,7 +2610,7 @@ step 314 task 314 node 320 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 15
   attr slot 15
-  buf in 0 t318 buffer b312 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t318 buffer b312 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t322 buffer b316 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2620,7 +2620,7 @@ step 315 task 315 node 321 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 15
   attr slot 16
-  buf in 0 t318 buffer b312 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t318 buffer b312 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t323 buffer b317 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2688,7 +2688,7 @@ step 324 task 324 node 330 op rms_norm_quantize backend sonic stream s0
   attr layer 15
   attr slot 8
   buf in 0 t331 buffer b325 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t332 buffer b326 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t332 buffer b326 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2698,7 +2698,7 @@ step 325 task 325 node 331 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 15
   attr slot 19
-  buf in 0 t332 buffer b326 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t332 buffer b326 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t333 buffer b327 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2708,7 +2708,7 @@ step 326 task 326 node 332 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 15
   attr slot 18
-  buf in 0 t332 buffer b326 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t332 buffer b326 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t334 buffer b328 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2719,7 +2719,7 @@ step 327 task 327 node 333 op silu_mul_quantize backend sonic stream s0
   attr layer 15
   buf in 0 t334 buffer b328 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t333 buffer b327 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t336 buffer b329 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t336 buffer b329 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 328 task 328 node 335 op quantized_matmul_q8 backend sonic
@@ -2728,7 +2728,7 @@ step 328 task 328 node 335 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 15
   attr slot 20
-  buf in 0 t336 buffer b329 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t336 buffer b329 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t337 buffer b330 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -2745,7 +2745,7 @@ step 330 task 330 node 337 op rms_norm_quantize backend sonic stream s0
   attr layer 16
   attr slot 7
   buf in 0 t338 buffer b331 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t339 buffer b332 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t339 buffer b332 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2755,7 +2755,7 @@ step 331 task 331 node 338 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 16
   attr slot 14
-  buf in 0 t339 buffer b332 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t339 buffer b332 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t340 buffer b333 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2779,7 +2779,7 @@ step 334 task 334 node 341 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 16
   attr slot 15
-  buf in 0 t339 buffer b332 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t339 buffer b332 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t343 buffer b336 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2789,7 +2789,7 @@ step 335 task 335 node 342 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 16
   attr slot 16
-  buf in 0 t339 buffer b332 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t339 buffer b332 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t344 buffer b337 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -2857,7 +2857,7 @@ step 344 task 344 node 351 op rms_norm_quantize backend sonic stream s0
   attr layer 16
   attr slot 8
   buf in 0 t352 buffer b345 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t353 buffer b346 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t353 buffer b346 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2867,7 +2867,7 @@ step 345 task 345 node 352 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 16
   attr slot 19
-  buf in 0 t353 buffer b346 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t353 buffer b346 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t354 buffer b347 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2877,7 +2877,7 @@ step 346 task 346 node 353 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 16
   attr slot 18
-  buf in 0 t353 buffer b346 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t353 buffer b346 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t355 buffer b348 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2916,7 +2916,7 @@ step 351 task 351 node 358 op rms_norm_quantize backend sonic stream s0
   attr layer 17
   attr slot 7
   buf in 0 t359 buffer b352 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t360 buffer b353 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t360 buffer b353 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -2926,7 +2926,7 @@ step 352 task 352 node 359 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 17
   attr slot 14
-  buf in 0 t360 buffer b353 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t360 buffer b353 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t361 buffer b354 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2950,7 +2950,7 @@ step 355 task 355 node 362 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 17
   attr slot 15
-  buf in 0 t360 buffer b353 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t360 buffer b353 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t364 buffer b357 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -2960,7 +2960,7 @@ step 356 task 356 node 363 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 17
   attr slot 16
-  buf in 0 t360 buffer b353 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t360 buffer b353 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t365 buffer b358 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3028,7 +3028,7 @@ step 365 task 365 node 372 op rms_norm_quantize backend sonic stream s0
   attr layer 17
   attr slot 8
   buf in 0 t373 buffer b366 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t374 buffer b367 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t374 buffer b367 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3038,7 +3038,7 @@ step 366 task 366 node 373 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 17
   attr slot 19
-  buf in 0 t374 buffer b367 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t374 buffer b367 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t375 buffer b368 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3048,7 +3048,7 @@ step 367 task 367 node 374 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 17
   attr slot 18
-  buf in 0 t374 buffer b367 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t374 buffer b367 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t376 buffer b369 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3059,7 +3059,7 @@ step 368 task 368 node 375 op silu_mul_quantize backend sonic stream s0
   attr layer 17
   buf in 0 t376 buffer b369 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t375 buffer b368 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t378 buffer b370 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t378 buffer b370 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 369 task 369 node 377 op quantized_matmul_q8 backend sonic
@@ -3068,7 +3068,7 @@ step 369 task 369 node 377 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 17
   attr slot 20
-  buf in 0 t378 buffer b370 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t378 buffer b370 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t379 buffer b371 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -3085,7 +3085,7 @@ step 371 task 371 node 379 op rms_norm_quantize backend sonic stream s0
   attr layer 18
   attr slot 7
   buf in 0 t380 buffer b372 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t381 buffer b373 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t381 buffer b373 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3095,7 +3095,7 @@ step 372 task 372 node 380 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 18
   attr slot 14
-  buf in 0 t381 buffer b373 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t381 buffer b373 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t382 buffer b374 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3119,7 +3119,7 @@ step 375 task 375 node 383 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 18
   attr slot 15
-  buf in 0 t381 buffer b373 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t381 buffer b373 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t385 buffer b377 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3129,7 +3129,7 @@ step 376 task 376 node 384 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 18
   attr slot 16
-  buf in 0 t381 buffer b373 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t381 buffer b373 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t386 buffer b378 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3197,7 +3197,7 @@ step 385 task 385 node 393 op rms_norm_quantize backend sonic stream s0
   attr layer 18
   attr slot 8
   buf in 0 t394 buffer b386 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t395 buffer b387 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t395 buffer b387 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3207,7 +3207,7 @@ step 386 task 386 node 394 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 18
   attr slot 19
-  buf in 0 t395 buffer b387 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t395 buffer b387 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t396 buffer b388 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3217,7 +3217,7 @@ step 387 task 387 node 395 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 18
   attr slot 18
-  buf in 0 t395 buffer b387 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t395 buffer b387 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t397 buffer b389 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3228,7 +3228,7 @@ step 388 task 388 node 396 op silu_mul_quantize backend sonic stream s0
   attr layer 18
   buf in 0 t397 buffer b389 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t396 buffer b388 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t399 buffer b390 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t399 buffer b390 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 389 task 389 node 398 op quantized_matmul_q8 backend sonic
@@ -3237,7 +3237,7 @@ step 389 task 389 node 398 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 18
   attr slot 20
-  buf in 0 t399 buffer b390 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t399 buffer b390 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t400 buffer b391 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -3254,7 +3254,7 @@ step 391 task 391 node 400 op rms_norm_quantize backend sonic stream s0
   attr layer 19
   attr slot 7
   buf in 0 t401 buffer b392 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t402 buffer b393 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t402 buffer b393 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3264,7 +3264,7 @@ step 392 task 392 node 401 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 19
   attr slot 14
-  buf in 0 t402 buffer b393 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t402 buffer b393 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t403 buffer b394 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3288,7 +3288,7 @@ step 395 task 395 node 404 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 19
   attr slot 15
-  buf in 0 t402 buffer b393 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t402 buffer b393 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t406 buffer b397 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3298,7 +3298,7 @@ step 396 task 396 node 405 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 19
   attr slot 16
-  buf in 0 t402 buffer b393 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t402 buffer b393 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t407 buffer b398 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -3366,7 +3366,7 @@ step 405 task 405 node 414 op rms_norm_quantize backend sonic stream s0
   attr layer 19
   attr slot 8
   buf in 0 t415 buffer b406 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t416 buffer b407 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t416 buffer b407 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3376,7 +3376,7 @@ step 406 task 406 node 415 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 19
   attr slot 19
-  buf in 0 t416 buffer b407 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t416 buffer b407 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t417 buffer b408 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3386,7 +3386,7 @@ step 407 task 407 node 416 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 19
   attr slot 18
-  buf in 0 t416 buffer b407 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t416 buffer b407 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t418 buffer b409 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3425,7 +3425,7 @@ step 412 task 412 node 421 op rms_norm_quantize backend sonic stream s0
   attr layer 20
   attr slot 7
   buf in 0 t422 buffer b413 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t423 buffer b414 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t423 buffer b414 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3435,7 +3435,7 @@ step 413 task 413 node 422 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 20
   attr slot 14
-  buf in 0 t423 buffer b414 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t423 buffer b414 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t424 buffer b415 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3459,7 +3459,7 @@ step 416 task 416 node 425 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 20
   attr slot 15
-  buf in 0 t423 buffer b414 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t423 buffer b414 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t427 buffer b418 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3469,7 +3469,7 @@ step 417 task 417 node 426 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 20
   attr slot 16
-  buf in 0 t423 buffer b414 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t423 buffer b414 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t428 buffer b419 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3537,7 +3537,7 @@ step 426 task 426 node 435 op rms_norm_quantize backend sonic stream s0
   attr layer 20
   attr slot 8
   buf in 0 t436 buffer b427 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t437 buffer b428 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t437 buffer b428 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3547,7 +3547,7 @@ step 427 task 427 node 436 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 20
   attr slot 19
-  buf in 0 t437 buffer b428 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t437 buffer b428 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t438 buffer b429 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3557,7 +3557,7 @@ step 428 task 428 node 437 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 20
   attr slot 18
-  buf in 0 t437 buffer b428 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t437 buffer b428 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t439 buffer b430 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3568,7 +3568,7 @@ step 429 task 429 node 438 op silu_mul_quantize backend sonic stream s0
   attr layer 20
   buf in 0 t439 buffer b430 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t438 buffer b429 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t441 buffer b431 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t441 buffer b431 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 430 task 430 node 440 op quantized_matmul_q8 backend sonic
@@ -3577,7 +3577,7 @@ step 430 task 430 node 440 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 20
   attr slot 20
-  buf in 0 t441 buffer b431 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t441 buffer b431 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t442 buffer b432 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -3594,7 +3594,7 @@ step 432 task 432 node 442 op rms_norm_quantize backend sonic stream s0
   attr layer 21
   attr slot 7
   buf in 0 t443 buffer b433 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t444 buffer b434 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t444 buffer b434 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3604,7 +3604,7 @@ step 433 task 433 node 443 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 21
   attr slot 14
-  buf in 0 t444 buffer b434 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t444 buffer b434 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t445 buffer b435 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3628,7 +3628,7 @@ step 436 task 436 node 446 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 21
   attr slot 15
-  buf in 0 t444 buffer b434 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t444 buffer b434 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t448 buffer b438 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3638,7 +3638,7 @@ step 437 task 437 node 447 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 21
   attr slot 16
-  buf in 0 t444 buffer b434 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t444 buffer b434 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t449 buffer b439 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q8_0
   activation_quant block_q8_1_mmq(d4)
@@ -3706,7 +3706,7 @@ step 446 task 446 node 456 op rms_norm_quantize backend sonic stream s0
   attr layer 21
   attr slot 8
   buf in 0 t457 buffer b447 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t458 buffer b448 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t458 buffer b448 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3716,7 +3716,7 @@ step 447 task 447 node 457 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 21
   attr slot 19
-  buf in 0 t458 buffer b448 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t458 buffer b448 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t459 buffer b449 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3726,7 +3726,7 @@ step 448 task 448 node 458 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 21
   attr slot 18
-  buf in 0 t458 buffer b448 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t458 buffer b448 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t460 buffer b450 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3765,7 +3765,7 @@ step 453 task 453 node 463 op rms_norm_quantize backend sonic stream s0
   attr layer 22
   attr slot 7
   buf in 0 t464 buffer b454 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t465 buffer b455 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t465 buffer b455 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3775,7 +3775,7 @@ step 454 task 454 node 464 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 22
   attr slot 14
-  buf in 0 t465 buffer b455 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t465 buffer b455 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t466 buffer b456 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3799,7 +3799,7 @@ step 457 task 457 node 467 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 22
   attr slot 15
-  buf in 0 t465 buffer b455 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t465 buffer b455 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t469 buffer b459 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3809,7 +3809,7 @@ step 458 task 458 node 468 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 22
   attr slot 16
-  buf in 0 t465 buffer b455 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t465 buffer b455 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t470 buffer b460 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3877,7 +3877,7 @@ step 467 task 467 node 477 op rms_norm_quantize backend sonic stream s0
   attr layer 22
   attr slot 8
   buf in 0 t478 buffer b468 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t479 buffer b469 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t479 buffer b469 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3887,7 +3887,7 @@ step 468 task 468 node 478 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 22
   attr slot 19
-  buf in 0 t479 buffer b469 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t479 buffer b469 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t480 buffer b470 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3897,7 +3897,7 @@ step 469 task 469 node 479 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 22
   attr slot 18
-  buf in 0 t479 buffer b469 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t479 buffer b469 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t481 buffer b471 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3908,7 +3908,7 @@ step 470 task 470 node 480 op silu_mul_quantize backend sonic stream s0
   attr layer 22
   buf in 0 t481 buffer b471 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t480 buffer b470 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t483 buffer b472 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t483 buffer b472 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 471 task 471 node 482 op quantized_matmul_q8 backend sonic
@@ -3917,7 +3917,7 @@ step 471 task 471 node 482 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 22
   attr slot 20
-  buf in 0 t483 buffer b472 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t483 buffer b472 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t484 buffer b473 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)
@@ -3934,7 +3934,7 @@ step 473 task 473 node 484 op rms_norm_quantize backend sonic stream s0
   attr layer 23
   attr slot 7
   buf in 0 t485 buffer b474 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t486 buffer b475 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t486 buffer b475 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -3944,7 +3944,7 @@ step 474 task 474 node 485 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 23
   attr slot 14
-  buf in 0 t486 buffer b475 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t486 buffer b475 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t487 buffer b476 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3968,7 +3968,7 @@ step 477 task 477 node 488 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 23
   attr slot 15
-  buf in 0 t486 buffer b475 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t486 buffer b475 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t490 buffer b479 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -3978,7 +3978,7 @@ step 478 task 478 node 489 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 23
   attr slot 16
-  buf in 0 t486 buffer b475 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t486 buffer b475 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t491 buffer b480 offset 0 size 4096 shape [8,128] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -4046,7 +4046,7 @@ step 487 task 487 node 498 op rms_norm_quantize backend sonic stream s0
   attr layer 23
   attr slot 8
   buf in 0 t499 buffer b488 offset 0 size 28672 shape [8,896] dtype float32
-  buf out 0 t500 buffer b489 offset 0 size 28672 shape [8,896] dtype float32
+  buf out 0 t500 buffer b489 offset 0 size 27648 shape [8,896] dtype float32
   activation_quant block_q8_1_mmq(d4)
   launch rms_norm_inv_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
   launch scale_quantize_mmq_q8_1_kernel<ds=d4> grid 8x2x1 block 128x1x1 smem 0 stream s0
@@ -4056,7 +4056,7 @@ step 488 task 488 node 499 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 23
   attr slot 19
-  buf in 0 t500 buffer b489 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t500 buffer b489 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t501 buffer b490 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -4066,7 +4066,7 @@ step 489 task 489 node 500 op quantized_matmul_q8 backend sonic
   attr ds 0
   attr layer 23
   attr slot 18
-  buf in 0 t500 buffer b489 offset 0 size 28672 shape [8,896] dtype float32
+  buf in 0 t500 buffer b489 offset 0 size 27648 shape [8,896] dtype float32
   buf out 0 t502 buffer b491 offset 0 size 155648 shape [8,4864] dtype float32
   weight_quant q5_0
   activation_quant block_q8_1_mmq(d4)
@@ -4077,7 +4077,7 @@ step 490 task 490 node 501 op silu_mul_quantize backend sonic stream s0
   attr layer 23
   buf in 0 t502 buffer b491 offset 0 size 155648 shape [8,4864] dtype float32
   buf in 1 t501 buffer b490 offset 0 size 155648 shape [8,4864] dtype float32
-  buf out 0 t504 buffer b492 offset 0 size 155648 shape [8,4864] dtype float32
+  buf out 0 t504 buffer b492 offset 0 size 62208 shape [8,4864] dtype float32
   activation_quant block_q8_1_mmq(ds4)
   launch silu_mul_quantize_mmq_q8_1_kernel<ds=ds4> grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 491 task 491 node 503 op quantized_matmul_q8 backend sonic
@@ -4086,7 +4086,7 @@ step 491 task 491 node 503 op quantized_matmul_q8 backend sonic
   attr ds 1
   attr layer 23
   attr slot 20
-  buf in 0 t504 buffer b492 offset 0 size 155648 shape [8,4864] dtype float32
+  buf in 0 t504 buffer b492 offset 0 size 62208 shape [8,4864] dtype float32
   buf out 0 t505 buffer b493 offset 0 size 28672 shape [8,896] dtype float32
   weight_quant q4_K
   activation_quant block_q8_1_mmq(ds4)

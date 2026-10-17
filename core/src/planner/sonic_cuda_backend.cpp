@@ -550,11 +550,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::RmsNormQuantize: {
       // rms_norm + quantize fused (T3): the norm weight is keyed by `slot`
-      // (AttnNorm / FfnNorm / OutputNorm); the output is the quantized
-      // activation packed into an f32-sized buffer (same superset convention as
-      // Quantize). The decode path (no `batch`) emits a q8_1 (32-elem block)
-      // activation; the prefill path (`batch` + `dim` + `ds`) emits a
-      // block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
+      // (AttnNorm / FfnNorm / OutputNorm); the output buffer holds only the
+      // quantized activation. The decode path (no `batch`) emits a q8_1
+      // (32-elem block) activation — its element count is the f32 input's, not
+      // the (smaller) output buffer's; the prefill path (`batch` + `dim` +
+      // `ds`) emits a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
       if (attr_i(*node, "batch", nb)) {
         attr_i(*node, "dim", dim_i);
@@ -566,9 +566,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             int(ds_i));
       } else {
         note_activation_quant("q8_1");
+        const int n = int(in[0].device.size_bytes / sizeof(float));
         ok = quant::cuda::rms_norm_quantize_q8_1_dev(
             fweight(slot), dev(in[0]), eps,
-            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n);
       }
       break;
     }
@@ -588,9 +589,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             int(ds_i));
       } else {
         note_activation_quant("q8_1");
+        const int n = int(in[0].device.size_bytes / sizeof(float));
         ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
             dev(in[0]), dev(in[1]),
-            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n);
       }
       break;
     }
@@ -611,9 +613,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             int(ds_i));
       } else {
         note_activation_quant("q8_1");
+        const int n = int(in[0].device.size_bytes / sizeof(float));
         ok = quant::cuda::silu_mul_quantize_q8_1_dev(
             dev(in[0]), dev(in[1]),
-            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), out_n);
+            reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n);
       }
       break;
     }
