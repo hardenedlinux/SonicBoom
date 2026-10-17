@@ -65,6 +65,12 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // The prefill segment length this execution runs with (Backend::
+  // bind_segment_extent). On a plan lowered from a symbolic IR it replaces the
+  // planned `batch` of every batched node and sizes every dynamic tensor's
+  // buffer, so one plan serves every segment of its shape class.
+  void bind_segment_extent(uint64_t extent) override { segment_extent_ = extent; }
+
   // Seed the device-resident token-id buffer (Phase 3.2 B4): uploads `token` as
   // a float index so the first decode step's Embedding gather reads it from the
   // device. The decode loop calls this once before stepping; thereafter Argmax
@@ -153,6 +159,7 @@ private:
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   hal::Buffer tokens_buf_;          // persistent device buffer: prefill chunk token ids ([chunk] uint64)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
+  uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
 
   void ensure_caches(uint64_t n_ctx);
 };

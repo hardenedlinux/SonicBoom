@@ -351,10 +351,30 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
   };
 
+  // The number of positions this execution covers: the node's `batch` (the
+  // extent the plan was built at) overridden by the extent bound for this
+  // execution. A plan lowered from a symbolic IR carries the planned maximum as
+  // its `batch`, so overriding it is what lets one plan serve every segment of
+  // its shape class.
+  auto batch_attr = [&](int64_t& nb) {
+    if (!attr_i(*node, "batch", nb))
+      return false;
+    if (segment_extent_ != 0)
+      nb = int64_t(segment_extent_);
+    return true;
+  };
+
   // Allocate the device output buffer from the pool. Device activations never
   // reach this backend on the host, so every input is device-resident except the
-  // Int64 `pos` scalar consumed by Rope.
-  const uint64_t out_bytes = out_td->size_bytes;
+  // Int64 `pos` scalar consumed by Rope. A tensor that scales with the plan's
+  // dynamic extent occupies its per-unit stride times this execution's extent.
+  if (out_td->dynamic_stride_bytes != 0 && segment_extent_ == 0)
+    return std::unexpected(fail("dynamic tensor executed without an extent"));
+  const uint64_t out_bytes =
+      out_td->dynamic_stride_bytes != 0
+          ? out_td->dynamic_stride_bytes * segment_extent_ +
+                out_td->dynamic_base_bytes
+          : out_td->size_bytes;
   const uint64_t out_handle = device::acquire(out_bytes);
   if (!out_handle)
     return std::unexpected(fail("device buffer allocation failed"));
@@ -373,7 +393,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::RmsNorm: {
       int64_t nb = 0, dim_i = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         // Row norm over [n, dim]: reuse the per-head norm with a single
         // `dim_i`-wide head per row (position), so each row is normalized
         // independently with the full-width weight.
@@ -407,7 +427,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         break;
       }
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         ok = nn::cuda::rope_neox_heads_batched_dev_pos(
             out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
             reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
@@ -466,7 +486,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::QuantizedMatmul: {
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
       } else {
         ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
@@ -495,7 +515,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // quantize; blocks_per_row / num_rows come from the weight.
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         int64_t ds_i = 0;
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
@@ -556,7 +576,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // the (smaller) output buffer's; the prefill path (`batch` + `dim` +
       // `ds`) emits a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
@@ -579,7 +599,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // activation for the down-projection matmul. Decode (no `batch`) emits
       // q8_1; prefill (`batch` + `dim` + `ds`) emits block_q8_1_mmq.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
@@ -603,7 +623,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation, the same
       // two flavours the gelu fusion has.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         attr_i(*node, "dim", dim_i);
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
@@ -622,7 +642,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     }
     case OpKind::MatvecF32: {
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         const int n = int(nb);
         const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
         const int rows = out_n / n;
@@ -648,7 +668,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           model_->weights.per_layer_model_proj.subspan(uint64_t(offset) * d,
                                                        uint64_t(rows) * d);
       int64_t nb = 0;
-      const bool batched = attr_i(*node, "batch", nb);
+      const bool batched = batch_attr(nb);
       const int n = int(nb);
       const int cols =
           int(in[0].device.size_bytes / sizeof(float) / uint64_t(batched ? n : 1));
@@ -726,7 +746,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // f32 and so has no quant type to record.
       if (slot != model::WeightSlot::PerLayerTokenEmbd)
         note_weight_quant(model_->weights.token_embd);
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         // Batched: gather n token rows (prefill), ids read from the persistent
         // device slot tokens_buf_.
         const uint64_t* tokens_dev =
@@ -788,7 +808,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // single chunk at start_pos == 0 the prior range is empty and this is
       // bit-identical to the old intra-batch flash attention.
       int64_t nb = 0;
-      attr_i(*node, "batch", nb);
+      batch_attr(nb);
       int64_t ksrc = layer;
       attr_i(*node, "kv_source_layer", ksrc);
       const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
@@ -806,7 +826,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // Deferred cache append: copy the chunk's n fp16-rounded K/V rows into the
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       int64_t nb = 0;
-      attr_i(*node, "batch", nb);
+      batch_attr(nb);
       KvCacheDev& cache = (*caches_)[uint32_t(layer)];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       if (!cache.k_buf || !cache.v_buf ||

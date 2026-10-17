@@ -44,7 +44,7 @@ void RuntimeExecutor::set_task_backend(TaskId task, Backend* backend) {
 
 std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
     const ExecutionPlan& plan, const ResourceSnapshot& live,
-    const std::vector<sx::Bytes>& inputs) const {
+    const std::vector<sx::Bytes>& inputs, uint64_t segment_extent) const {
   // 1. The live resources must still match what was planned. The executor must
   //    never silently replan or migrate, so a mismatch is a hard error.
   if (resource_fingerprint(live) != plan.resource_fingerprint)
@@ -52,6 +52,38 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         RuntimeErrorCode::ResourceChanged,
         "live resource fingerprint does not match the plan",
         Phase::Execution));
+
+  // 1b. A plan lowered from a symbolic IR was planned at its shape class's
+  //     maximum extent (its tensors' shape/size are that concretization and
+  //     dynamic_stride_bytes is the per-unit size); this execution binds the
+  //     actual extent. Overrunning the planned extent would write past buffers
+  //     the plan sized, and leaving a dynamic plan unbound would transfer 0
+  //     bytes and run kernels over an empty batch, so both are refused.
+  for (const auto& t : plan.tensors) {
+    if (t.dynamic_stride_bytes == 0)
+      continue;
+    if (segment_extent == 0)
+      return std::unexpected(RuntimeError(
+          RuntimeErrorCode::InvalidPlan,
+          "a plan with a dynamic extent was executed without one",
+          Phase::Execution));
+    // size(N) = stride * N + base, so the planned extent is the scaled part
+    // divided by the stride.
+    const uint64_t planned = (t.size_bytes - t.dynamic_base_bytes) /
+                             t.dynamic_stride_bytes;
+    if (segment_extent > planned)
+      return std::unexpected(RuntimeError(
+          RuntimeErrorCode::InvalidPlan,
+          "the execution extent exceeds the extent the plan was sized for",
+          Phase::Execution));
+  }
+  // Every dispatch target learns the bound extent; a static execution binds 0,
+  // which clears an extent left by a previous dynamic execution on the same
+  // backend.
+  for (auto& [tag, backend] : backends_)
+    backend->bind_segment_extent(segment_extent);
+  for (auto& [task, backend] : task_backends_)
+    backend->bind_segment_extent(segment_extent);
 
   // 2. (Plan correctness is already validated once at build time by
   //     plan_execution in pipeline.cpp; the plan is immutable afterward.
@@ -242,6 +274,13 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
         const MemorySpace* dst = plan.find_memory_space(tr->destination);
         const bool src_dev = src && src->kind != MemoryKind::Host;
         const bool dst_dev = dst && dst->kind != MemoryKind::Host;
+        // A tensor that scales with the plan's dynamic extent moves only the
+        // bytes this execution's extent occupies, not the planned maximum.
+        const uint64_t bytes =
+            tr->dynamic_stride_bytes != 0
+                ? tr->dynamic_stride_bytes * segment_extent +
+                      tr->dynamic_base_bytes
+                : tr->bytes;
         auto v = values.find(tr->tensor.value);
         if (v == values.end())
           return std::unexpected(RuntimeError(
@@ -254,26 +293,26 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "H2D transfer found an already-device value", Phase::Execution));
-          uint64_t handle = device::acquire(tr->bytes);
+          uint64_t handle = device::acquire(bytes);
           if (!handle)
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "device buffer allocation failed", Phase::Execution));
-          if (!device::upload(v->second.host.data(), handle, tr->bytes)) {
-            device::release(handle, tr->bytes);
+          if (!device::upload(v->second.host.data(), handle, bytes)) {
+            device::release(handle, bytes);
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure, "H2D copy failed",
                 Phase::Execution));
           }
-          values[tr->tensor.value] = TensorValue::from_device(handle, tr->bytes);
+          values[tr->tensor.value] = TensorValue::from_device(handle, bytes);
         } else if (src_dev && !dst_dev) {
           // Device -> host: download, release the device buffer.
           if (!v->second.on_device)
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "D2H transfer found a host value", Phase::Execution));
-          sx::Bytes host(tr->bytes);
-          if (!device::download(v->second.device.handle, host.data(), tr->bytes)) {
+          sx::Bytes host(bytes);
+          if (!device::download(v->second.device.handle, host.data(), bytes)) {
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure, "D2H copy failed",
                 Phase::Execution));
@@ -286,19 +325,19 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "D2D transfer found a host value", Phase::Execution));
-          uint64_t handle = device::acquire(tr->bytes);
+          uint64_t handle = device::acquire(bytes);
           if (!handle)
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "device buffer allocation failed", Phase::Execution));
-          if (!device::device_copy(v->second.device.handle, handle, tr->bytes)) {
-            device::release(handle, tr->bytes);
+          if (!device::device_copy(v->second.device.handle, handle, bytes)) {
+            device::release(handle, bytes);
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure, "D2D copy failed",
                 Phase::Execution));
           }
           device::release(v->second.device.handle, v->second.device.size_bytes);
-          values[tr->tensor.value] = TensorValue::from_device(handle, tr->bytes);
+          values[tr->tensor.value] = TensorValue::from_device(handle, bytes);
         } else {
           // Host -> host: a plain byte copy (defensive; the v0 planner never
           // emits this).
@@ -306,8 +345,8 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
             return std::unexpected(RuntimeError(
                 RuntimeErrorCode::TransferFailure,
                 "host transfer found a device value", Phase::Execution));
-          sx::Bytes host(tr->bytes);
-          std::memcpy(host.data(), v->second.host.data(), tr->bytes);
+          sx::Bytes host(bytes);
+          std::memcpy(host.data(), v->second.host.data(), bytes);
           values[tr->tensor.value] = TensorValue::from_host(std::move(host));
         }
         break;

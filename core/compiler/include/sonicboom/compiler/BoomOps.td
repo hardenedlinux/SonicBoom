@@ -85,7 +85,14 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
     StrAttr:$graph_name,
     ArrayAttr:$tensors,
     DenseI64ArrayAttr:$inputs,
-    DenseI64ArrayAttr:$outputs);
+    DenseI64ArrayAttr:$outputs,
+
+    // The segment length the tensor table's dynamic (leading-`?`) entries were
+    // sized at: each such entry states its byte size at this extent plus the
+    // fixed part of its affine size. 0 when the table has no dynamic entry.
+    // The lowering binds any extent up to this one by evaluating the affine
+    // size; it never exceeds it.
+    I64Attr:$dynamic_extent);
 
   let regions = (region SizedRegion<1>:$body);
 

@@ -128,15 +128,19 @@ public:
     maxTensorId_ = std::max(maxTensorId_, desc.getId());
   }
 
-  // Replace a tensor's declared byte size, keeping every other field. A fused
-  // op writes a compact quantized activation into a buffer the emitter declared
-  // as the f32 tensor it was derived from; once every reader of that buffer
-  // takes the quantized view, the declaration can be the quantized size.
-  void setTensorSize(int64_t id, uint64_t sizeBytes) {
+  // Replace a tensor's declared byte size (and the fixed part of its affine
+  // size in the graph's dynamic extent), keeping every other field. A fused op
+  // writes a compact quantized activation into a buffer the emitter declared as
+  // the f32 tensor it was derived from; once every reader of that buffer takes
+  // the quantized view, the declaration can be the quantized size. `sizeBytes`
+  // is the size at the extent this pass binds.
+  void setTensorSize(int64_t id, uint64_t sizeBytes,
+                     uint64_t dynamicBaseBytes = 0) {
     const boom::TensorDescAttr d = descs_.lookup(id);
     descs_[id] = boom::TensorDescAttr::get(
-        ctx_, id, d.getShape(), d.getDtype(), sizeBytes, d.getIsInput(),
-        d.getIsOutput(), d.getIsConstant(), d.getIsExternal(), d.getName());
+        ctx_, id, d.getShape(), d.getDtype(), sizeBytes, dynamicBaseBytes,
+        d.getIsInput(), d.getIsOutput(), d.getIsConstant(), d.getIsExternal(),
+        d.getName());
   }
 
   // Drop a tensor from the table. Only for a tensor nothing references any more:
@@ -305,6 +309,12 @@ uint64_t mmqActivationBytes(int64_t dim, int64_t n) {
   return (planes * uint64_t(n) + kMmqTailGuardBlocks) * kMmqBlockBytes;
 }
 
+// The fixed part of mmqActivationBytes: the tail guard does not scale with the
+// batch, so a symbolic (extent-parameterized) plan records it separately.
+constexpr uint64_t mmqActivationBaseBytes() {
+  return kMmqTailGuardBlocks * kMmqBlockBytes;
+}
+
 //--- the passes -------------------------------------------------------------
 
 // quantize_once_pass (rewrites.cpp:79), as a Boom IR pass.
@@ -356,8 +366,9 @@ public:
         view.appendTensor(boom::TensorDescAttr::get(
             view.ctx(), qid, xt.getShape(), xt.getDtype(),
             q8_1ActivationBytes(xt.getShape()),
-            /*is_input=*/false, /*is_output=*/false, /*is_constant=*/false,
-            /*is_external=*/false, ("q8_" + xt.getName()).str()));
+            /*dynamic_base_bytes=*/0, /*is_input=*/false, /*is_output=*/false,
+            /*is_constant=*/false, /*is_external=*/false,
+            ("q8_" + xt.getName()).str()));
 
         // The value type of the buffer the kernels read as q8_1: the Q8_1Type
         // of its (f32, block-multiple) shape, which is also what the graph
@@ -988,7 +999,8 @@ public:
 
       // The buffer now holds q8_1 blocks only: declare the mmq activation size
       // (the f32 superset is no longer read by anyone).
-      view.setTensorSize(outOfNorm.lookup(norm), q8BytesOfNorm.lookup(norm));
+      view.setTensorSize(outOfNorm.lookup(norm), q8BytesOfNorm.lookup(norm),
+                         mmqActivationBaseBytes());
     }
 
     // Then the consumers: the same nodes under the operator that reads the
@@ -1162,8 +1174,10 @@ bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
 
     // The Mul's buffer holds q8_1 blocks only now: declare the mmq activation
     // size in place of the f32 superset.
-    view.setTensorSize(fhId, mmqActivationBytes(dimOfAct.lookup(a),
-                                                batchOfAct.lookup(a)));
+    view.setTensorSize(fhId,
+                       mmqActivationBytes(dimOfAct.lookup(a),
+                                          batchOfAct.lookup(a)),
+                       mmqActivationBaseBytes());
 
     matmuls.push_back(matmulOfAct.lookup(a));
   }

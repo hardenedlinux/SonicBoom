@@ -517,7 +517,11 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
 
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
-  compiler::BoomBuilder b(ir.context.get(), "gemma4_prefill");
+  // Sized at `n`: a dynamic (symbolic-extent) build still records every byte
+  // count at the segment length it was emitted for, so the passes see the same
+  // graph the concrete build at `n` carries and choose the same fusions. The
+  // lowering re-derives the sizes from the extent it binds.
+  compiler::BoomBuilder b(ir.context.get(), "gemma4_prefill", n);
 
   // Graph inputs: the prompt token ids (Int64 [n]) and the absolute start
   // position (Int64 scalar).
@@ -1679,7 +1683,10 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       auto seg = std::make_unique<PrefillSegment>();
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
-        GraphIr seg_ir = emit_prefill_ir(m, nseg);
+        // Symbolic extent: the plan is lowered at this segment length and
+        // records it, so a smaller segment of the same shape class can execute
+        // the plan by binding its own length (RuntimeExecutor::execute).
+        GraphIr seg_ir = emit_prefill_ir(m, nseg, /*dynamic_extent=*/true);
         // C.4: fold the mmq activation quantize into the norm/gelu kernels when
         // the mmq tensor-core path is active for this segment (same conditions
         // the batched matmul uses, so fused and unfused positions never disagree
@@ -1687,7 +1694,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         seg->graph = lower_graph(
             seg_ir, planner::IrPassPhase::Prefill,
             quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
-                nseg >= uint64_t(quant::cuda::mmq_min_n()));
+                nseg >= uint64_t(quant::cuda::mmq_min_n()),
+            /*dynamic_extent=*/nseg);
+      }
+      if (seg->graph.nodes.empty()) {
+        std::cerr << "[prefill-cuda] n=" << nseg << " graph lowering failed\n";
+        return nullptr;
       }
       std::expected<planner::ExecutionPlan, planner::PlannerError> pplan;
       {
@@ -1760,7 +1772,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
           std::expected<planner::ExecutionResult, planner::RuntimeError> res;
           {
             Phase _w("prefill:capture_warmup", phase_timing);
-            res = full->exec->execute(full->plan, snap, in);
+            res = full->exec->execute(full->plan, snap, in, /*segment_extent=*/chunk);
           }
           if (res) {
             full->cuda->synchronize();
@@ -1771,7 +1783,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                 std::vector<sx::Bytes> cin;
                 cin.push_back(encode_tokens(first_chunk));
                 cin.push_back(encode_i64(start_pos));
-                auto cres = full->exec->execute(full->plan, snap, cin);
+                auto cres = full->exec->execute(full->plan, snap, cin,
+                                                /*segment_extent=*/chunk);
                 return cres.has_value();
               });
             }
@@ -1836,7 +1849,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       std::vector<sx::Bytes> in;
       in.push_back(encode_tokens(prompt.subspan(off, nseg)));
       in.push_back(encode_i64(pos));
-      auto res = seg->exec->execute(seg->plan, snap, in);
+      auto res = seg->exec->execute(seg->plan, snap, in,
+                                    /*segment_extent=*/nseg);
       if (!res) {
         std::cerr << "[prefill-cuda] segment off=" << off << " execute failed: "
                   << res.error().message << "\n";

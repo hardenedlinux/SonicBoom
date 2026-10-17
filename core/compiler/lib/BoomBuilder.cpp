@@ -92,9 +92,12 @@ nodeAttrs(mlir::MLIRContext *context, llvm::ArrayRef<sx::Attribute> attributes) 
 // representable — the table entry is what the round trip reads back, so a wrong
 // size there is a plan that differs from the graph it came from.
 //
-// A shape with a dynamic dimension (the graph's extent) has no extent-
-// independent byte count: the table entry records 0 here, and the lowering
-// computes the exact size when it binds the extent (BoomConversion.cpp).
+// A shape with a dynamic dimension (the graph's extent) is sized at the extent
+// the builder was given: the byte count in the table is then the one the
+// concrete graph at that length carries, which is what the passes compare.
+// The lowering recomputes the size from the extent it binds
+// (BoomConversion.cpp), so the recorded value is informative, not binding; a
+// builder given no extent records 0.
 struct TensorForm {
   mlir::Type type;
   uint64_t size_bytes;
@@ -104,7 +107,7 @@ std::optional<TensorForm> tensorForm(mlir::MLIRContext *context,
                                      mlir::Location loc, int64_t id,
                                      llvm::StringRef name,
                                      llvm::ArrayRef<int64_t> shape,
-                                     sx::DType dtype) {
+                                     sx::DType dtype, uint64_t extent) {
   const llvm::StringRef dtypeName = sx::dtype_name(dtype);
   if (!boom::boomDTypeFromName(dtypeName)) {
     mlir::emitError(loc) << "tensor id " << id << " ('" << name
@@ -113,11 +116,14 @@ std::optional<TensorForm> tensorForm(mlir::MLIRContext *context,
     return std::nullopt;
   }
   const bool dynamic = llvm::is_contained(shape, mlir::ShapedType::kDynamic);
+  std::vector<int64_t> sized(shape.begin(), shape.end());
+  for (int64_t &d : sized)
+    if (d == mlir::ShapedType::kDynamic) d = int64_t(extent);
   const std::optional<int64_t> size =
-      dynamic ? std::optional<int64_t>(0)
-              : sx::tensor_byte_size(sx::TensorType{
-                    dtype, sx::Shape{std::vector<int64_t>(shape.begin(),
-                                                          shape.end())}});
+      (dynamic && extent == 0)
+          ? std::optional<int64_t>(0)
+          : sx::tensor_byte_size(sx::TensorType{dtype,
+                                                sx::Shape{std::move(sized)}});
   if (!size) {
     mlir::emitError(loc) << "tensor id " << id << " ('" << name
                          << "') has the shape " << shape
@@ -277,8 +283,10 @@ mlir::Operation *createBoomNode(mlir::OpBuilder &builder, mlir::Location loc,
 
 //--- the builder --------------------------------------------------------------
 
-BoomBuilder::BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name)
-    : context_(context), loc_(mlir::UnknownLoc::get(context)), builder_(context) {
+BoomBuilder::BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name,
+                         uint64_t extent)
+    : context_(context), loc_(mlir::UnknownLoc::get(context)), extent_(extent),
+      builder_(context) {
   // An op cannot be created by name until its dialect is loaded, and every node
   // here is created by name.
   context->getOrLoadDialect<boom::BoomDialect>();
@@ -293,7 +301,8 @@ BoomBuilder::BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name)
       builder_, loc_, builder_.getStringAttr(graph_name),
       builder_.getArrayAttr(llvm::ArrayRef<mlir::Attribute>{}),
       builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
-      builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}));
+      builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
+      builder_.getI64IntegerAttr(int64_t(extent_)));
   body_ = builder_.createBlock(&graph_op_.getBody());
 }
 
@@ -310,8 +319,9 @@ int64_t BoomBuilder::addTensor(llvm::StringRef name, llvm::ArrayRef<int64_t> sha
   const int64_t id = int64_t(table_.size());
   table_.push_back(boom::TensorDescAttr::get(
       context_, id, shape, sx::dtype_name(dtype), size_bytes,
-      /*is_graph_input=*/is_input, /*is_graph_output=*/false,
-      /*is_constant=*/false, /*is_external=*/false, name));
+      /*dynamic_base_bytes=*/0, /*is_graph_input=*/is_input,
+      /*is_graph_output=*/false, /*is_constant=*/false,
+      /*is_external=*/false, name));
   if (is_input)
     inputs_.push_back(id);
   return id;
@@ -320,7 +330,7 @@ int64_t BoomBuilder::addTensor(llvm::StringRef name, llvm::ArrayRef<int64_t> sha
 mlir::Value BoomBuilder::input(llvm::StringRef name, llvm::ArrayRef<int64_t> shape,
                                sx::DType dtype) {
   const int64_t id = int64_t(table_.size());
-  auto form = tensorForm(context_, loc_, id, name, shape, dtype);
+  auto form = tensorForm(context_, loc_, id, name, shape, dtype, extent_);
   if (!form) {
     failed_ = true;
     return {};
@@ -339,7 +349,7 @@ mlir::Value BoomBuilder::node(planner::OpKind op,
                               planner::BackendTag backend) {
   const int64_t id = int64_t(table_.size());
   auto form = tensorForm(context_, loc_, id, out_name, out_shape,
-                         sx::DType::Float32);
+                         sx::DType::Float32, extent_);
   if (!form) {
     failed_ = true;
     return {};
@@ -375,8 +385,9 @@ void BoomBuilder::set_output(mlir::Value value) {
   auto desc = llvm::cast<boom::TensorDescAttr>(table_[*id]);
   table_[*id] = boom::TensorDescAttr::get(
       context_, *id, desc.getShape(), desc.getDtype(), desc.getByteSize(),
-      desc.getIsInput(), /*is_graph_output=*/true, desc.getIsConstant(),
-      desc.getIsExternal(), desc.getName());
+      desc.getDynamicBaseBytes(), desc.getIsInput(),
+      /*is_graph_output=*/true, desc.getIsConstant(), desc.getIsExternal(),
+      desc.getName());
   outputs_.assign(1, *id);
 }
 

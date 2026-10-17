@@ -52,6 +52,11 @@ public:
   std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) override;
 
+  // The prefill segment length this execution runs with (Backend::
+  // bind_segment_extent): it replaces the planned `batch` of every batched
+  // node and sizes every dynamic tensor's buffer.
+  void bind_segment_extent(uint64_t extent) override { segment_extent_ = extent; }
+
   // Share another backend's KV cache (same session). The prefill graph's
   // FlashAttention nodes fill the cache that the decode graph's Attention nodes
   // then read, so the prefill backend and decode backend must reference the same
@@ -75,6 +80,7 @@ private:
   const model::Gemma4Model& model_;
   const Graph& graph_;
   std::shared_ptr<std::vector<KvCache>> caches_;  // index == KV layer
+  uint64_t segment_extent_ = 0;  // bound prefill segment length (0: static)
 
   void ensure_caches(uint64_t n_ctx);
 };

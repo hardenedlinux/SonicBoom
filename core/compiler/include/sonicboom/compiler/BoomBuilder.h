@@ -101,7 +101,16 @@ class BoomBuilder {
 public:
   // The dialect is loaded here: an operation cannot be created by name until it
   // is. `context` must outlive the builder and everything built from it.
-  BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name);
+  //
+  // `extent` is the segment length a dynamic shape (`?`) stands for in this
+  // build: the table entry of a dynamic tensor records the byte count at that
+  // extent, so the passes (which decide fusions by comparing byte sizes) see
+  // the same sizes they would on the concrete graph at that length. The graph
+  // op records it as the sizing extent too, which is what the lowering
+  // evaluates the affine size from when it binds a (not larger) extent
+  // (BoomConversion.cpp). 0 leaves dynamic entries unsized.
+  BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name,
+              uint64_t extent = 0);
 
   // A graph input: a free variable, created as a block argument, and listed in
   // the graph's `inputs`. Emitters declare every input before any node, so the
@@ -140,6 +149,7 @@ private:
 
   mlir::MLIRContext *context_;
   mlir::Location loc_;
+  uint64_t extent_ = 0;  // segment length a dynamic shape is sized at
   mlir::OpBuilder builder_;
   mlir::OwningOpRef<mlir::ModuleOp> module_;
   boom::GraphOp graph_op_;

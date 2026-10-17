@@ -174,8 +174,9 @@ int main() {
 
   const auto desc = boom::TensorDescAttr::get(
       &context, /*id=*/7, {2560, 4096}, "q4_K", /*byte_size=*/1441792,
-      /*is_input=*/false, /*is_output=*/false, /*is_constant=*/true,
-      /*is_external=*/false, "/model/layers.0/mlp/gate_proj");
+      /*dynamic_base_bytes=*/0, /*is_input=*/false, /*is_output=*/false,
+      /*is_constant=*/true, /*is_external=*/false,
+      "/model/layers.0/mlp/gate_proj");
   check(bool(desc), "a #boom.tensor_desc builds");
   check(mlir::parseAttribute(printed(desc), &context) == desc,
         "#boom.tensor_desc round-trips: " + printed(desc));

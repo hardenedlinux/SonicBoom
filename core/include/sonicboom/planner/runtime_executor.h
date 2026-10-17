@@ -63,9 +63,17 @@ public:
 
   // Execute `plan`. `inputs` holds one raw buffer per graph-input tensor (in
   // plan order); constants/weights are baked into the backends' compiled units.
+  //
+  // `segment_extent` binds the plan's dynamic extent (the prefill segment
+  // length) for this execution: every tensor carrying TensorDesc::
+  // dynamic_stride_bytes occupies `dynamic_stride_bytes * segment_extent`
+  // bytes, and the backends read it as their `batch`. The plan is sized and
+  // planned at its shape class's maximum extent, so an extent larger than that
+  // is an error, as is a plan with dynamic tensors executed without one. 0 is
+  // the static (decode) case.
   std::expected<ExecutionResult, RuntimeError> execute(
       const ExecutionPlan& plan, const ResourceSnapshot& live,
-      const std::vector<sx::Bytes>& inputs) const;
+      const std::vector<sx::Bytes>& inputs, uint64_t segment_extent = 0) const;
 
 private:
   std::map<BackendTag, Backend*> backends_;

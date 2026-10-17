@@ -77,7 +77,9 @@ std::expected<void, PlannerError> TransferScheduler::schedule(
     TaskDesc tr;
     tr.id = tid;
     tr.kind = TaskKind::Transfer;
-    tr.payload = TransferTaskDesc{tensor, src, dst, td.size_bytes};
+    tr.payload = TransferTaskDesc{tensor, src, dst, td.size_bytes,
+                                  td.dynamic_stride_bytes,
+                                  td.dynamic_base_bytes};
     if (prod)
       tr.dependencies.push_back(*prod);
 

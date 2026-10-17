@@ -198,7 +198,27 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
     }
   };
 
-  sx::Bytes out(out_td->size_bytes);
+  // The number of positions this execution covers: the node's `batch` (the
+  // extent the plan was built at) overridden by the extent bound for this
+  // execution, so one plan serves every segment of its shape class.
+  auto batch_attr = [&](int64_t& nb) {
+    if (!attr_i(*node, "batch", nb))
+      return false;
+    if (segment_extent_ != 0)
+      nb = int64_t(segment_extent_);
+    return true;
+  };
+
+  // A tensor that scales with the plan's dynamic extent occupies its per-unit
+  // stride times this execution's extent, plus its fixed part.
+  if (out_td->dynamic_stride_bytes != 0 && segment_extent_ == 0)
+    return std::unexpected(fail("dynamic tensor executed without an extent"));
+  const uint64_t out_bytes =
+      out_td->dynamic_stride_bytes != 0
+          ? out_td->dynamic_stride_bytes * segment_extent_ +
+                out_td->dynamic_base_bytes
+          : out_td->size_bytes;
+  sx::Bytes out(out_bytes);
   bool ok = true;
 
   switch (node->op) {
@@ -208,7 +228,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
               ? model_.weights.per_layer_token_embd
               : model_.weights.token_embd;
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         // Batched: inputs[0] is the Int64 [n] token-id buffer (prefill).
         const uint64_t n = uint64_t(nb);
         std::span<float> o = f32_mut(out);  // [n, dim] position-major
@@ -232,7 +252,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
     }
     case OpKind::RmsNorm: {
       int64_t nb = 0, dim_i = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         // Batched row norm over [n, dim]: normalize each position with the
         // full-width weight (dim baked in as a node attribute by the emitter).
         attr_i(*node, "dim", dim_i);
@@ -265,7 +285,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         const uint64_t n = uint64_t(nb);
         const uint64_t dim = n ? x.size() / n : 0;
         for (uint64_t c = 0; c < n; ++c) {
@@ -290,7 +310,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         const uint64_t n = uint64_t(nb);
         const uint64_t dim = n ? x.size() / n : 0;
         for (uint64_t c = 0; c < n; ++c) {
@@ -350,7 +370,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
     }
     case OpKind::QuantizedMatmul: {
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb))
+      if (batch_attr(nb))
         ok = quant::matmul_f32_q8_K(qweight(slot), f32(inputs[0]), f32_mut(out),
                                     uint64_t(nb));
       else
@@ -362,7 +382,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       std::span<const float> W = fweight(slot);
       std::span<const float> x = f32(inputs[0]);
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         const uint64_t n = uint64_t(nb);
         std::span<float> o = f32_mut(out);  // [n, rows]
         const uint64_t dim = n ? x.size() / n : 0;
@@ -397,7 +417,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       // baseline (Phase 5D finding).
       std::span<const float> x = f32(inputs[0]);
       int64_t nb = 0;
-      if (attr_i(*node, "batch", nb)) {
+      if (batch_attr(nb)) {
         const uint64_t n = uint64_t(nb);
         std::span<float> o = f32_mut(out);  // [n, rows]
         std::vector<float> x_bf16(d), y(rows);
@@ -484,7 +504,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       // inputs: {q, kc/dk, vc/dv, start_pos}.
       const model::LayerConfig& lc = cfg.layer_config(uint32_t(layer));
       int64_t nb = 0;
-      attr_i(*node, "batch", nb);
+      batch_attr(nb);
       const uint64_t n = uint64_t(nb);
       double attn_scale = 1.0;
       attr_f(*node, "scale", attn_scale);
@@ -500,7 +520,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       // layer's cache at slots (start_pos + c) % n_slots. inputs: {kc, vc, start_pos}.
       const uint64_t start = read_i64(inputs[2]);
       int64_t nb = 0;
-      attr_i(*node, "batch", nb);
+      batch_attr(nb);
       const uint64_t n = uint64_t(nb);
       KvCache& cache = (*caches_)[uint32_t(layer)];
       const size_t row = (size_t)cache.n_heads_kv * cache.head_dim;

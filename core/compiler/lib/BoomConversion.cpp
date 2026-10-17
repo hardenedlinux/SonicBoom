@@ -149,22 +149,44 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
   mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(loc);
   builder.setInsertionPointToStart(module->getBody());
 
-  // The table entry of a dynamic tensor states its extent as `?` and has no
-  // bound byte size (its size is affine in the extent the lowering binds).
+  // The table entry of a dynamic tensor states its extent as `?` and records
+  // the byte size at the extent the graph was planned for, plus the fixed part
+  // of its affine size in that extent — the passes compare those sizes, and
+  // they must see what the concrete graph at that extent carries. The lowering
+  // rebinds the extent, so the value is a shape-function record, not a hard
+  // bound.
   llvm::SmallVector<mlir::Attribute> table;
   table.reserve(graph.tensors.size());
   for (const TensorDesc &t : graph.tensors) {
     const std::vector<int64_t> shape = irShape(t);
     table.push_back(boom::TensorDescAttr::get(
-        context, raw(t.id), shape, sx::dtype_name(t.dtype),
-        t.dynamic_stride_bytes != 0 ? 0 : t.size_bytes, t.is_graph_input,
-        t.is_graph_output, t.is_constant, t.is_external, t.name));
+        context, raw(t.id), shape, sx::dtype_name(t.dtype), t.size_bytes,
+        t.dynamic_base_bytes, t.is_graph_input, t.is_graph_output,
+        t.is_constant, t.is_external, t.name));
   }
 
+  // The extent the dynamic entries were sized at is the concretization the
+  // graph carries in its leading dimension. All dynamic tensors carry the same
+  // one extent, so the first sighting defines it.
+  int64_t build_extent = 0;
+  for (const TensorDesc &t : graph.tensors) {
+    if (t.dynamic_stride_bytes == 0 || t.shape.empty())
+      continue;
+    if (build_extent == 0)
+      build_extent = t.shape.front();
+    else if (t.shape.front() != build_extent) {
+      mlir::emitError(loc)
+          << "tensor '" << t.name << "' carries dynamic extent "
+          << t.shape.front() << ", but the graph's other dynamic tensors carry "
+          << build_extent;
+      return {};
+    }
+  }
   auto graphOp = boom::GraphOp::create(
       builder, loc, builder.getStringAttr(graph.name), builder.getArrayAttr(table),
       builder.getDenseI64ArrayAttr(flatten(graph.inputs)),
-      builder.getDenseI64ArrayAttr(flatten(graph.outputs)));
+      builder.getDenseI64ArrayAttr(flatten(graph.outputs)),
+      builder.getI64IntegerAttr(build_extent));
 
   mlir::Block *body = builder.createBlock(&graphOp.getBody());
 
@@ -315,17 +337,41 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
         return std::nullopt;
       }
       t.shape.front() = int64_t(dynamic_extent);
-      const std::optional<int64_t> size = sx::tensor_byte_size(sx::TensorType{
-          t.dtype, sx::Shape{t.shape}});
-      if (!size || *size <= 0 || *size % int64_t(dynamic_extent) != 0) {
+      // The table's byte size is the size at the extent the IR was sized at
+      // (the graph op's `dynamic_extent`), not a hard bound, and it is
+      // authoritative there: the planner passes rewrite the byte size of a
+      // packed q8_1 activation to its packed count, which shape + dtype cannot
+      // re-derive. The size is affine in the extent (the packed activation's
+      // tail guard does not scale), so the table also records the fixed part:
+      //
+      //   size(N) = stride * N + base
+      //
+      // Binding evaluates that at the requested extent; a larger extent than
+      // the sized one would overrun the buffers the plan reserved.
+      const int64_t sized_i = graphOp.getDynamicExtent();
+      const uint64_t sized = uint64_t(sized_i < 0 ? 0 : sized_i);
+      if (sized == 0 || dynamic_extent > sized) {
         graphOp.emitError()
-            << "tensor id " << desc.getId() << " has the bound shape " << t.shape
-            << ", whose byte size is not a whole multiple of the extent "
-            << dynamic_extent;
+            << "tensor id " << desc.getId() << " ('" << desc.getName()
+            << "') has a dynamic dimension to bind at extent " << dynamic_extent
+            << ", but the IR records no sizing extent at or above it (sized "
+            << sized << ")";
         return std::nullopt;
       }
-      t.size_bytes = uint64_t(*size);
-      t.dynamic_stride_bytes = uint64_t(*size) / dynamic_extent;
+      const uint64_t bound = desc.getByteSize();
+      const uint64_t base = desc.getDynamicBaseBytes();
+      if (bound <= base || (bound - base) % sized != 0) {
+        graphOp.emitError()
+            << "tensor id " << desc.getId() << " ('" << desc.getName()
+            << "') has byte size " << bound << " at extent " << sized
+            << " with a fixed part of " << base
+            << " bytes, which is not a whole multiple of the extent";
+        return std::nullopt;
+      }
+      const uint64_t stride = (bound - base) / sized;
+      t.size_bytes = stride * dynamic_extent + base;
+      t.dynamic_base_bytes = base;
+      t.dynamic_stride_bytes = stride;
     } else {
       t.size_bytes = desc.getByteSize();
     }

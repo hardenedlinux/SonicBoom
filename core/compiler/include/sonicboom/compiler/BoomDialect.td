@@ -159,6 +159,7 @@ def Boom_TensorDesc : AttrDef<Boom_Dialect, "TensorDesc"> {
     ArrayRefParameter<"int64_t", "dimensions">:$shape,
     StringRefParameter<"dtype name (sx::DType)">:$dtype,
     "uint64_t":$byte_size,
+    "uint64_t":$dynamic_base_bytes,
     "bool":$is_input,
     "bool":$is_output,
     "bool":$is_constant,
@@ -167,8 +168,8 @@ def Boom_TensorDesc : AttrDef<Boom_Dialect, "TensorDesc"> {
 
   let assemblyFormat = [{
     `<` $id `,` custom<DimList>($shape) `,` $dtype `,` $byte_size
-        `,` $is_input `,` $is_output `,` $is_constant `,` $is_external
-        `,` $name `>`
+        `,` $dynamic_base_bytes `,` $is_input `,` $is_output `,` $is_constant
+        `,` $is_external `,` $name `>`
   }];
 }
 

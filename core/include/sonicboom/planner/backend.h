@@ -29,6 +29,7 @@
 #include <sonicboom/planner/task.h>
 #include <sonicboom/sx/exec.h>
 
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -55,6 +56,15 @@ public:
   // session, so state persists between steps but is scoped to that session.
   virtual std::expected<std::vector<TensorValue>, RuntimeError> execute(
       const TaskDesc& task, const std::vector<TensorValue>& inputs) = 0;
+
+  // Bind the dynamic extent this plan executes with (the prefill segment
+  // length). A plan lowered from a symbolic IR carries TensorDesc::
+  // dynamic_stride_bytes on every tensor that scales with the extent; the
+  // executor binds the actual extent before dispatching. The byte counts and
+  // `batch` attributes the backend reads are then the plan-time ones
+  // overridden by it. Backends with no extent-dependent behavior ignore it; 0
+  // means "the plan's planned extent".
+  virtual void bind_segment_extent(uint64_t extent) { (void)extent; }
 
   // Pre-record one decode step into a re-playable program by running `step_fn`
   // (which calls execute() for each task of the step). Returns nullptr when the

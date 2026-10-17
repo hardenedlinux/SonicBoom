@@ -69,6 +69,11 @@ struct TransferTaskDesc {
   MemorySpaceId source;
   MemorySpaceId destination;
   uint64_t bytes = 0;
+  // Non-zero when the tensor scales with the plan's dynamic extent: the bytes
+  // moved at execution are `dynamic_stride_bytes * extent + dynamic_base_bytes`
+  // rather than the planned `bytes` (the size at the plan's bound extent).
+  uint64_t dynamic_stride_bytes = 0;
+  uint64_t dynamic_base_bytes = 0;
 };
 
 struct AllocateTaskDesc {

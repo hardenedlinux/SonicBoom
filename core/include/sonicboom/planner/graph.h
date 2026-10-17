@@ -45,14 +45,20 @@ struct TensorDesc {
   uint64_t size_bytes = 0;
 
   // Non-zero when the tensor's leading dimension is the graph's *dynamic
-  // extent* (the prefill segment length): the value here is the tensor's byte
-  // size per unit of that extent, so an execution bound to extent N occupies
-  // `dynamic_stride_bytes * N` bytes. `shape` and `size_bytes` remain the
-  // concretization at the extent the plan was built for (the shape class's
-  // maximum), so every consumer that only needs a bound is unchanged and the
-  // plan's buffers are sized for the largest member of the class. Zero for
-  // every static tensor — the decode graph included.
+  // extent* (the prefill segment length): the tensor's byte size is affine in
+  // that extent,
+  //
+  //   size(N) = dynamic_stride_bytes * N + dynamic_base_bytes
+  //
+  // and an execution bound to extent N occupies exactly that. `shape` and
+  // `size_bytes` remain the concretization at the extent the plan was built for
+  // (the shape class's maximum), so every consumer that only needs a bound is
+  // unchanged and the plan's buffers are sized for the largest member of the
+  // class. The base is non-zero for a buffer whose packed layout carries a
+  // fixed tail (the mmq q8_1 activation tail guard); a plain activation has a
+  // pure stride. Zero for every static tensor — the decode graph included.
   uint64_t dynamic_stride_bytes = 0;
+  uint64_t dynamic_base_bytes = 0;
 
   bool is_graph_input = false;
   bool is_graph_output = false;
