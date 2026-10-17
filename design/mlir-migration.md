@@ -677,6 +677,15 @@ plan-diff record in (b) then reads.
   where the performance lives (`design/benchmark.md`; `CLAUDE.md` names the
   hand-written kernels as the reference), so lowering them to linalg would
   discard it.
+- **The ggml-derived kernels are ukernels, callable from Boom IR.** The
+  `q*_K` matmul, attention and quantization kernels migrated from ggml are
+  attributed ukernels behind the `boom` ops, not IR the compiler owns: a
+  `boom.quantized_matmul` lowers to a call, and the IR neither models nor
+  rewrites their internals. Codegen replaces a ukernel only where the generated
+  kernel matches it — numerics on the project's tolerance, then performance
+  against the hand-written kernel at the same shape. A ukernel that does not
+  meet both stays. This keeps the derived kernels' attribution and licence
+  notice intact while giving the compiler the freedom to fuse *around* them.
 - **The execution-plan record and its diff test come before any pass is
   ported.** They are built in step (b), on the four-vector in §5.4 — kernel
   sequence, launch config, buffer identity, stream/effect ordering. Without them
@@ -713,3 +722,85 @@ plan-diff record in (b) then reads.
 - **`WholeGraph` survives step (a) and is deleted in step (d).** It is task
   granularity, and step (a)'s round-trip gate needs it present for fidelity;
   after (b) the plan record expresses task grouping directly.
+
+---
+
+## 10. Control flow: the step loop as Boom IR
+
+Today a *step* is a flat plan: one decode step or one prefill segment, emitted,
+optimized, lowered and executed; the loop around it lives in C++ (the decode
+loop, the chunked-prefill replay loop). The next structural step is to move the
+loop into the IR, which is what makes inter-step optimizations possible at all:
+
+1. **The step loop becomes `scf.for` (fixed trip count) or `scf.while` (stop on
+   an EOS token).** `boom.step` bodies become the loop body; the trip count and
+   the stop predicate are values of the loop, so a planner can see the whole
+   generation, not one iteration of it.
+2. **KV state is loop-carried.** The KV cache is a resource with
+   `boom.kv_read` / `boom.kv_write` effects (§6.3) and a loop-carried
+   `filled_tokens`; today the position is staged host-side per step
+   (`set_pos`), which is a plan-level restatement of the same dependency. With
+   the loop in the IR, the position and the cache length are values the
+   compiler can reason about (a rotated ring buffer becomes an indexed resource
+   rather than an opaque pointer).
+3. **Sampling and stop become ops.** `boom.argmax` / `boom.sample` and the EOS
+   test are the loop's terminating effect chain; keeping them as ops lets a
+   demand-driven DCE prove that a logit tensor is consumed by the sampler and
+   nothing else, and lets the compiler hoist or eliminate per-step work that
+   does not depend on the loop.
+4. **The analyses then have something to run on:** liveness (buffer reuse
+   across iterations, not just within a step), loop-invariant hoisting
+   (attention masks, RoPE tables, weights staging), demand-driven DCE (a logit
+   column never sampled), KV effects (ordering and aliasing), and shape/range
+   (the segment length, below).
+
+This ordering matters: without the loop in the IR these analyses can only see
+one step, and the largest measured opportunities of the source-of-truth run are
+*within* a step (see §11), so the loop migration is a distinct next stage, not a
+prerequisite for the fusions already landed.
+
+**Symbolic segment length.** A prefill plan is currently built for one N: the
+tensor byte sizes are baked at plan time, and the segment cache keys on N (with
+an LRU of 8). Making N an execute-time binding like the KV offset requires the
+IR's tensor types to carry a symbolic dimension and the memory planner to bind
+it at execute — the plan record then serializes the bound value. Until that
+lands, N remains part of the plan identity (the cache holds one plan per
+length); the analysis work is listed in §11.4.
+
+---
+
+## 11. Status after the Boom IR source-of-truth run
+
+**(1) One rewrite path.** The nine pass bodies that lived in
+`planner/rewrites.cpp` and the `SONICBOOM_IR_PASSES` switch are deleted.
+`SONICBOOM_IR_PASS_DISABLE` remains and is the ablation switch. MLIR is a
+required dependency: configure fails with a message when it is not found; the
+bundled LLVM is still the default and external `MLIR_DIR` / `LLVM_DIR` still
+work. `ir_passes_stub.cpp` is gone. A failing pass fails the plan — the IR is
+not lowered as though the phase had run — and an unrecognized
+`SONICBOOM_IR_PASS_DISABLE` name is reported and disables nothing.
+
+**(2) Emitters build Boom IR.** Both model emitters build `boom` ops directly;
+`planner::Graph` survives only as the private input format of the plan builder,
+reached through one lowering (`boom` → plan-builder graph). Its headers are
+private to the lowering and the plan builder — a new include outside them does
+not compile. The Graph → Boom IR direction of the converter is kept for the
+round-trip test (`tests/core/test_boom_conversion.cpp`); no runtime path uses it.
+
+**(3) Measurement.** The run's measurements (traces, fusion census, duplicate
+work, INT8 throughput, ablation) are in the run report. The census's result for
+the next tier: the remaining in-step glue is dominated by
+residual-add → RMS-norm → quantize chains that have no existing kernel to fuse
+onto (a two-input norm-quantize kernel would be new code) and by matmul-support
+pack/copyback kernels on the dense path; duplicate work inside a plan is zero.
+
+**(4) First IR-level optimizations.** The q8_1 activation buffers are declared at
+their quantized size (peak VRAM 7726 → 7628 MiB on `test_prefix_cache`); the
+prefill CUDA-graph capture is reused while its KV-cache identity matches
+(second and later 512-token prefills no longer pay the warm-up + record). The
+ablation harness (`tools/bench.sh --ablate`) reports each pass group against
+the all-on canonical set and workload (A).
+
+**(5) Not done in this run.** `N` is not yet symbolic (the plan cache still keys
+on it); the loop migration of §10 and the glue-codegen step (e) are the next
+structural stages. The K-quant ukernels remain hand-written and attributed.

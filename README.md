@@ -116,7 +116,7 @@ produced them. To add a row, run both tools on your machine and paste the
 output into an issue or a PR:
 
 ```sh
-tools/sb-report.sh          # hardware + the exact build (git commit, cuda archs)
+tools/sb-report.sh --gemma your-model.gguf --no-golden --no-bench  # hardware + exact build
 LLAMA_BENCH=... tools/bench.sh your-model.gguf --label your-model
 ```
 
@@ -207,7 +207,7 @@ C with `sb_build_info()` (`capi/include/sonicboom/capi.h`), from Guile with
 GPU and the toolchain:
 
 ```sh
-tools/sb-report.sh            # human-readable; --json for machines
+tools/sb-report.sh --gemma your-model.gguf --no-golden --no-bench  # --json for machines
 ```
 
 ### Run (Guile)
@@ -264,8 +264,12 @@ generated sidecar artifacts are absent, which is the state of a fresh checkout.
 
 ```sh
 LLAMA_BENCH=/path/to/llama-bench tools/bench.sh your-model.gguf
-tools/sb-report.sh        # the hardware and the build behind those numbers
+LLAMA_BENCH=/path/to/llama-bench tools/sb-report.sh --gemma your-model.gguf
 ```
+
+The second command runs the same canonical bench (3 process runs by default)
+and the golden checks through ctest, and prints the hardware and the build
+behind the numbers; `--qwen PATH` adds the Qwen goldens.
 
 Every metric is the median of 3 process runs and both runtimes are measured in
 the same session; `tools/bench.sh` is the only benchmark SonicBoom publishes

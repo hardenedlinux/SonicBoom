@@ -10,23 +10,44 @@
 # built (sb_build_info() through the Guile binding — see bindings/guile/README.md,
 # "(build-info)"). Paste it next to a benchmark result or a bug report.
 #
-# Everything is best-effort: a section whose tool is absent says so and the
-# script still exits 0, because a CPU-only host without CUDA or Guile is a
-# perfectly ordinary place to report from.
+# The report also *checks* the build it describes. With a model it runs the
+# golden checks through ctest (token goldens, prefix cache, plan cache,
+# elementwise, and the four golden plans) and the canonical benchmark through
+# tools/bench.sh, which is the same measurement a release reports. A model is
+# therefore required: a report that skips the numbers is the one thing this
+# script exists to prevent.
 #
-# Usage: tools/sb-report.sh [--json] [--lib PATH]
+# Everything else is best-effort: a section whose tool is absent says so, but a
+# failed golden check makes the script exit 1 (a host with no Guile still exits
+# 0). --no-golden / --no-bench skip the two sections when they are not wanted.
+#
+# Usage: tools/sb-report.sh --gemma PATH [--qwen PATH] [--json] [--lib PATH]
+#                           [--runs N] [--build] [--no-golden] [--no-bench]
 # Env:   SONICBOOM_LIB=/path/to/libsonicboom.so   (default <repo>/build/core/libsonicboom.so)
+#        LLAMA_BENCH=/path/to/llama-bench        (passed through; adds llama.cpp)
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JSON=0
 LIB="${SONICBOOM_LIB:-}"
+GEMMA=""
+QWEN=""
+RUNS=3
+BUILD=0
+GOLDEN=1
+BENCH=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --json) JSON=1; shift ;;
     --lib)  LIB="$2"; shift 2 ;;
-    -h|--help) sed -n '3,21p' "$0"; exit 0 ;;
+    --gemma) GEMMA="$2"; shift 2 ;;
+    --qwen)  QWEN="$2"; shift 2 ;;
+    --runs)  RUNS="$2"; shift 2 ;;
+    --build) BUILD=1; shift ;;
+    --no-golden) GOLDEN=0; shift ;;
+    --no-bench)  BENCH=0; shift ;;
+    -h|--help) sed -n '3,27p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -42,6 +63,8 @@ emit() { KEYS+=("$1"); VALS+=("$2"); }
 have() { command -v "$1" >/dev/null 2>&1; }
 # First line of a command's output, or the fallback if it does not exist/run.
 probe() { local fb="$1"; shift; if have "$1"; then local out; out="$("$@" 2>/dev/null | head -n1)"; [ -n "$out" ] && { echo "$out"; return; }; fi; echo "$fb"; }
+# One KEY=VALUE field of a `RESULT ...` line (bench.sh's machine-readable form).
+field() { awk -v k="$1" '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]==k){print a[2]; exit}}}'; }
 
 # --- the SonicBoom library --------------------------------------------------
 # The artifact itself first (identifies the file even when Guile cannot read it),
@@ -135,6 +158,80 @@ else
   emit toolchain.mlir "no in-tree install (external -DMLIR_DIR, or MLIR off)"
 fi
 
+# --- golden checks and the canonical benchmark ------------------------------
+# A model is required: the report exists to bind a number to the machine and
+# binary that produced it, so "no model, no numbers" is an error, not an empty
+# section. --no-golden / --no-bench still require a model; they only skip work.
+if [ -z "$GEMMA" ] && [ -z "$QWEN" ]; then
+  echo "sb-report: no model given — pass --gemma PATH and/or --qwen PATH" >&2
+  echo "           the report runs the golden checks and the canonical bench against it" >&2
+  exit 2
+fi
+for m in "$GEMMA" "$QWEN"; do
+  [ -z "$m" ] || [ -f "$m" ] || { echo "sb-report: model not found: $m" >&2; exit 2; }
+done
+[ -z "$GEMMA" ] || export SONICBOOM_GEMMA_GGUF="$GEMMA"
+[ -z "$QWEN" ]  || export SONICBOOM_QWEN_GGUF="$QWEN"
+
+GOLDEN_FAIL=0
+golden_run() { # LABEL CTEST_REGEX
+  local out rc
+  out=$(ctest --test-dir "$ROOT/build" -R "$2" --output-on-failure 2>&1); rc=$?
+  [ "$rc" = 0 ] || GOLDEN_FAIL=1
+  if [ "$JSON" = 1 ]; then
+    [ "$rc" = 0 ] && emit "golden.$1" pass || emit "golden.$1" fail
+  fi
+  if [ "$JSON" != 1 ]; then
+    printf '  %-24s %s\n' "$1" "$([ "$rc" = 0 ] && echo pass || echo FAIL)"
+    [ "$rc" = 0 ] || printf '%s\n' "$out" | tail -n 20
+  fi
+}
+
+if [ "$GOLDEN" = 1 ]; then
+  [ "$JSON" = 1 ] || echo "[golden]"
+  [ -n "$GEMMA" ] && golden_run gemma_tokens '^test_generate$'
+  [ -n "$GEMMA" ] && golden_run gemma_prefix_cache '^test_prefix_cache$'
+  [ -n "$GEMMA" ] && golden_run gemma_plan_cache '^test_plan_cache$'
+  [ -n "$GEMMA" ] && golden_run cuda_elementwise '^test_cuda_elementwise$'
+  [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate$'
+  if [ -n "$GEMMA" ] && [ -n "$QWEN" ]; then
+    golden_run golden_plans '^test_boom_conversion$'
+  else
+    [ "$JSON" = 1 ] && emit golden.golden_plans "skipped (needs --gemma and --qwen)"
+    [ "$JSON" = 1 ] || printf '  %-24s %s\n' golden_plans "skipped (needs --gemma and --qwen)"
+  fi
+  [ "$JSON" = 1 ] || echo
+fi
+
+if [ "$BENCH" = 1 ]; then
+  [ "$JSON" = 1 ] || echo "[bench]"
+  bench_one() { # LABEL GGUF
+    local args=("$ROOT/tools/bench.sh" "$2" --runs "$RUNS")
+    [ "$BUILD" = 1 ] || args+=(--no-build)
+    local out
+    out=$(SONICBOOM_GEMMA_GGUF="$2" "${args[@]}" 2>&1) || true
+    if [ "$JSON" != 1 ]; then
+      printf '%s\n' "$out"
+    fi
+    local line; line=$(printf '%s\n' "$out" | grep '^RESULT bench ' | tail -n1)
+    if [ -z "$line" ]; then
+      [ "$JSON" = 1 ] && emit "bench.$1" "failed (see the bench output above)"
+      [ "$JSON" = 1 ] || echo "  bench $1: FAILED (see output above)"
+      return
+    fi
+    local k v
+    for k in tg64 d512 pp512 reuse_ms; do
+      v=$(printf '%s\n' "$line" | field "$k")
+      [ -n "$v" ] && { [ "$JSON" = 1 ] && emit "bench.$1.$k" "$v"; }
+    done
+    v=$(printf '%s\n' "$out" | sed -n 's/.*gpu clock: SM [0-9]*-[0-9]* MHz (median \([0-9]*\)).*/\1/p' | tail -n1)
+    [ -n "$v" ] && { [ "$JSON" = 1 ] && emit "bench.$1.sm_clock_mhz" "$v"; }
+    [ "$JSON" = 1 ] || echo
+  }
+  [ -n "$GEMMA" ] && bench_one gemma "$GEMMA"
+  [ -n "$QWEN" ]  && bench_one qwen "$QWEN"
+fi
+
 # --- render -----------------------------------------------------------------
 if [ "$JSON" = 1 ]; then
   printf '{'
@@ -153,4 +250,5 @@ else
   done
   echo
 fi
+[ "$GOLDEN_FAIL" = 0 ] || exit 1
 exit 0
