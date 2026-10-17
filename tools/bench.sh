@@ -597,6 +597,7 @@ if [ "$ABLATE" = 1 ]; then
     "mmq-folds|RmsNormMmqPass,GeluMulMmqPass,SiluMulMmqPass"
     "add-rms-norm-fusion|FuseAddRmsNormMmqPass"
     "rms-norm-add-fusion|FuseRmsNormAddPass"
+    "heads-norm-rope-cast-fusion|FuseHeadsNormRopeCastPass"
   )
   ABL_FEATURE_GROUPS=(
     "cuda-graph-decode|cuda_graph_decode"

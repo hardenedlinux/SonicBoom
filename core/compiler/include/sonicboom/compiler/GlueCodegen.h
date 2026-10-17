@@ -54,6 +54,13 @@ enum class GlueRegionKind {
   // threads per [dim] row; the row's norm is the private intermediate, so the
   // region's only result is `residual + x * inv * w`.
   RmsNormAdd,
+  // Attention prep (heads_norm_rope_cast): per-head RMS-norm + optional NeoX
+  // RoPE + optional fp16 rounding. One CUDA block of 256 threads per head; the
+  // norm output is staged in shared memory because the rotation reads the
+  // partner element (i, i + head_dim/2). The runtime flags `do_rope` and
+  // `do_cast` cover the three chains the attention prep uses: Q norm->rope,
+  // K norm->rope->cast, V norm->cast.
+  HeadsNormRopeCast,
 };
 
 // The region kind named `name`, or nullopt if the compiler has no generator for
@@ -84,6 +91,15 @@ constexpr int kRmsNormAddBlockThreads = 256;
 constexpr int kRmsNormAddSharedBytes = 512;
 // Contextual: how many rows (norm vectors) one launch covers is the node's
 // element count / dim, computed at dispatch.
+
+// heads_norm_rope_cast: rms_heads_fused_kernel's 256-thread block. Shared
+// memory: 32 f64 warp partials at 0, the f32 inverse RMS at 256, and the staged
+// norm output at byte 512. The stage holds one head; the reduction and apply
+// loops stride by the block size, so the limit is the stage's 512 floats.
+// Gemma's global layers have head_dim 512, its local layers 256.
+constexpr int kHeadsNormRopeCastBlockThreads = 256;
+constexpr int kHeadsNormRopeCastSharedBytes = 2560;
+constexpr int kHeadsNormRopeCastMaxHeadDim = 512;
 
 // Generate the region's PTX for compute capability `sm_arch` (86 = sm_86).
 // Returns nullopt, having printed the MLIR diagnostic, when the region has no

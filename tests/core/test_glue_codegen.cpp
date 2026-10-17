@@ -30,7 +30,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <iostream>
@@ -348,6 +351,214 @@ void test_rms_norm_add(std::mt19937& rng, int tokens, int dim) {
   cudaFree(ygen);
 }
 
+// One attention-prep region launch (Stage 5d): per-head norm + optional RoPE +
+// optional fp16 rounding.
+//
+//   rope=0, cast=1 (V): byte-identical to rms_norm_heads_dev + cast_fp16_dev —
+//                       no trig is involved, so the reduction, the apply and
+//                       the fp16 roundtrip must all match exactly.
+//   rope=1          (Q/K): the rotation calls libdevice through MLIR's LLVM,
+//                       which is not the nvcc that built the reference kernel;
+//                       the two round trig differently by up to 1 ulp. Check
+//                       the rotation against a host fp64 evaluation of the
+//                       kernel's formula, and (cast=1) require every element
+//                       that still differs from the reference to be exactly
+//                       one fp16 ulp away — the fp16 rounding itself is exact.
+void test_heads_norm_rope_cast(std::mt19937& rng, int heads, int dim,
+                               int positions, bool do_rope, bool do_cast,
+                               bool with_weight, bool with_ff) {
+  const int hpp = heads / positions;
+  const std::string tag =
+      "heads_norm_rope_cast heads=" + std::to_string(heads) + " dim=" +
+      std::to_string(dim) + " pos=" + std::to_string(positions) +
+      " rope=" + std::to_string(do_rope ? 1 : 0) +
+      " cast=" + std::to_string(do_cast ? 1 : 0) +
+      " w=" + std::to_string(with_weight ? 1 : 0) +
+      " ff=" + std::to_string(with_ff ? 1 : 0);
+
+  const size_t elems = size_t(heads) * size_t(dim);
+  const size_t xy_bytes = elems * sizeof(float);
+  const int half = dim / 2;
+  std::vector<float> x(elems);
+  std::vector<float>& w = persistent_weight(dim);
+  std::vector<float>& ff = persistent_weight(half);
+  for (auto& v : x) v = std::uniform_real_distribution<float>(-2.0f, 2.0f)(rng);
+  for (auto& v : w) v = std::uniform_real_distribution<float>(0.5f, 1.5f)(rng);
+  for (auto& v : ff) v = std::uniform_real_distribution<float>(0.5f, 2.0f)(rng);
+  const float eps = 1e-6f;
+  const float base = 10000.0f;
+  const float log_base = std::log(base);
+  const uint64_t start_pos = 37;
+
+  float *xd = nullptr, *wd = nullptr, *ref = nullptr, *gen = nullptr;
+  float *gen_pre = nullptr, *nrm = nullptr;
+  uint64_t* dpos = nullptr;
+  float* dff = nullptr;
+  check(cudaMalloc(&xd, xy_bytes) == cudaSuccess, "cudaMalloc x");
+  check(cudaMalloc(&wd, with_weight ? dim * sizeof(float) : 1) == cudaSuccess,
+        "cudaMalloc w");
+  check(cudaMalloc(&ref, xy_bytes) == cudaSuccess, "cudaMalloc ref");
+  check(cudaMalloc(&gen, xy_bytes) == cudaSuccess, "cudaMalloc gen");
+  check(cudaMalloc(&gen_pre, xy_bytes) == cudaSuccess, "cudaMalloc gen_pre");
+  check(cudaMalloc(&nrm, xy_bytes) == cudaSuccess, "cudaMalloc nrm");
+  check(cudaMalloc(&dpos, sizeof(uint64_t)) == cudaSuccess, "cudaMalloc pos");
+  if (with_ff)
+    check(cudaMalloc(&dff, half * sizeof(float)) == cudaSuccess, "cudaMalloc ff");
+  if (g_failures) return;
+
+  cudaMemcpy(xd, x.data(), xy_bytes, cudaMemcpyHostToDevice);
+  if (with_weight)
+    cudaMemcpy(wd, w.data(), dim * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(dpos, &start_pos, sizeof(uint64_t), cudaMemcpyHostToDevice);
+  if (with_ff) cudaMemcpy(dff, ff.data(), half * sizeof(float),
+                          cudaMemcpyHostToDevice);
+
+  // The reference chain: norm, optional in-place rope (batched for prefill),
+  // optional cast.
+  const std::span<const float> wspan =
+      with_weight ? std::span<const float>(w) : std::span<const float>();
+  const std::span<const float> ffspan =
+      with_ff ? std::span<const float>(ff) : std::span<const float>();
+  check(sonicboom::nn::cuda::rms_norm_heads_dev(wspan, xd, eps, nrm, dim,
+                                                heads),
+        (tag + ": reference norm").c_str());
+  cudaMemcpy(ref, nrm, xy_bytes, cudaMemcpyDeviceToDevice);
+  if (do_rope) {
+    const bool ok =
+        positions == 1
+            ? sonicboom::nn::cuda::rope_neox_heads_dev_pos(ref, dim, heads,
+                                                           dpos, base, 1.0f,
+                                                           ffspan)
+            : sonicboom::nn::cuda::rope_neox_heads_batched_dev_pos(
+                  ref, dim, hpp, positions, dpos, base, 1.0f, ffspan);
+    check(ok, (tag + ": reference rope").c_str());
+  }
+  if (do_cast)
+    check(sonicboom::nn::cuda::cast_fp16_dev(ref, int(elems)),
+          (tag + ": reference cast").c_str());
+
+  auto launch = [&](float* dst, int cast_flag) {
+    // Kernel ABI: (x, w, has_w, y, pos, head_dim, eps, freq_scale, log_base,
+    // ff, heads_per_pos, do_rope, do_cast).
+    void* xarg = xd;
+    void* warg = with_weight ? static_cast<void*>(wd) : nullptr;
+    int haswarg = with_weight ? 1 : 0;
+    void* yarg = dst;
+    void* posarg = dpos;
+    int dimarg = dim;
+    float earg = eps;
+    float fsarg = 1.0f;
+    float lbarg = log_base;
+    void* ffarg = with_ff ? static_cast<void*>(dff) : nullptr;
+    int hpparg = hpp;
+    int ropearg = do_rope ? 1 : 0;
+    int castarg = cast_flag;
+    void* args[] = {&xarg,   &warg,  &haswarg, &yarg,   &posarg, &dimarg,
+                    &earg,   &fsarg, &lbarg,   &ffarg,  &hpparg, &ropearg,
+                    &castarg};
+    return sonicboom::planner::glue::launch(
+        "heads_norm_rope_cast", args, heads,
+        sonicboom::compiler::kHeadsNormRopeCastBlockThreads,
+        sonicboom::compiler::kHeadsNormRopeCastSharedBytes);
+  };
+
+  check(launch(gen, do_cast ? 1 : 0), (tag + ": generated launch").c_str());
+  // The unrounded launch is what the fp64 check compares: with cast on, the
+  // generated value is already fp16-rounded.
+  if (do_rope && do_cast)
+    check(launch(gen_pre, 0), (tag + ": generated pre-cast launch").c_str());
+  check(cudaDeviceSynchronize() == cudaSuccess, "device synchronize");
+
+  std::vector<float> got(elems), refv(elems), pre(elems);
+  cudaMemcpy(got.data(), gen, xy_bytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(refv.data(), ref, xy_bytes, cudaMemcpyDeviceToHost);
+
+  if (!do_rope) {
+    // V chain: the whole chain is trig-free; byte identity is required.
+    const bool equal = std::memcmp(got.data(), refv.data(), xy_bytes) == 0;
+    if (!equal) {
+      for (size_t i = 0; i < elems; ++i) {
+        if (std::memcmp(&got[i], &refv[i], sizeof(float)) != 0) {
+          std::cerr << "    first differing element " << i << ": got=" << got[i]
+                    << " ref=" << refv[i] << "\n";
+          break;
+        }
+      }
+    }
+    check(equal, (tag + ": byte-identical output").c_str());
+  } else {
+    // The fp64 check: the kernel's formula, evaluated in double over the
+    // reference norm output. theta's argument is rounded to float first (the
+    // kernel computes it in float); exp/cos/sin are the double functions.
+    std::vector<float> normv(elems);
+    cudaMemcpy(normv.data(), nrm, xy_bytes, cudaMemcpyDeviceToHost);
+    if (do_cast) cudaMemcpy(pre.data(), gen_pre, xy_bytes, cudaMemcpyDeviceToHost);
+    const std::vector<float>& gp = do_cast ? pre : got;
+    double max_abs = 0.0;
+    size_t bad = 0;
+    for (int h = 0; h < heads; ++h) {
+      const float pos = float(start_pos + uint64_t(h / hpp));
+      for (int off = 0; off < half; ++off) {
+        // The kernel's theta, built at the same float rounding points, with
+        // only exp/cos/sin evaluated in double: this isolates the rotation's
+        // trig from any formula error.
+        const float a1 = (-2.0f * float(off)) / float(dim);
+        const float e = float(std::exp(double(a1 * log_base)));
+        const float theta = 1.0f * pos * e;
+        const float th = with_ff ? theta / ff[off] : theta;
+        const double c = std::cos(double(th)), s = std::sin(double(th));
+        const double x0 = normv[size_t(h) * dim + off];
+        const double x1 = normv[size_t(h) * dim + off + half];
+        const double e0 = x0 * c - x1 * s;
+        const double e1 = x0 * s + x1 * c;
+        const double g0 = gp[size_t(h) * dim + off];
+        const double g1 = gp[size_t(h) * dim + off + half];
+        max_abs = std::max({max_abs, std::abs(g0 - e0), std::abs(g1 - e1)});
+        if (std::abs(g0 - e0) > 2e-5 || std::abs(g1 - e1) > 2e-5) ++bad;
+      }
+    }
+    std::cout << "  " << tag << ": max |gen - fp64| = " << max_abs << "\n";
+    check(bad == 0, (tag + ": rotation within 2e-5 of the fp64 formula").c_str());
+
+    if (do_cast) {
+      // Every remaining difference from the reference must be one fp16 ulp:
+      // both values are fp16-roundtripped, so their bit patterns are halves
+      // and adjacent halves differ by one. A wrong rounding or a larger value
+      // error would not satisfy this.
+      size_t differ = 0, far = 0;
+      for (size_t i = 0; i < elems; ++i) {
+        uint32_t a = 0, b = 0;
+        std::memcpy(&a, &got[i], sizeof(a));
+        std::memcpy(&b, &refv[i], sizeof(b));
+        if (a == b) continue;
+        ++differ;
+        const int raw_a = static_cast<int>(a);
+        const int raw_b = static_cast<int>(b);
+        if (std::abs(raw_a - raw_b) > 1) ++far;
+      }
+      std::cout << "  " << tag << ": " << differ << "/" << elems
+                << " elements differ from the reference after fp16 rounding\n";
+      check(far == 0,
+            (tag + ": differences are at most one fp16 ulp").c_str());
+    } else {
+      size_t differ = 0;
+      for (size_t i = 0; i < elems; ++i)
+        if (std::memcmp(&got[i], &refv[i], sizeof(float)) != 0) ++differ;
+      std::cout << "  " << tag << ": " << differ << "/" << elems
+                << " elements differ from the reference rotation\n";
+    }
+  }
+
+  cudaFree(xd);
+  cudaFree(wd);
+  cudaFree(ref);
+  cudaFree(gen);
+  cudaFree(gen_pre);
+  cudaFree(nrm);
+  cudaFree(dpos);
+  if (with_ff) cudaFree(dff);
+}
+
 } // namespace
 
 int main() {
@@ -381,6 +592,21 @@ int main() {
         "prefill PTX contains the kernel entry symbol");
   }
 
+  auto ptx_norm_rope = sonicboom::compiler::generate_glue_ptx(
+      sonicboom::compiler::GlueRegionKind::HeadsNormRopeCast, arch);
+  check(ptx_norm_rope.has_value(),
+        "generate_glue_ptx returned norm+rope+cast PTX");
+  if (ptx_norm_rope) {
+    check(ptx_norm_rope->find(sonicboom::compiler::glue_kernel_entry(
+              sonicboom::compiler::GlueRegionKind::HeadsNormRopeCast)) !=
+              std::string::npos,
+          "norm+rope+cast PTX contains the kernel entry symbol");
+    // The rotation's trig is libdevice; the link must have resolved it into
+    // the PTX rather than leaving an undefined __nv_* reference.
+    check(ptx_norm_rope->find("__nv_cosf") == std::string::npos,
+          "norm+rope+cast PTX has no unresolved libdevice call");
+  }
+
   auto ptx_norm_add = sonicboom::compiler::generate_glue_ptx(
       sonicboom::compiler::GlueRegionKind::RmsNormAdd, arch);
   check(ptx_norm_add.has_value(), "generate_glue_ptx returned norm+add PTX");
@@ -408,6 +634,19 @@ int main() {
   test_rms_norm_add(rng, 8, 256);
   test_rms_norm_add(rng, 5, 896);
   test_rms_norm_add(rng, 1, 2560);
+  // The attention prep, one chain per shape the model graph emits: V
+  // (norm -> cast), Q (norm -> rope), K (norm -> rope -> cast), decode (one
+  // position) and prefill (batch 2, two positions). Gemma's local head_dim
+  // 256, its global head_dim 512 (the full shared stage), and Qwen's 128;
+  // with and without the norm weight and the freq factors.
+  test_heads_norm_rope_cast(rng, 2, 256, 1, false, true, false, false);
+  test_heads_norm_rope_cast(rng, 8, 256, 1, true, false, true, true);
+  test_heads_norm_rope_cast(rng, 2, 256, 1, true, true, true, true);
+  test_heads_norm_rope_cast(rng, 14, 128, 1, true, false, true, false);
+  test_heads_norm_rope_cast(rng, 8, 512, 1, true, false, true, true);
+  test_heads_norm_rope_cast(rng, 2, 512, 1, true, true, true, true);
+  test_heads_norm_rope_cast(rng, 8, 256, 2, true, false, true, true);
+  test_heads_norm_rope_cast(rng, 16, 256, 2, true, true, true, false);
 
   if (g_failures) {
     std::cerr << g_failures << " failure(s)\n";

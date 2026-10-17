@@ -1153,6 +1153,145 @@ public:
   }
 };
 
+// FuseHeadsNormRopeCastPass — the attention-prep glue region (Stage 5d). The
+// per-head RMS-norm that starts each of Q/K/V, the NeoX RoPE on Q/K, and the
+// fp16 rounding on K/V are one region per chain:
+//
+//   rope=1, cast=0   Q: rms_norm_heads -> rope
+//   rope=1, cast=1   K: rms_norm_heads -> rope -> cast_fp16
+//   rope=0, cast=1   V: rms_norm_heads -> cast_fp16
+//
+// The norm's attribute record carries layer/slot (and `batch` in prefill), the
+// rope contributes its position operand, and the chain's last node names the
+// region and keeps its tensor ids. The intermediate tensors have no other
+// reader and are dropped with their producers. One generated kernel replaces
+// the chain's 2-3 launches, so a layer's attention prep is 3 launches instead
+// of 7 in decode.
+//
+// The KV-cache append stays inside OpKind::Attention: the cache buffers are
+// backend resources, not graph tensors, so no graph region can reach them
+// (recorded as a Stage 5d blocker in the run report).
+//
+// Runs last in both pipelines. The earlier folds take norms that feed a
+// quantizer or a matmul; the attention-prep norms feed rope/cast, which none of
+// them match, so the ordering is by construction and not by luck.
+class FuseHeadsNormRopeCastPass
+    : public mlir::PassWrapper<FuseHeadsNormRopeCastPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseHeadsNormRopeCastPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    struct Match {
+      mlir::Operation *norm;
+      mlir::Operation *rope; // null for the V chain
+      mlir::Operation *cast; // null for the Q chain
+    };
+    llvm::SmallVector<Match> matches;
+    const std::string normName = boomOpName(planner::OpKind::RmsNormHeads);
+    const std::string ropeName = boomOpName(planner::OpKind::Rope);
+    const std::string castName = boomOpName(planner::OpKind::CastFp16);
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != normName ||
+          node.getNumOperands() != 1 || node.getNumResults() != 1 ||
+          !node.getResult(0).hasOneUse())
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs)
+        continue;
+      // A segment-width norm (the per-layer projection norm) is not a head
+      // norm: the region's geometry is one block per head, dim = head_dim.
+      if (nodeAttrInt(attrs, "dim").value_or(0) > 0)
+        continue;
+      if (!nodeAttrInt(attrs, "layer").has_value())
+        continue;
+
+      mlir::Operation *use = node.getResult(0).use_begin()->getOwner();
+      mlir::Operation *rope = nullptr, *cast = nullptr;
+      if (use->getName().getStringRef() == ropeName) {
+        // The rope reads the norm and the position: (x, pos).
+        if (use->getNumOperands() != 2 || use->getNumResults() != 1 ||
+            use->getOperand(0) != node.getResult(0))
+          continue;
+        rope = use;
+        if (!rope->getResult(0).hasOneUse())
+          continue;
+        mlir::Operation *ruse = rope->getResult(0).use_begin()->getOwner();
+        if (ruse->getName().getStringRef() == castName &&
+            ruse->getNumOperands() == 1 && ruse->getNumResults() == 1 &&
+            ruse->getOperand(0) == rope->getResult(0))
+          cast = ruse;
+      } else if (use->getName().getStringRef() == castName) {
+        if (use->getNumOperands() != 1 || use->getNumResults() != 1 ||
+            use->getOperand(0) != node.getResult(0))
+          continue;
+        cast = use;
+      } else {
+        continue;
+      }
+      mlir::Operation *last = cast ? cast : rope;
+      if (!last)
+        continue;
+      matches.push_back({&node, rope, cast});
+    }
+
+    for (const Match &m : matches) {
+      mlir::Operation *last = m.cast ? m.cast : m.rope;
+      auto attrs = llvm::to_vector(
+          m.norm->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "rope",
+          builder.getI32IntegerAttr(m.rope ? 1 : 0)));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "cast",
+          builder.getI32IntegerAttr(m.cast ? 1 : 0)));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region",
+          builder.getStringAttr("heads_norm_rope_cast")));
+      auto name = last->getAttrOfType<mlir::StringAttr>("node_name");
+      const int64_t lastId = GraphEditor::resultIds(*last)[0];
+      const int64_t normId = GraphEditor::resultIds(*m.norm)[0];
+      // Kernel ABI: (x, w, has_w, y, pos, head_dim, eps, freq_scale, log_base,
+      // ff, heads_per_pos, do_rope, do_cast). `x` is the norm's input; `pos`
+      // is the rope's position operand (the position is a backend buffer; the
+      // operand keeps the graph dependency).
+      llvm::SmallVector<mlir::Value> operands{m.norm->getOperand(0)};
+      if (m.rope) operands.push_back(m.rope->getOperand(1));
+
+      builder.setInsertionPoint(last);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*last),
+          name ? name.getValue() : llvm::StringRef("heads_norm_rope_cast"),
+          builder.getArrayAttr(attrs), GraphEditor::resultIds(*last), operands,
+          last->getResultTypes(),
+          last->getAttrOfType<mlir::StringAttr>("backend"));
+
+      last->getResult(0).replaceAllUsesWith(fused->getResult(0));
+      view.noteValue(lastId, fused->getResult(0));
+      view.dropTensor(normId);
+      // The rope's tensor is an intermediate only when a cast follows it; when
+      // the rope is the chain's last node its id is the region's result id.
+      if (m.rope && m.cast)
+        view.dropTensor(GraphEditor::resultIds(*m.rope)[0]);
+      // The chain is linear, so erase from the last node back.
+      last->erase();
+      if (m.rope && m.cast) m.rope->erase();
+      m.norm->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -1558,6 +1697,7 @@ struct DisabledPasses {
   bool fuse_glue_regions = false;
   bool fuse_add_rms_norm_mmq = false;
   bool fuse_rms_norm_add = false;
+  bool fuse_heads_norm_rope_cast = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -1576,6 +1716,7 @@ constexpr PassName kPassNames[] = {
     {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
     {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
+    {"FuseHeadsNormRopeCastPass", &DisabledPasses::fuse_heads_norm_rope_cast},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1645,6 +1786,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // Last: it consumes the nodes the folds above produce.
     if (!off.fuse_glue_regions)
       pm.addPass(std::make_unique<FuseGlueRegionsPass>());
+    // The attention prep (norm/rope/cast) is independent of the folds above:
+    // none of them match those chains.
+    if (!off.fuse_heads_norm_rope_cast)
+      pm.addPass(std::make_unique<FuseHeadsNormRopeCastPass>());
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());
@@ -1658,6 +1803,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
       pm.addPass(std::make_unique<FuseRmsNormAddPass>());
     if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
     if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
+    // Attention prep: same shape as decode (norm -> rope [-> cast] / norm ->
+    // cast), the batched form selected by the norm's `batch` attribute.
+    if (!off.fuse_heads_norm_rope_cast)
+      pm.addPass(std::make_unique<FuseHeadsNormRopeCastPass>());
     return;
   }
 }

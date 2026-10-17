@@ -16,9 +16,10 @@
 
 // The glue-region code generator (compiler/GlueCodegen.h).
 //
-// Three region shapes so far: decode rms_norm + q8_1 quantize, prefill
-// residual add + RMS-norm + mmq q8_1 quantize, and prefill RMS-norm + residual
-// add. The kernels are emitted in the
+// Four region shapes so far: decode rms_norm + q8_1 quantize, prefill
+// residual add + RMS-norm + mmq q8_1 quantize, prefill RMS-norm + residual
+// add, and the attention prep (per-head RMS-norm + optional RoPE + optional
+// fp16 rounding). The kernels are emitted in the
 // GPU dialect and lowered with the standard MLIR pipeline
 //
 //   scf -> cf, arith -> llvm, gpu.module -> nvvm, finalize memref -> llvm,
@@ -58,10 +59,12 @@
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
+#include <mlir/Conversion/MathToNVVM/MathToNVVM.h>
 #include <mlir/Dialect/GPU/IR/GPUDialect.h>
 #include <mlir/Dialect/GPU/Transforms/Passes.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
+#include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/BuiltinOps.h>
@@ -79,6 +82,7 @@
 #include <llvm/Support/TargetSelect.h>
 
 #include <cstdio>
+#include <filesystem>
 #include <string>
 
 namespace sonicboom::compiler {
@@ -944,6 +948,324 @@ constexpr const char *kRmsNormAdd = R"MLIR(module attributes {gpu.container_modu
   }
 })MLIR";
 
+// The attention-prep region (Stage 5d): per-head RMS-norm + optional NeoX RoPE
+// + optional fp16 rounding, one 256-thread block per head.
+//
+// The reduction and the apply reproduce rms_heads_fused_kernel exactly (the
+// same f64 strided sum, the same shuffle-down tree, the same
+// 1/sqrt(float(t/head_dim) + eps), the same `(x * iv) * w` / `x * iv`). The
+// norm output is staged in shared memory because the rotation pairs element i
+// with i + head_dim/2. The rotation is rope_neox_heads_*_pos_kernel's:
+//
+//   theta = (freq_scale * float(pos)) *
+//           expf(((-2.0f * off) / head_dim) * log_base)
+//   x[i]        = x0 * c - x1 * s        (mul, mul, sub)
+//   x[i + half] = x0 * s + x1 * c        (mul, fma)
+//
+// with pos = *pos + head / heads_per_pos (the decode launch has one position,
+// so the head term is zero), and the optional fp16 roundtrip is
+// cast_fp16_kernel's (truncf f32->f16, extf back).
+//
+// The rotation's trig goes through libdevice (__nv_expf/__nv_cosf/__nv_sinf,
+// MathToNVVM). The MLIR pipeline's LLVM is not the nvcc that built the
+// reference kernel, and the two optimize the same libdevice bitcode slightly
+// differently, so a trig chain is checked on tolerance rather than byte
+// identity; the V chain (norm->cast, no trig) is still byte-identical.
+constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.container_module} {
+  gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
+    gpu.func @heads_norm_rope_cast(%x: !llvm.ptr, %w: !llvm.ptr, %has_w: i32,
+                                   %y: !llvm.ptr, %pos: !llvm.ptr,
+                                   %head_dim: i32, %eps: f32, %freq_scale: f32,
+                                   %log_base: f32, %ff: !llvm.ptr,
+                                   %heads_per_pos: i32, %do_rope: i32,
+                                   %do_cast: i32) kernel {
+      %head = gpu.block_id x
+      %tid = gpu.thread_id x
+      %tid_i = arith.index_cast %tid : index to i32
+      %head_i = arith.index_cast %head : index to i32
+      %c0i = arith.constant 0 : i32
+      %c1i = arith.constant 1 : i32
+      %c2i = arith.constant 2 : i32
+      %c4i = arith.constant 4 : i32
+      %c5i = arith.constant 5 : i32
+      %c8i = arith.constant 8 : i32
+      %c16i = arith.constant 16 : i32
+      %c31i = arith.constant 31 : i32
+      %c32i = arith.constant 32 : i32
+      %c256i = arith.constant 256 : i32
+      %c32l = arith.constant 32 : i64
+      %c0 = arith.constant 0.0 : f64
+      %c1f = arith.constant 1.0 : f32
+      %cm2f = arith.constant -2.0 : f32
+      %lane = arith.andi %tid_i, %c31i : i32
+      %warp = arith.shrui %tid_i, %c5i : i32
+      %wid = arith.constant 32 : i32
+      %head64 = arith.extsi %head_i : i32 to i64
+      %dim64 = arith.extsi %head_dim : i32 to i64
+      %rowoff = arith.muli %head64, %dim64 : i64
+      %xrow = llvm.getelementptr inbounds %x[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %yrow = llvm.getelementptr inbounds %y[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %s0 = scf.for %iv = %tid_i to %head_dim step %c256i iter_args(%acc = %c0) -> (f64) : i32 {
+        %xp = llvm.getelementptr inbounds %xrow[%iv] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %xv = llvm.load %xp : !llvm.ptr -> f32
+        %sq = arith.mulf %xv, %xv : f32
+        %sq64 = arith.extf %sq : f32 to f64
+        %na = arith.addf %acc, %sq64 : f64
+        scf.yield %na : f64
+      }
+      %b0 = arith.bitcast %s0 : f64 to i64
+      %lo0 = arith.trunci %b0 : i64 to i32
+      %h0 = arith.shrui %b0, %c32l : i64
+      %hi0 = arith.trunci %h0 : i64 to i32
+      %lo1, %vv1 = gpu.shuffle down %lo0, %c16i, %wid : i32
+      %hi1, %vv2 = gpu.shuffle down %hi0, %c16i, %wid : i32
+      %eq1 = arith.extui %lo1 : i32 to i64
+      %eh1 = arith.extui %hi1 : i32 to i64
+      %sh1 = arith.shli %eh1, %c32l : i64
+      %bt1 = arith.ori %eq1, %sh1 : i64
+      %pa1 = arith.bitcast %bt1 : i64 to f64
+      %s1 = arith.addf %s0, %pa1 : f64
+      %b1 = arith.bitcast %s1 : f64 to i64
+      %lo1b = arith.trunci %b1 : i64 to i32
+      %h1 = arith.shrui %b1, %c32l : i64
+      %hi1b = arith.trunci %h1 : i64 to i32
+      %lo2, %vv3 = gpu.shuffle down %lo1b, %c8i, %wid : i32
+      %hi2, %vv4 = gpu.shuffle down %hi1b, %c8i, %wid : i32
+      %eq2 = arith.extui %lo2 : i32 to i64
+      %eh2 = arith.extui %hi2 : i32 to i64
+      %sh2 = arith.shli %eh2, %c32l : i64
+      %bt2 = arith.ori %eq2, %sh2 : i64
+      %pa2 = arith.bitcast %bt2 : i64 to f64
+      %s2 = arith.addf %s1, %pa2 : f64
+      %b2 = arith.bitcast %s2 : f64 to i64
+      %lo2b = arith.trunci %b2 : i64 to i32
+      %h2 = arith.shrui %b2, %c32l : i64
+      %hi2b = arith.trunci %h2 : i64 to i32
+      %lo3, %vv5 = gpu.shuffle down %lo2b, %c4i, %wid : i32
+      %hi3, %vv6 = gpu.shuffle down %hi2b, %c4i, %wid : i32
+      %eq3 = arith.extui %lo3 : i32 to i64
+      %eh3 = arith.extui %hi3 : i32 to i64
+      %sh3 = arith.shli %eh3, %c32l : i64
+      %bt3 = arith.ori %eq3, %sh3 : i64
+      %pa3 = arith.bitcast %bt3 : i64 to f64
+      %s3 = arith.addf %s2, %pa3 : f64
+      %b3 = arith.bitcast %s3 : f64 to i64
+      %lo3b = arith.trunci %b3 : i64 to i32
+      %h3 = arith.shrui %b3, %c32l : i64
+      %hi3b = arith.trunci %h3 : i64 to i32
+      %lo4, %vv7 = gpu.shuffle down %lo3b, %c2i, %wid : i32
+      %hi4, %vv8 = gpu.shuffle down %hi3b, %c2i, %wid : i32
+      %eq4 = arith.extui %lo4 : i32 to i64
+      %eh4 = arith.extui %hi4 : i32 to i64
+      %sh4 = arith.shli %eh4, %c32l : i64
+      %bt4 = arith.ori %eq4, %sh4 : i64
+      %f4 = arith.bitcast %bt4 : i64 to f64
+      %s4 = arith.addf %s3, %f4 : f64
+      %b4 = arith.bitcast %s4 : f64 to i64
+      %lo4b = arith.trunci %b4 : i64 to i32
+      %h4 = arith.shrui %b4, %c32l : i64
+      %hi4b = arith.trunci %h4 : i64 to i32
+      %lo5, %vv9 = gpu.shuffle down %lo4b, %c1i, %wid : i32
+      %hi5, %vv10 = gpu.shuffle down %hi4b, %c1i, %wid : i32
+      %eq5 = arith.extui %lo5 : i32 to i64
+      %eh5 = arith.extui %hi5 : i32 to i64
+      %sh5 = arith.shli %eh5, %c32l : i64
+      %bt5 = arith.ori %eq5, %sh5 : i64
+      %f5 = arith.bitcast %bt5 : i64 to f64
+      %s5 = arith.addf %s4, %f5 : f64
+      %c0idx = arith.constant 0 : index
+      %smem = gpu.dynamic_shared_memory : memref<?xi8, #gpu.address_space<workgroup>>
+      %wpart = memref.view %smem[%c0idx][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<32xf64, #gpu.address_space<workgroup>>
+      %is_zero_lane = arith.cmpi eq, %lane, %c0i : i32
+      scf.if %is_zero_lane {
+        %widx = arith.index_cast %warp : i32 to index
+        memref.store %s5, %wpart[%widx] : memref<32xf64, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %lane_idx = arith.index_cast %lane : i32 to index
+      %c256idx = arith.constant 256 : index
+      %invm = memref.view %smem[%c256idx][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<4xf32, #gpu.address_space<workgroup>>
+      %in_w0 = arith.cmpi slt, %tid_i, %c32i : i32
+      scf.if %in_w0 {
+        %tl = memref.load %wpart[%lane_idx] : memref<32xf64, #gpu.address_space<workgroup>>
+        %is_active = arith.cmpi slt, %lane, %c8i : i32
+        %t0 = arith.select %is_active, %tl, %c0 : f64
+        %tb0 = arith.bitcast %t0 : f64 to i64
+        %tlo0 = arith.trunci %tb0 : i64 to i32
+        %th0 = arith.shrui %tb0, %c32l : i64
+        %thi0 = arith.trunci %th0 : i64 to i32
+        %tlo1, %tv1 = gpu.shuffle down %tlo0, %c16i, %wid : i32
+        %thi1, %tv2 = gpu.shuffle down %thi0, %c16i, %wid : i32
+        %te1 = arith.extui %tlo1 : i32 to i64
+        %the1 = arith.extui %thi1 : i32 to i64
+        %tsh1 = arith.shli %the1, %c32l : i64
+        %tbt1 = arith.ori %te1, %tsh1 : i64
+        %tf1 = arith.bitcast %tbt1 : i64 to f64
+        %t1 = arith.addf %t0, %tf1 : f64
+        %tb1 = arith.bitcast %t1 : f64 to i64
+        %tlo1b = arith.trunci %tb1 : i64 to i32
+        %th1 = arith.shrui %tb1, %c32l : i64
+        %thi1b = arith.trunci %th1 : i64 to i32
+        %tlo2, %tv3 = gpu.shuffle down %tlo1b, %c8i, %wid : i32
+        %thi2, %tv4 = gpu.shuffle down %thi1b, %c8i, %wid : i32
+        %te2 = arith.extui %tlo2 : i32 to i64
+        %the2 = arith.extui %thi2 : i32 to i64
+        %tsh2 = arith.shli %the2, %c32l : i64
+        %tbt2 = arith.ori %te2, %tsh2 : i64
+        %tf2 = arith.bitcast %tbt2 : i64 to f64
+        %t2 = arith.addf %t1, %tf2 : f64
+        %tb2 = arith.bitcast %t2 : f64 to i64
+        %tlo2b = arith.trunci %tb2 : i64 to i32
+        %th2 = arith.shrui %tb2, %c32l : i64
+        %thi2b = arith.trunci %th2 : i64 to i32
+        %tlo3, %tv5 = gpu.shuffle down %tlo2b, %c4i, %wid : i32
+        %thi3, %tv6 = gpu.shuffle down %thi2b, %c4i, %wid : i32
+        %te3 = arith.extui %tlo3 : i32 to i64
+        %the3 = arith.extui %thi3 : i32 to i64
+        %tsh3 = arith.shli %the3, %c32l : i64
+        %tbt3 = arith.ori %te3, %tsh3 : i64
+        %tf3 = arith.bitcast %tbt3 : i64 to f64
+        %t3 = arith.addf %t2, %tf3 : f64
+        %tb3 = arith.bitcast %t3 : f64 to i64
+        %tlo3b = arith.trunci %tb3 : i64 to i32
+        %th3 = arith.shrui %tb3, %c32l : i64
+        %thi3b = arith.trunci %th3 : i64 to i32
+        %tlo4, %tv7 = gpu.shuffle down %tlo3b, %c2i, %wid : i32
+        %thi4, %tv8 = gpu.shuffle down %thi3b, %c2i, %wid : i32
+        %te4 = arith.extui %tlo4 : i32 to i64
+        %the4 = arith.extui %thi4 : i32 to i64
+        %tsh4 = arith.shli %the4, %c32l : i64
+        %tbt4 = arith.ori %te4, %tsh4 : i64
+        %tf4 = arith.bitcast %tbt4 : i64 to f64
+        %t4 = arith.addf %t3, %tf4 : f64
+        %tb4 = arith.bitcast %t4 : f64 to i64
+        %tlo4b = arith.trunci %tb4 : i64 to i32
+        %th4 = arith.shrui %tb4, %c32l : i64
+        %thi4b = arith.trunci %th4 : i64 to i32
+        %tlo5, %tv9 = gpu.shuffle down %tlo4b, %c1i, %wid : i32
+        %thi5, %tv10 = gpu.shuffle down %thi4b, %c1i, %wid : i32
+        %te5 = arith.extui %tlo5 : i32 to i64
+        %the5 = arith.extui %thi5 : i32 to i64
+        %tsh5 = arith.shli %the5, %c32l : i64
+        %tbt5 = arith.ori %te5, %tsh5 : i64
+        %tf5 = arith.bitcast %tbt5 : i64 to f64
+        %t5 = arith.addf %t4, %tf5 : f64
+        %fn = arith.sitofp %head_dim : i32 to f64
+        %tn = arith.divf %t5, %fn : f64
+        %t32 = arith.truncf %tn : f64 to f32
+        %te = arith.addf %t32, %eps : f32
+        %sq = nvvm.sqrt %te {rnd = #nvvm.fp_rnd_mode<rn>} : f32
+        %inv = arith.divf %c1f, %sq : f32
+        %is_l0 = arith.cmpi eq, %lane, %c0i : i32
+        scf.if %is_l0 {
+          %i0i = arith.constant 0 : index
+          memref.store %inv, %invm[%i0i] : memref<4xf32, #gpu.address_space<workgroup>>
+        }
+      }
+      gpu.barrier
+      %i0b = arith.constant 0 : index
+      %ivv = memref.load %invm[%i0b] : memref<4xf32, #gpu.address_space<workgroup>>
+      %c512idx = arith.constant 512 : index
+      %stage = memref.view %smem[%c512idx][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<512xf32, #gpu.address_space<workgroup>>
+      %dim_idx = arith.index_cast %head_dim : i32 to index
+      %c256idx2 = arith.constant 256 : index
+      %hasw = arith.cmpi ne, %has_w, %c0i : i32
+      scf.for %k = %tid to %dim_idx step %c256idx2 {
+        %ki = arith.index_cast %k : index to i32
+        %xp2 = llvm.getelementptr inbounds %xrow[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %xv2 = llvm.load %xp2 : !llvm.ptr -> f32
+        %p = arith.mulf %xv2, %ivv : f32
+        %v = scf.if %hasw -> (f32) {
+          %wp = llvm.getelementptr inbounds %w[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+          %wv = llvm.load %wp : !llvm.ptr -> f32
+          %pv = arith.mulf %p, %wv : f32
+          scf.yield %pv : f32
+        } else {
+          scf.yield %p : f32
+        }
+        memref.store %v, %stage[%k] : memref<512xf32, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %half = arith.shrui %head_dim, %c1i : i32
+      %half_idx = arith.index_cast %half : i32 to index
+      %dorope = arith.cmpi ne, %do_rope, %c0i : i32
+      %docast = arith.cmpi ne, %do_cast, %c0i : i32
+      scf.if %dorope {
+        %in_half = arith.cmpi slt, %tid_i, %half : i32
+        scf.if %in_half {
+          %pos64 = llvm.load %pos : !llvm.ptr -> i64
+          %poshead = arith.divsi %head_i, %heads_per_pos : i32
+          %poshead64 = arith.extui %poshead : i32 to i64
+          %post = arith.addi %pos64, %poshead64 : i64
+          %fpos = arith.uitofp %post : i64 to f32
+          %foff = arith.sitofp %tid_i : i32 to f32
+          %fhd = arith.sitofp %head_dim : i32 to f32
+          %a0 = arith.mulf %cm2f, %foff : f32
+          %a1 = arith.divf %a0, %fhd : f32
+          %a2 = arith.mulf %a1, %log_base : f32
+          %e = math.exp %a2 : f32
+          %theta0 = arith.mulf %freq_scale, %fpos : f32
+          %basis = arith.mulf %theta0, %e : f32
+          %null = llvm.mlir.zero : !llvm.ptr
+          %isnull = llvm.icmp "eq" %ff, %null : !llvm.ptr
+          %th = scf.if %isnull -> (f32) {
+            scf.yield %basis : f32
+          } else {
+            %ffp = llvm.getelementptr inbounds %ff[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+            %ffv = llvm.load %ffp : !llvm.ptr -> f32
+            %thd = arith.divf %basis, %ffv : f32
+            scf.yield %thd : f32
+          }
+          %c = math.cos %th : f32
+          %s = math.sin %th : f32
+          %ih = arith.addi %tid, %half_idx : index
+          %x0 = memref.load %stage[%tid] : memref<512xf32, #gpu.address_space<workgroup>>
+          %x1 = memref.load %stage[%ih] : memref<512xf32, #gpu.address_space<workgroup>>
+          %x0c = arith.mulf %x0, %c : f32
+          %x1s = arith.mulf %x1, %s : f32
+          %o0 = arith.subf %x0c, %x1s : f32
+          %x0s = arith.mulf %x0, %s : f32
+          %o1 = math.fma %x1, %c, %x0s : f32
+          %r0 = scf.if %docast -> (f32) {
+            %h0f = arith.truncf %o0 : f32 to f16
+            %b0f2 = arith.extf %h0f : f16 to f32
+            scf.yield %b0f2 : f32
+          } else {
+            scf.yield %o0 : f32
+          }
+          %r1 = scf.if %docast -> (f32) {
+            %h1f = arith.truncf %o1 : f32 to f16
+            %b1f = arith.extf %h1f : f16 to f32
+            scf.yield %b1f : f32
+          } else {
+            scf.yield %o1 : f32
+          }
+          %yp0 = llvm.getelementptr inbounds %yrow[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+          %yp1 = llvm.getelementptr inbounds %yrow[%half] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+          %yp2 = llvm.getelementptr inbounds %yp1[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+          llvm.store %r0, %yp0 : f32, !llvm.ptr
+          llvm.store %r1, %yp2 : f32, !llvm.ptr
+        }
+      } else {
+        scf.for %k2 = %tid to %dim_idx step %c256idx2 {
+          %k2i = arith.index_cast %k2 : index to i32
+          %v2 = memref.load %stage[%k2] : memref<512xf32, #gpu.address_space<workgroup>>
+          %r2 = scf.if %docast -> (f32) {
+            %h2f = arith.truncf %v2 : f32 to f16
+            %b2f = arith.extf %h2f : f16 to f32
+            scf.yield %b2f : f32
+          } else {
+            scf.yield %v2 : f32
+          }
+          %yp3 = llvm.getelementptr inbounds %yrow[%k2i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+          llvm.store %r2, %yp3 : f32, !llvm.ptr
+        }
+      }
+      gpu.return
+    }
+  }
+})MLIR";
+
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
 std::string region_text(GlueRegionKind kind, int sm_arch) {
@@ -957,6 +1279,9 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
       break;
     case GlueRegionKind::RmsNormAdd:
       text = kRmsNormAdd;
+      break;
+    case GlueRegionKind::HeadsNormRopeCast:
+      text = kHeadsNormRopeCast;
       break;
   }
   if (text == nullptr) return {};
@@ -984,6 +1309,44 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
 // format) runs the LLVM NVPTX backend inside this process, so its target
 // description must be registered before the pass runs. The tool-level
 // equivalent (mlir-opt) does this for every built target at startup.
+// The CUDA toolkit's libdevice bitcode, needed when a region calls a libdevice
+// function (the attention-prep region's expf/cosf/sinf). GpuModuleToBinaryPass
+// links it through its `linkFiles` option; the NVVM translation's own toolkit
+// lookup may report a missing path, but that diagnostic is not a failure and
+// the link files are what resolve the __nv_* calls. Empty when none is found,
+// in which case lowering fails and the planner falls back to the reference
+// kernels.
+std::string find_libdevice() {
+  auto existing = [](const std::string &path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec) ? path : std::string();
+  };
+  if (const char *explicit_path = std::getenv("SONICBOOM_LIBDEVICE")) {
+    if (std::string p = existing(explicit_path); !p.empty()) return p;
+  }
+  for (const char *env : {"CUDA_HOME", "CUDA_PATH", "CUDA_ROOT"}) {
+    if (const char *root = std::getenv(env)) {
+      for (const char *rel : {"/nvvm/libdevice/libdevice.10.bc",
+                              "/nvvm/libdevice/libdevice.bc"}) {
+        if (std::string p = existing(std::string(root) + rel); !p.empty())
+          return p;
+      }
+    }
+  }
+  if (const char *dir = std::getenv("NVVMIR_LIBRARY_DIR")) {
+    for (const char *rel : {"/libdevice.10.bc", "/libdevice.bc"}) {
+      if (std::string p = existing(std::string(dir) + rel); !p.empty())
+        return p;
+    }
+  }
+  for (const char *path : {"/usr/lib/nvidia-cuda-toolkit/libdevice/libdevice.10.bc",
+                           "/usr/local/cuda/nvvm/libdevice/libdevice.10.bc",
+                           "/usr/local/cuda-12.0/nvvm/libdevice/libdevice.10.bc"}) {
+    if (std::string p = existing(path); !p.empty()) return p;
+  }
+  return {};
+}
+
 void register_nvptx_target() {
   static const bool once = [] {
     LLVMInitializeNVPTXTargetInfo();
@@ -1005,6 +1368,8 @@ std::optional<GlueRegionKind> glue_region_kind_from_name(
     return GlueRegionKind::AddRmsNormQuantizeMmqQ8_1;
   if (name == "rms_norm_add")
     return GlueRegionKind::RmsNormAdd;
+  if (name == "heads_norm_rope_cast")
+    return GlueRegionKind::HeadsNormRopeCast;
   return std::nullopt;
 }
 
@@ -1016,6 +1381,8 @@ const char *glue_region_name(GlueRegionKind kind) noexcept {
       return "add_rms_norm_quantize_mmq_q8_1";
     case GlueRegionKind::RmsNormAdd:
       return "rms_norm_add";
+    case GlueRegionKind::HeadsNormRopeCast:
+      return "heads_norm_rope_cast";
   }
   return "?";
 }
@@ -1028,6 +1395,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
       return "add_rms_norm_q8_1_mmq";
     case GlueRegionKind::RmsNormAdd:
       return "rms_norm_add";
+    case GlueRegionKind::HeadsNormRopeCast:
+      return "heads_norm_rope_cast";
   }
   return "?";
 }
@@ -1044,8 +1413,8 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
                   mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
-                  mlir::memref::MemRefDialect, mlir::NVVM::NVVMDialect,
-                  mlir::scf::SCFDialect>();
+                  mlir::math::MathDialect, mlir::memref::MemRefDialect,
+                  mlir::NVVM::NVVMDialect, mlir::scf::SCFDialect>();
   // The `#nvvm.target` serialization and the nvvm-dialect LLVM IR translation
   // are external models: without them the module-to-binary pass has no
   // serializer to call. mlir-opt registers both at startup.
@@ -1071,6 +1440,11 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
   register_nvptx_target();
 
   mlir::PassManager pm(&context);
+  // The attention-prep region's trig is libdevice's (__nv_expf/__nv_cosf/
+  // __nv_sinf). Convert it first, while it is still a math op; the other
+  // regions have no math ops and keep the nvcc-matching code path.
+  const bool link_libdevice = kind == GlueRegionKind::HeadsNormRopeCast;
+  if (link_libdevice) pm.addPass(mlir::createConvertMathToNVVM());
   pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
@@ -1088,13 +1462,17 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
   pm.addPass(mlir::createReconcileUnrealizedCastsPass());
   mlir::GpuModuleToBinaryPassOptions binary;
   binary.compilationTarget = "assembly";
+  if (link_libdevice) {
+    const std::string libdevice = find_libdevice();
+    if (!libdevice.empty()) binary.linkFiles.push_back(libdevice);
+  }
   pm.addPass(mlir::createGpuModuleToBinaryPass(binary));
 
   // The NVVM serializer emits a "LibDevice path" error when the CUDA toolkit's
-  // libdevice is not where it expects it, yet still produces the PTX: these
-  // kernels call no libdevice function, so the link is a no-op. Capture the
-  // diagnostics for this run and only surface them when lowering actually
-  // fails, so a cold compile does not print a non-error at every launch.
+  // libdevice is not where it expects it, yet still produces the PTX: the
+  // link is supplied through `linkFiles` above. Capture the diagnostics for
+  // this run and only surface them when lowering actually fails, so a cold
+  // compile does not print a non-error at every launch.
   std::string diagnostics;
   mlir::ScopedDiagnosticHandler capture(
       &context, [&](mlir::Diagnostic &diag) {

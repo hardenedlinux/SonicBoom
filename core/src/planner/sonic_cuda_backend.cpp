@@ -767,6 +767,95 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         break;
       }
+      if (region == "heads_norm_rope_cast") {
+        // Attention prep (Stage 5d): per-head RMS-norm, NeoX RoPE on the Q/K
+        // chains, fp16 rounding on the K/V chains, in one kernel. The norm
+        // carries layer/slot (and `batch` in prefill); `rope`/`cast` say which
+        // chain this is. One 256-thread block per head: the head count is the
+        // region node's element count / head_dim.
+        int64_t rope_i = 0, cast_i = 0, nb = 1;
+        attr_i(*node, "rope", rope_i);
+        attr_i(*node, "cast", cast_i);
+        if (!batch_attr(nb)) nb = 1;
+        const int dim = int(lc.head_dim);
+        const int heads = dim > 0 ? out_n / dim : 0;
+        if (dim <= 0 || (dim & 1) != 0 || heads <= 0 || out_n % dim != 0 ||
+            nb <= 0 || heads % int(nb) != 0) {
+          // Malformed for the reference chain too (RoPE pairs and the batched
+          // launch both need these): fail rather than write a wrong buffer.
+          ok = false;
+          break;
+        }
+        const int hpp = heads / int(nb);
+        const std::span<const float> w = fweight(slot);
+        const std::span<const float> ff =
+            rope_i != 0 && lc.attention == model::AttentionKind::Global
+                ? model_->weights.rope_freqs
+                : std::span<const float>{};
+        // The reference chain: norm, then in-place rope (batched when the
+        // launch covers more than one position), then the fp16 rounding.
+        auto reference = [&]() {
+          ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, dim,
+                                            heads);
+          if (ok && rope_i != 0) {
+            ok = nb == 1
+                     ? nn::cuda::rope_neox_heads_dev_pos(
+                           out, dim, heads,
+                           reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                           lc.rope_base, 1.0f, ff)
+                     : nn::cuda::rope_neox_heads_batched_dev_pos(
+                           out, dim, hpp, int(nb),
+                           reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                           lc.rope_base, 1.0f, ff);
+          }
+          if (ok && cast_i != 0) ok = nn::cuda::cast_fp16_dev(out, out_n);
+        };
+        // The region is an optimization: a head wider than its shared stage
+        // falls back to the reference chain (Gemma's global layers are 512,
+        // its local layers 256; the region covers both).
+        if (dim > compiler::kHeadsNormRopeCastMaxHeadDim) {
+          reference();
+          break;
+        }
+        const void* wd =
+            w.empty()
+                ? nullptr
+                : quant::cuda::upload_bytes_cached(w.data(),
+                                                   w.size() * sizeof(float));
+        const void* ffd =
+            ff.empty()
+                ? nullptr
+                : quant::cuda::upload_bytes_cached(ff.data(),
+                                                   ff.size() * sizeof(float));
+        if ((!w.empty() && wd == nullptr) || (!ff.empty() && ffd == nullptr)) {
+          reference();
+          break;
+        }
+        const float log_base = std::log(lc.rope_base);
+        // The generated kernel's ABI: (x, w, has_w, y, pos, head_dim, eps,
+        // freq_scale, log_base, ff, heads_per_pos, do_rope, do_cast).
+        void* xarg = const_cast<float*>(dev(in[0]));
+        void* warg = const_cast<void*>(wd);
+        int haswarg = w.empty() ? 0 : 1;
+        void* yarg = out;
+        void* posarg = reinterpret_cast<void*>(pos_buf_.id);
+        int dimarg = dim;
+        float earg = eps;
+        float fsarg = 1.0f;
+        float lbarg = log_base;
+        void* ffarg = const_cast<void*>(ffd);
+        int hpparg = hpp;
+        int ropearg = int(rope_i);
+        int castarg = int(cast_i);
+        void* args[] = {&xarg,   &warg,   &haswarg, &yarg,   &posarg, &dimarg,
+                        &earg,   &fsarg,  &lbarg,   &ffarg,  &hpparg, &ropearg,
+                        &castarg};
+        ok = glue::launch(region, args, heads,
+                          compiler::kHeadsNormRopeCastBlockThreads,
+                          compiler::kHeadsNormRopeCastSharedBytes);
+        if (!ok) reference();
+        break;
+      }
       // An unknown region would mean a pass emitted a node this backend has no
       // kernel for; fail rather than silently produce an unwritten buffer.
       ok = false;
