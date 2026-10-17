@@ -395,6 +395,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   const int out_n = int(out_bytes / sizeof(float));
 
   bool ok = true;
+  // A fused region may keep a producer's output as a second result (the prefill
+  // add+norm region writes the residual sum as well as the activation). The
+  // first output is `out` above; this is the one the region allocates for the
+  // second, and it is returned after `out`.
+  uint64_t extra_handle = 0;
+  uint64_t extra_bytes = 0;
   // NVTX range named after the graph node (its op kind, e.g. "rms_norm",
   // "quantized_matmul"), so nsys attributes each kernel launch to its operator
   // for the per-op launch-count breakdown.
@@ -648,6 +654,70 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           ok = quant::cuda::rms_norm_quantize_q8_1_dev(
               w, dev(in[0]), eps, reinterpret_cast<quant::cuda::BlockQ8_1*>(out),
               n);
+        break;
+      }
+      if (region == "add_rms_norm_quantize_mmq_q8_1") {
+        // Prefill residual add + batched norm + mmq quantize (Stage 5b):
+        // outputs are {mmq q8_1 activation, residual sum}. The sum is a real
+        // graph tensor — the next layer's residual add reads it — so the fused
+        // node keeps it as its second output and the kernel writes it.
+        int64_t nb = 0, dim_i = 0, ds_i = 0;
+        if (!batch_attr(nb) || !attr_i(*node, "dim", dim_i) ||
+            !attr_i(*node, "ds", ds_i) || node->outputs.size() < 2) {
+          ok = false;
+          break;
+        }
+        note_activation_quant(mmq_activation(ds_i));
+        const std::span<const float> w = fweight(slot);
+        const void* wd =
+            w.empty()
+                ? nullptr
+                : quant::cuda::upload_bytes_cached(w.data(),
+                                                   w.size() * sizeof(float));
+        if (!w.empty() && wd == nullptr) {
+          ok = false;
+          break;
+        }
+        const auto* res_td = graph_.find_tensor(node->outputs[1]);
+        if (!res_td) {
+          ok = false;
+          break;
+        }
+        extra_bytes = res_td->dynamic_stride_bytes != 0
+                          ? res_td->dynamic_stride_bytes * segment_extent_ +
+                                res_td->dynamic_base_bytes
+                          : res_td->size_bytes;
+        extra_handle = device::acquire(extra_bytes);
+        if (!extra_handle) {
+          ok = false;
+          break;
+        }
+        float* resp = dev_mut(extra_handle);
+        // The generated kernel's ABI: (a, b, w, y, res, dim, n, ds, eps), one
+        // block per token.
+        void* aarg = const_cast<float*>(dev(in[0]));
+        void* barg = const_cast<float*>(dev(in[1]));
+        void* warg = const_cast<void*>(wd);
+        void* yarg = out;
+        void* rarg = resp;
+        int dimarg = int(dim_i);
+        int nbarg = int(nb);
+        int dsarg = int(ds_i);
+        float earg = eps;
+        void* args[] = {&aarg,  &barg, &warg,  &yarg,     &rarg,
+                        &dimarg, &nbarg, &dsarg, &earg};
+        ok = glue::launch(region, args, int(nb),
+                          compiler::kAddRmsNormBlockThreads,
+                          compiler::kAddRmsNormSharedBytes);
+        if (!ok) {
+          ok = nn::cuda::add_dev(dev(in[0]), dev(in[1]), resp,
+                                 int(nb * dim_i));
+          if (ok)
+            ok = quant::cuda::rms_norm_quantize_mmq_q8_1_dev(
+                w, resp, eps,
+                reinterpret_cast<quant::cuda::BlockQ8_1Mmq*>(out), int(dim_i),
+                int(nb), int(ds_i));
+        }
         break;
       }
       // An unknown region would mean a pass emitted a node this backend has no
@@ -912,6 +982,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   if (nvtx_enabled()) nvtxRangePop();
 
   if (!ok) {
+    if (extra_handle) device::release(extra_handle, extra_bytes);
     device::release(out_handle, out_bytes);
     return std::unexpected(fail("Sonic CUDA kernel failed for node '" + node->name +
                                 "'"));
@@ -928,6 +999,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
 
   std::vector<TensorValue> res;
   res.push_back(TensorValue::from_device(out_handle, out_bytes));
+  if (extra_handle)
+    res.push_back(TensorValue::from_device(extra_handle, extra_bytes));
   return res;
 }
 

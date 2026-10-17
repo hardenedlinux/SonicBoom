@@ -595,6 +595,7 @@ if [ "$ABLATE" = 1 ]; then
     "bias-into-gemv|BiasIntoGemvPass"
     "residual-add-into-gemv|ResidualAddIntoGemvPass"
     "mmq-folds|RmsNormMmqPass,GeluMulMmqPass,SiluMulMmqPass"
+    "add-rms-norm-fusion|FuseAddRmsNormMmqPass"
   )
   ABL_FEATURE_GROUPS=(
     "cuda-graph-decode|cuda_graph_decode"

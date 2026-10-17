@@ -163,6 +163,11 @@ public:
       note(id, newNode->getResult(index));
   }
 
+  // Point one tensor id at `v`. For a fusion whose results are not the old
+  // node's in order (a region that keeps the producer's output as a second
+  // result, say), where noteReplaced's index-wise mapping would be wrong.
+  void noteValue(int64_t id, mlir::Value v) { note(id, v); }
+
   // Write the table back. Until this is called the op still holds the one it
   // came with, so a pass that fails part-way leaves the IR alone.
   void commitTable() {
@@ -926,6 +931,117 @@ public:
   }
 };
 
+// FuseAddRmsNormMmqPass — the prefill glue region (Stage 5b): a residual add
+// whose output a batched RmsNormMmq quantizer reads, and the quantizer itself,
+// become one GPU-dialect region. `add -> rms_norm_quantize` is the prefill
+// twin of the decode pair FuseGlueRegionsPass fuses; unlike that one, the sum
+// cannot be dropped.
+//
+// The add's output has two readers — this norm and the next residual add — so
+// the fused region keeps it: its second result is the residual sum, written by
+// the same kernel that normalizes it. The norm's reader then sees the add's
+// tensor id and the next add sees the same id; only the two nodes disappear.
+// The kernel is emitted per [dim] row with a 256-thread block, phase A writing
+// the sum and computing inv, phase B quantizing in the mmq geometry (see
+// GlueCodegen.cpp). Runs after RmsNormMmqPass: that is what creates the
+// batched quantizer this matches.
+//
+// The region is still a glue region in the codegen sense, so it is gated by the
+// same `glue_codegen` feature and has its own entry in the pass-disable list.
+class FuseAddRmsNormMmqPass
+    : public mlir::PassWrapper<FuseAddRmsNormMmqPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseAddRmsNormMmqPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    for (mlir::Operation &node : view.body())
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+
+    struct Match {
+      mlir::Operation *add;
+      mlir::Operation *norm;
+    };
+    llvm::SmallVector<Match> matches;
+    llvm::DenseSet<mlir::Operation *> usedAdds;
+    const std::string normName = boomOpName(planner::OpKind::RmsNormQuantize);
+    const std::string addName = boomOpName(planner::OpKind::Add);
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != normName || node.getNumOperands() != 1 ||
+          node.getNumResults() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs || !nodeAttrInt(attrs, "batch"))
+        continue; // the decode form is not this region
+      const int64_t ds = nodeAttrInt(attrs, "ds").value_or(-1);
+      if (ds != 0 && ds != 1)
+        continue; // D4_Q8_1 (-1/2) is not in this region's quantize
+      const int64_t dim = nodeAttrInt(attrs, "dim").value_or(0);
+      if (dim <= 0 || dim % 128 != 0)
+        continue; // the reference quantizer requires whole 128-element blocks
+      auto it = producer.find(view.idOf(node.getOperand(0)));
+      if (it == producer.end())
+        continue;
+      mlir::Operation *add = it->second;
+      if (add->getName().getStringRef() != addName ||
+          add->getNumOperands() != 2 || add->getNumResults() != 1)
+        continue;
+      if (!usedAdds.insert(add).second)
+        continue;
+      matches.push_back({add, &node});
+    }
+
+    for (const Match &m : matches) {
+      mlir::Operation *add = m.add;
+      mlir::Operation *norm = m.norm;
+      auto attrs =
+          llvm::to_vector(norm->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region",
+          builder.getStringAttr("add_rms_norm_quantize_mmq_q8_1")));
+      auto name = add->getAttrOfType<mlir::StringAttr>("node_name");
+
+      // Result order is the norm's first, so the ordinary index-wise id mapping
+      // below stays right for it, and the add's second.
+      llvm::SmallVector<int64_t> resultIds{
+          GraphEditor::resultIds(*norm)[0], GraphEditor::resultIds(*add)[0]};
+      llvm::SmallVector<mlir::Type> types{norm->getResult(0).getType(),
+                                         add->getResult(0).getType()};
+      const int64_t addId = GraphEditor::resultIds(*add)[0];
+      const int64_t normId = GraphEditor::resultIds(*norm)[0];
+
+      builder.setInsertionPoint(add);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*add),
+          name ? name.getValue() : llvm::StringRef("add_rms_norm_quantize"),
+          builder.getArrayAttr(attrs), resultIds, add->getOperands(), types,
+          add->getAttrOfType<mlir::StringAttr>("backend"));
+
+      // Index-wise, not norm->replaceAllUsesWith(fused): the fused node has two
+      // results and the norm's is only the first.
+      norm->getResult(0).replaceAllUsesWith(fused->getResult(0));
+      add->getResult(0).replaceAllUsesWith(fused->getResult(1));
+      view.noteValue(normId, fused->getResult(0));
+      view.noteValue(addId, fused->getResult(1));
+      norm->erase();
+      add->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -1329,6 +1445,7 @@ struct DisabledPasses {
   bool gelu_mul_mmq = false;
   bool silu_mul_mmq = false;
   bool fuse_glue_regions = false;
+  bool fuse_add_rms_norm_mmq = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -1345,6 +1462,7 @@ constexpr PassName kPassNames[] = {
     {"BiasIntoGemvPass", &DisabledPasses::bias_into_gemv},
     {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
     {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
+    {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1417,6 +1535,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());
+    // After RmsNormMmqPass: that is what creates the batched quantizer this
+    // region consumes.
+    if (!off.fuse_add_rms_norm_mmq)
+      pm.addPass(std::make_unique<FuseAddRmsNormMmqPass>());
     if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
     if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
     return;

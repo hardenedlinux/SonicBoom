@@ -115,7 +115,9 @@ bool carriesDs(llvm::StringRef opName) {
          opName == "boom.quantized_matmul_q8" ||
          opName == "boom.rms_norm_quantize" ||
          opName == "boom.gelu_mul_quantize" ||
-         opName == "boom.silu_mul_quantize";
+         opName == "boom.silu_mul_quantize" ||
+         // The prefill add+norm+quantize region carries the norm's ds.
+         opName == "boom.fused_region";
 }
 
 // Elementwise ops whose result has the shape of their first operand. `add_bias`
