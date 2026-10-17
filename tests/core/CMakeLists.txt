@@ -15,11 +15,20 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
 endforeach()
+
+# The runtime-feature disable list is parsed once per process, so the mode that
+# needs a different value of it is a separate invocation. (The unknown-name
+# error is exercised in-process by the default test, which forks a child.)
+add_test(NAME test_runtime_features_disabled
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_FEATURE_DISABLE=split_kv,plan_cache
+                 $<TARGET_FILE:test_runtime_features> --disabled)
 
 # test_dequant optionally diffs against the real Gemma 4 GGUF (skips cleanly
 # when the file is absent). It needs the repository root to locate models/.

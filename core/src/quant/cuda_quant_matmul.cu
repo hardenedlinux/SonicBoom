@@ -16,6 +16,8 @@
 
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include <sonicboom/runtime_features.h>
+
 #include "cuda_resident.h"
 
 #include "../nn/cuda_stream.h"
@@ -1308,12 +1310,12 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
 // restores the fp32 base/coop hybrid for differential testing against the CPU
 // reference (the fp32 path is the exact dequant arithmetic).
 //
-// Deliberately *not* cached: the env flag is a live toggle, so a differential
-// test can set/unset it mid-process to cover both the fp32 and q8_1 paths in one
-// binary. It is called once per matvec/matmul (not per element), so the getenv
-// cost is negligible.
+// Feature q8_1_dispatch; SONICBOOM_GEMV_F32 remains its live alias, so a
+// differential test can set/unset it mid-process to cover both the fp32 and
+// q8_1 paths in one binary. It is called once per matvec/matmul (not per
+// element), so the lookup cost is negligible.
 bool q8_1_enabled() noexcept {
-  return std::getenv("SONICBOOM_GEMV_F32") == nullptr;
+  return runtime::feature_enabled(runtime::Feature::Q8_1Dispatch);
 }
 
 // cuBLAS fp16 path for the batched prefill matmul (C.1). On by default; the

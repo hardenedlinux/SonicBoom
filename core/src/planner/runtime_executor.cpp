@@ -19,6 +19,7 @@
 #include "device_pool.h"
 
 #include <sonicboom/planner/plan_record.h>
+#include <sonicboom/runtime_features.h>
 
 #include <cstddef>
 #include <cstring>
@@ -82,9 +83,14 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
   // consumer has read it — keeping the peak device working set bounded instead of
   // holding every intermediate until the end of the step (which overflows the
   // device for a batched prefill graph, whose activations are [d, n]).
+  // Feature buffer_reuse: off leaves the map empty, so no buffer is released
+  // early and every live activation is held until the end of the step. That is
+  // the ablation's "no sharing" arm (the buffers then only return to the pool
+  // at step end).
   std::map<uint32_t, TaskId> last_use;
-  for (const auto& lt : plan.lifetimes)
-    last_use[lt.tensor.value] = lt.last_required;
+  if (runtime::feature_enabled(runtime::Feature::BufferReuse))
+    for (const auto& lt : plan.lifetimes)
+      last_use[lt.tensor.value] = lt.last_required;
   std::size_t in_i = 0;
   for (const auto& t : plan.tensors)
     if (t.is_graph_input)

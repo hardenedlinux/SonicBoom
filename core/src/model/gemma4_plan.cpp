@@ -16,6 +16,7 @@
 
 #include <sonicboom/model/plan.h>
 
+#include <sonicboom/runtime_features.h>
 #include <sonicboom/compiler/BoomBuilder.h>
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomPasses.h>
@@ -1020,12 +1021,11 @@ static PlannerEnv planner_env() {
                     quant::cuda::mmq_min_n()};
 }
 
-// SONICBOOM_PLAN_CACHE=0 disables the prefill segment cache (segments then go
-// back to being built per call), for A/B and for ruling the cache out of a
-// divergence. Any other value, including unset, keeps it on.
+// The prefill segment cache is a runtime feature (plan_cache), so it can be
+// ablated with SONICBOOM_FEATURE_DISABLE=plan_cache; the historical
+// SONICBOOM_PLAN_CACHE=0 remains as its alias.
 static bool plan_cache_enabled() {
-  const char* e = std::getenv("SONICBOOM_PLAN_CACHE");
-  return e == nullptr || std::string_view(e) != "0";
+  return runtime::feature_enabled(runtime::Feature::PlanCache);
 }
 
 // Cache cap. A single prefill call needs at most two distinct segment lengths
@@ -1059,9 +1059,18 @@ struct DecodeRuntime {
 static std::map<std::pair<const Gemma4Model*, uint64_t>,
                 std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
 
-static bool cuda_graphs_enabled() {
-  const char* e = std::getenv("SONICBOOM_CUDA_GRAPHS");
-  return e == nullptr || std::string_view(e) != "0";
+// Decode and prefill captures are separate features so an ablation can turn
+// off either one; SONICBOOM_CUDA_GRAPHS=0 still disables both.
+static bool cuda_graph_decode_enabled() {
+  return runtime::feature_enabled(runtime::Feature::CudaGraphDecode);
+}
+
+static bool cuda_graph_prefill_enabled() {
+  return runtime::feature_enabled(runtime::Feature::CudaGraphPrefill);
+}
+
+static bool capture_reuse_enabled() {
+  return runtime::feature_enabled(runtime::Feature::CaptureReuse);
 }
 
 // Route host-memory-space compute tasks (Embedding / Softcap) to the CPU backend
@@ -1136,7 +1145,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
 
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
-  if (cuda_graphs_enabled()) {
+  if (cuda_graph_decode_enabled()) {
     rt->cuda->seed_token(0);
     rt->cuda->set_pos(0);
     std::vector<sx::Bytes> in;
@@ -1163,6 +1172,10 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
 
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
+  // Ablatable warm-up: with the feature off nothing is built here, so the
+  // first generate call pays the plan/capture cost inside its own timed
+  // region. Reported as success: skipping the warm-up is not a failure.
+  if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   return get_decode_runtime(m, n_ctx) != nullptr;
 }
 
@@ -1705,13 +1718,14 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // persistent cache, so the device pointers do not move. Reuse skips the
     // warm-up too — it exists to initialize the kernels and allocations the
     // capture records, and those are already initialized once the graph exists.
-    const bool use_graphs = cuda_graphs_enabled();
+    const bool use_graphs = cuda_graph_prefill_enabled();
     if (use_graphs && n > chunk && start_pos == 0) {
       Phase _cap("prefill:capture_graph", phase_timing);
       PrefillSegment* full = segment_for(chunk);
       if (full) {
         const std::shared_ptr<void> cache_id = full->cuda->cache_identity();
-        if (full->chunk_prog && full->chunk_prog_cache.get() == cache_id.get()) {
+        if (capture_reuse_enabled() && full->chunk_prog &&
+            full->chunk_prog_cache.get() == cache_id.get()) {
           Phase _reuse("prefill:capture_reuse", phase_timing);
           progs[chunk] = full->chunk_prog.get();
         } else {

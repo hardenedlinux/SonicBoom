@@ -16,6 +16,8 @@
 
 #include <sonicboom/nn/cuda_elementwise.h>
 
+#include <sonicboom/runtime_features.h>
+
 #include "cuda_resident.h"
 #include "cuda_stream.h"
 
@@ -2359,8 +2361,23 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // smaller chunk is a larger partial buffer (n_chunks*8*322 floats) and a
   // longer merge loop at full depth, both negligible at the SWA depth.
   constexpr uint64_t kMaxChunk = 16;
-  const uint64_t chunk = std::max<uint64_t>(
-      1, std::min((window + target_chunks - 1) / target_chunks, kMaxChunk));
+  // Feature split_kv: off collapses to one chunk per KV head (no split-KV
+  // partials; the split kernel still runs its n_chunks == 1 path and the merge
+  // is a single-chunk copy). The reduction order differs from the split
+  // variant, so the ablation arm is a performance probe, not a numerics
+  // guarantee.
+  // The no-split arm is bounded by shared memory: the split kernel holds
+  // group_q*chunk floats, and dynamic shared memory is 48 KiB here. A window
+  // larger than that still splits, but into the fewest chunks that fit (vs the
+  // kMaxChunk-capped split above), which is the "less split-KV" comparison.
+  const uint64_t no_split_chunk =
+      std::max<uint64_t>(1, (48 * 1024 / sizeof(float)) / (uint64_t)group_q);
+  const uint64_t chunk =
+      runtime::feature_enabled(runtime::Feature::SplitKv)
+          ? std::max<uint64_t>(1, std::min((window + target_chunks - 1) /
+                                               target_chunks,
+                                           kMaxChunk))
+          : std::min(window, no_split_chunk);
   const uint64_t n_chunks = (window + chunk - 1) / chunk;
 
   const size_t partial_floats =
