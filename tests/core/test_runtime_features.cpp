@@ -49,7 +49,7 @@ void expect(bool cond, const char* what) {
 constexpr Feature kAll[] = {
     Feature::CudaGraphDecode, Feature::CudaGraphPrefill, Feature::CaptureReuse,
     Feature::SplitKv,         Feature::PlanCache,       Feature::Q8_1Dispatch,
-    Feature::BufferReuse,     Feature::Warmup,
+    Feature::BufferReuse,     Feature::Warmup,          Feature::Autotune,
 };
 
 bool known(const char* name) {

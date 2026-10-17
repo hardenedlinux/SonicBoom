@@ -608,6 +608,7 @@ if [ "$ABLATE" = 1 ]; then
     "q8_1-dispatch|q8_1_dispatch"
     "buffer-reuse|buffer_reuse"
     "glue-codegen|glue_codegen"
+    "autotune|autotune"
     "warmup|warmup"
   )
 

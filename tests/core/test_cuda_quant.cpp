@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <span>
@@ -604,6 +605,75 @@ void test_legacy_mmq_type(sbquant::QuantType type, const char* name,
             << worst << ", max dev " << max_dev << "\n";
 }
 
+// Stage 6: the mmq J tile only changes how tokens are grouped into blocks, not
+// the per-output K-reduction order, so every J candidate must write the same
+// bytes. Pin each candidate through SONICBOOM_MMQ_J and compare against J=8;
+// then run once with the override unset to exercise the autotuner itself, whose
+// chosen J must produce the same output as well.
+void test_mmq_j_invariant(sbquant::QuantType type, const char* name,
+                          uint64_t rows, uint64_t cols, uint64_t n) {
+  std::mt19937 rng(0x60D1CAFEu + unsigned(type));
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(type, rows, cols, rng));
+  const std::vector<std::byte>& bytes = keepalive.back();
+  sbquant::QuantizedTensor W(type, {cols, rows}, bytes);
+
+  std::vector<float> X(cols * n), Y(rows * n);
+  for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  unsetenv("SONICBOOM_GEMV_F32");   // q8_1 active -> mmq for n >= mmq_min_n()
+  setenv("SONICBOOM_MMQ", "1", 1);  // ... and mmq not disabled
+  unsetenv("SONICBOOM_CUBLAS");
+
+  constexpr int kJs[] = {8, 16, 32, 64, 128};
+  std::vector<float> base(rows * n);
+  bool ok = true;
+  bool identical = true;
+  for (int J : kJs) {
+    const std::string j = std::to_string(J);
+    setenv("SONICBOOM_MMQ_J", j.c_str(), 1);
+    std::fill(Y.begin(), Y.end(), 0.0f);
+    if (!sbquant::cuda::matmul_f32(W, X, Y, n)) {
+      check(false, "mmq J invariant: pinned-J matmul returned true");
+      ok = false;
+      break;
+    }
+    if (J == kJs[0]) {
+      base = Y;
+    } else if (std::memcmp(base.data(), Y.data(), base.size() * sizeof(float)) !=
+               0) {
+      identical = false;
+      std::cerr << "    " << name << ": J=" << J << " differs from J=" << kJs[0]
+                << "\n";
+    }
+  }
+  unsetenv("SONICBOOM_MMQ_J");
+  if (ok) {
+    const std::string what =
+        std::string("mmq J candidates write identical output (") + name + ")";
+    check(identical, what.c_str());
+  }
+
+  // No override: the tuner times every candidate and caches one. Its output
+  // must match the pinned runs bit-for-bit.
+  if (ok) {
+    std::fill(Y.begin(), Y.end(), 0.0f);
+    if (!sbquant::cuda::matmul_f32(W, X, Y, n)) {
+      check(false, "mmq autotuned matmul returns true");
+    } else {
+      const bool same =
+          std::memcmp(base.data(), Y.data(), base.size() * sizeof(float)) == 0;
+      const std::string what =
+          std::string("mmq autotuned output matches the pinned runs (") + name +
+          ")";
+      check(same, what.c_str());
+    }
+  }
+  std::cerr << "    mmq J invariant " << name << " (M=" << rows << " K=" << cols
+            << " n=" << n << "): " << (identical ? "identical" : "DIFFERENT")
+            << "\n";
+}
+
 void test_mmq_q6_type(std::mt19937& rng) {
   (void)rng;
   std::cout << "  SKIP Q6_K MMQ: TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed\n";
@@ -719,6 +789,10 @@ int main() {
   test_legacy_mmq_type(sbquant::QuantType::Q8_0, "q8_0/d896", 128, 896, 32);
   test_legacy_mmq_type(sbquant::QuantType::Q5_0, "q5_0/d896n512", 896, 896, 512);
   test_legacy_mmq_type(sbquant::QuantType::Q8_0, "q8_0/d896n512", 896, 896, 512);
+  // Stage 6: every mmq J candidate writes the same bytes, and the autotuned
+  // choice matches them (K-quant and legacy tile layouts).
+  test_mmq_j_invariant(sbquant::QuantType::Q4_K, "q4_K", 256, 1024, 128);
+  test_mmq_j_invariant(sbquant::QuantType::Q8_0, "q8_0", 256, 1024, 128);
   test_cublas_q6_type(rng);
   test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);

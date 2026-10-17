@@ -1380,6 +1380,157 @@ int mmq_min_n() {
   return v;
 }
 
+// MMQ J-tile autotune (Stage 6). `select_J` in the ggml-derived mmq.cuh takes
+// the smallest J that minimises the column-tile count ceil(n/J); that ignores M,
+// so it can leave a matmul with few row tiles spread over too few blocks, and
+// it never measures which tile shape actually keeps the tensor cores fed on
+// this GPU. The tuner times the candidates on the real call once per
+// (type, M, n, blocks_per_row) and caches the fastest.
+//
+// J only selects the token-tile width: every output element keeps the same
+// K-reduction order (rows_per_warp changes the M tile layout, not the K
+// accumulation), so all candidates write the same bytes. test_cuda_quant checks
+// that across every J. The choice is a pure performance one, and it does not
+// touch the plan record (mmq launches are not recorded).
+//
+// The search runs on the first call for a key, and only outside graph capture
+// (host timing is illegal while capturing); inside a capture the cached choice,
+// or select_J when the key is new, is used. SONICBOOM_MMQ_J=<J> pins a
+// candidate (A/B and the unit test); SONICBOOM_FEATURE_DISABLE=autotune turns
+// the search off (ablation group `autotune`).
+constexpr int kMmqTuneJs[] = {8, 16, 32, 64, 128};
+constexpr std::size_t kMmqTuneKeyCap = 64;
+
+int mmq_j_override() {
+  const char* e = std::getenv("SONICBOOM_MMQ_J");
+  if (e == nullptr) return 0;
+  const int x = std::atoi(e);
+  for (int J : kMmqTuneJs)
+    if (x == J) return x;
+  return 0;
+}
+
+struct MmqJKey {
+  int type;
+  int rows;
+  int n;
+  int bpr;
+  bool operator==(const MmqJKey&) const = default;
+};
+
+struct MmqJKeyHash {
+  std::size_t operator()(const MmqJKey& k) const noexcept {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    h ^= std::uint64_t(std::uint32_t(k.type)) * 0xC2B2AE3D27D4EB4Full;
+    h ^= std::uint64_t(std::uint32_t(k.rows)) * 0x165667B19E3779F9ull;
+    h ^= std::uint64_t(std::uint32_t(k.n)) * 0x85EBCA77C2B2AE63ull;
+    h ^= std::uint64_t(std::uint32_t(k.bpr));
+    return std::size_t(h ^ (h >> 29));
+  }
+};
+
+std::mutex g_mmq_j_mutex;
+std::unordered_map<MmqJKey, int, MmqJKeyHash> g_mmq_j_choice;
+
+template <int Type>
+void mmq_launch_j(int J, const char* w, const int* y, float* dst, int M, int n,
+                  int bpr, cudaStream_t stream) {
+  switch (J) {
+    case 8:   mmq::launch_mul_mat_q<Type, 8>  (w, y, dst, M, n, bpr, stream); break;
+    case 16:  mmq::launch_mul_mat_q<Type, 16> (w, y, dst, M, n, bpr, stream); break;
+    case 24:  mmq::launch_mul_mat_q<Type, 24> (w, y, dst, M, n, bpr, stream); break;
+    case 32:  mmq::launch_mul_mat_q<Type, 32> (w, y, dst, M, n, bpr, stream); break;
+    case 40:  mmq::launch_mul_mat_q<Type, 40> (w, y, dst, M, n, bpr, stream); break;
+    case 48:  mmq::launch_mul_mat_q<Type, 48> (w, y, dst, M, n, bpr, stream); break;
+    case 64:  mmq::launch_mul_mat_q<Type, 64> (w, y, dst, M, n, bpr, stream); break;
+    case 80:  mmq::launch_mul_mat_q<Type, 80> (w, y, dst, M, n, bpr, stream); break;
+    case 96:  mmq::launch_mul_mat_q<Type, 96> (w, y, dst, M, n, bpr, stream); break;
+    case 112: mmq::launch_mul_mat_q<Type, 112>(w, y, dst, M, n, bpr, stream); break;
+    case 128: mmq::launch_mul_mat_q<Type, 128>(w, y, dst, M, n, bpr, stream); break;
+    default:  mmq::launch_mul_mat_q<Type, 128>(w, y, dst, M, n, bpr, stream); break;
+  }
+}
+
+template <int Type>
+int mmq_j_select(const char* w, const int* y, float* dst, int M, int n, int bpr,
+                 cudaStream_t stream) {
+  const int forced = mmq_j_override();
+  if (forced != 0) return forced;
+  if (runtime::feature_disabled(runtime::Feature::Autotune))
+    return mmq::select_J(n);
+
+  const MmqJKey key{Type, M, n, bpr};
+  {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    const auto it = g_mmq_j_choice.find(key);
+    if (it != g_mmq_j_choice.end()) return it->second;
+    if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return mmq::select_J(n);
+  }
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
+      capture != cudaStreamCaptureStatusNone)
+    return mmq::select_J(n);
+
+  const int heuristic = mmq::select_J(n);
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  cudaEvent_t begin{}, end{};
+  if (cudaEventCreate(&begin) != cudaSuccess ||
+      cudaEventCreate(&end) != cudaSuccess) {
+    if (begin) cudaEventDestroy(begin);
+    if (end) cudaEventDestroy(end);
+    return heuristic;
+  }
+  int best_j = heuristic;
+  float best_ms = 0.0f;
+  float heuristic_ms = -1.0f;
+  bool have_best = false;
+  for (int J : kMmqTuneJs) {
+    mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);  // warm-up
+    if (cudaEventRecord(begin, stream) != cudaSuccess) continue;
+    constexpr int kReps = 2;
+    for (int r = 0; r < kReps; ++r)
+      mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);
+    if (cudaEventRecord(end, stream) != cudaSuccess) continue;
+    if (cudaEventSynchronize(end) != cudaSuccess) {
+      (void)cudaGetLastError();
+      continue;
+    }
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, begin, end) != cudaSuccess ||
+        cudaGetLastError() != cudaSuccess) {
+      (void)cudaGetLastError();
+      continue;
+    }
+    if (J == heuristic) heuristic_ms = ms;
+    if (!have_best || ms < best_ms) {
+      best_ms = ms;
+      best_j = J;
+      have_best = true;
+    }
+  }
+  cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  if (!have_best) return heuristic;
+  {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    g_mmq_j_choice.emplace(key, best_j);
+  }
+  if (verbose)
+    std::fprintf(stderr,
+                 "[autotune] mmq type=%d M=%d n=%d bpr=%d J=%d %.3f ms "
+                 "(heuristic J=%d %.3f ms)\n",
+                 Type, M, n, bpr, best_j, best_ms, heuristic, heuristic_ms);
+  return best_j;
+}
+
+template <int Type>
+bool mul_mat_q_tuned(const char* w, const int* y, float* dst, int M, int n,
+                     int bpr, cudaStream_t stream) {
+  const int J = mmq_j_select<Type>(w, y, dst, M, n, bpr, stream);
+  mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);
+  return true;
+}
+
 // Lazily create the process-wide cuBLAS handle and its stream-capture workspace.
 // Returns nullptr on failure (the caller falls back to the dp4a batched path).
 cublasHandle_t cublas_handle() {
@@ -1938,19 +2089,19 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   switch (W.type()) {
     case QuantType::Q3_K:
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mmq::mul_mat_q<mmq::MMQ_Q3_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
     case QuantType::Q4_K:
       mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mmq::mul_mat_q<mmq::MMQ_Q4_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
     case QuantType::Q5_K:
       mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mmq::mul_mat_q<mmq::MMQ_Q5_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
@@ -1958,13 +2109,13 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
     // (ggml's MMQ_Q8_1_DS_LAYOUT_D4), same as Q3_K.
     case QuantType::Q5_0:
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mmq::mul_mat_q<mmq::MMQ_Q5_0>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
     case QuantType::Q8_0:
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mmq::mul_mat_q<mmq::MMQ_Q8_0>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
           Y, ir, n, blocks_per_row, cur_stream());
       break;
@@ -2016,32 +2167,32 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   bool ok = false;
   switch (W.type()) {
     case QuantType::Q3_K:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q3_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
     case QuantType::Q4_K:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q4_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
     case QuantType::Q5_K:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q5_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
     case QuantType::Q6_K:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q6_K>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q6_K>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
     case QuantType::Q5_0:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q5_0>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;
     case QuantType::Q8_0:
-      ok = mmq::mul_mat_q<mmq::MMQ_Q8_0>(
+      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
           reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
           cur_stream());
       break;

@@ -58,6 +58,9 @@ enum class Feature {
   // emits `fused_region` nodes and the CUDA backend runs the MLIR->NVVM->PTX
   // kernel (off = the region keeps its hand-written kernel).
   GlueCodegen,
+  // Measure the mmq J-tile candidates on the real call and cache the fastest
+  // per (quant type, M, n) (off = select_J's min-tile heuristic).
+  Autotune,
 };
 
 // True unless the feature is named in SONICBOOM_FEATURE_DISABLE or turned off
