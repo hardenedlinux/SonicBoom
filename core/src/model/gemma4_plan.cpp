@@ -1021,10 +1021,15 @@ static bool plan_cache_enabled() {
 
 // Cache cap. A single prefill call needs at most two distinct segment lengths
 // (the full chunk, then the final shorter remainder — the per-call map is keyed
-// by length, so two full-chunk segments share one entry), so two entries per
-// decode runtime are always enough for the call in flight and bound what a
-// multi-turn session accumulates.
-static constexpr std::size_t kMaxCachedSegments = 2;
+// by length, so two full-chunk segments share one entry). Two entries are
+// therefore enough for the call in flight, but not across a multi-turn session:
+// every turn adds up to two new lengths (its prompt and its reuse suffix), so a
+// cap of two rebuilds lengths a session used one turn earlier (~115 ms of
+// planning each: the 8-turn workload trace rebuilds 36 segments for 10 hits).
+// Eight entries keep about four turns of history; the entry holds the plan and
+// the segment backends, whose device activations come from the global device
+// pool, so the cap bounds host-side planning state rather than VRAM.
+static constexpr std::size_t kMaxCachedSegments = 8;
 
 struct DecodeRuntime {
   planner::Graph graph;
