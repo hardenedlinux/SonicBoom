@@ -109,6 +109,14 @@ add_library(sonicboom SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 
+# Drop the static symbol table (and its string table) from the published
+# library in Release builds. Dynamic linking reads .dynsym, which is kept, and
+# the C ABI is exported there; the static table is a quarter of the file and
+# nothing in the runtime reads it. A non-Release build keeps every symbol.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+  target_link_options(sonicboom PRIVATE -Wl,-s)
+endif()
+
 target_include_directories(sonicboom
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
          ${CMAKE_SOURCE_DIR}/capi/include

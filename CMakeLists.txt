@@ -51,6 +51,12 @@ if(SONICBOOM_USE_CUDA)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+
+  # Compress embedded SASS in every fatbin. The CUDA driver decompresses a
+  # module when it is loaded (already a one-time cost before the first launch),
+  # so kernel execution is unaffected while libsonicboom.so loses most of the
+  # native-torch ATen kernel image size (~70% of .nv_fatbin in a sample TU).
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xfatbin -compress-all")
 endif()
 
 # SonicCross build-time code generator for the native-torch sources (matches
