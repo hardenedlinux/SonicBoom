@@ -990,6 +990,15 @@ struct PrefillSegment {
   std::unique_ptr<planner::SonicBackend> cpu;
   std::unique_ptr<planner::SonicCudaBackend> cuda;
   std::unique_ptr<planner::RuntimeExecutor> exec;
+  // The captured full-chunk CUDA graph, kept with the segment so a later call
+  // can replay it instead of paying the capture again. A capture bakes in the
+  // KV cache's device pointers, so it is reused only while `cuda` shares the
+  // very cache vector it was recorded against — stated by `chunk_prog_cache`
+  // (the cache_identity() at capture time). The segment's token/pos staging
+  // buffers are carried by `cuda` and re-staged per call, so the captured
+  // values themselves are not part of the capture.
+  std::unique_ptr<hal::StepProgram> chunk_prog;
+  std::shared_ptr<void> chunk_prog_cache;
 };
 
 // The planner environment a plan is a function of. Everything else the prefill
@@ -1599,9 +1608,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // runtime (see the DecodeRuntime note). The offset a segment is executed at
     // is not part of it: pos reaches the kernels as an execute-time binding
     // (set_pos + the `in` argument), and a plan records no position. The
-    // CUDA-graph capture stays per call — it must record against the KV cache in
-    // use now, and the replay path below is reachable only when a capture was
-    // made this call.
+    // CUDA-graph capture is kept with the segment and reused across calls for
+    // the one thing it does bake in — the KV cache's device pointers: it is
+    // replayed only while the segment shares the cache vector it was recorded
+    // against (chunk_prog_cache), otherwise it is captured again. The replay
+    // path below is reachable when a capture was made now or reused.
     const PlannerEnv env_now = planner_env();
     if (!rt->prefill_env_set || !(rt->prefill_env == env_now)) {
       rt->prefills.clear();  // planner environment changed: every entry is stale
@@ -1609,10 +1620,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       rt->prefill_env_set = true;
     }
     const bool cache_segments = plan_cache_enabled();
-    // Per-call owners: segments when the cache is off, and always the captured
-    // programs (a capture is deliberately not cached).
+    // Per-call owners: segments when the cache is off. A captured program is
+    // owned by its segment (which the replay loop reads through `progs`), so
+    // it outlives the call with the segment that recorded it.
     std::map<uint64_t, std::unique_ptr<PrefillSegment>> call_segments;
-    std::map<uint64_t, std::unique_ptr<hal::StepProgram>> progs;
+    std::map<uint64_t, hal::StepProgram*> progs;
     auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
       if (cache_segments) {
         auto it = std::find_if(
@@ -1686,33 +1698,52 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // (correctness over the launch-overhead win, which only matters for long
     // prompts). Opt-out via SONICBOOM_CUDA_GRAPHS=0; a capture failure leaves
     // `prog` null and falls back to per-segment dispatch.
+    //
+    // A previous call's capture is reused when the segment still shares the
+    // cache vector it was recorded against. That holds for every call on the
+    // same decode runtime: a fresh session publishes (or adopts) the runtime's
+    // persistent cache, so the device pointers do not move. Reuse skips the
+    // warm-up too — it exists to initialize the kernels and allocations the
+    // capture records, and those are already initialized once the graph exists.
     const bool use_graphs = cuda_graphs_enabled();
     if (use_graphs && n > chunk && start_pos == 0) {
       Phase _cap("prefill:capture_graph", phase_timing);
       PrefillSegment* full = segment_for(chunk);
       if (full) {
-        const std::span<const uint64_t> first_chunk = prompt.subspan(0, chunk);
-        full->cuda->set_prefill_tokens(first_chunk);
-        full->cuda->set_pos(start_pos);
-        std::vector<sx::Bytes> in;
-        in.push_back(encode_tokens(first_chunk));
-        in.push_back(encode_i64(start_pos));
-        std::expected<planner::ExecutionResult, planner::RuntimeError> res;
-        {
-          Phase _w("prefill:capture_warmup", phase_timing);
-          res = full->exec->execute(full->plan, snap, in);
-        }
-        if (res) {
-          full->cuda->synchronize();
+        const std::shared_ptr<void> cache_id = full->cuda->cache_identity();
+        if (full->chunk_prog && full->chunk_prog_cache.get() == cache_id.get()) {
+          Phase _reuse("prefill:capture_reuse", phase_timing);
+          progs[chunk] = full->chunk_prog.get();
+        } else {
+          const std::span<const uint64_t> first_chunk = prompt.subspan(0, chunk);
+          full->cuda->set_prefill_tokens(first_chunk);
+          full->cuda->set_pos(start_pos);
+          std::vector<sx::Bytes> in;
+          in.push_back(encode_tokens(first_chunk));
+          in.push_back(encode_i64(start_pos));
+          std::expected<planner::ExecutionResult, planner::RuntimeError> res;
           {
-            Phase _r("prefill:capture_record", phase_timing);
-            progs[chunk] = full->cuda->record_step([&]() {
-              std::vector<sx::Bytes> cin;
-              cin.push_back(encode_tokens(first_chunk));
-              cin.push_back(encode_i64(start_pos));
-              auto cres = full->exec->execute(full->plan, snap, cin);
-              return cres.has_value();
-            });
+            Phase _w("prefill:capture_warmup", phase_timing);
+            res = full->exec->execute(full->plan, snap, in);
+          }
+          if (res) {
+            full->cuda->synchronize();
+            std::unique_ptr<hal::StepProgram> prog;
+            {
+              Phase _r("prefill:capture_record", phase_timing);
+              prog = full->cuda->record_step([&]() {
+                std::vector<sx::Bytes> cin;
+                cin.push_back(encode_tokens(first_chunk));
+                cin.push_back(encode_i64(start_pos));
+                auto cres = full->exec->execute(full->plan, snap, cin);
+                return cres.has_value();
+              });
+            }
+            if (prog) {
+              full->chunk_prog = std::move(prog);
+              full->chunk_prog_cache = cache_id;
+              progs[chunk] = full->chunk_prog.get();
+            }
           }
         }
       }
@@ -1741,7 +1772,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
 
       auto prog_it = progs.find(nseg);
       hal::StepProgram* prog =
-          (prog_it == progs.end()) ? nullptr : prog_it->second.get();
+          (prog_it == progs.end()) ? nullptr : prog_it->second;
       if (!is_final && prog) {
         // Replay the captured full-chunk graph: stage this segment's token ids
         // and start position into the persistent device slots on the program's

@@ -133,6 +133,15 @@ public:
   // backend's destruction. No-op-safe when the session already owns a cache.
   void publish_cache(KvCacheSession& session) const;
 
+  // The identity of the KV cache vector this backend currently shares. A
+  // recorded step (record_step) bakes the cache's device pointers into the
+  // captured graph, so a capture may be replayed only while the cache this
+  // backend shares is the one it was recorded against; this value is how a
+  // caller states that. The shared_ptr keeps the captured-against cache alive
+  // for as long as the holder keeps it, so comparing the raw pointer cannot
+  // alias a different, later vector.
+  std::shared_ptr<void> cache_identity() const { return caches_; }
+
 private:
   const model::Gemma4Model* model_ = nullptr;  // compute model (weights/config), bound via bind_model()
   KvCacheSpec spec_;                           // KV-cache geometry (owned copy)
