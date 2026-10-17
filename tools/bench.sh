@@ -82,12 +82,26 @@
 # tokenizer; tools/baseline/workload_bench.cpp takes --turns/--turn-tokens/
 # --system/--gen/--prompt/--text for other shapes.
 #
+# Ablation mode — what each Boom IR pass group is worth:
+#
+#   tools/bench.sh <model.gguf> --ablate [--runs N] [--no-build]
+#
+#   Runs the canonical set and workload (A) with every pass enabled, then once
+#   per group with that group in SONICBOOM_IR_PASS_DISABLE. A group is a pass
+#   plus the folds that only match the IR it produces (QuantizeOncePass with
+#   the quantize folds; the mmq folds together), or a single fold. The table's
+#   contribution is the fraction of the group-off value the group is worth:
+#   throughput is (on - off) / off, latency (off - on) / off, so a positive
+#   number means the passes help. Passes that fail to parse are reported by the
+#   core and abort the run rather than silently reading as "no effect".
+#
 # Usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]
 #        tools/bench.sh <model.gguf> --ab BASE_LIB CUR_LIB [--runs N] [--no-build]
 #                                             [--control | --no-control]
 #                                             [--control-runs K] [--k X]
 #                                             [--gpu-clock MHZ] [--no-lock-clocks]
 #        tools/bench.sh <model.gguf> --workload [--runs N] [--no-build]
+#        tools/bench.sh <model.gguf> --ablate [--runs N] [--no-build]
 # Env:   LLAMA_BENCH=/path/to/llama-bench   (optional; enables the llama.cpp column)
 set -euo pipefail
 
@@ -105,6 +119,7 @@ KSIGMA=2
 CLOCKS=1
 CLOCK_MHZ=""
 WORKLOAD=0
+ABLATE=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -118,6 +133,7 @@ while [ $# -gt 0 ]; do
     --gpu-clock) CLOCK_MHZ="$2"; shift 2 ;;
     --no-lock-clocks) CLOCKS=0; shift ;;
     --workload) WORKLOAD=1; shift ;;
+    --ablate) ABLATE=1; shift ;;
     --ab)
       AB_BASE="${2:-}"; AB_CUR="${3:-}"
       { [ -n "$AB_BASE" ] && [ -n "$AB_CUR" ]; } || {
@@ -545,6 +561,109 @@ if [ "$WORKLOAD" = 1 ]; then
     "$(pm "${c_dec%% *}" "${c_dec##* }")" "tok/s"
   echo
   echo "RESULT workload model=$LABEL agent_ttft_ms=${a_ttft%% *} agent_decode_tok_s=${a_dec%% *} agent_turn_ms=${a_turn%% *} agent_trace_ms=${a_trace%% *} agent_fresh_ttft_ms=${f_ttft%% *} agent_fresh_trace_ms=${f_trace%% *} coding_ttft_ms=${c_ttft%% *} coding_decode_tok_s=${c_dec%% *}"
+  exit 0
+fi
+
+# --- ablation mode ---------------------------------------------------------
+# Each group is read in the core as "this pass and the folds it feeds": disabling
+# QuantizeOncePass leaves the IR without the quantize nodes the quantize folds
+# match, and the mmq folds' input pass is listed with them for the same reason.
+# The groups are what an ablation can actually turn off; a Stage 5 change that
+# lives inside an existing pass (the q8_1 buffer sizing) or in the runtime (the
+# prefill capture reuse) has no separate switch and is measured by A/B instead.
+if [ "$ABLATE" = 1 ]; then
+  ABL_GROUPS=(
+    "quantize-once+folds|QuantizeOncePass,RmsNormQuantizePass,GeluMulQuantizePass,SiluMulQuantizePass"
+    "bias-into-gemv|BiasIntoGemvPass"
+    "residual-add-into-gemv|ResidualAddIntoGemvPass"
+    "mmq-folds|RmsNormMmqPass,GeluMulMmqPass,SiluMulMmqPass"
+  )
+
+  abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field
+    local key=$1; shift
+    local vals="" v
+    for ((i=1;i<=RUNS;i++)); do
+      v=$("$@" 2>/dev/null | grep '^RESULT ' | res_field "$key") || v=""
+      [ -n "$v" ] && vals="$vals$v\n"
+    done
+    printf '%b' "$vals" | median
+  }
+
+  # The agent trace prints both fields from one run; running it twice for the
+  # two columns would double the probe's cost and compare two different traces.
+  abl_agent_both() { # sets ABL_AT / ABL_AW: medians of ttft_ms / trace_ms
+    local tv="" wv="" out a b
+    for ((i=1;i<=RUNS;i++)); do
+      out=$("$BASELINE/workload_bench" --workload agent 2>/dev/null \
+              | grep '^RESULT ' || true)
+      a=$(printf '%s\n' "$out" | res_field ttft_ms)
+      b=$(printf '%s\n' "$out" | res_field trace_ms)
+      [ -n "$a" ] && tv="$tv$a\n"
+      [ -n "$b" ] && wv="$wv$b\n"
+    done
+    ABL_AT=$(printf '%b' "$tv" | median)
+    ABL_AW=$(printf '%b' "$wv" | median)
+  }
+
+  abl_contrib() { # KIND ON OFF ; positive = the group is worth this share
+    awk -v k="$1" -v on="$2" -v off="$3" 'BEGIN{
+      if(on==""||off==""||on=="nan"||off=="nan"||off+0==0){print "n/a"; exit}
+      v = (k=="tok") ? (on-off)/off*100 : (off-on)/off*100
+      printf "%+.2f%%", v }'
+  }
+
+  TOKFILE=$(mktemp)
+  seq 2 1000 | tr '\n' ' ' >"$TOKFILE"
+  trap 'rm -f "$TOKFILE"; cleanup' EXIT
+
+  abl_metric() { # METRIC -> value with the current pass configuration
+    case "$1" in
+      tg64)  abl_median tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64 ;;
+      d512)  abl_median tok_s "$BASELINE/longctx_bench" --depth 512 --steps 64 ;;
+      pp512) abl_median pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt 512 --reps 3 ;;
+      reuse) abl_median reuse_ms "$BASELINE/prefix_cache_bench" \
+               --prefix 512 --new 64 --steps 4 --reps 3 --tokens-file "$TOKFILE" ;;
+    esac
+  }
+
+  ABL_METRICS="tg64:tok d512:tok pp512:tok reuse:ms agent_ttft:ms agent_wall:ms"
+  declare -A ABL_ON
+  unset SONICBOOM_IR_PASS_DISABLE
+  echo "ablation: all passes on, ${RUNS} run(s) per cell, CUDA spine"
+  for spec in $ABL_METRICS; do
+    case "${spec%%:*}" in agent_*) continue ;; esac
+    m=${spec%%:*}
+    ABL_ON[$m]=$(abl_metric "$m")
+  done
+  abl_agent_both; ABL_ON[agent_ttft]=$ABL_AT; ABL_ON[agent_wall]=$ABL_AW
+
+  echo
+  echo "| group                  | metric      |           all-on |      group-off | contribution |"
+  echo "|------------------------|-------------|------------------|----------------|--------------|"
+  for g in "${ABL_GROUPS[@]}"; do
+    gname=${g%%|*}; glist=${g##*|}
+    export SONICBOOM_IR_PASS_DISABLE="$glist"
+    abl_agent_both
+    for spec in $ABL_METRICS; do
+      m=${spec%%:*}; kind=${spec##*:}
+      case "$m" in
+        agent_ttft) off=$ABL_AT ;;
+        agent_wall) off=$ABL_AW ;;
+        *) off=$(abl_metric "$m") ;;
+      esac
+      printf '| %-22s | %-11s | %16s | %14s | %12s |\n' "$gname" "$m" \
+        "$(pm "${ABL_ON[$m]}" nan)" "$(pm "$off" nan)" \
+        "$(abl_contrib "$kind" "${ABL_ON[$m]}" "$off")"
+    done
+    unset SONICBOOM_IR_PASS_DISABLE
+  done
+  echo
+  echo "groups (contribution is the share of the group-off value the group is worth;"
+  echo "        positive = the passes help, negative = they cost that share):"
+  for g in "${ABL_GROUPS[@]}"; do
+    printf '  %-24s %s\n' "${g%%|*}" "${g##*|}"
+  done
+  echo "RESULT ablate model=$LABEL runs=$RUNS $(for spec in $ABL_METRICS; do m=${spec%%:*}; printf '%s_on=%s ' "$m" "${ABL_ON[$m]}"; done)"
   exit 0
 fi
 
