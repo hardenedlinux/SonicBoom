@@ -62,11 +62,32 @@
 # and reported as min/median/max on exit. The CPU governor is only *reported*;
 # this script never changes a CPU setting.
 #
+# Workload mode — the two session traces, which the per-request metric set above
+# cannot express:
+#
+#   tools/bench.sh <model.gguf> --workload [--runs N] [--no-build]
+#
+#   agent   a multi-turn session — a shared 1000-token system prompt, then eight
+#           user turns of 57/312/140/33/401/96/210/75 tokens and 128 generated
+#           tokens each, prefix cache on — reported as the median per-turn TTFT,
+#           the median per-turn decode rate and the trace's wall time, beside
+#           the same trace with a fresh session per turn (full re-prefill of the
+#           whole history), which is the ratio prefix reuse is worth here.
+#   coding  one 2048-token prompt and a 256-token generation: time to first
+#           token, and the decode rate that follows it at that depth.
+#
+# Both are warmed up internally and run once per process; the table reports the
+# median ± sd over --runs processes, the same statistic as the canonical rows.
+# The text is the tool's built-in corpus, tokenized with the model's own
+# tokenizer; tools/baseline/workload_bench.cpp takes --turns/--turn-tokens/
+# --system/--gen/--prompt/--text for other shapes.
+#
 # Usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]
 #        tools/bench.sh <model.gguf> --ab BASE_LIB CUR_LIB [--runs N] [--no-build]
 #                                             [--control | --no-control]
 #                                             [--control-runs K] [--k X]
 #                                             [--gpu-clock MHZ] [--no-lock-clocks]
+#        tools/bench.sh <model.gguf> --workload [--runs N] [--no-build]
 # Env:   LLAMA_BENCH=/path/to/llama-bench   (optional; enables the llama.cpp column)
 set -euo pipefail
 
@@ -83,6 +104,7 @@ CONTROL_RUNS=5
 KSIGMA=2
 CLOCKS=1
 CLOCK_MHZ=""
+WORKLOAD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -95,6 +117,7 @@ while [ $# -gt 0 ]; do
     --k) KSIGMA="$2"; shift 2 ;;
     --gpu-clock) CLOCK_MHZ="$2"; shift 2 ;;
     --no-lock-clocks) CLOCKS=0; shift ;;
+    --workload) WORKLOAD=1; shift ;;
     --ab)
       AB_BASE="${2:-}"; AB_CUR="${3:-}"
       { [ -n "$AB_BASE" ] && [ -n "$AB_CUR" ]; } || {
@@ -129,7 +152,7 @@ export LD_LIBRARY_PATH="$ROOT/build/core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export SONICBOOM_GEMMA_GGUF="$GGUF"   # the loader entry point, arch-generic
 
 if [ "$BUILD" = 1 ]; then
-  for b in longctx_bench prefill_bench prefix_cache_bench; do
+  for b in longctx_bench prefill_bench prefix_cache_bench workload_bench; do
     bash "$BASELINE/build_${b}.sh" >/dev/null
   done
 fi
@@ -440,6 +463,88 @@ if [ -n "$AB_BASE" ]; then
   echo
   echo "gates: ${ROW_GATES% }"
   echo "RESULT ab model=$LABEL base_so=$base_so cur_so=$cur_so control=$CONTROL"
+  exit 0
+fi
+
+# --- workload mode ---------------------------------------------------------
+# The canonical set measures one request shape at a time; a session is a
+# *sequence* of them, and what a session spends between its requests is what
+# this mode exists to show. Two traces (tools/baseline/workload_bench.cpp):
+#
+#   agent   a multi-turn session whose prompt grows every turn (1000-token
+#           system prompt, then eight turns of 57/312/140/33/401/96/210/75 user
+#           tokens and 128 generated each) — a turn's prefill is the cost of the
+#           tokens it adds, not of the history, when the prefix cache serves it
+#           — reported beside the same trace with a fresh session per turn (full
+#           re-prefill), which is the ratio prefix reuse is worth at this depth.
+#   coding  one 2048-token prompt and a 256-token generation: time to first
+#           token, and the decode rate that follows at that depth.
+#
+# Each is RUNS independent processes (each warmed up internally, --reps 1); the
+# reported value is their median and sample sd, the same statistic every other
+# row in this script reports.
+if [ "$WORKLOAD" = 1 ]; then
+  WB="$BASELINE/workload_bench"
+  [ -x "$WB" ] || { echo "workload_bench not built: $WB" >&2; exit 2; }
+
+  # A trace that produced no RESULT line (a refused GGUF, a failed run — the tool
+  # writes why to stderr, which is left unredirected so the reason is visible)
+  # must not turn into a table of empty cells: the first one to do it marks the
+  # run, and the mode aborts once the subshells have finished.
+  WL_FAIL="/tmp/wl-fail.$$"
+  rm -f "$WL_FAIL"
+  wl_stats() { # MODE FIELD-ARGS... ; "<median> <sd>" of RUNS runs
+    local mode=$1 key=$2; shift 2
+    local vals="" v
+    for ((i=1;i<=RUNS;i++)); do
+      v=$("$WB" --workload "$mode" "$@" | grep '^RESULT ' | res_field "$key") \
+        || v=""
+      [ -n "$v" ] && vals="$vals$v\n"
+    done
+    if [ -z "$vals" ]; then
+      echo "workload trace '$mode' produced no result (reason above)" >&2
+      : > "$WL_FAIL"
+      echo "0 0"
+      return
+    fi
+    printf '%b' "$vals" | stats
+  }
+
+  a_ttft=$(wl_stats agent ttft_ms)
+  a_dec=$(wl_stats agent decode_tok_s)
+  a_turn=$(wl_stats agent turn_ms)
+  a_trace=$(wl_stats agent trace_ms)
+  f_ttft=$(wl_stats agent ttft_ms --fresh)
+  f_trace=$(wl_stats agent trace_ms --fresh)
+  c_ttft=$(wl_stats coding ttft_ms)
+  c_dec=$(wl_stats coding decode_tok_s)
+  if [ -f "$WL_FAIL" ]; then rm -f "$WL_FAIL"; exit 2; fi
+  rm -f "$WL_FAIL"
+
+  echo
+  echo "==== $LABEL ===="
+  echo "workload traces, median ± sd of $RUNS runs, CUDA spine, whole model in VRAM"
+  echo
+  echo "| trace                        | value            | unit  |"
+  echo "|------------------------------|------------------|-------|"
+  printf '| %-28s | %16s | %5s |\n' "agent turn ttft (reuse)" \
+    "$(pm "${a_ttft%% *}" "${a_ttft##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "agent turn decode (reuse)" \
+    "$(pm "${a_dec%% *}" "${a_dec##* }")" "tok/s"
+  printf '| %-28s | %16s | %5s |\n' "agent turn total (reuse)" \
+    "$(pm "${a_turn%% *}" "${a_turn##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "agent trace wall (reuse)" \
+    "$(pm "${a_trace%% *}" "${a_trace##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "agent turn ttft (fresh)" \
+    "$(pm "${f_ttft%% *}" "${f_ttft##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "agent trace wall (fresh)" \
+    "$(pm "${f_trace%% *}" "${f_trace##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "coding ttft (p2048)" \
+    "$(pm "${c_ttft%% *}" "${c_ttft##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "coding decode" \
+    "$(pm "${c_dec%% *}" "${c_dec##* }")" "tok/s"
+  echo
+  echo "RESULT workload model=$LABEL agent_ttft_ms=${a_ttft%% *} agent_decode_tok_s=${a_dec%% *} agent_turn_ms=${a_turn%% *} agent_trace_ms=${a_trace%% *} agent_fresh_ttft_ms=${f_ttft%% *} agent_fresh_trace_ms=${f_trace%% *} coding_ttft_ms=${c_ttft%% *} coding_decode_tok_s=${c_dec%% *}"
   exit 0
 fi
 
