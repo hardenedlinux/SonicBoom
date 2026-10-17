@@ -32,6 +32,7 @@
 
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomOps.h>
+#include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/compiler/BoomTypes.h>
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/op_kind.h>
@@ -1297,6 +1298,34 @@ const char *phaseName(planner::IrPassPhase phase) {
 
 } // namespace
 
+// The phase's passes over the IR a caller built (compiler/BoomPasses.h).
+bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase) {
+  // The unit of meaning in this IR is the graph, not the module that holds it
+  // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
+  // IsolatedFromAbove, which is what makes it a pass anchor at all.
+  auto graphs = module.getOps<boom::GraphOp>();
+  if (graphs.empty()) {
+    std::fprintf(stderr, "ir_pass_pipeline(%s): the module holds no graph\n",
+                 phaseName(phase));
+    return false;
+  }
+  boom::GraphOp graphOp = *graphs.begin();
+
+  // The pass manager verifies after every pass, so a pass that leaves the IR in
+  // a state the dialect rejects fails here, naming that pass, rather than three
+  // passes later.
+  mlir::PassManager pm(module.getContext());
+  addPasses(pm, phase);
+  if (mlir::failed(pm.run(graphOp))) {
+    std::fprintf(stderr,
+                 "ir_pass_pipeline(%s): a Boom IR pass failed (diagnostic "
+                 "above); the graph is left unfused\n",
+                 phaseName(phase));
+    return false;
+  }
+  return true;
+}
+
 // The pipeline itself: graph -> Boom IR -> the phase's passes -> graph.
 void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
   mlir::MLIRContext context;
@@ -1311,23 +1340,8 @@ void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
     return;
   }
 
-  // The unit of meaning in this IR is the graph, not the module that holds it
-  // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
-  // IsolatedFromAbove, which is what makes it a pass anchor at all.
-  boom::GraphOp graphOp = *module->getOps<boom::GraphOp>().begin();
-
-  // The pass manager verifies after every pass, so a pass that leaves the IR in
-  // a state the dialect rejects fails here, naming that pass, rather than three
-  // passes later.
-  mlir::PassManager pm(&context);
-  addPasses(pm, phase);
-  if (mlir::failed(pm.run(graphOp))) {
-    std::fprintf(stderr,
-                 "ir_pass_pipeline(%s): a Boom IR pass failed (diagnostic "
-                 "above); the graph is left unfused\n",
-                 phaseName(phase));
+  if (!runBoomPasses(*module, phase))
     return;
-  }
 
   auto back = boomToGraph(*module);
   if (!back) {

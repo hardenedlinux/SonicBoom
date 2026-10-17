@@ -16,6 +16,9 @@
 
 #include <sonicboom/model/plan.h>
 
+#include <sonicboom/compiler/BoomBuilder.h>
+#include <sonicboom/compiler/BoomConversion.h>
+#include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/cost_model.h>
@@ -178,6 +181,50 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
 }
 
 // ---------------------------------------------------------------------------
+// The emitter's IR, and the one lowering.
+//
+// An emitter writes Boom IR (compiler/BoomBuilder.h) and returns the module it
+// lives in; the phase's passes rewrite that IR (compiler/BoomPasses.h); the
+// lowering below is the only place a planner::Graph is produced from it, and it
+// exists because the plan builder's input format is a graph, not a second
+// construction of the graph the emitter meant. Nothing between the emitter and
+// the lowering names a Graph.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct GraphIr {
+  std::unique_ptr<mlir::MLIRContext> context;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+};
+
+// Boom IR -> the graph the plan is derived from. A lowering that fails is
+// reported and leaves an empty graph, which fails the plan — there is
+// deliberately no fallback that would plan something else.
+planner::Graph lower_graph(mlir::ModuleOp module) {
+  auto graph = compiler::boomToGraph(module);
+  if (!graph) {
+    std::cerr << "[plan] Boom IR -> graph failed (diagnostic above)\n";
+    return {};
+  }
+  return std::move(*graph);
+}
+
+// What every plan site runs: the emitter's IR, the phase's passes, the
+// lowering. `rewrite` is the caller's condition — whether the quantized path is
+// available at all is a property of the device, not of the pipeline, so the
+// caller keeps it. A failed pass fails the plan rather than letting an unfused
+// graph be planned as if the phase had run.
+planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite) {
+  if (!ir.module)
+    return {};
+  if (rewrite && !compiler::runBoomPasses(*ir.module, phase))
+    return {};
+  return lower_graph(*ir.module);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
 // Plan emitter. Mirrors forward()/lm_head in exec.cpp — the same per-stage
 // arithmetic, re-expressed as a static acyclic graph of transformer OpKind
 // nodes. The graph is stateless (acyclic): the multi-token KV cache lives in the
@@ -187,7 +234,7 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
 // layer's (22 SWA / 23 global) cache, selected by the node's `kv_source_layer`
 // attribute. The residual stream is the *scaled* l_out of the previous block.
 // ---------------------------------------------------------------------------
-planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
+GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -198,51 +245,15 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   const uint32_t total_per = block_count * per;
   const uint64_t vocab = cfg.vocab_size;
 
-  struct Builder {
-    Graph g;
-    uint32_t next_tensor = 0;
-    uint32_t next_node = 0;
+  GraphIr ir;
+  ir.context = std::make_unique<mlir::MLIRContext>();
+  compiler::BoomBuilder b(ir.context.get(), "gemma4_decode");
 
-    TensorId tensor(std::string name, std::vector<int64_t> shape, sx::DType dt,
-                    bool is_in, bool is_out = false) {
-      sx::TensorType ty{dt, sx::Shape{shape}};
-      auto sz = sx::tensor_byte_size(ty);  // always valid for these fixed shapes
-      TensorDesc td;
-      td.id = TensorId{next_tensor++};
-      td.shape = std::move(shape);
-      td.dtype = dt;
-      td.size_bytes = static_cast<uint64_t>(*sz);
-      td.is_graph_input = is_in;
-      td.is_graph_output = is_out;
-      td.name = std::move(name);
-      g.tensors.push_back(std::move(td));
-      return g.tensors.back().id;
-    }
-
-    TensorId node(OpKind op, std::vector<TensorId> ins, std::string out_name,
-                  std::vector<int64_t> out_shape,
-                  std::vector<sx::Attribute> attrs) {
-      TensorId o = tensor(std::move(out_name), std::move(out_shape),
-                          sx::DType::Float32, /*is_in=*/false);
-      GraphNodeDesc nd;
-      nd.id = GraphNodeId{next_node++};
-      nd.op = op;
-      nd.inputs = std::move(ins);
-      nd.outputs = {o};
-      nd.attributes = std::move(attrs);
-      nd.backend = BackendTag::Sonic;
-      nd.name = op_kind_name(op);
-      g.nodes.push_back(std::move(nd));
-      return o;
-    }
-  } b;
-
-  b.g.name = "gemma4_decode";
-
-  // Graph inputs: token id + absolute position (Int64 scalars).
-  const TensorId token_id = b.tensor("token_id", {}, sx::DType::Int64, /*is_in=*/true);
-  const TensorId pos = b.tensor("pos", {}, sx::DType::Int64, /*is_in=*/true);
-  b.g.inputs = {token_id, pos};
+  // Graph inputs: token id + absolute position (Int64 scalars), declared to the
+  // builder — they are the graph's free variables, and a free variable is a block
+  // argument in the IR the emitter writes.
+  const mlir::Value token_id = b.input("token_id", {}, sx::DType::Int64);
+  const mlir::Value pos = b.input("pos", {}, sx::DType::Int64);
 
   const BlockProfile prof = profile_for(cfg);
 
@@ -265,9 +276,9 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   // embedding row (dequantized once; each block slices its `per`-element column
   // out of the combined `ple_all`). Both are deterministic, so hoisting them out
   // of the block loop is bit-identical to exec.cpp recomputing them per block.
-  const TensorId embd = b.node(OpKind::Embedding, {token_id}, "embd", {int64_t(d)},
+  const mlir::Value embd = b.node(OpKind::Embedding, {token_id}, "embd", {int64_t(d)},
                                {slot(WeightSlot::TokenEmbd)});
-  const TensorId inp = prof.embd_scale
+  const mlir::Value inp = prof.embd_scale
                            ? b.node(OpKind::Scale, {embd}, "inp", {int64_t(d)},
                                     {attr_f("scale", std::sqrt(float(d)))})
                            : embd;
@@ -280,9 +291,9 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   // RmsNormHeads(dim == per, weight == per_layer_proj_norm) + the combine
   // (proj + ple*sqrt(per)) / sqrt(2) as Scale/Add/Scale. A model without
   // per-layer inputs (Qwen2) emits none of this and runs the block alone.
-  TensorId ple_all{};
+  mlir::Value ple_all{};
   if (prof.per_layer_input) {
-    const TensorId ple_row = b.node(OpKind::Embedding, {token_id}, "ple_row",
+    const mlir::Value ple_row = b.node(OpKind::Embedding, {token_id}, "ple_row",
                                     {int64_t(total_per)},
                                     {slot(WeightSlot::PerLayerTokenEmbd)});
     const float proj_scale = 1.0f / std::sqrt(float(d));
@@ -298,16 +309,16 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                      {int64_t(total_per)},
                      {layer_a(0), slot(WeightSlot::PerLayerProjNorm),
                       attr_i("dim", int64_t(per))});
-    const TensorId ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
+    const mlir::Value ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
                                   {int64_t(total_per)},
                                   {attr_f("scale", double(ple_scale))});
-    const TensorId ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
+    const mlir::Value ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
                                     {int64_t(total_per)}, {});
     ple_all = b.node(OpKind::Scale, {ple_add}, "ple_all", {int64_t(total_per)},
                      {attr_f("scale", double(combine_scale))});
   }
 
-  TensorId residual = inp;
+  mlir::Value residual = inp;
   for (uint32_t l = 0; l < block_count; ++l) {
     const LayerConfig& lc = cfg.layer_config(l);
     const uint32_t n_q = lc.n_heads_q;
@@ -322,9 +333,9 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
     // branch). KV layers append their RoPE'd K (fp16) and normed V (fp16) to the
     // per-layer cache then attend over the accumulated keys; shared layers
     // (24..41) attend over their donor layer's cache instead.
-    TensorId h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
+    mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::AttnNorm)});
-    TensorId q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
+    mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
                         {layer_a(l), slot(WeightSlot::AttnQ)});
     if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
       q = b.node(OpKind::AddBias, {q}, "qb" + suff, {int64_t(qw)},
@@ -334,11 +345,11 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                  {layer_a(l), slot(WeightSlot::AttnQNorm)});
     q = b.node(OpKind::Rope, {q, pos}, "qr" + suff, {int64_t(qw)}, {layer_a(l)});
 
-    TensorId attn;
+    mlir::Value attn;
     if (cfg.has_kv(l)) {
-      TensorId k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
+      mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
                           {layer_a(l), slot(WeightSlot::AttnK)});
-      TensorId v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
+      mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
                           {layer_a(l), slot(WeightSlot::AttnV)});
       if (prof.proj_bias) {
         k = b.node(OpKind::AddBias, {k}, "kb" + suff, {int64_t(kvw)},
@@ -352,10 +363,10 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
       if (prof.v_norm)
         v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, {int64_t(kvw)},
                    {layer_a(l)});  // V norm: unit weight
-      const TensorId vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, {int64_t(kvw)},
+      const mlir::Value vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
       k = b.node(OpKind::Rope, {k, pos}, "kr" + suff, {int64_t(kvw)}, {layer_a(l)});
-      const TensorId kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
+      const mlir::Value kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
       attn = b.node(OpKind::Attention, {q, kc, vc, pos}, "attn" + suff,
                     {int64_t(qw)}, attn_attrs(l));
@@ -364,63 +375,63 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
                     {int64_t(qw)}, attn_attrs(l));
     }
 
-    TensorId ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
+    mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
                          {layer_a(l), slot(WeightSlot::AttnOutput)});
     if (prof.attn_out_bias)
       ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, {int64_t(d)},
                   {layer_a(l), slot(WeightSlot::AttnOutputBias)});
-    TensorId o = prof.post_attn_norm
+    mlir::Value o = prof.post_attn_norm
                      ? b.node(OpKind::RmsNorm, {ap}, "o" + suff, {int64_t(d)},
                               {layer_a(l), slot(WeightSlot::PostAttentionNorm)})
                      : ap;
-    TensorId x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, {int64_t(d)},
+    mlir::Value x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, {int64_t(d)},
                          {layer_a(l)});
 
     // --- gated feed-forward ------------------------------------------------
-    TensorId f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
+    mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::FfnNorm)});
-    TensorId up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
+    mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
                          {layer_a(l), slot(WeightSlot::FfnUp)});
-    TensorId gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
+    mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
                            {layer_a(l), slot(WeightSlot::FfnGate)});
     gate = prof.silu_ffn
                ? b.node(OpKind::Silu, {gate}, "silu" + suff, {int64_t(ff)}, {layer_a(l)})
                : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)},
                         {layer_a(l)});
-    TensorId fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
+    mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
                          {layer_a(l)});
-    TensorId fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
+    mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
                          {layer_a(l), slot(WeightSlot::FfnDown)});
-    TensorId f2 = prof.post_ffw_norm
+    mlir::Value f2 = prof.post_ffw_norm
                       ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
                                {layer_a(l), slot(WeightSlot::PostFfwNorm)})
                       : fo;
-    TensorId x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, {int64_t(d)},
+    mlir::Value x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, {int64_t(d)},
                          {layer_a(l)});
 
     // --- per-layer gate ----------------------------------------------------
     // The per-layer input (proj/scale/rms/combine) was hoisted to the preamble;
     // each block slices its [per] segment of ple_all. A model without per-layer
     // inputs (Qwen2) ends the block here.
-    TensorId x3 = x2;
+    mlir::Value x3 = x2;
     if (prof.per_layer_input) {
-      TensorId ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
+      mlir::Value ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
                             {attr_i("offset", int64_t(l) * per),
                              attr_i("length", int64_t(per))});
-      TensorId g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
+      mlir::Value g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
                            {layer_a(l), slot(WeightSlot::InpGate)});
       g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, {int64_t(per)}, {layer_a(l)});
       g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, {int64_t(per)}, {layer_a(l)});
-      TensorId g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, {int64_t(d)},
+      mlir::Value g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, {int64_t(d)},
                            {layer_a(l), slot(WeightSlot::Proj)});
-      TensorId g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, {int64_t(d)},
+      mlir::Value g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, {int64_t(d)},
                            {layer_a(l), slot(WeightSlot::PostNorm)});
       x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, {int64_t(d)},
                   {layer_a(l)});
     }
 
     // --- whole-block output scale ------------------------------------------
-    TensorId out;
+    mlir::Value out;
     if (prof.layer_scale && !m.weights.blocks[l].layer_output_scale.empty())
       out = b.node(OpKind::Scale, {x3}, "out" + suff, {int64_t(d)},
                    {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
@@ -430,9 +441,9 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   }
 
   // --- lm head -------------------------------------------------------------
-  TensorId hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
+  mlir::Value hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
                        {slot(WeightSlot::OutputNorm)});
-  TensorId logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
+  mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
                            {slot(prof.tied_output ? WeightSlot::TokenEmbd
                                                   : WeightSlot::Output)});
 
@@ -441,7 +452,7 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   // the device, so the per-token host transfer shrinks from the full 1 MiB
   // logits to 4 bytes. Sampling mode keeps the softcapped full logits (the
   // sampler needs the distribution).
-  TensorId out;
+  mlir::Value out;
   if (greedy) {
     out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)}, {});
   } else if (prof.softcap) {
@@ -451,12 +462,20 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
     out = logits;  // no softcapping: the raw logits are the graph output
   }
 
-  for (auto& t : b.g.tensors)
-    if (t.id == out)
-      t.is_graph_output = true;
-  b.g.outputs = {out};
+  b.set_output(out);
 
-  return std::move(b.g);
+  ir.module = b.finish();
+  return ir;
+}
+
+// The emitter's IR, lowered with no passes: the graph as the emitter wrote it,
+// which is what a caller that runs the pipeline itself — or records what the
+// emitter wrote — wants (model/plan.h).
+planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
+  GraphIr ir = emit_decode_ir(m, greedy);
+  if (!ir.module)
+    return {};
+  return lower_graph(*ir.module);
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,16 +1101,13 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 
 // The decode graph's rewrite pipeline, in order (design/mlir-migration.md §2):
 // the six fusion passes that take the emitter's graph to the graph the plan is
-// derived from. It runs as a Boom IR pipeline (planner/ir_passes.h) — the graph
-// is converted, the passes run as MLIR passes, and the result is converted
-// back — and it is the only implementation: the Graph rewrites it replaced were
-// removed once the port was complete. The caller keeps the conditions under
-// which the pipeline runs at all — the quantized path being available is a
-// property of the device, not of the pipeline.
-static void decode_rewrites(planner::Graph& g) {
-  planner::ir_pass_pipeline(g, planner::IrPassPhase::Decode);
-}
-
+// derived from. It runs as a Boom IR pipeline (compiler/BoomPasses.h) over the
+// IR the emitter wrote — no conversion precedes it, because the emitter's IR is
+// already what the passes read — and it is the only implementation: the Graph
+// rewrites it replaced were removed once the port was complete. The caller keeps
+// the conditions under which the pipeline runs at all — the quantized path being
+// available is a property of the device, not of the pipeline.
+//
 // The prefill graph's rewrite pipeline (C.4): the mmq fusions that fold the
 // activation quantize into the norm/gelu kernels.
 static void prefill_rewrites(planner::Graph& g) {
@@ -1108,9 +1124,9 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const GraphTransform* transform = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
-  rt->graph = build_gemma4_graph(m, /*greedy=*/true);
-  if (quant::cuda::q8_1_enabled())
-    decode_rewrites(rt->graph);
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
+  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
+                          quant::cuda::q8_1_enabled());
   // After every graph-level pass, so the transform sees the graph the plan is
   // actually derived from (plan.h: GraphTransform).
   if (transform && *transform) (*transform)(rt->graph);
@@ -1537,9 +1553,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   } else {
     Phase _p("prefill:build_decode_graph", phase_timing);
     dump_rt = std::make_unique<DecodeRuntime>();
-    dump_rt->graph = build_gemma4_graph(m, /*greedy=*/false);
-    if (quant::cuda::q8_1_enabled())
-      decode_rewrites(dump_rt->graph);
+    GraphIr dump_ir = emit_decode_ir(m, /*greedy=*/false);
+    dump_rt->graph = lower_graph(dump_ir, planner::IrPassPhase::Decode,
+                                 quant::cuda::q8_1_enabled());
     auto s = planner::CpuResourceProvider::snapshot();
     if (!s) return 0;
     dump_rt->snap = std::move(*s);
