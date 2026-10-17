@@ -193,6 +193,13 @@ std::optional<sx::Attribute> fromMlirAttribute(llvm::StringRef name,
   sx::Attribute out;
   out.name = name.str();
 
+  // BoolAttr *is* an IntegerAttr (it derives from it), so it must be tested
+  // first: the integer branch would read it as 0/1 and change the attribute's
+  // kind, and the kind is part of the model fingerprint.
+  if (auto b = llvm::dyn_cast<mlir::BoolAttr>(value)) {
+    out.value = b.getValue();
+    return out;
+  }
   if (auto i = llvm::dyn_cast<mlir::IntegerAttr>(value)) {
     out.value = i.getInt();
     return out;
@@ -205,15 +212,20 @@ std::optional<sx::Attribute> fromMlirAttribute(llvm::StringRef name,
     out.value = s.getValue().str();
     return out;
   }
-  if (auto b = llvm::dyn_cast<mlir::BoolAttr>(value)) {
-    out.value = b.getValue();
-    return out;
-  }
   if (auto a = llvm::dyn_cast<mlir::ArrayAttr>(value)) {
     // The element type is the first element's. An empty array is the one
     // ambiguous case (see toMlirAttribute) and reads back as int64.
     if (a.empty()) {
       out.value = std::vector<int64_t>{};
+      return out;
+    }
+    // As above: a BoolAttr is an IntegerAttr, so the bool array is the more
+    // specific test and comes first.
+    if (llvm::isa<mlir::BoolAttr>(a[0])) {
+      std::vector<bool> items;
+      for (mlir::Attribute x : a)
+        items.push_back(llvm::cast<mlir::BoolAttr>(x).getValue());
+      out.value = std::move(items);
       return out;
     }
     if (llvm::isa<mlir::IntegerAttr>(a[0])) {
@@ -234,13 +246,6 @@ std::optional<sx::Attribute> fromMlirAttribute(llvm::StringRef name,
       std::vector<std::string> items;
       for (mlir::Attribute x : a)
         items.push_back(llvm::cast<mlir::StringAttr>(x).getValue().str());
-      out.value = std::move(items);
-      return out;
-    }
-    if (llvm::isa<mlir::BoolAttr>(a[0])) {
-      std::vector<bool> items;
-      for (mlir::Attribute x : a)
-        items.push_back(llvm::cast<mlir::BoolAttr>(x).getValue());
       out.value = std::move(items);
       return out;
     }

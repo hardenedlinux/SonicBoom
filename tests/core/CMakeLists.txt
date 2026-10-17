@@ -199,6 +199,16 @@ target_link_libraries(test_boom_dialect PRIVATE sonicboom sonicboom_compiler
                                              MLIRAsmParser)
 sb_add_cpp_test(test_boom_dialect)
 
+# Blade -> Boom IR lowering test (design/mlir-migration.md §6.4 / §7d): the
+# direct document lowering must build the same IR as
+# graphToBoom(adapt_graph(doc)) for hand-written v0.1 documents, including
+# parameters, external sidecars, every attribute kind and the q8_1 layout.
+# Compiler-side and CPU-only: nothing here runs a plan.
+add_executable(test_blade_to_boom test_blade_to_boom.cpp)
+target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
+                                                    MLIRAsmParser)
+sb_add_cpp_test(test_blade_to_boom)
+
 # Boom IR conversion test (design/mlir-migration.md §7a): Graph -> Boom IR ->
 # Graph over the real models, and the plan gate — the round-tripped graph, fed
 # back through record_{decode,prefill}_plan's GraphTransform seam, must produce
