@@ -16,8 +16,9 @@
 
 // The glue-region code generator (compiler/GlueCodegen.h).
 //
-// Two region shapes so far: decode rms_norm + q8_1 quantize, and prefill
-// residual add + RMS-norm + mmq q8_1 quantize. The kernels are emitted in the
+// Three region shapes so far: decode rms_norm + q8_1 quantize, prefill
+// residual add + RMS-norm + mmq q8_1 quantize, and prefill RMS-norm + residual
+// add. The kernels are emitted in the
 // GPU dialect and lowered with the standard MLIR pipeline
 //
 //   scf -> cf, arith -> llvm, gpu.module -> nvvm, finalize memref -> llvm,
@@ -727,6 +728,222 @@ constexpr const char *kAddRmsNormQuantizeMmqQ8_1 = R"MLIR(module attributes {gpu
   }
 })MLIR";
 
+// Prefill RMS-norm + residual add (Stage 5c, rms_norm_add). One 256-thread block
+// per [dim] row. The reduction is rms_heads_fused_kernel's exactly: a strided
+// f64 accumulation, five shuffle-down steps, the 32-entry warp-partial array,
+// and the warp-0 reduction with lanes >= nwarps zero-filled, so `inv` is the
+// same fp32 value the norm kernel computes. The apply then does that kernel's
+// `x * iv * w` followed by add_kernel's `residual + v`, both at the same fp32
+// rounding points, so the region's output is byte-identical to the pair.
+constexpr const char *kRmsNormAdd = R"MLIR(module attributes {gpu.container_module} {
+  gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
+    gpu.func @rms_norm_add(%x: !llvm.ptr, %r: !llvm.ptr, %w: !llvm.ptr, %y: !llvm.ptr, %dim: i32, %eps: f32) kernel {
+      %token = gpu.block_id x
+      %tid = gpu.thread_id x
+      %tid_i = arith.index_cast %tid : index to i32
+      %c0i = arith.constant 0 : i32
+      %c1i = arith.constant 1 : i32
+      %c2i = arith.constant 2 : i32
+      %c4i = arith.constant 4 : i32
+      %c5i = arith.constant 5 : i32
+      %c8i = arith.constant 8 : i32
+      %c16i = arith.constant 16 : i32
+      %c31i = arith.constant 31 : i32
+      %c32i = arith.constant 32 : i32
+      %c256i = arith.constant 256 : i32
+      %c32l = arith.constant 32 : i64
+      %c0 = arith.constant 0.0 : f64
+      %c1f = arith.constant 1.0 : f32
+      %lane = arith.andi %tid_i, %c31i : i32
+      %warp = arith.shrui %tid_i, %c5i : i32
+      %wid = arith.constant 32 : i32
+      %token64 = arith.index_cast %token : index to i64
+      %dim64 = arith.extsi %dim : i32 to i64
+      %rowoff = arith.muli %token64, %dim64 : i64
+      %xrow = llvm.getelementptr inbounds %x[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %rrow = llvm.getelementptr inbounds %r[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %yrow = llvm.getelementptr inbounds %y[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %s0 = scf.for %iv = %tid_i to %dim step %c256i iter_args(%acc = %c0) -> (f64) : i32 {
+        %xp = llvm.getelementptr inbounds %xrow[%iv] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %xv = llvm.load %xp : !llvm.ptr -> f32
+        %sq = arith.mulf %xv, %xv : f32
+        %sq64 = arith.extf %sq : f32 to f64
+        %na = arith.addf %acc, %sq64 : f64
+        scf.yield %na : f64
+      }
+      %b0 = arith.bitcast %s0 : f64 to i64
+      %lo0 = arith.trunci %b0 : i64 to i32
+      %h0 = arith.shrui %b0, %c32l : i64
+      %hi0 = arith.trunci %h0 : i64 to i32
+      %lo1, %vv1 = gpu.shuffle down %lo0, %c16i, %wid : i32
+      %hi1, %vv2 = gpu.shuffle down %hi0, %c16i, %wid : i32
+      %eq1 = arith.extui %lo1 : i32 to i64
+      %eh1 = arith.extui %hi1 : i32 to i64
+      %sh1 = arith.shli %eh1, %c32l : i64
+      %bt1 = arith.ori %eq1, %sh1 : i64
+      %pa1 = arith.bitcast %bt1 : i64 to f64
+      %s1 = arith.addf %s0, %pa1 : f64
+      %b1 = arith.bitcast %s1 : f64 to i64
+      %lo1b = arith.trunci %b1 : i64 to i32
+      %h1 = arith.shrui %b1, %c32l : i64
+      %hi1b = arith.trunci %h1 : i64 to i32
+      %lo2, %vv3 = gpu.shuffle down %lo1b, %c8i, %wid : i32
+      %hi2, %vv4 = gpu.shuffle down %hi1b, %c8i, %wid : i32
+      %eq2 = arith.extui %lo2 : i32 to i64
+      %eh2 = arith.extui %hi2 : i32 to i64
+      %sh2 = arith.shli %eh2, %c32l : i64
+      %bt2 = arith.ori %eq2, %sh2 : i64
+      %pa2 = arith.bitcast %bt2 : i64 to f64
+      %s2 = arith.addf %s1, %pa2 : f64
+      %b2 = arith.bitcast %s2 : f64 to i64
+      %lo2b = arith.trunci %b2 : i64 to i32
+      %h2 = arith.shrui %b2, %c32l : i64
+      %hi2b = arith.trunci %h2 : i64 to i32
+      %lo3, %vv5 = gpu.shuffle down %lo2b, %c4i, %wid : i32
+      %hi3, %vv6 = gpu.shuffle down %hi2b, %c4i, %wid : i32
+      %eq3 = arith.extui %lo3 : i32 to i64
+      %eh3 = arith.extui %hi3 : i32 to i64
+      %sh3 = arith.shli %eh3, %c32l : i64
+      %bt3 = arith.ori %eq3, %sh3 : i64
+      %pa3 = arith.bitcast %bt3 : i64 to f64
+      %s3 = arith.addf %s2, %pa3 : f64
+      %b3 = arith.bitcast %s3 : f64 to i64
+      %lo3b = arith.trunci %b3 : i64 to i32
+      %h3 = arith.shrui %b3, %c32l : i64
+      %hi3b = arith.trunci %h3 : i64 to i32
+      %lo4, %vv7 = gpu.shuffle down %lo3b, %c2i, %wid : i32
+      %hi4, %vv8 = gpu.shuffle down %hi3b, %c2i, %wid : i32
+      %eq4 = arith.extui %lo4 : i32 to i64
+      %eh4 = arith.extui %hi4 : i32 to i64
+      %sh4 = arith.shli %eh4, %c32l : i64
+      %bt4 = arith.ori %eq4, %sh4 : i64
+      %f4 = arith.bitcast %bt4 : i64 to f64
+      %s4 = arith.addf %s3, %f4 : f64
+      %b4 = arith.bitcast %s4 : f64 to i64
+      %lo4b = arith.trunci %b4 : i64 to i32
+      %h4 = arith.shrui %b4, %c32l : i64
+      %hi4b = arith.trunci %h4 : i64 to i32
+      %lo5, %vv9 = gpu.shuffle down %lo4b, %c1i, %wid : i32
+      %hi5, %vv10 = gpu.shuffle down %hi4b, %c1i, %wid : i32
+      %eq5 = arith.extui %lo5 : i32 to i64
+      %eh5 = arith.extui %hi5 : i32 to i64
+      %sh5 = arith.shli %eh5, %c32l : i64
+      %bt5 = arith.ori %eq5, %sh5 : i64
+      %f5 = arith.bitcast %bt5 : i64 to f64
+      %s5 = arith.addf %s4, %f5 : f64
+      %c0idx = arith.constant 0 : index
+      %smem = gpu.dynamic_shared_memory : memref<?xi8, #gpu.address_space<workgroup>>
+      %wpart = memref.view %smem[%c0idx][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<32xf64, #gpu.address_space<workgroup>>
+      %is_zero_lane = arith.cmpi eq, %lane, %c0i : i32
+      scf.if %is_zero_lane {
+        %widx = arith.index_cast %warp : i32 to index
+        memref.store %s5, %wpart[%widx] : memref<32xf64, #gpu.address_space<workgroup>>
+      }
+      gpu.barrier
+      %lane_idx = arith.index_cast %lane : i32 to index
+      %c256idx = arith.constant 256 : index
+      %invm = memref.view %smem[%c256idx][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<4xf32, #gpu.address_space<workgroup>>
+      %in_w0 = arith.cmpi slt, %tid_i, %c32i : i32
+      scf.if %in_w0 {
+        %tl = memref.load %wpart[%lane_idx] : memref<32xf64, #gpu.address_space<workgroup>>
+        %is_active = arith.cmpi slt, %lane, %c8i : i32
+        %t0 = arith.select %is_active, %tl, %c0 : f64
+        %tb0 = arith.bitcast %t0 : f64 to i64
+        %tlo0 = arith.trunci %tb0 : i64 to i32
+        %th0 = arith.shrui %tb0, %c32l : i64
+        %thi0 = arith.trunci %th0 : i64 to i32
+        %tlo1, %tv1 = gpu.shuffle down %tlo0, %c16i, %wid : i32
+        %thi1, %tv2 = gpu.shuffle down %thi0, %c16i, %wid : i32
+        %te1 = arith.extui %tlo1 : i32 to i64
+        %the1 = arith.extui %thi1 : i32 to i64
+        %tsh1 = arith.shli %the1, %c32l : i64
+        %tbt1 = arith.ori %te1, %tsh1 : i64
+        %tf1 = arith.bitcast %tbt1 : i64 to f64
+        %t1 = arith.addf %t0, %tf1 : f64
+        %tb1 = arith.bitcast %t1 : f64 to i64
+        %tlo1b = arith.trunci %tb1 : i64 to i32
+        %th1 = arith.shrui %tb1, %c32l : i64
+        %thi1b = arith.trunci %th1 : i64 to i32
+        %tlo2, %tv3 = gpu.shuffle down %tlo1b, %c8i, %wid : i32
+        %thi2, %tv4 = gpu.shuffle down %thi1b, %c8i, %wid : i32
+        %te2 = arith.extui %tlo2 : i32 to i64
+        %the2 = arith.extui %thi2 : i32 to i64
+        %tsh2 = arith.shli %the2, %c32l : i64
+        %tbt2 = arith.ori %te2, %tsh2 : i64
+        %tf2 = arith.bitcast %tbt2 : i64 to f64
+        %t2 = arith.addf %t1, %tf2 : f64
+        %tb2 = arith.bitcast %t2 : f64 to i64
+        %tlo2b = arith.trunci %tb2 : i64 to i32
+        %th2 = arith.shrui %tb2, %c32l : i64
+        %thi2b = arith.trunci %th2 : i64 to i32
+        %tlo3, %tv5 = gpu.shuffle down %tlo2b, %c4i, %wid : i32
+        %thi3, %tv6 = gpu.shuffle down %thi2b, %c4i, %wid : i32
+        %te3 = arith.extui %tlo3 : i32 to i64
+        %the3 = arith.extui %thi3 : i32 to i64
+        %tsh3 = arith.shli %the3, %c32l : i64
+        %tbt3 = arith.ori %te3, %tsh3 : i64
+        %tf3 = arith.bitcast %tbt3 : i64 to f64
+        %t3 = arith.addf %t2, %tf3 : f64
+        %tb3 = arith.bitcast %t3 : f64 to i64
+        %tlo3b = arith.trunci %tb3 : i64 to i32
+        %th3 = arith.shrui %tb3, %c32l : i64
+        %thi3b = arith.trunci %th3 : i64 to i32
+        %tlo4, %tv7 = gpu.shuffle down %tlo3b, %c2i, %wid : i32
+        %thi4, %tv8 = gpu.shuffle down %thi3b, %c2i, %wid : i32
+        %te4 = arith.extui %tlo4 : i32 to i64
+        %the4 = arith.extui %thi4 : i32 to i64
+        %tsh4 = arith.shli %the4, %c32l : i64
+        %tbt4 = arith.ori %te4, %tsh4 : i64
+        %tf4 = arith.bitcast %tbt4 : i64 to f64
+        %t4 = arith.addf %t3, %tf4 : f64
+        %tb4 = arith.bitcast %t4 : f64 to i64
+        %tlo4b = arith.trunci %tb4 : i64 to i32
+        %th4 = arith.shrui %tb4, %c32l : i64
+        %thi4b = arith.trunci %th4 : i64 to i32
+        %tlo5, %tv9 = gpu.shuffle down %tlo4b, %c1i, %wid : i32
+        %thi5, %tv10 = gpu.shuffle down %thi4b, %c1i, %wid : i32
+        %te5 = arith.extui %tlo5 : i32 to i64
+        %the5 = arith.extui %thi5 : i32 to i64
+        %tsh5 = arith.shli %the5, %c32l : i64
+        %tbt5 = arith.ori %te5, %tsh5 : i64
+        %tf5 = arith.bitcast %tbt5 : i64 to f64
+        %t5 = arith.addf %t4, %tf5 : f64
+        %fn = arith.sitofp %dim : i32 to f64
+        %tn = arith.divf %t5, %fn : f64
+        %t32 = arith.truncf %tn : f64 to f32
+        %te = arith.addf %t32, %eps : f32
+        %sq = nvvm.sqrt %te {rnd = #nvvm.fp_rnd_mode<rn>} : f32
+        %inv = arith.divf %c1f, %sq : f32
+        %is_l0 = arith.cmpi eq, %lane, %c0i : i32
+        scf.if %is_l0 {
+          %i0i = arith.constant 0 : index
+          memref.store %inv, %invm[%i0i] : memref<4xf32, #gpu.address_space<workgroup>>
+        }
+      }
+      gpu.barrier
+      %i0b = arith.constant 0 : index
+      %ivv = memref.load %invm[%i0b] : memref<4xf32, #gpu.address_space<workgroup>>
+      %dim_idx = arith.index_cast %dim : i32 to index
+      %c256idx2 = arith.constant 256 : index
+      scf.for %k = %tid to %dim_idx step %c256idx2 {
+        %ki = arith.index_cast %k : index to i32
+        %xp2 = llvm.getelementptr inbounds %xrow[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %xv2 = llvm.load %xp2 : !llvm.ptr -> f32
+        %wp = llvm.getelementptr inbounds %w[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %wv = llvm.load %wp : !llvm.ptr -> f32
+        %rp = llvm.getelementptr inbounds %rrow[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %rv = llvm.load %rp : !llvm.ptr -> f32
+        %p = arith.mulf %xv2, %ivv : f32
+        %v = arith.mulf %p, %wv : f32
+        %o = arith.addf %rv, %v : f32
+        %yp = llvm.getelementptr inbounds %yrow[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        llvm.store %o, %yp : f32, !llvm.ptr
+      }
+      gpu.return
+    }
+  }
+})MLIR";
+
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
 std::string region_text(GlueRegionKind kind, int sm_arch) {
@@ -737,6 +954,9 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
       break;
     case GlueRegionKind::AddRmsNormQuantizeMmqQ8_1:
       text = kAddRmsNormQuantizeMmqQ8_1;
+      break;
+    case GlueRegionKind::RmsNormAdd:
+      text = kRmsNormAdd;
       break;
   }
   if (text == nullptr) return {};
@@ -783,6 +1003,8 @@ std::optional<GlueRegionKind> glue_region_kind_from_name(
     return GlueRegionKind::RmsNormQuantizeQ8_1;
   if (name == "add_rms_norm_quantize_mmq_q8_1")
     return GlueRegionKind::AddRmsNormQuantizeMmqQ8_1;
+  if (name == "rms_norm_add")
+    return GlueRegionKind::RmsNormAdd;
   return std::nullopt;
 }
 
@@ -792,6 +1014,8 @@ const char *glue_region_name(GlueRegionKind kind) noexcept {
       return "rms_norm_quantize_q8_1";
     case GlueRegionKind::AddRmsNormQuantizeMmqQ8_1:
       return "add_rms_norm_quantize_mmq_q8_1";
+    case GlueRegionKind::RmsNormAdd:
+      return "rms_norm_add";
   }
   return "?";
 }
@@ -802,6 +1026,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
       return "rms_norm_q8_1";
     case GlueRegionKind::AddRmsNormQuantizeMmqQ8_1:
       return "add_rms_norm_q8_1_mmq";
+    case GlueRegionKind::RmsNormAdd:
+      return "rms_norm_add";
   }
   return "?";
 }

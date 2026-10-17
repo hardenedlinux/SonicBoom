@@ -14,6 +14,11 @@
 // memcmp-equal nn::cuda::add_dev followed by
 // quant::cuda::rms_norm_quantize_mmq_q8_1_dev over the same rows.
 //
+// Prefill (5c): RMS-norm + residual add. The generated kernel's row must
+// memcmp-equal rms_norm_heads_dev followed by add_dev over the same rows: the
+// inverse RMS is the norm kernel's reduction and the apply is `residual +
+// x * inv * w` in that order.
+//
 // Skips cleanly (exit 0) when no CUDA device is present.
 
 #include <sonicboom/compiler/GlueCodegen.h>
@@ -265,6 +270,84 @@ void test_add_rms_norm_quantize_mmq_q8_1(std::mt19937& rng, int tokens, int dim,
   cudaFree(ygen);
 }
 
+// One prefill norm+add region launch, compared byte for byte with the
+// reference pair (rms_norm_heads_dev then add_dev).
+void test_rms_norm_add(std::mt19937& rng, int tokens, int dim) {
+  const std::string tag = "rms_norm_add tokens=" + std::to_string(tokens) +
+                          " dim=" + std::to_string(dim);
+
+  const size_t elems = size_t(tokens) * size_t(dim);
+  const size_t xy_bytes = elems * sizeof(float);
+  std::vector<float> x(elems), r(elems);
+  std::vector<float>& w = persistent_weight(dim);
+  for (auto& v : x) v = std::uniform_real_distribution<float>(-2.0f, 2.0f)(rng);
+  for (auto& v : r) v = std::uniform_real_distribution<float>(-2.0f, 2.0f)(rng);
+  for (auto& v : w) v = std::uniform_real_distribution<float>(0.5f, 1.5f)(rng);
+  const float eps = 1e-6f;
+
+  float *xd = nullptr, *rd = nullptr, *wd = nullptr, *nd = nullptr;
+  float *yref = nullptr, *ygen = nullptr;
+  check(cudaMalloc(&xd, xy_bytes) == cudaSuccess, "cudaMalloc x");
+  check(cudaMalloc(&rd, xy_bytes) == cudaSuccess, "cudaMalloc r");
+  check(cudaMalloc(&wd, dim * sizeof(float)) == cudaSuccess, "cudaMalloc w");
+  check(cudaMalloc(&nd, xy_bytes) == cudaSuccess, "cudaMalloc n");
+  check(cudaMalloc(&yref, xy_bytes) == cudaSuccess, "cudaMalloc yref");
+  check(cudaMalloc(&ygen, xy_bytes) == cudaSuccess, "cudaMalloc ygen");
+  if (g_failures) return;
+
+  cudaMemcpy(xd, x.data(), xy_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(rd, r.data(), xy_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(wd, w.data(), dim * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemset(yref, 0, xy_bytes);
+  cudaMemset(ygen, 0, xy_bytes);
+
+  // The reference: the two kernels the region replaces.
+  check(sonicboom::nn::cuda::rms_norm_heads_dev(std::span<const float>(w), xd,
+                                                eps, nd, dim, tokens),
+        (tag + ": reference norm").c_str());
+  check(sonicboom::nn::cuda::add_dev(rd, nd, yref, int(elems)),
+        (tag + ": reference add").c_str());
+
+  // The generated kernel, loaded and launched through the JIT: one 256-thread
+  // block per row.
+  void *xarg = xd;
+  void *rarg = rd;
+  void *warg = wd;
+  void *yarg = ygen;
+  int dimarg = dim;
+  float earg = eps;
+  void *args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg};
+  check(sonicboom::planner::glue::launch(
+            "rms_norm_add", args, tokens,
+            sonicboom::compiler::kRmsNormAddBlockThreads,
+            sonicboom::compiler::kRmsNormAddSharedBytes),
+        (tag + ": generated kernel launch").c_str());
+
+  check(cudaDeviceSynchronize() == cudaSuccess, "device synchronize");
+
+  std::vector<float> got(elems), ref(elems);
+  cudaMemcpy(got.data(), ygen, xy_bytes, cudaMemcpyDeviceToHost);
+  cudaMemcpy(ref.data(), yref, xy_bytes, cudaMemcpyDeviceToHost);
+  const bool equal = std::memcmp(got.data(), ref.data(), xy_bytes) == 0;
+  if (!equal) {
+    for (size_t i = 0; i < elems; ++i) {
+      if (std::memcmp(&got[i], &ref[i], sizeof(float)) != 0) {
+        std::cerr << "    first differing element " << i << ": got=" << got[i]
+                  << " ref=" << ref[i] << "\n";
+        break;
+      }
+    }
+  }
+  check(equal, (tag + ": byte-identical output").c_str());
+
+  cudaFree(xd);
+  cudaFree(rd);
+  cudaFree(wd);
+  cudaFree(nd);
+  cudaFree(yref);
+  cudaFree(ygen);
+}
+
 } // namespace
 
 int main() {
@@ -298,6 +381,16 @@ int main() {
         "prefill PTX contains the kernel entry symbol");
   }
 
+  auto ptx_norm_add = sonicboom::compiler::generate_glue_ptx(
+      sonicboom::compiler::GlueRegionKind::RmsNormAdd, arch);
+  check(ptx_norm_add.has_value(), "generate_glue_ptx returned norm+add PTX");
+  if (ptx_norm_add) {
+    check(ptx_norm_add->find(sonicboom::compiler::glue_kernel_entry(
+              sonicboom::compiler::GlueRegionKind::RmsNormAdd)) !=
+              std::string::npos,
+          "norm+add PTX contains the kernel entry symbol");
+  }
+
   std::mt19937 rng(0x5eed5a);
   for (int n : {512, 2048, 2560}) test_rms_norm_quantize_q8_1(rng, n);
   // The generated prefill region over Gemma's and Qwen's hidden sizes, both mmq
@@ -308,6 +401,13 @@ int main() {
   test_add_rms_norm_quantize_mmq_q8_1(rng, 5, 896, 1);
   test_add_rms_norm_quantize_mmq_q8_1(rng, 3, 128, 0);
   test_add_rms_norm_quantize_mmq_q8_1(rng, 3, 256, 1);
+  // The prefill norm+add region over Gemma's hidden size, the PLE projection
+  // width, a decode-sized row, and a single row (only one block's worth of
+  // work).
+  test_rms_norm_add(rng, 8, 2560);
+  test_rms_norm_add(rng, 8, 256);
+  test_rms_norm_add(rng, 5, 896);
+  test_rms_norm_add(rng, 1, 2560);
 
   if (g_failures) {
     std::cerr << g_failures << " failure(s)\n";

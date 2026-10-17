@@ -720,6 +720,53 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         break;
       }
+      if (region == "rms_norm_add") {
+        // Prefill norm + residual add (Stage 5c): one result, the residual
+        // stream with the normalized row added. Operands are (x, residual);
+        // `slot` and `dim` come from the norm the region replaced.
+        int64_t nb = 0, dim_i = 0;
+        if (!batch_attr(nb) || !attr_i(*node, "dim", dim_i) || nb <= 0 ||
+            dim_i <= 0) {
+          ok = false;
+          break;
+        }
+        const std::span<const float> w = fweight(slot);
+        const void* wd =
+            w.empty()
+                ? nullptr
+                : quant::cuda::upload_bytes_cached(w.data(),
+                                                   w.size() * sizeof(float));
+        if (w.empty() || wd == nullptr) {
+          ok = false;
+          break;
+        }
+        // The generated kernel's ABI: (x, r, w, y, dim, eps), one block per row.
+        void* xarg = const_cast<float*>(dev(in[0]));
+        void* rarg = const_cast<float*>(dev(in[1]));
+        void* warg = const_cast<void*>(wd);
+        void* yarg = out;
+        int dimarg = int(dim_i);
+        float earg = eps;
+        void* args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg};
+        ok = glue::launch(region, args, int(nb),
+                          compiler::kRmsNormAddBlockThreads,
+                          compiler::kRmsNormAddSharedBytes);
+        if (!ok) {
+          // The reference pair: norm into a scratch row set, then add.
+          const uint64_t tmp = device::acquire(out_bytes);
+          if (!tmp) {
+            ok = false;
+            break;
+          }
+          ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, dev_mut(tmp),
+                                            int(dim_i), int(nb));
+          if (ok)
+            ok = nn::cuda::add_dev(dev(in[1]), dev_mut(tmp), out,
+                                   int(nb * dim_i));
+          device::release(tmp, out_bytes);
+        }
+        break;
+      }
       // An unknown region would mean a pass emitted a node this backend has no
       // kernel for; fail rather than silently produce an unwritten buffer.
       ok = false;

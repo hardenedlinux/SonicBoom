@@ -1042,6 +1042,117 @@ public:
   }
 };
 
+// FuseRmsNormAddPass — the prefill glue region (Stage 5c): a batched RMS-norm
+// whose only reader is a residual add, and that add, become one GPU-dialect
+// region `rms_norm_add`. The kernel computes the row's inverse RMS with
+// rms_heads_fused_kernel's reduction, then writes `residual + x * inv * w` —
+// the pair's exact fp32 sequence.
+//
+// Unlike FuseAddRmsNormMmqPass the norm's result is private to the region (it
+// has one reader, the add), so the region has one result, under the add's
+// tensor id, and the norm's tensor leaves the table. The norm's attrs
+// (batch/dim/layer/slot) are the region's: the kernel needs the row width and
+// the weight; only the node id and name come from the add.
+//
+// Runs after FuseAddRmsNormMmqPass. That pass owns the `norm -> add ->
+// norm+quantize` chain; by the time this one runs, the adds it did not take
+// (the post-FF norm and the PLE post-norm) are the ones left with a
+// single-reader norm in front of them.
+//
+// Gated by the `glue_codegen` feature like the other regions, with its own
+// entry in the pass-disable list.
+class FuseRmsNormAddPass
+    : public mlir::PassWrapper<FuseRmsNormAddPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseRmsNormAddPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    struct Match {
+      mlir::Operation *norm;
+      mlir::Operation *add;
+    };
+    llvm::SmallVector<Match> matches;
+    llvm::DenseSet<mlir::Operation *> usedAdds;
+    const std::string normName = boomOpName(planner::OpKind::RmsNorm);
+    const std::string addName = boomOpName(planner::OpKind::Add);
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != normName || node.getNumOperands() != 1 ||
+          node.getNumResults() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs || !nodeAttrInt(attrs, "batch"))
+        continue; // the decode form is not this region
+      if (nodeAttrInt(attrs, "dim").value_or(0) <= 0)
+        continue;
+      if (nodeAttrInt(attrs, "slot").value_or(0) <= 0)
+        continue; // the generated kernel applies a norm weight (slot 0 = none)
+      if (!node.getResult(0).hasOneUse())
+        continue;
+      mlir::Operation *add = node.getResult(0).use_begin()->getOwner();
+      if (add->getName().getStringRef() != addName || add->getNumOperands() != 2 ||
+          add->getNumResults() != 1)
+        continue;
+      if (!usedAdds.insert(add).second)
+        continue; // both operands are single-reader norms; one region per add
+      matches.push_back({&node, add});
+    }
+
+    for (const Match &m : matches) {
+      // Re-read the operands here, not at match time: an earlier rewrite in
+      // this same pass may have replaced the add this norm feeds into (x2 is
+      // the post-FF region's result and later the PLE x3 add's residual), and
+      // a Value captured before that rewrite would point at the erased op.
+      mlir::Value x = m.norm->getOperand(0);
+      // The other add operand is the residual stream; operand order is not
+      // fixed by the emitter (the post-FF chain puts the norm first, the PLE
+      // post-norm chain puts the residual first).
+      mlir::Value residual = m.add->getOperand(0) == m.norm->getResult(0)
+                                 ? m.add->getOperand(1)
+                                 : m.add->getOperand(0);
+      auto attrs = llvm::to_vector(
+          m.norm->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region", builder.getStringAttr("rms_norm_add")));
+      auto name = m.add->getAttrOfType<mlir::StringAttr>("node_name");
+      const int64_t addId = GraphEditor::resultIds(*m.add)[0];
+      const int64_t normId = GraphEditor::resultIds(*m.norm)[0];
+      // Kernel ABI: (x, residual, w, y, dim, eps).
+      llvm::SmallVector<mlir::Value> operands{x, residual};
+
+      builder.setInsertionPoint(m.add);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*m.add),
+          name ? name.getValue() : llvm::StringRef("rms_norm_add"),
+          builder.getArrayAttr(attrs), GraphEditor::resultIds(*m.add), operands,
+          m.add->getResultTypes(),
+          m.add->getAttrOfType<mlir::StringAttr>("backend"));
+
+      m.add->getResult(0).replaceAllUsesWith(fused->getResult(0));
+      view.noteValue(addId, fused->getResult(0));
+      // The norm's tensor is now unreferenced. Drop it before the table is
+      // written back: an entry with no producer and no reader would otherwise
+      // turn into a free block argument when the graph is read again.
+      view.dropTensor(normId);
+      // The add holds the norm result's only use, so it has to go first: an op
+      // with a live use cannot be erased.
+      m.add->erase();
+      m.norm->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -1446,6 +1557,7 @@ struct DisabledPasses {
   bool silu_mul_mmq = false;
   bool fuse_glue_regions = false;
   bool fuse_add_rms_norm_mmq = false;
+  bool fuse_rms_norm_add = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -1463,6 +1575,7 @@ constexpr PassName kPassNames[] = {
     {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
     {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
+    {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1539,6 +1652,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // region consumes.
     if (!off.fuse_add_rms_norm_mmq)
       pm.addPass(std::make_unique<FuseAddRmsNormMmqPass>());
+    // After the mmq fusion: the norm+add chains it did not take are this
+    // region's.
+    if (!off.fuse_rms_norm_add)
+      pm.addPass(std::make_unique<FuseRmsNormAddPass>());
     if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
     if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
     return;

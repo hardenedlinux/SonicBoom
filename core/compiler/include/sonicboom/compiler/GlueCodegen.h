@@ -50,6 +50,10 @@ enum class GlueRegionKind {
   // (add_rms_norm_quantize_mmq_q8_1). One CUDA block of 256 threads per [dim]
   // row: it writes the residual sum and the normalized dim/128 mmq blocks.
   AddRmsNormQuantizeMmqQ8_1,
+  // Prefill RMS-norm + residual add (rms_norm_add). One CUDA block of 256
+  // threads per [dim] row; the row's norm is the private intermediate, so the
+  // region's only result is `residual + x * inv * w`.
+  RmsNormAdd,
 };
 
 // The region kind named `name`, or nullopt if the compiler has no generator for
@@ -73,6 +77,11 @@ constexpr int kGlueDynamicSharedBytes = 512;
 // does both phases in one block so it can also write the residual sum.
 constexpr int kAddRmsNormBlockThreads = 256;
 constexpr int kAddRmsNormSharedBytes = 512;
+
+// rms_norm_add: the same geometry — rms_heads_fused_kernel's 256-thread block
+// and 512 bytes of shared memory (32 f64 warp partials + the f32 inverse RMS).
+constexpr int kRmsNormAddBlockThreads = 256;
+constexpr int kRmsNormAddSharedBytes = 512;
 // Contextual: how many rows (norm vectors) one launch covers is the node's
 // element count / dim, computed at dispatch.
 
