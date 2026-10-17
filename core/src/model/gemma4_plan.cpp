@@ -1968,12 +1968,20 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                                  &session);
   if (done == 0) return 0;
 
-  // Record the tokens now resident in the cache for the next request's prefix
-  // match (positions 0..prefix_len-1 reused, prefix_len.. freshly filled).
-  if (start_pos == 0)
+  // Record every token whose KV this call actually wrote, for the next
+  // request's prefix match: the prompt, then the generated tokens the decode
+  // loop fed back. The loop at `step` fed tokens[0..step-2] (tokens[0] is fed at
+  // step 1 and the last generated token is never fed — it was only sampled), so
+  // the cache holds prompt + tokens[0..done-2]. Recording only the prompt (the
+  // old behaviour) re-prefilled a session's own generation on every later turn.
+  if (start_pos == 0) {
     session.filled_tokens.assign(prompt.begin(), prompt.end());
-  else
+    const uint64_t fed = (done > 1) ? done - 1 : 0;
+    for (uint64_t j = 0; j < fed; ++j)
+      session.filled_tokens.push_back(static_cast<uint64_t>(tokens[j]));
+  } else {
     session.filled_tokens.clear();
+  }
   return done;
 }
 #else

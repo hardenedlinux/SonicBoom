@@ -1107,10 +1107,15 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
           }
           while (n < max_tokens) {
             std::vector<int64_t> one(1, -1);
+            const uint64_t fed = session->token;  // this step writes fed's KV
             const uint64_t done = model::generate_spine_cuda(
                 m, session->token, session->pos, one, n_ctx);
             if (done == 0 || one[0] < 0)
               break;  // decode step failed
+            // The step wrote `fed`'s KV at session->pos: the session owns one
+            // more history position, so a later prefill on this session reuses
+            // the generation instead of re-prefilling it.
+            session->kv.filled_tokens.push_back(fed);
             session->token = static_cast<uint64_t>(one[0]);
             ++session->pos;
             if (cb && cb(user, static_cast<sb_token>(one[0]))) {
