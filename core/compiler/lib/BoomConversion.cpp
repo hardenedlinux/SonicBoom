@@ -18,6 +18,7 @@
 
 #include "sonicboom/compiler/BoomConversion.h"
 
+#include "sonicboom/compiler/BoomBuilder.h"
 #include "sonicboom/compiler/BoomTypes.h"
 
 #include "llvm/ADT/DenseMap.h"
@@ -35,7 +36,6 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <variant>
 
 namespace sonicboom::compiler {
 
@@ -69,120 +69,6 @@ std::optional<BackendTag> backendTagFromName(llvm::StringRef name) {
     return BackendTag::NativeTorch;
   if (name == "sonic")
     return BackendTag::Sonic;
-  return std::nullopt;
-}
-
-//--- node attributes ---------------------------------------------------------
-
-// sx::Attribute's value -> an MLIR attribute. Every kind sx::Attribute has maps
-// to one MLIR attribute, so a node attribute is never dropped; the one corner is
-// an empty vector, which cannot say which element type it is (neither could
-// sx::Attribute, whose variant index is the only sign of it) and reads back as
-// the int64 vector.
-mlir::Attribute toMlirAttribute(mlir::MLIRContext *context,
-                                const sx::Attribute &attr) {
-  using K = sx::AttrValueKind;
-  const auto &v = attr.value;
-  switch (attr.kind()) {
-  case K::Int:
-    return mlir::IntegerAttr::get(
-        mlir::IntegerType::get(context, 64), std::get<int64_t>(v));
-  case K::Float:
-    return mlir::FloatAttr::get(mlir::Float64Type::get(context),
-                               std::get<double>(v));
-  case K::String:
-    return mlir::StringAttr::get(context, std::get<std::string>(v));
-  case K::Bool:
-    return mlir::BoolAttr::get(context, std::get<bool>(v));
-  case K::Ints: {
-    llvm::SmallVector<mlir::Attribute> items;
-    for (int64_t x : std::get<std::vector<int64_t>>(v))
-      items.push_back(mlir::IntegerAttr::get(
-          mlir::IntegerType::get(context, 64), x));
-    return mlir::ArrayAttr::get(context, items);
-  }
-  case K::Floats: {
-    llvm::SmallVector<mlir::Attribute> items;
-    for (double x : std::get<std::vector<double>>(v))
-      items.push_back(
-          mlir::FloatAttr::get(mlir::Float64Type::get(context), x));
-    return mlir::ArrayAttr::get(context, items);
-  }
-  case K::Strings: {
-    llvm::SmallVector<mlir::Attribute> items;
-    for (const std::string &x : std::get<std::vector<std::string>>(v))
-      items.push_back(mlir::StringAttr::get(context, x));
-    return mlir::ArrayAttr::get(context, items);
-  }
-  case K::Bools: {
-    llvm::SmallVector<mlir::Attribute> items;
-    for (bool x : std::get<std::vector<bool>>(v))
-      items.push_back(mlir::BoolAttr::get(context, x));
-    return mlir::ArrayAttr::get(context, items);
-  }
-  }
-  return {};
-}
-
-// The reverse. `name` is carried over unchanged: node_attrs is order-preserving,
-// and the name is the key the typed attributes are matched against.
-std::optional<sx::Attribute> fromMlirAttribute(mlir::StringRef name,
-                                              mlir::Attribute value) {
-  sx::Attribute out;
-  out.name = name.str();
-
-  if (auto i = llvm::dyn_cast<mlir::IntegerAttr>(value)) {
-    out.value = i.getInt();
-    return out;
-  }
-  if (auto f = llvm::dyn_cast<mlir::FloatAttr>(value)) {
-    out.value = f.getValueAsDouble();
-    return out;
-  }
-  if (auto s = llvm::dyn_cast<mlir::StringAttr>(value)) {
-    out.value = s.getValue().str();
-    return out;
-  }
-  if (auto b = llvm::dyn_cast<mlir::BoolAttr>(value)) {
-    out.value = b.getValue();
-    return out;
-  }
-  if (auto a = llvm::dyn_cast<mlir::ArrayAttr>(value)) {
-    // The element type is the first element's. An empty array is the one
-    // ambiguous case (see toMlirAttribute) and reads back as int64.
-    if (a.empty()) {
-      out.value = std::vector<int64_t>{};
-      return out;
-    }
-    if (llvm::isa<mlir::IntegerAttr>(a[0])) {
-      std::vector<int64_t> items;
-      for (mlir::Attribute x : a)
-        items.push_back(llvm::cast<mlir::IntegerAttr>(x).getInt());
-      out.value = std::move(items);
-      return out;
-    }
-    if (llvm::isa<mlir::FloatAttr>(a[0])) {
-      std::vector<double> items;
-      for (mlir::Attribute x : a)
-        items.push_back(llvm::cast<mlir::FloatAttr>(x).getValueAsDouble());
-      out.value = std::move(items);
-      return out;
-    }
-    if (llvm::isa<mlir::StringAttr>(a[0])) {
-      std::vector<std::string> items;
-      for (mlir::Attribute x : a)
-        items.push_back(llvm::cast<mlir::StringAttr>(x).getValue().str());
-      out.value = std::move(items);
-      return out;
-    }
-    if (llvm::isa<mlir::BoolAttr>(a[0])) {
-      std::vector<bool> items;
-      for (mlir::Attribute x : a)
-        items.push_back(llvm::cast<mlir::BoolAttr>(x).getValue());
-      out.value = std::move(items);
-      return out;
-    }
-  }
   return std::nullopt;
 }
 
@@ -230,52 +116,6 @@ mlir::Type valueType(mlir::MLIRContext *context, mlir::Location loc,
   }
   return boom::TensorType::getChecked(
       mlir::detail::getDefaultDiagnosticEmitFn(loc), context, shape, dtypeName);
-}
-
-// The node attributes, in order, as the `node_attrs` array.
-llvm::SmallVector<mlir::Attribute> nodeAttrs(mlir::MLIRContext *context,
-                                             const GraphNodeDesc &n) {
-  llvm::SmallVector<mlir::Attribute> out;
-  for (const sx::Attribute &a : n.attributes)
-    out.push_back(boom::NodeAttr::get(
-        context, a.name, toMlirAttribute(context, a)));
-  return out;
-}
-
-// The typed view of a node's attributes: the ones ODS declares, which are the
-// names the plan emitters and the fusion passes read. An attribute in that
-// vocabulary whose value is neither an integer nor a float has no typed
-// attribute to set, and the graph verifier would reject the mismatch, so it is
-// reported here instead.
-bool addTypedAttributes(mlir::MLIRContext *context, mlir::Location loc,
-                        const GraphNodeDesc &n,
-                        llvm::SmallVectorImpl<mlir::NamedAttribute> &attrs) {
-  for (llvm::StringRef name : boom::boomTypedAttrNames()) {
-    const sx::Attribute *found = nullptr;
-    for (const sx::Attribute &a : n.attributes)
-      if (llvm::StringRef(a.name) == name)
-        found = &a;
-    if (!found)
-      continue;
-    switch (found->kind()) {
-    case sx::AttrValueKind::Int:
-      attrs.emplace_back(name, mlir::IntegerAttr::get(
-                                   mlir::IntegerType::get(context, 64),
-                                   std::get<int64_t>(found->value)));
-      break;
-    case sx::AttrValueKind::Float:
-      attrs.emplace_back(name, mlir::FloatAttr::get(
-                                   mlir::Float64Type::get(context),
-                                   std::get<double>(found->value)));
-      break;
-    default:
-      mlir::emitError(loc)
-          << "node '" << n.name << "' carries the attribute '" << name
-          << "', which the dialect declares with an integer or float type";
-      return false;
-    }
-  }
-  return true;
 }
 
 // Every id a graph lists, as the plain int64s the array attributes carry.
@@ -374,26 +214,14 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
       results.push_back(type);
     }
 
-    llvm::SmallVector<mlir::NamedAttribute> attrs;
-    attrs.emplace_back("node_name", builder.getStringAttr(n.name));
-    attrs.emplace_back("node_id", builder.getI64IntegerAttr(raw(n.id)));
-    attrs.emplace_back("result_ids",
-                       builder.getDenseI64ArrayAttr(flatten(n.outputs)));
-    attrs.emplace_back("node_attrs",
-                       builder.getArrayAttr(nodeAttrs(context, n)));
-    if (n.backend)
-      attrs.emplace_back(
-          "backend",
-          builder.getStringAttr(planner::backend_tag_name(*n.backend)));
-    if (!addTypedAttributes(context, loc, n, attrs))
+    // The node op record is built by the one implementation both this
+    // conversion and the emitter's builder go through (BoomBuilder.h), so the
+    // IR the runtime runs its passes on is the same whichever wrote it.
+    mlir::Operation *node =
+        createBoomNode(builder, loc, n.op, operands, results, n.name, raw(n.id),
+                       flatten(n.outputs), n.attributes, n.backend);
+    if (!node)
       return {};
-
-    mlir::OperationState state(
-        loc, std::string("boom.") + planner::op_kind_name(n.op));
-    state.addOperands(operands);
-    state.addTypes(results);
-    state.propertiesAttr = mlir::DictionaryAttr::get(context, attrs);
-    mlir::Operation *node = builder.create(state);
 
     for (auto [index, id] : llvm::enumerate(n.outputs))
       valueOf[raw(id)] = node->getResult(index);

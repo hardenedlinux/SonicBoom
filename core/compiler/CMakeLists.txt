@@ -80,6 +80,7 @@ add_library(sonicboom_compiler STATIC
   lib/BoomDialect.cpp
   lib/BoomTypes.cpp
   lib/BoomVerify.cpp
+  lib/BoomBuilder.cpp
   lib/BoomConversion.cpp
   lib/BoomPasses.cpp)
 
