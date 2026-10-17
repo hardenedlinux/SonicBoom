@@ -172,8 +172,9 @@ target-independent IR with a lowering pipeline.
 
 ## 2. Planner passes
 
-All nine passes live in `core/src/planner/rewrites.cpp` (700 lines) and are
-declared in `core/include/sonicboom/planner/rewrites.h` (136 lines). They are
+All nine passes lived in `core/src/planner/rewrites.cpp` (700 lines), declared
+in `core/include/sonicboom/planner/rewrites.h` (136 lines); both files have since
+been deleted (§7c status). They are
 **not** run by any generic pass manager: they are called only from the model
 emitter, at `gemma4_plan.cpp:1032-1038` (decode, six passes) and
 `:1386-1390` (prefill, three mmq passes), plus a duplicate call site for the
@@ -577,11 +578,12 @@ passes come after §6.2's quant types exist.
 - **Gate per pass:** the plan diff from (b) is unchanged, *plus* all of §7.6.
 
 **Status.** All nine passes are ported (§2's list), so every phase's pipeline now
-runs entirely through Boom IR. The IR pipeline is therefore what
-`libsonicboom.so` runs by default — the two implementations are required to
-leave the same graph, so this selects which one runs, not what the plan is.
-`SONICBOOM_IR_PASSES=0` selects the Graph rewrites the pipeline replaced, kept
-for differential comparison (`planner/ir_passes.h`).
+runs entirely through Boom IR. The Graph rewrites and the `SONICBOOM_IR_PASSES`
+switch that chose between the two paths have since been deleted, so Boom IR is
+not merely the default implementation — it is the only one
+(`planner/ir_passes.h`). The `rewrites.cpp:NNN` references earlier in this
+document are to that deleted file and are kept as the port's provenance; the
+semantics they describe now live in `core/compiler/lib/BoomPasses.cpp`.
 
 ### (d) Delete the `OpKind` IR
 

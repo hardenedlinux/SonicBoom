@@ -196,8 +196,9 @@ cmake -S . -B build -DSONICBOOM_USE_CUDA=ON \
 ```
 
 A different LLVM major is accepted with a warning, naming the version SonicBoom
-is tested against (23). `-DSONICBOOM_ENABLE_MLIR=OFF` builds without MLIR
-entirely, and the error message when MLIR is missing lists all three routes.
+is tested against (23). MLIR is required — the compiler library it carries is
+the only rewrite path the runtime has — and the error message when it is missing
+lists both routes.
 
 Whatever was configured is compiled into the library and can be read back — from
 C with `sb_build_info()` (`capi/include/sonicboom/capi.h`), from Guile with

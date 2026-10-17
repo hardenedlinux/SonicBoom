@@ -218,7 +218,7 @@ so a benchmark result or a bug report can name the exact binary behind it:
 | `git-commit` | commit at configure time, with a `-dirty` suffix for a modified tree, or `"unknown"` outside a git checkout |
 | `build-type` | CMake `CMAKE_BUILD_TYPE` (`Release`, `Debug`, …) |
 | `cuda` | alist: `enabled` (boolean), `archs` (list, e.g. `("86")` — the SM archs nvcc really compiled, resolved from `native`/`all` at build time), `toolkit` (e.g. `"12.0"`) |
-| `llvm` | alist: `version` and `major` of the LLVM/MLIR linked in, `origin` (`"bundled"` for the install `tools/mlir/build-mlir.sh` produces in-tree, `"external"` for any other, `"none"` when built with `-DSONICBOOM_ENABLE_MLIR=OFF`) |
+| `llvm` | alist: `version` and `major` of the LLVM/MLIR linked in, `origin` (`"bundled"` for the install `tools/mlir/build-mlir.sh` produces in-tree, `"external"` for any other — MLIR is required, so these are always real values) |
 | `platform` | target CPU the library was compiled for (`"x86_64"`), not the caller's machine |
 
 The underlying `sb_build_info()` C function (capi.h) returns the same thing as

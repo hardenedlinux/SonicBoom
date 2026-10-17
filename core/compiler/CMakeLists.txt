@@ -2,14 +2,13 @@
 # §6-§9): the `boom` dialect, the IR the planner's Graph is lifted into, and the
 # passes that rewrite that IR.
 #
-# Deliberately a SEPARATE library from `sonicboom`. It is linked into
-# libsonicboom.so, since the runtime grew a consumer for it: the Boom IR rewrite
-# pipeline (lib/BoomPasses.cpp), behind the switch in
-# <sonicboom/planner/ir_passes.h>. The switch is off by default, so the dialect
-# is linked into the runtime and not run by it unless the environment asks for
-# it (design §8.1).
+# Deliberately a SEPARATE library from `sonicboom`, but linked into
+# libsonicboom.so: the runtime's consumer is the Boom IR rewrite pipeline
+# (lib/BoomPasses.cpp), the only rewrite path there is
+# (<sonicboom/planner/ir_passes.h>).
 #
-# Only built when MLIR is enabled — the whole directory is MLIR.
+# The whole directory is MLIR, which is a required dependency (root
+# CMakeLists.txt).
 
 # --- TableGen: the generated dialect code ------------------------------------
 #

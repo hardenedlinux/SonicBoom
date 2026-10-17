@@ -66,6 +66,11 @@ add_subdirectory(third_party/native-torch)
 # MLIR integration: link the official MLIR CMake targets into libsonicboom.so.
 # MLIR/LLVM are a build-time input, not a runtime dependency.
 #
+# MLIR is REQUIRED. The Boom IR dialect and the rewrite pipeline that folds the
+# emitter's graph into the plan are the only rewrite path there is: a build
+# without the compiler library would run unfused graphs, so "no MLIR" is a
+# configure-time error rather than a supported configuration.
+#
 # Two ways to point at an LLVM/MLIR installation:
 #   1. -DMLIR_INSTALL_PREFIX=<prefix>  the prefix tools/mlir/build-mlir.sh
 #      installs to (default: <source>/build/llvm-mlir-install);
@@ -74,63 +79,59 @@ add_subdirectory(third_party/native-torch)
 # Either way the third_party/llvm-project submodule is NOT needed: the
 # submodule is only an input to tools/mlir/build-mlir.sh, which produces the
 # install. A build with the submodule empty is the supported external case.
-option(SONICBOOM_ENABLE_MLIR "Link MLIR into libsonicboom.so" ON)
-if(SONICBOOM_ENABLE_MLIR)
-  set(MLIR_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/build/llvm-mlir-install"
-      CACHE PATH "Prefix where tools/mlir/build-mlir.sh installed LLVM/MLIR")
+set(MLIR_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/build/llvm-mlir-install"
+    CACHE PATH "Prefix where tools/mlir/build-mlir.sh installed LLVM/MLIR")
 
-  # A directory given with -DMLIR_DIR/-DLLVM_DIR is used as is, working or not:
-  # a path the user chose that does not contain the package is their error to
-  # see, named in the message below, not something to quietly replace. Only a
-  # path this file derived itself (recorded in the *_DERIVED markers) is
-  # re-derived, so changing MLIR_INSTALL_PREFIX takes effect on the next
-  # configure without a fresh build directory.
-  if(NOT DEFINED SONICBOOM_MLIR_DIR_DERIVED AND MLIR_DIR)
-    set(_sb_mlir_dir_given TRUE)
+# A directory given with -DMLIR_DIR/-DLLVM_DIR is used as is, working or not:
+# a path the user chose that does not contain the package is their error to
+# see, named in the message below, not something to quietly replace. Only a
+# path this file derived itself (recorded in the *_DERIVED markers) is
+# re-derived, so changing MLIR_INSTALL_PREFIX takes effect on the next
+# configure without a fresh build directory.
+if(NOT DEFINED SONICBOOM_MLIR_DIR_DERIVED AND MLIR_DIR)
+  set(_sb_mlir_dir_given TRUE)
+endif()
+if(NOT DEFINED SONICBOOM_LLVM_DIR_DERIVED AND LLVM_DIR)
+  set(_sb_llvm_dir_given TRUE)
+endif()
+if(NOT MLIR_DIR OR (NOT _sb_mlir_dir_given AND NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake"))
+  set(MLIR_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/mlir"
+      CACHE PATH "MLIR CMake package directory" FORCE)
+  set(SONICBOOM_MLIR_DIR_DERIVED TRUE CACHE INTERNAL "MLIR_DIR was derived from MLIR_INSTALL_PREFIX")
+endif()
+if(NOT LLVM_DIR OR (NOT _sb_llvm_dir_given AND NOT EXISTS "${LLVM_DIR}/LLVMConfig.cmake"))
+  get_filename_component(_sb_mlir_cmake_dir "${MLIR_DIR}" DIRECTORY)
+  if(EXISTS "${_sb_mlir_cmake_dir}/llvm/LLVMConfig.cmake")
+    set(LLVM_DIR "${_sb_mlir_cmake_dir}/llvm"
+        CACHE PATH "LLVM CMake package directory" FORCE)
+  else()
+    set(LLVM_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/llvm"
+        CACHE PATH "LLVM CMake package directory" FORCE)
   endif()
-  if(NOT DEFINED SONICBOOM_LLVM_DIR_DERIVED AND LLVM_DIR)
-    set(_sb_llvm_dir_given TRUE)
-  endif()
-  if(NOT MLIR_DIR OR (NOT _sb_mlir_dir_given AND NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake"))
-    set(MLIR_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/mlir"
-        CACHE PATH "MLIR CMake package directory" FORCE)
-    set(SONICBOOM_MLIR_DIR_DERIVED TRUE CACHE INTERNAL "MLIR_DIR was derived from MLIR_INSTALL_PREFIX")
-  endif()
-  if(NOT LLVM_DIR OR (NOT _sb_llvm_dir_given AND NOT EXISTS "${LLVM_DIR}/LLVMConfig.cmake"))
-    get_filename_component(_sb_mlir_cmake_dir "${MLIR_DIR}" DIRECTORY)
-    if(EXISTS "${_sb_mlir_cmake_dir}/llvm/LLVMConfig.cmake")
-      set(LLVM_DIR "${_sb_mlir_cmake_dir}/llvm"
-          CACHE PATH "LLVM CMake package directory" FORCE)
-    else()
-      set(LLVM_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/llvm"
-          CACHE PATH "LLVM CMake package directory" FORCE)
-    endif()
-    set(SONICBOOM_LLVM_DIR_DERIVED TRUE CACHE INTERNAL "LLVM_DIR was derived from MLIR_DIR")
-  endif()
+  set(SONICBOOM_LLVM_DIR_DERIVED TRUE CACHE INTERNAL "LLVM_DIR was derived from MLIR_DIR")
+endif()
 
-  if(NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake")
-    message(FATAL_ERROR
-      "MLIR was not found at MLIR_DIR=${MLIR_DIR}.\n"
-      "Build and install it from the submodule:\n"
-      "  git submodule update --init third_party/llvm-project\n"
-      "  tools/mlir/build-mlir.sh            # installs to ${MLIR_INSTALL_PREFIX}\n"
-      "or point this build at an existing LLVM/MLIR with\n"
-      "  -DMLIR_DIR=<prefix>/lib/cmake/mlir -DLLVM_DIR=<prefix>/lib/cmake/llvm\n"
-      "(SonicBoom's MLIR path is tested with LLVM/MLIR 23.)\n"
-      "Or configure with -DSONICBOOM_ENABLE_MLIR=OFF to build without it.")
-  endif()
+if(NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake")
+  message(FATAL_ERROR
+    "MLIR is required but was not found at MLIR_DIR=${MLIR_DIR}.\n"
+    "Build and install it from the submodule:\n"
+    "  git submodule update --init third_party/llvm-project\n"
+    "  tools/mlir/build-mlir.sh            # installs to ${MLIR_INSTALL_PREFIX}\n"
+    "or point this build at an existing LLVM/MLIR with\n"
+    "  -DMLIR_DIR=<prefix>/lib/cmake/mlir -DLLVM_DIR=<prefix>/lib/cmake/llvm\n"
+    "(SonicBoom's MLIR path is tested with LLVM/MLIR 23.)")
+endif()
 
-  find_package(MLIR CONFIG REQUIRED)
+find_package(MLIR CONFIG REQUIRED)
 
-  # The MLIR path is developed and tested against one LLVM major. A different
-  # one is a warning, not an error: the failure mode is a lowering that needs
-  # adjusting, not a binary that cannot be built.
-  if(LLVM_VERSION_MAJOR AND NOT LLVM_VERSION_MAJOR EQUAL 23)
-    message(WARNING
-      "SonicBoom's MLIR path is tested with LLVM/MLIR 23; this build uses "
-      "${LLVM_PACKAGE_VERSION}. The lowering may need changes for this version; "
-      "treat resulting compile/runtime failures as untriaged until it runs on 23.")
-  endif()
+# The MLIR path is developed and tested against one LLVM major. A different
+# one is a warning, not an error: the failure mode is a lowering that needs
+# adjusting, not a binary that cannot be built.
+if(LLVM_VERSION_MAJOR AND NOT LLVM_VERSION_MAJOR EQUAL 23)
+  message(WARNING
+    "SonicBoom's MLIR path is tested with LLVM/MLIR 23; this build uses "
+    "${LLVM_PACKAGE_VERSION}. The lowering may need changes for this version; "
+    "treat resulting compile/runtime failures as untriaged until it runs on 23.")
 endif()
 
 # Build info. Everything sb_build_info() reports is resolved here, once, and
@@ -202,26 +203,27 @@ if(SONICBOOM_USE_CUDA AND CUDAToolkit_VERSION)
   set(SONICBOOM_BUILD_CUDA_TOOLKIT "${CUDAToolkit_VERSION}")
 endif()
 
+# MLIR is required, so these are always a real version/origin; the "none"
+# defaults are kept only because sb_build_info() declares the fields and a
+# CPU/toolchain-only reader should not have to know that.
 set(SONICBOOM_BUILD_LLVM_VERSION "none")
 set(SONICBOOM_BUILD_LLVM_MAJOR "0")
 set(SONICBOOM_BUILD_LLVM_ORIGIN "none")
-if(SONICBOOM_ENABLE_MLIR)
-  if(LLVM_PACKAGE_VERSION)
-    set(SONICBOOM_BUILD_LLVM_VERSION "${LLVM_PACKAGE_VERSION}")
-  else()
-    set(SONICBOOM_BUILD_LLVM_VERSION "unknown")
-  endif()
-  if(LLVM_VERSION_MAJOR)
-    set(SONICBOOM_BUILD_LLVM_MAJOR "${LLVM_VERSION_MAJOR}")
-  endif()
-  # 'bundled' = the install tools/mlir/build-mlir.sh produces inside this source
-  # tree; anything else is an external LLVM/MLIR.
-  string(FIND "${MLIR_INSTALL_PREFIX}" "${CMAKE_SOURCE_DIR}" _sb_prefix_in_src)
-  if(_sb_prefix_in_src EQUAL 0)
-    set(SONICBOOM_BUILD_LLVM_ORIGIN "bundled")
-  else()
-    set(SONICBOOM_BUILD_LLVM_ORIGIN "external")
-  endif()
+if(LLVM_PACKAGE_VERSION)
+  set(SONICBOOM_BUILD_LLVM_VERSION "${LLVM_PACKAGE_VERSION}")
+else()
+  set(SONICBOOM_BUILD_LLVM_VERSION "unknown")
+endif()
+if(LLVM_VERSION_MAJOR)
+  set(SONICBOOM_BUILD_LLVM_MAJOR "${LLVM_VERSION_MAJOR}")
+endif()
+# 'bundled' = the install tools/mlir/build-mlir.sh produces inside this source
+# tree; anything else is an external LLVM/MLIR.
+string(FIND "${MLIR_INSTALL_PREFIX}" "${CMAKE_SOURCE_DIR}" _sb_prefix_in_src)
+if(_sb_prefix_in_src EQUAL 0)
+  set(SONICBOOM_BUILD_LLVM_ORIGIN "bundled")
+else()
+  set(SONICBOOM_BUILD_LLVM_ORIGIN "external")
 endif()
 
 # SonicBoom stable C ABI (Layer 3). Built as an object library and linked into

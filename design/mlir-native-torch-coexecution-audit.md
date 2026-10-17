@@ -61,7 +61,7 @@ native-torch*, with a real `Bytes ↔ Tensor` boundary.
 | JIT facade (MLIR-free header) | `core/include/sonicboom/sx/exec.h` — `sx::Executable::compile/run` | committed |
 | C ABI (Layer 3) | `capi/include/sonicboom/capi.h`, `capi/src/capi.cpp` — `sb_parse/sb_compile/sb_bind_input/sb_execute/sb_retrieve_output` | committed |
 | Static planner + runtime executor | `core/src/planner/` + `core/include/sonicboom/planner/` | committed |
-| Build wiring | `core/CMakeLists.txt` (`SONICBOOM_ENABLE_MLIR` block: MLIR dialects + ExecutionEngine + bufferize→LLVM passes) | committed |
+| Build wiring | `core/CMakeLists.txt` (unconditional MLIR block: MLIR dialects + ExecutionEngine + bufferize→LLVM passes; MLIR itself is a required dependency, root `CMakeLists.txt`) | committed |
 
 ### 1.1 Lowering operator set (frozen v0.1)
 

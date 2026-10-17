@@ -15,19 +15,18 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // The Boom IR rewrite pipeline: one phase's Graph-level fusion passes, run as
-// MLIR passes over Boom IR instead (design/mlir-migration.md §7c).
+// MLIR passes over Boom IR (design/mlir-migration.md §7c).
 //
-// A phase's pipeline has two implementations that are required to leave the
-// *same* graph — the same nodes, in the same order, over the same tensor table
-// (BoomConversion.h states why that is the whole contract). The plan goldens in
-// tests/data/plans pin it, and it is what makes this a port rather than a second
-// set of rewrites. During the migration the two implementations are mixed: the
-// passes whose port has landed run as Boom IR passes, and the rest still run as
-// the Graph rewrites they were, at one boundary in one place (BoomPasses.cpp).
+// This is the only rewrite path. The passes were ported from the planner's
+// Graph rewrites, one pass at a time, until the port was complete — the plan
+// goldens in tests/data/plans pinned each one — and the Graph rewrites and the
+// switch that chose between the two were then removed. A pass is therefore
+// either a registered Boom IR pass or it does not exist; there is no second
+// implementation for a behavior to diverge from.
 //
-// The header carries no MLIR: the choice of pipeline is a switch a runtime
-// caller makes, and nothing on the runtime side has to name a compiler type to
-// make it. The pass themselves live in the compiler library, behind Layer 2.
+// The header carries no MLIR: nothing on the runtime side has to name a
+// compiler type to run the pipeline. The passes themselves live in the compiler
+// library, behind Layer 2.
 
 #pragma once
 
@@ -38,22 +37,6 @@ namespace sonicboom::planner {
 // Which phase's pipeline to run. The two the emitter builds differ in their
 // pass list and nothing else (design/mlir-migration.md §2 lists both).
 enum class IrPassPhase { Decode, Prefill };
-
-// Whether this build carries the Boom IR passes at all: they live in the
-// compiler library, which is built and linked only when the build has MLIR
-// (SONICBOOM_ENABLE_MLIR; core/compiler/CMakeLists.txt).
-bool ir_passes_available();
-
-// Whether the runtime should derive the plan through Boom IR. On by default:
-// Boom IR is what libsonicboom.so runs, and SONICBOOM_IR_PASSES=0 selects the
-// Graph rewrites it replaced (the two leave the same graph, so the switch is
-// for comparing implementations, not for choosing a behavior). Also false when
-// the build has no compiler library. Read on every call rather than cached —
-// the flag is a live toggle, so a differential test can turn it on and off
-// inside one process and compare the two pipelines over the same model, the
-// same reason quant::cuda::q8_1_enabled reads its own env flag live
-// (cuda_quant_matmul.cu:1311).
-bool ir_passes_enabled();
 
 // Run `phase`'s rewrite pipeline over `graph` through Boom IR: the graph is
 // converted, the phase's passes run as MLIR passes, and the result is converted
@@ -71,14 +54,14 @@ bool ir_passes_enabled();
 // GeluMulQuantizePass fold away — so a plan delta is read as what that pass and
 // the folds it feeds contribute, not as that pass alone. An unrecognized name
 // is reported on stderr with the valid names and disables nothing — a typo must
-// not pass for an ablation. The switch is read only here, so it has no effect
-// when ir_passes_enabled() is false.
+// not pass for an ablation. The switch is read in the pipeline itself, where the
+// passes and their names live (BoomPasses.cpp).
 //
 // A conversion or pass failure is reported on stderr and leaves `graph` as it
 // was handed over — unfused, which is correct but not what the phase's pipeline
-// would have produced. There is deliberately no fallback to the Graph rewrites:
-// a silent one would make a broken IR pass indistinguishable from a working one,
-// and the plan comparison that exists to catch that would pass.
+// would have produced. There is deliberately no fallback: a silent one would
+// make a broken IR pass indistinguishable from a working one, and the plan
+// comparison that exists to catch that would pass.
 void ir_pass_pipeline(Graph &graph, IrPassPhase phase);
 
 } // namespace sonicboom::planner

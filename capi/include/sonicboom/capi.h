@@ -131,8 +131,10 @@ void sb_error_free(sb_error *err);
  * `git_commit` is "<rev>[-dirty]" at configure time, or "unknown" outside a git
  * checkout. `cuda` is {"enabled":false,"archs":[],"toolkit":""} in a CPU-only
  * build. `llvm.origin` is "bundled" for the install tools/mlir/build-mlir.sh
- * produces inside the source tree and "external" for any other LLVM/MLIR;
- * both are "" / "none" when MLIR is not linked (SONICBOOM_ENABLE_MLIR=OFF).
+ * produces inside the source tree and "external" for any other LLVM/MLIR.
+ * (MLIR is a required dependency, so `llvm` is always a real version/origin;
+ * sb_build_info still reports none/"none" only in a build with no MLIR, which
+ * configure now rejects.)
  * `platform` is the target CPU the library was compiled for, not the builder's. */
 const char *sb_build_info(void);
 

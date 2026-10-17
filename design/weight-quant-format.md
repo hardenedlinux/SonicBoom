@@ -2,13 +2,13 @@
 
 Status: **proposal, under revision.** Nothing in this document is implemented.
 
-The document exists in the tree because two bodies of code point at it:
-`TODO(weight-format)` in the ported Boom IR passes
-(`core/compiler/lib/BoomPasses.cpp:820`, `:987`) and the private `ds` predicate
-those passes keep from the Graph rewrites
-(`core/src/planner/rewrites.cpp:362-377`). Both say the same thing: a weight's
-quant format is an emitter-baked integer today, and it should be a property of a
-type.
+The document exists in the tree because the Boom IR passes point at it:
+`TODO(weight-format)` in the ported passes
+(`core/compiler/lib/BoomPasses.cpp:825`, `:992`) and the private `ds` predicate
+those passes carry, which they kept from the Graph rewrites they were ported
+from (`core/src/planner/rewrites.cpp`, since deleted). Both say the same thing: a
+weight's quant format is an emitter-baked integer today, and it should be a
+property of a type.
 
 All `file:line` references are to `core/` unless stated, and are checked against
 the `boom-passes` tip. Statements that are inference rather than observation are
@@ -193,8 +193,8 @@ because the two halves of the review's ask land in different places:
 `ds` is the mmq activation layout a weight format selects, and it is the
 concrete reason this proposal exists:
 
-- `fuse_rms_norm_mmq_pass` (`planner/rewrites.cpp:362-377`, ported as
-  `RmsNormMmqPass`, `compiler/lib/BoomPasses.cpp:820`) fuses a norm into the
+- `fuse_rms_norm_mmq_pass` (ported as `RmsNormMmqPass` from the since-deleted
+  `planner/rewrites.cpp`, `compiler/lib/BoomPasses.cpp`) fuses a norm into the
   matmuls that read it **only if** those matmuls agree on `batch` and `ds`, and
   only if none of them carries `ds < 0`.
 - `ds < 0` is a hard-coded answer meaning "this weight type has no mmq

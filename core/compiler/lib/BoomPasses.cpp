@@ -17,15 +17,18 @@
 // The planner's fusion passes, as MLIR passes over Boom IR
 // (design/mlir-migration.md §7c, step (c) of the migration).
 //
-// Every pass here is the port of one pass in planner/rewrites.cpp, in that
-// pass's place in its phase's order, with the same preconditions; between them
-// the two phases are ported in full. What is *not* copied is how a pass reads
-// the graph: a pass here works through Boom IR — ops, SSA values, the tensor
-// table — and not through planner::Graph, which is why it can be a pass at all.
-// What is copied exactly is the result: the graph this pipeline produces is the
-// graph the Graph rewrites produce, tensor for tensor and attribute for
-// attribute, which is the whole acceptance criterion (BoomConversion.h) and
-// what tests/data/plans/*.plan pin.
+// Every pass here is the port of one pass in the planner's deleted Graph
+// rewrites (core/src/planner/rewrites.cpp), in that pass's place in its phase's
+// order, with the same preconditions; the `rewrites.cpp:NNN` references below
+// are to that file and are kept as the port's provenance. What was never copied
+// is how a pass reads the graph: a pass here works through Boom IR — ops, SSA
+// values, the tensor table — and not through planner::Graph, which is why it can
+// be a pass at all. What was copied exactly is the result: the graph this
+// pipeline produces is the graph the Graph rewrites produced, tensor for tensor
+// and attribute for attribute, which was the whole acceptance criterion for the
+// port (BoomConversion.h) and what tests/data/plans/*.plan pin. The rewrites and
+// the switch between the two paths were removed once the port was complete; this
+// pipeline is now the only rewrite path.
 
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomOps.h>
@@ -1171,9 +1174,9 @@ public:
 //--- the per-pass disable switch --------------------------------------------
 
 // Ablation for one fusion at a time: the passes a run skips, named on the
-// command line (SONICBOOM_IR_PASS_DISABLE, see planner/ir_passes.h — the switch
-// is documented on the runtime side next to the pipeline choice, and read here,
-// where the passes and their names live).
+// command line (SONICBOOM_IR_PASS_DISABLE, documented on the runtime side beside
+// the pipeline entry point in planner/ir_passes.h, and read here, where the
+// passes and their names live).
 //
 // Skipping a pass leaves the graph as the pass before it would, so a later pass
 // sees what it is written to see. That is not the same as the later pass being
@@ -1256,9 +1259,8 @@ bool parseDisabledPasses(DisabledPasses &out) {
 
 // A phase's passes, in the phase's execution order (design/mlir-migration.md
 // §2): the port of each Graph rewrite in planner/rewrites.cpp, in that pass's
-// place in the order and with its preconditions. Both phases run entirely here
-// now — the boundary the migration ran on is gone — and rewrites.cpp keeps the
-// passes the emitter's default path still runs.
+// place in the order and with its preconditions. Both phases run entirely here,
+// and the Graph rewrites are gone, so this is the emitter's only rewrite path.
 void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
   DisabledPasses off;
   // A rejected list disables nothing: running the phase with no passes would
@@ -1341,15 +1343,13 @@ void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
 
 } // namespace sonicboom::compiler
 
-//--- the switch's entry points ----------------------------------------------
+//--- the runtime's entry point ----------------------------------------------
 //
-// What the runtime names (planner/ir_passes.h). They live here, with the
-// pipeline they run, rather than in the planner: there is nothing on the
-// planner side of them but the choice of which phase to run.
+// What the runtime names (planner/ir_passes.h). It lives here, with the
+// pipeline it runs, rather than in the planner: there is nothing on the planner
+// side of it but the choice of which phase to run.
 
 namespace sonicboom::planner {
-
-bool ir_passes_available() { return true; }
 
 void ir_pass_pipeline(Graph &graph, IrPassPhase phase) {
   compiler::runBoomIrPipeline(graph, phase);

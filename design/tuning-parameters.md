@@ -200,9 +200,9 @@ warp-per-row, 8 warps per block.
 
 | constant | file:line | value | should depend on | how measured |
 |---|---|---|---|---|
-| `kMmqBlockBytes` | `planner/rewrites.cpp:62` | `144` | the q8_1_mmq block layout | sizing check for the pass's f32 buffer |
-| `kMmqTailGuardBlocks` | `:63` | `128` | J_max = I | tail over-read guard |
-| plane rounding | `:70-72` | `dim/128 + ((dim/128) & 1)` | dim (multiple of 128 enforced) | layout |
+| `kMmqBlockBytes` | `compiler/lib/BoomPasses.cpp:259` | `144` | the q8_1_mmq block layout | sizing check for the pass's f32 buffer |
+| `kMmqTailGuardBlocks` | `:260` | `128` | J_max = I | tail over-read guard |
+| plane rounding | `compiler/lib/BoomPasses.cpp:267-269` | `dim/128 + ((dim/128) & 1)` | dim (multiple of 128 enforced) | layout |
 | `ds` attribute | `model/gemma4_plan.cpp:559-568` | `1` for Q4_K/Q5_K, `0` for every other format with an mmq activation layout, `-1` for Q6_K | whether the *weight format* has an mmq activation layout | capability, not speed: the fusion passes read `ds` only to decide eligibility (see the emitter rows in §5 for why speed is not part of this decision) |
 | `kDefaultPrefillChunk` | `model/gemma4_plan.cpp:91` | `512` tokens | model (sliding window) | any positive value is correct; 512 matches the segment size the windowed models use |
 | chunk selection | `:163`, `:1356-1357` | `sliding_window > 0 ? sliding_window : kDefaultPrefillChunk` | SWA ring size | a segment is then a wrap-free run |

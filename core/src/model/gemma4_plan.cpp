@@ -22,7 +22,6 @@
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/resource.h>
-#include <sonicboom/planner/rewrites.h>
 #include <sonicboom/planner/runtime_executor.h>
 #include <sonicboom/planner/sonic_backend.h>
 #include <sonicboom/planner/sonic_cuda_backend.h>
@@ -1010,11 +1009,10 @@ struct PrefillSegment {
 // segment build reads — the model, n_ctx, the resource snapshot, the cost
 // model, the segment length — is fixed per decode runtime except the segment
 // length, which is the cache key. A change in any of these switches changes the
-// graph the plan is derived from (the IR passes replace the Graph rewrites; the
-// q8_1/mmq gates decide whether the mmq fusions run at all), so they are part
-// of the key rather than assumed constant for the process.
+// graph the plan is derived from (the q8_1/mmq gates decide whether the mmq
+// fusions run at all), so they are part of the key rather than assumed constant
+// for the process.
 struct PlannerEnv {
-  bool ir_passes;
   bool q8_1;
   bool mmq;
   int mmq_min_n;
@@ -1022,8 +1020,8 @@ struct PlannerEnv {
 };
 
 static PlannerEnv planner_env() {
-  return PlannerEnv{planner::ir_passes_enabled(), quant::cuda::q8_1_enabled(),
-                    quant::cuda::mmq_enabled(), quant::cuda::mmq_min_n()};
+  return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
+                    quant::cuda::mmq_min_n()};
 }
 
 // SONICBOOM_PLAN_CACHE=0 disables the prefill segment cache (segments then go
@@ -1084,44 +1082,20 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 
 // The decode graph's rewrite pipeline, in order (design/mlir-migration.md §2):
 // the six fusion passes that take the emitter's graph to the graph the plan is
-// derived from. There are two implementations of it — the Graph rewrites and
-// the Boom IR passes — and they are required to leave the same graph, which is
-// what the recorded plan goldens pin. Which one runs is the build and
-// SONICBOOM_IR_PASSES (planner/ir_passes.h); the IR pipeline runs here, as a
-// GraphTransform, so it stands in the same place in the pipeline as the
-// rewrites it replaces. The caller keeps the conditions under which the
-// pipeline runs at all — the quantized path being available is a property of
-// the device, not of either implementation.
+// derived from. It runs as a Boom IR pipeline (planner/ir_passes.h) — the graph
+// is converted, the passes run as MLIR passes, and the result is converted
+// back — and it is the only implementation: the Graph rewrites it replaced were
+// removed once the port was complete. The caller keeps the conditions under
+// which the pipeline runs at all — the quantized path being available is a
+// property of the device, not of the pipeline.
 static void decode_rewrites(planner::Graph& g) {
-  if (planner::ir_passes_enabled()) {
-    const GraphTransform pipeline = [](planner::Graph& graph) {
-      planner::ir_pass_pipeline(graph, planner::IrPassPhase::Decode);
-    };
-    pipeline(g);
-    return;
-  }
-  planner::quantize_once_pass(g);
-  planner::fuse_rms_norm_quantize_pass(g);
-  planner::fuse_gelu_mul_quantize_pass(g);
-  planner::fuse_silu_mul_quantize_pass(g);
-  planner::fuse_bias_into_gemv_pass(g);
-  planner::fuse_residual_add_into_gemv_pass(g);
+  planner::ir_pass_pipeline(g, planner::IrPassPhase::Decode);
 }
 
 // The prefill graph's rewrite pipeline (C.4): the mmq fusions that fold the
-// activation quantize into the norm/gelu kernels. The same two
-// implementations as the decode pipeline above.
+// activation quantize into the norm/gelu kernels.
 static void prefill_rewrites(planner::Graph& g) {
-  if (planner::ir_passes_enabled()) {
-    const GraphTransform pipeline = [](planner::Graph& graph) {
-      planner::ir_pass_pipeline(graph, planner::IrPassPhase::Prefill);
-    };
-    pipeline(g);
-    return;
-  }
-  planner::fuse_rms_norm_mmq_pass(g);
-  planner::fuse_gelu_mul_mmq_pass(g);
-  planner::fuse_silu_mul_mmq_pass(g);
+  planner::ir_pass_pipeline(g, planner::IrPassPhase::Prefill);
 }
 
 // Build the greedy decode graph, plan it, and wire up its backends — everything
