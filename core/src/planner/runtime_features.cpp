@@ -38,6 +38,7 @@ constexpr FeatureName kFeatureNames[] = {
     {"capture_reuse", Feature::CaptureReuse},
     {"split_kv", Feature::SplitKv},
     {"plan_cache", Feature::PlanCache},
+    {"symbolic_prefill", Feature::SymbolicPrefill},
     {"q8_1_dispatch", Feature::Q8_1Dispatch},
     {"buffer_reuse", Feature::BufferReuse},
     {"warmup", Feature::Warmup},
@@ -67,6 +68,8 @@ bool alias_disabled(Feature feature) noexcept {
       const char* e = std::getenv("SONICBOOM_PLAN_CACHE");
       return e && std::string_view(e) == "0";
     }
+    case Feature::SymbolicPrefill:
+      return false;  // no historical alias
     case Feature::Q8_1Dispatch:
       // Any value, including "0", selects the fp32 path (the historical
       // semantics of SONICBOOM_GEMV_F32).

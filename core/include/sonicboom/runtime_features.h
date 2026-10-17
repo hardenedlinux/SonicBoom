@@ -44,6 +44,9 @@ enum class Feature {
   SplitKv,
   // Cache prefill segment plans by segment length.
   PlanCache,
+  // Lower prefill segments from symbolic IR and bind the segment length at
+  // execute time (off = one concrete plan per exact segment length).
+  SymbolicPrefill,
   // q8_1 activation quantization + dp4a/MMQ dispatch (off = fp32 GEMV).
   Q8_1Dispatch,
   // Return an activation's device buffer to the pool as soon as its last

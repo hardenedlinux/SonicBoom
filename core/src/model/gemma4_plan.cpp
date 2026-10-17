@@ -1054,14 +1054,10 @@ static bool plan_cache_enabled() {
   return runtime::feature_enabled(runtime::Feature::PlanCache);
 }
 
-// Cache cap. A single prefill call needs at most two distinct segment lengths
-// (the full chunk, then the final shorter remainder — the per-call map is keyed
-// by length, so two full-chunk segments share one entry). Two entries are
-// therefore enough for the call in flight, but not across a multi-turn session:
-// every turn adds up to two new lengths (its prompt and its reuse suffix), so a
-// cap of two rebuilds lengths a session used one turn earlier (~115 ms of
-// planning each: the 8-turn workload trace rebuilds 36 segments for 10 hits).
-// Eight entries keep about four turns of history; the entry holds the plan and
+// Cache cap. A symbolic plan serves its whole shape class, so a session needs
+// at most two entries per model (the full-chunk class and the one-token class)
+// no matter how many distinct segment lengths it visits. The cap still bounds
+// entries across models and planner environments; the entry holds the plan and
 // the segment backends, whose device activations come from the global device
 // pool, so the cap bounds host-side planning state rather than VRAM.
 static constexpr std::size_t kMaxCachedSegments = 8;
@@ -1074,8 +1070,8 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
-  // Prefill segments by length, most-recently used first, capped at
-  // kMaxCachedSegments.
+  // Prefill segments by shape-class sizing extent, most-recently used first,
+  // capped at kMaxCachedSegments.
   std::list<std::pair<uint64_t, std::unique_ptr<PrefillSegment>>> prefills;
   // The planner environment `prefills` was built under; a change clears it.
   PlannerEnv prefill_env{};
@@ -1634,17 +1630,18 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     const uint64_t chunk = (m.config.sliding_window > 0) ? m.config.sliding_window
                                                         : kDefaultPrefillChunk;
 
-    // One prefill segment per distinct segment size (usually just `chunk`; the
-    // final segment may be shorter). Each is bound to its own graph but shares
-    // the decode backend's KV cache, so prior segments' context is visible. The
-    // full-chunk segment is captured into a CUDA Graph (prog) and replayed per
-    // non-final segment; the final (possibly shorter) segment runs uncaptured so
-    // its hidden column reaches the host through the executor's output path.
+    // One symbolic plan per shape class (the full chunk; the final segment is
+    // usually shorter but stays in the chunk's class and binds its own length
+    // at execute time). Each is bound to its own graph but shares the decode
+    // backend's KV cache, so prior segments' context is visible. The full-chunk
+    // segment is captured into a CUDA Graph (prog) and replayed per non-final
+    // segment; the final (possibly shorter) segment runs uncaptured so its
+    // hidden column reaches the host through the executor's output path.
     //
     // The segment build (graph + rewrites + plan + backends) is a pure function
-    // of (model, n_ctx, nseg, planner environment) and costs ~115 ms of planning
-    // per 512-token Gemma segment, so it is cached across calls in the decode
-    // runtime (see the DecodeRuntime note). The offset a segment is executed at
+    // of (model, n_ctx, shape class, planner environment) and costs ~115 ms of
+    // planning per 512-token Gemma segment, so it is cached across calls in the
+    // decode runtime (see the DecodeRuntime note). The offset a segment is executed at
     // is not part of it: pos reaches the kernels as an execute-time binding
     // (set_pos + the `in` argument), and a plan records no position. The
     // CUDA-graph capture is kept with the segment and reused across calls for
@@ -1659,16 +1656,34 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       rt->prefill_env_set = true;
     }
     const bool cache_segments = plan_cache_enabled();
+    // Shape classes. A plan is a function of the kernel-selection decisions
+    // that depend on the segment length, not of the length itself. The only
+    // such decision in the prefill passes is whether the mmq folds run at all
+    // (the segment must support the q8_1 activation footprint, i.e.
+    // length >= mmq_min_n), so every segment at or above that threshold shares
+    // one plan sized at the full chunk and every shorter segment (a one-token
+    // final segment) shares the plan sized at min_n - 1. The plan is lowered
+    // from symbolic IR and executed with the actual segment length bound at
+    // execute time; the cache is keyed by the class's sizing extent.
+    const bool symbolic_plans =
+        runtime::feature_enabled(runtime::Feature::SymbolicPrefill);
+    const uint64_t mmq_min_n = std::max<uint64_t>(
+        uint64_t(quant::cuda::mmq_min_n()), 1);
+    auto plan_extent_for = [&](uint64_t nseg) -> uint64_t {
+      if (!symbolic_plans) return nseg;  // ablation: concrete plan per length
+      return nseg >= mmq_min_n ? chunk : mmq_min_n - 1;
+    };
     // Per-call owners: segments when the cache is off. A captured program is
     // owned by its segment (which the replay loop reads through `progs`), so
     // it outlives the call with the segment that recorded it.
     std::map<uint64_t, std::unique_ptr<PrefillSegment>> call_segments;
     std::map<uint64_t, hal::StepProgram*> progs;
     auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
+      const uint64_t extent = plan_extent_for(nseg);
       if (cache_segments) {
         auto it = std::find_if(
             rt->prefills.begin(), rt->prefills.end(),
-            [nseg](const auto& e) { return e.first == nseg; });
+            [extent](const auto& e) { return e.first == extent; });
         if (it != rt->prefills.end()) {
           Phase _h("prefill:segment_cache_hit", phase_timing);
           PrefillSegment* hit = it->second.get();
@@ -1683,19 +1698,18 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       auto seg = std::make_unique<PrefillSegment>();
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
-        // Symbolic extent: the plan is lowered at this segment length and
-        // records it, so a smaller segment of the same shape class can execute
-        // the plan by binding its own length (RuntimeExecutor::execute).
-        GraphIr seg_ir = emit_prefill_ir(m, nseg, /*dynamic_extent=*/true);
+        GraphIr seg_ir = emit_prefill_ir(m, extent,
+                                         /*dynamic_extent=*/symbolic_plans);
         // C.4: fold the mmq activation quantize into the norm/gelu kernels when
         // the mmq tensor-core path is active for this segment (same conditions
         // the batched matmul uses, so fused and unfused positions never disagree
-        // about which kernel a position runs).
+        // about which kernel a position runs). A class's extent decides it on
+        // the class's behalf: all members share the decision.
         seg->graph = lower_graph(
             seg_ir, planner::IrPassPhase::Prefill,
             quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
-                nseg >= uint64_t(quant::cuda::mmq_min_n()),
-            /*dynamic_extent=*/nseg);
+                extent >= mmq_min_n,
+            /*dynamic_extent=*/symbolic_plans ? extent : 0);
       }
       if (seg->graph.nodes.empty()) {
         std::cerr << "[prefill-cuda] n=" << nseg << " graph lowering failed\n";
@@ -1722,12 +1736,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
       PrefillSegment* raw = seg.get();
       if (cache_segments) {
-        rt->prefills.emplace_front(nseg, std::move(seg));
+        rt->prefills.emplace_front(extent, std::move(seg));
         while (rt->prefills.size() > kMaxCachedSegments) rt->prefills.pop_back();
       } else {
         // Uncached: keep it alive for the rest of the call (a later segment of
-        // the same length must reuse it, not rebuild it).
-        call_segments.emplace(nseg, std::move(seg));
+        // the same class must reuse it, not rebuild it).
+        call_segments.emplace(extent, std::move(seg));
       }
       return raw;
     };
