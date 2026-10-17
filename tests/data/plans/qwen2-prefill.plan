@@ -4,7 +4,7 @@ model qwen2
 mode prefill
 n_ctx 0
 n 8
-plan_id 10236171699351001171
+plan_id 9772502594950117293
 model_fingerprint 17163295507327037867
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6

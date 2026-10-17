@@ -87,6 +87,12 @@ enum class OpKind : uint8_t {
   FlashAttention,        // chunked flash attention over prior cache + current batch
                          // (kv_source_layer selects the cache: own or donor)
   KvAppend,              // append n KV rows to the cache (deferred to after all layers)
+
+  // A fused glue region the compiler lowered through MLIR to a device kernel
+  // (Stage 5, FuseGlueRegionsPass). The region's shape is named by the node's
+  // `fused_region` string attribute; the node keeps the op it replaced as its
+  // name, so the region and the kernel that runs it are both identified there.
+  FusedRegion,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

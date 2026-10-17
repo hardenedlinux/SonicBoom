@@ -54,6 +54,10 @@ enum class Feature {
   BufferReuse,
   // Run the one-time decode-runtime warm-up before the timed region.
   Warmup,
+  // Fuse decode glue regions into compiler-generated kernels: the Boom IR pass
+  // emits `fused_region` nodes and the CUDA backend runs the MLIR->NVVM->PTX
+  // kernel (off = the region keeps its hand-written kernel).
+  GlueCodegen,
 };
 
 // True unless the feature is named in SONICBOOM_FEATURE_DISABLE or turned off

@@ -217,5 +217,11 @@ def Boom_FlashAttentionOp : Boom_Op<"flash_attention",
 def Boom_KvAppendOp : Boom_Op<"kv_append",
     "append n KV rows to the layer's cache, deferred past all layers",
     [Boom_KvWrite]>;
+// A maximal glue region lowered by the compiler to one device kernel. It takes
+// over the op it replaces (same node id, attributes, operands, results and
+// backend); the `fused_region` node attribute names the region, and that name
+// selects the generated kernel at dispatch.
+def Boom_FusedRegionOp : Boom_Op<"fused_region",
+    "compiler-generated glue region (e.g. rms_norm_quantize_q8_1)">;
 
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD

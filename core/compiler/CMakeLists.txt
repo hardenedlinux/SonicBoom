@@ -83,7 +83,8 @@ add_library(sonicboom_compiler STATIC
   lib/BoomVerify.cpp
   lib/BoomBuilder.cpp
   lib/BoomConversion.cpp
-  lib/BoomPasses.cpp)
+  lib/BoomPasses.cpp
+  lib/GlueCodegen.cpp)
 
 # Statically linked into libsonicboom.so once the runtime consumes Boom IR, and
 # already read from the tests next to it, so PIC now rather than as a later fix.
@@ -122,4 +123,31 @@ target_include_directories(sonicboom_compiler PRIVATE
 target_link_libraries(sonicboom_compiler PRIVATE
   MLIRIR
   MLIRSideEffectInterfaces
-  MLIRPass)
+  MLIRPass
+  # Glue codegen (lib/GlueCodegen.cpp): the GPU/NVVM dialect and the
+  # gpu.module -> NVVM -> PTX pipeline. MLIRNVVMTarget owns the assembly
+  # serialization; LLVMNVPTX* is the backend it runs in-process.
+  MLIRGPUDialect
+  MLIRGPUTransforms
+  MLIRGPUToNVVMTransforms
+  MLIRNVVMDialect
+  MLIRNVVMTarget
+  MLIRNVVMToLLVM
+  # The nvvm dialect's LLVM IR translation interface (nvvm ops -> LLVM IR for
+  # the NVPTX backend). Without it the target serializer has no translator.
+  MLIRNVVMToLLVMIRTranslation
+  # The gpu.module -> LLVM module translation (the serializer translates the
+  # module before handing it to NVPTX).
+  MLIRGPUToLLVMIRTranslation
+  # The llvm dialect's own translation (llvm.mlir.constant et al.).
+  MLIRLLVMIRToLLVMTranslation
+  MLIRTargetLLVMIRExport
+  MLIRArithToLLVM
+  MLIRControlFlowToLLVM
+  MLIRSCFToControlFlow
+  MLIRMemRefToLLVM
+  MLIRReconcileUnrealizedCasts
+  MLIRLLVMDialect
+  LLVMNVPTXCodeGen
+  LLVMNVPTXDesc
+  LLVMNVPTXInfo)

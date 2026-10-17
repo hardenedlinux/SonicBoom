@@ -42,6 +42,7 @@ constexpr FeatureName kFeatureNames[] = {
     {"q8_1_dispatch", Feature::Q8_1Dispatch},
     {"buffer_reuse", Feature::BufferReuse},
     {"warmup", Feature::Warmup},
+    {"glue_codegen", Feature::GlueCodegen},
 };
 
 constexpr std::size_t kFeatureCount =
@@ -69,6 +70,7 @@ bool alias_disabled(Feature feature) noexcept {
       return e && std::string_view(e) == "0";
     }
     case Feature::SymbolicPrefill:
+    case Feature::GlueCodegen:
       return false;  // no historical alias
     case Feature::Q8_1Dispatch:
       // Any value, including "0", selects the fp32 path (the historical

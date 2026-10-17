@@ -132,10 +132,19 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
 
+  # Compiler-generated glue kernel (Stage 5): the MLIR -> NVVM -> PTX pipeline
+  # and the driver JIT, byte-compared with the hand-written kernel the region
+  # replaces. Links the compiler library for generate_glue_ptx and the CUDA
+  # driver for the module load.
+  add_executable(test_glue_codegen test_glue_codegen.cpp)
+  target_link_libraries(test_glue_codegen PRIVATE sonicboom sonicboom_compiler
+                                                CUDA::cudart CUDA::cuda_driver)
+  sb_add_cpp_test(test_glue_codegen)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
-                       test_cuda_elementwise
+                       test_cuda_elementwise test_glue_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

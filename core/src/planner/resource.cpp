@@ -301,6 +301,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // *_dev kernels; the elementwise ops are reused unchanged on flat batched
         // buffers.
         OpKind::FlashAttention, OpKind::KvAppend,
+        // Compiler-generated glue regions (Stage 5): the PTX kernel is loaded
+        // and launched by the SonicCudaBackend itself.
+        OpKind::FusedRegion,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

@@ -18,6 +18,8 @@
 
 #include <sonicboom/quant/quantized_tensor.h>
 
+#include <cstddef>
+
 // Internal device-resident K-quant matvec (Phase 6a Option A). Mirrors
 // quant::cuda::matvec_f32 but takes a device input and writes a device output
 // with no H2D/D2H, so the caller can keep the activation resident on the
@@ -57,6 +59,12 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
 // quantize_q8_1_dev. Device in/out, no host copies. n must be a multiple of 32.
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
                                 float eps, BlockQ8_1* yq, int n);
+
+// Upload a host byte range to the device once and cache it by (pointer, size).
+// This is the cache the *_dev weight spans above use; it is exposed so the glue
+// JIT can hand a generated kernel the same resident norm-weight pointer, rather
+// than keeping a second copy. Returns nullptr on failure.
+const void* upload_bytes_cached(const void* host, std::size_t bytes);
 
 // gelu×up -> q8_1 fused (T5): yq = quantize_q8_1(gelu_fp16(gate) * up). One
 // kernel per 32-element block computes the fp16-gelu gate, multiplies by up, and

@@ -85,6 +85,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::KvAppend;
   if (name == "add_bias")
     return OpKind::AddBias;
+  if (name == "fused_region")
+    return OpKind::FusedRegion;
   return std::nullopt;
 }
 
@@ -124,6 +126,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Slice: return "slice";
     case OpKind::FlashAttention: return "flash_attention";
     case OpKind::KvAppend: return "kv_append";
+    case OpKind::FusedRegion: return "fused_region";
   }
   return "?";
 }

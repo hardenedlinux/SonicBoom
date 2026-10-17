@@ -604,6 +604,7 @@ if [ "$ABLATE" = 1 ]; then
     "plan-cache|plan_cache"
     "q8_1-dispatch|q8_1_dispatch"
     "buffer-reuse|buffer_reuse"
+    "glue-codegen|glue_codegen"
     "warmup|warmup"
   )
 

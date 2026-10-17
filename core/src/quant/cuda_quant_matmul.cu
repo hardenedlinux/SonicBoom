@@ -1134,6 +1134,10 @@ __global__ void dequant_mmq_q8_1_d4(const mmq::block_q8_1_mmq* __restrict__ q,
 
 } // namespace
 
+const void* upload_bytes_cached(const void* host, std::size_t bytes) {
+  return upload_bytes(host, bytes);
+}
+
 bool available() noexcept {
   if (!g_available_checked) {
     int n = 0;

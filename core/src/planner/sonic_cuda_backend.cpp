@@ -16,6 +16,7 @@
 
 #include <sonicboom/planner/sonic_cuda_backend.h>
 
+#include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/model/exec.h>
 #include <sonicboom/model/plan.h>
 #include <sonicboom/nn/activation.h>
@@ -33,6 +34,7 @@
 #include "../quant/cuda_resident.h"
 #include "device_allocator.h"
 #include "device_pool.h"
+#include "glue_jit.h"
 
 #include <nvToolsExt.h>
 
@@ -82,6 +84,17 @@ bool attr_f(const GraphNodeDesc& n, std::string_view name, double& out) {
   for (const auto& a : n.attributes)
     if (a.name == name && a.kind() == sx::AttrValueKind::Float) {
       out = std::get<double>(a.value);
+      return true;
+    }
+  return false;
+}
+
+// The string a node's attribute record carries for `name` (e.g. the region name
+// of a `fused_region` node), or false.
+bool attr_s(const GraphNodeDesc& n, std::string_view name, std::string_view& out) {
+  for (const auto& a : n.attributes)
+    if (a.name == name && a.kind() == sx::AttrValueKind::String) {
+      out = std::get<std::string>(a.value);
       return true;
     }
   return false;
@@ -591,6 +604,55 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             fweight(slot), dev(in[0]), eps,
             reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n);
       }
+      break;
+    }
+    case OpKind::FusedRegion: {
+      // A glue region the compiler lowered to a device kernel (Stage 5,
+      // FuseGlueRegionsPass). The region's name is the node's `fused_region`
+      // string attribute; the node's operands/attributes are the ones the op it
+      // replaced carried, so the same dispatch information is read here.
+      //
+      // rms_norm_quantize_q8_1 is the decode (rms_norm -> q8_1) region: one
+      // row, one 1024-thread block, `slot` naming the norm weight. The generated
+      // kernel is byte-identical to quant::cuda::rms_norm_quantize_q8_1_dev, so
+      // that call is also the fallback if the kernel cannot be compiled or
+      // loaded (a missing/corrupt cache and no MLIR in this process).
+      std::string_view region;
+      if (!attr_s(*node, "fused_region", region)) {
+        ok = false;
+        break;
+      }
+      if (region == "rms_norm_quantize_q8_1") {
+        note_activation_quant("q8_1");
+        const int n = int(in[0].device.size_bytes / sizeof(float));
+        const std::span<const float> w = fweight(slot);
+        const void* wd =
+            w.empty()
+                ? nullptr
+                : quant::cuda::upload_bytes_cached(w.data(),
+                                                   w.size() * sizeof(float));
+        if (!w.empty() && wd == nullptr) {
+          ok = false;
+          break;
+        }
+        // The generated kernel's ABI: (x, w, y, n, eps), one block per row.
+        void* xarg = const_cast<float*>(dev(in[0]));
+        void* warg = const_cast<void*>(wd);
+        void* yarg = out;
+        int narg = n;
+        float earg = eps;
+        void* args[] = {&xarg, &warg, &yarg, &narg, &earg};
+        ok = glue::launch(region, args, 1, compiler::kGlueBlockThreads,
+                          compiler::kGlueDynamicSharedBytes);
+        if (!ok)
+          ok = quant::cuda::rms_norm_quantize_q8_1_dev(
+              w, dev(in[0]), eps, reinterpret_cast<quant::cuda::BlockQ8_1*>(out),
+              n);
+        break;
+      }
+      // An unknown region would mean a pass emitted a node this backend has no
+      // kernel for; fail rather than silently produce an unwritten buffer.
+      ok = false;
       break;
     }
     case OpKind::GeluMulQuantize: {

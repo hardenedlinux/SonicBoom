@@ -104,7 +104,8 @@ namespace {
 bool isQ8_1Producer(llvm::StringRef opName) {
   return opName == "boom.quantize" || opName == "boom.rms_norm_quantize" ||
          opName == "boom.gelu_mul_quantize" ||
-         opName == "boom.silu_mul_quantize";
+         opName == "boom.silu_mul_quantize" ||
+         opName == "boom.fused_region";
 }
 
 // The ops that carry `ds`: the mmq matmuls it selects the activation layout for,

@@ -36,6 +36,7 @@
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/op_kind.h>
 #include <sonicboom/planner/partition.h>
+#include <sonicboom/runtime_features.h>
 
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
@@ -852,6 +853,79 @@ public:
   }
 };
 
+// fuse_glue_regions_pass (Stage 5): a maximal glue region becomes one node the
+// compiler lowers to a device kernel through MLIR (linalg/gpu -> NVVM -> PTX;
+// see compiler/GlueCodegen.h).
+//
+// The earlier decode passes have already done the region formation the design
+// calls for: the residual Add is folded into the gemv epilogue and rms_norm +
+// q8_1 quantize are one node. So the region this pass recognizes is the decode
+// `rms_norm_quantize` node itself (85 per Gemma decode step: the two norms of
+// each of the 42 layers plus the final norm; 49 for Qwen2.5 0.5B). The node is rewritten in place as
+// `boom.fused_region`, with the region's name in the `fused_region` attribute;
+// node id, name, attributes, operands, results and backend all carry over, so
+// the resulting plan differs only in the op kind (and in the kernel the CUDA
+// backend dispatches).
+//
+// The switch is the GlueCodegen runtime feature: with it off the pass does not
+// run, so the ablation arm plans exactly the hand-written kernel's graph.
+// SONICBOOM_IR_PASS_DISABLE=FuseGlueRegionsPass does the same from the pass side.
+class FuseGlueRegionsPass
+    : public mlir::PassWrapper<FuseGlueRegionsPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseGlueRegionsPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::SmallVector<mlir::Operation *> regions;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() !=
+          boomOpName(planner::OpKind::RmsNormQuantize))
+        continue;
+      // The prefill (batched, mmq-layout) form is Stage 5b; this pass runs in
+      // the decode pipeline, where the absence of `batch` is what selects the
+      // q8_1 (32-element block) region shape.
+      if (node.hasAttr("batch"))
+        continue;
+      regions.push_back(&node);
+    }
+
+    for (mlir::Operation *node : regions) {
+      auto attrs =
+          llvm::to_vector(node->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region",
+          builder.getStringAttr("rms_norm_quantize_q8_1")));
+      auto name = node->getAttrOfType<mlir::StringAttr>("node_name");
+
+      builder.setInsertionPoint(node);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*node),
+          name ? name.getValue() : llvm::StringRef("fused_region"),
+          builder.getArrayAttr(attrs), GraphEditor::resultIds(*node),
+          node->getOperands(), node->getResultTypes(),
+          node->getAttrOfType<mlir::StringAttr>("backend"));
+
+      node->replaceAllUsesWith(fused);
+      view.noteReplaced(node, fused);
+      node->erase();
+    }
+
+    // The region keeps its result tensor ids, so the table is unchanged; the
+    // commit is still the one place the (unchanged) view is written back.
+    view.commitTable();
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -1254,6 +1328,7 @@ struct DisabledPasses {
   bool rms_norm_mmq = false;
   bool gelu_mul_mmq = false;
   bool silu_mul_mmq = false;
+  bool fuse_glue_regions = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -1269,6 +1344,7 @@ constexpr PassName kPassNames[] = {
     {"SiluMulQuantizePass", &DisabledPasses::silu_mul_quantize},
     {"BiasIntoGemvPass", &DisabledPasses::bias_into_gemv},
     {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
+    {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1335,6 +1411,9 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     if (!off.bias_into_gemv) pm.addPass(std::make_unique<BiasIntoGemvPass>());
     if (!off.residual_add_into_gemv)
       pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
+    // Last: it consumes the nodes the folds above produce.
+    if (!off.fuse_glue_regions)
+      pm.addPass(std::make_unique<FuseGlueRegionsPass>());
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());

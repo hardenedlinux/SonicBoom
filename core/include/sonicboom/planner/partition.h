@@ -81,6 +81,9 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::Softcap:
     case OpKind::Argmax:
     case OpKind::Slice:
+    // A compiler-generated glue region has no MLIR-S-Expr lowering; it is a
+    // device kernel like the quant::* ops around it.
+    case OpKind::FusedRegion:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;
