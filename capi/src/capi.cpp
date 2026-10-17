@@ -983,6 +983,12 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
         h->bundle = model->bundle;  // keep the model (and its buffer) alive
         h->n_ctx = n_ctx;
         h->kv.n_ctx = n_ctx;  // size the persistent KV cache to this session's window
+        // Pay the one-time decode-runtime construction (graph + plan +
+        // decode-step capture, ~1 s) here rather than inside the session's first
+        // prefill, so first-request TTFT matches steady state. The runtime is
+        // cached under (model, n_ctx) and is the exact one the prefill builds.
+        if (quant::cuda_available() && n_ctx != 0)
+          (void)model::warmup_spine_cuda(model->bundle->model, n_ctx);
         *session_out = h;
         return SB_OK;
       },

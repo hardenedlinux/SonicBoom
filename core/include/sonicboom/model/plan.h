@@ -138,6 +138,20 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx = 0);
 
+// Pay the one-time decode-runtime construction for (model, n_ctx) up front.
+//
+// The first CUDA prefill call for an n_ctx builds the decode graph, plans it,
+// constructs the backends, and captures one decode step — ~1 s on Gemma 4 E4B,
+// of which the capture (warm-up + record) is most. That cost belongs to
+// load/serve setup, not to the first request: a caller that knows its session's
+// n_ctx (the CLI, the server, sb_llm_session_new) can pay it here and keep the
+// first token's time-to-first-token at the steady-state value. The runtime is
+// exactly the one the first generate call would build and is cached under the
+// same (model, n_ctx) key, so a later call is a map hit. Returns false when the
+// build has no CUDA support or no weights; the caller may ignore the result and
+// fall back to the lazy path.
+bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx);
+
 // Prefill + decode through the CPU spine. Processes the whole `prompt` in one
 // batched graph pass (build_gemma4_prefill_graph → plan_execution →
 // RuntimeExecutor with the batched OpKinds), samples `tokens[0]` from the final

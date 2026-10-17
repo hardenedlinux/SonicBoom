@@ -1152,6 +1152,11 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   return raw;
 }
 
+bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
+  if (m.weights.blocks.empty() || n_ctx == 0) return false;
+  return get_decode_runtime(m, n_ctx) != nullptr;
+}
+
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx) {
@@ -1393,6 +1398,10 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
                              std::span<int64_t>, uint64_t) {
   return 0;  // built without CUDA: no device spine is available
+}
+
+bool warmup_spine_cuda(const Gemma4Model&, uint64_t) {
+  return false;  // built without CUDA: there is no runtime to build
 }
 
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,

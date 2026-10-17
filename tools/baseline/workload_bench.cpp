@@ -254,6 +254,10 @@ int main(int argc, char** argv) {
   uint64_t system = kSystemTokens, gen = 0, prompt = kCodingPrompt;
   uint64_t n_ctx = 0, reps = 1;
   bool fresh = false;
+  // --warmup: pay the decode-runtime construction at load (the
+  // sb_llm_session_new behaviour) before the trace; --no-warm: skip the
+  // in-tool warm-up trace so the first measured turnover is genuinely cold.
+  bool warmup = false, no_warm = false;
   std::vector<uint64_t> turn_tokens(kTurnTokens, kTurnTokens + kTurnCount);
 
   for (int i = 1; i < argc; ++i) {
@@ -280,11 +284,14 @@ int main(int argc, char** argv) {
     else if (!strcmp(a, "--reps")) reps = std::stoull(next());
     else if (!strcmp(a, "--fresh")) fresh = true;
     else if (!strcmp(a, "--text")) text_path = next();
+    else if (!strcmp(a, "--warmup")) warmup = true;
+    else if (!strcmp(a, "--no-warm")) no_warm = true;
     else {
       fprintf(stderr,
               "usage: workload_bench --workload agent|coding [--turns T] "
               "[--turn-tokens L1,L2,...] [--system S] [--gen G] [--prompt P] "
-              "[--n-ctx N] [--reps R] [--fresh] [--text PATH]\n");
+              "[--n-ctx N] [--reps R] [--fresh] [--text PATH] [--warmup] "
+              "[--no-warm]\n");
       return 2;
     }
   }
@@ -343,11 +350,21 @@ int main(int argc, char** argv) {
       // and every turn's generation (the carried token plus the decode's).
       const uint64_t history = agent_need + turn_tokens.size() * gen;
       if (n_ctx == 0) n_ctx = history + gen + 1;
+      if (warmup) {
+        const Clock::time_point w0 = Clock::now();
+        const bool ok = sbmodel::warmup_spine_cuda(*m, n_ctx);
+        printf("[warmup] %s %.1f ms at load (n_ctx %llu)\n",
+               ok ? "built" : "failed", ms_since(w0),
+               (unsigned long long)n_ctx);
+      }
       std::vector<Turn> warm;
       double warm_ms = 0.0;
       // Warm up the plan/capture caches on the exact trace shape; the measured
       // runs then see a session starting from the same state every time.
-      if (!agent_trace(*m, ids, system, turn_tokens, gen, n_ctx, fresh, warm, &warm_ms))
+      // --no-warm skips it so the first measured turn is genuinely cold.
+      if (!no_warm &&
+          !agent_trace(*m, ids, system, turn_tokens, gen, n_ctx, fresh, warm,
+                       &warm_ms))
         return false;
 
       std::vector<Turn> best;
@@ -389,8 +406,15 @@ int main(int argc, char** argv) {
 
     // (B) one long prompt and a long generation, the same two phases as a turn.
     if (n_ctx == 0) n_ctx = prompt + gen + 1;
+    if (warmup) {
+      const Clock::time_point w0 = Clock::now();
+      const bool ok = sbmodel::warmup_spine_cuda(*m, n_ctx);
+      printf("[warmup] %s %.1f ms at load (n_ctx %llu)\n",
+             ok ? "built" : "failed", ms_since(w0),
+             (unsigned long long)n_ctx);
+    }
     std::vector<uint64_t> hist(ids.begin(), ids.begin() + prompt);
-    {
+    if (!no_warm) {
       std::vector<int64_t> warm(1);
       sbplanner::KvCacheSession session;
       session.n_ctx = n_ctx;
