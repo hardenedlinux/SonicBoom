@@ -216,7 +216,8 @@ target_include_directories(sonicboom PRIVATE ${MLIR_INCLUDE_DIRS})
 # The compiler library: the Boom MLIR dialect and the Boom IR passes
 # (core/compiler/). A separate static library, linked into the runtime because
 # the Boom IR rewrite pipeline is the runtime's only rewrite path
-# (<sonicboom/planner/ir_passes.h>). PRIVATE, like MLIR itself — the passes are
+# (<sonicboom/compiler/BoomPasses.h>, run by the plan emitter). PRIVATE, like
+# MLIR itself — the passes are
 # behind Layer 2, and no MLIR type reaches a public header.
 add_subdirectory(compiler)
 target_link_libraries(sonicboom PRIVATE sonicboom_compiler)

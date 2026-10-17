@@ -14,8 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The Boom IR rewrite pipeline: one phase's Graph-level fusion passes, run as
-// MLIR passes over Boom IR (design/mlir-migration.md §7c).
+// Which Boom IR pipeline a plan is built through (design/mlir-migration.md §7c).
 //
 // This is the only rewrite path. The passes were ported from the planner's
 // Graph rewrites, one pass at a time, until the port was complete — the plan
@@ -24,23 +23,11 @@
 // either a registered Boom IR pass or it does not exist; there is no second
 // implementation for a behavior to diverge from.
 //
-// The header carries no MLIR: nothing on the runtime side has to name a
-// compiler type to run the pipeline. The passes themselves live in the compiler
-// library, behind Layer 2.
-
-#pragma once
-
-#include <sonicboom/planner/graph.h>
-
-namespace sonicboom::planner {
-
-// Which phase's pipeline to run. The two the emitter builds differ in their
-// pass list and nothing else (design/mlir-migration.md §2 lists both).
-enum class IrPassPhase { Decode, Prefill };
-
-// Run `phase`'s rewrite pipeline over `graph` through Boom IR: the graph is
-// converted, the phase's passes run as MLIR passes, and the result is converted
-// back.
+// The passes themselves, and the entry that runs them, live in the compiler
+// library (compiler/BoomPasses.h runBoomPasses): a plan site emits Boom IR, runs
+// the phase's passes over it, and lowers the result — there is no graph-level
+// entry, because a graph is not what the passes read any more. What is left here
+// is the one thing a plan site has to name without naming MLIR: the phase.
 //
 // Ablation: SONICBOOM_IR_PASS_DISABLE=<comma-separated pass names> skips those
 // passes for the run, one fusion at a time, so the plan diff can say what each
@@ -57,11 +44,16 @@ enum class IrPassPhase { Decode, Prefill };
 // not pass for an ablation. The switch is read in the pipeline itself, where the
 // passes and their names live (BoomPasses.cpp).
 //
-// A conversion or pass failure is reported on stderr and leaves `graph` as it
-// was handed over — unfused, which is correct but not what the phase's pipeline
-// would have produced. There is deliberately no fallback: a silent one would
-// make a broken IR pass indistinguishable from a working one, and the plan
-// comparison that exists to catch that would pass.
-void ir_pass_pipeline(Graph &graph, IrPassPhase phase);
+// A pass failure fails the plan: the IR is not lowered as if the phase had run,
+// because an unfused graph planned as though it were fused is a slower plan
+// reported as the pipeline's, not an error.
+
+#pragma once
+
+namespace sonicboom::planner {
+
+// Which phase's pipeline to run. The two the emitter builds differ in their
+// pass list and nothing else (design/mlir-migration.md §2 lists both).
+enum class IrPassPhase { Decode, Prefill };
 
 } // namespace sonicboom::planner

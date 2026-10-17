@@ -3,9 +3,10 @@
 # passes that rewrite that IR.
 #
 # Deliberately a SEPARATE library from `sonicboom`, but linked into
-# libsonicboom.so: the runtime's consumer is the Boom IR rewrite pipeline
-# (lib/BoomPasses.cpp), the only rewrite path there is
-# (<sonicboom/planner/ir_passes.h>).
+# libsonicboom.so: the runtime's consumers are the plan emitter's IR builder
+# (lib/BoomBuilder.cpp) and the Boom IR rewrite pipeline (lib/BoomPasses.cpp),
+# which is the only rewrite path there is
+# (<sonicboom/compiler/BoomPasses.h>).
 #
 # The whole directory is MLIR, which is a required dependency (root
 # CMakeLists.txt).

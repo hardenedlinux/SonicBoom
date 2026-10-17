@@ -580,8 +580,11 @@ passes come after §6.2's quant types exist.
 **Status.** All nine passes are ported (§2's list), so every phase's pipeline now
 runs entirely through Boom IR. The Graph rewrites and the `SONICBOOM_IR_PASSES`
 switch that chose between the two paths have since been deleted, so Boom IR is
-not merely the default implementation — it is the only one
-(`planner/ir_passes.h`). The `rewrites.cpp:NNN` references earlier in this
+not merely the default implementation — it is the only one. The passes and the
+entry that runs them live in the compiler library
+(`core/compiler/lib/BoomPasses.cpp`, `<sonicboom/compiler/BoomPasses.h>`); what
+the planner still names is the phase to run
+(`planner::IrPassPhase`, `<sonicboom/planner/ir_passes.h>`). The `rewrites.cpp:NNN` references earlier in this
 document are to that deleted file and are kept as the port's provenance; the
 semantics they describe now live in `core/compiler/lib/BoomPasses.cpp`.
 

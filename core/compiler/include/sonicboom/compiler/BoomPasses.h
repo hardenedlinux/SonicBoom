@@ -17,15 +17,14 @@
 // The Boom IR pass pipeline's entry point (design/mlir-migration.md §7c): one
 // phase's passes, run over a module the emitter built.
 //
-// This is the entry point for a caller that holds the IR. A caller that holds a
-// planner::Graph instead runs the same passes through
-// planner::ir_pass_pipeline (planner/ir_passes.h), which is a graph in and a
-// graph out; both end in the one pass list in BoomPasses.cpp, so the two cannot
-// disagree about what a phase does.
+// A plan site holds the IR — it builds the module, runs this, and lowers the
+// result — so there is no graph-level entry: the passes read Boom IR, and a
+// caller that has only a planner::Graph has nothing they accept.
 //
 // Ablation: SONICBOOM_IR_PASS_DISABLE=<comma-separated pass names> skips those
 // passes for the run. The names and their meaning are documented on
-// planner::ir_pass_pipeline, where the switch's readers look for them.
+// planner::IrPassPhase (planner/ir_passes.h); the switch itself is read in
+// BoomPasses.cpp, where the passes and their names live.
 
 #pragma once
 

@@ -30,7 +30,6 @@
 // the switch between the two paths were removed once the port was complete; this
 // pipeline is now the only rewrite path.
 
-#include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomOps.h>
 #include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/compiler/BoomTypes.h>
@@ -1175,9 +1174,8 @@ public:
 //--- the per-pass disable switch --------------------------------------------
 
 // Ablation for one fusion at a time: the passes a run skips, named on the
-// command line (SONICBOOM_IR_PASS_DISABLE, documented on the runtime side beside
-// the pipeline entry point in planner/ir_passes.h, and read here, where the
-// passes and their names live).
+// command line (SONICBOOM_IR_PASS_DISABLE, documented on planner::IrPassPhase in
+// planner/ir_passes.h, and read here, where the passes and their names live).
 //
 // Skipping a pass leaves the graph as the pass before it would, so a later pass
 // sees what it is written to see. That is not the same as the later pass being
@@ -1305,7 +1303,7 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase) {
   // IsolatedFromAbove, which is what makes it a pass anchor at all.
   auto graphs = module.getOps<boom::GraphOp>();
   if (graphs.empty()) {
-    std::fprintf(stderr, "ir_pass_pipeline(%s): the module holds no graph\n",
+    std::fprintf(stderr, "runBoomPasses(%s): the module holds no graph\n",
                  phaseName(phase));
     return false;
   }
@@ -1318,55 +1316,12 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase) {
   addPasses(pm, phase);
   if (mlir::failed(pm.run(graphOp))) {
     std::fprintf(stderr,
-                 "ir_pass_pipeline(%s): a Boom IR pass failed (diagnostic "
-                 "above); the graph is left unfused\n",
+                 "runBoomPasses(%s): a Boom IR pass failed (diagnostic "
+                 "above); the IR is not a phase output\n",
                  phaseName(phase));
     return false;
   }
   return true;
 }
 
-// The pipeline itself: graph -> Boom IR -> the phase's passes -> graph.
-void runBoomIrPipeline(planner::Graph &graph, planner::IrPassPhase phase) {
-  mlir::MLIRContext context;
-  context.getOrLoadDialect<boom::BoomDialect>();
-
-  auto module = graphToBoom(graph, &context);
-  if (!module) {
-    std::fprintf(stderr,
-                 "ir_pass_pipeline(%s): graph -> Boom IR failed (diagnostic "
-                 "above); the graph is left unfused\n",
-                 phaseName(phase));
-    return;
-  }
-
-  if (!runBoomPasses(*module, phase))
-    return;
-
-  auto back = boomToGraph(*module);
-  if (!back) {
-    std::fprintf(stderr,
-                 "ir_pass_pipeline(%s): Boom IR -> graph failed (diagnostic "
-                 "above); the graph is left unfused\n",
-                 phaseName(phase));
-    return;
-  }
-
-  graph = std::move(*back);
-}
-
 } // namespace sonicboom::compiler
-
-//--- the runtime's entry point ----------------------------------------------
-//
-// What the runtime names (planner/ir_passes.h). It lives here, with the
-// pipeline it runs, rather than in the planner: there is nothing on the planner
-// side of it but the choice of which phase to run.
-
-namespace sonicboom::planner {
-
-void ir_pass_pipeline(Graph &graph, IrPassPhase phase) {
-  compiler::runBoomIrPipeline(graph, phase);
-}
-
-} // namespace sonicboom::planner
