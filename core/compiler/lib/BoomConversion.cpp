@@ -89,6 +89,31 @@ llvm::DenseSet<int64_t> q8_1Ids(const Graph &g) {
   return ids;
 }
 
+// The three ops whose cache access is a stated effect on the KVCacheResource
+// (BoomDialect.td): they carry their layer's `!boom.kv` handle.
+bool isCacheOp(OpKind op) {
+  return op == OpKind::Attention || op == OpKind::FlashAttention ||
+         op == OpKind::KvAppend;
+}
+
+std::optional<int64_t> intAttr(llvm::ArrayRef<sx::Attribute> attrs,
+                               llvm::StringRef name) {
+  for (const sx::Attribute &a : attrs)
+    if (llvm::StringRef(a.name) == name && a.kind() == sx::AttrValueKind::Int)
+      return std::get<int64_t>(a.value);
+  return std::nullopt;
+}
+
+// The cache layer a cache-touching node reads/writes: a shared-KV attention
+// names its donor with `kv_source_layer`; every other cache op acts on its own
+// `layer`.
+std::optional<int64_t> cacheLayer(const GraphNodeDesc &n) {
+  if (n.op == OpKind::Attention || n.op == OpKind::FlashAttention)
+    if (auto donor = intAttr(n.attributes, "kv_source_layer"))
+      return donor;
+  return intAttr(n.attributes, "layer");
+}
+
 // A tensor's IR shape. A tensor whose leading dimension is the graph's dynamic
 // extent states it as `?`; the lowering binds it back to a concrete extent.
 std::vector<int64_t> irShape(const TensorDesc &t) {
@@ -220,6 +245,36 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
     valueOf[id] = body->addArgument(type, loc);
   }
 
+  // The cache handles, one per layer the graph touches, appended after the free
+  // tensor variables in ascending layer order. A handle names backend state
+  // (BoomDialect.td), so it is a block argument rather than a tensor-table
+  // entry; the cache itself stays keyed by layer in the backend.
+  llvm::SmallVector<int64_t> cacheLayers;
+  for (const GraphNodeDesc &n : graph.nodes) {
+    if (!isCacheOp(n.op))
+      continue;
+    auto layer = cacheLayer(n);
+    if (!layer) {
+      mlir::emitError(loc) << "node '" << n.name << "' ("
+                           << planner::op_kind_name(n.op)
+                           << ") accesses the KV cache but carries neither a "
+                              "`layer` nor a `kv_source_layer` attribute";
+      return {};
+    }
+    cacheLayers.push_back(*layer);
+  }
+  llvm::sort(cacheLayers);
+  cacheLayers.erase(llvm::unique(cacheLayers), cacheLayers.end());
+
+  llvm::DenseMap<int64_t, mlir::Value> kvOf;
+  for (int64_t layer : cacheLayers) {
+    auto type = boom::KvType::getChecked(
+        mlir::detail::getDefaultDiagnosticEmitFn(loc), context, layer);
+    if (!type)
+      return {};
+    kvOf[layer] = body->addArgument(type, loc);
+  }
+
   for (const GraphNodeDesc &n : graph.nodes) {
     llvm::SmallVector<mlir::Value> operands;
     for (TensorId in : n.inputs) {
@@ -232,6 +287,11 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
       }
       operands.push_back(it->second);
     }
+
+    // The cache handle is the cache-touching op's last operand (BoomVerify.cpp
+    // checks the placement and the layer).
+    if (isCacheOp(n.op))
+      operands.push_back(kvOf[*cacheLayer(n)]);
 
     llvm::SmallVector<mlir::Type> results;
     for (TensorId out : n.outputs) {
@@ -408,7 +468,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
     if (!produced.count(raw(t.id)))
       freeIds.push_back(raw(t.id));
   llvm::sort(freeIds);
-  if (body.getNumArguments() != freeIds.size()) {
+  if (body.getNumArguments() < freeIds.size()) {
     graphOp.emitError() << "the body has " << body.getNumArguments()
                         << " block arguments but " << freeIds.size()
                         << " tensors in the table are not produced by a node";
@@ -418,6 +478,18 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
   llvm::DenseMap<mlir::Value, int64_t> idOfValue;
   for (auto [index, id] : llvm::enumerate(freeIds))
     idOfValue[body.getArgument(index)] = id;
+  // The trailing arguments are the cache handles. They name backend state, not
+  // tensors, so the rebuilt graph carries that state in the ops' layer
+  // attributes — the same graph the IR was converted from.
+  for (size_t index = freeIds.size(); index < body.getNumArguments(); ++index)
+    if (!llvm::isa<boom::KvType>(body.getArgument(unsigned(index)).getType())) {
+      graphOp.emitError()
+          << "block argument " << index << " is typed "
+          << body.getArgument(unsigned(index)).getType()
+          << ", but every argument after the free tensor variables must be a "
+             "!boom.kv handle";
+      return std::nullopt;
+    }
 
   for (mlir::Operation &node : body) {
     GraphNodeDesc n;
@@ -442,6 +514,10 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
     n.name = nameAttr.getValue().str();
 
     for (mlir::Value operand : node.getOperands()) {
+      // The cache handle is backend state, not a graph tensor: the rebuilt node
+      // names the layer with its attributes (checked by the dialect verifier).
+      if (llvm::isa<boom::KvType>(operand.getType()))
+        continue;
       auto it = idOfValue.find(operand);
       if (it == idOfValue.end()) {
         node.emitError() << "reads a value that no block argument holds and no "

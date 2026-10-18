@@ -263,6 +263,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy) {
   const mlir::Value token_id = b.input("token_id", {}, sx::DType::Int64);
   const mlir::Value pos = b.input("pos", {}, sx::DType::Int64);
 
+  // The per-layer KV cache handles: the cache a node reads or appends to is a
+  // `!boom.kv<layer>` operand stating the access as an effect, not a pointer
+  // bound at plan time. A shared layer's attention takes its donor's handle.
+  const uint32_t n_kv = cfg.n_layer_kv();
+  std::vector<mlir::Value> kv_handles(n_kv);
+  for (uint32_t l = 0; l < n_kv; ++l)
+    kv_handles[l] = b.kv(l);
+
   const BlockProfile prof = profile_for(cfg);
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
@@ -376,10 +384,11 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy) {
       k = b.node(OpKind::Rope, {k, pos}, "kr" + suff, {int64_t(kvw)}, {layer_a(l)});
       const mlir::Value kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
                                  {layer_a(l)});
-      attn = b.node(OpKind::Attention, {q, kc, vc, pos}, "attn" + suff,
-                    {int64_t(qw)}, attn_attrs(l));
+      attn = b.node(OpKind::Attention, {q, kc, vc, pos, kv_handles[l]},
+                    "attn" + suff, {int64_t(qw)}, attn_attrs(l));
     } else {
-      attn = b.node(OpKind::Attention, {q, pos}, "attn" + suff,
+      attn = b.node(OpKind::Attention,
+                    {q, pos, kv_handles[cfg.kv_donor_layer(l)]}, "attn" + suff,
                     {int64_t(qw)}, attn_attrs(l));
     }
 
@@ -534,6 +543,14 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
       sx::DType::Int64);
   const mlir::Value start_pos = b.input("start_pos", {}, sx::DType::Int64);
 
+  // The per-layer KV cache handles (see emit_decode_ir): the cache a node reads
+  // or appends to is a `!boom.kv<layer>` operand stating the access as an
+  // effect, not a pointer bound at plan time.
+  const uint32_t n_kv = cfg.n_layer_kv();
+  std::vector<mlir::Value> kv_handles(n_kv);
+  for (uint32_t l = 0; l < n_kv; ++l)
+    kv_handles[l] = b.kv(l);
+
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
   auto kv_src = [&cfg](uint32_t l) {
@@ -620,7 +637,6 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
                      {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
 
   const float proj_scale = 1.0f / std::sqrt(float(d));
-  const uint32_t n_kv = cfg.n_layer_kv();
   const uint32_t donor_swa_layer = n_kv - 2;
   const uint32_t donor_global_layer = n_kv - 1;
   mlir::Value donor_swa_k{}, donor_swa_v{}, donor_global_k{}, donor_global_v{};
@@ -680,7 +696,8 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
                  {layer_a(l), batch_a(n)});
       const mlir::Value kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
                                  {layer_a(l)});
-      attn = b.node(OpKind::FlashAttention, {q, kc, vc, start_pos}, "attn" + suff,
+      attn = b.node(OpKind::FlashAttention,
+                    {q, kc, vc, start_pos, kv_handles[l]}, "attn" + suff,
                     shape2(n, qw), attn_attrs(l));
       kv_k[l] = kc;
       kv_v[l] = vc;
@@ -695,7 +712,8 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
       const uint32_t donor = cfg.kv_donor_layer(l);
       const mlir::Value dk = (donor == donor_swa_layer) ? donor_swa_k : donor_global_k;
       const mlir::Value dv = (donor == donor_swa_layer) ? donor_swa_v : donor_global_v;
-      attn = b.node(OpKind::FlashAttention, {q, dk, dv, start_pos}, "attn" + suff,
+      attn = b.node(OpKind::FlashAttention,
+                    {q, dk, dv, start_pos, kv_handles[donor]}, "attn" + suff,
                     shape2(n, qw), attn_attrs(l));
     }
 
@@ -788,7 +806,7 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   // the SWA ring (start_pos >= sliding_window) still attend over the prior
   // window. The output is a dummy scalar — the append is a cache side effect.
   for (uint32_t l = 0; l < n_kv; ++l) {
-    b.node(OpKind::KvAppend, {kv_k[l], kv_v[l], start_pos},
+    b.node(OpKind::KvAppend, {kv_k[l], kv_v[l], start_pos, kv_handles[l]},
            "kv_append" + std::to_string(l), {}, {layer_a(l), batch_a(n)});
   }
 

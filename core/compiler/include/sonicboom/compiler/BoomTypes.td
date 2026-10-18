@@ -22,6 +22,7 @@
 //                                           layout the mmq path consumes
 //   !boom.q4_k<[4096, 2048]>                a weight in the Q4_K format
 //   !boom.q5_k<...> !boom.q6_k<...> !boom.q5_0<...> !boom.q8_0<...
+//   !boom.kv<3>                             layer 3's KV cache handle
 //
 // `!boom.tensor` is the type of every SSA value whose element type is one of
 // the frozen ten sx::DType names. The quantized types exist because a quantized
@@ -141,11 +142,30 @@ def Boom_Q8_1Type : Boom_QuantType<"Q8_1", "q8_1", "q8_1", 32> {
   let summary = "activation in the q8_1 activation layout";
 }
 
+//--- KV cache handle --------------------------------------------------------
+
+// The per-layer KV cache handle (§6.3). It is not a tensor: it has no shape,
+// no dtype and no tensor-table entry, and it is not the storage either — the
+// cache remains backend-resident and keyed by layer (§8.4), and `layer` is the
+// key. The three cache-touching ops (boom.attention, boom.flash_attention,
+// boom.kv_append) take it as their last operand and carry the matching
+// MemoryEffects trait (BoomDialect.td); a shared-KV layer's attention takes its
+// donor layer's handle, which is what makes `kv_source_layer` checkable.
+def Boom_KvType : Boom_Type<"Kv", "kv"> {
+  let summary = "per-layer KV cache handle";
+
+  let parameters = (ins "int64_t":$layer);
+
+  let assemblyFormat = "`<` $layer `>`";
+
+  let genVerifyDecl = 1;
+}
+
 //--- value-type constraint --------------------------------------------------
 
-// The types an SSA value in Boom IR may have. Every op's operands and results
-// are constrained by this, so the generated verifyInvariants rejects a value
-// of any other type without any hand-written check.
+// The types an SSA value in Boom IR may have. Every op's results are
+// constrained by this, so the generated verifyInvariants rejects a value of any
+// other type without any hand-written check.
 def Boom_ValueType : AnyTypeOf<[
   Boom_TensorType,
   Boom_Q8_1Type,
@@ -156,5 +176,12 @@ def Boom_ValueType : AnyTypeOf<[
   Boom_Q5_0Type,
   Boom_Q8_0Type
 ]>;
+
+// The operand constraint: every Boom value, plus the KV handle the three
+// cache-touching ops carry. It is deliberately wider than Boom_ValueType — the
+// handle is not a value — and the graph verifier (BoomVerify.cpp) states which
+// ops may carry one, that it is their last operand, and that its layer is the
+// cache layer the op names.
+def Boom_AnyType : AnyTypeOf<[Boom_ValueType, Boom_KvType]>;
 
 #endif // SONICBOOM_COMPILER_BOOMTYPES_TD

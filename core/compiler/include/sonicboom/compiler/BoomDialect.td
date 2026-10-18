@@ -100,10 +100,10 @@ def Boom_Dialect : Dialect {
 // Resources
 //===----------------------------------------------------------------------===//
 
-// The per-layer KV cache, as a memory-effect resource. The cache is not an SSA
-// value in Boom IR: it is device-resident state keyed by layer, and §6.3's
-// "the ring semantics and slot count are attributes of the cache value" is a
-// later step. Modelling it as an effect resource is what the current IR needs:
+// The per-layer KV cache, as a memory-effect resource. The cache is
+// device-resident state keyed by layer: the IR names it with a `!boom.kv<layer>`
+// handle operand (BoomTypes.td), whose storage stays backend-owned (§8.4), and
+// models the access as an effect on this resource:
 //
 //   * boom.attention      reads the prefix, then appends the current row;
 //   * boom.flash_attention reads the prefix only (the batched append is
@@ -114,7 +114,7 @@ def Boom_Dialect : Dialect {
 // the same ordering for free from "the executor walks the nodes in order"; in
 // the dialect it is stated, so a later pass can reason about it.
 def Boom_KvCache
-    : Resource<"::sonicboom::compiler::boom::KvCacheResource">;
+    : Resource<"::sonicboom::compiler::boom::KVCacheResource">;
 
 def Boom_KvRead  : MemoryEffects<[MemRead<Boom_KvCache>]>;
 def Boom_KvWrite : MemoryEffects<[MemWrite<Boom_KvCache>]>;

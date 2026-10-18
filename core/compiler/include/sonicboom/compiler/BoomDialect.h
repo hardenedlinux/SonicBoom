@@ -40,12 +40,14 @@
 
 namespace sonicboom::compiler::boom {
 
-// The per-layer KV cache as a memory-effect resource (§6.3). The runtime keeps
-// the cache in the backend, keyed by layer; stating the access as an effect is
-// what lets MLIR order the decode step's write against the next step's read
-// instead of relying on "the executor walks the nodes in order".
-struct KvCacheResource
-    : public mlir::SideEffects::Resource::Base<KvCacheResource> {
+// The per-layer KV cache as a memory-effect resource (§6.3). The IR names a
+// layer's cache with a `!boom.kv<layer>` handle (BoomTypes.td) and states the
+// access as an effect on this resource; the cache's storage stays in the
+// backend, keyed by layer. Stating the access is what lets MLIR order the
+// decode step's write against the next step's read instead of relying on "the
+// executor walks the nodes in order".
+struct KVCacheResource
+    : public mlir::SideEffects::Resource::Base<KVCacheResource> {
   llvm::StringRef getName() const final { return "boom KV cache"; }
 };
 

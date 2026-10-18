@@ -26,8 +26,11 @@
 //   * the tensor table is well formed, and every id the graph or a node names
 //     is in it and is defined exactly once;
 //   * the body's block arguments are the graph's free variables — every tensor
-//     the graph references but does not produce, in ascending id order — and
-//     each argument's type agrees with that tensor's table entry;
+//     the graph references but does not produce, in ascending id order — each
+//     agreeing with its tensor's table entry, followed by one `!boom.kv` handle
+//     per cache layer in ascending layer order;
+//   * the three cache-touching ops carry their layer's handle as the last
+//     operand, and no other op carries one;
 //   * a node's results carry `result_ids` (right arity, unique ids, in the
 //     table) and its operands resolve to tensor ids, so every SSA value has
 //     exactly one tensor id — the mapping the round trip relies on;
@@ -135,6 +138,13 @@ bool isShapePreserving(llvm::StringRef opName) {
 
 bool isAllSameShapeOp(llvm::StringRef opName) {
   return opName == "boom.add" || opName == "boom.mul";
+}
+
+// The ops whose cache access is stated on the KVCacheResource (BoomDialect.td):
+// they carry the layer's `!boom.kv` handle as their last operand.
+bool carriesKvHandle(llvm::StringRef opName) {
+  return opName == "boom.attention" || opName == "boom.flash_attention" ||
+         opName == "boom.kv_append";
 }
 
 // The logical dimensions of any Boom value type. Every one of them carries a
@@ -286,14 +296,17 @@ mlir::LogicalResult GraphOp::verify() {
     }
   }
 
-  // 4. The block arguments are the free variables in ascending id order.
+  // 4. The block arguments are the free variables in ascending id order,
+  //    followed by one `!boom.kv` handle per cache layer the graph touches, in
+  //    ascending layer order. A handle is not a tensor — it has no table entry
+  //    — so a block argument is the only place it can be defined.
   llvm::SmallVector<int64_t> freeIds;
   for (const auto &[id, desc] : table)
     if (!produced.count(id))
       freeIds.push_back(id);
   llvm::sort(freeIds);
 
-  if (entry.getNumArguments() != freeIds.size())
+  if (entry.getNumArguments() < freeIds.size())
     return emitOpError() << "graph '" << graphName << "': the body has "
                          << entry.getNumArguments() << " block arguments but "
                          << freeIds.size()
@@ -302,9 +315,35 @@ mlir::LogicalResult GraphOp::verify() {
   llvm::DenseMap<Value, int64_t> tensorOf;
   for (auto [index, id] : llvm::enumerate(freeIds)) {
     Value arg = entry.getArgument(index);
+    if (llvm::isa<KvType>(arg.getType()))
+      return emitOpError()
+             << "graph '" << graphName << "': block argument " << index
+             << " is a KV cache handle, but the first " << freeIds.size()
+             << " arguments must be the graph's free tensor variables";
     if (llvm::failed(checkAgainstTable(arg.getType(), id, table[id])))
       return mlir::failure();
     tensorOf[arg] = id;
+  }
+
+  llvm::DenseMap<Value, int64_t> kvLayerOf;
+  int64_t previousLayer = -1;
+  for (size_t index = freeIds.size(); index < entry.getNumArguments();
+       ++index) {
+    Value arg = entry.getArgument(index);
+    auto kv = llvm::dyn_cast<KvType>(arg.getType());
+    if (!kv)
+      return emitOpError()
+             << "graph '" << graphName << "': block argument " << index
+             << " is typed " << arg.getType() << ", but every argument after "
+             << "the " << freeIds.size()
+             << " free tensor variables must be a !boom.kv handle";
+    if (kv.getLayer() <= previousLayer)
+      return emitOpError()
+             << "graph '" << graphName << "': the KV cache handles are in "
+             << "strict ascending layer order, but layer " << kv.getLayer()
+             << " follows layer " << previousLayer;
+    previousLayer = kv.getLayer();
+    kvLayerOf[arg] = kv.getLayer();
   }
 
   // A graph input is fed from outside, so no node may produce it.
@@ -319,7 +358,43 @@ mlir::LogicalResult GraphOp::verify() {
         op.getName().getStringRef().drop_front(llvm::StringRef("boom.").size());
 
     // 5a. Operands resolve to tensor ids, and their types agree with the table.
-    for (Value operand : op.getOperands()) {
+    //     A `!boom.kv` operand is the cache handle: only the three
+    //     cache-touching ops may carry one, it is their last operand, and it
+    //     names exactly the layer the op's attributes select.
+    bool sawKvHandle = false;
+    for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
+      if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
+        if (!carriesKvHandle(op.getName().getStringRef()))
+          return op.emitOpError()
+                 << "reads a " << kv << " cache handle, but it does not access "
+                    "the KV cache";
+        if (sawKvHandle)
+          return op.emitOpError() << "reads more than one KV cache handle";
+        if (index + 1 != op.getNumOperands())
+          return op.emitOpError()
+                 << "carries its KV cache handle at operand " << index
+                 << ", but it must be the last operand";
+        sawKvHandle = true;
+        auto layerIt = kvLayerOf.find(operand);
+        if (layerIt == kvLayerOf.end())
+          return op.emitOpError()
+                 << "reads a KV cache handle that is not one of the graph's "
+                    "block arguments";
+        auto sourceAttr = op.getAttrOfType<mlir::IntegerAttr>("kv_source_layer");
+        const llvm::StringRef layerAttr = sourceAttr ? "kv_source_layer" : "layer";
+        auto named = sourceAttr ? sourceAttr
+                                : op.getAttrOfType<mlir::IntegerAttr>("layer");
+        if (!named)
+          return op.emitOpError()
+                 << "reads a KV cache handle without a `layer` or "
+                    "`kv_source_layer` attribute to check it against";
+        if (layerIt->second != named.getInt())
+          return op.emitOpError()
+                 << "reads layer " << layerIt->second
+                 << "'s KV cache handle, but its `" << layerAttr
+                 << "` attribute names layer " << named.getInt();
+        continue;
+      }
       auto it = tensorOf.find(operand);
       if (it == tensorOf.end())
         return op.emitOpError()
@@ -329,6 +404,9 @@ mlir::LogicalResult GraphOp::verify() {
                                          table[it->second])))
         return mlir::failure();
     }
+    if (carriesKvHandle(op.getName().getStringRef()) && !sawKvHandle)
+      return op.emitOpError()
+             << "accesses the KV cache but carries no !boom.kv handle operand";
 
     // 5b. `node_attrs` is an ordered list of #boom.attr with unique names, and
     //     the typed attributes are exactly its int/float subset.
@@ -393,6 +471,9 @@ mlir::LogicalResult GraphOp::verify() {
     const bool producesQ8_1 = isQ8_1Producer(op.getName().getStringRef());
     for (Value operand : op.getOperands()) {
       if (llvm::isa<TensorType>(operand.getType()))
+        continue;
+      // The cache handle, checked in 5a.
+      if (llvm::isa<KvType>(operand.getType()))
         continue;
       // The one op whose point is a pre-quantized activation.
       if (opName == "quantized_matmul_q8" && operand == op.getOperand(0))

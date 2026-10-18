@@ -137,6 +137,12 @@ int main() {
   check(mlir::parseType(printed(q8_1), &context) == q8_1,
         "!boom.q8_1 round-trips through its assembly format: " + printed(q8_1));
 
+  // The KV cache handle is not a tensor: it names a cache layer.
+  const auto kv = boom::KvType::get(&context, int64_t(3));
+  check(bool(kv), "a !boom.kv builds");
+  check(mlir::parseType(printed(kv), &context) == kv,
+        "!boom.kv round-trips through its assembly format: " + printed(kv));
+
   // 32-element formats and the K-quant 256-element ones share the syntax.
   check(mlir::parseType(printed(boom::Q5_0Type::get(&context, {32})), &context) ==
             boom::Q5_0Type::get(&context, {32}),
@@ -231,6 +237,8 @@ int main() {
         "a q8_1 shape whose last dimension is not a multiple of 32 is rejected");
   check(!boom::Q5_0Type::getChecked(emit_error, &context, {4096, 30}),
         "a q5_0 shape whose last dimension is not a multiple of 32 is rejected");
+  check(!boom::KvType::getChecked(emit_error, &context, int64_t(-1)),
+        "a KV cache handle for a negative layer is rejected");
 
   if (failures == 0)
     std::cout << "test_boom_dialect: OK (" << kinds << " OpKinds + boom.graph)\n";

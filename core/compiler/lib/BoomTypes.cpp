@@ -148,6 +148,16 @@ llvm::LogicalResult Q8_1Type::verify(
   return verifyQuantShape<Q8_1Type>(emitError, shape);
 }
 
+// The layer is the key the backend stores the cache under, so it must name a
+// cache layer — a non-negative index.
+llvm::LogicalResult KvType::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError, int64_t layer) {
+  if (layer < 0)
+    return emitError() << "a KV cache handle names layer " << layer
+                       << ", but a cache layer is a non-negative index";
+  return llvm::success();
+}
+
 //--- quant-format helpers ---------------------------------------------------
 
 bool isBoomWeightQuantType(mlir::Type type) {

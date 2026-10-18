@@ -346,6 +346,21 @@ mlir::Value BoomBuilder::input(llvm::StringRef name, llvm::ArrayRef<int64_t> sha
   return value;
 }
 
+mlir::Value BoomBuilder::kv(uint32_t layer) {
+  auto it = kv_.find(layer);
+  if (it != kv_.end())
+    return it->second;
+  auto type = boom::KvType::getChecked(
+      mlir::detail::getDefaultDiagnosticEmitFn(loc_), context_, int64_t(layer));
+  if (!type) {
+    failed_ = true;
+    return {};
+  }
+  mlir::Value value = body_->addArgument(type, loc_);
+  kv_[layer] = value;
+  return value;
+}
+
 mlir::Value BoomBuilder::node(planner::OpKind op,
                               llvm::ArrayRef<mlir::Value> operands,
                               llvm::StringRef out_name,

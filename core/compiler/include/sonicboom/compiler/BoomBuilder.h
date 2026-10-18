@@ -119,6 +119,12 @@ public:
   mlir::Value input(llvm::StringRef name, llvm::ArrayRef<int64_t> shape,
                     sx::DType dtype);
 
+  // The per-layer KV cache handle (`!boom.kv<layer>`): a block argument after
+  // every declared input, returned to the cache-touching node as its last
+  // operand. Declare the handles before any node, in ascending layer order —
+  // that is the block-argument order the verifier recomputes.
+  mlir::Value kv(uint32_t layer);
+
   // A node and its one result tensor: an f32 activation of `out_shape`. The
   // node's name is its operator's (op_kind_name), the tensor's is `out_name`.
   mlir::Value node(planner::OpKind op, llvm::ArrayRef<mlir::Value> operands,
@@ -158,6 +164,7 @@ private:
   llvm::SmallVector<int64_t> inputs_;
   std::vector<int64_t> outputs_;
   llvm::DenseMap<mlir::Value, int64_t> ids_;
+  llvm::DenseMap<uint32_t, mlir::Value> kv_;
   int64_t nodes_ = 0;
   bool failed_ = false;
 };

@@ -27,6 +27,10 @@
 // the graph verifier makes with the shape/dtype/quant checks, not a static
 // signature that would have to be corrected every time a kernel changes.
 //
+// Operands admit one non-value type: the `!boom.kv<layer>` cache handle. The
+// three cache-touching ops carry it as their last operand (BoomVerify.cpp
+// requires it there and only there); every other operand is a Boom value.
+//
 // All ops share one attribute record:
 //
 //   node_name, node_id, result_ids, node_attrs   graph-node identity — what is
@@ -108,7 +112,7 @@ class Boom_Op<string mnemonic, string opSummary, list<Trait> traits = []>
   let summary = opSummary;
 
   let arguments = (ins
-    Variadic<Boom_ValueType>:$inputs,
+    Variadic<Boom_AnyType>:$inputs,
 
     // --- graph-node identity (exact GraphNodeDesc reconstruction) ----------
     StrAttr:$node_name,
