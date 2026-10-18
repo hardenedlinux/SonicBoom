@@ -16,10 +16,12 @@ export LC_ALL=C LANG=C
 #
 # Method (the boom-day3 method):
 #   - SonicBoom: prefill_bench --prompt 512 --reps 1 under nsys (cuda+nvtx,
-#     --cuda-graph-trace=node, SONICBOOM_NVTX=1). The timed pass is the last
-#     NVTX `prefill:segment` range whose duration is >= 40% of the longest one
-#     (the first 512 pass is the warm-up and is longer); prompt-1 pass ranges
-#     are excluded by that threshold.
+#     --cuda-graph-trace=node, SONICBOOM_NVTX=1). prefill_bench runs, in
+#     order, a 512-token warm-up pass, a 1-token warm-up, the timed 512-token
+#     pass, then the timed 1-token pass. The warm-up 512 pass is the longest
+#     (JIT, plan build, and first-use autotune all land in it), so the timed
+#     512 pass is the second-longest `prefill:segment` range; the prompt-1
+#     ranges are an order of magnitude shorter.
 #   - llama.cpp: llama-bench -p 512 -n 0 -r 1 -ngl 99 under nsys. llama-bench
 #     runs a warm-up pass and then the timed pass; the timed pass is the last
 #     burst of >= 500 kernels with a > 20 ms gap before it.
@@ -43,7 +45,7 @@ while [ $# -gt 0 ]; do
     --gemma) GEMMA="$2"; shift 2 ;;
     --out)   OUT="$2";   shift 2 ;;
     --no-run) RUN=0; shift ;;
-    -h|--help) sed -n '3,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,34p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -95,10 +97,13 @@ def window_sb(db):
     if not ev:
         sys.exit("no prefill:segment NVTX ranges (is SONICBOOM_NVTX=1 set?)")
     dur = [e - s for s, e in ev]
-    # The timed 512 pass is the last range at least 40% as long as the longest
-    # one; the warm-up 512 pass precedes it and the prompt-1 passes are short.
-    cand = [i for i, d in enumerate(dur) if d >= 0.4 * max(dur)]
-    i = cand[-1]
+    # The timed 512 pass is the second-longest range: the longest is the
+    # warm-up 512 pass (cold JIT, plan build, first-use autotune), and the
+    # prompt-1 passes are far shorter. A duration-ratio threshold is not
+    # usable because the warm-up can be more than 2.5x the timed pass once
+    # first-use autotune is included in it.
+    order = sorted(range(len(dur)), key=lambda i: dur[i])
+    i = order[-2] if len(order) >= 2 else order[-1]
     return ev[i][0], ev[i][1], len(ev)
 
 def window_llama(db):
