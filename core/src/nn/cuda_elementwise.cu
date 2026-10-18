@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string_view>
 #include <unordered_map>
 
@@ -2491,6 +2492,104 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
+namespace {
+
+// --- Stage 3c: attention implementation selection --------------------------
+//
+// Three implementations serve the same contract: the native tiled kernel
+// ("own"), the imported ggml mma kernel ("ggml"), and the compiler-generated
+// FA-2 kernel ("codegen"). SONICBOOM_ATTN_IMPL pins one of them; "auto" uses
+// the measured per-shape-class table below. The table key is (head_dim, gqa,
+// mask kind) only — never the batch size or sequence length — for the same
+// batch-invariance reason as the MMQ decomposition policy: a reused prefix
+// must take the same path as the full prefill, and a different implementation
+// has a different reduction order.
+enum class AttnImpl { Own, Ggml, Codegen };
+
+// The generated kernel's shape class, or nothing when the generator does not
+// cover the shape. SONICBOOM_ATTN_CODEGEN="br,bc,dps" pins the tile config for
+// the Stage 3c sweep; unsupported pins are rejected like an unsupported shape.
+std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
+                                                           int gqa,
+                                                           bool window) {
+  compiler::AttentionShape shape{
+      .head_dim = head_dim, .gqa = gqa, .window_mask = window};
+  // Tile configs from the Stage 3c sweep (test_cuda_attention_codegen_wide
+  // --bench; RTX 3050/sm_86). Each warp keeps DC = head_dim/dps <= 128 output
+  // columns; wider tiles buy occupancy only until the dynamic-smem limit
+  // (96 KiB) or the 32-warp block limit is reached.
+  if (gqa == 7 && head_dim == 64) {
+    // defaults: br = bc = 64, dps = 1 (one warp, 24 KiB)
+  } else if (gqa == 4 && head_dim == 256) {
+    shape.br = 64;
+    shape.bc = 16;
+    shape.dps = 4;  // 16 warps, 64 KiB
+  } else if (gqa == 4 && head_dim == 512) {
+    shape.br = 32;
+    shape.bc = 16;
+    shape.dps = 8;  // 16 warps, 80 KiB
+  } else {
+    return std::nullopt;
+  }
+  if (const char *e = std::getenv("SONICBOOM_ATTN_CODEGEN")) {
+    int br = 0, bc = 0, dps = 0;
+    if (std::sscanf(e, "%d,%d,%d", &br, &bc, &dps) == 3 && br > 0 && bc > 0 &&
+        dps > 0) {
+      shape.br = br;
+      shape.bc = bc;
+      shape.dps = dps;
+    }
+  }
+  if (!compiler::attention_shape_supported(shape)) return std::nullopt;
+  return shape;
+}
+
+bool attn_launch_codegen(const compiler::AttentionShape &shape,
+                         const float *q, const float *k_batch,
+                         const float *v_batch, const float *k_cache,
+                         const float *v_cache, const uint64_t *start,
+                         uint64_t n_slots, int n, int n_heads_q,
+                         int n_heads_kv, uint64_t sliding_window, float scale,
+                         float *out) {
+  const float *q_p = q, *kb_p = k_batch, *vb_p = v_batch, *kc_p = k_cache,
+              *vc_p = v_cache;
+  const uint64_t *start_p = start;
+  uint64_t nslots_p = n_slots, window_p = sliding_window;
+  int nhq_p = n_heads_q, nhkv_p = n_heads_kv, n_p = n;
+  float scale_p = scale;
+  float *out_p = out;
+  void *args[] = {&q_p,      &kb_p,    &vb_p,   &kc_p,   &vc_p,  &start_p,
+                  &nslots_p, &nhq_p,   &nhkv_p, &n_p,    &window_p,
+                  &scale_p,  &out_p};
+  const int grid_x = (n + shape.br - 1) / shape.br;
+  return planner::glue::launch_attention(shape, args, grid_x, n_heads_q);
+}
+
+// The measured per-shape-class choice. The numbers behind each entry are in
+// the Stage 3c benchmark table (tools/bench.sh --ablate attn-auto and the
+// --bench mode of test_cuda_attention_codegen_wide); the table is the
+// "autotune" result, kept deterministic so a token stream cannot change
+// because two implementations measured within noise. Regenerate the table
+// with the bench sweep when the hardware or the kernels change.
+AttnImpl attn_auto_pick(int head_dim, int gqa, bool window) {
+  (void)window;
+  // d64: own wins the prefill leg by 1.7x and is within 3% on decode, so the
+  // generated kernel's decode lead at d256/d512 does not transfer to the
+  // narrow head.
+  if (gqa == 7 && head_dim == 64) return AttnImpl::Own;
+  // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
+  // (0.318/0.231 ms vs own 0.424/0.243 and ggml 0.466/0.482).
+  if (gqa == 4 && head_dim == 256) return AttnImpl::Codegen;
+  // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704) and
+  // beats ggml on both legs; own keeps a 13% prefill lead. Decode dominates a
+  // 64-token generation (64 steps vs one prefill), and the per-shape choice
+  // cannot depend on n (batch invariance), so auto takes codegen here too.
+  if (gqa == 4 && head_dim == 512) return AttnImpl::Codegen;
+  return AttnImpl::Own;
+}
+
+} // namespace
+
 bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    const float* v_batch, const float* k_cache,
                                    const float* v_cache, const uint64_t* start,
@@ -2518,54 +2617,38 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
 
-  // Attention implementation switch (v1 Stage 2). "own" (default) is the
-  // native tiled kernel below. "ggml" routes through the imported ggml mma
-  // kernel and falls back here for shapes it does not cover; "codegen" is the
-  // Stage 3 generated path and falls back here until it lands; "auto" keeps
-  // the own path until the Stage 3 autotuner chooses per shape class.
+  // Attention implementation switch (v1 Stages 2-3). "auto" (default)
+  // resolves the shape class through the measured table (attn_auto_pick);
+  // its key is the shape, not the batch size, so a reused prefix takes the
+  // same path as a full prefill. "own" pins the native tiled kernel below,
+  // "ggml" the imported mma kernel, "codegen" the compiler-generated FA-2
+  // kernel; the pinned implementations fall back to the native kernel for
+  // shapes they do not cover.
   const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
   const std::string_view attn_impl =
-      attn_impl_env ? std::string_view(attn_impl_env) : std::string_view();
-  if (attn_impl == "ggml" &&
+      attn_impl_env ? std::string_view(attn_impl_env) : std::string_view("auto");
+  bool try_ggml = attn_impl == "ggml";
+  bool try_codegen = attn_impl == "codegen";
+  if (attn_impl == "auto") {
+    const AttnImpl pick = attn_auto_pick(head_dim, gqa, sliding_window != 0);
+    try_ggml = pick == AttnImpl::Ggml;
+    try_codegen = pick == AttnImpl::Codegen;
+  }
+  if (try_ggml &&
       flash_attention_ggml_chunk_dev_pos(
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
           n_heads_kv, head_dim, sliding_window, scale, out))
     return true;
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
-  // "codegen" selects it; "auto" keeps the own path until the Stage 3c
-  // autotuner chooses per shape class. A shape without a generator (or a
-  // failed compile) falls through to the hand-written kernels below.
-  if (attn_impl == "codegen") {
-    compiler::AttentionShape shape{.head_dim = head_dim, .gqa = gqa,
-                                   .window_mask = sliding_window != 0};
-    // Tile config per shape class. dps splits head_dim across warps so each
-    // warp's output slice stays within the f32 accumulator budget (DC <= 128):
-    //     D=64   dps=1, br=64, bc=64  (1 warp,   shared ~24 KiB)
-    //     D=256  dps=2, br=32, bc=32  (4 warps,  shared ~56 KiB)
-    //     D=512  dps=4, br=16, bc=32  (4 warps,  shared ~88 KiB)
-    if (gqa == 4 && head_dim == 256) {
-      shape.dps = 2;
-      shape.br = 32;
-      shape.bc = 32;
-    } else if (gqa == 4 && head_dim == 512) {
-      shape.dps = 4;
-      shape.br = 16;
-      shape.bc = 32;
-    }
-    if (compiler::attention_shape_supported(shape)) {
-      const float *q_p = q, *kb_p = k_batch, *vb_p = v_batch,
-                  *kc_p = k_cache, *vc_p = v_cache;
-      const uint64_t *start_p = start;
-      uint64_t nslots_p = n_slots, window_p = sliding_window;
-      int nhq_p = n_heads_q, nhkv_p = n_heads_kv, n_p = n;
-      float scale_p = scale;
-      float *out_p = out;
-      void *args[] = {&q_p,     &kb_p,    &vb_p,      &kc_p,    &vc_p,
-                      &start_p, &nslots_p, &nhq_p,    &nhkv_p,  &n_p,
-                      &window_p, &scale_p, &out_p};
-      const int grid_x = (n + shape.br - 1) / shape.br;
-      if (planner::glue::launch_attention(shape, args, grid_x, n_heads_q))
+  // A shape without a generator (or a failed compile) falls through to the
+  // hand-written kernels below.
+  if (try_codegen) {
+    if (const auto shape = attn_codegen_shape(
+            head_dim, gqa, sliding_window != 0)) {
+      if (attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache,
+                              start, n_slots, n, n_heads_q, n_heads_kv,
+                              sliding_window, scale, out))
         return true;
     }
   }
