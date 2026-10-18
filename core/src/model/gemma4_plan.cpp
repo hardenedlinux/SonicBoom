@@ -92,6 +92,9 @@ sx::Bytes encode_tokens(std::span<const uint64_t> tokens) {
 
 sx::Attribute attr_i(const char* name, int64_t v) { return sx::Attribute{name, v}; }
 sx::Attribute attr_f(const char* name, double v) { return sx::Attribute{name, v}; }
+sx::Attribute attr_s(const char* name, std::string v) {
+  return sx::Attribute{name, std::move(v)};
+}
 
 // Device-prefill segment size for a model with no sliding window. The chunk
 // exists to keep a prefill segment a wrap-free run inside the KV ring; with no
@@ -538,6 +541,26 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   };
   auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
   auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
+  // The MMQ work decomposition for this weight shape (Stage 1): the runtime's
+  // policy (mmq_class_decomp) over the projection's (rows, K, quant type) and
+  // this device's SM count. Deliberately independent of the segment length n —
+  // split-K changes the summation order, so a batch-size-dependent choice would
+  // make prefix-cache reuse diverge from a full prefill. Recorded on every
+  // batched matmul so the plan says which kernel the class runs; the runtime
+  // resolves Auto (and unannotated nodes) with the same policy. A CPU-only
+  // build has no MMQ to classify and records tiled.
+  auto decomp_a = [](uint64_t rows, uint64_t cols, quant::QuantType type) {
+#ifdef SONICBOOM_USE_CUDA
+    const bool stream_k = quant::cuda::mmq_class_decomp(rows, cols, type) ==
+                          quant::cuda::MmqDecomp::StreamK;
+    return attr_s("decomp", stream_k ? "stream_k" : "tiled");
+#else
+    (void)rows;
+    (void)cols;
+    (void)type;
+    return attr_s("decomp", "tiled");
+#endif
+  };
   // The fused mmq quantize's activation scale layout follows the consuming
   // matmul's weight type: Q3_K and the legacy 32-element formats Q5_0/Q8_0 ->
   // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
@@ -621,7 +644,7 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
                         {layer_a(l), slot(WeightSlot::AttnNorm), batch_a(n), dim_a(d)});
     mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff,
                         shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n),
-                        dim_a(d), ds_a(m.weights.blocks[l].attn_q.type())});
+                        dim_a(d), ds_a(m.weights.blocks[l].attn_q.type()), decomp_a(qw, d, m.weights.blocks[l].attn_q.type())});
     if (prof.proj_bias)
       q = b.node(OpKind::AddBias, {q}, "qb" + suff, shape2(n, qw),
                  {layer_a(l), slot(WeightSlot::AttnQBias), batch_a(n)});
@@ -635,10 +658,10 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
     if (cfg.has_kv(l)) {
       mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff,
                           shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n),
-                          dim_a(d), ds_a(m.weights.blocks[l].attn_k.type())});
+                          dim_a(d), ds_a(m.weights.blocks[l].attn_k.type()), decomp_a(kvw, d, m.weights.blocks[l].attn_k.type())});
       mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
                           shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n),
-                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type())});
+                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type()), decomp_a(kvw, d, m.weights.blocks[l].attn_v.type())});
       if (prof.proj_bias) {
         k = b.node(OpKind::AddBias, {k}, "kb" + suff, shape2(n, kvw),
                    {layer_a(l), slot(WeightSlot::AttnKBias), batch_a(n)});
@@ -678,7 +701,7 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
 
     mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
                          shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n),
-                         dim_a(qw), ds_a(m.weights.blocks[l].attn_output.type())});
+                         dim_a(qw), ds_a(m.weights.blocks[l].attn_output.type()), decomp_a(d, qw, m.weights.blocks[l].attn_output.type())});
     if (prof.attn_out_bias)
       ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, shape2(n, d),
                   {layer_a(l), slot(WeightSlot::AttnOutputBias), batch_a(n)});
@@ -694,10 +717,10 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
                         {layer_a(l), slot(WeightSlot::FfnNorm), batch_a(n), dim_a(d)});
     mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, shape2(n, ff),
                          {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n),
-                         dim_a(d), ds_a(m.weights.blocks[l].ffn_up.type())});
+                         dim_a(d), ds_a(m.weights.blocks[l].ffn_up.type()), decomp_a(ff, d, m.weights.blocks[l].ffn_up.type())});
     mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, shape2(n, ff),
                            {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n),
-                           dim_a(d), ds_a(m.weights.blocks[l].ffn_gate.type())});
+                           dim_a(d), ds_a(m.weights.blocks[l].ffn_gate.type()), decomp_a(ff, d, m.weights.blocks[l].ffn_gate.type())});
     gate = prof.silu_ffn
                ? b.node(OpKind::Silu, {gate}, "silu" + suff, shape2(n, ff), {layer_a(l)})
                : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff),
@@ -705,7 +728,7 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
     mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
     mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, shape2(n, d),
                          {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n),
-                         dim_a(ff), ds_a(m.weights.blocks[l].ffn_down.type())});
+                         dim_a(ff), ds_a(m.weights.blocks[l].ffn_down.type()), decomp_a(d, ff, m.weights.blocks[l].ffn_down.type())});
     mlir::Value f2 = prof.post_ffw_norm
                       ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
                                {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n),

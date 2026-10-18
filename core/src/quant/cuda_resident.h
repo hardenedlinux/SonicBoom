@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <sonicboom/quant/quantized_matmul_cuda.h>
 #include <sonicboom/quant/quantized_tensor.h>
 
 #include <cstddef>
@@ -155,8 +156,10 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
 // quantize). W is the Q*_K weight [cols, rows]; yq is [cols/128][n] block_q8_1_mmq
 // (index blk*n + token); Y is [n, rows] position-major. The caller sized yq with
 // the J_max tail guard (see mmq_q8_blocks). Device in/out, no host copies.
+// `decomp` is the plan's decomposition for this shape class (the node's `decomp`
+// attribute); Auto lets the runtime choose (class policy / autotuner).
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
-                       int n);
+                       int n, MmqDecomp decomp = MmqDecomp::Auto);
 
 // Dequantize a single row (token `token`) of a 2-D quantized embedding matrix
 // to device f32: out[k] = W[k][token] for k in [0, width). W has GGUF shape

@@ -605,11 +605,16 @@ void test_legacy_mmq_type(sbquant::QuantType type, const char* name,
             << worst << ", max dev " << max_dev << "\n";
 }
 
-// Stage 6: the mmq J tile only changes how tokens are grouped into blocks, not
-// the per-output K-reduction order, so every J candidate must write the same
-// bytes. Pin each candidate through SONICBOOM_MMQ_J and compare against J=8;
-// then run once with the override unset to exercise the autotuner itself, whose
-// chosen J must produce the same output as well.
+// Stage 6: under the tiled decomposition the mmq J tile only changes how tokens
+// are grouped into blocks, not the per-output K-reduction order, so every J
+// candidate must write the same bytes. Pin each candidate through
+// SONICBOOM_MMQ_J and compare against J=8.
+//
+// Stage 1 (stream-k): the stream-k decomposition splits one output tile's K
+// reduction over blocks, and the split geometry depends on the tile count (hence
+// on J and on n), so J candidates legitimately round differently. They must
+// still agree with the tiled baseline to float-rounding tolerance, and the
+// autotuner's choice must do the same.
 void test_mmq_j_invariant(sbquant::QuantType type, const char* name,
                           uint64_t rows, uint64_t cols, uint64_t n) {
   std::mt19937 rng(0x60D1CAFEu + unsigned(type));
@@ -629,11 +634,31 @@ void test_mmq_j_invariant(sbquant::QuantType type, const char* name,
   std::vector<float> base(rows * n);
   bool ok = true;
   bool identical = true;
-  for (int J : kJs) {
+  bool streamk_close = true;
+  double streamk_worst = 0.0;
+
+  auto run = [&](const char* decomp, int J) {
+    setenv("SONICBOOM_MMQ_DECOMP", decomp, 1);
     const std::string j = std::to_string(J);
     setenv("SONICBOOM_MMQ_J", j.c_str(), 1);
     std::fill(Y.begin(), Y.end(), 0.0f);
-    if (!sbquant::cuda::matmul_f32(W, X, Y, n)) {
+    return sbquant::cuda::matmul_f32(W, X, Y, n);
+  };
+  // Float-rounding closeness: several reduction orders of the same ordered
+  // int8 dot may round differently, but only at fp32 ulp scale relative to the
+  // result magnitude.
+  auto relative_dev = [](const std::vector<float>& a,
+                         const std::vector<float>& b) {
+    double scale = 0.0;
+    for (float v : a) scale = std::max(scale, double(std::fabs(v)));
+    double worst = 0.0;
+    for (size_t i = 0; i < a.size(); ++i)
+      worst = std::max(worst, double(std::fabs(double(a[i]) - double(b[i]))));
+    return worst / std::max(1.0, scale);
+  };
+
+  for (int J : kJs) {
+    if (!run("tiled", J)) {
       check(false, "mmq J invariant: pinned-J matmul returned true");
       ok = false;
       break;
@@ -643,19 +668,48 @@ void test_mmq_j_invariant(sbquant::QuantType type, const char* name,
     } else if (std::memcmp(base.data(), Y.data(), base.size() * sizeof(float)) !=
                0) {
       identical = false;
-      std::cerr << "    " << name << ": J=" << J << " differs from J=" << kJs[0]
-                << "\n";
+      std::cerr << "    " << name << ": tiled J=" << J << " differs from J="
+                << kJs[0] << "\n";
     }
   }
   unsetenv("SONICBOOM_MMQ_J");
+  unsetenv("SONICBOOM_MMQ_DECOMP");
   if (ok) {
     const std::string what =
-        std::string("mmq J candidates write identical output (") + name + ")";
+        std::string("mmq tiled J candidates write identical output (") + name +
+        ")";
     check(identical, what.c_str());
   }
 
+  // Stream-k splits the K reduction across blocks; the split geometry depends
+  // on J, so candidates may round differently but must stay fp32-close to the
+  // tiled baseline.
+  for (int J : kJs) {
+    if (!run("stream_k", J)) {
+      check(false, "mmq stream-k: pinned-J matmul returned true");
+      ok = false;
+      break;
+    }
+    const double dev = relative_dev(base, Y);
+    streamk_worst = std::max(streamk_worst, dev);
+    if (dev > 1e-5) {
+      streamk_close = false;
+      std::cerr << "    " << name << ": stream-k J=" << J
+                << " relative deviation " << dev << "\n";
+    }
+  }
+  unsetenv("SONICBOOM_MMQ_J");
+  unsetenv("SONICBOOM_MMQ_DECOMP");
+  if (ok) {
+    const std::string what =
+        std::string("mmq stream-k output within rounding of tiled (") + name +
+        ")";
+    check(streamk_close, what.c_str());
+  }
+
   // No override: the tuner times every candidate and caches one. Its output
-  // must match the pinned runs bit-for-bit.
+  // must match the tiled baseline to the same rounding tolerance (bit-for-bit
+  // when it picks tiled).
   if (ok) {
     std::fill(Y.begin(), Y.end(), 0.0f);
     if (!sbquant::cuda::matmul_f32(W, X, Y, n)) {
@@ -663,15 +717,20 @@ void test_mmq_j_invariant(sbquant::QuantType type, const char* name,
     } else {
       const bool same =
           std::memcmp(base.data(), Y.data(), base.size() * sizeof(float)) == 0;
+      const double dev = relative_dev(base, Y);
       const std::string what =
           std::string("mmq autotuned output matches the pinned runs (") + name +
           ")";
-      check(same, what.c_str());
+      check(same || dev <= 1e-5, what.c_str());
+      std::cerr << "    mmq autotuned " << name << ": "
+                << (same ? "bit-identical" : "stream-k rounding") << " rel dev "
+                << dev << "\n";
     }
   }
   std::cerr << "    mmq J invariant " << name << " (M=" << rows << " K=" << cols
-            << " n=" << n << "): " << (identical ? "identical" : "DIFFERENT")
-            << "\n";
+            << " n=" << n << "): tiled "
+            << (identical ? "identical" : "DIFFERENT") << ", stream-k rel dev "
+            << streamk_worst << "\n";
 }
 
 void test_mmq_q6_type(std::mt19937& rng) {

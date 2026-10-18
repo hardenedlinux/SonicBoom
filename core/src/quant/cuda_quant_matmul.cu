@@ -1380,24 +1380,38 @@ int mmq_min_n() {
   return v;
 }
 
-// MMQ J-tile autotune (Stage 6). `select_J` in the ggml-derived mmq.cuh takes
-// the smallest J that minimises the column-tile count ceil(n/J); that ignores M,
-// so it can leave a matmul with few row tiles spread over too few blocks, and
-// it never measures which tile shape actually keeps the tensor cores fed on
-// this GPU. The tuner times the candidates on the real call once per
-// (type, M, n, blocks_per_row) and caches the fastest.
+// MMQ J-tile autotune (Stage 6), extended by Stage 1 with the work
+// decomposition. `select_J` in the ggml-derived mmq.cuh takes the smallest J
+// that minimises the column-tile count ceil(n/J); that ignores M, so it can
+// leave a matmul with few row tiles spread over too few blocks, and it never
+// measures which tile shape actually keeps the tensor cores fed on this GPU.
+// The tuner times the candidates on the real call once per shape class
+// (type, M, n, blocks_per_row, requested decomposition) and caches the fastest.
 //
-// J only selects the token-tile width: every output element keeps the same
-// K-reduction order (rows_per_warp changes the M tile layout, not the K
-// accumulation), so all candidates write the same bytes. test_cuda_quant checks
-// that across every J. The choice is a pure performance one, and it does not
-// touch the plan record (mmq launches are not recorded).
+// Decomposition: the Boom IR matmul carries the weight shape's decomposition as
+// a `decomp` attribute (tiled | stream_k), computed by the plan emitter from
+// the same policy (mmq_class_decomp). The tuner's cache key includes the
+// requested decomposition, so a class's J search is measured for the
+// decomposition its plan runs; Auto (an unannotated node, e.g. a direct call
+// to the non-IR batched entry) resolves through the same policy.
+//
+// The decomposition is NOT chosen by wall time and does not depend on n. It
+// changes the floating-point summation order (split-K pieces are combined in a
+// fixed order), so batch invariance requires that the same rows be reduced the
+// same way whether they are prefilled in one segment or many. The policy
+// therefore keys on the weight shape (M, K, quant type) only; timing at one
+// batch size would smuggle n back into the choice and break prefix-cache reuse
+// (test_prefix_cache). J, by contrast, only selects the token-tile width: the
+// fixed split-K pieces and the tiled K-reduction order are both independent of
+// J, so all candidates for a decomposition write the same bytes.
 //
 // The search runs on the first call for a key, and only outside graph capture
 // (host timing is illegal while capturing); inside a capture the cached choice,
-// or select_J when the key is new, is used. SONICBOOM_MMQ_J=<J> pins a
-// candidate (A/B and the unit test); SONICBOOM_FEATURE_DISABLE=autotune turns
-// the search off (ablation group `autotune`).
+// or the heuristic + class policy when the key is new, is used.
+// SONICBOOM_MMQ_J=<J> pins a tile width (A/B and the unit test);
+// SONICBOOM_MMQ_DECOMP=tiled|stream_k pins the decomposition (the `mmq-decomp`
+// ablation group); SONICBOOM_FEATURE_DISABLE=autotune turns the search off
+// (ablation group `autotune`).
 constexpr int kMmqTuneJs[] = {8, 16, 32, 64, 128};
 constexpr std::size_t kMmqTuneKeyCap = 64;
 
@@ -1410,11 +1424,69 @@ int mmq_j_override() {
   return 0;
 }
 
+// SONICBOOM_MMQ_DECOMP: pin the decomposition for A/B ablation. Anything but
+// the two exact strings leaves the plan's choice in force.
+MmqDecomp mmq_decomp_override() {
+  const char* e = std::getenv("SONICBOOM_MMQ_DECOMP");
+  if (e == nullptr) return MmqDecomp::Auto;
+  if (std::strcmp(e, "tiled") == 0) return MmqDecomp::Tiled;
+  if (std::strcmp(e, "stream_k") == 0) return MmqDecomp::StreamK;
+  return MmqDecomp::Auto;
+}
+
+// Cached SM count. 1 when the query fails, which makes every geometry a pure
+// tiling one (ntiles blocks, no fixup): the pre-stream-k behaviour.
+int mmq_sm_count() noexcept {
+  static const int n = [] {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 1;
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) !=
+        cudaSuccess)
+      return 1;
+    return v > 0 ? v : 1;
+  }();
+  return n;
+}
+
+// The class policy is tiled. The fixed split-K schedule is correct and
+// batch-invariant, but on the target GPU (RTX 3050, sm_86, 20 SMs) it is slower
+// at every measured batch size with this runtime's already-wide tiled launch:
+// Gemma pp512 1741 vs 1765 tok/s (-1.4%), Qwen pp512 12750 vs 13730 (-7.3%),
+// Qwen n=64 10896 vs 10932 (tie), n=128/256 -5.7%/-6.1% (3 runs each, 2026-10-
+// 18, measurement script /tmp/d3-s1-decomp-ab.md). The decomposition must be
+// chosen from the weight shape only (batch invariance), so there is no
+// shape/batch class in which selecting split-K would help a canonical metric.
+// It stays reachable through SONICBOOM_MMQ_DECOMP=stream_k for A/B and is
+// exercised by test_cuda_quant.
+MmqDecomp mmq_class_decomp(uint64_t rows, uint64_t cols,
+                           QuantType type) noexcept {
+  (void)rows;
+  (void)cols;
+  (void)type;
+  return MmqDecomp::Tiled;
+}
+
+namespace {
+
+// Auto resolves to the class policy (tiled). Batch size deliberately does not
+// enter: the decomposition changes the floating-point summation order, so a
+// choice that moved with n would make prefix-cache reuse diverge from a full
+// prefill.
+template <int Type>
+MmqDecomp mmq_resolve_decomp(MmqDecomp requested, int M, int bpr) {
+  (void)M;
+  (void)bpr;
+  if (requested != MmqDecomp::Auto) return requested;
+  return MmqDecomp::Tiled;
+}
+
 struct MmqJKey {
   int type;
   int rows;
   int n;
   int bpr;
+  int decomp;  // the requested decomposition (Auto included)
   bool operator==(const MmqJKey&) const = default;
 };
 
@@ -1424,110 +1496,163 @@ struct MmqJKeyHash {
     h ^= std::uint64_t(std::uint32_t(k.type)) * 0xC2B2AE3D27D4EB4Full;
     h ^= std::uint64_t(std::uint32_t(k.rows)) * 0x165667B19E3779F9ull;
     h ^= std::uint64_t(std::uint32_t(k.n)) * 0x85EBCA77C2B2AE63ull;
-    h ^= std::uint64_t(std::uint32_t(k.bpr));
+    h ^= std::uint64_t(std::uint32_t(k.bpr)) * 0x9E3779B185EBCA87ull;
+    h ^= std::uint64_t(std::uint32_t(k.decomp));
     return std::size_t(h ^ (h >> 29));
   }
 };
 
+// The tuner's result for a key: the J and the decomposition actually run.
+struct MmqChoice {
+  int j;
+  MmqDecomp decomp;
+};
+
 std::mutex g_mmq_j_mutex;
-std::unordered_map<MmqJKey, int, MmqJKeyHash> g_mmq_j_choice;
+std::unordered_map<MmqJKey, MmqChoice, MmqJKeyHash> g_mmq_j_choice;
+
+// Scratch for the fixed split-K partials (one J*I block per work unit; see
+// split_k_scratch_floats). Grown, never shrunk.
+void* g_mmq_fixup = nullptr;
+size_t g_mmq_fixup_bytes = 0;
+
+template <int Type, int J>
+void mmq_launch_one(MmqDecomp decomp, const char* w, const int* y, float* dst,
+                    int M, int n, int bpr, cudaStream_t stream) {
+  if (decomp == MmqDecomp::StreamK) {
+    const int nsm = mmq_sm_count();
+    const int parts = mmq::split_k_parts(M, bpr, mmq::qk_of<Type>(), nsm);
+    if (parts >= 2) {
+      const size_t bytes =
+          size_t(mmq::split_k_scratch_floats(M, n, J, parts)) * sizeof(float);
+      float* tmp =
+          static_cast<float*>(grow_scratch(g_mmq_fixup, g_mmq_fixup_bytes, bytes));
+      if (tmp) {
+        mmq::launch_mul_mat_q_split_k<Type, J>(w, y, dst, tmp, M, n, bpr, nsm,
+                                               parts, stream);
+        return;
+      }
+    }
+  }
+  mmq::launch_mul_mat_q<Type, J>(w, y, dst, M, n, bpr, stream);
+}
 
 template <int Type>
-void mmq_launch_j(int J, const char* w, const int* y, float* dst, int M, int n,
-                  int bpr, cudaStream_t stream) {
+void mmq_launch(int J, MmqDecomp decomp, const char* w, const int* y, float* dst,
+                int M, int n, int bpr, cudaStream_t stream) {
   switch (J) {
-    case 8:   mmq::launch_mul_mat_q<Type, 8>  (w, y, dst, M, n, bpr, stream); break;
-    case 16:  mmq::launch_mul_mat_q<Type, 16> (w, y, dst, M, n, bpr, stream); break;
-    case 24:  mmq::launch_mul_mat_q<Type, 24> (w, y, dst, M, n, bpr, stream); break;
-    case 32:  mmq::launch_mul_mat_q<Type, 32> (w, y, dst, M, n, bpr, stream); break;
-    case 40:  mmq::launch_mul_mat_q<Type, 40> (w, y, dst, M, n, bpr, stream); break;
-    case 48:  mmq::launch_mul_mat_q<Type, 48> (w, y, dst, M, n, bpr, stream); break;
-    case 64:  mmq::launch_mul_mat_q<Type, 64> (w, y, dst, M, n, bpr, stream); break;
-    case 80:  mmq::launch_mul_mat_q<Type, 80> (w, y, dst, M, n, bpr, stream); break;
-    case 96:  mmq::launch_mul_mat_q<Type, 96> (w, y, dst, M, n, bpr, stream); break;
-    case 112: mmq::launch_mul_mat_q<Type, 112>(w, y, dst, M, n, bpr, stream); break;
-    case 128: mmq::launch_mul_mat_q<Type, 128>(w, y, dst, M, n, bpr, stream); break;
-    default:  mmq::launch_mul_mat_q<Type, 128>(w, y, dst, M, n, bpr, stream); break;
+    case 8:   mmq_launch_one<Type, 8>  (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 16:  mmq_launch_one<Type, 16> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 24:  mmq_launch_one<Type, 24> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 32:  mmq_launch_one<Type, 32> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 40:  mmq_launch_one<Type, 40> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 48:  mmq_launch_one<Type, 48> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 64:  mmq_launch_one<Type, 64> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 80:  mmq_launch_one<Type, 80> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 96:  mmq_launch_one<Type, 96> (decomp, w, y, dst, M, n, bpr, stream); break;
+    case 112: mmq_launch_one<Type, 112>(decomp, w, y, dst, M, n, bpr, stream); break;
+    case 128: mmq_launch_one<Type, 128>(decomp, w, y, dst, M, n, bpr, stream); break;
+    default:  mmq_launch_one<Type, 128>(decomp, w, y, dst, M, n, bpr, stream); break;
   }
 }
 
 template <int Type>
-int mmq_j_select(const char* w, const int* y, float* dst, int M, int n, int bpr,
-                 cudaStream_t stream) {
-  const int forced = mmq_j_override();
-  if (forced != 0) return forced;
-  if (runtime::feature_disabled(runtime::Feature::Autotune))
-    return mmq::select_J(n);
+MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
+                       int bpr, MmqDecomp requested, cudaStream_t stream) {
+  // The env switch is an ablation override of the plan's class decision.
+  MmqDecomp want = mmq_decomp_override();
+  if (want == MmqDecomp::Auto) want = requested;
 
-  const MmqJKey key{Type, M, n, bpr};
+  const int heuristic = mmq::select_J(n);
+  const MmqChoice fallback{heuristic, mmq_resolve_decomp<Type>(want, M, bpr)};
+
+  const int forced = mmq_j_override();
+  if (forced != 0) return MmqChoice{forced, fallback.decomp};
+  if (runtime::feature_disabled(runtime::Feature::Autotune)) return fallback;
+
+  const MmqJKey key{Type, M, n, bpr, int(want)};
   {
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
     const auto it = g_mmq_j_choice.find(key);
     if (it != g_mmq_j_choice.end()) return it->second;
-    if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return mmq::select_J(n);
+    if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return fallback;
   }
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
-    return mmq::select_J(n);
+    return fallback;
 
-  const int heuristic = mmq::select_J(n);
+  // Only J is timed. The decomposition is fixed per weight shape (above);
+  // letting a measurement at one n pick it would make plan behaviour
+  // batch-size dependent.
+  const MmqDecomp candidates[1] = {fallback.decomp};
+  constexpr int ncandidates = 1;
+
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
   cudaEvent_t begin{}, end{};
   if (cudaEventCreate(&begin) != cudaSuccess ||
       cudaEventCreate(&end) != cudaSuccess) {
     if (begin) cudaEventDestroy(begin);
     if (end) cudaEventDestroy(end);
-    return heuristic;
+    return fallback;
   }
-  int best_j = heuristic;
+  MmqChoice best = fallback;
   float best_ms = 0.0f;
   float heuristic_ms = -1.0f;
   bool have_best = false;
-  for (int J : kMmqTuneJs) {
-    mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);  // warm-up
-    if (cudaEventRecord(begin, stream) != cudaSuccess) continue;
-    constexpr int kReps = 2;
-    for (int r = 0; r < kReps; ++r)
-      mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);
-    if (cudaEventRecord(end, stream) != cudaSuccess) continue;
-    if (cudaEventSynchronize(end) != cudaSuccess) {
-      (void)cudaGetLastError();
-      continue;
-    }
-    float ms = 0.0f;
-    if (cudaEventElapsedTime(&ms, begin, end) != cudaSuccess ||
-        cudaGetLastError() != cudaSuccess) {
-      (void)cudaGetLastError();
-      continue;
-    }
-    if (J == heuristic) heuristic_ms = ms;
-    if (!have_best || ms < best_ms) {
-      best_ms = ms;
-      best_j = J;
-      have_best = true;
+  for (int c = 0; c < ncandidates; ++c) {
+    const MmqDecomp decomp = candidates[c];
+    for (int J : kMmqTuneJs) {
+      mmq_launch<Type>(J, decomp, w, y, dst, M, n, bpr, stream);  // warm-up
+      if (cudaEventRecord(begin, stream) != cudaSuccess) continue;
+      constexpr int kReps = 2;
+      for (int r = 0; r < kReps; ++r)
+        mmq_launch<Type>(J, decomp, w, y, dst, M, n, bpr, stream);
+      if (cudaEventRecord(end, stream) != cudaSuccess) continue;
+      if (cudaEventSynchronize(end) != cudaSuccess) {
+        (void)cudaGetLastError();
+        continue;
+      }
+      float ms = 0.0f;
+      if (cudaEventElapsedTime(&ms, begin, end) != cudaSuccess ||
+          cudaGetLastError() != cudaSuccess) {
+        (void)cudaGetLastError();
+        continue;
+      }
+      if (J == heuristic && decomp == fallback.decomp) heuristic_ms = ms;
+      if (!have_best || ms < best_ms) {
+        best_ms = ms;
+        best = MmqChoice{J, decomp};
+        have_best = true;
+      }
     }
   }
   cudaEventDestroy(begin);
   cudaEventDestroy(end);
-  if (!have_best) return heuristic;
+  if (!have_best) return fallback;
   {
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-    g_mmq_j_choice.emplace(key, best_j);
+    g_mmq_j_choice.emplace(key, best);
   }
   if (verbose)
     std::fprintf(stderr,
-                 "[autotune] mmq type=%d M=%d n=%d bpr=%d J=%d %.3f ms "
-                 "(heuristic J=%d %.3f ms)\n",
-                 Type, M, n, bpr, best_j, best_ms, heuristic, heuristic_ms);
-  return best_j;
+                 "[autotune] mmq type=%d M=%d n=%d bpr=%d decomp=%s J=%d "
+                 "%.3f ms (heuristic J=%d %s %.3f ms)\n",
+                 Type, M, n, bpr,
+                 best.decomp == MmqDecomp::StreamK ? "stream_k" : "tiled",
+                 best.j, best_ms, heuristic,
+                 fallback.decomp == MmqDecomp::StreamK ? "stream_k" : "tiled",
+                 heuristic_ms);
+  return best;
 }
+
+}  // namespace
 
 template <int Type>
 bool mul_mat_q_tuned(const char* w, const int* y, float* dst, int M, int n,
-                     int bpr, cudaStream_t stream) {
-  const int J = mmq_j_select<Type>(w, y, dst, M, n, bpr, stream);
-  mmq_launch_j<Type>(J, w, y, dst, M, n, bpr, stream);
+                     int bpr, MmqDecomp decomp, cudaStream_t stream) {
+  const MmqChoice c = mmq_j_select<Type>(w, y, dst, M, n, bpr, decomp, stream);
+  mmq_launch<Type>(c.j, c.decomp, w, y, dst, M, n, bpr, stream);
   return true;
 }
 
@@ -2091,19 +2216,19 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
       ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
       break;
     case QuantType::Q4_K:
       mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
       ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
       break;
     case QuantType::Q5_K:
       mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
       ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
       break;
     // The legacy 32-element formats use the D4 float activation scale layout
     // (ggml's MMQ_Q8_1_DS_LAYOUT_D4), same as Q3_K.
@@ -2111,13 +2236,13 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
       ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
       break;
     case QuantType::Q8_0:
       mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
       ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
           reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, cur_stream());
+          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
       break;
     default:
       return false;
@@ -2131,7 +2256,7 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
 // (index blk*n + token); Y is [n, rows] position-major (the tensor-core matmul's
 // native output — no transpose, matching matmul_mmq_dev's C.3a path).
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
-                       float* Y, int n) {
+                       float* Y, int n, MmqDecomp decomp) {
   if (!available() || !W.valid() || W.dims().size() != 2 || !y_q8 || !Y || n <= 0)
     return false;
   const uint64_t cols = W.dims()[0];
@@ -2168,33 +2293,27 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   switch (W.type()) {
     case QuantType::Q3_K:
       ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     case QuantType::Q4_K:
       ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     case QuantType::Q5_K:
       ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     case QuantType::Q6_K:
       ok = mul_mat_q_tuned<mmq::MMQ_Q6_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     case QuantType::Q5_0:
       ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     case QuantType::Q8_0:
       ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row,
-          cur_stream());
+          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
       break;
     default:
       return false;

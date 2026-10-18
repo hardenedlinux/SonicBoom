@@ -1001,6 +1001,287 @@ __global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
   write_back_mma<J>(sum, dst + offset_dst, stride_col_dst, tile_y_max_j);
 }
 
+// --- matmul kernel, stream-k work partitioning (ggml mmq.cuh) -------------
+//
+// ggml's "stream-k" partitioning (arXiv:2301.03598), imported with the
+// stream_k_fixup kernel. A block owns a contiguous range of the continuous
+// (it, jt, kb0) index space `kbc`; every iteration that covers a whole output
+// tile writes dst directly, and a block's last iteration, if it covers only
+// part of a tile, writes its partial sums to tmp_fixup[blockIdx.x*J*I]
+// instead (two blocks writing the same tile element would race). The fixup
+// kernel then adds the preceding blocks' partials into dst, walking back over
+// the blocks that end where this one starts.
+//
+// SonicBoom's adaptation (same as the tiled kernel above): the MoE
+// (ids_dst/expert_bounds), channels and samples dimensions are dropped — this
+// runtime's matmul is a plain [M,K] x [K,n] product — so col_low/col_high/
+// col_diff and the ids table reduce to ncols_dst and the identity, and the
+// kbc space is (it, jt, kb0) over nty*ntx*blocks_per_row.
+
+// One tile's contribution over a K range [kb0_start, kb0_stop). When `fixup`
+// is true the sums go to tmp[blockIdx.x*J*I] instead of dst (the caller's last,
+// possibly partial, tile); the layout of that buffer is write_back_mma's dst
+// layout at stride I, which is what the fixup kernel reads.
+template <int Type, int J>
+__device__ __forceinline__ void mul_mat_q_process_tile(
+    const char* __restrict__ x, const int* __restrict__ y,
+    float* __restrict__ dst, float* __restrict__ fixup_dst,
+    const int blocks_per_row, const int ncols_dst, const int ncols_y,
+    const int stride_col_dst, const int it, const int jt,
+    const int kb0_start, const int kb0_stop, const bool fixup) {
+  extern __shared__ int data_mul_mat_q[];
+  int* tile_y = data_mul_mat_q;
+  int* tile_x = tile_y + PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS);
+
+  constexpr int sz = (int)(sizeof(block_q8_1_mmq) / sizeof(int));  // 36
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;   // 1 (K-quant) or 8 (legacy)
+
+  const int offset_y   = jt * J * sz;
+  const int offset_x   = it * I * blocks_per_row;
+
+  float sum[J*I/(WARP_SIZE*NWARPS)] = {0.0f};
+
+  for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+    load_tiles<Type, J>(x, tile_x, offset_x + kb0, blocks_per_row);
+    {
+      const int* by0 = y + offset_y + ncols_y * (kb0 * qk / QK8_1_MMQ) * sz;
+#pragma unroll
+      for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
+        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+        tile_y[l] = by0[l];
+      }
+    }
+    __syncthreads();
+    vec_dot<Type, J>(tile_x, tile_y, sum, 0);
+    __syncthreads();
+    {
+      const int* by0 = y + offset_y + ncols_y * ((kb0 * qk / QK8_1_MMQ) * sz + sz);
+#pragma unroll
+      for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
+        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
+        tile_y[l] = by0[l];
+      }
+    }
+    __syncthreads();
+    vec_dot<Type, J>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+    __syncthreads();
+  }
+
+  if (fixup) {
+    // The whole J x I sum block, at the tile-contiguous stride I: every output
+    // element is written, including the columns past ncols_dst (they are zero
+    // and the fixup reads only j <= j_max). `fixup_dst` is this call's partial
+    // slot — per block for upstream stream-k, per work unit for the fixed
+    // split-K schedule below.
+    write_back_mma<J>(sum, fixup_dst, I, J - 1);
+  } else {
+    const int offset_dst = jt * J * stride_col_dst + it * I;
+    const int tile_y_max_j = ncols_dst - jt*J - 1;
+    write_back_mma<J>(sum, dst + offset_dst, stride_col_dst, tile_y_max_j);
+  }
+}
+
+template <int Type, int J>
+__global__ void mul_mat_q_stream_k(const char* __restrict__ x,
+                                   const int* __restrict__ y,
+                                   float* __restrict__ dst,
+                                   float* __restrict__ tmp_fixup,
+                                   const int blocks_per_row, const int ncols_dst,
+                                   const int ncols_y, const int stride_col_dst,
+                                   const int ntx, const int nty) {
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+
+  // kbc == k block continuous, current index in continuous ijk space.
+  const int64_t total = int64_t(ntx) * nty * blocks_per_row;
+  int kbc      = int(int64_t(blockIdx.x)     * total / gridDim.x);
+  int kbc_stop = int(int64_t(blockIdx.x + 1) * total / gridDim.x);
+
+  kbc      -= (kbc      % blocks_per_row) % blocks_per_iter;
+  kbc_stop -= (kbc_stop % blocks_per_row) % blocks_per_iter;
+
+  // kb0 == k index when doing the matrix multiplication for an output tile.
+  int kb0_start = kbc % blocks_per_row;
+  int kb0_stop  = min(blocks_per_row, kb0_start + (kbc_stop - kbc));
+  while (kbc < kbc_stop && kb0_stop == blocks_per_row) {
+    const int tmp = kbc / blocks_per_row;
+    const int jt = tmp % ntx;
+    const int it = tmp / ntx;
+    mul_mat_q_process_tile<Type, J>(x, y, dst,
+                                    tmp_fixup + int64_t(blockIdx.x)*(J*I),
+                                    blocks_per_row, ncols_dst, ncols_y,
+                                    stride_col_dst, it, jt, kb0_start, kb0_stop,
+                                    /*fixup=*/false);
+    kbc += blocks_per_row;
+    kbc -= kbc % blocks_per_row;
+    kb0_start = 0;
+    kb0_stop  = min(blocks_per_row, kbc_stop - kbc);
+  }
+
+  if (kbc >= kbc_stop) return;
+
+  const int tmp = kbc / blocks_per_row;
+  const int jt = tmp % ntx;
+  const int it = tmp / ntx;
+  mul_mat_q_process_tile<Type, J>(x, y, dst,
+                                  tmp_fixup + int64_t(blockIdx.x)*(J*I),
+                                  blocks_per_row, ncols_dst, ncols_y,
+                                  stride_col_dst, it, jt, kb0_start, kb0_stop,
+                                  /*fixup=*/true);
+}
+
+// --- N-independent fixed split-K schedule ----------------------------------
+//
+// Upstream stream-k's split points are derived from the continuous index total
+// = ntx*nty*blocks_per_row, so they move when the number of columns (hence
+// nty) changes. That breaks batch invariance: the same activation rows
+// prefilled in one segment and in several prefix-cache segments would be
+// reduced in different orders. The schedule below keeps the work decomposition
+// fixed per *weight shape*: every output tile's K range is divided into the
+// same `parts` pieces, chosen from (M, K) and the SM count only. Work units
+// (it, jt, part) are then distributed over a 1D grid, so the K partition — and
+// therefore the per-row result — does not depend on n.
+
+template <int Type, int J>
+__global__ void mul_mat_q_split_k(const char* __restrict__ x,
+                                  const int* __restrict__ y,
+                                  float* __restrict__ dst,
+                                  float* __restrict__ tmp_partial,
+                                  const int blocks_per_row, const int ncols_dst,
+                                  const int ncols_y, const int stride_col_dst,
+                                  const int ntx, const int nty, const int parts,
+                                  const int bpr_aligned) {
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+  const int64_t units = int64_t(ntx) * nty * parts;
+  for (int64_t u = blockIdx.x; u < units; u += gridDim.x) {
+    const int it = int(u % nty);
+    const int64_t r = u / nty;
+    const int jt = int(r % ntx);
+    const int p  = int(r / ntx);
+    int kb0 = (int((int64_t(p)     * bpr_aligned) / parts) / blocks_per_iter) * blocks_per_iter;
+    int kb1 = (int((int64_t(p + 1) * bpr_aligned) / parts) / blocks_per_iter) * blocks_per_iter;
+    if (p + 1 == parts) kb1 = bpr_aligned;
+    if (kb0 == kb1) continue;
+    mul_mat_q_process_tile<Type, J>(x, y, dst,
+                                    tmp_partial + u*(J*I), blocks_per_row,
+                                    ncols_dst, ncols_y, stride_col_dst, it, jt,
+                                    kb0, kb1, /*fixup=*/true);
+  }
+}
+
+template <int Type, int J>
+__global__ void mul_mat_q_split_k_fixup(float* __restrict__ dst,
+                                        const float* __restrict__ tmp_partial,
+                                        const int ncols_dst,
+                                        const int stride_col_dst, const int ntx,
+                                        const int nty, const int parts) {
+  constexpr int NWARPS_F = NWARPS / 2;
+  const int t = blockIdx.x;
+  const int it = t % nty;
+  const int jt = t / nty;
+  const int i = blockIdx.y*WARP_SIZE + threadIdx.x;
+  const int tiles = ntx * nty;
+
+  float sum[J / NWARPS_F] = {0.0f};
+  // Partial slot of (tile t, part p) is work unit u = p*tiles + t.
+  // Sum the parts in a fixed order (ascending K), independent of scheduling.
+  for (int p = 0; p < parts; ++p) {
+    const float* s = tmp_partial + int64_t(p)*tiles*(J*I) + int64_t(t)*(J*I);
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
+      const int j = j0 + threadIdx.y;
+      sum[j0/NWARPS_F] += s[j*I + i];
+    }
+  }
+
+  dst += jt*J*stride_col_dst + it*I;
+  const int j_max = ncols_dst - jt*J - 1;
+#pragma unroll
+  for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
+    const int j = j0 + threadIdx.y;
+    if (j > j_max) return;
+    dst[j*stride_col_dst + i] = sum[j0/NWARPS_F];
+  }
+}
+
+template <int Type, int J>
+__global__ void mul_mat_q_stream_k_fixup(
+    float* __restrict__ dst, const float* __restrict__ tmp_last_tile,
+    const int blocks_per_row, const int ncols_dst, const int stride_col_dst,
+    const int ntx, const int nty) {
+  constexpr int NWARPS_F = NWARPS / 2;  // the fixup's block is half the warps
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+
+  float sum[J / NWARPS_F] = {0.0f};
+  const int i = blockIdx.y*WARP_SIZE + threadIdx.x;
+
+  const int64_t total = int64_t(ntx) * nty * blocks_per_row;
+  int kbc0      = int(int64_t(blockIdx.x)     * total / gridDim.x);
+  int kbc0_stop = int(int64_t(blockIdx.x + 1) * total / gridDim.x);
+
+  kbc0      -= (kbc0      % blocks_per_row) % blocks_per_iter;
+  kbc0_stop -= (kbc0_stop % blocks_per_row) % blocks_per_iter;
+
+  const bool did_not_have_any_data   = kbc0 == kbc0_stop;
+  const bool wrote_beginning_of_tile = (kbc0 % blocks_per_row) == 0;
+  const bool did_not_write_last =
+      (kbc0 / blocks_per_row) == (kbc0_stop / blocks_per_row) &&
+      (kbc0_stop % blocks_per_row) != 0;
+  if (did_not_have_any_data || wrote_beginning_of_tile || did_not_write_last)
+    return;
+
+  bool any_fixup = false;
+
+  // Iterate over previous blocks and sum up the partial sums they wrote.
+  int bidx = blockIdx.x - 1;
+  int kbc_stop = kbc0;
+  while (true) {
+    int kbc = int(int64_t(bidx) * total / gridDim.x);
+    kbc -= (kbc % blocks_per_row) % blocks_per_iter;
+
+    if (kbc == kbc_stop) {  // Did not have any data.
+      bidx--;
+      kbc_stop = kbc;
+      continue;
+    }
+
+    any_fixup = true;
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
+      const int j = j0 + threadIdx.y;
+      sum[j0/NWARPS_F] += tmp_last_tile[bidx*(J*I) + j*I + i];
+    }
+
+    // If this block started in a previous tile we are done and do not need to
+    // combine additional partial results.
+    if ((kbc % blocks_per_row) == 0 ||
+        (kbc / blocks_per_row) < (kbc0 / blocks_per_row))
+      break;
+    bidx--;
+    kbc_stop = kbc;
+  }
+
+  if (!any_fixup) return;
+
+  const int tmp = kbc0 / blocks_per_row;
+  const int jt = tmp % ntx;
+  const int it = tmp / ntx;
+
+  dst += jt*J*stride_col_dst + it*I;
+
+  const int j_max = ncols_dst - jt*J - 1;
+#pragma unroll
+  for (int j0 = 0; j0 < J; j0 += NWARPS_F) {
+    const int j = j0 + threadIdx.y;
+    if (j > j_max) return;
+    dst[j*stride_col_dst + i] += sum[j0/NWARPS_F];
+  }
+}
+
 // --- host-side launchers (SonicBoom's own) ---------------------------------
 
 // Number of 128-value block planes an activation row must have for mul_mat_q:
@@ -1073,6 +1354,111 @@ __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
   const int ntx = (n + J - 1) / J;
   mul_mat_q<Type, J><<<dim3(nty, ntx, 1), dim3(WARP_SIZE, NWARPS, 1), nbytes_shared, stream>>>(
       w, y_q8, dst, blocks_per_row, n, n, M);
+}
+
+// Stream-k launch geometry (ggml's mul_mat_q host launch, fallback = false).
+// ntx*nty tiles are spread over `nsm` blocks when a whole-tile-per-block
+// schedule would leave the SMs under-used (tiling efficiency < 90%), and the
+// fixup is needed exactly when the tile count does not divide the block count.
+struct StreamKGeometry {
+  int ntx;
+  int nty;
+  int nblocks;
+  bool fixup;
+};
+
+__host__ inline StreamKGeometry stream_k_geometry(int M, int n, int J, int nsm) {
+  StreamKGeometry g{};
+  g.nty = (M + I - 1) / I;
+  g.ntx = (n + J - 1) / J;
+  const int ntiles = g.ntx * g.nty;
+  if (nsm <= 0) nsm = 1;
+  const int rounds = (ntiles + nsm - 1) / nsm;
+  const int tiles_efficiency_percent = 100 * ntiles / (nsm * rounds);
+  g.nblocks = tiles_efficiency_percent >= 90 ? ntiles : nsm;
+  g.fixup = (ntiles % g.nblocks) != 0;
+  return g;
+}
+
+// Stream-k launch. `tmp_fixup` must hold >= nblocks*J*I floats when
+// stream_k_geometry(M, n, J, nsm).fixup is true; it is not touched otherwise.
+template <int Type, int J>
+__host__ void launch_mul_mat_q_stream_k(const char* w, const int* y_q8, float* dst,
+                                        float* tmp_fixup, int M, int n,
+                                        int blocks_per_row, int nsm,
+                                        cudaStream_t stream) {
+  constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
+                              Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
+                              (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
+                                                                    : SRAM_STRIDE_Q8_1;
+  constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
+  cudaFuncSetAttribute((const void*)mul_mat_q_stream_k<Type, J>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+  const StreamKGeometry g = stream_k_geometry(M, n, J, nsm);
+  mul_mat_q_stream_k<Type, J>
+      <<<g.nblocks, dim3(WARP_SIZE, NWARPS, 1), nbytes_shared, stream>>>(
+          w, y_q8, dst, tmp_fixup, blocks_per_row, n, n, M, g.ntx, g.nty);
+  if (!g.fixup) return;
+  mul_mat_q_stream_k_fixup<Type, J>
+      <<<dim3(g.nblocks, I/WARP_SIZE, 1), dim3(WARP_SIZE, NWARPS/2, 1), 0, stream>>>(
+          dst, tmp_fixup, blocks_per_row, n, M, g.ntx, g.nty);
+}
+
+// Number of K pieces the fixed split-K schedule uses for a weight shape. It is
+// a function of (M, K, device SM count) only — never of the batch size n — so
+// the K partition (and therefore every output element's rounding) is identical
+// however the activation batch is segmented. Returns 1 when splitting cannot
+// help or is not possible (1 K iteration, or the row tiles already fill the
+// device), which callers treat as "use the tiled kernel".
+// `qk` is QK_K (K-quants) or QK5_0 (legacy), as in qk_of.
+__host__ inline int split_k_parts(int M, int blocks_per_row, int qk, int nsm) {
+  constexpr int max_parts = 4;
+  const int nty = M / I;
+  if (nty <= 0 || M % I != 0) return 1;
+  if (nsm <= 0) nsm = 1;
+  const int blocks_per_iter = MMQ_ITER_K / qk;
+  const int iters = (blocks_per_row + blocks_per_iter - 1) / blocks_per_iter;
+  int parts = (nsm + nty - 1) / nty;
+  if (parts > max_parts) parts = max_parts;
+  if (parts > iters) parts = iters;
+  return parts < 2 ? 1 : parts;
+}
+
+// Scratch (in floats) the split-K launch needs: one J*I partial per work unit.
+__host__ inline int64_t split_k_scratch_floats(int M, int n, int J, int parts) {
+  return int64_t((n + J - 1) / J) * (M / I) * parts * (J*I);
+}
+
+// Fixed split-K launch. `tmp_partial` must hold
+// split_k_scratch_floats(M, n, J, parts) floats.
+template <int Type, int J>
+__host__ void launch_mul_mat_q_split_k(const char* w, const int* y_q8, float* dst,
+                                       float* tmp_partial, int M, int n,
+                                       int blocks_per_row, int nsm, int parts,
+                                       cudaStream_t stream) {
+  constexpr int sram_stride = Type == MMQ_Q3_K ? SRAM_STRIDE_Q3_K :
+                              Type == MMQ_Q6_K ? SRAM_STRIDE_Q6_K :
+                              (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
+                                                                    : SRAM_STRIDE_Q8_1;
+  constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
+  cudaFuncSetAttribute((const void*)mul_mat_q_split_k<Type, J>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+  constexpr int qk = qk_of<Type>();
+  constexpr int blocks_per_iter = MMQ_ITER_K / qk;
+  const int iters = (blocks_per_row + blocks_per_iter - 1) / blocks_per_iter;
+  const int bpr_aligned = iters * blocks_per_iter;
+  const int ntx = (n + J - 1) / J;
+  const int nty = M / I;
+  const int64_t units = int64_t(ntx) * nty * parts;
+  if (nsm <= 0) nsm = 1;
+  const int nblocks = int(units < nsm ? units : nsm);
+  mul_mat_q_split_k<Type, J>
+      <<<nblocks, dim3(WARP_SIZE, NWARPS, 1), nbytes_shared, stream>>>(
+          w, y_q8, dst, tmp_partial, blocks_per_row, n, n, M, ntx, nty, parts,
+          bpr_aligned);
+  mul_mat_q_split_k_fixup<Type, J>
+      <<<dim3(ntx*nty, I/WARP_SIZE, 1), dim3(WARP_SIZE, NWARPS/2, 1), 0, stream>>>(
+          dst, tmp_partial, n, M, ntx, nty, parts);
 }
 
 // Entry point: batched int8-tensor-core matmul, writing dst [M, n] column-major.

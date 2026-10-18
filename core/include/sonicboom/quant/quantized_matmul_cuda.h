@@ -57,6 +57,28 @@ bool q8_1_enabled() noexcept;
 bool mmq_enabled() noexcept;
 int mmq_min_n();
 
+// The MMQ work decomposition (Stage 1): the tiled kernel, or the fixed split-K
+// ("stream-k") schedule that spreads one output tile's K reduction over several
+// blocks, combining the partial sums in a fixed order. Auto defers to the
+// runtime's weight-shape policy.
+enum class MmqDecomp { Auto = 0, Tiled = 1, StreamK = 2 };
+
+// The decomposition for a weight shape class — M = weight rows, K = weight
+// columns, type = quant format. It is deliberately a function of the weight
+// shape only, never of the activation batch size n: split-K changes the
+// floating-point summation order, so a choice that moved with n would make
+// prefix-cache reuse diverge from a full prefill (test_prefix_cache). The plan
+// emitter records the answer as the node's `decomp` attribute; the runtime
+// resolves Auto with the same function.
+//
+// The policy currently returns Tiled for every shape: the fixed split-K
+// schedule has been measured slower on the target GPU at pp512 and at n =
+// 64..256 (see cuda_quant_matmul.cu), so selecting it would regress the
+// canonical metrics. It remains selectable with
+// SONICBOOM_MMQ_DECOMP=stream_k for A/B and is covered by the unit tests.
+MmqDecomp mmq_class_decomp(uint64_t rows, uint64_t cols,
+                           QuantType type) noexcept;
+
 // y = W @ x for a single-column activation, computed on the device. W's packed
 // bytes are uploaded on first use and cached keyed by (data pointer, byte
 // size), so repeated calls with the same weight reuse the device copy. x and y

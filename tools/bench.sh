@@ -621,6 +621,9 @@ if [ "$ABLATE" = 1 ]; then
   ABL_SWITCH_GROUPS=(
     "glue-cache|SONICBOOM_GLUE_CACHE=0"
     "prefix-align|SONICBOOM_PREFIX_ALIGN=0"
+    # Default is tiled; the group-off side runs the split-K schedule, so a
+    # positive contribution means selecting tiled was the right call.
+    "mmq-decomp|SONICBOOM_MMQ_DECOMP=stream_k"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field
@@ -701,7 +704,7 @@ if [ "$ABLATE" = 1 ]; then
     local ABL_MODEL=$1 table_label=$2
     export SONICBOOM_GEMMA_GGUF="$ABL_MODEL"
     unset SONICBOOM_IR_PASS_DISABLE SONICBOOM_FEATURE_DISABLE
-    unset SONICBOOM_GLUE_CACHE SONICBOOM_PREFIX_ALIGN
+    unset SONICBOOM_GLUE_CACHE SONICBOOM_PREFIX_ALIGN SONICBOOM_MMQ_DECOMP
 
     local -A ABL_ON
     local spec m kind off g gname glist

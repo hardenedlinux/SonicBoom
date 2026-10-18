@@ -538,10 +538,22 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         int64_t ds_i = 0;
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
+        // The node's `decomp` attribute is the plan's work decomposition for
+        // this weight shape (set by the emitter from mmq_class_decomp); absent
+        // or unrecognized leaves Auto, which the runtime resolves by the same
+        // weight-shape policy. The attribute never depends on the batch: split-K
+        // changes the summation order, so a choice that moved with the segment
+        // length would break prefix-cache batch invariance.
+        std::string_view decomp_s;
+        quant::cuda::MmqDecomp decomp = quant::cuda::MmqDecomp::Auto;
+        if (attr_s(*node, "decomp", decomp_s)) {
+          if (decomp_s == "stream_k") decomp = quant::cuda::MmqDecomp::StreamK;
+          else if (decomp_s == "tiled") decomp = quant::cuda::MmqDecomp::Tiled;
+        }
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
-            int(nb));
+            int(nb), decomp);
       } else {
         note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
