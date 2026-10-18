@@ -1,5 +1,7 @@
 # SonicBoom
 
+<img src="assets/sonic-boom-logo.webp" height="600">
+
 **A native tensor runtime. No Python. One `.so`.**
 
 SonicBoom is an AI framework written from the ground up in C++ and CUDA,
