@@ -45,6 +45,8 @@ namespace {
 struct LoadedKernel {
   CUmodule module = nullptr;
   CUfunction function = nullptr;
+  // Second entry of a decode module (fa_combine); null for prefill kernels.
+  CUfunction function2 = nullptr;
 };
 
 // Loaded modules live for the process: a module unload is not needed for a
@@ -198,11 +200,13 @@ bool use_disk_cache() {
 }
 
 std::string attention_region_name(const compiler::AttentionShape &shape) {
+  const std::string mask = shape.window_mask ? "-window" : "-causal";
+  if (shape.decode)
+    return "attn-dec-d" + std::to_string(shape.head_dim) + "-g" +
+           std::to_string(shape.gqa) + mask;
   return "attn-d" + std::to_string(shape.head_dim) + "-g" +
-         std::to_string(shape.gqa) +
-         (shape.window_mask ? "-window-" : "-causal-") + "b" +
-         std::to_string(shape.br) + "x" + std::to_string(shape.bc) + "-dps" +
-         std::to_string(shape.dps);
+         std::to_string(shape.gqa) + mask + "-b" + std::to_string(shape.br) +
+         "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps);
 }
 
 // The generated attention kernel's PTX: disk cache first, generator on a miss.
@@ -280,8 +284,16 @@ bool load_attention(const compiler::AttentionShape &shape,
                  int(key.size()), key.data(), cu_error(r));
     return false;
   }
-  r = cuModuleGetFunction(&out.function, out.module,
-                          compiler::kAttentionKernelEntry);
+  if (shape.decode) {
+    r = cuModuleGetFunction(&out.function, out.module,
+                            compiler::kAttentionDecodeKernelEntry);
+    if (r == CUDA_SUCCESS)
+      r = cuModuleGetFunction(&out.function2, out.module,
+                              compiler::kAttentionCombineKernelEntry);
+  } else {
+    r = cuModuleGetFunction(&out.function, out.module,
+                            compiler::kAttentionKernelEntry);
+  }
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr,
                  "glue JIT: cuModuleGetFunction failed for '%.*s': %s\n",
@@ -399,6 +411,72 @@ bool launch_attention(const compiler::AttentionShape &shape,
   (void)args;
   (void)grid_x;
   (void)grid_y;
+  return false;
+#endif
+}
+
+bool launch_attention_decode(const compiler::AttentionShape &shape,
+                             void *const *args, int n_chunks, int n_heads_q) {
+#if SONICBOOM_USE_CUDA
+  if (n_chunks <= 0 || n_heads_q <= 0) return false;
+  const int shared_bytes = compiler::attention_shared_bytes(shape);
+  const std::string key = attention_region_name(shape);
+  CUfunction partial_fn = nullptr;
+  CUfunction combine_fn = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load_attention(shape, key, shared_bytes, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    partial_fn = it->second.function;
+    combine_fn = it->second.function2;
+  }
+  if (partial_fn == nullptr || combine_fn == nullptr) return false;
+
+  // fa_decode: q, kc, vc, startp, nslots, nhq, nhkv, window, scale, part,
+  // chunk. args[11] is out and args[12] the chunk count for fa_combine.
+  void *part_args[11];
+  for (int i = 0; i < 11; ++i) part_args[i] = args[i];
+  void *comb_args[4] = {args[9], args[11], args[5], args[12]};
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    rec->add_launch(key + ":decode", "", unsigned(n_chunks),
+                    unsigned(n_heads_q), 1, 32, 1, 1,
+                    static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::cuda::sb_current_stream()));
+    rec->add_launch(key + ":combine", "", unsigned(n_heads_q), 1, 1,
+                    unsigned(shape.head_dim), 1, 1, 0,
+                    reinterpret_cast<const void *>(
+                        sonicboom::cuda::sb_current_stream()));
+  }
+  CUresult r = cuLaunchKernel(
+      partial_fn, unsigned(n_chunks), unsigned(n_heads_q), 1, 32, 1, 1,
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      part_args, nullptr);
+  if (r != CUDA_SUCCESS) {
+    std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), cu_error(r));
+    return false;
+  }
+  r = cuLaunchKernel(
+      combine_fn, unsigned(n_heads_q), 1, 1, unsigned(shape.head_dim), 1, 1, 0,
+      CUstream(sonicboom::cuda::sb_current_stream()), comb_args, nullptr);
+  if (r != CUDA_SUCCESS) {
+    std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), cu_error(r));
+    return false;
+  }
+  return true;
+#else
+  (void)shape;
+  (void)args;
+  (void)n_chunks;
+  (void)n_heads_q;
   return false;
 #endif
 }

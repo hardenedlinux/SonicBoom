@@ -779,6 +779,446 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   return text;
 }
 
+// Flash-decoding text: `fa_decode` (one warp per (head, chunk) partial) and
+// `fa_combine` (one block per head, ascending-chunk reduction). The split is
+// over key chunks of a runtime length, aligned to absolute positions: chunk s
+// covers keys [s*C, (s+1)*C), clamped to the window's valid lower bound and to
+// the current position. Each lane owns head_dim/32 output columns and keeps
+// them in registers; the q·k dot is reduced across the warp with XOR shuffles,
+// so the reduction order depends only on head_dim. The combine reads chunks in
+// ascending order, so the output does not depend on scheduling.
+std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) {
+  const int D = sh.head_dim;
+  const int GQA = sh.gqa;
+  const int K = D / 32;  // output columns per lane
+
+  Emitter e;
+  std::map<std::string, std::string> C;
+  const auto s = [](int v) { return std::to_string(v); };
+  const auto c32 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i32");
+  };
+  const auto c64 = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : i64");
+  };
+  const auto cf = [&](const char *n, const char *v) {
+    C[n] = e.val(std::string("arith.constant ") + v + " : f32");
+  };
+  const auto ci = [&](const char *n, int v) {
+    C[n] = e.val("arith.constant " + s(v) + " : index");
+  };
+
+  e.op("gpu.func @fa_decode(%q: !llvm.ptr, %kc: !llvm.ptr, %vc: !llvm.ptr, "
+       "%startp: !llvm.ptr, %nslots: i64, %nhq: i32, %nhkv: i32, "
+       "%window: i64, %scale: f32, %part: !llvm.ptr, %chunk: i64) kernel {");
+  c32("c0", 0); c32("c1", 1); c32("c4", 4); c32("c7", 7); c32("c16", 16);
+  c32("c31", 31); c32("c32", 32);
+  c64("l0", 0); c64("l1", 1); c64("l2", 2); c64("ldp", D + 2);
+  c64("lD", D);
+  cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
+  ci("x0", 0); ci("x1", 1);
+  if (GQA != 4 && GQA != 7) c32("gqa", GQA);
+
+  const std::string tid = e.val("gpu.thread_id x");
+  const std::string bx = e.val("gpu.block_id x");
+  const std::string by = e.val("gpu.block_id y");
+  const std::string tid_i = e.val("arith.index_cast " + tid + " : index to i32");
+  const std::string bx_i = e.val("arith.index_cast " + bx + " : index to i32");
+  const std::string by_i = e.val("arith.index_cast " + by + " : index to i32");
+  const std::string lane =
+      e.val("arith.andi " + tid_i + ", " + C["c31"] + " : i32");
+  const std::string lane64 = e.val("arith.extsi " + lane + " : i32 to i64");
+  const std::string bx64 = e.val("arith.extsi " + bx_i + " : i32 to i64");
+  const std::string by64 = e.val("arith.extsi " + by_i + " : i32 to i64");
+  const std::string nhq64 = e.val("arith.extui %nhq : i32 to i64");
+  const std::string nhkv64 = e.val("arith.extui %nhkv : i32 to i64");
+  const std::string start = e.val("llvm.load %startp : !llvm.ptr -> i64");
+  const std::string div =
+      GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
+  const std::string hkv = e.val("arith.divui " + by_i + ", " + div + " : i32");
+  const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
+
+  // Valid key window: [low, start] intersect the block's chunk.
+  std::string low = C["l0"];
+  if (sh.window_mask) {
+    const std::string hasw = e.val("arith.cmpi sgt, %window, " + C["l0"] +
+                                   " : i64");
+    const std::string big = e.val("arith.cmpi sge, " + start + ", %window : i64");
+    const std::string ws = e.val("arith.subi " + start + ", %window : i64");
+    const std::string ws1 = e.val("arith.addi " + ws + ", " + C["l1"] + " : i64");
+    const std::string cond = e.val("arith.andi " + hasw + ", " + big + " : i1");
+    low = e.val("arith.select " + cond + ", " + ws1 + ", " + C["l0"] + " : i64");
+  }
+  // Chunks are aligned to the window's first key (`low`), not to absolute
+  // position 0: the grid is sized for ceil(window / chunk) chunks, and they
+  // must cover any window of that size ending at the current position.
+  const std::string cbo = e.val("arith.muli " + bx64 + ", %chunk : i64");
+  const std::string clo = e.val("arith.addi " + low + ", " + cbo + " : i64");
+  const std::string chi = e.val("arith.addi " + clo + ", %chunk : i64");
+  const std::string endp1 = e.val("arith.addi " + start + ", " + C["l1"] +
+                                  " : i64");
+  const std::string jlo = e.val("arith.maxsi " + clo + ", " + low + " : i64");
+  const std::string jhi = e.val("arith.minsi " + chi + ", " + endp1 + " : i64");
+  const std::string jlo_i = e.val("arith.index_cast " + jlo + " : i64 to index");
+  const std::string jhi_i = e.val("arith.index_cast " + jhi + " : i64 to index");
+
+  // q: [n_heads_q][head_dim] f32, one token.
+  const std::string qbase = e.val("arith.muli " + by64 + ", " + C["lD"] +
+                                  " : i64");
+  std::vector<std::string> qv(K);
+  for (int i = 0; i < K; ++i) {
+    const std::string oi = e.val("arith.constant " + s(i * 32) + " : i64");
+    const std::string off = e.val("arith.addi " + qbase + ", " + lane64 +
+                                  " : i64");
+    const std::string offo = e.val("arith.addi " + off + ", " + oi + " : i64");
+    const std::string p = e.val("llvm.getelementptr %q[" + offo +
+                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    qv[i] = e.val("llvm.load " + p + " : !llvm.ptr -> f32");
+  }
+
+  // The chunk's scores go through a fixed shared-memory view: the block is one
+  // warp, and the P·V pass needs every key's score in every lane. Two passes
+  // (scores + max, then exp + accumulate) keep the computation identical to
+  // the hand-written kernel's chunking — no online rescaling of O — and cost
+  // a store plus a broadcast load per key.
+  const std::string smem =
+      e.val("gpu.dynamic_shared_memory : memref<?xi8, "
+            "#gpu.address_space<workgroup>>");
+  const std::string smemf = e.val(
+      "memref.view " + smem + "[" + C["x0"] +
+      "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<" +
+      s(kAttentionDecodeMaxChunk) + "xf32, #gpu.address_space<workgroup>>");
+  const std::string smtype = " : memref<" + s(kAttentionDecodeMaxChunk) +
+                             "xf32, #gpu.address_space<workgroup>>";
+  const std::string is0 = e.val("arith.cmpi eq, " + tid_i + ", " + C["c0"] +
+                                " : i32");
+
+  // The first key's cache slot costs one 64-bit modulo; every later key's is
+  // the predecessor plus one with a compare-and-reset (device division is a
+  // software routine and dominated this loop before).
+  const std::string slot0 = e.val("arith.remui " + jlo + ", %nslots : i64");
+
+  // Pass 1: one q·k per key, stored by lane 0.
+  e.op("scf.for %j = " + jlo_i + " to " + jhi_i + " step " + C["x1"] +
+       " iter_args(%slot = " + slot0 + ") -> (i64) {");
+  {
+    const std::string so1 =
+        e.val("arith.muli %slot, " + nhkv64 + " : i64");
+    const std::string so2 = e.val("arith.addi " + so1 + ", " + hkv64 + " : i64");
+    const std::string so3 = e.val("arith.muli " + so2 + ", " + C["lD"] +
+                                  " : i64");
+    const std::string base =
+        e.val("arith.addi " + so3 + ", " + lane64 + " : i64");
+    const auto at = [&](const std::string &ptr, int i) {
+      const std::string oi = e.val("arith.constant " + s(i * 32) + " : i64");
+      const std::string off = i == 0 ? base
+                                     : e.val("arith.addi " + base + ", " + oi +
+                                             " : i64");
+      return e.val("llvm.getelementptr %" + ptr + "[" + off +
+                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    };
+    std::string acc;
+    for (int i = 0; i < K; ++i) {
+      const std::string k =
+          e.val("llvm.load " + at("kc", i) + " : !llvm.ptr -> f32");
+      const std::string t = e.val("arith.mulf " + qv[i] + ", " + k + " : f32");
+      acc = i == 0 ? t : e.val("arith.addf " + acc + ", " + t + " : f32");
+    }
+    // Full-warp XOR reduction: every lane ends with the dot product.
+    for (int d = 1; d < 32; d *= 2) {
+      const std::string c = e.val("arith.constant " + s(d) + " : i32");
+      const std::string sh =
+          e.val2("gpu.shuffle xor " + acc + ", " + c + ", " + C["c32"] +
+                 " : f32").first;
+      acc = e.val("arith.addf " + acc + ", " + sh + " : f32");
+    }
+    const std::string sc = e.val("arith.mulf " + acc + ", %scale : f32");
+    const std::string sid = e.val("arith.subi %j, " + jlo_i + " : index");
+    e.op("scf.if " + is0 + " {");
+    e.op("memref.store " + sc + ", " + smemf + "[" + sid + "]" + smtype);
+    e.op("}");
+    const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] + " : i64");
+    const std::string full =
+        e.val("arith.cmpi eq, " + sp1 + ", %nslots : i64");
+    const std::string next =
+        e.val("arith.select " + full + ", " + C["l0"] + ", " + sp1 + " : i64");
+    e.op("scf.yield " + next + " : i64");
+  }
+  e.op("}");
+  e.op("gpu.barrier");
+
+  // Pass 2: chunk maximum, lane-strided local max then an exact warp reduce.
+  const std::string lane_idx =
+      e.val("arith.index_cast " + lane + " : i32 to index");
+  const std::string jstart = e.val("arith.addi " + jlo_i + ", " + lane_idx +
+                                   " : index");
+  std::map<std::string, std::string> cur;
+  {
+    const std::string m0 = e.val("arith.constant 32 : index");
+    const std::string mr = e.val(
+        "scf.for %j = " + jstart + " to " + jhi_i + " step " + m0 +
+        " iter_args(%mm = " + C["cneg"] + ") -> (f32) {");
+    const std::string sid = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string sv = e.val("memref.load " + smemf + "[" + sid + "]" +
+                                 smtype);
+    const std::string nm = e.val("arith.maximumf %mm, " + sv + " : f32");
+    e.op("scf.yield " + nm + " : f32");
+    e.op("}");
+    std::string mx = mr;
+    for (int d = 1; d < 32; d *= 2) {
+      const std::string c = e.val("arith.constant " + s(d) + " : i32");
+      const std::string sh =
+          e.val2("gpu.shuffle xor " + mx + ", " + c + ", " + C["c32"] +
+                 " : f32").first;
+      mx = e.val("arith.maximumf " + mx + ", " + sh + " : f32");
+    }
+    // Pass 3: exp + accumulate. Every lane iterates the whole chunk, so each
+    // lane's l is the full sum (identical across lanes; lane 0 stores it).
+    std::vector<std::string> names;
+    std::vector<std::string> init;
+    std::vector<std::string> types;
+    for (int i = 0; i < K; ++i) {
+      names.push_back("%o" + s(i));
+      init.push_back(C["cf0"]);
+      types.push_back("f32");
+    }
+    names.push_back("%l"); init.push_back(C["cf0"]); types.push_back("f32");
+    names.push_back("%slot"); init.push_back(slot0); types.push_back("i64");
+    std::string ia = "iter_args(";
+    std::string ty = " -> (";
+    std::string loopres;
+    for (size_t i = 0; i < names.size(); ++i) {
+      ia += (i ? ", " : "") + names[i] + " = " + init[i];
+      ty += (i ? ", " : "") + types[i];
+      loopres += (i ? ", " : "") + std::string("%r") + s(int(i));
+    }
+    ia += ")";
+    ty += ")";
+    e.op(loopres + " = scf.for %j = " + jlo_i + " to " + jhi_i + " step " +
+         C["x1"] + " " + ia + ty + " {");
+    std::map<std::string, std::string> iv;
+    for (size_t i = 0; i < names.size(); ++i) iv[names[i]] = names[i];
+
+    const std::string so1 =
+        e.val("arith.muli %slot, " + nhkv64 + " : i64");
+    const std::string so2 = e.val("arith.addi " + so1 + ", " + hkv64 + " : i64");
+    const std::string so3 = e.val("arith.muli " + so2 + ", " + C["lD"] +
+                                  " : i64");
+    const std::string base =
+        e.val("arith.addi " + so3 + ", " + lane64 + " : i64");
+    const auto at = [&](const std::string &ptr, int i) {
+      const std::string oi = e.val("arith.constant " + s(i * 32) + " : i64");
+      const std::string off = i == 0 ? base
+                                     : e.val("arith.addi " + base + ", " + oi +
+                                             " : i64");
+      return e.val("llvm.getelementptr %" + ptr + "[" + off +
+                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    };
+    const std::string psid = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string psv = e.val("memref.load " + smemf + "[" + psid + "]" +
+                                  smtype);
+    const std::string p =
+        e.val("math.exp " + e.val("arith.subf " + psv + ", " + mx + " : f32") +
+              " : f32");
+    // l: each lane sums its own keys and the warp tree-reduces (same reduction
+    // shape as the hand-written kernel), rather than every lane serially
+    // summing the whole chunk.
+    const std::string jj = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string idx31 = e.val("arith.constant 31 : index");
+    const std::string jj32 = e.val("arith.andi " + jj + ", " + idx31 +
+                                   " : index");
+    const std::string mine =
+        e.val("arith.cmpi eq, " + jj32 + ", " + lane_idx + " : index");
+    const std::string nlr = e.val("scf.if " + mine + " -> (f32) {");
+    e.op("scf.yield " +
+         e.val("arith.addf " + iv["%l"] + ", " + p + " : f32") + " : f32");
+    e.op("} else {");
+    e.op("scf.yield " + iv["%l"] + " : f32");
+    e.op("}");
+    iv["%l"] = nlr;
+    for (int i = 0; i < K; ++i) {
+      const std::string v =
+          e.val("llvm.load " + at("vc", i) + " : !llvm.ptr -> f32");
+      iv["%o" + s(i)] =
+          e.val("arith.addf " + iv["%o" + s(i)] + ", " +
+                e.val("arith.mulf " + p + ", " + v + " : f32") + " : f32");
+    }
+    {
+      const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] + " : i64");
+      const std::string full =
+          e.val("arith.cmpi eq, " + sp1 + ", %nslots : i64");
+      iv["%slot"] =
+          e.val("arith.select " + full + ", " + C["l0"] + ", " + sp1 + " : i64");
+    }
+    {
+      std::string y = "scf.yield ";
+      std::string t;
+      for (size_t i = 0; i < names.size(); ++i) {
+        y += (i ? ", " : "") + iv[names[i]];
+        t += (i ? ", " : "") + types[i];
+      }
+      e.op(y + " : " + t);
+    }
+    e.op("}");
+    std::map<std::string, std::string> out;
+    for (size_t i = 0; i < names.size(); ++i)
+      out[names[i]] = "%r" + s(int(i));
+    out["%m"] = mx;
+    // Warp tree sum of the per-lane l partials; lane 0 ends with the total,
+    // which is the only copy stored (same reduction as the own kernel).
+    std::string lt = out["%l"];
+    for (int d = 1; d < 32; d *= 2) {
+      const std::string c = e.val("arith.constant " + s(d) + " : i32");
+      const std::string sh =
+          e.val2("gpu.shuffle down " + lt + ", " + c + ", " + C["c32"] +
+                 " : f32").first;
+      lt = e.val("arith.addf " + lt + ", " + sh + " : f32");
+    }
+    out["%l"] = lt;
+    // Partial store below uses `cur`.
+    cur = out;
+  }
+
+  // Partial slot: (chunk, head) -> [head_dim + 2] f32; O stays unnormalized.
+  const std::string pid1 = e.val("arith.muli " + bx64 + ", " + nhq64 + " : i64");
+  const std::string pid2 = e.val("arith.addi " + pid1 + ", " + by64 + " : i64");
+  const std::string pid = e.val("arith.muli " + pid2 + ", " + C["ldp"] + " : i64");
+  for (int i = 0; i < K; ++i) {
+    const std::string oi = e.val("arith.constant " + s(i * 32) + " : i64");
+    const std::string t = e.val("arith.addi " + pid + ", " + oi + " : i64");
+    const std::string off = e.val("arith.addi " + t + ", " + lane64 + " : i64");
+    const std::string pp = e.val("llvm.getelementptr %part[" + off +
+                                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    e.op("llvm.store " + cur["%o" + s(i)] + ", " + pp + " : f32, !llvm.ptr");
+  }
+  e.op("scf.if " + is0 + " {");
+  const std::string moff = e.val("arith.addi " + pid + ", " + C["lD"] + " : i64");
+  const std::string mp = e.val("llvm.getelementptr %part[" + moff +
+                               "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  e.op("llvm.store " + cur["%m"] + ", " + mp + " : f32, !llvm.ptr");
+  const std::string loff = e.val("arith.addi " + moff + ", " + C["l1"] + " : i64");
+  const std::string lp = e.val("llvm.getelementptr %part[" + loff +
+                               "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  e.op("llvm.store " + cur["%l"] + ", " + lp + " : f32, !llvm.ptr");
+  e.op("}");
+  e.op("gpu.return");
+  e.op("}");
+
+  // ---- combine: one block per head, head_dim threads ----------------------
+  Emitter f;
+  std::map<std::string, std::string> C2;
+  const auto d32 = [&](const char *n, int v) {
+    C2[n] = f.val("arith.constant " + s(v) + " : i32");
+  };
+  const auto d64 = [&](const char *n, int v) {
+    C2[n] = f.val("arith.constant " + s(v) + " : i64");
+  };
+  const auto df = [&](const char *n, const char *v) {
+    C2[n] = f.val(std::string("arith.constant ") + v + " : f32");
+  };
+  const auto di = [&](const char *n, int v) {
+    C2[n] = f.val("arith.constant " + s(v) + " : index");
+  };
+  f.op("gpu.func @fa_combine(%part: !llvm.ptr, %out: !llvm.ptr, "
+       "%nhq: i32, %nchunks: i32) kernel {");
+  d32("c0", 0); d32("c1", 1); d32("c16", 16); d32("c31", 31); d32("c32", 32);
+  d64("l0", 0); d64("l1", 1); d64("ldp", D + 2); d64("lD", D);
+  df("cf0", "0.0"); df("cneg", "-1.0e+30"); df("cone", "1.0");
+  di("x0", 0); di("x1", 1);
+  const std::string ct = f.val("gpu.thread_id x");
+  const std::string bh = f.val("gpu.block_id x");
+  const std::string ct_i = f.val("arith.index_cast " + ct + " : index to i32");
+  const std::string bh_i = f.val("arith.index_cast " + bh + " : index to i32");
+  const std::string ct64 = f.val("arith.extsi " + ct_i + " : i32 to i64");
+  const std::string bh64 = f.val("arith.extsi " + bh_i + " : i32 to i64");
+  const std::string cnq = f.val("arith.extui %nhq : i32 to i64");
+  const std::string sn = f.val("arith.index_cast %nchunks : i32 to index");
+  // Pass 1: chunk maximum over chunks whose l > 0.
+  const std::string mr =
+      f.val("scf.for %s = " + C2["x0"] + " to " + sn + " step " + C2["x1"] +
+            " iter_args(%mm = " + C2["cneg"] + ") -> (f32) {");
+  const std::string s64 = f.val("arith.index_cast %s : index to i64");
+  const std::string q1 = f.val("arith.muli " + s64 + ", " + cnq + " : i64");
+  const std::string q2 = f.val("arith.addi " + q1 + ", " + bh64 + " : i64");
+  const std::string q3 = f.val("arith.muli " + q2 + ", " + C2["ldp"] + " : i64");
+  // Partial layout: O at [0, D), m at D, l at D+1. Chunks with l == 0 are
+  // empty (beyond the key window) and must not contribute -1e30 to the max.
+  const std::string lm = f.val("arith.addi " + q3 + ", " + C2["lD"] + " : i64");
+  const std::string lmi = f.val("arith.addi " + lm + ", " + C2["l1"] + " : i64");
+  const std::string lmp = f.val("llvm.getelementptr %part[" + lmi +
+                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  const std::string lv = f.val("llvm.load " + lmp + " : !llvm.ptr -> f32");
+  const std::string lok = f.val("arith.cmpf ogt, " + lv + ", " + C2["cf0"] +
+                                " : f32");
+  const std::string lmp2 = f.val("llvm.getelementptr %part[" + lm +
+                                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  const std::string mv = f.val("llvm.load " + lmp2 + " : !llvm.ptr -> f32");
+  const std::string mv2 = f.val("arith.select " + lok + ", " + mv + ", " +
+                                C2["cneg"] + " : f32");
+  const std::string nm = f.val("arith.maximumf %mm, " + mv2 + " : f32");
+  f.op("scf.yield " + nm + " : f32");
+  f.op("}");
+  const std::string mmax = mr;
+  // Pass 2: ascending-chunk weighted sum.
+  f.op("%ca, %cw = scf.for %s = " + C2["x0"] + " to " + sn + " step " +
+       C2["x1"] + " iter_args(%a = " + C2["cf0"] + ", %w = " + C2["cf0"] +
+       ") -> (f32, f32) {");
+  const std::string t64 = f.val("arith.index_cast %s : index to i64");
+  const std::string w1 = f.val("arith.muli " + t64 + ", " + cnq + " : i64");
+  const std::string w2 = f.val("arith.addi " + w1 + ", " + bh64 + " : i64");
+  const std::string w3 = f.val("arith.muli " + w2 + ", " + C2["ldp"] + " : i64");
+  const std::string wl = f.val("arith.addi " + w3 + ", " + C2["lD"] + " : i64");
+  const std::string wl1 = f.val("arith.addi " + wl + ", " + C2["l1"] + " : i64");
+  const std::string wlp = f.val("llvm.getelementptr %part[" + wl1 +
+                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  const std::string lv2 = f.val("llvm.load " + wlp + " : !llvm.ptr -> f32");
+  const std::string wok = f.val("arith.cmpf ogt, " + lv2 + ", " + C2["cf0"] +
+                                " : f32");
+  const std::string wmp = f.val("llvm.getelementptr %part[" + wl +
+                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  const std::string mv3 = f.val("llvm.load " + wmp + " : !llvm.ptr -> f32");
+  const std::string ex0 = f.val("math.exp " + f.val("arith.subf " + mv3 + ", " +
+                                                   mmax + " : f32") + " : f32");
+  // O is stored unnormalized, so the numerator rescales it by exp(m - mmax)
+  // only; the chunk's l contributes to the denominator weight alone.
+  const std::string ex =
+      f.val("arith.select " + wok + ", " + ex0 + ", " + C2["cf0"] + " : f32");
+  const std::string wv = f.val("arith.mulf " + ex + ", " + lv2 + " : f32");
+  const std::string oo = f.val("arith.addi " + w3 + ", " + ct64 + " : i64");
+  const std::string op = f.val("llvm.getelementptr %part[" + oo +
+                               "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  const std::string ov = f.val("llvm.load " + op + " : !llvm.ptr -> f32");
+  const std::string na = f.val("arith.addf %a, " +
+                               f.val("arith.mulf " + ex + ", " + ov + " : f32") +
+                               " : f32");
+  const std::string nw = f.val("arith.addf %w, " + wv + " : f32");
+  f.op("scf.yield " + na + ", " + nw + " : f32, f32");
+  f.op("}");
+  const std::string cacc = "%ca";
+  const std::string csumw = "%cw";
+  const std::string inv = f.val("arith.divf " + C2["cone"] + ", " + csumw +
+                                " : f32");
+  const std::string den = f.val("arith.cmpf ogt, " + csumw + ", " + C2["cf0"] +
+                                " : f32");
+  const std::string yv = f.val("arith.select " + den + ", " +
+                               f.val("arith.mulf " + cacc + ", " + inv +
+                                     " : f32") + ", " + C2["cf0"] + " : f32");
+  const std::string ob = f.val("arith.muli " + bh64 + ", " + C2["lD"] + " : i64");
+  const std::string oe = f.val("arith.addi " + ob + ", " + ct64 + " : i64");
+  const std::string op2 = f.val("llvm.getelementptr %out[" + oe +
+                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+  f.op("llvm.store " + yv + ", " + op2 + " : f32, !llvm.ptr");
+  f.op("gpu.return");
+  f.op("}");
+
+  std::string text = "module attributes {gpu.container_module} {\n";
+  text += "  gpu.module @fa [#nvvm.target<chip = \"sm_" + s(sm_arch) + "\">] {\n";
+  text += e.body;
+  text += f.body;
+  text += "  }\n}\n";
+  return text;
+}
+
 } // namespace
 
 bool attention_shape_supported(const AttentionShape &shape) {
@@ -788,6 +1228,11 @@ bool attention_shape_supported(const AttentionShape &shape) {
   // fragments per thread; wider needs a different accumulation). The staging
   // is Q + K + V plus the f32 partial-S buffer when the head_dim is split.
   if (shape.head_dim <= 0 || shape.gqa <= 0) return false;
+  if (shape.decode) {
+    // One warp per head/chunk: each lane holds head_dim/32 output floats.
+    return shape.head_dim % 32 == 0 && shape.head_dim / 32 <= 16 &&
+           shape.head_dim <= 1024;
+  }
   if (shape.br < 16 || shape.br > 64 || shape.br % 16 != 0) return false;
   if (shape.bc < 16 || shape.bc > 64 || shape.bc % 16 != 0) return false;
   const int dps = shape.dps;
@@ -802,10 +1247,13 @@ bool attention_shape_supported(const AttentionShape &shape) {
 }
 
 int attention_block_threads(const AttentionShape &shape) {
+  if (shape.decode) return 32;  // one warp for the partial kernel
   return (shape.br / 16) * shape.dps * 32;
 }
 
 int attention_shared_bytes(const AttentionShape &shape) {
+  // Decode: the fixed score view the partial kernel stages the chunk in.
+  if (shape.decode) return 4 * kAttentionDecodeMaxChunk;
   const int q = 2 * shape.br * shape.head_dim;
   const int k = 2 * shape.head_dim * shape.bc;
   const int v = 2 * shape.bc * shape.head_dim;
@@ -817,15 +1265,16 @@ int attention_shared_bytes(const AttentionShape &shape) {
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
                                                   int sm_arch) {
   if (!attention_shape_supported(shape)) return std::nullopt;
-  const std::string text = attention_region_text(shape, sm_arch);
+  const std::string text = shape.decode
+      ? attention_decode_region_text(shape, sm_arch)
+      : attention_region_text(shape, sm_arch);
   // The softmax exp is libdevice's __nv_expf (math.exp -> nvvm).
   return lower_gpu_module_to_ptx(text, /*link_libdevice=*/true, "attention");
 }
 
 std::string attention_codegen_version() {
-  // attn2: head_dim split across warps (partial S exchanged through shared
-  // memory) and the generic Br/Bc staging.
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn2";
+  // attn3: flash-decoding split-KV kernels (fa_decode + fa_combine).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn3";
 }
 
 } // namespace sonicboom::compiler

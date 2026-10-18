@@ -58,4 +58,16 @@ bool launch(std::string_view region, void* const* args, int blocks, int threads,
 bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
                       int grid_x, int grid_y);
 
+// Launch the flash-decoding pair for a decode shape. `args` has 13 entries:
+//   0 q, 1 k_cache, 2 v_cache, 3 start, 4 n_slots, 5 n_heads_q,
+//   6 n_heads_kv, 7 window, 8 scale, 9 partial, 10 chunk,
+//   11 out, 12 n_chunks
+// The partial kernel runs with grid (n_chunks, n_heads_q) and one warp per
+// block; the combine kernel with grid (n_heads_q) and head_dim threads. The
+// partial buffer is [n_chunks][n_heads_q][head_dim + 2] f32 and must be
+// device-resident before capture (warmed by the first launch). False means
+// the shape has no generator or the compile/load failed.
+bool launch_attention_decode(const compiler::AttentionShape &shape,
+                             void* const* args, int n_chunks, int n_heads_q);
+
 } // namespace sonicboom::planner::glue

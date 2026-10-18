@@ -63,11 +63,18 @@ struct AttentionShape {
   // DC = head_dim/dps <= 128. The warps exchange partial S through shared
   // memory and sum in warp order (batch invariance).
   int dps = 1;
+  // Flash-decoding (q_len = 1) split-KV kernels: `fa_decode` writes one
+  // partial (m, l, O) per (head, key chunk) and `fa_combine` reduces the
+  // partials in ascending chunk order. The chunk length is a runtime argument
+  // (fixed per shape class by the caller, at most kAttentionDecodeMaxChunk),
+  // so the generated text, br/bc/dps and the region identity do not depend on
+  // it. In decode mode br/bc/dps are ignored.
+  bool decode = false;
 
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
-           dps == o.dps;
+           dps == o.dps && decode == o.decode;
   }
 };
 
@@ -75,15 +82,36 @@ struct AttentionShape {
 // fragments of four f32 per thread (DC = head_dim/dps <= 128), so the register
 // budget bounds the per-warp column slice, not head_dim; the staging is
 // 2*(br*head_dim + 2*bc*head_dim) bytes plus the partial-S buffer when dps > 1.
+// Decode shapes need head_dim % 32 == 0 and head_dim / 32 <= 16 accumulator
+// registers per lane (a single warp owns one head), and head_dim <= 1024 so the
+// combine block fits the thread limit.
 bool attention_shape_supported(const AttentionShape &shape);
 
 // Launch geometry of the generated kernel: (br/16)*dps warps of 32 threads,
-// one block per (query tile, query head).
+// one block per (query tile, query head). Decode shapes: one warp per block,
+// with the chunk's scores staged in 4 * kAttentionDecodeMaxChunk bytes of
+// dynamic shared memory (the combine kernel uses head_dim threads and no
+// shared memory).
 int attention_block_threads(const AttentionShape &shape);
 int attention_shared_bytes(const AttentionShape &shape);
 
 // The generated kernel's PTX entry symbol (gpu.func name).
 constexpr const char *kAttentionKernelEntry = "fa";
+
+// Flash-decoding entries (decode shapes only). `fa_decode` takes
+//   q, k_cache, v_cache, start, n_slots, n_heads_q, n_heads_kv, window, scale,
+//   partial, chunk
+// with grid (n_chunks, n_heads_q) and one warp per block; `fa_combine` takes
+//   partial, out, n_heads_q, n_chunks
+// with grid (n_heads_q) and head_dim threads per block. The partial buffer is
+// [n_chunks][n_heads_q][head_dim + 2] f32 (O, then m and l).
+constexpr const char *kAttentionDecodeKernelEntry = "fa_decode";
+constexpr const char *kAttentionCombineKernelEntry = "fa_combine";
+
+// Largest key chunk the generated decoder supports: the chunk's scores live in
+// a fixed 256-slot shared-memory view (the block is one warp and every lane
+// needs each key's score for the P·V pass).
+constexpr int kAttentionDecodeMaxChunk = 256;
 
 // Emit and lower the kernel for `shape` targeting compute capability
 // `sm_arch` (86 = sm_86). Returns nullopt, having printed the MLIR

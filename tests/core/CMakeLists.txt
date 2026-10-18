@@ -208,12 +208,27 @@ if(SONICBOOM_USE_CUDA)
                                                              CUDA::cuda_driver)
   sb_add_cpp_test(test_cuda_attention_codegen_wide)
 
+  # Compiler-generated flash-decoding (Stage 5): the codegen path of
+  # decode_attention_dev — `fa_decode` partials + `fa_combine`, at head_dim
+  # 256/512 and the forced d64 GQA shape. Differential against an fp64
+  # softmax over the KV cache, determinism, and "not worse than the
+  # hand-written split-KV kernel it replaces". SONICBOOM_ATTN_DECODE is set by
+  # the test itself.
+  add_executable(test_cuda_attention_decode_codegen
+                 test_cuda_attention_decode_codegen.cpp)
+  target_link_libraries(test_cuda_attention_decode_codegen PRIVATE sonicboom
+                                                              sonicboom_compiler
+                                                              CUDA::cudart
+                                                              CUDA::cuda_driver)
+  sb_add_cpp_test(test_cuda_attention_decode_codegen)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
                        test_cuda_elementwise test_glue_codegen
                        test_cuda_attention_codegen
                        test_cuda_attention_codegen_wide
+                       test_cuda_attention_decode_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

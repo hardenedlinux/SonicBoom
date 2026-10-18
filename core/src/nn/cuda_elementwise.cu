@@ -2554,13 +2554,89 @@ bool decode_attention_dev(const float* q, const float* k_cache,
       !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0)
     return false;
 
+  const int group_q = n_heads_q / n_heads_kv;
+
+  // Generated flash-decoding (codegen) or the hand-written split-KV (own).
+  // Own is the default: the generated pair reorders the f32 sums, and its
+  // greedy token stream is not identical to own's (seed 2 diverges at step 35
+  // of 256; seeds 7 and 1234 agree for 256), so it does not meet the
+  // bit-identical-tokens default. SONICBOOM_ATTN_DECODE=codegen selects the
+  // generated pair (the ablation arm); SONICBOOM_ATTN_IMPL=own forces own.
+  //
+  // Measured per shape class (attention_bench, RTX 3050, us/call): windowed
+  // d256 at a 512-key window 23.2 (codegen, chunk 16) vs 31.3 (own); causal
+  // d512 44.8 vs 50.5 at 513 keys but 279+ vs 245.5 at 4097 keys -- own's
+  // blocks share one KV group's read across query heads, the generated
+  // one-warp-per-(head, chunk) blocks re-read it per query head. End to end
+  // (all classes switched) that is +1.3% at depth 512 and -4.7% at depth
+  // 4096 (47.1 vs 49.4 tok/s).
+  {
+    const char *adec = std::getenv("SONICBOOM_ATTN_DECODE");
+    const char *aimpl = std::getenv("SONICBOOM_ATTN_IMPL");
+    bool want_codegen = adec != nullptr && std::string_view(adec) == "codegen";
+    if (aimpl != nullptr && std::string_view(aimpl) == "own")
+      want_codegen = false;
+    compiler::AttentionShape dsh;
+    dsh.head_dim = head_dim;
+    dsh.gqa = group_q;
+    dsh.window_mask = sliding_window != 0;
+    dsh.decode = true;
+    if (want_codegen && compiler::attention_shape_supported(dsh) &&
+        n_heads_q % n_heads_kv == 0) {
+      // Fixed chunk length per shape class: the chunk count scales with the
+      // max valid KV extent (`window`), not with this launch's key count. The
+      // absolute alignment makes a chunk's keys independent of the step.
+      uint64_t kDecodeChunk = 16;
+      if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
+        const long v = std::atol(e);
+        if (v > 0) kDecodeChunk = (uint64_t)v;
+      }
+      // The generated decoder stages one chunk's scores in a fixed shared
+      // view; a larger chunk is outside what the generated text supports.
+      if (kDecodeChunk > (uint64_t)compiler::kAttentionDecodeMaxChunk)
+        kDecodeChunk = compiler::kAttentionDecodeMaxChunk;
+      const uint64_t n_chunks = (window + kDecodeChunk - 1) / kDecodeChunk;
+      const size_t partial_floats =
+          (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
+      float *partial = static_cast<float *>(
+          grow_scratch(g_attn_partial, g_attn_partial_bytes,
+                       partial_floats * sizeof(float)));
+      if (partial != nullptr) {
+        const float *qa = q;
+        const float *kca = k_cache;
+        const float *vca = v_cache;
+        const uint64_t *startp = pos;
+        uint64_t nslots_arg = n_slots;
+        uint64_t win_arg = sliding_window;
+        int nhq_arg = n_heads_q;
+        int nhkv_arg = n_heads_kv;
+        float scale_arg = scale;
+        uint64_t chunk_arg = kDecodeChunk;
+        float *out_arg = out;
+        int nch_arg = (int)n_chunks;
+        void *args[13] = {&qa,       &kca,      &vca,       &startp,
+                          &nslots_arg, &nhq_arg, &nhkv_arg, &win_arg,
+                          &scale_arg, &partial, &chunk_arg, &out_arg,
+                          &nch_arg};
+        if (planner::glue::launch_attention_decode(dsh, args, (int)n_chunks,
+                                                   n_heads_q)) {
+          if (attn_trace_on())
+            attn_trace_decode(attn_trace_read_start(pos), window,
+                              kDecodeChunk, n_chunks, head_dim, group_q,
+                              "codegen-split-decode",
+                              (int)(n_chunks * (uint64_t)n_heads_q), 32, 0);
+          return true;
+        }
+      }
+    }
+  }
+
   // Split-KV: n_chunks × n_kv_heads blocks each compute a per-head partial over
   // its slice of the KV sequence, then n_heads_q merge blocks combine them in
   // fixed order. The launch config is sized from the FIXED `window` (max key
   // count this graph replays for: sliding_window for SWA, n_ctx for global), so
   // grid/smem/chunk are stable for CUDA Graph capture; the split kernel computes
   // the real start/n_keys from *pos and early-exits chunks beyond n_keys.
-  const int group_q = n_heads_q / n_heads_kv;
   const uint64_t target_chunks =
       std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
   // chunk = ceil(window / target_chunks), but capped so a large n_ctx does not
