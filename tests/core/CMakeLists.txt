@@ -60,6 +60,18 @@ target_compile_definitions(test_generate PRIVATE
 target_compile_definitions(test_prefix_cache PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# The 8K-context prefix cases (8191 / 8192 / 8193) run in their own process.
+# On an 8 GiB device the allocations retained by the preceding cases push the
+# 8K peak over the limit (the 8191 CUDA graph fails to instantiate with "out of
+# memory" in the combined run) while the same cases fit when the process starts
+# fresh. Same executable, two enumerations; the device lock serializes them.
+add_test(NAME test_prefix_cache_long
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 $<TARGET_FILE:test_prefix_cache> --long)
+set_tests_properties(test_prefix_cache_long
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
 # test_vocab loads the real Gemma 4 GGUF tokenizer (skips cleanly when absent);
 # same repository-root requirement for locating models/.
 target_compile_definitions(test_vocab PRIVATE

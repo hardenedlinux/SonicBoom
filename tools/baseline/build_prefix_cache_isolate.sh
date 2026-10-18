@@ -8,7 +8,8 @@ export LC_ALL=C LANG=C
 set -euo pipefail
 
 ROOT="${SONICBOOM_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-LIB="$ROOT/build/core"
+BUILD="${SONICBOOM_BUILD_DIR:-build}"
+case "$BUILD" in /*) LIB="$BUILD/core" ;; *) LIB="$ROOT/$BUILD/core" ;; esac
 INC="$ROOT/core/include"
 
 CXX="${CXX:-g++-13}"

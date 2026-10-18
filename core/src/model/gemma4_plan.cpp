@@ -2022,6 +2022,21 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                   use_prefill, /*session=*/nullptr);
 }
 
+namespace {
+
+// Whether the reuse boundary is held back onto a prefill chunk boundary when a
+// seeded prefix would otherwise end with a one-token final segment.
+// SONICBOOM_PREFIX_ALIGN=0 restores the old boundary (divergence analysis).
+bool prefix_align_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_PREFIX_ALIGN");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return v;
+}
+
+} // namespace
+
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint64_t> prompt,
                                             uint64_t start_pos,
@@ -2045,6 +2060,22 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // The reported reuse count stays honest — this is exactly what was reused.
   if (prefix_len == prompt.size())
     prefix_len = prompt.size() - 1;
+
+  // Prefill lays its segments on absolute multiples of the chunk and a segment
+  // shorter than the mmq threshold (i.e. a single token) takes the
+  // single-column kernels instead of the batched ones. A prefix that ends one
+  // token past a chunk boundary was therefore seeded with a one-token final
+  // segment; a full prefill of a longer prompt computes the same position
+  // inside a multi-token segment, and the two disagree in the KV cache
+  // (measured: the layer-0 V row differs by ~3e-2 at the last seed position,
+  // the K row is bit-identical). Hold that token back so the suffix starts on
+  // the chunk boundary and its segmentation matches the full prefill's. The
+  // cost is one recomputed token.
+  const uint64_t chunk = (m.config.sliding_window > 0)
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  if (prefix_align_enabled() && prefix_len > 0 && prefix_len % chunk == 1)
+    --prefix_len;
   if (n_reused_out) *n_reused_out = prefix_len;
 
   // The cache size is the session's n_ctx (pre-set by the caller for its largest

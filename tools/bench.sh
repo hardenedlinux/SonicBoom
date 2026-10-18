@@ -583,7 +583,7 @@ if [ "$WORKLOAD" = 1 ]; then
 fi
 
 # --- ablation mode ---------------------------------------------------------
-# Two group families, both measured the same way:
+# Three group families, all measured the same way:
 #   pass groups   — "this pass and the folds it feeds": disabling
 #                   QuantizeOncePass leaves the IR without the quantize nodes
 #                   the quantize folds match, and the mmq folds' input pass is
@@ -592,6 +592,8 @@ fi
 #                   prefill CUDA graphs, capture reuse, split-KV attention, the
 #                   plan cache, the q8_1 dispatch, device-buffer reuse, and the
 #                   one-time warm-up.
+#   switch groups  — a single env switch that is not a FEATURE_DISABLE bit
+#                   (e.g. SONICBOOM_PREFIX_ALIGN=0).
 if [ "$ABLATE" = 1 ]; then
   ABL_PASS_GROUPS=(
     "quantize-once+folds|QuantizeOncePass,RmsNormQuantizePass,GeluMulQuantizePass,SiluMulQuantizePass"
@@ -613,6 +615,11 @@ if [ "$ABLATE" = 1 ]; then
     "glue-codegen|glue_codegen"
     "autotune|autotune"
     "warmup|warmup"
+  )
+  # switch groups — env switches that are not SONICBOOM_FEATURE_DISABLE bits.
+  # The entry is the literal VAR=value exported while the group is "off".
+  ABL_SWITCH_GROUPS=(
+    "prefix-align|SONICBOOM_PREFIX_ALIGN=0"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field
@@ -693,6 +700,7 @@ if [ "$ABLATE" = 1 ]; then
     local ABL_MODEL=$1 table_label=$2
     export SONICBOOM_GEMMA_GGUF="$ABL_MODEL"
     unset SONICBOOM_IR_PASS_DISABLE SONICBOOM_FEATURE_DISABLE
+    unset SONICBOOM_GLUE_CACHE SONICBOOM_PREFIX_ALIGN
 
     local -A ABL_ON
     local spec m kind off g gname glist
@@ -761,6 +769,23 @@ if [ "$ABLATE" = 1 ]; then
       done
       unset SONICBOOM_FEATURE_DISABLE
     done
+    for g in "${ABL_SWITCH_GROUPS[@]}"; do
+      gname=${g%%|*}; glist=${g##*|}
+      export "$glist"
+      abl_agent_both
+      for spec in $ABL_METRICS; do
+        m=${spec%%:*}; kind=${spec##*:}
+        case "$m" in
+          agent_ttft) off=$ABL_AT ;;
+          agent_wall) off=$ABL_AW ;;
+          *) off=$(abl_metric "$m") ;;
+        esac
+        printf '| %-22s | %-11s | %16s | %14s | %12s |\n' "$gname" "$m" \
+          "$(pm "${ABL_ON[$m]}" nan)" "$(pm "$off" nan)" \
+          "$(abl_contrib "$kind" "${ABL_ON[$m]}" "$off")"
+      done
+      unset "${glist%%=*}"
+    done
     echo
     echo "groups (contribution is the share of the group-off value the group is worth;"
     echo "        positive = the group helps, negative = it costs that share):"
@@ -769,6 +794,9 @@ if [ "$ABLATE" = 1 ]; then
     done
     for g in "${ABL_FEATURE_GROUPS[@]}"; do
       printf '  feature  %-24s %s\n' "${g%%|*}" "${g##*|}"
+    done
+    for g in "${ABL_SWITCH_GROUPS[@]}"; do
+      printf '  switch   %-24s %s\n' "${g%%|*}" "${g##*|}"
     done
     echo "RESULT ablate model=$table_label runs=$RUNS $(for spec in $ABL_METRICS; do m=${spec%%:*}; printf '%s_on=%s ' "$m" "${ABL_ON[$m]}"; done)"
   }

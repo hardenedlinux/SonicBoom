@@ -50,8 +50,8 @@ done
 "$DIR/tokenize_text" "$MODEL" "$TEXT" > "$TEXT.tokens.full"
 
 # Truncate to a committed fixture size large enough for the longest acceptance
-# case (prefix 4097 + new 600 + 32 continuation steps + margin).
-MAX_TOKENS="${REAL_PROMPT_MAX_TOKENS:-8000}"
+# case (prefix 8193 + new 600 + 32 continuation steps + margin).
+MAX_TOKENS="${REAL_PROMPT_MAX_TOKENS:-9000}"
 cut -d' ' -f1-"$MAX_TOKENS" "$TEXT.tokens.full" > "$TOKENS"
 rm -f "$TEXT.tokens.full"
 

@@ -270,6 +270,46 @@ int main(int argc, char** argv) {
   }
   if (!any_gt) printf("  (no K/V element differs by more than 1e-3)\n");
 
+  // Seed boundary: in path a, position prefix_n-1 is the first token of the
+  // trailing segment (new_n+1 tokens); in path b it is the final token of the
+  // prefix seed. When prefix_n % 512 == 1 that trailing seed segment is a
+  // single token, i.e. exactly where the two paths differ in segment extent.
+  // Positions before it are laid out in the same 512-token chunks in both
+  // paths, so a per-layer diff here localizes the batch (n) dependence to the
+  // last prefix token.
+  if (prefix_n > 0) {
+    printf("KV-cache diff a vs b at the last prefix token (pos=%llu):\n",
+           (unsigned long long)(prefix_n - 1));
+    bool any_seed_gt = false;
+    for (size_t l = 0; l < n_layer; ++l) {
+      const sbplanner::KvCacheDev& A = (*sa.caches)[l];
+      const sbplanner::KvCacheDev& B = (*sb.caches)[l];
+      const uint64_t row = A.n_heads_kv * A.head_dim;
+      std::vector<float> ak, av, bk, bv;
+      if (!read_buf(A.k_buf, ak) || !read_buf(A.v_buf, av) ||
+          !read_buf(B.k_buf, bk) || !read_buf(B.v_buf, bv))
+        continue;
+      float km[4] = {0, 0, 0, 0}, vm[4] = {0, 0, 0, 0};
+      for (uint64_t back = 1; back <= 4; ++back) {  // last 4 prefix tokens
+        const uint64_t pos = prefix_n - back;
+        const uint64_t base = (pos % A.n_slots) * row;
+        for (uint64_t e = 0; e < row; ++e) {
+          km[back - 1] = std::max(km[back - 1],
+                                  std::fabs(ak[base + e] - bk[base + e]));
+          vm[back - 1] = std::max(vm[back - 1],
+                                  std::fabs(av[base + e] - bv[base + e]));
+        }
+      }
+      printf("  layer %2zu: last K_max=%.3g V_max=%.3g | "
+             "[-2] K=%.3g V=%.3g | [-3] K=%.3g V=%.3g | "
+             "[-4] K=%.3g V=%.3g\n",
+             l, double(km[0]), double(vm[0]), double(km[1]), double(vm[1]),
+             double(km[2]), double(vm[2]), double(km[3]), double(vm[3]));
+      if (km[0] > 1e-3f || vm[0] > 1e-3f) any_seed_gt = true;
+    }
+    if (!any_seed_gt) printf("  (no K/V element differs by more than 1e-3)\n");
+  }
+
   // Per-position breakdown for the first SWA layer (l=0) and first global layer
   // (n_slots >= prefix_n+new_n), to localize which positions differ.
   for (size_t l = 0; l < n_layer; ++l) {

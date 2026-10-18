@@ -19,10 +19,22 @@
 // reusing the shared prefix's KV slots and prefilling only the new suffix must
 // reproduce the full prefill's greedy continuation token-for-token. The matrix
 // covers the C.4 acceptance prefixes (512 / 600 / 1000 / 1040 / 3584 / 3600 /
-// 3996 / 4000 / 4095 / 4097, each +100 new) plus a +600 new case whose suffix
-// exceeds the sliding window (single segment over the SWA ring) and a
-// fully-reused case (+0 new: the prompt is already resident, so it is reused up
-// to len-1 and the last token is re-prefilled).
+// 3996 / 4000, each +100 new), the segment-boundary set 4095 / 4096 / 4097 /
+// 4098 and 8191 / 8192 / 8193 (the sliding-window chunk is 512, so these are
+// the positions around 8x and 16x the chunk boundary; 4097 and 8193 also leave
+// a one-token final seed segment), plus a +600 new case whose suffix exceeds
+// the sliding window (single segment over the SWA ring) and a fully-reused case
+// (+0 new: the prompt is already resident, so it is reused up to len-1 and the
+// last token is re-prefilled).
+//
+// Every case runs in its own forked child: on an 8 GiB device the device
+// allocations retained from earlier cases push a later case's peak over the
+// limit (measured: the 8191 full prefill fails to instantiate its CUDA graph
+// with "out of memory" in one combined run, and the 4098 setup prefill fails
+// with "device buffer allocation failed" after the preceding cases), while the
+// same cases fit when the process starts fresh. The 8K-context cases are also
+// a separate enumeration (`--long`, ctest test_prefix_cache_long) so a default
+// run stays inside a sane wall-clock budget.
 //
 // Loads the Gemma 4 model and the token fixture (skips cleanly when either is
 // absent) and gates on a real CUDA device via quant::cuda_available().
@@ -33,12 +45,17 @@
 #include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sbgguf = sonicboom::gguf;
@@ -103,7 +120,118 @@ std::vector<uint64_t> load_tokens(const std::string& path) {
 
 } // namespace
 
-int main() {
+struct Case { uint64_t prefix; uint64_t new_n; };
+
+// One case: a full prefill (fresh session) and a prefix-reuse prefill of the
+// same tokens, compared token-for-token. Returns this case's failure count.
+int run_case(const sbmodel::Gemma4Model& m, const std::vector<uint64_t>& all,
+             const Case& c, uint64_t steps) {
+  g_failures = 0;
+  const uint64_t need = c.prefix + c.new_n;
+  if (need > all.size()) {
+    check(false, "tokens fixture too short");
+    return g_failures;
+  }
+  const std::vector<uint64_t> prefix(all.begin(), all.begin() + c.prefix);
+  const std::vector<uint64_t> full(all.begin(), all.begin() + need);
+
+  // Full prefill (fresh session -> no reuse).
+  std::vector<int64_t> full_toks(steps, -1);
+  const uint64_t full_done = sbmodel::generate_prefill_spine_cuda(
+      m, full, 0, full_toks, full.size() + steps);
+  full_toks.resize(full_done);
+
+  // Prefix reuse: seed the cache with the prefix, then reuse for `full`.
+  sbplanner::KvCacheSession session;
+  session.n_ctx = full.size() + steps;
+  std::vector<int64_t> setup_toks(1, -1);
+  if (sbmodel::generate_prefill_spine_cuda_prefix(m, prefix, 0, setup_toks,
+                                                  session, true) == 0) {
+    check(false, "prefix setup prefill failed");
+    return g_failures;
+  }
+  std::vector<int64_t> reuse_toks(steps, -1);
+  uint64_t reused = 0;
+  const uint64_t reuse_done = sbmodel::generate_prefill_spine_cuda_prefix(
+      m, full, 0, reuse_toks, session, true, &reused);
+  reuse_toks.resize(reuse_done);
+
+  check(full_done == reuse_done, "same step count as full prefill");
+  // The reuse boundary is the shared prefix, minus one token when the prompt
+  // is fully reused (its activation is needed for the next-token logits) and
+  // minus one more when that boundary falls one token past a chunk boundary:
+  // a seeded prefix ending there was computed as a one-token segment, while
+  // the full prefill computes the same position in a multi-token segment
+  // (see the prefix-align note in gemma4_plan.cpp). With
+  // SONICBOOM_PREFIX_ALIGN=0 the plan keeps the literal boundary, so this
+  // check must follow the same switch (the l4-repro variants depend on it).
+  const uint64_t chunk =
+      m.config.sliding_window > 0 ? m.config.sliding_window : 512;
+  const char *align_env = std::getenv("SONICBOOM_PREFIX_ALIGN");
+  const bool align =
+      !(align_env != nullptr && std::string_view(align_env) == "0");
+  uint64_t want_reused = (c.new_n == 0) ? c.prefix - 1 : c.prefix;
+  if (align && want_reused > 0 && want_reused % chunk == 1) --want_reused;
+  check(reused == want_reused,
+        "reuse count is the shared prefix (len-1 when fully reused)");
+
+  if (full_toks == reuse_toks) {
+    std::cout << "  prefix=" << c.prefix << " new=" << c.new_n
+              << ": reuse identical to full prefill (" << full_toks.size()
+              << " tokens)\n";
+    check(true, "reuse continuation identical to full prefill");
+  } else {
+    size_t div = 0;
+    while (div < full_toks.size() && div < reuse_toks.size() &&
+           full_toks[div] == reuse_toks[div])
+      ++div;
+    std::cout << "  prefix=" << c.prefix << " new=" << c.new_n
+              << ": DIVERGE at step " << div << " (full "
+              << (div < full_toks.size() ? full_toks[div] : -1) << " vs reuse "
+              << (div < reuse_toks.size() ? reuse_toks[div] : -1) << ")\n";
+    check(false, "reuse continuation identical to full prefill");
+  }
+  return g_failures;
+}
+
+// Run fn in a forked child and return its exit status. Each case gets a fresh
+// CUDA context and address space: the device allocations retained from earlier
+// cases (device pools sized against free memory, captured segment graphs) push
+// the later cases' peak over an 8 GiB device's limit — measured: the 4098 case
+// fails its setup prefill with "device buffer allocation failed" after the
+// preceding cases, and passes on its own. The child inherits the loaded model
+// copy-on-write, so this costs no reload. The parent must not touch CUDA
+// before forking (a CUDA context is not inherited across fork), which is why
+// the availability probe is itself a child.
+template <class F>
+int run_in_child(F&& fn) {
+  std::cout.flush();
+  std::cerr.flush();
+  const pid_t pid = fork();
+  if (pid < 0) {
+    std::perror("  fork");
+    return 1;
+  }
+  if (pid == 0) {
+    int rc = 1;
+    try {
+      rc = fn();
+    } catch (...) {
+      rc = 1;
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    _exit(rc);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) return 1;
+  if (WIFEXITED(status)) return WEXITSTATUS(status);
+  std::cerr << "  (child terminated by signal " << WTERMSIG(status) << ")\n";
+  return 1;
+}
+
+int main(int argc, char** argv) {
+  const bool long_only = argc > 1 && std::string(argv[1]) == "--long";
   const std::string path = find_model();
   if (path.empty()) {
     std::cout << "  (skipped: Gemma 4 model not found)\n";
@@ -113,11 +241,6 @@ int main() {
   const std::string tokens_file = find_tokens_file();
   if (tokens_file.empty()) {
     std::cout << "  (skipped: real_prompt.tokens fixture not found)\n";
-    std::cout << "test_prefix_cache OK\n";
-    return 0;
-  }
-  if (!sbquant::cuda_available()) {
-    std::cout << "  (skipped: no CUDA device)\n";
     std::cout << "test_prefix_cache OK\n";
     return 0;
   }
@@ -142,75 +265,39 @@ int main() {
     return 1;
   }
 
+  // CUDA availability probe, in a child (see run_in_child).
+  if (run_in_child([] { return sbquant::cuda_available() ? 0 : 2; }) == 2) {
+    std::cout << "  (skipped: no CUDA device)\n";
+    std::cout << "test_prefix_cache OK\n";
+    return 0;
+  }
+
   const uint64_t steps = env_u64("SONICBOOM_PREFIX_CACHE_STEPS", 32);
 
   // new_n == 0 is the fully-reused case: the prompt is what the session already
   // holds, so the reuse is capped at len-1 (the last token is re-prefilled to
   // produce the next-token logits) rather than leaving an empty suffix.
-  struct Case { uint64_t prefix; uint64_t new_n; };
   const Case kCases[] = {
-      {512, 100}, {600, 100},   {1000, 100}, {1040, 100},
-      {3584, 100}, {3600, 100}, {3996, 100}, {4000, 100},
-      {4095, 100}, {4097, 100}, {4000, 600},  {512, 0},
+      {512, 100},  {600, 100},   {1000, 100}, {1040, 100},
+      {3584, 100}, {3600, 100},  {3996, 100}, {4000, 100},
+      {4095, 100}, {4096, 100},  {4097, 100}, {4098, 100},
+      {4000, 600}, {512, 0},
   };
+  const Case kLongCases[] = {{8191, 100}, {8192, 100}, {8193, 100}};
+  const Case* cases = long_only ? kLongCases : kCases;
+  const size_t ncases = long_only ? sizeof(kLongCases) / sizeof(kLongCases[0])
+                                  : sizeof(kCases) / sizeof(kCases[0]);
 
-  for (const Case& c : kCases) {
-    const uint64_t need = c.prefix + c.new_n;
-    if (need > all.size()) {
-      check(false, "tokens fixture too short");
-      continue;
-    }
-    const std::vector<uint64_t> prefix(all.begin(),
-                                       all.begin() + c.prefix);
-    const std::vector<uint64_t> full(all.begin(), all.begin() + need);
-
-    // Full prefill (fresh session -> no reuse).
-    std::vector<int64_t> full_toks(steps, -1);
-    const uint64_t full_done = sbmodel::generate_prefill_spine_cuda(
-        *m, full, 0, full_toks, full.size() + steps);
-    full_toks.resize(full_done);
-
-    // Prefix reuse: seed the cache with the prefix, then reuse for `full`.
-    sbplanner::KvCacheSession session;
-    session.n_ctx = full.size() + steps;
-    std::vector<int64_t> setup_toks(1, -1);
-    if (sbmodel::generate_prefill_spine_cuda_prefix(*m, prefix, 0, setup_toks,
-                                                    session, true) == 0) {
-      check(false, "prefix setup prefill failed");
-      continue;
-    }
-    std::vector<int64_t> reuse_toks(steps, -1);
-    uint64_t reused = 0;
-    const uint64_t reuse_done = sbmodel::generate_prefill_spine_cuda_prefix(
-        *m, full, 0, reuse_toks, session, true, &reused);
-    reuse_toks.resize(reuse_done);
-
-    check(full_done == reuse_done, "same step count as full prefill");
-    check(reused == (c.new_n == 0 ? c.prefix - 1 : c.prefix),
-          "reuse count is the shared prefix (len-1 when fully reused)");
-
-    if (full_toks == reuse_toks) {
-      std::cout << "  prefix=" << c.prefix << " new=" << c.new_n
-                << ": reuse identical to full prefill (" << full_toks.size()
-                << " tokens)\n";
-      check(true, "reuse continuation identical to full prefill");
-    } else {
-      size_t div = 0;
-      while (div < full_toks.size() && div < reuse_toks.size() &&
-             full_toks[div] == reuse_toks[div])
-        ++div;
-      std::cout << "  prefix=" << c.prefix << " new=" << c.new_n
-                << ": DIVERGE at step " << div << " (full "
-                << (div < full_toks.size() ? full_toks[div] : -1) << " vs reuse "
-                << (div < reuse_toks.size() ? reuse_toks[div] : -1) << ")\n";
-      check(false, "reuse continuation identical to full prefill");
-    }
+  int failures = 0;
+  for (size_t ci = 0; ci < ncases; ++ci) {
+    const Case c = cases[ci];
+    failures += run_in_child([&] { return run_case(*m, all, c, steps); });
   }
 
-  if (g_failures == 0) {
+  if (failures == 0) {
     std::cout << "test_prefix_cache OK\n";
     return 0;
   }
-  std::cerr << "test_prefix_cache FAILED: " << g_failures << " check(s)\n";
+  std::cerr << "test_prefix_cache FAILED: " << failures << " check(s)\n";
   return 1;
 }
