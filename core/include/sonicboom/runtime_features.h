@@ -58,8 +58,9 @@ enum class Feature {
   // emits `fused_region` nodes and the CUDA backend runs the MLIR->NVVM->PTX
   // kernel (off = the region keeps its hand-written kernel).
   GlueCodegen,
-  // Measure the mmq J-tile candidates on the real call and cache the fastest
-  // per (quant type, M, n) (off = select_J's min-tile heuristic).
+  // Measure the mmq candidates (J tile x decomposition) on the real call and
+  // cache the fastest per weight-shape class, (quant type, M, blocks per row)
+  // (off = select_J's min-tile heuristic + the tiled class policy).
   Autotune,
 };
 

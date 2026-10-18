@@ -948,59 +948,6 @@ __host__ __device__ constexpr int qk_of() {
   return (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? QK5_0 : QK_K;
 }
 
-template <int Type, int J>
-__global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
-                          float* __restrict__ dst,
-                          const int blocks_per_row, const int ncols_dst, const int ncols_y,
-                          const int stride_col_dst) {
-  extern __shared__ int data_mul_mat_q[];
-  int* tile_y = data_mul_mat_q;
-  int* tile_x = tile_y + PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS);
-
-  constexpr int sz = (int)(sizeof(block_q8_1_mmq) / sizeof(int));  // 36
-  constexpr int qk = qk_of<Type>();
-  constexpr int blocks_per_iter = MMQ_ITER_K / qk;   // 1 (K-quant) or 8 (legacy)
-
-  const int jt = blockIdx.y;
-  const int it = blockIdx.x;
-
-  const int offset_y   = jt * J * sz;
-  const int offset_dst = jt * J * stride_col_dst + it * I;
-  const int offset_x   = it * I * blocks_per_row;
-
-  const int tile_y_max_j = ncols_dst - jt*J - 1;
-
-  float sum[J*I/(WARP_SIZE*NWARPS)] = {0.0f};
-
-  for (int kb0 = 0; kb0 < blocks_per_row; kb0 += blocks_per_iter) {
-    load_tiles<Type, J>(x, tile_x, offset_x + kb0, blocks_per_row);
-    {
-      const int* by0 = y + offset_y + ncols_y * (kb0 * qk / QK8_1_MMQ) * sz;
-#pragma unroll
-      for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
-        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
-        tile_y[l] = by0[l];
-      }
-    }
-    __syncthreads();
-    vec_dot<Type, J>(tile_x, tile_y, sum, 0);
-    __syncthreads();
-    {
-      const int* by0 = y + offset_y + ncols_y * ((kb0 * qk / QK8_1_MMQ) * sz + sz);
-#pragma unroll
-      for (int l0 = 0; l0 < J*MMQ_TILE_Y_K; l0 += WARP_SIZE*NWARPS) {
-        const int l = l0 + threadIdx.y*WARP_SIZE + threadIdx.x;
-        tile_y[l] = by0[l];
-      }
-    }
-    __syncthreads();
-    vec_dot<Type, J>(tile_x, tile_y, sum, MMQ_TILE_NE_K);
-    __syncthreads();
-  }
-
-  write_back_mma<J>(sum, dst + offset_dst, stride_col_dst, tile_y_max_j);
-}
-
 // --- matmul kernel, stream-k work partitioning (ggml mmq.cuh) -------------
 //
 // ggml's "stream-k" partitioning (arXiv:2301.03598), imported with the
@@ -1080,6 +1027,42 @@ __device__ __forceinline__ void mul_mat_q_process_tile(
     const int tile_y_max_j = ncols_dst - jt*J - 1;
     write_back_mma<J>(sum, dst + offset_dst, stride_col_dst, tile_y_max_j);
   }
+}
+
+// Entry points for the tiled matmul. llama.cpp applies
+// __launch_bounds__(256, 1) to every Ampere instantiation; on this RTX 3050
+// that is a clear win for wide tiles and a loss for narrow ones (measured,
+// step 9, pinned tile, 3 runs: J=128 at pp512 1936 -> 1844 tok/s without the
+// bound; J=64 at n=64 2720 -> 2794). The bound buys instruction-level
+// parallelism by letting ptxas spend the whole 255-register budget, and a
+// narrow tile has little parallel work to spend it on. Tiles from
+// kMmqLaunchBoundsMinJ up keep upstream's bound; both entry points are the
+// same tile body as the stream-k/split-K kernels.
+constexpr int kMmqLaunchBoundsMinJ = 96;
+
+// Tile index from the launch geometry in launch_mul_mat_q: blockIdx.x is the
+// token tile (jt), blockIdx.y the weight-row tile (it).
+template <int Type, int J>
+__global__ __launch_bounds__(WARP_SIZE * NWARPS, 1)
+void mul_mat_q_wide(const char* __restrict__ x, const int* __restrict__ y,
+                    float* __restrict__ dst, const int blocks_per_row,
+                    const int ncols_dst, const int ncols_y,
+                    const int stride_col_dst) {
+  mul_mat_q_process_tile<Type, J>(x, y, dst, nullptr, blocks_per_row,
+                                  ncols_dst, ncols_y, stride_col_dst,
+                                  blockIdx.y, blockIdx.x, 0, blocks_per_row,
+                                  false);
+}
+
+template <int Type, int J>
+__global__ void mul_mat_q(const char* __restrict__ x, const int* __restrict__ y,
+                          float* __restrict__ dst, const int blocks_per_row,
+                          const int ncols_dst, const int ncols_y,
+                          const int stride_col_dst) {
+  mul_mat_q_process_tile<Type, J>(x, y, dst, nullptr, blocks_per_row,
+                                  ncols_dst, ncols_y, stride_col_dst,
+                                  blockIdx.y, blockIdx.x, 0, blocks_per_row,
+                                  false);
 }
 
 template <int Type, int J>
@@ -1327,17 +1310,23 @@ __host__ void quantize_activation(const float* x, block_q8_1_mmq* y, int K, int 
   quantize_mmq_q8_1<ds><<<num_blocks, block_size, 0, stream>>>(x, y, K, n);
 }
 
-// J selection (fallback = false J set from mmq-config-ampere.cuh). Picks the
-// first (smallest) J achieving the minimal number of column tiles ceil(n/J).
+// J selection: llama.cpp's mmq_x rule (mul_mat_q_switch_J, fallback = false
+// J set from mmq-config-ampere.cuh). Ascending J, the first (smallest) J
+// achieving the minimal number of column tiles ceil(n/J); the loop stops as
+// soon as one tile is reached, exactly like upstream. The initial best is 0
+// rather than 128 so that a batch smaller than every J still gets the smallest
+// J (n = 100 picks 104, not 128).
 __host__ inline int select_J(int n) {
-  static constexpr int Js[] = {8, 16, 24, 32, 40, 48, 64, 80, 96, 112, 128};
-  int best = 128;
-  int min_ntiles = (n + 127) / 128;
+  static constexpr int Js[] = {8,   16,  24,  32,  40,  48,  56,  64,
+                               72,  80,  88,  96, 104, 112, 120, 128};
+  int best = 0;
+  int min_ntiles = 0x7fffffff;
   for (int J : Js) {
     const int ntiles = (n + J - 1) / J;
     if (ntiles < min_ntiles) { min_ntiles = ntiles; best = J; }
+    if (min_ntiles <= 1) break;
   }
-  return best;
+  return best != 0 ? best : 128;
 }
 
 template <int Type, int J>
@@ -1348,12 +1337,28 @@ __host__ void launch_mul_mat_q(const char* w, const int* y_q8, float* dst,
                               (Type == MMQ_Q5_0 || Type == MMQ_Q8_0) ? SRAM_STRIDE_LEGACY_32
                                                                     : SRAM_STRIDE_Q8_1;
   constexpr int nbytes_shared = (PAD(J*MMQ_TILE_Y_K, WARP_SIZE*NWARPS) + I*sram_stride) * 4;
-  cudaFuncSetAttribute((const void*)mul_mat_q<Type, J>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
-  const int nty = (M + I - 1) / I;
-  const int ntx = (n + J - 1) / J;
-  mul_mat_q<Type, J><<<dim3(nty, ntx, 1), dim3(WARP_SIZE, NWARPS, 1), nbytes_shared, stream>>>(
-      w, y_q8, dst, blocks_per_row, n, n, M);
+  const int nty = (M + I - 1) / I;   // weight-row tiles (the blockIdx.y axis)
+  const int ntx = (n + J - 1) / J;   // token tiles (the blockIdx.x axis)
+  // Blocks are dispatched in linear blockIdx order with x fastest, so with the
+  // token tile on x the (up to eight) blocks that multiply the same weight row
+  // strip by different token tiles run back to back and read that strip once
+  // from L2. This is upstream's block ordering (its stream-k kernel linearizes
+  // the tile index with the token tile fastest; see mul_mat_q_stream_k below);
+  // the row tile on x made every token tile re-stream all the weights. Same
+  // tiles, same arithmetic, different dispatch order.
+  const dim3 grid(ntx, nty, 1);
+  const dim3 block(WARP_SIZE, NWARPS, 1);
+  if constexpr (J >= kMmqLaunchBoundsMinJ) {
+    cudaFuncSetAttribute((const void*)mul_mat_q_wide<Type, J>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    mul_mat_q_wide<Type, J><<<grid, block, nbytes_shared, stream>>>(
+        w, y_q8, dst, blocks_per_row, n, n, M);
+  } else {
+    cudaFuncSetAttribute((const void*)mul_mat_q<Type, J>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    mul_mat_q<Type, J><<<grid, block, nbytes_shared, stream>>>(
+        w, y_q8, dst, blocks_per_row, n, n, M);
+  }
 }
 
 // Stream-k launch geometry (ggml's mul_mat_q host launch, fallback = false).

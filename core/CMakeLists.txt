@@ -164,6 +164,31 @@ if(SONICBOOM_USE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
+  # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
+  # ggml-cuda/mmq.cu with -use_fast_math -extended-lambda. The arch already
+  # matches (both trees emit sm_86 cubins) and the standard stays C++20 for
+  # SonicBoom sources. Per-source options are the finest granularity available:
+  # the derived MMQ kernels are header-only (ggml_derived/mmq.cuh) and this TU
+  # is the one that instantiates them, but it also carries SonicBoom's q8_1
+  # quantization, rms_norm_quantize_q8_1, gemv and dense-GEMM code.
+  #
+  # -use_fast_math is NOT applied: step 8 measured it as codegen-neutral for
+  # every Type/J here, and with it this TU's q8_1 scale/quantization math
+  # changes low bits -- test_cuda_quant's "q8_1 batched matches integer CPU
+  # reference" (Q6_K, rel err 9.4e-4 / 2.9e-2), test_glue_codegen's
+  # byte-identical rms_norm_quantize_q8_1 check against this TU's reference,
+  # and the Qwen greedy streams versus their goldens all fail. The numerics
+  # rule (tokens bit-identical) outranks flag parity. -extended-lambda has no
+  # effect on this TU (no device lambdas in the derived tree) and is kept for
+  # the upstream command line.
+  #
+  # The parity that matters is upstream's __launch_bounds__(256, 1), which
+  # lets ptxas use 254 registers for Q3_K J=128 instead of 202 (exactly
+  # llama.cpp's allocation; measured with cuobjdump). It lives in
+  # ggml_derived/mmq.cuh, next to the kernel it constrains.
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
+    PROPERTIES COMPILE_OPTIONS "-extended-lambda")
 endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;

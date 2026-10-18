@@ -125,12 +125,16 @@ SB_T = {0: 'Q3_K', 1: 'Q4_K', 2: 'Q5_K', 3: 'Q6_K'}
 
 def classify(name, side):
     n = name
-    if 'stream_k_fixup' in n: return 'MMQ fixup'
+    if 'stream_k_fixup' in n or 'split_k_fixup' in n: return 'MMQ fixup'
     if 'mul_mat_q' in n:
         t = None
         m = re.search(r'mul_mat_q<\(ggml_type\)(\d+)', n)
         if m: t = LLAMA_T.get(int(m.group(1)), 'type' + m.group(1))
-        m = re.search(r'mul_mat_q<\(int\)(\d+)', n)
+        # The tiled launch has two entry points (wide/narrow, see mmq.cuh);
+        # split-K and stream-k are named their own (still MMQ) kernels.
+        m = re.search(r'mul_mat_q(?:_wide)?<\(int\)(\d+)', n)
+        if m: t = SB_T.get(int(m.group(1)), 'type' + m.group(1))
+        m = re.search(r'mul_mat_q_(?:stream_k|split_k)<\(int\)(\d+)', n)
         if m: t = SB_T.get(int(m.group(1)), 'type' + m.group(1))
         return 'MMQ ' + (t or '?')
     if n.strip() == 'fa' or 'flash_attn' in n or 'attention' in n:
