@@ -64,6 +64,13 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
   const int TH = NW * 32;
   const int NT = BN / 8;   // 8-token accumulator tiles per lane
   const int KB = BK / 16;  // 16-K mma steps per stage
+  // Shared-memory row padding, in elements (16 bytes: rows stay 16-byte
+  // aligned for ldmatrix). A dense [rows][BK] stage makes every row start at
+  // the same bank ((BK*2/4) % 32 == 0 for BK = 64), which ldmatrix reads as an
+  // 8-way conflict; +8 elements shifts each row by 16 banks for BK = 32 and by
+  // 4 banks for BK = 64, so the 8 rows of a matrix hit disjoint bank ranges.
+  const int PAD = 8;
+  const int BKW = BK + PAD;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -85,7 +92,7 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
   ci("i0", 0); ci("i1", 1); ci("i8", 8);
   ci("ith", TH);                 // staging stride (one chunk per lane)
   ci("ibk", BK);
-  ci("ibsoff", 2 * BM * BK * 2); // B stage starts after the A double buffer
+  ci("ibsoff", 2 * BM * BKW * 2); // B stage starts after the A double buffer
   ci("icha", BM * BK / 8);       // 8-bf16 chunks per A tile
   ci("ichb", BN * BK / 8);       // 8-bf16 chunks per B tile (token-major)
   c32("ibmi", BM); c32("ibni", BN); c32("ibki", BK);
@@ -102,12 +109,12 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
   const std::string asm_ =
       e.val("memref.view " + smem + "[" + C["i0"] +
             "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<2x" +
-            s(BM) + "x" + s(BK) +
+            s(BM) + "x" + s(BKW) +
             "xbf16, #gpu.address_space<workgroup>>");
   const std::string bsm =
       e.val("memref.view " + smem + "[" + C["ibsoff"] +
             "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<2x" +
-            s(BN) + "x" + s(BK) +
+            s(BN) + "x" + s(BKW) +
             "xbf16, #gpu.address_space<workgroup>>");
   const std::string tidi = e.val("arith.index_cast " + tid + " : index to i32");
   const std::string lane =
@@ -166,7 +173,7 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
               " : index");
     e.val(std::string("nvgpu.device_async_copy %") + src + "[" + sri + ", " +
           sci + "], " + dst + "[" + buf + ", " + row + ", " + col + "], 8, " +
-          nel + " : memref<?x?xbf16> to memref<2x" + s(nrows) + "x" + s(BK) +
+          nel + " : memref<?x?xbf16> to memref<2x" + s(nrows) + "x" + s(BKW) +
           "xbf16, #gpu.address_space<workgroup>>");
     e.op("}");
   };
@@ -265,7 +272,7 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
     const std::string a =
         e.val("nvgpu.ldmatrix " + asm_ + "[" + buf_i + ", " + arowi + ", " +
               aci + "] {numTiles = 4 : i32, transpose = false} : memref<2x" +
-              s(BM) + "x" + s(BK) +
+              s(BM) + "x" + s(BKW) +
               "xbf16, #gpu.address_space<workgroup>> -> vector<4x2xbf16>");
     const std::string bci =
         e.val("arith.index_cast " + bcol + " : i32 to index");
@@ -281,7 +288,7 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
       const std::string b =
           e.val("nvgpu.ldmatrix " + bsm + "[" + buf_i + ", " + browi + ", " +
                 bci + "] {numTiles = 2 : i32, transpose = false} : memref<2x" +
-                s(BN) + "x" + s(BK) +
+                s(BN) + "x" + s(BKW) +
                 "xbf16, #gpu.address_space<workgroup>> -> vector<2x2xbf16>");
       cur[nt] = e.val("nvgpu.mma.sync (" + a + ", " + b + ", " + cur[nt] +
                       ") {mmaShape = [16, 8, 16]} : (vector<4x2xbf16>, "
@@ -380,7 +387,10 @@ int dense_gemm_block_threads(const DenseGemmShape &shape) {
 }
 
 int dense_gemm_shared_bytes(const DenseGemmShape &shape) {
-  return 2 * (shape.bm * shape.bk + shape.bn * shape.bk) * 2;
+  // Double-buffered A and B stages, each row padded by 8 elements (see
+  // gemm_region_text) so ldmatrix does not read every row from the same bank.
+  const int row = shape.bk + 8;
+  return 2 * (shape.bm * row + shape.bn * row) * 2;
 }
 
 std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
@@ -391,8 +401,8 @@ std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
 }
 
 std::string dense_gemm_codegen_version() {
-  // gemm1: first generated dense GEMM (mma m16n8k16, cp.async double buffer).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm1";
+  // gemm2: padded shared staging (conflict-free ldmatrix).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm2";
 }
 
 } // namespace sonicboom::compiler

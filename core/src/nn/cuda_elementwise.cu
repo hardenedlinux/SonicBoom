@@ -3893,8 +3893,97 @@ bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
   return cudaGetLastError() == cudaSuccess;
 }
 
-bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
-                            float* y, int rows, int ncols, bool strided) {
+// --- Step 10: generated dense GEMM selection ---------------------------------
+//
+// The generated GEMM (compiler/GemmCodegen.h, launched through
+// planner/glue_jit.h) computes the same C^T = W X^T as the cuBLASLt path in one
+// launch, with no column chunking: a token's row depends only on its own bf16
+// activation and W, so batch invariance holds by construction. The choice
+// between it and cuBLASLt is per (rows, cols) shape class — the model's
+// projection dimensions, never the batch size — decided by timing both on
+// synthetic zero data at a canonical 256-token chunk and cached in the autotune
+// cache (op "dense-gemm"). SONICBOOM_DENSE_GEMM=0 forces the cuBLASLt path
+// (the ablation arm).
+bool dense_gemm_enabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("SONICBOOM_DENSE_GEMM");
+    return !(e != nullptr && std::string_view(e) == "0");
+  }();
+  return enabled;
+}
+
+struct DenseChoice {
+  bool codegen = false;
+  compiler::DenseGemmShape shape;
+};
+
+// Candidate tiles: block shape and warp count only, so the choice is a property
+// of (shape class, GPU). All are covered by dense_gemm_shape_supported().
+// One tile per K-depth: after the shared-stage padding, m64 n64 k32 and k64
+// measure within noise of each other, and two candidates that close let the
+// recorded tile flap between runs; k64 (half the loop trips) is the listed one.
+const compiler::DenseGemmShape kDenseGemmCandidates[] = {
+    {64, 64, 64},   {32, 64, 64},   {64, 32, 64},
+    {128, 32, 32},  {32, 128, 32},  {128, 64, 32}, {128, 64, 64},
+    {128, 128, 32}, {128, 128, 64}, {64, 128, 32}};
+
+// The tuning chunk is the canonical prefill segment: the generated kernel is
+// only on this (prefill, batched) path, and the choice it produces is applied
+// to every batch size, so the measurement must represent the largest one.
+constexpr int kDenseTuneTokens = 512;
+// A candidate must beat cuBLASLt by this fraction to replace it (the same noise
+// margin the attention tuner uses).
+constexpr double kDenseSwitchMargin = 0.03;
+// A later candidate must also beat the current best tile by this fraction to
+// take its place. Candidates that measure within noise of each other then
+// resolve to the earlier (list order) one on every run: the plan record
+// contains the chosen tile, and a record made without a tune cache has to land
+// on the same one as a record made with it.
+constexpr double kDenseCandidateMargin = 0.03;
+
+bool dense_capturing() {
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(cur_stream(), &st) != cudaSuccess ||
+         st != cudaStreamCaptureStatusNone;
+}
+
+std::string dense_choice_name(const DenseChoice &c) {
+  if (!c.codegen) return "lt";
+  return "gemm-m" + std::to_string(c.shape.bm) + "n" +
+         std::to_string(c.shape.bn) + "k" + std::to_string(c.shape.bk);
+}
+
+bool dense_choice_from_values(const std::map<std::string, int> &v,
+                              DenseChoice &out) {
+  const auto impl = v.find("impl");
+  if (impl == v.end()) return false;
+  if (impl->second == 0) {
+    out = {};
+    return true;
+  }
+  int bm = 0, bn = 0, bk = 0;
+  const auto get = [&v](const char *n, int &dst) {
+    const auto i = v.find(n);
+    if (i == v.end()) return false;
+    dst = i->second;
+    return true;
+  };
+  if (!get("bm", bm) || !get("bn", bn) || !get("bk", bk)) return false;
+  const compiler::DenseGemmShape s{bm, bn, bk};
+  if (!compiler::dense_gemm_shape_supported(s)) return false;
+  out = {true, s};
+  return true;
+}
+
+// The strided bf16 dense projection: the fixed 128-column cuBLASLt blocking
+// over an already-bf16 position-major activation. Split from
+// matvec_bf16_cublas_dev so the dense-GEMM autotuner times this exact loop
+// against the generated kernel (both pay the same bf16 cast). The activation
+// block is position-major (ldb=cols); tail blocks run the same shape over a
+// zero-padded copy so a position's numerics do not depend on where a
+// segmentation splits.
+bool dense_lt_bf16_strided(const uint16_t* xb, const uint16_t* d_w, float* y,
+                           int rows, int cols, int ncols) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
   cublasLtHandle_t lt = dense_lt_handle();
@@ -3911,68 +4000,223 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
     return xpack && outpack;
   };
 
+  cublasSetStream(h, cur_stream());
+  const float alpha = 1.0f, beta = 0.0f;
+  for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
+    const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
+    // Same transposed formulation as the f32 path; the activation block is
+    // already bf16 in position-major order (ldb=cols).
+    const bool full = chunk_n == kDenseCublasWidth;
+    const uint16_t* a = xb + (size_t)c0 * cols;
+    float* c = y + (size_t)c0 * rows;
+    if (!full) {
+      if (!need_pack()) return false;
+      SB_NOTE_LAUNCH(pad_bf16_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+      pad_bf16_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                             cur_stream()>>>(xb, xpack, cols, c0, chunk_n);
+      a = xpack;
+      c = outpack;
+    }
+    // cuBLASLt bf16 tensor-core GEMM with the shape class's cached algorithm;
+    // GemmEx stays as the fallback when Lt has no candidate.
+    cublasStatus_t st =
+        (lt && dense_lt_enabled() && matvec_bf16_lt_dev(lt, d_w, cols, a, c, rows))
+            ? CUBLAS_STATUS_SUCCESS
+            : cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, kDenseCublasWidth,
+                           cols, &alpha, d_w, CUDA_R_16BF, cols, a, CUDA_R_16BF,
+                           cols, &beta, c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
+                           CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS && !full) {
+      SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+      copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+          outpack, y, rows, c0, chunk_n);
+    }
+    if (st != CUBLAS_STATUS_SUCCESS) return false;
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// Time cuBLASLt and every candidate tile on zeroed synthetic operands. Both
+// arms consume the same bf16 activation, so the measurement isolates the GEMM.
+DenseChoice dense_tune(int rows, int cols, double &tune_s,
+                       int &candidate_count) {
+  DenseChoice best;
+  candidate_count = 0;
+  const size_t w_n = size_t(rows) * size_t(cols);
+  const size_t x_n = size_t(kDenseTuneTokens) * size_t(cols);
+  const size_t y_n = size_t(kDenseTuneTokens) * size_t(rows);
+  uint16_t *w = nullptr, *x = nullptr;
+  float *y = nullptr;
+  if (cudaMalloc(&w, w_n * 2) != cudaSuccess) return best;
+  if (cudaMalloc(&x, x_n * 2) != cudaSuccess) {
+    cudaFree(w);
+    return best;
+  }
+  if (cudaMalloc(&y, y_n * 4) != cudaSuccess) {
+    cudaFree(x);
+    cudaFree(w);
+    return best;
+  }
+  // Zeroed inputs: the work is data-independent and denormals stay out of the
+  // timing.
+  cudaMemsetAsync(w, 0, w_n * 2, cur_stream());
+  cudaMemsetAsync(x, 0, x_n * 2, cur_stream());
+  cudaMemsetAsync(y, 0, y_n * 4, cur_stream());
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const double lt_ms = ::sonicboom::tune::median_launch_ms(
+      [&] {
+        return dense_lt_bf16_strided(x, w, y, rows, cols, kDenseTuneTokens);
+      },
+      cur_stream(), 2, 5);
+  double best_ms = 0.0;  // best candidate so far; cuBLASLt is compared below
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (verbose)
+    std::fprintf(stderr, "[autotune] dense-gemm m=%d k=%d n=%d lt=%.4f ms\n",
+                 rows, cols, kDenseTuneTokens, lt_ms);
+  for (const compiler::DenseGemmShape &s : kDenseGemmCandidates) {
+    if (!compiler::dense_gemm_shape_supported(s)) continue;
+    ++candidate_count;
+    const double ms = ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return planner::glue::launch_dense_gemm(s, x, w, y, rows, cols,
+                                                  kDenseTuneTokens);
+        },
+        cur_stream(), 2, 5);
+    if (verbose)
+      std::fprintf(stderr, "[autotune]   gemm m%d n%d k%d = %.4f ms\n", s.bm,
+                   s.bn, s.bk, ms);
+    if (ms > 0.0 &&
+        (best_ms <= 0.0 || ms < best_ms * (1.0 - kDenseCandidateMargin))) {
+      best = {true, s};
+      best_ms = ms;
+    }
+  }
+  // Keep cuBLASLt unless a generated tile wins by the noise margin.
+  if (best.codegen &&
+      !(lt_ms > 0.0 && best_ms < lt_ms * (1.0 - kDenseSwitchMargin)))
+    best = {};
+  tune_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  cudaFree(y);
+  cudaFree(x);
+  cudaFree(w);
+  return best;
+}
+
+// Resolve the dense projection implementation for a (rows, cols) shape class:
+// cached choice, else a tuning run, else cuBLASLt. The key never includes the
+// batch size or position.
+DenseChoice dense_resolve(int rows, int cols) {
+  const DenseChoice def;
+  if (!::sonicboom::tune::enabled()) return def;
+  const std::string key = compiler::dense_gemm_codegen_version() + "|m" +
+                          std::to_string(rows) + "k" + std::to_string(cols);
+  static std::mutex mu;
+  static std::unordered_map<std::string, DenseChoice> memo;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = memo.find(key);
+    if (it != memo.end()) return it->second;
+  }
+
+  DenseChoice choice = def;
+  bool have = false;
+  const std::map<std::string, int> cached =
+      ::sonicboom::tune::lookup("dense-gemm", key);
+  if (!cached.empty() && dense_choice_from_values(cached, choice)) have = true;
+
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (!have) {
+    if (dense_capturing()) return def;  // host timing is illegal in a capture
+    double tune_s = 0.0;
+    int candidate_count = 0;
+    choice = dense_tune(rows, cols, tune_s, candidate_count);
+    std::map<std::string, int> values{{"impl", choice.codegen ? 1 : 0}};
+    if (choice.codegen) {
+      values["bm"] = choice.shape.bm;
+      values["bn"] = choice.shape.bn;
+      values["bk"] = choice.shape.bk;
+    }
+    ::sonicboom::tune::store("dense-gemm", key, values);
+    if (verbose)
+      std::fprintf(stderr,
+                   "[autotune] dense-gemm %s default=lt chosen=%s "
+                   "candidates=%d tune=%.2f s\n",
+                   key.c_str(), dense_choice_name(choice).c_str(),
+                   candidate_count, tune_s);
+  } else if (verbose) {
+    std::fprintf(stderr, "[autotune] dense-gemm %s cached=%s\n", key.c_str(),
+                 dense_choice_name(choice).c_str());
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    memo[key] = choice;
+  }
+  return choice;
+}
+
+bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
+                            float* y, int rows, int ncols, bool strided) {
+  cublasHandle_t h = dense_cublas_handle();
+  if (!h) return false;
+  uint16_t* xpack = nullptr;
+  float* outpack = nullptr;
+  auto need_pack = [&] {
+    if (xpack) return true;
+    xpack = static_cast<uint16_t*>(grow_scratch(
+        g_xpack, g_xpack_bytes,
+        (size_t)cols * kDenseCublasWidth * sizeof(uint16_t)));
+    outpack = static_cast<float*>(grow_scratch(
+        g_outpack, g_outpack_bytes,
+        (size_t)rows * kDenseCublasWidth * sizeof(float)));
+    return xpack && outpack;
+  };
+
   // The strided path consumes a position-major bf16 activation: one contiguous
   // rounding pass, no transposing repack for full blocks. Its own scratch, so
-  // the tail padding below cannot alias it.
-  uint16_t* xb = nullptr;
+  // the tail padding cannot alias it. Both the generated GEMM and the cuBLASLt
+  // loop read that same bf16 staging, so this cast is common to both arms.
   if (strided) {
-    xb = static_cast<uint16_t*>(grow_scratch(
+    uint16_t* xb = static_cast<uint16_t*>(grow_scratch(
         g_xb, g_xb_bytes, (size_t)cols * ncols * sizeof(uint16_t)));
     if (!xb) return false;
     SB_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
     cast_bf16_rows_kernel<<<grid_for(cols * ncols), 256, 0, cur_stream()>>>(
         x, xb, cols * ncols);
+    // One launch per projection when the shape class selected the generated
+    // kernel (no 128-column chunks, per-token numerics independent of N). A
+    // failed launch falls through to the cuBLASLt path.
+    if (dense_gemm_enabled()) {
+      const DenseChoice choice = dense_resolve(rows, cols);
+      if (choice.codegen &&
+          planner::glue::launch_dense_gemm(choice.shape, xb, d_w, y, rows, cols,
+                                           ncols))
+        return true;
+    }
+    return dense_lt_bf16_strided(xb, d_w, y, rows, cols, ncols);
   }
 
+  // The non-strided path transposes each 128-column block into the cuBLAS
+  // layout first.
   cublasSetStream(h, cur_stream());
   const float alpha = 1.0f, beta = 0.0f;
   for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
     const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
-    cublasStatus_t st;
-    if (xb) {
-      // Same transposed formulation as the f32 path; the activation block is
-      // already bf16 in position-major order (ldb=cols). Tail blocks run the
-      // same shape over a zero-padded copy (see the f32 path).
-      const bool full = chunk_n == kDenseCublasWidth;
-      const uint16_t* a = xb + (size_t)c0 * cols;
-      float* c = y + (size_t)c0 * rows;
-      if (!full) {
-        if (!need_pack()) return false;
-        SB_NOTE_LAUNCH(pad_bf16_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
-        pad_bf16_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
-                               cur_stream()>>>(xb, xpack, cols, c0, chunk_n);
-        a = xpack;
-        c = outpack;
-      }
-      // cuBLASLt bf16 tensor-core GEMM with the shape class's cached algorithm;
-      // GemmEx stays as the fallback when Lt has no candidate.
-      st = (lt && dense_lt_enabled() &&
-            matvec_bf16_lt_dev(lt, d_w, cols, a, c, rows))
-               ? CUBLAS_STATUS_SUCCESS
-               : cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows,
-                              kDenseCublasWidth, cols, &alpha, d_w,
-                              CUDA_R_16BF, cols, a, CUDA_R_16BF, cols, &beta,
-                              c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
-                              CUBLAS_GEMM_DEFAULT);
-      if (st == CUBLAS_STATUS_SUCCESS && !full) {
-        SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
-        copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
-            outpack, y, rows, c0, chunk_n);
-      }
-    } else {
-      if (!need_pack()) return false;
-      SB_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
-      pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
-                               cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
-      st = cublasGemmEx(
-          h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
-          CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
-          CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-      if (st == CUBLAS_STATUS_SUCCESS) {
-        SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
-        copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
-            outpack, y, rows, ncols, c0, chunk_n);
-      }
+    if (!need_pack()) return false;
+    SB_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+    pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                             cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
+    cublasStatus_t st = cublasGemmEx(
+        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
+        CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
+        CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) {
+      SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+      copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+          outpack, y, rows, ncols, c0, chunk_n);
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }

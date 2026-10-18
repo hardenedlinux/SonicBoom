@@ -233,7 +233,8 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_cuda_dense_gemm_codegen PRIVATE sonicboom
                                                             sonicboom_compiler
                                                             CUDA::cudart
-                                                            CUDA::cuda_driver)
+                                                            CUDA::cuda_driver
+                                                            CUDA::cublas)
   sb_add_cpp_test(test_cuda_dense_gemm_codegen)
 
   # Small, but still GPU tests: they fail beside a model test (see "The GPU

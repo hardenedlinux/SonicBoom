@@ -20,6 +20,7 @@
 
 #include "../../core/src/planner/glue_jit.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <bit>
@@ -179,6 +180,46 @@ int main() {
   check(run(shape, b, M, K, 64, 0, 0), "generated dense GEMM launches");
   check(cudaDeviceSynchronize() == cudaSuccess, "kernel completes");
   compare(64, "generated GEMM matches fp64 on full tiles");
+
+  // ---- 1b. accuracy beside the cuBLAS bf16 path it replaces ----
+  // The numerics rule for a reduction-order change: the replacement's error
+  // against an fp64 reference must not exceed the error of the kernel it
+  // replaces, on the same bf16 operands. cuBLAS here is the plain bf16 GEMM
+  // (round-robin mma accumulation in fp32); the chunked path the plan uses
+  // adds a split-K reduction on top, which only reorders the same fp32 sums,
+  // so plain cuBLAS is the stricter of the two to match.
+  {
+    std::vector<double> want;
+    reference(xh, wh, M, K, 64, want);
+    cublasHandle_t h = nullptr;
+    check(cublasCreate(&h) == CUBLAS_STATUS_SUCCESS, "cublas handle");
+    float *ylt = nullptr;
+    check(cudaMalloc(&ylt, size_t(64) * M * 4) == cudaSuccess,
+          "cublas output allocation");
+    const float alpha = 1.0f, beta = 0.0f;
+    check(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, M, 64, K, &alpha, b.w,
+                       CUDA_R_16BF, K, b.x, CUDA_R_16BF, K, &beta, ylt,
+                       CUDA_R_32F, M, CUBLAS_COMPUTE_32F,
+                       CUBLAS_GEMM_DEFAULT) == CUBLAS_STATUS_SUCCESS,
+          "cublas bf16 GEMM");
+    check(cudaDeviceSynchronize() == cudaSuccess, "cublas GEMM completes");
+    std::vector<float> yv(size_t(64) * M);
+    check(cudaMemcpy(yv.data(), ylt, yv.size() * 4,
+                     cudaMemcpyDeviceToHost) == cudaSuccess,
+          "cublas result download");
+    double cg_rel = 0.0, lt_rel = 0.0;
+    for (size_t i = 0; i < want.size(); ++i) {
+      const double den = std::max(1.0, std::fabs(want[i]));
+      cg_rel = std::max(cg_rel, std::fabs(double(got[i]) - want[i]) / den);
+      lt_rel = std::max(lt_rel, std::fabs(double(yv[i]) - want[i]) / den);
+    }
+    std::printf("  fp64 error: generated=%.3e cublas=%.3e ratio=%.3f\n", cg_rel,
+                lt_rel, cg_rel / lt_rel);
+    check(cg_rel <= lt_rel,
+          "generated GEMM's fp64 error is not above the cuBLAS path's");
+    cudaFree(ylt);
+    cublasDestroy(h);
+  }
 
   // ---- 2. tail shape: M, K and N all miss the tile multiples ----
   const int MT = 1000, KT = 1000, NT = 7;

@@ -219,8 +219,7 @@ step 19 task 19 node 26 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t28 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 20 task 20 node 27 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -490,8 +489,7 @@ step 45 task 45 node 63 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t65 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 46 task 46 node 64 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -761,8 +759,7 @@ step 71 task 71 node 100 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t102 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 72 task 72 node 101 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -1032,8 +1029,7 @@ step 97 task 97 node 137 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t139 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 98 task 98 node 138 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -1303,8 +1299,7 @@ step 123 task 123 node 174 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t176 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 124 task 124 node 175 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -1574,8 +1569,7 @@ step 149 task 149 node 211 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t213 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 150 task 150 node 212 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -1845,8 +1839,7 @@ step 175 task 175 node 248 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t250 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 176 task 176 node 249 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -2116,8 +2109,7 @@ step 201 task 201 node 285 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t287 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 202 task 202 node 286 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -2387,8 +2379,7 @@ step 227 task 227 node 322 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t324 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 228 task 228 node 323 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -2658,8 +2649,7 @@ step 253 task 253 node 359 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t361 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 254 task 254 node 360 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -2929,8 +2919,7 @@ step 279 task 279 node 396 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t398 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 280 task 280 node 397 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -3200,8 +3189,7 @@ step 305 task 305 node 433 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t435 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 306 task 306 node 434 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -3471,8 +3459,7 @@ step 331 task 331 node 470 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t472 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 332 task 332 node 471 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -3742,8 +3729,7 @@ step 357 task 357 node 507 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t509 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 358 task 358 node 508 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -4013,8 +3999,7 @@ step 383 task 383 node 544 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t546 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 384 task 384 node 545 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -4284,8 +4269,7 @@ step 409 task 409 node 581 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t583 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 410 task 410 node 582 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -4555,8 +4539,7 @@ step 435 task 435 node 618 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t620 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 436 task 436 node 619 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -4826,8 +4809,7 @@ step 461 task 461 node 655 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t657 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 462 task 462 node 656 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -5097,8 +5079,7 @@ step 487 task 487 node 692 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t694 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 488 task 488 node 693 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -5368,8 +5349,7 @@ step 513 task 513 node 729 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t731 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 514 task 514 node 730 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -5639,8 +5619,7 @@ step 539 task 539 node 766 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t768 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 540 task 540 node 767 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -5910,8 +5889,7 @@ step 565 task 565 node 803 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t805 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 566 task 566 node 804 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -6181,8 +6159,7 @@ step 591 task 591 node 840 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t842 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 592 task 592 node 841 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -6452,8 +6429,7 @@ step 617 task 617 node 877 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t879 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 618 task 618 node 878 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -6683,8 +6659,7 @@ step 639 task 639 node 907 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t909 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 640 task 640 node 908 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -6914,8 +6889,7 @@ step 661 task 661 node 937 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t939 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 662 task 662 node 938 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -7145,8 +7119,7 @@ step 683 task 683 node 967 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t969 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 684 task 684 node 968 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -7376,8 +7349,7 @@ step 705 task 705 node 997 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t999 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 706 task 706 node 998 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -7607,8 +7579,7 @@ step 727 task 727 node 1027 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1029 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 728 task 728 node 1028 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -7838,8 +7809,7 @@ step 749 task 749 node 1057 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1059 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 750 task 750 node 1058 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -8069,8 +8039,7 @@ step 771 task 771 node 1087 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1089 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 772 task 772 node 1088 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -8300,8 +8269,7 @@ step 793 task 793 node 1117 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1119 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 794 task 794 node 1118 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -8531,8 +8499,7 @@ step 815 task 815 node 1147 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1149 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 816 task 816 node 1148 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -8762,8 +8729,7 @@ step 837 task 837 node 1177 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1179 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 838 task 838 node 1178 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -8993,8 +8959,7 @@ step 859 task 859 node 1207 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1209 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 860 task 860 node 1208 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -9224,8 +9189,7 @@ step 881 task 881 node 1237 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1239 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 882 task 882 node 1238 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -9455,8 +9419,7 @@ step 903 task 903 node 1267 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1269 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 904 task 904 node 1268 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -9686,8 +9649,7 @@ step 925 task 925 node 1297 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1299 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 926 task 926 node 1298 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -9917,8 +9879,7 @@ step 947 task 947 node 1327 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1329 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 948 task 948 node 1328 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -10148,8 +10109,7 @@ step 969 task 969 node 1357 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1359 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 970 task 970 node 1358 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -10379,8 +10339,7 @@ step 991 task 991 node 1387 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1389 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 992 task 992 node 1388 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
@@ -10610,8 +10569,7 @@ step 1013 task 1013 node 1417 op matvec_bf16 backend sonic stream s0
   buf in 0 t3 buffer b2 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1419 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
   launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch gemm-m64n64k64 grid 1x4x1 block 128x1x1 smem 36864 stream s0
 step 1014 task 1014 node 1418 op scale backend sonic stream s0
   attr buf 12
   attr inplace 1
