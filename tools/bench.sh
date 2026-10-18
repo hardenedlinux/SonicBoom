@@ -634,10 +634,6 @@ if [ "$ABLATE" = 1 ]; then
     # positive contribution means selecting tiled was the right call.
     "mmq-decomp|SONICBOOM_MMQ_DECOMP=stream_k"
     # Default is the per-shape "auto" pick; the group-off side pins the
-    # imported ggml mma kernel, so a positive contribution means auto is ahead
-    # of ggml on this model/shape.
-    "attn-impl|SONICBOOM_ATTN_IMPL=ggml"
-    # Default is the per-shape "auto" pick; the group-off side pins the
     # compiler-generated FA-2 kernel for every shape it covers (others fall
     # back to the native kernel), so a positive contribution means auto's
     # per-shape choice is ahead of codegen-everywhere.

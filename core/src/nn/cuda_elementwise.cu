@@ -38,6 +38,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -2568,15 +2569,17 @@ namespace {
 
 // --- Stage 3c: attention implementation selection --------------------------
 //
-// Three implementations serve the same contract: the native tiled kernel
-// ("own"), the imported ggml mma kernel ("ggml"), and the compiler-generated
-// FA-2 kernel ("codegen"). SONICBOOM_ATTN_IMPL pins one of them; "auto" uses
-// the measured per-shape-class table below. The table key is (head_dim, gqa,
+// Two implementations serve the same contract: the native tiled kernel
+// ("own") and the compiler-generated FA-2 kernel ("codegen").
+// SONICBOOM_ATTN_IMPL pins one of them; "auto" uses the measured
+// per-shape-class table below. The imported ggml mma kernel was retired; the
+// old "ggml" value is accepted as an alias for "auto" (with a warning) so
+// existing scripts keep working. The table key is (head_dim, gqa,
 // mask kind) only — never the batch size or sequence length — for the same
 // batch-invariance reason as the MMQ decomposition policy: a reused prefix
 // must take the same path as the full prefill, and a different implementation
 // has a different reduction order.
-enum class AttnImpl { Own, Ggml, Codegen };
+enum class AttnImpl { Own, Codegen };
 
 // The generated kernel's shape class, or nothing when the generator does not
 // cover the shape. SONICBOOM_ATTN_CODEGEN="br,bc,dps" pins the tile config for
@@ -2650,10 +2653,10 @@ AttnImpl attn_auto_pick(int head_dim, int gqa, bool window) {
   // narrow head.
   if (gqa == 7 && head_dim == 64) return AttnImpl::Own;
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
-  // (0.318/0.231 ms vs own 0.424/0.243 and ggml 0.466/0.482).
+  // (0.318/0.231 ms vs own 0.424/0.243).
   if (gqa == 4 && head_dim == 256) return AttnImpl::Codegen;
-  // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704) and
-  // beats ggml on both legs; own keeps a 13% prefill lead. Decode dominates a
+  // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
+  // own keeps a 13% prefill lead. Decode dominates a
   // 64-token generation (64 steps vs one prefill), and the per-shape choice
   // cannot depend on n (batch invariance), so auto takes codegen here too.
   if (gqa == 4 && head_dim == 512) return AttnImpl::Codegen;
@@ -2693,24 +2696,29 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   // resolves the shape class through the measured table (attn_auto_pick);
   // its key is the shape, not the batch size, so a reused prefix takes the
   // same path as a full prefill. "own" pins the native tiled kernel below,
-  // "ggml" the imported mma kernel, "codegen" the compiler-generated FA-2
-  // kernel; the pinned implementations fall back to the native kernel for
-  // shapes they do not cover.
+  // "codegen" the compiler-generated FA-2 kernel; the pinned implementations
+  // fall back to the native kernel for shapes they do not cover. "ggml" was
+  // the imported mma kernel, now retired: it maps to "auto" (once, with a
+  // warning) rather than failing, so an old script still runs the measured
+  // choice instead of silently changing behavior.
   const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
-  const std::string_view attn_impl =
+  std::string_view attn_impl =
       attn_impl_env ? std::string_view(attn_impl_env) : std::string_view("auto");
-  bool try_ggml = attn_impl == "ggml";
+  if (attn_impl == "ggml") {
+    static const bool warned = [] {
+      std::fprintf(stderr,
+                   "[attention] SONICBOOM_ATTN_IMPL=ggml is retired; using "
+                   "auto\n");
+      return true;
+    }();
+    (void)warned;
+    attn_impl = "auto";
+  }
   bool try_codegen = attn_impl == "codegen";
   if (attn_impl == "auto") {
     const AttnImpl pick = attn_auto_pick(head_dim, gqa, sliding_window != 0);
-    try_ggml = pick == AttnImpl::Ggml;
     try_codegen = pick == AttnImpl::Codegen;
   }
-  if (try_ggml &&
-      flash_attention_ggml_chunk_dev_pos(
-          q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-          n_heads_kv, head_dim, sliding_window, scale, out))
-    return true;
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
   // A shape without a generator (or a failed compile) falls through to the

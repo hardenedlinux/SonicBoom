@@ -265,7 +265,7 @@ struct ShapeCase {
 
 // --- Stage 3c autotune sweep -----------------------------------------------
 //
-// Times own / ggml / codegen (each generated tile config) for the three
+// Times own / codegen (each generated tile config) for the three
 // shipped shape classes at one decode step (start 512) and one prefill
 // (256 queries). The output is the data behind attn_auto_pick() in
 // core/src/nn/cuda_elementwise.cu and the Stage 3c report. Everything is
@@ -302,7 +302,7 @@ int run_bench() {
       const char *impl;
       const char *cfg;
     };
-    std::vector<Run> runs = {{"own", nullptr}, {"ggml", nullptr}};
+    std::vector<Run> runs = {{"own", nullptr}};
     for (const std::string &cfg : configs)
       runs.push_back({"codegen", cfg.c_str()});
 

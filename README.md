@@ -333,9 +333,9 @@ license. They live in `ggml_derived/` directories, with the details in
 
 | | Lines of code |
 |---|---:|
-| ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 3,025 |
-| SonicBoom core total (`core/src`, `core/include`) | 21,386 |
-| **Derived share** | **~14.1%** |
+| ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 3,313 |
+| SonicBoom core total (`core/src`, `core/include`) | 22,939 |
+| **Derived share** | **~14.4%** |
 
 *Counted with `cloc` 1.98. These are code lines only, excluding blanks and
 comments. The C ABI, the Guile bindings and the dependencies are not
