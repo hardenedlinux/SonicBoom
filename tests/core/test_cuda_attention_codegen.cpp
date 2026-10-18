@@ -278,9 +278,9 @@ int main() {
   // (SONICBOOM_GLUE_CACHE=0) writes no file, so it skips just this check.
   const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
   if (cache_env == nullptr || std::string_view(cache_env) != "0") {
-    check(codegen_cache_hit("attn-d64-g7-causal-b64x64"),
+    check(codegen_cache_hit("attn-d64-g7-causal-b64x64-dps1"),
           "the causal generated kernel was compiled and cached by the runtime");
-    check(codegen_cache_hit("attn-d64-g7-window-b64x64"),
+    check(codegen_cache_hit("attn-d64-g7-window-b64x64-dps1"),
           "the window generated kernel was compiled and cached by the runtime");
   }
 

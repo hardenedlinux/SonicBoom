@@ -58,20 +58,27 @@ struct AttentionShape {
   bool window_mask = false;
   int br = 64;        // query rows per block (multiple of 16)
   int bc = 64;        // key columns per tile (multiple of 16)
+  // Warps the head_dim is split across: warp w = rowchunk * dps + dchunk owns
+  // query rows [rowchunk*16, +16) and head_dim columns [dchunk*DC, +DC), where
+  // DC = head_dim/dps <= 128. The warps exchange partial S through shared
+  // memory and sum in warp order (batch invariance).
+  int dps = 1;
 
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
-           window_mask == o.window_mask && br == o.br && bc == o.bc;
+           window_mask == o.window_mask && br == o.br && bc == o.bc &&
+           dps == o.dps;
   }
 };
 
-// True when the generator covers the shape. The generated kernel holds
-// head_dim/8 output fragments of four f32 per thread, so the register budget
-// bounds head_dim; the staging is 2*head_dim*(br+bc) bytes of shared memory.
+// True when the generator covers the shape. Each warp holds DC/8 output
+// fragments of four f32 per thread (DC = head_dim/dps <= 128), so the register
+// budget bounds the per-warp column slice, not head_dim; the staging is
+// 2*(br*head_dim + 2*bc*head_dim) bytes plus the partial-S buffer when dps > 1.
 bool attention_shape_supported(const AttentionShape &shape);
 
-// Launch geometry of the generated kernel: br/16 warps of 32 threads, one
-// block per (query tile, query head).
+// Launch geometry of the generated kernel: (br/16)*dps warps of 32 threads,
+// one block per (query tile, query head).
 int attention_block_threads(const AttentionShape &shape);
 int attention_shared_bytes(const AttentionShape &shape);
 

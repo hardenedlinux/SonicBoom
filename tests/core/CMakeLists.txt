@@ -172,11 +172,25 @@ if(SONICBOOM_USE_CUDA)
                                                         CUDA::cuda_driver)
   sb_add_cpp_test(test_cuda_attention_codegen)
 
+  # Compiler-generated FlashAttention-2 kernel for wide heads (Stage 3b):
+  # head_dim 256 and 512 (Gemma sliding-window / global heads), where the
+  # generator splits head_dim across 2 and 4 warps and exchanges the partial S
+  # through shared memory. Same differential + batch-invariance contract as
+  # the 3a test, with the window length not a multiple of Bc.
+  add_executable(test_cuda_attention_codegen_wide
+                 test_cuda_attention_codegen_wide.cpp)
+  target_link_libraries(test_cuda_attention_codegen_wide PRIVATE sonicboom
+                                                             sonicboom_compiler
+                                                             CUDA::cudart
+                                                             CUDA::cuda_driver)
+  sb_add_cpp_test(test_cuda_attention_codegen_wide)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
                        test_cuda_elementwise test_glue_codegen
                        test_cuda_attention_codegen
+                       test_cuda_attention_codegen_wide
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

@@ -2537,8 +2537,22 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   // autotuner chooses per shape class. A shape without a generator (or a
   // failed compile) falls through to the hand-written kernels below.
   if (attn_impl == "codegen") {
-    const compiler::AttentionShape shape{.head_dim = head_dim, .gqa = gqa,
-                                         .window_mask = sliding_window != 0};
+    compiler::AttentionShape shape{.head_dim = head_dim, .gqa = gqa,
+                                   .window_mask = sliding_window != 0};
+    // Tile config per shape class. dps splits head_dim across warps so each
+    // warp's output slice stays within the f32 accumulator budget (DC <= 128):
+    //     D=64   dps=1, br=64, bc=64  (1 warp,   shared ~24 KiB)
+    //     D=256  dps=2, br=32, bc=32  (4 warps,  shared ~56 KiB)
+    //     D=512  dps=4, br=16, bc=32  (4 warps,  shared ~88 KiB)
+    if (gqa == 4 && head_dim == 256) {
+      shape.dps = 2;
+      shape.br = 32;
+      shape.bc = 32;
+    } else if (gqa == 4 && head_dim == 512) {
+      shape.dps = 4;
+      shape.br = 16;
+      shape.bc = 32;
+    }
     if (compiler::attention_shape_supported(shape)) {
       const float *q_p = q, *kb_p = k_batch, *vb_p = v_batch,
                   *kc_p = k_cache, *vc_p = v_cache;

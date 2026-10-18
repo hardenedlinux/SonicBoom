@@ -70,11 +70,14 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const int GQA = sh.gqa;
   const int BR = sh.br;
   const int BC = sh.bc;
-  const int NW = BR / 16;
+  const int WROW = BR / 16;   // 16-row query chunks per block
+  const int DPS = sh.dps;     // warps the head_dim is split across
+  const int DC = D / DPS;     // output columns per warp
+  const int NW = WROW * DPS;  // warps per block
   const int THREADS = NW * 32;
   const int SUBS = BC / 16;
-  const int NT = D / 8;   // output n-tiles of 8 columns
-  const int KT = D / 16;  // Q/K k-steps of 16
+  const int NT = DC / 8;   // output n-tiles of 8 columns per warp
+  const int KT = DC / 16;  // Q/K k-steps of 16 per warp
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -95,18 +98,27 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   c32("c0", 0); c32("c1", 1); c32("c2", 2); c32("c3", 3); c32("c4", 4);
   c32("c5", 5); c32("c7", 7); c32("c8", 8); c32("c15", 15); c32("c16", 16);
   c32("c31", 31); c32("c32", 32); c32("c63", 63); c32("c64", 64);
-  c32("c128", 128);
-  c64("l0", 0); c64("l1", 1); c64("l8", 8); c64("l64", 64);
+  c32("c128", 128); c32("cbr", BR);
+  c64("l0", 0); c64("l1", 1); c64("l8", 8);
+  c64("lbc", BC);
+  c64("lbr", BR);
+  c64("ld", D);
   cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
   ci("x0", 0);
   ci("xD", D);
   ci("xbc", BC);
-  ci("x64", 64);
   ci("xq", BR * D);       // Q staging elements
   ci("xkv", D * BC);      // K/V staging elements
   ci("xthr", THREADS);    // staging stride
-  ci("xkb", BR * D * 2);  // Kt byte offset: after the Q stage
-  ci("xvb", BR * D * 4);  // V byte offset: after the transposed K stage
+  // Dynamic shared memory: Q [BR][D] f16, K^T [D][BC] f16, V [BC][D] f16, and
+  // (when the head_dim is split across warps) the f32 partial-S buffer
+  // [DPS][BR][BC].
+  const int kByteOff = BR * D * 2;
+  const int vByteOff = kByteOff + D * BC * 2;
+  const int sByteOff = vByteOff + BC * D * 2;
+  ci("xkb", kByteOff);
+  ci("xvb", vByteOff);
+  ci("xsb", sByteOff);
   if (GQA != 4 && GQA != 7) c32("gqa", GQA);
 
   const std::string FUNC =
@@ -136,6 +148,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                                  "#gpu.address_space<workgroup>> to memref<" +
                                  s(BC) + "x" + s(D) +
                                  "xf16, #gpu.address_space<workgroup>>");
+  const std::string smem_s =
+      DPS > 1 ? e.val("memref.view " + smem + "[" + C["xsb"] +
+                      "][] : memref<?xi8, "
+                      "#gpu.address_space<workgroup>> to memref<" +
+                      s(DPS) + "x" + s(BR) + "x" + s(BC) +
+                      "xf32, #gpu.address_space<workgroup>>")
+              : std::string();
 
   const std::string tid_i =
       e.val("arith.index_cast " + tid + " : index to i32");
@@ -143,6 +162,24 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       e.val("arith.andi " + tid_i + ", " + C["c31"] + " : i32");
   const std::string warp =
       e.val("arith.shrui " + tid_i + ", " + C["c5"] + " : i32");
+  // Warp w owns query rows [rowchunk*16, rowchunk*16+16) and output columns
+  // [dchunk*DC, dchunk*DC+DC). With dps = 1 the row chunk is the whole warp
+  // role and the D split is trivial.
+  if (DPS != 1) c32("cdps", DPS);
+  const std::string rowchunk = DPS == 1
+      ? warp
+      : e.val("arith.divui " + warp + ", " + C["cdps"] + " : i32");
+  const std::string dchunk = DPS == 1
+      ? C["c0"]
+      : e.val("arith.remui " + warp + ", " + C["cdps"] + " : i32");
+  const std::string dbase = DPS == 1
+      ? C["c0"]
+      : e.val("arith.muli " + dchunk + ", " +
+              e.val("arith.constant " + s(DC) + " : i32") + " : i32");
+  // dbase as an index (smem views / V columns) and as i64 (output offsets).
+  const std::string dbase_i = e.val("arith.index_cast " + dbase +
+                                    " : i32 to index");
+  const std::string dbase64 = e.val("arith.extsi " + dbase + " : i32 to i64");
   const std::string g = e.val("arith.shrui " + lane + ", " + C["c2"] + " : i32");
   const std::string tc = e.val("arith.andi " + lane + ", " + C["c3"] + " : i32");
   const std::string lane15 =
@@ -162,12 +199,11 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string hkv =
       e.val("arith.divui " + by_i + ", " + divc + " : i32");
   const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
-  const std::string warp64 = e.val("arith.extsi " + warp + " : i32 to i64");
   const std::string g64 = e.val("arith.extsi " + g + " : i32 to i64");
   const std::string tc64 = e.val("arith.extsi " + tc + " : i32 to i64");
   // Absolute first query position of this block: bx * Br.
   const std::string bxbr =
-      e.val("arith.muli " + bx64 + ", " + C["l64"] + " : i64");
+      e.val("arith.muli " + bx64 + ", " + C["lbr"] + " : i64");
 
   // ---- Q tile: [BR][D] f16 ------------------------------------------------
   e.op("scf.for %qi = " + tid + " to " + C["xq"] + " step " + C["xthr"] +
@@ -187,7 +223,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string off2 =
           e.val("arith.addi " + off + ", " + by64 + " : i64");
       const std::string off3 =
-          e.val("arith.muli " + off2 + ", " + C["l64"] + " : i64");
+          e.val("arith.muli " + off2 + ", " + C["ld"] + " : i64");
       const std::string off4 =
           e.val("arith.addi " + off3 + ", " + dd64 + " : i64");
       const std::string qp = e.val("llvm.getelementptr %q[" + off4 +
@@ -207,15 +243,19 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   e.op("gpu.barrier");
 
   // ---- Q fragments (invariant across key tiles) ---------------------------
+  // Each warp loads its 16 query rows over its DC-column slice of head_dim.
   std::vector<std::string> aq;
-  for (int k0 = 0; k0 < D; k0 += 16) {
-    std::string row = e.val("arith.muli " + warp + ", " + C["c16"] + " : i32");
+  for (int k0 = 0; k0 < DC; k0 += 16) {
+    std::string row =
+        e.val("arith.muli " + rowchunk + ", " + C["c16"] + " : i32");
     row = e.val("arith.addi " + row + ", " + lane15 + " : i32");
     std::string col = e.val("arith.muli " + lsh16 + ", " + C["c8"] + " : i32");
     if (k0 != 0) {
       const std::string kc = e.val("arith.constant " + s(k0) + " : i32");
       col = e.val("arith.addi " + col + ", " + kc + " : i32");
     }
+    if (DPS != 1)
+      col = e.val("arith.addi " + col + ", " + dbase + " : i32");
     const std::string ri = e.val("arith.index_cast " + row + " : i32 to index");
     const std::string ci2 = e.val("arith.index_cast " + col + " : i32 to index");
     aq.push_back(e.val("nvgpu.ldmatrix " + qmem + "[" + ri + ", " + ci2 +
@@ -231,7 +271,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string nrem =
       e.val("arith.subi " + n64 + ", " + bxbr + " : i64");
   const std::string nblk =
-      e.val("arith.minsi " + nrem + ", " + C["l64"] + " : i64");
+      e.val("arith.minsi " + nrem + ", " + C["lbr"] + " : i64");
   const std::string keyend0 =
       e.val("arith.addi " + start + ", " + bxbr + " : i64");
   const std::string keyend1 =
@@ -253,13 +293,15 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const std::string key_start =
         e.val("arith.select " + cond + ", " + ws1 + ", " + C["l0"] + " : i64");
     j0s = e.val("arith.muli " +
-                e.val("arith.divsi " + key_start + ", " + C["l64"] + " : i64") +
-                ", " + C["l64"] + " : i64");
+                e.val("arith.divsi " + key_start + ", " + C["lbc"] + " : i64") +
+                ", " + C["lbc"] + " : i64");
   }
 
   // ---- per-row absolute positions ----------------------------------------
   const std::string w16_64 = e.val("arith.constant 16 : i64");
-  const std::string warprow = e.val("arith.muli " + warp64 + ", " + w16_64 +
+  const std::string rowchunk64 =
+      e.val("arith.extsi " + rowchunk + " : i32 to i64");
+  const std::string warprow = e.val("arith.muli " + rowchunk64 + ", " + w16_64 +
                                     " : i64");
   const std::string rowbase =
       e.val("arith.addi " + abs_pb + ", " + warprow + " : i64");
@@ -309,7 +351,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string kex = e.val("arith.index_cast " + keyend1 +
                                 " : i64 to index");
   e.op(loopres + " = scf.for %j0 = " + j0sx + " to " + kex + " step " +
-       C["x64"] + " " + ia + ty + " {");
+       C["xbc"] + " " + ia + ty + " {");
   const std::string j0v = e.val("arith.index_cast %j0 : index to i64");
   std::map<std::string, std::string> cur;  // iter-arg name -> current value
   for (size_t i = 0; i < names.size(); ++i) cur[names[i]] = names[i];
@@ -339,7 +381,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string co2 =
           e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
       const std::string co3 =
-          e.val("arith.muli " + co2 + ", " + C["l64"] + " : i64");
+          e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
       const std::string co4 =
           e.val("arith.addi " + co3 + ", " + dd64 + " : i64");
       const std::string cp =
@@ -352,7 +394,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string bo2 =
           e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
       const std::string bo3 =
-          e.val("arith.muli " + bo2 + ", " + C["l64"] + " : i64");
+          e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
       const std::string bo4 =
           e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
       const std::string bp =
@@ -380,18 +422,27 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   }
   e.op("gpu.barrier");
 
-  // ---- per 16-key sub-tile ------------------------------------------------
+  // ---- S = Q K^T for every sub-tile --------------------------------------
+  // Each warp accumulates S over its DC-column slice of head_dim. With the
+  // head_dim split across warps (DPS > 1) the partials go through shared
+  // memory; every warp then sums them in warp order, so the reduction order
+  // is fixed and the result does not depend on scheduling (batch invariance).
+  // C fragment: [0][0]=row r col 2c, [0][1]=col 2c+1, [1][*]=row r+8.
+  const auto ext = [&](const std::string &v, int r, int c) {
+    return e.val("vector.extract " + v + "[" + s(r) + ", " + s(c) +
+                 "] : f32 from vector<2x2xf32>");
+  };
+  std::vector<std::string> s0v(SUBS), s1v(SUBS);
   for (int sub = 0; sub < SUBS; ++sub) {
     const int key_off = sub * 16;
-
-    // S = Q K^T, two 8-key n-tiles, k-steps of 16.
     std::string s0 = e.val("arith.constant dense<0.0> : vector<2x2xf32>");
     std::string s1 = e.val("arith.constant dense<0.0> : vector<2x2xf32>");
     for (int k0i = 0; k0i < KT; ++k0i) {
       const std::string kc =
           e.val("arith.constant " + s(k0i * 16) + " : i32");
-      const std::string row32 = e.val("arith.addi " + lane15 + ", " + kc +
-                                      " : i32");
+      std::string row32 = e.val("arith.addi " + lane15 + ", " + kc + " : i32");
+      if (DPS != 1)
+        row32 = e.val("arith.addi " + row32 + ", " + dbase + " : i32");
       const std::string ri =
           e.val("arith.index_cast " + row32 + " : i32 to index");
       for (int half = 0; half < 2; ++half) {
@@ -408,16 +459,108 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                     "vector<2x2xf16>, vector<2x2xf32>) -> vector<2x2xf32>");
       }
     }
-    // C fragment: [0][0]=row r col 2c, [0][1]=col 2c+1, [1][*]=row r+8.
-    const auto ext = [&](const std::string &v, int r, int c) {
-      return e.val("vector.extract " + v + "[" + s(r) + ", " + s(c) +
-                   "] : f32 from vector<2x2xf32>");
+    s0v[sub] = s0;
+    s1v[sub] = s1;
+  }
+
+  // The shared-S handoff: each warp stores the 16xBC partial of its column
+  // slice; the barrier below makes all of them visible before the sums.
+  std::string prow0i, prow1i, pdchi, ptc2i, ptc2p1i;
+  if (DPS > 1) {
+    const std::string rowchunk16 =
+        e.val("arith.muli " + rowchunk + ", " + C["c16"] + " : i32");
+    const std::string prow0 = e.val("arith.addi " + rowchunk16 + ", " + g +
+                                    " : i32");
+    const std::string prow1 =
+        e.val("arith.addi " + prow0 + ", " + C["c8"] + " : i32");
+    const std::string tc2 =
+        e.val("arith.muli " + tc + ", " + C["c2"] + " : i32");
+    const std::string tc2p1 =
+        e.val("arith.addi " + tc2 + ", " + C["c1"] + " : i32");
+    const auto idx = [&](const std::string &v) {
+      return e.val("arith.index_cast " + v + " : i32 to index");
     };
+    prow0i = idx(prow0);
+    prow1i = idx(prow1);
+    pdchi = idx(dchunk);
+    ptc2i = idx(tc2);
+    ptc2p1i = idx(tc2p1);
+    const std::string stype = " : memref<" + s(DPS) + "x" + s(BR) + "x" +
+                              s(BC) + "xf32, #gpu.address_space<workgroup>>";
+    for (int sub = 0; sub < SUBS; ++sub) {
+      const int key_off = sub * 16;
+      for (int half = 0; half < 2; ++half) {
+        const std::string hbase = e.val("arith.constant " +
+                                        s(key_off + half * 8) + " : index");
+        const std::string c0i =
+            e.val("arith.addi " + hbase + ", " + ptc2i + " : index");
+        const std::string c1i =
+            e.val("arith.addi " + hbase + ", " + ptc2p1i + " : index");
+        const std::string &vv = half == 0 ? s0v[sub] : s1v[sub];
+        e.op("memref.store " + ext(vv, 0, 0) + ", " + smem_s + "[" + pdchi +
+             ", " + prow0i + ", " + c0i + "]" + stype);
+        e.op("memref.store " + ext(vv, 0, 1) + ", " + smem_s + "[" + pdchi +
+             ", " + prow0i + ", " + c1i + "]" + stype);
+        e.op("memref.store " + ext(vv, 1, 0) + ", " + smem_s + "[" + pdchi +
+             ", " + prow1i + ", " + c0i + "]" + stype);
+        e.op("memref.store " + ext(vv, 1, 1) + ", " + smem_s + "[" + pdchi +
+             ", " + prow1i + ", " + c1i + "]" + stype);
+      }
+    }
+    e.op("gpu.barrier");
+  }
+
+  // ---- per 16-key sub-tile: mask + online softmax + PV --------------------
+  for (int sub = 0; sub < SUBS; ++sub) {
+    const int key_off = sub * 16;
+
     // se: n-tile 0 (keys key_off+0..7); sf: n-tile 1 (keys key_off+8..15)
-    const std::string se00 = ext(s0, 0, 0), se01 = ext(s0, 0, 1);
-    const std::string se10 = ext(s0, 1, 0), se11 = ext(s0, 1, 1);
-    const std::string sf00 = ext(s1, 0, 0), sf01 = ext(s1, 0, 1);
-    const std::string sf10 = ext(s1, 1, 0), sf11 = ext(s1, 1, 1);
+    std::string se00, se01, se10, se11, sf00, sf01, sf10, sf11;
+    if (DPS == 1) {
+      se00 = ext(s0v[sub], 0, 0);
+      se01 = ext(s0v[sub], 0, 1);
+      se10 = ext(s0v[sub], 1, 0);
+      se11 = ext(s0v[sub], 1, 1);
+      sf00 = ext(s1v[sub], 0, 0);
+      sf01 = ext(s1v[sub], 0, 1);
+      sf10 = ext(s1v[sub], 1, 0);
+      sf11 = ext(s1v[sub], 1, 1);
+    } else {
+      const std::string stype =
+          " : memref<" + s(DPS) + "x" + s(BR) + "x" + s(BC) +
+          "xf32, #gpu.address_space<workgroup>>";
+      const auto sum_d = [&](const std::string &ri,
+                             const std::string &ci) -> std::string {
+        std::string acc;
+        for (int d = 0; d < DPS; ++d) {
+          const std::string di =
+              e.val("arith.constant " + s(d) + " : index");
+          const std::string v = e.val("memref.load " + smem_s + "[" + di +
+                                      ", " + ri + ", " + ci + "]" + stype);
+          acc = d == 0 ? v : e.val("arith.addf " + acc + ", " + v + " : f32");
+        }
+        return acc;
+      };
+      const std::string ce = e.val("arith.constant " + s(key_off) + " : index");
+      const std::string cf = e.val("arith.constant " + s(key_off + 8) +
+                                   " : index");
+      const std::string ce0 = e.val("arith.addi " + ce + ", " + ptc2i +
+                                    " : index");
+      const std::string ce1 = e.val("arith.addi " + ce + ", " + ptc2p1i +
+                                    " : index");
+      const std::string cf0 = e.val("arith.addi " + cf + ", " + ptc2i +
+                                    " : index");
+      const std::string cf1 = e.val("arith.addi " + cf + ", " + ptc2p1i +
+                                    " : index");
+      se00 = sum_d(prow0i, ce0);
+      se01 = sum_d(prow0i, ce1);
+      se10 = sum_d(prow1i, ce0);
+      se11 = sum_d(prow1i, ce1);
+      sf00 = sum_d(prow0i, cf0);
+      sf01 = sum_d(prow0i, cf1);
+      sf10 = sum_d(prow1i, cf0);
+      sf11 = sum_d(prow1i, cf1);
+    }
 
     // Absolute key of each of this lane's four columns (row r: two keys from
     // each n-tile; row r+8 shares them).
@@ -539,7 +682,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string o =
           e.val("arith.mulf " + cur["%o" + s(nt)] + ", " + rsv +
                 " : vector<2x2xf32>");
-      const std::string ccol = e.val("arith.constant " + s(nt * 8) + " : index");
+      std::string ccol = e.val("arith.constant " + s(nt * 8) + " : index");
+      if (DPS != 1)
+        ccol = e.val("arith.addi " + ccol + ", " + dbase_i + " : index");
       const std::string bv = e.val(
           "nvgpu.ldmatrix " + vmem + "[" + vri + ", " + ccol +
           "] {numTiles = 2 : i32, transpose = true} : memref<" + s(BC) + "x" +
@@ -574,10 +719,10 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string inv1 =
       e.val("arith.divf " + C["cone"] + ", " + cur["%l1"] + " : f32");
   std::string iq0 = e.val("arith.addi " +
-                          e.val("arith.muli " + bx_i + ", " + C["c64"] +
+                          e.val("arith.muli " + bx_i + ", " + C["cbr"] +
                                 " : i32") +
                           ", " +
-                          e.val("arith.muli " + warp + ", " + C["c16"] +
+                          e.val("arith.muli " + rowchunk + ", " + C["c16"] +
                                 " : i32") +
                           " : i32");
   iq0 = e.val("arith.addi " + iq0 + ", " + g + " : i32");
@@ -592,7 +737,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         e.val("arith.muli " + iq64 + ", " + nhq64 + " : i64");
     const std::string ro2 = e.val("arith.addi " + ro1 + ", " + by64 + " : i64");
     const std::string ro3 =
-        e.val("arith.muli " + ro2 + ", " + C["l64"] + " : i64");
+        e.val("arith.muli " + ro2 + ", " + C["ld"] + " : i64");
     for (int nt = 0; nt < NT; ++nt) {
       const std::string &o = cur["%o" + s(nt)];
       const std::string e0 =
@@ -610,6 +755,8 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                   e.val("arith.muli " + tc64 + ", " + e.val("arith.constant 2 : i64") +
                         " : i64") +
                   " : i64");
+      if (DPS != 1)
+        off = e.val("arith.addi " + off + ", " + dbase64 + " : i64");
       const std::string pout = e.val("llvm.getelementptr %out[" + off +
                                      "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
       e.op("llvm.store " + y0 + ", " + pout + " : f32, !llvm.ptr");
@@ -635,23 +782,36 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
 } // namespace
 
 bool attention_shape_supported(const AttentionShape &shape) {
-  // 16-row sub-tiles and 8/16-wide mma tiles fix the granularity; head_dim/8
-  // output fragments bound the registers, which keeps the generated path to
-  // narrow heads (64 is the shipped shape; the generator is D-generic up to
-  // that budget). The K/V staging is 2*head_dim*(br+bc) bytes.
-  return shape.head_dim > 0 && shape.head_dim % 16 == 0 &&
-         shape.head_dim / 8 <= 16 && shape.gqa > 0 && shape.br % 16 == 0 &&
-         shape.bc % 16 == 0 && shape.br <= 64 && shape.bc <= 64 &&
-         attention_shared_bytes(shape) <= 48 * 1024;
+  // 16-row sub-tiles and 8/16-wide mma tiles fix the granularity. Each warp
+  // owns head_dim/dps output columns — 8/16-wide fragments, so that slice, not
+  // head_dim, is what bounds the register budget (128 columns = 16 f32
+  // fragments per thread; wider needs a different accumulation). The staging
+  // is Q + K + V plus the f32 partial-S buffer when the head_dim is split.
+  if (shape.head_dim <= 0 || shape.gqa <= 0) return false;
+  if (shape.br < 16 || shape.br > 64 || shape.br % 16 != 0) return false;
+  if (shape.bc < 16 || shape.bc > 64 || shape.bc % 16 != 0) return false;
+  const int dps = shape.dps;
+  if (dps != 1 && dps != 2 && dps != 4 && dps != 8) return false;
+  if (shape.head_dim % dps != 0) return false;
+  const int dc = shape.head_dim / dps;
+  if (dc < 16 || dc % 16 != 0 || dc / 8 > 16) return false;
+  if ((shape.br / 16) * dps > 32) return false;
+  // Up to 96 KiB of dynamic shared memory; the loader raises the per-function
+  // limit above 48 KiB.
+  return attention_shared_bytes(shape) <= 96 * 1024;
 }
 
 int attention_block_threads(const AttentionShape &shape) {
-  return (shape.br / 16) * 32;
+  return (shape.br / 16) * shape.dps * 32;
 }
 
 int attention_shared_bytes(const AttentionShape &shape) {
-  return 2 * shape.br * shape.head_dim + 2 * shape.head_dim * shape.bc +
-         2 * shape.bc * shape.head_dim;
+  const int q = 2 * shape.br * shape.head_dim;
+  const int k = 2 * shape.head_dim * shape.bc;
+  const int v = 2 * shape.bc * shape.head_dim;
+  // Partial-S exchange buffer (one f32 per row x key per d-slice).
+  const int sp = shape.dps > 1 ? 4 * shape.dps * shape.br * shape.bc : 0;
+  return q + k + v + sp;
 }
 
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
@@ -663,7 +823,9 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn1";
+  // attn2: head_dim split across warps (partial S exchanged through shared
+  // memory) and the generic Br/Bc staging.
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn2";
 }
 
 } // namespace sonicboom::compiler
