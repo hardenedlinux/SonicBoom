@@ -638,6 +638,9 @@ if [ "$ABLATE" = 1 ]; then
     # tiled kernel (the pre-3c behavior), so a positive contribution means the
     # measured selection is ahead of always-native.
     "attn-auto|SONICBOOM_ATTN_IMPL=own"
+    # Default is the cuBLASLt bf16 tensor-core kernel with a per-shape cached
+    # algorithm; the group-off side runs the cublasGemmEx default algorithm.
+    "dense-lt|SONICBOOM_DENSE_LT=0"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field

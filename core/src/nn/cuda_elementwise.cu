@@ -27,6 +27,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 
 #include <algorithm>
 #include <cmath>
@@ -34,10 +35,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 // CUDA kernels for the native-transformer elementwise / norm / RoPE ops and the
 // dense gate matvecs (Phase 6a target 3, first slice). Each entry point mirrors
@@ -2886,6 +2889,13 @@ bool dense_cublas_enabled() noexcept {
   return std::string_view(std::getenv("SONICBOOM_DENSE_CUBLAS")) != "0";
 }
 
+// SONICBOOM_DENSE_LT=0 restores the cublasGemmEx default algorithm for the
+// strided bf16 dense projection (the Stage 4b A/B switch).
+bool dense_lt_enabled() noexcept {
+  if (std::getenv("SONICBOOM_DENSE_LT") == nullptr) return true;
+  return std::string_view(std::getenv("SONICBOOM_DENSE_LT")) != "0";
+}
+
 // n (batch) threshold at or above which the cuBLAS path is used. This must be 1,
 // not 2: a prefix-reuse suffix whose start_pos leaves exactly one token before
 // the next chunk boundary splits into a 1-column segment (gemma4_plan.cpp:1187),
@@ -2913,6 +2923,10 @@ int dense_cublas_min_n() {
 // fp32/bf16 GEMM with fp32 accumulate.
 constexpr size_t kDenseCublasWorkspaceBytes = 4 * 1024 * 1024;
 
+// The workspace block behind that budget: shared by the cuBLAS handle and the
+// cuBLASLt dense GEMM.
+void *g_dense_ws = nullptr;
+
 // Lazily create the process-wide cuBLAS handle for the dense projections, bound
 // to CUBLAS_DEFAULT_MATH (full fp32 Sgemm, no TF32 tensor ops; bf16 GemmEx uses
 // CUBLAS_COMPUTE_32F tensor cores explicitly and is unaffected). Returns nullptr
@@ -2927,11 +2941,111 @@ cublasHandle_t dense_cublas_handle() {
       return nullptr;
     }
     cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
-    void* ws = nullptr;
-    if (cudaMalloc(&ws, kDenseCublasWorkspaceBytes) == cudaSuccess)
-      cublasSetWorkspace(h, ws, kDenseCublasWorkspaceBytes);
+    if (cudaMalloc(&g_dense_ws, kDenseCublasWorkspaceBytes) == cudaSuccess)
+      cublasSetWorkspace(h, g_dense_ws, kDenseCublasWorkspaceBytes);
   }
   return h;
+}
+
+// cuBLASLt bf16 tensor-core GEMM for the strided dense projection (Stage 4b):
+// C^T (rows x 128) = W (rows x cols) * X^T (cols x 128), fp32 accumulate. The
+// heuristic runs once per (rows, cols) shape class and the chosen algorithm is
+// cached: the same shape always runs the same algorithm, so a position's
+// numerics do not depend on the batch size or column offset (batch invariance),
+// and no heuristic runs inside CUDA graph capture.
+struct DenseLtKernel {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+};
+
+cublasLtHandle_t dense_lt_handle() {
+  static cublasLtHandle_t h = nullptr;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!h && cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
+  return h;
+}
+
+// The cached algorithm for (rows, cols), chosen on first use. Returns false when
+// cuBLASLt has no candidate for the shape (the caller falls back to GemmEx).
+bool dense_lt_kernel(cublasLtHandle_t lt, cublasLtMatmulDesc_t op,
+                     cublasLtMatrixLayout_t ad, cublasLtMatrixLayout_t bd,
+                     cublasLtMatrixLayout_t cd, int rows, int cols,
+                     DenseLtKernel &out) {
+  static std::mutex mu;
+  static std::map<std::pair<int, int>, std::optional<DenseLtKernel>> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = cache.find({rows, cols});
+  if (it != cache.end()) {
+    if (!it->second) return false;
+    out = *it->second;
+    return true;
+  }
+  cublasLtMatmulPreference_t pref = nullptr;
+  cublasLtMatmulHeuristicResult_t heur{};
+  int found = 0;
+  std::optional<DenseLtKernel> picked;
+  if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+    size_t max_ws = kDenseCublasWorkspaceBytes;
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws));
+    if (cublasLtMatmulAlgoGetHeuristic(lt, op, ad, bd, cd, cd, pref, 1, &heur,
+                                       &found) == CUBLAS_STATUS_SUCCESS &&
+        found > 0) {
+      DenseLtKernel k;
+      k.algo = heur.algo;
+      k.workspace = g_dense_ws ? std::min(heur.workspaceSize,
+                                          kDenseCublasWorkspaceBytes)
+                               : 0;
+      picked = k;
+      if (std::getenv("SONICBOOM_DENSE_LT_DEBUG"))
+        std::fprintf(stderr,
+                     "[dense-lt] rows=%d cols=%d workspace=%zu selected\n", rows,
+                     cols, k.workspace);
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+  }
+  cache.insert({{rows, cols}, picked});
+  if (!picked) return false;
+  out = *picked;
+  return true;
+}
+
+// A is the position-major activation block (read as a column-major k x 128
+// matrix), W the row-major weight (a column-major k x m matrix under TRANSA).
+bool matvec_bf16_lt_dev(cublasLtHandle_t lt, const uint16_t *d_w, int cols,
+                        const uint16_t *a, float *c, int rows) {
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+  bool ok = false;
+  if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+  const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
+  const cudaDataType_t bf16 = CUDA_R_16BF, f32 = CUDA_R_32F;
+  if (cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tr_a,
+                                     sizeof(tr_a)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tr_b,
+                                     sizeof(tr_b)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&ad, bf16, cols, rows, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&bd, bf16, cols, kDenseCublasWidth, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&cd, f32, rows, kDenseCublasWidth, rows) ==
+          CUBLAS_STATUS_SUCCESS) {
+    DenseLtKernel k;
+    if (dense_lt_kernel(lt, op, ad, bd, cd, rows, cols, k)) {
+      const float alpha = 1.0f, beta = 0.0f;
+      ok = cublasLtMatmul(lt, op, &alpha, d_w, ad, a, bd, &beta, c, cd, c, cd,
+                          &k.algo, g_dense_ws, k.workspace, cur_stream()) ==
+           CUBLAS_STATUS_SUCCESS;
+    }
+  }
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  cublasLtMatmulDescDestroy(op);
+  return ok;
 }
 
 // Blocked cuBLAS matvec for the dense f32 projection. x is [cols, ncols], y is
@@ -3011,6 +3125,7 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
                             float* y, int rows, int ncols, bool strided) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
+  cublasLtHandle_t lt = dense_lt_handle();
   uint16_t* xpack = nullptr;
   float* outpack = nullptr;
   auto need_pack = [&] {
@@ -3057,10 +3172,16 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
         a = xpack;
         c = outpack;
       }
-      st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, kDenseCublasWidth,
-                        cols, &alpha, d_w, CUDA_R_16BF, cols, a, CUDA_R_16BF,
-                        cols, &beta, c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
-                        CUBLAS_GEMM_DEFAULT);
+      // cuBLASLt bf16 tensor-core GEMM with the shape class's cached algorithm;
+      // GemmEx stays as the fallback when Lt has no candidate.
+      st = (lt && dense_lt_enabled() &&
+            matvec_bf16_lt_dev(lt, d_w, cols, a, c, rows))
+               ? CUBLAS_STATUS_SUCCESS
+               : cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows,
+                              kDenseCublasWidth, cols, &alpha, d_w,
+                              CUDA_R_16BF, cols, a, CUDA_R_16BF, cols, &beta,
+                              c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT);
       if (st == CUBLAS_STATUS_SUCCESS && !full) {
         SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
         copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
