@@ -1,10 +1,15 @@
-// Compiler-generated FlashAttention-2 kernel test for wide heads (Stage 3b).
+// Compiler-generated FlashAttention-2 kernel test (Stage 3b), wide Gemma heads
+// and the narrow Qwen head.
 //
 // The Gemma-family attention heads are wider than a warp's mma accumulator
 // budget: head_dim 256 (sliding-window head) and 512 (global head). The
-// generator therefore splits head_dim across `dps` warps (256 -> 2 x 128,
-// 512 -> 4 x 128), exchanges the partial S through shared memory and sums the
-// slices in warp order.
+// generator therefore splits head_dim across `dps` warps (256 -> 4 x 64,
+// 512 -> 8 x 64), exchanges the partial S through shared memory and sums the
+// slices in warp order. The Qwen2.5 head (head_dim 64, GQA 7) fits one warp
+// and is covered by the same test: its generated kernel is checked against
+// fp64 and the batch-invariance contract like the wide heads, while
+// attn_auto_pick keeps the hand-written kernel for it (the prefill leg is
+// 1.7x faster there: 0.081 vs 0.138 ms at 256 queries).
 //
 // This test checks that path against an fp64 reference that simulates the
 // kernel's two roundings (f16 Q/K/V staging, f16 P), for both mask kinds and
@@ -261,6 +266,9 @@ struct ShapeCase {
   Cfg cfg;
   const char *causal_region;
   const char *window_region;
+  // The implementation attn_auto_pick is expected to choose for this class
+  // (d64: own wins the prefill leg by 1.7x; d256/d512: codegen).
+  bool auto_codegen = true;
 };
 
 // --- Stage 3c autotune sweep -----------------------------------------------
@@ -290,7 +298,8 @@ int run_bench() {
     }
     std::vector<std::string> configs;
     if (c.d == 64)
-      configs = {"64,64,1", "32,64,1", "64,32,1", "32,32,1"};
+      configs = {"64,64,1", "32,64,1", "64,32,1", "32,32,1",
+                 "64,64,2", "64,32,2", "64,64,4", "64,32,4", "64,16,4"};
     else if (c.d == 256)
       configs = {"32,32,2", "32,32,4", "64,32,4", "32,64,2", "16,32,2",
                  "48,32,4", "64,32,2", "64,16,4", "32,16,4"};
@@ -341,6 +350,8 @@ int main(int argc, char **argv) {
   setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
 
   const ShapeCase shapes[] = {
+      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x64-dps1",
+       "attn-d64-g7-window-b64x64-dps1", false},
       {{256, 2, 4, 8}, "attn-d256-g4-causal-b64x16-dps4",
        "attn-d256-g4-window-b64x16-dps4"},
       {{512, 2, 4, 8}, "attn-d512-g4-causal-b32x16-dps8",
@@ -456,13 +467,13 @@ int main(int argc, char **argv) {
     std::vector<float> got_auto;
     const bool ran_auto = run_case(c, b, qabs, kseq, vseq, 100, 130, 0, got_auto);
     check(ran_auto, "auto attention returns true");
-    setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
+    setenv("SONICBOOM_ATTN_IMPL", sc.auto_codegen ? "codegen" : "own", 1);
     size_t auto_diff = 0;
-    // Compare the whole causal chunk: auto must dispatch to the generated
-    // kernel, not merely produce a close result.
+    // Compare the whole causal chunk: auto must dispatch to the kernel the
+    // static table names for this class, not merely produce a close result.
     std::vector<float> got_cg;
     const bool ran_cg = run_case(c, b, qabs, kseq, vseq, 100, 130, 0, got_cg);
-    check(ran_cg, "codegen attention returns true");
+    check(ran_cg, "the auto_pick reference implementation returns true");
     if (ran_auto && ran_cg && got_auto.size() == got_cg.size()) {
       for (size_t z = 0; z < got_auto.size(); ++z)
         if (std::bit_cast<uint32_t>(got_auto[z]) !=
@@ -471,7 +482,9 @@ int main(int argc, char **argv) {
     }
     check(ran_auto && ran_cg && got_auto.size() == got_cg.size() &&
               auto_diff == 0,
-          "auto selects the generated kernel bitwise on this shape class");
+          sc.auto_codegen
+              ? "auto selects the generated kernel bitwise on this shape class"
+              : "auto selects the hand-written kernel bitwise on this shape class");
 
     const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
     if (cache_env == nullptr || std::string_view(cache_env) != "0") {

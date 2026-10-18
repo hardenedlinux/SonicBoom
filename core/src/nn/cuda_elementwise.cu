@@ -2870,9 +2870,12 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
 // with the bench sweep when the hardware or the kernels change.
 AttnImpl attn_auto_pick(int head_dim, int gqa, bool window) {
   (void)window;
-  // d64: own wins the prefill leg by 1.7x and is within 3% on decode, so the
-  // generated kernel's decode lead at d256/d512 does not transfer to the
-  // narrow head.
+  // d64 (Qwen2.5, GQA 7): own wins both legs after the split-KV decode
+  // landed. Prefill 256 queries: own 0.081 ms vs codegen 0.138 ms (default
+  // 64x64; the best swept config 64,32,4 is a tie at 0.081 and is not worth
+  // the reduction-order change). Decode via attention_bench: 513 keys own
+  // 21.8 us vs generated 38.6; 4097 keys 156.7 vs 181.4. The generated
+  // kernel's lead at d256/d512 does not transfer to the narrow head.
   if (gqa == 7 && head_dim == 64) return AttnImpl::Own;
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
   // (0.318/0.231 ms vs own 0.424/0.243).
