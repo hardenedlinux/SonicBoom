@@ -31,12 +31,15 @@
 // The graph op's verifier is exercised by the conversion test, which builds
 // real graphs from real models; here there is nothing but the dialect.
 
+#include "sonicboom/compiler/BoomBuilder.h"
 #include "sonicboom/compiler/BoomOps.h"
 
+#include "llvm/Support/raw_ostream.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/Verifier.h"
 
 #include "sonicboom/planner/op_kind.h"
 #include "sonicboom/quant/quantized_tensor.h"
@@ -239,6 +242,56 @@ int main() {
         "a q5_0 shape whose last dimension is not a multiple of 32 is rejected");
   check(!boom::KvType::getChecked(emit_error, &context, int64_t(-1)),
         "a KV cache handle for a negative layer is rejected");
+
+  //--- the generation program: lift a decode graph -------------------------
+  //
+  // The program is the decode graph plus the loop around it: the graph's body
+  // moves into a boom.step, and the position/token/cache become SSA operands
+  // of that step rather than free variables of an isolated graph.
+  {
+    mlir::MLIRContext program_context;
+    sonicboom::compiler::BoomBuilder b(&program_context, "decode", 0);
+    const auto tok = b.input("token_id", {1}, sonicboom::sx::DType::Int64);
+    const auto pos = b.input("pos", {1}, sonicboom::sx::DType::Int64);
+    const auto kv = b.kv(0);
+    const auto emb = b.node(planner::OpKind::Embedding, {tok}, "emb", {8}, {});
+    const sonicboom::sx::Attribute layer{"layer", int64_t(0)};
+    const auto attn = b.node(planner::OpKind::Attention,
+                             {emb, emb, emb, pos, kv}, "attn", {8}, {layer});
+    const auto out =
+        b.node(planner::OpKind::Argmax, {attn}, "tok_out", {1}, {});
+    b.set_output(out);
+    auto module = b.finish();
+    check(bool(module), "a decode graph builds");
+
+    if (module) {
+      check(mlir::succeeded(sonicboom::compiler::addGreedyProgram(
+                *module, "greedy", "prefill", {4}, {2}, 8)),
+            "the decode graph lifts into a generation program");
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      module->print(os);
+      os.flush();
+      check(text.find("boom.program") != std::string::npos,
+            "the lifted program is a boom.program");
+      check(text.find("boom.step") != std::string::npos,
+            "the decode graph becomes a boom.step");
+      check(text.find("scf.while") != std::string::npos,
+            "the program holds the decode loop");
+      check(text.find("boom.sample") != std::string::npos &&
+                text.find("boom.emit") != std::string::npos &&
+                text.find("boom.stop_check") != std::string::npos,
+            "the loop body samples, emits and tests the stop condition");
+      check(text.find("boom.pos_inc") != std::string::npos,
+            "the loop continuation advances the position");
+
+      // The graph op was consumed into the step: the module holds the program.
+      check(module->getBody()->getNumArguments() == 0 &&
+                module->getBody()->front().getName().getStringRef() ==
+                    "boom.program",
+            "the module holds the program");
+    }
+  }
 
   if (failures == 0)
     std::cout << "test_boom_dialect: OK (" << kinds << " OpKinds + boom.graph)\n";

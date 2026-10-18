@@ -89,6 +89,28 @@ mlir::Operation *createBoomNode(mlir::OpBuilder &builder, mlir::Location loc,
                                 llvm::ArrayRef<sx::Attribute> attributes,
                                 std::optional<planner::BackendTag> backend);
 
+// Lift a module's single boom.graph (a decode graph) into the greedy generation
+// program of design/mlir-migration.md §10: a `boom.program` holding a
+// `boom.prefill` call, then an `scf.while` whose body is the decode graph as a
+// `boom.step`, a `boom.sample`, a `boom.emit` and a `boom.stop_check`, and whose
+// continuation advances the position with `boom.pos_inc`.
+//
+// The graph op is consumed: its body — the node list and tensor table — moves
+// into the step, so the step's block arguments, in order, are the graph's free
+// tensor variables (the token and the position) followed by its cache handles.
+// The program's own block arguments are the prompt, the decoding start
+// position, the first token and position, and one cache handle per layer.
+//
+// `prompt_shape` types the prompt the prefill consumes (an int64 tensor);
+// `eos_tokens` is the stop set and `max_tokens` the emitted-count bound (0 for
+// unbounded). The program is verified when this returns.
+mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
+                                     llvm::StringRef program_name,
+                                     llvm::StringRef prefill_graph,
+                                     llvm::ArrayRef<int64_t> prompt_shape,
+                                     llvm::ArrayRef<int64_t> eos_tokens,
+                                     int64_t max_tokens);
+
 // A whole graph under construction: one module holding one boom.graph op, whose
 // body is the node list and whose block arguments are the inputs the emitter
 // declared.

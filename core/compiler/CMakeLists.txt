@@ -126,6 +126,10 @@ target_link_libraries(sonicboom_compiler PRIVATE
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRPass
+  # The generation program (BoomBuilder.cpp, BoomVerify.cpp) is an scf.while
+  # with arith step arithmetic; both dialects must be resolvable in the context.
+  MLIRSCFDialect
+  MLIRArithDialect
   # Glue codegen (lib/GlueCodegen.cpp): the GPU/NVVM dialect and the
   # gpu.module -> NVVM -> PTX pipeline. MLIRNVVMTarget owns the assembly
   # serialization; LLVMNVPTX* is the backend it runs in-process.

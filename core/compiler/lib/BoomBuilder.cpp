@@ -24,6 +24,8 @@
 #include "sonicboom/compiler/BoomTypes.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -425,6 +427,175 @@ mlir::OwningOpRef<mlir::ModuleOp> BoomBuilder::finish() {
     return {};
   }
   return std::move(module_);
+}
+
+//--- the generation program ---------------------------------------------------
+
+mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
+                                     llvm::StringRef program_name,
+                                     llvm::StringRef prefill_graph,
+                                     llvm::ArrayRef<int64_t> prompt_shape,
+                                     llvm::ArrayRef<int64_t> eos_tokens,
+                                     int64_t max_tokens) {
+  mlir::MLIRContext *context = module.getContext();
+  const mlir::Location loc = mlir::UnknownLoc::get(context);
+  // The program holds SCF control flow and arith step arithmetic, which cannot
+  // be created before their dialects are loaded.
+  context->getOrLoadDialect<mlir::scf::SCFDialect>();
+  context->getOrLoadDialect<mlir::arith::ArithDialect>();
+
+  // The decode graph this program lifts. Exactly one: a program is one
+  // generation, and two decode graphs in a module would have to be chosen
+  // between.
+  boom::GraphOp graph;
+  for (mlir::Operation &op : module.getBody()->getOperations())
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(&op)) {
+      if (graph)
+        return module.emitError()
+               << "a generation program lifts one decode graph, but the module "
+                  "holds more than one";
+      graph = g;
+    }
+  if (!graph)
+    return module.emitError()
+           << "a generation program needs a decode graph in its module";
+  if (!llvm::hasSingleElement(graph.getBody()))
+    return graph.emitOpError() << "must have exactly one block";
+
+  mlir::Block &graphBody = graph.getBody().front();
+
+  // The graph's free tensor variables, ascending id — the block-argument order
+  // the graph verifier recomputes. The step keeps them as its block arguments.
+  llvm::DenseSet<int64_t> produced;
+  for (mlir::Operation &op : graphBody)
+    for (int64_t id : op.getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids")
+                          .asArrayRef())
+      produced.insert(id);
+  llvm::SmallVector<int64_t> freeIds;
+  for (mlir::Attribute entry : graph.getTensorsAttr()) {
+    auto desc = llvm::cast<boom::TensorDescAttr>(entry);
+    if (!produced.count(desc.getId()))
+      freeIds.push_back(desc.getId());
+  }
+  llvm::sort(freeIds);
+
+  auto argOfId = [&](int64_t id) -> mlir::Value {
+    auto it = llvm::find(freeIds, id);
+    if (it == freeIds.end())
+      return {};
+    return graphBody.getArgument(size_t(std::distance(freeIds.begin(), it)));
+  };
+  auto descOfId = [&](int64_t id) -> boom::TensorDescAttr {
+    for (mlir::Attribute entry : graph.getTensorsAttr()) {
+      auto desc = llvm::cast<boom::TensorDescAttr>(entry);
+      if (desc.getId() == id)
+        return desc;
+    }
+    return {};
+  };
+
+  // The token and position the loop carries. The decode emitter declares them
+  // first (token_id, pos); by name, so a graph that lists its inputs in another
+  // order still lifts correctly.
+  mlir::Value firstTokenArg, posArg;
+  for (int64_t id : graph.getInputs()) {
+    auto desc = descOfId(id);
+    if (desc.getName() == "token_id")
+      firstTokenArg = argOfId(id);
+    else if (desc.getName() == "pos")
+      posArg = argOfId(id);
+  }
+  if (!firstTokenArg || !posArg)
+    return graph.emitOpError()
+           << "a decode graph lifted into a program must have `token_id` and "
+              "`pos` inputs";
+  const mlir::Type tokenType = firstTokenArg.getType();
+  const mlir::Type posType = posArg.getType();
+
+  llvm::SmallVector<mlir::Type> kvTypes;
+  for (size_t i = freeIds.size(); i < graphBody.getNumArguments(); ++i)
+    kvTypes.push_back(graphBody.getArgument(i).getType());
+
+  // The decode graph's output type is the step's result type.
+  if (graph.getOutputs().size() != 1)
+    return graph.emitOpError()
+           << "a decode graph lifted into a program must have one output";
+  auto outDesc = descOfId(graph.getOutputs().front());
+  if (!outDesc)
+    return graph.emitOpError() << "its output is not in the tensor table";
+  const mlir::Type outType =
+      boom::TensorType::get(context, outDesc.getShape(), outDesc.getDtype());
+
+  auto promptType =
+      boom::TensorType::get(context, prompt_shape, sx::dtype_name(sx::DType::Int64));
+
+  mlir::OpBuilder builder(context);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto program = boom::ProgramOp::create(
+      builder, loc, builder.getStringAttr(program_name),
+      builder.getStringAttr(prefill_graph));
+  mlir::Block *body = builder.createBlock(&program.getBody());
+  mlir::Value prompt = body->addArgument(promptType, loc);
+  mlir::Value startPos = body->addArgument(posType, loc);
+  mlir::Value firstToken = body->addArgument(tokenType, loc);
+  mlir::Value pos0 = body->addArgument(posType, loc);
+  llvm::SmallVector<mlir::Value> kvArgs;
+  for (mlir::Type kvType : kvTypes)
+    kvArgs.push_back(body->addArgument(kvType, loc));
+
+  builder.setInsertionPointToEnd(body);
+  llvm::SmallVector<mlir::Value> prefillOperands{prompt, startPos};
+  prefillOperands.append(kvArgs);
+  boom::PrefillOp::create(builder, loc, prefillOperands,
+                          builder.getStringAttr(prefill_graph));
+
+  const mlir::Type i64Type = builder.getI64Type();
+  mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
+  auto loop = mlir::scf::WhileOp::create(
+      builder, loc, mlir::TypeRange{tokenType, posType, i64Type},
+      mlir::ValueRange{firstToken, pos0, zero},
+      // The condition body: one decode step, then sample, emit and stop.
+      [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+        llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
+        stepOperands.append(kvArgs);
+        auto step = boom::StepOp::create(
+            b, l, mlir::TypeRange{outType}, stepOperands, graph.getTensorsAttr(),
+            graph.getInputsAttr(), graph.getOutputsAttr(),
+            graph.getDynamicExtentAttr());
+        // The decode graph's body becomes the step's: the same block
+        // arguments, now bound to the loop's SSA values.
+        step.getBody().takeBody(graph.getBody());
+
+        auto sample = boom::SampleOp::create(b, l, tokenType, step.getResult(0),
+                                             mlir::FloatAttr(),
+                                             mlir::IntegerAttr(),
+                                             mlir::FloatAttr());
+        boom::EmitOp::create(b, l, sample.getToken());
+        auto stop = boom::StopCheckOp::create(
+            b, l, b.getI1Type(), sample.getToken(), args[2],
+            llvm::ArrayRef<int64_t>(eos_tokens), uint64_t(max_tokens));
+        mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 1);
+        mlir::Value go = mlir::arith::XOrIOp::create(b, l, stop.getStop(), one);
+        mlir::scf::ConditionOp::create(
+            b, l, go, mlir::ValueRange{sample.getToken(), args[1], args[2]});
+      },
+      // The continuation: advance the position and the emitted count.
+      [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+        mlir::Value nextPos = boom::PosIncOp::create(
+            b, l, posType, args[1], b.getI64IntegerAttr(1));
+        mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 64);
+        mlir::Value nextCount =
+            mlir::arith::AddIOp::create(b, l, args[2], one);
+        mlir::scf::YieldOp::create(
+            b, l, mlir::ValueRange{args[0], nextPos, nextCount});
+      });
+
+  // The graph's body now lives in the step; the graph op is spent.
+  graph.erase();
+
+  if (mlir::failed(mlir::verify(module.getOperation())))
+    return mlir::failure();
+  return mlir::success();
 }
 
 } // namespace sonicboom::compiler

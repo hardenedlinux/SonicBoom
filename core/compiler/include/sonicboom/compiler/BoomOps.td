@@ -104,6 +104,116 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
 }
 
 //===----------------------------------------------------------------------===//
+// The generation program (§10)
+//===----------------------------------------------------------------------===//
+//
+// A `boom.program` is one whole greedy generation: a prefill call, then an
+// `scf.while` whose body runs one `boom.step` (the decode graph), samples the
+// next token, emits it to the host-visible ring, and tests the stop condition.
+// It is not IsolatedFromAbove: the step takes the loop-carried position, token
+// and cache handles as SSA operands instead of block arguments of an isolated
+// graph.
+//
+// The program is a container, like boom.graph: its body's block arguments are
+// the values the caller supplies — the prompt, the decoding start state and the
+// cache handles. It has no tensor table; the step brings its own.
+
+def Boom_ProgramOp : Op<Boom_Dialect, "program",
+                        [SingleBlock, NoTerminator]> {
+  let summary = "one greedy generation: prefill, then the decode loop";
+
+  let arguments = (ins
+    StrAttr:$graph_name,
+    // The prefill graph this program calls, by the `graph_name` of a
+    // module-level boom.graph. Empty when the caller runs its own prefill.
+    StrAttr:$prefill_graph);
+
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+}
+
+// The prefill call: runs the named prefill graph over `tokens` at `start_pos`,
+// filling the cache handles' layers. No results — the prefill's product is the
+// cache state, and the first decoded position/token are the program's inputs.
+def Boom_PrefillOp : Op<Boom_Dialect, "prefill", [Boom_KvReadWrite]> {
+  let summary = "call the named prefill graph over the prompt";
+
+  let arguments = (ins Variadic<Boom_AnyType>:$inputs, StrAttr:$graph_name);
+
+  let hasVerifier = 1;
+}
+
+// One decode step. The body is the decode graph's node list, carried with its
+// tensor table; its block arguments (in ascending tensor-id order, then the
+// cache handles) are the step's operands. The result is the tensor the table's
+// `output_ids` names.
+def Boom_StepOp : Op<Boom_Dialect, "step", [SingleBlock, NoTerminator]> {
+  let summary = "one decode step over the loop-carried position/token/cache";
+
+  let arguments = (ins
+    Variadic<Boom_AnyType>:$inputs,
+    ArrayAttr:$tensors,
+    DenseI64ArrayAttr:$input_ids,
+    DenseI64ArrayAttr:$output_ids,
+    I64Attr:$dynamic_extent);
+
+  let results = (outs Variadic<Boom_ValueType>:$results);
+
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+}
+
+// Greedy argmax when no sampling attributes are set; temperature/top-k/top-p
+// are the sampling form, implemented later.
+def Boom_SampleOp : Op<Boom_Dialect, "sample", [Pure]> {
+  let summary = "choose the next token from the logits";
+
+  let arguments = (ins
+    Boom_AnyType:$logits,
+    OptionalAttr<F64Attr>:$temperature,
+    OptionalAttr<I64Attr>:$top_k,
+    OptionalAttr<F64Attr>:$top_p);
+
+  let results = (outs Boom_AnyType:$token);
+
+  let hasVerifier = 1;
+}
+
+// The loop's terminating effect chain: EOS set + max tokens over the emitted
+// count (`count` is the loop-carried token counter).
+def Boom_StopCheckOp : Op<Boom_Dialect, "stop_check", [Pure]> {
+  let summary = "EOS set and max-token stop test";
+
+  let arguments = (ins
+    AnyType:$token,
+    I64:$count,
+    DenseI64ArrayAttr:$eos_tokens,
+    I64Attr:$max_tokens);
+
+  let results = (outs I1:$stop);
+}
+
+// Append the token to the host-visible device ring buffer. Its write is an
+// effect the executor must not reorder across the loop.
+def Boom_EmitOp : Op<Boom_Dialect, "emit"> {
+  let summary = "append the token to the emission ring";
+
+  let arguments = (ins AnyType:$token);
+}
+
+// Advance the loop-carried position by `delta`. Host-side in the executor
+// (positions are staged per step), so no device kernel is implied.
+def Boom_PosIncOp : Op<Boom_Dialect, "pos_inc", [Pure]> {
+  let summary = "advance the staged position";
+
+  let arguments = (ins Boom_AnyType:$pos, I64Attr:$delta);
+
+  let results = (outs Boom_AnyType:$next);
+}
+
+//===----------------------------------------------------------------------===//
 // Node ops — one per planner::OpKind
 //===----------------------------------------------------------------------===//
 
