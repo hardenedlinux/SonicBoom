@@ -57,7 +57,8 @@ design/resnet18.reference.bin
 .idea/
 *.swp
 .DS_Store
-models/
+
+models
 third_party/native-torch/generated/
 
 # baseline tool build outputs + regenerated reference dumps (tools/baseline/*.sh build them)
