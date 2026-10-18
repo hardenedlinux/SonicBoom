@@ -107,6 +107,35 @@ public:
   // the replay's completion barrier.
   bool read_token(float* host) const;
 
+  // --- decode chunking (§10) ------------------------------------------------
+  //
+  // k greedy decode steps are captured into one graph: step j reads the token
+  // step j-1's Argmax wrote (device-side feedback, no host round-trip), reads
+  // position `pos_slots_[j]`, and writes its own token to `token_slots_[j]`. The
+  // host stages one carry token and k positions, replays once, then reads the k
+  // tokens in one D2H. k = SONICBOOM_DECODE_CHUNK (default 4; 1 keeps the
+  // single-step loop and is the ablation switch).
+  uint32_t decode_chunk() const { return chunk_; }
+
+  // Turn chunking on for a decode backend: allocate the k-position and
+  // k-token rings. Only the decode runtime calls this — a prefill backend must
+  // keep the single stageable position/token slots. Returns false when the
+  // rings cannot be allocated (the caller keeps the single-step path).
+  bool enable_decode_chunking(uint32_t k);
+
+  // Which step of the chunk the next execute() belongs to. Set once before each
+  // execute inside the capture (and the warm-up); at replay the recorded
+  // pointers are already the per-step ones, so it is not consulted.
+  bool set_step_index(uint32_t index);
+
+  // Stage a chunk's carry token and k positions onto the program's stream,
+  // ordered before its next replay. `positions.size()` must be the chunk size.
+  bool stage_chunk(hal::StepProgram& prog, float carry,
+                   std::span<const uint64_t> positions);
+
+  // Download the chunk's `count` tokens from the ring in one D2H.
+  bool read_chunk_tokens(float* host, uint32_t count) const;
+
   // Block until all device work completes (cudaDeviceSynchronize-equivalent via
   // the device pool). Used to drain the warm-up step before capture so the
   // recorded kernels never race the warm kernels on their shared scratch.
@@ -158,8 +187,20 @@ private:
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   hal::Buffer tokens_buf_;          // persistent device buffer: prefill chunk token ids ([chunk] uint64)
+  hal::Buffer pos_ring_;            // chunk mode: k positions ([k] uint64_t)
+  hal::Buffer token_ring_;          // chunk mode: k emitted tokens ([k] float)
+  hal::Buffer carry_buf_;           // chunk mode: the token the chunk's first step reads
+  uint32_t chunk_ = 1;              // decode steps captured per graph
+  uint32_t step_index_ = 0;         // which step the next execute() is
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
+
+  // The device address of the position / token a kernel reads or writes for the
+  // current step: the single-step slots outside chunk mode, the step's own ring
+  // slot inside it.
+  uint64_t pos_slot() const;
+  uint64_t token_in_slot() const;
+  uint64_t token_out_slot() const;
 
   void ensure_caches(uint64_t n_ctx);
 };

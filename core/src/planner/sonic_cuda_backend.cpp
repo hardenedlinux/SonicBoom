@@ -158,6 +158,45 @@ SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
     const uint64_t zero = 0;
     g_alloc.copy_to_device(pos_buf_, &zero, sizeof(uint64_t));  // defensive: pos starts at 0
   }
+
+}
+
+bool SonicCudaBackend::enable_decode_chunking(uint32_t k) {
+  // Chunking is opt-in because it re-points the position/token slots the
+  // kernels read: a prefill backend must keep the single-stageable slots.
+  if (k <= 1) {
+    // Off (also the capture-failed fallback): release the rings so the slot
+    // accessors return the single pos/token slots the executor loop stages.
+    if (pos_ring_) g_alloc.deallocate(pos_ring_);
+    if (token_ring_) g_alloc.deallocate(token_ring_);
+    if (carry_buf_) g_alloc.deallocate(carry_buf_);
+    pos_ring_ = {};
+    token_ring_ = {};
+    carry_buf_ = {};
+    chunk_ = 1;
+    step_index_ = 0;
+    return true;
+  }
+  if (chunk_ > 1) return chunk_ == k;
+  hal::Buffer pos_ring = g_alloc.allocate(k * sizeof(uint64_t));
+  hal::Buffer token_ring = g_alloc.allocate(k * sizeof(float));
+  hal::Buffer carry = g_alloc.allocate(sizeof(float));
+  if (!pos_ring || !token_ring || !carry) {
+    if (pos_ring) g_alloc.deallocate(pos_ring);
+    if (token_ring) g_alloc.deallocate(token_ring);
+    if (carry) g_alloc.deallocate(carry);
+    return false;
+  }
+  // Zero the rings so a warm-up step never reads an uninitialized position or
+  // token id.
+  g_alloc.fill(pos_ring, 0, k * sizeof(uint64_t));
+  g_alloc.fill(token_ring, 0, k * sizeof(float));
+  g_alloc.fill(carry, 0, sizeof(float));
+  pos_ring_ = pos_ring;
+  token_ring_ = token_ring;
+  carry_buf_ = carry;
+  chunk_ = k;
+  return true;
 }
 
 SonicCudaBackend::~SonicCudaBackend() {
@@ -167,6 +206,53 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (token_buf_) g_alloc.deallocate(token_buf_);
   if (pos_buf_) g_alloc.deallocate(pos_buf_);
   if (tokens_buf_) g_alloc.deallocate(tokens_buf_);
+  if (pos_ring_) g_alloc.deallocate(pos_ring_);
+  if (token_ring_) g_alloc.deallocate(token_ring_);
+  if (carry_buf_) g_alloc.deallocate(carry_buf_);
+}
+
+uint64_t SonicCudaBackend::pos_slot() const {
+  if (chunk_ > 1 && pos_ring_)
+    return pos_ring_.id + uint64_t(step_index_) * sizeof(uint64_t);
+  return pos_buf_.id;
+}
+
+uint64_t SonicCudaBackend::token_in_slot() const {
+  if (chunk_ > 1 && token_ring_) {
+    // Step 0 reads the host-staged carry token; step j reads step j-1's argmax.
+    return step_index_ == 0
+               ? carry_buf_.id
+               : token_ring_.id + uint64_t(step_index_ - 1) * sizeof(float);
+  }
+  return token_buf_.id;
+}
+
+uint64_t SonicCudaBackend::token_out_slot() const {
+  if (chunk_ > 1 && token_ring_)
+    return token_ring_.id + uint64_t(step_index_) * sizeof(float);
+  return token_buf_.id;
+}
+
+bool SonicCudaBackend::set_step_index(uint32_t index) {
+  if (index >= chunk_) return false;
+  step_index_ = index;
+  return true;
+}
+
+bool SonicCudaBackend::stage_chunk(hal::StepProgram& prog, float carry,
+                                   std::span<const uint64_t> positions) {
+  if (chunk_ <= 1 || !carry_buf_ || !pos_ring_) return false;
+  if (positions.size() != chunk_) return false;
+  if (!prog.stage_upload(carry_buf_, &carry, sizeof(float))) return false;
+  return prog.stage_upload(pos_ring_, positions.data(),
+                           positions.size() * sizeof(uint64_t));
+}
+
+bool SonicCudaBackend::read_chunk_tokens(float* host, uint32_t count) const {
+  if (chunk_ <= 1 || !token_ring_ || !host) return false;
+  if (count > chunk_) return false;
+  return g_alloc.copy_from_device(host, token_ring_,
+                                  uint64_t(chunk_) * sizeof(float));
 }
 
 bool SonicCudaBackend::seed_token(uint64_t token) {
@@ -449,11 +535,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (batch_attr(nb)) {
         ok = nn::cuda::rope_neox_heads_batched_dev_pos(
             out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
-            reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
+            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff);
       } else {
         ok = nn::cuda::rope_neox_heads_dev_pos(
             out, int(lc.head_dim), out_n / int(lc.head_dim),
-            reinterpret_cast<const uint64_t*>(pos_buf_.id), lc.rope_base, 1.0f, ff);
+            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff);
       }
       break;
     }
@@ -482,7 +568,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         if (!cache.k_buf || !cache.v_buf ||
             !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                      dev(in[1]), dev(in[2]),
-                                     reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                                     reinterpret_cast<const uint64_t*>(pos_slot()),
                                      cache.n_slots, row_elems)) {
           ok = false;
           break;
@@ -492,7 +578,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_f(*node, "scale", attn_scale);
       ok = nn::cuda::decode_attention_dev(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
-          reinterpret_cast<const uint64_t*>(pos_buf_.id), window, cache.n_slots,
+          reinterpret_cast<const uint64_t*>(pos_slot()), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, float(attn_scale), out);
       break;
@@ -894,11 +980,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             ok = nb == 1
                      ? nn::cuda::rope_neox_heads_dev_pos(
                            out, dim, heads,
-                           reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                           reinterpret_cast<const uint64_t*>(pos_slot()),
                            lc.rope_base, 1.0f, ff)
                      : nn::cuda::rope_neox_heads_batched_dev_pos(
                            out, dim, hpp, int(nb),
-                           reinterpret_cast<const uint64_t*>(pos_buf_.id),
+                           reinterpret_cast<const uint64_t*>(pos_slot()),
                            lc.rope_base, 1.0f, ff);
           }
           if (ok && cast_i != 0) ok = nn::cuda::cast_fp16_dev(out, out_n);
@@ -931,7 +1017,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         void* warg = const_cast<void*>(wd);
         int haswarg = w.empty() ? 0 : 1;
         void* yarg = out;
-        void* posarg = reinterpret_cast<void*>(pos_buf_.id);
+        void* posarg = reinterpret_cast<void*>(pos_slot());
         int dimarg = dim;
         float earg = eps;
         float fsarg = 1.0f;
@@ -1141,7 +1227,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // f32. The token id is read from the persistent device buffer
         // `token_buf_` (Phase 3.2 B4), not the host graph input, so the next
         // token id never round-trips through the host.
-        const float* tok_dev = dev_mut(token_buf_.id);
+        const float* tok_dev = dev_mut(token_in_slot());
         if (slot == model::WeightSlot::PerLayerTokenEmbd) {
           // ~1.5 GiB tensor that does not fit resident: pin+map it in place and
           // gather the token's row zero-copy (no per-token H2D).
@@ -1165,7 +1251,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = nn::cuda::argmax_dev(dev(in[0]),
                                 int(in[0].device.size_bytes / sizeof(float)), out);
       if (ok && token_buf_)
-        ok = device::device_copy(out_handle, token_buf_.id, sizeof(float));
+        ok = device::device_copy(out_handle, token_out_slot(), sizeof(float));
       break;
     }
     // --- inherently-batched prefill ops (Phase 7 / Section C.3) ---------------
@@ -1194,7 +1280,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_f(*node, "scale", attn_scale);
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
-          dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_buf_.id),
+          dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_slot()),
           cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
           int(cache.head_dim), lc.sliding_window, float(attn_scale), out);
       break;
@@ -1209,7 +1295,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (!cache.k_buf || !cache.v_buf ||
           !nn::cuda::kv_append_batched_dev_pos(
               dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[0]),
-              dev(in[1]), reinterpret_cast<const uint64_t*>(pos_buf_.id),
+              dev(in[1]), reinterpret_cast<const uint64_t*>(pos_slot()),
               cache.n_slots, row_elems, int(nb))) {
         ok = false;
         break;

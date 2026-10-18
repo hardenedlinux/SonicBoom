@@ -129,6 +129,29 @@ set_tests_properties(test_plan_cache
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
   PROPERTIES RESOURCE_LOCK gpu_vram)
 
+# The decode-chunk path (k greedy steps captured per graph, §10) is off by
+# default — autotuned to k=1, since the decode step is GPU-bound and chunking
+# measured 0.2-0.5% slower. Run the same greedy-stream checks with it on so the
+# path stays covered; k=4 is the ablation value tools/bench.sh uses.
+add_test(NAME test_generate_decode_chunk
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_DECODE_CHUNK=4
+                 $<TARGET_FILE:test_generate>)
+set_tests_properties(test_generate_decode_chunk
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
+# The same coverage for the other consumer of the chunked loop: the
+# prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
+# golden streams with the chunked replay.
+add_test(NAME test_qwen2_generate_decode_chunk
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_DECODE_CHUNK=4
+                 $<TARGET_FILE:test_qwen2_generate>)
+set_tests_properties(test_qwen2_generate_decode_chunk
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
 if(SONICBOOM_USE_CUDA)

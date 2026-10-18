@@ -643,6 +643,12 @@ if [ "$ABLATE" = 1 ]; then
     # Default is the cuBLASLt bf16 tensor-core kernel with a per-shape cached
     # algorithm; the group-off side runs the cublasGemmEx default algorithm.
     "dense-lt|SONICBOOM_DENSE_LT=0"
+    # Default is 1 (the per-step replay loop: measured fastest, the decode step
+    # is GPU-bound so chunking's host-round-trip savings are already hidden);
+    # the group-off side captures k=4 steps into one graph (device-side token
+    # feedback, one host round-trip per 4 tokens), so a positive contribution
+    # means the per-step default is ahead.
+    "decode-chunk|SONICBOOM_DECODE_CHUNK=4"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field

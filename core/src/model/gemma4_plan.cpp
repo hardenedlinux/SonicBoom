@@ -1136,6 +1136,24 @@ static bool capture_reuse_enabled() {
   return runtime::feature_enabled(runtime::Feature::CaptureReuse);
 }
 
+// The number of greedy decode steps one captured graph runs (§10). Autotuned
+// over {1,4,8,16} on the target GPU: 1 is the fastest by 0.2-0.5% (d0/d512,
+// 3-run medians), because the decode step is GPU-bound at ~94% busy — the host
+// round-trips chunking removes were already hidden — so the measured default
+// is 1 (the per-step replay loop). k > 1 is the ablation switch (tools/
+// bench.sh --ablate, group "decode-chunk"): one graph launch + one host
+// round-trip per k tokens.
+static uint32_t decode_chunk_size() {
+  static const uint32_t k = [] {
+    const char* e = std::getenv("SONICBOOM_DECODE_CHUNK");
+    if (!e || !*e) return uint32_t(1);
+    const int requested = std::atoi(e);
+    if (requested <= 1) return uint32_t(1);
+    return uint32_t(std::min(requested, 16));
+  }();
+  return k;
+}
+
 // Route host-memory-space compute tasks (Embedding / Softcap) to the CPU backend
 // and leave device-memory-space tasks on the CUDA backend. Shared by the decode
 // and prefill runtimes so each executor gets the same placement overrides.
@@ -1209,23 +1227,33 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
   if (cuda_graph_decode_enabled()) {
+    // The k-step capture (§10): step j reads the token step j-1's argmax wrote
+    // and its own staged position. The warm-up runs the same k steps so every
+    // pooled buffer the capture records is already allocated.
+    rt->cuda->enable_decode_chunking(decode_chunk_size());
+    const uint32_t k = rt->cuda->decode_chunk();
     rt->cuda->seed_token(0);
     rt->cuda->set_pos(0);
-    std::vector<sx::Bytes> in;
-    in.push_back(encode_i64(0));
-    in.push_back(encode_i64(0));
-    auto res = rt->exec->execute(rt->plan, rt->snap, in);
-    if (res) {
+    auto run_steps = [&]() {
+      for (uint32_t j = 0; j < k; ++j) {
+        if (!rt->cuda->set_step_index(j)) return false;
+        std::vector<sx::Bytes> in;
+        in.push_back(encode_i64(0));
+        in.push_back(encode_i64(0));
+        auto res = rt->exec->execute(rt->plan, rt->snap, in);
+        if (!res) return false;
+      }
+      return true;
+    };
+    if (run_steps()) {
       rt->cuda->synchronize();
       rt->cuda->seed_token(0);
-      rt->prog = rt->cuda->record_step([&]() {
-        std::vector<sx::Bytes> cin;
-        cin.push_back(encode_i64(0));
-        cin.push_back(encode_i64(0));
-        auto cres = rt->exec->execute(rt->plan, rt->snap, cin);
-        return cres.has_value();
-      });
+      rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
     }
+    // No re-playable graph (capture failed, e.g. a plan whose decode step has a
+    // host task): the executor loop stages the single pos/token slots itself,
+    // so the ring slots must not stay selected.
+    if (!rt->prog) rt->cuda->enable_decode_chunking(1);
   }
 
   DecodeRuntime* raw = rt.get();
@@ -1266,7 +1294,40 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // warmed with a placeholder token, so every call re-seeds the real start token.
   rt->cuda->seed_token(start_token);
 
-  if (rt->prog) {
+  const uint32_t chunk = rt->cuda->decode_chunk();
+  if (rt->prog && chunk > 1) {
+    // Replay one captured k-step chunk: stage the carry token and the k
+    // positions on the graph's stream, launch once, then read the k tokens in
+    // one D2H. The device feeds each step's token to the next, so the host
+    // touches the device once per chunk instead of once per step.
+    float carry = float(start_token);
+    std::vector<uint64_t> positions(chunk);
+    std::vector<float> out(chunk);
+    while (step < tokens.size()) {
+      for (uint32_t j = 0; j < chunk; ++j) positions[j] = pos + j;
+      const std::string name = "decode_chunk_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(name.c_str());
+      if (!rt->cuda->stage_chunk(*rt->prog, carry, positions) ||
+          !rt->prog->replay() ||
+          !rt->cuda->read_chunk_tokens(out.data(), chunk)) {
+        if (nvtx_enabled()) nvtxRangePop();
+        std::cerr << "[spine] chunk at step " << step << " failed\n";
+        break;
+      }
+      if (nvtx_enabled()) nvtxRangePop();
+      bool stopped = false;
+      for (uint32_t j = 0; j < chunk && step < tokens.size(); ++j) {
+        const int64_t next = int64_t(out[j]);
+        if (next < 0) { stopped = true; break; }
+        tokens[step] = next;
+        carry = out[j];
+        ++pos;
+        ++step;
+        if (step == 1) t_first = std::chrono::steady_clock::now();
+      }
+      if (stopped) break;
+    }
+  } else if (rt->prog) {
     // Replay the cached captured step: stage the position, launch the graph, read
     // the winning token back from the persistent device slot. The synchronous D2H
     // read also drains the graph stream before the next step.
@@ -1999,11 +2060,41 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
 
   // Decode the remaining tokens with the same planner/backend/cache. When the
   // cached greedy decode step is captured (and we are not dumping logits, which
-  // needs the full softcapped vector rather than the argmax scalar), replay it
-  // per step: stage the position, launch the graph, read the winning token back
-  // from the persistent device slot (the synchronous D2H also drains the graph
-  // stream). Otherwise fall back to per-step executor dispatch.
-  if (!dump_logits && rt->prog) {
+  // needs the full softcapped vector rather than the argmax scalar), replay it:
+  // k steps per launch in chunk mode (carry + k positions in, k tokens out),
+  // else one step per launch staging the position and reading the winning token
+  // back from the persistent device slot (the synchronous D2H also drains the
+  // graph stream). Otherwise fall back to per-step executor dispatch.
+  const uint32_t chunk = rt->cuda->decode_chunk();
+  if (!dump_logits && rt->prog && chunk > 1) {
+    float carry = float(token);
+    std::vector<uint64_t> positions(chunk);
+    std::vector<float> out(chunk);
+    while (step < tokens.size()) {
+      for (uint32_t j = 0; j < chunk; ++j) positions[j] = pos + j;
+      const std::string name = "decode_chunk_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(name.c_str());
+      const bool ok = rt->cuda->stage_chunk(*rt->prog, carry, positions) &&
+                      rt->prog->replay() &&
+                      rt->cuda->read_chunk_tokens(out.data(), chunk);
+      if (nvtx_enabled()) nvtxRangePop();
+      if (!ok) {
+        std::cerr << "[prefill-spine-cuda] chunk at step " << step
+                  << " failed\n";
+        break;
+      }
+      bool stopped = false;
+      for (uint32_t j = 0; j < chunk && step < tokens.size(); ++j) {
+        const int64_t next = int64_t(out[j]);
+        if (next < 0) { stopped = true; break; }
+        tokens[step] = next;
+        carry = out[j];
+        ++pos;
+        ++step;
+      }
+      if (stopped) break;
+    }
+  } else if (!dump_logits && rt->prog) {
     for (; step < tokens.size(); ++step) {
       rt->cuda->set_pos(pos);
       if (!rt->prog->replay()) {
