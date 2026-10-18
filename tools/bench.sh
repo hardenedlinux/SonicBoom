@@ -603,6 +603,7 @@ if [ "$ABLATE" = 1 ]; then
     "add-rms-norm-fusion|FuseAddRmsNormMmqPass"
     "rms-norm-add-fusion|FuseRmsNormAddPass"
     "heads-norm-rope-cast-fusion|FuseHeadsNormRopeCastPass"
+    "dense-layout|DenseLayoutPropagationPass"
   )
   ABL_FEATURE_GROUPS=(
     "cuda-graph-decode|cuda_graph_decode"

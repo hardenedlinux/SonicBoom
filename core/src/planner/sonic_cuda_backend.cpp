@@ -926,8 +926,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int n = int(nb);
         const int cols = int(in[0].device.size_bytes / sizeof(float) / uint64_t(n));
         const int rows = out_n / n;
+        // Dense layout propagation: the activation is already position-major
+        // (the producer's own layout), so the batched GEMM reads it in place.
+        std::string_view layout;
+        const bool strided = attr_s(*node, "dense_layout", layout) &&
+                             layout == "strided";
         ok = nn::cuda::matvec_f32_batched_dev(fweight(slot), cols, dev(in[0]), out,
-                                              rows, n);
+                                              rows, n, strided);
       } else {
         const int cols = int(in[0].device.size_bytes / sizeof(float));
         ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, out_n);
@@ -952,6 +957,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const int n = int(nb);
       const int cols =
           int(in[0].device.size_bytes / sizeof(float) / uint64_t(batched ? n : 1));
+      // Dense layout propagation: in the strided batched path the dense kernel
+      // rounds the position-major activation itself, so the staging copy and
+      // the separate bf16 cast are not needed.
+      std::string_view layout;
+      const bool strided = batched && attr_s(*node, "dense_layout", layout) &&
+                           layout == "strided";
+      if (strided) {
+        ok = nn::cuda::matvec_bf16_batched_dev(W, cols, dev(in[0]), out,
+                                               int(rows), n, true);
+        break;
+      }
       // The CPU path rounds the activation through bf16 before the dot; do the
       // same on a scratch copy so the shared `inp` tensor is left untouched.
       const uint64_t xbytes = in[0].device.size_bytes;

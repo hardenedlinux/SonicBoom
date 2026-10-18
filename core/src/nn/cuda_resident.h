@@ -233,10 +233,16 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
 // row-major. The decode matvec_f32_dev / matvec_bf16_dev are the ncols == 1
 // case. Every ncols (including 1) routes to cuBLAS via fixed-width 128-position
 // blocks, so a position's numerics are identical across batch sizes and offsets.
+//
+// strided: the cuBLAS path reads the position-major activation block and writes
+// the position-major result directly (no transposing pack/copyback) for every
+// full 128-position block; the tail keeps the packed path. For bf16 it also
+// replaces the caller's bf16 staging copy with one contiguous rounding pass.
+// Falls back to the plain path when cuBLAS is unavailable.
 bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
-                            float* y, int rows, int ncols);
+                            float* y, int rows, int ncols, bool strided = false);
 bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
-                             float* y, int rows, int ncols);
+                             float* y, int rows, int ncols, bool strided = false);
 
 // Append n consecutive token rows (row_elems floats each) into the flat KV cache
 // at slots (start_pos + p) % n_slots. src_k/src_v are [n, row_elems]

@@ -1671,6 +1671,47 @@ public:
   }
 };
 
+// dense_layout_propagation_pass: the dense projections consume the activation
+// in the layout its producer already writes (position-major) instead of the
+// executor repacking it into fixed-width blocks and copying the result back.
+// The rewrite marks every batched `matvec_f32` / `matvec_bf16` node with
+// `dense_layout = "strided"`; the CUDA backend reads that attribute at
+// execution time (sonic_cuda_backend.cpp, MatvecF32 / MatvecBf16). Prefill
+// only: the batched form is the prefill form. Pure data movement — the GEMM
+// keeps its fixed 128-position block width, so per-position numerics stay
+// independent of batch size and offset (prefix-cache reuse).
+class DenseLayoutPropagationPass
+    : public mlir::PassWrapper<DenseLayoutPropagationPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DenseLayoutPropagationPass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    mlir::OpBuilder builder(graph.getContext());
+
+    for (mlir::Operation &node : graph.getBody().front()) {
+      const llvm::StringRef name = node.getName().getStringRef();
+      if (name != boomOpName(planner::OpKind::MatvecF32) &&
+          name != boomOpName(planner::OpKind::MatvecBf16))
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs || !nodeAttrInt(attrs, "batch"))
+        continue; // decode form: the per-row gemv has no packed layout
+      bool already = false;
+      for (mlir::Attribute entry : attrs) {
+        auto attr = mlir::cast<boom::NodeAttr>(entry);
+        if (attr.getName() == "dense_layout") already = true;
+      }
+      if (already) continue;
+      llvm::SmallVector<mlir::Attribute> entries(attrs.getValue());
+      entries.push_back(boom::NodeAttr::get(
+          graph.getContext(), "dense_layout", builder.getStringAttr("strided")));
+      node.setAttr("node_attrs", builder.getArrayAttr(entries));
+    }
+  }
+};
+
 //--- the per-pass disable switch --------------------------------------------
 
 // Ablation for one fusion at a time: the passes a run skips, named on the
@@ -1698,6 +1739,7 @@ struct DisabledPasses {
   bool fuse_add_rms_norm_mmq = false;
   bool fuse_rms_norm_add = false;
   bool fuse_heads_norm_rope_cast = false;
+  bool dense_layout_propagation = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -1720,6 +1762,7 @@ constexpr PassName kPassNames[] = {
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
+    {"DenseLayoutPropagationPass", &DisabledPasses::dense_layout_propagation},
 };
 
 // Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
@@ -1807,6 +1850,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // cast), the batched form selected by the norm's `batch` attribute.
     if (!off.fuse_heads_norm_rope_cast)
       pm.addPass(std::make_unique<FuseHeadsNormRopeCastPass>());
+    // Last: marks the projections the folds above left, so it sees the final
+    // node set (attribute-only, no node replacement).
+    if (!off.dense_layout_propagation)
+      pm.addPass(std::make_unique<DenseLayoutPropagationPass>());
     return;
   }
 }

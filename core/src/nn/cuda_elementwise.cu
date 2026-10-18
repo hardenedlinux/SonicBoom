@@ -1380,6 +1380,8 @@ void* g_xpack = nullptr;        // repacked activation column-block for the cuBL
 size_t g_xpack_bytes = 0;
 void* g_outpack = nullptr;      // padded output column-block ([rows, 128])
 size_t g_outpack_bytes = 0;
+void* g_xb = nullptr;           // bf16-rounded position-major activation ([n, cols]) for the strided path
+size_t g_xb_bytes = 0;
 double* g_sum = nullptr;        // device-resident rms_norm sum (double, matches CPU)
 
 bool g_available_checked = false;
@@ -1660,6 +1662,73 @@ __global__ void pack_bf16_chunk_kernel(const float* __restrict__ x,
   const int i = idx / kDenseCublasWidth;
   dst[idx] = (p < chunk_n) ? float_to_bf16(x[(size_t)(c0 + p) * cols + i])
                            : uint16_t(0);
+}
+
+// Round a position-major [ncols, cols] activation slice through bf16 in place
+// into a scratch buffer (same layout). The strided dense path feeds this scratch
+// to cuBLAS directly, so it replaces the pack (transposing repack) plus the
+// backend's own bf16 staging copy with one linear pass.
+__global__ void cast_bf16_rows_kernel(const float* __restrict__ x,
+                                      uint16_t* __restrict__ dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  dst[i] = float_to_bf16(x[i]);
+}
+
+// Zero-padded 128-position tail block for the strided dense path, in the same
+// position-major layout the full blocks read (dst[p*cols + i] = x[(c0+p)*cols +
+// i] for p < chunk_n, zero beyond). The tail must go through the same GEMM shape
+// as the full blocks: a position that lands in a full block in one segmentation
+// (full prefill) and in a tail block in another (prefix reuse) has to see the
+// same per-position numerics.
+__global__ void pad_f32_tail_kernel(const float* __restrict__ x,
+                                    float* __restrict__ dst, int cols,
+                                    int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= cols * kDenseCublasWidth) return;
+  const int p = idx / cols;
+  const int i = idx - p * cols;
+  dst[idx] = (p < chunk_n) ? x[(size_t)(c0 + p) * cols + i] : 0.0f;
+}
+
+__global__ void pad_bf16_tail_kernel(const uint16_t* __restrict__ x,
+                                     uint16_t* __restrict__ dst, int cols,
+                                     int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= cols * kDenseCublasWidth) return;
+  const int p = idx / cols;
+  const int i = idx - p * cols;
+  dst[idx] = (p < chunk_n) ? x[(size_t)(c0 + p) * cols + i] : uint16_t(0);
+}
+
+// Drop the padding columns of a [128, rows] position-major result block (the
+// strided GEMM writes it with ldc=rows) into the position-major output.
+__global__ void copyback_tail_kernel(const float* __restrict__ src,
+                                     float* __restrict__ dst, int rows, int c0,
+                                     int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= chunk_n * rows) return;
+  const int p = idx / rows;
+  const int r = idx - p * rows;
+  dst[(size_t)(c0 + p) * rows + r] = src[(size_t)p * rows + r];
+}
+
+// gemv_bf16_batched reading a position-major bf16 activation (the strided
+// path's fallback when cuBLAS is unavailable).
+__global__ void gemv_bf16_batched_xb(const uint16_t* __restrict__ W,
+                                     const uint16_t* __restrict__ x,
+                                     float* __restrict__ y, int cols, int rows,
+                                     int ncols) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= rows * ncols) return;
+  const int c = idx / rows;
+  const int r = idx - c * rows;
+  const uint16_t* wrow = W + (size_t)r * cols;
+  const uint16_t* xrow = x + (size_t)c * cols;
+  float acc = 0.0f;
+  for (int i = 0; i < cols; ++i)
+    acc += bf16_to_float(wrow[i]) * bf16_to_float(xrow[i]);
+  y[idx] = acc;
 }
 
 // Copy the first `chunk_n` positions of a [rows, 128] result block back into the
@@ -2871,65 +2940,154 @@ cublasHandle_t dense_cublas_handle() {
 // has shape (m=128, n=rows, k=cols, lda=ldc=128) — the same per-column numerics
 // regardless of n or column offset.
 bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
-                           int rows, int ncols) {
+                           int rows, int ncols, bool strided) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
-  float* xpack = static_cast<float*>(grow_scratch(
-      g_xpack, g_xpack_bytes, (size_t)cols * kDenseCublasWidth * sizeof(float)));
-  float* outpack = static_cast<float*>(grow_scratch(
-      g_outpack, g_outpack_bytes, (size_t)rows * kDenseCublasWidth * sizeof(float)));
-  if (!xpack || !outpack) return false;
+  float* xpack = nullptr;
+  float* outpack = nullptr;
+  auto need_pack = [&] {
+    if (xpack) return true;
+    xpack = static_cast<float*>(grow_scratch(
+        g_xpack, g_xpack_bytes, (size_t)cols * kDenseCublasWidth * sizeof(float)));
+    outpack = static_cast<float*>(grow_scratch(
+        g_outpack, g_outpack_bytes,
+        (size_t)rows * kDenseCublasWidth * sizeof(float)));
+    return xpack && outpack;
+  };
 
   cublasSetStream(h, cur_stream());
   const float alpha = 1.0f, beta = 0.0f;
   for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
     const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
-    SB_NOTE_LAUNCH(pack_f32_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
-    pack_f32_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
-                            cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
-    const cublasStatus_t st = cublasSgemm(
-        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
-        kDenseCublasWidth, d_w, cols, &beta, outpack, kDenseCublasWidth);
+    cublasStatus_t st;
+    if (strided) {
+      // Read the producer's position-major block directly and write the
+      // consumer's position-major result directly. In column-major terms both
+      // operands are already stored in the layout cuBLAS wants:
+      //   C^T (rows x 128) = W (rows x cols) * X^T (cols x 128)
+      // with C^T row-major == C column-major (m=rows, n=128, ldc=rows), which
+      // is exactly y[c0*rows ...]; W row-major (lda=cols) is the OP_T operand;
+      // X block row-major (cols x 128 with ldb=cols) is the OP_N operand.
+      // Tail blocks run the same shape over a zero-padded copy: the per-position
+      // numerics must not depend on where a segmentation splits.
+      const bool full = chunk_n == kDenseCublasWidth;
+      const float* a = x + (size_t)c0 * cols;
+      float* c = y + (size_t)c0 * rows;
+      if (!full) {
+        if (!need_pack()) return false;
+        SB_NOTE_LAUNCH(pad_f32_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+        pad_f32_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                              cur_stream()>>>(x, xpack, cols, c0, chunk_n);
+        a = xpack;
+        c = outpack;
+      }
+      st = cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, kDenseCublasWidth,
+                       cols, &alpha, d_w, cols, a, cols, &beta, c, rows);
+      if (st == CUBLAS_STATUS_SUCCESS && !full) {
+        SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+            outpack, y, rows, c0, chunk_n);
+      }
+    } else {
+      if (!need_pack()) return false;
+      SB_NOTE_LAUNCH(pack_f32_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+      pack_f32_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                              cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
+      st = cublasSgemm(
+          h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
+          kDenseCublasWidth, d_w, cols, &beta, outpack, kDenseCublasWidth);
+      if (st == CUBLAS_STATUS_SUCCESS) {
+        SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+            outpack, y, rows, ncols, c0, chunk_n);
+      }
+    }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
-    SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
-    copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
-        outpack, y, rows, ncols, c0, chunk_n);
   }
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
-                            float* y, int rows, int ncols) {
+                            float* y, int rows, int ncols, bool strided) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
-  uint16_t* xpack = static_cast<uint16_t*>(grow_scratch(
-      g_xpack, g_xpack_bytes,
-      (size_t)cols * kDenseCublasWidth * sizeof(uint16_t)));
-  float* outpack = static_cast<float*>(grow_scratch(
-      g_outpack, g_outpack_bytes, (size_t)rows * kDenseCublasWidth * sizeof(float)));
-  if (!xpack || !outpack) return false;
+  uint16_t* xpack = nullptr;
+  float* outpack = nullptr;
+  auto need_pack = [&] {
+    if (xpack) return true;
+    xpack = static_cast<uint16_t*>(grow_scratch(
+        g_xpack, g_xpack_bytes,
+        (size_t)cols * kDenseCublasWidth * sizeof(uint16_t)));
+    outpack = static_cast<float*>(grow_scratch(
+        g_outpack, g_outpack_bytes,
+        (size_t)rows * kDenseCublasWidth * sizeof(float)));
+    return xpack && outpack;
+  };
+
+  // The strided path consumes a position-major bf16 activation: one contiguous
+  // rounding pass, no transposing repack for full blocks. Its own scratch, so
+  // the tail padding below cannot alias it.
+  uint16_t* xb = nullptr;
+  if (strided) {
+    xb = static_cast<uint16_t*>(grow_scratch(
+        g_xb, g_xb_bytes, (size_t)cols * ncols * sizeof(uint16_t)));
+    if (!xb) return false;
+    SB_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
+    cast_bf16_rows_kernel<<<grid_for(cols * ncols), 256, 0, cur_stream()>>>(
+        x, xb, cols * ncols);
+  }
 
   cublasSetStream(h, cur_stream());
   const float alpha = 1.0f, beta = 0.0f;
   for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
     const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
-    SB_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
-    pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
-                             cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
-    const cublasStatus_t st = cublasGemmEx(
-        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
-        CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
-        CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    cublasStatus_t st;
+    if (xb) {
+      // Same transposed formulation as the f32 path; the activation block is
+      // already bf16 in position-major order (ldb=cols). Tail blocks run the
+      // same shape over a zero-padded copy (see the f32 path).
+      const bool full = chunk_n == kDenseCublasWidth;
+      const uint16_t* a = xb + (size_t)c0 * cols;
+      float* c = y + (size_t)c0 * rows;
+      if (!full) {
+        if (!need_pack()) return false;
+        SB_NOTE_LAUNCH(pad_bf16_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+        pad_bf16_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                               cur_stream()>>>(xb, xpack, cols, c0, chunk_n);
+        a = xpack;
+        c = outpack;
+      }
+      st = cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, kDenseCublasWidth,
+                        cols, &alpha, d_w, CUDA_R_16BF, cols, a, CUDA_R_16BF,
+                        cols, &beta, c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT);
+      if (st == CUBLAS_STATUS_SUCCESS && !full) {
+        SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+            outpack, y, rows, c0, chunk_n);
+      }
+    } else {
+      if (!need_pack()) return false;
+      SB_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+      pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
+                               cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
+      st = cublasGemmEx(
+          h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
+          CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
+          CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+      if (st == CUBLAS_STATUS_SUCCESS) {
+        SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
+            outpack, y, rows, ncols, c0, chunk_n);
+      }
+    }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
-    SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
-    copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
-        outpack, y, rows, ncols, c0, chunk_n);
   }
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
-                            float* y, int rows, int ncols) {
+                            float* y, int rows, int ncols, bool strided) {
   if (!available()) return false;
   if (cols <= 0 || rows <= 0 || ncols <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
@@ -2937,8 +3095,9 @@ bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
       upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
   if (!d_w) return false;
   if (dense_cublas_enabled() && ncols >= dense_cublas_min_n() &&
-      matvec_f32_cublas_dev(d_w, cols, x, y, rows, ncols))
+      matvec_f32_cublas_dev(d_w, cols, x, y, rows, ncols, strided))
     return true;
+  // The gemv reads the same position-major activation in either layout.
   const int total = rows * ncols;
   SB_NOTE_LAUNCH(gemv_dense_f32_batched, grid_for(total), 256, 0, cur_stream());
   gemv_dense_f32_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
@@ -2947,7 +3106,7 @@ bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
 }
 
 bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
-                             float* y, int rows, int ncols) {
+                             float* y, int rows, int ncols, bool strided) {
   if (!available()) return false;
   if (cols <= 0 || rows <= 0 || ncols <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
@@ -2955,8 +3114,23 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
       upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
   if (dense_cublas_enabled() && ncols >= dense_cublas_min_n() &&
-      matvec_bf16_cublas_dev(d_w, cols, x, y, rows, ncols))
+      matvec_bf16_cublas_dev(d_w, cols, x, y, rows, ncols, strided))
     return true;
+  if (strided) {
+    // The caller skipped its bf16 staging copy: round position-major here so
+    // the fallback consumes exactly the same bf16-rounded activation.
+    uint16_t* xb = static_cast<uint16_t*>(grow_scratch(
+        g_xpack, g_xpack_bytes, (size_t)cols * ncols * sizeof(uint16_t)));
+    if (!xb) return false;
+    SB_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
+    cast_bf16_rows_kernel<<<grid_for(cols * ncols), 256, 0, cur_stream()>>>(
+        x, xb, cols * ncols);
+    const int total = rows * ncols;
+    SB_NOTE_LAUNCH(gemv_bf16_batched_xb, grid_for(total), 256, 0, cur_stream());
+    gemv_bf16_batched_xb<<<grid_for(total), 256, 0, cur_stream()>>>(
+        d_w, xb, y, cols, rows, ncols);
+    return cudaGetLastError() == cudaSuccess;
+  }
   const int total = rows * ncols;
   SB_NOTE_LAUNCH(gemv_bf16_batched, grid_for(total), 256, 0, cur_stream());
   gemv_bf16_batched<<<grid_for(total), 256, 0, cur_stream()>>>(

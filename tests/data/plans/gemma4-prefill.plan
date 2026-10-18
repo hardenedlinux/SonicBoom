@@ -4,8 +4,8 @@ model gemma4
 mode prefill
 n_ctx 0
 n 8
-plan_id 10988248706337852266
-model_fingerprint 4659225621435493130
+plan_id 13008982807532874192
+model_fingerprint 8901932247203262556
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6
 steps 1131
@@ -192,14 +192,15 @@ step 18 task 18 node 25 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 19 task 19 node 26 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 0
   attr offset 0
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t28 buffer b22 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 20 task 20 node 27 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t28 buffer b22 offset 0 size 8192 shape [8,256] dtype float32
@@ -234,12 +235,13 @@ step 24 task 24 node 32 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 25 task 25 node 33 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 0
   attr slot 21
   buf in 0 t27 buffer b21 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t35 buffer b28 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 26 task 26 node 34 op gelu_fp16 backend sonic stream s0
   attr layer 0
   buf in 0 t35 buffer b28 offset 0 size 8192 shape [8,256] dtype float32
@@ -253,12 +255,13 @@ step 27 task 27 node 35 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 28 task 28 node 36 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 0
   attr slot 22
   buf in 0 t37 buffer b30 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t38 buffer b31 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 29 task 29 node 38 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -439,14 +442,15 @@ step 46 task 46 node 62 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 47 task 47 node 63 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 1
   attr offset 256
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t65 buffer b51 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 48 task 48 node 64 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t65 buffer b51 offset 0 size 8192 shape [8,256] dtype float32
@@ -481,12 +485,13 @@ step 52 task 52 node 69 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 53 task 53 node 70 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 1
   attr slot 21
   buf in 0 t64 buffer b50 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t72 buffer b57 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 54 task 54 node 71 op gelu_fp16 backend sonic stream s0
   attr layer 1
   buf in 0 t72 buffer b57 offset 0 size 8192 shape [8,256] dtype float32
@@ -500,12 +505,13 @@ step 55 task 55 node 72 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 56 task 56 node 73 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 1
   attr slot 22
   buf in 0 t74 buffer b59 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t75 buffer b60 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 57 task 57 node 75 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -686,14 +692,15 @@ step 74 task 74 node 99 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 75 task 75 node 100 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 2
   attr offset 512
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t102 buffer b80 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 76 task 76 node 101 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t102 buffer b80 offset 0 size 8192 shape [8,256] dtype float32
@@ -728,12 +735,13 @@ step 80 task 80 node 106 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 81 task 81 node 107 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 2
   attr slot 21
   buf in 0 t101 buffer b79 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t109 buffer b86 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 82 task 82 node 108 op gelu_fp16 backend sonic stream s0
   attr layer 2
   buf in 0 t109 buffer b86 offset 0 size 8192 shape [8,256] dtype float32
@@ -747,12 +755,13 @@ step 83 task 83 node 109 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 84 task 84 node 110 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 2
   attr slot 22
   buf in 0 t111 buffer b88 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t112 buffer b89 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 85 task 85 node 112 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -933,14 +942,15 @@ step 102 task 102 node 136 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 103 task 103 node 137 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 3
   attr offset 768
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t139 buffer b109 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 104 task 104 node 138 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t139 buffer b109 offset 0 size 8192 shape [8,256] dtype float32
@@ -975,12 +985,13 @@ step 108 task 108 node 143 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 109 task 109 node 144 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 3
   attr slot 21
   buf in 0 t138 buffer b108 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t146 buffer b115 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 110 task 110 node 145 op gelu_fp16 backend sonic stream s0
   attr layer 3
   buf in 0 t146 buffer b115 offset 0 size 8192 shape [8,256] dtype float32
@@ -994,12 +1005,13 @@ step 111 task 111 node 146 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 112 task 112 node 147 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 3
   attr slot 22
   buf in 0 t148 buffer b117 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t149 buffer b118 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 113 task 113 node 149 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -1180,14 +1192,15 @@ step 130 task 130 node 173 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 131 task 131 node 174 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 4
   attr offset 1024
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t176 buffer b138 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 132 task 132 node 175 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t176 buffer b138 offset 0 size 8192 shape [8,256] dtype float32
@@ -1222,12 +1235,13 @@ step 136 task 136 node 180 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 137 task 137 node 181 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 4
   attr slot 21
   buf in 0 t175 buffer b137 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t183 buffer b144 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 138 task 138 node 182 op gelu_fp16 backend sonic stream s0
   attr layer 4
   buf in 0 t183 buffer b144 offset 0 size 8192 shape [8,256] dtype float32
@@ -1241,12 +1255,13 @@ step 139 task 139 node 183 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 140 task 140 node 184 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 4
   attr slot 22
   buf in 0 t185 buffer b146 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t186 buffer b147 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 141 task 141 node 186 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -1427,14 +1442,15 @@ step 158 task 158 node 210 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 159 task 159 node 211 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 5
   attr offset 1280
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t213 buffer b167 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 160 task 160 node 212 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t213 buffer b167 offset 0 size 8192 shape [8,256] dtype float32
@@ -1469,12 +1485,13 @@ step 164 task 164 node 217 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 165 task 165 node 218 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 5
   attr slot 21
   buf in 0 t212 buffer b166 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t220 buffer b173 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 166 task 166 node 219 op gelu_fp16 backend sonic stream s0
   attr layer 5
   buf in 0 t220 buffer b173 offset 0 size 8192 shape [8,256] dtype float32
@@ -1488,12 +1505,13 @@ step 167 task 167 node 220 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 168 task 168 node 221 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 5
   attr slot 22
   buf in 0 t222 buffer b175 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t223 buffer b176 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 169 task 169 node 223 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -1674,14 +1692,15 @@ step 186 task 186 node 247 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 187 task 187 node 248 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 6
   attr offset 1536
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t250 buffer b196 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 188 task 188 node 249 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t250 buffer b196 offset 0 size 8192 shape [8,256] dtype float32
@@ -1716,12 +1735,13 @@ step 192 task 192 node 254 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 193 task 193 node 255 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 6
   attr slot 21
   buf in 0 t249 buffer b195 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t257 buffer b202 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 194 task 194 node 256 op gelu_fp16 backend sonic stream s0
   attr layer 6
   buf in 0 t257 buffer b202 offset 0 size 8192 shape [8,256] dtype float32
@@ -1735,12 +1755,13 @@ step 195 task 195 node 257 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 196 task 196 node 258 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 6
   attr slot 22
   buf in 0 t259 buffer b204 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t260 buffer b205 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 197 task 197 node 260 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -1921,14 +1942,15 @@ step 214 task 214 node 284 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 215 task 215 node 285 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 7
   attr offset 1792
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t287 buffer b225 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 216 task 216 node 286 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t287 buffer b225 offset 0 size 8192 shape [8,256] dtype float32
@@ -1963,12 +1985,13 @@ step 220 task 220 node 291 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 221 task 221 node 292 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 7
   attr slot 21
   buf in 0 t286 buffer b224 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t294 buffer b231 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 222 task 222 node 293 op gelu_fp16 backend sonic stream s0
   attr layer 7
   buf in 0 t294 buffer b231 offset 0 size 8192 shape [8,256] dtype float32
@@ -1982,12 +2005,13 @@ step 223 task 223 node 294 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 224 task 224 node 295 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 7
   attr slot 22
   buf in 0 t296 buffer b233 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t297 buffer b234 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 225 task 225 node 297 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -2168,14 +2192,15 @@ step 242 task 242 node 321 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 243 task 243 node 322 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 8
   attr offset 2048
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t324 buffer b254 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 244 task 244 node 323 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t324 buffer b254 offset 0 size 8192 shape [8,256] dtype float32
@@ -2210,12 +2235,13 @@ step 248 task 248 node 328 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 249 task 249 node 329 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 8
   attr slot 21
   buf in 0 t323 buffer b253 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t331 buffer b260 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 250 task 250 node 330 op gelu_fp16 backend sonic stream s0
   attr layer 8
   buf in 0 t331 buffer b260 offset 0 size 8192 shape [8,256] dtype float32
@@ -2229,12 +2255,13 @@ step 251 task 251 node 331 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 252 task 252 node 332 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 8
   attr slot 22
   buf in 0 t333 buffer b262 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t334 buffer b263 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 253 task 253 node 334 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -2415,14 +2442,15 @@ step 270 task 270 node 358 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 271 task 271 node 359 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 9
   attr offset 2304
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t361 buffer b283 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 272 task 272 node 360 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t361 buffer b283 offset 0 size 8192 shape [8,256] dtype float32
@@ -2457,12 +2485,13 @@ step 276 task 276 node 365 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 277 task 277 node 366 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 9
   attr slot 21
   buf in 0 t360 buffer b282 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t368 buffer b289 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 278 task 278 node 367 op gelu_fp16 backend sonic stream s0
   attr layer 9
   buf in 0 t368 buffer b289 offset 0 size 8192 shape [8,256] dtype float32
@@ -2476,12 +2505,13 @@ step 279 task 279 node 368 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 280 task 280 node 369 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 9
   attr slot 22
   buf in 0 t370 buffer b291 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t371 buffer b292 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 281 task 281 node 371 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -2662,14 +2692,15 @@ step 298 task 298 node 395 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 299 task 299 node 396 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 10
   attr offset 2560
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t398 buffer b312 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 300 task 300 node 397 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t398 buffer b312 offset 0 size 8192 shape [8,256] dtype float32
@@ -2704,12 +2735,13 @@ step 304 task 304 node 402 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 305 task 305 node 403 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 10
   attr slot 21
   buf in 0 t397 buffer b311 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t405 buffer b318 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 306 task 306 node 404 op gelu_fp16 backend sonic stream s0
   attr layer 10
   buf in 0 t405 buffer b318 offset 0 size 8192 shape [8,256] dtype float32
@@ -2723,12 +2755,13 @@ step 307 task 307 node 405 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 308 task 308 node 406 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 10
   attr slot 22
   buf in 0 t407 buffer b320 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t408 buffer b321 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 309 task 309 node 408 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -2909,14 +2942,15 @@ step 326 task 326 node 432 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 327 task 327 node 433 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 11
   attr offset 2816
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t435 buffer b341 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 328 task 328 node 434 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t435 buffer b341 offset 0 size 8192 shape [8,256] dtype float32
@@ -2951,12 +2985,13 @@ step 332 task 332 node 439 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 333 task 333 node 440 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 11
   attr slot 21
   buf in 0 t434 buffer b340 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t442 buffer b347 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 334 task 334 node 441 op gelu_fp16 backend sonic stream s0
   attr layer 11
   buf in 0 t442 buffer b347 offset 0 size 8192 shape [8,256] dtype float32
@@ -2970,12 +3005,13 @@ step 335 task 335 node 442 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 336 task 336 node 443 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 11
   attr slot 22
   buf in 0 t444 buffer b349 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t445 buffer b350 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 337 task 337 node 445 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -3156,14 +3192,15 @@ step 354 task 354 node 469 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 355 task 355 node 470 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 12
   attr offset 3072
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t472 buffer b370 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 356 task 356 node 471 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t472 buffer b370 offset 0 size 8192 shape [8,256] dtype float32
@@ -3198,12 +3235,13 @@ step 360 task 360 node 476 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 361 task 361 node 477 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 12
   attr slot 21
   buf in 0 t471 buffer b369 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t479 buffer b376 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 362 task 362 node 478 op gelu_fp16 backend sonic stream s0
   attr layer 12
   buf in 0 t479 buffer b376 offset 0 size 8192 shape [8,256] dtype float32
@@ -3217,12 +3255,13 @@ step 363 task 363 node 479 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 364 task 364 node 480 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 12
   attr slot 22
   buf in 0 t481 buffer b378 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t482 buffer b379 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 365 task 365 node 482 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -3403,14 +3442,15 @@ step 382 task 382 node 506 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 383 task 383 node 507 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 13
   attr offset 3328
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t509 buffer b399 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 384 task 384 node 508 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t509 buffer b399 offset 0 size 8192 shape [8,256] dtype float32
@@ -3445,12 +3485,13 @@ step 388 task 388 node 513 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 389 task 389 node 514 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 13
   attr slot 21
   buf in 0 t508 buffer b398 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t516 buffer b405 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 390 task 390 node 515 op gelu_fp16 backend sonic stream s0
   attr layer 13
   buf in 0 t516 buffer b405 offset 0 size 8192 shape [8,256] dtype float32
@@ -3464,12 +3505,13 @@ step 391 task 391 node 516 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 392 task 392 node 517 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 13
   attr slot 22
   buf in 0 t518 buffer b407 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t519 buffer b408 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 393 task 393 node 519 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -3650,14 +3692,15 @@ step 410 task 410 node 543 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 411 task 411 node 544 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 14
   attr offset 3584
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t546 buffer b428 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 412 task 412 node 545 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t546 buffer b428 offset 0 size 8192 shape [8,256] dtype float32
@@ -3692,12 +3735,13 @@ step 416 task 416 node 550 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 417 task 417 node 551 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 14
   attr slot 21
   buf in 0 t545 buffer b427 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t553 buffer b434 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 418 task 418 node 552 op gelu_fp16 backend sonic stream s0
   attr layer 14
   buf in 0 t553 buffer b434 offset 0 size 8192 shape [8,256] dtype float32
@@ -3711,12 +3755,13 @@ step 419 task 419 node 553 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 420 task 420 node 554 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 14
   attr slot 22
   buf in 0 t555 buffer b436 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t556 buffer b437 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 421 task 421 node 556 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -3897,14 +3942,15 @@ step 438 task 438 node 580 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 439 task 439 node 581 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 15
   attr offset 3840
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t583 buffer b457 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 440 task 440 node 582 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t583 buffer b457 offset 0 size 8192 shape [8,256] dtype float32
@@ -3939,12 +3985,13 @@ step 444 task 444 node 587 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 445 task 445 node 588 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 15
   attr slot 21
   buf in 0 t582 buffer b456 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t590 buffer b463 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 446 task 446 node 589 op gelu_fp16 backend sonic stream s0
   attr layer 15
   buf in 0 t590 buffer b463 offset 0 size 8192 shape [8,256] dtype float32
@@ -3958,12 +4005,13 @@ step 447 task 447 node 590 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 448 task 448 node 591 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 15
   attr slot 22
   buf in 0 t592 buffer b465 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t593 buffer b466 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 449 task 449 node 593 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -4144,14 +4192,15 @@ step 466 task 466 node 617 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 467 task 467 node 618 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 16
   attr offset 4096
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t620 buffer b486 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 468 task 468 node 619 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t620 buffer b486 offset 0 size 8192 shape [8,256] dtype float32
@@ -4186,12 +4235,13 @@ step 472 task 472 node 624 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 473 task 473 node 625 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 16
   attr slot 21
   buf in 0 t619 buffer b485 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t627 buffer b492 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 474 task 474 node 626 op gelu_fp16 backend sonic stream s0
   attr layer 16
   buf in 0 t627 buffer b492 offset 0 size 8192 shape [8,256] dtype float32
@@ -4205,12 +4255,13 @@ step 475 task 475 node 627 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 476 task 476 node 628 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 16
   attr slot 22
   buf in 0 t629 buffer b494 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t630 buffer b495 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 477 task 477 node 630 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -4391,14 +4442,15 @@ step 494 task 494 node 654 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 495 task 495 node 655 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 17
   attr offset 4352
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t657 buffer b515 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 496 task 496 node 656 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t657 buffer b515 offset 0 size 8192 shape [8,256] dtype float32
@@ -4433,12 +4485,13 @@ step 500 task 500 node 661 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 501 task 501 node 662 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 17
   attr slot 21
   buf in 0 t656 buffer b514 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t664 buffer b521 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 502 task 502 node 663 op gelu_fp16 backend sonic stream s0
   attr layer 17
   buf in 0 t664 buffer b521 offset 0 size 8192 shape [8,256] dtype float32
@@ -4452,12 +4505,13 @@ step 503 task 503 node 664 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 504 task 504 node 665 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 17
   attr slot 22
   buf in 0 t666 buffer b523 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t667 buffer b524 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 505 task 505 node 667 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -4638,14 +4692,15 @@ step 522 task 522 node 691 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 523 task 523 node 692 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 18
   attr offset 4608
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t694 buffer b544 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 524 task 524 node 693 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t694 buffer b544 offset 0 size 8192 shape [8,256] dtype float32
@@ -4680,12 +4735,13 @@ step 528 task 528 node 698 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 529 task 529 node 699 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 18
   attr slot 21
   buf in 0 t693 buffer b543 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t701 buffer b550 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 530 task 530 node 700 op gelu_fp16 backend sonic stream s0
   attr layer 18
   buf in 0 t701 buffer b550 offset 0 size 8192 shape [8,256] dtype float32
@@ -4699,12 +4755,13 @@ step 531 task 531 node 701 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 532 task 532 node 702 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 18
   attr slot 22
   buf in 0 t703 buffer b552 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t704 buffer b553 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 533 task 533 node 704 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -4885,14 +4942,15 @@ step 550 task 550 node 728 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 551 task 551 node 729 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 19
   attr offset 4864
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t731 buffer b573 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 552 task 552 node 730 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t731 buffer b573 offset 0 size 8192 shape [8,256] dtype float32
@@ -4927,12 +4985,13 @@ step 556 task 556 node 735 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 557 task 557 node 736 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 19
   attr slot 21
   buf in 0 t730 buffer b572 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t738 buffer b579 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 558 task 558 node 737 op gelu_fp16 backend sonic stream s0
   attr layer 19
   buf in 0 t738 buffer b579 offset 0 size 8192 shape [8,256] dtype float32
@@ -4946,12 +5005,13 @@ step 559 task 559 node 738 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 560 task 560 node 739 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 19
   attr slot 22
   buf in 0 t740 buffer b581 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t741 buffer b582 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 561 task 561 node 741 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -5132,14 +5192,15 @@ step 578 task 578 node 765 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 579 task 579 node 766 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 20
   attr offset 5120
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t768 buffer b602 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 580 task 580 node 767 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t768 buffer b602 offset 0 size 8192 shape [8,256] dtype float32
@@ -5174,12 +5235,13 @@ step 584 task 584 node 772 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 585 task 585 node 773 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 20
   attr slot 21
   buf in 0 t767 buffer b601 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t775 buffer b608 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 586 task 586 node 774 op gelu_fp16 backend sonic stream s0
   attr layer 20
   buf in 0 t775 buffer b608 offset 0 size 8192 shape [8,256] dtype float32
@@ -5193,12 +5255,13 @@ step 587 task 587 node 775 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 588 task 588 node 776 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 20
   attr slot 22
   buf in 0 t777 buffer b610 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t778 buffer b611 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 589 task 589 node 778 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -5379,14 +5442,15 @@ step 606 task 606 node 802 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 607 task 607 node 803 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 21
   attr offset 5376
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t805 buffer b631 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 608 task 608 node 804 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t805 buffer b631 offset 0 size 8192 shape [8,256] dtype float32
@@ -5421,12 +5485,13 @@ step 612 task 612 node 809 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 613 task 613 node 810 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 21
   attr slot 21
   buf in 0 t804 buffer b630 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t812 buffer b637 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 614 task 614 node 811 op gelu_fp16 backend sonic stream s0
   attr layer 21
   buf in 0 t812 buffer b637 offset 0 size 8192 shape [8,256] dtype float32
@@ -5440,12 +5505,13 @@ step 615 task 615 node 812 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 616 task 616 node 813 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 21
   attr slot 22
   buf in 0 t814 buffer b639 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t815 buffer b640 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 617 task 617 node 815 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -5626,14 +5692,15 @@ step 634 task 634 node 839 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 635 task 635 node 840 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 22
   attr offset 5632
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t842 buffer b660 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 636 task 636 node 841 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t842 buffer b660 offset 0 size 8192 shape [8,256] dtype float32
@@ -5668,12 +5735,13 @@ step 640 task 640 node 846 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 641 task 641 node 847 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 22
   attr slot 21
   buf in 0 t841 buffer b659 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t849 buffer b666 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 642 task 642 node 848 op gelu_fp16 backend sonic stream s0
   attr layer 22
   buf in 0 t849 buffer b666 offset 0 size 8192 shape [8,256] dtype float32
@@ -5687,12 +5755,13 @@ step 643 task 643 node 849 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 644 task 644 node 850 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 22
   attr slot 22
   buf in 0 t851 buffer b668 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t852 buffer b669 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 645 task 645 node 852 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -5873,14 +5942,15 @@ step 662 task 662 node 876 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 663 task 663 node 877 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 23
   attr offset 5888
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t879 buffer b689 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 664 task 664 node 878 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t879 buffer b689 offset 0 size 8192 shape [8,256] dtype float32
@@ -5915,12 +5985,13 @@ step 668 task 668 node 883 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 669 task 669 node 884 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 23
   attr slot 21
   buf in 0 t878 buffer b688 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t886 buffer b695 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 670 task 670 node 885 op gelu_fp16 backend sonic stream s0
   attr layer 23
   buf in 0 t886 buffer b695 offset 0 size 8192 shape [8,256] dtype float32
@@ -5934,12 +6005,13 @@ step 671 task 671 node 886 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 672 task 672 node 887 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 23
   attr slot 22
   buf in 0 t888 buffer b697 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t889 buffer b698 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 673 task 673 node 889 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -6084,14 +6156,15 @@ step 686 task 686 node 906 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 687 task 687 node 907 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 24
   attr offset 6144
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t909 buffer b714 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 688 task 688 node 908 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t909 buffer b714 offset 0 size 8192 shape [8,256] dtype float32
@@ -6126,12 +6199,13 @@ step 692 task 692 node 913 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 693 task 693 node 914 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 24
   attr slot 21
   buf in 0 t908 buffer b713 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t916 buffer b720 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 694 task 694 node 915 op gelu_fp16 backend sonic stream s0
   attr layer 24
   buf in 0 t916 buffer b720 offset 0 size 8192 shape [8,256] dtype float32
@@ -6145,12 +6219,13 @@ step 695 task 695 node 916 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 696 task 696 node 917 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 24
   attr slot 22
   buf in 0 t918 buffer b722 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t919 buffer b723 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 697 task 697 node 919 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -6295,14 +6370,15 @@ step 710 task 710 node 936 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 711 task 711 node 937 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 25
   attr offset 6400
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t939 buffer b739 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 712 task 712 node 938 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t939 buffer b739 offset 0 size 8192 shape [8,256] dtype float32
@@ -6337,12 +6413,13 @@ step 716 task 716 node 943 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 717 task 717 node 944 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 25
   attr slot 21
   buf in 0 t938 buffer b738 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t946 buffer b745 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 718 task 718 node 945 op gelu_fp16 backend sonic stream s0
   attr layer 25
   buf in 0 t946 buffer b745 offset 0 size 8192 shape [8,256] dtype float32
@@ -6356,12 +6433,13 @@ step 719 task 719 node 946 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 720 task 720 node 947 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 25
   attr slot 22
   buf in 0 t948 buffer b747 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t949 buffer b748 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 721 task 721 node 949 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -6506,14 +6584,15 @@ step 734 task 734 node 966 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 735 task 735 node 967 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 26
   attr offset 6656
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t969 buffer b764 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 736 task 736 node 968 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t969 buffer b764 offset 0 size 8192 shape [8,256] dtype float32
@@ -6548,12 +6627,13 @@ step 740 task 740 node 973 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 741 task 741 node 974 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 26
   attr slot 21
   buf in 0 t968 buffer b763 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t976 buffer b770 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 742 task 742 node 975 op gelu_fp16 backend sonic stream s0
   attr layer 26
   buf in 0 t976 buffer b770 offset 0 size 8192 shape [8,256] dtype float32
@@ -6567,12 +6647,13 @@ step 743 task 743 node 976 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 744 task 744 node 977 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 26
   attr slot 22
   buf in 0 t978 buffer b772 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t979 buffer b773 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 745 task 745 node 979 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -6717,14 +6798,15 @@ step 758 task 758 node 996 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 759 task 759 node 997 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 27
   attr offset 6912
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t999 buffer b789 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 760 task 760 node 998 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t999 buffer b789 offset 0 size 8192 shape [8,256] dtype float32
@@ -6759,12 +6841,13 @@ step 764 task 764 node 1003 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 765 task 765 node 1004 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 27
   attr slot 21
   buf in 0 t998 buffer b788 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1006 buffer b795 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 766 task 766 node 1005 op gelu_fp16 backend sonic stream s0
   attr layer 27
   buf in 0 t1006 buffer b795 offset 0 size 8192 shape [8,256] dtype float32
@@ -6778,12 +6861,13 @@ step 767 task 767 node 1006 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 768 task 768 node 1007 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 27
   attr slot 22
   buf in 0 t1008 buffer b797 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1009 buffer b798 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 769 task 769 node 1009 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -6928,14 +7012,15 @@ step 782 task 782 node 1026 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 783 task 783 node 1027 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 28
   attr offset 7168
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1029 buffer b814 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 784 task 784 node 1028 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1029 buffer b814 offset 0 size 8192 shape [8,256] dtype float32
@@ -6970,12 +7055,13 @@ step 788 task 788 node 1033 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 789 task 789 node 1034 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 28
   attr slot 21
   buf in 0 t1028 buffer b813 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1036 buffer b820 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 790 task 790 node 1035 op gelu_fp16 backend sonic stream s0
   attr layer 28
   buf in 0 t1036 buffer b820 offset 0 size 8192 shape [8,256] dtype float32
@@ -6989,12 +7075,13 @@ step 791 task 791 node 1036 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 792 task 792 node 1037 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 28
   attr slot 22
   buf in 0 t1038 buffer b822 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1039 buffer b823 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 793 task 793 node 1039 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -7139,14 +7226,15 @@ step 806 task 806 node 1056 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 807 task 807 node 1057 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 29
   attr offset 7424
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1059 buffer b839 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 808 task 808 node 1058 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1059 buffer b839 offset 0 size 8192 shape [8,256] dtype float32
@@ -7181,12 +7269,13 @@ step 812 task 812 node 1063 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 813 task 813 node 1064 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 29
   attr slot 21
   buf in 0 t1058 buffer b838 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1066 buffer b845 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 814 task 814 node 1065 op gelu_fp16 backend sonic stream s0
   attr layer 29
   buf in 0 t1066 buffer b845 offset 0 size 8192 shape [8,256] dtype float32
@@ -7200,12 +7289,13 @@ step 815 task 815 node 1066 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 816 task 816 node 1067 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 29
   attr slot 22
   buf in 0 t1068 buffer b847 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1069 buffer b848 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 817 task 817 node 1069 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -7350,14 +7440,15 @@ step 830 task 830 node 1086 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 831 task 831 node 1087 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 30
   attr offset 7680
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1089 buffer b864 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 832 task 832 node 1088 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1089 buffer b864 offset 0 size 8192 shape [8,256] dtype float32
@@ -7392,12 +7483,13 @@ step 836 task 836 node 1093 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 837 task 837 node 1094 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 30
   attr slot 21
   buf in 0 t1088 buffer b863 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1096 buffer b870 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 838 task 838 node 1095 op gelu_fp16 backend sonic stream s0
   attr layer 30
   buf in 0 t1096 buffer b870 offset 0 size 8192 shape [8,256] dtype float32
@@ -7411,12 +7503,13 @@ step 839 task 839 node 1096 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 840 task 840 node 1097 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 30
   attr slot 22
   buf in 0 t1098 buffer b872 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1099 buffer b873 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 841 task 841 node 1099 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -7561,14 +7654,15 @@ step 854 task 854 node 1116 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 855 task 855 node 1117 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 31
   attr offset 7936
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1119 buffer b889 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 856 task 856 node 1118 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1119 buffer b889 offset 0 size 8192 shape [8,256] dtype float32
@@ -7603,12 +7697,13 @@ step 860 task 860 node 1123 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 861 task 861 node 1124 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 31
   attr slot 21
   buf in 0 t1118 buffer b888 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1126 buffer b895 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 862 task 862 node 1125 op gelu_fp16 backend sonic stream s0
   attr layer 31
   buf in 0 t1126 buffer b895 offset 0 size 8192 shape [8,256] dtype float32
@@ -7622,12 +7717,13 @@ step 863 task 863 node 1126 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 864 task 864 node 1127 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 31
   attr slot 22
   buf in 0 t1128 buffer b897 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1129 buffer b898 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 865 task 865 node 1129 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -7772,14 +7868,15 @@ step 878 task 878 node 1146 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 879 task 879 node 1147 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 32
   attr offset 8192
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1149 buffer b914 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 880 task 880 node 1148 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1149 buffer b914 offset 0 size 8192 shape [8,256] dtype float32
@@ -7814,12 +7911,13 @@ step 884 task 884 node 1153 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 885 task 885 node 1154 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 32
   attr slot 21
   buf in 0 t1148 buffer b913 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1156 buffer b920 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 886 task 886 node 1155 op gelu_fp16 backend sonic stream s0
   attr layer 32
   buf in 0 t1156 buffer b920 offset 0 size 8192 shape [8,256] dtype float32
@@ -7833,12 +7931,13 @@ step 887 task 887 node 1156 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 888 task 888 node 1157 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 32
   attr slot 22
   buf in 0 t1158 buffer b922 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1159 buffer b923 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 889 task 889 node 1159 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -7983,14 +8082,15 @@ step 902 task 902 node 1176 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 903 task 903 node 1177 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 33
   attr offset 8448
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1179 buffer b939 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 904 task 904 node 1178 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1179 buffer b939 offset 0 size 8192 shape [8,256] dtype float32
@@ -8025,12 +8125,13 @@ step 908 task 908 node 1183 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 909 task 909 node 1184 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 33
   attr slot 21
   buf in 0 t1178 buffer b938 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1186 buffer b945 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 910 task 910 node 1185 op gelu_fp16 backend sonic stream s0
   attr layer 33
   buf in 0 t1186 buffer b945 offset 0 size 8192 shape [8,256] dtype float32
@@ -8044,12 +8145,13 @@ step 911 task 911 node 1186 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 912 task 912 node 1187 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 33
   attr slot 22
   buf in 0 t1188 buffer b947 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1189 buffer b948 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 913 task 913 node 1189 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -8194,14 +8296,15 @@ step 926 task 926 node 1206 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 927 task 927 node 1207 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 34
   attr offset 8704
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1209 buffer b964 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 928 task 928 node 1208 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1209 buffer b964 offset 0 size 8192 shape [8,256] dtype float32
@@ -8236,12 +8339,13 @@ step 932 task 932 node 1213 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 933 task 933 node 1214 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 34
   attr slot 21
   buf in 0 t1208 buffer b963 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1216 buffer b970 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 934 task 934 node 1215 op gelu_fp16 backend sonic stream s0
   attr layer 34
   buf in 0 t1216 buffer b970 offset 0 size 8192 shape [8,256] dtype float32
@@ -8255,12 +8359,13 @@ step 935 task 935 node 1216 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 936 task 936 node 1217 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 34
   attr slot 22
   buf in 0 t1218 buffer b972 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1219 buffer b973 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 937 task 937 node 1219 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -8405,14 +8510,15 @@ step 950 task 950 node 1236 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 951 task 951 node 1237 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 35
   attr offset 8960
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1239 buffer b989 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 952 task 952 node 1238 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1239 buffer b989 offset 0 size 8192 shape [8,256] dtype float32
@@ -8447,12 +8553,13 @@ step 956 task 956 node 1243 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 957 task 957 node 1244 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 35
   attr slot 21
   buf in 0 t1238 buffer b988 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1246 buffer b995 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 958 task 958 node 1245 op gelu_fp16 backend sonic stream s0
   attr layer 35
   buf in 0 t1246 buffer b995 offset 0 size 8192 shape [8,256] dtype float32
@@ -8466,12 +8573,13 @@ step 959 task 959 node 1246 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 960 task 960 node 1247 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 35
   attr slot 22
   buf in 0 t1248 buffer b997 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1249 buffer b998 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 961 task 961 node 1249 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -8616,14 +8724,15 @@ step 974 task 974 node 1266 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 975 task 975 node 1267 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 36
   attr offset 9216
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1269 buffer b1014 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 976 task 976 node 1268 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1269 buffer b1014 offset 0 size 8192 shape [8,256] dtype float32
@@ -8658,12 +8767,13 @@ step 980 task 980 node 1273 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 981 task 981 node 1274 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 36
   attr slot 21
   buf in 0 t1268 buffer b1013 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1276 buffer b1020 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 982 task 982 node 1275 op gelu_fp16 backend sonic stream s0
   attr layer 36
   buf in 0 t1276 buffer b1020 offset 0 size 8192 shape [8,256] dtype float32
@@ -8677,12 +8787,13 @@ step 983 task 983 node 1276 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 984 task 984 node 1277 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 36
   attr slot 22
   buf in 0 t1278 buffer b1022 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1279 buffer b1023 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 985 task 985 node 1279 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -8827,14 +8938,15 @@ step 998 task 998 node 1296 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 999 task 999 node 1297 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 37
   attr offset 9472
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1299 buffer b1039 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1000 task 1000 node 1298 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1299 buffer b1039 offset 0 size 8192 shape [8,256] dtype float32
@@ -8869,12 +8981,13 @@ step 1004 task 1004 node 1303 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1005 task 1005 node 1304 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 37
   attr slot 21
   buf in 0 t1298 buffer b1038 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1306 buffer b1045 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1006 task 1006 node 1305 op gelu_fp16 backend sonic stream s0
   attr layer 37
   buf in 0 t1306 buffer b1045 offset 0 size 8192 shape [8,256] dtype float32
@@ -8888,12 +9001,13 @@ step 1007 task 1007 node 1306 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1008 task 1008 node 1307 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 37
   attr slot 22
   buf in 0 t1308 buffer b1047 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1309 buffer b1048 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 1009 task 1009 node 1309 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -9038,14 +9152,15 @@ step 1022 task 1022 node 1326 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 1023 task 1023 node 1327 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 38
   attr offset 9728
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1329 buffer b1064 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1024 task 1024 node 1328 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1329 buffer b1064 offset 0 size 8192 shape [8,256] dtype float32
@@ -9080,12 +9195,13 @@ step 1028 task 1028 node 1333 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1029 task 1029 node 1334 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 38
   attr slot 21
   buf in 0 t1328 buffer b1063 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1336 buffer b1070 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1030 task 1030 node 1335 op gelu_fp16 backend sonic stream s0
   attr layer 38
   buf in 0 t1336 buffer b1070 offset 0 size 8192 shape [8,256] dtype float32
@@ -9099,12 +9215,13 @@ step 1031 task 1031 node 1336 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1032 task 1032 node 1337 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 38
   attr slot 22
   buf in 0 t1338 buffer b1072 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1339 buffer b1073 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 1033 task 1033 node 1339 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -9249,14 +9366,15 @@ step 1046 task 1046 node 1356 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 1047 task 1047 node 1357 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 39
   attr offset 9984
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1359 buffer b1089 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1048 task 1048 node 1358 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1359 buffer b1089 offset 0 size 8192 shape [8,256] dtype float32
@@ -9291,12 +9409,13 @@ step 1052 task 1052 node 1363 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1053 task 1053 node 1364 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 39
   attr slot 21
   buf in 0 t1358 buffer b1088 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1366 buffer b1095 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1054 task 1054 node 1365 op gelu_fp16 backend sonic stream s0
   attr layer 39
   buf in 0 t1366 buffer b1095 offset 0 size 8192 shape [8,256] dtype float32
@@ -9310,12 +9429,13 @@ step 1055 task 1055 node 1366 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1056 task 1056 node 1367 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 39
   attr slot 22
   buf in 0 t1368 buffer b1097 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1369 buffer b1098 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 1057 task 1057 node 1369 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -9460,14 +9580,15 @@ step 1070 task 1070 node 1386 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 1071 task 1071 node 1387 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 40
   attr offset 10240
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1389 buffer b1114 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1072 task 1072 node 1388 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1389 buffer b1114 offset 0 size 8192 shape [8,256] dtype float32
@@ -9502,12 +9623,13 @@ step 1076 task 1076 node 1393 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1077 task 1077 node 1394 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 40
   attr slot 21
   buf in 0 t1388 buffer b1113 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1396 buffer b1120 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1078 task 1078 node 1395 op gelu_fp16 backend sonic stream s0
   attr layer 40
   buf in 0 t1396 buffer b1120 offset 0 size 8192 shape [8,256] dtype float32
@@ -9521,12 +9643,13 @@ step 1079 task 1079 node 1396 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1080 task 1080 node 1397 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 40
   attr slot 22
   buf in 0 t1398 buffer b1122 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1399 buffer b1123 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 1081 task 1081 node 1399 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
@@ -9671,14 +9794,15 @@ step 1094 task 1094 node 1416 op fused_region backend sonic stream s0
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
 step 1095 task 1095 node 1417 op matvec_bf16 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 41
   attr offset 10496
   attr rows 256
   buf in 0 t3 buffer b3 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1419 buffer b1139 offset 0 size 8192 shape [8,256] dtype float32
-  launch cast_bf16_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
-  launch pack_bf16_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch cast_bf16_rows_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_bf16_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1096 task 1096 node 1418 op scale backend sonic stream s0
   attr scale 0.019764235243201256
   buf in 0 t1419 buffer b1139 offset 0 size 8192 shape [8,256] dtype float32
@@ -9713,12 +9837,13 @@ step 1100 task 1100 node 1423 op scale backend sonic stream s0
   launch scale_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1101 task 1101 node 1424 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 41
   attr slot 21
   buf in 0 t1418 buffer b1138 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1426 buffer b1145 offset 0 size 8192 shape [8,256] dtype float32
-  launch pack_f32_chunk_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1102 task 1102 node 1425 op gelu_fp16 backend sonic stream s0
   attr layer 41
   buf in 0 t1426 buffer b1145 offset 0 size 8192 shape [8,256] dtype float32
@@ -9732,12 +9857,13 @@ step 1103 task 1103 node 1426 op mul backend sonic stream s0
   launch mul_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1104 task 1104 node 1427 op matvec_f32 backend sonic stream s0
   attr batch 8
+  attr dense_layout strided
   attr layer 41
   attr slot 22
   buf in 0 t1428 buffer b1147 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1429 buffer b1148 offset 0 size 81920 shape [8,2560] dtype float32
-  launch pack_f32_chunk_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_chunk_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
+  launch pad_f32_tail_kernel grid 128x1x1 block 256x1x1 smem 0 stream s0
+  launch copyback_tail_kernel grid 80x1x1 block 256x1x1 smem 0 stream s0
 step 1105 task 1105 node 1429 op fused_region backend sonic stream s0
   attr batch 8
   attr dim 2560
