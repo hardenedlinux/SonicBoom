@@ -598,6 +598,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       }
       double attn_scale = 1.0;
       attr_f(*node, "scale", attn_scale);
+      nn::cuda::attention_trace_set_layer(int(layer));  // no-op when tracing off
       ok = nn::cuda::decode_attention_dev(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_slot()), window, cache.n_slots,
@@ -1338,6 +1339,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       KvCacheDev& cache = (*caches_)[cache_layer];
       double attn_scale = 1.0;
       attr_f(*node, "scale", attn_scale);
+      nn::cuda::attention_trace_set_layer(int(layer));  // no-op when tracing off
       ok = nn::cuda::flash_attention_chunk_dev_pos(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_slot()),

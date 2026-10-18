@@ -2402,6 +2402,148 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
   return cudaGetLastError() == cudaSuccess;
 }
 
+// --- attention work trace (SONICBOOM_ATTN_TRACE=1) -------------------------
+//
+// Off by default. A trace line reports, per call, the shape, the implementation
+// and config chosen, the absolute KV extent the kernel iterates, and the key
+// tiles visited versus the minimum the causal+window mask requires. Reading the
+// device position needs a D2H copy, so the trace is a diagnostic, not a timing
+// mode; it is skipped during stream capture (where a D2H copy is illegal).
+namespace {
+
+bool attn_trace_on() {
+  static const bool on = std::getenv("SONICBOOM_ATTN_TRACE") != nullptr;
+  return on;
+}
+
+int &attn_trace_layer_slot() {
+  static thread_local int layer = -1;
+  return layer;
+}
+
+// Absolute KV start for this call, or kNoPos when unavailable/capturing.
+constexpr uint64_t kNoPos = ~uint64_t(0);
+uint64_t attn_trace_read_start(const uint64_t *start) {
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  if (start == nullptr) return kNoPos;
+  if (cudaStreamIsCapturing(cur_stream(), &st) != cudaSuccess ||
+      st != cudaStreamCaptureStatusNone)
+    return kNoPos;
+  uint64_t v = 0;
+  if (cudaMemcpy(&v, start, sizeof(v), cudaMemcpyDeviceToHost) != cudaSuccess)
+    return kNoPos;
+  return v;
+}
+
+// Number of key tiles the (query tile, key tile) loop visits, and the minimum
+// the causal+window mask admits. Tiles are aligned to ABSOLUTE positions.
+void attn_trace_tile_counts(uint64_t start, int q_len, int tile_q, int tile_k,
+                            uint64_t window, uint64_t *visited,
+                            uint64_t *minimal, std::string *per_q) {
+  uint64_t v = 0, m = 0;
+  for (int t = 0; (uint64_t)t * (uint64_t)tile_q < (uint64_t)q_len; ++t) {
+    const uint64_t abs_pb = start + (uint64_t)t * (uint64_t)tile_q;
+    const uint64_t n_blk =
+        std::min<uint64_t>((uint64_t)tile_q, (uint64_t)q_len - abs_pb + start);
+    const uint64_t key_end = abs_pb + n_blk - 1;
+    const uint64_t key_start =
+        (window > 0 && abs_pb >= window) ? (abs_pb - window + 1) : 0;
+    const uint64_t j0 = (key_start / (uint64_t)tile_k) * (uint64_t)tile_k;
+    const uint64_t vt = (key_end + 1 - j0 + tile_k - 1) / (uint64_t)tile_k;
+    const uint64_t mt =
+        (key_end - key_start + 1 + tile_k - 1) / (uint64_t)tile_k;
+    v += vt; m += mt;
+    if (!per_q->empty()) per_q->push_back(',');
+    per_q->append(std::to_string(vt));
+  }
+  *visited = v;
+  *minimal = m;
+}
+
+void attn_trace_prefill(uint64_t start, int q_len, int head_dim, int gqa,
+                        uint64_t window, const char *impl, const char *cfg,
+                        int tile_q, int tile_k, int grid_x, int grid_y,
+                        int block, size_t smem) {
+  if (!attn_trace_on()) return;
+  std::string per_q;
+  uint64_t visited = 0, minimal = 0;
+  attn_trace_tile_counts(start, q_len, tile_q, tile_k, window, &visited,
+                         &minimal, &per_q);
+  if (start == kNoPos)
+    std::fprintf(stderr,
+                 "[attn-trace] layer=%d impl=%s d=%d gqa=%d win=%llu q=%d "
+                 "start=dev L=dev cfg=%s grid=%dx%d block=%d smem=%zu "
+                 "tiles=%llu minimal=%llu per_q=[%s]\n",
+                 attn_trace_layer_slot(), impl, head_dim, gqa,
+                 (unsigned long long)window, q_len, cfg, grid_x, grid_y, block,
+                 smem, (unsigned long long)visited,
+                 (unsigned long long)minimal, per_q.c_str());
+  else
+    std::fprintf(stderr,
+                 "[attn-trace] layer=%d impl=%s d=%d gqa=%d win=%llu q=%d "
+                 "start=%llu L=%llu cfg=%s grid=%dx%d block=%d smem=%zu "
+                 "tiles=%llu minimal=%llu per_q=[%s]\n",
+                 attn_trace_layer_slot(), impl, head_dim, gqa,
+                 (unsigned long long)window, q_len,
+                 (unsigned long long)start,
+                 (unsigned long long)(start + (uint64_t)q_len), cfg, grid_x,
+                 grid_y, block, smem, (unsigned long long)visited,
+                 (unsigned long long)minimal, per_q.c_str());
+}
+
+// Trace line for one of the hand-written tiled instantiations. The numbers
+// mirror launch_tiled_flash_attention's launch geometry.
+template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+void attn_trace_own(const uint64_t *start, int n, int n_heads_kv, int head_dim,
+                    int gqa, uint64_t window) {
+  if (!attn_trace_on()) return;
+  constexpr int threads = NW * GQA * (QB / 16) * 32;
+  constexpr int P_ELEMS = GQA * (QB / 16) * 16 * BK;
+  constexpr int RS_ELEMS = GQA * (QB / 16) * (BK / 16) * 16;
+  constexpr int L_ELEMS = GQA * (QB / 16) * 16;
+  constexpr int smem = HEAD_DIM * (2 * BK + 2) * (int)sizeof(__half) +
+                       P_ELEMS * (int)sizeof(__half) +
+                       (RS_ELEMS + L_ELEMS) * (int)sizeof(float);
+  char cfg[64];
+  std::snprintf(cfg, sizeof(cfg), "QB%d,BK%d,NW%d", QB, BK, NW);
+  attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa, window,
+                     "own", cfg, QB, BK, (n + QB - 1) / QB, n_heads_kv, threads,
+                     (size_t)smem);
+}
+
+void attn_trace_decode(uint64_t pos, uint64_t window, uint64_t chunk,
+                       uint64_t n_chunks, int head_dim, int gqa,
+                       const char *impl, int grid_x, int block, size_t smem) {
+  if (!attn_trace_on()) return;
+  if (pos == kNoPos) {
+    std::fprintf(stderr,
+                 "[attn-trace] layer=%d impl=%s d=%d gqa=%d "
+                 "win=%llu q=1 start=dev chunk=%llu launched_chunks=%llu "
+                 "grid=%d block=%d smem=%zu\n",
+                 attn_trace_layer_slot(), impl, head_dim, gqa,
+                 (unsigned long long)window, (unsigned long long)chunk,
+                 (unsigned long long)n_chunks, grid_x, block, smem);
+    return;
+  }
+  const uint64_t start =
+      (window > 0 && pos >= window) ? pos - window + 1 : 0;
+  const uint64_t n_keys = pos - start + 1;
+  const uint64_t active = (n_keys + chunk - 1) / chunk;
+  std::fprintf(stderr,
+               "[attn-trace] layer=%d impl=%s d=%d gqa=%d "
+               "win=%llu q=1 start=%llu L=%llu chunk=%llu launched_chunks=%llu "
+               "active_chunks=%llu grid=%d block=%d smem=%zu\n",
+               attn_trace_layer_slot(), impl, head_dim, gqa,
+               (unsigned long long)window, (unsigned long long)start,
+               (unsigned long long)(pos + 1), (unsigned long long)chunk,
+               (unsigned long long)n_chunks, (unsigned long long)active, grid_x,
+               block, smem);
+}
+
+} // namespace
+
+void attention_trace_set_layer(int layer) { attn_trace_layer_slot() = layer; }
+
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
@@ -2471,6 +2613,10 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim, 0, cur_stream()>>>(
       partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
       out);
+  if (attn_trace_on())
+    attn_trace_decode(attn_trace_read_start(pos), window, chunk, n_chunks,
+                      head_dim, group_q, "own-split-decode",
+                      int(n_chunks * (uint64_t)n_heads_kv), group_q * 32, smem);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2728,23 +2874,50 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
             head_dim, gqa, sliding_window != 0)) {
       if (attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache,
                               start, n_slots, n, n_heads_q, n_heads_kv,
-                              sliding_window, scale, out))
+                              sliding_window, scale, out)) {
+        if (attn_trace_on()) {
+          const std::string cfg =
+              std::to_string(shape->br) + "," + std::to_string(shape->bc) +
+              "," + std::to_string(shape->dps);
+          attn_trace_prefill(
+              attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
+              "codegen", cfg.c_str(), shape->br, shape->bc,
+              (n + shape->br - 1) / shape->br, n_heads_q,
+              compiler::attention_block_threads(*shape),
+              (size_t)compiler::attention_shared_bytes(*shape));
+        }
         return true;
+      }
     }
   }
 
-  if (gqa == 4 && head_dim == 256)
-    return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
+  if (gqa == 4 && head_dim == 256) {
+    const bool ok = launch_tiled_flash_attention<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
-  if (gqa == 4 && head_dim == 512)
-    return launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+    if (ok)
+      attn_trace_own<256, 64, 2, 32, 4>(start, n, n_heads_kv, head_dim, gqa,
+                           sliding_window);
+    return ok;
+  }
+  if (gqa == 4 && head_dim == 512) {
+    const bool ok = launch_tiled_flash_attention<512, 32, 4, 16, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
-  if (gqa == 7 && head_dim == 64)
-    return launch_tiled_flash_attention<64, 64, 2, 32, 7>(
+    if (ok)
+      attn_trace_own<512, 32, 4, 16, 4>(start, n, n_heads_kv, head_dim, gqa,
+                           sliding_window);
+    return ok;
+  }
+  if (gqa == 7 && head_dim == 64) {
+    const bool ok = launch_tiled_flash_attention<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
+    if (ok)
+      attn_trace_own<64, 64, 2, 32, 7>(start, n, n_heads_kv, head_dim, gqa,
+                           sliding_window);
+    return ok;
+  }
 
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   SB_NOTE_LAUNCH(flash_attention_chunk_pos_kernel, n, n_heads_q * 32, smem, cur_stream());

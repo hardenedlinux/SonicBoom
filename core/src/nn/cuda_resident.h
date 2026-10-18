@@ -168,16 +168,14 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t sliding_window, float scale,
                                    float* out);
 
-// Same contract as flash_attention_chunk_dev_pos, computed by the imported
-// ggml mma flash-attention kernel (Stage 2). Returns false without launching
-// anything when the shape is not covered by an imported tile configuration;
-// the caller then falls back to the native path. Selected by
-// SONICBOOM_ATTN_IMPL=ggml.
-bool flash_attention_ggml_chunk_dev_pos(
-    const float* q, const float* k_batch, const float* v_batch,
-    const float* k_cache, const float* v_cache, const uint64_t* start,
-    uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
-    uint64_t sliding_window, float scale, float* out);
+// Attention work trace (SONICBOOM_ATTN_TRACE=1). The backend sets the layer
+// before the call; the attention entry points then print one line per call to
+// stderr with the shape, the implementation/config chosen, the KV extent the
+// kernel iterates and the number of key tiles visited versus the minimum the
+// causal+window mask requires. Reading the device `start` value needs a D2H
+// copy, so the trace is off by default and must never be enabled in a timing
+// run. The layer is thread-local scratch: it does not affect the launch.
+void attention_trace_set_layer(int layer);
 
 // Per-layer embedding combine: y[i] = (proj[i] + ple[i] * ple_scale) * combine_scale.
 // `ple` is the caller-offset device pointer into the full per-layer embedding
