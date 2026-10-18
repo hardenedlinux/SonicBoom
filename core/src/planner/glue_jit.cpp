@@ -302,8 +302,11 @@ bool load_attention(const compiler::AttentionShape &shape,
     out = {};
     return false;
   }
-  // Above 48 KiB the dynamic shared-memory limit has to be raised per function.
-  if (shared_bytes > 48 * 1024)
+  // 48 KiB and above needs the per-function dynamic shared-memory limit
+  // raised: the driver reserves part of the 48 KiB default on sm_86, so a
+  // kernel that asks for exactly 49152 B is rejected without the attribute
+  // (the runtime tuner's b16x32-dps4 candidates hit this).
+  if (shared_bytes >= 48 * 1024)
     cuFuncSetAttribute(out.function,
                        CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                        shared_bytes);

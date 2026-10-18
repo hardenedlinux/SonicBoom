@@ -21,6 +21,7 @@
 #include "cuda_resident.h"
 #include "cuda_stream.h"
 
+#include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
@@ -30,6 +31,7 @@
 #include <cublasLt.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +44,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // CUDA kernels for the native-transformer elementwise / norm / RoPE ops and the
 // dense gate matvecs (Phase 6a target 3, first slice). Each entry point mirrors
@@ -2544,6 +2547,15 @@ void attn_trace_decode(uint64_t pos, uint64_t window, uint64_t chunk,
 
 void attention_trace_set_layer(int layer) { attn_trace_layer_slot() = layer; }
 
+namespace {
+// Defined with the Step 7 tuners below; declared here because the decode path
+// is emitted before them.
+uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
+                                   int n_heads_kv, uint64_t max_window,
+                                   uint64_t sliding_window,
+                                   uint64_t default_chunk);
+} // namespace
+
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
@@ -2590,6 +2602,12 @@ bool decode_attention_dev(const float* q, const float* k_cache,
       if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
         const long v = std::atol(e);
         if (v > 0) kDecodeChunk = (uint64_t)v;
+      } else {
+        // Step 7 runtime tuner (cached per GPU + shape class; 16 is the
+        // default, kept when tuning is off or inside a capture).
+        kDecodeChunk = attn_decode_chunk_resolve(
+            head_dim, group_q, n_heads_q, n_heads_kv, window, sliding_window,
+            16);
       }
       // The generated decoder stages one chunk's scores in a fixed shared
       // view; a larger chunk is outside what the generated text supports.
@@ -2803,12 +2821,14 @@ namespace {
 // has a different reduction order.
 enum class AttnImpl { Own, Codegen };
 
-// The generated kernel's shape class, or nothing when the generator does not
-// cover the shape. SONICBOOM_ATTN_CODEGEN="br,bc,dps" pins the tile config for
-// the Stage 3c sweep; unsupported pins are rejected like an unsupported shape.
-std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
-                                                           int gqa,
-                                                           bool window) {
+// The generated kernel's default tile config for a shape class, without the
+// SONICBOOM_ATTN_CODEGEN pin; empty when the generator does not cover the
+// shape. These are the per-class starting points of the Step 7 runtime tuner:
+// the tuner times them against every supported (br, bc, dps) and keeps the
+// default unless a candidate is faster by the switch margin.
+std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
+                                                                   int gqa,
+                                                                   bool window) {
   compiler::AttentionShape shape{
       .head_dim = head_dim, .gqa = gqa, .window_mask = window};
   // Tile configs from the Stage 3c sweep (test_cuda_attention_codegen_wide
@@ -2828,17 +2848,30 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
   } else {
     return std::nullopt;
   }
+  if (!compiler::attention_shape_supported(shape)) return std::nullopt;
+  return shape;
+}
+
+// Shape class -> generator shape, with SONICBOOM_ATTN_CODEGEN="br,bc,dps"
+// pinning the tile config (Stage 3c sweep). An unsupported pin is rejected
+// like an unsupported shape.
+std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
+                                                           int gqa,
+                                                           bool window) {
+  std::optional<compiler::AttentionShape> shape =
+      attn_codegen_default_shape(head_dim, gqa, window);
+  if (!shape) return std::nullopt;
   if (const char *e = std::getenv("SONICBOOM_ATTN_CODEGEN")) {
     int br = 0, bc = 0, dps = 0;
     if (std::sscanf(e, "%d,%d,%d", &br, &bc, &dps) == 3 && br > 0 && bc > 0 &&
         dps > 0) {
-      shape.br = br;
-      shape.bc = bc;
-      shape.dps = dps;
+      shape->br = br;
+      shape->bc = bc;
+      shape->dps = dps;
     }
   }
-  if (!compiler::attention_shape_supported(shape)) return std::nullopt;
-  return shape;
+  if (!compiler::attention_shape_supported(*shape)) return std::nullopt;
+  return *shape;
 }
 
 bool attn_launch_codegen(const compiler::AttentionShape &shape,
@@ -2862,30 +2895,496 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
   return planner::glue::launch_attention(shape, args, grid_x, n_heads_q);
 }
 
-// The measured per-shape-class choice. The numbers behind each entry are in
-// the Stage 3c benchmark table (tools/bench.sh --ablate attn-auto and the
-// --bench mode of test_cuda_attention_codegen_wide); the table is the
-// "autotune" result, kept deterministic so a token stream cannot change
-// because two implementations measured within noise. Regenerate the table
-// with the bench sweep when the hardware or the kernels change.
-AttnImpl attn_auto_pick(int head_dim, int gqa, bool window) {
-  (void)window;
+// Prefill implementation choice for a shape class: the hand-written kernel
+// ("own") or the generated FA-2 kernel at a (br, bc, dps) tile config.
+struct AttnChoice {
+  AttnImpl impl = AttnImpl::Own;
+  int br = 0;
+  int bc = 0;
+  int dps = 0;
+};
+
+bool attn_same_choice(const AttnChoice &a, const AttnChoice &b) {
+  if (a.impl != b.impl) return false;
+  return a.impl == AttnImpl::Own ||
+         (a.br == b.br && a.bc == b.bc && a.dps == b.dps);
+}
+
+std::string attn_choice_name(const AttnChoice &c) {
+  if (c.impl == AttnImpl::Own) return "own";
+  return "codegen:" + std::to_string(c.br) + "," + std::to_string(c.bc) + "," +
+         std::to_string(c.dps);
+}
+
+// The static per-shape-class choice: what auto used before the runtime tuner
+// existed, and what it still uses when tuning is off (SONICBOOM_AUTOTUNE=0)
+// or unavailable (graph capture). The tuner measures these same defaults
+// first and keeps them unless a candidate wins by the switch margin.
+AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // d64 (Qwen2.5, GQA 7): own wins both legs after the split-KV decode
   // landed. Prefill 256 queries: own 0.081 ms vs codegen 0.138 ms (default
   // 64x64; the best swept config 64,32,4 is a tie at 0.081 and is not worth
   // the reduction-order change). Decode via attention_bench: 513 keys own
   // 21.8 us vs generated 38.6; 4097 keys 156.7 vs 181.4. The generated
   // kernel's lead at d256/d512 does not transfer to the narrow head.
-  if (gqa == 7 && head_dim == 64) return AttnImpl::Own;
+  if (gqa == 7 && head_dim == 64) return {AttnImpl::Own, 0, 0, 0};
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
   // (0.318/0.231 ms vs own 0.424/0.243).
-  if (gqa == 4 && head_dim == 256) return AttnImpl::Codegen;
   // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
-  // own keeps a 13% prefill lead. Decode dominates a
-  // 64-token generation (64 steps vs one prefill), and the per-shape choice
-  // cannot depend on n (batch invariance), so auto takes codegen here too.
-  if (gqa == 4 && head_dim == 512) return AttnImpl::Codegen;
-  return AttnImpl::Own;
+  // own keeps a 13% prefill lead. The static table keeps codegen here; the
+  // tune-time measurement decides for the prefill leg (the decode leg has
+  // its own, separately switched implementation).
+  if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
+    if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
+      return {AttnImpl::Codegen, s->br, s->bc, s->dps};
+  }
+  return {AttnImpl::Own, 0, 0, 0};
+}
+
+// Launch the hand-written tiled kernel for the tuned shape classes, so the
+// tuner can time it with the same synthetic buffers as the generated kernel.
+bool attn_launch_own(int head_dim, int gqa, const float *q,
+                     const float *k_batch, const float *v_batch,
+                     const float *k_cache, const float *v_cache,
+                     const uint64_t *start, uint64_t n_slots, int n,
+                     int n_heads_q, int n_heads_kv, uint64_t sliding_window,
+                     float scale, float *out) {
+  if (gqa == 4 && head_dim == 256)
+    return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (gqa == 4 && head_dim == 512)
+    return launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (gqa == 7 && head_dim == 64)
+    return launch_tiled_flash_attention<64, 64, 2, 32, 7>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  return false;
+}
+
+// --- Step 7: per-GPU runtime tuning -----------------------------------
+//
+// The class default is timed once per (shape class, GPU) and every supported
+// generated (br, bc, dps) plus "own" is timed against it; the winner is
+// persisted in the autotune cache (planner/autotune.h) and reused. The
+// synthetic call is a canonical prefill chunk at position 0, so the search
+// never sees the caller's batch size or position and a reused prefix resolves
+// to the same config as a full prefill (batch invariance).
+constexpr int kAttnTuneQueries = 256;
+constexpr uint64_t kAttnTuneSlots = 256;
+// A candidate must beat the class default by this fraction to replace it.
+// The defaults are the measured 3050 winners; the margin keeps a re-measurement
+// of equal kernels from changing the default token stream.
+constexpr double kAttnSwitchMargin = 0.03;
+
+bool attn_capturing() {
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(cur_stream(), &st) != cudaSuccess ||
+         st != cudaStreamCaptureStatusNone;
+}
+
+struct AttnTuneBufs {
+  float *q = nullptr, *kb = nullptr, *vb = nullptr, *kc = nullptr,
+        *vc = nullptr, *out = nullptr;
+  uint64_t *start = nullptr;
+  ~AttnTuneBufs() {
+    for (float *p : {q, kb, vb, kc, vc, out})
+      if (p) cudaFree(p);
+    if (start) cudaFree(start);
+  }
+};
+
+AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
+                             int n_heads_kv, uint64_t window_len, bool window,
+                             const AttnChoice &def, double &tune_s,
+                             int &candidate_count) {
+  const auto t0 = std::chrono::steady_clock::now();
+  candidate_count = 0;
+
+  // Search space from the device limits: the generator's own shape rules
+  // (16-row sub-tiles, dps <= 8, DC <= 128, 32-warp blocks, 96 KiB) plus the
+  // device's shared-memory and thread limits.
+  int dev = 0, max_smem = 96 * 1024, max_threads = 1024;
+  if (cudaGetDevice(&dev) == cudaSuccess) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) == cudaSuccess &&
+        v > 0)
+      max_smem = v;
+    v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxThreadsPerBlock, dev) ==
+            cudaSuccess &&
+        v > 0)
+      max_threads = v;
+  }
+
+  std::vector<AttnChoice> cands{def};
+  for (int dps : {1, 2, 4, 8})
+    for (int bc : {16, 32, 48, 64})
+      for (int br : {16, 32, 48, 64}) {
+        const compiler::AttentionShape s{
+            .head_dim = head_dim, .gqa = gqa, .window_mask = window,
+            .br = br, .bc = bc, .dps = dps};
+        if (!compiler::attention_shape_supported(s)) continue;
+        if (compiler::attention_shared_bytes(s) > max_smem) continue;
+        if (compiler::attention_block_threads(s) > max_threads) continue;
+        const AttnChoice c{AttnImpl::Codegen, br, bc, dps};
+        bool dup = false;
+        for (const AttnChoice &x : cands)
+          if (attn_same_choice(x, c)) {
+            dup = true;
+            break;
+          }
+        if (!dup) cands.push_back(c);
+      }
+
+  AttnTuneBufs b;
+  const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;
+  const size_t kv_n = size_t(kAttnTuneQueries) * n_heads_kv * head_dim;
+  const size_t c_n = size_t(kAttnTuneSlots) * n_heads_kv * head_dim;
+  bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
+  ok = ok &&
+       cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
+           cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    tune_s = 0.0;
+    return def;
+  }
+  // Zeroed inputs: the kernel's work is data-independent (no early exits), and
+  // zeros keep denormals out of the timing.
+  cudaMemsetAsync(b.q, 0, q_n * 4, cur_stream());
+  cudaMemsetAsync(b.kb, 0, kv_n * 4, cur_stream());
+  cudaMemsetAsync(b.vb, 0, kv_n * 4, cur_stream());
+  cudaMemsetAsync(b.kc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.vc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
+  const uint64_t zero = 0;
+  ok = cudaMemcpyAsync(b.start, &zero, sizeof(zero), cudaMemcpyHostToDevice,
+                       cur_stream()) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    tune_s = 0.0;
+    return def;
+  }
+
+  const float scale = 1.0f / std::sqrt(float(head_dim));
+  const uint64_t w = window ? window_len : 0;
+  auto launch = [&](const AttnChoice &c) {
+    if (c.impl == AttnImpl::Own)
+      return attn_launch_own(head_dim, gqa, b.q, b.kb, b.vb, b.kc, b.vc,
+                             b.start, kAttnTuneSlots, kAttnTuneQueries,
+                             n_heads_q, n_heads_kv, w, scale, b.out);
+    const compiler::AttentionShape s{
+        .head_dim = head_dim, .gqa = gqa, .window_mask = window,
+        .br = c.br, .bc = c.bc, .dps = c.dps};
+    return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
+                               kAttnTuneSlots, kAttnTuneQueries, n_heads_q,
+                               n_heads_kv, w, scale, b.out);
+  };
+
+  candidate_count = int(cands.size());
+  const double def_ms =
+      ::sonicboom::tune::median_launch_ms([&] { return launch(def); },
+                                          cur_stream(), 2, 5);
+  AttnChoice best = def;
+  double best_ms = def_ms;
+  for (size_t i = 1; i < cands.size(); ++i) {
+    const double ms =
+        ::sonicboom::tune::median_launch_ms([&] { return launch(cands[i]); },
+                                            cur_stream(), 2, 5);
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
+      best = cands[i];
+      best_ms = ms;
+    }
+  }
+  if (best_ms <= 0.0)
+    best = def;
+  else if (!attn_same_choice(best, def) && def_ms > 0.0 &&
+           !(best_ms < def_ms * (1.0 - kAttnSwitchMargin)))
+    best = def;  // within the noise margin: keep the measured default
+
+  tune_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count();
+  return best;
+}
+
+std::mutex g_attn_choice_mutex;
+std::unordered_map<std::string, AttnChoice> g_attn_choice;
+
+std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
+                          bool window, uint64_t window_len) {
+  std::string k = compiler::attention_codegen_version();
+  k += "|prefill-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
+       "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
+       "-m" + (window ? "window" : "causal");
+  if (window) k += "-w" + std::to_string(window_len);
+  return k;
+}
+
+bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
+                             int gqa, bool window, AttnChoice &out) {
+  const auto get = [&v](const char *name, int &dst) {
+    const auto it = v.find(name);
+    if (it == v.end()) return false;
+    dst = it->second;
+    return true;
+  };
+  int impl = 0;
+  if (!get("impl", impl)) return false;
+  if (impl == 0) {
+    out = {AttnImpl::Own, 0, 0, 0};
+    return true;
+  }
+  int br = 0, bc = 0, dps = 0;
+  if (!get("br", br) || !get("bc", bc) || !get("dps", dps)) return false;
+  const compiler::AttentionShape s{
+      .head_dim = head_dim, .gqa = gqa, .window_mask = window,
+      .br = br, .bc = bc, .dps = dps};
+  if (!compiler::attention_shape_supported(s)) return false;
+  out = {AttnImpl::Codegen, br, bc, dps};
+  return true;
+}
+
+// Resolve the prefill implementation for a shape class: cached choice, else a
+// tuning run on synthetic inputs, else the static default. The key is the
+// shape class (head count included) and the generated-code version; it never
+// includes the batch size or position.
+AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
+                        bool window, uint64_t window_len) {
+  const AttnChoice def = attn_default_choice(head_dim, gqa, window);
+  if (!::sonicboom::tune::enabled()) return def;
+  // Only the classes the generator covers can be tuned; the rest keep own.
+  if (!attn_codegen_default_shape(head_dim, gqa, window)) return def;
+
+  const std::string key =
+      attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv, window, window_len);
+  {
+    std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
+    const auto it = g_attn_choice.find(key);
+    if (it != g_attn_choice.end()) return it->second;
+  }
+
+  AttnChoice choice = def;
+  bool have = false;
+  const std::map<std::string, int> cached =
+      ::sonicboom::tune::lookup("attention-prefill", key);
+  if (!cached.empty() &&
+      attn_choice_from_values(cached, head_dim, gqa, window, choice))
+    have = true;
+
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (!have) {
+    if (attn_capturing()) return def;  // host timing is illegal in a capture
+    double tune_s = 0.0;
+    int candidate_count = 0;
+    choice = attn_tune_prefill(head_dim, gqa, n_heads_q, n_heads_kv, window_len,
+                               window, def, tune_s, candidate_count);
+    std::map<std::string, int> values{
+        {"impl", choice.impl == AttnImpl::Codegen ? 1 : 0},
+        {"br", choice.br},
+        {"bc", choice.bc},
+        {"dps", choice.dps}};
+    ::sonicboom::tune::store("attention-prefill", key, values);
+    if (verbose)
+      std::fprintf(stderr,
+                   "[autotune] attention-prefill %s default=%s chosen=%s "
+                   "candidates=%d tune=%.2f s\n",
+                   key.c_str(), attn_choice_name(def).c_str(),
+                   attn_choice_name(choice).c_str(), candidate_count, tune_s);
+  } else if (verbose) {
+    std::fprintf(stderr, "[autotune] attention-prefill %s cached=%s\n",
+                 key.c_str(), attn_choice_name(choice).c_str());
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
+    g_attn_choice[key] = choice;
+  }
+  return choice;
+}
+
+// --- Step 7: decode chunk length for the generated split-KV pair ----------
+//
+// The generated flash-decoding pair is the explicit ablation arm
+// (SONICBOOM_ATTN_DECODE=codegen) because its reduction order does not match
+// the hand-written kernel bit-for-bit; the default path keeps own and its own
+// chunk rule. Within that arm the chunk length C trades grid width against
+// per-block work, and it is a pure runtime argument (generated text unchanged).
+// The choice is keyed by shape class + window extent, never by position.
+constexpr uint64_t kAttnDecodeTuneChunks[] = {8, 16, 32, 64};
+// The synthetic extent: the full window when it is small, capped so the
+// partial buffer stays bounded (a 32k-key extent would need hundreds of MB of
+// tuning scratch). The choice is made once per class; the kernel itself still
+// runs the real extent.
+constexpr uint64_t kAttnDecodeTuneMaxExtent = 4096;
+
+std::mutex g_attn_decode_key_mutex;
+std::unordered_map<std::string, uint64_t> g_attn_decode_chunk;
+
+uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
+                                   int n_heads_kv, uint64_t max_window,
+                                   uint64_t sliding_window,
+                                   uint64_t default_chunk) {
+  if (!::sonicboom::tune::enabled()) return default_chunk;
+  compiler::AttentionShape dsh;
+  dsh.head_dim = head_dim;
+  dsh.gqa = gqa;
+  dsh.window_mask = sliding_window != 0;
+  dsh.decode = true;
+  if (!compiler::attention_shape_supported(dsh)) return default_chunk;
+
+  std::string key = compiler::attention_codegen_version();
+  key += "|decode-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
+         "-h" + std::to_string(n_heads_q) + "-kv" +
+         std::to_string(n_heads_kv) + "-m" +
+         (sliding_window != 0 ? "window" : "causal");
+  key += "-w" + std::to_string(max_window);
+
+  {
+    std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
+    const auto it = g_attn_decode_chunk.find(key);
+    if (it != g_attn_decode_chunk.end()) return it->second;
+  }
+
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (const std::map<std::string, int> cached =
+          ::sonicboom::tune::lookup("attention-decode", key);
+      !cached.empty()) {
+    const auto it = cached.find("chunk");
+    if (it != cached.end() && it->second > 0 &&
+        (uint64_t)it->second <= (uint64_t)compiler::kAttentionDecodeMaxChunk) {
+      const uint64_t c = (uint64_t)it->second;
+      std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
+      g_attn_decode_chunk[key] = c;
+      if (verbose)
+        std::fprintf(stderr, "[autotune] attention-decode %s cached=chunk %llu\n",
+                     key.c_str(), (unsigned long long)c);
+      return c;
+    }
+  }
+  if (attn_capturing()) return default_chunk;
+
+  const uint64_t extent =
+      std::min<uint64_t>(std::max<uint64_t>(max_window, 1),
+                         kAttnDecodeTuneMaxExtent);
+  const uint64_t slots = std::min<uint64_t>(extent, 512);
+  AttnTuneBufs b;
+  const size_t q_n = size_t(n_heads_q) * head_dim;
+  bool ok =
+      cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
+  ok = ok &&
+       cudaMalloc(reinterpret_cast<void **>(&b.kc), slots * n_heads_kv * head_dim * 4) ==
+           cudaSuccess;
+  ok = ok &&
+       cudaMalloc(reinterpret_cast<void **>(&b.vc), slots * n_heads_kv * head_dim * 4) ==
+           cudaSuccess;
+  ok = ok &&
+       cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
+                 cudaSuccess;
+  // Partial scratch sized for the smallest chunk (the most chunks).
+  uint64_t max_chunks = 0;
+  for (uint64_t c : kAttnDecodeTuneChunks)
+    max_chunks = std::max<uint64_t>(max_chunks, (extent + c - 1) / c);
+  max_chunks = std::max<uint64_t>(max_chunks, (extent + default_chunk - 1) /
+                                                  default_chunk);
+  float *partial = nullptr;
+  const size_t partial_floats =
+      size_t(max_chunks) * size_t(n_heads_q) * size_t(head_dim + 2);
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&partial),
+                        partial_floats * 4) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    if (partial) cudaFree(partial);
+    return default_chunk;
+  }
+  // Zeroed inputs: data-independent work, no denormals in the timing.
+  cudaMemsetAsync(b.q, 0, q_n * 4, cur_stream());
+  cudaMemsetAsync(b.kc, 0, slots * n_heads_kv * head_dim * 4, cur_stream());
+  cudaMemsetAsync(b.vc, 0, slots * n_heads_kv * head_dim * 4, cur_stream());
+  cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
+  cudaMemsetAsync(partial, 0, partial_floats * 4, cur_stream());
+  // One full window of keys is valid: start = 0 when the extent does not
+  // exceed the window, so the whole synthetic ring is exercised.
+  const uint64_t pos_host = extent - 1;
+  ok = cudaMemcpyAsync(b.start, &pos_host, sizeof(pos_host),
+                       cudaMemcpyHostToDevice, cur_stream()) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    cudaFree(partial);
+    return default_chunk;
+  }
+
+  const auto t0 = std::chrono::steady_clock::now();
+  auto launch = [&](uint64_t c) {
+    const uint64_t n_chunks = (extent + c - 1) / c;
+    const float *qa = b.q;
+    const float *kca = b.kc;
+    const float *vca = b.vc;
+    const uint64_t *startp = b.start;
+    uint64_t nslots_arg = slots;
+    int nhq_arg = n_heads_q;
+    int nhkv_arg = n_heads_kv;
+    uint64_t win_arg = sliding_window;
+    float scale_arg = 1.0f / std::sqrt(float(head_dim));
+    uint64_t chunk_arg = c;
+    float *out_arg = b.out;
+    int nch_arg = int(n_chunks);
+    void *args[13] = {&qa,        &kca,       &vca,        &startp,
+                      &nslots_arg, &nhq_arg,  &nhkv_arg,   &win_arg,
+                      &scale_arg, &partial,   &chunk_arg,  &out_arg,
+                      &nch_arg};
+    return planner::glue::launch_attention_decode(dsh, args, int(n_chunks),
+                                                  n_heads_q);
+  };
+
+  const double def_ms =
+      ::sonicboom::tune::median_launch_ms([&] { return launch(default_chunk); },
+                                          cur_stream(), 2, 5);
+  uint64_t best = default_chunk;
+  double best_ms = def_ms;
+  for (uint64_t c : kAttnDecodeTuneChunks) {
+    if (c == default_chunk || c > (uint64_t)compiler::kAttentionDecodeMaxChunk)
+      continue;
+    const double ms =
+        ::sonicboom::tune::median_launch_ms([&] { return launch(c); },
+                                            cur_stream(), 2, 5);
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
+      best = c;
+      best_ms = ms;
+    }
+  }
+  if (best_ms <= 0.0)
+    best = default_chunk;
+  else if (best != default_chunk && def_ms > 0.0 &&
+           !(best_ms < def_ms * (1.0 - kAttnSwitchMargin)))
+    best = default_chunk;
+  cudaFree(partial);
+
+  ::sonicboom::tune::store("attention-decode", key, {{"chunk", int(best)}});
+  if (verbose)
+    std::fprintf(stderr,
+                 "[autotune] attention-decode %s default_chunk=%llu "
+                 "chosen_chunk=%llu default=%.4f ms chosen=%.4f ms tune=%.2f s\n",
+                 key.c_str(), (unsigned long long)default_chunk,
+                 (unsigned long long)best, def_ms, best_ms,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                               t0)
+                     .count());
+
+  {
+    std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
+    g_attn_decode_chunk[key] = best;
+  }
+  return best;
 }
 
 } // namespace
@@ -2918,14 +3417,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   const int gqa = n_heads_q / n_heads_kv;
 
   // Attention implementation switch (v1 Stages 2-3). "auto" (default)
-  // resolves the shape class through the measured table (attn_auto_pick);
-  // its key is the shape, not the batch size, so a reused prefix takes the
-  // same path as a full prefill. "own" pins the native tiled kernel below,
-  // "codegen" the compiler-generated FA-2 kernel; the pinned implementations
-  // fall back to the native kernel for shapes they do not cover. "ggml" was
-  // the imported mma kernel, now retired: it maps to "auto" (once, with a
-  // warning) rather than failing, so an old script still runs the measured
-  // choice instead of silently changing behavior.
+  // resolves the shape class through the runtime tuner (attn_resolve, Step 7)
+  // or its static defaults when tuning is off; its key is the shape class and
+  // not the batch size, so a reused prefix takes the same path as a full
+  // prefill. "own" pins the native tiled kernel below, "codegen" the
+  // compiler-generated FA-2 kernel; the pinned implementations fall back to
+  // the native kernel for shapes they do not cover. "ggml" was the imported
+  // mma kernel, now retired: it maps to "auto" (once, with a warning) rather
+  // than failing, so an old script still runs the measured choice instead of
+  // silently changing behavior.
   const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
   std::string_view attn_impl =
       attn_impl_env ? std::string_view(attn_impl_env) : std::string_view("auto");
@@ -2939,35 +3439,47 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     (void)warned;
     attn_impl = "auto";
   }
-  bool try_codegen = attn_impl == "codegen";
-  if (attn_impl == "auto") {
-    const AttnImpl pick = attn_auto_pick(head_dim, gqa, sliding_window != 0);
-    try_codegen = pick == AttnImpl::Codegen;
+  std::optional<compiler::AttentionShape> shape;
+  if (attn_impl == "codegen") {
+    shape = attn_codegen_shape(head_dim, gqa, sliding_window != 0);
+  } else if (attn_impl == "auto") {
+    const bool windowed = sliding_window != 0;
+    if (std::getenv("SONICBOOM_ATTN_CODEGEN") != nullptr &&
+        attn_default_choice(head_dim, gqa, windowed).impl == AttnImpl::Codegen) {
+      // Explicit tile pin (the Stage 3c sweep): codegen at that config. The
+      // pin does not move a class whose measured default is own.
+      shape = attn_codegen_shape(head_dim, gqa, windowed);
+    } else {
+      const AttnChoice c = attn_resolve(head_dim, gqa, n_heads_q, n_heads_kv,
+                                        windowed, sliding_window);
+      if (c.impl == AttnImpl::Codegen) {
+        const compiler::AttentionShape s{
+            .head_dim = head_dim, .gqa = gqa, .window_mask = windowed,
+            .br = c.br, .bc = c.bc, .dps = c.dps};
+        if (compiler::attention_shape_supported(s)) shape = s;
+      }
+    }
   }
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
   // A shape without a generator (or a failed compile) falls through to the
   // hand-written kernels below.
-  if (try_codegen) {
-    if (const auto shape = attn_codegen_shape(
-            head_dim, gqa, sliding_window != 0)) {
-      if (attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache,
-                              start, n_slots, n, n_heads_q, n_heads_kv,
-                              sliding_window, scale, out)) {
-        if (attn_trace_on()) {
-          const std::string cfg =
-              std::to_string(shape->br) + "," + std::to_string(shape->bc) +
-              "," + std::to_string(shape->dps);
-          attn_trace_prefill(
-              attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
-              "codegen", cfg.c_str(), shape->br, shape->bc,
-              (n + shape->br - 1) / shape->br, n_heads_q,
-              compiler::attention_block_threads(*shape),
-              (size_t)compiler::attention_shared_bytes(*shape));
-        }
-        return true;
-      }
+  if (shape &&
+      attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache, start,
+                          n_slots, n, n_heads_q, n_heads_kv, sliding_window,
+                          scale, out)) {
+    if (attn_trace_on()) {
+      const std::string cfg = std::to_string(shape->br) + "," +
+                              std::to_string(shape->bc) + "," +
+                              std::to_string(shape->dps);
+      attn_trace_prefill(
+          attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
+          "codegen", cfg.c_str(), shape->br, shape->bc,
+          (n + shape->br - 1) / shape->br, n_heads_q,
+          compiler::attention_block_threads(*shape),
+          (size_t)compiler::attention_shared_bytes(*shape));
     }
+    return true;
   }
 
   if (gqa == 4 && head_dim == 256) {

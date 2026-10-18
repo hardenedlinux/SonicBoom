@@ -22,6 +22,7 @@
 
 #include "../nn/cuda_stream.h"
 
+#include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
 #include "ggml_derived/mmvq_q8_1.cuh"
@@ -41,7 +42,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 
@@ -1577,6 +1580,30 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
     if (it != g_mmq_j_choice.end()) return it->second;
     if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return fallback;
   }
+
+  // Step 7: the same choice persisted per (GPU, op, class). J only selects
+  // the token-tile width (the fixed split-K pieces and the K-reduction order
+  // are J-independent), so a value restored from disk cannot change numerics;
+  // the decomposition is not stored and still comes from the class policy.
+  const std::string disk_key =
+      std::string("t") + std::to_string(Type) + "-M" + std::to_string(M) +
+      "-n" + std::to_string(n) + "-bpr" + std::to_string(bpr) + "-d" +
+      std::to_string(int(want));
+  {
+    const std::map<std::string, int> cached =
+        ::sonicboom::tune::lookup("mmq-j", disk_key);
+    const auto it = cached.find("j");
+    if (it != cached.end()) {
+      for (int J : kMmqTuneJs)
+        if (J == it->second) {
+          const MmqChoice c{it->second, fallback.decomp};
+          std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+          g_mmq_j_choice.emplace(key, c);
+          return c;
+        }
+    }
+  }
+
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
@@ -1634,6 +1661,7 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
     g_mmq_j_choice.emplace(key, best);
   }
+  ::sonicboom::tune::store("mmq-j", disk_key, {{"j", best.j}});
   if (verbose)
     std::fprintf(stderr,
                  "[autotune] mmq type=%d M=%d n=%d bpr=%d decomp=%s J=%d "
