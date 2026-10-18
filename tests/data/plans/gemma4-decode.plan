@@ -4,8 +4,8 @@ model gemma4
 mode decode
 n_ctx 512
 n 1
-plan_id 2182694237643414419
-model_fingerprint 6260846858821006496
+plan_id 17824671683519070966
+model_fingerprint 8378948288563517534
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6
 steps 1074
@@ -104,14 +104,17 @@ step 13 task 13 node 14 op quantized_matmul_q8 backend sonic stream s0
 step 14 task 14 node 17 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 0
   attr rope 0
   buf in 0 t16 buffer b14 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t19 buffer b15 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 15 task 15 node 19 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 0
   attr rope 1
   attr slot 10
@@ -120,6 +123,7 @@ step 15 task 15 node 19 op fused_region backend sonic stream s0
   buf out 0 t21 buffer b16 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 16 task 16 node 20 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 0
   attr layer 0
   buf in 0 t14 buffer b12 offset 0 size 8192 shape [2048] dtype float32
@@ -127,8 +131,6 @@ step 16 task 16 node 20 op attention backend sonic stream s0
   buf in 2 t19 buffer b15 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t22 buffer b17 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 17 task 17 node 1189 op quantize backend sonic stream s0
@@ -298,14 +300,17 @@ step 40 task 40 node 45 op quantized_matmul_q8 backend sonic stream s0
 step 41 task 41 node 48 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 1
   attr rope 0
   buf in 0 t47 buffer b37 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t50 buffer b38 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 42 task 42 node 50 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 1
   attr rope 1
   attr slot 10
@@ -314,6 +319,7 @@ step 42 task 42 node 50 op fused_region backend sonic stream s0
   buf out 0 t52 buffer b39 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 43 task 43 node 51 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 1
   attr layer 1
   buf in 0 t45 buffer b35 offset 0 size 8192 shape [2048] dtype float32
@@ -321,8 +327,6 @@ step 43 task 43 node 51 op attention backend sonic stream s0
   buf in 2 t50 buffer b38 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t53 buffer b40 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 44 task 44 node 1193 op quantize backend sonic stream s0
@@ -492,14 +496,17 @@ step 67 task 67 node 76 op quantized_matmul_q8 backend sonic stream s0
 step 68 task 68 node 79 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 2
   attr rope 0
   buf in 0 t78 buffer b60 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t81 buffer b61 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 69 task 69 node 81 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 2
   attr rope 1
   attr slot 10
@@ -508,6 +515,7 @@ step 69 task 69 node 81 op fused_region backend sonic stream s0
   buf out 0 t83 buffer b62 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 70 task 70 node 82 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 2
   attr layer 2
   buf in 0 t76 buffer b58 offset 0 size 8192 shape [2048] dtype float32
@@ -515,8 +523,6 @@ step 70 task 70 node 82 op attention backend sonic stream s0
   buf in 2 t81 buffer b61 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t84 buffer b63 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 71 task 71 node 1197 op quantize backend sonic stream s0
@@ -686,14 +692,17 @@ step 94 task 94 node 107 op quantized_matmul_q8 backend sonic stream s0
 step 95 task 95 node 110 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 3
   attr rope 0
   buf in 0 t109 buffer b83 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t112 buffer b84 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 96 task 96 node 112 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 3
   attr rope 1
   attr slot 10
@@ -702,6 +711,7 @@ step 96 task 96 node 112 op fused_region backend sonic stream s0
   buf out 0 t114 buffer b85 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 97 task 97 node 113 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 3
   attr layer 3
   buf in 0 t107 buffer b81 offset 0 size 8192 shape [2048] dtype float32
@@ -709,8 +719,6 @@ step 97 task 97 node 113 op attention backend sonic stream s0
   buf in 2 t112 buffer b84 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t115 buffer b86 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 98 task 98 node 1201 op quantize backend sonic stream s0
@@ -880,14 +888,17 @@ step 121 task 121 node 138 op quantized_matmul_q8 backend sonic stream s0
 step 122 task 122 node 141 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 4
   attr rope 0
   buf in 0 t140 buffer b106 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t143 buffer b107 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 123 task 123 node 143 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 4
   attr rope 1
   attr slot 10
@@ -896,6 +907,7 @@ step 123 task 123 node 143 op fused_region backend sonic stream s0
   buf out 0 t145 buffer b108 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 124 task 124 node 144 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 4
   attr layer 4
   buf in 0 t138 buffer b104 offset 0 size 8192 shape [2048] dtype float32
@@ -903,8 +915,6 @@ step 124 task 124 node 144 op attention backend sonic stream s0
   buf in 2 t143 buffer b107 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t146 buffer b109 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 125 task 125 node 1205 op quantize backend sonic stream s0
@@ -1074,14 +1084,17 @@ step 148 task 148 node 169 op quantized_matmul_q8 backend sonic stream s0
 step 149 task 149 node 172 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 5
   attr rope 0
   buf in 0 t171 buffer b129 offset 0 size 4096 shape [1024] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t174 buffer b130 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 150 task 150 node 174 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 5
   attr rope 1
   attr slot 10
@@ -1090,6 +1103,7 @@ step 150 task 150 node 174 op fused_region backend sonic stream s0
   buf out 0 t176 buffer b131 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 151 task 151 node 175 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 5
   attr layer 5
   buf in 0 t169 buffer b127 offset 0 size 16384 shape [4096] dtype float32
@@ -1097,8 +1111,6 @@ step 151 task 151 node 175 op attention backend sonic stream s0
   buf in 2 t174 buffer b130 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t177 buffer b132 offset 0 size 16384 shape [4096] dtype float32
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 152 task 152 node 1209 op quantize backend sonic stream s0
@@ -1268,14 +1280,17 @@ step 175 task 175 node 200 op quantized_matmul_q8 backend sonic stream s0
 step 176 task 176 node 203 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 6
   attr rope 0
   buf in 0 t202 buffer b152 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t205 buffer b153 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 177 task 177 node 205 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 6
   attr rope 1
   attr slot 10
@@ -1284,6 +1299,7 @@ step 177 task 177 node 205 op fused_region backend sonic stream s0
   buf out 0 t207 buffer b154 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 178 task 178 node 206 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 6
   attr layer 6
   buf in 0 t200 buffer b150 offset 0 size 8192 shape [2048] dtype float32
@@ -1291,8 +1307,6 @@ step 178 task 178 node 206 op attention backend sonic stream s0
   buf in 2 t205 buffer b153 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t208 buffer b155 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 179 task 179 node 1213 op quantize backend sonic stream s0
@@ -1462,14 +1476,17 @@ step 202 task 202 node 231 op quantized_matmul_q8 backend sonic stream s0
 step 203 task 203 node 234 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 7
   attr rope 0
   buf in 0 t233 buffer b175 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t236 buffer b176 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 204 task 204 node 236 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 7
   attr rope 1
   attr slot 10
@@ -1478,6 +1495,7 @@ step 204 task 204 node 236 op fused_region backend sonic stream s0
   buf out 0 t238 buffer b177 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 205 task 205 node 237 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 7
   attr layer 7
   buf in 0 t231 buffer b173 offset 0 size 8192 shape [2048] dtype float32
@@ -1485,8 +1503,6 @@ step 205 task 205 node 237 op attention backend sonic stream s0
   buf in 2 t236 buffer b176 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t239 buffer b178 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 206 task 206 node 1217 op quantize backend sonic stream s0
@@ -1656,14 +1672,17 @@ step 229 task 229 node 262 op quantized_matmul_q8 backend sonic stream s0
 step 230 task 230 node 265 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 8
   attr rope 0
   buf in 0 t264 buffer b198 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t267 buffer b199 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 231 task 231 node 267 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 8
   attr rope 1
   attr slot 10
@@ -1672,6 +1691,7 @@ step 231 task 231 node 267 op fused_region backend sonic stream s0
   buf out 0 t269 buffer b200 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 232 task 232 node 268 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 8
   attr layer 8
   buf in 0 t262 buffer b196 offset 0 size 8192 shape [2048] dtype float32
@@ -1679,8 +1699,6 @@ step 232 task 232 node 268 op attention backend sonic stream s0
   buf in 2 t267 buffer b199 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t270 buffer b201 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 233 task 233 node 1221 op quantize backend sonic stream s0
@@ -1850,14 +1868,17 @@ step 256 task 256 node 293 op quantized_matmul_q8 backend sonic stream s0
 step 257 task 257 node 296 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 9
   attr rope 0
   buf in 0 t295 buffer b221 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t298 buffer b222 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 258 task 258 node 298 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 9
   attr rope 1
   attr slot 10
@@ -1866,6 +1887,7 @@ step 258 task 258 node 298 op fused_region backend sonic stream s0
   buf out 0 t300 buffer b223 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 259 task 259 node 299 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 9
   attr layer 9
   buf in 0 t293 buffer b219 offset 0 size 8192 shape [2048] dtype float32
@@ -1873,8 +1895,6 @@ step 259 task 259 node 299 op attention backend sonic stream s0
   buf in 2 t298 buffer b222 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t301 buffer b224 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 260 task 260 node 1225 op quantize backend sonic stream s0
@@ -2044,14 +2064,17 @@ step 283 task 283 node 324 op quantized_matmul_q8 backend sonic stream s0
 step 284 task 284 node 327 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 10
   attr rope 0
   buf in 0 t326 buffer b244 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t329 buffer b245 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 285 task 285 node 329 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 10
   attr rope 1
   attr slot 10
@@ -2060,6 +2083,7 @@ step 285 task 285 node 329 op fused_region backend sonic stream s0
   buf out 0 t331 buffer b246 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 286 task 286 node 330 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 10
   attr layer 10
   buf in 0 t324 buffer b242 offset 0 size 8192 shape [2048] dtype float32
@@ -2067,8 +2091,6 @@ step 286 task 286 node 330 op attention backend sonic stream s0
   buf in 2 t329 buffer b245 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t332 buffer b247 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 287 task 287 node 1229 op quantize backend sonic stream s0
@@ -2238,14 +2260,17 @@ step 310 task 310 node 355 op quantized_matmul_q8 backend sonic stream s0
 step 311 task 311 node 358 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 11
   attr rope 0
   buf in 0 t357 buffer b267 offset 0 size 4096 shape [1024] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t360 buffer b268 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 312 task 312 node 360 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 11
   attr rope 1
   attr slot 10
@@ -2254,6 +2279,7 @@ step 312 task 312 node 360 op fused_region backend sonic stream s0
   buf out 0 t362 buffer b269 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 313 task 313 node 361 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 11
   attr layer 11
   buf in 0 t355 buffer b265 offset 0 size 16384 shape [4096] dtype float32
@@ -2261,8 +2287,6 @@ step 313 task 313 node 361 op attention backend sonic stream s0
   buf in 2 t360 buffer b268 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t363 buffer b270 offset 0 size 16384 shape [4096] dtype float32
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 314 task 314 node 1233 op quantize backend sonic stream s0
@@ -2432,14 +2456,17 @@ step 337 task 337 node 386 op quantized_matmul_q8 backend sonic stream s0
 step 338 task 338 node 389 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 12
   attr rope 0
   buf in 0 t388 buffer b290 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t391 buffer b291 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 339 task 339 node 391 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 12
   attr rope 1
   attr slot 10
@@ -2448,6 +2475,7 @@ step 339 task 339 node 391 op fused_region backend sonic stream s0
   buf out 0 t393 buffer b292 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 340 task 340 node 392 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 12
   attr layer 12
   buf in 0 t386 buffer b288 offset 0 size 8192 shape [2048] dtype float32
@@ -2455,8 +2483,6 @@ step 340 task 340 node 392 op attention backend sonic stream s0
   buf in 2 t391 buffer b291 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t394 buffer b293 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 341 task 341 node 1237 op quantize backend sonic stream s0
@@ -2626,14 +2652,17 @@ step 364 task 364 node 417 op quantized_matmul_q8 backend sonic stream s0
 step 365 task 365 node 420 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 13
   attr rope 0
   buf in 0 t419 buffer b313 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t422 buffer b314 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 366 task 366 node 422 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 13
   attr rope 1
   attr slot 10
@@ -2642,6 +2671,7 @@ step 366 task 366 node 422 op fused_region backend sonic stream s0
   buf out 0 t424 buffer b315 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 367 task 367 node 423 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 13
   attr layer 13
   buf in 0 t417 buffer b311 offset 0 size 8192 shape [2048] dtype float32
@@ -2649,8 +2679,6 @@ step 367 task 367 node 423 op attention backend sonic stream s0
   buf in 2 t422 buffer b314 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t425 buffer b316 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 368 task 368 node 1241 op quantize backend sonic stream s0
@@ -2820,14 +2848,17 @@ step 391 task 391 node 448 op quantized_matmul_q8 backend sonic stream s0
 step 392 task 392 node 451 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 14
   attr rope 0
   buf in 0 t450 buffer b336 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t453 buffer b337 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 393 task 393 node 453 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 14
   attr rope 1
   attr slot 10
@@ -2836,6 +2867,7 @@ step 393 task 393 node 453 op fused_region backend sonic stream s0
   buf out 0 t455 buffer b338 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 394 task 394 node 454 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 14
   attr layer 14
   buf in 0 t448 buffer b334 offset 0 size 8192 shape [2048] dtype float32
@@ -2843,8 +2875,6 @@ step 394 task 394 node 454 op attention backend sonic stream s0
   buf in 2 t453 buffer b337 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t456 buffer b339 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 395 task 395 node 1245 op quantize backend sonic stream s0
@@ -3014,14 +3044,17 @@ step 418 task 418 node 479 op quantized_matmul_q8 backend sonic stream s0
 step 419 task 419 node 482 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 15
   attr rope 0
   buf in 0 t481 buffer b359 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t484 buffer b360 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 420 task 420 node 484 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 15
   attr rope 1
   attr slot 10
@@ -3030,6 +3063,7 @@ step 420 task 420 node 484 op fused_region backend sonic stream s0
   buf out 0 t486 buffer b361 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 421 task 421 node 485 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 15
   attr layer 15
   buf in 0 t479 buffer b357 offset 0 size 8192 shape [2048] dtype float32
@@ -3037,8 +3071,6 @@ step 421 task 421 node 485 op attention backend sonic stream s0
   buf in 2 t484 buffer b360 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t487 buffer b362 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 422 task 422 node 1249 op quantize backend sonic stream s0
@@ -3208,14 +3240,17 @@ step 445 task 445 node 510 op quantized_matmul_q8 backend sonic stream s0
 step 446 task 446 node 513 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 16
   attr rope 0
   buf in 0 t512 buffer b382 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t515 buffer b383 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 447 task 447 node 515 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 16
   attr rope 1
   attr slot 10
@@ -3224,6 +3259,7 @@ step 447 task 447 node 515 op fused_region backend sonic stream s0
   buf out 0 t517 buffer b384 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 448 task 448 node 516 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 16
   attr layer 16
   buf in 0 t510 buffer b380 offset 0 size 8192 shape [2048] dtype float32
@@ -3231,8 +3267,6 @@ step 448 task 448 node 516 op attention backend sonic stream s0
   buf in 2 t515 buffer b383 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t518 buffer b385 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 449 task 449 node 1253 op quantize backend sonic stream s0
@@ -3402,14 +3436,17 @@ step 472 task 472 node 541 op quantized_matmul_q8 backend sonic stream s0
 step 473 task 473 node 544 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 17
   attr rope 0
   buf in 0 t543 buffer b405 offset 0 size 4096 shape [1024] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t546 buffer b406 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 474 task 474 node 546 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 17
   attr rope 1
   attr slot 10
@@ -3418,6 +3455,7 @@ step 474 task 474 node 546 op fused_region backend sonic stream s0
   buf out 0 t548 buffer b407 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 475 task 475 node 547 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 17
   attr layer 17
   buf in 0 t541 buffer b403 offset 0 size 16384 shape [4096] dtype float32
@@ -3425,8 +3463,6 @@ step 475 task 475 node 547 op attention backend sonic stream s0
   buf in 2 t546 buffer b406 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t549 buffer b408 offset 0 size 16384 shape [4096] dtype float32
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 476 task 476 node 1257 op quantize backend sonic stream s0
@@ -3596,14 +3632,17 @@ step 499 task 499 node 572 op quantized_matmul_q8 backend sonic stream s0
 step 500 task 500 node 575 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 18
   attr rope 0
   buf in 0 t574 buffer b428 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t577 buffer b429 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 501 task 501 node 577 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 18
   attr rope 1
   attr slot 10
@@ -3612,6 +3651,7 @@ step 501 task 501 node 577 op fused_region backend sonic stream s0
   buf out 0 t579 buffer b430 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 502 task 502 node 578 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 18
   attr layer 18
   buf in 0 t572 buffer b426 offset 0 size 8192 shape [2048] dtype float32
@@ -3619,8 +3659,6 @@ step 502 task 502 node 578 op attention backend sonic stream s0
   buf in 2 t577 buffer b429 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t580 buffer b431 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 503 task 503 node 1261 op quantize backend sonic stream s0
@@ -3790,14 +3828,17 @@ step 526 task 526 node 603 op quantized_matmul_q8 backend sonic stream s0
 step 527 task 527 node 606 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 19
   attr rope 0
   buf in 0 t605 buffer b451 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t608 buffer b452 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 528 task 528 node 608 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 19
   attr rope 1
   attr slot 10
@@ -3806,6 +3847,7 @@ step 528 task 528 node 608 op fused_region backend sonic stream s0
   buf out 0 t610 buffer b453 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 529 task 529 node 609 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 19
   attr layer 19
   buf in 0 t603 buffer b449 offset 0 size 8192 shape [2048] dtype float32
@@ -3813,8 +3855,6 @@ step 529 task 529 node 609 op attention backend sonic stream s0
   buf in 2 t608 buffer b452 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t611 buffer b454 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 530 task 530 node 1265 op quantize backend sonic stream s0
@@ -3984,14 +4024,17 @@ step 553 task 553 node 634 op quantized_matmul_q8 backend sonic stream s0
 step 554 task 554 node 637 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 20
   attr rope 0
   buf in 0 t636 buffer b474 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t639 buffer b475 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 555 task 555 node 639 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 20
   attr rope 1
   attr slot 10
@@ -4000,6 +4043,7 @@ step 555 task 555 node 639 op fused_region backend sonic stream s0
   buf out 0 t641 buffer b476 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 556 task 556 node 640 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 20
   attr layer 20
   buf in 0 t634 buffer b472 offset 0 size 8192 shape [2048] dtype float32
@@ -4007,8 +4051,6 @@ step 556 task 556 node 640 op attention backend sonic stream s0
   buf in 2 t639 buffer b475 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t642 buffer b477 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 557 task 557 node 1269 op quantize backend sonic stream s0
@@ -4178,14 +4220,17 @@ step 580 task 580 node 665 op quantized_matmul_q8 backend sonic stream s0
 step 581 task 581 node 668 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 21
   attr rope 0
   buf in 0 t667 buffer b497 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t670 buffer b498 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 582 task 582 node 670 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 21
   attr rope 1
   attr slot 10
@@ -4194,6 +4239,7 @@ step 582 task 582 node 670 op fused_region backend sonic stream s0
   buf out 0 t672 buffer b499 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 583 task 583 node 671 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 21
   attr layer 21
   buf in 0 t665 buffer b495 offset 0 size 8192 shape [2048] dtype float32
@@ -4201,8 +4247,6 @@ step 583 task 583 node 671 op attention backend sonic stream s0
   buf in 2 t670 buffer b498 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t673 buffer b500 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 584 task 584 node 1273 op quantize backend sonic stream s0
@@ -4372,14 +4416,17 @@ step 607 task 607 node 696 op quantized_matmul_q8 backend sonic stream s0
 step 608 task 608 node 699 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 22
   attr rope 0
   buf in 0 t698 buffer b520 offset 0 size 2048 shape [512] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t701 buffer b521 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 609 task 609 node 701 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 22
   attr rope 1
   attr slot 10
@@ -4388,6 +4435,7 @@ step 609 task 609 node 701 op fused_region backend sonic stream s0
   buf out 0 t703 buffer b522 offset 0 size 2048 shape [512] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 610 task 610 node 702 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 22
   attr layer 22
   buf in 0 t696 buffer b518 offset 0 size 8192 shape [2048] dtype float32
@@ -4395,8 +4443,6 @@ step 610 task 610 node 702 op attention backend sonic stream s0
   buf in 2 t701 buffer b521 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t704 buffer b523 offset 0 size 8192 shape [2048] dtype float32
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 2x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 611 task 611 node 1277 op quantize backend sonic stream s0
@@ -4566,14 +4612,17 @@ step 634 task 634 node 727 op quantized_matmul_q8 backend sonic stream s0
 step 635 task 635 node 730 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 2
   attr layer 23
   attr rope 0
   buf in 0 t729 buffer b543 offset 0 size 4096 shape [1024] dtype float32
+  buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t732 buffer b544 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 636 task 636 node 732 op fused_region backend sonic stream s0
   attr cast 1
   attr fused_region heads_norm_rope_cast
+  attr kv_store 1
   attr layer 23
   attr rope 1
   attr slot 10
@@ -4582,6 +4631,7 @@ step 636 task 636 node 732 op fused_region backend sonic stream s0
   buf out 0 t734 buffer b545 offset 0 size 4096 shape [1024] dtype float32
   launch heads_norm_rope_cast grid 2x1x1 block 256x1x1 smem 2560 stream s0
 step 637 task 637 node 733 op attention backend sonic stream s0
+  attr kv_appended 1
   attr kv_source_layer 23
   attr layer 23
   buf in 0 t727 buffer b541 offset 0 size 16384 shape [4096] dtype float32
@@ -4589,8 +4639,6 @@ step 637 task 637 node 733 op attention backend sonic stream s0
   buf in 2 t732 buffer b544 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t735 buffer b546 offset 0 size 16384 shape [4096] dtype float32
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
-  launch kv_append_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
   launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
   launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 638 task 638 node 1281 op quantize backend sonic stream s0

@@ -89,12 +89,7 @@ llvm::DenseSet<int64_t> q8_1Ids(const Graph &g) {
   return ids;
 }
 
-// The three ops whose cache access is a stated effect on the KVCacheResource
-// (BoomDialect.td): they carry their layer's `!boom.kv` handle.
-bool isCacheOp(OpKind op) {
-  return op == OpKind::Attention || op == OpKind::FlashAttention ||
-         op == OpKind::KvAppend;
-}
+bool isCacheOp(const GraphNodeDesc &n);
 
 std::optional<int64_t> intAttr(llvm::ArrayRef<sx::Attribute> attrs,
                                llvm::StringRef name) {
@@ -102,6 +97,17 @@ std::optional<int64_t> intAttr(llvm::ArrayRef<sx::Attribute> attrs,
     if (llvm::StringRef(a.name) == name && a.kind() == sx::AttrValueKind::Int)
       return std::get<int64_t>(a.value);
   return std::nullopt;
+}
+
+// The ops whose cache access is a stated effect on the KVCacheResource
+// (BoomDialect.td): they carry their layer's `!boom.kv` handle. The attention
+// prep region is one exactly when it performs the append itself (`kv_store`,
+// Stage 6d; BoomVerify.cpp states the same rule on the IR side).
+bool isCacheOp(const GraphNodeDesc &n) {
+  return n.op == OpKind::Attention || n.op == OpKind::FlashAttention ||
+         n.op == OpKind::KvAppend ||
+         (n.op == OpKind::FusedRegion &&
+          intAttr(n.attributes, "kv_store").value_or(0) != 0);
 }
 
 // The cache layer a cache-touching node reads/writes: a shared-KV attention
@@ -251,7 +257,7 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
   // entry; the cache itself stays keyed by layer in the backend.
   llvm::SmallVector<int64_t> cacheLayers;
   for (const GraphNodeDesc &n : graph.nodes) {
-    if (!isCacheOp(n.op))
+    if (!isCacheOp(n))
       continue;
     auto layer = cacheLayer(n);
     if (!layer) {
@@ -290,7 +296,7 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
 
     // The cache handle is the cache-touching op's last operand (BoomVerify.cpp
     // checks the placement and the layer).
-    if (isCacheOp(n.op))
+    if (isCacheOp(n))
       operands.push_back(kvOf[*cacheLayer(n)]);
 
     llvm::SmallVector<mlir::Type> results;

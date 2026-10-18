@@ -142,10 +142,24 @@ bool isAllSameShapeOp(llvm::StringRef opName) {
 }
 
 // The ops whose cache access is stated on the KVCacheResource (BoomDialect.td):
-// they carry the layer's `!boom.kv` handle as their last operand.
-bool carriesKvHandle(llvm::StringRef opName) {
-  return opName == "boom.attention" || opName == "boom.flash_attention" ||
-         opName == "boom.kv_append";
+// they carry the layer's `!boom.kv` handle as their last operand. A
+// `boom.fused_region` is a cache op exactly when it performs the append itself
+// (`kv_store`: 1 = K, 2 = V), which FuseKvAppendIntoPrepPass writes on the
+// attention-prep region and the backend reads to store instead of running
+// kv_append (Stage 6d).
+bool carriesKvHandle(Operation &op) {
+  const llvm::StringRef opName = op.getName().getStringRef();
+  if (opName == "boom.attention" || opName == "boom.flash_attention" ||
+      opName == "boom.kv_append")
+    return true;
+  if (opName != "boom.fused_region") return false;
+  auto attrs = op.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+  if (!attrs) return false;
+  for (Attribute entry : attrs) {
+    auto nodeAttr = mlir::dyn_cast<NodeAttr>(entry);
+    if (nodeAttr && nodeAttr.getName() == "kv_store") return true;
+  }
+  return false;
 }
 
 // The logical dimensions of any Boom value type. Every one of them carries a
@@ -365,7 +379,7 @@ mlir::LogicalResult GraphOp::verify() {
     bool sawKvHandle = false;
     for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
       if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
-        if (!carriesKvHandle(op.getName().getStringRef()))
+        if (!carriesKvHandle(op))
           return op.emitOpError()
                  << "reads a " << kv << " cache handle, but it does not access "
                     "the KV cache";
@@ -405,7 +419,7 @@ mlir::LogicalResult GraphOp::verify() {
                                          table[it->second])))
         return mlir::failure();
     }
-    if (carriesKvHandle(op.getName().getStringRef()) && !sawKvHandle)
+    if (carriesKvHandle(op) && !sawKvHandle)
       return op.emitOpError()
              << "accesses the KV cache but carries no !boom.kv handle operand";
 
@@ -719,7 +733,7 @@ mlir::LogicalResult StepOp::verify() {
     bool sawKvHandle = false;
     for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
       if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
-        if (!carriesKvHandle(opName))
+        if (!carriesKvHandle(op))
           return op.emitOpError()
                  << "reads a " << kv
                  << " cache handle, but it does not access the KV cache";
@@ -757,7 +771,7 @@ mlir::LogicalResult StepOp::verify() {
                                       table[it->second])))
         return mlir::failure();
     }
-    if (carriesKvHandle(opName) && !sawKvHandle)
+    if (carriesKvHandle(op) && !sawKvHandle)
       return op.emitOpError()
              << "accesses the KV cache but carries no !boom.kv handle operand";
 

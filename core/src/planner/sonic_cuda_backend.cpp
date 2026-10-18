@@ -557,14 +557,18 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // A KV layer appends its fp16-rounded K/V to the cache at slot
       // `pos % n_slots` (computed in-kernel from pos_buf_) before attending
       // (inputs {q, kc, vc}); a shared layer omits K/V and does not append
-      // (inputs {q}). The position comes from the device slot.
+      // (inputs {q}). The position comes from the device slot. When the prep
+      // regions already stored the row (Stage 6d: `kv_appended`), the append
+      // here is skipped and only the attention runs.
       int64_t ksrc = layer;
       attr_i(*node, "kv_source_layer", ksrc);
+      int64_t kv_appended = 0;
+      attr_i(*node, "kv_appended", kv_appended);
       const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
       KvCacheDev& cache = (*caches_)[cache_layer];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
-      if (in.size() >= 4) {
+      if (in.size() >= 4 && kv_appended == 0) {
         if (!cache.k_buf || !cache.v_buf ||
             !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                      dev(in[1]), dev(in[2]),
@@ -952,9 +956,31 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // carries layer/slot (and `batch` in prefill); `rope`/`cast` say which
         // chain this is. One 256-thread block per head: the head count is the
         // region node's element count / head_dim.
-        int64_t rope_i = 0, cast_i = 0, nb = 1;
+        int64_t rope_i = 0, cast_i = 0, kv_store = 0, nb = 1;
         attr_i(*node, "rope", rope_i);
         attr_i(*node, "cast", cast_i);
+        // Stage 6d: a KV layer's K/V prep region stores its own output row into
+        // that layer's cache (kv_store 1 = K, 2 = V); the attention node it
+        // feeds is marked `kv_appended` and skips its kv_append launches.
+        attr_i(*node, "kv_store", kv_store);
+        KvCacheDev* kv = nullptr;
+        int kv_slots = 0, kv_row = 0;
+        float* kv_dst = nullptr;
+        if (kv_store != 0) {
+          if (layer < 0 || size_t(layer) >= caches_->size() ||
+              !(*caches_)[layer].k_buf || !(*caches_)[layer].v_buf) {
+            ok = false;
+            break;
+          }
+          kv = &(*caches_)[layer];
+          kv_slots = int(kv->n_slots);
+          kv_row = int(kv->n_heads_kv * kv->head_dim);
+          kv_dst = dev_mut(kv_store == 1 ? kv->k_buf.id : kv->v_buf.id);
+          if (kv_slots <= 0 || kv_row <= 0 || kv_dst == nullptr) {
+            ok = false;
+            break;
+          }
+        }
         if (!batch_attr(nb)) nb = 1;
         const int dim = int(lc.head_dim);
         const int heads = dim > 0 ? out_n / dim : 0;
@@ -988,6 +1014,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                            lc.rope_base, 1.0f, ff);
           }
           if (ok && cast_i != 0) ok = nn::cuda::cast_fp16_dev(out, out_n);
+          // A cache-writing chain appends here too, so the fallback leaves the
+          // cache exactly as the generated kernel would have. kv_append writes
+          // both destinations; passing the one buffer for both is how a
+          // single-buffer append runs through the existing kernel.
+          if (ok && kv_store != 0) {
+            ok = nn::cuda::kv_append_dev(
+                kv_dst, kv_dst, out, out,
+                reinterpret_cast<const uint64_t*>(pos_slot()), kv->n_slots,
+                kv_row);
+          }
         };
         // The region is an optimization: a head wider than its shared stage
         // falls back to the reference chain (Gemma's global layers are 512,
@@ -1012,7 +1048,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         const float log_base = std::log(lc.rope_base);
         // The generated kernel's ABI: (x, w, has_w, y, pos, head_dim, eps,
-        // freq_scale, log_base, ff, heads_per_pos, do_rope, do_cast).
+        // freq_scale, log_base, ff, heads_per_pos, do_rope, do_cast, cache,
+        // n_slots, row_elems, do_store). The last four are the Stage 6d cache
+        // store; `cache` is null and `do_store` 0 for a chain that writes none.
         void* xarg = const_cast<float*>(dev(in[0]));
         void* warg = const_cast<void*>(wd);
         int haswarg = w.empty() ? 0 : 1;
@@ -1026,9 +1064,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         int hpparg = hpp;
         int ropearg = int(rope_i);
         int castarg = int(cast_i);
-        void* args[] = {&xarg,   &warg,   &haswarg, &yarg,   &posarg, &dimarg,
-                        &earg,   &fsarg,  &lbarg,   &ffarg,  &hpparg, &ropearg,
-                        &castarg};
+        void* carg = kv_dst;
+        int slotsarg = kv_slots;
+        int rowarg = kv_row;
+        int storearg = int(kv_store);
+        void* args[] = {&xarg,   &warg,    &haswarg, &yarg,   &posarg, &dimarg,
+                        &earg,   &fsarg,   &lbarg,   &ffarg,  &hpparg, &ropearg,
+                        &castarg, &carg,   &slotsarg, &rowarg, &storearg};
         ok = glue::launch(region, args, heads,
                           compiler::kHeadsNormRopeCastBlockThreads,
                           compiler::kHeadsNormRopeCastSharedBytes);

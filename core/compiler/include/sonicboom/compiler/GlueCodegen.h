@@ -59,7 +59,9 @@ enum class GlueRegionKind {
   // norm output is staged in shared memory because the rotation reads the
   // partner element (i, i + head_dim/2). The runtime flags `do_rope` and
   // `do_cast` cover the three chains the attention prep uses: Q norm->rope,
-  // K norm->rope->cast, V norm->cast.
+  // K norm->rope->cast, V norm->cast. On a KV layer's K/V chain the kernel
+  // also stores its output row into that layer's KV cache (`do_store`: 1 = K,
+  // 2 = V), replacing the two kv_append launches (Stage 6d).
   HeadsNormRopeCast,
   // Strided row slice + scale (slice_scale): one thread per output element,
   //   y[r*length + k] = x[offset + r*stride + k] * s.

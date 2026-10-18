@@ -603,6 +603,9 @@ if [ "$ABLATE" = 1 ]; then
     "add-rms-norm-fusion|FuseAddRmsNormMmqPass"
     "rms-norm-add-fusion|FuseRmsNormAddPass"
     "heads-norm-rope-cast-fusion|FuseHeadsNormRopeCastPass"
+    # Stage 6d: the KV append folded into that region. Disabling it restores the
+    # attention op's two kv_append launches per KV layer.
+    "kv-append-into-prep|FuseKvAppendIntoPrepPass"
     "slice-scale-fusion|FuseSliceScalePass"
     "gelu-mul-fusion|FuseGeluMulPass"
     "dense-layout|DenseLayoutPropagationPass"

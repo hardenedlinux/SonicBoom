@@ -437,9 +437,11 @@ void test_heads_norm_rope_cast(std::mt19937& rng, int heads, int dim,
     check(sonicboom::nn::cuda::cast_fp16_dev(ref, int(elems)),
           (tag + ": reference cast").c_str());
 
-  auto launch = [&](float* dst, int cast_flag) {
+  auto launch = [&](float* dst, int cast_flag, float* cache = nullptr,
+                    int store_flag = 0, int n_slots = 0, int row_elems = 0) {
     // Kernel ABI: (x, w, has_w, y, pos, head_dim, eps, freq_scale, log_base,
-    // ff, heads_per_pos, do_rope, do_cast).
+    // ff, heads_per_pos, do_rope, do_cast, cache, n_slots, row_elems,
+    // do_store). The last four are the Stage 6d cache store.
     void* xarg = xd;
     void* warg = with_weight ? static_cast<void*>(wd) : nullptr;
     int haswarg = with_weight ? 1 : 0;
@@ -453,9 +455,13 @@ void test_heads_norm_rope_cast(std::mt19937& rng, int heads, int dim,
     int hpparg = hpp;
     int ropearg = do_rope ? 1 : 0;
     int castarg = cast_flag;
-    void* args[] = {&xarg,   &warg,  &haswarg, &yarg,   &posarg, &dimarg,
-                    &earg,   &fsarg, &lbarg,   &ffarg,  &hpparg, &ropearg,
-                    &castarg};
+    void* carg = cache;
+    int slotsarg = n_slots;
+    int rowarg = row_elems;
+    int storearg = store_flag;
+    void* args[] = {&xarg,   &warg,    &haswarg, &yarg,  &posarg,  &dimarg,
+                    &earg,   &fsarg,   &lbarg,   &ffarg, &hpparg,  &ropearg,
+                    &castarg, &carg,   &slotsarg, &rowarg, &storearg};
     return sonicboom::planner::glue::launch(
         "heads_norm_rope_cast", args, heads,
         sonicboom::compiler::kHeadsNormRopeCastBlockThreads,
@@ -468,6 +474,40 @@ void test_heads_norm_rope_cast(std::mt19937& rng, int heads, int dim,
   if (do_rope && do_cast)
     check(launch(gen_pre, 0), (tag + ": generated pre-cast launch").c_str());
   check(cudaDeviceSynchronize() == cudaSuccess, "device synchronize");
+
+  // Stage 6d: a cache-writing chain stores the row it writes to y at slot
+  // (pos % n_slots) — the write Attention's kv_append made, now in this
+  // kernel. The stored row must be exactly the kernel's output row.
+  if (do_cast) {
+    const int n_slots = 3;
+    const size_t kv_bytes = size_t(n_slots) * elems * sizeof(float);
+    float* dkv = nullptr;
+    check(cudaMalloc(&dkv, kv_bytes) == cudaSuccess, "cudaMalloc kv");
+    if (!g_failures) {
+      check(cudaMemset(dkv, 0, kv_bytes) == cudaSuccess, "cudaMemset kv");
+      check(launch(gen, 1, dkv, 1, n_slots, int(elems)),
+            (tag + ": generated kv store").c_str());
+      check(cudaDeviceSynchronize() == cudaSuccess, (tag + ": kv store sync").c_str());
+      std::vector<float> kv(size_t(n_slots) * elems), row(elems);
+      cudaMemcpy(kv.data(), dkv, kv_bytes, cudaMemcpyDeviceToHost);
+      cudaMemcpy(row.data(), gen, xy_bytes, cudaMemcpyDeviceToHost);
+      const size_t slot = size_t(start_pos % uint64_t(n_slots));
+      const bool stored =
+          std::memcmp(kv.data() + slot * elems, row.data(), xy_bytes) == 0;
+      check(stored, (tag + ": kv store row equals the kernel output").c_str());
+      if (stored) {
+        // The other slots were written too only by the same kernel; they must
+        // still be the zero they started as (the store writes one row).
+        bool untouched = true;
+        for (size_t s = 0; s < size_t(n_slots) && untouched; ++s)
+          if (s != slot)
+            for (size_t i = 0; i < elems && untouched; ++i)
+              untouched = kv[s * elems + i] == 0.0f;
+        check(untouched, (tag + ": kv store wrote only its slot").c_str());
+      }
+    }
+    cudaFree(dkv);
+  }
 
   std::vector<float> got(elems), refv(elems), pre(elems);
   cudaMemcpy(got.data(), gen, xy_bytes, cudaMemcpyDeviceToHost);

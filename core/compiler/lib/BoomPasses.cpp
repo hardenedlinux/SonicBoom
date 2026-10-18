@@ -280,6 +280,22 @@ std::optional<double> nodeAttrFloat(mlir::ArrayAttr nodeAttrs,
   return std::nullopt;
 }
 
+// The string a node's attribute record carries for `name`, or nullopt. The
+// string-valued counterpart of nodeAttrInt/nodeAttrFloat (the region name and
+// the dense layout are the strings passes read).
+std::optional<llvm::StringRef> nodeAttrString(mlir::ArrayAttr nodeAttrs,
+                                             llvm::StringRef name) {
+  for (mlir::Attribute entry : nodeAttrs) {
+    auto attr = mlir::cast<boom::NodeAttr>(entry);
+    if (attr.getName() != name)
+      continue;
+    if (auto value = mlir::dyn_cast<mlir::StringAttr>(attr.getValue()))
+      return value.getValue();
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 // The IR name of an op kind's node. `buildNode` adds the dialect prefix (an op
 // is `boom.quantize`, not `quantize`), so a pass that matches a node by name
 // spells it through here rather than by hand — the Graph passes match on the
@@ -1478,6 +1494,97 @@ public:
   }
 };
 
+// FuseKvAppendIntoPrepPass — the KV-cache append into the attention-prep region
+// (Stage 6d). The cache used to be a backend resource no graph region could
+// reach, which is why the append stayed inside OpKind::Attention through Stage
+// 5d; Stage 6a made it a graph resource (the `!boom.kv` handle), so the K and V
+// prep regions can carry the handle and the append becomes a store the
+// generated kernel performs on values it already has in registers.
+//
+//   K prep (heads_norm_rope_cast, rope=1, cast=1): kv_store = 1
+//   V prep (heads_norm_rope_cast, rope=0, cast=1): kv_store = 2
+//
+// Both region nodes take the position and then the layer's handle as their last
+// two operands (the V chain has no rope to carry the position), and the
+// attention node is marked `kv_appended` so the backend skips its two
+// kv_append launches. The cache content is unchanged: the stored values are the
+// fp16-rounded values the region already writes to its output, which is what
+// Attention appended before.
+//
+// Decode only: the prefill graph appends a whole segment with
+// kv_append_batched, and has no OpKind::Attention node to match.
+class FuseKvAppendIntoPrepPass
+    : public mlir::PassWrapper<FuseKvAppendIntoPrepPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseKvAppendIntoPrepPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    mlir::OpBuilder builder(graph.getContext());
+    const std::string attnName = boomOpName(planner::OpKind::Attention);
+
+    // The region `op` is a heads_norm_rope_cast chain with `rope` and a cast:
+    // the K chain (rope=1) and the V chain (rope=0) are the two that append.
+    auto is_prep = [](mlir::Operation *op, int64_t rope) {
+      if (op == nullptr ||
+          op->getName().getStringRef() != "boom.fused_region")
+        return false;
+      auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs) return false;
+      auto region = nodeAttrString(attrs, "fused_region");
+      return region && *region == "heads_norm_rope_cast" &&
+             nodeAttrInt(attrs, "rope").value_or(0) == rope &&
+             nodeAttrInt(attrs, "cast").value_or(0) == 1;
+    };
+    auto add_int_attr = [&](mlir::Operation *op, llvm::StringRef name,
+                            int32_t value) {
+      auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      llvm::SmallVector<mlir::Attribute> entries(attrs.getValue());
+      entries.push_back(boom::NodeAttr::get(graph.getContext(), name,
+                                            builder.getI32IntegerAttr(value)));
+      op->setAttr("node_attrs", builder.getArrayAttr(entries));
+    };
+
+    for (mlir::Operation &node : graph.getBody().front()) {
+      if (node.getName().getStringRef() != attnName) continue;
+      // {q, kc, vc, pos, handle}: only a KV layer has K/V to append. A shared
+      // layer reads its donor's cache and has nothing to write.
+      if (node.getNumOperands() < 5) continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs || nodeAttrInt(attrs, "kv_appended").value_or(0) != 0)
+        continue;
+      mlir::Value handle = node.getOperand(node.getNumOperands() - 1);
+      auto kv = llvm::dyn_cast<boom::KvType>(handle.getType());
+      if (!kv) continue;
+      mlir::Operation *k = node.getOperand(1).getDefiningOp();
+      mlir::Operation *v = node.getOperand(2).getDefiningOp();
+      if (!is_prep(k, 1) || !is_prep(v, 0)) continue;
+      // The handle must be the layer the prep regions write (the verifier
+      // states the same rule for the attention node).
+      auto kattrs = k->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (nodeAttrInt(kattrs, "layer").value_or(-1) != (int64_t)kv.getLayer() ||
+          nodeAttrInt(v->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "layer")
+                  .value_or(-1) != (int64_t)kv.getLayer())
+        continue;
+
+      mlir::Value pos = node.getOperand(3);
+      // The K chain is {x, pos}; the V chain is {x}. Both take the handle last.
+      llvm::SmallVector<mlir::Value> kop{k->getOperand(0), k->getOperand(1),
+                                         handle};
+      llvm::SmallVector<mlir::Value> vop{v->getOperand(0), pos, handle};
+      k->setOperands(kop);
+      v->setOperands(vop);
+      add_int_attr(k, "kv_store", 1);
+      add_int_attr(v, "kv_store", 2);
+      add_int_attr(&node, "kv_appended", 1);
+    }
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -1925,6 +2032,7 @@ struct DisabledPasses {
   bool fuse_add_rms_norm_mmq = false;
   bool fuse_rms_norm_add = false;
   bool fuse_heads_norm_rope_cast = false;
+  bool fuse_kv_append_into_prep = false;
   bool fuse_slice_scale = false;
   bool fuse_gelu_mul = false;
   bool dense_layout_propagation = false;
@@ -1947,6 +2055,7 @@ constexpr PassName kPassNames[] = {
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
     {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
     {"FuseHeadsNormRopeCastPass", &DisabledPasses::fuse_heads_norm_rope_cast},
+    {"FuseKvAppendIntoPrepPass", &DisabledPasses::fuse_kv_append_into_prep},
     {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
     {"FuseGeluMulPass", &DisabledPasses::fuse_gelu_mul},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
@@ -2023,6 +2132,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // none of them match those chains.
     if (!off.fuse_heads_norm_rope_cast)
       pm.addPass(std::make_unique<FuseHeadsNormRopeCastPass>());
+    // After the prep fusion: this pass marks the K/V prep regions it built and
+    // the attention node that consumed them.
+    if (!off.fuse_kv_append_into_prep)
+      pm.addPass(std::make_unique<FuseKvAppendIntoPrepPass>());
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());

@@ -977,6 +977,14 @@ constexpr const char *kRmsNormAdd = R"MLIR(module attributes {gpu.container_modu
 // reference kernel, and the two optimize the same libdevice bitcode slightly
 // differently, so a trig chain is checked on tolerance rather than byte
 // identity; the V chain (norm->cast, no trig) is still byte-identical.
+//
+// Stage 6d: when the region is a KV layer's K or V prep, it also stores its
+// output row into the layer's KV cache at slot (*pos % n_slots), which is what
+// kv_append_kernel did in two separate launches. The stored values are the
+// values already written to y (the fp16 roundtrip in both chains), so the
+// cache content is bit-identical to appending the region's output afterwards.
+// `do_store` (1 = K, 2 = V, 0 = not a cache-writing chain) gates it; the
+// address is (slot * row_elems) + head * head_dim + i.
 constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.container_module} {
   gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
     gpu.func @heads_norm_rope_cast(%x: !llvm.ptr, %w: !llvm.ptr, %has_w: i32,
@@ -984,7 +992,9 @@ constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.contain
                                    %head_dim: i32, %eps: f32, %freq_scale: f32,
                                    %log_base: f32, %ff: !llvm.ptr,
                                    %heads_per_pos: i32, %do_rope: i32,
-                                   %do_cast: i32) kernel {
+                                   %do_cast: i32, %cache: !llvm.ptr,
+                                   %n_slots: i32, %row_elems: i32,
+                                   %do_store: i32) kernel {
       %head = gpu.block_id x
       %tid = gpu.thread_id x
       %tid_i = arith.index_cast %tid : index to i32
@@ -1011,6 +1021,14 @@ constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.contain
       %rowoff = arith.muli %head64, %dim64 : i64
       %xrow = llvm.getelementptr inbounds %x[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
       %yrow = llvm.getelementptr inbounds %y[%rowoff] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %nslots64 = arith.extui %n_slots : i32 to i64
+      %row64 = arith.extui %row_elems : i32 to i64
+      %posv = llvm.load %pos : !llvm.ptr -> i64
+      %slot = arith.remui %posv, %nslots64 : i64
+      %soff = arith.muli %slot, %row64 : i64
+      %cbase = arith.addi %soff, %rowoff : i64
+      %cptr = llvm.getelementptr %cache[%cbase] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+      %dostore = arith.cmpi ne, %do_store, %c0i : i32
       %s0 = scf.for %iv = %tid_i to %head_dim step %c256i iter_args(%acc = %c0) -> (f64) : i32 {
         %xp = llvm.getelementptr inbounds %xrow[%iv] : (!llvm.ptr, i32) -> !llvm.ptr, f32
         %xv = llvm.load %xp : !llvm.ptr -> f32
@@ -1251,6 +1269,18 @@ constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.contain
           %yp2 = llvm.getelementptr inbounds %yp1[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
           llvm.store %r0, %yp0 : f32, !llvm.ptr
           llvm.store %r1, %yp2 : f32, !llvm.ptr
+          // Stage 6d: when this chain is the K prep of a KV layer, the same
+          // fp16-rounded values it writes to y are the row the KV-cache append
+          // stores at slot (pos % n_slots) — kv_append_kernel's two launches
+          // are folded into this one. The stored values are exactly the y
+          // values, so the cache content is unchanged.
+          scf.if %dostore {
+            %cp0 = llvm.getelementptr %cptr[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+            llvm.store %r0, %cp0 : f32, !llvm.ptr
+            %cph = llvm.getelementptr %cptr[%half] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+            %cp1 = llvm.getelementptr %cph[%tid_i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+            llvm.store %r1, %cp1 : f32, !llvm.ptr
+          }
         }
       } else {
         scf.for %k2 = %tid to %dim_idx step %c256idx2 {
@@ -1265,6 +1295,11 @@ constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.contain
           }
           %yp3 = llvm.getelementptr inbounds %yrow[%k2i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
           llvm.store %r2, %yp3 : f32, !llvm.ptr
+          // Stage 6d: the V prep's fp16-rounded value is also the cache row.
+          scf.if %dostore {
+            %cp2 = llvm.getelementptr %cptr[%k2i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+            llvm.store %r2, %cp2 : f32, !llvm.ptr
+          }
         }
       }
       gpu.return
@@ -1681,7 +1716,7 @@ std::string glue_codegen_version() {
   // does not record. (The cache also stores a hash of the generated text and
   // ignores an entry whose body does not match, so a stale entry cannot run
   // even without a bump; this keeps the two checks independent.)
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue1";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue2";
 }
 
 } // namespace sonicboom::compiler
