@@ -222,6 +222,20 @@ if(SONICBOOM_USE_CUDA)
                                                               CUDA::cuda_driver)
   sb_add_cpp_test(test_cuda_attention_decode_codegen)
 
+  # Compiler-generated dense bf16 GEMM (step 10a): the codegen path of the
+  # strided dense projection (Y[N][M] = X[N][K] W[M][K]^T). Differential
+  # against an fp64 reference over bf16-rounded operands, a tail shape where
+  # every dimension misses the tile multiple, and the bitwise batch-invariance
+  # contract (N = 1 / 7 / 64 / 512, and a shifted-base re-run that moves the
+  # same token to a different block coordinate).
+  add_executable(test_cuda_dense_gemm_codegen
+                 test_cuda_dense_gemm_codegen.cpp)
+  target_link_libraries(test_cuda_dense_gemm_codegen PRIVATE sonicboom
+                                                            sonicboom_compiler
+                                                            CUDA::cudart
+                                                            CUDA::cuda_driver)
+  sb_add_cpp_test(test_cuda_dense_gemm_codegen)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
@@ -229,6 +243,7 @@ if(SONICBOOM_USE_CUDA)
                        test_cuda_attention_codegen
                        test_cuda_attention_codegen_wide
                        test_cuda_attention_decode_codegen
+                       test_cuda_dense_gemm_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

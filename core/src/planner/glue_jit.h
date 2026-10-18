@@ -31,6 +31,7 @@
 #include <string_view>
 
 #include <sonicboom/compiler/AttentionCodegen.h>
+#include <sonicboom/compiler/GemmCodegen.h>
 
 namespace sonicboom::planner::glue {
 
@@ -69,5 +70,14 @@ bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
 // the shape has no generator or the compile/load failed.
 bool launch_attention_decode(const compiler::AttentionShape &shape,
                              void* const* args, int n_chunks, int n_heads_q);
+
+// Launch the compiler-generated dense bf16 GEMM for `shape`:
+//   y[n][m] f32 (token-major) = x[n][k] bf16 (token-major) * w[m][k]^T
+// with grid (ceil(n/bn), ceil(m/bm)) and (bm/16)*32 threads per block. The
+// first launch compiles and caches the PTX like a glue region; false means the
+// shape has no generator or the compile/load failed (the caller falls back to
+// the cuBLASLt path).
+bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
+                       const void *w, void *y, int m, int k, int n);
 
 } // namespace sonicboom::planner::glue
