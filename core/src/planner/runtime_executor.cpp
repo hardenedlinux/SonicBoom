@@ -239,6 +239,23 @@ std::expected<ExecutionResult, RuntimeError> RuntimeExecutor::execute(
               RuntimeErrorCode::InvalidPlan,
               "backend produced an unexpected number of outputs",
               Phase::Execution));
+        // An in-place result shares its input's device buffer (the IR marks the
+        // op; the CUDA backend writes into that buffer). Ownership moves to the
+        // output value: clear the input's handle so neither the last-use release
+        // below nor the end-of-step sweep returns a buffer the output still
+        // owns — the output's own last use returns it once.
+        for (TensorId in : task->inputs) {
+          auto v = values.find(in.value);
+          if (v == values.end() || !v->second.on_device) continue;
+          for (const auto& r : *res)
+            if (r.on_device && r.device.handle != 0 &&
+                r.device.handle == v->second.device.handle) {
+              v->second.on_device = false;
+              v->second.device.handle = 0;
+              v->second.device.size_bytes = 0;
+              break;
+            }
+        }
         for (std::size_t k = 0; k < task->outputs.size(); ++k)
           values[task->outputs[k].value] = std::move((*res)[k]);
 

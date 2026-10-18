@@ -609,6 +609,9 @@ if [ "$ABLATE" = 1 ]; then
     "slice-scale-fusion|FuseSliceScalePass"
     "gelu-mul-fusion|FuseGeluMulPass"
     "dense-layout|DenseLayoutPropagationPass"
+    # Stage 7: liveness-based buffer classes and in-place elementwise results.
+    # Disabling it restores one buffer per activation and no in-place writes.
+    "buffer-reuse-assign|BufferReusePass"
   )
   ABL_FEATURE_GROUPS=(
     "cuda-graph-decode|cuda_graph_decode"

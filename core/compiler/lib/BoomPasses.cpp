@@ -1585,6 +1585,140 @@ public:
   }
 };
 
+// BufferReusePass — liveness-based buffer assignment (Stage 7).
+//
+// The planner's memory assignment used to give every activation its own buffer.
+// This pass computes, over the final node set of the phase, which activations
+// can share one, and records the assignment on the nodes so it survives the
+// Graph round trip:
+//
+//   inplace=1  the node's result may be written into operand 0's device
+//              buffer. Only a same-type elementwise op qualifies (Scale, Add,
+//              Mul, Silu), and only when operand 0 is a node result with no
+//              use but this node and the result is not a graph output. The
+//              CUDA backend borrows the buffer; the executor moves ownership
+//              to the result value.
+//   buf=N      the node's result belongs to buffer class N. A class is reused
+//              by a later result of the same byte size once every earlier
+//              member's last use is behind it; an in-place result joins its
+//              operand's class.
+//
+// Both are facts about the graph (uses, sizes, the output list), not about a
+// backend: a backend that ignores the attributes keeps its per-tensor
+// allocation, so a mark can make a backend refuse an optimization but cannot
+// make it compute a wrong value.
+class BufferReusePass
+    : public mlir::PassWrapper<BufferReusePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferReusePass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+
+    llvm::DenseSet<int64_t> outputs;
+    for (int64_t id : graph.getOutputs()) outputs.insert(id);
+
+    // Liveness over the flat node list: the last node position that reads a
+    // tensor (a graph output is live through the whole graph), and the position
+    // that produces each node result.
+    llvm::DenseMap<int64_t, int64_t> lastUse;
+    llvm::DenseMap<int64_t, int64_t> producedAt;
+    int64_t pos = 0;
+    for (mlir::Operation &node : view.body()) {
+      for (mlir::Value operand : node.getOperands())
+        lastUse[view.idOf(operand)] = pos;
+      for (int64_t id : GraphEditor::resultIds(node)) producedAt[id] = pos;
+      ++pos;
+    }
+    for (int64_t id : graph.getOutputs()) lastUse[id] = INT64_MAX;
+
+    struct BufferClass {
+      uint64_t bytes = 0;
+      int64_t lastLive = -1;
+    };
+    std::vector<BufferClass> classes;
+    llvm::DenseMap<int64_t, int64_t> tensorClass;  // tensor id -> class id
+
+    auto add_attr = [&](mlir::Operation *op, llvm::StringRef name,
+                        int64_t value) {
+      llvm::SmallVector<mlir::Attribute> entries;
+      if (auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs"))
+        entries.append(attrs.begin(), attrs.end());
+      entries.push_back(boom::NodeAttr::get(
+          view.ctx(), name, builder.getI32IntegerAttr(int32_t(value))));
+      op->setAttr("node_attrs", builder.getArrayAttr(entries));
+    };
+
+    auto is_inplace_candidate = [&](mlir::Operation &node) -> bool {
+      const llvm::StringRef name = node.getName().getStringRef();
+      if (name != boomOpName(planner::OpKind::Scale) &&
+          name != boomOpName(planner::OpKind::Add) &&
+          name != boomOpName(planner::OpKind::Mul) &&
+          name != boomOpName(planner::OpKind::Silu))
+        return false;
+      if (node.getNumResults() != 1 || node.getNumOperands() < 1) return false;
+      if (GraphEditor::resultIds(node).size() != 1) return false;
+      mlir::Value src = node.getOperand(0);
+      // A block argument is a graph input, a weight or a constant: none of
+      // them is the node's to overwrite.
+      if (src.getDefiningOp() == nullptr) return false;
+      if (src.getType() != node.getResult(0).getType()) return false;
+      if (!src.hasOneUse()) return false;
+      return !outputs.contains(GraphEditor::resultIds(node)[0]);
+    };
+
+    pos = 0;
+    for (mlir::Operation &node : view.body()) {
+      const bool inplace = is_inplace_candidate(node);
+      if (inplace) add_attr(&node, "inplace", 1);
+
+      // A class names one result; a node with several keeps the planner's
+      // per-tensor assignment for all of them.
+      if (node.getNumResults() != 1 ||
+          GraphEditor::resultIds(node).size() != 1) {
+        ++pos;
+        continue;
+      }
+      const int64_t rid = GraphEditor::resultIds(node)[0];
+      const boom::TensorDescAttr desc = view.desc(rid);
+      if (!desc) {
+        ++pos;
+        continue;
+      }
+      const uint64_t bytes = desc.getByteSize();
+
+      int64_t cls = -1;
+      if (inplace) {
+        auto it = tensorClass.find(view.idOf(node.getOperand(0)));
+        if (it != tensorClass.end()) cls = it->second;
+      }
+      if (cls < 0) {
+        // Reuse by size class: a buffer of this byte size whose members are
+        // all dead before this node.
+        for (std::size_t c = 0; c < classes.size(); ++c)
+          if (classes[c].bytes == bytes && classes[c].lastLive < pos) {
+            cls = int64_t(c);
+            break;
+          }
+        if (cls < 0) {
+          cls = int64_t(classes.size());
+          classes.push_back(BufferClass{bytes, -1});
+        }
+      }
+      tensorClass[rid] = cls;
+      add_attr(&node, "buf", cls);
+      auto lu = lastUse.find(rid);
+      const int64_t live =
+          lu != lastUse.end() ? lu->second : producedAt.lookup(rid);
+      classes[cls].lastLive = std::max(classes[cls].lastLive, live);
+      ++pos;
+    }
+  }
+};
+
 // fuse_rms_norm_mmq_pass (rewrites.cpp:323), as a Boom IR pass — the first pass
 // of the prefill pipeline.
 //
@@ -2036,6 +2170,7 @@ struct DisabledPasses {
   bool fuse_slice_scale = false;
   bool fuse_gelu_mul = false;
   bool dense_layout_propagation = false;
+  bool buffer_reuse = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -2062,6 +2197,7 @@ constexpr PassName kPassNames[] = {
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
     {"DenseLayoutPropagationPass", &DisabledPasses::dense_layout_propagation},
+    {"BufferReusePass", &DisabledPasses::buffer_reuse},
 };
 
 // Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
@@ -2136,6 +2272,8 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // the attention node that consumed them.
     if (!off.fuse_kv_append_into_prep)
       pm.addPass(std::make_unique<FuseKvAppendIntoPrepPass>());
+    // Last: buffer assignment reads the final node set's uses and sizes.
+    if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());
@@ -2164,6 +2302,8 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // node set (attribute-only, no node replacement).
     if (!off.dense_layout_propagation)
       pm.addPass(std::make_unique<DenseLayoutPropagationPass>());
+    // Last: buffer assignment reads the final node set's uses and sizes.
+    if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
     return;
   }
 }

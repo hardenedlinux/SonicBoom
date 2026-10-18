@@ -474,9 +474,27 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           ? out_td->dynamic_stride_bytes * segment_extent_ +
                 out_td->dynamic_base_bytes
           : out_td->size_bytes;
-  const uint64_t out_handle = device::acquire(out_bytes);
-  if (!out_handle)
-    return std::unexpected(fail("device buffer allocation failed"));
+  //
+  // In-place: BufferReusePass marks a same-type elementwise node whose operand
+  // 0 dies at this node; the result can be written into that operand's buffer.
+  // The op list is restated here so a stale or hand-made attribute cannot make
+  // the backend alias a buffer into a kernel that does not support it.
+  int64_t inplace = 0;
+  attr_i(*node, "inplace", inplace);
+  const bool inplace_op = node->op == OpKind::Scale || node->op == OpKind::Add ||
+                          node->op == OpKind::Mul || node->op == OpKind::Silu;
+  bool borrowed = false;
+  uint64_t out_handle = 0;
+  if (inplace != 0 && inplace_op && !in.empty() && in[0].on_device &&
+      in[0].device.handle != 0 && in[0].device.size_bytes == out_bytes) {
+    out_handle = in[0].device.handle;
+    borrowed = true;
+  }
+  if (!out_handle) {
+    out_handle = device::acquire(out_bytes);
+    if (!out_handle)
+      return std::unexpected(fail("device buffer allocation failed"));
+  }
   float* out = dev_mut(out_handle);
   const int out_n = int(out_bytes / sizeof(float));
 
@@ -1356,7 +1374,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
 
   if (!ok) {
     if (extra_handle) device::release(extra_handle, extra_bytes);
-    device::release(out_handle, out_bytes);
+    // A borrowed buffer belongs to the input value; the executor still owns it.
+    if (!borrowed) device::release(out_handle, out_bytes);
     return std::unexpected(fail("Sonic CUDA kernel failed for node '" + node->name +
                                 "'"));
   }
@@ -1366,7 +1385,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // task's declared output count. The output buffer was allocated but is never
   // consumed; release it rather than leak it.
   if (task.outputs.empty()) {
-    device::release(out_handle, out_bytes);
+    if (!borrowed) device::release(out_handle, out_bytes);
     return std::vector<TensorValue>{};
   }
 

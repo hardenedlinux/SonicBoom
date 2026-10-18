@@ -159,15 +159,37 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
     }
   }
 
-  // 2. Buffer allocation: one aligned buffer per tensor. Because the whole-graph
-  //    task keeps every tensor live simultaneously, lifetimes fully overlap and
-  //    no buffer reuse is possible — the honest static result is N buffers.
-  plan.allocations.clear();
-  plan.allocations.reserve(plan.tensors.size());
-  uint64_t peak = 0;
-  uint32_t next_buffer = 0;
-  double memory_latency_us = 0.0;
+  // 2. Buffer allocation. A node's IR `buf` attribute (BufferReusePass) names
+  //    the buffer class its result was assigned to by liveness: every tensor in
+  //    one class has a lifetime disjoint from the others, so they share one
+  //    buffer of the class's largest size. A tensor the pass did not name — a
+  //    graph input, a constant, a multi-result node's results, or every tensor
+  //    of a whole-graph plan — keeps a buffer of its own. (A whole-graph plan's
+  //    lifetimes fully overlap, so no reuse is possible there: the honest
+  //    static result is N buffers.)
+  std::unordered_map<uint32_t, int64_t> tensor_class;
+  if (!whole_graph) {
+    for (const auto& task : plan.tasks) {
+      if (task.kind != TaskKind::Compute)
+        continue;
+      const auto* c = task.as_compute();
+      // The attribute is stated once per node, so only a one-result node can
+      // name its result's class.
+      if (!c || task.outputs.size() != 1)
+        continue;
+      for (const auto& a : c->attributes) {
+        if (a.name != "buf" || a.kind() != sx::AttrValueKind::Int)
+          continue;
+        tensor_class[task.outputs[0].value] = std::get<int64_t>(a.value);
+        break;
+      }
+    }
+  }
 
+  // Aligned sizes and, per class, the largest member's size.
+  std::unordered_map<uint32_t, uint64_t> aligned_size;
+  aligned_size.reserve(plan.tensors.size());
+  std::unordered_map<int64_t, uint64_t> class_size;
   for (const auto& t : plan.tensors) {
     auto aligned = align_up(t.size_bytes, align);
     if (!aligned)
@@ -175,24 +197,32 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
           PlannerErrorCode::ArithmeticOverflow,
           "buffer size alignment overflow for tensor '" + t.name + "'",
           Phase::Memory));
-    const uint64_t size = *aligned;
+    aligned_size[t.id.value] = *aligned;
+    if (auto it = tensor_class.find(t.id.value); it != tensor_class.end()) {
+      uint64_t& size = class_size[it->second];
+      size = std::max(size, *aligned);
+    }
+  }
+
+  plan.allocations.clear();
+  plan.allocations.reserve(plan.tensors.size());
+  uint64_t peak = 0;
+  uint32_t next_buffer = 0;
+  double memory_latency_us = 0.0;
+  std::unordered_map<int64_t, std::size_t> class_allocation;
+
+  auto add_allocation =
+      [&](uint64_t size, TensorId tensor) -> std::expected<std::size_t, PlannerError> {
     if (size > UINT64_MAX - peak)
       return std::unexpected(PlannerError(PlannerErrorCode::ArithmeticOverflow,
                                           "peak memory overflow", Phase::Memory));
-
     BufferAllocation a;
     a.buffer = BufferId{next_buffer};
     a.memory_space = space_id;
     a.offset_bytes = 0;
     a.size_bytes = size;
     a.alignment_bytes = align;
-    a.assigned_tensors.push_back(t.id);
-    plan.allocations.push_back(std::move(a));
-    peak += size;
-    if (!next_id(next_buffer))
-      return std::unexpected(PlannerError(PlannerErrorCode::InternalError,
-                                          "buffer id counter overflow",
-                                          Phase::Memory));
+    a.assigned_tensors.push_back(tensor);
 
     MemoryRequest req;
     req.size_bytes = size;
@@ -200,7 +230,35 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
     auto mc = cost_model_.estimate_memory(req, space_id);
     if (!mc)
       return std::unexpected(mc.error());
+
+    plan.allocations.push_back(std::move(a));
+    peak += size;
+    if (!next_id(next_buffer))
+      return std::unexpected(PlannerError(PlannerErrorCode::InternalError,
+                                          "buffer id counter overflow",
+                                          Phase::Memory));
     memory_latency_us += mc->allocation_latency_us;
+    return plan.allocations.size() - 1;
+  };
+
+  for (const auto& t : plan.tensors) {
+    const uint64_t size = aligned_size[t.id.value];
+    auto cls = tensor_class.find(t.id.value);
+    if (cls == tensor_class.end()) {
+      auto added = add_allocation(size, t.id);
+      if (!added)
+        return std::unexpected(std::move(added.error()));
+      continue;
+    }
+    auto known = class_allocation.find(cls->second);
+    if (known != class_allocation.end()) {
+      plan.allocations[known->second].assigned_tensors.push_back(t.id);
+      continue;
+    }
+    auto added = add_allocation(class_size[cls->second], t.id);
+    if (!added)
+      return std::unexpected(std::move(added.error()));
+    class_allocation[cls->second] = *added;
   }
 
   // 3. Memory summary and budget check.
