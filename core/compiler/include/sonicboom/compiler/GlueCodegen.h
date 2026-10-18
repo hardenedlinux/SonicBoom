@@ -67,6 +67,11 @@ enum class GlueRegionKind {
   // the following scale into the same read. Byte-identical to slice_strided
   // followed by scale (the multiply is the reference kernel's).
   SliceScale,
+  // Gated activation (gelu_mul): gelu_fp16's fp16-round-trip tanh-GELU on the
+  // gate, multiplied by the up projection, one thread per element. The tanh
+  // goes through libdevice, so this region uses the same checked-on-tolerance
+  // pathway as the attention prep's trig.
+  GeluMul,
 };
 
 // The region kind named `name`, or nullopt if the compiler has no generator for
@@ -110,6 +115,10 @@ constexpr int kHeadsNormRopeCastMaxHeadDim = 512;
 // slice_scale: the reference kernels' geometry — one thread per output element,
 // 256 threads per block, no shared memory.
 constexpr int kSliceScaleBlockThreads = 256;
+
+// gelu_mul: gelu_fp16_kernel/mul_kernel's geometry — one thread per element,
+// 256 threads per block, no shared memory.
+constexpr int kGeluMulBlockThreads = 256;
 
 // Generate the region's PTX for compute capability `sm_arch` (86 = sm_86).
 // Returns nullopt, having printed the MLIR diagnostic, when the region has no

@@ -1259,6 +1259,86 @@ public:
   }
 };
 
+// FuseGeluMulPass — the gated activation (Stage 5f). The prefill FFN's
+// activation chain is a plain gelu_fp16 followed by the gate*up multiply when
+// the product feeds a dense projection (the mmq forms are already fused by
+// GeluMulMmqPass):
+//
+//   gelu_fp16(gate) -> mul(_, up)   =>   fused_region "gelu_mul"
+//
+// The generated kernel is the two reference kernels' arithmetic in one launch.
+// The gelu result has no other reader, so the intermediate tensor is dropped.
+// Runs after the mmq activation fold, which takes the chains that feed a
+// quantized matmul; what remains here feeds a dense projection.
+class FuseGeluMulPass
+    : public mlir::PassWrapper<FuseGeluMulPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseGeluMulPass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    const std::string geluName = boomOpName(planner::OpKind::GeluFp16);
+    const std::string mulName = boomOpName(planner::OpKind::Mul);
+    struct Match {
+      mlir::Operation *gelu;
+      mlir::Operation *mul;
+    };
+    llvm::SmallVector<Match> matches;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != geluName ||
+          node.getNumOperands() != 1 || node.getNumResults() != 1)
+        continue;
+      if (!node.getResult(0).hasOneUse())
+        continue;
+      mlir::Operation *mul = node.getResult(0).use_begin()->getOwner();
+      if (mul->getName().getStringRef() != mulName || mul->getNumOperands() != 2 ||
+          mul->getNumResults() != 1)
+        continue;
+      matches.push_back({&node, mul});
+    }
+
+    for (const Match &m : matches) {
+      // Re-read the operands now, not at match time (see FuseRmsNormAddPass).
+      mlir::Value gate = m.gelu->getOperand(0);
+      mlir::Value up = m.mul->getOperand(0) == m.gelu->getResult(0)
+                           ? m.mul->getOperand(1)
+                           : m.mul->getOperand(0);
+      auto attrs =
+          llvm::to_vector(m.mul->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region", builder.getStringAttr("gelu_mul")));
+      auto name = m.mul->getAttrOfType<mlir::StringAttr>("node_name");
+      const int64_t mulId = GraphEditor::resultIds(*m.mul)[0];
+      const int64_t geluId = GraphEditor::resultIds(*m.gelu)[0];
+
+      builder.setInsertionPoint(m.mul);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*m.mul),
+          name ? name.getValue() : llvm::StringRef("gelu_mul"),
+          builder.getArrayAttr(attrs), GraphEditor::resultIds(*m.mul),
+          {gate, up}, m.mul->getResultTypes(),
+          m.mul->getAttrOfType<mlir::StringAttr>("backend"));
+
+      m.mul->getResult(0).replaceAllUsesWith(fused->getResult(0));
+      view.noteValue(mulId, fused->getResult(0));
+      view.dropTensor(geluId);
+      m.mul->erase();
+      m.gelu->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // FuseHeadsNormRopeCastPass — the attention-prep glue region (Stage 5d). The
 // per-head RMS-norm that starts each of Q/K/V, the NeoX RoPE on Q/K, and the
 // fp16 rounding on K/V are one region per chain:
@@ -1846,6 +1926,7 @@ struct DisabledPasses {
   bool fuse_rms_norm_add = false;
   bool fuse_heads_norm_rope_cast = false;
   bool fuse_slice_scale = false;
+  bool fuse_gelu_mul = false;
   bool dense_layout_propagation = false;
 };
 
@@ -1867,6 +1948,7 @@ constexpr PassName kPassNames[] = {
     {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
     {"FuseHeadsNormRopeCastPass", &DisabledPasses::fuse_heads_norm_rope_cast},
     {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
+    {"FuseGeluMulPass", &DisabledPasses::fuse_gelu_mul},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1958,6 +2040,9 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // region folds above match a strided slice, and the pass only reads the
     // nodes it replaces.
     if (!off.fuse_slice_scale) pm.addPass(std::make_unique<FuseSliceScalePass>());
+    // After the mmq activation fold: only the gelu->mul chains that feed a
+    // dense projection are left.
+    if (!off.fuse_gelu_mul) pm.addPass(std::make_unique<FuseGeluMulPass>());
     // Attention prep: same shape as decode (norm -> rope [-> cast] / norm ->
     // cast), the batched form selected by the norm's `batch` attribute.
     if (!off.fuse_heads_norm_rope_cast)

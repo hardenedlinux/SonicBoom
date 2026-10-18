@@ -829,6 +829,37 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         break;
       }
+      if (region == "gelu_mul") {
+        // The gated activation (Stage 5f): gelu_fp16(gate) * up in one generated
+        // kernel. Operands are (gate, up); one element per thread. The fallback
+        // is the reference pair through a scratch row set.
+        if (in.size() < 2 || out_n <= 0) {
+          ok = false;
+          break;
+        }
+        // The generated kernel's ABI: (gate, up, y, n).
+        void* garg = const_cast<float*>(dev(in[0]));
+        void* uarg = const_cast<float*>(dev(in[1]));
+        void* yarg = out;
+        int narg = out_n;
+        void* args[] = {&garg, &uarg, &yarg, &narg};
+        const int grid = (out_n + compiler::kGeluMulBlockThreads - 1) /
+                         compiler::kGeluMulBlockThreads;
+        ok = glue::launch(region, args, grid,
+                          compiler::kGeluMulBlockThreads, 0);
+        if (!ok) {
+          const uint64_t tmp = device::acquire(out_bytes);
+          if (!tmp) {
+            ok = false;
+            break;
+          }
+          ok = nn::cuda::gelu_fp16_dev(dev(in[0]), dev_mut(tmp), out_n);
+          if (ok)
+            ok = nn::cuda::mul_dev(dev_mut(tmp), dev(in[1]), out, out_n);
+          device::release(tmp, out_bytes);
+        }
+        break;
+      }
       if (region == "heads_norm_rope_cast") {
         // Attention prep (Stage 5d): per-head RMS-norm, NeoX RoPE on the Q/K
         // chains, fp16 rounding on the K/V chains, in one kernel. The norm

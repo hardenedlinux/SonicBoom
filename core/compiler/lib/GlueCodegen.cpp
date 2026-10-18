@@ -1317,6 +1317,74 @@ constexpr const char *kSliceScale = R"MLIR(module attributes {gpu.container_modu
   }
 })MLIR";
 
+// Gated activation (Stage 5f, gelu_mul): gelu_fp16_kernel's tanh-GELU of the
+// gate, times mul_kernel's up operand, one thread per element. The GELU is
+// reproduced expression for expression:
+//
+//   if v <= -10: 0; else if v >= 10: v; else
+//     round_f16(gelu_tanh_f32(round_f16(v)))
+//   gelu_tanh_f32(x) = 0.5f*x*(1 + tanhf(c*x*(1 + a*x*x)))
+//
+// with the fp16 round trips as truncf/extf (round-to-nearest-even, the same
+// conversion __float2half_rn/__half2float perform). tanh goes through libdevice
+// (MathToNVVM).
+constexpr const char *kGeluMul = R"MLIR(module attributes {gpu.container_module} {
+  gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
+    gpu.func @gelu_mul(%gate: !llvm.ptr, %up: !llvm.ptr, %y: !llvm.ptr, %n: i32) kernel {
+      %c256i = arith.constant 256 : i32
+      %bid = gpu.block_id x
+      %tid = gpu.thread_id x
+      %bid_i = arith.index_cast %bid : index to i32
+      %tid_i = arith.index_cast %tid : index to i32
+      %base = arith.muli %bid_i, %c256i : i32
+      %i = arith.addi %base, %tid_i : i32
+      %inb = arith.cmpi slt, %i, %n : i32
+      scf.if %inb {
+        %gp = llvm.getelementptr inbounds %gate[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %v = llvm.load %gp : !llvm.ptr -> f32
+        %lo = arith.constant -1.000000e+01 : f32
+        %hi = arith.constant 1.000000e+01 : f32
+        %zero = arith.constant 0.0 : f32
+        %c1f = arith.constant 1.0 : f32
+        %chalf = arith.constant 0.5 : f32
+        %ca = arith.constant 0.044715 : f32
+        %cs = arith.constant 0.79788456080286535587989211986876 : f32
+        %isle = arith.cmpf ole, %v, %lo : f32
+        %isge = arith.cmpf oge, %v, %hi : f32
+        %g = scf.if %isle -> (f32) {
+          scf.yield %zero : f32
+        } else {
+          %g2 = scf.if %isge -> (f32) {
+            scf.yield %v : f32
+          } else {
+            %vh = arith.truncf %v : f32 to f16
+            %x = arith.extf %vh : f16 to f32
+            %cx = arith.mulf %ca, %x : f32
+            %cx2 = arith.mulf %cx, %x : f32
+            %inner = arith.addf %c1f, %cx2 : f32
+            %t1 = arith.mulf %cs, %x : f32
+            %t2 = arith.mulf %t1, %inner : f32
+            %th = math.tanh %t2 : f32
+            %one = arith.addf %c1f, %th : f32
+            %hx = arith.mulf %chalf, %x : f32
+            %gv = arith.mulf %hx, %one : f32
+            %gh = arith.truncf %gv : f32 to f16
+            %gr = arith.extf %gh : f16 to f32
+            scf.yield %gr : f32
+          }
+          scf.yield %g2 : f32
+        }
+        %upp = llvm.getelementptr inbounds %up[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %uv = llvm.load %upp : !llvm.ptr -> f32
+        %yv = arith.mulf %g, %uv : f32
+        %yp = llvm.getelementptr inbounds %y[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        llvm.store %yv, %yp : f32, !llvm.ptr
+      }
+      gpu.return
+    }
+  }
+})MLIR";
+
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
 std::string region_text(GlueRegionKind kind, int sm_arch) {
@@ -1336,6 +1404,9 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
       break;
     case GlueRegionKind::SliceScale:
       text = kSliceScale;
+      break;
+    case GlueRegionKind::GeluMul:
+      text = kGeluMul;
       break;
   }
   if (text == nullptr) return {};
@@ -1426,6 +1497,8 @@ std::optional<GlueRegionKind> glue_region_kind_from_name(
     return GlueRegionKind::HeadsNormRopeCast;
   if (name == "slice_scale")
     return GlueRegionKind::SliceScale;
+  if (name == "gelu_mul")
+    return GlueRegionKind::GeluMul;
   return std::nullopt;
 }
 
@@ -1441,6 +1514,8 @@ const char *glue_region_name(GlueRegionKind kind) noexcept {
       return "heads_norm_rope_cast";
     case GlueRegionKind::SliceScale:
       return "slice_scale";
+    case GlueRegionKind::GeluMul:
+      return "gelu_mul";
   }
   return "?";
 }
@@ -1457,6 +1532,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
       return "heads_norm_rope_cast";
     case GlueRegionKind::SliceScale:
       return "slice_scale";
+    case GlueRegionKind::GeluMul:
+      return "gelu_mul";
   }
   return "?";
 }
@@ -1469,8 +1546,9 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
                  glue_region_name(kind));
     return std::nullopt;
   }
-  return lower_gpu_module_to_ptx(
-      text, kind == GlueRegionKind::HeadsNormRopeCast, glue_region_name(kind));
+  const bool libdevice = kind == GlueRegionKind::HeadsNormRopeCast ||
+                         kind == GlueRegionKind::GeluMul;
+  return lower_gpu_module_to_ptx(text, libdevice, glue_region_name(kind));
 }
 
 std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,

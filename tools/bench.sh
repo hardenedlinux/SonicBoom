@@ -604,6 +604,7 @@ if [ "$ABLATE" = 1 ]; then
     "rms-norm-add-fusion|FuseRmsNormAddPass"
     "heads-norm-rope-cast-fusion|FuseHeadsNormRopeCastPass"
     "slice-scale-fusion|FuseSliceScalePass"
+    "gelu-mul-fusion|FuseGeluMulPass"
     "dense-layout|DenseLayoutPropagationPass"
   )
   ABL_FEATURE_GROUPS=(
