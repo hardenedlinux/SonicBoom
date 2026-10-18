@@ -264,6 +264,22 @@ std::optional<int64_t> nodeAttrInt(mlir::ArrayAttr nodeAttrs, llvm::StringRef na
   return std::nullopt;
 }
 
+// The float a node's attribute record carries for `name`, or nullopt. Attribute
+// records come from the planner as doubles, which the Boom dialect carries as
+// f64 attributes.
+std::optional<double> nodeAttrFloat(mlir::ArrayAttr nodeAttrs,
+                                    llvm::StringRef name) {
+  for (mlir::Attribute entry : nodeAttrs) {
+    auto attr = mlir::cast<boom::NodeAttr>(entry);
+    if (attr.getName() != name)
+      continue;
+    if (auto value = mlir::dyn_cast<mlir::FloatAttr>(attr.getValue()))
+      return value.getValueAsDouble();
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 // The IR name of an op kind's node. `buildNode` adds the dialect prefix (an op
 // is `boom.quantize`, not `quantize`), so a pass that matches a node by name
 // spells it through here rather than by hand — the Graph passes match on the
@@ -1153,6 +1169,96 @@ public:
   }
 };
 
+// FuseSliceScalePass — the PLE column extraction (Stage 5e). The per-layer
+// embedding column is a strided Slice whose result is immediately scaled (the
+// Gemma PLE scale) before the layer combine:
+//
+//   slice(stride>0) -> scale   =>   fused_region "slice_scale"
+//
+// The slice's result has no other reader, so the chain is one launch instead of
+// two. The fused node keeps the scale's tensor ids (its result is the graph
+// value) and the slice's offset/length/stride, and carries the scale factor as
+// the `scale` attribute. The generated kernel is slice_strided_kernel's index
+// arithmetic with scale_kernel's multiply folded in, so the output is
+// byte-identical to the pair.
+class FuseSliceScalePass
+    : public mlir::PassWrapper<FuseSliceScalePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSliceScalePass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    const std::string sliceName = boomOpName(planner::OpKind::Slice);
+    const std::string scaleName = boomOpName(planner::OpKind::Scale);
+    struct Match {
+      mlir::Operation *slice;
+      mlir::Operation *scale;
+    };
+    llvm::SmallVector<Match> matches;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != sliceName ||
+          node.getNumOperands() != 1 || node.getNumResults() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!attrs || nodeAttrInt(attrs, "stride").value_or(0) <= 0)
+        continue; // the contiguous span form is not this region
+      if (!node.getResult(0).hasOneUse())
+        continue;
+      mlir::Operation *scale = node.getResult(0).use_begin()->getOwner();
+      if (scale->getName().getStringRef() != scaleName ||
+          scale->getNumOperands() != 1 || scale->getNumResults() != 1)
+        continue;
+      matches.push_back({&node, scale});
+    }
+
+    for (const Match &m : matches) {
+      // Re-read the operands now, not at match time (see FuseRmsNormAddPass).
+      mlir::Value x = m.slice->getOperand(0);
+      auto sliceAttrs =
+          llvm::to_vector(m.slice->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+      auto scaleAttrs = m.scale->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      auto scaleValue = scaleAttrs ? nodeAttrFloat(scaleAttrs, "scale")
+                                   : std::nullopt;
+      if (!scaleValue) continue; // no scale factor to fold in
+      llvm::SmallVector<mlir::Attribute> attrs(sliceAttrs.begin(),
+                                               sliceAttrs.end());
+      // Keep the planner's exact f64 value (buildNode re-emits the typed attr).
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "scale", builder.getF64FloatAttr(*scaleValue)));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "fused_region", builder.getStringAttr("slice_scale")));
+      auto name = m.scale->getAttrOfType<mlir::StringAttr>("node_name");
+      const int64_t scaleId = GraphEditor::resultIds(*m.scale)[0];
+      const int64_t sliceId = GraphEditor::resultIds(*m.slice)[0];
+
+      builder.setInsertionPoint(m.scale);
+      mlir::Operation *fused = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*m.scale),
+          name ? name.getValue() : llvm::StringRef("slice_scale"),
+          builder.getArrayAttr(attrs), GraphEditor::resultIds(*m.scale), {x},
+          m.scale->getResultTypes(),
+          m.scale->getAttrOfType<mlir::StringAttr>("backend"));
+
+      m.scale->getResult(0).replaceAllUsesWith(fused->getResult(0));
+      view.noteValue(scaleId, fused->getResult(0));
+      view.dropTensor(sliceId);
+      m.scale->erase();
+      m.slice->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // FuseHeadsNormRopeCastPass — the attention-prep glue region (Stage 5d). The
 // per-head RMS-norm that starts each of Q/K/V, the NeoX RoPE on Q/K, and the
 // fp16 rounding on K/V are one region per chain:
@@ -1739,6 +1845,7 @@ struct DisabledPasses {
   bool fuse_add_rms_norm_mmq = false;
   bool fuse_rms_norm_add = false;
   bool fuse_heads_norm_rope_cast = false;
+  bool fuse_slice_scale = false;
   bool dense_layout_propagation = false;
 };
 
@@ -1759,6 +1866,7 @@ constexpr PassName kPassNames[] = {
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
     {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
     {"FuseHeadsNormRopeCastPass", &DisabledPasses::fuse_heads_norm_rope_cast},
+    {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -1846,6 +1954,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
       pm.addPass(std::make_unique<FuseRmsNormAddPass>());
     if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
     if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
+    // The PLE column extraction is an elementwise chain of its own: none of the
+    // region folds above match a strided slice, and the pass only reads the
+    // nodes it replaces.
+    if (!off.fuse_slice_scale) pm.addPass(std::make_unique<FuseSliceScalePass>());
     // Attention prep: same shape as decode (norm -> rope [-> cast] / norm ->
     // cast), the batched form selected by the norm's `batch` attribute.
     if (!off.fuse_heads_norm_rope_cast)

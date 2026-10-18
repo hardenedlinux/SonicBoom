@@ -61,6 +61,12 @@ enum class GlueRegionKind {
   // `do_cast` cover the three chains the attention prep uses: Q norm->rope,
   // K norm->rope->cast, V norm->cast.
   HeadsNormRopeCast,
+  // Strided row slice + scale (slice_scale): one thread per output element,
+  //   y[r*length + k] = x[offset + r*stride + k] * s.
+  // Extracts a layer's per-layer-embedding column from each position and folds
+  // the following scale into the same read. Byte-identical to slice_strided
+  // followed by scale (the multiply is the reference kernel's).
+  SliceScale,
 };
 
 // The region kind named `name`, or nullopt if the compiler has no generator for
@@ -100,6 +106,10 @@ constexpr int kRmsNormAddSharedBytes = 512;
 constexpr int kHeadsNormRopeCastBlockThreads = 256;
 constexpr int kHeadsNormRopeCastSharedBytes = 2560;
 constexpr int kHeadsNormRopeCastMaxHeadDim = 512;
+
+// slice_scale: the reference kernels' geometry — one thread per output element,
+// 256 threads per block, no shared memory.
+constexpr int kSliceScaleBlockThreads = 256;
 
 // Generate the region's PTX for compute capability `sm_arch` (86 = sm_86).
 // Returns nullopt, having printed the MLIR diagnostic, when the region has no

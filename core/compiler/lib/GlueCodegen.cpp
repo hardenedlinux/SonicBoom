@@ -1272,6 +1272,51 @@ constexpr const char *kHeadsNormRopeCast = R"MLIR(module attributes {gpu.contain
   }
 })MLIR";
 
+// Strided row slice + scale (Stage 5e, slice_scale). One thread per output
+// element, the reference slice_strided_kernel's index arithmetic in the same
+// i32 domain (i / length is the same truncating division on the same
+// non-negative values), with scale_kernel's `x * s` folded into the store:
+//
+//   y[r*length + k] = x[offset + (size_t)r*stride + k] * s
+//
+// where r = i / length, k = i - r*length. The pointer arithmetic is widened to
+// i64 exactly as the reference's size_t expression is; the values are identical
+// so the region's output is byte-identical to the two-kernel chain.
+constexpr const char *kSliceScale = R"MLIR(module attributes {gpu.container_module} {
+  gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
+    gpu.func @slice_scale(%x: !llvm.ptr, %y: !llvm.ptr, %rows: i32, %length: i32,
+                          %offset: i32, %stride: i32, %scale: f32) kernel {
+      %c256i = arith.constant 256 : i32
+      %bid = gpu.block_id x
+      %tid = gpu.thread_id x
+      %bid_i = arith.index_cast %bid : index to i32
+      %tid_i = arith.index_cast %tid : index to i32
+      %base = arith.muli %bid_i, %c256i : i32
+      %i = arith.addi %base, %tid_i : i32
+      %n = arith.muli %rows, %length : i32
+      %inb = arith.cmpi slt, %i, %n : i32
+      scf.if %inb {
+        %r = arith.divsi %i, %length : i32
+        %rl = arith.muli %r, %length : i32
+        %k = arith.subi %i, %rl : i32
+        %r64 = arith.extsi %r : i32 to i64
+        %st64 = arith.extsi %stride : i32 to i64
+        %rs = arith.muli %r64, %st64 : i64
+        %k64 = arith.extsi %k : i32 to i64
+        %rs2 = arith.addi %rs, %k64 : i64
+        %off64 = arith.extsi %offset : i32 to i64
+        %srcidx = arith.addi %rs2, %off64 : i64
+        %xpi = llvm.getelementptr inbounds %x[%srcidx] : (!llvm.ptr, i64) -> !llvm.ptr, f32
+        %xv = llvm.load %xpi : !llvm.ptr -> f32
+        %yv = arith.mulf %xv, %scale : f32
+        %ypi = llvm.getelementptr inbounds %y[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        llvm.store %yv, %ypi : f32, !llvm.ptr
+      }
+      gpu.return
+    }
+  }
+})MLIR";
+
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
 std::string region_text(GlueRegionKind kind, int sm_arch) {
@@ -1288,6 +1333,9 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
       break;
     case GlueRegionKind::HeadsNormRopeCast:
       text = kHeadsNormRopeCast;
+      break;
+    case GlueRegionKind::SliceScale:
+      text = kSliceScale;
       break;
   }
   if (text == nullptr) return {};
@@ -1376,6 +1424,8 @@ std::optional<GlueRegionKind> glue_region_kind_from_name(
     return GlueRegionKind::RmsNormAdd;
   if (name == "heads_norm_rope_cast")
     return GlueRegionKind::HeadsNormRopeCast;
+  if (name == "slice_scale")
+    return GlueRegionKind::SliceScale;
   return std::nullopt;
 }
 
@@ -1389,6 +1439,8 @@ const char *glue_region_name(GlueRegionKind kind) noexcept {
       return "rms_norm_add";
     case GlueRegionKind::HeadsNormRopeCast:
       return "heads_norm_rope_cast";
+    case GlueRegionKind::SliceScale:
+      return "slice_scale";
   }
   return "?";
 }
@@ -1403,6 +1455,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
       return "rms_norm_add";
     case GlueRegionKind::HeadsNormRopeCast:
       return "heads_norm_rope_cast";
+    case GlueRegionKind::SliceScale:
+      return "slice_scale";
   }
   return "?";
 }

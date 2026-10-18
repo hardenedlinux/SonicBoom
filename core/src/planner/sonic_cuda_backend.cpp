@@ -779,6 +779,56 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         break;
       }
+      if (region == "slice_scale") {
+        // The PLE column extraction (Stage 5e): a strided row slice and the
+        // scale that follows it in one generated kernel. The node carries the
+        // slice's offset/length/stride and the scale factor. One thread per
+        // output element; the fallback is the reference pair (slice into a
+        // scratch row set, then scale into the output).
+        int64_t offset_i = 0, length_i = 0, stride_i = 0;
+        double scale_d = 1.0;
+        if (!attr_i(*node, "offset", offset_i) ||
+            !attr_i(*node, "length", length_i) ||
+            !attr_i(*node, "stride", stride_i) || length_i <= 0 ||
+            stride_i <= 0 || !attr_f(*node, "scale", scale_d)) {
+          ok = false;
+          break;
+        }
+        const int len = int(length_i);
+        if (out_n <= 0 || out_n % len != 0) {
+          ok = false;
+          break;
+        }
+        const int rows = out_n / len;
+        // The generated kernel's ABI: (x, y, rows, length, offset, stride,
+        // scale), one thread per output element.
+        void* xarg = const_cast<float*>(dev(in[0]));
+        void* yarg = out;
+        int rowsarg = rows;
+        int lenarg = len;
+        int offarg = int(offset_i);
+        int stridearg = int(stride_i);
+        float sarg = float(scale_d);
+        void* args[] = {&xarg,    &yarg,    &rowsarg, &lenarg,
+                        &offarg,  &stridearg, &sarg};
+        const int grid = (out_n + compiler::kSliceScaleBlockThreads - 1) /
+                         compiler::kSliceScaleBlockThreads;
+        ok = glue::launch(region, args, grid,
+                          compiler::kSliceScaleBlockThreads, 0);
+        if (!ok) {
+          const uint64_t tmp = device::acquire(out_bytes);
+          if (!tmp) {
+            ok = false;
+            break;
+          }
+          ok = nn::cuda::slice_strided_dev(dev(in[0]), dev_mut(tmp), rows, len,
+                                           int(offset_i), int(stride_i));
+          if (ok)
+            ok = nn::cuda::scale_dev(dev_mut(tmp), float(scale_d), out, out_n);
+          device::release(tmp, out_bytes);
+        }
+        break;
+      }
       if (region == "heads_norm_rope_cast") {
         // Attention prep (Stage 5d): per-head RMS-norm, NeoX RoPE on the Q/K
         // chains, fp16 rounding on the K/V chains, in one kernel. The norm
