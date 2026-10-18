@@ -2098,6 +2098,122 @@ public:
   }
 };
 
+// scale_into_dense_pass (step 10c): a scalar `scale` that reads the only output
+// of a batched dense projection becomes an epilogue of the projection:
+//
+//   matvec_bf16 -> scale   =>   matvec_bf16 (epilogue_scale = s)
+//
+// In both models this is the per-layer model scaling applied to the projection
+// of per_layer_model_proj (42 sites per Gemma prefill, 1 per decode step — the
+// decode form is not matched). The projection keeps its identity, operands and
+// place, takes the scale's output tensor over (the scale writes the projection's
+// buffer in place) and carries the factor as `epilogue_scale`.
+//
+// The epilogue applies the factor in the projection's own store when the
+// generated dense GEMM is selected — one f32 multiply, the same operation and
+// rounding the separate scale kernel did — and as a scale pass after the
+// cuBLASLt loop or the gemv fallback otherwise, so the ablation arm (generated
+// GEMM off) has exactly the semantics it had before. Prefill only: the batched
+// form, as dense_layout_propagation is.
+class ScaleIntoDensePass
+    : public mlir::PassWrapper<ScaleIntoDensePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScaleIntoDensePass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    // Scale op -> (dense projection, the factor). These Scale nodes are exactly
+    // the nodes the rewrite removes.
+    llvm::SmallVector<mlir::Operation *> scales;
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> denseOf;
+    llvm::DenseMap<mlir::Operation *, double> factorOf;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::Scale) ||
+          node.getNumOperands() != 1 || node.getNumResults() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      const std::optional<double> factor =
+          attrs ? nodeAttrFloat(attrs, "scale") : std::nullopt;
+      if (!factor)
+        continue; // no scalar to fold in
+      const int64_t src = view.idOf(node.getOperand(0));
+      auto producedBy = producer.find(src);
+      if (producedBy == producer.end())
+        continue;
+      mlir::Operation *m = producedBy->second;
+      if (m->getName().getStringRef() !=
+              boomOpName(planner::OpKind::MatvecBf16) ||
+          m->getNumResults() != 1)
+        continue;
+      auto matvecAttrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (!matvecAttrs || !nodeAttrInt(matvecAttrs, "batch"))
+        continue; // decode form: the gemv has no epilogue
+      bool already = false;
+      for (mlir::Attribute entry : matvecAttrs) {
+        auto attr = mlir::cast<boom::NodeAttr>(entry);
+        if (attr.getName() == "epilogue_scale") already = true;
+      }
+      if (already)
+        continue;
+      if (consumers[src] != 1)
+        continue; // the projection has another reader
+      scales.push_back(&node);
+      denseOf.insert({&node, m});
+      factorOf.insert({&node, *factor});
+    }
+
+    if (scales.empty())
+      return;
+
+    for (mlir::Operation *scale : scales) {
+      mlir::Operation *m = denseOf.lookup(scale);
+
+      // The projection's attributes plus the factor it now applies, appended —
+      // the same ordered record the other folds use.
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          m->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      nodeAttrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "epilogue_scale",
+          builder.getF64FloatAttr(factorOf.lookup(scale))));
+
+      // The projection keeps its identity and place and takes the scale's
+      // output; its own f32 output tensor stops being a tensor of the graph.
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
+      builder.setInsertionPoint(m);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::MatvecBf16),
+          GraphEditor::nodeId(*m),
+          m->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*scale),
+          m->getOperands(), scale->getResultTypes(),
+          m->getAttrOfType<mlir::StringAttr>("backend"));
+
+      scale->replaceAllUsesWith(node);
+      view.noteReplaced(scale, node);
+      scale->erase();
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      m->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // dense_layout_propagation_pass: the dense projections consume the activation
 // in the layout its producer already writes (position-major) instead of the
 // executor repacking it into fixed-width blocks and copying the result back.
@@ -2169,6 +2285,7 @@ struct DisabledPasses {
   bool fuse_kv_append_into_prep = false;
   bool fuse_slice_scale = false;
   bool fuse_gelu_mul = false;
+  bool scale_into_dense = false;
   bool dense_layout_propagation = false;
   bool buffer_reuse = false;
 };
@@ -2193,6 +2310,7 @@ constexpr PassName kPassNames[] = {
     {"FuseKvAppendIntoPrepPass", &DisabledPasses::fuse_kv_append_into_prep},
     {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
     {"FuseGeluMulPass", &DisabledPasses::fuse_gelu_mul},
+    {"ScaleIntoDensePass", &DisabledPasses::scale_into_dense},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -2294,6 +2412,9 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // After the mmq activation fold: only the gelu->mul chains that feed a
     // dense projection are left.
     if (!off.fuse_gelu_mul) pm.addPass(std::make_unique<FuseGeluMulPass>());
+    // The scalar scale after a dense projection is the projection's epilogue
+    // (attribute-only: the node keeps its place and gets `epilogue_scale`).
+    if (!off.scale_into_dense) pm.addPass(std::make_unique<ScaleIntoDensePass>());
     // Attention prep: same shape as decode (norm -> rope [-> cast] / norm ->
     // cast), the batched form selected by the norm's `batch` attribute.
     if (!off.fuse_heads_norm_rope_cast)

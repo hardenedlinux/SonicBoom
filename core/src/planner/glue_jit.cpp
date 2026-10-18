@@ -550,7 +550,8 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
 }
 
 bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
-                       const void *w, void *y, int m, int k, int n) {
+                       const void *w, void *y, int m, int k, int n,
+                       float alpha) {
 #if SONICBOOM_USE_CUDA
   if (m <= 0 || k <= 0 || n <= 0 || x == nullptr || w == nullptr ||
       y == nullptr)
@@ -586,11 +587,13 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
   MemRef2D xd{const_cast<void *>(x), const_cast<void *>(x), 0, n, k, k, 1};
   MemRef2D wd{const_cast<void *>(w), const_cast<void *>(w), 0, m, k, k, 1};
   int mi = m, ki = k, ni = n;
-  void *args[18] = {&xd.allocated, &xd.aligned, &xd.offset, &xd.size0,
+  float a = alpha;
+  void *args[19] = {&xd.allocated, &xd.aligned, &xd.offset, &xd.size0,
                     &xd.size1,     &xd.stride0, &xd.stride1,
                     &wd.allocated, &wd.aligned, &wd.offset, &wd.size0,
                     &wd.size1,     &wd.stride0, &wd.stride1,
-                    &y,            &mi,         &ki,        &ni};
+                    &y,            &mi,         &ki,        &ni,
+                    &a};
   const int gx = (n + shape.bn - 1) / shape.bn;
   const int gy = (m + shape.bm - 1) / shape.bm;
 
@@ -618,6 +621,7 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
   (void)m;
   (void)k;
   (void)n;
+  (void)alpha;
   return false;
 #endif
 }

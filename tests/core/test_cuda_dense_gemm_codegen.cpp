@@ -277,6 +277,38 @@ int main() {
                         << " row-0 elements differ from n=1\n";
     check(diff == 0, "token 0 row is bitwise independent of N");
   }
+  // ---- 3a. scalar-scale epilogue (step 10c) ----
+  // A projection's unfolded scale is y -> alpha * y as one f32 multiply per
+  // element, so the epilogue's output must be exactly alpha * (the unscaled
+  // kernel's output) in fp32 — the same operation and rounding the separate
+  // scale kernel performs.
+  {
+    const float alpha = 3.25f;
+    const int n = 7;
+    check(run(shape, b, M, K, n, 0, 0), "unscaled launch");
+    check(cudaDeviceSynchronize() == cudaSuccess, "unscaled kernel completes");
+    std::vector<float> y1(size_t(n) * M);
+    check(cudaMemcpy(y1.data(), b.y, y1.size() * 4, cudaMemcpyDeviceToHost) ==
+              cudaSuccess,
+          "unscaled download");
+    check(sonicboom::planner::glue::launch_dense_gemm(shape, b.x, b.w, b.y, M, K,
+                                                     n, alpha),
+          "scaled launch");
+    check(cudaDeviceSynchronize() == cudaSuccess, "scaled kernel completes");
+    std::vector<float> ya(size_t(n) * M);
+    check(cudaMemcpy(ya.data(), b.y, ya.size() * 4, cudaMemcpyDeviceToHost) ==
+              cudaSuccess,
+          "scaled download");
+    size_t diff = 0;
+    for (size_t i = 0; i < ya.size(); ++i)
+      if (std::bit_cast<uint32_t>(ya[i]) !=
+          std::bit_cast<uint32_t>(alpha * y1[i]))
+        ++diff;
+    if (diff) std::cerr << "    epilogue: " << diff << "/" << ya.size()
+                        << " elements differ from alpha*y\n";
+    check(diff == 0, "epilogue writes exactly alpha * the unscaled output");
+  }
+
   // Tokens 0..6 between the 7-token and the 512-token call.
   check(run(shape, b, M, K, 7, 0, 0), "7-token launch");
   check(cudaDeviceSynchronize() == cudaSuccess, "7-token kernel completes");

@@ -99,7 +99,7 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
 
   const std::string FUNC =
       "gpu.func @gemm(%x: memref<?x?xbf16>, %w: memref<?x?xbf16>, "
-      "%y: !llvm.ptr, %m: i32, %k: i32, %n: i32) kernel {";
+      "%y: !llvm.ptr, %m: i32, %k: i32, %n: i32, %alpha: f32) kernel {";
 
   const std::string tid = e.val("gpu.thread_id x");
   const std::string bx = e.val("gpu.block_id x");
@@ -353,7 +353,11 @@ std::string gemm_region_text(const DenseGemmShape &sh, int sm_arch) {
         const std::string v =
             e.val("vector.extract " + o + "[" + s(rr) + ", " + s(cc) +
                   "] : f32 from vector<2x2xf32>");
-        e.op("llvm.store " + v + ", " + p + " : f32, !llvm.ptr");
+        // Epilogue: the planner folds a single-reader scalar scale into the
+        // projection (the per-layer model scaling in both models), so the
+        // output is written scaled and the consumer reads it as before.
+        const std::string ys = e.val("arith.mulf " + v + ", %alpha : f32");
+        e.op("llvm.store " + ys + ", " + p + " : f32, !llvm.ptr");
         e.op("}");
       }
     }
@@ -401,8 +405,9 @@ std::optional<std::string> generate_dense_gemm_ptx(const DenseGemmShape &shape,
 }
 
 std::string dense_gemm_codegen_version() {
-  // gemm2: padded shared staging (conflict-free ldmatrix).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm2";
+  // gemm2: padded shared staging (conflict-free ldmatrix); gemm3: scalar
+  // scale epilogue (the folded `scale` consumer).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-gemm3";
 }
 
 } // namespace sonicboom::compiler

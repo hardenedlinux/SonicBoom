@@ -1191,9 +1191,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       std::string_view layout;
       const bool strided = batched && attr_s(*node, "dense_layout", layout) &&
                            layout == "strided";
+      // ScaleIntoDensePass folds a single-reader `scale` into the batched
+      // projection (the per-layer model scaling); it only marks the batched
+      // form, so the decode gemv below needs no epilogue.
+      double epi_scale = 1.0;
+      const float alpha = attr_f(*node, "epilogue_scale", epi_scale)
+                              ? float(epi_scale)
+                              : 1.0f;
       if (strided) {
         ok = nn::cuda::matvec_bf16_batched_dev(W, cols, dev(in[0]), out,
-                                               int(rows), n, true);
+                                               int(rows), n, true, alpha);
         break;
       }
       // The CPU path rounds the activation through bf16 before the dot; do the

@@ -3890,6 +3890,11 @@ bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }
+  if (alpha != 1.0f) {
+    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
+        y, alpha, y, rows * ncols);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4033,6 +4038,11 @@ bool dense_lt_bf16_strided(const uint16_t* xb, const uint16_t* d_w, float* y,
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }
+  if (alpha != 1.0f) {
+    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
+        y, alpha, y, rows * ncols);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4130,9 +4140,15 @@ DenseChoice dense_resolve(int rows, int cols) {
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
   if (!have) {
     if (dense_capturing()) return def;  // host timing is illegal in a capture
+    // The timing launches are not part of any run: the first execution of a
+    // dense step may be the one being recorded, and a recorded plan must name
+    // the projection's real grid, not the tuning pass's synthetic one.
+    planner::PlanRecorder *saved = planner::recorder();
+    planner::set_thread_recorder(nullptr);
     double tune_s = 0.0;
     int candidate_count = 0;
     choice = dense_tune(rows, cols, tune_s, candidate_count);
+    planner::set_thread_recorder(saved);
     std::map<std::string, int> values{{"impl", choice.codegen ? 1 : 0}};
     if (choice.codegen) {
       values["bm"] = choice.shape.bm;
@@ -4159,7 +4175,8 @@ DenseChoice dense_resolve(int rows, int cols) {
 }
 
 bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
-                            float* y, int rows, int ncols, bool strided) {
+                            float* y, int rows, int ncols, bool strided,
+                            float alpha) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
   uint16_t* xpack = nullptr;
@@ -4193,16 +4210,24 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
       const DenseChoice choice = dense_resolve(rows, cols);
       if (choice.codegen &&
           planner::glue::launch_dense_gemm(choice.shape, xb, d_w, y, rows, cols,
-                                           ncols))
+                                           ncols, alpha))
         return true;
     }
-    return dense_lt_bf16_strided(xb, d_w, y, rows, cols, ncols);
+    if (!dense_lt_bf16_strided(xb, d_w, y, rows, cols, ncols)) return false;
+    // cuBLASLt has no epilogue here; the folded scale runs as its own pass, so
+    // the ablation arm produces the same output as the generated kernel's.
+    if (alpha != 1.0f) {
+      SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+      scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
+          y, alpha, y, rows * ncols);
+    }
+    return cudaGetLastError() == cudaSuccess;
   }
 
   // The non-strided path transposes each 128-column block into the cuBLAS
   // layout first.
   cublasSetStream(h, cur_stream());
-  const float alpha = 1.0f, beta = 0.0f;
+  const float one = 1.0f, zero = 0.0f;
   for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
     const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
     if (!need_pack()) return false;
@@ -4210,8 +4235,8 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
     pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
                              cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
     cublasStatus_t st = cublasGemmEx(
-        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
-        CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &beta, outpack,
+        h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &one, xpack,
+        CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &zero, outpack,
         CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_SUCCESS) {
       SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
@@ -4219,6 +4244,11 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
           outpack, y, rows, ncols, c0, chunk_n);
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
+  }
+  if (alpha != 1.0f) {
+    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
+        y, alpha, y, rows * ncols);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -4243,7 +4273,8 @@ bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
 }
 
 bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
-                             float* y, int rows, int ncols, bool strided) {
+                             float* y, int rows, int ncols, bool strided,
+                             float alpha) {
   if (!available()) return false;
   if (cols <= 0 || rows <= 0 || ncols <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
@@ -4251,8 +4282,15 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
       upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
   if (dense_cublas_enabled() && ncols >= dense_cublas_min_n() &&
-      matvec_bf16_cublas_dev(d_w, cols, x, y, rows, ncols, strided))
+      matvec_bf16_cublas_dev(d_w, cols, x, y, rows, ncols, strided, alpha))
     return true;
+  // The gemv fallbacks below have no epilogue: the folded scale is a pass.
+  const auto scale_if = [&] {
+    if (alpha == 1.0f) return;
+    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
+        y, alpha, y, rows * ncols);
+  };
   if (strided) {
     // The caller skipped its bf16 staging copy: round position-major here so
     // the fallback consumes exactly the same bf16-rounded activation.
@@ -4266,12 +4304,14 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
     SB_NOTE_LAUNCH(gemv_bf16_batched_xb, grid_for(total), 256, 0, cur_stream());
     gemv_bf16_batched_xb<<<grid_for(total), 256, 0, cur_stream()>>>(
         d_w, xb, y, cols, rows, ncols);
+    scale_if();
     return cudaGetLastError() == cudaSuccess;
   }
   const int total = rows * ncols;
   SB_NOTE_LAUNCH(gemv_bf16_batched, grid_for(total), 256, 0, cur_stream());
   gemv_bf16_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
       d_w, x, y, cols, rows, ncols);
+  scale_if();
   return cudaGetLastError() == cudaSuccess;
 }
 

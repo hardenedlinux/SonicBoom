@@ -239,8 +239,12 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
 // Falls back to the plain path when cuBLAS is unavailable.
 bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
                             float* y, int rows, int ncols, bool strided = false);
+// `alpha` is the folded scalar-scale epilogue (the planner folds a
+// single-reader `scale` into the projection); it is applied by the generated
+// GEMM's store when that kernel is selected and by a scale pass otherwise.
 bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float* x,
-                             float* y, int rows, int ncols, bool strided = false);
+                             float* y, int rows, int ncols, bool strided = false,
+                             float alpha = 1.0f);
 
 // Append n consecutive token rows (row_elems floats each) into the flat KV cache
 // at slots (start_pos + p) % n_slots. src_k/src_v are [n, row_elems]
