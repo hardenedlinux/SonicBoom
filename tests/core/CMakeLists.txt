@@ -98,9 +98,17 @@ set_tests_properties(test_plan_cache
 #
 # The lock covers every test that allocates device memory. Two of them at once
 # do not fit on this device (8192 MiB): the measured peak of a single run is
-# 7726 MiB for test_prefix_cache, 4780 for test_plan_cache, 3784 for
+# 4210 MiB for test_prefix_cache, 4780 for test_plan_cache, 3784 for
 # test_plan_record and test_boom_conversion, 3370 for test_generate and 924 for
-# test_qwen2_generate (idle 242). `ctest -jN` runs tests in parallel by default
+# test_qwen2_generate (idle 242). The prefix-cache figure is measured after the
+# test was split into one forked child per case (2026-10-18): nvidia-smi
+# memory.used sampled every 40 ms, maximum over both the short and --long
+# enumerations, is 4210 MiB (4142 MiB short, 4210 MiB long). The earlier
+# 7726/7628/7830 MiB figures were the single-process test, which accumulated
+# every case's device pools and captured graphs; the pre-fork source run
+# against the same library peaks at 7806 MiB, so that 7628-7830 spread is the
+# sampling point and the planner's free-memory-dependent pool sizing, not a
+# code change. `ctest -jN` runs tests in parallel by default
 # (the default is -j1 for `ctest` but -jN for a CI driver), and the two peaks are
 # not independent budgets: the run that gets there first sizes its device pools
 # against the memory that is free, so the second one's allocation comes out of
