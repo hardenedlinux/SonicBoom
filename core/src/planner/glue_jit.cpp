@@ -19,6 +19,7 @@
 #include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/planner/plan_record.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -26,6 +27,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 #if SONICBOOM_USE_CUDA
@@ -92,17 +94,94 @@ void write_file(const std::filesystem::path &path, const std::string &text) {
   out.write(text.data(), std::streamsize(text.size()));
 }
 
+// FNV-1a 64 over the entry body. The cache is a local disk cache, not a trust
+// boundary: this detects a truncated, corrupted, or stale body cheaply (the
+// alternative — regenerating to compare — is exactly what the cache exists to
+// avoid). The compiler version is validated separately below.
+uint64_t fnv1a64(std::string_view text) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : text) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+std::string hex64(uint64_t v) {
+  char buf[17];
+  std::snprintf(buf, sizeof buf, "%016llx",
+                static_cast<unsigned long long>(v));
+  return std::string(buf);
+}
+
+// A cache entry is one header line plus the kernel text:
+//
+//   # sb-glue-ptx 1 region=<name> arch=<cc> codegen=<id> hash=<fnv1a64>
+//   <ptx>
+//
+// The hash covers the body. The file name (region-sm<cc>.ptx) stays stable so
+// a warm entry is found without generating first; the header is what makes a
+// stale entry detectable — an entry written by another compiler, for another
+// arch, in the old headerless format, or with a body that does not match its
+// hash is ignored and regenerated.
+std::string make_entry(const std::string &region, int arch,
+                       const std::string &body) {
+  std::string text = "# sb-glue-ptx 1 region=" + region +
+                     " arch=" + std::to_string(arch) +
+                     " codegen=" + compiler::glue_codegen_version() +
+                     " hash=" + hex64(fnv1a64(body)) + "\n";
+  text += body;
+  return text;
+}
+
+std::string validate_entry(const std::string &text, const std::string &region,
+                           int arch) {
+  constexpr std::string_view kMagic = "# sb-glue-ptx 1 ";
+  if (text.compare(0, kMagic.size(), kMagic) != 0) return {};
+  const size_t nl = text.find('\n');
+  if (nl == std::string::npos) return {};
+  const std::string header = text.substr(0, nl);
+  const std::string body = text.substr(nl + 1);
+
+  auto field = [&](const char *key) -> std::string {
+    const std::string k = std::string(" ") + key + "=";
+    size_t p = header.find(k);
+    if (p == std::string::npos) return {};
+    p += k.size();
+    const size_t e = header.find(' ', p);
+    return header.substr(p, e == std::string::npos ? std::string::npos : e - p);
+  };
+  if (field("region") != region) return {};
+  if (field("arch") != std::to_string(arch)) return {};
+  if (field("codegen") != compiler::glue_codegen_version()) return {};
+  if (field("hash") != hex64(fnv1a64(body))) return {};
+  return body;
+}
+
 // The PTX for the region on this device: the disk cache first (a warm file is
 // the whole point — the MLIR pipeline is ~100 ms), the compiler on a miss.
 std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
   if (arch <= 0) return {};
   const std::string region = compiler::glue_region_name(kind);
+  // SONICBOOM_GLUE_CACHE=0 bypasses the disk cache (read and write): the
+  // ablation for "is this the cached kernel or the one this compiler builds".
+  static const bool use_cache = [] {
+    const char *e = std::getenv("SONICBOOM_GLUE_CACHE");
+    return !(e != nullptr && std::string_view(e) == "0");
+  }();
   const std::filesystem::path path = cache_path(region, arch);
-  std::string text = read_file(path);
-  if (!text.empty()) return text;
+  if (use_cache) {
+    const std::string cached = read_file(path);
+    if (!cached.empty()) {
+      std::string body = validate_entry(cached, region, arch);
+      if (!body.empty()) return body;
+      std::fprintf(stderr, "glue JIT: ignoring stale PTX cache entry %s\n",
+                   path.c_str());
+    }
+  }
   auto generated = compiler::generate_glue_ptx(kind, arch);
   if (!generated) return {};
-  write_file(path, *generated);
+  if (use_cache) write_file(path, make_entry(region, arch, *generated));
   return std::move(*generated);
 }
 

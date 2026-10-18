@@ -619,6 +619,7 @@ if [ "$ABLATE" = 1 ]; then
   # switch groups — env switches that are not SONICBOOM_FEATURE_DISABLE bits.
   # The entry is the literal VAR=value exported while the group is "off".
   ABL_SWITCH_GROUPS=(
+    "glue-cache|SONICBOOM_GLUE_CACHE=0"
     "prefix-align|SONICBOOM_PREFIX_ALIGN=0"
   )
 

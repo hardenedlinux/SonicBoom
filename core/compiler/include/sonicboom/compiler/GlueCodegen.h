@@ -106,4 +106,11 @@ constexpr int kHeadsNormRopeCastMaxHeadDim = 512;
 // generator, the module fails to verify, or the downstream lowering fails.
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch);
 
+// The identity of the compiler that produces that PTX: the linked LLVM version
+// plus this generator's revision. The JIT disk cache stamps it into every entry
+// and ignores an entry written by anything else — a PTX file cached by a
+// different compiler must not be loaded and run just because the region name
+// and arch in its file name match.
+std::string glue_codegen_version();
+
 } // namespace sonicboom::compiler

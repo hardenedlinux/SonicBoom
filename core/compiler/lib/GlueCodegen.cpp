@@ -50,6 +50,7 @@
 
 #include <sonicboom/compiler/GlueCodegen.h>
 
+#include <llvm/Config/llvm-config.h>  // LLVM_VERSION_STRING (cache key)
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
 #include <mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h>
 #include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
@@ -1508,6 +1509,16 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
     return std::nullopt;
   }
   return ptx;
+}
+
+std::string glue_codegen_version() {
+  // The linked LLVM is what turns the NVVM IR into PTX, so its version is the
+  // compiler half of the cache key. The suffix is this generator's own
+  // revision: bump it when the emitted MLIR changes in a way the LLVM version
+  // does not record. (The cache also stores a hash of the generated text and
+  // ignores an entry whose body does not match, so a stale entry cannot run
+  // even without a bump; this keeps the two checks independent.)
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue1";
 }
 
 } // namespace sonicboom::compiler
