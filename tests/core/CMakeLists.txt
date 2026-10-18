@@ -161,10 +161,22 @@ if(SONICBOOM_USE_CUDA)
                                                 CUDA::cudart CUDA::cuda_driver)
   sb_add_cpp_test(test_glue_codegen)
 
+  # Compiler-generated FlashAttention-2 kernel (Stage 3a): the codegen path of
+  # flash_attention_chunk_dev_pos at head_dim 64, differential against an fp64
+  # reference with the kernel's f16 staging simulated, plus bitwise batch
+  # invariance. SONICBOOM_ATTN_IMPL=codegen is set by the test itself.
+  add_executable(test_cuda_attention_codegen test_cuda_attention_codegen.cpp)
+  target_link_libraries(test_cuda_attention_codegen PRIVATE sonicboom
+                                                        sonicboom_compiler
+                                                        CUDA::cudart
+                                                        CUDA::cuda_driver)
+  sb_add_cpp_test(test_cuda_attention_codegen)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
                        test_cuda_elementwise test_glue_codegen
+                       test_cuda_attention_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 

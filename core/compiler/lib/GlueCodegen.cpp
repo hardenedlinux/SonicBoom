@@ -56,7 +56,9 @@
 #include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
 #include <mlir/Conversion/GPUToNVVM/GPUToNVVMPass.h>
 #include <mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h>
+#include <mlir/Conversion/NVGPUToNVVM/NVGPUToNVVM.h>
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
+#include <mlir/Conversion/Passes.h>
 #include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
@@ -67,7 +69,9 @@
 #include <mlir/Dialect/LLVMIR/NVVMDialect.h>
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/NVGPU/IR/NVGPUDialect.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/Diagnostics.h>
 #include <mlir/IR/DialectRegistry.h>
@@ -76,6 +80,7 @@
 #include <mlir/Parser/Parser.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Target/LLVM/NVVM/Target.h>
+#include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/GPU/GPUToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h>
 #include <mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h>
@@ -1410,17 +1415,31 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
                  glue_region_name(kind));
     return std::nullopt;
   }
+  return lower_gpu_module_to_ptx(
+      text, kind == GlueRegionKind::HeadsNormRopeCast, glue_region_name(kind));
+}
 
+std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
+                                                   bool link_libdevice,
+                                                   std::string_view what) {
+  const std::string text(mlir_text);
+  const std::string name(what);
   mlir::DialectRegistry registry;
   registry.insert<mlir::arith::ArithDialect, mlir::cf::ControlFlowDialect,
                   mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect,
                   mlir::math::MathDialect, mlir::memref::MemRefDialect,
-                  mlir::NVVM::NVVMDialect, mlir::scf::SCFDialect>();
+                  mlir::nvgpu::NVGPUDialect, mlir::NVVM::NVVMDialect,
+                  mlir::scf::SCFDialect, mlir::vector::VectorDialect>();
   // The `#nvvm.target` serialization and the nvvm-dialect LLVM IR translation
   // are external models: without them the module-to-binary pass has no
   // serializer to call. mlir-opt registers both at startup.
   mlir::NVVM::registerNVVMTargetInterfaceExternalModels(registry);
   mlir::registerNVVMDialectTranslation(registry);
+  // The attention kernel's reconcile leaves builtin.unrealized_conversion_cast
+  // ops inside the gpu.module when a cast has no typed bridge; the LLVM IR
+  // translation needs the builtin dialect's interface to pass them through.
+  // mlir-opt registers it at startup.
+  mlir::registerBuiltinDialectTranslation(registry);
   mlir::registerGPUDialectTranslation(registry);
   mlir::registerLLVMDialectTranslation(registry);
   // The GPU-to-NVVM pass lowers memref ops through the memref dialect's
@@ -1434,7 +1453,7 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
       mlir::parseSourceString<mlir::ModuleOp>(text, &context);
   if (!module) {
     std::fprintf(stderr, "glue codegen: the %s module did not parse\n",
-                 glue_region_name(kind));
+                 name.c_str());
     return std::nullopt;
   }
 
@@ -1442,13 +1461,19 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
 
   mlir::PassManager pm(&context);
   // The attention-prep region's trig is libdevice's (__nv_expf/__nv_cosf/
-  // __nv_sinf). Convert it first, while it is still a math op; the other
+  // __nv_sinf), and the generated attention kernel's softmax exp is
+  // __nv_expf. Convert math first, while it is still a math op; the other
   // regions have no math ops and keep the nvcc-matching code path.
-  const bool link_libdevice = kind == GlueRegionKind::HeadsNormRopeCast;
   if (link_libdevice) pm.addPass(mlir::createConvertMathToNVVM());
   pm.addPass(mlir::createSCFToControlFlowPass());
   pm.addPass(mlir::createArithToLLVMConversionPass());
   pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+  // The generated attention kernel's tensor-core ops (nvgpu.mma.sync,
+  // nvgpu.ldmatrix) lower to the NVVM/LLVM intrinsics the GPU conversion then
+  // completes. The pass is generic and walks into gpu.module from the module
+  // level, exactly like mlir-opt's --convert-nvgpu-to-nvvm; the glue regions
+  // contain no nvgpu ops, so it is a no-op for them.
+  pm.addPass(mlir::createConvertNVGPUToNVVMPass());
   // Everything ring-fenced by the conversion lives in the gpu.module (the
   // module holds no memref ops of its own), so the GPU conversion's memref
   // patterns — fed by the memref dialect's ConvertToLLVMPatternInterface — do
@@ -1456,6 +1481,12 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
   // fail on the workgroup address space it cannot map.
   pm.addNestedPass<mlir::gpu::GPUModuleOp>(
       mlir::createConvertGpuOpsToNVVMOps());
+  // The generated attention kernel extracts its mma fragments with
+  // vector.extract/insert. The GPU conversion leaves those alone in-process
+  // (mlir-opt's pipeline gets them lowered as part of the same conversion), so
+  // convert them explicitly before the LLVM translation; the glue regions have
+  // no vector ops and are unaffected.
+  pm.addPass(mlir::createConvertVectorToLLVMPass());
   // gpu.module is isolated from above, so the casts the GPU conversion leaves
   // behind need a reconcile inside it as well as at module level.
   pm.addNestedPass<mlir::gpu::GPUModuleOp>(
@@ -1485,7 +1516,7 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
 
   if (mlir::failed(pm.run(*module))) {
     std::fprintf(stderr, "glue codegen: lowering the %s module failed\n%s",
-                 glue_region_name(kind), diagnostics.c_str());
+                 name.c_str(), diagnostics.c_str());
     return std::nullopt;
   }
 
@@ -1505,7 +1536,7 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
   if (ptx.empty()) {
     std::fprintf(stderr,
                  "glue codegen: the %s module produced no PTX object\n",
-                 glue_region_name(kind));
+                 name.c_str());
     return std::nullopt;
   }
   return ptx;

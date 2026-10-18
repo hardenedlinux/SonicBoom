@@ -21,6 +21,7 @@
 #include "cuda_resident.h"
 #include "cuda_stream.h"
 
+#include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
 #include <cuda_fp16.h>
@@ -2530,6 +2531,30 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
           n_heads_kv, head_dim, sliding_window, scale, out))
     return true;
+
+  // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
+  // "codegen" selects it; "auto" keeps the own path until the Stage 3c
+  // autotuner chooses per shape class. A shape without a generator (or a
+  // failed compile) falls through to the hand-written kernels below.
+  if (attn_impl == "codegen") {
+    const compiler::AttentionShape shape{.head_dim = head_dim, .gqa = gqa,
+                                         .window_mask = sliding_window != 0};
+    if (compiler::attention_shape_supported(shape)) {
+      const float *q_p = q, *kb_p = k_batch, *vb_p = v_batch,
+                  *kc_p = k_cache, *vc_p = v_cache;
+      const uint64_t *start_p = start;
+      uint64_t nslots_p = n_slots, window_p = sliding_window;
+      int nhq_p = n_heads_q, nhkv_p = n_heads_kv, n_p = n;
+      float scale_p = scale;
+      float *out_p = out;
+      void *args[] = {&q_p,     &kb_p,    &vb_p,      &kc_p,    &vc_p,
+                      &start_p, &nslots_p, &nhq_p,    &nhkv_p,  &n_p,
+                      &window_p, &scale_p, &out_p};
+      const int grid_x = (n + shape.br - 1) / shape.br;
+      if (planner::glue::launch_attention(shape, args, grid_x, n_heads_q))
+        return true;
+    }
+  }
 
   if (gqa == 4 && head_dim == 256)
     return launch_tiled_flash_attention<256, 64, 2, 32, 4>(

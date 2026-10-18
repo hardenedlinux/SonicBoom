@@ -628,6 +628,11 @@ if [ "$ABLATE" = 1 ]; then
     # imported ggml mma kernel, so a positive contribution means the native
     # path is still ahead on this model/shape.
     "attn-impl|SONICBOOM_ATTN_IMPL=ggml"
+    # Default is the native tiled attention; the group-off side runs the
+    # compiler-generated FA-2 kernel (shapes without a generator fall back to
+    # the native kernel), so a positive contribution means the native path is
+    # still ahead on this model/shape.
+    "attn-codegen|SONICBOOM_ATTN_IMPL=codegen"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field

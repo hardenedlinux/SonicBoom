@@ -106,6 +106,15 @@ constexpr int kHeadsNormRopeCastMaxHeadDim = 512;
 // generator, the module fails to verify, or the downstream lowering fails.
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch);
 
+// Lower a textual GPU-dialect module (a container module holding one
+// gpu.module) to PTX assembly through the NVVM pipeline above. `link_libdevice`
+// converts math ops through libdevice and links it, for kernels that use exp /
+// trig. `what` names the source in diagnostics. The glue-region generator and
+// the attention generator (AttentionCodegen.h) share this one pipeline.
+std::optional<std::string> lower_gpu_module_to_ptx(std::string_view mlir_text,
+                                                   bool link_libdevice,
+                                                   std::string_view what);
+
 // The identity of the compiler that produces that PTX: the linked LLVM version
 // plus this generator's revision. The JIT disk cache stamps it into every entry
 // and ignores an entry written by anything else — a PTX file cached by a

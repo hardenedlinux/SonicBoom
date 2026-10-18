@@ -85,7 +85,8 @@ add_library(sonicboom_compiler STATIC
   lib/BoomConversion.cpp
   lib/BladeToBoom.cpp
   lib/BoomPasses.cpp
-  lib/GlueCodegen.cpp)
+  lib/GlueCodegen.cpp
+  lib/AttentionCodegen.cpp)
 
 # Statically linked into libsonicboom.so once the runtime consumes Boom IR, and
 # already read from the tests next to it, so PIC now rather than as a later fix.
@@ -131,6 +132,16 @@ target_link_libraries(sonicboom_compiler PRIVATE
   MLIRGPUDialect
   MLIRGPUTransforms
   MLIRGPUToNVVMTransforms
+  # The generated attention kernel's tensor-core ops (nvgpu.mma.sync,
+  # nvgpu.ldmatrix): the dialect and its NVVM conversion.
+  MLIRNVGPUDialect
+  MLIRNVGPUToNVVM
+  # The generated attention kernel extracts mma fragment elements with
+  # vector.extract/insert; those are lowered explicitly with the vector-to-LLVM
+  # conversion (the GPU conversion does not cover them in-process).
+  MLIRVectorDialect
+  MLIRVectorToLLVM
+  MLIRVectorToLLVMPass
   MLIRNVVMDialect
   MLIRNVVMTarget
   MLIRNVVMToLLVM

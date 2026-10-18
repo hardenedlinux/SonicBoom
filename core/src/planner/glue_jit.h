@@ -30,6 +30,8 @@
 
 #include <string_view>
 
+#include <sonicboom/compiler/AttentionCodegen.h>
+
 namespace sonicboom::planner::glue {
 
 // True when the compiler has a code generator for `region` (the value of a
@@ -43,5 +45,17 @@ bool known_region(std::string_view region);
 // caller is expected to fall back to the hand-written kernel for that node.
 bool launch(std::string_view region, void* const* args, int blocks, int threads,
             int shared_bytes);
+
+// Launch the compiler-generated attention kernel for `shape` (Stage 3). The
+// kernel entry takes the attention call's parameters in the order
+//   q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
+//   n_heads_kv, n, window, scale, out
+// (same as the hand-written kernels). The grid is one block per (query tile,
+// query head); the block geometry comes from the shape class. The first launch
+// compiles and caches the PTX exactly like a glue region; false means the
+// shape has no generator or the compile/load failed, and the caller falls back
+// to the hand-written kernel.
+bool launch_attention(const compiler::AttentionShape &shape, void* const* args,
+                      int grid_x, int grid_y);
 
 } // namespace sonicboom::planner::glue
