@@ -168,6 +168,17 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t sliding_window, float scale,
                                    float* out);
 
+// Same contract as flash_attention_chunk_dev_pos, computed by the imported
+// ggml mma flash-attention kernel (Stage 2). Returns false without launching
+// anything when the shape is not covered by an imported tile configuration;
+// the caller then falls back to the native path. Selected by
+// SONICBOOM_ATTN_IMPL=ggml.
+bool flash_attention_ggml_chunk_dev_pos(
+    const float* q, const float* k_batch, const float* v_batch,
+    const float* k_cache, const float* v_cache, const uint64_t* start,
+    uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
+    uint64_t sliding_window, float scale, float* out);
+
 // Per-layer embedding combine: y[i] = (proj[i] + ple[i] * ple_scale) * combine_scale.
 // `ple` is the caller-offset device pointer into the full per-layer embedding
 // row (i.e. already advanced by `layer * per_layer_input`). Mirrors

@@ -44,10 +44,12 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/quant/quantized_matmul.h>
+#include <sonicboom/quant/quantized_matmul_cuda.h>
 
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -171,7 +173,19 @@ int run_case(const sbmodel::Gemma4Model& m, const std::vector<uint64_t>& all,
   const bool align =
       !(align_env != nullptr && std::string_view(align_env) == "0");
   uint64_t want_reused = (c.new_n == 0) ? c.prefix - 1 : c.prefix;
-  if (align && want_reused > 0 && want_reused % chunk == 1) --want_reused;
+  if (align && want_reused > 0) {
+    // Mirror the production holdback (see generate_prefill_spine_cuda_prefix):
+    // a segment shorter than the mmq threshold runs the single-column kernels
+    // and does not reproduce a multi-token segment's KV, so the boundary is
+    // moved off any such segment, on either side of the reuse point.
+    const uint64_t min_n =
+        std::max<uint64_t>(uint64_t(sbquant::cuda::mmq_min_n()), 1);
+    const uint64_t rem = want_reused % chunk;
+    if (rem != 0 && rem < min_n)
+      want_reused -= rem;
+    else if (rem != 0 && chunk - rem < min_n)
+      want_reused -= min_n - (chunk - rem);
+  }
   check(reused == want_reused,
         "reuse count is the shared prefix (len-1 when fully reused)");
 
@@ -288,9 +302,25 @@ int main(int argc, char** argv) {
   const size_t ncases = long_only ? sizeof(kLongCases) / sizeof(kLongCases[0])
                                   : sizeof(kCases) / sizeof(kCases[0]);
 
+  // SONICBOOM_PREFIX_CACHE_ONLY=8191[,8192...] runs a subset (debug repro).
+  std::vector<uint64_t> only;
+  if (const char* e = std::getenv("SONICBOOM_PREFIX_CACHE_ONLY")) {
+    const char* p = e;
+    while (*p) {
+      char* end = nullptr;
+      const unsigned long long v = std::strtoull(p, &end, 10);
+      if (end == p) break;
+      only.push_back(v);
+      p = (*end == ',') ? end + 1 : end;
+    }
+  }
+
   int failures = 0;
   for (size_t ci = 0; ci < ncases; ++ci) {
     const Case c = cases[ci];
+    if (!only.empty() &&
+        std::find(only.begin(), only.end(), c.prefix) == only.end())
+      continue;
     failures += run_in_child([&] { return run_case(*m, all, c, steps); });
   }
 

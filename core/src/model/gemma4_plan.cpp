@@ -2086,19 +2086,33 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 
   // Prefill lays its segments on absolute multiples of the chunk and a segment
   // shorter than the mmq threshold (i.e. a single token) takes the
-  // single-column kernels instead of the batched ones. A prefix that ends one
-  // token past a chunk boundary was therefore seeded with a one-token final
-  // segment; a full prefill of a longer prompt computes the same position
-  // inside a multi-token segment, and the two disagree in the KV cache
-  // (measured: the layer-0 V row differs by ~3e-2 at the last seed position,
-  // the K row is bit-identical). Hold that token back so the suffix starts on
-  // the chunk boundary and its segmentation matches the full prefill's. The
-  // cost is one recomputed token.
+  // single-column kernels instead of the batched ones. A full prefill of a
+  // longer prompt computes the same position inside a multi-token segment, and
+  // the two disagree in the KV cache (measured: the layer-0 V row differs by
+  // ~3e-2 at a one-token position, the K row is bit-identical). Two boundaries
+  // can put such a segment next to the reuse point:
+  //   - the seed's final segment: prefix_len % chunk is nonzero but shorter
+  //     than the mmq threshold. Hold those tokens back so the seed ends on a
+  //     chunk boundary (the full prefill's segmentation).
+  //   - the suffix's first segment: the suffix starts less than threshold-many
+  //     tokens before a chunk boundary, so the boundary truncation would give
+  //     it a one-token first segment while the full prefill computes those
+  //     positions in a multi-token one. Hold back just enough tokens to lift
+  //     the first segment to the threshold.
+  // Both costs are at most threshold-1 recomputed tokens.
   const uint64_t chunk = (m.config.sliding_window > 0)
                              ? m.config.sliding_window
                              : kDefaultPrefillChunk;
-  if (prefix_align_enabled() && prefix_len > 0 && prefix_len % chunk == 1)
-    --prefix_len;
+  const uint64_t mmq_min_n = std::max<uint64_t>(
+      uint64_t(quant::cuda::mmq_min_n()), 1);
+  if (prefix_align_enabled() && prefix_len > 0) {
+    const uint64_t rem = prefix_len % chunk;
+    if (rem != 0 && rem < mmq_min_n) {
+      prefix_len -= rem;
+    } else if (rem != 0 && chunk - rem < mmq_min_n) {
+      prefix_len -= mmq_min_n - (chunk - rem);
+    }
+  }
   if (n_reused_out) *n_reused_out = prefix_len;
 
   // The cache size is the session's n_ctx (pre-set by the caller for its largest

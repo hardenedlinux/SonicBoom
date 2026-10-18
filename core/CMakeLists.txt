@@ -162,8 +162,15 @@ if(SONICBOOM_USE_CUDA)
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
+  # The imported ggml flash-attention kernel (src/nn/fattn_ggml.cu) uses
+  # device lambdas in its cp.async pipelines and needs nvcc's
+  # --extended-lambda; the option stays scoped to that translation unit.
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
+    PROPERTIES COMPILE_OPTIONS "--extended-lambda")
 endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;

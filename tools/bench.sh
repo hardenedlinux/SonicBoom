@@ -624,6 +624,10 @@ if [ "$ABLATE" = 1 ]; then
     # Default is tiled; the group-off side runs the split-K schedule, so a
     # positive contribution means selecting tiled was the right call.
     "mmq-decomp|SONICBOOM_MMQ_DECOMP=stream_k"
+    # Default is the native tiled attention; the group-off side runs the
+    # imported ggml mma kernel, so a positive contribution means the native
+    # path is still ahead on this model/shape.
+    "attn-impl|SONICBOOM_ATTN_IMPL=ggml"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field

@@ -2516,6 +2516,21 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   //   - SwiGLU families (Qwen2.5-0.5B, and the same 7:1 group ratio at the
   //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
+
+  // Attention implementation switch (v1 Stage 2). "own" (default) is the
+  // native tiled kernel below. "ggml" routes through the imported ggml mma
+  // kernel and falls back here for shapes it does not cover; "codegen" is the
+  // Stage 3 generated path and falls back here until it lands; "auto" keeps
+  // the own path until the Stage 3 autotuner chooses per shape class.
+  const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
+  const std::string_view attn_impl =
+      attn_impl_env ? std::string_view(attn_impl_env) : std::string_view();
+  if (attn_impl == "ggml" &&
+      flash_attention_ggml_chunk_dev_pos(
+          q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+          n_heads_kv, head_dim, sliding_window, scale, out))
+    return true;
+
   if (gqa == 4 && head_dim == 256)
     return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
