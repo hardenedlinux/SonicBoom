@@ -100,6 +100,18 @@ enum class OpKind : uint8_t {
   // update index the bias correction needs. The update is in place: `param`,
   // `m1` and `m2` are mutated, and the single result aliases `param`.
   AdamW,
+
+  // Training: backward operators of the explicit reverse-mode graph.
+  //
+  // matmul_bwd: operands [A, B, dY] for the forward Y = A @ B with A [M,K],
+  // B [K,N], dY [M,N]; results [dA [M,K], dB [K,N]].
+  // softmax_bwd: operands [Y, dY] where Y is a last-axis softmax output;
+  // result [dX] with the same shape.
+  // cross_entropy_bwd: operands [logits [R,C], targets [R] int32]; results
+  // [loss (scalar f32, mean over rows), dlogits [R,C]].
+  MatmulBwd,
+  SoftmaxBwd,
+  CrossEntropyBwd,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

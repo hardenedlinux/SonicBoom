@@ -420,4 +420,24 @@ def Boom_FusedRegionOp : Boom_Op<"fused_region",
 def Boom_AdamWOp : Boom_Op<"adamw",
     "fused AdamW parameter update (decoupled weight decay)">;
 
+// matmul_bwd: the VJP of Y = A @ B (A [M,K], B [K,N], dY [M,N]) with respect
+// to both operands. Operands [A, B, dY]; results [dA [M,K], dB [K,N]]. The
+// row-major layouts are the forward matmul's: A[m*K + k], B[k*N + n],
+// dY[m*N + n], dA[m*K + k], dB[k*N + n].
+def Boom_MatmulBwdOp : Boom_Op<"matmul_bwd",
+    "backward of matmul: dA = dY @ B^T, dB = A^T @ dY">;
+
+// softmax_bwd: the VJP of a last-axis softmax. Operands [Y, dY] where Y is the
+// forward output (softmax of the logits) and dY the upstream gradient; result
+// [dX], same [rows, cols] shape. dX = Y * (dY - sum_col(dY * Y)).
+def Boom_SoftmaxBwdOp : Boom_Op<"softmax_bwd",
+    "backward of last-axis softmax">;
+
+// cross_entropy_bwd: fused mean cross-entropy over rows and its gradient.
+// Operands [logits [R,C] f32, targets [R] int32]; results [loss (rank-0 f32,
+// the mean over rows), dlogits [R,C]]. The gradient written is the one of that
+// mean loss: (softmax(logits) - onehot(target)) / R.
+def Boom_CrossEntropyBwdOp : Boom_Op<"cross_entropy_bwd",
+    "fused mean cross-entropy loss and its gradient">;
+
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD

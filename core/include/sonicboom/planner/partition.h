@@ -87,6 +87,11 @@ inline BackendTag route_op(OpKind op) noexcept {
     // Training updates run as hand-written kernels over the parameter's own
     // device buffers; they have no MLIR-S-Expr lowering either.
     case OpKind::AdamW:
+    // The training backward ops are hand-written kernels over device buffers;
+    // there is no S-Expr lowering for them either.
+    case OpKind::MatmulBwd:
+    case OpKind::SoftmaxBwd:
+    case OpKind::CrossEntropyBwd:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

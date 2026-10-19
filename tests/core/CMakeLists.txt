@@ -219,6 +219,12 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
 
+  # R3: backward ops (matmul, softmax, cross-entropy) — device kernels vs an
+  # independent fp64 reference, plus finite-difference gradient checks.
+  add_executable(test_backward_ops test_backward_ops.cpp)
+  target_link_libraries(test_backward_ops PRIVATE sonicboom)
+  sb_add_cpp_test(test_backward_ops)
+
   # Compiler-generated glue kernel (Stage 5): the MLIR -> NVVM -> PTX pipeline
   # and the driver JIT, byte-compared with the hand-written kernel the region
   # replaces. Links the compiler library for generate_glue_ptx and the CUDA

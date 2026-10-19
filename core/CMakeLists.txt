@@ -170,6 +170,7 @@ if(SONICBOOM_USE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/adamw.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/training/backward_ops.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
