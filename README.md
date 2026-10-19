@@ -165,7 +165,10 @@ reporter's machine.
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
   newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.3 is built
   and tested for **sm_86** only (RTX 30-series).
-- GNU Guile 3.0
+- GNU Guile 3.0 and
+  [guile-json](https://github.com/aconchillo/guile-json) (the `(json)` module,
+  used by the Guile binding for build info and by the serve front end).
+  `apt install guile-3.0 guile-json` on Debian/Ubuntu.
 - [SonicCross](https://github.com/hardenedlinux/SonicCross), a required
   build-time dependency (see below)
 

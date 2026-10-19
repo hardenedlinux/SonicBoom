@@ -13,7 +13,12 @@ Every numeric operation is dispatched across the C API into
 Scheme does is build graphs, hold handles, and drive loops. Per-element
 arithmetic is not written in Scheme.
 
-Guile 3.0.9 or later.
+Guile 3.0.9 or later, plus
+[guile-json](https://github.com/aconchillo/guile-json) for its `(json)` module:
+[`(sonicboom ffi)`](scheme/sonicboom/ffi.scm) decodes `sb_build_info()` with it,
+and [`(sonicboom serve)`](scheme/sonicboom/serve) uses it for chat templates and
+the OpenAI-compatible API. Both are packaged as `guile-3.0` and `guile-json` on
+Debian/Ubuntu.
 
 ## Running
 
