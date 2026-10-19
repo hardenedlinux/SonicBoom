@@ -1719,6 +1719,72 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   return true;
 }
 
+bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
+                          std::span<const uint64_t> drafts,
+                          planner::KvCacheSession& session,
+                          std::span<int64_t> out, uint64_t* accepted_out) {
+  auto fail = [](const char* why) {
+    std::cerr << "[spec] spec_step: " << why << "\n";
+    return false;
+  };
+  if (drafts.empty() || drafts.size() + 1 > size_t(planner::kMaxVerifyRows))
+    return fail("bad draft length");
+  if (out.size() < drafts.size() + 1) return fail("output too small");
+  if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
+  // The valid length: the history is exactly the tokens whose KV is resident,
+  // so the token the previous step sampled (last_token) goes at start_pos and
+  // the drafts at start_pos+1 .. start_pos+k.
+  const uint64_t start_pos = uint64_t(session.filled_tokens.size());
+  const size_t rows = drafts.size() + 1;
+  if (start_pos + rows > session.n_ctx)
+    return fail("positions exceed the session cache");
+
+  // Row i's context ends at drafts[i-1] (row 0 at last_token), so its argmax is
+  // the plain-decode greedy token at position start_pos+i+1.
+  std::vector<uint64_t> feed(rows);
+  feed[0] = last_token;
+  for (size_t i = 0; i < drafts.size(); ++i) feed[i + 1] = drafts[i];
+  std::vector<int64_t> row_argmax(rows, -1);
+  if (!verify_step_spine_cuda(m, feed, start_pos, session, row_argmax))
+    return fail("verify step failed");
+
+  uint64_t accepted = 0;
+  while (accepted < drafts.size() &&
+         row_argmax[size_t(accepted)] == int64_t(drafts[size_t(accepted)]))
+    ++accepted;
+  for (uint64_t i = 0; i < accepted; ++i) out[i] = int64_t(drafts[size_t(i)]);
+  out[accepted] = row_argmax[size_t(accepted)];
+  if (accepted_out) *accepted_out = accepted;
+
+  // Rollback: the verify wrote all rows, but only start_pos .. start_pos+accepted
+  // belong to the accepted run. The rest are dead entries past the valid length:
+  // no later attention extent reaches them (an extent at position p reads only
+  // positions <= p), and the next steps overwrite them in order. The session
+  // history records the accepted tokens only, so a later prefix match cannot
+  // reuse a KV row computed from a rejected draft.
+  session.filled_tokens.push_back(last_token);
+  for (uint64_t i = 0; i < accepted; ++i)
+    session.filled_tokens.push_back(drafts[size_t(i)]);
+  return true;
+}
+
+bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
+                       bool is_k, uint64_t first, uint64_t count,
+                       std::span<float> out) {
+  if (!session.caches || layer >= session.caches->size() || count == 0)
+    return false;
+  const planner::KvCacheDev& c = (*session.caches)[layer];
+  const uint64_t row = c.n_heads_kv * c.head_dim;
+  if (row == 0 || out.size() < count * row) return false;
+  for (uint64_t i = 0; i < count; ++i) {
+    if (!planner::SonicCudaBackend::read_cache_row(
+            c, is_k, first + i,
+            out.subspan(size_t(i * row), size_t(row))))
+      return false;
+  }
+  return true;
+}
+
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
   // Ablatable warm-up: with the feature off nothing is built here, so the
@@ -2028,6 +2094,17 @@ bool verify_step_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
                             uint64_t, planner::KvCacheSession&,
                             std::span<int64_t>) {
   return false;  // built without CUDA: no device spine to run
+}
+
+bool spec_step_spine_cuda(const Gemma4Model&, uint64_t,
+                          std::span<const uint64_t>, planner::KvCacheSession&,
+                          std::span<int64_t>, uint64_t*) {
+  return false;  // built without CUDA: no device spine to run
+}
+
+bool kv_read_rows_cuda(const planner::KvCacheSession&, uint32_t, bool,
+                       uint64_t, uint64_t, std::span<float>) {
+  return false;  // built without CUDA: there is no device cache to read
 }
 
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,

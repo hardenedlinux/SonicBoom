@@ -205,6 +205,37 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
                              planner::KvCacheSession& session,
                              std::span<int64_t> out);
 
+// B4: one speculative step — draft, verify, accept, and roll the session back to
+// the accepted run. `last_token` is the token the previous step sampled (it sits
+// at position L = session.filled_tokens.size(), not yet in the cache); `drafts`
+// are the drafter's proposals for positions L+1 .. L+k. The step feeds
+// [last_token, drafts...] through the verify graph at positions L .. L+k and
+// accepts the longest prefix a of `drafts` whose i-th entry equals row i's
+// argmax (row i's context ends at drafts[i-1], so its argmax is exactly the
+// plain-decode greedy token at position L+i+1). The verifier's own next token,
+// row a's argmax, follows the accepted drafts. `out` receives accepted+1 tokens
+// (out.size() >= drafts.size()+1) and *accepted_out the count a.
+//
+// The verify step wrote KV for all k+1 rows, but only positions L .. L+a belong
+// to the accepted run: rows L+a+1 .. L+k were computed with rejected draft
+// tokens. Those entries are left in place (they are past the valid length) —
+// no later attention extent reaches them, and the next steps overwrite them in
+// order. The session's token history records exactly the accepted run
+// (last_token and drafts[0..a-1]), so prefix reuse after a speculative session
+// matches only KV that belongs to accepted tokens.
+bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
+                          std::span<const uint64_t> drafts,
+                          planner::KvCacheSession& session,
+                          std::span<int64_t> out, uint64_t* accepted_out);
+
+// Test seam (B4): copy one KV layer's K (is_k) or V rows for absolute positions
+// [first, first+count) into `out` (count * n_heads_kv * head_dim floats). The
+// speculative rollback test compares a verify step's valid KV region bit-for-bit
+// against plain decode; nothing in the runtime reads a cache back to the host.
+bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
+                       bool is_k, uint64_t first, uint64_t count,
+                       std::span<float> out);
+
 // Prefill + decode through the CPU spine. Processes the whole `prompt` in one
 // batched graph pass (build_gemma4_prefill_graph → plan_execution →
 // RuntimeExecutor with the batched OpKinds), samples `tokens[0]` from the final

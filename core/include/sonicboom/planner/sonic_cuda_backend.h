@@ -201,6 +201,14 @@ public:
   // alias a different, later vector.
   std::shared_ptr<void> cache_identity() const { return caches_; }
 
+  // Test seam (B4): copy one KV layer's K or V row for absolute position `pos`
+  // into `out` (n_heads_kv * head_dim floats). The row's slot is `pos %
+  // n_slots`, exactly what the kernels address. Used only by the speculative
+  // rollback test, which compares a verify step's valid KV region bit-for-bit
+  // against plain decode; production code never reads a cache back to the host.
+  static bool read_cache_row(const KvCacheDev& cache, bool is_k, uint64_t pos,
+                             std::span<float> out);
+
 private:
   const model::Gemma4Model* model_ = nullptr;  // compute model (weights/config), bound via bind_model()
   KvCacheSpec spec_;                           // KV-cache geometry (owned copy)

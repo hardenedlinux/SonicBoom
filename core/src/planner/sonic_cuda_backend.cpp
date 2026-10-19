@@ -394,6 +394,15 @@ void SonicCudaBackend::publish_cache(KvCacheSession& session) const {
   session.n_ctx = n_ctx_;
 }
 
+bool SonicCudaBackend::read_cache_row(const KvCacheDev& cache, bool is_k,
+                                      uint64_t pos, std::span<float> out) {
+  const uint64_t row = cache.n_heads_kv * cache.head_dim;
+  const hal::Buffer& buf = is_k ? cache.k_buf : cache.v_buf;
+  if (!buf || cache.n_slots == 0 || row == 0 || out.size() < row) return false;
+  const uint64_t byte_off = (pos % cache.n_slots) * row * sizeof(float);
+  return device::download(buf.id + byte_off, out.data(), row * sizeof(float));
+}
+
 std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     const TaskDesc& task, const std::vector<TensorValue>& in) {
   const auto* compute = task.as_compute();

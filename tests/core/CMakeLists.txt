@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_runtime_features)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -100,6 +100,11 @@ set_tests_properties(test_plan_cache
 target_compile_definitions(test_spec_invariance PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# test_spec_rollback (B4 KV rollback) needs both model GGUFs, looked up
+# relative to the repository root, one forked child per (model, depth, case).
+target_compile_definitions(test_spec_rollback PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).
 #
 # The lock covers every test that allocates device memory. Two of them at once
@@ -133,7 +138,7 @@ target_compile_definitions(test_spec_invariance PRIVATE
 # touching the device (test_gguf, test_dequant, test_gemma4, test_qwen2_config,
 # test_vocab), and everything else in the suite — CPU-only tests stay parallel.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
-                              test_spec_invariance
+                              test_spec_invariance test_spec_rollback
   PROPERTIES RESOURCE_LOCK gpu_vram)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
