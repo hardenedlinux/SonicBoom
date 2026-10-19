@@ -29,9 +29,11 @@
 //
 // The function is invoked through the bare-pointer calling convention: a
 // `func.func @main(tensor<...xf32>, ..., tensor<...xf32>) -> tensor<...xf32>`
-// (identity layout) becomes `float *main(float *, ..., float *)`; the returned
-// pointer is malloc'd by the JIT runtime and freed by the caller. v0 execution
-// scope is one or more float32 inputs and exactly one float32 output.
+// (identity layout) becomes `float *main(float *, ..., float *)`; a graph with
+// several outputs lowers to `{float *, ...} main(float *, ..., float *)`. The
+// returned pointers are malloc'd by the JIT runtime and freed by the caller.
+// v0 execution scope is one or more float32 inputs and one or more float32
+// outputs.
 
 #include <sonicboom/sx/exec.h>
 
@@ -183,29 +185,55 @@ struct Executable::Impl {
   std::vector<std::size_t> output_bytes;
 };
 
+// The result-count switch in call_entry enumerates this many; keep them in step.
+static constexpr std::size_t kMaxOutputs = 8;
+
 // Invoke the JIT entry with one bare pointer per graph input. The bare-ptr call
 // convention turns `func @main(memref<..>, ..., memref<..>) -> memref<..>`
 // (identity layout) into `float* main(float*, ..., float*)`, so the entry takes
-// one pointer per input and returns the single output pointer. Arity is fixed
-// at compile time by the graph, so dispatch on it. Returns nullptr for an
-// unsupported (larger) arity.
-void* call_entry(void* entry, const std::vector<const void*>& ptrs) {
+// one pointer per input and returns the output pointer(s). With several
+// results the lowering returns an LLVM struct of pointers, which the target
+// ABI maps to the same registers/memory a C++ struct of that shape uses
+// (two pointers in RAX:RDX on x86-64, a hidden result pointer beyond that), so
+// a matching `PtrResult<N>` return type reproduces the callee convention.
+// Input arity and result count are fixed at compile time by the graph; the
+// unprototyped parameter list keeps the input dispatch in one place (the
+// pointer arguments are integer-class and pass identically either way).
+//
+// Returns an empty vector for an unsupported arity.
+template <std::size_t N>
+struct PtrResult {
+  void* ptr[N];
+};
+
+template <std::size_t N>
+std::vector<void*> call_entry_n(void* entry,
+                                const std::vector<const void*>& ptrs) {
+  using Fn = PtrResult<N> (*)(...);
+  auto fn = reinterpret_cast<Fn>(entry);
+  PtrResult<N> r{};
   switch (ptrs.size()) {
-    case 1:
-      return reinterpret_cast<void* (*)(const void*)>(entry)(ptrs[0]);
-    case 2:
-      return reinterpret_cast<void* (*)(const void*, const void*)>(entry)(
-          ptrs[0], ptrs[1]);
-    case 3:
-      return reinterpret_cast<void* (*)(const void*, const void*,
-                                       const void*)>(entry)(
-          ptrs[0], ptrs[1], ptrs[2]);
-    case 4:
-      return reinterpret_cast<void* (*)(const void*, const void*, const void*,
-                                       const void*)>(entry)(
-          ptrs[0], ptrs[1], ptrs[2], ptrs[3]);
-    default:
-      return nullptr;
+    case 1: r = fn(ptrs[0]); break;
+    case 2: r = fn(ptrs[0], ptrs[1]); break;
+    case 3: r = fn(ptrs[0], ptrs[1], ptrs[2]); break;
+    case 4: r = fn(ptrs[0], ptrs[1], ptrs[2], ptrs[3]); break;
+    default: return {};
+  }
+  return std::vector<void*>(r.ptr, r.ptr + N);
+}
+
+std::vector<void*> call_entry(void* entry, const std::vector<const void*>& ptrs,
+                              std::size_t num_outputs) {
+  switch (num_outputs) {
+    case 1: return call_entry_n<1>(entry, ptrs);
+    case 2: return call_entry_n<2>(entry, ptrs);
+    case 3: return call_entry_n<3>(entry, ptrs);
+    case 4: return call_entry_n<4>(entry, ptrs);
+    case 5: return call_entry_n<5>(entry, ptrs);
+    case 6: return call_entry_n<6>(entry, ptrs);
+    case 7: return call_entry_n<7>(entry, ptrs);
+    case 8: return call_entry_n<8>(entry, ptrs);
+    default: return {};
   }
 }
 
@@ -218,15 +246,18 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
     const Document& doc, const std::unordered_map<std::string, Bytes>& weights) {
   const Graph& g = doc.graph;
 
-  // v0 execution scope: one or more float32 inputs, exactly one float32 output.
+  // v0 execution scope: one or more float32 inputs, one or more float32 outputs.
   if (g.inputs.empty())
     return std::unexpected(make_error(
         ExecErrorKind::Compile, "execution requires at least one graph input"));
-  if (g.outputs.size() != 1)
+  if (g.outputs.empty())
+    return std::unexpected(make_error(
+        ExecErrorKind::Compile, "execution requires at least one graph output"));
+  if (g.outputs.size() > kMaxOutputs)
     return std::unexpected(make_error(
         ExecErrorKind::Compile,
-        "execution requires exactly one graph output (got " +
-            std::to_string(g.outputs.size()) + ")"));
+        "execution supports at most " + std::to_string(kMaxOutputs) +
+            " graph outputs (got " + std::to_string(g.outputs.size()) + ")"));
 
   // Reject overflowing byte sizes up front, before any MLIR lowering or JIT,
   // so a wrapped size can never reach an allocation, file read, or memcpy.
@@ -245,18 +276,26 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
     in_bytes.push_back(static_cast<std::size_t>(*b));
   }
 
-  const TensorType* out_type = find_def_type(g, g.outputs[0]);
-  if (!out_type)
-    return std::unexpected(make_error(
-        ExecErrorKind::Compile,
-        "graph output references undefined value '" + g.outputs[0] + "'"));
-  if (out_type->dtype != DType::Float32)
-    return std::unexpected(make_error(
-        ExecErrorKind::Compile, "execution output must be float32 in v0"));
-  auto out_bytes = tensor_byte_size(*out_type);
-  if (!out_bytes)
-    return std::unexpected(make_error(
-        ExecErrorKind::Compile, "output tensor byte size overflows"));
+  std::vector<TensorType> out_types;
+  std::vector<std::size_t> out_bytes;
+  out_types.reserve(g.outputs.size());
+  out_bytes.reserve(g.outputs.size());
+  for (const auto& name : g.outputs) {
+    const TensorType* out_type = find_def_type(g, name);
+    if (!out_type)
+      return std::unexpected(make_error(
+          ExecErrorKind::Compile,
+          "graph output references undefined value '" + name + "'"));
+    if (out_type->dtype != DType::Float32)
+      return std::unexpected(make_error(
+          ExecErrorKind::Compile, "execution output must be float32 in v0"));
+    auto bytes = tensor_byte_size(*out_type);
+    if (!bytes)
+      return std::unexpected(make_error(
+          ExecErrorKind::Compile, "output tensor byte size overflows"));
+    out_types.push_back(*out_type);
+    out_bytes.push_back(static_cast<std::size_t>(*bytes));
+  }
 
   // Dialect set: the lowering emits func/arith/tensor/linalg ops, and the
   // pipeline introduces bufferization/scf/cf/memref/affine/LLVM ops. The
@@ -340,14 +379,20 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
   exe->impl_->engine = std::move(eng);
   exe->impl_->entry = *sym;
   exe->impl_->inputs = std::move(in_types);
-  exe->impl_->outputs = {*out_type};
+  exe->impl_->outputs = std::move(out_types);
   exe->impl_->input_bytes = std::move(in_bytes);
-  exe->impl_->output_bytes = {static_cast<std::size_t>(*out_bytes)};
+  exe->impl_->output_bytes = std::move(out_bytes);
   return exe;
 }
 
 const TensorType& Executable::input_type() const { return impl_->inputs.front(); }
 const TensorType& Executable::output_type() const { return impl_->outputs.front(); }
+const std::vector<TensorType>& Executable::input_types() const {
+  return impl_->inputs;
+}
+const std::vector<TensorType>& Executable::output_types() const {
+  return impl_->outputs;
+}
 
 std::expected<void, ExecError> Executable::run(const std::vector<Bytes>& inputs,
                                                std::vector<Bytes>& outputs) const {
@@ -363,9 +408,11 @@ std::expected<void, ExecError> Executable::run(const std::vector<Bytes>& inputs,
           "input buffer " + std::to_string(i) + " is " +
               std::to_string(inputs[i].size()) + " bytes, expected " +
               std::to_string(impl_->input_bytes[i])));
-  if (impl_->output_bytes.front() == 0)
-    return std::unexpected(make_error(ExecErrorKind::Binding,
-                                      "output tensor has zero elements"));
+  for (std::size_t i = 0; i < impl_->output_bytes.size(); ++i)
+    if (impl_->output_bytes[i] == 0)
+      return std::unexpected(make_error(
+          ExecErrorKind::Binding,
+          "output tensor " + std::to_string(i) + " has zero elements"));
 
   if (inputs.size() > 4)
     return std::unexpected(make_error(
@@ -378,15 +425,30 @@ std::expected<void, ExecError> Executable::run(const std::vector<Bytes>& inputs,
   for (const auto& b : inputs)
     ptrs.push_back(b.data());
 
-  void* result = call_entry(impl_->entry, ptrs);
-  if (!result)
+  std::vector<void*> results = call_entry(impl_->entry, ptrs,
+                                          impl_->output_bytes.size());
+  if (results.size() != impl_->output_bytes.size())
     return std::unexpected(make_error(
-        ExecErrorKind::Runtime, "JIT entry returned a null pointer"));
+        ExecErrorKind::Runtime,
+        "JIT entry returned " + std::to_string(results.size()) +
+            " results, expected " + std::to_string(impl_->output_bytes.size())));
+
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    if (!results[i]) {
+      for (std::size_t j = 0; j < results.size(); ++j)
+        std::free(results[j]);
+      return std::unexpected(make_error(
+          ExecErrorKind::Runtime,
+          "JIT entry returned a null pointer for output " + std::to_string(i)));
+    }
+  }
 
   outputs.assign(impl_->outputs.size(), Bytes{});
-  outputs.front().resize(impl_->output_bytes.front());
-  std::memcpy(outputs.front().data(), result, impl_->output_bytes.front());
-  std::free(result);  // the bare-ptr ABI returns a malloc'd buffer
+  for (std::size_t i = 0; i < results.size(); ++i) {
+    outputs[i].resize(impl_->output_bytes[i]);
+    std::memcpy(outputs[i].data(), results[i], impl_->output_bytes[i]);
+    std::free(results[i]);  // the bare-ptr ABI returns malloc'd buffers
+  }
   return {};
 }
 

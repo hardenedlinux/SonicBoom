@@ -170,6 +170,21 @@ sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
                          int64_t *rank_out, const int64_t **dims_out,
                          uint64_t *num_bytes_out);
 
+/* Graph arity and per-index introspection. A graph may have several inputs and
+ * several outputs (a training graph typically returns one gradient per
+ * parameter). sb_input_info/sb_output_info describe index 0; the *_info_at
+ * forms describe any index in [0, count). An index out of range is
+ * SB_ERR_INTERNAL (invalid argument). */
+sb_status sb_input_count(const sb_executable *exe, size_t *count_out);
+sb_status sb_output_count(const sb_executable *exe, size_t *count_out);
+sb_status sb_input_info_at(const sb_executable *exe, size_t index,
+                           sb_dtype *dtype_out, int64_t *rank_out,
+                           const int64_t **dims_out, uint64_t *num_bytes_out);
+sb_status sb_output_info_at(const sb_executable *exe, size_t index,
+                            sb_dtype *dtype_out, int64_t *rank_out,
+                            const int64_t **dims_out,
+                            uint64_t *num_bytes_out);
+
 /* --- Execute / retrieve ---------------------------------------------------- */
 
 /* Bind the input tensor buffer. `data` is copied, so the caller may free it
@@ -185,6 +200,22 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out);
  * `*written_out` is the output byte count (== the output num_bytes). */
 sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
                              size_t *written_out, sb_error **err_out);
+
+/* Run the graph over N inputs and M outputs in one call — the general form
+ * behind sb_bind_input/sb_execute/sb_retrieve_output (the 1-in/1-out wrapper).
+ * `num_inputs` must equal sb_input_count and `num_outputs` must equal
+ * sb_output_count. Every input is copied, so the caller may free it as soon as
+ * this returns; `input_lens[i]` must equal that input's num_bytes.
+ * `output_data[i]` must have capacity at least the i-th output's num_bytes and
+ * `output_caps[i]` carries that capacity; capacities are checked before the
+ * graph runs. On success each result is copied into `output_data[i]` and, when
+ * `output_lens` is non-NULL, `output_lens[i]` receives the byte count written.
+ * On failure no result buffer is modified. */
+sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
+                       const size_t *input_lens, size_t num_inputs,
+                       void *const *output_data, const size_t *output_caps,
+                       size_t num_outputs, size_t *output_lens,
+                       sb_error **err_out);
 
 /* --- Release --------------------------------------------------------------- */
 

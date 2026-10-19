@@ -479,6 +479,63 @@ sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
       nullptr);
 }
 
+sb_status sb_input_count(const sb_executable *exe, size_t *count_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !count_out)
+          return fail_arg(nullptr);
+        *count_out = exe->exe->input_types().size();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_count(const sb_executable *exe, size_t *count_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !count_out)
+          return fail_arg(nullptr);
+        *count_out = exe->exe->output_types().size();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_input_info_at(const sb_executable *exe, size_t index,
+                           sb_dtype *dtype_out, int64_t *rank_out,
+                           const int64_t **dims_out, uint64_t *num_bytes_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe)
+          return fail_arg(nullptr);
+        const auto &types = exe->exe->input_types();
+        if (index >= types.size())
+          return fail_arg(nullptr);
+        fill_tensor_info(types[index], dtype_out, rank_out, dims_out,
+                         num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_info_at(const sb_executable *exe, size_t index,
+                            sb_dtype *dtype_out, int64_t *rank_out,
+                            const int64_t **dims_out,
+                            uint64_t *num_bytes_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe)
+          return fail_arg(nullptr);
+        const auto &types = exe->exe->output_types();
+        if (index >= types.size())
+          return fail_arg(nullptr);
+        fill_tensor_info(types[index], dtype_out, rank_out, dims_out,
+                         num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
 // --- Execute / retrieve -----------------------------------------------------
 
 sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
@@ -504,6 +561,85 @@ sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
       err_out);
 }
 
+sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
+                       const size_t *input_lens, size_t num_inputs,
+                       void *const *output_data, const size_t *output_caps,
+                       size_t num_outputs, size_t *output_lens,
+                       sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !input_data || !input_lens || !output_data ||
+            !output_caps)
+          return fail_arg(err_out);
+
+        const auto &in_types = exe->exe->input_types();
+        const auto &out_types = exe->exe->output_types();
+        if (num_inputs != in_types.size()) {
+          std::string msg =
+              "graph takes " + std::to_string(in_types.size()) +
+              " inputs, sb_run_multi got " + std::to_string(num_inputs);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        if (num_outputs != out_types.size()) {
+          std::string msg =
+              "graph has " + std::to_string(out_types.size()) +
+              " outputs, sb_run_multi got " + std::to_string(num_outputs);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+
+        // Validate every buffer before running: a binding error must leave
+        // the output buffers untouched.
+        std::vector<sx::Bytes> ins;
+        ins.reserve(num_inputs);
+        for (size_t i = 0; i < num_inputs; ++i) {
+          uint64_t need = tensor_num_bytes(in_types[i]);
+          if (input_lens[i] != need) {
+            std::string msg = "input " + std::to_string(i) + " is " +
+                              std::to_string(input_lens[i]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+          if (need == 0) {
+            ins.emplace_back();
+            continue;
+          }
+          if (!input_data[i])
+            return fail_arg(err_out);
+          const auto *p = static_cast<const std::byte *>(input_data[i]);
+          ins.emplace_back(p, p + need);
+        }
+        for (size_t i = 0; i < num_outputs; ++i) {
+          uint64_t need = tensor_num_bytes(out_types[i]);
+          if (!output_data[i] || output_caps[i] < need) {
+            std::string msg = "output " + std::to_string(i) + " has capacity " +
+                              std::to_string(output_caps[i]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::vector<sx::Bytes> outs;
+        auto res = exe->exe->run(ins, outs);
+        if (!res) {
+          set_error(err_out, exec_errkind(res.error().kind),
+                    res.error().message.c_str());
+          return exec_status(res.error().kind);
+        }
+
+        for (size_t i = 0; i < num_outputs; ++i) {
+          std::memcpy(output_data[i], outs[i].data(), outs[i].size());
+          if (output_lens)
+            output_lens[i] = outs[i].size();
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
 sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
@@ -514,16 +650,26 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
                     "input not bound (call sb_bind_input)");
           return SB_ERR_BINDING;
         }
-
-        auto res = exe->exe->run(exe->input, exe->output);
-        if (!res) {
+        size_t n_out = exe->exe->output_types().size();
+        if (n_out != 1) {
+          std::string msg =
+              "graph has " + std::to_string(n_out) +
+              " outputs; sb_execute is the 1-in/1-out wrapper, use sb_run_multi";
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
           exe->has_output = false;
-          set_error(err_out, exec_errkind(res.error().kind),
-                    res.error().message.c_str());
-          return exec_status(res.error().kind);
+          return SB_ERR_BINDING;
         }
-        exe->has_output = true;
-        return SB_OK;
+
+        exe->output.resize(tensor_num_bytes(exe->exe->output_type()));
+        const void *in_ptr = exe->input.data();
+        size_t in_len = exe->input.size();
+        void *out_ptr = exe->output.data();
+        size_t out_cap = exe->output.size();
+        size_t written = 0;
+        sb_status s = sb_run_multi(exe, &in_ptr, &in_len, 1, &out_ptr,
+                                   &out_cap, 1, &written, err_out);
+        exe->has_output = (s == SB_OK);
+        return s;
       },
       err_out);
 }

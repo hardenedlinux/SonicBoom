@@ -333,6 +333,12 @@ add_executable(test_capi test_capi.c)
 target_link_libraries(test_capi PRIVATE sonicboom m)
 sb_add_cpp_test(test_capi)
 
+# Multi-input / multi-output C ABI: one graph returning both a+b and a*b,
+# driven through sb_run_multi and the per-index introspection.
+add_executable(test_capi_multi test_capi_multi.c)
+target_link_libraries(test_capi_multi PRIVATE sonicboom m)
+sb_add_cpp_test(test_capi_multi)
+
 # Boom IR dialect test: op registration against planner::OpKind, the generated
 # assembly formats, the type verifiers. It links the compiler library
 # (sonicboom_compiler), which is always built — MLIR is a required dependency

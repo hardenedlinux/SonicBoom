@@ -25,10 +25,11 @@
 // it into a callable native function. `run` executes that function over raw
 // little-endian tensor buffers.
 //
-// v0 execution scope: one or more float32 graph inputs and exactly one float32
-// graph output (the ResNet-18 example and the Add/Relu smoke graphs have a
-// single input/output; a co-execution merge slice such as `add(a, b)` has two).
-// Compiling a graph outside this scope is an explicit error.
+// v0 execution scope: one or more float32 graph inputs and one or more float32
+// graph outputs (the ResNet-18 example and the Add/Relu smoke graphs have a
+// single input/output; a co-execution merge slice such as `add(a, b)` has two
+// inputs, and a training graph can return several gradients). Compiling a graph
+// outside this scope is an explicit error.
 
 #include <cstddef>
 #include <cstdint>
@@ -70,8 +71,8 @@ class Executable {
 public:
   // Compile `doc` for CPU execution. `weights` must provide a buffer for every
   // `:external` parameter (see load_external_weights); `:values` parameters are
-  // taken from `doc` itself. Requires one or more float32 graph inputs and
-  // exactly one float32 graph output (v0 execution scope).
+  // taken from `doc` itself. Requires one or more float32 graph inputs and one
+  // or more float32 graph outputs (v0 execution scope).
   static std::expected<std::unique_ptr<Executable>, ExecError> compile(
       const Document& doc, const std::unordered_map<std::string, Bytes>& weights);
 
@@ -81,11 +82,13 @@ public:
   Executable& operator=(const Executable&) = delete;
   ~Executable();
 
-  // The graph's input and output tensor types (binding contract). `input_type`
-  // returns the first input; single-input graphs are the common case. The
-  // full vector form is available via the multi-input run() overload.
+  // The graph's input and output tensor types (binding contract), in graph
+  // order. `input_type`/`output_type` return the first of each; the vector
+  // forms describe all of them.
   const TensorType& input_type() const;
   const TensorType& output_type() const;
+  const std::vector<TensorType>& input_types() const;
+  const std::vector<TensorType>& output_types() const;
 
   // Run the graph over one raw little-endian buffer per graph input (in graph
   // input order). Each buffer's byte count must equal numel(its type) *
