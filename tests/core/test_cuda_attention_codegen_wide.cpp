@@ -7,9 +7,9 @@
 // 512 -> 8 x 64), exchanges the partial S through shared memory and sums the
 // slices in warp order. The Qwen2.5 head (head_dim 64, GQA 7) fits one warp
 // and is covered by the same test: its generated kernel is checked against
-// fp64 and the batch-invariance contract like the wide heads, while
-// attn_auto_pick keeps the hand-written kernel for it (the prefill leg is
-// 1.7x faster there: 0.081 vs 0.138 ms at 256 queries).
+// fp64 and the batch-invariance contract like the wide heads. Since attn9
+// its prefill is the class default and is bit-identical to the hand-written
+// tiled kernel (`--shapes d64 tokens`).
 //
 // This test checks that path against an fp64 reference that simulates the
 // kernel's two roundings (f16 Q/K/V staging, f16 P), for both mask kinds and
@@ -267,7 +267,7 @@ struct ShapeCase {
   const char *causal_region;
   const char *window_region;
   // The implementation attn_auto_pick is expected to choose for this class
-  // (d64: own wins the prefill leg by 1.7x; d256/d512: codegen).
+  // (all three classes: generated prefill since attn9).
   bool auto_codegen = true;
 };
 
@@ -426,8 +426,8 @@ int main(int argc, char **argv) {
   setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
 
   const ShapeCase shapes[] = {
-      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x64-dps1",
-       "attn-d64-g7-window-b64x64-dps1", false},
+      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x32-dps1",
+       "attn-d64-g7-window-b64x32-dps1", true},
       {{256, 2, 4, 8}, "attn-d256-g4-causal-b64x16-dps4",
        "attn-d256-g4-window-b64x16-dps4"},
       {{512, 2, 4, 8}, "attn-d512-g4-causal-b32x16-dps8",

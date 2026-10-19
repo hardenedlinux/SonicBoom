@@ -2890,7 +2890,13 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
   // columns; wider tiles buy occupancy only until the dynamic-smem limit
   // (96 KiB) or the 32-warp block limit is reached.
   if (gqa == 7 && head_dim == 64) {
-    // defaults: br = bc = 64, dps = 1 (one warp, 24 KiB)
+    // br = 64, bc = 32, dps = 1 (one warp, 12 KiB). bc = 32 is the tuner's
+    // measured winner for this class; since attn9 the generated prefill is
+    // bit-identical to the hand-written tiled kernel, so moving the class no
+    // longer changes the token stream.
+    shape.br = 64;
+    shape.bc = 32;
+    shape.dps = 1;
   } else if (gqa == 4 && head_dim == 256) {
     shape.br = 64;
     shape.bc = 16;
@@ -2998,13 +3004,23 @@ std::string attn_choice_name(const AttnChoice &c) {
 // or unavailable (graph capture). The tuner measures these same defaults
 // first and keeps them unless a candidate wins by the switch margin.
 AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
-  // d64 (Qwen2.5, GQA 7): own wins both legs after the split-KV decode
-  // landed. Prefill 256 queries: own 0.081 ms vs codegen 0.138 ms (default
-  // 64x64; the best swept config 64,32,4 is a tie at 0.081 and is not worth
-  // the reduction-order change). Decode via attention_bench: 513 keys own
-  // 21.8 us vs generated 38.6; 4097 keys 156.7 vs 181.4. The generated
-  // kernel's lead at d256/d512 does not transfer to the narrow head.
-  if (gqa == 7 && head_dim == 64) return {AttnImpl::Own, 0, 0, 0};
+  // d64 (Qwen2.5, GQA 7): generated prefill is the default since attn9 made
+  // its softmax bookkeeping bit-identical to the hand-written tiled kernel
+  // (left-to-right row sum, fused l update). The ablation arm
+  // SONICBOOM_ATTN_PREFILL_D64=own pins the hand-written kernel.
+  //
+  // Decode is separately keyed: the generated split-KV pair is token-identical
+  // there too (C7), but at d64 the hand-written split-KV kernel is faster
+  // (513 keys: own 21.8 us vs generated 38.6; 4097 keys: 156.7 vs 181.4), so
+  // this choice is the prefill table only.
+  if (gqa == 7 && head_dim == 64) {
+    if (const char *e = std::getenv("SONICBOOM_ATTN_PREFILL_D64");
+        e != nullptr && std::string_view(e) == "own")
+      return {AttnImpl::Own, 0, 0, 0};
+    if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
+      return {AttnImpl::Codegen, s->br, s->bc, s->dps};
+    return {AttnImpl::Own, 0, 0, 0};
+  }
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
   // (0.318/0.231 ms vs own 0.424/0.243).
   // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
@@ -3271,10 +3287,11 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   if (!::sonicboom::tune::enabled()) return def;
   // Only the classes the generator covers can be tuned; the rest keep own.
   if (!attn_codegen_default_shape(head_dim, gqa, window)) return def;
-  // A class whose measured default is the hand-written kernel keeps it: the
-  // generated kernel's S reduction association differs from the hand-written
-  // one, so moving the class would change the token stream. That arm is
-  // opt-in (same switch as the non-identical tile variants).
+  // A class whose measured default is the hand-written kernel keeps it,
+  // except d64, whose generated prefill has matched the hand-written kernel
+  // bitwise since attn9. The guard stays for any other own class: there the
+  // generated S reduction association still differs, so moving the class
+  // would change the token stream (the opt-in non-identical arm).
   if (def.impl == AttnImpl::Own &&
       std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") == nullptr)
     return def;
