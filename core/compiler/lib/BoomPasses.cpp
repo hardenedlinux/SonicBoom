@@ -2571,6 +2571,14 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     // Last: buffer assignment reads the final node set's uses and sizes.
     if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
     return;
+  case planner::IrPassPhase::Training:
+    // A traced training graph: the forward matmul/norm/activation vocabulary
+    // plus the explicit adjoint nodes. None of the inference folds above apply
+    // (no quantized weights, no KV cache, no decode/serve split), so the phase
+    // runs only what is semantic-neutral here — buffer reuse marks single-use
+    // elementwise results the device executor may write in place.
+    if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
+    return;
   }
 }
 
@@ -2582,6 +2590,8 @@ const char *phaseName(planner::IrPassPhase phase) {
     return "prefill";
   case planner::IrPassPhase::Verify:
     return "verify";
+  case planner::IrPassPhase::Training:
+    return "training";
   }
   return "?";
 }

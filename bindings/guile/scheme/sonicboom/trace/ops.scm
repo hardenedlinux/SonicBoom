@@ -770,6 +770,36 @@
                        (+ (vector-ref dw (+ row i)) (ctensor-ref dy (+ (* r dim) i)))))))
     (make-ctensor 'float32 (list vocab dim) dw)))
 
+(define (adamw-kernel ts attrs)
+  "One fused AdamW update: (new param, new m1, new m2). Same arithmetic as the
+device kernel (core/src/training/device_graph_kernels.cu): the moments see the
+raw gradient, the weight decay is decoupled and applied with the step, and the
+step counter is a 1-based int32 tensor."
+  (let* ((p (car ts)) (g (cadr ts)) (m1 (caddr ts)) (m2 (cadddr ts))
+         (step (car (cddddr ts)))
+         (lr (attr-ref attrs 'lr 1e-3))
+         (beta1 (attr-ref attrs 'beta1 0.9))
+         (beta2 (attr-ref attrs 'beta2 0.999))
+         (eps (attr-ref attrs 'eps 1e-8))
+         (wd (attr-ref attrs 'weight_decay 0.01))
+         (t (inexact->exact (ctensor-item step)))
+         (bc1 (/ 1.0 (- 1.0 (expt beta1 t))))
+         (bc2 (/ 1.0 (- 1.0 (expt beta2 t))))
+         (n (ctensor-numel p))
+         (p* (make-vector n)) (m1* (make-vector n)) (m2* (make-vector n)))
+    (do ((i 0 (+ i 1))) ((= i n))
+      (let* ((gi (ctensor-ref g i))
+             (m (+ (* beta1 (ctensor-ref m1 i)) (* (- 1.0 beta1) gi)))
+             (v (+ (* beta2 (ctensor-ref m2 i)) (* (- 1.0 beta2) gi gi))))
+        (vector-set! m1* i m)
+        (vector-set! m2* i v)
+        (vector-set! p* i (- (ctensor-ref p i)
+                             (* lr (+ (/ (* m bc1) (+ (sqrt (* v bc2)) eps))
+                                      (* wd (ctensor-ref p i))))))))
+    (list (make-ctensor (ctensor-dtype p) (ctensor-shape p) p*)
+          (make-ctensor (ctensor-dtype m1) (ctensor-shape m1) m1*)
+          (make-ctensor (ctensor-dtype m2) (ctensor-shape m2) m2*))))
+
 ;;; --- gradients ----------------------------------------------------------------------
 ;;; A gradient rule is a pure function
 ;;;   (rule emit shape ins out g attrs) -> list of input gradients (#f = none)
@@ -1011,7 +1041,8 @@ axes TARGET has as 1, then reshape."
     (rmsnorm_bwd      3 ,first-input-type ,rmsnorm-bwd-kernel #f #f #f)
     (rope_bwd         1 ,first-input-type ,rope-bwd-kernel #f #f #f)
     (silu_mul_bwd     3 ,first-input-type ,silu-mul-bwd-kernel #f #f #f)
-    (embedding_bwd    2 ,embedding-bwd-type ,embedding-bwd-kernel #f #f #f)))
+    (embedding_bwd    2 ,embedding-bwd-type ,embedding-bwd-kernel #f #f #f)
+    (adamw            5 ,first-input-type ,adamw-kernel #f #f #f)))
 
 ;; Ops whose kernel has an effect: always recorded while tracing and never
 ;; removed by DCE.

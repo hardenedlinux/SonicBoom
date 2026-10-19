@@ -171,6 +171,9 @@ if(SONICBOOM_USE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/adamw.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/backward_ops.cu
+    # The training graph executor's forward + AdamW kernels (device_graph.cpp
+    # dispatches them; the fused adjoints are backward_ops.cu above).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/training/device_graph_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles

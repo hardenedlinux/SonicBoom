@@ -16,7 +16,7 @@
   #:export (make-ctensor ctensor? ctensor-dtype ctensor-shape ctensor-data
             ctensor-numel ctensor-ref ctensor->list ctensor->nested
             list->ctensor scalar->ctensor ctensor-item
-            make-leaf leaf? leaf-value leaf-grad set-leaf-grad!
+            make-leaf leaf? leaf-value set-leaf-value! leaf-grad set-leaf-grad!
             shape-numel float-dtype? int-dtype? valid-dtype?
             coerce-value))
 

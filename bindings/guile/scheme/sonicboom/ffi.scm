@@ -126,6 +126,24 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                (list '* '* '* '* '*)))
                (sb_output_info . ,(foreign-proc "sb_output_info" int
                                                 (list '* '* '* '* '*)))
+               ;; device training graph (sb_compile_device) — see capi.h
+               (sb_compile_device . ,(foreign-proc "sb_compile_device" int
+                                                   (list '* '* '*)))
+               (sb_input_count . ,(foreign-proc "sb_input_count" int
+                                                (list '* '*)))
+               (sb_output_count . ,(foreign-proc "sb_output_count" int
+                                                 (list '* '*)))
+               (sb_input_info_at . ,(foreign-proc "sb_input_info_at" int
+                                                  (list '* size_t '* '* '* '*)))
+               (sb_output_info_at . ,(foreign-proc "sb_output_info_at" int
+                                                   (list '* size_t '* '* '* '*)))
+               (sb_input_name_at . ,(foreign-proc "sb_input_name_at" int
+                                                  (list '* size_t '*)))
+               (sb_output_name_at . ,(foreign-proc "sb_output_name_at" int
+                                                   (list '* size_t '*)))
+               (sb_run_multi . ,(foreign-proc "sb_run_multi" int
+                                              (list '* '* '* size_t '* '* size_t
+                                                    '* '*)))
                (sb_bind_input . ,(foreign-proc "sb_bind_input" int
                                                (list '* '* size_t '*)))
                (sb_execute . ,(foreign-proc "sb_execute" int (list '* '*)))

@@ -72,6 +72,21 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-trace-lower.scm)
 
+  # guile-train-tiny traces a whole tiny Transformer training step (forward,
+  # `backward!`, fused AdamW), compiles it with sb_compile_device and runs it
+  # on the GPU, checking every parameter gradient against the pure-Scheme
+  # reference (1e-5) and that the loss falls. Same shared-library dependency
+  # as guile-nn, plus the GPU.
+  add_test(
+    NAME guile-train-tiny
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace/test-train-tiny.scm)
+  set_tests_properties(guile-train-tiny PROPERTIES RESOURCE_LOCK gpu_vram)
+
   # guile-nn-trace runs a `sequential` model through both
   # routes — the emitted-text forward pass and the traced/lowered one — and
   # checks that they agree; same shared-library dependency as guile-nn.

@@ -17,11 +17,17 @@
 ;;; is the ordinary `index-select` on axis 0. The composite versions in
 ;;; (sonicboom trace layers) still decompose into primitive ops; these exist
 ;;; for training graphs that go to the native lowering.
+;;;
+;;; adamw-step! is the one optimizer update that is itself a graph op: one
+;;; node for the whole parameter/moment update, so a training graph with any
+;;; number of parameters has one optimizer node per tensor instead of a
+;;; decomposed arithmetic chain.
 
 (define-module (sonicboom trace fused)
+  #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace symbolic)
   #:export (fused-softmax fused-rms-norm fused-rope fused-silu-mul
-            fused-cross-entropy))
+            fused-cross-entropy adamw-step!))
 
 (define (fused-softmax x)
   "Numerically stable softmax over the last axis."
@@ -50,3 +56,26 @@ row index selects the position. Shape [rows, heads * head_dim]."
 [rows, classes]. Returns a rank-0 mean loss (unlike the composite version,
 which also keeps the per-row values in the graph)."
   (apply-op 'cross_entropy (list logits targets) '()))
+
+(define (tensor-type x)
+  (cond ((sym? x) (cons (sym-dtype x) (sym-shape x)))
+        ((leaf? x) (tensor-type (leaf-value x)))
+        (else (cons (ctensor-dtype x) (ctensor-shape x)))))
+
+(define* (adamw-step! param grad m1 m2 step
+                      #:key (lr 1e-3) (beta1 0.9) (beta2 0.999)
+                      (eps 1e-8) (weight-decay 0.01))
+  "One fused AdamW update of PARAM from GRAD, with first/second moment state
+M1/M2 and the 1-based int32 STEP tensor. When PARAM/M1/M2 are leaves their
+value is replaced by the updated tensor, which the tracer syncs back to the
+caller's leaf after the segment runs. Returns (new-param new-m1 new-m2)."
+  (let ((outs (apply-op-multi 'adamw (list param grad m1 m2 step)
+                              `((lr (float ,lr)) (beta1 (float ,beta1))
+                                (beta2 (float ,beta2)) (eps (float ,eps))
+                                (weight_decay (float ,weight-decay)))
+                              (list (tensor-type param) (tensor-type m1)
+                                    (tensor-type m2)))))
+    (when (leaf? param) (set-leaf-value! param (car outs)))
+    (when (leaf? m1) (set-leaf-value! m1 (cadr outs)))
+    (when (leaf? m2) (set-leaf-value! m2 (caddr outs)))
+    outs))

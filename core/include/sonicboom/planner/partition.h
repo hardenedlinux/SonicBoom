@@ -96,6 +96,17 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::RopeBwd:
     case OpKind::SiluMulBwd:
     case OpKind::EmbeddingBwd:
+    // Training forward vocabulary: dense matmul/bmm, layout and reduction
+    // primitives, and the fused SwiGLU/CE forms. Like the backward ops they
+    // run as hand-written kernels over device buffers; the trained graph is
+    // executed by the device training graph executor, not a plan emitter.
+    case OpKind::Matmul:
+    case OpKind::Bmm:
+    case OpKind::Permute:
+    case OpKind::IndexSelect:
+    case OpKind::ReduceSum:
+    case OpKind::SiluMul:
+    case OpKind::CrossEntropy:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

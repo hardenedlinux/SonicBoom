@@ -37,6 +37,7 @@
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
+#include <sonicboom/training/device_graph.h>
 #include <sonicboom/training/param.h>
 #include <sonicboom/vocab/vocab.h>
 
@@ -61,11 +62,30 @@ struct sb_document {
 };
 
 struct sb_executable {
+  // Exactly one of the two is set: the CPU interpreter's executable
+  // (sb_compile) or a compiled device training graph (sb_compile_device). The
+  // introspection, bind, execute and retrieve entry points below are shared,
+  // and so are the sb_run_multi semantics.
   std::unique_ptr<sx::Executable> exe;
+  std::unique_ptr<sonicboom::training::DeviceTrainingGraph> device;
   bool input_bound = false;
   sx::Bytes input;    // copied at bind time
   sx::Bytes output;   // retained after execute
   bool has_output = false;
+
+  bool is_device() const { return device != nullptr; }
+  std::size_t input_count() const;
+  std::size_t output_count() const;
+  void input_info(std::size_t index, sb_dtype *dtype_out, int64_t *rank_out,
+                  const int64_t **dims_out, uint64_t *num_bytes_out) const;
+  void output_info(std::size_t index, sb_dtype *dtype_out, int64_t *rank_out,
+                   const int64_t **dims_out, uint64_t *num_bytes_out) const;
+  uint64_t input_num_bytes(std::size_t index) const;
+  uint64_t output_num_bytes(std::size_t index) const;
+  // Tensor names in binding order; nullptr for the CPU interpreter, whose
+  // executable does not retain value names.
+  const char *input_name(std::size_t index) const;
+  const char *output_name(std::size_t index) const;
 };
 
 struct sb_error {
@@ -437,6 +457,28 @@ sb_status sb_compile(const sb_document *doc, const char *base_dir,
       err_out);
 }
 
+sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!doc || !exe_out)
+          return fail_arg(err_out);
+        *exe_out = nullptr;
+
+        auto graph = sonicboom::training::DeviceTrainingGraph::compile(doc->doc);
+        if (!graph) {
+          set_error(err_out, SB_ERRKIND_COMPILE, graph.error().c_str());
+          return SB_ERR_COMPILE;
+        }
+
+        auto *out = new sb_executable();
+        out->device = std::move(*graph);
+        *exe_out = out;
+        return SB_OK;
+      },
+      err_out);
+}
+
 // --- I/O introspection (bind) -----------------------------------------------
 
 namespace {
@@ -454,17 +496,79 @@ void fill_tensor_info(const sx::TensorType &t, sb_dtype *dtype_out,
     *num_bytes_out = tensor_num_bytes(t);
 }
 
+using DeviceInfo = sonicboom::training::DeviceTensorInfo;
+
+void fill_device_info(const DeviceInfo &t, sb_dtype *dtype_out,
+                      int64_t *rank_out, const int64_t **dims_out,
+                      uint64_t *num_bytes_out) {
+  if (dtype_out)
+    *dtype_out = map_dtype(t.dtype);
+  if (rank_out)
+    *rank_out = static_cast<int64_t>(t.shape.size());
+  if (dims_out)
+    *dims_out = t.shape.data();
+  if (num_bytes_out)
+    *num_bytes_out = t.num_bytes;
+}
+
 } // namespace
+
+std::size_t sb_executable::input_count() const {
+  return is_device() ? device->inputs().size() : exe->input_types().size();
+}
+
+std::size_t sb_executable::output_count() const {
+  return is_device() ? device->outputs().size() : exe->output_types().size();
+}
+
+void sb_executable::input_info(std::size_t index, sb_dtype *dtype_out,
+                               int64_t *rank_out, const int64_t **dims_out,
+                               uint64_t *num_bytes_out) const {
+  if (is_device())
+    fill_device_info(device->inputs()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+  else
+    fill_tensor_info(exe->input_types()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+}
+
+void sb_executable::output_info(std::size_t index, sb_dtype *dtype_out,
+                                int64_t *rank_out, const int64_t **dims_out,
+                                uint64_t *num_bytes_out) const {
+  if (is_device())
+    fill_device_info(device->outputs()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+  else
+    fill_tensor_info(exe->output_types()[index], dtype_out, rank_out, dims_out,
+                     num_bytes_out);
+}
+
+uint64_t sb_executable::input_num_bytes(std::size_t index) const {
+  return is_device() ? device->inputs()[index].num_bytes
+                     : tensor_num_bytes(exe->input_types()[index]);
+}
+
+uint64_t sb_executable::output_num_bytes(std::size_t index) const {
+  return is_device() ? device->outputs()[index].num_bytes
+                     : tensor_num_bytes(exe->output_types()[index]);
+}
+
+const char *sb_executable::input_name(std::size_t index) const {
+  return is_device() ? device->inputs()[index].name.c_str() : nullptr;
+}
+
+const char *sb_executable::output_name(std::size_t index) const {
+  return is_device() ? device->outputs()[index].name.c_str() : nullptr;
+}
 
 sb_status sb_input_info(const sb_executable *exe, sb_dtype *dtype_out,
                         int64_t *rank_out, const int64_t **dims_out,
                         uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || exe->input_count() == 0)
           return fail_arg(nullptr);
-        fill_tensor_info(exe->exe->input_type(), dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        exe->input_info(0, dtype_out, rank_out, dims_out, num_bytes_out);
         return SB_OK;
       },
       nullptr);
@@ -475,10 +579,9 @@ sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
                          uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || exe->output_count() == 0)
           return fail_arg(nullptr);
-        fill_tensor_info(exe->exe->output_type(), dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        exe->output_info(0, dtype_out, rank_out, dims_out, num_bytes_out);
         return SB_OK;
       },
       nullptr);
@@ -489,7 +592,7 @@ sb_status sb_input_count(const sb_executable *exe, size_t *count_out) {
       [&]() -> sb_status {
         if (!exe || !count_out)
           return fail_arg(nullptr);
-        *count_out = exe->exe->input_types().size();
+        *count_out = exe->input_count();
         return SB_OK;
       },
       nullptr);
@@ -500,7 +603,7 @@ sb_status sb_output_count(const sb_executable *exe, size_t *count_out) {
       [&]() -> sb_status {
         if (!exe || !count_out)
           return fail_arg(nullptr);
-        *count_out = exe->exe->output_types().size();
+        *count_out = exe->output_count();
         return SB_OK;
       },
       nullptr);
@@ -511,13 +614,9 @@ sb_status sb_input_info_at(const sb_executable *exe, size_t index,
                            const int64_t **dims_out, uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || index >= exe->input_count())
           return fail_arg(nullptr);
-        const auto &types = exe->exe->input_types();
-        if (index >= types.size())
-          return fail_arg(nullptr);
-        fill_tensor_info(types[index], dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        exe->input_info(index, dtype_out, rank_out, dims_out, num_bytes_out);
         return SB_OK;
       },
       nullptr);
@@ -529,13 +628,33 @@ sb_status sb_output_info_at(const sb_executable *exe, size_t index,
                             uint64_t *num_bytes_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe)
+        if (!exe || index >= exe->output_count())
           return fail_arg(nullptr);
-        const auto &types = exe->exe->output_types();
-        if (index >= types.size())
+        exe->output_info(index, dtype_out, rank_out, dims_out, num_bytes_out);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_input_name_at(const sb_executable *exe, size_t index,
+                           const char **name_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name_out || index >= exe->input_count())
           return fail_arg(nullptr);
-        fill_tensor_info(types[index], dtype_out, rank_out, dims_out,
-                         num_bytes_out);
+        *name_out = exe->input_name(index);
+        return SB_OK;
+      },
+      nullptr);
+}
+
+sb_status sb_output_name_at(const sb_executable *exe, size_t index,
+                            const char **name_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name_out || index >= exe->output_count())
+          return fail_arg(nullptr);
+        *name_out = exe->output_name(index);
         return SB_OK;
       },
       nullptr);
@@ -547,10 +666,10 @@ sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
                         sb_error **err_out) {
   return guard(
       [&]() -> sb_status {
-        if (!exe || !data)
+        if (!exe || !data || exe->input_count() == 0)
           return fail_arg(err_out);
 
-        uint64_t expected = tensor_num_bytes(exe->exe->input_type());
+        uint64_t expected = exe->input_num_bytes(0);
         if (static_cast<uint64_t>(len) != expected) {
           std::string msg = "input buffer is " + std::to_string(len) +
                             " bytes, expected " + std::to_string(expected);
@@ -577,18 +696,18 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
             !output_caps)
           return fail_arg(err_out);
 
-        const auto &in_types = exe->exe->input_types();
-        const auto &out_types = exe->exe->output_types();
-        if (num_inputs != in_types.size()) {
+        const std::size_t in_count = exe->input_count();
+        const std::size_t out_count = exe->output_count();
+        if (num_inputs != in_count) {
           std::string msg =
-              "graph takes " + std::to_string(in_types.size()) +
+              "graph takes " + std::to_string(in_count) +
               " inputs, sb_run_multi got " + std::to_string(num_inputs);
           set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
           return SB_ERR_BINDING;
         }
-        if (num_outputs != out_types.size()) {
+        if (num_outputs != out_count) {
           std::string msg =
-              "graph has " + std::to_string(out_types.size()) +
+              "graph has " + std::to_string(out_count) +
               " outputs, sb_run_multi got " + std::to_string(num_outputs);
           set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
           return SB_ERR_BINDING;
@@ -599,7 +718,7 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
         std::vector<sx::Bytes> ins;
         ins.reserve(num_inputs);
         for (size_t i = 0; i < num_inputs; ++i) {
-          uint64_t need = tensor_num_bytes(in_types[i]);
+          uint64_t need = exe->input_num_bytes(i);
           if (input_lens[i] != need) {
             std::string msg = "input " + std::to_string(i) + " is " +
                               std::to_string(input_lens[i]) +
@@ -617,7 +736,7 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
           ins.emplace_back(p, p + need);
         }
         for (size_t i = 0; i < num_outputs; ++i) {
-          uint64_t need = tensor_num_bytes(out_types[i]);
+          uint64_t need = exe->output_num_bytes(i);
           if (!output_data[i] || output_caps[i] < need) {
             std::string msg = "output " + std::to_string(i) + " has capacity " +
                               std::to_string(output_caps[i]) +
@@ -628,11 +747,27 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
         }
 
         std::vector<sx::Bytes> outs;
-        auto res = exe->exe->run(ins, outs);
-        if (!res) {
-          set_error(err_out, exec_errkind(res.error().kind),
-                    res.error().message.c_str());
-          return exec_status(res.error().kind);
+        if (exe->is_device()) {
+          std::vector<const std::byte *> ptrs(num_inputs);
+          for (size_t i = 0; i < num_inputs; ++i)
+            ptrs[i] = static_cast<const std::byte *>(input_data[i]);
+          std::vector<std::vector<std::byte>> device_outs;
+          std::string device_error;
+          if (!exe->device->run(ptrs.data(), input_lens, &device_outs,
+                                &device_error)) {
+            set_error(err_out, SB_ERRKIND_RUNTIME, device_error.c_str());
+            return SB_ERR_RUNTIME;
+          }
+          outs.resize(device_outs.size());
+          for (size_t i = 0; i < device_outs.size(); ++i)
+            outs[i] = std::move(device_outs[i]);
+        } else {
+          auto res = exe->exe->run(ins, outs);
+          if (!res) {
+            set_error(err_out, exec_errkind(res.error().kind),
+                      res.error().message.c_str());
+            return exec_status(res.error().kind);
+          }
         }
 
         for (size_t i = 0; i < num_outputs; ++i) {
@@ -655,7 +790,7 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
                     "input not bound (call sb_bind_input)");
           return SB_ERR_BINDING;
         }
-        size_t n_out = exe->exe->output_types().size();
+        size_t n_out = exe->output_count();
         if (n_out != 1) {
           std::string msg =
               "graph has " + std::to_string(n_out) +
@@ -665,7 +800,7 @@ sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
           return SB_ERR_BINDING;
         }
 
-        exe->output.resize(tensor_num_bytes(exe->exe->output_type()));
+        exe->output.resize(exe->output_num_bytes(0));
         const void *in_ptr = exe->input.data();
         size_t in_len = exe->input.size();
         void *out_ptr = exe->output.data();

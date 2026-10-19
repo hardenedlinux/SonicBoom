@@ -60,6 +60,12 @@ namespace sonicboom::planner {
 // The verify graph deals one decode over k+1 query positions, and its attention
 // appends one row per position, which a prep region that stores a single row at
 // the base position cannot express.
-enum class IrPassPhase { Decode, Prefill, Verify };
+//
+// Training is the pipeline for a traced forward+backward graph
+// (core/src/training/device_graph.cpp): the training vocabulary has none of the
+// inference folds' inputs, so the phase carries only the passes that are
+// semantic-neutral for it — today BufferReusePass, whose in-place marks the
+// device executor may honour but need not.
+enum class IrPassPhase { Decode, Prefill, Verify, Training };
 
 } // namespace sonicboom::planner

@@ -412,11 +412,12 @@ def Boom_FusedRegionOp : Boom_Op<"fused_region",
 
 //--- training operators -----------------------------------------------------
 
-// AdamW: one fused in-place parameter update. Operands are
-// [param, grad, m1, m2]; the hyperparameters (lr, beta1, beta2, eps,
-// weight_decay) and the 1-based `step` ride on node_attrs. The single result
-// aliases `param`; m1 and m2 are updated in place (the same aliasing
-// `boom.rms_norm_heads` uses).
+// AdamW: one fused parameter update written as a pure function. Operands are
+// [param, grad, m1, m2, step], where `step` is a one-element int32 tensor
+// (1-based); results are [param', m1', m2'] with the inputs' shapes. The
+// hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on node_attrs.
+// Results are new tensors, not aliases: a traced training step reads them back
+// as the next state, which keeps the same node on every step.
 def Boom_AdamWOp : Boom_Op<"adamw",
     "fused AdamW parameter update (decoupled weight decay)">;
 
@@ -463,5 +464,24 @@ def Boom_SiluMulBwdOp : Boom_Op<"silu_mul_bwd",
 // it needs no zero-fill; repeated tokens accumulate into one row.
 def Boom_EmbeddingBwdOp : Boom_Op<"embedding_bwd",
     "backward of embedding lookup (scatter-add into the weight gradient)">;
+
+// The forward operators of an explicitly differentiated training graph. They
+// are dense-matmul and elementwise primitives with no model-bound weight, so
+// every operand is a plain Boom value and all their attributes ride on
+// node_attrs.
+def Boom_MatmulOp : Boom_Op<"matmul",
+    "dense matmul A [M,K] @ B [K,N]">;
+def Boom_BmmOp : Boom_Op<"bmm",
+    "batched matmul A [B,M,K] @ B [B,K,N]">;
+def Boom_PermuteOp : Boom_Op<"permute",
+    "reorder axes; `dims` on node_attrs">;
+def Boom_IndexSelectOp : Boom_Op<"index_select",
+    "gather rows along `axis`; operands [table, indices]">;
+def Boom_ReduceSumOp : Boom_Op<"reduce_sum",
+    "sum over `axes` (`keepdims` on node_attrs)">;
+def Boom_SiluMulOp : Boom_Op<"silu_mul",
+    "silu(gate) * up (SwiGLU)">;
+def Boom_CrossEntropyOp : Boom_Op<"cross_entropy",
+    "mean cross-entropy loss; operands [logits, targets]">;
 
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD

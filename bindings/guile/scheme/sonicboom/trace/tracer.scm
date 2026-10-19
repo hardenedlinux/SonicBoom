@@ -120,23 +120,35 @@
 (define (segment-defs nodes params)
   (append (append-map gnode-output-names nodes) (map gparam-name params)))
 
-(define (segment-grad-outputs st nodes params outputs)
-  "OUTPUTS plus the .grad value of every registered leaf that this segment
-defines. A traced call reads those back and writes the concrete gradient into
-the caller's leaf (see sync-leaf-grads!)."
-  (let* ((defs (segment-defs nodes params))
-         (grads (filter-map
-                 (lambda (p)
-                   (let ((g (leaf-grad (cdr p))))
-                     (and (sym? g) (member (sym-name g) defs) (sym-name g))))
-                 (trace-context-leaves (tstate-ctx st)))))
-    (delete-duplicates (append outputs grads))))
+(define (segment-leaf-outputs st nodes params outputs)
+  "OUTPUTS plus the value and .grad of every registered leaf that this segment
+defines. A traced call reads those back: the gradient is written into the
+caller's leaf, and a value the body replaced (an optimizer step's new
+parameter/moment) replaces the caller's leaf value (see sync-leaf-state!)."
+  (let* (;; Only values a node produces can be graph outputs: a leaf whose
+         ;; gradient is a constant (a leaf the loss does not use) needs no
+         ;; output, and marking the parameter as one would be rejected by the
+         ;; verifier (a graph output must be produced by a node).
+         (defs (append-map gnode-output-names nodes))
+         (leaves (filter-map
+                  (lambda (p)
+                    (let ((v (leaf-value (cdr p))) (g (leaf-grad (cdr p))))
+                      (append
+                       ;; A leaf whose value is still its own input symbol was
+                       ;; not updated by this segment.
+                       (if (and (sym? v) (not (equal? (sym-name v) (car p)))
+                                (member (sym-name v) defs))
+                           (list (sym-name v)) '())
+                       (if (and (sym? g) (member (sym-name g) defs))
+                           (list (sym-name g)) '()))))
+                  (trace-context-leaves (tstate-ctx st)))))
+    (delete-duplicates (append outputs (apply append leaves)))))
 
 (define (compile-segment st label nodes params outputs)
   "DCE NODES/PARAMS from OUTPUTS and emit the S-Expr v0.1 text. Inputs are the
-values referenced but not defined by what survives. Leaf gradients this
-segment defines are always outputs, so a traced call observes them."
-  (let ((outputs (segment-grad-outputs st nodes params outputs)))
+values referenced but not defined by what survives. Leaf state this segment
+defines is always an output, so a traced call observes it."
+  (let ((outputs (segment-leaf-outputs st nodes params outputs)))
     (compile-segment-1 st label nodes params outputs)))
 
 (define (compile-segment-1 st label nodes params outputs)
@@ -650,23 +662,30 @@ extended?)."
       (call-with-values (lambda () (replay st entry args))
         (lambda (result extended?)
           (unless (or fresh? extended?) (stat! st 'cache-hits))
-          (sync-leaf-grads! st args)
+          (sync-leaf-state! st args)
           result)))))
 
-(define (sync-leaf-grads! st args)
-  "Copy each caller leaf's concrete gradient out of the environment the executed
+(define (sync-leaf-state! st args)
+  "Copy each caller leaf's concrete state out of the environment the executed
 graph left behind. The trace-time leaf holds the symbolic adjoint backward!
-recorded; compile-segment made it a graph output, so replay bound it here."
+recorded and, when the body updated it (an optimizer step), the symbolic new
+value; compile-segment made both graph outputs, so replay bound them here. A
+gradient is written to the caller's .grad; an updated value replaces the
+caller's .value, unless the trace-time value is still the leaf's own input."
   (let ((ctx (tstate-ctx st))
         (env (tstate-env st)))
     (for-each
      (lambda (p)
        (let ((trace-leaf (assoc-ref (trace-context-leaves ctx) (car p))))
          (when trace-leaf
-           (let ((g (leaf-grad trace-leaf)))
+           (let ((v (leaf-value trace-leaf))
+                 (g (leaf-grad trace-leaf)))
+             (when (and (sym? v) (not (equal? (sym-name v) (car p))))
+               (let ((new (table-ref env (sym-name v) #f)))
+                 (when new (set-leaf-value! (cdr p) new))))
              (when (sym? g)
-               (let ((v (table-ref env (sym-name g) #f)))
-                 (when v (set-leaf-grad! (cdr p) v))))))))
+               (let ((new (table-ref env (sym-name g) #f)))
+                 (when new (set-leaf-grad! (cdr p) new))))))))
      (arg-leaves args))))
 
 ;;; --- public API ------------------------------------------------------------------------------

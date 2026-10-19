@@ -158,6 +158,19 @@ sb_status sb_parse(const char *text, size_t len, sb_document **doc_out,
 sb_status sb_compile(const sb_document *doc, const char *base_dir,
                      sb_executable **exe_out, sb_error **err_out);
 
+/* Compile a parsed document as a device training graph. The document is the
+ * forward+backward+step graph a traced training function produced: it is
+ * lowered Blade -> Boom IR, run through the Boom IR Training pass phase, and
+ * executed node by node on the GPU (CUDA). The graph is bound by name — the
+ * tracer names every tensor argument — through sb_input_name_at /
+ * sb_output_name_at, and a step runs through sb_run_multi. Parameters must be
+ * inline (`data :values`); external weight sidecars are not supported. On a
+ * build without CUDA this fails with SB_ERR_COMPILE and a message saying so;
+ * the graph is still lowered and verified first, so a bad graph is reported as
+ * such on either build. Release with sb_executable_free. */
+sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
+                            sb_error **err_out);
+
 /* --- I/O introspection (bind) ---------------------------------------------- */
 
 /* Query the single input/output tensor. `dims_out`, if non-NULL, is set to a
@@ -185,6 +198,15 @@ sb_status sb_output_info_at(const sb_executable *exe, size_t index,
                             sb_dtype *dtype_out, int64_t *rank_out,
                             const int64_t **dims_out,
                             uint64_t *num_bytes_out);
+
+/* Tensor names in binding order. `*name_out` is a borrowed NUL-terminated
+ * string valid until the executable is freed, or NULL when the compiled form
+ * does not retain names (the CPU interpreter compiled by sb_compile). A
+ * device training graph always names its tensors: the tracer's names. */
+sb_status sb_input_name_at(const sb_executable *exe, size_t index,
+                           const char **name_out);
+sb_status sb_output_name_at(const sb_executable *exe, size_t index,
+                            const char **name_out);
 
 /* --- Execute / retrieve ---------------------------------------------------- */
 

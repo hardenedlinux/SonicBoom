@@ -103,6 +103,20 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SiluMulBwd;
   if (name == "embedding_bwd")
     return OpKind::EmbeddingBwd;
+  if (name == "matmul")
+    return OpKind::Matmul;
+  if (name == "bmm")
+    return OpKind::Bmm;
+  if (name == "permute")
+    return OpKind::Permute;
+  if (name == "index_select")
+    return OpKind::IndexSelect;
+  if (name == "reduce_sum")
+    return OpKind::ReduceSum;
+  if (name == "silu_mul")
+    return OpKind::SiluMul;
+  if (name == "cross_entropy")
+    return OpKind::CrossEntropy;
   return std::nullopt;
 }
 
@@ -151,6 +165,13 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::RopeBwd: return "rope_bwd";
     case OpKind::SiluMulBwd: return "silu_mul_bwd";
     case OpKind::EmbeddingBwd: return "embedding_bwd";
+    case OpKind::Matmul: return "matmul";
+    case OpKind::Bmm: return "bmm";
+    case OpKind::Permute: return "permute";
+    case OpKind::IndexSelect: return "index_select";
+    case OpKind::ReduceSum: return "reduce_sum";
+    case OpKind::SiluMul: return "silu_mul";
+    case OpKind::CrossEntropy: return "cross_entropy";
   }
   return "?";
 }

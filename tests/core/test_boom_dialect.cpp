@@ -99,11 +99,11 @@ int main() {
 
   //--- one op per OpKind, named after it -----------------------------------
 
-  // The enum is contiguous (Conv = 0 .. EmbeddingBwd), so looping the
+  // The enum is contiguous (Conv = 0 .. CrossEntropy), so looping the
   // integers covers the vocabulary; the reverse mapping is the one the
   // conversion uses to rebuild a planner node from an op. FusedRegion is a
   // region container rather than a node operator and has no op of its own.
-  const int kinds = int(planner::OpKind::EmbeddingBwd) + 1;
+  const int kinds = int(planner::OpKind::CrossEntropy) + 1;
   for (int i = 0; i < kinds; ++i) {
     const auto kind = planner::OpKind(i);
     if (kind == planner::OpKind::FusedRegion)

@@ -128,17 +128,48 @@ bool carriesDs(llvm::StringRef opName) {
 // is included deliberately: it adds a [width] bias to a [.., width] activation,
 // so the broadcast lands on the later dimensions and the result keeps the
 // activation's shape. Ops that change shape (argmax collapses, reshape, the
-// gathers, the matmuls) are absent.
+// gathers, the matmuls) are absent; add and mul are broadcast ops, checked
+// against the broadcast shape below.
 bool isShapePreserving(llvm::StringRef opName) {
-  return opName == "boom.relu" || opName == "boom.mul" ||
-         opName == "boom.scale" || opName == "boom.gelu_fp16" ||
-         opName == "boom.silu" || opName == "boom.cast_fp16" ||
-         opName == "boom.softcap" || opName == "boom.add_bias" ||
-         opName == "boom.add";
+  return opName == "boom.relu" || opName == "boom.scale" ||
+         opName == "boom.gelu_fp16" || opName == "boom.silu" ||
+         opName == "boom.cast_fp16" || opName == "boom.softcap" ||
+         opName == "boom.add_bias";
 }
 
-bool isAllSameShapeOp(llvm::StringRef opName) {
+// Add and mul broadcast their operands numpy-style (right-aligned; a missing
+// leading dimension or a dimension of 1 spreads). The result therefore has the
+// broadcast shape, which is not necessarily the first operand's: `mul` of an
+// activation by a [D] scale, and `add` of [S,S] logits by a [S] mask.
+bool isBroadcastShapeOp(llvm::StringRef opName) {
   return opName == "boom.add" || opName == "boom.mul";
+}
+
+// The numpy broadcast of two shapes; nullopt when two concrete dimensions
+// disagree. A dynamic dimension takes the other operand's extent.
+std::optional<llvm::SmallVector<int64_t, 4>>
+broadcastShapes(llvm::ArrayRef<int64_t> a, llvm::ArrayRef<int64_t> b) {
+  const size_t rank = std::max(a.size(), b.size());
+  llvm::SmallVector<int64_t, 4> out(rank, 1);
+  for (size_t i = 0; i < rank; ++i) {
+    const int64_t da = i < rank - a.size() ? 1 : a[i - (rank - a.size())];
+    const int64_t db = i < rank - b.size() ? 1 : b[i - (rank - b.size())];
+    const bool dynA = mlir::ShapedType::isDynamic(da);
+    const bool dynB = mlir::ShapedType::isDynamic(db);
+    if (da == db)
+      out[i] = da;
+    else if (da == 1)
+      out[i] = db;
+    else if (db == 1)
+      out[i] = da;
+    else if (dynA)
+      out[i] = db;
+    else if (dynB)
+      out[i] = da;
+    else
+      return std::nullopt;
+  }
+  return out;
 }
 
 // The ops whose cache access is stated on the KVCacheResource (BoomDialect.td):
@@ -521,7 +552,8 @@ mlir::LogicalResult GraphOp::verify() {
     }
 
     // 5e. Elementwise shapes.
-    if (isShapePreserving(op.getName().getStringRef()) && op.getNumOperands() &&
+    const llvm::StringRef shapeOpName = op.getName().getStringRef();
+    if (isShapePreserving(shapeOpName) && op.getNumOperands() &&
         op.getNumResults() && boomValueShape(op.getOperand(0).getType()) !=
                                   boomValueShape(op.getResult(0).getType()))
       return op.emitOpError()
@@ -529,14 +561,25 @@ mlir::LogicalResult GraphOp::verify() {
              << boomValueShape(op.getResult(0).getType())
              << " while its first operand is "
              << boomValueShape(op.getOperand(0).getType());
-    if (isAllSameShapeOp(op.getName().getStringRef()))
-      for (Value operand : llvm::drop_begin(op.getOperands()))
-        if (boomValueShape(operand.getType()) !=
-            boomValueShape(op.getOperand(0).getType()))
+    if (isBroadcastShapeOp(shapeOpName) && op.getNumOperands() &&
+        op.getNumResults()) {
+      std::optional<llvm::SmallVector<int64_t, 4>> shape =
+          llvm::to_vector<4>(boomValueShape(op.getOperand(0).getType()));
+      for (Value operand : llvm::drop_begin(op.getOperands())) {
+        shape = broadcastShapes(*shape, boomValueShape(operand.getType()));
+        if (!shape)
           return op.emitOpError()
-                 << "has operands of different shapes ("
+                 << "has operands whose shapes do not broadcast ("
                  << boomValueShape(op.getOperand(0).getType()) << " vs "
                  << boomValueShape(operand.getType()) << ")";
+      }
+      if (llvm::ArrayRef<int64_t>(*shape) !=
+          boomValueShape(op.getResult(0).getType()))
+        return op.emitOpError()
+               << "broadcasts its operands to " << *shape
+               << " but its result is "
+               << boomValueShape(op.getResult(0).getType());
+    }
 
     // 5f. Register this op's results, so the next op's operands resolve.
     auto resultIds = op.getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");

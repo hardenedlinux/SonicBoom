@@ -124,6 +124,32 @@ enum class OpKind : uint8_t {
   RopeBwd,
   SiluMulBwd,
   EmbeddingBwd,
+
+  // Training: the forward operators a traced training graph needs that the
+  // inference vocabulary above does not carry. They are the dense-matmul and
+  // elementwise primitives of an explicitly differentiated graph:
+  //
+  // matmul: operands [A [M,K], B [K,N]]; result [M,N].
+  // bmm: operands [A [B,M,K], B [B,K,N]]; result [B,M,N].
+  // permute: operand X; attribute `dims` (the permutation); result with the
+  //   permuted shape.
+  // index_select: operands [table, indices [R] int32]; attribute `axis`;
+  //   result gathers along that axis (the embedding lookup at axis 0).
+  // reduce_sum: operand X; attributes `axes`, `keepdims`; result the sum over
+  //   those axes.
+  // silu_mul: operands [gate, up]; result silu(gate) * up.
+  // cross_entropy: operands [logits [R,C], targets [R] int32]; result the mean
+  //   negative log-likelihood (a rank-0 f32 value).
+  //
+  // The device training graph executor dispatches these to hand-written CUDA
+  // kernels (core/src/training/device_graph.cu); no inference plan emits them.
+  Matmul,
+  Bmm,
+  Permute,
+  IndexSelect,
+  ReduceSum,
+  SiluMul,
+  CrossEntropy,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;
