@@ -28,6 +28,19 @@
 // absolute position, and key tiles are aligned to multiples of Bc, so a prefix
 // reuse is bit-identical to the equivalent full prefill. That is checked by
 // test_cuda_attention_codegen.
+//
+// Fragment sources (C3; verified in the cached kernel's SASS. Neither half
+// needed a change because both were already true in the emitted kernel):
+//   - Q is staged once and read with ldmatrix (non-transpose) into fragments
+//     held in registers for the whole key-tile loop; the loop body contains
+//     no Q ldmatrix.
+//   - K and V are both read with ldmatrix.trans (LDSM.MT88.2) from their
+//     natural, non-transposed shared layouts, so neither needs a separate
+//     transposed staging copy.
+// For d256 br64 bc16 dps4 the loop body is 8 K + 8 V ldmatrix.trans per key
+// tile and the 4 Q ldmatrix sit outside it; the warp-head d256 bc16 variant
+// is 32 + 32 inside and 16 outside. These counts follow from the fragment
+// loops below and were confirmed with cuobjdump -sass on the cached PTX.
 
 #include <sonicboom/compiler/AttentionCodegen.h>
 
