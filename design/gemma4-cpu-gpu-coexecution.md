@@ -1,11 +1,14 @@
 # Gemma 4 CPU/GPU co-execution — current state + optimization roadmap
 
-Status: **recorded 2026-10-07.** The CPU/GPU co-execution path is implemented and
-is the current CUDA runtime path (decode + prefill). Optimization is
-**deliberately deferred** — v0 targets numerical correctness first. This document
-captures (1) how the co-execution works today, (2) the measured v0 numbers, and
-(3) the bottleneck and levers already identified, so future optimization work
-starts here instead of re-deriving it.
+Status: **recorded 2026-10-07.** The CPU/GPU co-execution path is implemented.
+At the time, optimization was deliberately deferred — v0 targeted numerical
+correctness first. The levers listed here were taken up in v1 and v0.0.3 and
+the document is now the co-execution design record, not the performance
+status: generated GPU kernels, planner fusions, CUDA Graphs and runtime
+autotune are described in [STATUS.md](STATUS.md), [mlir-migration.md](mlir-migration.md)
+and the [README](../README.md). This document captures (1) how the co-execution
+works, (2) the measured v0 numbers, and (3) the bottlenecks identified at v0.
+The v0 numbers are history, not the current comparison.
 
 ## 1. What "co-execution" means here
 

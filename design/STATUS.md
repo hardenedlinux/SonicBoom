@@ -1,55 +1,88 @@
 # Project Status
 
-- Branch: `optimize` at `dd47858`.
-- Q6_K implementation: `2e361d1`; benchmark update: `dd47858`; not pushed.
-- API server: `3dd60dd`; present on `origin/master` (pushed).
-- Load-time fallback commits are in the local history; the two commits above are the current optimize work.
+- Release: **v0.0.3**.
+- Branch: `master`. The release content is `3a8c8d8` (fast-forwarded from the
+  `boom-pp` branch; base `5ee7b3f`), with the release documentation on top.
+- Scope and canonical numbers: [README](../README.md#numbers) and
+  [Scope of v0.0.3](../README.md#scope-of-v003).
+- Measurement record for this release: `/tmp/boom-pp-report.md` (raw logs
+  referenced there; not part of the repository).
 
 ## Completed
 
-- GGUF load-time quant fallback to Q5_K for supported foreign types.
-- Native Q6_K CPU and CUDA: dequant, gather, f32 GEMV, q8_1 MMVQ single and batched.
-- Q6_K uses D4_Q8_1 activation layout.
-- OpenAI-compatible API server uses the real SonicBoom backend; checks a–f passed.
+- **Boom IR is the only rewrite path.** The model emitters build Boom IR, the
+  planner's rewrite phase runs MLIR passes over it, and `SONICBOOM_IR_PASS_DISABLE`
+  is the ablation switch. The old planner `Graph` rewrite path and its switch
+  are gone.
+- **Generated GPU kernels** (MLIR `linalg → gpu → nvvm`, JIT-compiled and cached
+  by shape signature): fused glue regions (norm, quantize, activation,
+  residual, RoPE), FA-2 prefill attention, split-KV decode attention and a
+  bf16 dense GEMM with an `mma.m16n8k16` core.
+- **Per-GPU runtime autotune** for attention prefill/decode, MMQ tile and
+  decomposition, and the dense GEMM vs cuBLASLt choice. One service, one disk
+  cache (`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>/<op>.json`), keyed
+  by GPU, operator and shape class — never by batch size or position. Choices
+  need a 3% win to replace a default. `SONICBOOM_AUTOTUNE=0` uses the static
+  defaults; `force` retunes.
+- **MMQ at upstream build parity:** wide tiles use
+  `__launch_bounds__(256,1)`, and the block order matches llama.cpp. At pp512,
+  Q3_K is 112.4 ms against llama.cpp's 111.2 ms; the aggregate MMQ delta is
+  about 1%.
+- **ggml imported flash attention retired.** Attention is SonicBoom's own
+  tiled kernel or generated code; the old `SONICBOOM_ATTN_IMPL=ggml` value is
+  an alias for `auto`.
+- **Scale folds:** the projection scale is folded into the dense GEMM epilogue,
+  and the remaining scale into the `rms_norm_add` glue epilogue
+  (`ScaleIntoDensePass`, `FoldScaleIntoGluePass`), removing launches from the
+  prefill plan.
+- Two model families run end to end (Gemma 4 E4B-it Q3_K_M, Qwen2.5-0.5B
+  Q4_K_M) on CPU and CUDA, with prefix reuse, an OpenAI-compatible server and
+  the Guile binding. `test_prefix_cache` is 14/14 bitwise; the separate
+  `--long` enumeration adds three 8K-context cases (3/3).
 
-## Disabled / Known Issues
+## Current numbers
 
-- Q6_K MMQ weight path is disabled (`TODO(q6k-mmq)`).
-- Q6_K prefill uses dequantization plus cuBLAS.
+Medians of 3 process runs, same session, llama.cpp `43fe9c64281`, RTX 3050
+sm_86 (full table and conditions in the README):
 
-## Decode and Prefill Benchmarks
+| model | tg64 | d512 | pp512 | reuse |
+|---|---:|---:|---:|---:|
+| Gemma 4 E4B Q3_K_M | 53.0 tok/s (1.18×) | 52.1 tok/s (1.18×) | 1990 tok/s (1.00×) | 65.2 ms |
+| Qwen2.5-0.5B Q4_K_M | 344.7 tok/s (1.12×) | 296.4 tok/s (0.98×) | 15346 tok/s (1.09×) | 13.7 ms |
 
-Tok/s; ratios are SonicBoom / llama.cpp. llama.cpp checkout: `43fe9c64281`.
+SM clock medians: 1912 MHz (Gemma), 1942 MHz (Qwen). pp512 kernel time is
+277.8 ms / 1543 launches against llama.cpp's 242.1 ms / 1253 launches
+(1.148× kernel time, 1.231× launches).
 
-| Model / metric | SonicBoom | llama.cpp | Ratio |
-|---|---:|---:|---:|
-| Q3_K_M tg64 depth 0 | 51.65 | 45.22 | 1.14x |
-| Q3_K_M tg64 depth 512 | 49.96 | 44.76 | 1.12x |
-| Q3_K_M tg64 depth 2048 | 47.13 | 44.08 | 1.07x |
-| Q3_K_M pp512 | 1148 | 1949 | 0.59x |
-| Q3_K_M pp2048 | 1058 | 1993 | 0.53x |
-| Q3_K_M pp4100 | 1051 | 1944 | 0.54x |
-| Q4_K_M tg64 depth 0 | 49.34 | 54.99 | 0.90x |
-| Q4_K_M tg64 depth 512 | 48.29 | 54.30 | 0.89x |
-| Q4_K_M tg64 depth 2048 | 46.30 | 53.32 | 0.87x |
-| Q4_K_M pp512 | 1082.6 | 2048.02 | 0.53x |
-| Q4_K_M pp2048 | 989.2 | 2084.09 | 0.47x |
-| Q4_K_M pp4100 | 986.6 | 2035.26 | 0.48x |
+## Known issues
 
-## Decode Gap Findings
+- **Prefill attention is the dominant remaining gap** at pp512: 37.3 ms
+  against llama.cpp's 8.35 ms (about 81% of the residual kernel-time delta).
+  Both SonicBoom paths now iterate only the valid causal/window-minimal KV;
+  the generated FA-2 is warp/scalar and the hand-written tiled kernel is the
+  faster one at d512. The next lever is a generated tensor-core (mma) FA-2.
+- **Generated split-KV decode attention is opt-in**
+  (`SONICBOOM_ATTN_DECODE=codegen`). It is about 2% faster end to end at d512
+  but reorders floating-point sums; default token streams are bit-identical,
+  so the own kernel remains the default under the project's numerics rule.
+- **Generated decode versus prefill choice gap at d512.** The autotuner keeps
+  codegen for the d512 prefill class, while a 256-query sweep measures the own
+  kernel about 12% faster; the class probe's query length differs from the
+  in-model call. The choice is stable and cached; the class definition is an
+  open question.
+- **Q6_K MMQ is disabled** (`TODO(q6k-mmq)`). Q6_K loads and decodes natively,
+  but prefill dequantizes to fp16 and uses cuBLAS.
+- **Sampling is greedy only.**
+- **CUDA is tested on sm_86 only.** The CPU path is a correctness reference,
+  not a fast path.
 
-- Q4_K_M SonicBoom minus llama.cpp, GPU kernel time per step: norm +931 us;
-  elementwise +853 us; Q6_K MMVQ +597 us; attention +392 us; Q4_K MMVQ -252 us.
-- Kernel launches per step: SonicBoom 1279, llama.cpp 1084.
-- Q3_K_M lead mainly comes from llama.cpp's fused Q3_K up+gate kernel:
-  45% of 192 GB/s reference peak vs SonicBoom's separate kernels at 76%.
-- Local llama.cpp source checkout: `/home/alexon/Project/llama.cpp`
-  (`43fe9c64281`).
+## Next
 
-## Next Steps
-
-1. Q6_K MMVQ launch configuration.
-2. Norm/elementwise fusion (design pending).
-3. Attention split/merge.
-4. Q6_K MMQ.
-5. Reduce shared-library size.
+1. Generated tensor-core FA-2 for prefill attention (the largest gap).
+2. Generated f32 dense GEMM, replacing the remaining chunked cuBLASLt
+   projections and the 128-column blocking used for batch invariance.
+3. Generated decode attention with a bit-identical summation order, or an
+   explicit tolerance policy for decode.
+4. Q6_K MMQ; further model families.
+5. GPU-independent targeting (compute capability discovered at run time,
+   SPIR-V) and the step-loop migration to Boom IR control flow.

@@ -10,25 +10,29 @@ stable C ABI, and GNU Guile is its first-class language. You load
 `libsonicboom.so` from whatever language you use. There is no Python
 interpreter, no pip, and no wheel tree on the inference path.
 
-The first release targets local LLM inference on consumer GPUs. On a laptop
+SonicBoom targets local LLM inference on consumer GPUs. On a laptop
 RTX 3050 it **decodes 12–18% faster than llama.cpp, using the same quantized
 kernels** — 1.18× on Gemma 4 E4B-it Q3_K_M, 1.12× on Qwen2.5-0.5B-Instruct
-Q4_K_M ([numbers](#numbers), same machine, medians of 3). The kernels are the
-same, so the lead comes from the layers above them: a graph planner, and behind
-it an MLIR compiler tier. Those layers are what llama.cpp's architecture does
-not have, and they are where SonicBoom keeps improving.
+Q4_K_M ([numbers](#numbers), same machine, medians of 3) — and its prefill is
+now at llama.cpp parity on Gemma 4 and 9% ahead on Qwen2.5. On decode the hot
+kernels are the same, so the lead comes from the layers above them: a graph
+planner, and behind it an MLIR compiler tier that now also generates GPU
+kernels. Those layers are what llama.cpp's architecture does not have, and they
+are where SonicBoom keeps improving.
 
-> **Status: v0.0.2.** Two model families are verified end to end — Gemma 4
+> **Status: v0.0.3.** Two model families are verified end to end — Gemma 4
 > E4B-it (Q3_K_M) and Qwen2.5-0.5B-Instruct (Q4_K_M) — on CUDA sm_86, both
-> checked against llama.cpp. Read [Scope of v0.0.2](#scope-of-v002) before
-> trying it.
+> checked against llama.cpp. v0.0.3 makes Boom IR the only rewrite path, adds
+> generated GPU kernels (fused glue, attention and a bf16 dense GEMM),
+> per-GPU runtime autotuning, MMQ at upstream build parity, and brings prefill
+> to llama.cpp parity. Read [Scope of v0.0.3](#scope-of-v003) before trying it.
 
 ---
 
 ## Why another runtime?
 
 **For people who need to know what they are running.** The core is
-17.7k lines of C++/CUDA. It is GPL-3.0-or-later, and the boundary is a plain
+22k lines of C++/CUDA. It is GPL-3.0-or-later, and the boundary is a plain
 C ABI that you can audit, pin and link against. It has no Python dependency
 chain to vet, and nothing is downloaded at run time. Python is not needed to
 build it either: PyTorch's Python code generator, torchgen, is replaced by
@@ -62,30 +66,37 @@ the build that produced it.
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **52.7 tok/s** | 44.8 tok/s | **1.18×** |
-| Decode at KV depth 512 | **51.7 tok/s** | 44.2 tok/s | **1.17×** |
-| Prefill, 512-token prompt (marginal) | 1673 tok/s | 1997 tok/s | 0.84× |
-| Prefix reuse, 512-token prefix + 64 new | 212.2 ms to first token | — | — |
+| **Decode**, 64-step steady state | **53.0 tok/s** | 44.8 tok/s | **1.18×** |
+| Decode at KV depth 512 | **52.1 tok/s** | 44.2 tok/s | **1.18×** |
+| Prefill, 512-token prompt (marginal) | 1990 tok/s | 1992 tok/s | 1.00× |
+| Prefix reuse, 512-token prefix + 64 new | 65.2 ms to first token | — | — |
 
 **Qwen2.5-0.5B-Instruct Q4_K_M** (same machine, same session)
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **344.7 tok/s** | 307.9 tok/s | **1.12×** |
-| Decode at KV depth 512 | 296.5 tok/s | 304.1 tok/s | 0.97× |
-| Prefill, 512-token prompt (marginal) | 12765 tok/s | 14085 tok/s | 0.91× |
-| Prefix reuse, 512-token prefix + 64 new | 29.7 ms to first token | — | — |
+| **Decode**, 64-step steady state | **344.7 tok/s** | 307.6 tok/s | **1.12×** |
+| Decode at KV depth 512 | 296.4 tok/s | 303.2 tok/s | 0.98× |
+| Prefill, 512-token prompt (marginal) | 15346 tok/s | 14044 tok/s | 1.09× |
+| Prefix reuse, 512-token prefix + 64 new | 13.7 ms to first token | — | — |
 
 - **Decode is ahead on both families**, at depth 0 and at depth 512 on Gemma.
-  Qwen2 at depth 512 is level with llama.cpp (0.97×): it has no sliding window, so all
+  Qwen2 at depth 512 is level with llama.cpp (0.98×): it has no sliding window, so all
   512 keys are attended while Gemma's ring buffer wraps.
-- **Prefill is behind** — 0.84× (Gemma) and 0.91× (Qwen). It is a real batched
-  path (int8 tensor-core MMQ plus cuBLAS); closing the rest is on the roadmap.
+- **Prefill is at parity on Gemma (1.00×) and ahead on Qwen (1.09×).** The
+  path is int8 tensor-core MMQ plus a generated bf16 dense GEMM. The remaining
+  prefill cost is attention: the generated FA-2 kernel is still warp/scalar,
+  and a tensor-core version is the next lever.
 - **Prefix reuse** has no llama.cpp counterpart (`llama-bench` cannot measure
   it), so it is reported as first-token latency in milliseconds and nothing
   else. The exactness claim beside it is a test, not a benchmark: a
   prefix-reuse continuation is token-identical to a full prefill at every
-  tested prefix length (`test_prefix_cache`, 12/12).
+  tested prefix length (`test_prefix_cache`, 14/14; three more 8K-context cases
+  under `--long`).
+- SM clock medians over the published runs: 1912 MHz (Gemma) and 1942 MHz
+  (Qwen); `tools/bench.sh` prints its own clock readings, because the GPU is
+  not power-capped on this host. Decode moves by about 1% between runs at
+  these clocks.
 - Decode at 512/2048/4100-token depth, the per-kernel breakdowns, and the older
   hand-rolled measurements are in [`design/benchmark.md`](design/benchmark.md);
   they were taken on earlier code and on different harnesses, so they are
@@ -147,7 +158,7 @@ reporter's machine.
   it does not compile there as it stands. The port is a guard plus a NEON
   sibling of the same fixed-point kernel.
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
-  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.2 is built
+  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.3 is built
   and tested for **sm_86** only (RTX 30-series).
 - GNU Guile 3.0
 - [SonicCross](https://github.com/hardenedlinux/SonicCross), a required
@@ -225,7 +236,7 @@ echo "0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4  models/g
 
 Any GGUF the runtime supports runs the same way — for instance
 `qwen2.5-0.5b-instruct-q4_k_m.gguf`, the other verified model (both files and
-their checksums are in [Scope of v0.0.2](#scope-of-v002)).
+their checksums are in [Scope of v0.0.3](#scope-of-v003)).
 
 Then start Guile:
 
@@ -279,10 +290,11 @@ numbers from.
 
 ---
 
-## Scope of v0.0.2
+## Scope of v0.0.3
 
-v0.0.2 is a working runtime, not a drop-in replacement for llama.cpp. Its
-limits:
+v0.0.3 is a working runtime, not a drop-in replacement for llama.cpp. It adds
+GPU kernel generation and per-GPU runtime autotuning to the v0.0.2 runtime.
+Its limits:
 
 - **Two verified model families:** Gemma 4 E4B-it Q3_K_M and Qwen2.5-0.5B-Instruct
   Q4_K_M. Both run end to end — load, tokenize, prefill and decode on CPU and
@@ -307,6 +319,19 @@ limits:
   loads and decodes natively, but its prefill does not use the int8 tensor-core
   weight kernel yet — it dequantizes to fp16 and uses cuBLAS, so a Q6_K
   `ffn_down` makes prefill slower than the same shape in Q4_K.
+- **Compiler tier:** Boom IR is the only rewrite path, and it now generates
+  CUDA kernels through MLIR/NVVM for fused glue regions (norm, quantize,
+  activation, residual, RoPE), prefill flash attention, split-KV decode
+  attention and a bf16 dense GEMM. Generated kernels are checked against the
+  hand-written ones they replace and are selected per shape class by a runtime
+  tuner; the first tune of a shape class runs during warm-up (never inside
+  CUDA-graph capture) and is cached under `~/.cache/sonicboom/tune/`, keyed by
+  GPU, operator and shape class — never by prompt length or position.
+  `SONICBOOM_AUTOTUNE=0` uses the static defaults, `force` retunes. Generated
+  decode attention is opt-in (`SONICBOOM_ATTN_DECODE=codegen`): it is faster
+  at depth, but it reorders floating-point sums and does not reproduce the
+  default token stream bit-for-bit. The hand-written attention kernel remains
+  the default and the numerical reference.
 - **GPU:** CUDA on sm_86. `CMAKE_CUDA_ARCHITECTURES` defaults to `native` (the
   GPU in the build machine) and is resolved at configure time; other
   architectures have not been tested. Whatever was compiled is reported by
@@ -334,8 +359,8 @@ license. They live in `ggml_derived/` directories, with the details in
 | | Lines of code |
 |---|---:|
 | ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 3,301 |
-| SonicBoom core total (`core/src`, `core/include`) | 24,051 |
-| **Derived share** | **~13.7%** |
+| SonicBoom core total (`core/src`, `core/include`) | 24,412 |
+| **Derived share** | **~13.5%** |
 
 *Counted with `cloc` 1.98. These are code lines only, excluding blanks and
 comments. The C ABI, the Guile bindings and the dependencies are not
@@ -346,10 +371,12 @@ q8_1 activation quantization, the legacy Q5_0/Q8_0 block formats, and the BPE
 tokenizers (SPM-style for Gemma 4, byte-level with the qwen2 pre-tokenizer,
 plus the Unicode classes and byte maps they split on).
 
-**SonicBoom's own:** everything else. That includes the planner and graph
-passes, operator fusion, CUDA Graph capture and replay, the device-resident KV
-cache, split-KV flash decoding, tiled flash attention for prefill, chunked
-prefill, prefix-cache reuse, and batch-invariant dense GEMM.
+**SonicBoom's own:** everything else. That includes the planner and Boom IR
+compiler passes, operator fusion, the generated GPU kernels (glue, attention
+and bf16 dense GEMM), per-GPU runtime autotuning, CUDA Graph capture and
+replay, the device-resident KV cache, split-KV flash decoding, tiled flash
+attention for prefill, chunked prefill, prefix-cache reuse, and batch-invariant
+dense GEMM.
 
 Decode uses the same quantized GEMV kernels as llama.cpp and is still 12–18%
 faster on the two models measured (see [Numbers](#numbers)). That difference
@@ -366,9 +393,9 @@ this order of preference:
 
 | Tier | What it does | Status |
 |---|---|---|
-| **1. MLIR compiler** | S-Expr graphs are lowered to MLIR (`linalg`) and compiled to native code. ResNet-18, imported from ONNX, runs through this path and matches the ONNX reference. | **Shipped on CPU** (LLVM JIT). GPU code generation is next. |
-| **2. Graph planner** | Rewrites the whole model before it runs: quantize-once, norm→quantize and activation→quantize fusion, dead-computation elimination, and CUDA Graph capture of the full decode step. | **Shipped**: this tier produces the decode lead measured above. |
-| **3. Hand-written kernels** | Used only where the other tiers are not yet fast enough, for example the ported ggml MMQ/MMVQ kernels. | **Shipped** |
+| **1. MLIR compiler** | Model graphs become Boom IR, which is rewritten and lowered to MLIR. GPU kernels are generated through `linalg → gpu → nvvm` and JIT-compiled by shape signature; S-Expr graphs still run on the CPU JIT, and ONNX-imported ResNet-18 matches the ONNX reference. | **Shipped**: fused glue, attention and a bf16 dense GEMM are generated on CUDA. |
+| **2. Graph planner** | Rewrites the whole model before it runs: quantize-once, norm→quantize and activation→quantize fusion, dead-computation elimination, layout selection and CUDA Graph capture of the full decode step. | **Shipped**: this tier produces the decode lead measured above. |
+| **3. Hand-written kernels** | Used where the other tiers are not yet faster, for example the ported ggml MMQ/MMVQ kernels and the tiled prefill attention. | **Shipped** |
 
 What follows from this design:
 
@@ -390,21 +417,22 @@ What follows from this design:
 
 ## MLIR migration: a staged plan
 
-MLIR is already linked into `libsonicboom.so` and already carries a graph:
-S-Expr documents are lowered to `arith`/`func`/`linalg` and executed through the
-LLVM JIT, which is how ONNX-imported ResNet-18 runs. What is not yet generated
-are GPU kernels — those are still the hand-written CUDA ones. The migration is
-staged so that each step is independently useful and independently verifiable,
-and so that a generated kernel can always be checked against the hand-written
-one it replaces.
+MLIR is linked into `libsonicboom.so` and carries the production graphs: model
+plans become Boom IR, the compiler's rewrite passes run on it, and CUDA kernels
+are generated from it through `linalg → gpu → nvvm` and JIT-compiled. S-Expr
+documents still lower to `arith`/`func`/`linalg` and run on the CPU through the
+LLVM JIT, which is how ONNX-imported ResNet-18 runs. The migration is staged so
+that each step is independently verifiable, and so that a generated kernel can
+always be checked against the hand-written one it replaces.
 
-| stage | what lands | done when |
+| stage | what lands | status |
 |---|---|---|
-| **0. Lowering (shipped)** | S-Expr → `arith`/`func`/`linalg`, executed on CPU through the LLVM JIT; ONNX ResNet-18 matches the ONNX reference | already the case |
-| **1. One GPU glue kernel** | A single fused region — norm + quantize — lowered `linalg → gpu → nvvm → cubin`, JIT-compiled at load and cached by shape signature | it runs inside the decode step and matches the hand-written kernel numerically within the documented tolerance, with the canonical `tools/bench.sh` metrics no worse |
-| **2. The glue set** | The rest of the between-kernel glue: activation→quantize, residual add, RoPE | each region replaces a kernel without moving the canonical numbers down |
-| **3. GPU-independent targeting** | The same lowering for a GPU the binary was not built for (compute capability discovered at run time), and for a second vendor through SPIR-V | a machine with a different GPU runs without a SonicBoom rebuild |
-| **4. Beyond LLM glue** | Whole-model lowering for the research route's traced graphs | a traced model runs on the same planner and backends as a built-in one |
+| **0. Lowering** | S-Expr → `arith`/`func`/`linalg`, executed on CPU through the LLVM JIT; ONNX ResNet-18 matches the ONNX reference | **shipped** |
+| **1. One GPU glue kernel** | A single fused region — norm + quantize — lowered `linalg → gpu → nvvm → cubin`, JIT-compiled at load and cached by shape signature | **shipped** |
+| **2. The glue set** | The rest of the between-kernel glue: activation→quantize, residual add, RoPE | **shipped** |
+| **2b. Attention and dense GEMM** | Generated FA-2 prefill attention, split-KV decode attention and a bf16 dense GEMM with an mma m16n8k16 core, selected per shape class by the runtime tuner | **shipped**; generated decode attention is opt-in because it reorders f32 sums |
+| **3. GPU-independent targeting** | The same lowering for a GPU the binary was not built for (compute capability discovered at run time), and for a second vendor through SPIR-V | not started |
+| **4. Beyond LLM glue** | Whole-model lowering for the research route's traced graphs | not started |
 
 Ground rules that hold at every stage: generated code and the JIT live **behind**
 Layer 2 (no MLIR, LLVM, CUDA or native-torch type crosses the C ABI); the
@@ -485,8 +513,10 @@ C ABI (`capi/`); the C++ Layer 2 interface is source-level only.
 Two routes share this core:
 
 - **Production inference:** model architectures are defined in the C++ core.
-  The static execution planner lowers them into a fused plan that is captured
-  as CUDA Graphs. The host language loads weights and drives sessions.
+  The execution planner and the Boom IR compiler lower them into a fused plan;
+  generated GPU kernels are JIT-compiled for the detected device, and the
+  decode step is captured as CUDA Graphs. The host language loads weights and
+  drives sessions.
 - **Research and training:** `(sonicboom nn)`, `(sonicboom model)` and
   `(sonicboom train)` give a minimal PyTorch/Keras-like API with native-torch
   reverse-mode autograd. Models can be exported as an S-Expr graph plus
@@ -501,10 +531,15 @@ Two routes share this core:
 - **Formats and models:** Q6_K, Q8_0 and Q5_0 are native and Qwen2 is a second
   verified family; next are further families (Llama, Mistral) and the quant
   formats they ship with
-- **Speed:** prefill parity with llama.cpp; speculative decoding, aiming for
-  an average decode rate around 100 tok/s on the same RTX 3050
-- **Compiler:** MLIR GPU code generation for fused elementwise and norm
-  chains
+- **Speed:** prefill parity with llama.cpp was reached in v0.0.3 (1.00× on
+  Gemma 4, 1.09× on Qwen2.5); next are a generated tensor-core FA-2 (attention
+  is the remaining prefill gap) and a generated f32 dense GEMM, then
+  speculative decoding, aiming for an average decode rate around 100 tok/s on
+  the same RTX 3050
+- **Compiler:** GPU code generation for fused elementwise and norm chains is
+  shipped; next are GPU-independent targeting (compute capability discovered
+  at run time, SPIR-V for a second vendor) and whole-model lowering for traced
+  graphs
 - **Research route:** connect the Guile tracer to the core and compile traced
   graphs through the C ABI
 - **Usability:** sampling — the runtime is still greedy only — on top of the

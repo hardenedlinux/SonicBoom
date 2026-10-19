@@ -3,6 +3,13 @@
 Living status document for the Static Execution Planner v0 implementation.
 Updated as phases complete; describes implemented behavior, not aspirational.
 
+> **v0.0.3 note (2026-10-19).** This document records the planner at its own
+> baseline. Since then the model emitters build Boom IR and the rewrite phase
+> runs MLIR passes over it ([mlir-migration.md](mlir-migration.md)); generated
+> GPU kernels and per-GPU runtime autotune are part of v0.0.3. For the release
+> status and current numbers see [STATUS.md](STATUS.md) and the
+> [README](../README.md).
+
 ## Baseline (audit snapshot)
 
 - Branch `master`, baseline HEAD `6eea2b4` ("Update docs"). The S-Expr → MLIR

@@ -5,6 +5,14 @@ migration). Every hand-tuned constant on the CUDA path, in one place, with what
 it *should* depend on, how its value was arrived at, and the values that were
 measured and rejected.
 
+**Updated for v0.0.3 (2026-10-19).** The static values below are now mostly the
+*defaults* of a per-GPU runtime autotuner: attention prefill/decode tile
+configs, MMQ J and decomposition, and the dense GEMM implementation/tile are
+timed at warm-up, cached under `~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>/`
+and reused by shape class. §10 records what the tuner searches and what stays
+fixed by numerics. `SONICBOOM_AUTOTUNE=0` restores every default in this
+document.
+
 This is an inventory, not a specification: the constants are correct today, and
 several of them encode measurements that only hold for the shapes and hardware
 in the "Measured on" column. Two uses are intended:
@@ -23,7 +31,11 @@ Environment overrides (dev-time only, read once and cached) are noted per row;
 they exist so these values can be re-measured without a rebuild
 (`SONICBOOM_GEMV_COOP_MIN_BPR`, `SONICBOOM_MMQ_MIN_N`, `SONICBOOM_CUBLAS_MIN_N`,
 `SONICBOOM_DENSE_CUBLAS_MIN_N`, `SONICBOOM_MMQ`, `SONICBOOM_CUBLAS`,
-`SONICBOOM_CUDA_GRAPHS`).
+`SONICBOOM_CUDA_GRAPHS`). The v0.0.3 generated-kernel switches are
+`SONICBOOM_AUTOTUNE` (`0` / `force` / unset), `SONICBOOM_ATTN_IMPL`
+(`own` / `auto` / `codegen`; `ggml` is a deprecated alias for `auto`),
+`SONICBOOM_ATTN_DECODE=codegen`, `SONICBOOM_ATTN_CODEGEN=br,bc,dps`,
+`SONICBOOM_DENSE_GEMM=0`, and `SONICBOOM_IR_PASS_DISABLE=<passes>`.
 
 ---
 
@@ -84,6 +96,22 @@ window so the decode step stays CUDA-Graph-capturable.
 - **Splitting QK^T keys across all warps**: +14% (1.225 s vs 1.072 s) — the
   kernel is tensor-core-bound, not warp-bound. Condition: sm_86, these shapes.
 
+### 2b. Generated attention (v0.0.3)
+
+Prefill: the generated FA-2 kernel
+(`core/compiler/include/sonicboom/compiler/AttentionCodegen.h`) takes
+`(br, bc, dps)`; the sm_86 defaults are `d256 → (64,16,4)`, `d512 → (32,16,8)`,
+`d64/GQA7 → own`. Decode: the generated split-KV pair takes a chunk cap `C`
+(default 32; 16 for the d256 window class). All are autotune parameters keyed
+by `(head_dim, gqa, mask kind)` — never by batch size or position — and the
+chosen implementation can be `own` (the tensor-core kernel above) or
+`codegen`. The generated decode pair is **not the default**: its reduction
+order differs and the default token stream must stay bit-identical, so it is
+selected only by `SONICBOOM_ATTN_DECODE=codegen`. Known mismatch: the tuner
+keeps `codegen` for the d512 prefill class while a 256-query sweep measures
+`own` about 12% faster; the class probe's query length differs from the
+in-model call. Conditions: sm_86, Gemma 4/Qwen2.5 head geometries.
+
 ## 3. Dense / matvec (non-quantized)
 
 `core/src/nn/cuda_elementwise.cu`.
@@ -103,6 +131,21 @@ result does not depend on the batch size or on the column offset. That
 independence is what makes prefix-cache reuse bit-exact (up to fp16 rounding).
 Measured effect of the fix: dense 12.2 s → 1.5 s at 4100-token prefill. Do not
 "optimise" these two away.
+
+**Generated bf16 dense GEMM (v0.0.3).** The strided bf16 projection is now a
+generated tensor-core GEMM
+(`core/compiler/include/sonicboom/compiler/GemmCodegen.h`): `mma.m16n8k16`, cp.async
+double buffering, padded shared staging, one launch per GEMM and no column
+chunking — a token's row depends only on its own activation, so batch
+invariance holds by construction. Candidate tiles are
+`{64,64,64} {32,64,64} {64,32,64} {128,32,32} {32,128,32} {128,64,32}
+{128,64,64} {128,128,32} {128,128,64} {64,128,32}`; the choice is per
+`(rows, cols)` shape class, tuned against cuBLASLt at a 512-token chunk, and
+must win by 3% to replace it (`kDenseSwitchMargin`); a later candidate must
+also beat the current tile by 3% (`kDenseCandidateMargin`) so ties resolve to
+list order. `SONICBOOM_DENSE_GEMM=0` forces cuBLASLt. The f32 projections
+(about 20 ms / 507 launches at pp512) still take the fixed 128-column cuBLASLt
+path; extending the generated GEMM to f32 is the next dense step.
 
 ## 4. Quantized GEMV (decode, K-quant + legacy 32-element)
 
@@ -227,16 +270,36 @@ Full entries above; the list a future optimizer should read before starting:
 
 ## 10. Autotuner search space
 
-Candidate parameters are the ones whose correct value is a function of *shape*
-(batch, dim, rows, head geometry) rather than of the model's numerics:
+**Implemented (v0.0.3).** One service and one disk cache
+(`core/src/planner/autotune.{h,cpp}`,
+`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>/<op>.json`), shared by:
 
-- `select_J` over `Js[]` per (n, quant type, M) — the only one already
-  shape-parameterised; the natural first search space.
+- **Attention prefill:** `own` versus generated `(br, bc, dps)` over every
+  candidate the generator supports and whose shared memory fits. A candidate
+  must beat the default by 3% to replace it.
+- **Attention decode:** generated split-KV chunk `C` (own remains the default
+  for numerics; the tuned choice applies only under
+  `SONICBOOM_ATTN_DECODE=codegen`).
+- **MMQ:** J over `Js[]` and the decomposition (`tiled` vs `stream-k`), moved
+  from the static selection.
+- **Dense GEMM:** generated kernel versus cuBLASLt, and the generated tile
+  (§3). Both switches need a 3% win.
+
+Every key is `(operator, shape class, GPU)` — never batch size or position, so
+a reused prefix resolves the same way as a full prefill. Tuning runs only
+outside CUDA-graph capture; a capture uses the cached or default choice. On the
+RTX 3050, first-use tuning cost 0.07–0.17 s per attention class, 1.05 s for the
+first dense-GEMM tune, and 0.1–2.5 ms per MMQ candidate group.
+
+**Next search space.** Parameters still static that have a shape- or
+device-dependent correct value:
+
 - `kCoopMinBlocksPerRow` per (blocks_per_row, L1 size) — two measured clusters
   today, a 1-D threshold.
-- `kMaxChunk` / `target_chunks` per (window, sm_count, n_heads_kv).
-- The `(head_dim, gqa)` instantiation table (currently hand-written; the
-  fallthrough exists so a wrong key is slow, not wrong).
+- `kMaxChunk` / `target_chunks` for the own decode kernel per (window,
+  sm_count, n_heads_kv); the generated pair's `C` is already tuned.
+- The `(head_dim, gqa)` instantiation table (the fallthrough exists so a wrong
+  key is slow, not wrong).
 - `GEMV_BATCH_T` per batch n and register budget.
 - `kGemvWarpsPerBlock` / `kGemvTargetWarps` per rows.
 - `select_J`-style selection for the batched mmq vs dp4a vs cuBLAS thresholds —
@@ -246,4 +309,6 @@ Candidate parameters are the ones whose correct value is a function of *shape*
 Not searchable (correctness/numerics, listed so a tuner does not "win" by
 changing them): `kMmqMinN`, `kDenseCublasWidth`, `kDenseCublasMinN`, the
 `kWeightTailPad`/plane-padding arithmetic, `mmq_q8_planes`, and the reduction
-trees of the norm emitters (byte-identity with the unfused path).
+trees of the norm emitters (byte-identity with the unfused path). The generated
+decode attention's reduction order is also fixed; that is why it is not a
+default choice.

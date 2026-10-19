@@ -1,9 +1,13 @@
 # MLIR migration plan
 
-Status: step 0 — inventory and design. **No code has been changed by this
-document.** Every factual claim about current code carries a `file:line`
-citation. Statements that are inference rather than observation are marked
-**(inference)**.
+Status: living design and implementation record. Migration steps (a) dialect
+and conversion, (b) plan record and diff, (c) the passes on Boom IR, and (e)
+GPU codegen are implemented; (d) is partial — the plan builder still consumes
+the private `planner::Graph`, and `planner::OpKind` remains its op enum. The
+step-loop migration (§10) and GPU-independent targeting are the open stages.
+Every factual claim about code written before the migration carries a
+`file:line` citation from the time it was written; statements that are
+inference rather than observation are marked **(inference)**.
 
 Scope of this document: replace the transitional `planner::OpKind` graph IR with
 an MLIR-based compiler IR — the `boom` dialect, **Boom IR** — keeping the runtime
@@ -607,13 +611,25 @@ itself; the hand-written kernels remain the numerical and performance reference.
   on tolerance (per the v1 rules in `CLAUDE.md`), with any divergence reported
   (first divergent step, top-1/top-2 margin).
 
+**Status (v0.0.3).** Implemented and shipped. The glue set is generated
+(`core/compiler/lib/GlueCodegen.cpp`), and the same NVVM route now also
+generates prefill FA-2 attention (`AttentionCodegen.cpp`), the split-KV decode
+pair (opt-in), and a bf16 dense GEMM with an `mma.m16n8k16` core and
+`cp.async` double buffering (`GemmCodegen.cpp`). Kernel choice and tile
+configuration moved to a per-GPU runtime autotuner with a disk cache
+(`core/src/planner/autotune.h`), keyed by GPU, operator and shape class. The
+generated decode attention reorders floating-point sums, so it remains behind
+`SONICBOOM_ATTN_DECODE=codegen`; every other generated kernel reproduces the
+default token stream. The hand-written kernels remain the numerical and
+performance reference.
+
 ### 7.6 The gates (run before each step is declared done)
 
 | Gate | Definition |
 |---|---|
 | Gemma golden | the 64-step `[spine-cuda]` token line is bit-identical |
 | Qwen anchor | `test_qwen2_generate` passes: the greedy stream matches the llama.cpp golden, divergences allowed only inside the test's near-tie margin |
-| Prefix cache | `test_prefix_cache` 12/12 |
+| Prefix cache | `test_prefix_cache` 14/14; the 8K-context enumeration is `test_prefix_cache_long`, 3/3 |
 | Perf | `tools/bench.sh --ab` with its control group: every metric's delta inside the control-derived gate (the control's median bias + 2σ of its paired deltas) |
 | Plan time | the `[cuda-timing] plan X ms` observable (`gemma4_plan.cpp:1177-1181`) does not regress |
 
@@ -669,14 +685,15 @@ plan-diff record in (b) then reads.
 
 ## 9. Design decisions
 
-- **Transformer ops stay high-level Boom IR ops.** All 25 transformer ops
-  (§1.3) lower to calls into the hand-written kernels; only the glue — norms,
-  quantize, elementwise, residual adds, RoPE — additionally acquires a
-  linalg/GPU-codegen lowering, in step (e), with the hand-written kernel kept as
-  the reference. The K-quant gemv, attention and flash-attention kernels are
-  where the performance lives (`design/benchmark.md`; `CLAUDE.md` names the
-  hand-written kernels as the reference), so lowering them to linalg would
-  discard it.
+- **Transformer ops stay high-level Boom IR ops.** They begin as calls into
+  the hand-written kernels; the glue — norms, quantize, elementwise, residual
+  adds, RoPE — acquires a GPU-codegen lowering in step (e), and v0.0.3 extended
+  codegen to attention and the bf16 dense GEMM, each with the hand-written (or
+  library) implementation kept as the numerical and performance reference and
+  selected by the autotuner. The K-quant gemv/matmul kernels remain
+  hand-written ukernels: they are where decode performance lives
+  (`design/benchmark.md`; `CLAUDE.md` names the hand-written kernels as the
+  reference), so lowering them to linalg would discard it.
 - **The ggml-derived kernels are ukernels, callable from Boom IR.** The
   `q*_K` matmul, attention and quantization kernels migrated from ggml are
   attributed ukernels behind the `boom` ops, not IR the compiler owns: a
@@ -690,13 +707,16 @@ plan-diff record in (b) then reads.
   ported.** They are built in step (b), on the four-vector in §5.4 — kernel
   sequence, launch config, buffer identity, stream/effect ordering. Without them
   step (c) is unfalsifiable.
-- **Launch parameters stay in the backend as a transitional choice.** Through
-  step (d) they remain kernel-specific tuning inside the backend and the `.cu`
-  wrappers, tracked by `design/tuning-parameters.md` and recorded *on the plan*
-  as an observable; **from step (e) they become a tuning-config attribute on
-  `boom` ops**, chosen by the autotuner / runtime JIT and recorded in the plan.
-  Moving them into the IR before the autotuner exists would only re-derive
-  `design/tuning-parameters.md` for no runtime benefit.
+- **Launch parameters are chosen at run time, not baked into the IR.** They
+  remain kernel-specific tuning inside the backend and the `.cu` wrappers,
+  tracked by `design/tuning-parameters.md`. Step (e) shipped the autotuner
+  (`core/src/planner/autotune.h`) rather than tuning-config attributes on
+  `boom` ops: the attention tile config, MMQ J/decomposition, and the dense
+  GEMM implementation/tile are chosen per (operator, shape class, GPU),
+  cached on disk, and resolved by the backend. The choice is observable in the
+  execution-plan record, whose `LaunchRecord` carries the kernel name, concrete
+  template parameters, grid/block and shared-memory size. The IR shapes the
+  graph; the runtime picks a launch configuration for the device it is on.
 - **The KV cache is modelled as dialect effects; its physical storage stays
   backend-owned.** `boom.kv_read` / `boom.kv_write` effects (§6.3) give the
   compiler the dependency to analyse and order, while the cache itself remains a
@@ -802,5 +822,13 @@ ablation harness (`tools/bench.sh --ablate`) reports each pass group against
 the all-on canonical set and workload (A).
 
 **(5) Not done in this run.** `N` is not yet symbolic (the plan cache still keys
-on it); the loop migration of §10 and the glue-codegen step (e) are the next
-structural stages. The K-quant ukernels remain hand-written and attributed.
+on it); the loop migration of §10 was the next structural stage. The K-quant
+ukernels remain hand-written and attributed.
+
+**(6) v0.0.3 update (2026-10-19).** Step (e) landed after this run: generated
+glue, generated FA-2 prefill attention, generated split-KV decode attention
+(opt-in) and a generated bf16 dense GEMM, with per-GPU runtime autotune
+(§7e status). The map of the remaining work is in §10 (loop and symbolic N);
+GPU-independent targeting is not started. The imported ggml flash attention
+was retired; both attention implementations are now SonicBoom's own or
+generated.

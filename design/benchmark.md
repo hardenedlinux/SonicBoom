@@ -8,20 +8,22 @@
 > divergence records and the negative results are still what explains the
 > current design — **not** as a comparison table. Reproducible, same-session,
 > median-of-3 numbers are now produced only by `tools/bench.sh`, and the ones
-> current as of 2026-10-16 are in the README's [Numbers](../README.md#numbers)
-> section: Gemma 52.6 / 51.6 tok/s decode (1.17× llama.cpp), 1672 tok/s prefill
-> (0.84×), 212.9 ms prefix reuse; Qwen2.5-0.5B 343.4 / 296.4 tok/s (1.12× /
-> 0.98×), 12790 tok/s prefill (0.91×), 29.8 ms reuse.
+> current as of **v0.0.3 (2026-10-19)** are in the README's
+> [Numbers](../README.md#numbers) section: Gemma 53.0 / 52.1 tok/s decode
+> (1.18× llama.cpp), 1990 tok/s prefill (1.00×), 65.2 ms prefix reuse;
+> Qwen2.5-0.5B 344.7 / 296.4 tok/s (1.12× / 0.98×), 15346 tok/s prefill
+> (1.09×), 13.7 ms reuse.
 
 **Test date: 2026-10-12** (final v1-performance state; development spanned
 2026-10-06 → 2026-10-12). Supersedes the 2026-10-07 v0 baseline.
 
-**Status: v1 complete.** CUDA decode is **ahead** of llama.cpp on the 64-step
-protocol (1.14×) and at long context (1.11× at depth 512, 1.04× at depth 2048);
-the chunked batched prefill is ~0.53–0.59× llama.cpp (§1.4). The remaining decode
-gap is one dominated kernel (the q8_1 gemv); the attention growth at depth ≥ 2048
-was traced to split-KV chunk serialization at large n_ctx and fixed with a
-`kMaxChunk` cap (§1.2.1).
+**Status at v1 wrap-up (history).** CUDA decode was **ahead** of llama.cpp on
+the 64-step protocol (1.14×) and at long context (1.11× at depth 512, 1.04× at
+depth 2048); the chunked batched prefill was ~0.53–0.59× llama.cpp (§1.4).
+The remaining decode gap was one dominated kernel (the q8_1 gemv); the
+attention growth at depth ≥ 2048 was traced to split-KV chunk serialization at
+large n_ctx and fixed with a `kMaxChunk` cap (§1.2.1). Prefill was closed later
+— v0.0.3 is at 1.00× on Gemma 4 and 1.09× on Qwen2.5 (README).
 
 ## Scope
 
@@ -428,14 +430,16 @@ prefill over 32 tokens at every acceptance prefix (512/600/1000/1040/3584/
 
 Recorded at v1 wrap-up; none of these block the release.
 
-- **Qwen2 decode — blocked.** The arch-generic loader (`detect_arch` +
-  `load_config`) reads a Qwen2.5 GGUF (`general.architecture` == "qwen2") and
-  derives a Qwen2 `Gemma4Config`; `test_qwen2_config` asserts the frozen 0.5B
-  facts (24 blocks, d 896, ff 4864, 14/2 heads, head_dim 64, context 32768,
-  vocab 151936, rope 1e6, no SWA/shared-KV/per-layer-input/softcap). Weight
-  binding, the Qwen plan builder (decode + prefill), and end-to-end Qwen2
-  decode verification are **deferred/blocked**: Qwen2.5 Q4_K_M uses Q5_0/Q8_0/
-  Q6_K quant types and attention q/k/v biases SonicBoom does not yet model.
+- **Qwen2 decode — was blocked at v1; later resolved.** The arch-generic
+  loader (`detect_arch` + `load_config`) reads a Qwen2.5 GGUF
+  (`general.architecture` == "qwen2") and derives a Qwen2 `Gemma4Config`;
+  `test_qwen2_config` asserts the frozen 0.5B facts (24 blocks, d 896, ff 4864,
+  14/2 heads, head_dim 64, context 32768, vocab 151936, rope 1e6, no
+  SWA/shared-KV/per-layer-input/softcap). At v1 wrap-up, weight binding, the
+  Qwen plan builder and end-to-end verification were deferred because Qwen2.5
+  Q4_K_M uses Q5_0/Q8_0/Q6_K quant types and attention q/k/v biases SonicBoom
+  did not yet model. All of it landed after v1: Qwen2.5-0.5B is one of the two
+  verified families in v0.0.3 (README). The paragraph is kept as the v1 record.
 - **CUDA plugin split — deferred (#58).** Splitting the CUDA backend into a
   runtime-loadable plugin (Step 4 Deliverable 2) awaits an amendment decision.
 

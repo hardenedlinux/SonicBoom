@@ -1,10 +1,12 @@
 # OpenAI-compatible local inference service (Guile + GNU Artanis)
 
-Status: **prototype**, with a deterministic mock backend. The application layer
-of the production inference route (Route 2 / Path 2 of
-`design/execution-paths.md`): an HTTP service speaking the OpenAI
+Status: **prototype**, with two implementations of the backend protocol. The
+default `--backend real` drives a GGUF through libsonicboom's C ABI (the Guile
+binding), and `--backend mock` is the deterministic in-process backend the
+tests use. The application layer of the production inference route (Route 2 /
+Path 2 of `design/execution-paths.md`): an HTTP service speaking the OpenAI
 chat-completions API, written in Guile on GNU Artanis. The backend interface is
-the one a libsonicboom backend will implement; its C ABI is drafted in
+the one a libsonicboom backend implements; its C ABI is drafted in
 `design/route2-capi-draft.md`.
 
 ## 1. Layout
@@ -12,6 +14,7 @@ the one a libsonicboom backend will implement; its C ABI is drafted in
 ```text
 bindings/guile/scheme/sonicboom/serve/
 ├── backend.scm        the backend protocol (record of procedures), the sampler
+├── real-backend.scm   the libsonicboom backend, through the Guile binding
 ├── mock-backend.scm   a deterministic mock implementing the protocol
 ├── chat-template.scm  hand-written chat templates: gemma, qwen; tool-call text
 ├── sessions.scm       session pool: prefix matching, fork, LRU, token budget
@@ -27,9 +30,10 @@ bindings/guile/tests/serve/
 ```
 
 Dependencies point down: `app.scm` → `openai`, `engine`, `sse` → `sessions` →
-`backend` ← `mock-backend`. Only `app.scm` and `sse.scm` import Artanis; the
-other modules need Guile and guile-json only, and are what a libsonicboom
-backend reuses as is.
+`backend` ← `mock-backend`, `real-backend`. Only `app.scm` and `sse.scm` import
+Artanis; the other modules need Guile and guile-json only. `real-backend.scm`
+reaches libsonicboom through `(sonicboom inference)`, which sits on the C ABI;
+it never touches the core or native-torch directly.
 
 ## 2. Backend protocol
 
@@ -40,7 +44,7 @@ backend reuses as is.
 | `load-model config` | → model handle |
 | `model-info model` | alist: `id`, `family`, `context-length`, `eos-tokens` |
 | `tokenize model text` / `detokenize model tokens` | special tokens are single tokens |
-| `render-chat model messages tools tool-choice` | → prompt text (the mock delegates to `chat-template.scm`) |
+| `render-chat model messages tools tool-choice` | → prompt text (both backends use `chat-template.scm`) |
 | `create-session model` / `free-session session` | a session is a KV cache holding one token sequence |
 | `fork-session session n` (optional) | a new session holding the first n tokens, without recomputing them |
 | `prefill session tokens` | the session holds exactly `tokens` afterwards; the longest common prefix with what it held is kept; → number of reused tokens |
@@ -53,9 +57,21 @@ request's parameters and random state; temperature 0 is greedy. A
 sampling, the hook for constrained decoding (tool-call or JSON grammars). The
 mock applies it; nothing in the service installs one yet.
 `sample-from-logits` is a reference sampler for backends that produce logits
-on the host (the mock uses it; a device backend samples on the device).
+on the host (the mock uses it; the real backend's C ABI returns the sampled
+token).
 
-## 3. The mock backend
+### The real backend
+
+`real-backend.scm` loads one GGUF through `(sonicboom inference)` (the default
+is `models/gemma-4-E4B-it-Q3_K_M.gguf`, `--model` / `--model-id` override it).
+The chat-template family is selected from the GGUF architecture (`gemma4` →
+`gemma`, `qwen2` → `qwen`), stop tokens are the union of the model's EOS ids
+and the template's end-of-turn markers, and sessions are KV-cache handles from
+`make-session` / `prefill!` / `generate-tokens`. `--backend real` is the
+default; `tools/test-api-server.sh` is the committed smoke test for this path,
+because the unit and HTTP suites run the mock and need no model file.
+
+### The mock backend
 
 Deterministic, so the tests can predict every byte:
 
@@ -76,7 +92,7 @@ Deterministic, so the tests can predict every byte:
 - counters: prefill calls / tokens, reused and computed tokens, steps,
   sessions, forks.
 
-## 4. Chat templates
+## 3. Chat templates
 
 Hand-written Scheme per family, no Jinja (`chat-template.scm`):
 
@@ -96,7 +112,7 @@ line demanding the call (with a real model, a constraint should enforce it).
 An assistant message is rendered exactly as the model produced it, so the
 next turn's prompt starts with the tokens the session already holds.
 
-## 5. Sessions and the prefix cache
+## 4. Sessions and the prefix cache
 
 `(sonicboom serve sessions)`, one pool per model, `--max-sessions` sessions
 and a `--token-budget` of held tokens. The pool mirrors each session's tokens.
@@ -116,7 +132,7 @@ end-of-turn included). Then LRU idle sessions are freed until the held tokens
 fit the budget. `usage.prompt_tokens_details.cached_tokens` is the backend's
 `prefill` result.
 
-## 6. Queue and generation
+## 5. Queue and generation
 
 `(sonicboom serve engine)`:
 
@@ -139,7 +155,7 @@ fit the budget. `usage.prompt_tokens_details.cached_tokens` is the backend's
 - **finish_reason**: `stop`, `length`, `tool_calls` (a call was made and the
   model ended its turn).
 
-## 7. HTTP layer
+## 6. HTTP layer
 
 `app.scm` is a single-file Artanis app in the style of the Artanis examples:
 
@@ -153,7 +169,7 @@ Endpoints:
 
 | endpoint | |
 |---|---|
-| `GET /v1/models`, `GET /v1/models/:id` | the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
+| `GET /v1/models`, `GET /v1/models/:id` | the served models: one real model (default `gemma-4-E4B-it-Q3_K_M`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE of `chat.completion.chunk`, then `data: [DONE]` |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
 | `GET /sonicboom/stats` | engine, pool and backend counters (not OpenAI) |
@@ -188,12 +204,13 @@ the WebSocket replies are generated in a thread so the connection task can
 write each chunk. Details, and the Artanis changes that would replace both
 workarounds: `design/artanis-streaming-notes.md`.
 
-Options: `--host`, `--port`, `--queue`, `--max-sessions`, `--token-budget`,
-`--context-length`, `--step-delay`, `--prefill-delay`, `--runtime-dir`. The
+Options: `--backend real|mock`, `--model`, `--model-id`, `--host`, `--port`,
+`--queue`, `--max-sessions`, `--token-budget`, `--context-length`,
+`--step-delay`, `--prefill-delay`, `--runtime-dir`. The
 app sets `server.websocket = true` and `server.runners = queue + 2` (each
 running or waiting stream holds a runner).
 
-## 8. Running
+## 7. Running
 
 Environment used (Ubuntu 24.04): Guile 3.0.9 and guile-json from apt;
 guile-curl and guile-redis from git; libargon2; GNU Artanis from
@@ -201,8 +218,11 @@ guile-curl and guile-redis from git; libargon2; GNU Artanis from
 `./autogen.sh && ./configure && make && make install`).
 
 ```sh
-# the service
+# the service (default --backend real; needs libsonicboom.so and a GGUF)
 guile -L bindings/guile/scheme bindings/guile/scheme/sonicboom/serve/app.scm --port 8000
+
+# the same service with no model file or shared library
+guile -L bindings/guile/scheme bindings/guile/scheme/sonicboom/serve/app.scm --backend mock --port 8000
 
 # tests, from the repository root
 guile -L bindings/guile/scheme bindings/guile/tests/serve/test-serve-units.scm
@@ -212,7 +232,7 @@ python3 bindings/guile/tests/serve/test-openai-sdk.py      # pip install openai
 
 Results: units 47/47, HTTP 86/86, openai SDK (3.29.0) 24/24.
 
-## 9. Limits of the prototype
+## 8. Limits of the prototype
 
 - `n` must be 1; no `logprobs`; `response_format` is ignored (a JSON-mode
   constraint is the intended implementation).
