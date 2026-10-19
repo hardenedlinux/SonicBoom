@@ -41,6 +41,11 @@
 // tile and the 4 Q ldmatrix sit outside it; the warp-head d256 bc16 variant
 // is 32 + 32 inside and 16 outside. These counts follow from the fragment
 // loops below and were confirmed with cuobjdump -sass on the cached PTX.
+//
+// The shared tiles are row-padded by 8 f16 (16 bytes) so the rows a single
+// LDSM wavefront touches land in distinct 16-byte bank segments; the pad also
+// keeps the converted async stage tiles conflict-free. Values and iteration
+// order are unchanged, so the padded layout is bit-identical.
 
 #include <sonicboom/compiler/AttentionCodegen.h>
 
@@ -150,12 +155,31 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // and (when the head_dim is split across warps) the f32 partial-S buffer
   // [DPS][BR][BC]. The warp-head variant has no partial-S buffer: S never
   // leaves the warp.
-  const int kByteOff = QROWS * D * 2;
-  const int vByteOff = kByteOff + D * BC * 2;
-  const int sByteOff = vByteOff + BC * D * 2;
-  // The cp.async variant appends ABUF f32 stage buffers of K|V tile data.
+  //
+  // Every f16 tile row is padded by 8 elements (16 bytes) — the swizzle. A
+  // row's natural stride is a multiple of 128 bytes for every supported
+  // head_dim and for BC=16 (D=64/256/512 -> 128/512/1024 bytes; BC=16 -> 32
+  // bytes), so the rows one LDSM wavefront touches all start in the same
+  // bank segment. The 16-byte pad rotates each successive row by four banks,
+  // so the 8 rows a tile reads occupy 8 distinct 16-byte segments in both
+  // directions. The pad is a multiple of 16 bytes, so every row start (and
+  // every following buffer offset) stays 16-byte aligned for ldmatrix and
+  // cp.async.
+  const int QD = D + 8;    // Q row stride (f16 elements)
+  const int KBC = BC + 8;  // K^T row stride
+  const int qBytes = QROWS * QD * 2;
+  const int kByteOff = qBytes;
+  const int vByteOff = kByteOff + D * KBC * 2;
+  const int sByteOff = vByteOff + BC * QD * 2;
+  // The cp.async variant needs ABUF f32 stage buffers of K|V tile data. Q is
+  // staged once and then lives in registers for the whole key-tile loop, so
+  // when the stage buffers fit in Q's bytes they reuse that region (no extra
+  // shared memory); a barrier after the Q fragment loads makes the handoff
+  // safe. Larger stage buffers append after the partial-S buffer.
   const int sBytes = DPS > 1 ? DPS * BR * BC * 4 : 0;
-  const int aByteOff = sByteOff + sBytes;
+  const int abBytes = ASYNC ? ABUF * 2 * BC * D * 4 : 0;
+  const bool abOverlap = ASYNC && abBytes <= qBytes;
+  const int aByteOff = abOverlap ? 0 : sByteOff + sBytes;
   ci("xkb", kByteOff);
   ci("xvb", vByteOff);
   ci("xsb", sByteOff);
@@ -177,17 +201,17 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string qmem = e.val("memref.view " + smem + "[" + C["x0"] +
                                  "][] : memref<?xi8, "
                                  "#gpu.address_space<workgroup>> to memref<" +
-                                 s(QROWS) + "x" + s(D) +
+                                 s(QROWS) + "x" + s(QD) +
                                  "xf16, #gpu.address_space<workgroup>>");
   const std::string ktmem = e.val("memref.view " + smem + "[" + C["xkb"] +
                                   "][] : memref<?xi8, "
                                   "#gpu.address_space<workgroup>> to memref<" +
-                                  s(D) + "x" + s(BC) +
+                                  s(D) + "x" + s(KBC) +
                                   "xf16, #gpu.address_space<workgroup>>");
   const std::string vmem = e.val("memref.view " + smem + "[" + C["xvb"] +
                                  "][] : memref<?xi8, "
                                  "#gpu.address_space<workgroup>> to memref<" +
-                                 s(BC) + "x" + s(D) +
+                                 s(BC) + "x" + s(QD) +
                                  "xf16, #gpu.address_space<workgroup>>");
   const std::string smem_s =
       DPS > 1 ? e.val("memref.view " + smem + "[" + C["xsb"] +
@@ -218,7 +242,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string vmemv =
       ASYNC ? e.val("memref.view " + smem + "[" + C["xvb"] +
                     "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<" +
-                    s(BC) + "x" + s(D / 4) +
+                    s(BC) + "x" + s(QD / 4) +
                     "xvector<4xf16>, #gpu.address_space<workgroup>>")
             : std::string();
   std::string abase;
@@ -344,7 +368,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     e.op("}");
     const std::string qh = e.val("arith.truncf " + qv + " : f32 to f16");
     e.op("memref.store " + qh + ", " + qmem + "[" + kk + ", " + dd +
-         "] : memref<" + s(QROWS) + "x" + s(D) +
+         "] : memref<" + s(QROWS) + "x" + s(QD) +
          "xf16, #gpu.address_space<workgroup>>");
   }
   e.op("}");
@@ -370,10 +394,14 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const std::string ci2 = e.val("arith.index_cast " + col + " : i32 to index");
     aq.push_back(e.val("nvgpu.ldmatrix " + qmem + "[" + ri + ", " + ci2 +
                        "] {numTiles = 4 : i32, transpose = false} : memref<" +
-                       s(QROWS) + "x" + s(D) +
+                       s(QROWS) + "x" + s(QD) +
                        "xf16, #gpu.address_space<workgroup>> -> "
                        "vector<4x2xf16>"));
   }
+  // Every warp holds its Q fragments now; the Q staging region can be reused
+  // by the cp.async stage buffers (see the shared-memory layout above). The
+  // barrier orders the last Q read before the first stage copy.
+  if (ASYNC && abOverlap) e.op("gpu.barrier");
 
   // ---- key-tile loop bounds ----------------------------------------------
   // n_blk = min(BR, n - bx*BR); the last absolute key this block sees is
@@ -547,7 +575,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         "memref<" + s(ABUF) + "x" + s(2 * BC * D / 4) +
         "xvector<4xf32>, #gpu.address_space<workgroup>>";
     const std::string vmt =
-        "memref<" + s(BC) + "x" + s(D / 4) +
+        "memref<" + s(BC) + "x" + s(QD / 4) +
         "xvector<4xf16>, #gpu.address_space<workgroup>>";
     // K: the stage buffer's [key][D] f32 chunks (chunk %ci of the tile) ->
     // ktmem [D][BC] f16 elements.
@@ -572,7 +600,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
              e.val("vector.extract " + h + "[" + s(i) +
                    "] : f16 from vector<4xf16>") +
              ", " + ktmem + "[" + drow + ", " + key + "] : memref<" + s(D) +
-             "x" + s(BC) + "xf16, #gpu.address_space<workgroup>>");
+             "x" + s(KBC) + "xf16, #gpu.address_space<workgroup>>");
       }
     }
     e.op("}");
@@ -693,11 +721,11 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const std::string h = e.val("arith.truncf " + vv + " : f32 to f16");
     if (is_k)
       e.op("memref.store " + h + ", " + ktmem + "[" + dd + ", " + keyoff +
-           "] : memref<" + s(D) + "x" + s(BC) +
+           "] : memref<" + s(D) + "x" + s(KBC) +
            "xf16, #gpu.address_space<workgroup>>");
     else
       e.op("memref.store " + h + ", " + vmem + "[" + keyoff + ", " + dd +
-           "] : memref<" + s(BC) + "x" + s(D) +
+           "] : memref<" + s(BC) + "x" + s(QD) +
            "xf16, #gpu.address_space<workgroup>>");
     e.op("}");
   }
@@ -733,7 +761,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         const std::string b = e.val(
             "nvgpu.ldmatrix " + ktmem + "[" + ri + ", " + cidx +
             "] {numTiles = 2 : i32, transpose = true} : memref<" + s(D) + "x" +
-            s(BC) +
+            s(KBC) +
             "xf16, #gpu.address_space<workgroup>> -> vector<2x2xf16>");
         std::string &acc = half == 0 ? s0 : s1;
         acc = e.val("nvgpu.mma.sync (" + aq[k0i] + ", " + b + ", " + acc +
@@ -970,7 +998,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string bv = e.val(
           "nvgpu.ldmatrix " + vmem + "[" + vri + ", " + ccol +
           "] {numTiles = 2 : i32, transpose = true} : memref<" + s(BC) + "x" +
-          s(D) +
+          s(QD) +
           "xf16, #gpu.address_space<workgroup>> -> vector<2x2xf16>");
       cur["%o" + s(nt)] =
           e.val("nvgpu.mma.sync (" + pv3 + ", " + bv + ", " + o +
@@ -1557,20 +1585,23 @@ int attention_shared_bytes(const AttentionShape &shape) {
   // Decode: the fixed score view the partial kernel stages the chunk in.
   if (shape.decode) return 4 * kAttentionDecodeMaxChunk;
   const int qrows = shape.warp_head ? shape.gqa * shape.br : shape.br;
-  const int q = 2 * qrows * shape.head_dim;
-  const int k = 2 * shape.head_dim * shape.bc;
-  const int v = 2 * shape.bc * shape.head_dim;
+  // Every f16 tile row carries the 8-element bank-conflict pad (see
+  // attention_region_text).
+  const int q = 2 * qrows * (shape.head_dim + 8);
+  const int k = 2 * shape.head_dim * (shape.bc + 8);
+  const int v = 2 * shape.bc * (shape.head_dim + 8);
   // Partial-S exchange buffer (one f32 per row x key per d-slice). The
   // warp-head variant has none: S stays in the warp that produced it.
   const int sp = !shape.warp_head && shape.dps > 1
                      ? 4 * shape.dps * shape.br * shape.bc
                      : 0;
-  // cp.async prefetch buffers: async_stages-1 buffers of one K|V f32 tile.
+  // cp.async prefetch buffers: async_stages-1 buffers of one K|V f32 tile,
+  // reusing the Q tile's bytes when they fit (Q is in registers by then).
   const int ab = shape.async_stages >= 2
                      ? (shape.async_stages - 1) * 2 * shape.bc *
                            shape.head_dim * 4
                      : 0;
-  return q + k + v + sp + ab;
+  return q + k + v + sp + (ab <= q ? 0 : ab);
 }
 
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
@@ -1584,10 +1615,11 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
-  // attn5: cp.async K/V staging pipeline (f32 prefetch buffers converted to
-  // the f16 mma tiles in shared memory); attn4: warp-head variant (S and P
-  // stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn5";
+  // attn6: 8-element row padding on the Q/K/V shared tiles (conflict-free
+  // LDSM wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch
+  // buffers converted to the f16 mma tiles in shared memory); attn4:
+  // warp-head variant (S and P stay in registers; br fixed at 16).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn6";
 }
 
 } // namespace sonicboom::compiler

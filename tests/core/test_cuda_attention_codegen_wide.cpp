@@ -304,15 +304,16 @@ int run_bench(int prefill_n) {
                  // cp.async staging pipeline (br,bc,dps,stages).
                  "64,64,1,2", "64,32,1,2", "64,64,1,3"};
     else if (c.d == 256)
-      configs = {"32,32,2", "32,32,4", "64,32,4", "32,64,2", "16,32,2",
+      configs = {"32,32,2", "32,32,4", "32,64,2", "16,32,2",
                  "48,32,4", "64,32,2", "64,16,4", "32,16,4",
                  // P-in-registers arm (warp-head; br is fixed at 16).
-                 "wh,16,16", "wh,16,32", "wh,16,48", "wh,16,64",
-                 // cp.async staging pipeline (br,bc,dps,stages); d256 at
-                 // br=64 is the only shape class that fits 2 stages in 96 KiB.
-                 "64,16,4,2", "64,16,2,2", "16,16,4,3"};
+                 "wh,16,16", "wh,16,32", "wh,16,48",
+                 // cp.async staging pipeline (br,bc,dps,stages); the d256
+                 // br=64 dps=4 stage buffer reuses the (dead) Q tile, so the
+                 // pipelined arm fits without extra shared memory.
+                 "64,16,4,2", "64,16,2,2", "16,16,2,3"};
     else
-      configs = {"16,32,4", "16,32,8", "16,16,4", "16,16,8", "32,16,8",
+      configs = {"16,16,4", "16,16,8", "32,16,8",
                  "32,16,4"};
 
     struct Run {

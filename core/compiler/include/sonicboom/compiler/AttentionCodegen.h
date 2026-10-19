@@ -110,10 +110,12 @@ struct AttentionShape {
 // True when the generator covers the shape. Each warp holds DC/8 output
 // fragments of four f32 per thread (DC = head_dim/dps <= 128), so the register
 // budget bounds the per-warp column slice, not head_dim; the staging is
-// 2*(br*head_dim + 2*bc*head_dim) bytes plus the partial-S buffer when dps > 1.
+// 2*(br*(head_dim+8) + head_dim*(bc+8) + bc*(head_dim+8)) bytes (the +8 is
+// the bank-conflict row pad) plus the partial-S buffer when dps > 1.
 // Warp-head shapes (warp_head) additionally require br == 16, dps == 1,
 // gqa <= 8, head_dim % 16 == 0 and head_dim <= 256 (the whole head_dim is
-// accumulated in one warp), and their staging is 2*(gqa*br + 2*bc)*head_dim.
+// accumulated in one warp), and their staging is
+// 2*(gqa*br*(head_dim+8) + head_dim*(bc+8) + bc*(head_dim+8)).
 // Decode shapes need head_dim % 32 == 0 and head_dim / 32 <= 16 accumulator
 // registers per lane (a single warp owns one head), and head_dim <= 1024 so the
 // combine block fits the thread limit.

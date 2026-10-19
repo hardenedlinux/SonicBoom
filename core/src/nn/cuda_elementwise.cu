@@ -3069,10 +3069,22 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   }
 
   std::vector<AttnChoice> cands{def};
+  const bool nonidentical =
+      std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr;
   auto add_candidate = [&](const compiler::AttentionShape &s, const AttnChoice &c) {
     if (!compiler::attention_shape_supported(s)) return;
     if (compiler::attention_shared_bytes(s) > max_smem) return;
     if (compiler::attention_block_threads(s) > max_threads) return;
+    // A different implementation, key-tile width, or head_dim split changes
+    // the f32 reduction association; under a window a different br also moves
+    // the key-tile alignment. Either changes the token stream, so those
+    // variants are opt-in (SONICBOOM_ATTN_TUNE_NONIDENTICAL) like the
+    // warp-head arm. Only the query-tile width (causal), the async depth and
+    // the tile height are numerics-neutral levers.
+    if (!nonidentical &&
+        (c.impl != def.impl || c.bc != def.bc || c.dps != def.dps ||
+         c.wh != def.wh || (window && c.br != def.br)))
+      return;
     for (const AttnChoice &x : cands)
       if (attn_same_choice(x, c)) return;
     cands.push_back(c);
