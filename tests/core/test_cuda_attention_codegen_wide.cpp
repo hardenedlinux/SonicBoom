@@ -290,7 +290,6 @@ int run_bench(int prefill_n) {
     for (auto &x : kseq) x = nd(rng);
     for (auto &x : vseq) x = nd(rng);
     for (auto &x : qabs) x = nd(rng);
-
     DeviceBufs b;
     if (!alloc_bufs(c, b)) {
       std::cerr << "bench: cudaMalloc failed\n";
@@ -301,12 +300,17 @@ int run_bench(int prefill_n) {
       configs = {"64,64,1", "32,64,1", "64,32,1", "32,32,1",
                  "64,64,2", "64,32,2", "64,64,4", "64,32,4", "64,16,4",
                  // P-in-registers arm (warp-head; br is fixed at 16).
-                 "wh,16,16", "wh,16,32", "wh,16,64"};
+                 "wh,16,16", "wh,16,32", "wh,16,64",
+                 // cp.async staging pipeline (br,bc,dps,stages).
+                 "64,64,1,2", "64,32,1,2", "64,64,1,3"};
     else if (c.d == 256)
       configs = {"32,32,2", "32,32,4", "64,32,4", "32,64,2", "16,32,2",
                  "48,32,4", "64,32,2", "64,16,4", "32,16,4",
                  // P-in-registers arm (warp-head; br is fixed at 16).
-                 "wh,16,16", "wh,16,32", "wh,16,48", "wh,16,64"};
+                 "wh,16,16", "wh,16,32", "wh,16,48", "wh,16,64",
+                 // cp.async staging pipeline (br,bc,dps,stages); d256 at
+                 // br=64 is the only shape class that fits 2 stages in 96 KiB.
+                 "64,16,4,2", "64,16,2,2", "16,16,4,3"};
     else
       configs = {"16,32,4", "16,32,8", "16,16,4", "16,16,8", "32,16,8",
                  "32,16,4"};
@@ -492,6 +496,45 @@ int main(int argc, char **argv) {
           sc.auto_codegen
               ? "auto selects the generated kernel bitwise on this shape class"
               : "auto selects the hand-written kernel bitwise on this shape class");
+
+    // C4: the cp.async staging pipeline stages the same f32 values in the same
+    // order and truncates the same way, so a pipelined kernel must reproduce
+    // the synchronous one bitwise. d512 has no pipeline config inside the
+    // 96 KiB shared-memory budget; d64 and d256 are checked on the causal and
+    // windowed chunk with the cached default tiles.
+    const char *async_cfg = c.d == 64    ? "64,64,1,2"
+                            : c.d == 256 ? "64,16,4,2"
+                                         : nullptr;
+    if (async_cfg != nullptr) {
+      const std::string async_s = async_cfg;
+      const std::string sync_cfg =
+          async_s.substr(0, async_s.rfind(','));
+      for (uint64_t win : {uint64_t(0), uint64_t(96)}) {
+        std::vector<float> got_a, got_s;
+        setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
+        setenv("SONICBOOM_ATTN_CODEGEN", async_cfg, 1);
+        const bool ra =
+            run_case(c, b, qabs, kseq, vseq, 100, 130, win, got_a);
+        setenv("SONICBOOM_ATTN_CODEGEN", sync_cfg.c_str(), 1);
+        const bool rs =
+            run_case(c, b, qabs, kseq, vseq, 100, 130, win, got_s);
+        size_t diff = 1;  // a failed run leaves nothing to compare
+        if (ra && rs && got_a.size() == got_s.size()) {
+          diff = 0;
+          for (size_t z = 0; z < got_a.size(); ++z)
+            if (std::bit_cast<uint32_t>(got_a[z]) !=
+                std::bit_cast<uint32_t>(got_s[z]))
+              ++diff;
+        }
+        if (diff && ra && rs)
+          std::cerr << "    d=" << c.d << " async cfg=" << async_cfg
+                    << " window=" << win << ": " << diff << "/"
+                    << got_s.size() << " elements differ\n";
+        check(ra && rs && got_s.size() == got_a.size() && diff == 0,
+              "cp.async staging is bit-identical to synchronous staging");
+      }
+      unsetenv("SONICBOOM_ATTN_CODEGEN");
+    }
 
     const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
     if (cache_env == nullptr || std::string_view(cache_env) != "0") {

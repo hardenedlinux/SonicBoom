@@ -86,10 +86,24 @@ struct AttentionShape {
   // arm.
   bool warp_head = false;
 
+  // cp.async pipeline depth for the K/V staging (0 = synchronous staging, the
+  // default; 2 or 3 = pipeline stages). The KV cache and batch buffers are
+  // f32 and the mma operands are f16, so cp.async cannot write the mma tiles
+  // directly: each stage first copies the tile's f32 bytes into shared memory
+  // with cp.async (16-byte chunks, overlapping the previous tile's compute),
+  // then a vectorized in-shared conversion writes the f16 K/V tiles. The f32
+  // prefetch buffers are the pipeline stages; their size is part of the
+  // shape's shared-memory budget, and the tail of the pipeline is predicated
+  // by clamping the source key (out-of-range keys are masked in the softmax,
+  // so their staged values never contribute). Staging order and rounding are
+  // identical to the synchronous path, so token streams are bit-identical.
+  int async_stages = 0;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
-           dps == o.dps && decode == o.decode && warp_head == o.warp_head;
+           dps == o.dps && decode == o.decode && warp_head == o.warp_head &&
+           async_stages == o.async_stages;
   }
 };
 

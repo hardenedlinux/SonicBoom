@@ -97,6 +97,12 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // Rows of the staged Q tile: one 16-row tile per query head (warp-head
   // variant) or one br-row tile shared by every warp.
   const int QROWS = WH ? GQA * BR : BR;
+  // cp.async staging pipeline (C4). Zero keeps the synchronous staging.
+  // ABUF is the number of f32 prefetch buffers: a depth-S pipeline holds the
+  // tile being converted/consumed plus S-1 tiles in flight, and the f32
+  // buffers are the only per-stage shared-memory cost.
+  const bool ASYNC = sh.async_stages >= 2;
+  const int ABUF = ASYNC ? sh.async_stages - 1 : 0;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -118,10 +124,14 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   c32("c5", 5); c32("c7", 7); c32("c8", 8); c32("c15", 15); c32("c16", 16);
   c32("c31", 31); c32("c32", 32); c32("c63", 63); c32("c64", 64);
   c32("c128", 128); c32("cbr", BR);
-  c64("l0", 0); c64("l1", 1); c64("l8", 8);
+  c64("l0", 0); c64("l1", 1); c64("l4", 4); c64("l8", 8);
   c64("lbc", BC);
   c64("lbr", BR);
   c64("ld", D);
+  if (ASYNC) {
+    c64("lbcd", BC * D);         // one f32 K (or V) tile
+    c64("ladv", ABUF * BC);      // key-tile lead of the prefetch
+  }
   cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
   ci("x0", 0);
   ci("xD", D);
@@ -129,6 +139,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   ci("xq", QROWS * D);    // Q staging elements
   ci("xkv", D * BC);      // K/V staging elements
   ci("xthr", THREADS);    // staging stride
+  if (ASYNC) {
+    ci("x4i", 4);
+    ci("xstage", 2 * BC * D);      // one f32 K|V stage buffer
+    if (ABUF > 1) ci("xabuf", ABUF);
+    ci("xd4", D / 4);              // 16-byte f32 chunks per key row
+    ci("xckv4", BC * D / 4);       // 16-byte chunks per K (or V) tile
+  }
   // Dynamic shared memory: Q [QROWS][D] f16, K^T [D][BC] f16, V [BC][D] f16,
   // and (when the head_dim is split across warps) the f32 partial-S buffer
   // [DPS][BR][BC]. The warp-head variant has no partial-S buffer: S never
@@ -136,9 +153,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const int kByteOff = QROWS * D * 2;
   const int vByteOff = kByteOff + D * BC * 2;
   const int sByteOff = vByteOff + BC * D * 2;
+  // The cp.async variant appends ABUF f32 stage buffers of K|V tile data.
+  const int sBytes = DPS > 1 ? DPS * BR * BC * 4 : 0;
+  const int aByteOff = sByteOff + sBytes;
   ci("xkb", kByteOff);
   ci("xvb", vByteOff);
   ci("xsb", sByteOff);
+  ci("xab", aByteOff);
   if (GQA != 4 && GQA != 7) c32("gqa", GQA);
 
   const std::string FUNC =
@@ -175,6 +196,40 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                       s(DPS) + "x" + s(BR) + "x" + s(BC) +
                       "xf32, #gpu.address_space<workgroup>>")
               : std::string();
+  // [ABUF][K tile | V tile] f32 staging buffers for the cp.async pipeline,
+  // plus the shared-space base pointer cp.async writes through.
+  const std::string amem =
+      ASYNC ? e.val("memref.view " + smem + "[" + C["xab"] +
+                    "][] : memref<?xi8, "
+                    "#gpu.address_space<workgroup>> to memref<" +
+                    s(ABUF) + "x" + s(2 * BC * D) +
+                    "xf32, #gpu.address_space<workgroup>>")
+            : std::string();
+  // Vector-element views for the in-shared conversion: one element is the
+  // 16-byte f32 chunk / its 8-byte f16 quad. memref.load/store of a vector
+  // element lowers through the memref converter (vector.load on a workgroup
+  // memref does not).
+  const std::string amemv =
+      ASYNC ? e.val("memref.view " + smem + "[" + C["xab"] +
+                    "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<" +
+                    s(ABUF) + "x" + s(2 * BC * D / 4) +
+                    "xvector<4xf32>, #gpu.address_space<workgroup>>")
+            : std::string();
+  const std::string vmemv =
+      ASYNC ? e.val("memref.view " + smem + "[" + C["xvb"] +
+                    "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<" +
+                    s(BC) + "x" + s(D / 4) +
+                    "xvector<4xf16>, #gpu.address_space<workgroup>>")
+            : std::string();
+  std::string abase;
+  if (ASYNC) {
+    const std::string ai =
+        e.val("memref.extract_aligned_pointer_as_index " + amem +
+              " : memref<" + s(ABUF) + "x" + s(2 * BC * D) +
+              "xf32, #gpu.address_space<workgroup>> -> index");
+    const std::string ai64 = e.val("arith.index_cast " + ai + " : index to i64");
+    abase = e.val("llvm.inttoptr " + ai64 + " : i64 to !llvm.ptr<3>");
+  }
 
   const std::string tid_i =
       e.val("arith.index_cast " + tid + " : index to i32");
@@ -405,6 +460,152 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string j0sx = e.val("arith.index_cast " + j0s + " : i64 to index");
   const std::string kex = e.val("arith.index_cast " + keyend1 +
                                 " : i64 to index");
+
+  // ---- cp.async K/V staging (C4) -----------------------------------------
+  // emit_issue copies the f32 key tile starting at absolute key `tstart` into
+  // stage buffer `slot`: each thread moves 16-byte chunks of the K tile and of
+  // the V tile. Keys past the last valid key are clamped to it -- the softmax
+  // masks them, so their staged value never contributes, and the address stays
+  // in range. The copies form one commit group per tile.
+  const auto emit_issue = [&](const std::string &tstart,
+                              const std::string &slot) {
+    e.op("scf.for %ci = " + tid + " to " + C["xckv4"] + " step " + C["xthr"] +
+         " : index {");
+    const std::string key = e.val("arith.divui %ci, " + C["xd4"] + " : index");
+    const std::string dq = e.val("arith.remui %ci, " + C["xd4"] + " : index");
+    const std::string key64 =
+        e.val("arith.index_cast " + key + " : index to i64");
+    const std::string dq64 = e.val("arith.index_cast " + dq + " : index to i64");
+    const std::string jr =
+        e.val("arith.addi " + tstart + ", " + key64 + " : i64");
+    const std::string j = e.val("arith.minsi " + jr + ", " + keyend + " : i64");
+    const std::string isc =
+        e.val("arith.cmpi slt, " + j + ", " + start + " : i64");
+    const std::string sl = e.val("arith.remui " + j + ", %nslots : i64");
+    const std::string co1 = e.val("arith.muli " + sl + ", " + nhkv64 + " : i64");
+    const std::string co2 = e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
+    const std::string co3 = e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+    const std::string d4 = e.val("arith.muli " + dq64 + ", " + C["l4"] + " : i64");
+    const std::string co4 = e.val("arith.addi " + co3 + ", " + d4 + " : i64");
+    const std::string bi = e.val("arith.subi " + j + ", " + start + " : i64");
+    const std::string bo1 = e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
+    const std::string bo2 = e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
+    const std::string bo3 = e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
+    const std::string bo4 = e.val("arith.addi " + bo3 + ", " + d4 + " : i64");
+    const std::string cp =
+        e.val("llvm.getelementptr %kc[" + co4 +
+              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    const std::string cpv =
+        e.val("llvm.getelementptr %vc[" + co4 +
+              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    const std::string bp =
+        e.val("llvm.getelementptr %kb[" + bo4 +
+              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    const std::string bpv =
+        e.val("llvm.getelementptr %vb[" + bo4 +
+              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+    const std::string rp = e.val("llvm.select " + isc + ", " + cp + ", " + bp +
+                                 " : i1, !llvm.ptr");
+    const std::string rpv = e.val("llvm.select " + isc + ", " + cpv + ", " + bpv +
+                                  " : i1, !llvm.ptr");
+    // Stage-buffer offsets: [slot][K tile][key][4 f32]; V follows at +BC*D.
+    const std::string krow =
+        e.val("arith.muli " + key + ", " + C["xD"] + " : index");
+    const std::string koff =
+        e.val("arith.addi " + krow + ", " +
+              e.val("arith.muli " + dq + ", " + C["x4i"] + " : index") +
+              " : index");
+    const std::string soff =
+        e.val("arith.addi " +
+              e.val("arith.muli " + slot + ", " + C["xstage"] + " : index") +
+              ", " + koff + " : index");
+    const std::string soff64 =
+        e.val("arith.index_cast " + soff + " : index to i64");
+    const std::string voff64 =
+        e.val("arith.addi " + soff64 + ", " + C["lbcd"] + " : i64");
+    const std::string sp =
+        e.val("llvm.getelementptr " + abase + "[" + soff64 +
+              "] : (!llvm.ptr<3>, i64) -> !llvm.ptr<3>, f32");
+    const std::string spv =
+        e.val("llvm.getelementptr " + abase + "[" + voff64 +
+              "] : (!llvm.ptr<3>, i64) -> !llvm.ptr<3>, f32");
+    const std::string gp =
+        e.val("llvm.addrspacecast " + rp + " : !llvm.ptr to !llvm.ptr<1>");
+    const std::string gpv =
+        e.val("llvm.addrspacecast " + rpv + " : !llvm.ptr to !llvm.ptr<1>");
+    e.op("nvvm.cp.async.shared.global " + sp + ", " + gp +
+         ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
+    e.op("nvvm.cp.async.shared.global " + spv + ", " + gpv +
+         ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
+    e.op("}");
+  };
+  // emit_convert turns stage buffer `slot` into the f16 K^T and V tiles with
+  // vectorized in-shared loads/stores. The tile contents and the f32 -> f16
+  // truncation are the synchronous path's.
+  const auto emit_convert = [&](const std::string &slot) {
+    const std::string amt =
+        "memref<" + s(ABUF) + "x" + s(2 * BC * D / 4) +
+        "xvector<4xf32>, #gpu.address_space<workgroup>>";
+    const std::string vmt =
+        "memref<" + s(BC) + "x" + s(D / 4) +
+        "xvector<4xf16>, #gpu.address_space<workgroup>>";
+    // K: the stage buffer's [key][D] f32 chunks (chunk %ci of the tile) ->
+    // ktmem [D][BC] f16 elements.
+    e.op("scf.for %ci = " + tid + " to " + C["xckv4"] + " step " + C["xthr"] +
+         " : index {");
+    {
+      const std::string key = e.val("arith.divui %ci, " + C["xd4"] + " : index");
+      const std::string dq = e.val("arith.remui %ci, " + C["xd4"] + " : index");
+      const std::string v = e.val("memref.load " + amemv + "[" + slot + ", %ci" +
+                                  "] : " + amt);
+      const std::string h =
+          e.val("arith.truncf " + v + " : vector<4xf32> to vector<4xf16>");
+      const std::string dq4 = e.val("arith.muli " + dq + ", " + C["x4i"] +
+                                    " : index");
+      for (int i = 0; i < 4; ++i) {
+        std::string drow = dq4;
+        if (i) {
+          const std::string ii = e.val("arith.constant " + s(i) + " : index");
+          drow = e.val("arith.addi " + dq4 + ", " + ii + " : index");
+        }
+        e.op("memref.store " +
+             e.val("vector.extract " + h + "[" + s(i) +
+                   "] : f16 from vector<4xf16>") +
+             ", " + ktmem + "[" + drow + ", " + key + "] : memref<" + s(D) +
+             "x" + s(BC) + "xf16, #gpu.address_space<workgroup>>");
+      }
+    }
+    e.op("}");
+    // V: the V half's [key][D] f32 chunks (chunk %ci + BC*D/4 of the stage
+    // buffer) -> vmem [key][dq*4 .. +4] f16.
+    e.op("scf.for %ci = " + tid + " to " + C["xckv4"] + " step " + C["xthr"] +
+         " : index {");
+    {
+      const std::string key = e.val("arith.divui %ci, " + C["xd4"] + " : index");
+      const std::string dq = e.val("arith.remui %ci, " + C["xd4"] + " : index");
+      const std::string vidx =
+          e.val("arith.addi %ci, " + C["xckv4"] + " : index");
+      const std::string v = e.val("memref.load " + amemv + "[" + slot + ", " +
+                                  vidx + "] : " + amt);
+      const std::string h =
+          e.val("arith.truncf " + v + " : vector<4xf32> to vector<4xf16>");
+      e.op("memref.store " + h + ", " + vmemv + "[" + key + ", " + dq + "] : " +
+           vmt);
+    }
+    e.op("}");
+  };
+  if (ASYNC) {
+    // Prologue: fill every stage buffer before the first conversion.
+    for (int t = 0; t < ABUF; ++t) {
+      std::string ts = j0s;
+      if (t) {
+        const std::string lt = e.val("arith.constant " + s(t * BC) + " : i64");
+        ts = e.val("arith.addi " + j0s + ", " + lt + " : i64");
+      }
+      emit_issue(ts, e.val("arith.constant " + s(t) + " : index"));
+      e.op("nvvm.cp.async.commit.group");
+    }
+  }
   e.op(loopres + " = scf.for %j0 = " + j0sx + " to " + kex + " step " +
        C["xbc"] + " " + ia + ty + " {");
   const std::string j0v = e.val("arith.index_cast %j0 : index to i64");
@@ -412,6 +613,31 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   for (size_t i = 0; i < names.size(); ++i) cur[names[i]] = names[i];
 
   // ---- stage K/V for this key tile ---------------------------------------
+  if (ASYNC) {
+    // Wait for this tile's cp.async group; ABUF-1 newer groups may remain in
+    // flight. Then every thread's copies are visible, and the f32 stage buffer
+    // can be converted into the f16 mma tiles. The second barrier orders the
+    // conversion's reads of the stage buffer before the prefetch that reuses
+    // it; the copy overlaps the compute below.
+    e.op("nvvm.cp.async.wait.group " + s(ABUF - 1));
+    e.op("gpu.barrier");
+    std::string slot;
+    if (ABUF > 1) {
+      const std::string dlt =
+          e.val("arith.subi %j0, " + j0sx + " : index");
+      const std::string di =
+          e.val("arith.divui " + dlt + ", " + C["xbc"] + " : index");
+      slot = e.val("arith.remui " + di + ", " + C["xabuf"] + " : index");
+    } else {
+      slot = C["x0"];
+    }
+    emit_convert(slot);
+    e.op("gpu.barrier");
+    const std::string nstart =
+        e.val("arith.addi " + j0v + ", " + C["ladv"] + " : i64");
+    emit_issue(nstart, slot);
+    e.op("nvvm.cp.async.commit.group");
+  } else {
   for (const char *which : {"k", "v"}) {
     const bool is_k = std::string(which) == "k";
     e.op("scf.for %si = " + tid + " to " + C["xkv"] + " step " + C["xthr"] +
@@ -476,6 +702,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     e.op("}");
   }
   e.op("gpu.barrier");
+  }
 
   // ---- S = Q K^T for every sub-tile --------------------------------------
   // Each warp accumulates S over its DC-column slice of head_dim. With the
@@ -766,6 +993,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     e.op(y + " : " + t);
   }
   e.op("}");
+  // The prefetches past the last key tile were clamped to the last valid key;
+  // drain them before the block finishes with shared memory.
+  if (ASYNC) e.op("nvvm.cp.async.wait.group 0");
   for (size_t i = 0; i < names.size(); ++i) cur[names[i]] = "%r" + s(int(i));
 
   // ---- finalize: O / l, guarded by the row's position in n -----------------
@@ -1283,6 +1513,10 @@ bool attention_shape_supported(const AttentionShape &shape) {
   // fragments per thread; wider needs a different accumulation). The staging
   // is Q + K + V plus the f32 partial-S buffer when the head_dim is split.
   if (shape.head_dim <= 0 || shape.gqa <= 0) return false;
+  // The cp.async pipeline has synchronous depth 0 (off) or 2/3 stages.
+  if (shape.async_stages != 0 && shape.async_stages != 2 &&
+      shape.async_stages != 3)
+    return false;
   if (shape.decode) {
     // One warp per head/chunk: each lane holds head_dim/32 output floats.
     return shape.head_dim % 32 == 0 && shape.head_dim / 32 <= 16 &&
@@ -1331,7 +1565,12 @@ int attention_shared_bytes(const AttentionShape &shape) {
   const int sp = !shape.warp_head && shape.dps > 1
                      ? 4 * shape.dps * shape.br * shape.bc
                      : 0;
-  return q + k + v + sp;
+  // cp.async prefetch buffers: async_stages-1 buffers of one K|V f32 tile.
+  const int ab = shape.async_stages >= 2
+                     ? (shape.async_stages - 1) * 2 * shape.bc *
+                           shape.head_dim * 4
+                     : 0;
+  return q + k + v + sp + ab;
 }
 
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
@@ -1345,8 +1584,10 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
-  // attn4: warp-head variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn4";
+  // attn5: cp.async K/V staging pipeline (f32 prefetch buffers converted to
+  // the f16 mma tiles in shared memory); attn4: warp-head variant (S and P
+  // stay in registers; br fixed at 16).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn5";
 }
 
 } // namespace sonicboom::compiler
