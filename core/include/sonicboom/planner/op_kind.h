@@ -93,6 +93,13 @@ enum class OpKind : uint8_t {
   // `fused_region` string attribute; the node keeps the op it replaced as its
   // name, so the region and the kernel that runs it are both identified there.
   FusedRegion,
+
+  // Training: one fused AdamW update of a parameter (decoupled weight decay).
+  // Operands are [param, grad, m1, m2]; the hyperparameters (lr, beta1, beta2,
+  // eps, weight_decay) ride on the node's attributes, and `step` is the 1-based
+  // update index the bias correction needs. The update is in place: `param`,
+  // `m1` and `m2` are mutated, and the single result aliases `param`.
+  AdamW,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

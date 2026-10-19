@@ -99,12 +99,15 @@ int main() {
 
   //--- one op per OpKind, named after it -----------------------------------
 
-  // The enum is contiguous (Conv = 0 .. KvAppend), so looping the integers
-  // covers the vocabulary; the reverse mapping is the one the conversion uses
-  // to rebuild a planner node from an op.
-  const int kinds = int(planner::OpKind::KvAppend) + 1;
+  // The enum is contiguous (Conv = 0 .. AdamW), so looping the integers covers
+  // the vocabulary; the reverse mapping is the one the conversion uses to
+  // rebuild a planner node from an op. FusedRegion is a region container rather
+  // than a node operator and has no op of its own.
+  const int kinds = int(planner::OpKind::AdamW) + 1;
   for (int i = 0; i < kinds; ++i) {
     const auto kind = planner::OpKind(i);
+    if (kind == planner::OpKind::FusedRegion)
+      continue;
     const std::string name = std::string("boom.") + planner::op_kind_name(kind);
     check(mlir::OperationName(name, &context).isRegistered(),
           name + " is registered");

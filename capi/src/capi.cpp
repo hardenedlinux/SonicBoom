@@ -37,6 +37,7 @@
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
+#include <sonicboom/training/param.h>
 #include <sonicboom/vocab/vocab.h>
 
 #include <cstddef>
@@ -78,6 +79,10 @@ struct sb_tensor {
 
 struct sb_tape {
   sonicboom::Tape tape;
+};
+
+struct sb_param {
+  std::unique_ptr<sonicboom::training::Param> p;
 };
 
 namespace model = sonicboom::model;
@@ -782,6 +787,162 @@ sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
 }
 
 void sb_tensor_free(sb_tensor *t) { delete t; }
+
+// --- Training: parameter + fused AdamW --------------------------------------
+
+namespace {
+
+// Element count of a row-major shape, rejecting a negative dimension, a zero
+// extent (a parameter with no elements has no update) and uint64 overflow.
+bool param_numel(const int64_t *dims, int64_t rank, uint64_t &numel) {
+  if (!dims || rank <= 0)
+    return false;
+  numel = 1;
+  for (int64_t i = 0; i < rank; ++i) {
+    if (dims[i] <= 0)
+      return false;
+    if (numel > UINT64_MAX / static_cast<uint64_t>(dims[i]))
+      return false;
+    numel *= static_cast<uint64_t>(dims[i]);
+  }
+  return true;
+}
+
+} // namespace
+
+sb_status sb_param_create(const int64_t *dims, int64_t rank, const void *init,
+                          size_t len, sb_param **out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!out || !init)
+          return fail_arg(err_out);
+        *out = nullptr;
+
+        uint64_t numel = 0;
+        if (!param_numel(dims, rank, numel))
+          return fail_arg(err_out);
+        if (numel > UINT64_MAX / sizeof(float) ||
+            len != static_cast<size_t>(numel * sizeof(float))) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "parameter byte count does not match shape");
+          return SB_ERR_BINDING;
+        }
+
+        std::vector<float> values(static_cast<size_t>(numel));
+        std::memcpy(values.data(), init, len);
+        auto p = sonicboom::training::Param::create(values);
+        if (!p) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, p.error().c_str());
+          return SB_ERR_INTERNAL;
+        }
+        *out = new sb_param{std::move(*p)};
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_numel(const sb_param *p, size_t *numel_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !numel_out)
+          return fail_arg(nullptr);
+        *numel_out = p->p->size();
+        return SB_OK;
+      },
+      nullptr);
+}
+
+int sb_param_on_device(const sb_param *p) {
+  return p && p->p->on_device() ? 1 : 0;
+}
+
+uint64_t sb_param_step_count(const sb_param *p) {
+  return p ? p->p->step_count() : 0;
+}
+
+sb_status sb_param_zero_grad(sb_param *p, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p)
+          return fail_arg(err_out);
+        p->p->zero_grad();
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
+                            sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !grad)
+          return fail_arg(err_out);
+        const size_t want = p->p->size() * sizeof(float);
+        if (len != want) {
+          std::string msg = "gradient buffer is " + std::to_string(len) +
+                            " bytes, expected " + std::to_string(want);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        std::vector<float> values(p->p->size());
+        std::memcpy(values.data(), grad, len);
+        if (!p->p->set_grad(values)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "gradient upload failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
+                        float eps, float weight_decay, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p)
+          return fail_arg(err_out);
+        sonicboom::training::AdamWConfig cfg;
+        cfg.lr = lr;
+        cfg.beta1 = beta1;
+        cfg.beta2 = beta2;
+        cfg.eps = eps;
+        cfg.weight_decay = weight_decay;
+        if (!p->p->step(cfg)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "AdamW update failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
+                        size_t *written_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !out)
+          return fail_arg(err_out);
+        const size_t n = p->p->size() * sizeof(float);
+        if (cap < n) {
+          std::string msg = "output buffer is " + std::to_string(cap) +
+                            " bytes, expected " + std::to_string(n);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+        std::vector<float> values(p->p->size());
+        if (!p->p->read_param(values)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "parameter read failed");
+          return SB_ERR_RUNTIME;
+        }
+        std::memcpy(out, values.data(), n);
+        if (written_out)
+          *written_out = n;
+        return SB_OK;
+      },
+      err_out);
+}
+
+void sb_param_free(sb_param *p) { delete p; }
 
 sb_status sb_tape_new(sb_tape **out, sb_error **err_out) {
   return guard(

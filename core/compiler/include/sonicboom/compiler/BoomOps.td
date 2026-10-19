@@ -410,4 +410,14 @@ def Boom_KvAppendOp : Boom_Op<"kv_append",
 def Boom_FusedRegionOp : Boom_Op<"fused_region",
     "compiler-generated glue region (e.g. rms_norm_quantize_q8_1)">;
 
+//--- training operators -----------------------------------------------------
+
+// AdamW: one fused in-place parameter update. Operands are
+// [param, grad, m1, m2]; the hyperparameters (lr, beta1, beta2, eps,
+// weight_decay) and the 1-based `step` ride on node_attrs. The single result
+// aliases `param`; m1 and m2 are updated in place (the same aliasing
+// `boom.rms_norm_heads` uses).
+def Boom_AdamWOp : Boom_Op<"adamw",
+    "fused AdamW parameter update (decoupled weight decay)">;
+
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD

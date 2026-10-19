@@ -40,6 +40,7 @@ typedef struct sb_executable sb_executable;  /* a compiled, runnable graph     *
 typedef struct sb_error sb_error;            /* a failure detail               */
 typedef struct sb_tensor sb_tensor;          /* a float32 tensor (autograd)     */
 typedef struct sb_tape sb_tape;              /* a differentiable-op tape        */
+typedef struct sb_param sb_param;            /* a trainable param + AdamW state */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
 typedef enum sb_status {
@@ -240,6 +241,39 @@ sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
                           size_t *written_out, sb_error **err_out);
 
 void sb_tensor_free(sb_tensor *t);
+
+/* --- Training: parameter + fused AdamW -------------------------------------- */
+/* A trainable float32 parameter owns its values, its gradient, and AdamW's two
+ * moment buffers. When a CUDA device is present the four buffers stay in device
+ * memory across steps and the update is one fused kernel launch; otherwise they
+ * are host buffers and the host reference runs. The handle hides which.
+ *
+ * `dims[0..rank)` (row-major) only determine the element count; `len` must
+ * equal numel * 4 and supplies the initial values. The gradient and both moment
+ * buffers start at zero. */
+
+sb_status sb_param_create(const int64_t *dims, int64_t rank, const void *init,
+                          size_t len, sb_param **out, sb_error **err_out);
+
+/* Element count, and whether the buffers are device-resident (1) or host
+ * (0). Both are always available once the handle exists. */
+sb_status sb_param_numel(const sb_param *p, size_t *numel_out);
+int sb_param_on_device(const sb_param *p);
+
+/* Updates applied so far (0 before the first successful sb_param_step). */
+uint64_t sb_param_step_count(const sb_param *p);
+
+/* Zero the gradient, replace it with `grad` (len == numel * 4), and apply one
+ * AdamW update. `sb_param_read` copies the current parameter values out. */
+sb_status sb_param_zero_grad(sb_param *p, sb_error **err_out);
+sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
+                            sb_error **err_out);
+sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
+                        float eps, float weight_decay, sb_error **err_out);
+sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
+                        size_t *written_out, sb_error **err_out);
+
+void sb_param_free(sb_param *p);
 
 /* Create an empty tape (no recorded ops, no gradients). */
 sb_status sb_tape_new(sb_tape **out, sb_error **err_out);

@@ -84,6 +84,9 @@ inline BackendTag route_op(OpKind op) noexcept {
     // A compiler-generated glue region has no MLIR-S-Expr lowering; it is a
     // device kernel like the quant::* ops around it.
     case OpKind::FusedRegion:
+    // Training updates run as hand-written kernels over the parameter's own
+    // device buffers; they have no MLIR-S-Expr lowering either.
+    case OpKind::AdamW:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

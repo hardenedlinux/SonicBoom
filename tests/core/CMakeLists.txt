@@ -339,6 +339,12 @@ add_executable(test_capi_multi test_capi_multi.c)
 target_link_libraries(test_capi_multi PRIVATE sonicboom m)
 sb_add_cpp_test(test_capi_multi)
 
+# R2: SonicBoomParam + fused AdamW through the C ABI, 10 steps against an
+# independent double-precision reference (max-abs <= 1e-6).
+add_executable(test_adamw test_adamw.cpp)
+target_link_libraries(test_adamw PRIVATE sonicboom)
+sb_add_cpp_test(test_adamw)
+
 # Boom IR dialect test: op registration against planner::OpKind, the generated
 # assembly formats, the type verifiers. It links the compiler library
 # (sonicboom_compiler), which is always built — MLIR is a required dependency
