@@ -108,6 +108,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // buffers are the only per-stage shared-memory cost.
   const bool ASYNC = sh.async_stages >= 2;
   const int ABUF = ASYNC ? sh.async_stages - 1 : 0;
+  // exp2 softmax (opt-in): fold log2(e) into the score scale and exponentiate
+  // in log2 units. `scl` is the score scale either way.
+  const bool EXP2 = sh.exp2;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -138,6 +141,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     c64("ladv", ABUF * BC);      // key-tile lead of the prefetch
   }
   cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
+  // exp2 arm: the softmax scale carries log2(e), so the scores are already in
+  // log2 units when the exponential runs.
+  std::string scl = "%scale";
+  if (EXP2) {
+    cf("clog2e", "1.44269502e+00");
+    scl = e.val("arith.mulf %scale, " + C["clog2e"] + " : f32");
+  }
   ci("x0", 0);
   ci("xD", D);
   ci("xbc", BC);
@@ -894,7 +904,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string ge = e.val("arith.cmpi sge, " + key + ", " + low +
                                    " : i64");
       const std::string ok = e.val("arith.andi " + le + ", " + ge + " : i1");
-      const std::string sc = e.val("arith.mulf " + sv + ", %scale : f32");
+      const std::string sc = e.val("arith.mulf " + sv + ", " + scl + " : f32");
       return e.val("arith.select " + ok + ", " + sc + ", " + C["cneg"] +
                    " : f32");
     };
@@ -939,15 +949,16 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         rmax4(maxf(maxf(m1a, m1b), maxf(m1c, m1d)));
     const std::string mn0 = maxf(cur["%m0"], mx0);
     const std::string mn1 = maxf(cur["%m1"], mx1);
+    const auto exp_of = [&](const std::string &x) {
+      return e.val(std::string(EXP2 ? "math.exp2 " : "math.exp ") + x +
+                   " : f32");
+    };
     const std::string rs0 =
-        e.val("math.exp " + e.val("arith.subf " + cur["%m0"] + ", " + mn0 +
-                                  " : f32") + " : f32");
+        exp_of(e.val("arith.subf " + cur["%m0"] + ", " + mn0 + " : f32"));
     const std::string rs1 =
-        e.val("math.exp " + e.val("arith.subf " + cur["%m1"] + ", " + mn1 +
-                                  " : f32") + " : f32");
+        exp_of(e.val("arith.subf " + cur["%m1"] + ", " + mn1 + " : f32"));
     const auto prob = [&](const std::string &sv, const std::string &mn) {
-      return e.val("math.exp " + e.val("arith.subf " + sv + ", " + mn +
-                                       " : f32") + " : f32");
+      return exp_of(e.val("arith.subf " + sv + ", " + mn + " : f32"));
     };
     const std::string p0a = prob(m0a, mn0), p0b = prob(m0b, mn0);
     const std::string p0c = prob(m0c, mn0), p0d = prob(m0d, mn0);
@@ -988,10 +999,27 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                   e.val("arith.constant " + s(key_off) + " : index") +
                   " : index");
     }
+    // Conditional rescale: when neither row's running maximum grew in this
+    // sub-tile, the rescale factor is exactly exp(0) = 1 and the whole
+    // O rescale is skipped. Skipping it is bit-identical (multiplying by 1.0
+    // is exact); l still goes through the same `l*rs + sum` expression.
+    const std::string ch0 = e.val("arith.cmpf ogt, " + mn0 + ", " +
+                                  cur["%m0"] + " : f32");
+    const std::string ch1 = e.val("arith.cmpf ogt, " + mn1 + ", " +
+                                  cur["%m1"] + " : f32");
+    const std::string changed =
+        e.val("arith.ori " + ch0 + ", " + ch1 + " : i1");
     for (int nt = 0; nt < NT; ++nt) {
-      const std::string o =
-          e.val("arith.mulf " + cur["%o" + s(nt)] + ", " + rsv +
-                " : vector<2x2xf32>");
+      const std::string ifr = e.val("scf.if " + changed +
+                                    " -> vector<2x2xf32> {");
+      e.op("  scf.yield " +
+           e.val("arith.mulf " + cur["%o" + s(nt)] + ", " + rsv +
+                 " : vector<2x2xf32>") +
+           " : vector<2x2xf32>");
+      e.op("} else {");
+      e.op("  scf.yield " + cur["%o" + s(nt)] + " : vector<2x2xf32>");
+      e.op("}");
+      const std::string o = ifr;
       std::string ccol = e.val("arith.constant " + s(nt * 8) + " : index");
       if (DPS != 1)
         ccol = e.val("arith.addi " + ccol + ", " + dbase_i + " : index");
@@ -1104,6 +1132,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const int D = sh.head_dim;
   const int GQA = sh.gqa;
   const int K = D / 32;  // output columns per lane
+  const bool EXP2 = sh.exp2;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -1129,6 +1158,13 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   c64("l0", 0); c64("l1", 1); c64("l2", 2); c64("ldp", D + 2);
   c64("lD", D);
   cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
+  // exp2 arm: scores and the partial m are in log2 units (see the prefill
+  // generator); the combine kernel's exp2 then matches them.
+  std::string scl = "%scale";
+  if (EXP2) {
+    cf("clog2e", "1.44269502e+00");
+    scl = e.val("arith.mulf %scale, " + C["clog2e"] + " : f32");
+  }
   ci("x0", 0); ci("x1", 1);
   if (GQA != 4 && GQA != 7) c32("gqa", GQA);
 
@@ -1245,7 +1281,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
                  " : f32").first;
       acc = e.val("arith.addf " + acc + ", " + sh + " : f32");
     }
-    const std::string sc = e.val("arith.mulf " + acc + ", %scale : f32");
+    const std::string sc = e.val("arith.mulf " + acc + ", " + scl + " : f32");
     const std::string sid = e.val("arith.subi %j, " + jlo_i + " : index");
     e.op("scf.if " + is0 + " {");
     e.op("memref.store " + sc + ", " + smemf + "[" + sid + "]" + smtype);
@@ -1331,8 +1367,8 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     const std::string psv = e.val("memref.load " + smemf + "[" + psid + "]" +
                                   smtype);
     const std::string p =
-        e.val("math.exp " + e.val("arith.subf " + psv + ", " + mx + " : f32") +
-              " : f32");
+        e.val(std::string(EXP2 ? "math.exp2 " : "math.exp ") +
+              e.val("arith.subf " + psv + ", " + mx + " : f32") + " : f32");
     // l: each lane sums its own keys and the warp tree-reduces (same reduction
     // shape as the hand-written kernel), rather than every lane serially
     // summing the whole chunk.
@@ -1490,8 +1526,11 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const std::string wmp = f.val("llvm.getelementptr %part[" + wl +
                                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
   const std::string mv3 = f.val("llvm.load " + wmp + " : !llvm.ptr -> f32");
-  const std::string ex0 = f.val("math.exp " + f.val("arith.subf " + mv3 + ", " +
-                                                   mmax + " : f32") + " : f32");
+  // The partial m is in the same units as the decode kernel's exp: log2 when
+  // the exp2 arm generated them, natural otherwise.
+  const std::string ex0 =
+      f.val(std::string(EXP2 ? "math.exp2 " : "math.exp ") +
+            f.val("arith.subf " + mv3 + ", " + mmax + " : f32") + " : f32");
   // O is stored unnormalized, so the numerator rescales it by exp(m - mmax)
   // only; the chunk's l contributes to the denominator weight alone.
   const std::string ex =
@@ -1610,16 +1649,19 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
   const std::string text = shape.decode
       ? attention_decode_region_text(shape, sm_arch)
       : attention_region_text(shape, sm_arch);
-  // The softmax exp is libdevice's __nv_expf (math.exp -> nvvm).
+  // The softmax exp is libdevice's __nv_expf (math.exp -> nvvm); the opt-in
+  // exp2 arm uses __nv_exp2f instead.
   return lower_gpu_module_to_ptx(text, /*link_libdevice=*/true, "attention");
 }
 
 std::string attention_codegen_version() {
-  // attn6: 8-element row padding on the Q/K/V shared tiles (conflict-free
-  // LDSM wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch
-  // buffers converted to the f16 mma tiles in shared memory); attn4:
-  // warp-head variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn6";
+  // attn7: conditional online-softmax rescale (skip the O rescale when the
+  // running max did not grow) and the opt-in exp2 softmax arm; attn6:
+  // 8-element row padding on the Q/K/V shared tiles (conflict-free LDSM
+  // wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch buffers
+  // converted to the f16 mma tiles in shared memory); attn4: warp-head
+  // variant (S and P stay in registers; br fixed at 16).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn7";
 }
 
 } // namespace sonicboom::compiler

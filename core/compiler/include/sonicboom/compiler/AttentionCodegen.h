@@ -99,11 +99,19 @@ struct AttentionShape {
   // identical to the synchronous path, so token streams are bit-identical.
   int async_stages = 0;
 
+  // exp2 softmax: the scores are scaled by scale*log2(e) and the exponential
+  // is math.exp2, so the online-softmax max and the running rescale factors
+  // live in log2 units. This saves the per-score scale multiply and lets the
+  // exponential lower to the hardware exp2 approximation, but it is not
+  // bit-identical to the exp path (the folded scale rounds differently), so it
+  // is an opt-in arm (SONICBOOM_ATTN_EXP2).
+  bool exp2 = false;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
            dps == o.dps && decode == o.decode && warp_head == o.warp_head &&
-           async_stages == o.async_stages;
+           async_stages == o.async_stages && exp2 == o.exp2;
   }
 };
 

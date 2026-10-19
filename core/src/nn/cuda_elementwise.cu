@@ -2597,6 +2597,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
     dsh.gqa = group_q;
     dsh.window_mask = sliding_window != 0;
     dsh.decode = true;
+    dsh.exp2 = std::getenv("SONICBOOM_ATTN_EXP2") != nullptr;
     if (want_codegen && compiler::attention_shape_supported(dsh) &&
         n_heads_q % n_heads_kv == 0) {
       // Fixed chunk length per shape class: the chunk count scales with the
@@ -2831,6 +2832,14 @@ enum class AttnImpl { Own, Codegen };
 // shape. These are the per-class starting points of the Step 7 runtime tuner:
 // the tuner times them against every supported (br, bc, dps) and keeps the
 // default unless a candidate is faster by the switch margin.
+// exp2 softmax arm (C6, opt-in): the generated kernel folds log2(e) into the
+// score scale and exponentiates with exp2. The folded scale rounds
+// differently from the exp path, so it is not token-identical and stays
+// behind an explicit switch.
+bool attn_exp2_enabled() {
+  return std::getenv("SONICBOOM_ATTN_EXP2") != nullptr;
+}
+
 // Build a prefill shape field by field. nvcc's host front end stops applying
 // designated initializers at the first skipped member: a shape written as
 // `.head_dim = ..., ..., .async_stages = ...` leaves `decode` at its default
@@ -2848,6 +2857,7 @@ compiler::AttentionShape attn_prefill_shape(int head_dim, int gqa, bool window,
   s.dps = dps;
   s.warp_head = wh;
   s.async_stages = as;
+  s.exp2 = attn_exp2_enabled();
   return s;
 }
 
@@ -2856,6 +2866,7 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
                                                                    bool window) {
   compiler::AttentionShape shape{
       .head_dim = head_dim, .gqa = gqa, .window_mask = window};
+  shape.exp2 = attn_exp2_enabled();
   // Tile configs from the Stage 3c sweep (test_cuda_attention_codegen_wide
   // --bench; RTX 3050/sm_86). Each warp keeps DC = head_dim/dps <= 128 output
   // columns; wider tiles buy occupancy only until the dynamic-smem limit
@@ -3203,6 +3214,7 @@ std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
        "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
        "-m" + (window ? "window" : "causal");
   if (window) k += "-w" + std::to_string(window_len);
+  if (attn_exp2_enabled()) k += "-x2";
   return k;
 }
 
@@ -3326,6 +3338,7 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
   dsh.gqa = gqa;
   dsh.window_mask = sliding_window != 0;
   dsh.decode = true;
+  dsh.exp2 = attn_exp2_enabled();
   if (!compiler::attention_shape_supported(dsh)) return default_chunk;
 
   std::string key = compiler::attention_codegen_version();
@@ -3334,6 +3347,7 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
          std::to_string(n_heads_kv) + "-m" +
          (sliding_window != 0 ? "window" : "causal");
   key += "-w" + std::to_string(max_window);
+  if (attn_exp2_enabled()) key += "-x2";
 
   {
     std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
@@ -3565,6 +3579,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           std::to_string(shape->bc) + "," + std::to_string(shape->dps);
       if (shape->async_stages >= 2)
         cfg += ",as" + std::to_string(shape->async_stages);
+      if (shape->exp2) cfg += ",x2";
       attn_trace_prefill(
           attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
           "codegen", cfg.c_str(), shape->br, shape->bc,

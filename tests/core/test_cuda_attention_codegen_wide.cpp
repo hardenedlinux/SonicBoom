@@ -399,6 +399,7 @@ int main(int argc, char **argv) {
     // hand-written kernel's on the same inputs. Both stage f16 K/V and round P
     // to f16, so this compares the reduction orders, not the precision.
     double cg_err = 0.0, own_err = 0.0;
+    std::vector<std::pair<const Case *, double>> case_exp_err;
     for (const Case &cc : cases) {
       std::vector<float> got;
       const bool ran =
@@ -419,6 +420,7 @@ int main(int argc, char **argv) {
                   << " maxabs=" << maxabs << " maxrel=" << maxrel << "\n";
       check(maxrel <= 1e-3, "generated wide-head attention matches fp64");
       cg_err = std::max(cg_err, maxabs);
+      case_exp_err.emplace_back(&cc, maxabs);
 
       setenv("SONICBOOM_ATTN_IMPL", "own", 1);
       std::vector<float> got_own;
@@ -536,6 +538,48 @@ int main(int argc, char **argv) {
       }
       unsetenv("SONICBOOM_ATTN_CODEGEN");
     }
+
+    // C6: the opt-in exp2 softmax arm (folded log2(e) scale, exp2) is not
+    // bit-identical to the exp path by construction. The numerics rule's
+    // "fp64 error no worse than current" clause was measured and is NOT met on
+    // d64 (2.665e-4 vs 2.301e-4, +15.8%: a single P value lands on the other
+    // side of an f16 rounding boundary; d256/d512 match within 0.1%). The arm
+    // therefore stays opt-in and is not a candidate for default selection. The
+    // check below holds it to the kernel's acceptance envelope (1e-3 max
+    // relative error against fp64), which a real precision regression would
+    // still break; the per-case comparison against the exp path is printed.
+    double exp2_err = 0.0;
+    setenv("SONICBOOM_ATTN_EXP2", "1", 1);
+    unsetenv("SONICBOOM_ATTN_CODEGEN");
+    setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
+    for (const Case &cc : cases) {
+      std::vector<float> got;
+      const bool ran =
+          run_case(c, b, qabs, kseq, vseq, cc.start, cc.n, cc.window, got);
+      check(ran, "exp2 softmax attention returns true");
+      if (!ran) continue;
+      std::vector<double> want;
+      reference(c, qabs, kseq, vseq, cc.start, cc.n, cc.window, scale, want);
+      double maxabs = 0.0, maxrel = 0.0;
+      for (size_t i = 0; i < want.size(); ++i) {
+        const double dd = std::fabs(double(got[i]) - want[i]);
+        maxabs = std::max(maxabs, dd);
+        maxrel = std::max(maxrel, dd / std::max(1.0, std::fabs(want[i])));
+      }
+      check(maxrel <= 1e-3, "exp2 softmax matches fp64");
+      exp2_err = std::max(exp2_err, maxabs);
+      const auto it = std::find_if(
+          case_exp_err.begin(), case_exp_err.end(),
+          [&cc](const auto &p) { return p.first == &cc; });
+      if (it != case_exp_err.end() && maxabs > it->second * 1.01)
+        std::cerr << "    d=" << c.d << " start=" << cc.start
+                  << " n=" << cc.n << " window=" << cc.window
+                  << " exp2_abs=" << maxabs << " exp_abs=" << it->second
+                  << " (opt-in arm; see comment)\n";
+    }
+    unsetenv("SONICBOOM_ATTN_EXP2");
+    std::cout << "  head_dim " << c.d << " exp2 maxabs=" << exp2_err
+              << " exp=" << cg_err << "\n";
 
     const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
     if (cache_env == nullptr || std::string_view(cache_env) != "0") {
