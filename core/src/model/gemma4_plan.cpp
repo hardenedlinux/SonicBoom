@@ -1103,6 +1103,22 @@ static bool plan_cache_enabled() {
 // pool, so the cap bounds host-side planning state rather than VRAM.
 static constexpr std::size_t kMaxCachedSegments = 8;
 
+// The greedy generation program (§10), read out of the `boom.program` the
+// module's decode graph lifts into. It is the loop's structure — a prefill
+// call, then a body of step / sample / emit / stop_check and a pos_inc
+// continuation — not a second plan: the step's device work stays the captured
+// StepProgram the plan produced, and the executor below walks the program to
+// decide when to replay it, which token to emit, and when to stop.
+//
+// The desc is plain data so the runtime never holds an MLIR module alive; the
+// lift runs once at plan-build time and its diagnostics fail the plan there.
+struct GreedyProgramDesc {
+  bool valid = false;
+  std::string prefill_graph;
+  std::vector<int64_t> eos_tokens;
+  int64_t max_tokens = 0;  // 0 = the caller's token span is the bound
+};
+
 struct DecodeRuntime {
   planner::Graph graph;
   planner::ExecutionPlan plan;
@@ -1111,6 +1127,7 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  GreedyProgramDesc program;                          // the lowered loop (§10)
   // Prefill segments by shape-class sizing extent, most-recently used first,
   // capped at kMaxCachedSegments.
   std::list<std::pair<uint64_t, std::unique_ptr<PrefillSegment>>> prefills;
@@ -1118,6 +1135,169 @@ struct DecodeRuntime {
   PlannerEnv prefill_env{};
   bool prefill_env_set = false;
 };
+
+// SONICBOOM_IR_PROGRAM=0 runs the hand-written decode loop instead of the
+// program-driven one (ablation group "ir-program"). Default: the program.
+static bool ir_program_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_IR_PROGRAM");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return v;
+}
+
+// Read the program back out of the lifted module. The program verifier has
+// already checked the shape; this only recovers the attributes the executor
+// needs (the prefill call's name, the stop set and the emitted-count bound) and
+// confirms that one of each loop op is present.
+static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
+  namespace boom = compiler::boom;
+  GreedyProgramDesc desc;
+  boom::ProgramOp program;
+  for (mlir::Operation& op : module.getBody()->getOperations()) {
+    if (auto p = llvm::dyn_cast<boom::ProgramOp>(&op)) {
+      if (program) return desc;  // more than one program: not a generation
+      program = p;
+    }
+  }
+  if (!program) return desc;
+
+  int prefills = 0, steps = 0, samples = 0, emits = 0, stops = 0, incs = 0;
+  int64_t delta = 0;
+  program.walk([&](mlir::Operation* op) {
+    if (auto p = llvm::dyn_cast<boom::PrefillOp>(op)) {
+      ++prefills;
+      desc.prefill_graph = p.getGraphName().str();
+    } else if (llvm::isa<boom::StepOp>(op)) {
+      ++steps;
+    } else if (llvm::isa<boom::SampleOp>(op)) {
+      ++samples;
+    } else if (llvm::isa<boom::EmitOp>(op)) {
+      ++emits;
+    } else if (auto s = llvm::dyn_cast<boom::StopCheckOp>(op)) {
+      ++stops;
+      desc.eos_tokens.assign(s.getEosTokens().begin(), s.getEosTokens().end());
+      desc.max_tokens = int64_t(s.getMaxTokens());
+    } else if (auto p = llvm::dyn_cast<boom::PosIncOp>(op)) {
+      ++incs;
+      delta = int64_t(p.getDelta());
+    }
+  });
+  desc.valid = prefills == 1 && steps == 1 && samples == 1 && emits == 1 &&
+               stops == 1 && incs == 1 && delta == 1;
+  return desc;
+}
+
+// The stop_check node: EOS membership, and the emitted-count bound. The count
+// the program carries is the number of tokens emitted before this one, so the
+// bound is tested against it.
+static bool program_stop(const GreedyProgramDesc& p, int64_t token,
+                         uint64_t emitted_before) {
+  if (p.max_tokens > 0 && emitted_before >= uint64_t(p.max_tokens))
+    return true;
+  return std::find(p.eos_tokens.begin(), p.eos_tokens.end(), token) !=
+         p.eos_tokens.end();
+}
+
+// Execute the program's decode loop from `step` (the caller has already emitted
+// `step` tokens and `token` is the next input, at `pos`). The step node is one
+// StepProgram replay — k chained steps per replay in chunk mode — the sample
+// node is the argmax the replay wrote, emit writes the host token, stop_check
+// tests the program's stop set and pos_inc advances the position. Returns the
+// number of tokens written.
+static uint64_t run_program_steps(
+    DecodeRuntime& rt, const GreedyProgramDesc& p, uint64_t token, uint64_t pos,
+    std::span<int64_t> tokens, uint64_t step,
+    std::chrono::steady_clock::time_point* first_out = nullptr) {
+  const uint64_t limit = p.max_tokens > 0
+                             ? std::min<uint64_t>(uint64_t(p.max_tokens),
+                                                  tokens.size())
+                             : tokens.size();
+  const uint32_t chunk = rt.cuda->decode_chunk();
+  if (rt.prog && chunk > 1) {
+    // One replay per k loop iterations: the step node is executed k times, and
+    // sample/emit/stop_check/pos_inc run on each of its k results in order.
+    float carry = float(token);
+    std::vector<uint64_t> positions(chunk);
+    std::vector<float> out(chunk);
+    while (step < limit) {
+      for (uint32_t j = 0; j < chunk; ++j) positions[j] = pos + j;
+      const std::string name = "decode_chunk_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(name.c_str());
+      const bool ok = rt.cuda->stage_chunk(*rt.prog, carry, positions) &&
+                      rt.prog->replay() &&
+                      rt.cuda->read_chunk_tokens(out.data(), chunk);
+      if (nvtx_enabled()) nvtxRangePop();
+      if (!ok) {
+        std::cerr << "[program] chunk at step " << step << " failed\n";
+        break;
+      }
+      bool stopped = false;
+      for (uint32_t j = 0; j < chunk && step < limit; ++j) {
+        const int64_t next = int64_t(out[j]);
+        if (next < 0) { stopped = true; break; }
+        tokens[step] = next;
+        const bool stop = program_stop(p, next, step);
+        carry = out[j];
+        ++pos;
+        ++step;
+        if (first_out && step == 1) *first_out = std::chrono::steady_clock::now();
+        if (stop) { stopped = true; break; }
+      }
+      if (stopped) break;
+    }
+  } else if (rt.prog) {
+    for (; step < limit; ++step) {
+      rt.cuda->set_pos(pos);
+      if (!rt.prog->replay()) {
+        std::cerr << "[program] step " << step << " graph replay failed\n";
+        break;
+      }
+      float next_f = -1.0f;
+      rt.cuda->read_token(&next_f);
+      const int64_t next = int64_t(next_f);
+      if (next < 0) break;
+      tokens[step] = next;
+      const bool stop = program_stop(p, next, step);
+      token = static_cast<uint64_t>(next);
+      ++pos;
+      if (first_out && step == 0) *first_out = std::chrono::steady_clock::now();
+      if (stop) { ++step; break; }
+    }
+  } else {
+    // No re-playable graph: the step node is one executor dispatch.
+    for (; step < limit; ++step) {
+      rt.cuda->set_pos(pos);
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+      auto res = rt.exec->execute(rt.plan, rt.snap, in);
+      if (!res || res->outputs.empty()) {
+        if (!res)
+          std::cerr << "[program] step " << step << " execute failed: "
+                    << res.error().message << "\n";
+        else
+          std::cerr << "[program] step " << step << " no outputs\n";
+        break;
+      }
+      const sx::Bytes& arg = res->outputs[0];
+      if (arg.size() < sizeof(float)) {
+        std::cerr << "[program] step " << step << " argmax too small: "
+                  << arg.size() << " < " << sizeof(float) << "\n";
+        break;
+      }
+      const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
+      if (next < 0) break;
+      tokens[step] = next;
+      const bool stop = program_stop(p, next, step);
+      token = static_cast<uint64_t>(next);
+      ++pos;
+      if (first_out && step == 0) *first_out = std::chrono::steady_clock::now();
+      if (stop) { ++step; break; }
+    }
+  }
+  return step;
+}
 
 static std::map<std::pair<const Gemma4Model*, uint64_t>,
                 std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
@@ -1184,6 +1364,28 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled());
+  // §10: lift the post-pass decode graph into the generation program and read
+  // the loop back. Done on a clone so the module that produced the plan is left
+  // exactly as it was; the clone is discarded once the desc is extracted. A
+  // program that does not construct fails the runtime: the loop's structure is
+  // not an optional decoration of the step, and silently running something else
+  // would make the default path the hand-written loop again.
+  if (rt->graph.nodes.empty())
+    return nullptr;
+  {
+    mlir::OwningOpRef<mlir::ModuleOp> program_module(
+        mlir::cast<mlir::ModuleOp>((*ir.module)->clone()));
+    if (mlir::failed(compiler::addGreedyProgram(*program_module, "greedy",
+                                                "prefill", {1}, {}, 0))) {
+      std::cerr << "[plan] lowering boom.program failed (diagnostic above)\n";
+      return nullptr;
+    }
+    rt->program = read_greedy_program(*program_module);
+    if (!rt->program.valid) {
+      std::cerr << "[plan] boom.program did not read back as a greedy loop\n";
+      return nullptr;
+    }
+  }
   // After every graph-level pass, so the transform sees the graph the plan is
   // actually derived from (plan.h: GraphTransform).
   if (transform && *transform) (*transform)(rt->graph);
@@ -1295,7 +1497,12 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   rt->cuda->seed_token(start_token);
 
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (rt->prog && chunk > 1) {
+  if (ir_program_enabled() && rt->program.valid) {
+    // The lowered boom.program drives the loop; each step node is the captured
+    // StepProgram replay (or the executor dispatch when nothing was captured).
+    step = run_program_steps(*rt, rt->program, token, pos, tokens, step,
+                             &t_first);
+  } else if (rt->prog && chunk > 1) {
     // Replay one captured k-step chunk: stage the carry token and the k
     // positions on the graph's stream, launch once, then read the k tokens in
     // one D2H. The device feeds each step's token to the next, so the host
@@ -2066,7 +2273,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   // back from the persistent device slot (the synchronous D2H also drains the
   // graph stream). Otherwise fall back to per-step executor dispatch.
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (!dump_logits && rt->prog && chunk > 1) {
+  if (!dump_logits && ir_program_enabled() && rt->program.valid) {
+    step = run_program_steps(*rt, rt->program, token, pos, tokens, step);
+  } else if (!dump_logits && rt->prog && chunk > 1) {
     float carry = float(token);
     std::vector<uint64_t> positions(chunk);
     std::vector<float> out(chunk);
