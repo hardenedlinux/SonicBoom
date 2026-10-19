@@ -8,11 +8,12 @@
 > divergence records and the negative results are still what explains the
 > current design — **not** as a comparison table. Reproducible, same-session,
 > median-of-3 numbers are now produced only by `tools/bench.sh`, and the ones
-> current as of **v0.0.3 (2026-10-19)** are in the README's
-> [Numbers](../README.md#numbers) section: Gemma 53.0 / 52.1 tok/s decode
-> (1.18× llama.cpp), 1990 tok/s prefill (1.00×), 65.2 ms prefix reuse;
-> Qwen2.5-0.5B 344.7 / 296.4 tok/s (1.12× / 0.98×), 15346 tok/s prefill
-> (1.09×), 13.7 ms reuse.
+> current as of **`boom-next` (2026-10-19)** are in the README's
+> [Numbers](../README.md#numbers) section: Gemma 53.6 / 53.5 tok/s decode
+> (1.20× / 1.21× llama.cpp), 2084 tok/s prefill (1.04×), 57.4 ms prefix reuse;
+> Qwen2.5-0.5B 345.9 / 307.0 tok/s (1.13× / 1.01×), 15301 tok/s prefill
+> (1.09×), 13.7 ms reuse. (v0.0.3 was 53.0 / 52.1, 1.18×, 1990 tok/s, 65.2 ms;
+> 344.7 / 296.4, 1.12× / 0.98×, 15346 tok/s, 13.7 ms.)
 
 **Test date: 2026-10-12** (final v1-performance state; development spanned
 2026-10-06 → 2026-10-12). Supersedes the 2026-10-07 v0 baseline.

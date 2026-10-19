@@ -31,11 +31,14 @@ Environment overrides (dev-time only, read once and cached) are noted per row;
 they exist so these values can be re-measured without a rebuild
 (`SONICBOOM_GEMV_COOP_MIN_BPR`, `SONICBOOM_MMQ_MIN_N`, `SONICBOOM_CUBLAS_MIN_N`,
 `SONICBOOM_DENSE_CUBLAS_MIN_N`, `SONICBOOM_MMQ`, `SONICBOOM_CUBLAS`,
-`SONICBOOM_CUDA_GRAPHS`). The v0.0.3 generated-kernel switches are
+`SONICBOOM_CUDA_GRAPHS`). The generated-kernel switches are
 `SONICBOOM_AUTOTUNE` (`0` / `force` / unset), `SONICBOOM_ATTN_IMPL`
 (`own` / `auto` / `codegen`; `ggml` is a deprecated alias for `auto`),
-`SONICBOOM_ATTN_DECODE=own|codegen`, `SONICBOOM_ATTN_CODEGEN=br,bc,dps`,
-`SONICBOOM_DENSE_GEMM=0`, and `SONICBOOM_IR_PASS_DISABLE=<passes>`.
+`SONICBOOM_ATTN_DECODE=own|codegen`, `SONICBOOM_ATTN_DECODE_CHUNK=<C>`,
+`SONICBOOM_ATTN_CODEGEN=br,bc,dps`, `SONICBOOM_ATTN_EXP2=1`,
+`SONICBOOM_ATTN_TUNE_NONIDENTICAL=1`, `SONICBOOM_DENSE_GEMM=0`,
+`SONICBOOM_IR_PASS_DISABLE=<passes>`, `SONICBOOM_IR_PROGRAM=0` and
+`SONICBOOM_SPEC=off|on|auto` (§11).
 
 ---
 
@@ -96,24 +99,38 @@ window so the decode step stays CUDA-Graph-capturable.
 - **Splitting QK^T keys across all warps**: +14% (1.225 s vs 1.072 s) — the
   kernel is tensor-core-bound, not warp-bound. Condition: sm_86, these shapes.
 
-### 2b. Generated attention (v0.0.3)
+### 2b. Generated attention (v0.0.3, extended on boom-next)
 
 Prefill: the generated FA-2 kernel
 (`core/compiler/include/sonicboom/compiler/AttentionCodegen.h`) takes
-`(br, bc, dps)`; the sm_86 defaults are `d256 → (64,16,4)`, `d512 → (32,16,8)`,
-`d64/GQA7 → own`. Decode: the generated split-KV pair **is the default**; its
+`(br, bc, dps, warp_head, async_stages)`. The tuner also sweeps cp.async
+stages `{0,2,3}`; the sm_86 choices are `d256 → (64,16,4)` with two stages,
+`d512 → (32,16,8)` synchronous (no async configuration fits the 96 KiB cap),
+`d64/GQA7 → own` (the generated arm is not token-identical). Shared tiles are
+padded by 8 f16 elements per row against LDSM bank conflicts, and the online
+softmax skips a rescale whose factor is exactly `exp(0)`; both leave the token
+stream unchanged. `SONICBOOM_ATTN_EXP2=1` folds `log2(e)*scale` into the
+scores and uses `exp2`; it is performance-neutral and not token-identical, so
+it is opt-in only. Decode: the generated split-KV pair **is the default**; its
 chunk length follows the hand-written pair's rule (cap 16, or the no-split
 48 KiB rule when the `split_kv` feature is off), because matching the split is
-what makes the two paths bit-identical, and its fma/reduction order matches
+what makes the two paths bit-identical, and its fma reduction order matches
 too. `SONICBOOM_ATTN_DECODE=own` selects the hand-written pair (the ablation
-and numerical reference); the chunk tuner changes the split and is therefore
-active only in the non-token-identical arm
-(`SONICBOOM_ATTN_TUNE_NONIDENTICAL`). All are keyed
-by `(head_dim, gqa, mask kind)` — never by batch size or position. Known
-mismatch: the tuner
-keeps `codegen` for the d512 prefill class while a 256-query sweep measures
-`own` about 12% faster; the class probe's query length differs from the
-in-model call. Conditions: sm_86, Gemma 4/Qwen2.5 head geometries.
+and numerical reference); `SONICBOOM_ATTN_DECODE_CHUNK` pins a chunk for an
+ablation. The chunk tuner changes the split and is therefore active only
+under `SONICBOOM_ATTN_TUNE_NONIDENTICAL`, the same switch that admits the
+non-identical d64 prefill arm. All choices are keyed by
+`(head_dim, gqa, mask kind[, window])` and the codegen version — never by
+batch size or position. Known mismatch: the tuner keeps `codegen` for the
+d512 prefill class while the shape bench measures `own` about 12% faster at
+n=512; the class probe's query length differs from the in-model call.
+Conditions: sm_86, Gemma 4/Qwen2.5 head geometries.
+
+Measured at n=512 (ms/call, own vs generated best): d64 0.232 vs 0.124
+(+10.2% Qwen pp512 and −23% reuse in the opt-in arm); d256 0.747 vs 0.358
+(selected); d512 1.603 vs 1.850 (generated selected despite own being faster).
+Decode us/call at 513 keys: d256 21.8 vs 31.3, d512 40.3 vs 50.8, d64 33.8 vs
+15.0 (generated vs own).
 
 ## 3. Dense / matvec (non-quantized)
 
@@ -221,7 +238,7 @@ warp-per-row, 8 warps per block.
 
 | constant | file:line | value | should depend on | how measured |
 |---|---|---|---|---|
-| `Js[]` | `:1052` | `{8,16,24,32,40,48,64,80,96,112,128}` | batch n | `select_J(n)` takes the smallest J that minimises `ceil(n/J)` |
+| `Js[]` | `mmq.cuh:1320` | `{8,16,24,32,40,48,56,64,72,80,88,96,104,112,120,128}` | batch n | `select_J(n)` takes the smallest J that minimises `ceil(n/J)` (upstream's rule); `mmq_launch_choice` (`cuda_quant_matmul.cu:1570-1590`) has a case for every J, which is the static fallback when autotuning is off |
 | `I` | `:96` | `128` rows/tile | M (fixed) | the q8_1_mmq block is 128 values |
 | `MMQ_ITER_K` | `:95` | `256` | weight K-quant block (256) | fixed |
 | `NWARPS`, `WARP_SIZE` | `:97-98` | `8`, `32` | — | 256 threads/block |
@@ -314,5 +331,36 @@ Not searchable (correctness/numerics, listed so a tuner does not "win" by
 changing them): `kMmqMinN`, `kDenseCublasWidth`, `kDenseCublasMinN`, the
 `kWeightTailPad`/plane-padding arithmetic, `mmq_q8_planes`, and the reduction
 trees of the norm emitters (byte-identity with the unfused path). The generated
-decode attention's reduction order is also fixed; that is why it is not a
-default choice.
+decode attention's reduction order and chunk split are also fixed — to the
+hand-written pair's — and that is what makes it the default choice.
+
+## 11. Speculative decoding
+
+`SONICBOOM_SPEC=off|on|auto` (default off; parsed once per process). The loop
+is a `boom.program`; `off` and `on` are also the two arms of the
+"spec-policy" ablation group. `SONICBOOM_IR_PROGRAM=0` restores the
+hand-written decode loop for the non-speculative path.
+
+| constant | location | value | should depend on | how measured |
+|---|---|---|---|---|
+| n-gram orders | `NGramDrafter` | 4, then 3, then 2 | language/history length | first hit wins; each occurrence indexed by its most recent end position |
+| `max_drafts` | spec program | 7 | verify cost curve | B7's `on` arm and the c(k) sweep |
+| α0 (EMA start) | `spec_alpha_update` | 0.5 | — | conservative prior; updated by accepted/drafted |
+| verify classes | planner | `verify_k1..k7`, one captured graph each | k | each is bit-identical to k+1 plain steps (§B3) |
+| c(k) cache | autotune `spec-length` | `v1\|model\|embedding\|ctx class` | GPU, model shape, context class | two passes per k, second timed; warm-up excluded from the EMA |
+
+Measured c(k), µs per verify step (Gemma e2560 / Qwen e896, context class m):
+Gemma 20014, 38731, 53163, 68038, 83519, 99153, 114756, 129926; Qwen 3243,
+5189, 7158, 9186, 11185, 13145, 15076, 17078. A plain Gemma step is 18.66 ms
+(c0 = 1.07×), a Qwen step 2.89 ms (c0 = 1.12×).
+
+**Known bad (do-not-retry as-is):**
+
+- **Fixed k=7 as a default**: bit-identical but slower on every measured
+  trace — Gemma tg64 25.2 vs 53.6 tok/s, agent trace 41.9 vs 48.7 (247 drafts,
+  6 accepted on Gemma). Condition: these traces, α well below the 0.5 prior.
+- **`auto` with α0 = 0.5 on the current drafter**: proposes nothing (k=0 on
+  100% of steps in all four workload traces and the canonical bench, including
+  code-edit), so it is plain decode within noise. Treat this as a drafter
+  defect to diagnose, not as evidence about speculative decoding itself.
+  Condition: current history indexing and trace set.

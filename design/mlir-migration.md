@@ -611,19 +611,24 @@ itself; the hand-written kernels remain the numerical and performance reference.
   on tolerance (per the v1 rules in `CLAUDE.md`), with any divergence reported
   (first divergent step, top-1/top-2 margin).
 
-**Status (v0.0.3).** Implemented and shipped. The glue set is generated
-(`core/compiler/lib/GlueCodegen.cpp`), and the same NVVM route now also
-generates prefill FA-2 attention (`AttentionCodegen.cpp`), the split-KV decode
-pair, and a bf16 dense GEMM with an `mma.m16n8k16` core and
-`cp.async` double buffering (`GemmCodegen.cpp`). Kernel choice and tile
+**Status (v0.0.3, extended on boom-next).** Implemented and shipped. The glue
+set is generated (`core/compiler/lib/GlueCodegen.cpp`), and the same NVVM route
+now also generates prefill FA-2 attention (`AttentionCodegen.cpp`), the
+split-KV decode pair, and a bf16 dense GEMM with an `mma.m16n8k16` core and
+`cp.async` double buffering (`GemmCodegen.cpp`). The generated prefill
+attention stages K/V through a 2–3-stage `cp.async` pipeline, pads its shared
+tiles against LDSM bank conflicts, and skips the online-softmax rescale when
+the factor is exactly `exp(0)`; those changes are bit-identical, and the
+codegen version records each text change (`attn8`). Kernel choice and tile
 configuration moved to a per-GPU runtime autotuner with a disk cache
 (`core/src/planner/autotune.h`), keyed by GPU, operator and shape class. The
 generated decode pair reproduces the hand-written kernel's chunk split, fma
 rounding and reduction order, so it is the default decode path and its token
 stream is bit-identical to the hand-written reference
 (`SONICBOOM_ATTN_DECODE=own` for the comparison arm). Every generated kernel
-reproduces the default token stream. The hand-written kernels remain the
-numerical and performance reference.
+selected by default reproduces the default token stream; the non-identical
+arms stay behind opt-in switches. The hand-written kernels remain the numerical
+and performance reference.
 
 ### 7.6 The gates (run before each step is declared done)
 
@@ -829,8 +834,16 @@ ukernels remain hand-written and attributed.
 
 **(6) v0.0.3 update (2026-10-19).** Step (e) landed after this run: generated
 glue, generated FA-2 prefill attention, generated split-KV decode attention
-(opt-in) and a generated bf16 dense GEMM, with per-GPU runtime autotune
-(§7e status). The map of the remaining work is in §10 (loop and symbolic N);
-GPU-independent targeting is not started. The imported ggml flash attention
-was retired; both attention implementations are now SonicBoom's own or
-generated.
+and a generated bf16 dense GEMM, with per-GPU runtime autotune (§7e status).
+The imported ggml flash attention was retired; both attention implementations
+are now SonicBoom's own or generated.
+
+**(7) boom-next update (2026-10-19).** The generated split-KV decode pair is
+now token-identical to the hand-written pair and is the default decode path;
+the generated prefill attention gained a cp.async K/V pipeline, padded shared
+tiles and conditional online-softmax rescaling. The decode loop is lowered
+from `boom.program` to the step executor, and speculative decoding (drafter →
+verify → accept, with KV rollback) is the first non-trivial program lowered
+through it; the hand-written loop remains behind `SONICBOOM_IR_PROGRAM=0`.
+The map of the remaining work is in §10 (symbolic N, GPU-independent
+targeting); GPU-independent targeting is not started.
