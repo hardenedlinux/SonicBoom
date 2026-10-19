@@ -421,6 +421,15 @@ def Boom_FusedRegionOp : Boom_Op<"fused_region",
 def Boom_AdamWOp : Boom_Op<"adamw",
     "fused AdamW parameter update (decoupled weight decay)">;
 
+// clip_grad_norm: global-norm gradient clipping written as a pure function.
+// Operands are N gradients; results are the N clipped gradients, each with its
+// operand's shape, and `max_norm` rides on node_attrs. The global L2 norm is
+// accumulated in double in one pass over every element of every operand. When
+// it does not exceed max_norm each result is a copy of its operand (the values
+// are unchanged); otherwise each is scaled by max_norm / (norm + 1e-6).
+def Boom_ClipGradNormOp : Boom_Op<"clip_grad_norm",
+    "global-norm gradient clipping over N gradients">;
+
 // matmul_bwd: the VJP of Y = A @ B (A [M,K], B [K,N], dY [M,N]) with respect
 // to both operands. Operands [A, B, dY]; results [dA [M,K], dB [K,N]]. The
 // row-major layouts are the forward matmul's: A[m*K + k], B[k*N + n],

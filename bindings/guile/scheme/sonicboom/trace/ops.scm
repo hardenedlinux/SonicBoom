@@ -800,6 +800,30 @@ step counter is a 1-based int32 tensor."
           (make-ctensor (ctensor-dtype m1) (ctensor-shape m1) m1*)
           (make-ctensor (ctensor-dtype m2) (ctensor-shape m2) m2*))))
 
+(define (clip-grad-norm-kernel ts attrs)
+  "Global-norm gradient clipping: one clipped tensor per input, in order. The
+norm is accumulated in double over every element of every input; when it does
+not exceed max_norm the inputs are returned unchanged (a pure no-op), otherwise
+each is scaled by max_norm / (norm + 1e-6). Same arithmetic as the host
+reference (core/src/training/clip_grad_norm.cpp) and the device kernel."
+  (let* ((max-norm (attr-ref attrs 'max_norm 1.0))
+         (sumsq
+          (fold (lambda (t acc)
+                  (let ((n (ctensor-numel t)))
+                    (do ((i 0 (+ i 1)) (s acc (+ s (* (ctensor-ref t i)
+                                                     (ctensor-ref t i)))))
+                        ((= i n) s))))
+                0.0 ts))
+         (norm (sqrt sumsq)))
+    (if (<= norm max-norm)
+        ts
+        (let ((scale (/ max-norm (+ norm 1e-6))))
+          (map (lambda (t)
+                 (make-ctensor (ctensor-dtype t) (ctensor-shape t)
+                               (vmap (lambda (x) (* x scale))
+                                     (ctensor-data t))))
+               ts)))))
+
 ;;; --- gradients ----------------------------------------------------------------------
 ;;; A gradient rule is a pure function
 ;;;   (rule emit shape ins out g attrs) -> list of input gradients (#f = none)
@@ -1042,7 +1066,8 @@ axes TARGET has as 1, then reshape."
     (rope_bwd         1 ,first-input-type ,rope-bwd-kernel #f #f #f)
     (silu_mul_bwd     3 ,first-input-type ,silu-mul-bwd-kernel #f #f #f)
     (embedding_bwd    2 ,embedding-bwd-type ,embedding-bwd-kernel #f #f #f)
-    (adamw            5 ,first-input-type ,adamw-kernel #f #f #f)))
+    (adamw            5 ,first-input-type ,adamw-kernel #f #f #f)
+    (clip_grad_norm   n ,first-input-type ,clip-grad-norm-kernel #f #f #f)))
 
 ;; Ops whose kernel has an effect: always recorded while tracing and never
 ;; removed by DCE.

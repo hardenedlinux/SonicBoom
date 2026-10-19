@@ -37,10 +37,12 @@
 #include <sonicboom/sx/ir.h>
 #include <sonicboom/sx/parser.h>
 #include <sonicboom/tensor.h>
+#include <sonicboom/training/clip_grad_norm.h>
 #include <sonicboom/training/device_graph.h>
 #include <sonicboom/training/param.h>
 #include <sonicboom/vocab/vocab.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -48,6 +50,7 @@
 #include <fstream>
 #include <memory>
 #include <new>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1187,6 +1190,51 @@ sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
           return SB_ERR_RUNTIME;
         }
         return make_tensor(std::move(g), out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
+                            float *norm_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (count < 0 || (count > 0 && !grads)) return fail_arg(err_out);
+        if (!std::isfinite(max_norm) || max_norm < 0.0f)
+          return fail_arg(err_out);
+        if (norm_out) *norm_out = 0.0f;
+        // The host reference reads and writes each gradient's storage in
+        // place, which is exactly the tape's gradient buffer: the next
+        // optimizer step sees the clipped values.
+        std::vector<float *> ptrs;
+        std::vector<std::size_t> sizes;
+        ptrs.reserve(static_cast<std::size_t>(count));
+        sizes.reserve(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+          const sb_tensor *t = grads[i];
+          if (!t || !t->t.defined()) return fail_arg(err_out);
+          if (t->t.dtype() != nt::ScalarType::Float) {
+            const std::string msg =
+                "gradient " + std::to_string(i) + " is not float32";
+            set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+            return SB_ERR_INTERNAL;
+          }
+          if (t->t.device().type != nt::DeviceType::CPU) {
+            const std::string msg =
+                "gradient " + std::to_string(i) +
+                " is not on the CPU; use the device training graph "
+                "for GPU gradients";
+            set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+            return SB_ERR_INTERNAL;
+          }
+          ptrs.push_back(static_cast<float *>(t->t.data_ptr()));
+          sizes.push_back(static_cast<std::size_t>(t->t.numel()));
+        }
+        const double norm = sonicboom::training::clip_grad_norm_inplace(
+            std::span<float *const>(ptrs.data(), ptrs.size()),
+            std::span<const std::size_t>(sizes.data(), sizes.size()),
+            static_cast<double>(max_norm));
+        if (norm_out) *norm_out = static_cast<float>(norm);
+        return SB_OK;
       },
       err_out);
 }

@@ -150,6 +150,16 @@ enum class OpKind : uint8_t {
   ReduceSum,
   SiluMul,
   CrossEntropy,
+
+  // Training: global-norm gradient clipping written as a pure function over N
+  // gradients. Operands are the gradients, results the clipped gradients with
+  // the operands' shapes; `max_norm` rides on node_attrs. The global L2 norm is
+  // accumulated in double in one pass over every element; when it does not
+  // exceed max_norm the results are copies of the operands (the values are
+  // unchanged), otherwise each is scaled by max_norm / (norm + 1e-6).
+  // Appended last: OpKind is an internal enum, but appending keeps the numeric
+  // values of the operators above stable across this change.
+  ClipGradNorm,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;
