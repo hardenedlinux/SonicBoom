@@ -745,9 +745,15 @@ constexpr const char *kAddRmsNormQuantizeMmqQ8_1 = R"MLIR(module attributes {gpu
 // same fp32 value the norm kernel computes. The apply then does that kernel's
 // `x * iv * w` followed by add_kernel's `residual + v`, both at the same fp32
 // rounding points, so the region's output is byte-identical to the pair.
+//
+// `scale` is the epilogue factor of the scalar `scale` a single-reader chain
+// used to run after the region (FoldScaleIntoGluePass). It multiplies the
+// region's own output with one fp32 multiply — the same operation and rounding
+// scale_kernel did — so the graph's value is unchanged; a caller with no folded
+// scale passes 1.0f, which leaves the output bit-identical (x * 1.0f == x).
 constexpr const char *kRmsNormAdd = R"MLIR(module attributes {gpu.container_module} {
   gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
-    gpu.func @rms_norm_add(%x: !llvm.ptr, %r: !llvm.ptr, %w: !llvm.ptr, %y: !llvm.ptr, %dim: i32, %eps: f32) kernel {
+    gpu.func @rms_norm_add(%x: !llvm.ptr, %r: !llvm.ptr, %w: !llvm.ptr, %y: !llvm.ptr, %dim: i32, %eps: f32, %scale: f32) kernel {
       %token = gpu.block_id x
       %tid = gpu.thread_id x
       %tid_i = arith.index_cast %tid : index to i32
@@ -946,8 +952,9 @@ constexpr const char *kRmsNormAdd = R"MLIR(module attributes {gpu.container_modu
         %p = arith.mulf %xv2, %ivv : f32
         %v = arith.mulf %p, %wv : f32
         %o = arith.addf %rv, %v : f32
+        %os = arith.mulf %o, %scale : f32
         %yp = llvm.getelementptr inbounds %yrow[%ki] : (!llvm.ptr, i32) -> !llvm.ptr, f32
-        llvm.store %o, %yp : f32, !llvm.ptr
+        llvm.store %os, %yp : f32, !llvm.ptr
       }
       gpu.return
     }
@@ -1716,7 +1723,7 @@ std::string glue_codegen_version() {
   // does not record. (The cache also stores a hash of the generated text and
   // ignores an entry whose body does not match, so a stale entry cannot run
   // even without a bump; this keeps the two checks independent.)
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue2";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue3";
 }
 
 } // namespace sonicboom::compiler

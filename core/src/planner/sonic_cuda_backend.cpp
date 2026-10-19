@@ -861,19 +861,27 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           ok = false;
           break;
         }
-        // The generated kernel's ABI: (x, r, w, y, dim, eps), one block per row.
+        // The epilogue factor of the scalar scale a single-reader chain ran
+        // after the region (FoldScaleIntoGluePass); 1.0f when there was none.
+        double epi_scale = 1.0;
+        attr_f(*node, "epilogue_scale", epi_scale);
+        const float sarg = float(epi_scale);
+        // The generated kernel's ABI: (x, r, w, y, dim, eps, scale), one block
+        // per row.
         void* xarg = const_cast<float*>(dev(in[0]));
         void* rarg = const_cast<float*>(dev(in[1]));
         void* warg = const_cast<void*>(wd);
         void* yarg = out;
         int dimarg = int(dim_i);
         float earg = eps;
-        void* args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg};
+        float farg = sarg;
+        void* args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg, &farg};
         ok = glue::launch(region, args, int(nb),
                           compiler::kRmsNormAddBlockThreads,
                           compiler::kRmsNormAddSharedBytes);
         if (!ok) {
-          // The reference pair: norm into a scratch row set, then add.
+          // The reference pair: norm into a scratch row set, then add, then the
+          // scale the region folded.
           const uint64_t tmp = device::acquire(out_bytes);
           if (!tmp) {
             ok = false;
@@ -884,6 +892,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           if (ok)
             ok = nn::cuda::add_dev(dev(in[1]), dev_mut(tmp), out,
                                    int(nb * dim_i));
+          if (ok && sarg != 1.0f)
+            ok = nn::cuda::scale_dev(out, sarg, out, out_n);
           device::release(tmp, out_bytes);
         }
         break;

@@ -312,14 +312,16 @@ void test_rms_norm_add(std::mt19937& rng, int tokens, int dim) {
         (tag + ": reference add").c_str());
 
   // The generated kernel, loaded and launched through the JIT: one 256-thread
-  // block per row.
+  // block per row. `scale` is the epilogue factor FoldScaleIntoGluePass folds
+  // into the region; 1.0f (no folded scale) must leave the output untouched.
   void *xarg = xd;
   void *rarg = rd;
   void *warg = wd;
   void *yarg = ygen;
   int dimarg = dim;
   float earg = eps;
-  void *args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg};
+  float sarg = 1.0f;
+  void *args[] = {&xarg, &rarg, &warg, &yarg, &dimarg, &earg, &sarg};
   check(sonicboom::planner::glue::launch(
             "rms_norm_add", args, tokens,
             sonicboom::compiler::kRmsNormAddBlockThreads,
@@ -343,12 +345,39 @@ void test_rms_norm_add(std::mt19937& rng, int tokens, int dim) {
   }
   check(equal, (tag + ": byte-identical output").c_str());
 
+  // The folded epilogue: a non-unit factor must be byte-identical to the same
+  // region followed by scale_dev, which is the pair the graph used to run.
+  float *yexp = nullptr, *ygot = nullptr;
+  check(cudaMalloc(&yexp, xy_bytes) == cudaSuccess, "cudaMalloc yexp");
+  check(cudaMalloc(&ygot, xy_bytes) == cudaSuccess, "cudaMalloc ygot");
+  if (!g_failures) {
+    const float scale = 0.70710677f;
+    check(sonicboom::nn::cuda::scale_dev(yref, scale, yexp, int(elems)),
+          (tag + ": reference scale").c_str());
+    void *yarg2 = ygot;
+    float sarg2 = scale;
+    void *args2[] = {&xarg, &rarg, &warg, &yarg2, &dimarg, &earg, &sarg2};
+    check(sonicboom::planner::glue::launch(
+              "rms_norm_add", args2, tokens,
+              sonicboom::compiler::kRmsNormAddBlockThreads,
+              sonicboom::compiler::kRmsNormAddSharedBytes),
+          (tag + ": scaled kernel launch").c_str());
+    check(cudaDeviceSynchronize() == cudaSuccess, "device synchronize");
+    std::vector<float> sgot(elems), sexp(elems);
+    cudaMemcpy(sgot.data(), ygot, xy_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(sexp.data(), yexp, xy_bytes, cudaMemcpyDeviceToHost);
+    check(std::memcmp(sgot.data(), sexp.data(), xy_bytes) == 0,
+          (tag + ": scaled epilogue byte-identical").c_str());
+  }
+
   cudaFree(xd);
   cudaFree(rd);
   cudaFree(wd);
   cudaFree(nd);
   cudaFree(yref);
   cudaFree(ygen);
+  cudaFree(yexp);
+  cudaFree(ygot);
 }
 
 // One attention-prep region launch (Stage 5d): per-head norm + optional RoPE +

@@ -2214,6 +2214,134 @@ public:
   }
 };
 
+// fold_scale_into_glue_pass (step 11): a scalar `scale` that reads the only
+// output of a generated glue region becomes an epilogue of that region:
+//
+//   fused_region "rms_norm_add" -> scale   =>   fused_region (+ epilogue_scale)
+//
+// This is the glue-region counterpart of ScaleIntoDensePass. The generated
+// dense GEMM's epilogue takes the scale of the projection beside it; the region
+// that reads the GEMM's output in the Gemma PLE chain is `rms_norm_add`, and the
+// scale that follows it is a chain of its own:
+//
+//   matvec_bf16 -> rms_norm_add -> scale
+//
+// The norm itself cannot be an epilogue of the GEMM: its reduction spans the
+// projection's whole output row (256 wide in the PLE chain, 2560 in the
+// post-FF one), while the dense GEMM's M tile partitions that row across blocks
+// — the norm's row tile and the GEMM's output tile are different partitions.
+// The scale, however, is elementwise on the region's own store, so
+// the region absorbs it exactly: one fp32 multiply after the apply, the same
+// operation and rounding the separate scale kernel did. The post-FF chain
+// (matvec_f32 -> rms_norm_add -> scale) has the same shape and folds by the
+// same rule; the pass matches the producer's region kind, not its input
+// operator, so both chains are covered (42 + 42 sites per Gemma prefill).
+//
+// The region keeps its identity, operands and place, takes the scale's output
+// tensor over (its own output tensor stops being a graph tensor) and carries
+// the factor as `epilogue_scale`; the CUDA backend passes it to the generated
+// kernel, whose apply multiplies by it. With the generated region off
+// (GlueCodegen disabled) this pass does not run, so the ablation arm plans the
+// separate scale kernel it always had.
+class FoldScaleIntoGluePass
+    : public mlir::PassWrapper<FoldScaleIntoGluePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FoldScaleIntoGluePass)
+
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    llvm::SmallVector<mlir::Operation *> scales;
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> regionOf;
+    llvm::DenseMap<mlir::Operation *, double> factorOf;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::Scale) ||
+          node.getNumOperands() != 1 || node.getNumResults() != 1)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      const std::optional<double> factor =
+          attrs ? nodeAttrFloat(attrs, "scale") : std::nullopt;
+      if (!factor)
+        continue; // no scalar to fold in
+      const int64_t src = view.idOf(node.getOperand(0));
+      auto producedBy = producer.find(src);
+      if (producedBy == producer.end())
+        continue;
+      mlir::Operation *m = producedBy->second;
+      if (m->getName().getStringRef() !=
+              boomOpName(planner::OpKind::FusedRegion) ||
+          m->getNumResults() != 1)
+        continue;
+      auto regionAttrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      auto region =
+          regionAttrs ? nodeAttrString(regionAttrs, "fused_region") : std::nullopt;
+      // Only the region kind whose generated kernel has the epilogue multiply.
+      if (!region || *region != "rms_norm_add")
+        continue;
+      if (nodeAttrFloat(regionAttrs, "epilogue_scale"))
+        continue;
+      if (consumers[src] != 1)
+        continue; // the region has another reader
+      scales.push_back(&node);
+      regionOf.insert({&node, m});
+      factorOf.insert({&node, *factor});
+    }
+
+    if (scales.empty())
+      return;
+
+    for (mlir::Operation *scale : scales) {
+      mlir::Operation *m = regionOf.lookup(scale);
+
+      // The region's attributes plus the factor it now applies, appended — the
+      // same ordered record the other folds use.
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          m->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      nodeAttrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "epilogue_scale",
+          builder.getF64FloatAttr(factorOf.lookup(scale))));
+
+      // The region keeps its identity and place and takes the scale's output;
+      // its own f32 output tensor stops being a tensor of the graph.
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
+      auto name = m->getAttrOfType<mlir::StringAttr>("node_name");
+      builder.setInsertionPoint(m);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+          GraphEditor::nodeId(*m),
+          name ? name.getValue() : llvm::StringRef("fused_region"),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*scale),
+          m->getOperands(), scale->getResultTypes(),
+          m->getAttrOfType<mlir::StringAttr>("backend"));
+
+      scale->replaceAllUsesWith(node);
+      view.noteReplaced(scale, node);
+      scale->erase();
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      m->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // dense_layout_propagation_pass: the dense projections consume the activation
 // in the layout its producer already writes (position-major) instead of the
 // executor repacking it into fixed-width blocks and copying the result back.
@@ -2286,6 +2414,7 @@ struct DisabledPasses {
   bool fuse_slice_scale = false;
   bool fuse_gelu_mul = false;
   bool scale_into_dense = false;
+  bool fold_scale_into_glue = false;
   bool dense_layout_propagation = false;
   bool buffer_reuse = false;
 };
@@ -2311,6 +2440,7 @@ constexpr PassName kPassNames[] = {
     {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
     {"FuseGeluMulPass", &DisabledPasses::fuse_gelu_mul},
     {"ScaleIntoDensePass", &DisabledPasses::scale_into_dense},
+    {"FoldScaleIntoGluePass", &DisabledPasses::fold_scale_into_glue},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
     {"GeluMulMmqPass", &DisabledPasses::gelu_mul_mmq},
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
@@ -2403,6 +2533,11 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
     // region's.
     if (!off.fuse_rms_norm_add)
       pm.addPass(std::make_unique<FuseRmsNormAddPass>());
+    // After the region exists: the scalar scale a single-reader chain runs after
+    // it is the region's epilogue (attribute-only: the node keeps its place and
+    // gets `epilogue_scale`).
+    if (!off.fold_scale_into_glue)
+      pm.addPass(std::make_unique<FoldScaleIntoGluePass>());
     if (!off.gelu_mul_mmq) pm.addPass(std::make_unique<GeluMulMmqPass>());
     if (!off.silu_mul_mmq) pm.addPass(std::make_unique<SiluMulMmqPass>());
     // The PLE column extraction is an elementwise chain of its own: none of the

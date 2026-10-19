@@ -608,6 +608,11 @@ if [ "$ABLATE" = 1 ]; then
     "kv-append-into-prep|FuseKvAppendIntoPrepPass"
     "slice-scale-fusion|FuseSliceScalePass"
     "gelu-mul-fusion|FuseGeluMulPass"
+    # The two epilogue folds: the scalar scale after a dense projection / after
+    # a generated glue region becomes an attribute of that node. Disabling one
+    # restores its standalone scale_kernel launches.
+    "scale-into-dense|ScaleIntoDensePass"
+    "fold-scale-into-glue|FoldScaleIntoGluePass"
     "dense-layout|DenseLayoutPropagationPass"
     # Stage 7: liveness-based buffer classes and in-place elementwise results.
     # Disabling it restores one buffer per activation and no in-place writes.
@@ -645,6 +650,10 @@ if [ "$ABLATE" = 1 ]; then
     # Default is the cuBLASLt bf16 tensor-core kernel with a per-shape cached
     # algorithm; the group-off side runs the cublasGemmEx default algorithm.
     "dense-lt|SONICBOOM_DENSE_LT=0"
+    # Default is 1: the bf16 dense projection runs the compiler-generated
+    # tensor-core GEMM when the per-GPU autotune prefers it, with the folded
+    # epilogue. The group-off side runs the cuBLASLt path for every shape.
+    "dense-codegen|SONICBOOM_DENSE_GEMM=0"
     # Default is 1 (the per-step replay loop: measured fastest, the decode step
     # is GPU-bound so chunking's host-round-trip savings are already hidden);
     # the group-off side captures k=4 steps into one graph (device-side token
