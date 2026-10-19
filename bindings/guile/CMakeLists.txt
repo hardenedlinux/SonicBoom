@@ -48,6 +48,18 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-train.scm)
 
+  # guile-checkpoint round-trips named float32 tensors (parameters and AdamW
+  # moments) through (sonicboom checkpoint) → sb_save_params/sb_load_params,
+  # including the error paths; same shared-library dependency as guile-nn.
+  add_test(
+    NAME guile-checkpoint
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-checkpoint.scm)
+
   # guile-executable compiles a graph once and runs it repeatedly through
   # libsonicboom.so, checking numerics, reuse and handle lifetime; same
   # shared-library dependency as guile-nn.

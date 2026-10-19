@@ -352,6 +352,43 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
                           const char *const *names, const sb_tensor *const *params,
                           size_t count, const char *dir, sb_error **err_out);
 
+/* --- Checkpoints ------------------------------------------------------------- */
+
+/* Named float32 tensors persisted in one self-describing binary file:
+ *
+ *   "SBCKPT1\n"                    8-byte magic
+ *   u64                            entry count
+ *   per entry:
+ *     u32 name_len, name bytes     UTF-8, not NUL-terminated
+ *     u8 dtype                     sb_dtype (float32 in this version)
+ *     u32 rank
+ *     i64 dims[rank]               row-major shape
+ *     u64 byte_count               == numel * 4
+ *     byte_count data bytes        little-endian float32, row-major
+ *
+ * All integers are little-endian. Entries are matched by name, so the order in
+ * which a caller saves and loads them need not agree.
+ *
+ * sb_save_params writes `count` named tensors to `path` (overwriting it).
+ * Names must be non-empty and unique; tensors must be float32. sb_load_params
+ * copies the stored values into the caller's existing tensors, matched by
+ * name: each target must be float32 with exactly the stored shape. The file is
+ * fully parsed and validated before any target is written, so on any failure
+ * every target is left untouched. The file may hold entries the caller does
+ * not load (a checkpoint can carry more state than one call needs), and one
+ * call may load a subset of its targets from several checkpoints.
+ *
+ * Errors: a missing, unreadable, truncated or malformed checkpoint is
+ * SB_ERR_WEIGHT; a name/shape/dtype mismatch between file and caller is
+ * SB_ERR_BINDING (also on save for duplicate names or a non-float32 tensor);
+ * an invalid argument is SB_ERR_INTERNAL. */
+sb_status sb_save_params(const char *path, const char *const *names,
+                         const sb_tensor *const *params, size_t count,
+                         sb_error **err_out);
+sb_status sb_load_params(const char *path, const char *const *names,
+                         sb_tensor *const *params, size_t count,
+                         sb_error **err_out);
+
 /* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
 /* A thin facade over the Layer 2 model loader + planner spine, exposing the
  * smallest inference set the first binding (Guile) needs: model load/free,

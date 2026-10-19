@@ -351,6 +351,13 @@ add_executable(test_adamw test_adamw.cpp)
 target_link_libraries(test_adamw PRIVATE sonicboom)
 sb_add_cpp_test(test_adamw)
 
+# R7: named parameter checkpoints through the C ABI. save → load is bit-exact
+# and load order independent; malformed files and name/shape mismatches are
+# rejected without touching any target.
+add_executable(test_checkpoint test_checkpoint.cpp)
+target_link_libraries(test_checkpoint PRIVATE sonicboom)
+sb_add_cpp_test(test_checkpoint)
+
 # Boom IR dialect test: op registration against planner::OpKind, the generated
 # assembly formats, the type verifiers. It links the compiler library
 # (sonicboom_compiler), which is always built — MLIR is a required dependency

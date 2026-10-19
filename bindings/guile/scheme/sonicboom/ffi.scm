@@ -177,6 +177,11 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                ;; export: graph text + named trained tensors → artifact dir
                (sb_export_model . ,(foreign-proc "sb_export_model" int
                                                  (list '* size_t '* '* size_t '* '*)))
+               ;; checkpoints: named float32 tensors ↔ one binary file
+               (sb_save_params . ,(foreign-proc "sb_save_params" int
+                                                (list '* '* '* size_t '*)))
+               (sb_load_params . ,(foreign-proc "sb_load_params" int
+                                                (list '* '* '* size_t '*)))
                ;; inference (minimal LLM surface) — see capi.h sb_llm_*
                (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
                                                    (list '* '* '*)))

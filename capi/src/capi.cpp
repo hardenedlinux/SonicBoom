@@ -45,11 +45,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <new>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1229,6 +1231,341 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
           set_error(err_out, SB_ERRKIND_INTERNAL,
                     ("export: " + r.error().message).c_str());
           return SB_ERR_INTERNAL;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+// --- Checkpoints -------------------------------------------------------------
+
+namespace {
+
+// The canonical checkpoint magic. Bump the version character, never reuse it,
+// when the entry layout changes.
+constexpr char kCheckpointMagic[8] = {'S', 'B', 'C', 'K', 'P', 'T', '1', '\n'};
+constexpr uint32_t kCheckpointMaxRank = 16;
+constexpr uint32_t kCheckpointMaxName = 4096;
+
+void write_le(std::ofstream &out, uint64_t v, int bytes) {
+  char buf[8];
+  for (int i = 0; i < bytes; ++i)
+    buf[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+  out.write(buf, bytes);
+}
+
+// Bounds-checked little-endian cursor over the whole checkpoint buffer.
+class CheckpointReader {
+ public:
+  CheckpointReader(const std::uint8_t *data, std::size_t size)
+      : data_(data), size_(size) {}
+
+  bool take(void *dst, std::size_t n) {
+    if (n > size_ - pos_)
+      return false;
+    if (n > 0)
+      std::memcpy(dst, data_ + pos_, n);
+    pos_ += n;
+    return true;
+  }
+
+  bool u8(std::uint8_t &v) { return take(&v, 1); }
+
+  bool u32(std::uint32_t &v) {
+    std::uint8_t b[4];
+    if (!take(b, 4))
+      return false;
+    v = static_cast<std::uint32_t>(b[0]) |
+        (static_cast<std::uint32_t>(b[1]) << 8) |
+        (static_cast<std::uint32_t>(b[2]) << 16) |
+        (static_cast<std::uint32_t>(b[3]) << 24);
+    return true;
+  }
+
+  bool u64(std::uint64_t &v) {
+    std::uint8_t b[8];
+    if (!take(b, 8))
+      return false;
+    v = 0;
+    for (int i = 7; i >= 0; --i)
+      v = (v << 8) | b[i];
+    return true;
+  }
+
+  bool i64(std::int64_t &v) {
+    std::uint64_t u = 0;
+    if (!u64(u))
+      return false;
+    v = static_cast<std::int64_t>(u);
+    return true;
+  }
+
+  bool skip(std::size_t n) {
+    if (n > size_ - pos_)
+      return false;
+    pos_ += n;
+    return true;
+  }
+
+  std::size_t remaining() const { return size_ - pos_; }
+  const std::uint8_t *here() const { return data_ + pos_; }
+
+ private:
+  const std::uint8_t *data_;
+  std::size_t size_;
+  std::size_t pos_ = 0;
+};
+
+// Row-major element count; rejects a negative dimension and uint64 overflow.
+bool checkpoint_numel(const std::vector<int64_t> &dims, uint64_t &numel) {
+  numel = 1;
+  for (int64_t d : dims) {
+    if (d < 0)
+      return false;
+    const uint64_t du = static_cast<uint64_t>(d);
+    if (du != 0 && numel > UINT64_MAX / du)
+      return false;
+    numel *= du;
+  }
+  return true;
+}
+
+bool read_whole_file(const char *path, std::vector<std::uint8_t> &bytes,
+                     std::string &why) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    why = "cannot open checkpoint file";
+    return false;
+  }
+  in.seekg(0, std::ios::end);
+  std::streamoff size = in.tellg();
+  if (size < 0) {
+    why = "cannot size checkpoint file";
+    return false;
+  }
+  in.seekg(0, std::ios::beg);
+  bytes.resize(static_cast<std::size_t>(size));
+  if (!bytes.empty())
+    in.read(reinterpret_cast<char *>(bytes.data()), size);
+  if (!in) {
+    why = "cannot read checkpoint file";
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
+sb_status sb_save_params(const char *path, const char *const *names,
+                         const sb_tensor *const *params, size_t count,
+                         sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!path)
+          return fail_arg(err_out);
+        if (count > 0 && (!names || !params))
+          return fail_arg(err_out);
+
+        // Validate everything before touching the file: a rejected save must
+        // not truncate an existing checkpoint.
+        std::unordered_set<std::string> seen;
+        seen.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (!names[i] || !params[i])
+            return fail_arg(err_out);
+          std::string name(names[i]);
+          if (name.empty() || name.size() > kCheckpointMaxName) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoint entry name is empty or too long");
+            return SB_ERR_BINDING;
+          }
+          if (!seen.insert(name).second) {
+            const std::string msg = "duplicate checkpoint entry '" + name + "'";
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+          const nt::Tensor &t = params[i]->t;
+          if (t.dtype() != nt::ScalarType::Float) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoints only store float32 tensors");
+            return SB_ERR_BINDING;
+          }
+          if (t.dim() < 0 ||
+              static_cast<uint64_t>(t.dim()) > kCheckpointMaxRank) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "checkpoint tensor rank is out of range");
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "cannot create checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        out.write(kCheckpointMagic, sizeof(kCheckpointMagic));
+        write_le(out, static_cast<uint64_t>(count), 8);
+        for (size_t i = 0; i < count; ++i) {
+          const std::string name(names[i]);
+          const nt::Tensor &t = params[i]->t;
+          write_le(out, static_cast<uint64_t>(name.size()), 4);
+          out.write(name.data(), static_cast<std::streamsize>(name.size()));
+          write_le(out, static_cast<uint64_t>(SB_DTYPE_FLOAT32), 1);
+          write_le(out, static_cast<uint64_t>(t.dim()), 4);
+          for (int64_t d = 0; d < t.dim(); ++d)
+            write_le(out, static_cast<uint64_t>(t.size(d)), 8);
+          const size_t n = f32_bytes(t.numel());
+          write_le(out, static_cast<uint64_t>(n), 8);
+          if (n > 0)
+            out.write(static_cast<const char *>(t.data_ptr()),
+                      static_cast<std::streamsize>(n));
+        }
+        out.flush();
+        if (!out) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "cannot write checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_load_params(const char *path, const char *const *names,
+                         sb_tensor *const *params, size_t count,
+                         sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!path)
+          return fail_arg(err_out);
+        if (count > 0 && (!names || !params))
+          return fail_arg(err_out);
+
+        std::unordered_map<std::string, size_t> target;
+        target.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (!names[i] || !params[i])
+            return fail_arg(err_out);
+          std::string name(names[i]);
+          if (!target.emplace(std::move(name), i).second) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "duplicate requested checkpoint entry");
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::vector<std::uint8_t> bytes;
+        std::string why;
+        if (!read_whole_file(path, bytes, why)) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, why.c_str());
+          return SB_ERR_WEIGHT;
+        }
+        CheckpointReader rd(bytes.data(), bytes.size());
+
+        char magic[sizeof(kCheckpointMagic)];
+        if (!rd.take(magic, sizeof(magic)) ||
+            std::memcmp(magic, kCheckpointMagic, sizeof(magic)) != 0) {
+          set_error(err_out, SB_ERRKIND_WEIGHT,
+                    "not a SonicBoom checkpoint file");
+          return SB_ERR_WEIGHT;
+        }
+        uint64_t entries = 0;
+        if (!rd.u64(entries)) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint header");
+          return SB_ERR_WEIGHT;
+        }
+        // Every entry has a header larger than 16 bytes, so a count that
+        // cannot possibly fit in the remaining bytes is corruption.
+        if (entries > rd.remaining() / 16) {
+          set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint");
+          return SB_ERR_WEIGHT;
+        }
+
+        std::vector<char> matched(count, 0);
+        std::vector<std::vector<std::uint8_t>> staged(count);
+        std::unordered_set<std::string> seen;
+
+        for (uint64_t e = 0; e < entries; ++e) {
+          uint32_t name_len = 0;
+          if (!rd.u32(name_len) || name_len == 0 ||
+              name_len > kCheckpointMaxName || name_len > rd.remaining()) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          std::string name(reinterpret_cast<const char *>(rd.here()), name_len);
+          rd.skip(name_len);
+
+          uint8_t dtype = 0;
+          uint32_t rank = 0;
+          if (!rd.u8(dtype) || !rd.u32(rank) || rank > kCheckpointMaxRank) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          std::vector<int64_t> dims(rank);
+          for (uint32_t d = 0; d < rank; ++d) {
+            if (!rd.i64(dims[d])) {
+              set_error(err_out, SB_ERRKIND_WEIGHT,
+                        "truncated checkpoint entry");
+              return SB_ERR_WEIGHT;
+            }
+          }
+          uint64_t n = 0;
+          uint64_t numel = 0;
+          if (!rd.u64(n) || !checkpoint_numel(dims, numel) ||
+              numel > UINT64_MAX / sizeof(float)) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "malformed checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+          if (dtype != SB_DTYPE_FLOAT32 ||
+              n != numel * static_cast<uint64_t>(sizeof(float))) {
+            set_error(err_out, SB_ERRKIND_WEIGHT,
+                      "checkpoint entry dtype or byte count is invalid");
+            return SB_ERR_WEIGHT;
+          }
+          if (!seen.insert(name).second) {
+            set_error(err_out, SB_ERRKIND_WEIGHT,
+                      "checkpoint contains a duplicate entry name");
+            return SB_ERR_WEIGHT;
+          }
+
+          auto it = target.find(name);
+          if (it != target.end()) {
+            const size_t idx = it->second;
+            const nt::Tensor &t = params[idx]->t;
+            if (t.dtype() != nt::ScalarType::Float ||
+                t.sizes() != dims) {
+              const std::string msg =
+                  "checkpoint entry '" + name +
+                  "' does not match the target tensor's dtype/shape";
+              set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+              return SB_ERR_BINDING;
+            }
+            staged[idx].assign(rd.here(), rd.here() + n);
+            matched[idx] = 1;
+          }
+          if (!rd.skip(static_cast<std::size_t>(n))) {
+            set_error(err_out, SB_ERRKIND_WEIGHT, "truncated checkpoint entry");
+            return SB_ERR_WEIGHT;
+          }
+        }
+        if (rd.remaining() != 0) {
+          set_error(err_out, SB_ERRKIND_WEIGHT,
+                    "checkpoint has trailing bytes");
+          return SB_ERR_WEIGHT;
+        }
+        for (size_t i = 0; i < count; ++i) {
+          if (!matched[i]) {
+            const std::string msg =
+                "checkpoint has no entry named '" + std::string(names[i]) + "'";
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+        }
+
+        // Fully validated: commit every target.
+        for (size_t i = 0; i < count; ++i) {
+          if (!staged[i].empty())
+            std::memcpy(params[i]->t.data_ptr(), staged[i].data(),
+                        staged[i].size());
         }
         return SB_OK;
       },
