@@ -113,11 +113,21 @@ alist (output-name . ctensor) in the graph's output order."
                   names types (run-loop-node (map lookup ins) attrs)))
        (('node op ('inputs ins ...) ('outputs (names types) ...) ('attrs attrs ...))
         (unless (op-known? op) (error "interp: unsupported op" op))
-        (unless (= 1 (length names))
-          (error "interp: prototype ops have exactly one output" op))
         (let ((r (op-kernel op (map lookup ins) attrs)))
-          (check-type op (car names) r (parse-type (car types)))
-          (define! (car names) r)))
+          (if (= 1 (length names))
+              (begin
+                (check-type op (car names) r (parse-type (car types)))
+                (define! (car names) r))
+              ;; A multi-output node (the fused backward ops): the kernel
+              ;; returns one ctensor per declared output, in order.
+              (begin
+                (unless (and (list? r) (= (length r) (length names)))
+                  (error "interp: multi-output kernel returned the wrong arity" op
+                         (if (list? r) (length r) 1) (length names)))
+                (for-each (lambda (name type value)
+                            (check-type op name value (parse-type type))
+                            (define! name value))
+                          names types r)))))
        (x (error "interp: bad node form" x)))
      (field graph 'nodes))
     (map (match-lambda

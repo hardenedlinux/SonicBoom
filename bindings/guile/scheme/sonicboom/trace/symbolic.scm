@@ -35,13 +35,14 @@
             make-trace-context trace-context? trace-context-types
             trace-context-counters context-count!
             trace-context-strict trace-context-notes add-context-note!
-            trace-context-max-unroll
+            trace-context-max-unroll trace-context-leaves
+            set-trace-context-leaves! register-leaf!
             fresh-name! register-type!
             make-recorder recorder? recorder-context recorder-nodes
             recorder-params recorder-count recorder-assumptions
             recorder-depth recorder-spec-base
             set-recorder-nodes! set-recorder-params! set-recorder-count!
-            as-value record-node!
+            as-value record-node! apply-op-multi unwrap-leaf ref-dtype
             ;; ops
             add sub mul matmul relu neg sum gt lt where bool trace-print
             equal-to logical-and logical-or logical-not
@@ -58,15 +59,21 @@
   (dtype sym-dtype)
   (shape sym-shape))
 
+(define (unwrap-leaf x)
+  "X with a leaf tensor replaced by its value; anything else unchanged."
+  (if (leaf? x) (leaf-value x) x))
+
 (define (shape-of x)
   (cond ((sym? x) (sym-shape x))
         ((ctensor? x) (ctensor-shape x))
+        ((leaf? x) (shape-of (leaf-value x)))
         ((or (number? x) (boolean? x)) '())
         (else (error "shape-of: not a tensor" x))))
 
 (define (dtype-of x)
   (cond ((sym? x) (sym-dtype x))
         ((ctensor? x) (ctensor-dtype x))
+        ((leaf? x) (dtype-of (leaf-value x)))
         (else #f)))
 
 ;;; --- mode -------------------------------------------------------------------------
@@ -112,7 +119,7 @@ has no `if` on tensor values): strict mode stops reporting it. Returns PROC."
 ;; collects strict-mode reports; MAX-UNROLL bounds loop unrolling (#f: none).
 (define-record-type <trace-context>
   (%make-trace-context next-id types max-side-nodes counters strict notes
-                       max-unroll)
+                       max-unroll leaves)
   trace-context?
   (next-id trace-context-next-id set-trace-context-next-id!)
   (types trace-context-types)               ; table: name -> (dtype . shape)
@@ -120,12 +127,22 @@ has no `if` on tensor values): strict mode stops reporting it. Returns PROC."
   (counters trace-context-counters)         ; table: event -> count
   (strict trace-context-strict)
   (notes trace-context-notes set-trace-context-notes!)
-  (max-unroll trace-context-max-unroll))
+  (max-unroll trace-context-max-unroll)
+  ;; Alist input-name -> leaf tensor (parameters of the current fresh trace).
+  ;; backward! reads their .grad, and the tracer turns those gradient values
+  ;; into segment outputs and writes them back to the caller's leaves.
+  (leaves trace-context-leaves set-trace-context-leaves!))
 
 (define* (make-trace-context max-side-nodes #:optional (strict 'default)
                              (max-unroll 64))
   (%make-trace-context 0 (make-table) max-side-nodes (make-table) strict '()
-                       max-unroll))
+                       max-unroll '()))
+
+(define (register-leaf! ctx name leaf)
+  "Record LEAF as the leaf tensor bound to input NAME for the current trace."
+  (set-trace-context-leaves!
+   ctx (acons name leaf (filter (lambda (p) (not (equal? (car p) name)))
+                                (trace-context-leaves ctx)))))
 
 (define (context-count! ctx key)
   (let ((h (trace-context-counters ctx)))
@@ -159,26 +176,31 @@ has no `if` on tensor values): strict mode stops reporting it. Returns PROC."
   (spec-base   recorder-spec-base))
 
 (define (lift x dtype)
-  "Scheme number / boolean / ctensor -> ctensor."
-  (cond ((ctensor? x) x)
-        ((boolean? x) (scalar->ctensor x 'bool))
-        ((number? x) (scalar->ctensor x (or dtype 'float32)))
-        (else (error "not a tensor operand" x))))
+  "Scheme number / boolean / ctensor / leaf -> ctensor."
+  (let ((x (unwrap-leaf x)))
+    (cond ((ctensor? x) x)
+          ((boolean? x) (scalar->ctensor x 'bool))
+          ((number? x) (scalar->ctensor x (or dtype 'float32)))
+          (else (error "not a tensor operand" x)))))
 
 (define (as-value rec x dtype)
   "Symbolic value for X in recorder REC: symbolic tensors pass through;
 concrete operands become an inline parameter of the current segment."
-  (if (sym? x)
-      x
-      (let* ((t (lift x dtype))
-             (ctx (recorder-context rec))
-             (name (fresh-name! ctx "c")))
-        (register-type! ctx name (ctensor-dtype t) (ctensor-shape t))
-        (set-recorder-params!
-         rec (cons (make-gparam name (ctensor-dtype t) (ctensor-shape t)
-                                (ctensor->list t))
-                   (recorder-params rec)))
-        (make-sym name (ctensor-dtype t) (ctensor-shape t)))))
+  (let ((x (unwrap-leaf x)))
+    (if (sym? x)
+        x
+        (as-value-1 rec x dtype))))
+
+(define (as-value-1 rec x dtype)
+  (let* ((t (lift x dtype))
+         (ctx (recorder-context rec))
+         (name (fresh-name! ctx "c")))
+    (register-type! ctx name (ctensor-dtype t) (ctensor-shape t))
+    (set-recorder-params!
+     rec (cons (make-gparam name (ctensor-dtype t) (ctensor-shape t)
+                            (ctensor->list t))
+               (recorder-params rec)))
+    (make-sym name (ctensor-dtype t) (ctensor-shape t))))
 
 (define (record-node! rec op ins attrs)
   "Append node OP(INS) to REC and return its symbolic output."
@@ -199,6 +221,28 @@ concrete operands become an inline parameter of the current segment."
         (%raise-signal 'sonicboom-trace-speculation-overflow)))
     (make-sym name (car type) (cdr type))))
 
+(define (record-node-multi! rec op ins attrs out-types)
+  "Append a node OP(INS) with several outputs to REC and return the symbolic
+outputs, one per element of OUT-TYPES (a list of (dtype . shape)). The type
+rules of the op table describe single-output ops only; a multi-output op (the
+fused backward operators) declares its result types here instead."
+  (let* ((ctx (recorder-context rec))
+         (names (map (lambda (_) (fresh-name! ctx "v")) out-types)))
+    (for-each (lambda (n t) (register-type! ctx n (car t) (cdr t)))
+              names out-types)
+    (set-recorder-nodes!
+     rec (cons (make-gnode op (map sym-name ins)
+                           (map (lambda (n t) (list n (car t) (cdr t)))
+                                names out-types)
+                           attrs)
+               (recorder-nodes rec)))
+    (set-recorder-count! rec (+ 1 (recorder-count rec)))
+    (let ((base (recorder-spec-base rec)))
+      (when (and base (> (- (recorder-count rec) base)
+                         (trace-context-max-side-nodes ctx)))
+        (%raise-signal 'sonicboom-trace-speculation-overflow)))
+    (map (lambda (n t) (make-sym n (car t) (cdr t))) names out-types)))
+
 ;;; --- op front end -------------------------------------------------------------
 
 ;; dtype used to lift bare Scheme numbers: that of the first non-bool tensor
@@ -208,8 +252,9 @@ concrete operands become an inline parameter of the current segment."
       'float32))
 
 (define (apply-op op args attrs)
-  (let ((rec (current-tracer))
-        (dt (ref-dtype args)))
+  (let* ((args (map unwrap-leaf args))
+         (rec (current-tracer))
+         (dt (ref-dtype args)))
     (cond ((not (or (any sym? args)
                     ;; an effect must happen at run time, not at trace time
                     (and rec (op-effectful? op))))
@@ -219,6 +264,22 @@ concrete operands become an inline parameter of the current segment."
           (else
            (record-node! rec op (map (lambda (a) (as-value rec a dt)) args)
                          attrs)))))
+
+(define (apply-op-multi op args attrs out-types)
+  "Like apply-op, for an op with several results: OUT-TYPES (a list of
+(dtype . shape)) declares them, and the result is a list of symbolic values
+while tracing (or of ctensors in eager mode)."
+  (let* ((args (map unwrap-leaf args))
+         (rec (current-tracer))
+         (dt (ref-dtype args)))
+    (cond ((not (or (any sym? args) (and rec (op-effectful? op))))
+           (op-kernel op (map (lambda (a) (lift a dt)) args) attrs))
+          ((not rec)
+           (error "symbolic tensor used outside of tracing" op))
+          (else
+           (record-node-multi! rec op
+                               (map (lambda (a) (as-value rec a dt)) args)
+                               attrs out-types)))))
 
 (define (add a b) (apply-op 'add (list a b) '()))
 (define (sub a b) (apply-op 'sub (list a b) '()))

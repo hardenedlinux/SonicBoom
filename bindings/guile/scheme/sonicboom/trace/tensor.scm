@@ -16,6 +16,7 @@
   #:export (make-ctensor ctensor? ctensor-dtype ctensor-shape ctensor-data
             ctensor-numel ctensor-ref ctensor->list ctensor->nested
             list->ctensor scalar->ctensor ctensor-item
+            make-leaf leaf? leaf-value leaf-grad set-leaf-grad!
             shape-numel float-dtype? int-dtype? valid-dtype?
             coerce-value))
 
@@ -97,3 +98,25 @@ otherwise."
   (unless (= (ctensor-numel t) 1)
     (error "ctensor-item: tensor has more than one element" (ctensor-shape t)))
   (ctensor-ref t 0))
+
+;;; --- leaf tensors (parameters) ------------------------------------------------------
+;;
+;;; A leaf is what training differentiates: a tensor value with a gradient slot.
+;;; It is deliberately not the value itself, so that the tracer can replace the
+;;; value by a symbolic input while the object the caller holds stays the same
+;;; identity across calls. During tracing a leaf contains a symbolic tensor and
+;;; its GRAD is the symbolic adjoint recorded by `backward!`; after a traced
+;;; call the tracer writes the concrete gradient of the executed graph back into
+;;; the caller's leaf (see (sonicboom trace tracer)). Ops accept a leaf anywhere
+;;; they accept a tensor and use its value.
+
+(define-record-type <leaf>
+  (%make-leaf value grad)
+  leaf?
+  (value leaf-value set-leaf-value!)
+  (grad  leaf-grad  set-leaf-grad!))
+
+(define* (make-leaf value #:optional (grad #f))
+  "A leaf tensor: VALUE (a ctensor, or the symbolic tensor the tracer substitutes
+for it) plus a GRAD slot."
+  (%make-leaf value grad))
