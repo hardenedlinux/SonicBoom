@@ -49,6 +49,23 @@ if(SONICBOOM_USE_CUDA)
   # under; C++20 is the closest nvcc 12.0 can reach.
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+  # Locate nvcc before the language probe and refuse to configure without it.
+  # Distributions do not agree on its location (Ubuntu's packaged CUDA puts it
+  # in /usr/bin, NVIDIA's runfile in /usr/local/cuda/bin), so PATH is searched
+  # rather than any one prefix. A missing compiler must stop the configure here,
+  # named: quietly continuing leaves ninja on a stale build graph that fails
+  # much later in an unrelated translation unit.
+  if(NOT CMAKE_CUDA_COMPILER)
+    find_program(CMAKE_CUDA_COMPILER NAMES nvcc nvcc.exe
+                 DOC "CUDA compiler (nvcc)")
+  endif()
+  if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR
+      "SONICBOOM_USE_CUDA=ON but nvcc was not found on PATH.\n"
+      "Install the CUDA toolkit, add its bin directory to PATH, or configure "
+      "with -DCMAKE_CUDA_COMPILER=/path/to/nvcc.")
+  endif()
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
 
