@@ -503,7 +503,7 @@ fi
 # --- workload mode ---------------------------------------------------------
 # The canonical set measures one request shape at a time; a session is a
 # *sequence* of them, and what a session spends between its requests is what
-# this mode exists to show. Two traces (tools/baseline/workload_bench.cpp):
+# this mode exists to show. Four traces (tools/baseline/workload_bench.cpp):
 #
 #   agent   a multi-turn session whose prompt grows every turn (1000-token
 #           system prompt, then eight turns of 57/312/140/33/401/96/210/75 user
@@ -513,6 +513,12 @@ fi
 #           re-prefill), which is the ratio prefix reuse is worth at this depth.
 #   coding  one 2048-token prompt and a 256-token generation: time to first
 #           token, and the decode rate that follows at that depth.
+#   codeedit six independent edit requests, each pasting a 150-400 line repo
+#           source file and generating the file's own token count back — the
+#           copy-heavy trace speculative drafting is aimed at (B8).
+#   chat    eight short unrelated user turns and 96 generated tokens each —
+#           free-form text, where the drafter rarely fires, so speculation must
+#           not cost anything (B8).
 #
 # Each is RUNS independent processes (each warmed up internally, --reps 1); the
 # reported value is their median and sample sd, the same statistic every other
@@ -552,6 +558,12 @@ if [ "$WORKLOAD" = 1 ]; then
   f_trace=$(wl_stats agent trace_ms --fresh)
   c_ttft=$(wl_stats coding ttft_ms)
   c_dec=$(wl_stats coding decode_tok_s)
+  e_ttft=$(wl_stats codeedit ttft_ms)
+  e_dec=$(wl_stats codeedit decode_tok_s)
+  e_wall=$(wl_stats codeedit trace_ms)
+  h_ttft=$(wl_stats chat ttft_ms)
+  h_dec=$(wl_stats chat decode_tok_s)
+  h_wall=$(wl_stats chat trace_ms)
   if [ -f "$WL_FAIL" ]; then rm -f "$WL_FAIL"; exit 2; fi
   rm -f "$WL_FAIL"
 
@@ -577,8 +589,20 @@ if [ "$WORKLOAD" = 1 ]; then
     "$(pm "${c_ttft%% *}" "${c_ttft##* }")" "ms"
   printf '| %-28s | %16s | %5s |\n' "coding decode" \
     "$(pm "${c_dec%% *}" "${c_dec##* }")" "tok/s"
+  printf '| %-28s | %16s | %5s |\n' "code-edit turn ttft" \
+    "$(pm "${e_ttft%% *}" "${e_ttft##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "code-edit turn decode" \
+    "$(pm "${e_dec%% *}" "${e_dec##* }")" "tok/s"
+  printf '| %-28s | %16s | %5s |\n' "code-edit trace wall" \
+    "$(pm "${e_wall%% *}" "${e_wall##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "chat turn ttft" \
+    "$(pm "${h_ttft%% *}" "${h_ttft##* }")" "ms"
+  printf '| %-28s | %16s | %5s |\n' "chat decode" \
+    "$(pm "${h_dec%% *}" "${h_dec##* }")" "tok/s"
+  printf '| %-28s | %16s | %5s |\n' "chat trace wall" \
+    "$(pm "${h_wall%% *}" "${h_wall##* }")" "ms"
   echo
-  echo "RESULT workload model=$LABEL agent_ttft_ms=${a_ttft%% *} agent_decode_tok_s=${a_dec%% *} agent_turn_ms=${a_turn%% *} agent_trace_ms=${a_trace%% *} agent_fresh_ttft_ms=${f_ttft%% *} agent_fresh_trace_ms=${f_trace%% *} coding_ttft_ms=${c_ttft%% *} coding_decode_tok_s=${c_dec%% *}"
+  echo "RESULT workload model=$LABEL agent_ttft_ms=${a_ttft%% *} agent_decode_tok_s=${a_dec%% *} agent_turn_ms=${a_turn%% *} agent_trace_ms=${a_trace%% *} agent_fresh_ttft_ms=${f_ttft%% *} agent_fresh_trace_ms=${f_trace%% *} coding_ttft_ms=${c_ttft%% *} coding_decode_tok_s=${c_dec%% *} codeedit_ttft_ms=${e_ttft%% *} codeedit_decode_tok_s=${e_dec%% *} codeedit_trace_ms=${e_wall%% *} chat_ttft_ms=${h_ttft%% *} chat_decode_tok_s=${h_dec%% *} chat_trace_ms=${h_wall%% *}"
   exit 0
 fi
 
