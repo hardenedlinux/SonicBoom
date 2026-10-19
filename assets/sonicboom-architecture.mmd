@@ -1,0 +1,76 @@
+flowchart LR
+  %% SonicBoom — public-facing conceptual architecture
+  %% Grounded in architecture.md, 2026-10-19. Keep GGML-derived kernels distinct from a GGML backend.
+
+  classDef input fill:#EAF3FF,stroke:#4389E8,color:#102A56,stroke-width:1.5px
+  classDef compiler fill:#F0EBFF,stroke:#8B6BE8,color:#35206D,stroke-width:1.5px
+  classDef planner fill:#FFF4DE,stroke:#D99A27,color:#593B06,stroke-width:1.5px
+  classDef runtime fill:#E5FAF4,stroke:#25A982,color:#064E3B,stroke-width:1.5px
+  classDef kernel fill:#E6F7FF,stroke:#2196C8,color:#073B56,stroke-width:1.5px
+  classDef backend fill:#F1F5F9,stroke:#64748B,color:#1E293B,stroke-width:1.3px
+  classDef cache fill:#FFF8D9,stroke:#C18A10,color:#614100,stroke-width:1.2px
+  classDef side fill:#F8FAFC,stroke:#94A3B8,color:#475569,stroke-width:1.2px,stroke-dasharray:5 4
+
+  subgraph INPUT["1 · MODEL & API"]
+    API["OpenAI-compatible Guile server"]
+    BIND["Guile FFI binding"]
+    ABI["Stable C ABI"]
+    GGUF["GGUF reader<br/>architecture · config · weights"]
+    EMIT["Model-family emitter<br/>prefill + decode → Boom IR"]
+    API --> BIND --> ABI
+    ABI --> GGUF --> EMIT
+  end
+
+  subgraph COMP["2 · SONICBOOM COMPILER"]
+    BOOM["Boom IR · MLIR dialect<br/>transformer-level ops + quant/KV types"]
+    PASSES["IR optimization passes<br/>fusion · quantization · layout · buffer reuse"]
+    PLANNER["Graph compiler / Planner<br/>Boom IR → execution graph"]
+    PLAN["ExecutionPlan + shape-class cache"]
+    BOOM --> PASSES --> PLANNER --> PLAN
+  end
+
+  subgraph RUN["3 · ADAPTIVE RUNTIME"]
+    EXEC["RuntimeExecutor<br/>dispatches tasks by backend"]
+    CUDA["SonicCudaBackend"]
+    GRAPH["CUDA Graph capture / replay<br/>decode chunks · prefill chunks"]
+    KV["KV cache + reusable prefix"]
+    TUNE["Autotune + PTX cache"]
+    EXEC --> CUDA --> GRAPH
+    KV <--> CUDA
+    TUNE -. kernel choice / compiled PTX .-> CUDA
+  end
+
+  subgraph KERNELS["4 · KERNELS THAT FIT THE WORKLOAD"]
+    GEN["Generated GPU kernels<br/>MLIR → NVVM → PTX<br/>FlashAttention · fused glue · GEMM"]
+    OWN["Custom CUDA kernels<br/>attention · RoPE · norms · elementwise"]
+    UK["GGML-derived quant kernels<br/>MMQ · MMVQ · quant dot helpers"]
+    BLAS["cuBLAS / cuBLASLt<br/>dense fallback + selected projections"]
+  end
+
+  subgraph ALT["5 · OTHER EXECUTION ROUTES"]
+    CPU["CPU backend<br/>reference + AVX2"]
+    NT["Native Torch · Layer 1<br/>training / autograd + selected routing"]
+    SX["Guile tracer → Blade S-Expr<br/>separate CPU MLIR-JIT route"]
+  end
+
+  EMIT --> BOOM
+  PLAN --> EXEC
+  GRAPH --> GEN
+  GRAPH --> OWN
+  GRAPH --> UK
+  GRAPH --> BLAS
+  EXEC -. CPU tasks .-> CPU
+  EXEC -. native-torch tasks .-> NT
+  API -. trace request .-> SX
+
+  W["BladeToBoom · defined, not wired"]:::side -.-> BOOM
+  X["boom.program · defined, not wired"]:::side -.-> BOOM
+
+  class API,BIND,ABI,GGUF,EMIT input
+  class BOOM,PASSES compiler
+  class PLANNER,PLAN planner
+  class EXEC,CUDA,GRAPH,KV runtime
+  class GEN,OWN,UK,BLAS kernel
+  class CPU,NT,SX backend
+  class TUNE cache
+  class W,X side

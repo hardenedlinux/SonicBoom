@@ -27,6 +27,11 @@ are where SonicBoom keeps improving.
 > per-GPU runtime autotuning, MMQ at upstream build parity, and brings prefill
 > to llama.cpp parity. Read [Scope of v0.0.3](#scope-of-v003) before trying it.
 
+## The architecture
+
+![SonicBoom architecture](assets/sonicboom-architecture-light.svg#gh-light-mode-only)
+![SonicBoom architecture](assets/sonicboom-architecture-dark.svg#gh-dark-mode-only)
+
 ---
 
 ## Why another runtime?
