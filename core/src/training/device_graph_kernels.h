@@ -92,4 +92,12 @@ bool graph_adamw_step(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
                       std::int64_t n, DevBuf step, float lr, float beta1,
                       float beta2, float eps, float weight_decay);
 
+// Global-norm clipping. graph_sumsq_acc adds sum(x^2) over N float32 elements
+// into ACC, a one-element double device buffer the caller has zeroed; the
+// block sums are combined with double atomics, so the accumulation is one pass
+// over the data. graph_scale_copy writes out = in * scale; with scale == 1.0
+// it copies the values exactly.
+bool graph_sumsq_acc(DevBuf acc, DevBuf x, std::int64_t n);
+bool graph_scale_copy(DevBuf out, DevBuf in, std::int64_t n, double scale);
+
 } // namespace sonicboom::training::detail

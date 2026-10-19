@@ -27,6 +27,7 @@
             autograd-backward
             autograd-sgd-step!
             autograd-grad
+            clip-grad-norm!
             train-xor))
 
 ;;; --- float32 bytevector <-> Scheme list --------------------------------------
@@ -128,6 +129,33 @@ Returns an opaque handle (pointer)."
 
 (define (autograd-grad tape param)
   (call-tensor-op 'sb_grad (list tape param)))
+
+;;; --- global-norm gradient clipping ------------------------------------------
+
+(define (clip-grad-norm! tape params max-norm)
+  "Clip the accumulated gradients of PARAMS in place by their global L2 norm.
+PARAMS is a list of native parameter tensor handles (as returned by
+model-params); TAPE must hold their gradients from autograd-backward. The norm
+is accumulated in double over every element of every gradient; when it exceeds
+MAX-NORM each gradient is scaled by MAX-NORM / (norm + 1e-6), and the next
+autograd-sgd-step! sees the clipped values. Returns the pre-clip global norm."
+  (let* ((grads (map (lambda (p) (autograd-grad tape p)) params))
+         (count (length grads))
+         (ptr-bv (make-bytevector (* 8 count) 0))
+         (norm-bv (make-bytevector 4 0))
+         (err-slot (make-slot)))
+    (let loop ((i 0) (gs grads))
+      (unless (null? gs)
+        (bytevector-u64-native-set! ptr-bv (* 8 i)
+                                    (pointer-address (car gs)))
+        (loop (+ i 1) (cdr gs))))
+    (let ((st ((proc 'sb_clip_grad_norm)
+               (bytevector->pointer ptr-bv) count (exact->inexact max-norm)
+               (bytevector->pointer norm-bv) (slot-ptr err-slot))))
+      (for-each tensor-free! grads)
+      (unless (sb-status-ok? st)
+        (error "clip-grad-norm!:" (capture-error err-slot)))
+      (bytevector-ieee-single-native-ref norm-bv 0))))
 
 ;;; --- demo: a deterministic 2-layer MLP (relu hidden) trained on XOR ----------
 

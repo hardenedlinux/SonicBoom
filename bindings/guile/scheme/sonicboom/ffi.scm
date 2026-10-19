@@ -174,6 +174,8 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_sgd_step . ,(foreign-proc "sb_sgd_step" int
                                             (list '* '* double '*)))
                (sb_grad . ,(foreign-proc "sb_grad" int (list '* '* '* '*)))
+               (sb_clip_grad_norm . ,(foreign-proc "sb_clip_grad_norm" int
+                                                   (list '* int float '* '*)))
                ;; export: graph text + named trained tensors → artifact dir
                (sb_export_model . ,(foreign-proc "sb_export_model" int
                                                  (list '* size_t '* '* size_t '* '*)))

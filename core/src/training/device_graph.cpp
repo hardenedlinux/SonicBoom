@@ -48,6 +48,7 @@
 #include <mlir/IR/MLIRContext.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -559,6 +560,33 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
         return fail("kernel launch failed");
       return true;
     }
+    case OpKind::ClipGradNorm: {
+      if (n.inputs.empty() || n.outputs.size() != n.inputs.size())
+        return fail("expects one result per gradient operand");
+      const double max_norm = double(float_attr(n, "max_norm", 1.0f));
+      // One double accumulator for the whole set: every tensor contributes in
+      // one pass (graph_sumsq_acc), then the scale decision is made once.
+      const detail::DevBuf acc = detail::dev_alloc(sizeof(double));
+      if (acc == 0) return fail("cannot allocate the norm accumulator");
+      bool ok = detail::dev_zero(acc, sizeof(double));
+      for (std::size_t i = 0; ok && i < n.inputs.size(); ++i)
+        ok = detail::graph_sumsq_acc(acc, buf(n.inputs[i]),
+                                     numel(n.inputs[i]));
+      double sumsq = 0.0;
+      if (ok)
+        ok = detail::dev_sync() &&
+             detail::dev_download(acc, &sumsq, sizeof(sumsq));
+      detail::dev_free(acc);
+      if (!ok) return fail("kernel launch failed");
+      const double norm = std::sqrt(sumsq);
+      const double scale =
+          norm > max_norm ? max_norm / (norm + 1e-6) : 1.0;
+      for (std::size_t i = 0; i < n.inputs.size(); ++i)
+        if (!detail::graph_scale_copy(buf(n.outputs[i]), buf(n.inputs[i]),
+                                      numel(n.inputs[i]), scale))
+          return fail("kernel launch failed");
+      return true;
+    }
     default:
       *error = "node '" + n.name + "' (" + op_text(n) +
                "): not supported by the device training executor";
@@ -718,6 +746,20 @@ bool validate_node(const Graph& g, const GraphNodeDesc& n, std::string* error) {
       return fail("the step counter must be int32");
     if (numel(n.inputs[1]) != numel(n.inputs[0]))
       return fail("gradient and parameter differ in size");
+    return true;
+  }
+  case OpKind::ClipGradNorm: {
+    if (n.inputs.empty() || n.outputs.size() != n.inputs.size())
+      return fail("expects one result per gradient operand");
+    const double max_norm = double(float_attr(n, "max_norm", 1.0f));
+    if (!std::isfinite(max_norm) || max_norm < 0.0)
+      return fail("`max_norm` must be finite and non-negative");
+    for (std::size_t i = 0; i < n.inputs.size(); ++i) {
+      if (dtype(n.inputs[i]) != sx::DType::Float32)
+        return fail("every gradient must be float32");
+      if (shape(n.outputs[i]) != shape(n.inputs[i]))
+        return fail("a result has a different shape from its gradient");
+    }
     return true;
   }
   default:

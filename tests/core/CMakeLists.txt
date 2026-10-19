@@ -15,11 +15,25 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_ngram_drafter test_runtime_features)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_ngram_drafter test_clip_grad_norm test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
 endforeach()
+
+# test_clip_grad_norm exercises the fused device kernels directly when the
+# library was built with CUDA (the internal kernel header is CUDA-only).
+if(SONICBOOM_USE_CUDA)
+  target_compile_definitions(test_clip_grad_norm PRIVATE SB_TEST_CUDA=1)
+  set_tests_properties(test_clip_grad_norm PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
+# The S1 drafter-coverage gate, registered under the spec-* family name so it
+# is selected with the other speculative-decode suites (`ctest -R spec`).
+add_test(NAME test_spec_drafter
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 $<TARGET_FILE:test_ngram_drafter>)
 
 # The runtime-feature disable list is parsed once per process, so the mode that
 # needs a different value of it is a separate invocation. (The unknown-name
@@ -116,6 +130,12 @@ target_compile_definitions(test_spec_rollback PRIVATE
 # test_spec_program (B6 speculative loop) needs both model GGUFs, looked up
 # relative to the repository root; it forks one child per (model, depth) case.
 target_compile_definitions(test_spec_program PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_ngram_drafter's coverage case feeds the code-edit trace's source files
+# (the same files workload_bench pastes) through the drafter; it needs the
+# repository root to read them.
+target_compile_definitions(test_ngram_drafter PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).

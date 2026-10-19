@@ -27,7 +27,40 @@
   #:use-module (sonicboom trace tensor)
   #:use-module (sonicboom trace symbolic)
   #:export (fused-softmax fused-rms-norm fused-rope fused-silu-mul
-            fused-cross-entropy adamw-step!))
+            fused-cross-entropy adamw-step! fused-clip-grad-norm
+            clip-grad-norm!))
+
+(define* (fused-clip-grad-norm grads #:key (max-norm 1.0))
+  "Global-norm gradient clipping over GRADS, a list of gradient tensors.
+Returns one clipped tensor per gradient, in order. The global L2 norm is
+accumulated in double over every element of every gradient; when it does not
+exceed MAX-NORM the results are copies of the inputs (their values unchanged),
+otherwise each is scaled by MAX-NORM / (norm + 1e-6). One clip_grad_norm node:
+the device executor runs it as one accumulation pass plus one scale kernel per
+gradient."
+  (unless (and (real? max-norm) (>= max-norm 0))
+    (error "fused-clip-grad-norm: max-norm must be a non-negative number"
+           max-norm))
+  (apply-op-multi 'clip_grad_norm grads
+                  `((max_norm (float ,max-norm)))
+                  (map tensor-type grads)))
+
+(define* (clip-grad-norm! params #:optional (max-norm 1.0))
+  "Clip the accumulated .grad of every leaf in PARAMS (a leaf or a list) by the
+global L2 norm of all their gradients, in place. PARAMS is what `backward!`
+filled in; after this call each leaf's .grad is the clipped gradient, so the
+next `adamw-step!` sees it. Leaves without an accumulated gradient are skipped.
+Returns the list of clipped gradient values. Inside a traced step this emits
+one clip_grad_norm node (the fused CUDA kernel); in eager mode it runs the
+reference kernel."
+  (let* ((ps (if (leaf? params) (list params) params))
+         (leaves (filter (lambda (p) (leaf-grad p)) ps)))
+    (when (null? leaves)
+      (error "clip-grad-norm!: no leaf has an accumulated gradient"))
+    (let ((clipped (fused-clip-grad-norm (map leaf-grad leaves)
+                                         #:max-norm max-norm)))
+      (for-each set-leaf-grad! leaves clipped)
+      clipped)))
 
 (define (fused-softmax x)
   "Numerically stable softmax over the last axis."

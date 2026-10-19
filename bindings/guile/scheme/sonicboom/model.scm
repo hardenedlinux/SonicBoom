@@ -99,10 +99,13 @@ is left untouched."
 
 ;;; --- training (plain SGD) ---------------------------------------------------
 
-(define* (model-train! model x tgt #:key (epochs 1000) (lr 0.5))
+(define* (model-train! model x tgt #:key (epochs 1000) (lr 0.5)
+                       (max-grad-norm #f))
   "Train MODEL by plain SGD on the full dataset X (native [N,in]) and TGT
-(native [N,out]) for EPOCHS iterations, updating parameters in place. Returns
-(values initial-loss final-loss), the mean-squared error before/after."
+(native [N,out]) for EPOCHS iterations, updating parameters in place. When
+MAX-GRAD-NORM is a number, the global gradient norm is clipped to it after
+every backward pass. Returns (values initial-loss final-loss), the mean-squared
+error before/after."
   (let ((tape (train:make-tape)))
     (define (step)
       (train:tape-zero-grad! tape)
@@ -110,6 +113,9 @@ is left untouched."
              (loss (train:autograd-mse pred tgt tape)))
         (let ((v (car (train:tensor->list loss 1))))
           (train:autograd-backward loss tape)
+          (when max-grad-norm
+            (train:clip-grad-norm! tape (map cdr (nn-model-params model))
+                                   max-grad-norm))
           (for-each (lambda (p) (train:autograd-sgd-step! tape (cdr p) lr))
                     (nn-model-params model))
           (train:tensor-free! pred)

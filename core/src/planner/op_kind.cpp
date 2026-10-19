@@ -117,6 +117,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SiluMul;
   if (name == "cross_entropy")
     return OpKind::CrossEntropy;
+  if (name == "clip_grad_norm")
+    return OpKind::ClipGradNorm;
   return std::nullopt;
 }
 
@@ -172,6 +174,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::ReduceSum: return "reduce_sum";
     case OpKind::SiluMul: return "silu_mul";
     case OpKind::CrossEntropy: return "cross_entropy";
+    case OpKind::ClipGradNorm: return "clip_grad_norm";
   }
   return "?";
 }

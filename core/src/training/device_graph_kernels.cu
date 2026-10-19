@@ -364,6 +364,36 @@ __global__ void adamw_kernel(float* __restrict__ p_out, float* __restrict__ m1_o
   }
 }
 
+// sum(x^2): one pass over the tensor, a block reduction in double, then one
+// atomic per block into the caller's double accumulator.
+__global__ void sumsq_kernel(const float* __restrict__ x, std::int64_t n,
+                             double* __restrict__ acc) {
+  __shared__ double sh[kThreads];
+  const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  double s = 0.0;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+       i < n; i += stride) {
+    const double v = static_cast<double>(x[i]);
+    s += v * v;
+  }
+  s = block_reduce(s, sh, AddOp{});
+  if (threadIdx.x == 0) atomicAdd(acc, s);
+}
+
+__global__ void scale_copy_kernel(float* __restrict__ out,
+                                  const float* __restrict__ in,
+                                  std::int64_t n, double scale) {
+  const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+  for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x +
+                        threadIdx.x;
+       i < n; i += stride) {
+    // scale == 1.0 is the no-clip case: copy so the values stay bit-exact.
+    out[i] = scale == 1.0 ? in[i]
+                          : static_cast<float>(static_cast<double>(in[i]) * scale);
+  }
+}
+
 bool ok() { return cudaGetLastError() == cudaSuccess; }
 
 } // namespace
@@ -551,6 +581,20 @@ bool graph_adamw_step(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
       static_cast<double>(lr), static_cast<double>(beta1),
       static_cast<double>(beta2), static_cast<double>(eps),
       static_cast<double>(weight_decay));
+  return ok();
+}
+
+bool graph_sumsq_acc(DevBuf acc, DevBuf x, std::int64_t n) {
+  if (n <= 0) return true; // an empty gradient adds nothing
+  sumsq_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
+      ptr<const float>(x), n, ptr<double>(acc));
+  return ok();
+}
+
+bool graph_scale_copy(DevBuf out, DevBuf in, std::int64_t n, double scale) {
+  if (n <= 0) return true;
+  scale_copy_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
+      ptr<float>(out), ptr<const float>(in), n, scale);
   return ok();
 }
 

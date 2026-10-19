@@ -61,6 +61,9 @@ design/resnet18.reference.bin
 models
 third_party/native-torch/generated/
 
+# personal course modes (e.g. CS336 assignments) live here, not in the repo
+modes/
+
 # baseline tool build outputs + regenerated reference dumps (tools/baseline/*.sh build them)
 tools/baseline/compare_dumps
 tools/baseline/gemma4_dump

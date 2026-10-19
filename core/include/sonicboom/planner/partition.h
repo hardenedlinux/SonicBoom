@@ -107,6 +107,9 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::ReduceSum:
     case OpKind::SiluMul:
     case OpKind::CrossEntropy:
+    // Global-norm gradient clipping is a hand-written training kernel pair
+    // (one accumulation pass, one scale per gradient) over device buffers.
+    case OpKind::ClipGradNorm:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

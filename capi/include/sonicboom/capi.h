@@ -332,6 +332,15 @@ sb_status sb_sgd_step(sb_tape *tape, sb_tensor *param, double lr,
 sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
                   sb_error **err_out);
 
+/* Clip a set of gradient tensors by their global L2 norm, in place. GRADS is
+ * COUNT float32 CPU tensors (the gradients read back with sb_grad, or any
+ * other gradient buffers); the norm is accumulated in double over every
+ * element of every tensor. When it exceeds MAX_NORM each tensor is scaled by
+ * MAX_NORM / (norm + 1e-6); otherwise the tensors are left byte-for-byte
+ * unchanged. *NORM_OUT, when non-NULL, receives the pre-clip global norm. */
+sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
+                            float *norm_out, sb_error **err_out);
+
 /* --- Export ----------------------------------------------------------------- */
 
 /* Persist a trained model as a self-contained artifact directory (`dir`):
