@@ -95,6 +95,14 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SoftmaxBwd;
   if (name == "cross_entropy_bwd")
     return OpKind::CrossEntropyBwd;
+  if (name == "rmsnorm_bwd")
+    return OpKind::RmsNormBwd;
+  if (name == "rope_bwd")
+    return OpKind::RopeBwd;
+  if (name == "silu_mul_bwd")
+    return OpKind::SiluMulBwd;
+  if (name == "embedding_bwd")
+    return OpKind::EmbeddingBwd;
   return std::nullopt;
 }
 
@@ -139,6 +147,10 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::MatmulBwd: return "matmul_bwd";
     case OpKind::SoftmaxBwd: return "softmax_bwd";
     case OpKind::CrossEntropyBwd: return "cross_entropy_bwd";
+    case OpKind::RmsNormBwd: return "rmsnorm_bwd";
+    case OpKind::RopeBwd: return "rope_bwd";
+    case OpKind::SiluMulBwd: return "silu_mul_bwd";
+    case OpKind::EmbeddingBwd: return "embedding_bwd";
   }
   return "?";
 }

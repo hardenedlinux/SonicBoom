@@ -92,6 +92,10 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::MatmulBwd:
     case OpKind::SoftmaxBwd:
     case OpKind::CrossEntropyBwd:
+    case OpKind::RmsNormBwd:
+    case OpKind::RopeBwd:
+    case OpKind::SiluMulBwd:
+    case OpKind::EmbeddingBwd:
       return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;

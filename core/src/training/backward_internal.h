@@ -39,4 +39,21 @@ bool cross_entropy_bwd_dev(std::uint64_t loss, std::uint64_t dlogits,
                            std::uint64_t logits, std::uint64_t targets,
                            std::int64_t rows, std::int64_t cols);
 
+bool rmsnorm_bwd_dev(std::uint64_t dX, std::uint64_t dW, std::uint64_t x,
+                     std::uint64_t w, std::uint64_t dY, std::int64_t rows,
+                     std::int64_t dim, float eps);
+
+bool rope_bwd_dev(std::uint64_t dX, std::uint64_t dY, std::int64_t rows,
+                  std::int64_t heads, std::int64_t head_dim,
+                  std::uint64_t pos0, float theta_base, float freq_scale);
+
+bool silu_mul_bwd_dev(std::uint64_t dG, std::uint64_t dU, std::uint64_t g,
+                      std::uint64_t u, std::uint64_t dZ, std::int64_t n);
+
+// `tokens` is an int32 device buffer of `rows` elements; dW [vocab, dim] is
+// written in full (no zero-fill needed).
+bool embedding_bwd_dev(std::uint64_t dW, std::uint64_t tokens,
+                       std::uint64_t dY, std::int64_t rows,
+                       std::int64_t dim, std::int64_t vocab);
+
 } // namespace sonicboom::training::detail

@@ -179,6 +179,139 @@ __global__ void ce_sum_kernel(const float* __restrict__ row_loss,
     loss[0] = static_cast<float>(total / static_cast<double>(rows));
 }
 
+// --- RMSNorm backward -------------------------------------------------------
+
+// One block per row: writes dX and the row's inverse RMS to `inv` (the dW
+// kernel reuses it).
+__global__ void rmsnorm_bwd_dx_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ w,
+                                      const float* __restrict__ dY,
+                                      float* __restrict__ dX,
+                                      float* __restrict__ inv, int64_t dim,
+                                      float eps) {
+  __shared__ double sh[kBlock];
+  const int64_t r = blockIdx.x;
+  const float* xr = x + r * dim;
+  const float* dyr = dY + r * dim;
+  float* dxr = dX + r * dim;
+
+  double ss = 0.0;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x)
+    ss += static_cast<double>(xr[d]) * static_cast<double>(xr[d]);
+  ss = block_reduce(ss, sh, AddOp{});
+  const double rinv = 1.0 / sqrt(ss / static_cast<double>(dim) + eps);
+  if (threadIdx.x == 0)
+    inv[r] = static_cast<float>(rinv);
+
+  double s = 0.0;
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    const double xhat = static_cast<double>(xr[d]) * rinv;
+    s += static_cast<double>(w[d]) * static_cast<double>(dyr[d]) * xhat;
+  }
+  s = block_reduce(s, sh, AddOp{}) / static_cast<double>(dim);
+
+  for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+    const double xhat = static_cast<double>(xr[d]) * rinv;
+    const double u = static_cast<double>(w[d]) * static_cast<double>(dyr[d]);
+    dxr[d] = static_cast<float>(rinv * u - rinv * xhat * s);
+  }
+}
+
+// One thread per column: dW[d] = sum_r dY[r,d] * x[r,d] * inv[r], rows in
+// ascending order (deterministic, no zero-fill required).
+__global__ void rmsnorm_bwd_dw_kernel(const float* __restrict__ x,
+                                      const float* __restrict__ dY,
+                                      const float* __restrict__ inv,
+                                      float* __restrict__ dW, int64_t rows,
+                                      int64_t dim) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t d = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       d < dim; d += stride) {
+    double sum = 0.0;
+    for (int64_t r = 0; r < rows; ++r)
+      sum += static_cast<double>(dY[r * dim + d]) *
+             static_cast<double>(x[r * dim + d]) *
+             static_cast<double>(inv[r]);
+    dW[d] = static_cast<float>(sum);
+  }
+}
+
+// --- RoPE backward ----------------------------------------------------------
+
+// One thread per (row, head, pair).
+__global__ void rope_bwd_kernel(const float* __restrict__ dY,
+                                float* __restrict__ dX, int64_t rows,
+                                int64_t heads, int64_t head_dim,
+                                std::uint64_t pos0, float theta_base,
+                                float freq_scale) {
+  const int64_t half = head_dim / 2;
+  const int64_t total = rows * heads * half;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  const double log_theta = log(static_cast<double>(theta_base));
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+       idx < total; idx += stride) {
+    const int64_t i = idx % half;
+    const int64_t h = (idx / half) % heads;
+    const int64_t r = idx / (half * heads);
+    const int64_t base = (r * heads + h) * head_dim;
+    const double pos =
+        static_cast<double>(pos0 + static_cast<std::uint64_t>(r));
+    const double angle =
+        pos * static_cast<double>(freq_scale) *
+        exp(-2.0 * static_cast<double>(i) / static_cast<double>(head_dim) *
+            log_theta);
+    double sn, cs;
+    sincos(angle, &sn, &cs);
+    const double ga = static_cast<double>(dY[base + i]);
+    const double gb = static_cast<double>(dY[base + i + half]);
+    dX[base + i] = static_cast<float>(ga * cs + gb * sn);
+    dX[base + i + half] = static_cast<float>(-ga * sn + gb * cs);
+  }
+}
+
+// --- SwiGLU backward --------------------------------------------------------
+
+__global__ void silu_mul_bwd_kernel(const float* __restrict__ g,
+                                    const float* __restrict__ u,
+                                    const float* __restrict__ dZ,
+                                    float* __restrict__ dG,
+                                    float* __restrict__ dU, int64_t n) {
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       i < n; i += stride) {
+    const double gi = static_cast<double>(g[i]);
+    const double sig = 1.0 / (1.0 + exp(-gi));
+    const double dz = static_cast<double>(dZ[i]);
+    dU[i] = static_cast<float>(dz * (gi * sig));
+    dG[i] = static_cast<float>(dz * static_cast<double>(u[i]) * sig *
+                               (1.0 + gi * (1.0 - sig)));
+  }
+}
+
+// --- embedding backward -----------------------------------------------------
+
+// One thread per (vocab row, column): scans the token rows in ascending order,
+// so repeated tokens accumulate deterministically with no atomics.
+__global__ void embedding_bwd_kernel(const int32_t* __restrict__ tokens,
+                                     const float* __restrict__ dY,
+                                     float* __restrict__ dW, int64_t rows,
+                                     int64_t dim, int64_t vocab) {
+  const int64_t total = vocab * dim;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                     threadIdx.x;
+       idx < total; idx += stride) {
+    const int64_t v = idx / dim;
+    const int64_t d = idx % dim;
+    double sum = 0.0;
+    for (int64_t r = 0; r < rows; ++r)
+      if (tokens[r] == v)
+        sum += static_cast<double>(dY[r * dim + d]);
+    dW[idx] = static_cast<float>(sum);
+  }
+}
+
 int grid_for(int64_t total) {
   const int64_t blocks = (total + kBlock - 1) / kBlock;
   return static_cast<int>(blocks > 4096 ? 4096 : blocks);
@@ -241,6 +374,69 @@ bool cross_entropy_bwd_dev(std::uint64_t loss, std::uint64_t dlogits,
   cudaStreamSynchronize(s);
   planner::device::release(scratch, scratch_bytes);
   return good;
+}
+
+bool rmsnorm_bwd_dev(std::uint64_t dX, std::uint64_t dW, std::uint64_t x,
+                     std::uint64_t w, std::uint64_t dY, std::int64_t rows,
+                     std::int64_t dim, float eps) {
+  if (rows <= 0 || dim <= 0 || dX == 0 || dW == 0 || x == 0 || w == 0 ||
+      dY == 0)
+    return false;
+  const std::uint64_t inv_bytes =
+      static_cast<std::uint64_t>(rows) * sizeof(float);
+  const std::uint64_t inv = planner::device::acquire(inv_bytes);
+  if (!inv)
+    return false;
+  const cudaStream_t s = cur_stream();
+  rmsnorm_bwd_dx_kernel<<<rows, kBlock, 0, s>>>(
+      reinterpret_cast<const float*>(x), reinterpret_cast<const float*>(w),
+      reinterpret_cast<const float*>(dY), reinterpret_cast<float*>(dX),
+      reinterpret_cast<float*>(inv), dim, eps);
+  rmsnorm_bwd_dw_kernel<<<grid_for(dim), kBlock, 0, s>>>(
+      reinterpret_cast<const float*>(x), reinterpret_cast<const float*>(dY),
+      reinterpret_cast<const float*>(inv), reinterpret_cast<float*>(dW), rows,
+      dim);
+  const bool good = ok();
+  cudaStreamSynchronize(s);
+  planner::device::release(inv, inv_bytes);
+  return good;
+}
+
+bool rope_bwd_dev(std::uint64_t dX, std::uint64_t dY, std::int64_t rows,
+                  std::int64_t heads, std::int64_t head_dim,
+                  std::uint64_t pos0, float theta_base, float freq_scale) {
+  if (rows <= 0 || heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 ||
+      theta_base <= 0.0f || dX == 0 || dY == 0)
+    return false;
+  const int64_t total = rows * heads * (head_dim / 2);
+  rope_bwd_kernel<<<grid_for(total), kBlock, 0, cur_stream()>>>(
+      reinterpret_cast<const float*>(dY), reinterpret_cast<float*>(dX), rows,
+      heads, head_dim, pos0, theta_base, freq_scale);
+  return ok();
+}
+
+bool silu_mul_bwd_dev(std::uint64_t dG, std::uint64_t dU, std::uint64_t g,
+                      std::uint64_t u, std::uint64_t dZ, std::int64_t n) {
+  if (n <= 0 || dG == 0 || dU == 0 || g == 0 || u == 0 || dZ == 0)
+    return false;
+  silu_mul_bwd_kernel<<<grid_for(n), kBlock, 0, cur_stream()>>>(
+      reinterpret_cast<const float*>(g), reinterpret_cast<const float*>(u),
+      reinterpret_cast<const float*>(dZ), reinterpret_cast<float*>(dG),
+      reinterpret_cast<float*>(dU), n);
+  return ok();
+}
+
+bool embedding_bwd_dev(std::uint64_t dW, std::uint64_t tokens,
+                       std::uint64_t dY, std::int64_t rows,
+                       std::int64_t dim, std::int64_t vocab) {
+  if (rows <= 0 || dim <= 0 || vocab <= 0 || dW == 0 || tokens == 0 ||
+      dY == 0)
+    return false;
+  embedding_bwd_kernel<<<grid_for(vocab * dim), kBlock, 0, cur_stream()>>>(
+      reinterpret_cast<const int32_t*>(tokens),
+      reinterpret_cast<const float*>(dY), reinterpret_cast<float*>(dW), rows,
+      dim, vocab);
+  return ok();
 }
 
 } // namespace detail
@@ -372,6 +568,121 @@ bool cross_entropy_bwd(std::span<const float> logits,
       !download(loss.p, loss_out, sizeof(float)))
     return false;
   return std::isfinite(*loss_out);
+}
+
+bool rmsnorm_bwd(std::span<const float> x, std::span<const float> w,
+                 std::span<const float> dY, int64_t rows, int64_t dim,
+                 float eps, std::span<float> dX, std::span<float> dW) {
+  if (!available() || rows <= 0 || dim <= 0 || eps < 0.0f)
+    return false;
+  const auto n = static_cast<std::size_t>(rows * dim);
+  const auto d = static_cast<std::size_t>(dim);
+  if (x.size() != n || dY.size() != n || w.size() != d || dX.size() != n ||
+      dW.size() != d)
+    return false;
+
+  const std::uint64_t nb = bytes_of(n, sizeof(float));
+  const std::uint64_t db = bytes_of(d, sizeof(float));
+  DevBuf xb(nb), wb(db), dyb(nb), dxb(nb), dwb(db);
+  if (!xb.ok() || !wb.ok() || !dyb.ok() || !dxb.ok() || !dwb.ok())
+    return false;
+  if (!upload(x.data(), xb.p, nb) || !upload(w.data(), wb.p, db) ||
+      !upload(dY.data(), dyb.p, nb))
+    return false;
+  if (!detail::rmsnorm_bwd_dev(
+          reinterpret_cast<std::uint64_t>(dxb.p),
+          reinterpret_cast<std::uint64_t>(dwb.p),
+          reinterpret_cast<std::uint64_t>(xb.p),
+          reinterpret_cast<std::uint64_t>(wb.p),
+          reinterpret_cast<std::uint64_t>(dyb.p), rows, dim, eps))
+    return false;
+  if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+    return false;
+  return download(dxb.p, dX.data(), nb) && download(dwb.p, dW.data(), db);
+}
+
+bool rope_bwd(std::span<const float> dY, int64_t rows, int64_t heads,
+              int64_t head_dim, uint64_t pos0, float theta_base,
+              float freq_scale, std::span<float> dX) {
+  if (!available() || rows <= 0 || heads <= 0 || head_dim <= 0 ||
+      head_dim % 2 != 0 || theta_base <= 0.0f)
+    return false;
+  const auto n = static_cast<std::size_t>(rows * heads * head_dim);
+  if (dY.size() != n || dX.size() != n)
+    return false;
+
+  const std::uint64_t nb = bytes_of(n, sizeof(float));
+  DevBuf dyb(nb), dxb(nb);
+  if (!dyb.ok() || !dxb.ok())
+    return false;
+  if (!upload(dY.data(), dyb.p, nb))
+    return false;
+  if (!detail::rope_bwd_dev(reinterpret_cast<std::uint64_t>(dxb.p),
+                            reinterpret_cast<std::uint64_t>(dyb.p), rows, heads,
+                            head_dim, pos0, theta_base, freq_scale))
+    return false;
+  if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+    return false;
+  return download(dxb.p, dX.data(), nb);
+}
+
+bool silu_mul_bwd(std::span<const float> g, std::span<const float> u,
+                  std::span<const float> dZ, std::span<float> dG,
+                  std::span<float> dU) {
+  if (!available() || g.empty())
+    return false;
+  const auto n = g.size();
+  if (u.size() != n || dZ.size() != n || dG.size() != n || dU.size() != n)
+    return false;
+
+  const std::uint64_t nb = bytes_of(n, sizeof(float));
+  DevBuf gb(nb), ub(nb), dzb(nb), dgb(nb), dub(nb);
+  if (!gb.ok() || !ub.ok() || !dzb.ok() || !dgb.ok() || !dub.ok())
+    return false;
+  if (!upload(g.data(), gb.p, nb) || !upload(u.data(), ub.p, nb) ||
+      !upload(dZ.data(), dzb.p, nb))
+    return false;
+  if (!detail::silu_mul_bwd_dev(
+          reinterpret_cast<std::uint64_t>(dgb.p),
+          reinterpret_cast<std::uint64_t>(dub.p),
+          reinterpret_cast<std::uint64_t>(gb.p),
+          reinterpret_cast<std::uint64_t>(ub.p),
+          reinterpret_cast<std::uint64_t>(dzb.p), static_cast<int64_t>(n)))
+    return false;
+  if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+    return false;
+  return download(dgb.p, dG.data(), nb) && download(dub.p, dU.data(), nb);
+}
+
+bool embedding_bwd(std::span<const int32_t> tokens, std::span<const float> dY,
+                   int64_t rows, int64_t dim, int64_t vocab,
+                   std::span<float> dW) {
+  if (!available() || rows <= 0 || dim <= 0 || vocab <= 0)
+    return false;
+  if (tokens.size() != static_cast<std::size_t>(rows) ||
+      dY.size() != static_cast<std::size_t>(rows * dim) ||
+      dW.size() != static_cast<std::size_t>(vocab * dim))
+    return false;
+  for (int32_t t : tokens)
+    if (t < 0 || t >= vocab)
+      return false;
+
+  const std::uint64_t tb = bytes_of(tokens.size(), sizeof(int32_t));
+  const std::uint64_t nb = bytes_of(dY.size(), sizeof(float));
+  const std::uint64_t wb = bytes_of(dW.size(), sizeof(float));
+  DevBuf tokb(tb), dyb(nb), dwb(wb);
+  if (!tokb.ok() || !dyb.ok() || !dwb.ok())
+    return false;
+  if (!upload(tokens.data(), tokb.p, tb) || !upload(dY.data(), dyb.p, nb))
+    return false;
+  if (!detail::embedding_bwd_dev(
+          reinterpret_cast<std::uint64_t>(dwb.p),
+          reinterpret_cast<std::uint64_t>(tokb.p),
+          reinterpret_cast<std::uint64_t>(dyb.p), rows, dim, vocab))
+    return false;
+  if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+    return false;
+  return download(dwb.p, dW.data(), wb);
 }
 
 } // namespace cuda

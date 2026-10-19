@@ -112,6 +112,18 @@ enum class OpKind : uint8_t {
   MatmulBwd,
   SoftmaxBwd,
   CrossEntropyBwd,
+  //
+  // rmsnorm_bwd: operands [x [R,D], w [D], dY [R,D]]; results [dX [R,D],
+  // dW [D]]. `eps` rides on node_attrs.
+  // rope_bwd: operands [dY [R, H*D]]; result [dX]. Attributes: head_dim,
+  // theta_base, freq_scale, and `pos0` (the position of row 0).
+  // silu_mul_bwd: operands [g, u, dZ]; results [dG, dU], all the same shape.
+  // embedding_bwd: operands [tokens [R] int32, dY [R,D]]; result
+  // [dW [V,D]], written in full.
+  RmsNormBwd,
+  RopeBwd,
+  SiluMulBwd,
+  EmbeddingBwd,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

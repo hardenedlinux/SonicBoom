@@ -174,6 +174,126 @@ std::vector<double> as_double(const std::vector<float>& f) {
   return std::vector<double>(f.begin(), f.end());
 }
 
+// --- R4 references ----------------------------------------------------------
+
+struct RmsRef {
+  std::vector<double> dX, dW;
+};
+
+std::vector<double> rmsnorm_fwd_ref(const std::vector<double>& x,
+                                    const std::vector<double>& w,
+                                    std::size_t rows, std::size_t dim,
+                                    double eps) {
+  std::vector<double> y(x.size());
+  for (std::size_t r = 0; r < rows; ++r) {
+    double ss = 0.0;
+    for (std::size_t d = 0; d < dim; ++d)
+      ss += x[r * dim + d] * x[r * dim + d];
+    const double invariant = 1.0 / std::sqrt(ss / static_cast<double>(dim) + eps);
+    for (std::size_t d = 0; d < dim; ++d)
+      y[r * dim + d] = x[r * dim + d] * invariant * w[d];
+  }
+  return y;
+}
+
+RmsRef rmsnorm_bwd_ref(const std::vector<double>& x,
+                       const std::vector<double>& w,
+                       const std::vector<float>& dY, std::size_t rows,
+                       std::size_t dim, double eps) {
+  RmsRef r;
+  r.dX.assign(x.size(), 0.0);
+  r.dW.assign(dim, 0.0);
+  for (std::size_t rr = 0; rr < rows; ++rr) {
+    double ss = 0.0;
+    for (std::size_t d = 0; d < dim; ++d)
+      ss += x[rr * dim + d] * x[rr * dim + d];
+    const double inv = 1.0 / std::sqrt(ss / static_cast<double>(dim) + eps);
+    double s = 0.0;
+    for (std::size_t d = 0; d < dim; ++d)
+      s += w[d] * static_cast<double>(dY[rr * dim + d]) * x[rr * dim + d] * inv;
+    s /= static_cast<double>(dim);
+    for (std::size_t d = 0; d < dim; ++d) {
+      const double xhat = x[rr * dim + d] * inv;
+      r.dX[rr * dim + d] =
+          inv * w[d] * static_cast<double>(dY[rr * dim + d]) - inv * xhat * s;
+      r.dW[d] += static_cast<double>(dY[rr * dim + d]) * xhat;
+    }
+  }
+  return r;
+}
+
+std::vector<double> rope_fwd_ref(const std::vector<double>& x,
+                                 std::size_t rows, std::size_t heads,
+                                 std::size_t head_dim, std::uint64_t pos0,
+                                 double theta_base, double freq_scale) {
+  std::vector<double> y(x);
+  const std::size_t half = head_dim / 2;
+  for (std::size_t r = 0; r < rows; ++r) {
+    const double pos = static_cast<double>(pos0 + r);
+    for (std::size_t h = 0; h < heads; ++h) {
+      const std::size_t base = (r * heads + h) * head_dim;
+      for (std::size_t i = 0; i < half; ++i) {
+        const double angle =
+            pos * freq_scale *
+            std::pow(theta_base, -2.0 * static_cast<double>(i) / head_dim);
+        const double c = std::cos(angle), s = std::sin(angle);
+        const double a = x[base + i], b = x[base + i + half];
+        y[base + i] = a * c - b * s;
+        y[base + i + half] = a * s + b * c;
+      }
+    }
+  }
+  return y;
+}
+
+std::vector<double> rope_bwd_ref(const std::vector<float>& dY,
+                                 std::size_t rows, std::size_t heads,
+                                 std::size_t head_dim, std::uint64_t pos0,
+                                 double theta_base, double freq_scale) {
+  std::vector<double> dx(dY.size());
+  const std::size_t half = head_dim / 2;
+  for (std::size_t r = 0; r < rows; ++r) {
+    const double pos = static_cast<double>(pos0 + r);
+    for (std::size_t h = 0; h < heads; ++h) {
+      const std::size_t base = (r * heads + h) * head_dim;
+      for (std::size_t i = 0; i < half; ++i) {
+        const double angle =
+            pos * freq_scale *
+            std::pow(theta_base, -2.0 * static_cast<double>(i) / head_dim);
+        const double c = std::cos(angle), s = std::sin(angle);
+        const double ga = dY[base + i], gb = dY[base + i + half];
+        dx[base + i] = ga * c + gb * s;
+        dx[base + i + half] = -ga * s + gb * c;
+      }
+    }
+  }
+  return dx;
+}
+
+void silu_mul_bwd_ref(const std::vector<double>& g,
+                      const std::vector<double>& u,
+                      const std::vector<float>& dZ,
+                      std::vector<double>& dG, std::vector<double>& dU) {
+  dG.assign(g.size(), 0.0);
+  dU.assign(g.size(), 0.0);
+  for (std::size_t i = 0; i < g.size(); ++i) {
+    const double sig = 1.0 / (1.0 + std::exp(-g[i]));
+    dU[i] = dZ[i] * g[i] * sig;
+    dG[i] = dZ[i] * u[i] * sig * (1.0 + g[i] * (1.0 - sig));
+  }
+}
+
+std::vector<double> embedding_bwd_ref(const std::vector<std::int32_t>& tokens,
+                                      const std::vector<float>& dY,
+                                      std::size_t rows, std::size_t dim,
+                                      std::size_t vocab) {
+  std::vector<double> dw(vocab * dim, 0.0);
+  for (std::size_t r = 0; r < rows; ++r)
+    for (std::size_t d = 0; d < dim; ++d)
+      dw[static_cast<std::size_t>(tokens[r]) * dim + d] += dY[r * dim + d];
+  return dw;
+}
+
 float max_abs(const std::vector<double>& ref, const std::vector<float>& got) {
   float m = 0.0f;
   for (std::size_t i = 0; i < got.size(); ++i)
@@ -402,6 +522,238 @@ int main() {
     const float rel = max_rel(as_double(dl), num);
     std::printf("cross_entropy_bwd: grad-check %.3e\n", rel);
     check(c, rel <= 1e-3f, "cross_entropy_bwd grad-check <= 1e-3");
+  }
+
+  // ----------------------------------------------------------- RMSNorm bwd --
+  {
+    Rng r5;
+    const std::size_t rows = kSeq, dim = kHidden;
+    const float eps = 1e-6f;
+    std::vector<float> x = rnd(rows * dim, -1.0f, 1.0f, r5);
+    std::vector<float> w = rnd(dim, -0.5f, 0.5f, r5);
+    std::vector<float> dY = rnd(rows * dim, -1.0f, 1.0f, r5);
+    std::vector<float> dX(rows * dim), dW(dim), hX(rows * dim), hW(dim);
+
+    check(c, sonicboom::training::cuda::rmsnorm_bwd(
+                 x, w, dY, static_cast<int64_t>(rows), static_cast<int64_t>(dim),
+                 eps, dX, dW),
+          "rmsnorm_bwd device run");
+    sonicboom::training::rmsnorm_bwd_f32(
+        x.data(), w.data(), dY.data(), static_cast<int64_t>(rows),
+        static_cast<int64_t>(dim), eps, hX.data(), hW.data());
+
+    const RmsRef ref = rmsnorm_bwd_ref(as_double(x), as_double(w), dY, rows,
+                                       dim, static_cast<double>(eps));
+    const float dx_err = max_abs(ref.dX, dX), dw_err = max_abs(ref.dW, dW);
+    const float hx_err = max_abs(ref.dX, hX), hw_err = max_abs(ref.dW, hW);
+    std::printf("rmsnorm_bwd: device dX %.3e dW %.3e | host dX %.3e dW %.3e\n",
+                dx_err, dw_err, hx_err, hw_err);
+    check(c, dx_err <= 1e-5f, "rmsnorm_bwd device dX <= 1e-5");
+    check(c, dw_err <= 1e-5f, "rmsnorm_bwd device dW <= 1e-5");
+    check(c, hx_err <= 1e-5f, "rmsnorm_bwd host dX <= 1e-5");
+    check(c, hw_err <= 1e-5f, "rmsnorm_bwd host dW <= 1e-5");
+
+    // Grad-check.
+    const std::size_t m = 2, d = 4;
+    std::vector<float> xs = rnd(m * d, -1.0f, 1.0f, r5);
+    std::vector<float> ws = rnd(d, -1.0f, 1.0f, r5);
+    std::vector<float> dys = rnd(m * d, -1.0f, 1.0f, r5);
+    std::vector<float> dxs(m * d), dws(d);
+    check(c, sonicboom::training::cuda::rmsnorm_bwd(
+                 xs, ws, dys, static_cast<int64_t>(m), static_cast<int64_t>(d),
+                 eps, dxs, dws),
+          "rmsnorm_bwd grad-check device run");
+    const std::vector<double> xs64 = as_double(xs), ws64 = as_double(ws);
+    auto loss_x = [&](const std::vector<double>& xv) {
+      const std::vector<double> y =
+          rmsnorm_fwd_ref(xv, ws64, m, d, static_cast<double>(eps));
+      double s = 0.0;
+      for (std::size_t i = 0; i < y.size(); ++i)
+        s += static_cast<double>(dys[i]) * y[i];
+      return s;
+    };
+    auto loss_w = [&](const std::vector<double>& wv) {
+      const std::vector<double> y =
+          rmsnorm_fwd_ref(xs64, wv, m, d, static_cast<double>(eps));
+      double s = 0.0;
+      for (std::size_t i = 0; i < y.size(); ++i)
+        s += static_cast<double>(dys[i]) * y[i];
+      return s;
+    };
+    std::vector<double> num_x(dxs.size()), num_w(dws.size());
+    for (std::size_t i = 0; i < num_x.size(); ++i)
+      num_x[i] = fd_grad(loss_x, xs64, i, kH);
+    for (std::size_t i = 0; i < num_w.size(); ++i)
+      num_w[i] = fd_grad(loss_w, ws64, i, kH);
+    const float rel_x = max_rel(as_double(dxs), num_x);
+    const float rel_w = max_rel(as_double(dws), num_w);
+    std::printf("rmsnorm_bwd: grad-check dX %.3e dW %.3e\n", rel_x, rel_w);
+    check(c, rel_x <= 1e-3f, "rmsnorm_bwd grad-check dX <= 1e-3");
+    check(c, rel_w <= 1e-3f, "rmsnorm_bwd grad-check dW <= 1e-3");
+  }
+
+  // --------------------------------------------------------------- RoPE bwd --
+  {
+    Rng r6;
+    const std::size_t rows = kSeq, heads = 4, head_dim = 16;
+    const auto n = rows * heads * head_dim;
+    const float theta = 10000.0f, fs = 1.0f;
+    const std::uint64_t pos0 = 0;
+    std::vector<float> dY = rnd(n, -1.0f, 1.0f, r6);
+    std::vector<float> dX(n), hX(n);
+
+    check(c, sonicboom::training::cuda::rope_bwd(
+                 dY, static_cast<int64_t>(rows), static_cast<int64_t>(heads),
+                 static_cast<int64_t>(head_dim), pos0, theta, fs, dX),
+          "rope_bwd device run");
+    sonicboom::training::rope_bwd_f32(
+        dY.data(), static_cast<int64_t>(rows), static_cast<int64_t>(heads),
+        static_cast<int64_t>(head_dim), pos0, theta, fs, hX.data());
+
+    const std::vector<double> ref =
+        rope_bwd_ref(dY, rows, heads, head_dim, pos0, theta, fs);
+    const float dev_err = max_abs(ref, dX), host_err = max_abs(ref, hX);
+    std::printf("rope_bwd: device %.3e host %.3e\n", dev_err, host_err);
+    check(c, dev_err <= 1e-5f, "rope_bwd device <= 1e-5");
+    check(c, host_err <= 1e-5f, "rope_bwd host <= 1e-5");
+
+    // Grad-check: perturb the forward input, compare dX to dL/dx.
+    const std::size_t m = 2, h = 1, hd = 4;
+    const std::uint64_t p0 = 3;
+    std::vector<float> x = rnd(m * h * hd, -1.0f, 1.0f, r6);
+    std::vector<float> dy = rnd(m * h * hd, -1.0f, 1.0f, r6);
+    std::vector<float> dx(m * h * hd);
+    check(c, sonicboom::training::cuda::rope_bwd(
+                 dy, static_cast<int64_t>(m), static_cast<int64_t>(h),
+                 static_cast<int64_t>(hd), p0, theta, fs, dx),
+          "rope_bwd grad-check device run");
+    const std::vector<double> x64 = as_double(x);
+    auto loss = [&](const std::vector<double>& xv) {
+      const std::vector<double> y =
+          rope_fwd_ref(xv, m, h, hd, p0, theta, fs);
+      double s = 0.0;
+      for (std::size_t i = 0; i < y.size(); ++i)
+        s += static_cast<double>(dy[i]) * y[i];
+      return s;
+    };
+    std::vector<double> num(dx.size());
+    for (std::size_t i = 0; i < num.size(); ++i)
+      num[i] = fd_grad(loss, x64, i, kH);
+    const float rel = max_rel(as_double(dx), num);
+    std::printf("rope_bwd: grad-check %.3e\n", rel);
+    check(c, rel <= 1e-3f, "rope_bwd grad-check <= 1e-3");
+  }
+
+  // ----------------------------------------------------------- SwiGLU bwd --
+  {
+    Rng r7;
+    const auto n = kSeq * kHidden;
+    std::vector<float> g = rnd(n, -2.0f, 2.0f, r7);
+    std::vector<float> u = rnd(n, -1.0f, 1.0f, r7);
+    std::vector<float> dZ = rnd(n, -1.0f, 1.0f, r7);
+    std::vector<float> dG(n), dU(n), hG(n), hU(n);
+
+    check(c, sonicboom::training::cuda::silu_mul_bwd(g, u, dZ, dG, dU),
+          "silu_mul_bwd device run");
+    sonicboom::training::silu_mul_bwd_f32(g.data(), u.data(), dZ.data(),
+                                          static_cast<int64_t>(n), hG.data(),
+                                          hU.data());
+    std::vector<double> refG, refU;
+    silu_mul_bwd_ref(as_double(g), as_double(u), dZ, refG, refU);
+    const float dg_err = max_abs(refG, dG), du_err = max_abs(refU, dU);
+    const float hg_err = max_abs(refG, hG), hu_err = max_abs(refU, hU);
+    std::printf("silu_mul_bwd: device dG %.3e dU %.3e | host dG %.3e dU %.3e\n",
+                dg_err, du_err, hg_err, hu_err);
+    check(c, dg_err <= 1e-5f, "silu_mul_bwd device dG <= 1e-5");
+    check(c, du_err <= 1e-5f, "silu_mul_bwd device dU <= 1e-5");
+    check(c, hg_err <= 1e-5f, "silu_mul_bwd host dG <= 1e-5");
+    check(c, hu_err <= 1e-5f, "silu_mul_bwd host dU <= 1e-5");
+
+    // Grad-check over g and u.
+    const std::size_t m = 5;
+    std::vector<float> gs = rnd(m, -2.0f, 2.0f, r7);
+    std::vector<float> us = rnd(m, -1.0f, 1.0f, r7);
+    std::vector<float> dzs = rnd(m, -1.0f, 1.0f, r7);
+    std::vector<float> dgs(m), dus(m);
+    check(c, sonicboom::training::cuda::silu_mul_bwd(gs, us, dzs, dgs, dus),
+          "silu_mul_bwd grad-check device run");
+    const std::vector<double> gs64 = as_double(gs), us64 = as_double(us);
+    auto loss_g = [&](const std::vector<double>& gv) {
+      double s = 0.0;
+      for (std::size_t i = 0; i < m; ++i) {
+        const double sig = 1.0 / (1.0 + std::exp(-gv[i]));
+        s += static_cast<double>(dzs[i]) * (gv[i] * sig) * us64[i];
+      }
+      return s;
+    };
+    auto loss_u = [&](const std::vector<double>& uv) {
+      double s = 0.0;
+      for (std::size_t i = 0; i < m; ++i) {
+        const double sig = 1.0 / (1.0 + std::exp(-gs64[i]));
+        s += static_cast<double>(dzs[i]) * (gs64[i] * sig) * uv[i];
+      }
+      return s;
+    };
+    std::vector<double> num_g(m), num_u(m);
+    for (std::size_t i = 0; i < m; ++i) {
+      num_g[i] = fd_grad(loss_g, gs64, i, kH);
+      num_u[i] = fd_grad(loss_u, us64, i, kH);
+    }
+    const float rel_g = max_rel(as_double(dgs), num_g);
+    const float rel_u = max_rel(as_double(dus), num_u);
+    std::printf("silu_mul_bwd: grad-check dG %.3e dU %.3e\n", rel_g, rel_u);
+    check(c, rel_g <= 1e-3f, "silu_mul_bwd grad-check dG <= 1e-3");
+    check(c, rel_u <= 1e-3f, "silu_mul_bwd grad-check dU <= 1e-3");
+  }
+
+  // -------------------------------------------------------- embedding bwd --
+  {
+    Rng r8;
+    const std::size_t rows = kSeq, dim = kHidden, vocab = kVocab;
+    std::vector<std::int32_t> tokens(rows);
+    for (auto& t : tokens)
+      t = static_cast<std::int32_t>(r8.next() % vocab);
+    std::vector<float> dY = rnd(rows * dim, -1.0f, 1.0f, r8);
+    std::vector<float> dW(vocab * dim), hW(vocab * dim);
+
+    check(c, sonicboom::training::cuda::embedding_bwd(
+                 tokens, dY, static_cast<int64_t>(rows),
+                 static_cast<int64_t>(dim), static_cast<int64_t>(vocab), dW),
+          "embedding_bwd device run");
+    sonicboom::training::embedding_bwd_f32(
+        tokens.data(), dY.data(), static_cast<int64_t>(rows),
+        static_cast<int64_t>(dim), static_cast<int64_t>(vocab), hW.data());
+    const std::vector<double> ref =
+        embedding_bwd_ref(tokens, dY, rows, dim, vocab);
+    const float dev_err = max_abs(ref, dW), host_err = max_abs(ref, hW);
+    std::printf("embedding_bwd: device %.3e host %.3e\n", dev_err, host_err);
+    check(c, dev_err <= 1e-5f, "embedding_bwd device <= 1e-5");
+    check(c, host_err <= 1e-5f, "embedding_bwd host <= 1e-5");
+
+    // Grad-check with repeated tokens (vocab 3, 4 rows).
+    const std::size_t m = 4, d = 3, v = 3;
+    const std::vector<std::int32_t> tk = {0, 2, 0, 1};
+    std::vector<float> dy = rnd(m * d, -1.0f, 1.0f, r8);
+    std::vector<float> dw(v * d);
+    check(c, sonicboom::training::cuda::embedding_bwd(
+                 tk, dy, static_cast<int64_t>(m), static_cast<int64_t>(d),
+                 static_cast<int64_t>(v), dw),
+          "embedding_bwd grad-check device run");
+    auto loss = [&](const std::vector<double>& wv) {
+      double s = 0.0;
+      for (std::size_t r = 0; r < m; ++r)
+        for (std::size_t q = 0; q < d; ++q)
+          s += static_cast<double>(dy[r * d + q]) *
+               wv[static_cast<std::size_t>(tk[r]) * d + q];
+      return s;
+    };
+    std::vector<double> num(dw.size());
+    std::vector<double> w64(v * d, 0.0);
+    for (std::size_t i = 0; i < num.size(); ++i)
+      num[i] = fd_grad(loss, w64, i, kH);
+    const float rel = max_rel(as_double(dw), num);
+    std::printf("embedding_bwd: grad-check %.3e\n", rel);
+    check(c, rel <= 1e-3f, "embedding_bwd grad-check <= 1e-3");
   }
 
   if (!c.ok) {

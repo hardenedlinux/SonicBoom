@@ -440,4 +440,28 @@ def Boom_SoftmaxBwdOp : Boom_Op<"softmax_bwd",
 def Boom_CrossEntropyBwdOp : Boom_Op<"cross_entropy_bwd",
     "fused mean cross-entropy loss and its gradient">;
 
+// rmsnorm_bwd: the VJP of y = x * rsqrt(mean_d(x^2) + eps) * w. Operands
+// [x [R,D], w [D], dY [R,D]]; results [dX [R,D], dW [D]]. `eps` is the
+// forward epsilon and rides on node_attrs.
+def Boom_RmsNormBwdOp : Boom_Op<"rmsnorm_bwd",
+    "backward of RMSNorm: dX and the per-column dW">;
+
+// rope_bwd: the inverse GPT-NeoX rotation of the upstream gradient. Operand
+// [dY [R, H*D]] (head-major); result [dX]. The rotation is orthogonal and its
+// angle depends only on the row's position, so no forward activation is read.
+// Attributes on node_attrs: head_dim, theta_base, freq_scale, pos0.
+def Boom_RopeBwdOp : Boom_Op<"rope_bwd",
+    "backward of GPT-NeoX RoPE (inverse rotation)">;
+
+// silu_mul_bwd: the VJP of the SwiGLU gate z = silu(g) * u. Operands
+// [g, u, dZ]; results [dG, dU], all elementwise with the same shape.
+def Boom_SiluMulBwdOp : Boom_Op<"silu_mul_bwd",
+    "backward of the SwiGLU gated activation">;
+
+// embedding_bwd: the VJP of the row gather y[r,:] = W[tokens[r],:]. Operands
+// [tokens [R] int32, dY [R,D]]; result [dW [V,D]]. dW is written in full, so
+// it needs no zero-fill; repeated tokens accumulate into one row.
+def Boom_EmbeddingBwdOp : Boom_Op<"embedding_bwd",
+    "backward of embedding lookup (scatter-add into the weight gradient)">;
+
 #endif // SONICBOOM_COMPILER_BOOMOPS_TD
