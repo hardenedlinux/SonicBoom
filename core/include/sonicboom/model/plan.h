@@ -269,6 +269,20 @@ struct SpecCounters {
 SpecCounters spec_counters();
 void spec_counters_reset();
 
+// B7: the adaptive draft-length policy, factored out for testing.
+//
+// With acceptance rate alpha, k drafts yield E(k) = 1 + alpha + ... + alpha^k =
+// (1 - alpha^(k+1)) / (1 - alpha) emitted tokens (a geometric run); c(k) is one
+// iteration's measured cost in microseconds (cost_us[k] == 0 means unmeasured,
+// and k is not considered). Returns the k <= max_k maximizing E(k) / c(k), or
+// max_k when nothing is measured (the fixed cap, the static default).
+int64_t spec_choose_drafts(double alpha, std::span<const double> cost_us,
+                           int64_t max_k);
+
+// B7: the acceptance-rate EMA update, alpha <- 0.5*alpha + 0.5*(accepted/drafted).
+// A run starts at alpha = 0.5 (the policy's initial guess).
+double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted);
+
 // Test seam (B6): run the speculative loop over `tokens` on the model's decode
 // runtime with a chosen drafter strategy, bypassing SONICBOOM_SPEC's program.
 // "ngram" is the runtime's prompt-lookup drafter; "repeat" proposes the last

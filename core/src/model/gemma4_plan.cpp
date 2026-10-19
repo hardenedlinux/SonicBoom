@@ -32,6 +32,7 @@
 #include <sonicboom/planner/sonic_cuda_backend.h>
 #include <sonicboom/sx/exec.h>
 
+#include "../planner/autotune.h"  // B7 draft-length cost cache
 #include "mlir/IR/BuiltinTypes.h"
 
 #ifdef SONICBOOM_USE_CUDA
@@ -41,6 +42,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1050,6 +1052,39 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
   return r;
 }
 
+// B7: the adaptive draft-length policy (plan.h). The objective is emitted
+// tokens per unit of iteration time: with acceptance rate alpha, k drafts yield
+// the expected run E(k) = 1 + alpha + ... + alpha^k, so choose the k that
+// maximizes E(k) / c(k), c(k) being one iteration's measured cost.
+int64_t spec_choose_drafts(double alpha, std::span<const double> cost_us,
+                           int64_t max_k) {
+  if (max_k < 0) return 0;
+  alpha = std::clamp(alpha, 0.0, 1.0);
+  const auto expected = [alpha](int64_t k) {
+    if (alpha >= 1.0 - 1e-9) return double(k) + 1.0;  // the limit of the sum
+    return (1.0 - std::pow(alpha, double(k) + 1.0)) / (1.0 - alpha);
+  };
+  int64_t best_k = max_k;  // nothing measured: the fixed cap
+  double best = 0.0;
+  bool any = false;
+  for (int64_t k = 0; k <= max_k && size_t(k) < cost_us.size(); ++k) {
+    if (!(cost_us[size_t(k)] > 0.0)) continue;  // unmeasured
+    const double score = expected(k) / cost_us[size_t(k)];
+    if (!any || score > best) {
+      any = true;
+      best = score;
+      best_k = k;
+    }
+  }
+  return best_k;
+}
+
+double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted) {
+  if (drafted == 0) return alpha;
+  const double x = double(accepted) / double(drafted);
+  return 0.5 * alpha + 0.5 * x;
+}
+
 namespace {
 SpecCounters g_spec_counters;
 } // namespace
@@ -1404,6 +1439,61 @@ static uint64_t run_program_steps(
   return step;
 }
 
+// B7: state of the adaptive draft-length policy for one generation call.
+// `cost_us[k]` is the measured cost of an iteration that verifies k drafts
+// (0 = unmeasured), `alpha` the acceptance-rate EMA, and `warm_next` the next
+// draft length the warm-up still has to measure (negative when it is done).
+// Without a cost cache (autotune disabled) every cost stays unmeasured and the
+// policy reduces to the fixed cap, i.e. `on`'s behavior.
+struct SpecLengthPolicy {
+  static constexpr int kMax = int(kSpecMaxDrafts);
+  std::string key;
+  std::array<double, kMax + 1> cost_us{};
+  double alpha = 0.5;          // alpha0
+  int64_t warm_next = -1;      // next k to warm up, < 0 when done
+  bool warm_primed = false;    // the first pass at warm_next has run
+};
+
+// The warm-up measures c(k) once per (model shape, context class) on this GPU:
+// k = 0..min(7, room) in turn, each iteration timed whole (the second pass at
+// each k: the first absorbs that row count's runtime construction and capture).
+// The costs are cached in the autotune cache under "spec-length"; later runs
+// load them and skip the warm-up. The context class keeps a long-context
+// session's KV traffic from being priced with a short-context measurement (the
+// cache class only widens the key; the kernel/tile choices stay keyed by shape
+// class as before).
+static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
+                             SpecLengthPolicy& p) {
+  if (!tune::enabled()) return;
+  const char* cls = n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
+  // v1: the key version separates costs measured on this loop's code from an
+  // older binary's (a cost is only meaningful for the kernels that produced it).
+  p.key = std::string("v1|") +
+          (m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") + "|e" +
+          std::to_string(m.config.embedding_length) + "|ctx=" + cls;
+  const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
+  bool any = false;
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    const auto it = cached.find("c" + std::to_string(k));
+    if (it != cached.end() && it->second > 0) {
+      p.cost_us[size_t(k)] = double(it->second);
+      any = true;
+    }
+  }
+  if (!any) p.warm_next = 0;
+}
+
+static void spec_policy_store(const SpecLengthPolicy& p) {
+  std::map<std::string, int> values;
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    if (p.cost_us[size_t(k)] > 0.0) {
+      values["c" + std::to_string(k)] =
+          std::max(1, int(std::lround(p.cost_us[size_t(k)])));
+    }
+  }
+  if (!values.empty()) tune::store("spec-length", p.key, values);
+}
+
 // Execute the program's speculative loop from (token, pos, step). One
 // iteration is the program body: draft up to max_drafts tokens from the
 // accepted history, then either replay the captured single decode step (the
@@ -1419,7 +1509,8 @@ static uint64_t run_program_steps(
 // draft only discards work. `history` is the accepted token history known to
 // the caller (the prompt, or empty when the prefill was not seen here); it
 // seeds the drafter, and the drafter only ever proposes — acceptance is the
-// verifier's decision.
+// verifier's decision. In `auto` mode the policy above chooses each
+// iteration's draft length.
 static uint64_t run_spec_program_steps(
     const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
@@ -1449,6 +1540,11 @@ static uint64_t run_spec_program_steps(
   }
   planner::NGramDrafter drafter(cap);
   drafter.push(history);
+  // SONICBOOM_SPEC=auto picks k per iteration (B7). The forced-strategy seam
+  // keeps the fixed cap so a test can pin every iteration's shape.
+  const bool adaptive = !strategy_override && spec_mode() == SpecMode::Auto;
+  SpecLengthPolicy policy;
+  if (adaptive) spec_policy_init(m, session.n_ctx, policy);
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
   uint64_t L = pos;
@@ -1458,6 +1554,7 @@ static uint64_t run_spec_program_steps(
 
   while (step < limit) {
     ++g_spec_counters.iterations;
+    const auto iter_start = std::chrono::steady_clock::now();
     if (L + 1 > session.n_ctx) {
       std::cerr << "[spec] the session cache is full at position " << L << "\n";
       break;
@@ -1467,11 +1564,45 @@ static uint64_t run_spec_program_steps(
     drafter.push(token);
     const uint64_t room = std::min<uint64_t>(
         uint64_t(cap), session.n_ctx - L - 1);
-    const size_t k = repeat
-                         ? size_t(room)
-                         : drafter.propose(std::span<uint64_t>(drafts, size_t(room)));
-    if (repeat)
+    size_t k = 0;
+    bool warm = false;         // a warm-up iteration (forced k drafts)
+    bool measure = false;      // ... whose time is c(k) (its second pass)
+    bool finish_warm = false;  // the last measurement: persist after timing
+    if (repeat) {
+      k = size_t(room);
       for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
+    } else if (adaptive) {
+      if (policy.warm_next >= 0) {
+        if (uint64_t(policy.warm_next) <= room) {
+          // Warm-up: force k drafts so the iteration's cost is c(k). Each k is
+          // run twice: the first pass absorbs the one-time cost of building and
+          // capturing that row-count's verify runtime, the second is timed.
+          // Forced drafts are proposals only; the verifier decides the run.
+          k = size_t(policy.warm_next);
+          warm = true;
+          measure = policy.warm_primed;
+          if (policy.warm_primed) {
+            policy.warm_primed = false;
+            if (++policy.warm_next > kSpecMaxDrafts) finish_warm = true;
+          } else {
+            policy.warm_primed = true;
+          }
+          for (size_t i = 0; i < k; ++i) drafts[i] = token;
+        } else {
+          // No room left for the next length: finish with what is measured.
+          spec_policy_store(policy);
+          policy.warm_next = -1;
+        }
+      }
+      if (!warm) {
+        const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
+        k = size_t(drafter.propose(std::span<uint64_t>(
+            drafts, size_t(spec_choose_drafts(
+                        policy.alpha, policy.cost_us, int64_t(max_k))))));
+      }
+    } else {
+      k = drafter.propose(std::span<uint64_t>(drafts, size_t(room)));
+    }
 
     if (k == 0) {
       // (k == 0 ? step : verify): the captured single decode step at L.
@@ -1499,6 +1630,14 @@ static uint64_t run_spec_program_steps(
       ++step;
       ++g_spec_counters.plain_steps;
       ++g_spec_counters.emitted_tokens;
+      if (measure) {
+        policy.cost_us[0] = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - iter_start).count();
+        if (finish_warm) {
+          policy.warm_next = -1;
+          spec_policy_store(policy);
+        }
+      }
       if (stop) break;
       continue;
     }
@@ -1531,6 +1670,19 @@ static uint64_t run_spec_program_steps(
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
     g_spec_counters.emitted_tokens += decision.emitted;
+    // B7 bookkeeping: a warm-up iteration prices c(k); every other one feeds
+    // the acceptance-rate EMA (warm-up drafts are forced, so their acceptance
+    // says nothing about the drafter).
+    if (measure) {
+      policy.cost_us[k] = std::chrono::duration<double, std::micro>(
+          std::chrono::steady_clock::now() - iter_start).count();
+      if (finish_warm) {
+        policy.warm_next = -1;
+        spec_policy_store(policy);
+      }
+    } else if (adaptive && !warm) {
+      policy.alpha = spec_alpha_update(policy.alpha, decision.accepted, k);
+    }
     if (decision.emitted == 0) break;  // the bound was already reached
     for (size_t i = 0; i < decision.emitted; ++i) {
       tokens[step + i] = int64_t(run[i]);
@@ -1543,6 +1695,9 @@ static uint64_t run_spec_program_steps(
     token = run[decision.emitted - 1];
     if (decision.stopped) break;
   }
+  // A run that ended before the warm-up finished stores what it measured; the
+  // policy then compares only the lengths it has prices for.
+  if (adaptive && policy.warm_next >= 0) spec_policy_store(policy);
   return step;
 }
 

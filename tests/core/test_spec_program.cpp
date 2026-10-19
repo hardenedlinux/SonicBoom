@@ -29,6 +29,9 @@
 //      of chained plain decode steps from the same starting state, for Gemma 4
 //      E4B and Qwen2.5 0.5B at depth 0 and 512.
 //
+// Part 3 covers B7's SONICBOOM_SPEC=auto: the draft-length policy's warm-up and
+// cost cache, with the same bit-identity contract.
+//
 // SONICBOOM_SPEC=on is set before the first call: the mode is parsed once per
 // process. The reference stream uses decode_steps_spine_cuda, which feeds given
 // tokens through the uncaptured decode dispatch — the plain per-step decode.
@@ -47,11 +50,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -161,6 +167,43 @@ void accept_unit_tests() {
   if (g_failures == 0) std::cout << "  accept/emit truncation rules: OK\n";
 }
 
+// --- part 1b: the B7 draft-length policy ------------------------------------
+
+void run_choose_case(double alpha, std::vector<double> costs, int64_t max_k,
+                     int64_t expected, int index) {
+  const int64_t got = sbmodel::spec_choose_drafts(alpha, costs, max_k);
+  if (got != expected) {
+    std::cerr << "  FAIL: choose case " << index << ": alpha=" << alpha
+              << " max_k=" << max_k << " got k=" << got << " expected "
+              << expected << "\n";
+    ++g_failures;
+  }
+}
+
+void policy_unit_tests() {
+  // alpha0 = 0.5 with rising costs: one draft pays, the longer runs do not.
+  run_choose_case(0.5, {2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5}, 7, 1, 0);
+  // Flat costs: the expected geometric run keeps growing, so the cap wins.
+  run_choose_case(0.9, {1, 1, 1, 1, 1, 1, 1, 1}, 7, 7, 1);
+  // A weak drafter: the plain step is the best value.
+  run_choose_case(0.1, {1, 10, 10, 10}, 3, 0, 2);
+  // Nothing measured (autotune disabled): the fixed cap, `on`'s behavior.
+  run_choose_case(0.5, {0, 0, 0, 0}, 3, 3, 3);
+  // alpha == 1: E(k) = k + 1, still linear in the measured cost.
+  run_choose_case(1.0, {2.0, 3.0, 4.0}, 2, 2, 4);
+  // max_k past the measured span only considers the span.
+  run_choose_case(0.5, {2.0, 1.0, 1.0}, 7, 2, 5);
+  // k = 0 is a legitimate choice (no draft at all).
+  run_choose_case(0.0, {1.0, 5.0}, 1, 0, 6);
+
+  // The EMA: alpha <- 0.5*alpha + 0.5*(accepted/drafted).
+  const double a1 = sbmodel::spec_alpha_update(0.5, 3, 7);
+  check(std::abs(a1 - (0.25 + 0.5 * 3.0 / 7.0)) < 1e-12, "alpha EMA value");
+  check(sbmodel::spec_alpha_update(0.4, 0, 0) == 0.4,
+        "alpha EMA ignores an empty draft");
+  if (g_failures == 0) std::cout << "  draft-length policy: OK\n";
+}
+
 // --- part 2: the speculative loop vs chained plain decode -------------------
 
 constexpr uint64_t kOut = 16;
@@ -242,6 +285,77 @@ int run_case(const sbmodel::Gemma4Model& m, const std::vector<uint64_t>& all,
   return g_failures;
 }
 
+// --- part 3: SONICBOOM_SPEC=auto (B7) --------------------------------------
+
+// The adaptive policy's contract is still the plain greedy stream. A 32-token
+// generation covers the warm-up (k = 0..7, two passes each: the first absorbs
+// that row count's one-time runtime construction, the second is timed) and
+// leaves policy iterations after it. The forced drafts of the warm-up are
+// proposals only, so they must not leak into the emitted stream, and the
+// measured costs must be persisted under the child's private tune directory.
+// The spec mode and the tune directory are parsed once per process, so this
+// case runs in its own child with the environment set before the first call.
+int run_auto_case(const sbmodel::Gemma4Model& m, const std::string& tune_dir) {
+  g_failures = 0;
+  setenv("SONICBOOM_SPEC", "auto", 1);
+  setenv("SONICBOOM_TUNE_DIR", tune_dir.c_str(), 1);
+  // The warm-up is 16 iterations (two per k = 0..7); with every forced draft
+  // accepted one iteration can emit k+1 tokens, so the bounds must fit
+  // 2 * (1 + ... + 8) = 72 emitted tokens before the policy gets its turn.
+  constexpr uint64_t kAutoOut = 128;
+  const uint64_t n_ctx = 256;
+  const uint64_t seed = m.config.vocab_size / 3;
+
+  // The reference's session is allocated first: the auto run publishes the
+  // decode runtime's cache, and the reference decodes through its own session.
+  sbplanner::KvCacheSession b;
+  if (!sbmodel::kv_session_allocate(m, b, n_ctx)) {
+    check(false, "kv_session_allocate failed");
+    return g_failures;
+  }
+
+  sbmodel::spec_counters_reset();
+  std::vector<int64_t> got(kAutoOut, -1);
+  const uint64_t done = sbmodel::generate_spine_cuda(m, seed, 0, got, n_ctx);
+  const sbmodel::SpecCounters counters = sbmodel::spec_counters();
+  check(done == kAutoOut, "auto loop produced all tokens");
+  check(counters.iterations >= 16, "the warm-up ran (2 passes x k = 0..7)");
+  check(counters.plain_steps >= 2, "the warm-up primed and timed c(0)");
+
+  std::vector<int64_t> ref(kAutoOut, -1);
+  uint64_t token = seed;
+  for (uint64_t i = 0; i < kAutoOut; ++i) {
+    std::vector<int64_t> one(1, -1);
+    if (!sbmodel::decode_steps_spine_cuda(m, std::span<const uint64_t>(&token, 1),
+                                          i, b, one))
+      break;
+    ref[i] = one[0];
+    if (one[0] < 0) break;
+    token = uint64_t(one[0]);
+  }
+  size_t diverge = 0;
+  while (diverge < ref.size() && ref[diverge] == got[diverge]) ++diverge;
+  check(diverge == ref.size(), "auto stream is bit-identical to plain");
+
+  bool cached = false;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::recursive_directory_iterator(tune_dir, ec)) {
+    if (e.path().filename() != "spec-length.json") continue;
+    std::ifstream f(e.path());
+    const std::string s((std::istreambuf_iterator<char>(f)),
+                        std::istreambuf_iterator<char>());
+    cached = s.find("\"c0\"") != std::string::npos &&
+             s.find("\"c1\"") != std::string::npos;
+  }
+  check(cached, "the warm-up cached c(0) and c(1)");
+  std::cout << "  " << kAutoOut << " tokens, " << counters.iterations
+            << " iterations, " << counters.verify_steps << " verifies, "
+            << counters.accepted_tokens << "/" << counters.draft_tokens
+            << " drafts accepted"
+            << (diverge == ref.size() ? "" : " (DIVERGED)") << "\n";
+  return g_failures;
+}
+
 template <class F>
 int run_in_child(F&& fn) {
   std::cout.flush();
@@ -273,6 +387,7 @@ int run_in_child(F&& fn) {
 
 int main() {
   accept_unit_tests();
+  policy_unit_tests();
 
   const std::string gemma_path =
       find_file("SONICBOOM_GEMMA_GGUF", "models/gemma-4-E4B-it-Q3_K_M.gguf");
@@ -331,6 +446,13 @@ int main() {
       std::cout << "model=" << name << " depth=" << depth << "\n";
       failures += run_in_child([&] { return run_case(*model, all, depth); });
     }
+    const std::string dir = "/tmp/sb-spec-auto-" + std::to_string(getpid()) +
+                            "-" + name;
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::cout << "model=" << name << " spec=auto\n";
+    failures += run_in_child([&] { return run_auto_case(*model, dir); });
+    std::filesystem::remove_all(dir, ec);
   }
 
   if (failures == 0) {

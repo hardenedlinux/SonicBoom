@@ -171,6 +171,20 @@ add_test(NAME test_generate_spec
 set_tests_properties(test_generate_spec
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
 
+# B7's adaptive draft length (SONICBOOM_SPEC=auto) also goes through the same
+# golden streams: the warm-up's forced drafts and the policy's per-step k are
+# proposals only, so not one emitted token may change. The tune directory is
+# the build tree's own so the test neither reads the user's cache nor races the
+# other GPU tests (they hold gpu_vram).
+add_test(NAME test_generate_spec_auto
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_SPEC=auto
+                 SONICBOOM_TUNE_DIR=${CMAKE_BINARY_DIR}/spec-auto-tune
+                 $<TARGET_FILE:test_generate>)
+set_tests_properties(test_generate_spec_auto
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
 # The same coverage for the other consumer of the chunked loop: the
 # prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
 # golden streams with the chunked replay.

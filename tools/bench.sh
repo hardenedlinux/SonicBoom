@@ -660,6 +660,12 @@ if [ "$ABLATE" = 1 ]; then
     # feedback, one host round-trip per 4 tokens), so a positive contribution
     # means the per-step default is ahead.
     "decode-chunk|SONICBOOM_DECODE_CHUNK=4"
+    # With SONICBOOM_SPEC=auto exported, the all-on arm is B7's per-step
+    # draft-length policy and the group-off side pins the fixed cap
+    # (SONICBOOM_SPEC=on), so a positive contribution means the policy is ahead
+    # of always drafting max_drafts. Without SONICBOOM_SPEC=auto both arms are
+    # the plain loop and the row is zero by construction.
+    "spec-policy|SONICBOOM_SPEC=on"
   )
 
   abl_median() { # KEY CMD... -> median of RUNS values of KEY's RESULT field
