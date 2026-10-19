@@ -160,8 +160,13 @@ if(SONICBOOM_USE_CUDA)
   target_compile_definitions(sonicboom PRIVATE SONICBOOM_USE_CUDA=1)
   # cuda_driver: the glue JIT (src/planner/glue_jit.cpp) loads compiler-generated
   # PTX with cuModuleLoadData and launches it on the planner's stream.
+  # NVTX is header-only in nvtx3: the shim provides inline implementations, so
+  # there is no library to link. CUDA >= 12.9 no longer ships libnvtx with the
+  # toolkit; an old /usr/include/nvToolsExt.h can still be present and hide the
+  # missing symbol until link time, which is why the old nvToolsExt link target
+  # is gone.
   target_link_libraries(sonicboom PRIVATE CUDA::cudart CUDA::cublas
-                                       CUDA::cuda_driver nvToolsExt)
+                                       CUDA::cuda_driver)
   # SonicBoom-owned CUDA K-quant matvec kernel (dequantize-on-the-fly gemv).
   # Compiled with nvcc (enable_language(CUDA) + CMAKE_CUDA_ARCHITECTURES=86 are
   # set in the root CMakeLists), statically linked into libsonicboom.so like the

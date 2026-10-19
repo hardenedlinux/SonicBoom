@@ -37,7 +37,7 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
