@@ -284,12 +284,16 @@ The same functions are available from C through
 ### Test
 
 ```sh
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -LE long --output-on-failure   # per-commit suite
+ctest --test-dir build -L long                        # nightly/weekly suite
 ```
 
-Tests that need the model skip themselves when the GGUF is not present, and the
-two ResNet-18 end-to-end tests skip (CTest `SKIP_RETURN_CODE 77`) when their
-generated sidecar artifacts are absent, which is the state of a fresh checkout.
+Tests labelled `long` verify correctness slowly (model loads and the pure-Scheme
+reference interpreter), so they run in the nightly/weekly job rather than on
+every change. Tests that need the model skip themselves when the GGUF is not
+present, and the two ResNet-18 end-to-end tests skip (CTest
+`SKIP_RETURN_CODE 77`) when their generated sidecar artifacts are absent, which
+is the state of a fresh checkout.
 
 ### Benchmark
 

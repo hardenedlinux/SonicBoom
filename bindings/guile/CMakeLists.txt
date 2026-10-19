@@ -97,7 +97,13 @@ if(GUILE_EXECUTABLE)
             ${GUILE_EXECUTABLE} --no-auto-compile
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace/test-train-tiny.scm)
-  set_tests_properties(guile-train-tiny PROPERTIES RESOURCE_LOCK gpu_vram)
+  # It is a correctness test whose time is dominated by the pure-Scheme
+  # reference interpreter (~50 s of ~57 s), so it is labelled "long": the
+  # default suite runs `ctest -LE long`, and the nightly/weekly CI job runs
+  # `ctest -L long`. It still takes the GPU lock when it does run.
+  set_tests_properties(guile-train-tiny PROPERTIES
+    LABELS long
+    RESOURCE_LOCK gpu_vram)
 
   # guile-nn-trace runs a `sequential` model through both
   # routes — the emitted-text forward pass and the traced/lowered one — and
