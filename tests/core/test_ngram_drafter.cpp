@@ -25,8 +25,11 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace sbplanner = sonicboom::planner;
@@ -129,6 +132,60 @@ int main() {
           "same history proposes the same tokens");
     a.reset();
     check(a.size() == 0 && a.propose(oa) == 0, "reset clears the history");
+  }
+
+  // Code-edit trace coverage (S1). The trace pastes 150-400 line repo source
+  // files and asks for the file back, so its history is full of repeated
+  // spans. Feeding that history one token at a time must give the drafter
+  // something to propose: a seeded table that stays empty (the prefix-reuse
+  // suffix bug) shows up here as a near-zero hit rate. The bytes are the
+  // token ids — the real tokenizer is byte-level BPE and the drafter treats
+  // ids as opaque, so this needs no model.
+  {
+#ifdef SONICBOOM_SRC_DIR
+    static const char* kFiles[] = {
+        "core/src/planner/cost_model.cpp",
+        "core/src/planner/partition.cpp",
+        "core/src/planner/device_pool.cpp",
+        "core/src/planner/transfer_scheduler.cpp",
+        "core/src/planner/native_torch_backend.cpp",
+        "core/src/autograd/autograd.cpp",
+    };
+    size_t calls = 0, hits = 0, drafted = 0;
+    for (const char* rel : kFiles) {
+      std::ifstream in(std::string(SONICBOOM_SRC_DIR) + "/" + rel,
+                       std::ios::binary);
+      if (!in) continue;  // an out-of-tree source copy: the case is optional
+      const std::string bytes((std::istreambuf_iterator<char>(in)),
+                              std::istreambuf_iterator<char>());
+      NGramDrafter d(7);
+      uint64_t out[8];
+      for (size_t i = 0; i < bytes.size(); ++i) {
+        d.push(uint64_t(static_cast<unsigned char>(bytes[i])));
+        if (i < 100) continue;  // the trace is warmed up after 100 tokens
+        const size_t n = d.propose(out);
+        ++calls;
+        if (n > 0) {
+          ++hits;
+          drafted += n;
+        }
+      }
+    }
+    if (calls > 0) {
+      std::printf("  code-edit history: %zu/%zu proposals after token 100 "
+                  "(%.1f%%), mean %.2f tokens\n",
+                  hits, calls, 100.0 * double(hits) / double(calls),
+                  hits ? double(drafted) / double(hits) : 0.0);
+      check(hits * 2 >= calls,
+            "code-edit trace history proposes on >= 50% of calls after 100 "
+            "tokens");
+      check(drafted > hits,
+            "code-edit trace history proposes runs longer than one token");
+    }
+#else
+    std::cerr << "  (SONICBOOM_SRC_DIR undefined: code-edit history case "
+                 "skipped)\n";
+#endif
   }
 
   // Cost: one push (the token an accepted step emits) plus one propose per

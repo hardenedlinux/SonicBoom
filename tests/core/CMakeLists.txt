@@ -21,6 +21,13 @@ foreach(test_name IN ITEMS test_schema test_value test_operator test_backend tes
   sb_add_cpp_test(${test_name})
 endforeach()
 
+# The S1 drafter-coverage gate, registered under the spec-* family name so it
+# is selected with the other speculative-decode suites (`ctest -R spec`).
+add_test(NAME test_spec_drafter
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 $<TARGET_FILE:test_ngram_drafter>)
+
 # The runtime-feature disable list is parsed once per process, so the mode that
 # needs a different value of it is a separate invocation. (The unknown-name
 # error is exercised in-process by the default test, which forks a child.)
@@ -108,6 +115,12 @@ target_compile_definitions(test_spec_rollback PRIVATE
 # test_spec_program (B6 speculative loop) needs both model GGUFs, looked up
 # relative to the repository root; it forks one child per (model, depth) case.
 target_compile_definitions(test_spec_program PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
+# test_ngram_drafter's coverage case feeds the code-edit trace's source files
+# (the same files workload_bench pastes) through the drafter; it needs the
+# repository root to read them.
+target_compile_definitions(test_ngram_drafter PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).

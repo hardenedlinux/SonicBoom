@@ -2611,7 +2611,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                          uint64_t start_pos,
                                          std::span<int64_t> tokens,
                                          uint64_t n_ctx, bool use_prefill,
-                                         planner::KvCacheSession* session) {
+                                         planner::KvCacheSession* session,
+                                         std::span<const uint64_t> history) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
 
@@ -3063,8 +3064,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       rt->cuda->publish_cache(local);
       kv = &local;
     }
+    // The drafter must see the session's accepted token history, not the
+    // prefill suffix: on a prefix-reuse call the suffix can be a single token,
+    // which leaves the n-gram tables with nothing to match. `history` is the
+    // caller's full accepted sequence (see the prefix wrapper).
     step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
-                                  *kv, prompt);
+                                  *kv, history.empty() ? prompt : history);
   } else if (!dump_logits && ir_program_enabled() && rt->program.valid) {
     step = run_program_steps(*rt, rt->program, token, pos, tokens, step);
   } else if (!dump_logits && rt->prog && chunk > 1) {
@@ -3152,7 +3157,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx, bool use_prefill) {
   return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
-                                  use_prefill, /*session=*/nullptr);
+                                  use_prefill, /*session=*/nullptr, prompt);
 }
 
 namespace {
@@ -3236,9 +3241,13 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   const uint64_t prefill_start = start_pos + prefix_len;
   const std::span<const uint64_t> suffix = prompt.subspan(prefix_len);
 
+  // `prompt` is the full accepted sequence this request extends; `suffix` is
+  // only what the cache still needs prefilled. The spec drafter is seeded with
+  // the former so its n-gram tables cover the whole session, not just the
+  // reuse tail.
   const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
                                                  tokens, n_ctx, use_prefill,
-                                                 &session);
+                                                 &session, prompt);
   if (done == 0) return 0;
 
   // Record every token whose KV this call actually wrote, for the next
