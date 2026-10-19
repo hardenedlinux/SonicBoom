@@ -293,6 +293,51 @@ int main() {
     }
   }
 
+  //--- the speculative generation program (B6) ------------------------------
+  //
+  // The same decode graph lifts into the draft -> verify -> accept loop: the
+  // graph becomes the k == 0 fallback step, the verify call reuses it, and the
+  // continuation advances by the accept node's run length.
+  {
+    mlir::MLIRContext program_context;
+    sonicboom::compiler::BoomBuilder b(&program_context, "decode", 0);
+    const auto tok = b.input("token_id", {1}, sonicboom::sx::DType::Int64);
+    const auto pos = b.input("pos", {1}, sonicboom::sx::DType::Int64);
+    const auto kv = b.kv(0);
+    const auto emb = b.node(planner::OpKind::Embedding, {tok}, "emb", {8}, {});
+    const sonicboom::sx::Attribute layer{"layer", int64_t(0)};
+    const auto attn = b.node(planner::OpKind::Attention,
+                             {emb, emb, emb, pos, kv}, "attn", {8}, {layer});
+    const auto out =
+        b.node(planner::OpKind::Argmax, {attn}, "tok_out", {1}, {});
+    b.set_output(out);
+    auto module = b.finish();
+    check(bool(module), "a decode graph builds for the speculative lift");
+
+    if (module) {
+      check(mlir::succeeded(sonicboom::compiler::addSpeculativeProgram(
+                *module, "speculative", "prefill", {4}, {}, 0, /*max_drafts=*/3,
+                "ngram")),
+            "the decode graph lifts into a speculative generation program");
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      module->print(os);
+      os.flush();
+      check(text.find("boom.draft") != std::string::npos,
+            "the loop body proposes drafts");
+      check(text.find("boom.verify") != std::string::npos,
+            "the loop body verifies the draft feed");
+      check(text.find("boom.accept") != std::string::npos,
+            "the loop body accepts the matching prefix");
+      check(text.find("boom.sample") == std::string::npos,
+            "the speculative loop samples nothing (accept keeps the token)");
+      check(text.find("boom.step") != std::string::npos,
+            "the plain step stays as the drafter's k == 0 fallback");
+      check(text.find("boom.pos_inc") != std::string::npos,
+            "the continuation advances the position");
+    }
+  }
+
   if (failures == 0)
     std::cout << "test_boom_dialect: OK (" << kinds << " OpKinds + boom.graph)\n";
   else

@@ -195,22 +195,94 @@ def Boom_StopCheckOp : Op<Boom_Dialect, "stop_check", [Pure]> {
   let results = (outs I1:$stop);
 }
 
-// Append the token to the host-visible device ring buffer. Its write is an
-// effect the executor must not reorder across the loop.
+// Append the token to the host-visible device ring buffer. A speculative
+// iteration emits the whole accepted run (the accept node's tokens); the plain
+// loop emits the one sampled token. Its write is an effect the executor must
+// not reorder across the loop.
 def Boom_EmitOp : Op<Boom_Dialect, "emit"> {
-  let summary = "append the token to the emission ring";
+  let summary = "append the token(s) to the emission ring";
 
-  let arguments = (ins AnyType:$token);
+  let arguments = (ins Variadic<AnyType>:$tokens);
 }
 
-// Advance the loop-carried position by `delta`. Host-side in the executor
-// (positions are staged per step), so no device kernel is implied.
+// Advance the loop-carried position by `delta`, or by the `by` operand when one
+// is present (a speculative iteration advances by the accepted count + 1).
+// Host-side in the executor (positions are staged per step), so no device
+// kernel is implied.
 def Boom_PosIncOp : Op<Boom_Dialect, "pos_inc", [Pure]> {
   let summary = "advance the staged position";
 
-  let arguments = (ins Boom_AnyType:$pos, I64Attr:$delta);
+  let arguments = (ins Boom_AnyType:$pos, Optional<I64>:$by, I64Attr:$delta);
 
   let results = (outs Boom_AnyType:$next);
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// The speculation pipeline (B6)
+//===----------------------------------------------------------------------===//
+//
+// A speculative iteration replaces the loop body's step/sample pair with
+// draft -> verify -> accept: the drafter proposes k tokens from the accepted
+// history, the verify step feeds [last token, drafts...] through the decode
+// graph dealt over rows, and accept keeps the longest draft prefix that matches
+// the verifier's per-row argmax plus the verifier's own next token. The plain
+// step stays in the body: when the drafter proposes nothing (k == 0) the
+// executor runs that captured step instead, which is the same token the verify
+// would have produced for row 0.
+
+// The proposal stage: up to `max_drafts` tokens following the accepted history.
+// `strategy` names the proposal source ("ngram": the prompt-lookup drafter).
+// `count` is the number of tokens proposed; zero means take the plain step.
+// Drafting reads the session history, a host-side effect the executor must not
+// reorder across the loop.
+def Boom_DraftOp : Op<Boom_Dialect, "draft"> {
+  let summary = "propose up to max_drafts tokens from the accepted history";
+
+  let arguments = (ins StrAttr:$strategy, I64Attr:$max_drafts);
+
+  let results = (outs Variadic<Boom_ValueType>:$drafts, I64:$count);
+
+  let hasVerifier = 1;
+}
+
+// The verify stage: the decode graph dealt over rows. `inputs` are the last
+// token, the draft tokens and the base position (the cache handles come last);
+// `graph_name` names the decode graph and `max_rows` the largest row count it
+// is built for. Row i's argmax is the plain greedy token at start_pos + i + 1.
+// It appends k+1 rows to the cache; accept decides how many are live.
+def Boom_VerifyOp : Op<Boom_Dialect, "verify", [Boom_KvReadWrite]> {
+  let summary = "row-invariant verify step over the draft feed";
+
+  let arguments = (ins Variadic<Boom_AnyType>:$inputs,
+                       StrAttr:$graph_name,
+                       I64Attr:$max_rows);
+
+  let results = (outs Variadic<Boom_ValueType>:$rows);
+
+  let hasVerifier = 1;
+}
+
+// The accept stage: the longest prefix with draft[i] == verifier row i's
+// argmax, plus the verifier's next token. `inputs` is the draft array, the
+// plain step's token and the verifier's row array (in that order — the
+// verifier checks the arity, the executor's desc reads the structure).
+// `tokens` is the accepted run (the accepted drafts, then the verifier token),
+// `next` is the run's last token (the loop's next feed) and `accepted` is the
+// number kept. It also sets the session's valid KV length to
+// start_pos + accepted + 1: the verify rows past the run are dead and are
+// overwritten by later steps.
+def Boom_AcceptOp : Op<Boom_Dialect, "accept"> {
+  let summary = "longest matching draft prefix plus the verifier's token";
+
+  let arguments = (ins Variadic<Boom_AnyType>:$inputs);
+
+  let results = (outs Variadic<Boom_ValueType>:$tokens,
+                      Boom_ValueType:$next,
+                      I64:$accepted);
+
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

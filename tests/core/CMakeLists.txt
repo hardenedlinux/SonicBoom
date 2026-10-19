@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_ngram_drafter test_runtime_features)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_ngram_drafter test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -105,6 +105,11 @@ target_compile_definitions(test_spec_invariance PRIVATE
 target_compile_definitions(test_spec_rollback PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# test_spec_program (B6 speculative loop) needs both model GGUFs, looked up
+# relative to the repository root; it forks one child per (model, depth) case.
+target_compile_definitions(test_spec_program PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).
 #
 # The lock covers every test that allocates device memory. Two of them at once
@@ -139,6 +144,7 @@ target_compile_definitions(test_spec_rollback PRIVATE
 # test_vocab), and everything else in the suite — CPU-only tests stay parallel.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
+                              test_spec_program
   PROPERTIES RESOURCE_LOCK gpu_vram)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
@@ -151,6 +157,18 @@ add_test(NAME test_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_decode_chunk
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+
+# The speculative loop (SONICBOOM_SPEC, B6) is also parsed once per process.
+# Run the golden-stream checks with it on: the drafter's proposals must not
+# change a single token, and the prefill path's speculative iterations must
+# still match the per-token prompt's stream.
+add_test(NAME test_generate_spec
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_SPEC=on
+                 $<TARGET_FILE:test_generate>)
+set_tests_properties(test_generate_spec
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
 
 # The same coverage for the other consumer of the chunked loop: the

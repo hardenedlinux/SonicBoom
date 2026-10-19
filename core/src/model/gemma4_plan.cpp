@@ -23,6 +23,7 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/cost_model.h>
+#include <sonicboom/planner/drafter.h>
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/resource.h>
@@ -1022,6 +1023,40 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
   return step;
 }
 
+// B6: the accept/emit decision (plan.h). Model- and device-independent, so it
+// lives outside the CUDA section and is unit-tested directly.
+SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
+                           std::span<const int64_t> row_argmax,
+                           std::span<const int64_t> eos_tokens,
+                           uint64_t emitted_before, uint64_t limit,
+                           std::span<uint64_t> out) {
+  SpecAccept r;
+  if (drafts.empty() || row_argmax.size() < drafts.size() + 1 ||
+      out.size() < drafts.size() + 1)
+    return r;
+  while (r.accepted < drafts.size() &&
+         row_argmax[size_t(r.accepted)] == int64_t(drafts[size_t(r.accepted)]))
+    ++r.accepted;
+  for (uint64_t i = 0; i <= r.accepted && emitted_before + i < limit; ++i) {
+    const uint64_t t =
+        i < r.accepted ? drafts[size_t(i)] : uint64_t(row_argmax[size_t(r.accepted)]);
+    out[size_t(r.emitted++)] = t;
+    if (std::find(eos_tokens.begin(), eos_tokens.end(), int64_t(t)) !=
+        eos_tokens.end()) {
+      r.stopped = true;
+      break;
+    }
+  }
+  return r;
+}
+
+namespace {
+SpecCounters g_spec_counters;
+} // namespace
+
+SpecCounters spec_counters() { return g_spec_counters; }
+void spec_counters_reset() { g_spec_counters = SpecCounters{}; }
+
 // ---------------------------------------------------------------------------
 // CUDA spine decode loop. Same token-stream contract as generate_spine, but the
 // plan is built against a CUDA-aware snapshot so every Sonic node with a *_dev
@@ -1124,7 +1159,15 @@ static constexpr std::size_t kMaxCachedSegments = 8;
 // lift runs once at plan-build time and its diagnostics fail the plan there.
 struct GreedyProgramDesc {
   bool valid = false;
+  // A speculative program (boom.draft / verify / accept in place of the
+  // sample). The step node is still present: it is the drafter's k == 0
+  // fallback, replayed as the captured decode step.
+  bool speculative = false;
   std::string prefill_graph;
+  std::string verify_graph;    // the graph the verify node deals over rows
+  int64_t max_rows = 0;        // its row budget (max_drafts + 1)
+  std::string draft_strategy;  // "ngram"
+  int64_t max_drafts = 0;      // the drafter's proposal cap
   std::vector<int64_t> eos_tokens;
   int64_t max_tokens = 0;  // 0 = the caller's token span is the bound
 };
@@ -1161,10 +1204,39 @@ static bool ir_program_enabled() {
   return v;
 }
 
+// The speculative draft cap (B6). One speculative step runs at most
+// kSpecMaxDrafts + 1 verify rows, which is the envelope the row-invariant
+// verify step was built and tested for (B3's verify_k1..k7 classes); B7's
+// per-step length policy stays inside it.
+constexpr int64_t kSpecMaxDrafts = 7;
+
+// SONICBOOM_SPEC selects the generation loop:
+//   off  (default) the plain greedy loop (B1's program, step per token);
+//   on   the speculative program: draft, verify, accept;
+//   auto the same program with the draft length decided by policy (B7).
+// Until B7 both values take the drafter's proposal unchanged.
+enum class SpecMode { Off, On, Auto };
+
+static SpecMode spec_mode() {
+  static const SpecMode mode = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC");
+    if (!e || !*e || std::string_view(e) == "off") return SpecMode::Off;
+    if (std::string_view(e) == "on") return SpecMode::On;
+    if (std::string_view(e) == "auto") return SpecMode::Auto;
+    std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
+              << "' (expected off|on|auto); using off\n";
+    return SpecMode::Off;
+  }();
+  return mode;
+}
+
+static bool spec_enabled() { return spec_mode() != SpecMode::Off; }
+
 // Read the program back out of the lifted module. The program verifier has
 // already checked the shape; this only recovers the attributes the executor
-// needs (the prefill call's name, the stop set and the emitted-count bound) and
-// confirms that one of each loop op is present.
+// needs (the prefill call's name, the stop set and the emitted-count bound, and
+// the speculation pipeline's drafter/verify description) and confirms that one
+// of each loop op is present.
 static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
   namespace boom = compiler::boom;
   GreedyProgramDesc desc;
@@ -1177,7 +1249,8 @@ static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
   }
   if (!program) return desc;
 
-  int prefills = 0, steps = 0, samples = 0, emits = 0, stops = 0, incs = 0;
+  int prefills = 0, steps = 0, samples = 0, drafts = 0, verifies = 0;
+  int accepts = 0, emits = 0, stops = 0, incs = 0, dynamic_incs = 0;
   int64_t delta = 0;
   program.walk([&](mlir::Operation* op) {
     if (auto p = llvm::dyn_cast<boom::PrefillOp>(op)) {
@@ -1187,6 +1260,16 @@ static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
       ++steps;
     } else if (llvm::isa<boom::SampleOp>(op)) {
       ++samples;
+    } else if (auto d = llvm::dyn_cast<boom::DraftOp>(op)) {
+      ++drafts;
+      desc.draft_strategy = d.getStrategy().str();
+      desc.max_drafts = int64_t(d.getMaxDrafts());
+    } else if (auto v = llvm::dyn_cast<boom::VerifyOp>(op)) {
+      ++verifies;
+      desc.verify_graph = v.getGraphName().str();
+      desc.max_rows = int64_t(v.getMaxRows());
+    } else if (llvm::isa<boom::AcceptOp>(op)) {
+      ++accepts;
     } else if (llvm::isa<boom::EmitOp>(op)) {
       ++emits;
     } else if (auto s = llvm::dyn_cast<boom::StopCheckOp>(op)) {
@@ -1196,10 +1279,17 @@ static GreedyProgramDesc read_greedy_program(mlir::ModuleOp module) {
     } else if (auto p = llvm::dyn_cast<boom::PosIncOp>(op)) {
       ++incs;
       delta = int64_t(p.getDelta());
+      if (p.getBy()) ++dynamic_incs;
     }
   });
-  desc.valid = prefills == 1 && steps == 1 && samples == 1 && emits == 1 &&
-               stops == 1 && incs == 1 && delta == 1;
+  const bool spec = drafts == 1 && verifies == 1 && accepts == 1 &&
+                    samples == 0 && dynamic_incs == 1 && desc.max_drafts > 0 &&
+                    desc.max_rows == desc.max_drafts + 1;
+  const bool greedy = drafts == 0 && verifies == 0 && accepts == 0 &&
+                      samples == 1 && dynamic_incs == 0 && delta == 1;
+  desc.valid = prefills == 1 && steps == 1 && emits == 1 && stops == 1 &&
+               incs == 1 && (spec || greedy);
+  desc.speculative = desc.valid && spec;
   return desc;
 }
 
@@ -1314,6 +1404,148 @@ static uint64_t run_program_steps(
   return step;
 }
 
+// Execute the program's speculative loop from (token, pos, step). One
+// iteration is the program body: draft up to max_drafts tokens from the
+// accepted history, then either replay the captured single decode step (the
+// drafter proposed nothing) or run the row-invariant verify step over
+// [last token, drafts...]; accept keeps the longest draft prefix that matches
+// the verifier's per-row argmax plus the verifier's own next token; emit writes
+// the accepted run, truncated at the first stop token exactly as the plain
+// loop truncates; the position advances by the run's length.
+//
+// The sequence is bit-identical to the plain loop: by the verify step's row
+// invariance, row i's argmax is the token the plain decode step at position
+// L+i+1 produces, so the accepted run is the plain continuation and a rejected
+// draft only discards work. `history` is the accepted token history known to
+// the caller (the prompt, or empty when the prefill was not seen here); it
+// seeds the drafter, and the drafter only ever proposes — acceptance is the
+// verifier's decision.
+static uint64_t run_spec_program_steps(
+    const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
+    uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
+    planner::KvCacheSession& session, std::span<const uint64_t> history,
+    std::chrono::steady_clock::time_point* first_out = nullptr,
+    const char* strategy_override = nullptr) {
+  const uint64_t limit = p.max_tokens > 0
+                             ? std::min<uint64_t>(uint64_t(p.max_tokens),
+                                                  tokens.size())
+                             : tokens.size();
+  const size_t cap =
+      size_t(std::min<int64_t>(p.max_drafts, kSpecMaxDrafts));
+  if (cap == 0 || !session.caches || session.n_ctx == 0) {
+    std::cerr << "[spec] the speculative loop needs a drafter cap and a "
+                 "session cache\n";
+    return step;
+  }
+  // "ngram" is the program's prompt-lookup drafter; "repeat" is the test seam's
+  // always-proposing drafter (the last token, cap times). Either way the
+  // verifier decides, so the accepted stream is the plain greedy stream.
+  const std::string_view strategy =
+      strategy_override ? strategy_override : p.draft_strategy;
+  const bool repeat = strategy == "repeat";
+  if (!repeat && strategy != "ngram") {
+    std::cerr << "[spec] unknown draft strategy '" << strategy << "'\n";
+    return step;
+  }
+  planner::NGramDrafter drafter(cap);
+  drafter.push(history);
+  // The valid KV length: everything before `pos` the caller prefilled is
+  // resident, and every later step appends exactly the tokens it feeds.
+  uint64_t L = pos;
+  uint64_t drafts[kSpecMaxDrafts];
+  std::vector<uint64_t> feed;
+  std::vector<int64_t> rows;
+
+  while (step < limit) {
+    ++g_spec_counters.iterations;
+    if (L + 1 > session.n_ctx) {
+      std::cerr << "[spec] the session cache is full at position " << L << "\n";
+      break;
+    }
+    // The drafter may propose at most what the cache can verify in one step:
+    // k+1 rows at positions L..L+k must fit.
+    drafter.push(token);
+    const uint64_t room = std::min<uint64_t>(
+        uint64_t(cap), session.n_ctx - L - 1);
+    const size_t k = repeat
+                         ? size_t(room)
+                         : drafter.propose(std::span<uint64_t>(drafts, size_t(room)));
+    if (repeat)
+      for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
+
+    if (k == 0) {
+      // (k == 0 ? step : verify): the captured single decode step at L.
+      if (!rt.prog) {
+        std::cerr << "[spec] no captured decode step for the k == 0 path\n";
+        break;
+      }
+      rt.cuda->set_pos(L);
+      if (!rt.cuda->seed_token(token) || !rt.prog->replay()) {
+        std::cerr << "[spec] the k == 0 decode step failed at position " << L
+                  << "\n";
+        break;
+      }
+      float next_f = -1.0f;
+      rt.cuda->read_token(&next_f);
+      const int64_t next = int64_t(next_f);
+      if (next < 0) break;
+      // The fed token is now resident; the sampled one is emitted but not fed.
+      ++L;
+      tokens[step] = next;
+      if (first_out && step == 1)
+        *first_out = std::chrono::steady_clock::now();
+      const bool stop = program_stop(p, next, step);
+      token = static_cast<uint64_t>(next);
+      ++step;
+      ++g_spec_counters.plain_steps;
+      ++g_spec_counters.emitted_tokens;
+      if (stop) break;
+      continue;
+    }
+
+    // verify: [last token, drafts...] at L..L+k, one row per position.
+    feed.assign(size_t(k) + 1, 0);
+    feed[0] = token;
+    std::copy_n(drafts, k, feed.begin() + 1);
+    rows.assign(size_t(k) + 1, -1);
+    if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
+      std::cerr << "[spec] the verify step failed at position " << L << "\n";
+      break;
+    }
+
+    // accept + emit: the run is the accepted drafts plus the verifier's token,
+    // truncated at a stop token or the caller's bound (spec_accept_run). The
+    // valid KV length advances by the emitted count: the verify appended k+1
+    // rows, but only `token` and the emitted run's fed tokens are live (the
+    // last emitted token is sampled, not fed). Rows past them are dead entries
+    // no later attention extent reaches (an extent at p reads only positions
+    // <= p) and the next steps overwrite in order — the same rollback the
+    // rejected drafts take.
+    uint64_t run[kSpecMaxDrafts + 1];
+    const SpecAccept decision =
+        spec_accept_run(std::span<const uint64_t>(drafts, k),
+                        std::span<const int64_t>(rows.data(), rows.size()),
+                        p.eos_tokens, step, limit,
+                        std::span<uint64_t>(run, size_t(k) + 1));
+    ++g_spec_counters.verify_steps;
+    g_spec_counters.draft_tokens += k;
+    g_spec_counters.accepted_tokens += decision.accepted;
+    g_spec_counters.emitted_tokens += decision.emitted;
+    if (decision.emitted == 0) break;  // the bound was already reached
+    for (size_t i = 0; i < decision.emitted; ++i) {
+      tokens[step + i] = int64_t(run[i]);
+      if (first_out && step + i == 1)
+        *first_out = std::chrono::steady_clock::now();
+    }
+    step += decision.emitted;
+    L += decision.emitted;
+    for (size_t i = 0; i + 1 < decision.emitted; ++i) drafter.push(run[i]);
+    token = run[decision.emitted - 1];
+    if (decision.stopped) break;
+  }
+  return step;
+}
+
 static std::map<std::pair<const Gemma4Model*, uint64_t>,
                 std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
 
@@ -1339,6 +1571,10 @@ static bool capture_reuse_enabled() {
 // bench.sh --ablate, group "decode-chunk"): one graph launch + one host
 // round-trip per k tokens.
 static uint32_t decode_chunk_size() {
+  // Speculation and chunking are alternative launch-overhead reducers: a
+  // speculative step needs the captured graph to mean exactly one decode step
+  // (the k == 0 fallback replays it once), so the chunk capture is off.
+  if (spec_enabled()) return 1;
   static const uint32_t k = [] {
     const char* e = std::getenv("SONICBOOM_DECODE_CHUNK");
     if (!e || !*e) return uint32_t(1);
@@ -1390,8 +1626,17 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   {
     mlir::OwningOpRef<mlir::ModuleOp> program_module(
         mlir::cast<mlir::ModuleOp>((*ir.module)->clone()));
-    if (mlir::failed(compiler::addGreedyProgram(*program_module, "greedy",
-                                                "prefill", {1}, {}, 0))) {
+    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program by
+    // default, the draft/verify/accept program when speculation is on. Both
+    // lift the same decode graph; only the loop around it differs.
+    const mlir::LogicalResult lifted =
+        spec_enabled()
+            ? compiler::addSpeculativeProgram(*program_module, "speculative",
+                                              "prefill", {1}, {}, 0,
+                                              kSpecMaxDrafts, "ngram")
+            : compiler::addGreedyProgram(*program_module, "greedy", "prefill",
+                                         {1}, {}, 0);
+    if (mlir::failed(lifted)) {
       std::cerr << "[plan] lowering boom.program failed (diagnostic above)\n";
       return nullptr;
     }
@@ -1819,7 +2064,16 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   rt->cuda->seed_token(start_token);
 
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (ir_program_enabled() && rt->program.valid) {
+  if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
+      rt->prog) {
+    // The speculative program drives the loop. There is no captured prefill
+    // here, so the drafter starts from an empty history: its proposals are
+    // verified, never trusted, so the token stream is the plain loop's.
+    planner::KvCacheSession session;
+    rt->cuda->publish_cache(session);
+    step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
+                                  session, {}, &t_first);
+  } else if (ir_program_enabled() && rt->program.valid) {
     // The lowered boom.program drives the loop; each step node is the captured
     // StepProgram replay (or the executor dispatch when nothing was captured).
     step = run_program_steps(*rt, rt->program, token, pos, tokens, step,
@@ -1934,6 +2188,22 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
               << " tok/s (excl plan+first)\n";
   }
   return step;
+}
+
+uint64_t spec_generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
+                                  uint64_t start_pos, std::span<int64_t> tokens,
+                                  uint64_t n_ctx, const char* draft_strategy) {
+  if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
+  if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt || !rt->prog || !rt->program.valid || !rt->program.speculative)
+    return 0;
+  rt->cuda->seed_token(start_token);
+  planner::KvCacheSession session;
+  rt->cuda->publish_cache(session);
+  return run_spec_program_steps(m, *rt, rt->program, start_token, start_pos,
+                                tokens, 0, session, {}, nullptr,
+                                draft_strategy);
 }
 
 // RAII: install `rec` as this thread's plan recorder for the scope, so an early
@@ -2073,6 +2343,11 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
                              std::span<int64_t>, uint64_t) {
   return 0;  // built without CUDA: no device spine is available
+}
+
+uint64_t spec_generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
+                                  std::span<int64_t>, uint64_t, const char*) {
+  return 0;  // built without CUDA: no speculative loop to run
 }
 
 bool warmup_spine_cuda(const Gemma4Model&, uint64_t) {
@@ -2621,7 +2896,21 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   // back from the persistent device slot (the synchronous D2H also drains the
   // graph stream). Otherwise fall back to per-step executor dispatch.
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (!dump_logits && ir_program_enabled() && rt->program.valid) {
+  if (!dump_logits && ir_program_enabled() && rt->program.valid &&
+      rt->program.speculative && rt->prog) {
+    // The speculative program drives the loop over the same cache the prefill
+    // filled: the session's when the caller passed one, otherwise a session
+    // published from this runtime's own cache (the one the step capture was
+    // recorded against).
+    planner::KvCacheSession local;
+    planner::KvCacheSession* kv = session;
+    if (!kv) {
+      rt->cuda->publish_cache(local);
+      kv = &local;
+    }
+    step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
+                                  *kv, prompt);
+  } else if (!dump_logits && ir_program_enabled() && rt->program.valid) {
     step = run_program_steps(*rt, rt->program, token, pos, tokens, step);
   } else if (!dump_logits && rt->prog && chunk > 1) {
     float carry = float(token);

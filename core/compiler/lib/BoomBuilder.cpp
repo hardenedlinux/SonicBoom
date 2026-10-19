@@ -455,12 +455,15 @@ mlir::OwningOpRef<mlir::ModuleOp> BoomBuilder::finish() {
 
 //--- the generation program ---------------------------------------------------
 
-mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
-                                     llvm::StringRef program_name,
-                                     llvm::StringRef prefill_graph,
-                                     llvm::ArrayRef<int64_t> prompt_shape,
-                                     llvm::ArrayRef<int64_t> eos_tokens,
-                                     int64_t max_tokens) {
+// Build the program around the module's decode graph. `max_drafts == 0` is the
+// greedy loop (step -> sample -> emit -> stop_check); a positive count is the
+// speculative loop (draft -> step/verify -> accept -> emit -> stop_check, with
+// the step as the drafter's k == 0 fallback).
+static mlir::LogicalResult buildGenerationProgram(
+    mlir::ModuleOp module, llvm::StringRef program_name,
+    llvm::StringRef prefill_graph, llvm::ArrayRef<int64_t> prompt_shape,
+    llvm::ArrayRef<int64_t> eos_tokens, int64_t max_tokens,
+    int64_t max_drafts, llvm::StringRef draft_strategy) {
   mlir::MLIRContext *context = module.getContext();
   const mlir::Location loc = mlir::UnknownLoc::get(context);
   // The program holds SCF control flow and arith step arithmetic, which cannot
@@ -472,13 +475,15 @@ mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
   // generation, and two decode graphs in a module would have to be chosen
   // between.
   boom::GraphOp graph;
+  int64_t graph_count = 0;
   for (mlir::Operation &op : module.getBody()->getOperations())
     if (auto g = llvm::dyn_cast<boom::GraphOp>(&op)) {
-      if (graph)
+      if (graph_count > 0)
         return module.emitError()
                << "a generation program lifts one decode graph, but the module "
                   "holds more than one";
       graph = g;
+      ++graph_count;
     }
   if (!graph)
     return module.emitError()
@@ -575,51 +580,156 @@ mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
 
   const mlir::Type i64Type = builder.getI64Type();
   mlir::Value zero = mlir::arith::ConstantIntOp::create(builder, loc, 0, 64);
-  auto loop = mlir::scf::WhileOp::create(
-      builder, loc, mlir::TypeRange{tokenType, posType, i64Type},
-      mlir::ValueRange{firstToken, pos0, zero},
-      // The condition body: one decode step, then sample, emit and stop.
-      [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
-        llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
-        stepOperands.append(kvArgs);
-        auto step = boom::StepOp::create(
-            b, l, mlir::TypeRange{outType}, stepOperands, graph.getTensorsAttr(),
-            graph.getInputsAttr(), graph.getOutputsAttr(),
-            graph.getDynamicExtentAttr());
-        // The decode graph's body becomes the step's: the same block
-        // arguments, now bound to the loop's SSA values.
-        step.getBody().takeBody(graph.getBody());
 
-        auto sample = boom::SampleOp::create(b, l, tokenType, step.getResult(0),
-                                             mlir::FloatAttr(),
-                                             mlir::IntegerAttr(),
-                                             mlir::FloatAttr());
-        boom::EmitOp::create(b, l, sample.getToken());
-        auto stop = boom::StopCheckOp::create(
-            b, l, b.getI1Type(), sample.getToken(), args[2],
-            llvm::ArrayRef<int64_t>(eos_tokens), uint64_t(max_tokens));
-        mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 1);
-        mlir::Value go = mlir::arith::XOrIOp::create(b, l, stop.getStop(), one);
-        mlir::scf::ConditionOp::create(
-            b, l, go, mlir::ValueRange{sample.getToken(), args[1], args[2]});
-      },
-      // The continuation: advance the position and the emitted count.
-      [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
-        mlir::Value nextPos = boom::PosIncOp::create(
-            b, l, posType, args[1], b.getI64IntegerAttr(1));
-        mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 64);
-        mlir::Value nextCount =
-            mlir::arith::AddIOp::create(b, l, args[2], one);
-        mlir::scf::YieldOp::create(
-            b, l, mlir::ValueRange{args[0], nextPos, nextCount});
-      });
+  if (max_drafts <= 0) {
+    // The greedy loop: one decode step, then sample, emit and stop.
+    mlir::scf::WhileOp::create(
+        builder, loc, mlir::TypeRange{tokenType, posType, i64Type},
+        mlir::ValueRange{firstToken, pos0, zero},
+        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
+          stepOperands.append(kvArgs);
+          auto step = boom::StepOp::create(
+              b, l, mlir::TypeRange{outType}, stepOperands,
+              graph.getTensorsAttr(), graph.getInputsAttr(),
+              graph.getOutputsAttr(), graph.getDynamicExtentAttr());
+          // The decode graph's body becomes the step's: the same block
+          // arguments, now bound to the loop's SSA values.
+          step.getBody().takeBody(graph.getBody());
 
-  // The graph's body now lives in the step; the graph op is spent.
-  graph.erase();
+          auto sample = boom::SampleOp::create(b, l, tokenType, step.getResult(0),
+                                               mlir::FloatAttr(),
+                                               mlir::IntegerAttr(),
+                                               mlir::FloatAttr());
+          boom::EmitOp::create(b, l, mlir::ValueRange{sample.getToken()});
+          auto stop = boom::StopCheckOp::create(
+              b, l, b.getI1Type(), sample.getToken(), args[2],
+              llvm::ArrayRef<int64_t>(eos_tokens), uint64_t(max_tokens));
+          mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 1);
+          mlir::Value go = mlir::arith::XOrIOp::create(b, l, stop.getStop(), one);
+          mlir::scf::ConditionOp::create(
+              b, l, go, mlir::ValueRange{sample.getToken(), args[1], args[2]});
+        },
+        // The continuation: advance the position and the emitted count.
+        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          mlir::Value nextPos = boom::PosIncOp::create(
+              b, l, posType, args[1], mlir::Value(), b.getI64IntegerAttr(1));
+          mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 64);
+          mlir::Value nextCount =
+              mlir::arith::AddIOp::create(b, l, args[2], one);
+          mlir::scf::YieldOp::create(
+              b, l, mlir::ValueRange{args[0], nextPos, nextCount});
+        });
+    graph.erase();
+  } else {
+    // The speculative loop. The carried tuple is (token, position, emitted
+    // count, accepted+1): the continuation advances the position by the accept
+    // node's run length, which the condition region computes and the
+    // continuation needs, so it rides along.
+    const int64_t rows = max_drafts + 1;
+    const mlir::Type draftsType = boom::TensorType::get(
+        context, llvm::ArrayRef<int64_t>{max_drafts}, sx::dtype_name(sx::DType::Int64));
+    const mlir::Type rowsType = boom::TensorType::get(
+        context, llvm::ArrayRef<int64_t>{rows}, sx::dtype_name(sx::DType::Int64));
+    const mlir::Type runType = boom::TensorType::get(
+        context, llvm::ArrayRef<int64_t>{rows}, sx::dtype_name(sx::DType::Int64));
+    const mlir::StringAttr graphName = graph.getGraphNameAttr();
+
+    mlir::scf::WhileOp::create(
+        builder, loc, mlir::TypeRange{tokenType, posType, i64Type, i64Type},
+        mlir::ValueRange{firstToken, pos0, zero, zero},
+        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          // Draft: up to max_drafts tokens following the accepted history.
+          auto draft = boom::DraftOp::create(
+              b, l, mlir::TypeRange{draftsType, i64Type},
+              b.getStringAttr(draft_strategy),
+              b.getI64IntegerAttr(max_drafts));
+
+          // The plain step: the k == 0 path, and the decode fallback the
+          // executor runs instead of a zero-row verify. It owns the graph body.
+          llvm::SmallVector<mlir::Value> stepOperands{args[0], args[1]};
+          stepOperands.append(kvArgs);
+          auto step = boom::StepOp::create(
+              b, l, mlir::TypeRange{outType}, stepOperands,
+              graph.getTensorsAttr(), graph.getInputsAttr(),
+              graph.getOutputsAttr(), graph.getDynamicExtentAttr());
+          step.getBody().takeBody(graph.getBody());
+
+          // Verify: the last token and the drafts, at the base position, over
+          // the cache handles. Row i's argmax is the plain greedy token at
+          // start_pos + i + 1.
+          llvm::SmallVector<mlir::Value> verifyOperands{
+              args[0], draft.getDrafts().front(), args[1]};
+          verifyOperands.append(kvArgs);
+          auto verify = boom::VerifyOp::create(
+              b, l, mlir::TypeRange{rowsType}, verifyOperands, graphName,
+              b.getI64IntegerAttr(rows));
+
+          // Accept: the longest matching draft prefix plus row a's argmax.
+          auto accept = boom::AcceptOp::create(
+              b, l, mlir::TypeRange{runType, tokenType, i64Type},
+              mlir::ValueRange{draft.getDrafts().front(), step.getResult(0),
+                               verify.getRows().front()});
+
+          boom::EmitOp::create(b, l, accept.getTokens());
+          auto stop = boom::StopCheckOp::create(
+              b, l, b.getI1Type(), accept.getTokens().front(), args[2],
+              llvm::ArrayRef<int64_t>(eos_tokens), uint64_t(max_tokens));
+          mlir::Value one = mlir::arith::ConstantIntOp::create(b, l, 1, 1);
+          mlir::Value go = mlir::arith::XOrIOp::create(b, l, stop.getStop(), one);
+          mlir::Value one64 = mlir::arith::ConstantIntOp::create(b, l, 1, 64);
+          mlir::Value advance =
+              mlir::arith::AddIOp::create(b, l, accept.getAccepted(), one64);
+          mlir::scf::ConditionOp::create(
+              b, l, go,
+              mlir::ValueRange{accept.getNext(), args[1], args[2], advance});
+        },
+        // The continuation: advance by the accepted run's length and count the
+        // run's tokens; the next iteration starts with no pending advance.
+        [&](mlir::OpBuilder &b, mlir::Location l, mlir::ValueRange args) {
+          mlir::Value nextPos = boom::PosIncOp::create(
+              b, l, posType, args[1], args[3], b.getI64IntegerAttr(1));
+          mlir::Value nextCount =
+              mlir::arith::AddIOp::create(b, l, args[2], args[3]);
+          mlir::Value zero64 = mlir::arith::ConstantIntOp::create(b, l, 0, 64);
+          mlir::scf::YieldOp::create(
+              b, l, mlir::ValueRange{args[0], nextPos, nextCount, zero64});
+        });
+
+    // The graph's body now lives in the step; the graph op is spent.
+    graph.erase();
+  }
 
   if (mlir::failed(mlir::verify(module.getOperation())))
     return mlir::failure();
   return mlir::success();
+}
+
+mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
+                                     llvm::StringRef program_name,
+                                     llvm::StringRef prefill_graph,
+                                     llvm::ArrayRef<int64_t> prompt_shape,
+                                     llvm::ArrayRef<int64_t> eos_tokens,
+                                     int64_t max_tokens) {
+  return buildGenerationProgram(module, program_name, prefill_graph,
+                                prompt_shape, eos_tokens, max_tokens,
+                                /*max_drafts=*/0, /*draft_strategy=*/{});
+}
+
+mlir::LogicalResult addSpeculativeProgram(mlir::ModuleOp module,
+                                          llvm::StringRef program_name,
+                                          llvm::StringRef prefill_graph,
+                                          llvm::ArrayRef<int64_t> prompt_shape,
+                                          llvm::ArrayRef<int64_t> eos_tokens,
+                                          int64_t max_tokens,
+                                          int64_t max_drafts,
+                                          llvm::StringRef draft_strategy) {
+  if (max_drafts <= 0)
+    return module.emitError()
+           << "a speculative program needs a positive draft length";
+  return buildGenerationProgram(module, program_name, prefill_graph,
+                                prompt_shape, eos_tokens, max_tokens,
+                                max_drafts, draft_strategy);
 }
 
 } // namespace sonicboom::compiler

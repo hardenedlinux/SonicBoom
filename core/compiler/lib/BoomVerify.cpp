@@ -841,9 +841,111 @@ mlir::LogicalResult SampleOp::verify() {
   return mlir::success();
 }
 
+// The verify step's row budget. The planner's resident verify kernels are
+// built for at most this many query rows (planner::kMaxVerifyRows, the device
+// token slot's size); a draft of k tokens needs k+1 rows.
+constexpr int64_t kVerifyRowCap = 16;
+
+// The draft node: a named strategy and a proposal cap inside the verify step's
+// row budget. The draft array's last dimension is the cap — that is what the
+// executor allocates for a proposal.
+mlir::LogicalResult DraftOp::verify() {
+  if (getStrategy().empty())
+    return emitOpError() << "names no drafting strategy";
+  const int64_t k = getMaxDrafts();
+  if (k <= 0 || k + 1 > kVerifyRowCap)
+    return emitOpError() << "max_drafts must be in [1, " << (kVerifyRowCap - 1)
+                         << "]: k drafts take k+1 verify rows, at most "
+                         << kVerifyRowCap;
+  if (getDrafts().size() != 1)
+    return emitOpError() << "produces one draft array, but has "
+                         << getDrafts().size() << " draft results";
+  const auto shape = boomValueShape(getDrafts().front().getType());
+  if (!shape.empty() && shape.back() != k)
+    return emitOpError() << "the draft array is shaped " << shape
+                         << " but max_drafts is " << k;
+  return mlir::success();
+}
+
+// The verify node: a named graph, a row budget at least two (one row is the
+// plain step) and a row array sized to it. Its operands are the feed's Boom
+// values and then the cache handles, in ascending layer order — the same
+// convention the prefill call follows.
+mlir::LogicalResult VerifyOp::verify() {
+  if (getGraphName().empty())
+    return emitOpError() << "names no verify graph";
+  const int64_t rows = getMaxRows();
+  if (rows <= 1 || rows > kVerifyRowCap)
+    return emitOpError() << "max_rows must be in [2, " << kVerifyRowCap << "]";
+  if (getRows().size() != 1)
+    return emitOpError() << "produces one row array, but has "
+                         << getRows().size() << " row results";
+  const auto shape = boomValueShape(getRows().front().getType());
+  if (!shape.empty() && shape.back() != rows)
+    return emitOpError() << "the row array is shaped " << shape
+                         << " but max_rows is " << rows;
+
+  bool sawKvHandle = false;
+  int64_t previousLayer = -1;
+  for (auto [index, operand] : llvm::enumerate(getInputs())) {
+    if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
+      if (kv.getLayer() <= previousLayer)
+        return emitOpError() << "the KV cache handles are in strict ascending "
+                                "layer order, but layer "
+                             << kv.getLayer() << " follows layer "
+                             << previousLayer;
+      previousLayer = kv.getLayer();
+      sawKvHandle = true;
+      continue;
+    }
+    if (!isBoomValueType(operand.getType()))
+      return emitOpError() << "operand " << index << " is typed "
+                           << operand.getType()
+                           << ", which is neither a Boom value nor a KV cache "
+                              "handle";
+    if (sawKvHandle)
+      return emitOpError()
+             << "operand " << index
+             << " is a value after a KV cache handle; the handles come last";
+  }
+  if (!sawKvHandle)
+    return emitOpError() << "takes no KV cache handle, but a verify step "
+                            "appends its rows to the cache";
+  return mlir::success();
+}
+
+// The accept node: the draft array, the plain step's token and the verifier
+// rows in, the accepted run and its accepted count out. It touches no cache
+// handle itself (the verify step wrote the rows; accept only decides how many
+// are live), so every operand is a Boom value and the run is non-empty. The
+// operand record is one variadic group, so the arity check is the structure
+// check: at least the draft array and the rows.
+mlir::LogicalResult AcceptOp::verify() {
+  if (getInputs().size() < 2)
+    return emitOpError() << "takes a draft array and verifier rows";
+  if (getTokens().empty())
+    return emitOpError() << "produces no accepted tokens";
+  for (auto [index, operand] : llvm::enumerate(getOperands()))
+    if (!isBoomValueType(operand.getType()))
+      return emitOpError() << "operand " << index << " is typed "
+                           << operand.getType()
+                           << ", which is not a Boom value";
+  return mlir::success();
+}
+
+// The position increment: `delta` is the per-iteration advance when no dynamic
+// `by` operand is given.
+mlir::LogicalResult PosIncOp::verify() {
+  if (getDelta() < 1)
+    return emitOpError() << "delta must be positive";
+  return mlir::success();
+}
+
 // The program: a prefill call, then a while loop carrying (token, position,
 // emitted count) whose body is exactly one step, one sample, one emit and one
-// stop check, and whose continuation advances the position.
+// stop check, and whose continuation advances the position. The speculative
+// form replaces the sample with draft / verify / accept and advances by the
+// accepted run's length.
 mlir::LogicalResult ProgramOp::verify() {
   if (!llvm::hasSingleElement(getBody()))
     return emitOpError() << "must have exactly one block";
@@ -910,70 +1012,113 @@ mlir::LogicalResult ProgramOp::verify() {
       !llvm::hasSingleElement(loop.getAfter()))
     return loop.emitOpError() << "must have one block in each region";
 
-  // The loop body: one step, then the sample/emit/stop-check chain; the
+  // The loop body: one step, then the sample/emit/stop-check chain (the plain
+  // loop) or the draft/verify/accept chain (the speculative one); the
   // continuation advances the position.
   StepOp step;
   SampleOp sample;
+  DraftOp draft;
+  VerifyOp verify;
+  AcceptOp accept;
   EmitOp emit;
   StopCheckOp stop;
-  bool sawEmit = false;
-  bool sawStop = false;
-  llvm::DenseSet<int64_t> order;  // 0 step, 1 sample, 2 emit, 3 stop
-  for (Operation &op : loop.getBeforeBody()->getOperations()) {
-    if (auto s = llvm::dyn_cast<StepOp>(&op)) {
-      if (step)
-        return op.emitOpError() << "the loop body holds more than one step";
+  int64_t atDraft = -1, atStep = -1, atSample = -1, atVerify = -1;
+  int64_t atAccept = -1, atEmit = -1, atStop = -1;
+  for (auto [index, op] : llvm::enumerate(loop.getBeforeBody()->getOperations())) {
+    const int64_t at = int64_t(index);
+    if (auto s = llvm::dyn_cast<DraftOp>(&op)) {
+      if (draft) return op.emitOpError() << "the loop body holds more than one draft";
+      draft = s;
+      atDraft = at;
+    } else if (auto s = llvm::dyn_cast<StepOp>(&op)) {
+      if (step) return op.emitOpError() << "the loop body holds more than one step";
       step = s;
-      order.insert(0);
+      atStep = at;
     } else if (auto s = llvm::dyn_cast<SampleOp>(&op)) {
-      if (sample)
-        return op.emitOpError() << "the loop body holds more than one sample";
+      if (sample) return op.emitOpError() << "the loop body holds more than one sample";
       sample = s;
-      order.insert(1);
+      atSample = at;
+    } else if (auto s = llvm::dyn_cast<VerifyOp>(&op)) {
+      if (verify) return op.emitOpError() << "the loop body holds more than one verify";
+      verify = s;
+      atVerify = at;
+    } else if (auto s = llvm::dyn_cast<AcceptOp>(&op)) {
+      if (accept) return op.emitOpError() << "the loop body holds more than one accept";
+      accept = s;
+      atAccept = at;
     } else if (auto e = llvm::dyn_cast<EmitOp>(&op)) {
-      if (sawEmit)
-        return op.emitOpError() << "the loop body holds more than one emit";
-      sawEmit = true;
+      if (emit) return op.emitOpError() << "the loop body holds more than one emit";
       emit = e;
-      order.insert(2);
+      atEmit = at;
     } else if (auto s = llvm::dyn_cast<StopCheckOp>(&op)) {
-      if (sawStop)
-        return op.emitOpError() << "the loop body holds more than one stop check";
-      sawStop = true;
+      if (stop) return op.emitOpError() << "the loop body holds more than one stop check";
       stop = s;
-      order.insert(3);
+      atStop = at;
     } else if (op.getName().getDialectNamespace() == "boom") {
       return op.emitOpError()
              << "a decode loop body holds a step, a sample, an emit and a stop "
-                "check, and no other Boom op";
+                "check (or, speculatively, a draft, a verify and an accept in "
+                "place of the sample), and no other Boom op";
     }
   }
   if (!step)
     return loop.emitOpError() << "its body holds no boom.step";
-  if (!sample)
-    return loop.emitOpError() << "its body holds no boom.sample";
-  if (!sawEmit)
+  if (!emit)
     return loop.emitOpError() << "its body holds no boom.emit";
-  if (!sawStop)
+  if (!stop)
     return loop.emitOpError() << "its body holds no boom.stop_check";
-  for (int64_t needed : {int64_t(1), int64_t(2), int64_t(3)})
-    if (!order.count(needed))
+
+  // The speculative body is all of draft, verify and accept or none of them:
+  // the step it keeps is the k == 0 fallback the executor runs instead of a
+  // zero-row verify.
+  const bool speculative = draft || verify || accept;
+  if (speculative) {
+    if (!draft || !verify || !accept)
+      return loop.emitOpError()
+             << "its speculative body holds a draft, a verify, an accept and "
+                "the plain step they fall back to, not a subset";
+    if (sample)
+      return loop.emitOpError()
+             << "its speculative body samples nothing; accept keeps the "
+                "verifier's token";
+    if (!(atDraft < atStep && atStep < atVerify && atVerify < atAccept &&
+          atAccept < atEmit && atEmit < atStop))
+      return loop.emitOpError()
+             << "the draft, step, verify, accept, emit and stop check are out "
+                "of order";
+  } else {
+    if (!sample)
+      return loop.emitOpError() << "its body holds no boom.sample";
+    if (!(atStep < atSample && atSample < atEmit && atEmit < atStop))
       return loop.emitOpError()
              << "the step, sample, emit and stop check are out of order";
+  }
 
-  bool sawPosInc = false;
+  PosIncOp posInc;
   for (Operation &op : loop.getAfterBody()->getOperations()) {
-    if (llvm::isa<PosIncOp>(&op))
-      sawPosInc = true;
-    else if (op.getName().getDialectNamespace() == "boom" &&
-             !llvm::isa<mlir::scf::YieldOp>(&op))
+    if (auto p = llvm::dyn_cast<PosIncOp>(&op)) {
+      if (posInc)
+        return op.emitOpError()
+               << "the loop body holds more than one position increment";
+      posInc = p;
+    } else if (op.getName().getDialectNamespace() == "boom" &&
+               !llvm::isa<mlir::scf::YieldOp>(&op)) {
       return op.emitOpError()
              << "a decode loop's continuation advances the position and yields "
                 "the next iteration";
+    }
   }
-  if (!sawPosInc)
+  if (!posInc)
     return loop.emitOpError()
            << "its continuation does not advance the position (boom.pos_inc)";
+  if (speculative && !posInc.getBy())
+    return loop.emitOpError()
+           << "its speculative continuation advances by the accept node's run "
+              "length (boom.pos_inc with `by`), not a fixed delta";
+  if (!speculative && posInc.getBy())
+    return loop.emitOpError()
+           << "a plain decode loop advances one position per iteration "
+              "(boom.pos_inc delta), but its pos_inc takes a dynamic `by`";
 
   return mlir::success();
 }

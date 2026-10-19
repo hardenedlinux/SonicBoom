@@ -236,6 +236,50 @@ bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
                        bool is_k, uint64_t first, uint64_t count,
                        std::span<float> out);
 
+// B6: the accept/emit decision of one speculative iteration, factored out of
+// the loop so its truncation rules are testable without a model or a device.
+//   accepted = the longest prefix with row_argmax[i] == drafts[i]
+//   out      = drafts[0..accepted-1], then row_argmax[accepted], cut after the
+//              first stop token (the stop token is emitted, exactly as the plain
+//              loop emits it before breaking) or once emitted_before + emitted
+//              reaches `limit`.
+// `row_argmax` and `out` must have room for drafts.size() + 1 entries.
+struct SpecAccept {
+  uint64_t accepted = 0;  // drafts the verifier confirmed
+  uint64_t emitted = 0;   // run tokens to emit (drafts + the verifier token)
+  bool stopped = false;   // a stop token ended the run
+};
+SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
+                           std::span<const int64_t> row_argmax,
+                           std::span<const int64_t> eos_tokens,
+                           uint64_t emitted_before, uint64_t limit,
+                           std::span<uint64_t> out);
+
+// B6/B8 diagnostic counters for the speculative loop. Process-wide (the decode
+// path is single-threaded); reset them before a run whose α — accepted_tokens /
+// draft_tokens — is being reported.
+struct SpecCounters {
+  uint64_t iterations = 0;       // loop iterations
+  uint64_t plain_steps = 0;      // iterations the drafter proposed nothing
+  uint64_t verify_steps = 0;     // iterations that ran a verify (k > 0)
+  uint64_t draft_tokens = 0;     // tokens proposed and verified
+  uint64_t accepted_tokens = 0;  // drafts the verifier accepted
+  uint64_t emitted_tokens = 0;   // tokens emitted
+};
+SpecCounters spec_counters();
+void spec_counters_reset();
+
+// Test seam (B6): run the speculative loop over `tokens` on the model's decode
+// runtime with a chosen drafter strategy, bypassing SONICBOOM_SPEC's program.
+// "ngram" is the runtime's prompt-lookup drafter; "repeat" proposes the last
+// accepted token `max_drafts` times, so every iteration runs a verify — the
+// deterministic way for the B6 test to exercise the verify/accept/emit path.
+// Because the drafter only proposes and the verifier decides, the token stream
+// must still be the plain greedy stream. Returns the number of tokens written.
+uint64_t spec_generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
+                                  uint64_t start_pos, std::span<int64_t> tokens,
+                                  uint64_t n_ctx, const char* draft_strategy);
+
 // Prefill + decode through the CPU spine. Processes the whole `prompt` in one
 // batched graph pass (build_gemma4_prefill_graph → plan_execution →
 // RuntimeExecutor with the batched OpKinds), samples `tokens[0]` from the final

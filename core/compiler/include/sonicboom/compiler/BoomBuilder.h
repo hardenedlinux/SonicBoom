@@ -112,6 +112,27 @@ mlir::LogicalResult addGreedyProgram(mlir::ModuleOp module,
                                      llvm::ArrayRef<int64_t> eos_tokens,
                                      int64_t max_tokens);
 
+// The speculative form of the program (B6). The loop body is
+//
+//   boom.draft -> boom.step / boom.verify -> boom.accept -> boom.emit ->
+//   boom.stop_check
+//
+// with the step kept as the k == 0 fallback the executor runs when the drafter
+// proposes nothing. The draft node names the proposal strategy (`"ngram"`:
+// the prompt-lookup drafter) and its cap `max_drafts`; `max_drafts + 1` is the
+// verify step's row budget (at most 16, the device token slot's rows). The
+// continuation advances the carried position by the accept node's run length
+// plus one (boom.pos_inc's `by` operand). The graph op is consumed exactly as
+// addGreedyProgram consumes it.
+mlir::LogicalResult addSpeculativeProgram(mlir::ModuleOp module,
+                                          llvm::StringRef program_name,
+                                          llvm::StringRef prefill_graph,
+                                          llvm::ArrayRef<int64_t> prompt_shape,
+                                          llvm::ArrayRef<int64_t> eos_tokens,
+                                          int64_t max_tokens,
+                                          int64_t max_drafts,
+                                          llvm::StringRef draft_strategy);
+
 // A whole graph under construction: one module holding one boom.graph op, whose
 // body is the node list and whose block arguments are the inputs the emitter
 // declared.
