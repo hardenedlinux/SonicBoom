@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_ngram_drafter test_clip_grad_norm test_runtime_features)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_ngram_drafter test_clip_grad_norm test_runtime_features)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -124,6 +124,11 @@ target_compile_definitions(test_spec_rollback PRIVATE
 target_compile_definitions(test_spec_program PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# test_spec_bootstrap (S2 cold-start exploration) needs the Qwen GGUF and runs
+# its case in a forked child, like the other spec suites.
+target_compile_definitions(test_spec_bootstrap PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
 # test_ngram_drafter's coverage case feeds the code-edit trace's source files
 # (the same files workload_bench pastes) through the drafter; it needs the
 # repository root to read them.
@@ -164,7 +169,7 @@ target_compile_definitions(test_ngram_drafter PRIVATE
 # test_vocab), and everything else in the suite — CPU-only tests stay parallel.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
-                              test_spec_program
+                              test_spec_program test_spec_bootstrap
   PROPERTIES RESOURCE_LOCK gpu_vram)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
