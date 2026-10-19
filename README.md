@@ -336,10 +336,10 @@ Its limits:
   CUDA-graph capture) and is cached under `~/.cache/sonicboom/tune/`, keyed by
   GPU, operator and shape class — never by prompt length or position.
   `SONICBOOM_AUTOTUNE=0` uses the static defaults, `force` retunes. Generated
-  decode attention is opt-in (`SONICBOOM_ATTN_DECODE=codegen`): it is faster
-  at depth, but it reorders floating-point sums and does not reproduce the
-  default token stream bit-for-bit. The hand-written attention kernel remains
-  the default and the numerical reference.
+  decode attention is the default decode path: it uses the hand-written
+  split-KV pair's chunk rule, fused-multiply-add rounding and reduction order,
+  so it reproduces the token stream bit-for-bit (`SONICBOOM_ATTN_DECODE=own`
+  selects the hand-written pair, which remains the numerical reference).
 - **GPU:** CUDA on sm_86. `CMAKE_CUDA_ARCHITECTURES` defaults to `native` (the
   GPU in the build machine) and is resolved at configure time; other
   architectures have not been tested. Whatever was compiled is reported by

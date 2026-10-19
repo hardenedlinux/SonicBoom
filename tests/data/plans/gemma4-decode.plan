@@ -153,8 +153,8 @@ step 16 task 16 node 20 op attention backend sonic stream s0
   buf in 2 t19 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t22 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 17 task 17 node 1189 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t22 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -380,8 +380,8 @@ step 43 task 43 node 51 op attention backend sonic stream s0
   buf in 2 t50 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t53 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 44 task 44 node 1193 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t53 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -607,8 +607,8 @@ step 70 task 70 node 82 op attention backend sonic stream s0
   buf in 2 t81 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t84 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 71 task 71 node 1197 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t84 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -834,8 +834,8 @@ step 97 task 97 node 113 op attention backend sonic stream s0
   buf in 2 t112 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t115 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 98 task 98 node 1201 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t115 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -1061,8 +1061,8 @@ step 124 task 124 node 144 op attention backend sonic stream s0
   buf in 2 t143 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t146 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 125 task 125 node 1205 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t146 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -1288,8 +1288,8 @@ step 151 task 151 node 175 op attention backend sonic stream s0
   buf in 2 t174 buffer b22 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t177 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 152 task 152 node 1209 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t177 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -1515,8 +1515,8 @@ step 178 task 178 node 206 op attention backend sonic stream s0
   buf in 2 t205 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t208 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 179 task 179 node 1213 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t208 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -1742,8 +1742,8 @@ step 205 task 205 node 237 op attention backend sonic stream s0
   buf in 2 t236 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t239 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 206 task 206 node 1217 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t239 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -1969,8 +1969,8 @@ step 232 task 232 node 268 op attention backend sonic stream s0
   buf in 2 t267 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t270 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 233 task 233 node 1221 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t270 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -2196,8 +2196,8 @@ step 259 task 259 node 299 op attention backend sonic stream s0
   buf in 2 t298 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t301 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 260 task 260 node 1225 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t301 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -2423,8 +2423,8 @@ step 286 task 286 node 330 op attention backend sonic stream s0
   buf in 2 t329 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t332 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 287 task 287 node 1229 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t332 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -2650,8 +2650,8 @@ step 313 task 313 node 361 op attention backend sonic stream s0
   buf in 2 t360 buffer b22 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t363 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 314 task 314 node 1233 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t363 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -2877,8 +2877,8 @@ step 340 task 340 node 392 op attention backend sonic stream s0
   buf in 2 t391 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t394 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 341 task 341 node 1237 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t394 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -3104,8 +3104,8 @@ step 367 task 367 node 423 op attention backend sonic stream s0
   buf in 2 t422 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t425 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 368 task 368 node 1241 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t425 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -3331,8 +3331,8 @@ step 394 task 394 node 454 op attention backend sonic stream s0
   buf in 2 t453 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t456 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 395 task 395 node 1245 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t456 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -3558,8 +3558,8 @@ step 421 task 421 node 485 op attention backend sonic stream s0
   buf in 2 t484 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t487 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 422 task 422 node 1249 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t487 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -3785,8 +3785,8 @@ step 448 task 448 node 516 op attention backend sonic stream s0
   buf in 2 t515 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t518 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 449 task 449 node 1253 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t518 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -4012,8 +4012,8 @@ step 475 task 475 node 547 op attention backend sonic stream s0
   buf in 2 t546 buffer b22 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t549 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 476 task 476 node 1257 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t549 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -4239,8 +4239,8 @@ step 502 task 502 node 578 op attention backend sonic stream s0
   buf in 2 t577 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t580 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 503 task 503 node 1261 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t580 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -4466,8 +4466,8 @@ step 529 task 529 node 609 op attention backend sonic stream s0
   buf in 2 t608 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t611 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 530 task 530 node 1265 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t611 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -4693,8 +4693,8 @@ step 556 task 556 node 640 op attention backend sonic stream s0
   buf in 2 t639 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t642 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 557 task 557 node 1269 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t642 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -4920,8 +4920,8 @@ step 583 task 583 node 671 op attention backend sonic stream s0
   buf in 2 t670 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t673 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 584 task 584 node 1273 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t673 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -5147,8 +5147,8 @@ step 610 task 610 node 702 op attention backend sonic stream s0
   buf in 2 t701 buffer b10 offset 0 size 2048 shape [512] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t704 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 611 task 611 node 1277 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t704 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -5374,8 +5374,8 @@ step 637 task 637 node 733 op attention backend sonic stream s0
   buf in 2 t732 buffer b22 offset 0 size 4096 shape [1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t735 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 638 task 638 node 1281 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t735 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -5557,8 +5557,8 @@ step 660 task 660 node 757 op attention backend sonic stream s0
   buf in 0 t758 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t759 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 661 task 661 node 1285 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t759 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -5740,8 +5740,8 @@ step 683 task 683 node 781 op attention backend sonic stream s0
   buf in 0 t782 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t783 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 684 task 684 node 1289 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t783 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -5923,8 +5923,8 @@ step 706 task 706 node 805 op attention backend sonic stream s0
   buf in 0 t806 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t807 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 707 task 707 node 1293 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t807 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -6106,8 +6106,8 @@ step 729 task 729 node 829 op attention backend sonic stream s0
   buf in 0 t830 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t831 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 730 task 730 node 1297 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t831 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -6289,8 +6289,8 @@ step 752 task 752 node 853 op attention backend sonic stream s0
   buf in 0 t854 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t855 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 753 task 753 node 1301 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t855 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -6472,8 +6472,8 @@ step 775 task 775 node 877 op attention backend sonic stream s0
   buf in 0 t878 buffer b19 offset 0 size 16384 shape [4096] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t879 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 776 task 776 node 1305 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t879 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -6655,8 +6655,8 @@ step 798 task 798 node 901 op attention backend sonic stream s0
   buf in 0 t902 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t903 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 799 task 799 node 1309 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t903 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -6838,8 +6838,8 @@ step 821 task 821 node 925 op attention backend sonic stream s0
   buf in 0 t926 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t927 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 822 task 822 node 1313 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t927 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -7021,8 +7021,8 @@ step 844 task 844 node 949 op attention backend sonic stream s0
   buf in 0 t950 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t951 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 845 task 845 node 1317 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t951 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -7204,8 +7204,8 @@ step 867 task 867 node 973 op attention backend sonic stream s0
   buf in 0 t974 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t975 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 868 task 868 node 1321 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t975 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -7387,8 +7387,8 @@ step 890 task 890 node 997 op attention backend sonic stream s0
   buf in 0 t998 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t999 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 891 task 891 node 1325 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t999 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -7570,8 +7570,8 @@ step 913 task 913 node 1021 op attention backend sonic stream s0
   buf in 0 t1022 buffer b19 offset 0 size 16384 shape [4096] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1023 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 914 task 914 node 1329 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t1023 buffer b18 offset 0 size 16384 shape [4096] dtype float32
@@ -7753,8 +7753,8 @@ step 936 task 936 node 1045 op attention backend sonic stream s0
   buf in 0 t1046 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1047 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 937 task 937 node 1333 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t1047 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -7936,8 +7936,8 @@ step 959 task 959 node 1069 op attention backend sonic stream s0
   buf in 0 t1070 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1071 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 960 task 960 node 1337 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t1071 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -8119,8 +8119,8 @@ step 982 task 982 node 1093 op attention backend sonic stream s0
   buf in 0 t1094 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1095 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 983 task 983 node 1341 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t1095 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -8302,8 +8302,8 @@ step 1005 task 1005 node 1117 op attention backend sonic stream s0
   buf in 0 t1118 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1119 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1006 task 1006 node 1345 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t1119 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -8485,8 +8485,8 @@ step 1028 task 1028 node 1141 op attention backend sonic stream s0
   buf in 0 t1142 buffer b7 offset 0 size 8192 shape [2048] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1143 buffer b6 offset 0 size 8192 shape [2048] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
+  launch attn-dec-d256-g4-window:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d256-g4-window:combine grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 1029 task 1029 node 1349 op quantize backend sonic stream s0
   attr buf 10
   buf in 0 t1143 buffer b6 offset 0 size 8192 shape [2048] dtype float32
@@ -8668,8 +8668,8 @@ step 1051 task 1051 node 1165 op attention backend sonic stream s0
   buf in 0 t1166 buffer b19 offset 0 size 16384 shape [4096] dtype float32
   buf in_graph 1 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1167 buffer b18 offset 0 size 16384 shape [4096] dtype float32
-  launch decode_attention_split_kernel grid 80x1x1 block 128x1x1 smem 208 stream s0
-  launch decode_attention_merge_kernel grid 8x1x1 block 512x1x1 smem 0 stream s0
+  launch attn-dec-d512-g4-causal:decode grid 40x8x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d512-g4-causal:combine grid 8x1x1 block 512x1x1 smem 0 stream s0
 step 1052 task 1052 node 1353 op quantize backend sonic stream s0
   attr buf 24
   buf in 0 t1167 buffer b18 offset 0 size 16384 shape [4096] dtype float32

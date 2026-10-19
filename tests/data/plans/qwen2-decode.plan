@@ -93,8 +93,8 @@ step 9 task 9 node 12 op attention backend sonic stream s0
   buf out 0 t14 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 10 task 10 node 509 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t14 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -236,8 +236,8 @@ step 25 task 25 node 33 op attention backend sonic stream s0
   buf out 0 t35 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 26 task 26 node 513 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t35 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -379,8 +379,8 @@ step 41 task 41 node 54 op attention backend sonic stream s0
   buf out 0 t56 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 42 task 42 node 517 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t56 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -521,8 +521,8 @@ step 57 task 57 node 75 op attention backend sonic stream s0
   buf out 0 t77 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 58 task 58 node 521 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t77 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -664,8 +664,8 @@ step 73 task 73 node 96 op attention backend sonic stream s0
   buf out 0 t98 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 74 task 74 node 525 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t98 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -806,8 +806,8 @@ step 89 task 89 node 117 op attention backend sonic stream s0
   buf out 0 t119 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 90 task 90 node 529 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t119 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -948,8 +948,8 @@ step 105 task 105 node 138 op attention backend sonic stream s0
   buf out 0 t140 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 106 task 106 node 533 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t140 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1091,8 +1091,8 @@ step 121 task 121 node 159 op attention backend sonic stream s0
   buf out 0 t161 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 122 task 122 node 537 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t161 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1234,8 +1234,8 @@ step 137 task 137 node 180 op attention backend sonic stream s0
   buf out 0 t182 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 138 task 138 node 541 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t182 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1377,8 +1377,8 @@ step 153 task 153 node 201 op attention backend sonic stream s0
   buf out 0 t203 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 154 task 154 node 545 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t203 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1520,8 +1520,8 @@ step 169 task 169 node 222 op attention backend sonic stream s0
   buf out 0 t224 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 170 task 170 node 549 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t224 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1663,8 +1663,8 @@ step 185 task 185 node 243 op attention backend sonic stream s0
   buf out 0 t245 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 186 task 186 node 553 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t245 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1805,8 +1805,8 @@ step 201 task 201 node 264 op attention backend sonic stream s0
   buf out 0 t266 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 202 task 202 node 557 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t266 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -1947,8 +1947,8 @@ step 217 task 217 node 285 op attention backend sonic stream s0
   buf out 0 t287 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 218 task 218 node 561 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t287 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2090,8 +2090,8 @@ step 233 task 233 node 306 op attention backend sonic stream s0
   buf out 0 t308 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 234 task 234 node 565 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t308 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2232,8 +2232,8 @@ step 249 task 249 node 327 op attention backend sonic stream s0
   buf out 0 t329 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 250 task 250 node 569 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t329 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2374,8 +2374,8 @@ step 265 task 265 node 348 op attention backend sonic stream s0
   buf out 0 t350 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 266 task 266 node 573 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t350 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2517,8 +2517,8 @@ step 281 task 281 node 369 op attention backend sonic stream s0
   buf out 0 t371 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 282 task 282 node 577 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t371 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2659,8 +2659,8 @@ step 297 task 297 node 390 op attention backend sonic stream s0
   buf out 0 t392 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 298 task 298 node 581 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t392 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2801,8 +2801,8 @@ step 313 task 313 node 411 op attention backend sonic stream s0
   buf out 0 t413 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 314 task 314 node 585 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t413 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -2944,8 +2944,8 @@ step 329 task 329 node 432 op attention backend sonic stream s0
   buf out 0 t434 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 330 task 330 node 589 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t434 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -3086,8 +3086,8 @@ step 345 task 345 node 453 op attention backend sonic stream s0
   buf out 0 t455 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 346 task 346 node 593 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t455 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -3229,8 +3229,8 @@ step 361 task 361 node 474 op attention backend sonic stream s0
   buf out 0 t476 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 362 task 362 node 597 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t476 buffer b3 offset 0 size 3584 shape [896] dtype float32
@@ -3371,8 +3371,8 @@ step 377 task 377 node 495 op attention backend sonic stream s0
   buf out 0 t497 buffer b3 offset 0 size 3584 shape [896] dtype float32
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
   launch kv_append_kernel grid 1x1x1 block 256x1x1 smem 0 stream s0
-  launch decode_attention_split_kernel grid 80x1x1 block 224x1x1 smem 364 stream s0
-  launch decode_attention_merge_kernel grid 14x1x1 block 64x1x1 smem 0 stream s0
+  launch attn-dec-d64-g7-causal:decode grid 40x14x1 block 32x1x1 smem 1024 stream s0
+  launch attn-dec-d64-g7-causal:combine grid 14x1x1 block 64x1x1 smem 0 stream s0
 step 378 task 378 node 601 op quantize backend sonic stream s0
   attr buf 1
   buf in 0 t497 buffer b3 offset 0 size 3584 shape [896] dtype float32

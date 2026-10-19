@@ -614,14 +614,16 @@ itself; the hand-written kernels remain the numerical and performance reference.
 **Status (v0.0.3).** Implemented and shipped. The glue set is generated
 (`core/compiler/lib/GlueCodegen.cpp`), and the same NVVM route now also
 generates prefill FA-2 attention (`AttentionCodegen.cpp`), the split-KV decode
-pair (opt-in), and a bf16 dense GEMM with an `mma.m16n8k16` core and
+pair, and a bf16 dense GEMM with an `mma.m16n8k16` core and
 `cp.async` double buffering (`GemmCodegen.cpp`). Kernel choice and tile
 configuration moved to a per-GPU runtime autotuner with a disk cache
 (`core/src/planner/autotune.h`), keyed by GPU, operator and shape class. The
-generated decode attention reorders floating-point sums, so it remains behind
-`SONICBOOM_ATTN_DECODE=codegen`; every other generated kernel reproduces the
-default token stream. The hand-written kernels remain the numerical and
-performance reference.
+generated decode pair reproduces the hand-written kernel's chunk split, fma
+rounding and reduction order, so it is the default decode path and its token
+stream is bit-identical to the hand-written reference
+(`SONICBOOM_ATTN_DECODE=own` for the comparison arm). Every generated kernel
+reproduces the default token stream. The hand-written kernels remain the
+numerical and performance reference.
 
 ### 7.6 The gates (run before each step is declared done)
 

@@ -1,7 +1,8 @@
 // Compiler-generated flash-decoding (split-KV) test (Stage 5).
 //
-// SONICBOOM_ATTN_DECODE=codegen routes nn::cuda::decode_attention_dev through
-// the MLIR-generated pair compiler/AttentionCodegen.h emits for decode shapes:
+// nn::cuda::decode_attention_dev routes through the MLIR-generated pair
+// (SONICBOOM_ATTN_DECODE=codegen; also the default) that
+// compiler/AttentionCodegen.h emits for decode shapes:
 // `fa_decode` (one warp per (query head, key chunk), online softmax in f32)
 // and `fa_combine` (one block per query head, ascending chunk order). The
 // generated kernels read the f32 KV cache directly (no f16 staging), so the
@@ -17,7 +18,10 @@
 //
 // The hand-written split-KV kernel is run on the same inputs: the generated
 // path must not be worse against the fp64 reference than the kernel it
-// replaces. A second codegen run must be bit-identical (determinism).
+// replaces, and at the default chunk (the shared split rule) it must be
+// bit-identical to it, which is what lets the generated pair be the default
+// without touching the token stream. A second codegen run must be
+// bit-identical (determinism).
 //
 // Skips cleanly (exit 0) when no CUDA device is present.
 
@@ -29,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -257,6 +262,24 @@ int main() {
       // than the kernel it replaces (small slack for run-to-run comparison).
       check(cg_err <= std::max(2.0 * own_err, 1e-4),
             "codegen error not worse than the hand-written split-KV");
+    }
+    // Default chunk on both paths = the same split of the same window, and the
+    // generated pair reproduces the hand-written fma/reduction order, so the
+    // outputs must agree bit for bit.
+    if (own.size() == cg.size()) {
+      size_t diff = 0;
+      double worst = 0.0;
+      for (size_t i = 0; i < own.size(); ++i)
+        if (std::memcmp(&own[i], &cg[i], sizeof(float)) != 0) {
+          ++diff;
+          worst = std::max(worst, std::abs(double(own[i]) - double(cg[i])));
+        }
+      if (diff != 0)
+        std::cerr << "  bit diff: " << diff << " of " << own.size()
+                  << " values, max |delta| " << worst << "\n";
+      check(diff == 0, "codegen is bit-identical to the hand-written split-KV");
+    } else {
+      check(false, "own and codegen outputs have the same size");
     }
     check(cg.size() == cg2.size() &&
               std::equal(cg.begin(), cg.end(), cg2.begin()),

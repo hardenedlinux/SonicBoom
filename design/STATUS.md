@@ -61,10 +61,12 @@ SM clock medians: 1912 MHz (Gemma), 1942 MHz (Qwen). pp512 kernel time is
   Both SonicBoom paths now iterate only the valid causal/window-minimal KV;
   the generated FA-2 is warp/scalar and the hand-written tiled kernel is the
   faster one at d512. The next lever is a generated tensor-core (mma) FA-2.
-- **Generated split-KV decode attention is opt-in**
-  (`SONICBOOM_ATTN_DECODE=codegen`). It is about 2% faster end to end at d512
-  but reorders floating-point sums; default token streams are bit-identical,
-  so the own kernel remains the default under the project's numerics rule.
+- **Generated split-KV decode attention is the default.** Its chunk rule,
+  fused-multiply-add rounding and reduction order match the hand-written pair,
+  so the token stream is bit-identical; measured +1% (tg64) to +3-4% (decode
+  at depth 512) end to end for Gemma 4 and Qwen2.5 on the RTX 3050.
+  `SONICBOOM_ATTN_DECODE=own` keeps the hand-written pair as the ablation and
+  numerical reference.
 - **Generated decode versus prefill choice gap at d512.** The autotuner keeps
   codegen for the d512 prefill class, while a 256-query sweep measures the own
   kernel about 12% faster; the class probe's query length differs from the

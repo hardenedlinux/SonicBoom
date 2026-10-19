@@ -1125,9 +1125,11 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
 // over key chunks of a runtime length, aligned to absolute positions: chunk s
 // covers keys [s*C, (s+1)*C), clamped to the window's valid lower bound and to
 // the current position. Each lane owns head_dim/32 output columns and keeps
-// them in registers; the q·k dot is reduced across the warp with XOR shuffles,
-// so the reduction order depends only on head_dim. The combine reads chunks in
-// ascending order, so the output does not depend on scheduling.
+// them in registers. Rounding and reduction order match the hand-written
+// split-KV pair exactly (fma chains for q·k, P·V and the combine; __shfl_down
+// trees at o = 16, 8, 4, 2, 1; a final division), so for the same chunk length
+// the two paths are bit-identical. The combine reads chunks in ascending
+// order, so the output does not depend on scheduling.
 std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) {
   const int D = sh.head_dim;
   const int GQA = sh.gqa;
@@ -1266,18 +1268,23 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
       return e.val("llvm.getelementptr %" + ptr + "[" + off +
                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
     };
-    std::string acc;
+    // The dot product is a chain of fused multiply-adds in ascending i, and
+    // the warp reduction is the hand-written kernel's __shfl_down tree
+    // (o = 16, 8, 4, 2, 1), so lane 0 ends with the same f32 value the decode
+    // reference path stores. Only lane 0's score is used (it is staged in
+    // shared memory and re-read by every lane), so the other lanes' partial
+    // sums are don't-care.
+    std::string acc = C["cf0"];
     for (int i = 0; i < K; ++i) {
       const std::string k =
           e.val("llvm.load " + at("kc", i) + " : !llvm.ptr -> f32");
-      const std::string t = e.val("arith.mulf " + qv[i] + ", " + k + " : f32");
-      acc = i == 0 ? t : e.val("arith.addf " + acc + ", " + t + " : f32");
+      acc = e.val("llvm.intr.fma(" + qv[i] + ", " + k + ", " + acc +
+                  ") : (f32, f32, f32) -> f32");
     }
-    // Full-warp XOR reduction: every lane ends with the dot product.
-    for (int d = 1; d < 32; d *= 2) {
+    for (int d = 16; d > 0; d >>= 1) {
       const std::string c = e.val("arith.constant " + s(d) + " : i32");
       const std::string sh =
-          e.val2("gpu.shuffle xor " + acc + ", " + c + ", " + C["c32"] +
+          e.val2("gpu.shuffle down " + acc + ", " + c + ", " + C["c32"] +
                  " : f32").first;
       acc = e.val("arith.addf " + acc + ", " + sh + " : f32");
     }
@@ -1388,9 +1395,10 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     for (int i = 0; i < K; ++i) {
       const std::string v =
           e.val("llvm.load " + at("vc", i) + " : !llvm.ptr -> f32");
-      iv["%o" + s(i)] =
-          e.val("arith.addf " + iv["%o" + s(i)] + ", " +
-                e.val("arith.mulf " + p + ", " + v + " : f32") + " : f32");
+      // Fused P*V accumulate: the reference kernel's `acc += p * v` is one
+      // FFMA, so a separate mul+add would round differently.
+      iv["%o" + s(i)] = e.val("llvm.intr.fma(" + p + ", " + v + ", " +
+                              iv["%o" + s(i)] + ") : (f32, f32, f32) -> f32");
     }
     {
       const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] + " : i64");
@@ -1416,7 +1424,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     // Warp tree sum of the per-lane l partials; lane 0 ends with the total,
     // which is the only copy stored (same reduction as the own kernel).
     std::string lt = out["%l"];
-    for (int d = 1; d < 32; d *= 2) {
+    for (int d = 16; d > 0; d >>= 1) {
       const std::string c = e.val("arith.constant " + s(d) + " : i32");
       const std::string sh =
           e.val2("gpu.shuffle down " + lt + ", " + c + ", " + C["c32"] +
@@ -1535,25 +1543,26 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   // only; the chunk's l contributes to the denominator weight alone.
   const std::string ex =
       f.val("arith.select " + wok + ", " + ex0 + ", " + C2["cf0"] + " : f32");
-  const std::string wv = f.val("arith.mulf " + ex + ", " + lv2 + " : f32");
   const std::string oo = f.val("arith.addi " + w3 + ", " + ct64 + " : i64");
   const std::string op = f.val("llvm.getelementptr %part[" + oo +
                                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
   const std::string ov = f.val("llvm.load " + op + " : !llvm.ptr -> f32");
-  const std::string na = f.val("arith.addf %a, " +
-                               f.val("arith.mulf " + ex + ", " + ov + " : f32") +
-                               " : f32");
-  const std::string nw = f.val("arith.addf %w, " + wv + " : f32");
+  // The reference merge accumulates `l += w * l_c` and `acc += w * o_c` as
+  // fused multiply-adds and divides once at the end, so use the same rounding.
+  // Empty chunks (l == 0, written as neutral by fa_decode) contribute
+  // fma(0, 0, x) == x, exactly as skipping them would.
+  const std::string na = f.val("llvm.intr.fma(" + ex + ", " + ov + ", %a" +
+                               ") : (f32, f32, f32) -> f32");
+  const std::string nw = f.val("llvm.intr.fma(" + ex + ", " + lv2 + ", %w" +
+                               ") : (f32, f32, f32) -> f32");
   f.op("scf.yield " + na + ", " + nw + " : f32, f32");
   f.op("}");
   const std::string cacc = "%ca";
   const std::string csumw = "%cw";
-  const std::string inv = f.val("arith.divf " + C2["cone"] + ", " + csumw +
-                                " : f32");
   const std::string den = f.val("arith.cmpf ogt, " + csumw + ", " + C2["cf0"] +
                                 " : f32");
   const std::string yv = f.val("arith.select " + den + ", " +
-                               f.val("arith.mulf " + cacc + ", " + inv +
+                               f.val("arith.divf " + cacc + ", " + csumw +
                                      " : f32") + ", " + C2["cf0"] + " : f32");
   const std::string ob = f.val("arith.muli " + bh64 + ", " + C2["lD"] + " : i64");
   const std::string oe = f.val("arith.addi " + ob + ", " + ct64 + " : i64");
@@ -1655,13 +1664,16 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
-  // attn7: conditional online-softmax rescale (skip the O rescale when the
-  // running max did not grow) and the opt-in exp2 softmax arm; attn6:
+  // attn8: the generated decode pair matches the hand-written split-KV pair
+  // bit-for-bit (fma chains for q·k / P·V / combine, __shfl_down reduction
+  // trees, final division); attn7: conditional online-softmax rescale (skip
+  // the O rescale when the running max did not grow) and the opt-in exp2
+  // softmax arm; attn6:
   // 8-element row padding on the Q/K/V shared tiles (conflict-free LDSM
   // wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch buffers
   // converted to the f16 mma tiles in shared memory); attn4: warp-head
   // variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn7";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn8";
 }
 
 } // namespace sonicboom::compiler

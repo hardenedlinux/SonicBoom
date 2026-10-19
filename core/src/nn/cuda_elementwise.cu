@@ -2572,12 +2572,16 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
   const int group_q = n_heads_q / n_heads_kv;
 
+  // Chunk cap shared by both decode paths (see the own split-KV launch below):
+  // it bounds how far a single block's key slice can grow with n_ctx.
+  constexpr uint64_t kMaxChunk = 16;
+
   // Generated flash-decoding (codegen) or the hand-written split-KV (own).
-  // Own is the default: the generated pair reorders the f32 sums, and its
-  // greedy token stream is not identical to own's (seed 2 diverges at step 35
-  // of 256; seeds 7 and 1234 agree for 256), so it does not meet the
-  // bit-identical-tokens default. SONICBOOM_ATTN_DECODE=codegen selects the
-  // generated pair (the ablation arm); SONICBOOM_ATTN_IMPL=own forces own.
+  // Codegen is the default: since attn8 its rounding and reduction order match
+  // the hand-written pair exactly and both split the window with the same
+  // chunk rule, so it is token-identical. SONICBOOM_ATTN_DECODE=own selects
+  // the hand-written pair (the ablation arm); SONICBOOM_ATTN_DECODE=codegen
+  // is still accepted and SONICBOOM_ATTN_IMPL=own forces own.
   //
   // Measured per shape class (attention_bench, RTX 3050, us/call): windowed
   // d256 at a 512-key window 23.2 (codegen, chunk 16) vs 31.3 (own); causal
@@ -2589,7 +2593,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   {
     const char *adec = std::getenv("SONICBOOM_ATTN_DECODE");
     const char *aimpl = std::getenv("SONICBOOM_ATTN_IMPL");
-    bool want_codegen = adec != nullptr && std::string_view(adec) == "codegen";
+    bool want_codegen = adec == nullptr || std::string_view(adec) != "own";
     if (aimpl != nullptr && std::string_view(aimpl) == "own")
       want_codegen = false;
     compiler::AttentionShape dsh;
@@ -2603,16 +2607,31 @@ bool decode_attention_dev(const float* q, const float* k_cache,
       // Fixed chunk length per shape class: the chunk count scales with the
       // max valid KV extent (`window`), not with this launch's key count. The
       // absolute alignment makes a chunk's keys independent of the step.
-      uint64_t kDecodeChunk = 16;
+      //
+      // Token identity with the hand-written pair requires the same split, so
+      // the default reproduces its chunk rule; the Step 7 chunk tuner changes
+      // the split and is therefore part of the non-token-identical arm.
+      // SONICBOOM_ATTN_DECODE_CHUNK overrides either way (ablation).
+      const uint64_t gen_target_chunks =
+          std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
+      const uint64_t gen_no_split_chunk =
+          std::max<uint64_t>(1, (48 * 1024 / sizeof(float)) / (uint64_t)group_q);
+      uint64_t kDecodeChunk =
+          runtime::feature_enabled(runtime::Feature::SplitKv)
+              ? std::max<uint64_t>(
+                    1, std::min((window + gen_target_chunks - 1) /
+                                    gen_target_chunks,
+                                kMaxChunk))
+              : std::min(window, gen_no_split_chunk);
       if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
         const long v = std::atol(e);
         if (v > 0) kDecodeChunk = (uint64_t)v;
-      } else {
-        // Step 7 runtime tuner (cached per GPU + shape class; 16 is the
-        // default, kept when tuning is off or inside a capture).
+      } else if (std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr) {
+        // Step 7 runtime tuner (cached per GPU + shape class; the identity
+        // chunk is the fallback when tuning is off or inside a capture).
         kDecodeChunk = attn_decode_chunk_resolve(
             head_dim, group_q, n_heads_q, n_heads_kv, window, sliding_window,
-            16);
+            kDecodeChunk);
       }
       // The generated decoder stages one chunk's scores in a fixed shared
       // view; a larger chunk is outside what the generated text supports.
@@ -2676,7 +2695,6 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // ~2.4x slower split (3.20 vs 1.29 ms at depth 512). The trade-off of the
   // smaller chunk is a larger partial buffer (n_chunks*8*322 floats) and a
   // longer merge loop at full depth, both negligible at the SWA depth.
-  constexpr uint64_t kMaxChunk = 16;
   // Feature split_kv: off collapses to one chunk per KV head (no split-KV
   // partials; the split kernel still runs its n_chunks == 1 path and the merge
   // is a single-chunk copy). The reduction order differs from the split
@@ -3312,11 +3330,12 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
 
 // --- Step 7: decode chunk length for the generated split-KV pair ----------
 //
-// The generated flash-decoding pair is the explicit ablation arm
-// (SONICBOOM_ATTN_DECODE=codegen) because its reduction order does not match
-// the hand-written kernel bit-for-bit; the default path keeps own and its own
-// chunk rule. Within that arm the chunk length C trades grid width against
-// per-block work, and it is a pure runtime argument (generated text unchanged).
+// The generated flash-decoding pair is the default decode path. Its default
+// chunk rule reproduces the hand-written kernel's split, which is what makes
+// the two bit-identical; the tuner below trades grid width against per-block
+// work and therefore changes the split, so it belongs to the
+// non-token-identical arm (SONICBOOM_ATTN_TUNE_NONIDENTICAL). The chunk
+// length is a pure runtime argument (generated text unchanged).
 // The choice is keyed by shape class + window extent, never by position.
 constexpr uint64_t kAttnDecodeTuneChunks[] = {8, 16, 32, 64};
 // The synthetic extent: the full window when it is small, capped so the

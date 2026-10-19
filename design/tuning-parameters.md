@@ -34,7 +34,7 @@ they exist so these values can be re-measured without a rebuild
 `SONICBOOM_CUDA_GRAPHS`). The v0.0.3 generated-kernel switches are
 `SONICBOOM_AUTOTUNE` (`0` / `force` / unset), `SONICBOOM_ATTN_IMPL`
 (`own` / `auto` / `codegen`; `ggml` is a deprecated alias for `auto`),
-`SONICBOOM_ATTN_DECODE=codegen`, `SONICBOOM_ATTN_CODEGEN=br,bc,dps`,
+`SONICBOOM_ATTN_DECODE=own|codegen`, `SONICBOOM_ATTN_CODEGEN=br,bc,dps`,
 `SONICBOOM_DENSE_GEMM=0`, and `SONICBOOM_IR_PASS_DISABLE=<passes>`.
 
 ---
@@ -101,13 +101,16 @@ window so the decode step stays CUDA-Graph-capturable.
 Prefill: the generated FA-2 kernel
 (`core/compiler/include/sonicboom/compiler/AttentionCodegen.h`) takes
 `(br, bc, dps)`; the sm_86 defaults are `d256 → (64,16,4)`, `d512 → (32,16,8)`,
-`d64/GQA7 → own`. Decode: the generated split-KV pair takes a chunk cap `C`
-(default 32; 16 for the d256 window class). All are autotune parameters keyed
-by `(head_dim, gqa, mask kind)` — never by batch size or position — and the
-chosen implementation can be `own` (the tensor-core kernel above) or
-`codegen`. The generated decode pair is **not the default**: its reduction
-order differs and the default token stream must stay bit-identical, so it is
-selected only by `SONICBOOM_ATTN_DECODE=codegen`. Known mismatch: the tuner
+`d64/GQA7 → own`. Decode: the generated split-KV pair **is the default**; its
+chunk length follows the hand-written pair's rule (cap 16, or the no-split
+48 KiB rule when the `split_kv` feature is off), because matching the split is
+what makes the two paths bit-identical, and its fma/reduction order matches
+too. `SONICBOOM_ATTN_DECODE=own` selects the hand-written pair (the ablation
+and numerical reference); the chunk tuner changes the split and is therefore
+active only in the non-token-identical arm
+(`SONICBOOM_ATTN_TUNE_NONIDENTICAL`). All are keyed
+by `(head_dim, gqa, mask kind)` — never by batch size or position. Known
+mismatch: the tuner
 keeps `codegen` for the d512 prefill class while a 256-query sweep measures
 `own` about 12% faster; the class probe's query length differs from the
 in-model call. Conditions: sm_86, Gemma 4/Qwen2.5 head geometries.
@@ -277,9 +280,10 @@ Full entries above; the list a future optimizer should read before starting:
 - **Attention prefill:** `own` versus generated `(br, bc, dps)` over every
   candidate the generator supports and whose shared memory fits. A candidate
   must beat the default by 3% to replace it.
-- **Attention decode:** generated split-KV chunk `C` (own remains the default
-  for numerics; the tuned choice applies only under
-  `SONICBOOM_ATTN_DECODE=codegen`).
+- **Attention decode:** generated split-KV chunk `C` changes the f32 reduction
+  split, so (like the warp-head prefill arm) it is tuned only under
+  `SONICBOOM_ATTN_TUNE_NONIDENTICAL`; the default keeps the bit-identical
+  chunk rule.
 - **MMQ:** J over `Js[]` and the decomposition (`tiled` vs `stream-k`), moved
   from the static selection.
 - **Dense GEMM:** generated kernel versus cuBLASLt, and the generated tile
