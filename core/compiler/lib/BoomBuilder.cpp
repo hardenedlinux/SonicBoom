@@ -363,12 +363,36 @@ mlir::Value BoomBuilder::kv(uint32_t layer) {
   return value;
 }
 
+void BoomBuilder::set_row_scale(int64_t rows, llvm::StringRef attr_name) {
+  if (rows < 0) {
+    failed_ = true;
+    return;
+  }
+  row_scale_ = rows;
+  row_scale_attr_ = attr_name.str();
+}
+
 mlir::Value BoomBuilder::node(planner::OpKind op,
                               llvm::ArrayRef<mlir::Value> operands,
                               llvm::StringRef out_name,
                               llvm::ArrayRef<int64_t> out_shape,
                               llvm::ArrayRef<sx::Attribute> attributes,
                               planner::BackendTag backend) {
+  // Row-dealt emission (verify step): the emitter writes one query row's
+  // shapes, the builder lays them out over `rows` positions and stamps the
+  // row count on every node so the backend dispatches per-row decode kernels.
+  llvm::SmallVector<int64_t, 4> scaled_shape;
+  llvm::SmallVector<sx::Attribute, 6> scaled_attrs;
+  if (row_scale_ > 0) {
+    scaled_shape.assign(out_shape.begin(), out_shape.end());
+    for (int64_t& v : scaled_shape) v *= row_scale_;
+    scaled_attrs.assign(attributes.begin(), attributes.end());
+    scaled_attrs.push_back(
+        sx::Attribute{row_scale_attr_, int64_t(row_scale_)});
+    out_shape = scaled_shape;
+    attributes = scaled_attrs;
+  }
+
   const int64_t id = int64_t(table_.size());
   auto form = tensorForm(context_, loc_, id, out_name, out_shape,
                          sx::DType::Float32, extent_);

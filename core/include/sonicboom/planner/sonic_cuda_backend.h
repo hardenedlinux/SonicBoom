@@ -41,6 +41,10 @@
 
 namespace sonicboom::planner {
 
+// The verify step's widest row set: a draft length of at most 7 gives k+1 = 8
+// query rows; the token slot is sized for this many argmax results.
+inline constexpr int kMaxVerifyRows = 16;
+
 class SonicCudaBackend : public Backend {
 public:
   // `spec` describes the KV-cache geometry (copied into the backend) and `graph`
@@ -100,12 +104,24 @@ public:
                             std::span<const uint64_t> tokens);
   bool stage_pos(hal::StepProgram& prog, uint64_t pos);
 
+  // Verify step: stage the absolute position of each query row into the
+  // per-row position slot. The attention dispatch hands row r a pointer to
+  // element r, and the decode kernels read the position from the device slot,
+  // so row r appends/attends at start_pos + r while the captured graph stays
+  // position-agnostic. Decode reads element 0 only (set_pos).
+  bool set_verify_pos(uint64_t start_pos, int rows);
+  bool stage_verify_pos(hal::StepProgram& prog, uint64_t start_pos, int rows);
+
   // Download the current token id from the persistent device-resident `token_buf_`
   // slot (one float) into `host`. Used after a CUDA Graph replay to recover the
   // argmax result without the executor's host-output path (which is a synchronous
   // cudaMemcpy and therefore not capturable). The synchronous D2H also serves as
   // the replay's completion barrier.
   bool read_token(float* host) const;
+
+  // Download the verify step's per-row argmax results (rows <= kMaxVerifyRows)
+  // from the persistent token slot. The synchronous D2H is the replay barrier.
+  bool read_verify_tokens(float* host, int rows) const;
 
   // --- decode chunking (§10) ------------------------------------------------
   //
@@ -167,6 +183,14 @@ public:
   // prefill): the session takes shared ownership so the cache survives this
   // backend's destruction. No-op-safe when the session already owns a cache.
   void publish_cache(KvCacheSession& session) const;
+
+  // Allocate a standalone cache set for `spec` at decode length `n_ctx`, with
+  // the same geometry and freeing deleter as the backend's own cache. A session
+  // that owns one of these has a cache independent of every other session on
+  // the same runtime (the speculative test compares two decodes from identical
+  // starting states). Null on allocation failure.
+  static std::shared_ptr<std::vector<KvCacheDev>>
+  allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx);
 
   // The identity of the KV cache vector this backend currently shares. A
   // recorded step (record_step) bakes the cache's device pointers into the

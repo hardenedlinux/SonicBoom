@@ -2560,11 +2560,15 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
-                          float scale, float* out) {
+                          float scale, float* out, int pos_offset) {
   if (!available()) return false;
   if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || head_dim > 512 ||
-      !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0)
+      !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0 ||
+      pos_offset < 0)
     return false;
+  // B3 verify: row `pos_offset` of the verify step is the n == 1 call at its
+  // position, so the whole launch is the decode call with a shifted slot.
+  pos += pos_offset;
 
   const int group_q = n_heads_q / n_heads_kv;
 
@@ -2716,11 +2720,12 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems) {
+                   int row_elems, int pos_offset) {
   if (!available()) return false;
   if (row_elems <= 0 || !dst_k || !dst_v || !src_k || !src_v || !pos ||
-      n_slots == 0)
+      n_slots == 0 || pos_offset < 0)
     return false;
+  pos += pos_offset;  // B3 verify: append row `pos_offset` at its position
   const int grid = grid_for(row_elems);
   SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
   kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_k, src_k, pos, n_slots,

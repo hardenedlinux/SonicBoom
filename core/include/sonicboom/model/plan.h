@@ -160,6 +160,51 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
 // fall back to the lazy path.
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx);
 
+// ---------------------------------------------------------------------------
+// Speculative verification (Part B). A draft of k tokens is checked by running
+// the model over the k+1 query positions 0..k at once and taking each row's
+// argmax. The verify step is the decode graph dealt over rows (the verify phase
+// of BoomPasses): every op runs its decode kernel per row, except the quantized
+// matmul, which runs the row-invariant batched mmvq — so row i is bit-identical
+// to a plain decode step at pos+i, and the KV cache after the step holds exactly
+// what k+1 chained decode steps would have written. That bit-identity is the
+// lossless contract: the accepted tokens are the same tokens greedy decoding
+// would have produced, not close to them.
+// ---------------------------------------------------------------------------
+
+// Allocate `session` a device KV cache of the model's geometry at decode length
+// `n_ctx`, so two sessions on the same model/runtime have independent caches
+// (a session left empty adopts the decode runtime's cache on its first prefill).
+// Clears the session's filled-token history. Returns false without CUDA.
+bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
+                         uint64_t n_ctx);
+
+// The verify step: feed `tokens` at positions `start_pos .. start_pos+rows-1`
+// through the row-invariant verify graph on `session`'s cache and write each
+// row's argmax into `out` (out.size() >= tokens.size(), rows <=
+// planner::kMaxVerifyRows, start_pos + rows <= session.n_ctx). The cache is left
+// holding those rows, as `rows` plain decode steps would leave it. Returns false
+// on a build/step failure. The first call for a (model, n_ctx, rows, cache)
+// builds, plans and captures the step; later calls replay it.
+bool verify_step_spine_cuda(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens,
+                            uint64_t start_pos,
+                            planner::KvCacheSession& session,
+                            std::span<int64_t> out);
+
+// The plain-decode reference for the verify step: feed `tokens[i]` at
+// `start_pos + i` through the captured single-token decode step on `session`'s
+// cache, without chaining each step's argmax into the next, and write each
+// step's argmax into `out`. Used to test that verify_step_spine_cuda is
+// bit-identical to k+1 decode steps. Returns false without a captured decode
+// step bound to `session`'s cache (a session whose cache the decode runtime did
+// not publish or adopt first).
+bool decode_steps_spine_cuda(const Gemma4Model& m,
+                             std::span<const uint64_t> tokens,
+                             uint64_t start_pos,
+                             planner::KvCacheSession& session,
+                             std::span<int64_t> out);
+
 // Prefill + decode through the CPU spine. Processes the whole `prompt` in one
 // batched graph pass (build_gemma4_prefill_graph → plan_execution →
 // RuntimeExecutor with the batched OpKinds), samples `tokens[0]` from the final

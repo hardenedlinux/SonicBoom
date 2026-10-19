@@ -43,6 +43,12 @@ namespace sonicboom::compiler {
 // The module is verified after every pass by the pass manager, so a pass that
 // leaves the IR in a state the dialect rejects fails here, naming that pass,
 // rather than three passes later.
-bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase);
+//
+// `skip_kv_append_fusion` leaves the K/V append on the attention node instead
+// of folding it into the prep regions. The verify step (B3) needs that: its
+// attention appends one row per query position, which a region that stores a
+// single row at the base position cannot express.
+bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
+                   bool skip_kv_append_fusion = false);
 
 } // namespace sonicboom::compiler

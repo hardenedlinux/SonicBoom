@@ -2170,6 +2170,24 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
   return cudaGetLastError() == cudaSuccess;
 }
 
+bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
+                           float* y, int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (!xq || !y || n <= 0) return false;
+  const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact
+  if (blocks_per_row == 0) return false;
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  launch_gemv_q8_1_batched(
+      W.type(), static_cast<const uint8_t*>(d_w),
+      reinterpret_cast<const q8_1::block_q8_1*>(xq), y, int(blocks_per_row),
+      int(rows), n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 // q8_1 activation blocks consumed per *weight* block. A K-quant weight block
 // spans 256 elements, i.e. 8 of the 32-element q8_1 blocks; a legacy Q5_0/Q8_0
 // weight block spans exactly 32 elements, i.e. one. The flat activation layout

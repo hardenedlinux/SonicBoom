@@ -54,6 +54,12 @@ namespace sonicboom::planner {
 
 // Which phase's pipeline to run. The two the emitter builds differ in their
 // pass list and nothing else (design/mlir-migration.md §2 lists both).
-enum class IrPassPhase { Decode, Prefill };
+//
+// Verify is the speculative-decoding verify step (B3): the decode pipeline
+// except that FuseKvAppendIntoPrep leaves the KV append on the attention node.
+// The verify graph deals one decode over k+1 query positions, and its attention
+// appends one row per position, which a prep region that stores a single row at
+// the base position cannot express.
+enum class IrPassPhase { Decode, Prefill, Verify };
 
 } // namespace sonicboom::planner

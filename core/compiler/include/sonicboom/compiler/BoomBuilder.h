@@ -54,6 +54,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace sonicboom::compiler {
@@ -147,6 +148,12 @@ public:
   // that is the block-argument order the verifier recomputes.
   mlir::Value kv(uint32_t layer);
 
+  // Deal each node's single-row output out over `rows` positions: every
+  // node() shape is multiplied by `rows` (position-major [rows, dim]) and each
+  // node carries `attr_name` = rows as an extra attribute. The verify step
+  // (B3) emits one decode graph over k+1 query rows this way; 0 disables.
+  void set_row_scale(int64_t rows, llvm::StringRef attr_name);
+
   // A node and its one result tensor: an f32 activation of `out_shape`. The
   // node's name is its operator's (op_kind_name), the tensor's is `out_name`.
   mlir::Value node(planner::OpKind op, llvm::ArrayRef<mlir::Value> operands,
@@ -188,6 +195,8 @@ private:
   llvm::DenseMap<mlir::Value, int64_t> ids_;
   llvm::DenseMap<uint32_t, mlir::Value> kv_;
   int64_t nodes_ = 0;
+  int64_t row_scale_ = 0;        // out_shape multiplier (verify rows); 0 = off
+  std::string row_scale_attr_;   // attribute stamped on each node when on
   bool failed_ = false;
 };
 

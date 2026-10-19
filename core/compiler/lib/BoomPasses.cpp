@@ -2494,13 +2494,23 @@ bool parseDisabledPasses(DisabledPasses &out) {
 // §2): the port of each Graph rewrite in planner/rewrites.cpp, in that pass's
 // place in the order and with its preconditions. Both phases run entirely here,
 // and the Graph rewrites are gone, so this is the emitter's only rewrite path.
-void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase) {
+void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
+               bool skip_kv_append_fusion) {
   DisabledPasses off;
   // A rejected list disables nothing: running the phase with no passes would
   // leave the graph unfused, and an ablation run would then report that as the
   // effect of the pass it meant to skip.
   if (!parseDisabledPasses(off)) off = DisabledPasses{};
+  // The caller's explicit skip is a correctness requirement (verify), not an
+  // ablation: it applies regardless of the environment list.
+  if (skip_kv_append_fusion) off.fuse_kv_append_into_prep = true;
   switch (phase) {
+  case planner::IrPassPhase::Verify:
+    // The decode pipeline, except the KV append stays on the attention node: the
+    // verify graph appends one row per query position, which a prep region that
+    // stores a single row at the base position cannot express.
+    off.fuse_kv_append_into_prep = true;
+    [[fallthrough]];
   case planner::IrPassPhase::Decode:
     if (!off.quantize_once) pm.addPass(std::make_unique<QuantizeOncePass>());
     if (!off.rms_norm_quantize) pm.addPass(std::make_unique<RmsNormQuantizePass>());
@@ -2570,6 +2580,8 @@ const char *phaseName(planner::IrPassPhase phase) {
     return "decode";
   case planner::IrPassPhase::Prefill:
     return "prefill";
+  case planner::IrPassPhase::Verify:
+    return "verify";
   }
   return "?";
 }
@@ -2577,7 +2589,8 @@ const char *phaseName(planner::IrPassPhase phase) {
 } // namespace
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).
-bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase) {
+bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
+                   bool skip_kv_append_fusion) {
   // The unit of meaning in this IR is the graph, not the module that holds it
   // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
   // IsolatedFromAbove, which is what makes it a pass anchor at all.
@@ -2593,7 +2606,7 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase) {
   // a state the dialect rejects fails here, naming that pass, rather than three
   // passes later.
   mlir::PassManager pm(module.getContext());
-  addPasses(pm, phase);
+  addPasses(pm, phase, skip_kv_append_fusion);
   if (mlir::failed(pm.run(graphOp))) {
     std::fprintf(stderr,
                  "runBoomPasses(%s): a Boom IR pass failed (diagnostic "

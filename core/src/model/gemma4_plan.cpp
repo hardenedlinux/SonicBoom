@@ -52,6 +52,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -222,10 +223,12 @@ planner::Graph lower_graph(mlir::ModuleOp module,
 // caller keeps it. A failed pass fails the plan rather than letting an unfused
 // graph be planned as if the phase had run.
 planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite,
-                           uint64_t dynamic_extent = 0) {
+                           uint64_t dynamic_extent = 0,
+                           bool skip_kv_append_fusion = false) {
   if (!ir.module)
     return {};
-  if (rewrite && !compiler::runBoomPasses(*ir.module, phase))
+  if (rewrite &&
+      !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion))
     return {};
   return lower_graph(*ir.module, dynamic_extent);
 }
@@ -242,7 +245,12 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
 // layer's (22 SWA / 23 global) cache, selected by the node's `kv_source_layer`
 // attribute. The residual stream is the *scaled* l_out of the previous block.
 // ---------------------------------------------------------------------------
-GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy) {
+// `rows` > 1 emits the same graph dealt over that many query positions
+// (position-major [rows, dim] activations, each node stamped with a `verify`
+// attribute): the row-invariant verify step of §B3. The backend then runs the
+// decode kernel per row, with the row-invariant batched mmvq for the quantized
+// matmuls — so row i is bit-identical to a plain decode step at pos+i.
+GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -255,7 +263,9 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy) {
 
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
-  compiler::BoomBuilder b(ir.context.get(), "gemma4_decode");
+  compiler::BoomBuilder b(ir.context.get(),
+                          rows > 1 ? "gemma4_verify" : "gemma4_decode");
+  if (rows > 1) b.set_row_scale(int64_t(rows), "verify");
 
   // Graph inputs: token id + absolute position (Int64 scalars), declared to the
   // builder — they are the graph's free variables, and a free variable is a block
@@ -1127,6 +1137,11 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  // The cache vector `prog` was recorded against. A capture bakes the KV cache's
+  // device pointers in, and a prefill session can adopt a different vector; a
+  // caller that replays `prog` must state that the cache it shares is this one
+  // (decode_steps_spine_cuda does; B3's reference).
+  std::shared_ptr<void> prog_cache;
   GreedyProgramDesc program;                          // the lowered loop (§10)
   // Prefill segments by shape-class sizing extent, most-recently used first,
   // capped at kMaxCachedSegments.
@@ -1451,6 +1466,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       rt->cuda->synchronize();
       rt->cuda->seed_token(0);
       rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
+      if (rt->prog) rt->prog_cache = rt->cuda->cache_identity();
     }
     // No re-playable graph (capture failed, e.g. a plan whose decode step has a
     // host task): the executor loop stages the single pos/token slots itself,
@@ -1461,6 +1477,246 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   DecodeRuntime* raw = rt.get();
   g_decode_runtimes.emplace(key, std::move(rt));
   return raw;
+}
+
+// ---------------------------------------------------------------------------
+// B3: the row-invariant verify step. One runtime per (model, n_ctx, rows):
+// the decode graph emitted with `rows` query positions, run through the verify
+// phase's passes (decode fusions, KV append left on attention), planned and
+// captured as its own graph. Sharing the decode runtime's cache is the point:
+// the verify appends rows at pos..pos+rows-1 exactly as `rows` plain decode
+// steps would, so the cache after a verify is the cache a chained decode would
+// have written.
+// ---------------------------------------------------------------------------
+struct VerifyRuntime {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  planner::ResourceSnapshot snap;
+  std::unique_ptr<planner::SonicBackend> cpu;
+  std::unique_ptr<planner::SonicCudaBackend> cuda;
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+  std::unique_ptr<hal::StepProgram> prog;  // captured verify step
+  // The session cache the runtime (and therefore the capture) is bound to. The
+  // backend adopts it after the warm-up (which must not write the session) and
+  // before the capture, so the captured kernels carry its device pointers; the
+  // shared_ptr keeps those buffers alive for as long as
+  // the capture can be replayed, and a different session cannot alias it while
+  // this entry exists (same reason as cache_identity()).
+  std::shared_ptr<void> cache;
+};
+
+static std::map<std::tuple<const Gemma4Model*, uint64_t, int>,
+                std::unique_ptr<VerifyRuntime>>
+    g_verify_runtimes;
+
+static std::unique_ptr<VerifyRuntime>
+build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
+                     const planner::KvCacheSession& session) {
+  auto rt = std::make_unique<VerifyRuntime>();
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/true, uint64_t(rows));
+  rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
+                          quant::cuda::q8_1_enabled());
+  if (rt->graph.nodes.empty()) return nullptr;
+
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap) return nullptr;
+  rt->snap = std::move(*snap);
+  {
+    planner::AnalyticalCpuCostModel cost(rt->snap);
+    auto plan = planner::plan_execution(rt->graph, rt->snap, cost);
+    if (!plan) return nullptr;
+    rt->plan = std::move(*plan);
+  }
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx);
+  rt->cuda->bind_model(m);
+  // The capture records the session cache's device pointers, but the warm-up
+  // that precedes it *writes* the cache: it runs one verify step at positions
+  // 0..rows-1, which would overwrite the prompt's KV rows 0..rows-1 in the
+  // session before the real verify replays at start_pos. So the warm-up runs on
+  // the backend's own (freshly allocated, identically sized) cache and
+  // get_verify_runtime adopts the session cache after it, before the capture.
+  rt->cache = session.caches;
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
+// Build (or fetch) the cached verify runtime. The capture reads the token ids
+// from `tokens_buf_` and the base position from `pos_buf_`, both restaged before
+// every replay, so one capture serves every call at any depth. Keyed by the
+// session cache as well as the shape: a capture is only replayable against the
+// vector it was recorded with. Returns nullptr on a build/plan failure.
+static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
+                                         int rows,
+                                         const planner::KvCacheSession& session) {
+  if (!session.caches) return nullptr;
+  auto key = std::make_tuple(&m, n_ctx, rows);
+  auto it = g_verify_runtimes.find(key);
+  if (it != g_verify_runtimes.end()) {
+    if (it->second->cache.get() == session.caches.get())
+      return it->second.get();
+    // A different session on the same shape: the old capture cannot be replayed
+    // against the new cache, and holding both would be two full verify graphs.
+    g_verify_runtimes.erase(it);
+  }
+
+  auto rt = build_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return nullptr;
+
+  if (cuda_graph_decode_enabled()) {
+    // Warm-up run: allocates every pooled buffer and uploads the weights the
+    // capture pass then only records. The ids and position are placeholders;
+    // every real call stages its own before replay.
+    const std::vector<uint64_t> warm(size_t(rows), 0);
+    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+    auto run = [&]() {
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
+      return bool(res);
+    };
+    if (rt->cuda->set_prefill_tokens(warm) &&
+        rt->cuda->set_verify_pos(0, rows) && run()) {
+      rt->cuda->synchronize();
+      // Adopt the session cache only after the warm-up and before the capture.
+      // Capture records the launches without executing them, so the graph bakes
+      // the session's pointers while no kernel writes a row of it.
+      rt->cuda->share_caches(session);
+      if (rt->cuda->set_prefill_tokens(warm) &&
+          rt->cuda->set_verify_pos(0, rows))
+        rt->prog = rt->cuda->record_step(run);
+    }
+  }
+
+  VerifyRuntime* raw = rt.get();
+  g_verify_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
+                         uint64_t n_ctx) {
+  if (m.weights.blocks.empty() || n_ctx == 0) return false;
+  session.caches =
+      planner::SonicCudaBackend::allocate_cache_set(kv_cache_spec(m.config), n_ctx);
+  if (!session.caches) return false;
+  session.n_ctx = n_ctx;
+  session.filled_tokens.clear();
+  return true;
+}
+
+bool decode_steps_spine_cuda(const Gemma4Model& m,
+                             std::span<const uint64_t> tokens,
+                             uint64_t start_pos,
+                             planner::KvCacheSession& session,
+                             std::span<int64_t> out) {
+  auto fail = [](const char* why) {
+    std::cerr << "[spec] decode_steps: " << why << "\n";
+    return false;
+  };
+  if (tokens.empty() || out.size() < tokens.size())
+    return fail("empty input");
+  if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
+  if (start_pos + uint64_t(tokens.size()) > session.n_ctx)
+    return fail("positions exceed the session cache");
+
+  // Deliberately not the captured runtime: a capture bakes the cache it was
+  // recorded against, and this seam is fed a session cache it did not choose.
+  // The uncaptured runtime runs the very same decode graph through the very same
+  // executor dispatch; only the graph launch is absent, and it has no numerical
+  // effect. It is built once per (model, n_ctx) and bound to the session's cache
+  // before its first execution.
+  struct FedRuntime {
+    std::unique_ptr<DecodeRuntime> rt;
+    std::shared_ptr<void> cache;
+  };
+  static std::map<std::pair<const Gemma4Model*, uint64_t>,
+                  std::unique_ptr<FedRuntime>>
+      fed;
+  auto key = std::make_pair(&m, session.n_ctx);
+  auto it = fed.find(key);
+  FedRuntime* fr = nullptr;
+  if (it != fed.end() && it->second->cache.get() == session.caches.get()) {
+    fr = it->second.get();
+  } else {
+    auto rt = build_decode_runtime(m, session.n_ctx);
+    if (!rt) return fail("decode runtime build failed");
+    rt->cuda->share_caches(session);
+    it = fed.insert_or_assign(
+        key, std::make_unique<FedRuntime>(FedRuntime{
+                 std::move(rt), std::shared_ptr<void>(session.caches)})).first;
+    fr = it->second.get();
+  }
+
+  for (size_t i = 0; i < tokens.size(); ++i) {
+    // Feed the given token rather than the previous step's argmax: reseed the
+    // device token slot and stage the row's position, then dispatch the step.
+    if (!fr->rt->cuda->seed_token(tokens[i]) ||
+        !fr->rt->cuda->set_pos(start_pos + i))
+      return fail("device slot staging failed");
+    const std::vector<sx::Bytes> in{encode_i64(tokens[i]),
+                                    encode_i64(start_pos + i)};
+    auto res = fr->rt->exec->execute(fr->rt->plan, fr->rt->snap, in);
+    if (!res) {
+      std::cerr << "[spec] decode_steps: step " << i
+                << " execute failed: " << res.error().message << "\n";
+      return false;
+    }
+    if (res->outputs.empty()) return fail("step produced no output");
+    const sx::Bytes& arg = res->outputs[0];
+    if (arg.size() < sizeof(float)) return fail("argmax output too small");
+    out[i] = int64_t(*reinterpret_cast<const float*>(arg.data()));
+  }
+  return true;
+}
+
+bool verify_step_spine_cuda(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens,
+                            uint64_t start_pos,
+                            planner::KvCacheSession& session,
+                            std::span<int64_t> out) {
+  auto fail = [](const char* why) {
+    std::cerr << "[spec] verify: " << why << "\n";
+    return false;
+  };
+  const int rows = int(tokens.size());
+  if (rows <= 0 || rows > planner::kMaxVerifyRows || out.size() < tokens.size())
+    return fail("bad row count");
+  if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
+  if (start_pos + uint64_t(rows) > session.n_ctx)
+    return fail("positions exceed the session cache");
+  VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
+  if (!rt) return fail("verify runtime build failed");
+  rt->cuda->share_caches(session);  // identity: the capture is bound to it
+
+  if (rt->prog) {
+    // Stage the row token ids and the base position on the captured graph's
+    // stream, then one replay: the whole verify step is one graph launch.
+    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
+        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
+      return fail("staging failed");
+    // The replay is async on the graph stream; the token readback must see the
+    // completed step (the readback copy orders against the graph's stream).
+    if (!rt->prog->replay() || !rt->prog->sync())
+      return fail("graph replay failed");
+  } else {
+    if (!rt->cuda->set_prefill_tokens(tokens) ||
+        !rt->cuda->set_verify_pos(start_pos, rows))
+      return fail("staging failed");
+    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (!res) {
+      std::cerr << "[spec] verify: execute failed: "
+                << res.error().message << "\n";
+      return false;
+    }
+  }
+  float host[planner::kMaxVerifyRows];
+  if (!rt->cuda->read_verify_tokens(host, rows))
+    return fail("token readback failed");
+  for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
+  return true;
 }
 
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
@@ -1755,6 +2011,23 @@ uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
 
 bool warmup_spine_cuda(const Gemma4Model&, uint64_t) {
   return false;  // built without CUDA: there is no runtime to build
+}
+
+bool kv_session_allocate(const Gemma4Model&, planner::KvCacheSession&,
+                         uint64_t) {
+  return false;  // built without CUDA: no device cache to allocate
+}
+
+bool decode_steps_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
+                             uint64_t, planner::KvCacheSession&,
+                             std::span<int64_t>) {
+  return false;  // built without CUDA: no device spine to run
+}
+
+bool verify_step_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
+                            uint64_t, planner::KvCacheSession&,
+                            std::span<int64_t>) {
+  return false;  // built without CUDA: no device spine to run
 }
 
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,
@@ -2126,14 +2399,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       Phase _seg("prefill:segment", phase_timing);
       const uint64_t pos = start_pos + off;
       uint64_t nseg = std::min(chunk, n - off);
-      // Align the segment boundary to an absolute multiple of `chunk` so a
-      // segment never spans a ring-wraparound point: a KV slot is `pos %
-      // n_slots` with n_slots == chunk for the SWA layers, so a segment whose
-      // start_pos is not a multiple of `chunk` would wrap the ring and its
-      // deferred append would overwrite slots a later position still reads. The
-      // cap also makes a prefix-reuse suffix (start_pos not a multiple of
-      // `chunk`) split at the same boundaries a full prefill would, so the two
-      // paths write the same per-position KV.
+      // Align the segment boundary to an absolute multiple of `chunk`. The SWA
+      // ring is sized `chunk + kMaxVerifyRows` (the verify headroom), so a
+      // segment is a run of at most `chunk` consecutive positions, never a full
+      // ring. The alignment also makes a prefix-reuse suffix (start_pos not a
+      // multiple of `chunk`) split at the same boundaries a full prefill would,
+      // so the two paths write the same per-position KV.
       const uint64_t rem = pos % chunk;
       if (rem != 0 && chunk - rem < nseg)
         nseg = chunk - rem;

@@ -100,6 +100,16 @@ bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* y
 bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
                    std::span<const float> bias = {}, const float* add = nullptr);
 
+// Row-invariant verify shape (B3): n positions of pre-quantized q8_1
+// activations against one weight. `xq` is [n, cols/32] blocks contiguous and
+// `y` is [n, rows]. The batched gemv's per-position arithmetic is the same lane
+// decomposition and summation order as gemv_q8_1_dev (single vs batched mmvq,
+// B2 audit), so row i of the result is bit-identical to the single-column call
+// on row i. No bias/add epilogue: the verify step adds them with elementwise
+// kernels, which store the same f32 values as the fused epilogue.
+bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
+                           float* y, int n);
+
 // Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
 // gemv kernel carries the epilogue). Callers that must add a bias regardless use
 // this to choose between the epilogue and a separate add_bias_dev.

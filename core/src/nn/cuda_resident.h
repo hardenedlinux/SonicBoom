@@ -109,20 +109,24 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 // (see decode_attention_dev in cuda_elementwise.cu). Requires window >= n_keys
 // at every position, i.e. window == sliding_window (SWA) or window == n_ctx
 // (global, since n_keys == pos+1 <= n_ctx).
+// `pos_offset` selects a row of a verify step (B3): the position read is
+// pos[pos_offset], so one call per query row executes exactly the n == 1 call
+// of that row with the same split/chunk constants. 0 is the decode call.
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
-                          float scale, float* out);
+                          float scale, float* out, int pos_offset = 0);
 
 // Append one token's K and V rows (row_elems floats each) into a device-resident
 // KV cache at slot (pos % n_slots). src/dst are device buffers; `pos` is a DEVICE
 // uint64_t, so the append is capturable into a CUDA Graph (the slot offset is
 // computed in-kernel, not baked into a launch argument). dst_k/dst_v are the
 // cache rows for this layer, src_k/src_v the freshly projected K/V.
+// `pos_offset` is the verify step's row index (pos[pos_offset]; 0 = decode).
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems);
+                   int row_elems, int pos_offset = 0);
 
 // Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
 // tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
