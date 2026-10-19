@@ -967,16 +967,23 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const auto addf = [&](const std::string &a, const std::string &b) {
       return e.val("arith.addf " + a + ", " + b + " : f32");
     };
-    const std::string sm0 = rsum4(addf(addf(p0a, p0b), addf(p0c, p0d)));
-    const std::string sm1 = rsum4(addf(addf(p1a, p1b), addf(p1c, p1d)));
+    // Sum association must match the hand-written tiled kernel's
+    // `sum0 = fa_rsum4(p00 + p01 + p08 + p09)`, i.e. left-to-right:
+    // ((a + b) + c) + d. A balanced tree rounds differently and changes the
+    // token stream at the final division.
+    const std::string sm0 =
+        rsum4(addf(addf(addf(p0a, p0b), p0c), p0d));
+    const std::string sm1 =
+        rsum4(addf(addf(addf(p1a, p1b), p1c), p1d));
+    // `l = l * rs + sum` is one FFMA in the hand-written kernel (nvcc's
+    // default fmad=true); a separate mul+add rounds twice and changes the
+    // final division. Same rule the generated decode path follows.
     const std::string nl0 =
-        e.val("arith.addf " +
-              e.val("arith.mulf " + cur["%l0"] + ", " + rs0 + " : f32") + ", " +
-              sm0 + " : f32");
+        e.val("llvm.intr.fma(" + cur["%l0"] + ", " + rs0 + ", " + sm0 +
+              ") : (f32, f32, f32) -> f32");
     const std::string nl1 =
-        e.val("arith.addf " +
-              e.val("arith.mulf " + cur["%l1"] + ", " + rs1 + " : f32") + ", " +
-              sm1 + " : f32");
+        e.val("llvm.intr.fma(" + cur["%l1"] + ", " + rs1 + ", " + sm1 +
+              ") : (f32, f32, f32) -> f32");
 
     // P fragment: A operand of O += P V (rows r / r+8, k = 16 keys).
     std::string pv3 = e.val("arith.constant dense<0.0> : vector<4x2xf16>");
@@ -1664,6 +1671,10 @@ std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
 }
 
 std::string attention_codegen_version() {
+  // attn9: the generated prefill kernel's per-row softmax sum uses the
+  // hand-written tiled kernel's left-to-right association (and the l update
+  // is fused like the reference's `l*rs + sum`), so the d64 prefill output is
+  // bit-identical to the hand-written kernel.
   // attn8: the generated decode pair matches the hand-written split-KV pair
   // bit-for-bit (fma chains for q·k / P·V / combine, __shfl_down reduction
   // trees, final division); attn7: conditional online-softmax rescale (skip
@@ -1673,7 +1684,7 @@ std::string attention_codegen_version() {
   // wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch buffers
   // converted to the f16 mma tiles in shared memory); attn4: warp-head
   // variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn8";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn9";
 }
 
 } // namespace sonicboom::compiler
