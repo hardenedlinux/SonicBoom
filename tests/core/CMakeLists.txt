@@ -45,6 +45,14 @@ target_compile_definitions(test_gemma4 PRIVATE
 target_compile_definitions(test_qwen2_config PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# The host-only tests that read a real GGUF (dequantization diff, model load,
+# tokenizer) are correctness goldens over a multi-GB file, several seconds each
+# and skipped only when the GGUF is absent. They go with the rest of the
+# model-driven tests into the nightly/weekly suite. (test_qwen2_config stays in
+# the per-commit set: it parses the config header only, ~1 s.)
+set_tests_properties(test_dequant test_gemma4 test_vocab
+  PROPERTIES LABELS long)
+
 # test_qwen2_generate (Qwen2 prefill + greedy decode vs the llama.cpp golden
 # streams) needs the repository root to locate models/ and tests/data/qwen2/.
 target_compile_definitions(test_qwen2_generate PRIVATE
@@ -70,7 +78,7 @@ add_test(NAME test_prefix_cache_long
                  LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
                  $<TARGET_FILE:test_prefix_cache> --long)
 set_tests_properties(test_prefix_cache_long
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_vocab loads the real Gemma 4 GGUF tokenizer (skips cleanly when absent);
 # same repository-root requirement for locating models/.
@@ -84,7 +92,7 @@ target_compile_definitions(test_vocab PRIVATE
 target_compile_definitions(test_plan_record PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_plan_record
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_plan_cache (prefill segment cache: a hit must be indistinguishable from a
 # fresh build) needs the repository root for models/, and the same CUDA + GGUF
@@ -92,7 +100,7 @@ set_tests_properties(test_plan_record
 target_compile_definitions(test_plan_cache PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_plan_cache
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # test_spec_invariance (B3 verify-step invariance) needs both model GGUFs,
 # looked up relative to the repository root. It forks one child per
@@ -142,10 +150,14 @@ target_compile_definitions(test_spec_program PRIVATE
 # Deliberately not locked: the tests that read a GGUF on the host without
 # touching the device (test_gguf, test_dequant, test_gemma4, test_qwen2_config,
 # test_vocab), and everything else in the suite — CPU-only tests stay parallel.
+# These are labelled long: each loads a real GGUF and runs a whole
+# prefill/decode or speculative session to compare against token goldens
+# (~15 s to ~2 min apiece, serialized by the device lock), so they belong to
+# the nightly/weekly suite rather than the per-commit one.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
                               test_spec_program
-  PROPERTIES RESOURCE_LOCK gpu_vram)
+  PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
@@ -157,7 +169,7 @@ add_test(NAME test_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_decode_chunk
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # The speculative loop (SONICBOOM_SPEC, B6) is also parsed once per process.
 # Run the golden-stream checks with it on: the drafter's proposals must not
@@ -169,7 +181,7 @@ add_test(NAME test_generate_spec
                  SONICBOOM_SPEC=on
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_spec
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # B7's adaptive draft length (SONICBOOM_SPEC=auto) also goes through the same
 # golden streams: the warm-up's forced drafts and the policy's per-step k are
@@ -183,7 +195,7 @@ add_test(NAME test_generate_spec_auto
                  SONICBOOM_TUNE_DIR=${CMAKE_BINARY_DIR}/spec-auto-tune
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_spec_auto
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # The same coverage for the other consumer of the chunked loop: the
 # prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
@@ -194,7 +206,7 @@ add_test(NAME test_qwen2_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_qwen2_generate>)
 set_tests_properties(test_qwen2_generate_decode_chunk
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
@@ -393,4 +405,4 @@ sb_add_cpp_test(test_boom_conversion)
 # It loads both models onto the GPU for the plan gate, so it takes the same
 # lock as the other model tests (see "The model tests run one at a time").
 set_tests_properties(test_boom_conversion
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram)
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)

@@ -134,7 +134,10 @@ if(GUILE_EXECUTABLE)
     # model tests (tests/core/CMakeLists.txt): two of those at once do not fit
     # on this device, and this one fails beside one of them with "device buffer
     # allocation failed".
-    set_tests_properties(guile-inference PROPERTIES RESOURCE_LOCK gpu_vram)
+    # It loads the real GGUF and generates tokens, so it is a model-driven
+    # golden like the C++ end-to-end suites: nightly/weekly, not per commit.
+    set_tests_properties(guile-inference PROPERTIES
+      RESOURCE_LOCK gpu_vram LABELS long)
 
   # guile-serve-http drives the OpenAI-compatible server (serve/app.scm) end to
   # end — plain JSON, SSE over a raw socket, a WebSocket — against the mock
