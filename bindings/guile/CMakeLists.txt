@@ -26,6 +26,15 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-tensor.scm)
 
+  # guile-bpe trains and round-trips a byte-level BPE tokenizer; pure Scheme,
+  # no native library dependency.
+  add_test(
+    NAME guile-bpe
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/tokenizer/test-bpe.scm)
+
   # guile-nn loads libsonicboom.so (built by the `sonicboom` target), so put its
   # directory on LD_LIBRARY_PATH for the dynamic-link call.
   add_test(
