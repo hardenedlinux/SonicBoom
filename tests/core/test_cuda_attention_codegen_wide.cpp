@@ -279,7 +279,7 @@ struct ShapeCase {
 // core/src/nn/cuda_elementwise.cu and the Stage 3c report. Everything is
 // switched by the same environment the runtime reads, so a run measures
 // exactly the path a caller gets.
-int run_bench() {
+int run_bench(int prefill_n) {
   const Cfg cfgs[] = {{64, 2, 7, 14}, {256, 2, 4, 8}, {512, 2, 4, 8}};
   for (const Cfg &c : cfgs) {
     std::mt19937 rng(9100 + c.d);
@@ -299,10 +299,14 @@ int run_bench() {
     std::vector<std::string> configs;
     if (c.d == 64)
       configs = {"64,64,1", "32,64,1", "64,32,1", "32,32,1",
-                 "64,64,2", "64,32,2", "64,64,4", "64,32,4", "64,16,4"};
+                 "64,64,2", "64,32,2", "64,64,4", "64,32,4", "64,16,4",
+                 // P-in-registers arm (warp-head; br is fixed at 16).
+                 "wh,16,16", "wh,16,32", "wh,16,64"};
     else if (c.d == 256)
       configs = {"32,32,2", "32,32,4", "64,32,4", "32,64,2", "16,32,2",
-                 "48,32,4", "64,32,2", "64,16,4", "32,16,4"};
+                 "48,32,4", "64,32,2", "64,16,4", "32,16,4",
+                 // P-in-registers arm (warp-head; br is fixed at 16).
+                 "wh,16,16", "wh,16,32", "wh,16,48", "wh,16,64"};
     else
       configs = {"16,32,4", "16,32,8", "16,16,4", "16,16,8", "32,16,8",
                  "32,16,4"};
@@ -326,12 +330,14 @@ int run_bench() {
       double dec = -1.0, pre = -1.0;
       if (prepare_case(c, b, qabs, kseq, vseq, 512, 1))
         dec = bench_calls(c, b, 1, window, 50);
-      if (prepare_case(c, b, qabs, kseq, vseq, 0, 256))
-        pre = bench_calls(c, b, 256, window, 10);
+      // Prefill batch: 256 by default; --bench <n> uses the ppN used by the
+      // C1/C2 comparisons against llama.cpp.
+      if (prepare_case(c, b, qabs, kseq, vseq, 0, prefill_n))
+        pre = bench_calls(c, b, prefill_n, window, 10);
       std::printf(
-          "BENCH d=%d gqa=%d window=%llu impl=%s cfg=%s decode_ms=%.4f "
+          "BENCH d=%d gqa=%d window=%llu n=%d impl=%s cfg=%s decode_ms=%.4f "
           "prefill_ms=%.4f\n",
-          c.d, c.gqa, (unsigned long long)window, r.impl,
+          c.d, c.gqa, (unsigned long long)window, prefill_n, r.impl,
           r.cfg != nullptr ? r.cfg : "-", dec, pre);
       std::fflush(stdout);
     }
@@ -346,7 +352,8 @@ int main(int argc, char **argv) {
     std::cout << "test_cuda_attention_codegen_wide SKIP (no CUDA device)\n";
     return 0;
   }
-  if (argc > 1 && std::string_view(argv[1]) == "--bench") return run_bench();
+  if (argc > 1 && std::string_view(argv[1]) == "--bench")
+    return run_bench(argc > 2 ? std::atoi(argv[2]) : 256);
   setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
 
   const ShapeCase shapes[] = {

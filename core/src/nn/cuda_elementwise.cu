@@ -2868,8 +2868,14 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
   if (!shape) return std::nullopt;
   if (const char *e = std::getenv("SONICBOOM_ATTN_CODEGEN")) {
     int br = 0, bc = 0, dps = 0;
-    if (std::sscanf(e, "%d,%d,%d", &br, &bc, &dps) == 3 && br > 0 && bc > 0 &&
-        dps > 0) {
+    if (std::sscanf(e, "wh,%d,%d", &br, &bc) == 2 && br > 0 && bc > 0) {
+      // P-in-registers (warp-head) arm: br must be 16, dps is implicit.
+      shape->warp_head = true;
+      shape->br = br;
+      shape->bc = bc;
+      shape->dps = 1;
+    } else if (std::sscanf(e, "%d,%d,%d", &br, &bc, &dps) == 3 && br > 0 &&
+               bc > 0 && dps > 0) {
       shape->br = br;
       shape->bc = bc;
       shape->dps = dps;
@@ -2897,7 +2903,10 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
                   &nslots_p, &nhq_p,   &nhkv_p, &n_p,    &window_p,
                   &scale_p,  &out_p};
   const int grid_x = (n + shape.br - 1) / shape.br;
-  return planner::glue::launch_attention(shape, args, grid_x, n_heads_q);
+  // Warp-head blocks are (query tile, KV head): each warp covers one of the
+  // KV head's query heads.
+  const int grid_y = shape.warp_head ? n_heads_kv : n_heads_q;
+  return planner::glue::launch_attention(shape, args, grid_x, grid_y);
 }
 
 // Prefill implementation choice for a shape class: the hand-written kernel
@@ -2907,17 +2916,23 @@ struct AttnChoice {
   int br = 0;
   int bc = 0;
   int dps = 0;
+  // P-in-registers variant: one warp per (query head, 16-row chunk), no d
+  // split, S/P never in shared memory. Not token-identical to the dps split
+  // (different S reduction association), so only an opt-in arm.
+  bool wh = false;
 };
 
 bool attn_same_choice(const AttnChoice &a, const AttnChoice &b) {
   if (a.impl != b.impl) return false;
+  if (a.wh != b.wh) return false;
   return a.impl == AttnImpl::Own ||
          (a.br == b.br && a.bc == b.bc && a.dps == b.dps);
 }
 
 std::string attn_choice_name(const AttnChoice &c) {
   if (c.impl == AttnImpl::Own) return "own";
-  return "codegen:" + std::to_string(c.br) + "," + std::to_string(c.bc) + "," +
+  return std::string(c.wh ? "codegen-wh:" : "codegen:") +
+         std::to_string(c.br) + "," + std::to_string(c.bc) + "," +
          std::to_string(c.dps);
 }
 
@@ -3026,24 +3041,33 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   }
 
   std::vector<AttnChoice> cands{def};
+  auto add_candidate = [&](const compiler::AttentionShape &s, const AttnChoice &c) {
+    if (!compiler::attention_shape_supported(s)) return;
+    if (compiler::attention_shared_bytes(s) > max_smem) return;
+    if (compiler::attention_block_threads(s) > max_threads) return;
+    for (const AttnChoice &x : cands)
+      if (attn_same_choice(x, c)) return;
+    cands.push_back(c);
+  };
   for (int dps : {1, 2, 4, 8})
     for (int bc : {16, 32, 48, 64})
       for (int br : {16, 32, 48, 64}) {
         const compiler::AttentionShape s{
             .head_dim = head_dim, .gqa = gqa, .window_mask = window,
             .br = br, .bc = bc, .dps = dps};
-        if (!compiler::attention_shape_supported(s)) continue;
-        if (compiler::attention_shared_bytes(s) > max_smem) continue;
-        if (compiler::attention_block_threads(s) > max_threads) continue;
-        const AttnChoice c{AttnImpl::Codegen, br, bc, dps};
-        bool dup = false;
-        for (const AttnChoice &x : cands)
-          if (attn_same_choice(x, c)) {
-            dup = true;
-            break;
-          }
-        if (!dup) cands.push_back(c);
+        add_candidate(s, {AttnImpl::Codegen, br, bc, dps});
       }
+  // P-in-registers arm (warp per query head, no d split). Its S reduction
+  // association differs from the dps-split kernels, so it enters the search
+  // only when the non-token-identical arm is enabled; the measured default
+  // never switches to it otherwise.
+  if (std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr)
+    for (int bc : {16, 32, 48, 64}) {
+      const compiler::AttentionShape s{
+          .head_dim = head_dim, .gqa = gqa, .window_mask = window,
+          .br = 16, .bc = bc, .dps = 1, .warp_head = true};
+      add_candidate(s, {AttnImpl::Codegen, 16, bc, 1, true});
+    }
 
   AttnTuneBufs b;
   const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;
@@ -3089,7 +3113,7 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
                              n_heads_q, n_heads_kv, w, scale, b.out);
     const compiler::AttentionShape s{
         .head_dim = head_dim, .gqa = gqa, .window_mask = window,
-        .br = c.br, .bc = c.bc, .dps = c.dps};
+        .br = c.br, .bc = c.bc, .dps = c.dps, .warp_head = c.wh};
     return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
                                kAttnTuneSlots, kAttnTuneQueries, n_heads_q,
                                n_heads_kv, w, scale, b.out);
@@ -3148,13 +3172,14 @@ bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
     out = {AttnImpl::Own, 0, 0, 0};
     return true;
   }
-  int br = 0, bc = 0, dps = 0;
+  int br = 0, bc = 0, dps = 0, wh = 0;
   if (!get("br", br) || !get("bc", bc) || !get("dps", dps)) return false;
+  (void)get("wh", wh);
   const compiler::AttentionShape s{
       .head_dim = head_dim, .gqa = gqa, .window_mask = window,
-      .br = br, .bc = bc, .dps = dps};
+      .br = br, .bc = bc, .dps = dps, .warp_head = wh != 0};
   if (!compiler::attention_shape_supported(s)) return false;
-  out = {AttnImpl::Codegen, br, bc, dps};
+  out = {AttnImpl::Codegen, br, bc, dps, wh != 0};
   return true;
 }
 
@@ -3196,7 +3221,8 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
         {"impl", choice.impl == AttnImpl::Codegen ? 1 : 0},
         {"br", choice.br},
         {"bc", choice.bc},
-        {"dps", choice.dps}};
+        {"dps", choice.dps},
+        {"wh", choice.wh ? 1 : 0}};
     ::sonicboom::tune::store("attention-prefill", key, values);
     if (verbose)
       std::fprintf(stderr,
@@ -3460,7 +3486,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
       if (c.impl == AttnImpl::Codegen) {
         const compiler::AttentionShape s{
             .head_dim = head_dim, .gqa = gqa, .window_mask = windowed,
-            .br = c.br, .bc = c.bc, .dps = c.dps};
+            .br = c.br, .bc = c.bc, .dps = c.dps, .warp_head = c.wh};
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
@@ -3474,9 +3500,9 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                           n_slots, n, n_heads_q, n_heads_kv, sliding_window,
                           scale, out)) {
     if (attn_trace_on()) {
-      const std::string cfg = std::to_string(shape->br) + "," +
-                              std::to_string(shape->bc) + "," +
-                              std::to_string(shape->dps);
+      const std::string cfg =
+          (shape->warp_head ? "wh," : "") + std::to_string(shape->br) + "," +
+          std::to_string(shape->bc) + "," + std::to_string(shape->dps);
       attn_trace_prefill(
           attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
           "codegen", cfg.c_str(), shape->br, shape->bc,

@@ -207,7 +207,8 @@ std::string attention_region_name(const compiler::AttentionShape &shape) {
            std::to_string(shape.gqa) + mask;
   return "attn-d" + std::to_string(shape.head_dim) + "-g" +
          std::to_string(shape.gqa) + mask + "-b" + std::to_string(shape.br) +
-         "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps);
+         "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps) +
+         (shape.warp_head ? "-wh" : "");
 }
 
 // The generated attention kernel's PTX: disk cache first, generator on a miss.

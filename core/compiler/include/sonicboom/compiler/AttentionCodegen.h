@@ -71,10 +71,25 @@ struct AttentionShape {
   // it. In decode mode br/bc/dps are ignored.
   bool decode = false;
 
+  // P-in-registers variant (prefill): the head_dim is not split across warps.
+  // One warp owns one (query head, 16-row chunk) for its whole head_dim, so S
+  // is produced entirely inside that warp, the softmax runs on its own
+  // accumulated fragments, and P is converted to fp16 A-fragments in registers
+  // for P V -- no partial-S exchange and no P round trip through shared
+  // memory. A block holds `gqa` warps, one per query head of the same KV head,
+  // so the K/V tile staged in shared memory is shared by all of them; the grid
+  // is (query tiles, n_heads_kv) with br fixed at 16. The register budget caps
+  // this variant at head_dim <= 256 (head_dim/2 f32 accumulators per lane;
+  // wider heads keep the dps-split kernel). Its S reduction order differs from
+  // the dps-split kernel's (one ascending k sweep instead of per-dps partials
+  // summed in warp order), so it is not token-identical and stays an opt-in
+  // arm.
+  bool warp_head = false;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
-           dps == o.dps && decode == o.decode;
+           dps == o.dps && decode == o.decode && warp_head == o.warp_head;
   }
 };
 
@@ -82,6 +97,9 @@ struct AttentionShape {
 // fragments of four f32 per thread (DC = head_dim/dps <= 128), so the register
 // budget bounds the per-warp column slice, not head_dim; the staging is
 // 2*(br*head_dim + 2*bc*head_dim) bytes plus the partial-S buffer when dps > 1.
+// Warp-head shapes (warp_head) additionally require br == 16, dps == 1,
+// gqa <= 8, head_dim % 16 == 0 and head_dim <= 256 (the whole head_dim is
+// accumulated in one warp), and their staging is 2*(gqa*br + 2*bc)*head_dim.
 // Decode shapes need head_dim % 32 == 0 and head_dim / 32 <= 16 accumulator
 // registers per lane (a single warp owns one head), and head_dim <= 1024 so the
 // combine block fits the thread limit.
