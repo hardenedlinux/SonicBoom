@@ -48,9 +48,12 @@ constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // Version 2 widens the op field from 16 to 32 bytes so a full op name (V2's
 // "spec_verify_ratio") fits. Version 3 changes the "attn_prefill" TileConfig
 // meaning from (tile_seq, tile_head) to (br, dc, bc, as), so a version-2
-// record must not be applied to the new grid. An older file misses on lookup
-// and is rewritten by the first store, which is the cache's own reset path.
-constexpr uint32_t kVersion = 3;
+// record must not be applied to the new grid. Version 4 splits gemv rows
+// above 16384 into their own buckets, so a version-3 "bprN-r16384" record
+// would be applied to a class it was not measured for. An older file misses
+// on lookup and is rewritten by the first store, which is the cache's own
+// reset path.
+constexpr uint32_t kVersion = 4;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
@@ -315,10 +318,13 @@ std::optional<double> lookup_ratio(std::string_view op,
 }
 
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {
-  // Rows bucket to the next power of two in [128, 16384]; the blocks-per-row
+  // Rows bucket to the next power of two in [128, 262144]; the blocks-per-row
   // count already clusters the model's matvecs (8..64) and is kept exact.
+  // The buckets above 16384 keep a tall output (the 262144-row logits
+  // projection) from sharing a class with a 10240-row FFN, whose best launch
+  // width is wider than gridDim.y allows for the tall shape.
   int rows_bucket = 128;
-  while (rows_bucket < num_rows && rows_bucket < 16384) rows_bucket <<= 1;
+  while (rows_bucket < num_rows && rows_bucket < 262144) rows_bucket <<= 1;
   return "bpr" + std::to_string(blocks_per_row) + "-r" +
          std::to_string(rows_bucket);
 }

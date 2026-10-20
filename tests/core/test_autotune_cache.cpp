@@ -117,6 +117,11 @@ int main() {
         "a different row bucket has a different shape class");
   check(mt::gemv_shape_class(8, 512) != mt::gemv_shape_class(40, 512),
         "different blocks-per-row differ");
+  check(mt::gemv_shape_class(10, 10240) == "bpr10-r16384" &&
+            mt::gemv_shape_class(10, 262144) == "bpr10-r262144",
+        "rows above 16384 bucket separately (FFN vs logits)");
+  check(mt::gemv_shape_class(10, 262144) == mt::gemv_shape_class(10, 400000),
+        "the tallest bucket is clamped at r262144");
 
   // The runner gate, and the gemv lookup that honors it.
   {

@@ -148,7 +148,8 @@ TileConfig gemv_config(int blocks_per_row, int num_rows);
 
 // A shape class is a coarse, bucketized description of the problem: settings
 // are per class, never per batch size or KV position, so a reused prefix and a
-// full prefill resolve the same way.
+// full prefill resolve the same way. Rows bucket to the next power of two in
+// [128, 262144]; blocks-per-row is kept exact.
 std::string gemv_shape_class(int blocks_per_row, int num_rows);
 
 // MMQ2 — the generated int8 tensor-core prefill matmul (op "matmul_q8_tc").
