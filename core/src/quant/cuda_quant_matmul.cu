@@ -2170,6 +2170,57 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Two or three legacy projections over one q8_1 activation, one launch. The
+// decode graph's siblings share their activation row for row, so the merged
+// kernel lays the members' rows end to end and every row keeps its own
+// lane-to-block walk and reduction: bit-identical per row, one ramp/tail for
+// the group instead of one each.
+bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
+                            const BlockQ8_1* xq) {
+  if (!available() || !xq) return false;
+  if (siblings.size() < 2 || siblings.size() > 3) return false;
+
+  q8_1::legacy_slot slots[3] = {};
+  uint32_t blocks_per_row = 0;
+  for (std::size_t i = 0; i < siblings.size(); ++i) {
+    const GemvSibling& s = siblings[i];
+    if (!s.weight || !s.y) return false;
+    const QuantizedTensor& W = *s.weight;
+    if (!W.valid() || W.dims().size() != 2) return false;
+    if (!is_legacy_quant(W.type()) || W.block_size() != q8_1::QK8_1) return false;
+    const uint64_t cols = W.dims()[0];
+    const uint64_t rows = W.dims()[1];
+    if (rows == 0) return false;
+    const uint32_t bpr = uint32_t(cols / q8_1::QK8_1);
+    if (bpr == 0) return false;
+    if (blocks_per_row == 0)
+      blocks_per_row = bpr;
+    else if (blocks_per_row != bpr)
+      return false;  // not the same activation
+    const float* d_bias = nullptr;
+    if (!s.bias.empty()) {
+      if (s.bias.size() != rows) return false;
+      d_bias = static_cast<const float*>(
+          upload_bytes(s.bias.data(), rows * sizeof(float)));
+      if (!d_bias) return false;
+    }
+    const void* d_w = upload_weight(W);
+    if (!d_w) return false;
+    slots[i] = q8_1::legacy_slot{
+        static_cast<const uint8_t*>(d_w), d_bias, s.y, int(rows),
+        W.type() == QuantType::Q8_0 ? 1 : 0};
+  }
+
+  const int total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
+  const dim3 block(32, 8);
+  const dim3 grid(1, (total_rows + 7) / 8);
+  SB_NOTE_LAUNCH(q8_1::gemv_legacy_siblings_q8_1, grid, block, 0, cur_stream());
+  q8_1::gemv_legacy_siblings_q8_1<<<grid, block, 0, cur_stream()>>>(
+      slots[0], slots[1], slots[2],
+      reinterpret_cast<const q8_1::block_q8_1*>(xq), int(blocks_per_row));
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
                            float* y, int n) {
   if (!available()) return false;

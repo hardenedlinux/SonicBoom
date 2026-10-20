@@ -890,6 +890,108 @@ public:
   }
 };
 
+// fuse_sibling_gemv_pass (D1): projections that read the same quantized
+// activation — the q/k/v trio of one attention, the gate/up pair of one FFN —
+// become one node, and the CUDA backend runs them as one launch.
+//
+// The decode graph quantizes an activation once and feeds every projection that
+// consumes it, so those projections are separate nodes and separate kernel
+// launches. At decode shape each launch is small enough that its ramp/tail
+// dominates its memory time (nsys on Qwen2.5 0.5B: the same q5_0 gemv kernel
+// reaches 203 GB/s at 48640 rows, 181 at 4864, 132 at 896), so one launch over
+// the members' rows laid end to end pays that cost once. Every row keeps its own
+// lane-to-block walk and 32-lane reduction in the merged kernel, so the outputs
+// are bit-identical to the separate launches.
+//
+// Attribute form: the first projection keeps the node and its identity, gains
+// `s1_slot` (`s2_slot`) naming the members' weights and `s1_bias_slot`
+// (`s2_bias_slot`) for their folded biases, and carries the members' output
+// tensors as extra results. A backend that cannot run the merged form falls
+// back to the members' separate launches in order, so this is a scheduling
+// change only. Decode form only: a `batch` (mmq prefill) or `verify` node is
+// left alone, as is one carrying `add_input` (the merged kernel has no residual
+// epilogue).
+class FuseSiblingGemvPass
+    : public mlir::PassWrapper<FuseSiblingGemvPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSiblingGemvPass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    // Projections grouped by the activation tensor they read (operand 0 — the
+    // only operand of a decode gemv), in body order.
+    llvm::DenseMap<int64_t, llvm::SmallVector<mlir::Operation *>> groups;
+    llvm::SmallVector<int64_t> order;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() !=
+          boomOpName(planner::OpKind::QuantizedMatmulQ8))
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (nodeAttrInt(attrs, "batch") || nodeAttrInt(attrs, "verify")) continue;
+      if (nodeAttrInt(attrs, "add_input")) continue;
+      if (!nodeAttrInt(attrs, "slot")) continue;
+      if (node.getNumResults() != 1 || node.getNumOperands() != 1) continue;
+      const int64_t act = view.idOf(node.getOperand(0));
+      auto [it, inserted] = groups.try_emplace(act);
+      if (inserted) order.push_back(act);
+      it->second.push_back(&node);
+    }
+
+    for (int64_t act : order) {
+      llvm::SmallVector<mlir::Operation *> &g = groups.find(act)->second;
+      if (g.size() < 2) continue;
+      const std::size_t members = std::min<std::size_t>(g.size(), 3);
+      mlir::Operation *head = g[0];
+
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          head->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      llvm::SmallVector<int64_t> resultIds;
+      llvm::SmallVector<mlir::Type> resultTypes;
+      for (std::size_t k = 0; k < members; ++k) {
+        mlir::Operation *m = g[k];
+        auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        if (k > 0) {
+          // The member's weight and its folded bias (when it has one), named
+          // after its position in the merged launch.
+          const std::string prefix = k == 1 ? "s1_" : "s2_";
+          const std::string slotName = prefix + "slot";
+          nodeAttrs.push_back(boom::NodeAttr::get(
+              view.ctx(), slotName, builder.getI64IntegerAttr(*nodeAttrInt(attrs, "slot"))));
+          if (auto bias = nodeAttrInt(attrs, "bias_slot")) {
+            const std::string biasName = prefix + "bias_slot";
+            nodeAttrs.push_back(boom::NodeAttr::get(
+                view.ctx(), biasName, builder.getI64IntegerAttr(*bias)));
+          }
+        }
+        resultIds.push_back(GraphEditor::resultIds(*m).front());
+        resultTypes.push_back(m->getResult(0).getType());
+      }
+
+      // The head keeps its id, name, place and activation; the members' outputs
+      // become the node's additional results.
+      builder.setInsertionPoint(head);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+          GraphEditor::nodeId(*head),
+          head->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), resultIds, head->getOperands(),
+          resultTypes, head->getAttrOfType<mlir::StringAttr>("backend"));
+
+      for (std::size_t k = 0; k < members; ++k) {
+        view.noteValue(resultIds[k], node->getResult(k));
+        g[k]->getResult(0).replaceAllUsesWith(node->getResult(k));
+      }
+      for (std::size_t k = 0; k < members; ++k) g[k]->erase();
+    }
+    view.commitTable();
+  }
+};
+
 // fuse_glue_regions_pass (Stage 5): a maximal glue region becomes one node the
 // compiler lowers to a device kernel through MLIR (linalg/gpu -> NVVM -> PTX;
 // see compiler/GlueCodegen.h).
@@ -2403,6 +2505,7 @@ struct DisabledPasses {
   bool silu_mul_quantize = false;
   bool bias_into_gemv = false;
   bool residual_add_into_gemv = false;
+  bool sibling_gemv = false;
   bool rms_norm_mmq = false;
   bool gelu_mul_mmq = false;
   bool silu_mul_mmq = false;
@@ -2432,6 +2535,7 @@ constexpr PassName kPassNames[] = {
     {"SiluMulQuantizePass", &DisabledPasses::silu_mul_quantize},
     {"BiasIntoGemvPass", &DisabledPasses::bias_into_gemv},
     {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
+    {"FuseSiblingGemvPass", &DisabledPasses::sibling_gemv},
     {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
     {"FuseRmsNormAddPass", &DisabledPasses::fuse_rms_norm_add},
@@ -2519,6 +2623,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     if (!off.bias_into_gemv) pm.addPass(std::make_unique<BiasIntoGemvPass>());
     if (!off.residual_add_into_gemv)
       pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
+    // After the epilogue folds: those decide which projections take a bias or
+    // residual. Groups are formed by shared activation, not adjacency, so a
+    // projection may be lifted across an unrelated node's position.
+    if (!off.sibling_gemv) pm.addPass(std::make_unique<FuseSiblingGemvPass>());
     // Last: it consumes the nodes the folds above produce.
     if (!off.fuse_glue_regions)
       pm.addPass(std::make_unique<FuseGlueRegionsPass>());

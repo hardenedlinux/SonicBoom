@@ -580,6 +580,68 @@ SONICBOOM_DEFINE_LEGACY_MMVQ(q5_0, 22, vec_dot_q5_0_q8_1)
 SONICBOOM_DEFINE_LEGACY_MMVQ(q8_0, 34, vec_dot_q8_0_q8_1)
 #undef SONICBOOM_DEFINE_LEGACY_MMVQ
 
+// --- sibling launches ------------------------------------------------------
+//
+// Two or three legacy projections that read the same q8_1 activation — the
+// q/k/v trio of one attention (Qwen's v is Q8_0 while q/k are Q5_0), the
+// gate/up pair of one FFN — run as one launch: the members' rows are laid end
+// to end over one grid, and each warp computes its row exactly as the
+// standalone kernel would (same lane-to-block walk, same 32-lane shuffle tree,
+// the same optional bias epilogue), so every output value is bit-identical to
+// the separate launches. The point is the launch itself: at decode shapes these
+// projections are small enough that the ramp/tail dominates their memory time
+// (nsys: 181 GB/s at 4864 rows, 132 GB/s at 896 against 203 GB/s at 48640 for
+// the same kernel), and one launch over the union pays it once.
+//
+// The mixed types are dispatched per row: `q8_0` is row-uniform, so the branch
+// outside the block walk leaves each row's loop exactly the specialized
+// kernel's.
+struct legacy_slot {
+  const uint8_t* w;
+  const float* bias;  // optional [rows], added after the reduced sum
+  float* dst;
+  int rows;
+  int q8_0;  // 1 -> 34-byte blocks, 0 -> 22-byte blocks
+};
+
+__global__ void gemv_legacy_siblings_q8_1(legacy_slot s0, legacy_slot s1,
+                                          legacy_slot s2,
+                                          const block_q8_1* __restrict__ y,
+                                          int blocks_per_row) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= s0.rows + s1.rows + s2.rows) return;
+  legacy_slot s = s0;
+  int r = row;
+  if (row >= s0.rows) {
+    s = s1;
+    r -= s0.rows;
+  }
+  if (row >= s0.rows + s1.rows) {
+    s = s2;
+    r -= s1.rows;
+  }
+  float sum = 0.0f;
+  if (s.q8_0) {
+    for (int b = lane; b < blocks_per_row; b += 32) {
+      const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 34;
+      sum += vec_dot_q8_0_q8_1(wb, y + b);
+    }
+  } else {
+    for (int b = lane; b < blocks_per_row; b += 32) {
+      const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 22;
+      sum += vec_dot_q5_0_q8_1(wb, y + b);
+    }
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) {
+    float v = sum;
+    if (s.bias) v += s.bias[r];
+    s.dst[r] = v;
+  }
+}
+
 // --- batched warp-per-row mmvq (prefill) ------------------------------------
 //
 // Y[row, pos] = sum_b vec_dot(W[row,b], Xq[pos,b]) for pos in [0, n).
