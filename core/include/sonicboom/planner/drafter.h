@@ -66,6 +66,14 @@ class NGramDrafter {
   // history, so the proposal never invents a token.
   size_t propose(std::span<uint64_t> out) const;
 
+  // As above, also reporting the length of the n-gram that hit (4, 3 or 2) in
+  // *matched_n, or 0 when nothing matched. Diagnostic only (S4); the proposal
+  // is identical to the overload above. Note the structural limit this exposes
+  // on a repeated stream: the most recent occurrence of the suffix usually ends
+  // one token back, so the proposal is one token even when the stream continues
+  // for hundreds (see the one-token-cycle case in test_ngram_drafter).
+  size_t propose(std::span<uint64_t> out, size_t* matched_n) const;
+
   std::span<const uint64_t> history() const noexcept { return hist_; }
   size_t size() const noexcept { return hist_.size(); }
 
