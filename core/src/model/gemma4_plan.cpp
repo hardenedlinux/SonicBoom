@@ -1246,7 +1246,10 @@ static bool ir_program_enabled() {
 constexpr int64_t kSpecMaxDrafts = 7;
 
 // S2 bootstrap draft length: the adaptive policy's forced exploration length.
-constexpr int64_t kSpecBootstrapDrafts = 3;
+// S3 starts at k = 1: the bootstrap only has to supply the EMA with accept /
+// reject data, and on a workload without matches every extra forced draft is
+// verify cost the abort cannot refund.
+constexpr int64_t kSpecBootstrapDrafts = 1;
 
 // SONICBOOM_SPEC selects the generation loop:
 //   off  (default) the plain greedy loop (B1's program, step per token);
@@ -1455,20 +1458,39 @@ struct SpecLengthPolicy {
   double alpha = 0.5;          // alpha0
   int64_t warm_next = -1;      // next k to warm up, < 0 when done
   bool warm_primed = false;    // the first pass at warm_next has run
-  // S2 bootstrap: forced k = 3 iterations still owed after the warm-up. The
+  // S2 bootstrap: forced k = 1 iterations still owed after the warm-up. The
   // cost model cannot break its own cold start: with alpha at its 0.5 prior,
   // k = 0 wins for any nearly-linear cost curve, no draft is ever proposed, so
   // alpha is never updated. The bootstrap supplies the drafts the EMA needs.
   uint64_t bootstrap_left = 0;
+  // S3 early abort: consecutive bootstrap verify steps that accepted nothing.
+  // A workload the drafter cannot match will never teach the EMA anything, so
+  // five rejects in a row end the bootstrap instead of paying 50 iterations.
+  uint64_t consecutive_zero_accept = 0;
 };
 
 // SONICBOOM_SPEC_BOOTSTRAP (default 50, 0 disables): number of adaptive
-// iterations after the cost warm-up that force k = 3. Parsed once per process,
+// iterations after the cost warm-up that force k = 1. Parsed once per process,
 // like SONICBOOM_SPEC.
 static uint64_t spec_bootstrap_steps() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP");
     if (!e || !*e) return uint64_t(50);
+    const long v = std::strtol(e, nullptr, 10);
+    return v > 0 ? uint64_t(v) : uint64_t(0);
+  }();
+  return n;
+}
+
+// SONICBOOM_SPEC_BOOTSTRAP_ABORT (default 5, 0 disables): consecutive
+// bootstrap verify steps that accept no draft before the bootstrap gives up
+// and the policy takes over. A workload without drafter matches never updates
+// alpha usefully, so the remaining forced iterations are pure verify cost.
+// 0 restores the fixed SONICBOOM_SPEC_BOOTSTRAP stepping (the S2 ablation).
+static uint64_t spec_bootstrap_abort() {
+  static const uint64_t n = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP_ABORT");
+    if (!e || !*e) return uint64_t(5);
     const long v = std::strtol(e, nullptr, 10);
     return v > 0 ? uint64_t(v) : uint64_t(0);
   }();
@@ -1592,6 +1614,7 @@ static uint64_t run_spec_program_steps(
     bool warm = false;         // a warm-up iteration (forced k drafts)
     bool measure = false;      // ... whose time is c(k) (its second pass)
     bool finish_warm = false;  // the last measurement: persist after timing
+    bool bootstrap_iter = false;  // a forced bootstrap verify (S3 abort input)
     if (repeat) {
       k = size_t(room);
       for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
@@ -1623,11 +1646,13 @@ static uint64_t run_spec_program_steps(
         if (policy.bootstrap_left > 0) {
           // S2: force exploration so the EMA sees real acceptance data. Like
           // the warm-up's forced drafts these are proposals only; the verifier
-          // still decides the emitted run.
+          // still decides the emitted run. S3: one draft and an abort on a
+          // run of rejects keep the exploration cheap on unmatched workloads.
           k = size_t(std::min<uint64_t>(uint64_t(kSpecBootstrapDrafts), max_k));
           for (size_t i = 0; i < k; ++i) drafts[i] = token;
           --policy.bootstrap_left;
           ++g_spec_counters.bootstrap_steps;
+          bootstrap_iter = true;
         } else {
           k = size_t(drafter.propose(std::span<uint64_t>(
               drafts, size_t(spec_choose_drafts(
@@ -1717,6 +1742,19 @@ static uint64_t run_spec_program_steps(
       }
     } else if (adaptive && !warm) {
       policy.alpha = spec_alpha_update(policy.alpha, decision.accepted, k);
+    }
+    // S3 early abort: a bootstrap verify that accepts nothing is a drafter
+    // miss. A run of them means this workload has nothing to match, so the
+    // remaining forced iterations can only add verify cost — switch to the
+    // normal policy now.
+    if (bootstrap_iter) {
+      const uint64_t abort_after = spec_bootstrap_abort();
+      if (abort_after > 0) {
+        policy.consecutive_zero_accept =
+            decision.accepted == 0 ? policy.consecutive_zero_accept + 1 : 0;
+        if (policy.consecutive_zero_accept >= abort_after)
+          policy.bootstrap_left = 0;
+      }
     }
     if (decision.emitted == 0) break;  // the bound was already reached
     for (size_t i = 0; i < decision.emitted; ++i) {

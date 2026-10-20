@@ -562,6 +562,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // second, and it is returned after `out`.
   uint64_t extra_handle = 0;
   uint64_t extra_bytes = 0;
+  // A merged gemv node (fuse_sibling_gemv_pass) writes one output per member
+  // projection, in node->outputs order; the first is `out` above and these are
+  // the rest, allocated here and returned after it.
+  std::vector<std::pair<uint64_t, uint64_t>> sibling_outs;
   // NVTX range named after the graph node (its op kind, e.g. "rms_norm",
   // "quantized_matmul"), so nsys attributes each kernel launch to its operator
   // for the per-op launch-count breakdown.
@@ -821,7 +825,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
         const auto& qw = qweight(slot);
-        const bool epilogue = quant::cuda::gemv_bias_epilogue_supported(qw.type());
         // `bias_slot` is set by fuse_bias_into_gemv_pass: the projection's bias
         // (a bound [rows] model weight) was folded into this matmul node by
         // dropping the AddBias node that followed it. `add_input` is set by
@@ -841,24 +844,81 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const std::span<const float> b =
             has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
                      : std::span<const float>{};
-        const bool bias_fused = has_bias && b.size() == size_t(out_n) && epilogue;
+        // One projection: the gemv with whatever epilogue its type supports,
+        // then the elementwise kernels for a bias/residual it could not take
+        // (same values, more launches).
+        auto run_one = [&](const quant::QuantizedTensor& w,
+                           std::span<const float> bias, const float* add_p,
+                           float* y, int n) -> bool {
+          const bool ep = quant::cuda::gemv_bias_epilogue_supported(w.type());
+          const bool bias_fused = !bias.empty() && bias.size() == size_t(n) && ep;
+          const bool add_fused = add_p != nullptr && ep;
+          bool r = quant::cuda::gemv_q8_1_dev(
+              w, xq, y, bias_fused ? bias : std::span<const float>{},
+              add_fused ? add_p : nullptr);
+          if (r && !bias.empty() && !bias_fused)
+            r = nn::cuda::add_bias_dev(bias, y, y, n);
+          if (r && add_p && !add_fused) r = nn::cuda::add_dev(add_p, y, y, n);
+          return r;
+        };
         const float* add_p = has_add ? static_cast<const float*>(dev(in[add_idx]))
                                      : nullptr;
-        const bool add_fused = add_p != nullptr && epilogue;
-        if (bias_fused || add_fused) {
-          ok = quant::cuda::gemv_q8_1_dev(
-              qw, xq, out, bias_fused ? b : std::span<const float>{},
-              add_fused ? add_p : nullptr);
-          if (ok && has_bias && !bias_fused && !b.empty())
-            ok = nn::cuda::add_bias_dev(b, out, out, out_n);
-          if (ok && has_add && !add_fused)
-            ok = nn::cuda::add_dev(add_p, out, out, out_n);
-        } else {
-          ok = quant::cuda::gemv_q8_1_dev(qw, xq, out);
-          if (ok && has_bias && !b.empty())
-            ok = nn::cuda::add_bias_dev(b, out, out, out_n);
-          if (ok && has_add) ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        // `s1_slot`/`s2_slot` are set by fuse_sibling_gemv_pass: this node is
+        // the merged form of two or three projections that read the same
+        // activation (the q/k/v trio, the gate/up pair), one output each. They
+        // run as one launch — bit-identical per row — when the merged kernel
+        // takes them; otherwise the members run as separate launches in order,
+        // which is exactly what the unmerged plan did.
+        int64_t s1_slot = 0, s2_slot = 0;
+        const bool has_s1 = attr_i(*node, "s1_slot", s1_slot);
+        if (has_s1 && node->outputs.size() >= 2) {
+          const bool has_s2 =
+              attr_i(*node, "s2_slot", s2_slot) && node->outputs.size() >= 3;
+          const size_t members = has_s2 ? 3 : 2;
+          const int64_t slots[3] = {slot_i, s1_slot, s2_slot};
+          std::vector<quant::cuda::GemvSibling> sib;
+          std::vector<std::span<const float>> biases;
+          sib.reserve(members);
+          biases.reserve(members);
+          bool ready = true;
+          int rows[3] = {out_n, 0, 0};
+          for (size_t k = 0; k < members && ready; ++k) {
+            const auto* td = graph_.find_tensor(node->outputs[k]);
+            if (!td) { ready = false; break; }
+            rows[k] = int(td->size_bytes / sizeof(float));
+            int64_t bias_idx = 0;
+            bool hb = false;
+            if (k == 0) { bias_idx = bias_slot; hb = has_bias; }
+            else if (k == 1) hb = attr_i(*node, "s1_bias_slot", bias_idx);
+            else hb = attr_i(*node, "s2_bias_slot", bias_idx);
+            const auto& w = qweight(static_cast<model::WeightSlot>(slots[k]));
+            biases.push_back(hb ? fweight(static_cast<model::WeightSlot>(bias_idx))
+                                : std::span<const float>{});
+            float* yp = out;
+            if (k > 0) {
+              const uint64_t bytes = td->size_bytes;
+              const uint64_t h = bytes ? device::acquire(bytes) : 0;
+              if (!h) { ready = false; break; }
+              sibling_outs.push_back({h, bytes});
+              yp = dev_mut(h);
+            }
+            sib.push_back(quant::cuda::GemvSibling{&w, biases.back(), yp});
+          }
+          if (ready && quant::cuda::gemv_q8_1_siblings_dev(sib, xq)) {
+            ok = true;
+          } else if (ready) {
+            ok = true;
+            for (size_t k = 0; k < members && ok; ++k) {
+              float* yp = k == 0 ? out : dev_mut(sibling_outs[k - 1].first);
+              ok = run_one(*sib[k].weight, biases[k],
+                           k == 0 ? add_p : nullptr, yp, rows[k]);
+            }
+          } else {
+            ok = false;
+          }
+          break;  // the node's outputs are all written by the branch above
         }
+        ok = run_one(qw, b, add_p, out, out_n);
       }
       break;
     }
@@ -1695,6 +1755,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
 
   if (!ok) {
     if (extra_handle) device::release(extra_handle, extra_bytes);
+    for (const auto& e : sibling_outs) device::release(e.first, e.second);
     // A borrowed buffer belongs to the input value; the executor still owns it.
     if (!borrowed) device::release(out_handle, out_bytes);
     return std::unexpected(fail("Sonic CUDA kernel failed for node '" + node->name +
@@ -1707,6 +1768,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // consumed; release it rather than leak it.
   if (task.outputs.empty()) {
     if (!borrowed) device::release(out_handle, out_bytes);
+    for (const auto& e : sibling_outs) device::release(e.first, e.second);
     return std::vector<TensorValue>{};
   }
 
@@ -1714,6 +1776,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   res.push_back(TensorValue::from_device(out_handle, out_bytes));
   if (extra_handle)
     res.push_back(TensorValue::from_device(extra_handle, extra_bytes));
+  for (const auto& e : sibling_outs)
+    res.push_back(TensorValue::from_device(e.first, e.second));
   return res;
 }
 
