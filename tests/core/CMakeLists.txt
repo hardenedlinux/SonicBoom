@@ -454,6 +454,15 @@ if(SONICBOOM_USE_CUDA)
   set_tests_properties(test_async_prefetch_noop PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
+# SD1 DraftModel interface: NgramDraftModel (direct and through DraftModel*)
+# must propose token-identically to NGramDrafter, max_drafts must cross the
+# interface, the factory must select the n-gram drafter unless
+# SONICBOOM_DRAFT_MODEL is set, and LlmDraftModel must throw the
+# not-implemented message.
+add_executable(test_draft_model_interface test_draft_model_interface.cpp)
+target_link_libraries(test_draft_model_interface PRIVATE sonicboom)
+sb_add_cpp_test(test_draft_model_interface)
+
 # Blade -> Boom IR lowering test (design/mlir-migration.md §6.4 / §7d): the
 # direct document lowering must build the same IR as
 # graphToBoom(adapt_graph(doc)) for hand-written v0.1 documents, including
