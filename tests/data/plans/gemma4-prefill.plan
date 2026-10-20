@@ -4,7 +4,7 @@ model gemma4
 mode prefill
 n_ctx 0
 n 8
-plan_id 18133411966523103167
+plan_id 299303832001977777
 model_fingerprint 4623461846798960630
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6

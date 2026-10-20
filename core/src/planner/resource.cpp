@@ -16,8 +16,10 @@
 
 #include <sonicboom/planner/resource.h>
 
+#include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
+#include "async_prefetch.h"
 #include "fingerprint.h"
 
 #include <algorithm>
@@ -241,11 +243,18 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are reused unchanged on
       // the flat batched buffers).
       OpKind::FlashAttention, OpKind::KvAppend,
-      // VS1 prefetch markers. They carry no outputs and no kernels; the
-      // backend executes them as prefetch-stream bookkeeping, so the planner's
-      // capability check places them on the same device as the layer nodes.
-      OpKind::AsyncWeightPrefetch, OpKind::SyncPrefetch,
   };
+  // VS1 prefetch markers are registered only under the switch that can place
+  // them. They carry no outputs and no kernels; the backend executes them as
+  // prefetch-stream bookkeeping, so the planner's capability check places them
+  // on the same device as the layer nodes. With the switch off the pass inserts
+  // none, and leaving them out keeps the snapshot's supported-ops list — and
+  // therefore the resource fingerprint and every plan id derived from it —
+  // identical to the pre-VS1 one.
+  if (AsyncPrefetchRuntime::instance().enabled()) {
+    cpu.capability.supported_ops.push_back(OpKind::AsyncWeightPrefetch);
+    cpu.capability.supported_ops.push_back(OpKind::SyncPrefetch);
+  }
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the
   // Int64 token id / position of the transformer decode graph) are
@@ -284,9 +293,6 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,
         OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
-        // MMQ1: the prefill dispatch of the same projections onto the
-        // compiler-generated int8 tensor-core kernel.
-        OpKind::MatmulQ8Tc,
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
         OpKind::SiluMulQuantize,
@@ -311,10 +317,21 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // Compiler-generated glue regions (Stage 5): the PTX kernel is loaded
         // and launched by the SonicCudaBackend itself.
         OpKind::FusedRegion,
-        // VS1 prefetch markers: handled by the backend before any kernel launch
-        // (prefetch-stream bookkeeping only).
-        OpKind::AsyncWeightPrefetch, OpKind::SyncPrefetch,
     };
+    // MMQ1: the prefill dispatch of the same projections onto the
+    // compiler-generated int8 tensor-core kernel. Registered only while that
+    // dispatch is enabled (PrefillDispatchPass rewrites nothing when it is off),
+    // so the default snapshot's ops list, resource fingerprint and plan ids stay
+    // the pre-MMQ1 ones.
+    if (compiler::mmq_tc_mode() != compiler::MmqTcMode::Off)
+      gpu.capability.supported_ops.push_back(OpKind::MatmulQ8Tc);
+    // VS1 prefetch markers: handled by the backend before any kernel launch
+    // (prefetch-stream bookkeeping only). Same switch-gated registration as the
+    // CPU device above.
+    if (AsyncPrefetchRuntime::instance().enabled()) {
+      gpu.capability.supported_ops.push_back(OpKind::AsyncWeightPrefetch);
+      gpu.capability.supported_ops.push_back(OpKind::SyncPrefetch);
+    }
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));
 

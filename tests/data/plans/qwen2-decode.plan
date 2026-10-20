@@ -4,7 +4,7 @@ model qwen2
 mode decode
 n_ctx 512
 n 1
-plan_id 5892387602544828688
+plan_id 3231062210416953362
 model_fingerprint 5800016059479621579
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6
