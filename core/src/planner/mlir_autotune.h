@@ -276,6 +276,12 @@ class AutotuneRunner {
     // Called after each launch when set (a device stream sync for async
     // launches; synchronous launches leave it empty).
     std::function<void()> sync;
+    // The wait used while timing, when set: a lighter sync than `sync` (e.g. a
+    // stream sync without the device-to-host copy the bit-identity check
+    // needs), so the measurement is the launch rather than the launch plus an
+    // identical-for-every-candidate copy. Empty uses `sync`. The check runs and
+    // the final winner run always use `sync`.
+    std::function<void()> timing_sync;
     // Timed iterations per candidate (the brief's N=5).
     int iters = 5;
   };

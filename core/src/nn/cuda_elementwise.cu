@@ -3453,6 +3453,11 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
       (void)cudaGetLastError();
     }
   };
+  // Timing does not need the bit-identity window on the host: the ~900 KiB
+  // copy is identical for every candidate and was larger than the tile
+  // difference being measured. The check runs and the final winner run still
+  // use the copying sync above.
+  p.timing_sync = [&] { (void)cudaStreamSynchronize(cur_stream()); };
   // 8 timed bursts of 16 launches, min: the tile differences are small and the
   // choice is persisted, so the measurement must be stable.
   p.iters = 8;
@@ -3465,9 +3470,10 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   std::optional<TileConfig> best = mlir_tune::AutotuneRunner::run(p);
 
   // The probe's per-burst minimum is noisy at this size, so a candidate
-  // replaces production only when it beats it by more than the burst-to-burst
-  // spread measured on production itself. Two interleaved pairs of bursts
-  // keep a clock ramp common to both configs.
+  // replaces production only when it beats it by more than a fixed resolution.
+  // Three untimed warm-up bursts bring the memory clock up (its ramp inflated
+  // the old two-sample spread), then five timed pairs in alternating order keep
+  // a residual drift common to both configs; each side keeps its minimum.
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
   auto timed_burst = [&](const TileConfig &cfg) -> std::optional<double> {
     const auto s = apply(cfg);
@@ -3489,20 +3495,43 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   };
   TileConfig winner = production;
   if (best && !(*best == production)) {
-    const auto ref_a = timed_burst(production);
-    const auto win_a = timed_burst(*best);
-    const auto ref_b = timed_burst(production);
-    const auto win_b = timed_burst(*best);
-    if (ref_a && ref_b && win_a && win_b) {
-      const double ref = std::min(*ref_a, *ref_b);
-      const double win = std::min(*win_a, *win_b);
-      const double noise = (std::max(*ref_a, *ref_b) - ref) / ref;
-      if (win < ref * (1.0 - noise)) winner = *best;
+    for (int i = 0; i < 3; ++i) (void)timed_burst(production);
+    constexpr int kRounds = 5;
+    double refs[kRounds] = {}, wins[kRounds] = {};
+    bool ok = true;
+    for (int i = 0; i < kRounds && ok; ++i) {
+      if ((i & 1) == 0) {
+        const auto r = timed_burst(production);
+        const auto w = timed_burst(*best);
+        ok = r.has_value() && w.has_value();
+        if (ok) {
+          refs[i] = *r;
+          wins[i] = *w;
+        }
+      } else {
+        const auto w = timed_burst(*best);
+        const auto r = timed_burst(production);
+        ok = r.has_value() && w.has_value();
+        if (ok) {
+          refs[i] = *r;
+          wins[i] = *w;
+        }
+      }
+    }
+    if (ok) {
+      double ref = refs[0], win = wins[0], spread = 0;
+      for (int i = 1; i < kRounds; ++i) {
+        ref = std::min(ref, refs[i]);
+        win = std::min(win, wins[i]);
+        spread = std::max(spread, std::fabs(refs[i] - refs[0]));
+      }
+      constexpr double kResolution = 0.005;
+      if (win < ref * (1.0 - kResolution)) winner = *best;
       if (verbose)
         std::fprintf(stderr,
                      "[autotune] attn_prefill probe: prod=%.4f ms "
-                     "best=%.4f ms noise=%.2f%% -> %s\n",
-                     ref * 1e3, win * 1e3, noise * 100.0,
+                     "best=%.4f ms spread=%.2f%% -> %s\n",
+                     ref * 1e3, win * 1e3, spread / refs[0] * 100.0,
                      winner == *best ? "take" : "keep production");
     }
   }

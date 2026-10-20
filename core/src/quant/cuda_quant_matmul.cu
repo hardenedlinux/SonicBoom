@@ -2112,8 +2112,9 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
   };
   // The widths differ by at most a few percent on a class where they differ at
   // all, and the choice is persisted, so the measurement must be stable: 12
-  // timed bursts of 16 launches, min. The per-burst copy and host wait are
-  // common to every candidate.
+  // timed bursts of 16 launches, min. Timing waits on the stream only; the
+  // bit-identity copy is the check runs' job, not the timed ones'.
+  p.timing_sync = [&] { (void)cudaStreamSynchronize(cur_stream()); };
   p.iters = 12;
   const auto best = mlir_tune::AutotuneRunner::run(p);
   if (!best) return gemv_warps_for_launch(choice.cfg, num_rows);
@@ -2993,6 +2994,9 @@ static compiler::MmqTcShape resolve_mmq_tc_shape(
       cudaGetLastError();
     }
   };
+  // Timing waits on the stream only; the bit-identity copy belongs to the
+  // check runs.
+  p.timing_sync = [&] { (void)cudaStreamSynchronize(cur_stream()); };
   // 8 timed bursts of 16 launches, min: the tile differences are small and the
   // choice is persisted, so the measurement must be stable.
   p.iters = 8;

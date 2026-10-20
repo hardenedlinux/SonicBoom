@@ -569,30 +569,22 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
       std::memcpy(reference.data(), problem.output, problem.output_bytes);
   };
 
-  // Candidate 0 is the reference: its output is the bit-identity window and
-  // its time is the number to beat.
-  auto best_launch = problem.compile(problem.candidates[0]);
-  if (!best_launch) return std::nullopt;
-  (*best_launch)();
-  snapshot();
-
-  auto time_launch = [&](const Launch& launch) {
-    uint64_t best = std::numeric_limits<uint64_t>::max();
-    for (int i = 0; i < iters; ++i) {
-      const auto t0 = std::chrono::steady_clock::now();
-      launch();
-      if (problem.sync) problem.sync();
-      const auto t1 = std::chrono::steady_clock::now();
-      best = std::min<uint64_t>(
-          best,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    }
-    return best;
+  // Candidate 0 is the reference: its output is the bit-identity window.
+  struct Entry {
+    TileConfig cfg;
+    Launch launch;
+    uint64_t ns = std::numeric_limits<uint64_t>::max();
   };
+  std::vector<Entry> entries;
 
-  TileConfig best_cfg = problem.candidates[0];
-  uint64_t best_ns = time_launch(*best_launch);
+  auto ref_launch = problem.compile(problem.candidates[0]);
+  if (!ref_launch) return std::nullopt;
+  (*ref_launch)();
+  snapshot();
+  entries.push_back(Entry{problem.candidates[0], std::move(*ref_launch)});
 
+  // Compile and bit-check every other candidate before any timing: a
+  // candidate that cannot compile or that writes a different window is out.
   for (size_t i = 1; i < problem.candidates.size(); ++i) {
     auto launch = problem.compile(problem.candidates[i]);
     if (!launch) continue;
@@ -603,19 +595,53 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
             0) {
       continue;  // numerically different from the reference: not a candidate
     }
-    const uint64_t ns = time_launch(*launch);
-    if (ns < best_ns) {
-      best_ns = ns;
-      best_cfg = problem.candidates[i];
-      best_launch = std::move(launch);
+    entries.push_back(Entry{problem.candidates[i], std::move(*launch)});
+  }
+
+  // Time every candidate once per round, alternating the direction each round,
+  // so no candidate is always first or always last. Timing one candidate for
+  // all its rounds before the next (the old order) let a clock ramp or host
+  // load drift land on whichever end of the list ran first; at the few-percent
+  // margins these tuners measure, that bias flipped the nomination between
+  // processes. Each candidate keeps its fastest round.
+  for (int r = 0; r < iters; ++r) {
+    const bool forward = (r & 1) == 0;
+    for (size_t j = 0; j < entries.size(); ++j) {
+      Entry& e = entries[forward ? j : entries.size() - 1 - j];
+      const auto t0 = std::chrono::steady_clock::now();
+      e.launch();
+      if (problem.timing_sync)
+        problem.timing_sync();
+      else if (problem.sync)
+        problem.sync();
+      const auto t1 = std::chrono::steady_clock::now();
+      e.ns = std::min<uint64_t>(
+          e.ns,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
   }
+
+  // Strict <: on a tie the earlier candidate (candidate 0, the reference) wins,
+  // so a marginal measurement keeps the known config.
+  size_t best = 0;
+  for (size_t i = 1; i < entries.size(); ++i)
+    if (entries[i].ns < entries[best].ns) best = i;
+
+  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE")) {
+    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d rounds\n",
+                 entries.size(), iters);
+    for (const Entry& e : entries)
+      std::fprintf(stderr, "  %d,%d,%d,%d,%d: %.4f ms%s\n", e.cfg.tile_m,
+                   e.cfg.tile_n, e.cfg.tile_k, e.cfg.unroll, e.cfg.vectorize,
+                   double(e.ns) / 1e6, &e == &entries[best] ? " <-" : "");
+  }
+
   // Probing a rejected candidate leaves its output in the window; run the
   // winner once more so the caller's buffer holds the returned config's
   // result, not the last probe's.
-  (*best_launch)();
+  entries[best].launch();
   if (problem.sync) problem.sync();
-  return best_cfg;
+  return entries[best].cfg;
 }
 
 } // namespace sonicboom::mlir_tune
