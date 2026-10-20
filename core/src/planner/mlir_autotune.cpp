@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,9 +45,12 @@ namespace {
 // The file is a fixed-layout record array behind a 16-byte header. Records are
 // plain old data so a process can read them straight out of the mapping.
 constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
-constexpr uint32_t kVersion = 1;
+// Version 2 widens the op field from 16 to 32 bytes so a full op name (V2's
+// "spec_verify_ratio") fits; a version-1 file misses on lookup and is rewritten
+// by the first store, which is the cache's own reset path.
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kCapacity = 256;
-constexpr size_t kOpBytes = 16;
+constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
 
 struct Header {
@@ -66,7 +70,7 @@ struct Record {
 
 static_assert(sizeof(TileConfig) == 20, "TileConfig is five int32 fields");
 static_assert(sizeof(Header) == 16, "cache header layout");
-static_assert(sizeof(Record) == 96, "cache record layout");
+static_assert(sizeof(Record) == 112, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
 
@@ -282,6 +286,25 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
   }
   ::close(fd);
   return ok;
+}
+
+bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
+  if (!(ratio > 0.0)) return false;
+  const double milli = ratio * 1000.0;
+  if (milli < 1.0 || milli > 1048575.0) return false;
+  // The scalar lives in tile_m; the remaining fields are a fixed placeholder
+  // so the record is a well-formed TileConfig (see the header).
+  const TileConfig cfg{int32_t(std::llround(milli)), 1, 1, 1, 1};
+  return AutotuneCache::instance().store(op, shape, cfg);
+}
+
+std::optional<double> lookup_ratio(std::string_view op,
+                                   std::string_view shape) {
+  const auto rec = AutotuneCache::instance().lookup(op, shape);
+  if (!rec || rec->tile_n != 1 || rec->tile_k != 1 || rec->unroll != 1 ||
+      rec->vectorize != 1)
+    return std::nullopt;
+  return double(rec->tile_m) / 1000.0;
 }
 
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {

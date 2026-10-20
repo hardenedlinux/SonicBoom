@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -137,6 +137,11 @@ target_compile_definitions(test_spec_program PRIVATE
 target_compile_definitions(test_spec_bootstrap PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
+# test_spec_autoprobe (V2 probe decision, cache round-trip, env override) loads
+# the Gemma GGUF and runs one forked generation per case.
+target_compile_definitions(test_spec_autoprobe PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+
 # test_ngram_drafter's coverage case feeds the code-edit trace's source files
 # (the same files workload_bench pastes) through the drafter; it needs the
 # repository root to read them.
@@ -182,6 +187,7 @@ target_compile_definitions(test_ngram_drafter PRIVATE
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
                               test_spec_program test_spec_bootstrap
+                              test_spec_autoprobe
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by

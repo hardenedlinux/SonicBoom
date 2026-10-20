@@ -101,6 +101,18 @@ class AutotuneCache {
   mutable std::string path_;  // resolved on the first path() call
 };
 
+// V2 spec auto-detect: a scalar ratio record in the same per-SM file. The spec
+// probe measures one plain decode step against one k=1 verify step and stores
+// verify/plain here, so the decision is made once per GPU rather than once per
+// process. The record is encoded as a TileConfig ratio in thousandths
+// ({tile_m = round(ratio*1000), 1, 1, 1, 1}); the op name keeps it apart from
+// every real tile choice. Not gated by enabled(): this is a probe result, not
+// a JIT candidate. lookup_ratio returns nullopt on a miss or a stored value
+// outside [0.001, 1048.575].
+bool store_ratio(std::string_view op, std::string_view shape, double ratio);
+std::optional<double> lookup_ratio(std::string_view op,
+                                   std::string_view shape);
+
 // The per-session gemv choice. The first call for a shape class resolves it
 // once and memoizes it for the life of the process; every later call with the
 // same shape class is a map lookup. With the gate off, or on a cache miss,
