@@ -200,12 +200,15 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
 // Q3 — prefill attention shape classes (the generated FA-2 kernel).
 //
 // TileConfig mapping: tile_m is the query rows per block (the generator's
-// `br`), tile_n the head_dim columns a warp owns (`dc` = head_dim / dps);
-// tile_k, unroll and vectorize are fixed at 1. The candidate grid is
-// tile_seq {16,32,64} x tile_head {16,32}; candidates[0] is the (16,16)
-// bit-identity reference. Only head_dims where both head tiles yield a
-// supported dps (head_dim in {32,64,128}) have classes; wider heads keep the
-// existing choice.
+// `br`), tile_n the head_dim columns a warp owns (`dc` = head_dim / dps),
+// tile_k the key columns per tile (`bc`), unroll the cp.async pipeline depth
+// (`as`: 0 = synchronous staging, 2 = double buffered); vectorize is unused.
+// dps stays at the production shape's value in every candidate: another
+// split changes the S reduction order and fails the runner's bit-identity
+// gate. The grid is (br x bc x as) around the production config, which is
+// candidates[0] and the reference both the bit check and the timing target.
+// Classes cover the generator's defaulted head_dims {32,64,128,256,512}; the
+// production dps for 256/512 is 4/8 (dc = 64 in every shipped class).
 //
 // Shape class: head_dim exact; the query length (the prefill chunk size) and
 // the query-head count are bucketed, so a class is tuned once per GPU and
@@ -218,15 +221,16 @@ std::string attn_prefill_heads_bucket(int n_heads);
 // "attn_prefill/<head_dim>/<seq_len_bucket>/<num_heads_bucket>").
 std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads);
 
-// Head dims the grid covers: tile_head 16 and 32 must both be legal so
-// dps = head_dim / tile_head is 1, 2, 4 or 8.
+// Head dims the generated prefill kernel has defaulted shape classes for.
 bool attn_prefill_tunable(int head_dim);
 
-// tile_seq {16,32,64} x tile_head {16,32}; candidates[0] = (16,16).
-std::span<const TileConfig> attn_prefill_candidates();
-
-// The fallback when the runner finds no winner: tile_seq 32, tile_head 16.
-TileConfig attn_prefill_default_config();
+// Grid around `production` (which must be candidates[0]): br in
+// {production.br, 32, 64} (16 also for head_dim >= 512), bc in
+// {production.bc, 32}, as in {production.async_stages, 0, 2}. The caller
+// rejects candidates the generator does not support (shared-memory budget)
+// in its compile step.
+std::vector<TileConfig> attn_prefill_candidates(int head_dim,
+                                                const TileConfig &production);
 
 enum class AttnPrefillSource {
   Default,   // gate off, or the class is not resolved yet
@@ -235,7 +239,7 @@ enum class AttnPrefillSource {
 };
 
 struct AttnPrefillChoice {
-  TileConfig cfg = TileConfig{32, 16, 1, 1, 1};
+  TileConfig cfg{};
   AttnPrefillSource source = AttnPrefillSource::Default;
   bool resolved() const { return source != AttnPrefillSource::Default; }
 };

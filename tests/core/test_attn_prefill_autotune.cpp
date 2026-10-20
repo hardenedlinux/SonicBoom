@@ -17,15 +17,16 @@
 // Q3 prefill attention autotune.
 //
 // Model-free: the shape-class key (head_dim, seq_len bucket, query-head
-// bucket), the six (tile_seq, tile_head) candidates with (16,16) first, the
-// tunable head_dims, and the gate/cache behaviour of attn_prefill_choice.
+// bucket), the (br, bc, as) grid around a production config (production
+// first), the tunable head_dims, and the gate/cache behaviour of
+// attn_prefill_choice.
 //
 // On a GPU: the generated d64/gqa7 prefill kernel is tuned in-process under
 // SONICBOOM_AUTOTUNE=1; the emitted output must be bit-identical to the
-// (16,16) pinned reference, the winner must land in the per-SM cache under
-// "attn_prefill", and three cold runs (memo + cache cleared, AUTOTUNE=force)
-// must pick the same config. Skips the GPU part cleanly when no device is
-// present.
+// production (64,16,1,as2) pinned reference, the winner must land in the
+// per-SM cache under "attn_prefill", and three cold runs (memo + cache
+// cleared, AUTOTUNE=force) must pick the same config. Skips the GPU part
+// cleanly when no device is present.
 
 #include "../../core/src/nn/cuda_resident.h"
 #include "../../core/src/planner/mlir_autotune.h"
@@ -66,8 +67,9 @@ bool have_cuda() {
   return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
 }
 
-bool in_grid(const mt::TileConfig &c) {
-  for (const mt::TileConfig &g : mt::attn_prefill_candidates())
+bool in_grid(const std::vector<mt::TileConfig> &grid,
+             const mt::TileConfig &c) {
+  for (const mt::TileConfig &g : grid)
     if (g == c) return true;
   return false;
 }
@@ -114,29 +116,45 @@ int main() {
           "shape class is <head_dim>/<seq bucket>/<heads bucket>");
   }
 
-  // --- candidates and the fallback default -------------------------------
+  // --- candidates: production first, real (br, bc, as) neighbours --------
   {
-    const std::span<const mt::TileConfig> grid = mt::attn_prefill_candidates();
-    check(grid.size() == 6, "six candidates (3 tile_seq x 2 tile_head)");
-    check(grid.front() == mt::TileConfig{16, 16, 1, 1, 1},
-          "the first candidate is the (16,16) reference");
-    for (int seq : {16, 32, 64})
-      for (int head : {16, 32})
-        check(in_grid(mt::TileConfig{seq, head, 1, 1, 1}),
-              "candidate (" + std::to_string(seq) + "," +
-                  std::to_string(head) + ") is present");
-    check(mt::attn_prefill_default_config() == mt::TileConfig{32, 16, 1, 1, 1},
-          "the no-winner default is tile_seq 32 / tile_head 16");
+    const mt::TileConfig prod{64, 64, 16, 2, 1};  // Qwen d64: 64,16,1,as2
+    const std::vector<mt::TileConfig> grid =
+        mt::attn_prefill_candidates(64, prod);
+    check(!grid.empty() && grid.front() == prod,
+          "the first candidate is the production config");
+    for (int br : {32, 64})
+      for (int bc : {16, 32})
+        for (int as : {0, 2})
+          check(in_grid(grid, mt::TileConfig{br, 64, bc, as, 1}),
+                "candidate (br=" + std::to_string(br) + ",bc=" +
+                    std::to_string(bc) + ",as=" + std::to_string(as) +
+                    ") is present");
+    check(!in_grid(grid, mt::TileConfig{64, 32, 16, 2, 1}),
+          "dps is not varied (dc stays at head_dim/dps)");
+
+    const mt::TileConfig gemma{64, 64, 16, 0, 1};  // d256: 64,16,dps4,as0
+    const std::vector<mt::TileConfig> ggrid =
+        mt::attn_prefill_candidates(256, gemma);
+    check(ggrid.front() == gemma, "d256 production is the reference");
+    check(in_grid(ggrid, mt::TileConfig{32, 64, 16, 2, 1}),
+          "d256 grid spans br/as");
+
+    const mt::TileConfig global{32, 64, 16, 0, 1};  // d512: 32,16,dps8,as0
+    const std::vector<mt::TileConfig> wgrid =
+        mt::attn_prefill_candidates(512, global);
+    check(wgrid.front() == global && in_grid(wgrid, mt::TileConfig{16, 64, 16, 2, 1}),
+          "d512 grid includes br=16 and production first");
   }
 
   // --- which head dims the grid covers -----------------------------------
   {
     check(mt::attn_prefill_tunable(64) && mt::attn_prefill_tunable(128) &&
-              mt::attn_prefill_tunable(32),
-          "head_dim 32/64/128 have Q3 classes");
-    check(!mt::attn_prefill_tunable(256) && !mt::attn_prefill_tunable(512) &&
-              !mt::attn_prefill_tunable(96) && !mt::attn_prefill_tunable(0),
-          "wider/unsupported head dims have no Q3 class");
+              mt::attn_prefill_tunable(32) && mt::attn_prefill_tunable(256) &&
+              mt::attn_prefill_tunable(512),
+          "head_dim 32/64/128/256/512 have Q3 classes");
+    check(!mt::attn_prefill_tunable(96) && !mt::attn_prefill_tunable(0),
+          "unsupported head dims have no Q3 class");
   }
 
   // --- gate and cache ----------------------------------------------------
@@ -149,7 +167,7 @@ int main() {
     mt::AttnPrefillChoice cold = mt::attn_prefill_choice(128, 200, 14);
     check(!cold.resolved(), "gate on, cold cache: the class is unresolved");
 
-    const mt::TileConfig winner{64, 32, 1, 1, 1};
+    const mt::TileConfig winner{64, 64, 32, 2, 1};
     check(mt::attn_prefill_choice_store(128, 200, 14, winner),
           "the winner is persisted");
     mt::attn_prefill_reset_for_test();
@@ -224,13 +242,14 @@ int main() {
         return ran;
       };
 
-      // Reference: the (16,16) tile pair pinned; Q3 is bypassed by the pin.
-      set_env("SONICBOOM_ATTN_CODEGEN", "16,16,4");
+      // Reference: the production (br,bc,dps,as) = (64,16,1,2) pinned; Q3 is
+      // bypassed by the pin. The tuner's reference is the same config.
+      set_env("SONICBOOM_ATTN_CODEGEN", "64,16,1,2");
       set_env("SONICBOOM_ATTN_IMPL", nullptr);
       set_env("SONICBOOM_AUTOTUNE", nullptr);
       std::vector<float> ref;
       const bool ref_ok = run(ref);
-      check(ref_ok, "the (16,16) reference runs");
+      check(ref_ok, "the production-config reference runs");
 
       // Q3: the generated kernel with the autotuner choosing the tile.
       set_env("SONICBOOM_ATTN_CODEGEN", nullptr);
@@ -244,12 +263,14 @@ int main() {
       check(tuned_ok, "the Q3-tuned generated kernel runs");
       check(ref_ok && tuned_ok && !ref.empty() && !tuned.empty() &&
                 std::memcmp(ref.data(), tuned.data(), q_n * 4) == 0,
-            "the Q3 pick is bit-identical to the (16,16) reference");
+            "the Q3 pick is bit-identical to the production reference");
 
       const std::string cls = mt::attn_prefill_shape_class(D, N, NHQ);
+      const std::vector<mt::TileConfig> grid = mt::attn_prefill_candidates(
+          D, mt::TileConfig{64, 64, 16, 2, 1});
       std::optional<mt::TileConfig> rec =
           mt::AutotuneCache::instance().lookup("attn_prefill", cls);
-      check(rec.has_value() && in_grid(*rec),
+      check(rec.has_value() && in_grid(grid, *rec),
             "the winner is a grid config in the attn_prefill class " + cls);
 
       // Warm cache: three cold runs (memo and disk cache cleared, forced
@@ -273,10 +294,11 @@ int main() {
       bool same = picks.size() == 3;
       for (size_t i = 1; same && i < picks.size(); ++i)
         same = picks[i] == picks[0];
-      check(same, "three cold runs pick the same (tile_seq, tile_head)");
+      check(same, "three cold runs pick the same (br, bc, as)");
       if (!picks.empty())
-        std::printf("  Q3 winner %s: tile_seq=%d tile_head=%d\n", cls.c_str(),
-                    picks[0].tile_m, picks[0].tile_n);
+        std::printf("  Q3 winner %s: br=%d dc=%d bc=%d as=%d\n", cls.c_str(),
+                    picks[0].tile_m, picks[0].tile_n, picks[0].tile_k,
+                    picks[0].unroll);
     }
 
     for (float *p : {dq, dk, dv, dkc, dvc, dout}) cudaFree(p);

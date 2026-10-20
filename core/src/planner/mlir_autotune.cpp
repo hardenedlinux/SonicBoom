@@ -46,9 +46,11 @@ namespace {
 // plain old data so a process can read them straight out of the mapping.
 constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // Version 2 widens the op field from 16 to 32 bytes so a full op name (V2's
-// "spec_verify_ratio") fits; a version-1 file misses on lookup and is rewritten
-// by the first store, which is the cache's own reset path.
-constexpr uint32_t kVersion = 2;
+// "spec_verify_ratio") fits. Version 3 changes the "attn_prefill" TileConfig
+// meaning from (tile_seq, tile_head) to (br, dc, bc, as), so a version-2
+// record must not be applied to the new grid. An older file misses on lookup
+// and is rewritten by the first store, which is the cache's own reset path.
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
@@ -471,21 +473,36 @@ std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads) {
 }
 
 bool attn_prefill_tunable(int head_dim) {
-  // dps = head_dim / tile_head must be 1, 2, 4 or 8 for both tile_head values,
-  // so head_dim/16 <= 8 and head_dim is a multiple of 32.
-  return head_dim == 32 || head_dim == 64 || head_dim == 128;
+  // The head dims the generator gives a default shape class (d64/gqa7,
+  // d256/gqa4, d512/gqa4), plus the narrower classes its support rules allow.
+  return head_dim == 32 || head_dim == 64 || head_dim == 128 ||
+         head_dim == 256 || head_dim == 512;
 }
 
-std::span<const TileConfig> attn_prefill_candidates() {
-  // tile_seq x tile_head; the first entry is the bit-identity reference.
-  static const TileConfig kCandidates[] = {
-      {16, 16, 1, 1, 1}, {16, 32, 1, 1, 1}, {32, 16, 1, 1, 1},
-      {32, 32, 1, 1, 1}, {64, 16, 1, 1, 1}, {64, 32, 1, 1, 1},
+std::vector<TileConfig> attn_prefill_candidates(int head_dim,
+                                                const TileConfig &production) {
+  // tile_m = br, tile_n = dc = head_dim/dps, tile_k = bc, unroll = as.
+  // Production is first: it is the bit-identity reference and the time to
+  // beat. dps is not varied (see mlir_autotune.h).
+  std::vector<TileConfig> grid;
+  grid.push_back(production);
+  const int dc = production.tile_n;
+  auto add = [&](int br, int bc, int as) {
+    const TileConfig c{br, dc, bc, as, 1};
+    if (c == production) return;
+    for (const TileConfig &g : grid)
+      if (g == c) return;
+    grid.push_back(c);
   };
-  return kCandidates;
+  const std::vector<int> brs = head_dim >= 512
+                                   ? std::vector<int>{16, 32, 64}
+                                   : std::vector<int>{32, 64};
+  for (int br : brs)
+    for (int bc : {production.tile_k, 32})
+      for (int as : {production.unroll, 0, 2})
+        add(br, bc, as);
+  return grid;
 }
-
-TileConfig attn_prefill_default_config() { return TileConfig{32, 16, 1, 1, 1}; }
 
 namespace {
 std::mutex& attn_prefill_memo_mutex() {
@@ -499,9 +516,7 @@ std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
 } // namespace
 
 AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
-  if (!enabled())
-    return AttnPrefillChoice{attn_prefill_default_config(),
-                             AttnPrefillSource::Default};
+  if (!enabled()) return AttnPrefillChoice{};
   const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
@@ -518,8 +533,7 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
       return choice;
     }
   }
-  return AttnPrefillChoice{attn_prefill_default_config(),
-                           AttnPrefillSource::Default};
+  return AttnPrefillChoice{};
 }
 
 bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,

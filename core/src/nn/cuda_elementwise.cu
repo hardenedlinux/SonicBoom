@@ -3299,18 +3299,21 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
 
 // --- Q3: prefill attention shape classes ----------------------------------
 //
-// The generated prefill kernel's tile config is (br, dps) on top of the class
-// default. Q3 exposes that as (tile_seq, tile_head): tile_seq is the query
-// rows per block (br) and tile_head the head_dim columns a warp owns
-// (dc = head_dim / dps). The class key is (head_dim, seq_len bucket,
-// query-head bucket) and the choice lives in the mlir_tune per-SM cache under
-// "attn_prefill", gated by SONICBOOM_AUTOTUNE=1. The runner keeps a candidate
-// only when its output is bit-identical to the (16,16) reference, so the
-// gate's own numerics are the reference's.
+// The generated prefill kernel's tile config is (br, bc, dps, as). Q3 exposes
+// (br, bc, as) in real units: tile_m = br (query rows per block), tile_n = dc
+// = head_dim/dps (head columns per warp), tile_k = bc (key columns per tile),
+// unroll = as (cp.async pipeline depth). dps stays at the production shape's
+// value: another split changes the S reduction order, so it would fail the
+// runner's bit-identity gate. The production config (the shape the dispatcher
+// chose) is always candidates[0], the bit-identity reference and the time the
+// winner must beat by more than the measured burst-to-burst noise.
 //
-// Returns a shape with br/dps applied, or nullopt to keep `base` (gate off,
-// capture, no cache entry and the tuning could not run, or an inapplicable
-// cached config).
+// The class key is (head_dim, seq_len bucket, query-head bucket) and the
+// choice lives in the mlir_tune per-SM cache under "attn_prefill", gated by
+// SONICBOOM_AUTOTUNE=1.
+//
+// Returns a shape with the winner's knobs applied, or nullopt to keep `base`
+// (gate off, capture, probe failure, no bit-identical winner).
 static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
     int head_dim, int gqa, int n_heads_q, int n_heads_kv, int n,
     const compiler::AttentionShape &base, uint64_t sliding_window,
@@ -3322,17 +3325,26 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
 
   auto apply = [&](const TileConfig &cfg)
       -> std::optional<compiler::AttentionShape> {
-    if (cfg.tile_m <= 0 || cfg.tile_n <= 0 ||
-        head_dim % cfg.tile_n != 0)
+    if (cfg.tile_m <= 0 || cfg.tile_n <= 0 || head_dim % cfg.tile_n != 0)
+      return std::nullopt;
+    if (cfg.tile_k < 16 || cfg.tile_k > 64 || cfg.tile_k % 16 != 0)
+      return std::nullopt;
+    if (cfg.unroll != 0 && cfg.unroll != 2 && cfg.unroll != 3)
       return std::nullopt;
     compiler::AttentionShape s = base;
     s.br = cfg.tile_m;
+    s.bc = cfg.tile_k;
     s.dps = head_dim / cfg.tile_n;
+    s.async_stages = cfg.unroll;
     s.warp_head = false;
     if (!compiler::attention_shape_supported(s)) return std::nullopt;
     if (compiler::attention_shared_bytes(s) > 96 * 1024) return std::nullopt;
     return s;
   };
+  // The dispatcher's own shape: the bit-identity reference and the default we
+  // keep unless a candidate clearly beats it.
+  const TileConfig production{base.br, head_dim / base.dps, base.bc,
+                              base.async_stages, 1};
 
   const mlir_tune::AttnPrefillChoice choice =
       mlir_tune::attn_prefill_choice(head_dim, n, n_heads_q);
@@ -3415,8 +3427,7 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   };
 
   mlir_tune::AutotuneRunner::Problem p;
-  const std::span<const TileConfig> grid = mlir_tune::attn_prefill_candidates();
-  p.candidates.assign(grid.begin(), grid.end());
+  p.candidates = mlir_tune::attn_prefill_candidates(head_dim, production);
   p.compile = [&](const TileConfig &cfg)
       -> std::optional<mlir_tune::AutotuneRunner::Launch> {
     const auto s = apply(cfg);
@@ -3452,21 +3463,60 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   planner::PlanRecorder *saved_rec = planner::recorder();
   planner::set_thread_recorder(nullptr);
   std::optional<TileConfig> best = mlir_tune::AutotuneRunner::run(p);
+
+  // The probe's per-burst minimum is noisy at this size, so a candidate
+  // replaces production only when it beats it by more than the burst-to-burst
+  // spread measured on production itself. Two interleaved pairs of bursts
+  // keep a clock ramp common to both configs.
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  auto timed_burst = [&](const TileConfig &cfg) -> std::optional<double> {
+    const auto s = apply(cfg);
+    if (!s) return std::nullopt;
+    auto launch = make_launch(*s);
+    double best_s = 1e30;
+    for (int i = 0; i < 2; ++i) {
+      if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+        return std::nullopt;
+      const auto t0 = std::chrono::steady_clock::now();
+      launch();
+      if (cudaStreamSynchronize(cur_stream()) != cudaSuccess)
+        return std::nullopt;
+      const auto t1 = std::chrono::steady_clock::now();
+      best_s = std::min(
+          best_s, std::chrono::duration<double>(t1 - t0).count());
+    }
+    return launch_ok ? std::optional<double>(best_s) : std::nullopt;
+  };
+  TileConfig winner = production;
+  if (best && !(*best == production)) {
+    const auto ref_a = timed_burst(production);
+    const auto win_a = timed_burst(*best);
+    const auto ref_b = timed_burst(production);
+    const auto win_b = timed_burst(*best);
+    if (ref_a && ref_b && win_a && win_b) {
+      const double ref = std::min(*ref_a, *ref_b);
+      const double win = std::min(*win_a, *win_b);
+      const double noise = (std::max(*ref_a, *ref_b) - ref) / ref;
+      if (win < ref * (1.0 - noise)) winner = *best;
+      if (verbose)
+        std::fprintf(stderr,
+                     "[autotune] attn_prefill probe: prod=%.4f ms "
+                     "best=%.4f ms noise=%.2f%% -> %s\n",
+                     ref * 1e3, win * 1e3, noise * 100.0,
+                     winner == *best ? "take" : "keep production");
+    }
+  }
   planner::set_thread_recorder(saved_rec);
 
-  // E: with no winner, the fallback is tile_seq 32 / tile_head 16 (same dps as
-  // the reference, so it stays bit-identical by construction).
-  const TileConfig winner =
-      best ? *best : mlir_tune::attn_prefill_default_config();
   const bool stored =
       mlir_tune::attn_prefill_choice_store(head_dim, n, n_heads_q, winner);
-  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+  if (verbose)
     std::fprintf(stderr,
-                 "[autotune] %s: tile_seq=%d tile_head=%d%s%s\n",
+                 "[autotune] %s: br=%d dc=%d bc=%d as=%d%s\n",
                  ("attn_prefill/" +
                   mlir_tune::attn_prefill_shape_class(head_dim, n, n_heads_q))
                      .c_str(),
-                 winner.tile_m, winner.tile_n, best ? "" : " (default)",
+                 winner.tile_m, winner.tile_n, winner.tile_k, winner.unroll,
                  stored ? "" : " [not persisted]");
   return apply(winner);
 }
