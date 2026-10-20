@@ -111,6 +111,11 @@ inline BackendTag route_op(OpKind op) noexcept {
     // (one accumulation pass, one scale per gradient) over device buffers.
     case OpKind::ClipGradNorm:
       return BackendTag::Sonic;
+    // VS1 prefetch markers: the runtime's prefetch stream is backend state, so
+    // they dispatch like the other device-side bookkeeping ops (KvAppend).
+    case OpKind::AsyncWeightPrefetch:
+    case OpKind::SyncPrefetch:
+      return BackendTag::Sonic;
     default:
       return BackendTag::Mlir;
   }

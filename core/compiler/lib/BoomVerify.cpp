@@ -112,11 +112,20 @@ bool isQ8_1Producer(llvm::StringRef opName) {
          opName == "boom.fused_region";
 }
 
+// The ops whose first operand is the pre-quantized (q8_1) activation, and whose
+// second is the weight: the mmq matmuls, one of which the prefill dispatch pass
+// may pick over the other. Both read the same two layouts, so the q8_1 typing
+// rule below names both.
+bool readsQ8_1FirstOperand(llvm::StringRef opName) {
+  return opName == "quantized_matmul_q8" || opName == "matmul_q8_tc";
+}
+
 // The ops that carry `ds`: the mmq matmuls it selects the activation layout for,
 // and the fused quantizers that produce that layout.
 bool carriesDs(llvm::StringRef opName) {
   return opName == "boom.quantized_matmul" ||
          opName == "boom.quantized_matmul_q8" ||
+         opName == "boom.matmul_q8_tc" ||
          opName == "boom.rms_norm_quantize" ||
          opName == "boom.gelu_mul_quantize" ||
          opName == "boom.silu_mul_quantize" ||
@@ -521,29 +530,35 @@ mlir::LogicalResult GraphOp::verify() {
       // The cache handle, checked in 5a.
       if (llvm::isa<KvType>(operand.getType()))
         continue;
-      // The one op whose point is a pre-quantized activation.
-      if (opName == "quantized_matmul_q8" && operand == op.getOperand(0))
+      // The ops whose point is a pre-quantized activation.
+      if (readsQ8_1FirstOperand(opName) && operand == op.getOperand(0))
         continue;
       return op.emitOpError()
              << "reads a " << boomQuantFormatName(operand.getType())
-             << " value; only boom.quantized_matmul_q8's first operand may be "
-                "quantized";
+             << " value; only the first operand of boom.quantized_matmul_q8 or "
+                "boom.matmul_q8_tc may be quantized";
     }
     for (auto [index, type] : llvm::enumerate(op.getResultTypes())) {
       bool consumedAsQ8_1 = false;
-      for (Operation *user : op.getResult(index).getUsers())
-        if (user->getName().getStringRef() == "boom.quantized_matmul_q8" &&
+      for (Operation *user : op.getResult(index).getUsers()) {
+        const llvm::StringRef userName =
+            user->getName().getStringRef().drop_front(
+                llvm::StringRef("boom.").size());
+        // Only the graph ops carry node operands; a builtin op that happens to
+        // read the value (e.g. a terminator) has no operand 0 to compare.
+        if (readsQ8_1FirstOperand(userName) && user->getNumOperands() > 0 &&
             user->getOperand(0) == op.getResult(index))
           consumedAsQ8_1 = true;
+      }
 
       if (consumedAsQ8_1 && !llvm::isa<Q8_1Type>(type))
         return op.emitOpError()
-               << "result " << index << " feeds a boom.quantized_matmul_q8 "
+               << "result " << index << " feeds a q8_1-consuming matmul "
                << "but is typed " << type << " instead of !boom.q8_1";
       if (consumedAsQ8_1 && !producesQ8_1)
-        return op.emitOpError() << "produces the q8_1 activation a "
-                                   "boom.quantized_matmul_q8 consumes, but is "
-                                   "not an activation quantizer";
+        return op.emitOpError() << "produces the q8_1 activation a q8_1-consuming "
+                                   "matmul consumes, but is not an activation "
+                                   "quantizer";
       if (!llvm::isa<TensorType>(type) && !producesQ8_1)
         return op.emitOpError()
                << "produces a " << boomQuantFormatName(type)

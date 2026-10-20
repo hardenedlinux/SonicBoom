@@ -134,6 +134,75 @@ int main() {
           "gate unset: the static default");
   }
 
+  // MMQ2: the generated int8 tensor-core matmul's shape class, candidate grid,
+  // gate and persisted winner.
+  {
+    const std::string mkey = mt::mmq_tc_shape_class(512, 4864, 896);
+    check(mt::mmq_tc_shape_class(4, 4864, 896) ==
+              mt::mmq_tc_shape_class(7, 4864, 896),
+          "mmq: M 4-7 share a bucket");
+    check(mt::mmq_tc_shape_class(8, 4864, 896) !=
+              mt::mmq_tc_shape_class(7, 4864, 896),
+          "mmq: a different M bucket differs");
+    check(mt::mmq_tc_shape_class(1024, 4864, 896) ==
+              mt::mmq_tc_shape_class(4096, 4864, 896),
+          "mmq: 1024+ is one bucket");
+    check(mt::mmq_tc_shape_class(512, 4864, 896) !=
+              mt::mmq_tc_shape_class(512, 896, 896),
+          "mmq: N stays exact");
+    check(mt::mmq_tc_shape_class(512, 4864, 896) !=
+              mt::mmq_tc_shape_class(512, 4864, 4864),
+          "mmq: K stays exact");
+
+    const auto grid = mt::mmq_tc_candidates();
+    check(grid.size() == 12, "mmq: 12 tile candidates (K=32 only)");
+    check(grid.front() == (mt::TileConfig{16, 16, 32, 1, 1}),
+          "mmq: the smallest config is the reference");
+    bool k32 = true, unique = true, in_range = true;
+    for (size_t i = 0; i < grid.size(); ++i) {
+      k32 = k32 && grid[i].tile_k == 32 && grid[i].unroll == 1 &&
+            grid[i].vectorize == 1;
+      in_range = in_range && (grid[i].tile_m == 16 || grid[i].tile_m == 32 ||
+                              grid[i].tile_m == 64 || grid[i].tile_m == 128) &&
+                 (grid[i].tile_n == 16 || grid[i].tile_n == 32 ||
+                  grid[i].tile_n == 64);
+      for (size_t j = i + 1; j < grid.size(); ++j)
+        unique = unique && !(grid[i] == grid[j]);
+    }
+    check(k32, "mmq: every candidate stages 32-K chunks");
+    check(in_range, "mmq: every candidate is on the tile grid");
+    check(unique, "mmq: the candidates are distinct");
+    check(mt::mmq_tc_default_config() == (mt::TileConfig{64, 64, 32, 1, 1}),
+          "mmq: the static default is the MMQ1 tile");
+
+    ::unsetenv("SONICBOOM_AUTOTUNE");
+    check(mt::mmq_tc_choice(512, 4864, 896).cfg == mt::mmq_tc_default_config(),
+          "mmq gate off: the static default");
+    check(!mt::mmq_tc_choice(512, 4864, 896).resolved(),
+          "mmq gate off: nothing is resolved");
+
+    ::setenv("SONICBOOM_AUTOTUNE", "1", 1);
+    const mt::TileConfig winner{128, 32, 32, 1, 1};
+    check(mt::mmq_tc_choice_store(512, 4864, 896, winner),
+          "mmq: the winner is persisted");
+    const mt::MmqTcChoice choice = mt::mmq_tc_choice(512, 4864, 896);
+    check(choice.resolved() && choice.cfg == winner &&
+              choice.source == mt::MmqTcSource::Measured,
+          "mmq: the measured winner is memoized");
+    const auto mstored = cache.lookup("matmul_q8_tc", mkey);
+    check(mstored && *mstored == winner, "mmq: the winner reads back");
+
+    // force() skips the disk cache, so a class the process has not memoized
+    // yet resolves to the default and the caller retunes it.
+    const std::string other = mt::mmq_tc_shape_class(512, 896, 896);
+    check(cache.store("matmul_q8_tc", other, winner),
+          "mmq: seed a second class on disk");
+    ::setenv("SONICBOOM_AUTOTUNE", "force", 1);
+    check(!mt::mmq_tc_choice(512, 896, 896).resolved(),
+          "mmq force: the cache is ignored");
+    ::unsetenv("SONICBOOM_AUTOTUNE");
+  }
+
   std::error_code ec;
   fs::remove_all(root, ec);
 

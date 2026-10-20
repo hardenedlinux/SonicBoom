@@ -32,6 +32,7 @@
 #include "../nn/cuda_resident.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
+#include "async_prefetch.h"
 #include "device_allocator.h"
 #include "device_pool.h"
 #include "glue_jit.h"
@@ -427,6 +428,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   const auto* node = graph_.find_node(compute->graph_nodes.front());
   if (!node)
     return std::unexpected(fail("Sonic CUDA task references an unknown graph node"));
+
+  // VS1 prefetch markers: scheduling bookkeeping, not a kernel. Checked before
+  // the output check — a marker has no outputs by construction. The runtime is
+  // a no-op while SONICBOOM_ASYNC_PREFETCH is not "on".
+  if (node->op == OpKind::AsyncWeightPrefetch || node->op == OpKind::SyncPrefetch) {
+    int64_t layer = -1;
+    attr_i(*node, "layer", layer);
+    int64_t bytes = 0;
+    attr_i(*node, "prefetch_bytes", bytes);
+    AsyncPrefetchRuntime& prefetch = AsyncPrefetchRuntime::instance();
+    if (node->op == OpKind::AsyncWeightPrefetch)
+      prefetch.begin(int(layer), bytes > 0 ? uint64_t(bytes) : 0);
+    else
+      prefetch.wait(int(layer));
+    return std::vector<TensorValue>{};
+  }
+
   if (node->outputs.empty())
     return std::unexpected(fail("Sonic CUDA node has no output"));
   const auto* out_td = graph_.find_tensor(node->outputs.front());
@@ -799,6 +817,34 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       note_activation_quant("q8_1");
       ok = quant::cuda::quantize_q8_1_dev(
           dev(in[0]), reinterpret_cast<quant::cuda::BlockQ8_1*>(out), n / 32);
+      break;
+    }
+    case OpKind::MatmulQ8Tc: {
+      // MMQ1: the prefill dispatch pass's choice of the generated int8
+      // tensor-core kernel over the same q8_1 activation and weight slot as the
+      // batched QuantizedMatmulQ8 it was rewritten from. A node whose copy
+      // cannot be built or whose shape the generator does not serve falls back
+      // to the ggml mmq kernel here, so a dispatch is never a correctness
+      // condition.
+      note_weight_quant(qweight(slot));
+      int64_t nb = 0;
+      int64_t ds_i = 0;
+      attr_i(*node, "ds", ds_i);
+      const auto* xq =
+          reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0]));
+      if (batch_attr(nb) && nb > 0) {
+        note_activation_quant("block_q8_1_mmq(tc)");
+        ok = quant::cuda::matmul_mmq_tc_dev(qweight(slot), xq, out, int(nb),
+                                            int(ds_i));
+        if (!ok) {
+          note_activation_quant(mmq_activation(ds_i));
+          ok = quant::cuda::matmul_mmq_q8_dev(qweight(slot), xq, out, int(nb));
+        }
+      } else {
+        // Only the batched prefill form is dispatched here (the pass rewrites
+        // nothing else); a node without one is a plan error, not a no-op.
+        ok = false;
+      }
       break;
     }
     case OpKind::QuantizedMatmulQ8: {

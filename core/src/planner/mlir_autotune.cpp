@@ -145,7 +145,12 @@ std::optional<TileConfig> TileConfig::from_string(std::string_view s) {
 
 bool enabled() {
   const char* e = std::getenv("SONICBOOM_AUTOTUNE");
-  return e && std::strcmp(e, "1") == 0;
+  return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "force") == 0);
+}
+
+bool force() {
+  const char* e = std::getenv("SONICBOOM_AUTOTUNE");
+  return e && std::strcmp(e, "force") == 0;
 }
 
 int sm_version() {
@@ -335,11 +340,13 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
     const auto it = gemv_memo().find(key);
     if (it != gemv_memo().end()) return it->second;
   }
-  if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
-    const GemvChoice choice{*cached, GemvSource::Cache};
-    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
-    gemv_memo().emplace(key, choice);
-    return choice;
+  if (!force()) {
+    if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
+      const GemvChoice choice{*cached, GemvSource::Cache};
+      std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+      gemv_memo().emplace(key, choice);
+      return choice;
+    }
   }
   return GemvChoice{default_config("gemv"), GemvSource::Default};
 }
@@ -356,6 +363,89 @@ bool gemv_choice_store(int blocks_per_row, int num_rows,
 
 TileConfig gemv_config(int blocks_per_row, int num_rows) {
   return gemv_choice(blocks_per_row, num_rows).cfg;
+}
+
+TileConfig mmq_tc_default_config() { return TileConfig{64, 64, 32, 1, 1}; }
+
+std::span<const TileConfig> mmq_tc_candidates() {
+  // tile_k 16 is pruned: the kernel stages one m16n8k32 mma per K chunk, so a
+  // 16-K chunk has no generator. candidates[0] is the smallest config and is
+  // the runner's bit-identity reference.
+  static const TileConfig kCandidates[] = {
+      {16, 16, 32, 1, 1},  {16, 32, 32, 1, 1},  {16, 64, 32, 1, 1},
+      {32, 16, 32, 1, 1},  {32, 32, 32, 1, 1},  {32, 64, 32, 1, 1},
+      {64, 16, 32, 1, 1},  {64, 32, 32, 1, 1},  {64, 64, 32, 1, 1},
+      {128, 16, 32, 1, 1}, {128, 32, 32, 1, 1}, {128, 64, 32, 1, 1},
+  };
+  return kCandidates;
+}
+
+std::string mmq_tc_shape_class(int m_tokens, int n_rows, int k) {
+  // Token-count buckets, one per order of magnitude in the low range. A token
+  // count below the first bucket (the unbatched path never reaches here) is
+  // clamped to it.
+  static constexpr struct {
+    int hi;
+    const char* name;
+  } kBuckets[] = {
+      {7, "4-7"},      {15, "8-15"},    {31, "16-31"},   {63, "32-63"},
+      {127, "64-127"}, {255, "128-255"}, {511, "256-511"},
+      {1023, "512-1023"}, {std::numeric_limits<int>::max(), "1024+"},
+  };
+  const char* bucket = kBuckets[0].name;
+  for (const auto& b : kBuckets) {
+    if (m_tokens <= b.hi) {
+      bucket = b.name;
+      break;
+    }
+  }
+  // N and K stay exact: they are the weight's own dimensions and the model has
+  // only a handful of each.
+  return std::string("m") + bucket + "-n" + std::to_string(n_rows) + "-k" +
+         std::to_string(k);
+}
+
+namespace {
+std::mutex& mmq_tc_memo_mutex() {
+  static std::mutex m;
+  return m;
+}
+std::unordered_map<std::string, MmqTcChoice>& mmq_tc_memo() {
+  static std::unordered_map<std::string, MmqTcChoice> memo;
+  return memo;
+}
+} // namespace
+
+MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
+  if (!enabled())
+    return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
+  const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
+  {
+    std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
+    const auto it = mmq_tc_memo().find(key);
+    if (it != mmq_tc_memo().end()) return it->second;
+  }
+  // force() retunes: the cache read is skipped and the caller measures.
+  if (!force()) {
+    if (const auto cached =
+            AutotuneCache::instance().lookup("matmul_q8_tc", key)) {
+      const MmqTcChoice choice{*cached, MmqTcSource::Cache};
+      std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
+      mmq_tc_memo().emplace(key, choice);
+      return choice;
+    }
+  }
+  return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
+}
+
+bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
+                         const TileConfig& cfg) {
+  const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
+  {
+    std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
+    mmq_tc_memo()[key] = MmqTcChoice{cfg, MmqTcSource::Measured};
+  }
+  return AutotuneCache::instance().store("matmul_q8_tc", key, cfg);
 }
 
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {

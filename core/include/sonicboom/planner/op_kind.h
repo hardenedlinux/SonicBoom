@@ -162,6 +162,25 @@ enum class OpKind : uint8_t {
   // Appended last: OpKind is an internal enum, but appending keeps the numeric
   // values of the operators above stable across this change.
   ClipGradNorm,
+
+  // Prefill q8_1 tensor-core matmul (MMQ1, v1 Wave 4): the batched projection
+  // against the per-weight q8_1 copy (int8 values, per-32 f32 scales) instead
+  // of the K-quant weight. An attribute-only dispatch decision over the same
+  // operands and attributes as QuantizedMatmulQ8: PrefillDispatchPass rewrites
+  // an eligible batched QuantizedMatmulQ8 node into this op when the device's
+  // q8_1 weight copy fits its budget, and leaves it as QuantizedMatmulQ8
+  // otherwise (the ggml mmq fallback). Appended last for the same reason as
+  // ClipGradNorm.
+  MatmulQ8Tc,
+
+  // VS1: async weight-prefetch markers (AsyncPrefetchPass). They have no
+  // outputs: the async marker starts prefetching the layer's weight operands on
+  // the runtime's prefetch stream, the sync marker waits for them before the
+  // layer's first node. Both are no-ops while SONICBOOM_ASYNC_PREFETCH is not
+  // "on" (the pass inserts none then). Appended last for the same reason as
+  // ClipGradNorm.
+  AsyncWeightPrefetch,
+  SyncPrefetch,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

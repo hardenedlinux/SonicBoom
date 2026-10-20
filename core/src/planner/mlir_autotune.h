@@ -25,9 +25,10 @@
 // compile each candidate, time N iterations, keep a candidate only if its
 // output matches the reference bit for bit, and return the fastest.
 //
-// Gate: the runner is enabled only by SONICBOOM_AUTOTUNE=1 (off by default).
-// With the gate off nothing is compiled, timed, or stored, and callers keep
-// their static default. This is deliberately the opposite default of the
+// Gate: the runner is enabled by SONICBOOM_AUTOTUNE=1 (off by default);
+// SONICBOOM_AUTOTUNE=force additionally ignores the disk cache and retimes
+// every class. With the gate off nothing is compiled, timed, or stored, and
+// callers keep their static default. This is deliberately the opposite default of the
 // older sonicboom::tune service (autotune.h, which tunes already-compiled
 // hand-written kernels at runtime and is on unless SONICBOOM_AUTOTUNE=0):
 // compiling and launching JIT candidates is opt-in.
@@ -70,7 +71,10 @@ struct TileConfig {
 TileConfig default_config(std::string_view op);
 
 // SONICBOOM_AUTOTUNE=1 (exact string) enables the runner. Read per call.
+// SONICBOOM_AUTOTUNE=force also enables it and makes every per-class lookup
+// skip the disk cache, so each class is retimed in this process.
 bool enabled();
+bool force();
 
 // Device compute capability × 10 (86, 89, 120); 0 when the build has no CUDA
 // or no device is visible. Cached after the first call.
@@ -146,6 +150,52 @@ TileConfig gemv_config(int blocks_per_row, int num_rows);
 // are per class, never per batch size or KV position, so a reused prefix and a
 // full prefill resolve the same way.
 std::string gemv_shape_class(int blocks_per_row, int num_rows);
+
+// MMQ2 — the generated int8 tensor-core prefill matmul (op "matmul_q8_tc").
+//
+// TileConfig mapping: tile_m is the weight rows per block (MmqTcShape::bm),
+// tile_n the tokens per block (MmqTcShape::bn), tile_k the K values per staged
+// chunk. unroll and vectorize are fixed at 1.
+//
+// Shape class: the token count (the activation's batched dimension, "M" in the
+// BLAS sense) is bucketed; the weight rows (N, the output features) and K are
+// kept exact. A bucket spans every token count that resolves to the same tile
+// choice, so a class is tuned once per GPU and reused across launches.
+std::string mmq_tc_shape_class(int m_tokens, int n_rows, int k);
+
+// The pre-MMQ2 launch shape: 64 weight rows x 64 tokens, 32-K chunks
+// (whatever the shape class, so SONICBOOM_AUTOTUNE=0 is the MMQ1 path).
+TileConfig mmq_tc_default_config();
+
+// The candidate grid: tile_m {16,32,64,128} x tile_n {16,32,64} x tile_k {32}.
+// Pruning: tile_k 16 is not a candidate because the kernel's unit is the
+// m16n8k32 mma (a 16-K chunk cannot feed it); the runner additionally skips a
+// config the generator does not support. candidates[0] is the smallest config
+// (16 x 16 x 32) and is the bit-identity reference.
+std::span<const TileConfig> mmq_tc_candidates();
+
+enum class MmqTcSource {
+  Default,   // gate off, or the class is not resolved yet
+  Cache,     // loaded from the per-SM cache file
+  Measured,  // the runner timed it in this process
+};
+
+struct MmqTcChoice {
+  TileConfig cfg = TileConfig{64, 64, 32, 1, 1};
+  MmqTcSource source = MmqTcSource::Default;
+  bool resolved() const { return source != MmqTcSource::Default; }
+};
+
+// Resolve (memoized per process). An unresolved result means the caller may
+// tune the class with AutotuneRunner (candidates from mmq_tc_candidates() and
+// the smallest config as reference) and then call mmq_tc_choice_store.
+MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k);
+
+// Memoize a measured winner and persist it for the SM. The process memo is
+// updated even when the file write fails, so a class is never retimed on every
+// launch. False means the file write failed.
+bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
+                         const TileConfig& cfg);
 
 class AutotuneRunner {
  public:

@@ -241,6 +241,10 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are reused unchanged on
       // the flat batched buffers).
       OpKind::FlashAttention, OpKind::KvAppend,
+      // VS1 prefetch markers. They carry no outputs and no kernels; the
+      // backend executes them as prefetch-stream bookkeeping, so the planner's
+      // capability check places them on the same device as the layer nodes.
+      OpKind::AsyncWeightPrefetch, OpKind::SyncPrefetch,
   };
   // v0 execution dtype: float32 compute (input/output). Integer parameters
   // (reshape/reduce axes) are baked constants, and scalar graph inputs (e.g. the
@@ -280,6 +284,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,
         OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
+        // MMQ1: the prefill dispatch of the same projections onto the
+        // compiler-generated int8 tensor-core kernel.
+        OpKind::MatmulQ8Tc,
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
         OpKind::SiluMulQuantize,
@@ -304,6 +311,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // Compiler-generated glue regions (Stage 5): the PTX kernel is loaded
         // and launched by the SonicCudaBackend itself.
         OpKind::FusedRegion,
+        // VS1 prefetch markers: handled by the backend before any kernel launch
+        // (prefetch-stream bookkeeping only).
+        OpKind::AsyncWeightPrefetch, OpKind::SyncPrefetch,
     };
     gpu.capability.supported_dtypes = {sx::DType::Float32};
     s.devices.push_back(std::move(gpu));

@@ -87,7 +87,8 @@ add_library(sonicboom_compiler STATIC
   lib/BoomPasses.cpp
   lib/GlueCodegen.cpp
   lib/AttentionCodegen.cpp
-  lib/GemmCodegen.cpp)
+  lib/GemmCodegen.cpp
+  lib/MmqTcCodegen.cpp)
 
 # Statically linked into libsonicboom.so once the runtime consumes Boom IR, and
 # already read from the tests next to it, so PIC now rather than as a later fix.

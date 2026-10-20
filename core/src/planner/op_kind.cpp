@@ -41,6 +41,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::Quantize;
   if (name == "quantized_matmul_q8")
     return OpKind::QuantizedMatmulQ8;
+  if (name == "matmul_q8_tc")
+    return OpKind::MatmulQ8Tc;
   if (name == "rms_norm_quantize")
     return OpKind::RmsNormQuantize;
   if (name == "gelu_mul_quantize")
@@ -117,6 +119,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SiluMul;
   if (name == "cross_entropy")
     return OpKind::CrossEntropy;
+  if (name == "async_weight_prefetch")
+    return OpKind::AsyncWeightPrefetch;
+  if (name == "sync_prefetch")
+    return OpKind::SyncPrefetch;
   if (name == "clip_grad_norm")
     return OpKind::ClipGradNorm;
   return std::nullopt;
@@ -136,6 +142,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::QuantizedMatmul: return "quantized_matmul";
     case OpKind::Quantize: return "quantize";
     case OpKind::QuantizedMatmulQ8: return "quantized_matmul_q8";
+    case OpKind::MatmulQ8Tc: return "matmul_q8_tc";
     case OpKind::RmsNormQuantize: return "rms_norm_quantize";
     case OpKind::GeluMulQuantize: return "gelu_mul_quantize";
     case OpKind::SiluMulQuantize: return "silu_mul_quantize";
@@ -175,6 +182,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::SiluMul: return "silu_mul";
     case OpKind::CrossEntropy: return "cross_entropy";
     case OpKind::ClipGradNorm: return "clip_grad_norm";
+    case OpKind::AsyncWeightPrefetch: return "async_weight_prefetch";
+    case OpKind::SyncPrefetch: return "sync_prefetch";
   }
   return "?";
 }

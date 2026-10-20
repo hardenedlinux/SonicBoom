@@ -76,13 +76,17 @@ std::optional<BackendTag> backendTagFromName(llvm::StringRef name) {
 //--- value types -------------------------------------------------------------
 
 // The tensor ids the graph declares as the mmq activation layout: the first
-// operand of a quantized_matmul_q8 node. The graph itself says nothing more — a
-// `quantize` result could in principle feed an f32 path — so this is the whole
-// rule, and it is the same one the graph verifier applies (BoomVerify.cpp).
+// operand of a quantized_matmul_q8 node, or of the matmul_q8_tc node the
+// prefill dispatch pass may turn it into. The graph itself says nothing more —
+// a `quantize` result could in principle feed an f32 path — so this is the
+// whole rule, and it is the same one the graph verifier applies
+// (BoomVerify.cpp). Both ops read the same two layouts (K-quant weights,
+// q8_1 activation), so both keep the operand typed the same way.
 llvm::DenseSet<int64_t> q8_1Ids(const Graph &g) {
   llvm::DenseSet<int64_t> ids;
   for (const GraphNodeDesc &n : g.nodes) {
-    if (n.op != OpKind::QuantizedMatmulQ8 || n.inputs.empty())
+    if ((n.op != OpKind::QuantizedMatmulQ8 && n.op != OpKind::MatmulQ8Tc) ||
+        n.inputs.empty())
       continue;
     ids.insert(raw(n.inputs.front()));
   }

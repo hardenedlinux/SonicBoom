@@ -23,7 +23,7 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/cost_model.h>
-#include <sonicboom/planner/drafter.h>
+#include <sonicboom/planner/draft_model.h>
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/resource.h>
@@ -1280,12 +1280,24 @@ struct PlannerEnv {
   bool q8_1;
   bool mmq;
   int mmq_min_n;
+  // MMQ1's dispatch switch (compiler/BoomPasses.h): the prefill graph differs
+  // between the generated tensor-core kernel and the ggml mmq path, so a
+  // segment planned under one is stale under the other.
+  compiler::MmqTcMode mmq_tc;
+  int mmq_tc_max_mb;
+  // VS1's prefetch switch (compiler/BoomPasses.h): the markers the pass inserts
+  // are part of the graph, and the threshold decides whether they appear, so a
+  // segment planned under one setting is stale under another.
+  compiler::AsyncPrefetchMode async_prefetch;
+  int vram_threshold_mb;
   friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
 };
 
 static PlannerEnv planner_env() {
   return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
-                    quant::cuda::mmq_min_n()};
+                    quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
+                    compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
+                    compiler::vram_threshold_mb()};
 }
 
 // The prefill segment cache is a runtime feature (plan_cache), so it can be
@@ -1731,8 +1743,16 @@ static uint64_t run_spec_program_steps(
     std::cerr << "[spec] unknown draft strategy '" << strategy << "'\n";
     return step;
   }
-  planner::NGramDrafter drafter(cap);
-  drafter.push(history);
+  // Drafter selection: the prompt-lookup n-gram drafter by default, or the
+  // model-backed drafter named by SONICBOOM_DRAFT_MODEL (SD1). Everything below
+  // is drafter-agnostic: the verify graph, the accept rule and the emitted
+  // stream depend only on the proposals, so a different drafter plugs in here
+  // with the verification path reused unchanged. LlmDraftModel still throws
+  // "LlmDraftModel not yet implemented" from its constructor, so asking for it
+  // fails loudly instead of silently running n-gram.
+  std::unique_ptr<planner::DraftModel> drafter =
+      planner::make_draft_model(cap);
+  drafter->push(history);
   // SONICBOOM_SPEC=auto picks k per iteration (B7). The forced-strategy seam
   // keeps the fixed cap so a test can pin every iteration's shape.
   const bool adaptive = !strategy_override && spec_mode() == SpecMode::Auto;
@@ -1761,7 +1781,7 @@ static uint64_t run_spec_program_steps(
     }
     // The drafter may propose at most what the cache can verify in one step:
     // k+1 rows at positions L..L+k must fit.
-    drafter.push(token);
+    drafter->push(token);
     const uint64_t room = std::min<uint64_t>(
         uint64_t(cap), session.n_ctx - L - 1);
     size_t k = 0;
@@ -1812,7 +1832,7 @@ static uint64_t run_spec_program_steps(
           bootstrap_iter = true;
           diag_kind = SpecDiagKind::Bootstrap;
         } else {
-          k = drafter.propose(std::span<uint64_t>(
+          k = drafter->propose(std::span<uint64_t>(
                                   drafts, size_t(spec_choose_drafts(
                                               policy.alpha, policy.cost_us,
                                               int64_t(max_k)))),
@@ -1822,7 +1842,8 @@ static uint64_t run_spec_program_steps(
         }
       }
     } else {
-      k = drafter.propose(std::span<uint64_t>(drafts, size_t(room)), &match_n);
+      k = drafter->propose(std::span<uint64_t>(drafts, size_t(room)),
+                           &match_n);
     }
 
     // S4: when the policy chooses k = 0 it never asks the drafter, which leaves
@@ -1833,7 +1854,8 @@ static uint64_t run_spec_program_steps(
       uint64_t probe[kSpecMaxDrafts];
       const size_t probe_room =
           size_t(std::min<uint64_t>(uint64_t(cap), room));
-      (void)drafter.propose(std::span<uint64_t>(probe, probe_room), &match_n);
+      (void)drafter->propose(std::span<uint64_t>(probe, probe_room),
+                             &match_n);
     }
 
     if (k == 0) {
@@ -1949,7 +1971,7 @@ static uint64_t run_spec_program_steps(
     }
     step += decision.emitted;
     L += decision.emitted;
-    for (size_t i = 0; i + 1 < decision.emitted; ++i) drafter.push(run[i]);
+    for (size_t i = 0; i + 1 < decision.emitted; ++i) drafter->push(run[i]);
     token = run[decision.emitted - 1];
     if (decision.stopped) break;
   }
