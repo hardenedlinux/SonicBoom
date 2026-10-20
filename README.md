@@ -38,6 +38,12 @@ are where SonicBoom keeps improving.
 ![SonicBoom architecture](assets/sonicboom-architecture-light.svg#gh-light-mode-only)
 ![SonicBoom architecture](assets/sonicboom-architecture-dark.svg#gh-dark-mode-only)
 
+## How this is built
+
+- Human architectured
+- Agent: Claude Code
+- Worker: Deepseek-flash-v4.1
+
 ---
 
 ## Why another runtime?
