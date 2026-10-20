@@ -448,6 +448,95 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
   return AutotuneCache::instance().store("matmul_q8_tc", key, cfg);
 }
 
+// --- Q3: prefill attention shape classes -----------------------------------
+
+std::string attn_prefill_seq_bucket(int seq_len) {
+  if (seq_len < 64) return "1-63";
+  if (seq_len < 128) return "64-127";
+  if (seq_len < 256) return "128-255";
+  if (seq_len < 512) return "256-511";
+  if (seq_len < 1024) return "512-1023";
+  return "1024+";
+}
+
+std::string attn_prefill_heads_bucket(int n_heads) {
+  if (n_heads < 8) return "1-7";
+  if (n_heads < 16) return "8-15";
+  return "16+";
+}
+
+std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads) {
+  return std::to_string(head_dim) + "/" + attn_prefill_seq_bucket(seq_len) +
+         "/" + attn_prefill_heads_bucket(n_heads);
+}
+
+bool attn_prefill_tunable(int head_dim) {
+  // dps = head_dim / tile_head must be 1, 2, 4 or 8 for both tile_head values,
+  // so head_dim/16 <= 8 and head_dim is a multiple of 32.
+  return head_dim == 32 || head_dim == 64 || head_dim == 128;
+}
+
+std::span<const TileConfig> attn_prefill_candidates() {
+  // tile_seq x tile_head; the first entry is the bit-identity reference.
+  static const TileConfig kCandidates[] = {
+      {16, 16, 1, 1, 1}, {16, 32, 1, 1, 1}, {32, 16, 1, 1, 1},
+      {32, 32, 1, 1, 1}, {64, 16, 1, 1, 1}, {64, 32, 1, 1, 1},
+  };
+  return kCandidates;
+}
+
+TileConfig attn_prefill_default_config() { return TileConfig{32, 16, 1, 1, 1}; }
+
+namespace {
+std::mutex& attn_prefill_memo_mutex() {
+  static std::mutex m;
+  return m;
+}
+std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
+  static std::unordered_map<std::string, AttnPrefillChoice> m;
+  return m;
+}
+} // namespace
+
+AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
+  if (!enabled())
+    return AttnPrefillChoice{attn_prefill_default_config(),
+                             AttnPrefillSource::Default};
+  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  {
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    const auto it = attn_prefill_memo().find(key);
+    if (it != attn_prefill_memo().end()) return it->second;
+  }
+  // force() retunes: the cache read is skipped and the caller measures.
+  if (!force()) {
+    if (const auto cached =
+            AutotuneCache::instance().lookup("attn_prefill", key)) {
+      const AttnPrefillChoice choice{*cached, AttnPrefillSource::Cache};
+      std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+      attn_prefill_memo().emplace(key, choice);
+      return choice;
+    }
+  }
+  return AttnPrefillChoice{attn_prefill_default_config(),
+                           AttnPrefillSource::Default};
+}
+
+bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+                               const TileConfig& cfg) {
+  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  {
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    attn_prefill_memo()[key] = AttnPrefillChoice{cfg, AttnPrefillSource::Measured};
+  }
+  return AutotuneCache::instance().store("attn_prefill", key, cfg);
+}
+
+void attn_prefill_reset_for_test() {
+  std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+  attn_prefill_memo().clear();
+}
+
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   if (!enabled() || problem.candidates.empty() || !problem.compile)
     return std::nullopt;

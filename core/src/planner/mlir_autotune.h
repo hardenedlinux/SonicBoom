@@ -197,6 +197,63 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k);
 bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
                          const TileConfig& cfg);
 
+// Q3 — prefill attention shape classes (the generated FA-2 kernel).
+//
+// TileConfig mapping: tile_m is the query rows per block (the generator's
+// `br`), tile_n the head_dim columns a warp owns (`dc` = head_dim / dps);
+// tile_k, unroll and vectorize are fixed at 1. The candidate grid is
+// tile_seq {16,32,64} x tile_head {16,32}; candidates[0] is the (16,16)
+// bit-identity reference. Only head_dims where both head tiles yield a
+// supported dps (head_dim in {32,64,128}) have classes; wider heads keep the
+// existing choice.
+//
+// Shape class: head_dim exact; the query length (the prefill chunk size) and
+// the query-head count are bucketed, so a class is tuned once per GPU and
+// reused across launches in the same bucket.
+std::string attn_prefill_seq_bucket(int seq_len);
+std::string attn_prefill_heads_bucket(int n_heads);
+
+// "<head_dim>/<seq_len_bucket>/<num_heads_bucket>" (the cache's shape field;
+// the op field is "attn_prefill", so the combined name is
+// "attn_prefill/<head_dim>/<seq_len_bucket>/<num_heads_bucket>").
+std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads);
+
+// Head dims the grid covers: tile_head 16 and 32 must both be legal so
+// dps = head_dim / tile_head is 1, 2, 4 or 8.
+bool attn_prefill_tunable(int head_dim);
+
+// tile_seq {16,32,64} x tile_head {16,32}; candidates[0] = (16,16).
+std::span<const TileConfig> attn_prefill_candidates();
+
+// The fallback when the runner finds no winner: tile_seq 32, tile_head 16.
+TileConfig attn_prefill_default_config();
+
+enum class AttnPrefillSource {
+  Default,   // gate off, or the class is not resolved yet
+  Cache,     // loaded from the per-SM cache file
+  Measured,  // the runner timed it in this process
+};
+
+struct AttnPrefillChoice {
+  TileConfig cfg = TileConfig{32, 16, 1, 1, 1};
+  AttnPrefillSource source = AttnPrefillSource::Default;
+  bool resolved() const { return source != AttnPrefillSource::Default; }
+};
+
+// Resolve (memoized per process). An unresolved result means the caller may
+// tune the class with AutotuneRunner (candidates from
+// attn_prefill_candidates(), the first as reference) and then call
+// attn_prefill_choice_store.
+AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads);
+
+// Memoize a measured winner and persist it for the SM. True when the file
+// write succeeded.
+bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+                               const TileConfig& cfg);
+
+// Drop the in-process memo (tests; the disk cache is untouched).
+void attn_prefill_reset_for_test();
+
 class AutotuneRunner {
  public:
   using Launch = std::function<void()>;

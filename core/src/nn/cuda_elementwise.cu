@@ -23,6 +23,7 @@
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
+#include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
 #include <cuda_fp16.h>
@@ -36,6 +37,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -3295,6 +3297,180 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   return best;
 }
 
+// --- Q3: prefill attention shape classes ----------------------------------
+//
+// The generated prefill kernel's tile config is (br, dps) on top of the class
+// default. Q3 exposes that as (tile_seq, tile_head): tile_seq is the query
+// rows per block (br) and tile_head the head_dim columns a warp owns
+// (dc = head_dim / dps). The class key is (head_dim, seq_len bucket,
+// query-head bucket) and the choice lives in the mlir_tune per-SM cache under
+// "attn_prefill", gated by SONICBOOM_AUTOTUNE=1. The runner keeps a candidate
+// only when its output is bit-identical to the (16,16) reference, so the
+// gate's own numerics are the reference's.
+//
+// Returns a shape with br/dps applied, or nullopt to keep `base` (gate off,
+// capture, no cache entry and the tuning could not run, or an inapplicable
+// cached config).
+static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
+    int head_dim, int gqa, int n_heads_q, int n_heads_kv, int n,
+    const compiler::AttentionShape &base, uint64_t sliding_window,
+    float scale) {
+  using mlir_tune::TileConfig;
+  if (n <= 0 || base.warp_head) return std::nullopt;
+  if (!mlir_tune::attn_prefill_tunable(head_dim)) return std::nullopt;
+  if (!mlir_tune::enabled()) return std::nullopt;
+
+  auto apply = [&](const TileConfig &cfg)
+      -> std::optional<compiler::AttentionShape> {
+    if (cfg.tile_m <= 0 || cfg.tile_n <= 0 ||
+        head_dim % cfg.tile_n != 0)
+      return std::nullopt;
+    compiler::AttentionShape s = base;
+    s.br = cfg.tile_m;
+    s.dps = head_dim / cfg.tile_n;
+    s.warp_head = false;
+    if (!compiler::attention_shape_supported(s)) return std::nullopt;
+    if (compiler::attention_shared_bytes(s) > 96 * 1024) return std::nullopt;
+    return s;
+  };
+
+  const mlir_tune::AttnPrefillChoice choice =
+      mlir_tune::attn_prefill_choice(head_dim, n, n_heads_q);
+  if (choice.resolved()) return apply(choice.cfg);
+  if (attn_capturing()) return std::nullopt;  // host timing is illegal there
+
+  // Probe at the caller's query length (capped so the scratch stays small; a
+  // class is a bucket, and any length inside it is a valid probe).
+  const int probe_n = std::min(n, 1024);
+  const size_t q_n = size_t(probe_n) * size_t(n_heads_q) * size_t(head_dim);
+  const size_t kv_n = size_t(probe_n) * size_t(n_heads_kv) * size_t(head_dim);
+  const size_t c_n = size_t(kAttnTuneSlots) * size_t(n_heads_kv) *
+                     size_t(head_dim);
+  AttnTuneBufs b;
+  bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
+  ok = ok &&
+       cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
+           cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    return std::nullopt;
+  }
+  // Non-uniform Q/K/V: the bit-identity gate is only meaningful on data that
+  // exercises the softmax and the P·V product (zeroed operands make every
+  // tile config produce the same zeros). The kernel's work is
+  // data-independent, so this does not bias the timing. The cache is unread
+  // at start 0 and stays zeroed.
+  auto fill = [](std::vector<float> &v) {
+    uint32_t s = 12345u;
+    for (float &x : v) {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+      x = float(s % 2000u) / 1000.0f - 1.0f;
+    }
+  };
+  std::vector<float> hq(q_n), hkv(kv_n);
+  fill(hq);
+  fill(hkv);
+  ok = cudaMemcpyAsync(b.q, hq.data(), q_n * 4, cudaMemcpyHostToDevice,
+                       cur_stream()) == cudaSuccess;
+  ok = ok && cudaMemcpyAsync(b.kb, hkv.data(), kv_n * 4,
+                             cudaMemcpyHostToDevice, cur_stream()) ==
+                 cudaSuccess;
+  ok = ok && cudaMemcpyAsync(b.vb, hkv.data(), kv_n * 4,
+                             cudaMemcpyHostToDevice, cur_stream()) ==
+                 cudaSuccess;
+  cudaMemsetAsync(b.kc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.vc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
+  if (!ok) {
+    (void)cudaGetLastError();
+    return std::nullopt;
+  }
+  const uint64_t zero = 0;
+  ok = cudaMemcpyAsync(b.start, &zero, sizeof(zero), cudaMemcpyHostToDevice,
+                       cur_stream()) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    return std::nullopt;
+  }
+
+  std::vector<float> host_out(q_n);
+  bool launch_ok = true;
+  constexpr int kQ3ProbeReps = 16;
+  auto make_launch = [&](const compiler::AttentionShape &s) {
+    return mlir_tune::AutotuneRunner::Launch([&, s] {
+      bool ran = true;
+      for (int i = 0; i < kQ3ProbeReps && ran; ++i)
+        ran = attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
+                                  kAttnTuneSlots, probe_n, n_heads_q,
+                                  n_heads_kv, sliding_window, scale, b.out);
+      launch_ok = ran;
+    });
+  };
+
+  mlir_tune::AutotuneRunner::Problem p;
+  const std::span<const TileConfig> grid = mlir_tune::attn_prefill_candidates();
+  p.candidates.assign(grid.begin(), grid.end());
+  p.compile = [&](const TileConfig &cfg)
+      -> std::optional<mlir_tune::AutotuneRunner::Launch> {
+    const auto s = apply(cfg);
+    if (!s) return std::nullopt;
+    return make_launch(*s);
+  };
+  p.output = host_out.data();
+  p.output_bytes = host_out.size() * sizeof(float);
+  p.sync = [&] {
+    if (!launch_ok) {
+      // A failed candidate must not look like a bit-identical fast one.
+      std::memset(host_out.data(), 0xFF, p.output_bytes);
+      (void)cudaGetLastError();
+      return;
+    }
+    cudaError_t e = cudaMemcpyAsync(host_out.data(), b.out, p.output_bytes,
+                                    cudaMemcpyDeviceToHost, cur_stream());
+    if (e == cudaSuccess) e = cudaStreamSynchronize(cur_stream());
+    if (e != cudaSuccess) {
+      std::fprintf(stderr, "[autotune] attn_prefill probe: %s\n",
+                   cudaGetErrorString(e));
+      std::memset(host_out.data(), 0xFF, p.output_bytes);
+      (void)cudaGetLastError();
+    }
+  };
+  // 8 timed bursts of 16 launches, min: the tile differences are small and the
+  // choice is persisted, so the measurement must be stable.
+  p.iters = 8;
+
+  // The timing launches are not part of any run: a recorded prefill must name
+  // the chosen kernel's real grid, not the probe's (same rule as the dense
+  // and MMQ tuners).
+  planner::PlanRecorder *saved_rec = planner::recorder();
+  planner::set_thread_recorder(nullptr);
+  std::optional<TileConfig> best = mlir_tune::AutotuneRunner::run(p);
+  planner::set_thread_recorder(saved_rec);
+
+  // E: with no winner, the fallback is tile_seq 32 / tile_head 16 (same dps as
+  // the reference, so it stays bit-identical by construction).
+  const TileConfig winner =
+      best ? *best : mlir_tune::attn_prefill_default_config();
+  const bool stored =
+      mlir_tune::attn_prefill_choice_store(head_dim, n, n_heads_q, winner);
+  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+    std::fprintf(stderr,
+                 "[autotune] %s: tile_seq=%d tile_head=%d%s%s\n",
+                 ("attn_prefill/" +
+                  mlir_tune::attn_prefill_shape_class(head_dim, n, n_heads_q))
+                     .c_str(),
+                 winner.tile_m, winner.tile_n, best ? "" : " (default)",
+                 stored ? "" : " [not persisted]");
+  return apply(winner);
+}
+
 std::mutex g_attn_choice_mutex;
 std::unordered_map<std::string, AttnChoice> g_attn_choice;
 
@@ -3670,6 +3846,20 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
+  }
+
+  // Q3: when the class resolves to the generated kernel, tune its
+  // (tile_seq, tile_head) once per (head_dim, seq_len bucket, head bucket).
+  // An explicit tile pin (the Stage 3c sweep) bypasses the tuner, so the
+  // sweep measures exactly the config it names; an implementation pin
+  // (SONICBOOM_ATTN_IMPL / SONICBOOM_ATTN_PREFILL) still lets Q3 choose the
+  // generated kernel's tile.
+  const bool tile_pinned = std::getenv("SONICBOOM_ATTN_CODEGEN") != nullptr;
+  if (shape && !tile_pinned) {
+    if (auto tuned =
+            attn_prefill_tile_autotune(head_dim, gqa, n_heads_q, n_heads_kv, n,
+                                       *shape, sliding_window, scale))
+      shape = *tuned;
   }
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.

@@ -307,6 +307,16 @@ if(SONICBOOM_USE_CUDA)
                                                              CUDA::cuda_driver)
   sb_add_cpp_test(test_cuda_attention_codegen_wide)
 
+  # Q3 prefill attention autotune: shape classes
+  # (head_dim, seq_len bucket, query-head bucket), the six
+  # tile_seq x tile_head candidates, the gate/cache, and (on a device) a tuned
+  # d64/gqa7 prefill that must be bit-identical to the (16,16) reference and
+  # stable across three cold runs.
+  add_executable(test_attn_prefill_autotune test_attn_prefill_autotune.cpp)
+  target_link_libraries(test_attn_prefill_autotune PRIVATE sonicboom
+                                                          CUDA::cudart)
+  sb_add_cpp_test(test_attn_prefill_autotune)
+
   # Compiler-generated flash-decoding (Stage 5): the codegen path of
   # decode_attention_dev — `fa_decode` partials + `fa_combine`, at head_dim
   # 256/512 and the forced d64 GQA shape. Differential against an fp64
@@ -353,6 +363,7 @@ if(SONICBOOM_USE_CUDA)
                        test_cuda_elementwise test_glue_codegen
                        test_cuda_attention_codegen
                        test_cuda_attention_codegen_wide
+                       test_attn_prefill_autotune
                        test_cuda_attention_decode_codegen
                        test_cuda_dense_gemm_codegen
                        test_cuda_mmq_tc_codegen
