@@ -28,6 +28,10 @@ if(SONICBOOM_USE_CUDA)
   set_tests_properties(test_clip_grad_norm PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
+# test_autotune_runner's Q2 section runs the real q8_1 gemv on a synthetic
+# weight, so it allocates device memory (small, but the lock is per-test).
+set_tests_properties(test_autotune_runner PROPERTIES RESOURCE_LOCK gpu_vram)
+
 # The S1 drafter-coverage gate, registered under the spec-* family name so it
 # is selected with the other speculative-decode suites (`ctest -R spec`).
 add_test(NAME test_spec_drafter

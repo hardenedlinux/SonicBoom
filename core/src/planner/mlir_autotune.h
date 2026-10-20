@@ -115,8 +115,31 @@ std::optional<double> lookup_ratio(std::string_view op,
 
 // The per-session gemv choice. The first call for a shape class resolves it
 // once and memoizes it for the life of the process; every later call with the
-// same shape class is a map lookup. With the gate off, or on a cache miss,
-// this is default_config("gemv").
+// same shape class is a map lookup. With the gate off this is
+// default_config("gemv") and nothing is resolved.
+enum class GemvSource {
+  Default,   // gate off, or the class is not resolved yet
+  Cache,     // loaded from the per-SM cache file
+  Measured,  // the runner timed it in this process
+};
+
+struct GemvChoice {
+  TileConfig cfg = TileConfig{256, 1, 32, 1, 1};
+  GemvSource source = GemvSource::Default;
+  bool resolved() const { return source != GemvSource::Default; }
+};
+
+// Resolve (memoized). An unresolved result means the caller may tune the class
+// with AutotuneRunner and then call gemv_choice_store with the winner.
+GemvChoice gemv_choice(int blocks_per_row, int num_rows);
+
+// Memoize a measured winner for the process and persist it for the SM. The
+// process memo is updated even when the file write fails, so a class is never
+// retimed on every launch. False means the file write failed.
+bool gemv_choice_store(int blocks_per_row, int num_rows,
+                       const TileConfig& cfg);
+
+// The resolved config alone (callers that never tune).
 TileConfig gemv_config(int blocks_per_row, int num_rows);
 
 // A shape class is a coarse, bucketized description of the problem: settings

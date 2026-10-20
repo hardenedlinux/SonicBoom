@@ -316,18 +316,46 @@ std::string gemv_shape_class(int blocks_per_row, int num_rows) {
          std::to_string(rows_bucket);
 }
 
-TileConfig gemv_config(int blocks_per_row, int num_rows) {
-  if (!enabled()) return default_config("gemv");
-  static std::mutex mu;
-  static std::unordered_map<std::string, TileConfig> memo;
+namespace {
+std::mutex& gemv_memo_mutex() {
+  static std::mutex m;
+  return m;
+}
+std::unordered_map<std::string, GemvChoice>& gemv_memo() {
+  static std::unordered_map<std::string, GemvChoice> memo;
+  return memo;
+}
+} // namespace
+
+GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
+  if (!enabled()) return GemvChoice{default_config("gemv"), GemvSource::Default};
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
-  std::lock_guard<std::mutex> lock(mu);
-  if (const auto it = memo.find(key); it != memo.end()) return it->second;
-  TileConfig cfg =
-      AutotuneCache::instance().lookup("gemv", key).value_or(
-          default_config("gemv"));
-  memo.emplace(key, cfg);
-  return cfg;
+  {
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    const auto it = gemv_memo().find(key);
+    if (it != gemv_memo().end()) return it->second;
+  }
+  if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
+    const GemvChoice choice{*cached, GemvSource::Cache};
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo().emplace(key, choice);
+    return choice;
+  }
+  return GemvChoice{default_config("gemv"), GemvSource::Default};
+}
+
+bool gemv_choice_store(int blocks_per_row, int num_rows,
+                       const TileConfig& cfg) {
+  const std::string key = gemv_shape_class(blocks_per_row, num_rows);
+  {
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo()[key] = GemvChoice{cfg, GemvSource::Measured};
+  }
+  return AutotuneCache::instance().store("gemv", key, cfg);
+}
+
+TileConfig gemv_config(int blocks_per_row, int num_rows) {
+  return gemv_choice(blocks_per_row, num_rows).cfg;
 }
 
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
