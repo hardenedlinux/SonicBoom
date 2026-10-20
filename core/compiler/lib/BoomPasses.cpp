@@ -2718,6 +2718,133 @@ public:
   }
 };
 
+//--- VS1: layer-wise async weight prefetch ----------------------------------
+
+// Insert the prefetch markers a graph runs under the async-prefetch switch.
+//
+// The decision is the model-bound weight footprint: the byte sizes of the
+// tensor table's constant tensors (the IR's model-bound weights; they are the
+// block arguments no node produces). When that footprint does not exceed
+// SONICBOOM_VRAM_THRESHOLD_MB there is nothing to stream and the pass is a
+// no-op. `SONICBOOM_ASYNC_PREFETCH=on` is the switch; unset/off leaves the
+// graph untouched.
+//
+// Placement, per distinct `layer` attribute on the nodes (ascending):
+//
+//   async(layer 0)                       at the graph start
+//   before layer L's first node:         sync(L), async(next layer)
+//
+// so a layer's weights are requested one layer ahead and waited for at that
+// layer's boundary. The async marker's operands are the layer's constant
+// weight tensors (deduplicated); its `prefetch_bytes` attribute records their
+// total. The markers have no results: the runtime executes them as
+// prefetch-stream bookkeeping (planner/async_prefetch.h).
+//
+// A graph with fewer than two layers has no boundary to overlap and is left
+// alone. Idempotence: markers already present are skipped, so running the
+// phase twice would not stack two prefetch schedules.
+class AsyncPrefetchPass
+    : public mlir::PassWrapper<AsyncPrefetchPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AsyncPrefetchPass)
+
+  void runOnOperation() override {
+    if (async_prefetch_mode() == AsyncPrefetchMode::Off) return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+
+    // The resident model-bound weight footprint.
+    uint64_t footprint = 0;
+    for (mlir::BlockArgument arg : view.body().getArguments()) {
+      if (llvm::isa<boom::KvType>(arg.getType())) continue;  // cache handle
+      const auto id = view.idOf(arg);
+      if (!view.hasTensor(id)) continue;
+      const boom::TensorDescAttr desc = view.desc(id);
+      if (desc.getIsConstant()) footprint += desc.getByteSize();
+    }
+    const uint64_t threshold = uint64_t(vram_threshold_mb()) * 1024 * 1024;
+    if (footprint <= threshold) return;
+
+    // The layers, in first-appearance order, and each one's first node.
+    llvm::SmallVector<int64_t> layers;
+    llvm::DenseMap<int64_t, mlir::Operation *> firstOfLayer;
+    for (mlir::Operation &node : view.body()) {
+      const llvm::StringRef name = node.getName().getStringRef();
+      if (name == "boom.async_weight_prefetch" ||
+          name == "boom.sync_prefetch")
+        return;  // already scheduled
+      auto layer = node.getAttrOfType<mlir::IntegerAttr>("layer");
+      if (!layer || layer.getInt() < 0) continue;
+      auto [it, inserted] = firstOfLayer.try_emplace(layer.getInt(), &node);
+      if (inserted) layers.push_back(layer.getInt());
+    }
+    if (layers.size() < 2) return;
+
+    struct LayerWeights {
+      llvm::SmallVector<mlir::Value> operands;
+      uint64_t bytes = 0;
+    };
+    llvm::DenseMap<int64_t, LayerWeights> weights;
+    llvm::DenseMap<int64_t, llvm::DenseSet<int64_t>> seen;
+    for (mlir::Operation &node : view.body()) {
+      auto layer = node.getAttrOfType<mlir::IntegerAttr>("layer");
+      if (!layer || layer.getInt() < 0) continue;
+      const int64_t l = layer.getInt();
+      for (mlir::Value operand : node.getOperands()) {
+        if (llvm::isa<boom::KvType>(operand.getType())) continue;
+        const auto id = view.idOf(operand);
+        if (!view.hasTensor(id) || !view.desc(id).getIsConstant()) continue;
+        if (!seen[l].insert(id).second) continue;
+        weights[l].operands.push_back(operand);
+        weights[l].bytes += view.desc(id).getByteSize();
+      }
+    }
+
+    const mlir::Location loc = graph.getLoc();
+    mlir::OpBuilder builder(view.ctx());
+    auto insertMarker = [&](llvm::StringRef opName, int64_t layer,
+                            uint64_t bytes,
+                            mlir::ValueRange operands) -> mlir::Operation * {
+      llvm::SmallVector<mlir::Attribute> attrs;
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "layer", builder.getI64IntegerAttr(layer)));
+      attrs.push_back(boom::NodeAttr::get(
+          view.ctx(), "prefetch_bytes",
+          builder.getI64IntegerAttr(int64_t(bytes))));
+      const std::string nodeName =
+          (opName + "_" + std::to_string(layer)).str();
+      return buildNode(builder, loc, opName, view.nextNodeId(), nodeName,
+                       builder.getArrayAttr(attrs), llvm::ArrayRef<int64_t>(),
+                       operands, mlir::TypeRange(), nullptr);
+    };
+
+    // The first layer's weights are requested before the graph's first node;
+    // there is no earlier work to overlap them with.
+    const int64_t first = layers.front();
+    builder.setInsertionPointToStart(&view.body());
+    insertMarker(planner::op_kind_name(planner::OpKind::AsyncWeightPrefetch),
+                 first, weights[first].bytes, weights[first].operands);
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+      const int64_t l = layers[i];
+      builder.setInsertionPoint(firstOfLayer.lookup(l));
+      insertMarker(planner::op_kind_name(planner::OpKind::SyncPrefetch), l, 0,
+                   mlir::ValueRange());
+      if (i + 1 < layers.size()) {
+        const int64_t next = layers[i + 1];
+        insertMarker(
+            planner::op_kind_name(planner::OpKind::AsyncWeightPrefetch), next,
+            weights[next].bytes, weights[next].operands);
+      }
+    }
+
+    // Marker-only: no tensor is added, dropped or resized.
+    view.commitTable();
+  }
+};
+
 //--- the per-pass disable switch --------------------------------------------
 
 // Ablation for one fusion at a time: the passes a run skips, named on the
@@ -2755,6 +2882,7 @@ struct DisabledPasses {
   bool fold_scale_into_glue = false;
   bool dense_layout_propagation = false;
   bool buffer_reuse = false;
+  bool async_prefetch = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -2787,6 +2915,7 @@ constexpr PassName kPassNames[] = {
     {"SiluMulMmqPass", &DisabledPasses::silu_mul_mmq},
     {"DenseLayoutPropagationPass", &DisabledPasses::dense_layout_propagation},
     {"BufferReusePass", &DisabledPasses::buffer_reuse},
+    {"AsyncPrefetchPass", &DisabledPasses::async_prefetch},
 };
 
 // Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
@@ -2881,6 +3010,9 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
       pm.addPass(std::make_unique<FuseKvAppendIntoPrepPass>());
     // Last: buffer assignment reads the final node set's uses and sizes.
     if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
+    // VS1: the prefetch markers annotate the final node set's layer
+    // boundaries; no pass before this one reads them and no pass after does.
+    if (!off.async_prefetch) pm.addPass(std::make_unique<AsyncPrefetchPass>());
     return;
   case planner::IrPassPhase::Prefill:
     if (!off.rms_norm_mmq) pm.addPass(std::make_unique<RmsNormMmqPass>());
@@ -2923,6 +3055,7 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
       pm.addPass(std::make_unique<DenseLayoutPropagationPass>());
     // Last: buffer assignment reads the final node set's uses and sizes.
     if (!off.buffer_reuse) pm.addPass(std::make_unique<BufferReusePass>());
+    if (!off.async_prefetch) pm.addPass(std::make_unique<AsyncPrefetchPass>());
     return;
   case planner::IrPassPhase::Training:
     // A traced training graph: the forward matmul/norm/activation vocabulary
@@ -2973,6 +3106,29 @@ int mmq_tc_max_mb() {
   if (env == nullptr || *env == '\0') return 2048;
   const long v = std::strtol(env, nullptr, 10);
   return v > 0 ? int(std::min<long>(v, 1L << 20)) : 2048;
+}
+
+AsyncPrefetchMode async_prefetch_mode() {
+  // Read on every call, like the other ablation switches: a caller that changes
+  // it between runs must see the new value. Unset means off — the skeleton
+  // inserts nothing until a run opts in.
+  const char *env = std::getenv("SONICBOOM_ASYNC_PREFETCH");
+  if (env == nullptr || *env == '\0') return AsyncPrefetchMode::Off;
+  const std::string_view v(env);
+  if (v == "on") return AsyncPrefetchMode::On;
+  if (v != "off" && v != "0")
+    std::fprintf(stderr,
+                 "SONICBOOM_ASYNC_PREFETCH: '%s' is not on/off; reading it as "
+                 "off\n",
+                 env);
+  return AsyncPrefetchMode::Off;
+}
+
+int vram_threshold_mb() {
+  const char *env = std::getenv("SONICBOOM_VRAM_THRESHOLD_MB");
+  if (env == nullptr || *env == '\0') return 6000;
+  const long v = std::strtol(env, nullptr, 10);
+  return v > 0 ? int(std::min<long>(v, 1L << 20)) : 6000;
 }
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).

@@ -119,6 +119,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SiluMul;
   if (name == "cross_entropy")
     return OpKind::CrossEntropy;
+  if (name == "async_weight_prefetch")
+    return OpKind::AsyncWeightPrefetch;
+  if (name == "sync_prefetch")
+    return OpKind::SyncPrefetch;
   if (name == "clip_grad_norm")
     return OpKind::ClipGradNorm;
   return std::nullopt;
@@ -178,6 +182,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::SiluMul: return "silu_mul";
     case OpKind::CrossEntropy: return "cross_entropy";
     case OpKind::ClipGradNorm: return "clip_grad_norm";
+    case OpKind::AsyncWeightPrefetch: return "async_weight_prefetch";
+    case OpKind::SyncPrefetch: return "sync_prefetch";
   }
   return "?";
 }

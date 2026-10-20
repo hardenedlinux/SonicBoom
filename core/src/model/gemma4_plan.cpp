@@ -1285,13 +1285,19 @@ struct PlannerEnv {
   // segment planned under one is stale under the other.
   compiler::MmqTcMode mmq_tc;
   int mmq_tc_max_mb;
+  // VS1's prefetch switch (compiler/BoomPasses.h): the markers the pass inserts
+  // are part of the graph, and the threshold decides whether they appear, so a
+  // segment planned under one setting is stale under another.
+  compiler::AsyncPrefetchMode async_prefetch;
+  int vram_threshold_mb;
   friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
 };
 
 static PlannerEnv planner_env() {
   return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
                     quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
-                    compiler::mmq_tc_max_mb()};
+                    compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
+                    compiler::vram_threshold_mb()};
 }
 
 // The prefill segment cache is a runtime feature (plan_cache), so it can be

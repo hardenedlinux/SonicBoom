@@ -172,6 +172,15 @@ enum class OpKind : uint8_t {
   // otherwise (the ggml mmq fallback). Appended last for the same reason as
   // ClipGradNorm.
   MatmulQ8Tc,
+
+  // VS1: async weight-prefetch markers (AsyncPrefetchPass). They have no
+  // outputs: the async marker starts prefetching the layer's weight operands on
+  // the runtime's prefetch stream, the sync marker waits for them before the
+  // layer's first node. Both are no-ops while SONICBOOM_ASYNC_PREFETCH is not
+  // "on" (the pass inserts none then). Appended last for the same reason as
+  // ClipGradNorm.
+  AsyncWeightPrefetch,
+  SyncPrefetch,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

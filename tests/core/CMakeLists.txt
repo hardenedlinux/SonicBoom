@@ -437,6 +437,23 @@ target_link_libraries(test_prefill_dispatch PRIVATE sonicboom sonicboom_compiler
                                                    MLIRAsmParser)
 sb_add_cpp_test(test_prefill_dispatch)
 
+# VS1 async-prefetch skeleton: AsyncPrefetchPass under SONICBOOM_ASYNC_PREFETCH
+# and SONICBOOM_VRAM_THRESHOLD_MB (marker placement, operands and bytes, the
+# pass-disable ablation, the boomToGraph round trip), the runtime's no-op
+# default and prefetch stream, and the LRU eviction stub.
+add_executable(test_async_prefetch_noop test_async_prefetch_noop.cpp)
+target_link_libraries(test_async_prefetch_noop PRIVATE sonicboom
+                                                        sonicboom_compiler
+                                                        MLIRAsmParser)
+if(SONICBOOM_USE_CUDA)
+  target_compile_definitions(test_async_prefetch_noop PRIVATE SB_TEST_CUDA=1)
+endif()
+sb_add_cpp_test(test_async_prefetch_noop)
+if(SONICBOOM_USE_CUDA)
+  # begin() creates the prefetch stream, so the suite is a GPU consumer.
+  set_tests_properties(test_async_prefetch_noop PROPERTIES RESOURCE_LOCK gpu_vram)
+endif()
+
 # Blade -> Boom IR lowering test (design/mlir-migration.md §6.4 / §7d): the
 # direct document lowering must build the same IR as
 # graphToBoom(adapt_graph(doc)) for hand-written v0.1 documents, including

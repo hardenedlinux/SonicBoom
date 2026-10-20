@@ -32,6 +32,7 @@
 #include "../nn/cuda_resident.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
+#include "async_prefetch.h"
 #include "device_allocator.h"
 #include "device_pool.h"
 #include "glue_jit.h"
@@ -427,6 +428,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   const auto* node = graph_.find_node(compute->graph_nodes.front());
   if (!node)
     return std::unexpected(fail("Sonic CUDA task references an unknown graph node"));
+
+  // VS1 prefetch markers: scheduling bookkeeping, not a kernel. Checked before
+  // the output check — a marker has no outputs by construction. The runtime is
+  // a no-op while SONICBOOM_ASYNC_PREFETCH is not "on".
+  if (node->op == OpKind::AsyncWeightPrefetch || node->op == OpKind::SyncPrefetch) {
+    int64_t layer = -1;
+    attr_i(*node, "layer", layer);
+    int64_t bytes = 0;
+    attr_i(*node, "prefetch_bytes", bytes);
+    AsyncPrefetchRuntime& prefetch = AsyncPrefetchRuntime::instance();
+    if (node->op == OpKind::AsyncWeightPrefetch)
+      prefetch.begin(int(layer), bytes > 0 ? uint64_t(bytes) : 0);
+    else
+      prefetch.wait(int(layer));
+    return std::vector<TensorValue>{};
+  }
+
   if (node->outputs.empty())
     return std::unexpected(fail("Sonic CUDA node has no output"));
   const auto* out_td = graph_.find_tensor(node->outputs.front());

@@ -29,6 +29,8 @@
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
+#include "async_prefetch.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -125,6 +127,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
   const auto* node = graph_.find_node(compute->graph_nodes.front());
   if (!node)
     return std::unexpected(fail("Sonic task references an unknown graph node"));
+
+  // VS1 prefetch markers: host-side bookkeeping, not a kernel (the CPU backend
+  // sees them when the plan runs without a device). No-op unless the switch
+  // is on.
+  if (node->op == OpKind::AsyncWeightPrefetch || node->op == OpKind::SyncPrefetch) {
+    int64_t layer = -1;
+    attr_i(*node, "layer", layer);
+    int64_t bytes = 0;
+    attr_i(*node, "prefetch_bytes", bytes);
+    AsyncPrefetchRuntime& prefetch = AsyncPrefetchRuntime::instance();
+    if (node->op == OpKind::AsyncWeightPrefetch)
+      prefetch.begin(int(layer), bytes > 0 ? uint64_t(bytes) : 0);
+    else
+      prefetch.wait(int(layer));
+    return std::vector<TensorValue>{};
+  }
+
   if (node->outputs.empty())
     return std::unexpected(fail("Sonic node has no output"));
   const auto* out_td = graph_.find_tensor(node->outputs.front());

@@ -405,6 +405,26 @@ def Boom_FlashAttentionOp : Boom_Op<"flash_attention",
 def Boom_KvAppendOp : Boom_Op<"kv_append",
     "append n KV rows to the layer's cache, deferred past all layers",
     [Boom_KvWrite]>;
+
+//--- VS1: layer-wise async weight prefetch ---------------------------------
+//
+// Two markers the AsyncPrefetchPass inserts at the layer boundaries of a graph
+// whose model-bound weights exceed the VRAM threshold. They carry no results:
+// they are scheduling instructions for the runtime's prefetch stream, not
+// values. The async marker starts prefetching the layer's weight operands (its
+// operands — the graph's constant tensors the layer reads); the sync marker
+// waits for the named layer's weights before that layer's first node runs.
+// `layer` is the typed layer attribute; `prefetch_bytes` (node_attrs only)
+// records how many weight bytes the start covers.
+//
+// A marker is a no-op unless SONICBOOM_ASYNC_PREFETCH is "on", and the pass
+// inserts none then; the markers exist in the vocabulary so a graph built with
+// the switch on round-trips through boomToGraph like any other graph.
+def Boom_AsyncWeightPrefetchOp : Boom_Op<"async_weight_prefetch",
+    "start prefetching a layer's weight operands on the prefetch stream">;
+def Boom_SyncPrefetchOp : Boom_Op<"sync_prefetch",
+    "wait for a layer's weights before its first node runs">;
+
 // A maximal glue region lowered by the compiler to one device kernel. It takes
 // over the op it replaces (same node id, attributes, operands, results and
 // backend); the `fused_region` node attribute names the region, and that name

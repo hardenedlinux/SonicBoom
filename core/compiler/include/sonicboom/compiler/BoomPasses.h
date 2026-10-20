@@ -73,4 +73,18 @@ MmqTcMode mmq_tc_mode();
 // the VRAM a dispatch decision may spend, not the model size.
 int mmq_tc_max_mb();
 
+// The VS1 async-prefetch switch (AsyncPrefetchPass), read from
+// SONICBOOM_ASYNC_PREFETCH:
+//   on  — insert boom.async_weight_prefetch / boom.sync_prefetch markers when
+//         the graph's model-bound weights exceed the VRAM threshold;
+//   off — the default; no marker is inserted.
+// Unset reads as off. Anything else is reported on stderr and read as off.
+enum class AsyncPrefetchMode { On, Off };
+AsyncPrefetchMode async_prefetch_mode();
+
+// The model-weight footprint above which the markers are inserted, in MiB
+// (SONICBOOM_VRAM_THRESHOLD_MB, default 6000). The default is the model size
+// that no longer leaves the decode working set comfortable on an 8 GiB device.
+int vram_threshold_mb();
+
 } // namespace sonicboom::compiler
