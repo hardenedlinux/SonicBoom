@@ -336,6 +336,17 @@ if(SONICBOOM_USE_CUDA)
                                                             CUDA::cublas)
   sb_add_cpp_test(test_cuda_dense_gemm_codegen)
 
+  # Compiler-generated q8_1 tensor-core matmul (MMQ1): the int8 m16n8k32 path
+  # of the prefill projection. Differential against the kernel's arithmetic
+  # (exact per-32 integer dot, scaled by both operands' scales) in fp64, both
+  # activation scale layouts, a tail shape, and bitwise batch invariance.
+  add_executable(test_cuda_mmq_tc_codegen test_cuda_mmq_tc_codegen.cpp)
+  target_link_libraries(test_cuda_mmq_tc_codegen PRIVATE sonicboom
+                                                         sonicboom_compiler
+                                                         CUDA::cudart
+                                                         CUDA::cuda_driver)
+  sb_add_cpp_test(test_cuda_mmq_tc_codegen)
+
   # Small, but still GPU tests: they fail beside a model test (see "The GPU
   # tests run one at a time" above).
   set_tests_properties(test_cuda test_cuda_quant test_cuda_gather
@@ -344,6 +355,7 @@ if(SONICBOOM_USE_CUDA)
                        test_cuda_attention_codegen_wide
                        test_cuda_attention_decode_codegen
                        test_cuda_dense_gemm_codegen
+                       test_cuda_mmq_tc_codegen
     PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
@@ -416,6 +428,14 @@ add_executable(test_boom_dialect test_boom_dialect.cpp)
 target_link_libraries(test_boom_dialect PRIVATE sonicboom sonicboom_compiler
                                              MLIRAsmParser)
 sb_add_cpp_test(test_boom_dialect)
+
+# PrefillDispatchPass (MMQ1): a model-free graph pins the dispatch decision under
+# the two switches (SONICBOOM_MMQ_TC auto/on/off, SONICBOOM_MMQ_TC_MAX_MB), the
+# pass-disable ablation, the shape eligibility, and the attribute carry-over.
+add_executable(test_prefill_dispatch test_prefill_dispatch.cpp)
+target_link_libraries(test_prefill_dispatch PRIVATE sonicboom sonicboom_compiler
+                                                   MLIRAsmParser)
+sb_add_cpp_test(test_prefill_dispatch)
 
 # Blade -> Boom IR lowering test (design/mlir-migration.md §6.4 / §7d): the
 # direct document lowering must build the same IR as

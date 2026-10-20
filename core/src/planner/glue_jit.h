@@ -32,6 +32,7 @@
 
 #include <sonicboom/compiler/AttentionCodegen.h>
 #include <sonicboom/compiler/GemmCodegen.h>
+#include <sonicboom/compiler/MmqTcCodegen.h>
 
 namespace sonicboom::planner::glue {
 
@@ -81,5 +82,16 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
 bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
                        const void *w, void *y, int m, int k, int n,
                        float alpha = 1.0f);
+
+// Launch the compiler-generated q8_1 tensor-core prefill matmul for `shape`:
+//   y[n][m] f32 (token-major) = xq * wq^T
+// where `xq` is the block_q8_1_mmq activation ([k/128][n] 144-byte blocks),
+// `wq` m rows of k int8 values (row-major) and `ws` their per-32 f32 scales
+// ([m][k/32]). Grid (ceil(n/bn), ceil(m/bm)). False means the shape has no
+// generator (k not a multiple of 32 included) or compile/load failed; the
+// caller falls back to the ggml mmq kernel.
+bool launch_mmq_tc(const compiler::MmqTcShape &shape, const void *xq,
+                   const void *wq, const void *ws, void *y, int m, int k,
+                   int n);
 
 } // namespace sonicboom::planner::glue

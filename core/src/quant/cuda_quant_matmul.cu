@@ -16,6 +16,7 @@
 
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include <sonicboom/quant/dequant.h>
 #include <sonicboom/runtime_features.h>
 
 #include "cuda_resident.h"
@@ -23,6 +24,7 @@
 #include "../nn/cuda_stream.h"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
+#include "../planner/glue_jit.h"  // the generated MMQ1 tensor-core kernel
 #include "../planner/mlir_autotune.h"  // Q1 tile-config cache (opt-in)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
@@ -38,6 +40,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -48,6 +51,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 // CUDA dequantize-on-the-fly gemv for Q3_K/Q4_K/Q5_K weights @ f32 activation.
 //
@@ -654,6 +658,72 @@ const void* upload_bytes(const void* host, size_t bytes) {
   return dptr;
 }
 
+// --- MMQ1 tensor-core q8_1 weight copy --------------------------------------
+//
+// The generated int8 tensor-core kernel takes an int8 weight with one f32 scale
+// per 32 values, so the packed K-quant weight is converted once: dequantized
+// row by row (quant::dequantize_row_f32, the same reference every other
+// consumer reproduces), then each 32-value group is quantized to [-127, 127]
+// with scale amax/127. The copy is int8 [rows][cols] followed by f32 scales
+// [rows][cols/32], uploaded once and cached by (data pointer, byte size).
+//
+// The conversion is the pass's budgeted cost (SONICBOOM_MMQ_TC_MAX_MB): it runs
+// on first dispatch, which — for a captured prefill segment — is the uncaptured
+// warm-up run, so no allocation happens inside CUDA Graph capture.
+struct TcWeight {
+  void* q = nullptr;  // int8 [rows][cols]
+  void* s = nullptr;  // f32 [rows][cols/32]
+  size_t bytes = 0;
+};
+
+std::unordered_map<CacheKey, TcWeight, CacheKeyHash> g_tc_cache;
+
+TcWeight upload_tc_weight(const QuantizedTensor& W, int rows, int cols) {
+  if (rows <= 0 || cols <= 0 || cols % 32 != 0) return {};
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  CacheKey key{W.data().data(), W.byte_size()};
+  auto it = g_tc_cache.find(key);
+  if (it != g_tc_cache.end()) return it->second;
+
+  const size_t groups = size_t(cols) / 32;
+  std::vector<int8_t> qh(size_t(rows) * size_t(cols));
+  std::vector<float> sh(size_t(rows) * groups);
+  std::vector<float> row_buf(static_cast<size_t>(cols));
+  for (int r = 0; r < rows; ++r) {
+    if (!quant::dequantize_row_f32(W, uint64_t(r), row_buf.data(),
+                                   uint64_t(cols)))
+      return {};
+    int8_t* qr = qh.data() + size_t(r) * size_t(cols);
+    float* sr = sh.data() + size_t(r) * groups;
+    for (size_t b = 0; b < groups; ++b) {
+      const float* x = row_buf.data() + b * 32;
+      float amax = 0.0f;
+      for (int i = 0; i < 32; ++i) amax = std::fmax(amax, std::fabs(x[i]));
+      const float d = amax / 127.0f;
+      const float id = d > 0.0f ? 1.0f / d : 0.0f;
+      sr[b] = d;
+      for (int i = 0; i < 32; ++i) {
+        const float v = std::roundf(x[i] * id);
+        qr[b * 32 + i] = int8_t(std::fmin(127.0f, std::fmax(-127.0f, v)));
+      }
+    }
+  }
+
+  const size_t qbytes = qh.size();
+  const size_t sbytes = sh.size() * sizeof(float);
+  void* dq = nullptr;
+  if (cudaMalloc(&dq, qbytes + sbytes) != cudaSuccess) return {};
+  void* ds = static_cast<char*>(dq) + qbytes;
+  if (cudaMemcpy(dq, qh.data(), qbytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(ds, sh.data(), sbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+    cudaFree(dq);
+    return {};
+  }
+  TcWeight w{dq, ds, qbytes + sbytes};
+  g_tc_cache.emplace(key, w);
+  return w;
+}
+
 // --- temporary profiling (remove after measuring) ---------------------------
 long g_prof_calls = 0;
 double g_prof_kernel_ms = 0.0;
@@ -1155,6 +1225,8 @@ void clear_cache() {
   std::lock_guard<std::mutex> lk(g_cache_mutex);
   for (auto& kv : g_cache) cudaFree(kv.second.ptr);
   g_cache.clear();
+  for (auto& kv : g_tc_cache) cudaFree(kv.second.q);
+  g_tc_cache.clear();
   if (g_ple_mapped.host) cudaHostUnregister(const_cast<void*>(g_ple_mapped.host));
   g_ple_mapped = {};
   // cuBLAS handle + workspace (C.1): destroy so a later lazy create starts fresh.
@@ -2753,6 +2825,32 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   }
   if (!ok) return false;
   return cudaGetLastError() == cudaSuccess;
+}
+
+// MMQ1: the same operands as matmul_mmq_q8_dev, multiplied by the generated
+// int8 tensor-core kernel over the per-weight q8_1 copy (upload_tc_weight).
+// The activation is the fused quantizers' block_q8_1_mmq — the kernel reads the
+// same layout the ggml mmq kernel does — so the two paths differ only in the
+// weight representation. MMQ1 uses one tile class (64x64); the MMQ2 autotuner
+// extends the choice per shape.
+bool matmul_mmq_tc_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
+                       float* Y, int n, int ds) {
+  if (!available() || !W.valid() || W.dims().size() != 2 || !yq || !Y || n <= 0)
+    return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (cols == 0 || rows == 0 || cols % 128 != 0) return false;
+  if (cols > INT32_MAX || rows > INT32_MAX) return false;
+  if (ds < 0 || ds > 2) return false;
+
+  const TcWeight tw = upload_tc_weight(W, int(rows), int(cols));
+  if (!tw.q) return false;
+
+  compiler::MmqTcShape shape;
+  shape.ds = ds;
+  if (!compiler::mmq_tc_shape_supported(shape)) return false;
+  return planner::glue::launch_mmq_tc(shape, yq, tw.q, tw.s, Y, int(rows),
+                                      int(cols), n);
 }
 
 // --- MMQ batched/fused prefill quantize (C.4, position-major) ---------------

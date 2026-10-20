@@ -280,6 +280,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::Rope,           OpKind::CastFp16,   OpKind::Attention,
         OpKind::GqaBroadcast, OpKind::QuantizedMatmul,
         OpKind::Quantize,       OpKind::QuantizedMatmulQ8,
+        // MMQ1: the prefill dispatch of the same projections onto the
+        // compiler-generated int8 tensor-core kernel.
+        OpKind::MatmulQ8Tc,
         OpKind::RmsNormQuantize,
         OpKind::GeluMulQuantize,
         OpKind::SiluMulQuantize,

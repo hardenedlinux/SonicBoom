@@ -1280,12 +1280,18 @@ struct PlannerEnv {
   bool q8_1;
   bool mmq;
   int mmq_min_n;
+  // MMQ1's dispatch switch (compiler/BoomPasses.h): the prefill graph differs
+  // between the generated tensor-core kernel and the ggml mmq path, so a
+  // segment planned under one is stale under the other.
+  compiler::MmqTcMode mmq_tc;
+  int mmq_tc_max_mb;
   friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
 };
 
 static PlannerEnv planner_env() {
   return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
-                    quant::cuda::mmq_min_n()};
+                    quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
+                    compiler::mmq_tc_max_mb()};
 }
 
 // The prefill segment cache is a runtime feature (plan_cache), so it can be

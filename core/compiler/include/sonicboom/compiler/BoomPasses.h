@@ -51,4 +51,26 @@ namespace sonicboom::compiler {
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
                    bool skip_kv_append_fusion = false);
 
+// The MMQ1 prefill dispatch switch (prefill_dispatch_pass), read from
+// SONICBOOM_MMQ_TC:
+//   off (default) — never rewrite: the ggml mmq path. This is the default
+//                   because the generated kernel measured slower than the ggml
+//                   mmq kernel on the reference GPU (Qwen2.5-0.5B pp512:
+//                   17.0k tok/s off vs 14.1k on at the best tile), so opting in
+//                   must be deliberate until the tile autotuner has a winner.
+//   auto          — rewrite a batched matmul to the generated int8 tensor-core
+//                   kernel when the whole graph's per-weight q8_1 copy fits the
+//                   budget (the Gemma 4 E4B decision on a large-VRAM machine).
+//   on            — rewrite regardless of the budget (for verifying the path on
+//                   a machine with the VRAM headroom; the runtime still falls
+//                   back per node if a copy cannot be built).
+// Anything else is reported on stderr and read as off.
+enum class MmqTcMode { Auto, On, Off };
+MmqTcMode mmq_tc_mode();
+
+// The q8_1 weight-copy budget in MiB (SONICBOOM_MMQ_TC_MAX_MB, default 2048).
+// The copies are additional to the K-quant weights already resident, so this is
+// the VRAM a dispatch decision may spend, not the model size.
+int mmq_tc_max_mb();
+
 } // namespace sonicboom::compiler

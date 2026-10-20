@@ -356,6 +356,8 @@ def Boom_QuantizeOp : Boom_Op<"quantize",
     "f32 activation -> q8_1, the explicit quantize-once node (CUDA)">;
 def Boom_QuantizedMatmulQ8Op : Boom_Op<"quantized_matmul_q8",
     "K-quant matvec consuming a pre-quantized q8_1 activation">;
+def Boom_MatmulQ8TcOp : Boom_Op<"matmul_q8_tc",
+    "prefill q8_1 tensor-core matmul over the per-weight q8_1 copy">;
 def Boom_RmsNormQuantizeOp : Boom_Op<"rms_norm_quantize",
     "rms_norm + q8_1 quantize, fused">;
 def Boom_GeluMulQuantizeOp : Boom_Op<"gelu_mul_quantize",

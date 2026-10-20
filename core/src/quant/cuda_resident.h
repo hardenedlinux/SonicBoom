@@ -191,6 +191,20 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
                        int n, MmqDecomp decomp = MmqDecomp::Auto);
 
+// MMQ1: Y = W @ X on the compiler-generated int8 tensor-core kernel
+// (compiler/MmqTcCodegen.h), over a per-weight q8_1 copy instead of the packed
+// K-quant weight. On first use W is dequantized (quant::dequantize_row_f32,
+// row by row), re-quantized to int8 with one f32 scale per 32 values, and the
+// copy is uploaded and cached by (data pointer, byte size) — the same key
+// discipline as upload_weight, in a cache of its own. `yq` and Y are the
+// matmul_mmq_q8_dev operands ([cols/128][n] block_q8_1_mmq, [n, rows]); `ds`
+// names the activation scale layout (MmqDsD4/MmqDsDS4). Returns false — having
+// launched nothing — when the shape is outside the generator (cols not a
+// multiple of 128, empty rows) or the copy/launch fails, so the caller can run
+// the ggml mmq kernel for that node.
+bool matmul_mmq_tc_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
+                       int n, int ds);
+
 // Dequantize a single row (token `token`) of a 2-D quantized embedding matrix
 // to device f32: out[k] = W[k][token] for k in [0, width). W has GGUF shape
 // [width, vocab]; `token` selects the row. `out` must hold `width` floats (the

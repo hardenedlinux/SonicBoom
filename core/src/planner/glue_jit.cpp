@@ -267,6 +267,67 @@ std::string dense_gemm_ptx(const compiler::DenseGemmShape &shape, int arch) {
   return std::move(*generated);
 }
 
+std::string mmq_tc_region_name(const compiler::MmqTcShape &shape) {
+  return "mmqtc-m" + std::to_string(shape.bm) + "n" + std::to_string(shape.bn) +
+         "d" + std::to_string(shape.ds);
+}
+
+// The generated q8_1 tensor-core kernel's PTX: disk cache first, generator on
+// a miss. Same entry format and trust model as region_ptx.
+std::string mmq_tc_ptx(const compiler::MmqTcShape &shape, int arch) {
+  if (arch <= 0 || !compiler::mmq_tc_shape_supported(shape)) return {};
+  const std::string region = mmq_tc_region_name(shape);
+  const std::string codegen = compiler::mmq_tc_codegen_version();
+  const std::filesystem::path path = cache_path(region, arch);
+  if (use_disk_cache()) {
+    const std::string cached = read_file(path);
+    if (!cached.empty()) {
+      std::string body = validate_entry(cached, region, arch, codegen);
+      if (!body.empty()) return body;
+      std::fprintf(stderr, "glue JIT: ignoring stale PTX cache entry %s\n",
+                   path.c_str());
+    }
+  }
+  auto generated = compiler::generate_mmq_tc_ptx(shape, arch);
+  if (!generated) return {};
+  if (use_disk_cache())
+    write_file(path, make_entry(region, arch, codegen, *generated));
+  return std::move(*generated);
+}
+
+bool load_mmq_tc(const compiler::MmqTcShape &shape, std::string_view key,
+                 int shared_bytes, LoadedKernel &out) {
+  const int arch = sm_arch();
+  const std::string ptx = mmq_tc_ptx(shape, arch);
+  if (ptx.empty()) {
+    std::fprintf(stderr, "glue JIT: no generated mmq-tc PTX for '%.*s'\n",
+                 int(key.size()), key.data());
+    return false;
+  }
+  CUresult r = cuModuleLoadData(&out.module, ptx.c_str());
+  if (r != CUDA_SUCCESS) {
+    std::fprintf(stderr,
+                 "glue JIT: cuModuleLoadData failed for '%.*s': %s\n",
+                 int(key.size()), key.data(), cu_error(r));
+    return false;
+  }
+  r = cuModuleGetFunction(&out.function, out.module,
+                          compiler::kMmqTcKernelEntry);
+  if (r != CUDA_SUCCESS) {
+    std::fprintf(stderr,
+                 "glue JIT: cuModuleGetFunction failed for '%.*s': %s\n",
+                 int(key.size()), key.data(), cu_error(r));
+    cuModuleUnload(out.module);
+    out = {};
+    return false;
+  }
+  if (shared_bytes >= 48 * 1024)
+    cuFuncSetAttribute(out.function,
+                       CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                       shared_bytes);
+  return true;
+}
+
 bool load_dense_gemm(const compiler::DenseGemmShape &shape,
                      std::string_view key, int shared_bytes,
                      LoadedKernel &out) {
@@ -626,6 +687,65 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
   (void)k;
   (void)n;
   (void)alpha;
+  return false;
+#endif
+}
+
+bool launch_mmq_tc(const compiler::MmqTcShape &shape, const void *xq,
+                   const void *wq, const void *ws, void *y, int m, int k,
+                   int n) {
+#if SONICBOOM_USE_CUDA
+  if (m <= 0 || k <= 0 || n <= 0 || k % 32 != 0 || xq == nullptr ||
+      wq == nullptr || ws == nullptr || y == nullptr)
+    return false;
+  if (!compiler::mmq_tc_shape_supported(shape)) return false;
+  const int threads = compiler::mmq_tc_block_threads(shape);
+  const int shared_bytes = compiler::mmq_tc_shared_bytes(shape);
+  const std::string key = mmq_tc_region_name(shape);
+  CUfunction function = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(cache_mutex());
+    auto &cache = kernel_cache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+      LoadedKernel loaded;
+      if (!load_mmq_tc(shape, key, shared_bytes, loaded)) return false;
+      it = cache.emplace(key, loaded).first;
+    }
+    function = it->second.function;
+  }
+  if (function == nullptr) return false;
+
+  const void *a = xq, *w = wq, *s = ws;
+  void *args[7] = {&a, &w, &s, &y, &m, &k, &n};
+  const int gx = (n + shape.bn - 1) / shape.bn;
+  const int gy = (m + shape.bm - 1) / shape.bm;
+
+  if (auto *rec = sonicboom::planner::recorder()) {
+    rec->add_launch(key, "", unsigned(gx), unsigned(gy), 1, unsigned(threads),
+                    1, 1, static_cast<uint64_t>(shared_bytes),
+                    reinterpret_cast<const void *>(
+                        sonicboom::cuda::sb_current_stream()));
+  }
+  const CUresult r = cuLaunchKernel(
+      function, unsigned(gx), unsigned(gy), 1, unsigned(threads), 1, 1,
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      args, nullptr);
+  if (r != CUDA_SUCCESS) {
+    std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
+                 key.c_str(), cu_error(r));
+    return false;
+  }
+  return true;
+#else
+  (void)shape;
+  (void)xq;
+  (void)wq;
+  (void)ws;
+  (void)y;
+  (void)m;
+  (void)k;
+  (void)n;
   return false;
 #endif
 }

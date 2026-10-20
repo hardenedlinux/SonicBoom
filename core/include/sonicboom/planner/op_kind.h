@@ -162,6 +162,16 @@ enum class OpKind : uint8_t {
   // Appended last: OpKind is an internal enum, but appending keeps the numeric
   // values of the operators above stable across this change.
   ClipGradNorm,
+
+  // Prefill q8_1 tensor-core matmul (MMQ1, v1 Wave 4): the batched projection
+  // against the per-weight q8_1 copy (int8 values, per-32 f32 scales) instead
+  // of the K-quant weight. An attribute-only dispatch decision over the same
+  // operands and attributes as QuantizedMatmulQ8: PrefillDispatchPass rewrites
+  // an eligible batched QuantizedMatmulQ8 node into this op when the device's
+  // q8_1 weight copy fits its budget, and leaves it as QuantizedMatmulQ8
+  // otherwise (the ggml mmq fallback). Appended last for the same reason as
+  // ClipGradNorm.
+  MatmulQ8Tc,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

@@ -2612,6 +2612,112 @@ public:
   }
 };
 
+// prefill_dispatch_pass (MMQ1): the batched prefill projections run on the q8_1
+// tensor-core kernel the compiler generates (MmqTcCodegen), or on the ggml mmq
+// kernel they ran on before. The choice is structural on the IR plus one
+// device-independent number:
+//
+//   * eligible — a batched quantized_matmul_q8 (a fused q8_1 quantizer feeds
+//     it, so the activation layout is the one the generated kernel takes), with
+//     a fixed K that is a multiple of 128 (the mmq activation block and the
+//     kernel's 32-value mma chunks) and a non-empty output width;
+//   * affordable — the per-weight q8_1 copies the eligible nodes need (K int8
+//     values + K/32 f32 scales per output row, i.e. rows*K*9/8 bytes each)
+//     fit SONICBOOM_MMQ_TC_MAX_MB. The copies are additional to the K-quant
+//     weights that stay resident, so a model whose q8_1 copy alone exceeds the
+//     budget keeps the ggml path: Gemma 4 E4B's eligible prefill projections
+//     alone measure 3662 MiB (the whole model's quantized tensors would be
+//     7.79 GiB), against a 2048 MiB default budget on an 8 GiB device. The
+//     runtime builds each copy lazily on first use, so the budget is what the
+//     pass may spend, not what it allocates up front.
+//
+// `SONICBOOM_MMQ_TC=on` bypasses the budget for a machine with headroom to
+// verify the path; `=off` is the pre-MMQ1 behavior. A node keeps every
+// attribute it had (the runtime dispatches on `slot`/`ds`/`batch` exactly as
+// it does for quantized_matmul_q8) — only the operator name changes.
+class PrefillDispatchPass
+    : public mlir::PassWrapper<PrefillDispatchPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrefillDispatchPass)
+
+  void runOnOperation() override {
+    const MmqTcMode mode = mmq_tc_mode();
+    if (mode == MmqTcMode::Off) return;
+
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::SmallVector<mlir::Operation *> eligible;
+    uint64_t copy_bytes = 0;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() !=
+              boomOpName(planner::OpKind::QuantizedMatmulQ8) ||
+          node.getNumOperands() == 0 || node.getNumResults() == 0)
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      auto nb = nodeAttrInt(attrs, "batch");
+      auto ds = nodeAttrInt(attrs, "ds");
+      if (!nb || *nb <= 0 || !ds || *ds < 0 || *ds > 2)
+        continue;  // a decode node, or a weight type with no mmq layout
+      const int64_t in_id = view.idOf(node.getOperand(0));
+      const int64_t out_id = GraphEditor::resultIds(node)[0];
+      if (!view.hasTensor(in_id) || !view.hasTensor(out_id)) continue;
+      const auto in_shape = view.desc(in_id).getShape();
+      const auto out_shape = view.desc(out_id).getShape();
+      if (in_shape.size() != 2 || out_shape.size() != 2) continue;
+      const int64_t k = in_shape[1], rows = out_shape[1];
+      if (k <= 0 || rows <= 0 || k % 128 != 0) continue;
+      eligible.push_back(&node);
+      copy_bytes += uint64_t(rows) * (uint64_t(k) + 4 * (uint64_t(k) / 32));
+    }
+    if (eligible.empty()) return;
+
+    // One line per process: a plan build runs this pass once per segment class,
+    // and the decision is the same for every one of them.
+    static bool reported = false;
+    const uint64_t budget = uint64_t(mmq_tc_max_mb()) * 1024 * 1024;
+    if (mode == MmqTcMode::Auto && copy_bytes > budget) {
+      if (!reported) {
+        std::fprintf(stderr,
+                     "[mmq-tc] %zu batched projections need a %.0f MiB q8_1 "
+                     "weight copy, over the %d MiB budget: keeping the ggml "
+                     "mmq path (SONICBOOM_MMQ_TC=on overrides)\n",
+                     eligible.size(), double(copy_bytes) / (1024.0 * 1024.0),
+                     mmq_tc_max_mb());
+        reported = true;
+      }
+      return;
+    }
+    if (!reported) {
+      std::fprintf(stderr,
+                   "[mmq-tc] %zu batched projections on the generated "
+                   "tensor-core kernel (%.0f MiB q8_1 weight copy)\n",
+                   eligible.size(), double(copy_bytes) / (1024.0 * 1024.0));
+      reported = true;
+    }
+
+    for (mlir::Operation *node : eligible) {
+      builder.setInsertionPoint(node);
+      mlir::Operation *tc = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::MatmulQ8Tc),
+          GraphEditor::nodeId(*node),
+          planner::op_kind_name(planner::OpKind::MatmulQ8Tc),
+          node->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+          GraphEditor::resultIds(*node), node->getOperands(),
+          node->getResultTypes(),
+          node->getAttrOfType<mlir::StringAttr>("backend"));
+      node->replaceAllUsesWith(tc);
+      view.noteReplaced(node, tc);
+      node->erase();
+    }
+    // Attribute-only: no tensor is added, dropped or resized.
+    view.commitTable();
+  }
+};
+
 //--- the per-pass disable switch --------------------------------------------
 
 // Ablation for one fusion at a time: the passes a run skips, named on the
@@ -2626,6 +2732,7 @@ public:
 // see the plan deltas in the run that landed this). A disabled pass is read as
 // "this pass and the folds it feeds", which is what the plan diff records.
 struct DisabledPasses {
+  bool prefill_dispatch = false;
   bool quantize_once = false;
   bool rms_norm_quantize = false;
   bool gelu_mul_quantize = false;
@@ -2657,6 +2764,7 @@ struct PassName {
   bool DisabledPasses::*flag;
 };
 constexpr PassName kPassNames[] = {
+    {"PrefillDispatchPass", &DisabledPasses::prefill_dispatch},
     {"QuantizeOncePass", &DisabledPasses::quantize_once},
     {"RmsNormQuantizePass", &DisabledPasses::rms_norm_quantize},
     {"GeluMulQuantizePass", &DisabledPasses::gelu_mul_quantize},
@@ -2805,6 +2913,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     // cast), the batched form selected by the norm's `batch` attribute.
     if (!off.fuse_heads_norm_rope_cast)
       pm.addPass(std::make_unique<FuseHeadsNormRopeCastPass>());
+    // After the mmq fusions: only the batched quantized_matmul_q8 nodes they
+    // produced are candidates for the tensor-core dispatch.
+    if (!off.prefill_dispatch)
+      pm.addPass(std::make_unique<PrefillDispatchPass>());
     // Last: marks the projections the folds above left, so it sees the final
     // node set (attribute-only, no node replacement).
     if (!off.dense_layout_propagation)
@@ -2838,6 +2950,30 @@ const char *phaseName(planner::IrPassPhase phase) {
 }
 
 } // namespace
+
+MmqTcMode mmq_tc_mode() {
+  // Read on every call (not cached): the switch is an ablation input, and a
+  // caller that changes it between runs must see the new value. Unset means
+  // off: the ggml mmq path, which the reference GPU measured faster.
+  const char *env = std::getenv("SONICBOOM_MMQ_TC");
+  if (env == nullptr || *env == '\0') return MmqTcMode::Off;
+  const std::string_view v(env);
+  if (v == "on") return MmqTcMode::On;
+  if (v == "auto") return MmqTcMode::Auto;
+  if (v != "off" && v != "0")
+    std::fprintf(stderr,
+                 "SONICBOOM_MMQ_TC: '%s' is not on/off/auto; reading it as "
+                 "off\n",
+                 env);
+  return MmqTcMode::Off;
+}
+
+int mmq_tc_max_mb() {
+  const char *env = std::getenv("SONICBOOM_MMQ_TC_MAX_MB");
+  if (env == nullptr || *env == '\0') return 2048;
+  const long v = std::strtol(env, nullptr, 10);
+  return v > 0 ? int(std::min<long>(v, 1L << 20)) : 2048;
+}
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
