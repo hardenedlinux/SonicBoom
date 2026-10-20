@@ -36,7 +36,7 @@
 #include "device_pool.h"
 #include "glue_jit.h"
 
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 
 #include <algorithm>
 #include <cmath>

@@ -17,6 +17,7 @@
             ctensor-numel ctensor-ref ctensor->list ctensor->nested
             list->ctensor scalar->ctensor ctensor-item
             make-leaf leaf? leaf-value set-leaf-value! leaf-grad set-leaf-grad!
+            make-lr-tensor
             shape-numel float-dtype? int-dtype? valid-dtype?
             coerce-value))
 
@@ -120,3 +121,18 @@ otherwise."
   "A leaf tensor: VALUE (a ctensor, or the symbolic tensor the tracer substitutes
 for it) plus a GRAD slot."
   (%make-leaf value grad))
+
+(define* (make-lr-tensor #:optional (device 'cpu) #:key (value 1e-3))
+  "A one-element float32 learning-rate tensor for a traced training step.
+
+Passed to `adamw-step!` as #:lr, it becomes a graph input instead of an
+attribute, so a schedule can change the rate every step without retracing.
+Returns a leaf: replace the rate between steps with set-leaf-value!.
+
+DEVICE names where the tensor lives ('cpu or 'cuda). The tracing executor
+transfers the tensor's current value on every run, so the tensor is held on
+the host today; the argument is accepted for call-site symmetry with device
+tensors and for a future device-resident path."
+  (unless (memq device '(cpu cuda))
+    (error "make-lr-tensor: unknown device" device))
+  (make-leaf (scalar->ctensor value 'float32)))

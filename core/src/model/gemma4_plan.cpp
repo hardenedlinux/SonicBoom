@@ -37,7 +37,7 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #endif
 
@@ -1245,6 +1245,9 @@ static bool ir_program_enabled() {
 // per-step length policy stays inside it.
 constexpr int64_t kSpecMaxDrafts = 7;
 
+// S2 bootstrap draft length: the adaptive policy's forced exploration length.
+constexpr int64_t kSpecBootstrapDrafts = 3;
+
 // SONICBOOM_SPEC selects the generation loop:
 //   off  (default) the plain greedy loop (B1's program, step per token);
 //   on   the speculative program: draft, verify, accept;
@@ -1452,7 +1455,25 @@ struct SpecLengthPolicy {
   double alpha = 0.5;          // alpha0
   int64_t warm_next = -1;      // next k to warm up, < 0 when done
   bool warm_primed = false;    // the first pass at warm_next has run
+  // S2 bootstrap: forced k = 3 iterations still owed after the warm-up. The
+  // cost model cannot break its own cold start: with alpha at its 0.5 prior,
+  // k = 0 wins for any nearly-linear cost curve, no draft is ever proposed, so
+  // alpha is never updated. The bootstrap supplies the drafts the EMA needs.
+  uint64_t bootstrap_left = 0;
 };
+
+// SONICBOOM_SPEC_BOOTSTRAP (default 50, 0 disables): number of adaptive
+// iterations after the cost warm-up that force k = 3. Parsed once per process,
+// like SONICBOOM_SPEC.
+static uint64_t spec_bootstrap_steps() {
+  static const uint64_t n = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP");
+    if (!e || !*e) return uint64_t(50);
+    const long v = std::strtol(e, nullptr, 10);
+    return v > 0 ? uint64_t(v) : uint64_t(0);
+  }();
+  return n;
+}
 
 // The warm-up measures c(k) once per (model shape, context class) on this GPU:
 // k = 0..min(7, room) in turn, each iteration timed whole (the second pass at
@@ -1544,7 +1565,10 @@ static uint64_t run_spec_program_steps(
   // keeps the fixed cap so a test can pin every iteration's shape.
   const bool adaptive = !strategy_override && spec_mode() == SpecMode::Auto;
   SpecLengthPolicy policy;
-  if (adaptive) spec_policy_init(m, session.n_ctx, policy);
+  if (adaptive) {
+    spec_policy_init(m, session.n_ctx, policy);
+    policy.bootstrap_left = spec_bootstrap_steps();
+  }
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
   uint64_t L = pos;
@@ -1596,9 +1620,20 @@ static uint64_t run_spec_program_steps(
       }
       if (!warm) {
         const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
-        k = size_t(drafter.propose(std::span<uint64_t>(
-            drafts, size_t(spec_choose_drafts(
-                        policy.alpha, policy.cost_us, int64_t(max_k))))));
+        if (policy.bootstrap_left > 0) {
+          // S2: force exploration so the EMA sees real acceptance data. Like
+          // the warm-up's forced drafts these are proposals only; the verifier
+          // still decides the emitted run.
+          k = size_t(std::min<uint64_t>(uint64_t(kSpecBootstrapDrafts), max_k));
+          for (size_t i = 0; i < k; ++i) drafts[i] = token;
+          --policy.bootstrap_left;
+          ++g_spec_counters.bootstrap_steps;
+        } else {
+          k = size_t(drafter.propose(std::span<uint64_t>(
+              drafts, size_t(spec_choose_drafts(
+                          policy.alpha, policy.cost_us, int64_t(max_k))))));
+          ++g_spec_counters.policy_steps;
+        }
       }
     } else {
       k = drafter.propose(std::span<uint64_t>(drafts, size_t(room)));

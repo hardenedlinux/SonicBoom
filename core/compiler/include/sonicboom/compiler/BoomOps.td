@@ -415,9 +415,11 @@ def Boom_FusedRegionOp : Boom_Op<"fused_region",
 // AdamW: one fused parameter update written as a pure function. Operands are
 // [param, grad, m1, m2, step], where `step` is a one-element int32 tensor
 // (1-based); results are [param', m1', m2'] with the inputs' shapes. The
-// hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on node_attrs.
-// Results are new tensors, not aliases: a traced training step reads them back
-// as the next state, which keeps the same node on every step.
+// hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on node_attrs; an
+// optional sixth operand, a one-element float32 lr tensor, overrides the `lr`
+// attribute and lets one graph serve a whole schedule. Results are new
+// tensors, not aliases: a traced training step reads them back as the next
+// state, which keeps the same node on every step.
 def Boom_AdamWOp : Boom_Op<"adamw",
     "fused AdamW parameter update (decoupled weight decay)">;
 

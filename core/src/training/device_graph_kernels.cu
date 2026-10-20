@@ -341,8 +341,13 @@ __global__ void adamw_kernel(float* __restrict__ p_out, float* __restrict__ m1_o
                              const float* __restrict__ m1,
                              const float* __restrict__ m2,
                              const int32_t* __restrict__ step, std::int64_t n,
-                             double lr, double beta1, double beta2, double eps,
+                             const float* __restrict__ lr_dev, double lr,
+                             double beta1, double beta2, double eps,
                              double weight_decay) {
+  // lr_dev, when non-null, is the lr-input form: the rate is read on the
+  // device and the host scalar is unused.
+  const double rate =
+      lr_dev ? static_cast<double>(lr_dev[0]) : lr;
   const double t = static_cast<double>(step[0]);
   const double bc1 = 1.0 / (1.0 - std::pow(beta1, t));
   const double bc2 = 1.0 / (1.0 - std::pow(beta2, t));
@@ -358,8 +363,8 @@ __global__ void adamw_kernel(float* __restrict__ p_out, float* __restrict__ m1_o
     m2_out[i] = static_cast<float>(vi);
     const double mh = mi * bc1;
     const double vh = vi * bc2;
-    const double update = lr * (mh / (std::sqrt(vh) + eps) +
-                                weight_decay * static_cast<double>(p[i]));
+    const double update = rate * (mh / (std::sqrt(vh) + eps) +
+                                  weight_decay * static_cast<double>(p[i]));
     p_out[i] = static_cast<float>(static_cast<double>(p[i]) - update);
   }
 }
@@ -577,8 +582,24 @@ bool graph_adamw_step(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
   adamw_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
       ptr<float>(param_out), ptr<float>(m1_out), ptr<float>(m2_out),
       ptr<const float>(param), ptr<const float>(grad), ptr<const float>(m1),
-      ptr<const float>(m2), ptr<const int32_t>(step), n,
+      ptr<const float>(m2), ptr<const int32_t>(step), n, nullptr,
       static_cast<double>(lr), static_cast<double>(beta1),
+      static_cast<double>(beta2), static_cast<double>(eps),
+      static_cast<double>(weight_decay));
+  return ok();
+}
+
+bool graph_adamw_step_lr(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
+                         DevBuf param, DevBuf grad, DevBuf m1, DevBuf m2,
+                         std::int64_t n, DevBuf step, DevBuf lr,
+                         float beta1, float beta2, float eps,
+                         float weight_decay) {
+  if (n <= 0) return false;
+  adamw_kernel<<<grid_for(n), kThreads, 0, cur_stream()>>>(
+      ptr<float>(param_out), ptr<float>(m1_out), ptr<float>(m2_out),
+      ptr<const float>(param), ptr<const float>(grad), ptr<const float>(m1),
+      ptr<const float>(m2), ptr<const int32_t>(step), n,
+      ptr<const float>(lr), 0.0, static_cast<double>(beta1),
       static_cast<double>(beta2), static_cast<double>(eps),
       static_cast<double>(weight_decay));
   return ok();

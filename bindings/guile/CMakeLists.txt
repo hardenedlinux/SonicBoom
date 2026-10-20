@@ -132,6 +132,21 @@ if(GUILE_EXECUTABLE)
     LABELS long
     RESOURCE_LOCK gpu_vram)
 
+  # test_adamw_lr_input (D2) runs ten AdamW steps with a schedule delivered as
+  # a learning-rate tensor, checks that all ten share one compiled segment (the
+  # attribute form needs one per rate), compares the loss curve against the
+  # attribute form and the interpreter, and exercises the
+  # SONICBOOM_ADAMW_LR_ATTR=1 ablation switch. GPU-bound like guile-train-tiny.
+  add_test(
+    NAME test_adamw_lr_input
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/trace/test-adamw-lr-input.scm)
+  set_tests_properties(test_adamw_lr_input PROPERTIES RESOURCE_LOCK gpu_vram)
+
   # guile-nn-trace runs a `sequential` model through both
   # routes — the emitted-text forward pass and the traced/lowered one — and
   # checks that they agree; same shared-library dependency as guile-nn.

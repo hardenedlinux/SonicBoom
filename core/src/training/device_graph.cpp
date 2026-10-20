@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -265,6 +266,15 @@ struct NodeContext {
   const Graph& graph;
   const std::vector<std::uint64_t>& buffers;
 };
+
+// SONICBOOM_ADAMW_LR_ATTR=1 restores the pre-lr-tensor behaviour: a sixth
+// (learning-rate) operand is ignored and the node's `lr` attribute is used
+// instead. It is the ablation switch for the lr-input form; unset or 0 leaves
+// the operand in charge. Read per execution so a test can toggle it.
+bool adamw_lr_attr_mode() {
+  const char* e = std::getenv("SONICBOOM_ADAMW_LR_ATTR");
+  return e && *e && !(e[0] == '0' && e[1] == '\0');
+}
 
 #ifdef SONICBOOM_USE_CUDA
 bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
@@ -546,18 +556,36 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
       return true;
     }
     case OpKind::AdamW: {
-      if (!arity(5, 3)) return false;
+      if (n.outputs.size() != 3 ||
+          (n.inputs.size() != 5 && n.inputs.size() != 6))
+        return fail("expected 5 or 6 inputs and 3 results, got " +
+                    std::to_string(n.inputs.size()) + " and " +
+                    std::to_string(n.outputs.size()));
       if (tensor(n.inputs[4]).dtype != sx::DType::Int32)
         return fail("the step counter must be int32");
       const std::int64_t n_elem = numel(n.inputs[0]);
-      if (!detail::graph_adamw_step(
-              buf(n.outputs[0]), buf(n.outputs[1]), buf(n.outputs[2]),
-              buf(n.inputs[0]), buf(n.inputs[1]), buf(n.inputs[2]),
-              buf(n.inputs[3]), n_elem, buf(n.inputs[4]),
-              float_attr(n, "lr", 1e-3f), float_attr(n, "beta1", 0.9f),
-              float_attr(n, "beta2", 0.999f), float_attr(n, "eps", 1e-8f),
-              float_attr(n, "weight_decay", 0.01f)))
-        return fail("kernel launch failed");
+      const bool lr_operand =
+          n.inputs.size() == 6 && !adamw_lr_attr_mode();
+      const bool ok =
+          lr_operand
+              ? detail::graph_adamw_step_lr(
+                    buf(n.outputs[0]), buf(n.outputs[1]), buf(n.outputs[2]),
+                    buf(n.inputs[0]), buf(n.inputs[1]), buf(n.inputs[2]),
+                    buf(n.inputs[3]), n_elem, buf(n.inputs[4]),
+                    buf(n.inputs[5]), float_attr(n, "beta1", 0.9f),
+                    float_attr(n, "beta2", 0.999f),
+                    float_attr(n, "eps", 1e-8f),
+                    float_attr(n, "weight_decay", 0.01f))
+              : detail::graph_adamw_step(
+                    buf(n.outputs[0]), buf(n.outputs[1]), buf(n.outputs[2]),
+                    buf(n.inputs[0]), buf(n.inputs[1]), buf(n.inputs[2]),
+                    buf(n.inputs[3]), n_elem, buf(n.inputs[4]),
+                    float_attr(n, "lr", 1e-3f),
+                    float_attr(n, "beta1", 0.9f),
+                    float_attr(n, "beta2", 0.999f),
+                    float_attr(n, "eps", 1e-8f),
+                    float_attr(n, "weight_decay", 0.01f));
+      if (!ok) return fail("kernel launch failed");
       return true;
     }
     case OpKind::ClipGradNorm: {
@@ -741,9 +769,20 @@ bool validate_node(const Graph& g, const GraphNodeDesc& n, std::string* error) {
     return true;
   }
   case OpKind::AdamW: {
-    if (!arity(5, 3)) return false;
+    if (n.outputs.size() != 3 ||
+        (n.inputs.size() != 5 && n.inputs.size() != 6))
+      return fail("expected 5 or 6 inputs and 3 results, got " +
+                  std::to_string(n.inputs.size()) + " and " +
+                  std::to_string(n.outputs.size()));
     if (dtype(n.inputs[4]) != sx::DType::Int32)
       return fail("the step counter must be int32");
+    // The optional sixth operand is the learning rate: one float32 element.
+    if (n.inputs.size() == 6) {
+      if (dtype(n.inputs[5]) != sx::DType::Float32)
+        return fail("the learning-rate input must be float32");
+      if (numel(n.inputs[5]) != 1)
+        return fail("the learning-rate input must hold exactly one element");
+    }
     if (numel(n.inputs[1]) != numel(n.inputs[0]))
       return fail("gradient and parameter differ in size");
     return true;

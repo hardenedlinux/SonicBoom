@@ -203,8 +203,12 @@ sm_samples=""
 sm_sampler_pid=""
 
 sm_clock_mhz() { # current SM clock in MHz, empty when unreadable
+  # sed reads the whole stream, unlike `head -1`: under `set -o pipefail` an
+  # early-exiting head turns nvidia-smi's SIGPIPE into a 141 status and, on a
+  # Blackwell card (whose clocks.max.gr query prints a cosmetic warning), that
+  # used to kill the script from the EXIT trap.
   nvidia-smi --query-gpu=clocks.sm --format=csv,noheader,nounits 2>/dev/null |
-    head -1 | tr -d ' '
+    sed -n '1p' | tr -d ' '
 }
 
 # One reading a second for the whole run, in the background. The sampler is a
@@ -268,7 +272,7 @@ lock_clocks() {
   fi
   if [ -z "$CLOCK_MHZ" ]; then
     CLOCK_MHZ=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits \
-                  2>/dev/null | head -1 | tr -d ' ')
+                  2>/dev/null | sed -n '1p' | tr -d ' ')
   fi
   case "$CLOCK_MHZ" in
     ''|*[!0-9]*)

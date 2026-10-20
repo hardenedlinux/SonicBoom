@@ -176,7 +176,7 @@ target_compile_definitions(test_ngram_drafter PRIVATE
 # the nightly/weekly suite rather than the per-commit one.
 set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_invariance test_spec_rollback
-                              test_spec_program
+                              test_spec_program test_spec_bootstrap
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by

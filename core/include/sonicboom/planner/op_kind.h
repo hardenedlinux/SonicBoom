@@ -95,10 +95,12 @@ enum class OpKind : uint8_t {
   FusedRegion,
 
   // Training: one fused AdamW update of a parameter (decoupled weight decay).
-  // Operands are [param, grad, m1, m2]; the hyperparameters (lr, beta1, beta2,
-  // eps, weight_decay) ride on the node's attributes, and `step` is the 1-based
-  // update index the bias correction needs. The update is in place: `param`,
-  // `m1` and `m2` are mutated, and the single result aliases `param`.
+  // Operands are [param, grad, m1, m2, step], where `step` is a one-element
+  // int32 tensor holding the 1-based update index the bias correction needs.
+  // The hyperparameters (lr, beta1, beta2, eps, weight_decay) ride on the
+  // node's attributes; an optional sixth operand, a one-element float32
+  // learning-rate tensor, overrides the `lr` attribute. Results are
+  // [param', m1', m2'].
   AdamW,
 
   // Training: backward operators of the explicit reverse-mode graph.
