@@ -135,7 +135,6 @@ step 13 task 13 node 20 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 14 task 14 node 22 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -255,7 +254,6 @@ step 26 task 26 node 41 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 27 task 27 node 43 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -494,7 +492,6 @@ step 52 task 52 node 83 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 53 task 53 node 85 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -852,7 +849,6 @@ step 91 task 91 node 146 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 92 task 92 node 148 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -972,7 +968,6 @@ step 104 task 104 node 167 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 105 task 105 node 169 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -1092,7 +1087,6 @@ step 117 task 117 node 188 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 118 task 118 node 190 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -1212,7 +1206,6 @@ step 130 task 130 node 209 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 131 task 131 node 211 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -1332,7 +1325,6 @@ step 143 task 143 node 230 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 144 task 144 node 232 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -1690,7 +1682,6 @@ step 182 task 182 node 293 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 183 task 183 node 295 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -2048,7 +2039,6 @@ step 221 task 221 node 356 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 222 task 222 node 358 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -2406,7 +2396,6 @@ step 260 task 260 node 419 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 261 task 261 node 421 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1
@@ -2645,7 +2634,6 @@ step 286 task 286 node 461 op quantized_matmul_q8 backend sonic stream s0
   weight_quant q6_K
   activation_quant q8_1
   launch q8_1::gemv_q6_K_q8_1 grid 1x112x1 block 32x8x1 smem 0 stream s0
-  launch add_kernel grid 4x1x1 block 256x1x1 smem 0 stream s0
 step 287 task 287 node 463 op fused_region backend sonic stream s0
   attr buf 1
   attr fused_region rms_norm_quantize_q8_1

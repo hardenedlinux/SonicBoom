@@ -1858,6 +1858,18 @@ cublasHandle_t cublas_handle() {
 // this set run without an epilogue, so a caller that must add a bias or a
 // residual either falls back to a separate elementwise kernel or declines the
 // fusion.
+// Ablation for the Q6_K epilogue (G1): SONICBOOM_GEMV_Q6K_EPILOGUE=0 reports
+// Q6_K unsupported again, so the projection runs the plain gemv followed by
+// the separate add_bias/add kernels — the pre-G1 launch sequence. Read once,
+// like the other backend switches.
+static bool gemv_q6k_epilogue_enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("SONICBOOM_GEMV_Q6K_EPILOGUE");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return enabled;
+}
+
 bool gemv_bias_epilogue_supported(QuantType qt) {
   switch (qt) {
     case QuantType::Q3_K:
@@ -1866,7 +1878,8 @@ bool gemv_bias_epilogue_supported(QuantType qt) {
     case QuantType::Q5_0:
     case QuantType::Q8_0:
       return true;
-    case QuantType::Q6_K:  // owned elsewhere: no epilogue, see TODO(q6k-mmq)
+    case QuantType::Q6_K:
+      return gemv_q6k_epilogue_enabled();
     default:
       return false;
   }
@@ -1904,7 +1917,8 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
       break;
     case QuantType::Q6_K:
       SB_NOTE_LAUNCH(q8_1::gemv_q6_K_q8_1, grid, block, 0, cur_stream());
-      q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(wp, xq, yp, blocks_per_row, num_rows);
+      q8_1::gemv_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
     case QuantType::Q5_0:
       SB_NOTE_LAUNCH(q8_1::gemv_q5_0_q8_1, grid, block, 0, cur_stream());

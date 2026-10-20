@@ -14,7 +14,12 @@
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include <sonicboom/quant/quantized_tensor.h>
 
+#include "../../core/src/nn/cuda_resident.h"
+#include "../../core/src/quant/cuda_resident.h"
+
 #include "ggml_baseline.h"
+
+#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <array>
@@ -244,6 +249,75 @@ void test_q6_single_q8_1(std::mt19937& rng) {
   check(cmp, "Q6_K q8_1 single-column gemv matches integer CPU q8_1 reference");
   if (!cmp) std::cerr << "    worst rel err (Q6_K q8_1 single) = " << worst << "\n";
   setenv("SONICBOOM_GEMV_F32", "1", 1);
+}
+
+// G1: the fused gemv epilogue must be *bit-identical* to the kernels it
+// replaces, not merely close. It takes arithmetic that is already per-row
+// independent and changes only where it runs:
+//
+//   gemv_q8_1_dev(Q6_K, bias, add)
+//     vs gemv_q8_1_dev(Q6_K) + add_bias_dev + add_dev
+//
+// so every f32 result must memcmp-equal the separate sequence.
+void test_q6k_epilogue(std::mt19937& rng) {
+  constexpr uint64_t cols = 256 * 8;  // 8 K super-blocks = 64 q8_1 blocks
+  constexpr uint64_t rows = 64;
+
+  static std::vector<std::vector<std::byte>> keepalive;
+  keepalive.push_back(build_weight(sbquant::QuantType::Q6_K, rows, cols, rng));
+  sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows},
+                             keepalive.back());
+
+  std::vector<float> x(cols), bias(rows), add(rows);
+  for (float& v : x) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  for (float& v : bias)
+    v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+  for (float& v : add)
+    v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+
+  float* xd = nullptr;
+  void* xq_raw = nullptr;
+  float* y_plain = nullptr;
+  float* y_fused = nullptr;
+  float* add_d = nullptr;
+  check(cudaMalloc(&xd, cols * sizeof(float)) == cudaSuccess, "cudaMalloc x");
+  check(cudaMalloc(&xq_raw, (cols / 32) * sizeof(sbquant::cuda::BlockQ8_1)) ==
+            cudaSuccess, "cudaMalloc xq");
+  check(cudaMalloc(&y_plain, rows * sizeof(float)) == cudaSuccess,
+        "cudaMalloc y_plain");
+  check(cudaMalloc(&y_fused, rows * sizeof(float)) == cudaSuccess,
+        "cudaMalloc y_fused");
+  check(cudaMalloc(&add_d, rows * sizeof(float)) == cudaSuccess,
+        "cudaMalloc add");
+  auto* xq = static_cast<sbquant::cuda::BlockQ8_1*>(xq_raw);
+  cudaMemcpy(xd, x.data(), cols * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(add_d, add.data(), rows * sizeof(float), cudaMemcpyHostToDevice);
+
+  check(sbquant::cuda::quantize_q8_1_dev(xd, xq, int(cols / 32)),
+        "quantize_q8_1_dev returns true");
+  check(sbquant::cuda::gemv_q8_1_dev(W, xq, y_plain), "plain Q6_K gemv");
+  check(sonicboom::nn::cuda::add_bias_dev(bias, y_plain, y_plain, int(rows)),
+        "add_bias_dev");
+  check(sonicboom::nn::cuda::add_dev(add_d, y_plain, y_plain, int(rows)),
+        "add_dev");
+  check(sbquant::cuda::gemv_bias_epilogue_supported(sbquant::QuantType::Q6_K),
+        "Q6_K gemv bias epilogue is supported");
+  check(sbquant::cuda::gemv_q8_1_dev(W, xq, y_fused, bias, add_d),
+        "fused Q6_K gemv");
+
+  std::vector<float> plain(rows), fused(rows);
+  cudaMemcpy(plain.data(), y_plain, rows * sizeof(float),
+             cudaMemcpyDeviceToHost);
+  cudaMemcpy(fused.data(), y_fused, rows * sizeof(float),
+             cudaMemcpyDeviceToHost);
+  check(std::memcmp(plain.data(), fused.data(), rows * sizeof(float)) == 0,
+        "Q6_K bias+add epilogue is bit-identical to the separate kernels");
+
+  cudaFree(xd);
+  cudaFree(xq_raw);
+  cudaFree(y_plain);
+  cudaFree(y_fused);
+  cudaFree(add_d);
 }
 
 void test_one_shape(sbquant::QuantType type, const char* name, uint64_t rows,
@@ -855,6 +929,9 @@ int main() {
   test_cublas_q6_type(rng);
   test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);
+  // Last: the epilogue check draws from the shared rng, so it must not shift
+  // the random data the existing tolerance tests above were tuned against.
+  test_q6k_epilogue(rng);
 
   if (g_failures == 0) {
     std::cout << "test_cuda_quant OK\n";

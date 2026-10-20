@@ -229,8 +229,10 @@ if(SONICBOOM_USE_CUDA)
   sb_add_cpp_test(test_cuda)
 
   # CUDA K-quant matvec differential test (CUDA gemv vs scalar CPU reference).
+  # It also drives the internal q8_1 gemv entry point directly (the Q6_K
+  # epilogue), which needs device allocation of its own.
   add_executable(test_cuda_quant test_cuda_quant.cpp)
-  target_link_libraries(test_cuda_quant PRIVATE sonicboom)
+  target_link_libraries(test_cuda_quant PRIVATE sonicboom CUDA::cudart)
   sb_add_cpp_test(test_cuda_quant)
 
   # CUDA single-row gather differential test (device gather vs dequantize_row_f32).

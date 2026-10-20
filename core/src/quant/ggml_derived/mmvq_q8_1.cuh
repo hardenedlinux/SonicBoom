@@ -414,8 +414,8 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const uint8_t* wb,
 // device activation (the residual of an `Add(proj, residual)`). Both are added to
 // the row's fully reduced f32 sum, `bias` first and then `add`, which is exactly
 // what a following add_bias kernel and then an elementwise add would compute from
-// the stored output, so the fused and unfused orders are bit-identical.
-// gemv_q6_K_q8_1 has no epilogue (see gemv_bias_epilogue_supported).
+// the stored output, so the fused and unfused orders are bit-identical. Every
+// warp-per-row kernel below, Q6_K included, carries the epilogue.
 
 __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
@@ -498,7 +498,8 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
 __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
-                               int num_rows) {
+                               int num_rows, const float* __restrict__ bias,
+                               const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -511,7 +512,12 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
-  if (lane == 0) dst[row] = sum;
+  if (lane == 0) {
+    float v = sum;
+    if (bias) v += bias[row];
+    if (add) v += add[row];
+    dst[row] = v;
+  }
 }
 
 // Legacy mmvq. Because one weight block is one q8_1 block, a lane can simply
