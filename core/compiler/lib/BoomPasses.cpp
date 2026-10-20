@@ -1504,10 +1504,10 @@ public:
   }
 };
 
-// FuseGeluMulPass — the gated activation (Stage 5f). The prefill FFN's
-// activation chain is a plain gelu_fp16 followed by the gate*up multiply when
-// the product feeds a dense projection (the mmq forms are already fused by
-// GeluMulMmqPass):
+// FuseGeluMulPass — the gated activation (Stage 5f). A gelu_fp16 followed by
+// the gate*up multiply is one region when the product feeds a dense
+// projection (the mmq forms are already fused by GeluMulMmqPass): the prefill
+// FFN's chain and, in decode, Gemma's per-layer gate fed to matvec_f32:
 //
 //   gelu_fp16(gate) -> mul(_, up)   =>   fused_region "gelu_mul"
 //
@@ -2993,6 +2993,11 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     if (!off.rms_norm_quantize) pm.addPass(std::make_unique<RmsNormQuantizePass>());
     if (!off.gelu_mul_quantize) pm.addPass(std::make_unique<GeluMulQuantizePass>());
     if (!off.silu_mul_quantize) pm.addPass(std::make_unique<SiluMulQuantizePass>());
+    // The gated activation that feeds a dense projection (Gemma's PLE gate:
+    // gelu_fp16 -> mul -> matvec_f32) is the same chain FuseGeluMulPass folds
+    // in prefill. The mmq fold above already took the chains that feed a
+    // quantized matmul, so what remains here is the dense form.
+    if (!off.fuse_gelu_mul) pm.addPass(std::make_unique<FuseGeluMulPass>());
     if (!off.bias_into_gemv) pm.addPass(std::make_unique<BiasIntoGemvPass>());
     if (!off.residual_add_into_gemv)
       pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
