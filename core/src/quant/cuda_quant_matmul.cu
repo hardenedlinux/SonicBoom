@@ -2184,11 +2184,41 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
   return cudaGetLastError() == cudaSuccess;
 }
 
-// Two or three legacy projections over one q8_1 activation, one launch. The
-// decode graph's siblings share their activation row for row, so the merged
-// kernel lays the members' rows end to end and every row keeps its own
+// The quant types the merged sibling launch dispatches per row (G2). The
+// legacy formats were D1's only members; the K-quants read the same q8_1
+// activation and differ only in their per-row lane-to-block walk, so a merged
+// launch runs each row exactly as that type's standalone kernel does.
+static int sibling_slot_type(QuantType t) {
+  switch (t) {
+    case QuantType::Q5_0: return q8_1::kSlotQ5_0;
+    case QuantType::Q8_0: return q8_1::kSlotQ8_0;
+    case QuantType::Q3_K: return q8_1::kSlotQ3_K;
+    case QuantType::Q4_K: return q8_1::kSlotQ4_K;
+    case QuantType::Q5_K: return q8_1::kSlotQ5_K;
+    case QuantType::Q6_K: return q8_1::kSlotQ6_K;
+  }
+  return -1;
+}
+
+// Ablation for the K-quant extension: SONICBOOM_GEMV_SIBLING_KQUANT=0 keeps
+// the merged launch to the legacy formats, so a mixed group falls back to its
+// members' separate launches — the pre-G2 execution of the same plan. Read
+// once, like the other backend switches.
+static bool gemv_sibling_kquant_enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("SONICBOOM_GEMV_SIBLING_KQUANT");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return enabled;
+}
+
+// Two or three projections over one q8_1 activation, one launch. The decode
+// graph's siblings share their activation row for row, so the merged kernel
+// lays the members' rows end to end and every row keeps its own type's
 // lane-to-block walk and reduction: bit-identical per row, one ramp/tail for
-// the group instead of one each.
+// the group instead of one each. Members may be any of the supported quant
+// types (D1 required all-legacy; G2 adds the K-quants, which is what Gemma's
+// q3_K/q3_K/q5_K attention trio needs).
 bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
                             const BlockQ8_1* xq) {
   if (!available() || !xq) return false;
@@ -2201,10 +2231,13 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     if (!s.weight || !s.y) return false;
     const QuantizedTensor& W = *s.weight;
     if (!W.valid() || W.dims().size() != 2) return false;
-    if (!is_legacy_quant(W.type()) || W.block_size() != q8_1::QK8_1) return false;
+    const int slot_type = sibling_slot_type(W.type());
+    if (slot_type < 0) return false;
+    if (!is_legacy_quant(W.type()) && !gemv_sibling_kquant_enabled())
+      return false;
     const uint64_t cols = W.dims()[0];
     const uint64_t rows = W.dims()[1];
-    if (rows == 0) return false;
+    if (rows == 0 || cols % q8_1::QK8_1 != 0) return false;
     const uint32_t bpr = uint32_t(cols / q8_1::QK8_1);
     if (bpr == 0) return false;
     if (blocks_per_row == 0)
@@ -2220,9 +2253,8 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     }
     const void* d_w = upload_weight(W);
     if (!d_w) return false;
-    slots[i] = q8_1::legacy_slot{
-        static_cast<const uint8_t*>(d_w), d_bias, s.y, int(rows),
-        W.type() == QuantType::Q8_0 ? 1 : 0};
+    slots[i] = q8_1::legacy_slot{static_cast<const uint8_t*>(d_w), d_bias, s.y,
+                                 int(rows), slot_type};
   }
 
   const int total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
