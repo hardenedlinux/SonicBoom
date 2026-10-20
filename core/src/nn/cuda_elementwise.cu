@@ -3093,10 +3093,12 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
   // (0.318/0.231 ms vs own 0.424/0.243).
   // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
-  // own keeps a 13% prefill lead. The static table keeps codegen here; the
-  // tune-time measurement decides for the prefill leg (the decode leg has
-  // its own, separately switched implementation).
-  if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
+  // own keeps the prefill lead (pp512 on the 3050: 1.61 vs 1.86 ms per call,
+  // 7 global layers), so the prefill table takes own. The decode leg has its
+  // own, separately switched implementation; SONICBOOM_ATTN_PREFILL=codegen
+  // pins the generated kernel back for this leg.
+  if (gqa == 4 && head_dim == 512) return {AttnImpl::Own, 0, 0, 0};
+  if (gqa == 4 && head_dim == 256) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
       return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
   }
@@ -3211,6 +3213,11 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
         attn_prefill_shape(head_dim, gqa, window, 16, bc, 1, true, 0);
     add_candidate(s, {AttnImpl::Codegen, 16, bc, 1, true});
   }
+  // The hand-written kernel is part of the search too (the header comment's
+  // "plus own"): a class that reaches here has a generated default, but the
+  // measurement must be able to say the reference kernel is faster. It is the
+  // token reference, so the identity gate accepts it unconditionally.
+  cands.push_back({AttnImpl::Own, 0, 0, 0});
 
   AttnTuneBufs b;
   const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;

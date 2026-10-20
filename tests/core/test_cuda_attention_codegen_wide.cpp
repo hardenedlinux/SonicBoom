@@ -266,8 +266,9 @@ struct ShapeCase {
   Cfg cfg;
   const char *causal_region;
   const char *window_region;
-  // The implementation attn_auto_pick is expected to choose for this class
-  // (all three classes: generated prefill since attn9).
+  // The implementation attn_auto_pick is expected to choose for this class:
+  // generated prefill for d64 and d256, the hand-written kernel for d512
+  // (its measured prefill lead).
   bool auto_codegen = true;
 };
 
@@ -431,7 +432,7 @@ int main(int argc, char **argv) {
       {{256, 2, 4, 8}, "attn-d256-g4-causal-b64x16-dps4",
        "attn-d256-g4-window-b64x16-dps4"},
       {{512, 2, 4, 8}, "attn-d512-g4-causal-b32x16-dps8",
-       "attn-d512-g4-window-b32x16-dps8"},
+       "attn-d512-g4-window-b32x16-dps8", false},
   };
   // Both mask kinds, including the windowed row 229 reused from a 130-query
   // chunk so the batch-invariance comparison below has a windowed baseline.
