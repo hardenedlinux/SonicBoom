@@ -414,8 +414,8 @@ __device__ __forceinline__ float vec_dot_q5_0_q8_1(const uint8_t* wb,
 // device activation (the residual of an `Add(proj, residual)`). Both are added to
 // the row's fully reduced f32 sum, `bias` first and then `add`, which is exactly
 // what a following add_bias kernel and then an elementwise add would compute from
-// the stored output, so the fused and unfused orders are bit-identical.
-// gemv_q6_K_q8_1 has no epilogue (see gemv_bias_epilogue_supported).
+// the stored output, so the fused and unfused orders are bit-identical. Every
+// warp-per-row kernel below, Q6_K included, carries the epilogue.
 
 __global__ void gemv_q3_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
@@ -498,7 +498,8 @@ __global__ void gemv_q5_K_q8_1(const uint8_t* __restrict__ w,
 __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
                                const block_q8_1* __restrict__ y,
                                float* __restrict__ dst, int blocks_per_row,
-                               int num_rows) {
+                               int num_rows, const float* __restrict__ bias,
+                               const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -511,7 +512,12 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
-  if (lane == 0) dst[row] = sum;
+  if (lane == 0) {
+    float v = sum;
+    if (bias) v += bias[row];
+    if (add) v += add[row];
+    dst[row] = v;
+  }
 }
 
 // Legacy mmvq. Because one weight block is one q8_1 block, a lane can simply
@@ -593,15 +599,26 @@ SONICBOOM_DEFINE_LEGACY_MMVQ(q8_0, 34, vec_dot_q8_0_q8_1)
 // (nsys: 181 GB/s at 4864 rows, 132 GB/s at 896 against 203 GB/s at 48640 for
 // the same kernel), and one launch over the union pays it once.
 //
-// The mixed types are dispatched per row: `q8_0` is row-uniform, so the branch
-// outside the block walk leaves each row's loop exactly the specialized
-// kernel's.
+// The mixed types are dispatched per row: the slot's type is row-uniform, so
+// the branch outside the block walk leaves each row's loop exactly the
+// specialized kernel's. `blocks_per_row` is the q8_1 activation block count
+// (cols/32) for every slot; the K-quant branches derive their 256-element
+// super-block count from it.
+enum : int {
+  kSlotQ5_0 = 0,
+  kSlotQ8_0 = 1,
+  kSlotQ3_K = 2,
+  kSlotQ4_K = 3,
+  kSlotQ5_K = 4,
+  kSlotQ6_K = 5,
+};
+
 struct legacy_slot {
   const uint8_t* w;
   const float* bias;  // optional [rows], added after the reduced sum
   float* dst;
   int rows;
-  int q8_0;  // 1 -> 34-byte blocks, 0 -> 22-byte blocks
+  int type;  // kSlotQ5_0 / kSlotQ8_0 / kSlotQ3_K / kSlotQ4_K / kSlotQ5_K / kSlotQ6_K
 };
 
 __global__ void gemv_legacy_siblings_q8_1(legacy_slot s0, legacy_slot s1,
@@ -621,17 +638,55 @@ __global__ void gemv_legacy_siblings_q8_1(legacy_slot s0, legacy_slot s1,
     s = s2;
     r -= s1.rows;
   }
+  // K-quants walk 256-element super-blocks; one activation super-block is
+  // QK_K/QK8_1 = 8 q8_1 blocks.
+  const int kbpr = blocks_per_row / (QK_K / QK8_1);
   float sum = 0.0f;
-  if (s.q8_0) {
-    for (int b = lane; b < blocks_per_row; b += 32) {
-      const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 34;
-      sum += vec_dot_q8_0_q8_1(wb, y + b);
+  switch (s.type) {
+    case kSlotQ8_0:
+      for (int b = lane; b < blocks_per_row; b += 32) {
+        const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 34;
+        sum += vec_dot_q8_0_q8_1(wb, y + b);
+      }
+      break;
+    case kSlotQ5_0:
+      for (int b = lane; b < blocks_per_row; b += 32) {
+        const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 22;
+        sum += vec_dot_q5_0_q8_1(wb, y + b);
+      }
+      break;
+    case kSlotQ3_K: {
+      const int iqs = lane & 15;  // QI3_K=16 slices
+      for (int b = lane >> 4; b < kbpr; b += 2) {
+        const uint8_t* wb = s.w + ((size_t)r * kbpr + b) * 110;
+        sum += vec_dot_q3_K_q8_1(wb, y + (size_t)b * (QK_K / QK8_1), iqs);
+      }
+      break;
     }
-  } else {
-    for (int b = lane; b < blocks_per_row; b += 32) {
-      const uint8_t* wb = s.w + ((size_t)r * blocks_per_row + b) * 22;
-      sum += vec_dot_q5_0_q8_1(wb, y + b);
+    case kSlotQ4_K: {
+      const int iqs = 2 * (lane & 15);  // QI4_K=32, vdr=2 -> iqs even 0..30
+      for (int b = lane >> 4; b < kbpr; b += 2) {
+        const uint8_t* wb = s.w + ((size_t)r * kbpr + b) * 144;
+        sum += vec_dot_q4_K_q8_1(wb, y + (size_t)b * (QK_K / QK8_1), iqs);
+      }
+      break;
     }
+    case kSlotQ5_K: {
+      const int iqs = 2 * (lane & 15);  // QI5_K=32, vdr=2 -> iqs even 0..30
+      for (int b = lane >> 4; b < kbpr; b += 2) {
+        const uint8_t* wb = s.w + ((size_t)r * kbpr + b) * 176;
+        sum += vec_dot_q5_K_q8_1(wb, y + (size_t)b * (QK_K / QK8_1), iqs);
+      }
+      break;
+    }
+    case kSlotQ6_K:
+      // The standalone Q6_K MMVQ uses one 16-element slice per lane over every
+      // super-block (VDR_Q6_K_Q8_1_MMVQ = 1).
+      for (int b = 0; b < kbpr; ++b) {
+        const uint8_t* wb = s.w + ((size_t)r * kbpr + b) * 210;
+        sum += vec_dot_q6_K_q8_1(wb, y + (size_t)b * (QK_K / QK8_1), lane);
+      }
+      break;
   }
   #pragma unroll
   for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);

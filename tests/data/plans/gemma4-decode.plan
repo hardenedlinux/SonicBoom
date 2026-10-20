@@ -93,9 +93,7 @@ step 10 task 10 node 10 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t16 buffer b9 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q5_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 11 task 11 node 12 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -190,8 +188,7 @@ step 20 task 20 node 25 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t28 buffer b16 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 21 task 21 node 27 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 0
@@ -300,9 +297,7 @@ step 34 task 34 node 41 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t47 buffer b22 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q5_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 35 task 35 node 43 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -397,8 +392,7 @@ step 44 task 44 node 56 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t59 buffer b24 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 45 task 45 node 58 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 1
@@ -507,9 +501,7 @@ step 58 task 58 node 72 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t78 buffer b27 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 59 task 59 node 74 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -604,8 +596,7 @@ step 68 task 68 node 87 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t90 buffer b29 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 69 task 69 node 89 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 2
@@ -714,9 +705,7 @@ step 82 task 82 node 103 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t109 buffer b32 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 83 task 83 node 105 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -811,8 +800,7 @@ step 92 task 92 node 118 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t121 buffer b34 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 93 task 93 node 120 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 3
@@ -921,9 +909,7 @@ step 106 task 106 node 134 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t140 buffer b37 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 107 task 107 node 136 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -1018,8 +1004,7 @@ step 116 task 116 node 149 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t152 buffer b39 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 117 task 117 node 151 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 4
@@ -1128,9 +1113,7 @@ step 130 task 130 node 165 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t171 buffer b43 offset 0 size 4096 shape [1024] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x512x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x768x1 block 32x8x1 smem 0 stream s0
 step 131 task 131 node 167 op fused_region backend sonic stream s0
   attr buf 16
   attr cast 0
@@ -1225,8 +1208,7 @@ step 140 task 140 node 180 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t183 buffer b48 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 141 task 141 node 182 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 5
@@ -1335,9 +1317,7 @@ step 154 task 154 node 196 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t202 buffer b51 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 155 task 155 node 198 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -1432,8 +1412,7 @@ step 164 task 164 node 211 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t214 buffer b53 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 165 task 165 node 213 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 6
@@ -1542,9 +1521,7 @@ step 178 task 178 node 227 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t233 buffer b56 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 179 task 179 node 229 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -1639,8 +1616,7 @@ step 188 task 188 node 242 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t245 buffer b58 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 189 task 189 node 244 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 7
@@ -1749,9 +1725,7 @@ step 202 task 202 node 258 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t264 buffer b61 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 203 task 203 node 260 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -1846,8 +1820,7 @@ step 212 task 212 node 273 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t276 buffer b63 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 213 task 213 node 275 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 8
@@ -1956,9 +1929,7 @@ step 226 task 226 node 289 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t295 buffer b66 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 227 task 227 node 291 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -2053,8 +2024,7 @@ step 236 task 236 node 304 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t307 buffer b68 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 237 task 237 node 306 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 9
@@ -2163,9 +2133,7 @@ step 250 task 250 node 320 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t326 buffer b71 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 251 task 251 node 322 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -2260,8 +2228,7 @@ step 260 task 260 node 335 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t338 buffer b73 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 261 task 261 node 337 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 10
@@ -2370,9 +2337,7 @@ step 274 task 274 node 351 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t357 buffer b76 offset 0 size 4096 shape [1024] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x512x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x768x1 block 32x8x1 smem 0 stream s0
 step 275 task 275 node 353 op fused_region backend sonic stream s0
   attr buf 16
   attr cast 0
@@ -2467,8 +2432,7 @@ step 284 task 284 node 366 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t369 buffer b78 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 285 task 285 node 368 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 11
@@ -2577,9 +2541,7 @@ step 298 task 298 node 382 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t388 buffer b81 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 299 task 299 node 384 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -2674,8 +2636,7 @@ step 308 task 308 node 397 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t400 buffer b83 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 309 task 309 node 399 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 12
@@ -2784,9 +2745,7 @@ step 322 task 322 node 413 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t419 buffer b86 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 323 task 323 node 415 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -2881,8 +2840,7 @@ step 332 task 332 node 428 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t431 buffer b88 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 333 task 333 node 430 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 13
@@ -2991,9 +2949,7 @@ step 346 task 346 node 444 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t450 buffer b91 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 347 task 347 node 446 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -3088,8 +3044,7 @@ step 356 task 356 node 459 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t462 buffer b93 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 357 task 357 node 461 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 14
@@ -3198,9 +3153,7 @@ step 370 task 370 node 475 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t481 buffer b96 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 371 task 371 node 477 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -3295,8 +3248,7 @@ step 380 task 380 node 490 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t493 buffer b98 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 381 task 381 node 492 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 15
@@ -3405,9 +3357,7 @@ step 394 task 394 node 506 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t512 buffer b101 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 395 task 395 node 508 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -3502,8 +3452,7 @@ step 404 task 404 node 521 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t524 buffer b103 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 405 task 405 node 523 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 16
@@ -3612,9 +3561,7 @@ step 418 task 418 node 537 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t543 buffer b106 offset 0 size 4096 shape [1024] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x512x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x768x1 block 32x8x1 smem 0 stream s0
 step 419 task 419 node 539 op fused_region backend sonic stream s0
   attr buf 16
   attr cast 0
@@ -3709,8 +3656,7 @@ step 428 task 428 node 552 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t555 buffer b108 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 429 task 429 node 554 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 17
@@ -3819,9 +3765,7 @@ step 442 task 442 node 568 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t574 buffer b111 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 443 task 443 node 570 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -3916,8 +3860,7 @@ step 452 task 452 node 583 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t586 buffer b113 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 453 task 453 node 585 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 18
@@ -4026,9 +3969,7 @@ step 466 task 466 node 599 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t605 buffer b116 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 467 task 467 node 601 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -4123,8 +4064,7 @@ step 476 task 476 node 614 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t617 buffer b118 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 477 task 477 node 616 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 19
@@ -4233,9 +4173,7 @@ step 490 task 490 node 630 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t636 buffer b121 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 491 task 491 node 632 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -4330,8 +4268,7 @@ step 500 task 500 node 645 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t648 buffer b123 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 501 task 501 node 647 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 20
@@ -4440,9 +4377,7 @@ step 514 task 514 node 661 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t667 buffer b126 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 515 task 515 node 663 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -4537,8 +4472,7 @@ step 524 task 524 node 676 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t679 buffer b128 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 525 task 525 node 678 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 21
@@ -4647,9 +4581,7 @@ step 538 task 538 node 692 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t698 buffer b131 offset 0 size 2048 shape [512] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x256x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x64x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x384x1 block 32x8x1 smem 0 stream s0
 step 539 task 539 node 694 op fused_region backend sonic stream s0
   attr buf 5
   attr cast 0
@@ -4744,8 +4676,7 @@ step 548 task 548 node 707 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t710 buffer b133 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 549 task 549 node 709 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 22
@@ -4854,9 +4785,7 @@ step 562 task 562 node 723 op quantized_matmul_q8 backend sonic stream s0
   buf out 2 t729 buffer b136 offset 0 size 4096 shape [1024] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x512x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q4_K_q8_1 grid 1x128x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x768x1 block 32x8x1 smem 0 stream s0
 step 563 task 563 node 725 op fused_region backend sonic stream s0
   attr buf 16
   attr cast 0
@@ -4951,8 +4880,7 @@ step 572 task 572 node 738 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t741 buffer b138 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 573 task 573 node 740 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 23
@@ -5127,8 +5055,7 @@ step 594 task 594 node 762 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t765 buffer b140 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 595 task 595 node 764 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 24
@@ -5303,8 +5230,7 @@ step 616 task 616 node 786 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t789 buffer b142 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 617 task 617 node 788 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 25
@@ -5479,8 +5405,7 @@ step 638 task 638 node 810 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t813 buffer b144 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 639 task 639 node 812 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 26
@@ -5655,8 +5580,7 @@ step 660 task 660 node 834 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t837 buffer b146 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 661 task 661 node 836 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 27
@@ -5831,8 +5755,7 @@ step 682 task 682 node 858 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t861 buffer b148 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 683 task 683 node 860 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 28
@@ -6007,8 +5930,7 @@ step 704 task 704 node 882 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t885 buffer b150 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 705 task 705 node 884 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 29
@@ -6183,8 +6105,7 @@ step 726 task 726 node 906 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t909 buffer b152 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 727 task 727 node 908 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 30
@@ -6359,8 +6280,7 @@ step 748 task 748 node 930 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t933 buffer b154 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 749 task 749 node 932 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 31
@@ -6535,8 +6455,7 @@ step 770 task 770 node 954 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t957 buffer b156 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 771 task 771 node 956 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 32
@@ -6711,8 +6630,7 @@ step 792 task 792 node 978 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t981 buffer b158 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 793 task 793 node 980 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 33
@@ -6887,8 +6805,7 @@ step 814 task 814 node 1002 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1005 buffer b160 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 815 task 815 node 1004 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 34
@@ -7063,8 +6980,7 @@ step 836 task 836 node 1026 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1029 buffer b162 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 837 task 837 node 1028 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 35
@@ -7239,8 +7155,7 @@ step 858 task 858 node 1050 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1053 buffer b164 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 859 task 859 node 1052 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 36
@@ -7415,8 +7330,7 @@ step 880 task 880 node 1074 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1077 buffer b166 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 881 task 881 node 1076 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 37
@@ -7591,8 +7505,7 @@ step 902 task 902 node 1098 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1101 buffer b168 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 903 task 903 node 1100 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 38
@@ -7767,8 +7680,7 @@ step 924 task 924 node 1122 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1125 buffer b170 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 925 task 925 node 1124 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 39
@@ -7943,8 +7855,7 @@ step 946 task 946 node 1146 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1149 buffer b172 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 947 task 947 node 1148 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 40
@@ -8119,8 +8030,7 @@ step 968 task 968 node 1170 op quantized_matmul_q8 backend sonic stream s0
   buf out 1 t1173 buffer b174 offset 0 size 40960 shape [10240] dtype float32
   weight_quant q3_K
   activation_quant q8_1
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
-  launch q8_1::gemv_q3_K_q8_1 grid 1x1280x1 block 32x8x1 smem 0 stream s0
+  launch q8_1::gemv_legacy_siblings_q8_1 grid 1x2560x1 block 32x8x1 smem 0 stream s0
 step 969 task 969 node 1172 op gelu_mul_quantize backend sonic stream s0
   attr buf 12
   attr layer 41

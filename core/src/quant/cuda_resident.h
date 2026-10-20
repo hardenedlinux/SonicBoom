@@ -110,19 +110,20 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
                            float* y, int n);
 
-// One member of a sibling launch: a legacy (Q5_0/Q8_0) projection reading the
-// shared q8_1 activation, with its optional [rows] bias and its [rows] output.
+// One member of a sibling launch: a quantized projection reading the shared
+// q8_1 activation, with its optional [rows] bias and its [rows] output.
 struct GemvSibling {
   const QuantizedTensor* weight = nullptr;
   std::span<const float> bias;  // empty => none
   float* y = nullptr;
 };
 
-// Two or three legacy projections over one pre-quantized q8_1 activation, in a
-// single launch (the decode q/k/v trio, the gate/up pair). All members must
-// share the activation's column count and be Q5_0 or Q8_0; each member's bias is
-// either empty or exactly [rows]. Every output value is bit-identical to
-// gemv_q8_1_dev on that member (same row decomposition, summation order and
+// Two or three projections over one pre-quantized q8_1 activation, in a single
+// launch (the decode q/k/v trio, the gate/up pair). Members may be Q5_0, Q8_0
+// or any supported K-quant, mixed within the group (Gemma's q3_K/q3_K/q5_K
+// attention); all must share the activation's column count, and each member's
+// bias is either empty or exactly [rows]. Every output value is bit-identical
+// to gemv_q8_1_dev on that member (same row decomposition, summation order and
 // bias epilogue); only the launch grouping differs. Returns false — having set
 // no output — when the set does not fit the merged kernel, so a caller can fall
 // back to the separate launches.
