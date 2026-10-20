@@ -4,7 +4,7 @@ model gemma4
 mode decode
 n_ctx 512
 n 1
-plan_id 5212870624185414703
+plan_id 15315575448673397025
 model_fingerprint 4035262826174519302
 backend sonic
 device NVIDIA GeForce RTX 3050 sm 20 cc 8.6

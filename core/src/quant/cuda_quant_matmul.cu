@@ -2031,10 +2031,10 @@ static int gemv_warps_for(const mlir_tune::TileConfig& cfg) {
 }
 
 // gridDim.y caps a launch at 65535 blocks, so a stored narrow block (fewer rows
-// per block, more blocks) is unsupported for a very tall output. A shape class
-// is coarse — the 262144-row logits projection shares bpr10-r16384 with the
-// 10240-row FFN — so the choice is widened to the narrowest supported block
-// rather than failing the launch.
+// per block, more blocks) is unsupported for a very tall output. The wide rows
+// buckets only keep the 262144-row logits projection and the 10240-row FFN in
+// different classes; they do not remove the cap, so the choice is still
+// widened to the narrowest supported block rather than failing the launch.
 static int gemv_warps_for_launch(const mlir_tune::TileConfig& cfg,
                                  int num_rows) {
   int warps = gemv_warps_for(cfg);
@@ -2110,20 +2110,88 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
       cudaGetLastError();
     }
   };
-  // The three widths differ by 1-3% on this GPU and the choice is persisted,
-  // so the measurement must be stable: 12 timed bursts of 16 launches, min.
-  // The per-burst copy and host wait are common to every candidate.
+  // The widths differ by at most a few percent on a class where they differ at
+  // all, and the choice is persisted, so the measurement must be stable: 12
+  // timed bursts of 16 launches, min. Timing waits on the stream only; the
+  // bit-identity copy is the check runs' job, not the timed ones'.
+  p.timing_sync = [&] { (void)cudaStreamSynchronize(cur_stream()); };
   p.iters = 12;
   const auto best = mlir_tune::AutotuneRunner::run(p);
   if (!best) return gemv_warps_for_launch(choice.cfg, num_rows);
 
+  // The production width is the reference to beat. A candidate replaces it
+  // only when it is faster by more than the probe's resolution: on the
+  // memory-bound classes (the 151936-row logits projection, the 4864-row FFN)
+  // the three widths are indistinguishable per kernel, and a pick chosen from
+  // that noise flips between processes and is persisted that way.
+  const mlir_tune::TileConfig production = mlir_tune::default_config("gemv");
+  mlir_tune::TileConfig winner = *best;
+  if (!(winner == production)) {
+    // 100 launches per burst: 16 leaves a few percent of burst-to-burst jitter
+    // on the short kernels, which reads as noise and rejects a real win.
+    constexpr int kProbeReps = 100;
+    auto timed_burst = [&](const mlir_tune::TileConfig &cfg,
+                           double &ms) -> bool {
+      const int warps = gemv_warps_for(cfg);
+      if (int64_t(warps) * 65535 < num_rows) return false;
+      if (cudaStreamSynchronize(cur_stream()) != cudaSuccess) return false;
+      const auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kProbeReps; ++r)
+        launch_gemv_q8_1_rows(qt, wp, xq, yp, blocks_per_row, num_rows, bias,
+                              add, warps);
+      if (cudaStreamSynchronize(cur_stream()) != cudaSuccess) return false;
+      ms = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count();
+      return cudaGetLastError() == cudaSuccess;
+    };
+    // The first calls of a process run while the memory clock is still ramping
+    // (idle 810 MHz to 6801 MHz on this part), so three untimed bursts bring it
+    // to steady state before anything is compared. The five timed pairs then
+    // alternate order so a residual drift does not favour whichever side runs
+    // second. The min of the five references is the target; their spread is
+    // diagnostic.
+    constexpr int kRounds = 5;
+    double refs[kRounds] = {}, wins[kRounds] = {}, scratch = 0;
+    bool ok = true;
+    for (int i = 0; i < 3 && ok; ++i) ok = timed_burst(production, scratch);
+    for (int i = 0; ok && i < kRounds; ++i) {
+      ok = i % 2 == 0
+               ? timed_burst(production, refs[i]) && timed_burst(winner, wins[i])
+               : timed_burst(winner, wins[i]) && timed_burst(production, refs[i]);
+    }
+    if (ok) {
+      double ref = refs[0], win = wins[0];
+      double spread = 0;
+      for (int i = 1; i < kRounds; ++i) {
+        spread = std::max(spread, std::fabs(refs[i] - refs[0]));
+        ref = std::min(ref, refs[i]);
+        win = std::min(win, wins[i]);
+      }
+      // The min of five bursts reproduces to a few tenths of a percent per
+      // side across processes on this part, so a pick closer than 0.5% to
+      // production is not reproducible and production is kept. The spread is only
+      // diagnostic: a large one means a burst was disturbed (a transient
+      // slows a burst, it does not speed one up), not that the two sides
+      // differ by that much — which is why the min, not the spread, is
+      // compared.
+      constexpr double kResolution = 0.005;
+      if (!(win < ref * (1.0 - kResolution))) winner = production;
+      if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
+        std::fprintf(stderr,
+                     "[autotune] gemv probe: prod=%.4f ms best=%.4f ms "
+                     "spread=%.2f%% -> %s\n",
+                     ref * 1e3, win * 1e3, spread / refs[0] * 100.0,
+                     winner == production ? "keep production" : "take");
+    }
+  }
+
   const bool stored = mlir_tune::gemv_choice_store(blocks_per_row, num_rows,
-                                                   *best);
+                                                   winner);
   std::fprintf(stderr, "[autotune] gemv %s: tile_m=%d (%d warps/block)%s\n",
                mlir_tune::gemv_shape_class(blocks_per_row, num_rows).c_str(),
-               best->tile_m, gemv_warps_for_launch(*best, num_rows),
+               winner.tile_m, gemv_warps_for_launch(winner, num_rows),
                stored ? "" : " [not persisted]");
-  return gemv_warps_for_launch(*best, num_rows);
+  return gemv_warps_for_launch(winner, num_rows);
 }
 
 void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
@@ -2926,6 +2994,9 @@ static compiler::MmqTcShape resolve_mmq_tc_shape(
       cudaGetLastError();
     }
   };
+  // Timing waits on the stream only; the bit-identity copy belongs to the
+  // check runs.
+  p.timing_sync = [&] { (void)cudaStreamSynchronize(cur_stream()); };
   // 8 timed bursts of 16 launches, min: the tile differences are small and the
   // choice is persisted, so the measurement must be stable.
   p.iters = 8;

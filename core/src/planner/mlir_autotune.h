@@ -148,7 +148,8 @@ TileConfig gemv_config(int blocks_per_row, int num_rows);
 
 // A shape class is a coarse, bucketized description of the problem: settings
 // are per class, never per batch size or KV position, so a reused prefix and a
-// full prefill resolve the same way.
+// full prefill resolve the same way. Rows bucket to the next power of two in
+// [128, 262144]; blocks-per-row is kept exact.
 std::string gemv_shape_class(int blocks_per_row, int num_rows);
 
 // MMQ2 — the generated int8 tensor-core prefill matmul (op "matmul_q8_tc").
@@ -197,6 +198,67 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k);
 bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
                          const TileConfig& cfg);
 
+// Q3 — prefill attention shape classes (the generated FA-2 kernel).
+//
+// TileConfig mapping: tile_m is the query rows per block (the generator's
+// `br`), tile_n the head_dim columns a warp owns (`dc` = head_dim / dps),
+// tile_k the key columns per tile (`bc`), unroll the cp.async pipeline depth
+// (`as`: 0 = synchronous staging, 2 = double buffered); vectorize is unused.
+// dps stays at the production shape's value in every candidate: another
+// split changes the S reduction order and fails the runner's bit-identity
+// gate. The grid is (br x bc x as) around the production config, which is
+// candidates[0] and the reference both the bit check and the timing target.
+// Classes cover the generator's defaulted head_dims {32,64,128,256,512}; the
+// production dps for 256/512 is 4/8 (dc = 64 in every shipped class).
+//
+// Shape class: head_dim exact; the query length (the prefill chunk size) and
+// the query-head count are bucketed, so a class is tuned once per GPU and
+// reused across launches in the same bucket.
+std::string attn_prefill_seq_bucket(int seq_len);
+std::string attn_prefill_heads_bucket(int n_heads);
+
+// "<head_dim>/<seq_len_bucket>/<num_heads_bucket>" (the cache's shape field;
+// the op field is "attn_prefill", so the combined name is
+// "attn_prefill/<head_dim>/<seq_len_bucket>/<num_heads_bucket>").
+std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads);
+
+// Head dims the generated prefill kernel has defaulted shape classes for.
+bool attn_prefill_tunable(int head_dim);
+
+// Grid around `production` (which must be candidates[0]): br in
+// {production.br, 32, 64} (16 also for head_dim >= 512), bc in
+// {production.bc, 32}, as in {production.async_stages, 0, 2}. The caller
+// rejects candidates the generator does not support (shared-memory budget)
+// in its compile step.
+std::vector<TileConfig> attn_prefill_candidates(int head_dim,
+                                                const TileConfig &production);
+
+enum class AttnPrefillSource {
+  Default,   // gate off, or the class is not resolved yet
+  Cache,     // loaded from the per-SM cache file
+  Measured,  // the runner timed it in this process
+};
+
+struct AttnPrefillChoice {
+  TileConfig cfg{};
+  AttnPrefillSource source = AttnPrefillSource::Default;
+  bool resolved() const { return source != AttnPrefillSource::Default; }
+};
+
+// Resolve (memoized per process). An unresolved result means the caller may
+// tune the class with AutotuneRunner (candidates from
+// attn_prefill_candidates(), the first as reference) and then call
+// attn_prefill_choice_store.
+AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads);
+
+// Memoize a measured winner and persist it for the SM. True when the file
+// write succeeded.
+bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+                               const TileConfig& cfg);
+
+// Drop the in-process memo (tests; the disk cache is untouched).
+void attn_prefill_reset_for_test();
+
 class AutotuneRunner {
  public:
   using Launch = std::function<void()>;
@@ -214,6 +276,12 @@ class AutotuneRunner {
     // Called after each launch when set (a device stream sync for async
     // launches; synchronous launches leave it empty).
     std::function<void()> sync;
+    // The wait used while timing, when set: a lighter sync than `sync` (e.g. a
+    // stream sync without the device-to-host copy the bit-identity check
+    // needs), so the measurement is the launch rather than the launch plus an
+    // identical-for-every-candidate copy. Empty uses `sync`. The check runs and
+    // the final winner run always use `sync`.
+    std::function<void()> timing_sync;
     // Timed iterations per candidate (the brief's N=5).
     int iters = 5;
   };

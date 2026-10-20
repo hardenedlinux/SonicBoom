@@ -46,9 +46,14 @@ namespace {
 // plain old data so a process can read them straight out of the mapping.
 constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // Version 2 widens the op field from 16 to 32 bytes so a full op name (V2's
-// "spec_verify_ratio") fits; a version-1 file misses on lookup and is rewritten
-// by the first store, which is the cache's own reset path.
-constexpr uint32_t kVersion = 2;
+// "spec_verify_ratio") fits. Version 3 changes the "attn_prefill" TileConfig
+// meaning from (tile_seq, tile_head) to (br, dc, bc, as), so a version-2
+// record must not be applied to the new grid. Version 4 splits gemv rows
+// above 16384 into their own buckets, so a version-3 "bprN-r16384" record
+// would be applied to a class it was not measured for. An older file misses
+// on lookup and is rewritten by the first store, which is the cache's own
+// reset path.
+constexpr uint32_t kVersion = 4;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
@@ -313,10 +318,13 @@ std::optional<double> lookup_ratio(std::string_view op,
 }
 
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {
-  // Rows bucket to the next power of two in [128, 16384]; the blocks-per-row
+  // Rows bucket to the next power of two in [128, 262144]; the blocks-per-row
   // count already clusters the model's matvecs (8..64) and is kept exact.
+  // The buckets above 16384 keep a tall output (the 262144-row logits
+  // projection) from sharing a class with a 10240-row FFN, whose best launch
+  // width is wider than gridDim.y allows for the tall shape.
   int rows_bucket = 128;
-  while (rows_bucket < num_rows && rows_bucket < 16384) rows_bucket <<= 1;
+  while (rows_bucket < num_rows && rows_bucket < 262144) rows_bucket <<= 1;
   return "bpr" + std::to_string(blocks_per_row) + "-r" +
          std::to_string(rows_bucket);
 }
@@ -448,6 +456,107 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
   return AutotuneCache::instance().store("matmul_q8_tc", key, cfg);
 }
 
+// --- Q3: prefill attention shape classes -----------------------------------
+
+std::string attn_prefill_seq_bucket(int seq_len) {
+  if (seq_len < 64) return "1-63";
+  if (seq_len < 128) return "64-127";
+  if (seq_len < 256) return "128-255";
+  if (seq_len < 512) return "256-511";
+  if (seq_len < 1024) return "512-1023";
+  return "1024+";
+}
+
+std::string attn_prefill_heads_bucket(int n_heads) {
+  if (n_heads < 8) return "1-7";
+  if (n_heads < 16) return "8-15";
+  return "16+";
+}
+
+std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads) {
+  return std::to_string(head_dim) + "/" + attn_prefill_seq_bucket(seq_len) +
+         "/" + attn_prefill_heads_bucket(n_heads);
+}
+
+bool attn_prefill_tunable(int head_dim) {
+  // The head dims the generator gives a default shape class (d64/gqa7,
+  // d256/gqa4, d512/gqa4), plus the narrower classes its support rules allow.
+  return head_dim == 32 || head_dim == 64 || head_dim == 128 ||
+         head_dim == 256 || head_dim == 512;
+}
+
+std::vector<TileConfig> attn_prefill_candidates(int head_dim,
+                                                const TileConfig &production) {
+  // tile_m = br, tile_n = dc = head_dim/dps, tile_k = bc, unroll = as.
+  // Production is first: it is the bit-identity reference and the time to
+  // beat. dps is not varied (see mlir_autotune.h).
+  std::vector<TileConfig> grid;
+  grid.push_back(production);
+  const int dc = production.tile_n;
+  auto add = [&](int br, int bc, int as) {
+    const TileConfig c{br, dc, bc, as, 1};
+    if (c == production) return;
+    for (const TileConfig &g : grid)
+      if (g == c) return;
+    grid.push_back(c);
+  };
+  const std::vector<int> brs = head_dim >= 512
+                                   ? std::vector<int>{16, 32, 64}
+                                   : std::vector<int>{32, 64};
+  for (int br : brs)
+    for (int bc : {production.tile_k, 32})
+      for (int as : {production.unroll, 0, 2})
+        add(br, bc, as);
+  return grid;
+}
+
+namespace {
+std::mutex& attn_prefill_memo_mutex() {
+  static std::mutex m;
+  return m;
+}
+std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
+  static std::unordered_map<std::string, AttnPrefillChoice> m;
+  return m;
+}
+} // namespace
+
+AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
+  if (!enabled()) return AttnPrefillChoice{};
+  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  {
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    const auto it = attn_prefill_memo().find(key);
+    if (it != attn_prefill_memo().end()) return it->second;
+  }
+  // force() retunes: the cache read is skipped and the caller measures.
+  if (!force()) {
+    if (const auto cached =
+            AutotuneCache::instance().lookup("attn_prefill", key)) {
+      const AttnPrefillChoice choice{*cached, AttnPrefillSource::Cache};
+      std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+      attn_prefill_memo().emplace(key, choice);
+      return choice;
+    }
+  }
+  return AttnPrefillChoice{};
+}
+
+bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+                               const TileConfig& cfg) {
+  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  {
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    attn_prefill_memo()[key] = AttnPrefillChoice{cfg, AttnPrefillSource::Measured};
+  }
+  return AutotuneCache::instance().store("attn_prefill", key, cfg);
+}
+
+void attn_prefill_reset_for_test() {
+  std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+  attn_prefill_memo().clear();
+}
+
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   if (!enabled() || problem.candidates.empty() || !problem.compile)
     return std::nullopt;
@@ -460,30 +569,22 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
       std::memcpy(reference.data(), problem.output, problem.output_bytes);
   };
 
-  // Candidate 0 is the reference: its output is the bit-identity window and
-  // its time is the number to beat.
-  auto best_launch = problem.compile(problem.candidates[0]);
-  if (!best_launch) return std::nullopt;
-  (*best_launch)();
-  snapshot();
-
-  auto time_launch = [&](const Launch& launch) {
-    uint64_t best = std::numeric_limits<uint64_t>::max();
-    for (int i = 0; i < iters; ++i) {
-      const auto t0 = std::chrono::steady_clock::now();
-      launch();
-      if (problem.sync) problem.sync();
-      const auto t1 = std::chrono::steady_clock::now();
-      best = std::min<uint64_t>(
-          best,
-          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-    }
-    return best;
+  // Candidate 0 is the reference: its output is the bit-identity window.
+  struct Entry {
+    TileConfig cfg;
+    Launch launch;
+    uint64_t ns = std::numeric_limits<uint64_t>::max();
   };
+  std::vector<Entry> entries;
 
-  TileConfig best_cfg = problem.candidates[0];
-  uint64_t best_ns = time_launch(*best_launch);
+  auto ref_launch = problem.compile(problem.candidates[0]);
+  if (!ref_launch) return std::nullopt;
+  (*ref_launch)();
+  snapshot();
+  entries.push_back(Entry{problem.candidates[0], std::move(*ref_launch)});
 
+  // Compile and bit-check every other candidate before any timing: a
+  // candidate that cannot compile or that writes a different window is out.
   for (size_t i = 1; i < problem.candidates.size(); ++i) {
     auto launch = problem.compile(problem.candidates[i]);
     if (!launch) continue;
@@ -494,19 +595,53 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
             0) {
       continue;  // numerically different from the reference: not a candidate
     }
-    const uint64_t ns = time_launch(*launch);
-    if (ns < best_ns) {
-      best_ns = ns;
-      best_cfg = problem.candidates[i];
-      best_launch = std::move(launch);
+    entries.push_back(Entry{problem.candidates[i], std::move(*launch)});
+  }
+
+  // Time every candidate once per round, alternating the direction each round,
+  // so no candidate is always first or always last. Timing one candidate for
+  // all its rounds before the next (the old order) let a clock ramp or host
+  // load drift land on whichever end of the list ran first; at the few-percent
+  // margins these tuners measure, that bias flipped the nomination between
+  // processes. Each candidate keeps its fastest round.
+  for (int r = 0; r < iters; ++r) {
+    const bool forward = (r & 1) == 0;
+    for (size_t j = 0; j < entries.size(); ++j) {
+      Entry& e = entries[forward ? j : entries.size() - 1 - j];
+      const auto t0 = std::chrono::steady_clock::now();
+      e.launch();
+      if (problem.timing_sync)
+        problem.timing_sync();
+      else if (problem.sync)
+        problem.sync();
+      const auto t1 = std::chrono::steady_clock::now();
+      e.ns = std::min<uint64_t>(
+          e.ns,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
   }
+
+  // Strict <: on a tie the earlier candidate (candidate 0, the reference) wins,
+  // so a marginal measurement keeps the known config.
+  size_t best = 0;
+  for (size_t i = 1; i < entries.size(); ++i)
+    if (entries[i].ns < entries[best].ns) best = i;
+
+  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE")) {
+    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d rounds\n",
+                 entries.size(), iters);
+    for (const Entry& e : entries)
+      std::fprintf(stderr, "  %d,%d,%d,%d,%d: %.4f ms%s\n", e.cfg.tile_m,
+                   e.cfg.tile_n, e.cfg.tile_k, e.cfg.unroll, e.cfg.vectorize,
+                   double(e.ns) / 1e6, &e == &entries[best] ? " <-" : "");
+  }
+
   // Probing a rejected candidate leaves its output in the window; run the
   // winner once more so the caller's buffer holds the returned config's
   // result, not the last probe's.
-  (*best_launch)();
+  entries[best].launch();
   if (problem.sync) problem.sync();
-  return best_cfg;
+  return entries[best].cfg;
 }
 
 } // namespace sonicboom::mlir_tune
