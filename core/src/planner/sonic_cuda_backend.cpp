@@ -578,6 +578,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::RmsNorm: {
       int64_t nb = 0, dim_i = 0;
       int64_t vr = 0;
+      // `add_input` is set by fuse_residual_epilogue_pass: the residual of the
+      // Add that consumed this norm became a second activation input, and the
+      // norm kernel applies it in its apply loop (same f32 addition, one
+      // launch). Verify/batch forms keep the separate add; the pass does not
+      // match them.
+      int64_t add_idx = 0;
+      const float* add_p = nullptr;
+      if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
+          add_idx < int64_t(in.size()))
+        add_p = dev(in[add_idx]);
       if (verify_attr(vr)) {
         // Verify: one decode norm per row (the 1024-thread kernel decode runs;
         // the batched rms_norm_heads kernel uses a different thread count).
@@ -594,7 +604,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = nn::cuda::rms_norm_heads_dev(fweight(slot), dev(in[0]), eps, out,
                                           int(dim_i), int(nb));
       } else {
-        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n);
+        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n,
+                                    add_p);
       }
       break;
     }
@@ -607,6 +618,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t dim_i = lc.head_dim;
       attr_i(*node, "dim", dim_i);
       int64_t vr = 0;
+      int64_t add_idx = 0;
+      const float* add_p = nullptr;
+      if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
+          add_idx < int64_t(in.size()))
+        add_p = dev(in[add_idx]);
       if (verify_attr(vr) && dim_i > 0) {
         // Verify: per row, the same heads kernel the decode row runs.
         if (vr <= 0 || out_n % int(vr) != 0 ||
@@ -622,7 +638,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         break;
       }
       ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
-                                        out_n / int(dim_i));
+                                        out_n / int(dim_i), add_p);
       break;
     }
     case OpKind::Rope: {

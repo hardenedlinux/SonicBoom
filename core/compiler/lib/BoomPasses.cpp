@@ -890,6 +890,133 @@ public:
   }
 };
 
+// FuseResidualEpiloguePass — the decode residual add whose producer is a norm,
+// folded into the norm's apply loop (the gemv form is
+// ResidualAddIntoGemvPass above; between them, a decode graph has no
+// standalone residual add left).
+//
+// This is the shape the Gemma sandwich norm leaves in the decode graph:
+// `Add(rms_norm(proj), residual)` for the attn and FFN post-norms, and
+// `Add(rms_norm_heads(x), scaled_embedding)` for the PLE path — 127 add_kernel
+// launches per decode step at 42 layers. The norm writes the add's tensor and
+// takes the residual as an appended input, marked `add_input` (the same
+// attribute and index convention the gemv epilogue uses). The kernel applies
+// `y = norm(x) + residual` in one launch; the f32 value is the one the pair
+// produced (the add of the stored norm value, with no multiply contraction).
+//
+// Decode form only, like the gemv residual fold: a `batch` (prefill) or
+// `verify` node is left alone (prefill has the generated rms_norm_add region;
+// verify runs the per-row decode norm).
+class FuseResidualEpiloguePass
+    : public mlir::PassWrapper<FuseResidualEpiloguePass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseResidualEpiloguePass)
+
+  void runOnOperation() override {
+    boom::GraphOp graph = getOperation();
+    GraphEditor view(graph);
+    mlir::OpBuilder builder(view.ctx());
+    const mlir::Location loc = graph.getLoc();
+
+    llvm::DenseMap<int64_t, mlir::Operation *> producer;
+    llvm::DenseMap<int64_t, unsigned> consumers;
+    for (mlir::Operation &node : view.body()) {
+      for (int64_t id : GraphEditor::resultIds(node))
+        producer.insert({id, &node});
+      for (mlir::Value operand : node.getOperands())
+        ++consumers[view.idOf(operand)];
+    }
+
+    // Add op -> (norm op, operand index the residual sits at).
+    llvm::SmallVector<mlir::Operation *> adds;
+    llvm::DenseMap<mlir::Operation *, mlir::Operation *> normOfAdd;
+    llvm::DenseMap<mlir::Operation *, unsigned> residualOfAdd;
+    // std::string, not StringRef: boomOpName returns by value, and a StringRef
+    // to the temporary would dangle.
+    const std::string rmsNorm = boomOpName(planner::OpKind::RmsNorm);
+    const std::string rmsHeads = boomOpName(planner::OpKind::RmsNormHeads);
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() != boomOpName(planner::OpKind::Add) ||
+          node.getNumOperands() != 2 || node.getNumResults() != 1)
+        continue;
+      // A decode Add may carry no node_attrs at all (the PLE post-norm add);
+      // only the batched/verify forms are excluded.
+      auto addAttrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (addAttrs && (nodeAttrInt(addAttrs, "batch") ||
+                       nodeAttrInt(addAttrs, "verify")))
+        continue;
+      for (unsigned s = 0; s < 2; ++s) {
+        const int64_t proj = view.idOf(node.getOperand(s));
+        auto producedBy = producer.find(proj);
+        if (producedBy == producer.end())
+          continue;
+        mlir::Operation *m = producedBy->second;
+        const llvm::StringRef name = m->getName().getStringRef();
+        if ((name != rmsNorm && name != rmsHeads) || m->getNumResults() != 1 ||
+            m->getNumOperands() != 1)
+          continue;
+        auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        if (!attrs || nodeAttrInt(attrs, "batch") || nodeAttrInt(attrs, "verify"))
+          continue; // batched/verify form: no residual epilogue
+        if (consumers[proj] != 1)
+          continue; // the norm has another reader
+        adds.push_back(&node);
+        normOfAdd.insert({&node, m});
+        residualOfAdd.insert({&node, 1 - s});
+        break;
+      }
+    }
+
+    if (adds.empty())
+      return;
+
+    for (mlir::Operation *add : adds) {
+      mlir::Operation *m = normOfAdd.lookup(add);
+      const unsigned residual = residualOfAdd.lookup(add);
+
+      llvm::SmallVector<mlir::Value> operands;
+      for (mlir::Value operand : m->getOperands())
+        operands.push_back(operand);
+      operands.push_back(add->getOperand(residual));
+
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          m->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      // The residual's input index, as for the gemv epilogue.
+      nodeAttrs.push_back(boom::NodeAttr::get(view.ctx(), "add_input",
+                                              builder.getI64IntegerAttr(
+                                                  m->getNumOperands())));
+
+      const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
+      // buildNode takes the bare op name and adds the dialect prefix.
+      const char *opName =
+          m->getName().getStringRef() == rmsNorm
+              ? planner::op_kind_name(planner::OpKind::RmsNorm)
+              : planner::op_kind_name(planner::OpKind::RmsNormHeads);
+      // At the Add's place, not the norm's: the residual is only guaranteed to
+      // dominate the Add (the PLE chain's scale runs between the norm and the
+      // add), and the norm's output has no reader but this add.
+      builder.setInsertionPoint(add);
+      mlir::Operation *node = buildNode(
+          builder, loc, opName,
+          GraphEditor::nodeId(*add),
+          add->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*add),
+          operands, add->getResultTypes(),
+          m->getAttrOfType<mlir::StringAttr>("backend"));
+
+      add->replaceAllUsesWith(node);
+      view.noteReplaced(add, node);
+      add->erase();
+      for (int64_t id : dead)
+        view.dropTensor(id);
+      m->erase();
+    }
+
+    view.commitTable();
+  }
+};
+
 // fuse_sibling_gemv_pass (D1): projections that read the same quantized
 // activation — the q/k/v trio of one attention, the gate/up pair of one FFN —
 // become one node, and the CUDA backend runs them as one launch.
@@ -2505,6 +2632,7 @@ struct DisabledPasses {
   bool silu_mul_quantize = false;
   bool bias_into_gemv = false;
   bool residual_add_into_gemv = false;
+  bool residual_epilogue = false;
   bool sibling_gemv = false;
   bool rms_norm_mmq = false;
   bool gelu_mul_mmq = false;
@@ -2535,6 +2663,7 @@ constexpr PassName kPassNames[] = {
     {"SiluMulQuantizePass", &DisabledPasses::silu_mul_quantize},
     {"BiasIntoGemvPass", &DisabledPasses::bias_into_gemv},
     {"ResidualAddIntoGemvPass", &DisabledPasses::residual_add_into_gemv},
+    {"FuseResidualEpiloguePass", &DisabledPasses::residual_epilogue},
     {"FuseSiblingGemvPass", &DisabledPasses::sibling_gemv},
     {"FuseGlueRegionsPass", &DisabledPasses::fuse_glue_regions},
     {"FuseAddRmsNormMmqPass", &DisabledPasses::fuse_add_rms_norm_mmq},
@@ -2623,6 +2752,10 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     if (!off.bias_into_gemv) pm.addPass(std::make_unique<BiasIntoGemvPass>());
     if (!off.residual_add_into_gemv)
       pm.addPass(std::make_unique<ResidualAddIntoGemvPass>());
+    // The norm-produced residual adds (the Gemma sandwich norm and the PLE
+    // post-norm) take the same epilogue treatment on the norm side.
+    if (!off.residual_epilogue)
+      pm.addPass(std::make_unique<FuseResidualEpiloguePass>());
     // After the epilogue folds: those decide which projections take a bias or
     // residual. Groups are formed by shared activation, not adjacency, so a
     // projection may be lifted across an unrelated node's position.
