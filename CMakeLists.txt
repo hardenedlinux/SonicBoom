@@ -10,6 +10,14 @@ project(SonicBoom
   DESCRIPTION "Native tensor runtime"
   LANGUAGES C CXX)
 
+# Performance is measured against llama.cpp on the same hardware, so a default
+# configure must produce an optimized binary: an unset build type becomes
+# Release (-O3 -DNDEBUG for the host; CMAKE_CUDA_FLAGS_RELEASE likewise for
+# nvcc). Multiconfig generators choose their own configuration.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type (Release = -O3)" FORCE)
+endif()
+
 # SonicBoom-owned code targets C++23 with g++-13.
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
