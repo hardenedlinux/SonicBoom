@@ -266,9 +266,11 @@ struct SpecCounters {
   uint64_t accepted_tokens = 0;  // drafts the verifier accepted
   uint64_t emitted_tokens = 0;   // tokens emitted
   // SONICBOOM_SPEC=auto, S2 bootstrap: iterations after the cost warm-up that
-  // forced k = 3 exploration (so the acceptance-rate EMA sees real drafts
+  // forced k = 1 exploration (so the acceptance-rate EMA sees real drafts
   // before the cost model starts choosing), and iterations afterwards that the
-  // policy chose. Warm-up iterations are neither.
+  // policy chose. S3 ends the bootstrap early after
+  // SONICBOOM_SPEC_BOOTSTRAP_ABORT consecutive zero-accept iterations.
+  // Warm-up iterations are neither.
   uint64_t bootstrap_steps = 0;
   uint64_t policy_steps = 0;
 };
