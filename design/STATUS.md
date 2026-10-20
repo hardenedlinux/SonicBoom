@@ -29,8 +29,11 @@
   deterministic; the verify phase runs per-row decode kernels at their own
   positions with the same split constants as one plain step; rejected KV is
   rolled back by valid length, with SWA ring headroom so dead future slots
-  cannot alias a live one. `SONICBOOM_SPEC=off|on|auto` (default off); `auto`
-  picks k from a measured c(k) curve and an acceptance EMA (α0 = 0.5).
+  cannot alias a live one. `SONICBOOM_SPEC=off|on|auto`; unset runs the V2
+  startup probe (verify/plain ratio per SM, auto below 1.5, off otherwise; the
+  sm_86 measurement is ~1.9, so the default is the plain loop), and an explicit
+  value bypasses it. `auto` picks k from a measured c(k) curve and an
+  acceptance EMA (α0 = 0.5).
   `test_spec_invariance` (k=1..7, both models, depth 0/512), `test_spec_rollback`
   (forced rejections 0/3/7, valid KV bitwise equal to plain decode) and the
   workload token hashes all pass. It is bit-identical to greedy by

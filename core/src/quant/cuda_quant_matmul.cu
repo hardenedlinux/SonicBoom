@@ -1905,13 +1905,18 @@ bool gemv_bias_epilogue_supported(QuantType qt) {
 // folded `Add(proj, residual)`) are the optional [num_rows] epilogue operands,
 // applied in that order; the caller must pass null for a type where
 // gemv_bias_epilogue_supported() is false.
-void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
-                                     const q8_1::block_q8_1* xq, float* yp,
-                                     int blocks_per_row, int num_rows,
-                                     const float* bias = nullptr,
-                                     const float* add = nullptr) {
-  const dim3 block(32, 8);
-  const dim3 grid(1, (num_rows + 7) / 8);
+// One q8_1 warp-per-row launch with `warps` rows per block. Each row is
+// computed entirely by its own warp (row = blockIdx.y * blockDim.y +
+// threadIdx.y, reduction by __shfl_down within that warp), so blockDim.y
+// selects only how many rows share a block: the per-row arithmetic, and
+// therefore every output byte, is independent of it.
+static void launch_gemv_q8_1_rows(QuantType qt, const uint8_t* wp,
+                                  const q8_1::block_q8_1* xq, float* yp,
+                                  int blocks_per_row, int num_rows,
+                                  const float* bias, const float* add,
+                                  int warps) {
+  const dim3 block(32, warps);
+  const dim3 grid(1, (num_rows + warps - 1) / warps);
   switch (qt) {
     case QuantType::Q3_K:
       SB_NOTE_LAUNCH(q8_1::gemv_q3_K_q8_1, grid, block, 0, cur_stream());
@@ -1944,6 +1949,120 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
           wp, xq, yp, blocks_per_row, num_rows, bias, add);
       break;
   }
+}
+
+// tile_m is the block width in threads — Q1's meaning for the fp32 gemv launch
+// — so 128 and 512 threads are 4 and 16 rows per block; anything else is the
+// pre-Q1 (32, 8).
+static int gemv_warps_for(const mlir_tune::TileConfig& cfg) {
+  return cfg.tile_m == 128 ? 4 : cfg.tile_m == 512 ? 16 : 8;
+}
+
+// gridDim.y caps a launch at 65535 blocks, so a stored narrow block (fewer rows
+// per block, more blocks) is unsupported for a very tall output. A shape class
+// is coarse — the 262144-row logits projection shares bpr10-r16384 with the
+// 10240-row FFN — so the choice is widened to the narrowest supported block
+// rather than failing the launch.
+static int gemv_warps_for_launch(const mlir_tune::TileConfig& cfg,
+                                 int num_rows) {
+  int warps = gemv_warps_for(cfg);
+  while (int64_t(warps) * 65535 < num_rows) warps *= 2;
+  return warps;
+}
+
+// Q2: resolve this shape class's launch width. The first call for a class under
+// SONICBOOM_AUTOTUNE=1 times the three candidate widths on the live buffers
+// through the Q1 runner, which accepts a width only when its output matches the
+// 256-thread launch bit for bit, and persists the winner. Skipped inside a CUDA
+// graph capture, where the host must not synchronize or launch probes; the
+// class stays unresolved and is tuned by the first call outside a capture.
+static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
+                              const q8_1::block_q8_1* xq, float* yp,
+                              int blocks_per_row, int num_rows,
+                              const float* bias, const float* add) {
+  const mlir_tune::GemvChoice choice =
+      mlir_tune::gemv_choice(blocks_per_row, num_rows);
+  if (choice.resolved())
+    return gemv_warps_for_launch(choice.cfg, num_rows);
+
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
+      capture != cudaStreamCaptureStatusNone)
+    return gemv_warps_for_launch(choice.cfg, num_rows);
+
+  static const mlir_tune::TileConfig kWidths[] = {
+      mlir_tune::default_config("gemv"),
+      mlir_tune::TileConfig{128, 1, 32, 1, 1},
+      mlir_tune::TileConfig{512, 1, 32, 1, 1},
+  };
+  mlir_tune::AutotuneRunner::Problem p;
+  p.candidates.assign(std::begin(kWidths), std::end(kWidths));
+  p.compile = [&](const mlir_tune::TileConfig& cfg)
+      -> std::optional<mlir_tune::AutotuneRunner::Launch> {
+    const int warps = gemv_warps_for(cfg);
+    // gridDim.y caps the launch at 65535 blocks: a narrow block (more rows per
+    // block) is unsupported for a very tall output, e.g. the 262144-row logits
+    // projection. Such a candidate is skipped, not launched and timed as a
+    // fast failure.
+    if (int64_t(warps) * 65535 < num_rows) return std::nullopt;
+    // Each "launch" is a short burst of the same gemv. The runner times one
+    // launch per host wait, and a wait costs about as much as the smaller
+    // projections; a burst amortizes that floor so the 1-3% width differences
+    // are measurable. Every launch in the burst writes the same bytes.
+    constexpr int kProbeReps = 16;
+    return mlir_tune::AutotuneRunner::Launch([=] {
+      for (int i = 0; i < kProbeReps; ++i)
+        launch_gemv_q8_1_rows(qt, wp, xq, yp, blocks_per_row, num_rows, bias,
+                              add, warps);
+    });
+  };
+  // The runner compares on the host, so the window is a device-to-host copy of
+  // this call's own output (every width writes each row exactly once).
+  std::vector<float> host_out(static_cast<std::size_t>(num_rows));
+  p.output = host_out.data();
+  p.output_bytes = host_out.size() * sizeof(float);
+  p.sync = [&] {
+    // The copy is enqueued behind the candidate on the same stream, so an
+    // iteration pays one host wait, not a wait plus a synchronous copy. The
+    // copy time is identical for every candidate and cancels in the ranking.
+    cudaError_t e = cudaMemcpyAsync(host_out.data(), yp, p.output_bytes,
+                                    cudaMemcpyDeviceToHost, cur_stream());
+    if (e == cudaSuccess) e = cudaStreamSynchronize(cur_stream());
+    if (e != cudaSuccess) {
+      std::fprintf(stderr, "[autotune] gemv probe launch: %s\n",
+                   cudaGetErrorString(e));
+      // Poison the window so the runner's bit-identity check rejects a failed
+      // candidate instead of seeing the previous candidate's output, and clear
+      // the error so it cannot fail the caller's node.
+      std::memset(host_out.data(), 0xFF, p.output_bytes);
+      cudaGetLastError();
+    }
+  };
+  // The three widths differ by 1-3% on this GPU and the choice is persisted,
+  // so the measurement must be stable: 12 timed bursts of 16 launches, min.
+  // The per-burst copy and host wait are common to every candidate.
+  p.iters = 12;
+  const auto best = mlir_tune::AutotuneRunner::run(p);
+  if (!best) return gemv_warps_for_launch(choice.cfg, num_rows);
+
+  const bool stored = mlir_tune::gemv_choice_store(blocks_per_row, num_rows,
+                                                   *best);
+  std::fprintf(stderr, "[autotune] gemv %s: tile_m=%d (%d warps/block)%s\n",
+               mlir_tune::gemv_shape_class(blocks_per_row, num_rows).c_str(),
+               best->tile_m, gemv_warps_for_launch(*best, num_rows),
+               stored ? "" : " [not persisted]");
+  return gemv_warps_for_launch(*best, num_rows);
+}
+
+void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
+                                     const q8_1::block_q8_1* xq, float* yp,
+                                     int blocks_per_row, int num_rows,
+                                     const float* bias = nullptr,
+                                     const float* add = nullptr) {
+  const int warps = resolve_gemv_warps(qt, wp, xq, yp, blocks_per_row, num_rows,
+                                       bias, add);
+  launch_gemv_q8_1_rows(qt, wp, xq, yp, blocks_per_row, num_rows, bias, add,
+                        warps);
 }
 
 // Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
@@ -2194,7 +2313,12 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
   launch_gemv_q8_1_from_quantized(
       W.type(), wp, reinterpret_cast<const q8_1::block_q8_1*>(xq), y,
       int(blocks_per_row), int(rows), d_bias, add);
-  return cudaGetLastError() == cudaSuccess;
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess)
+    std::fprintf(stderr, "[gemv] rows=%llu bpr=%u: %s\n",
+                 (unsigned long long)rows, blocks_per_row,
+                 cudaGetErrorString(e));
+  return e == cudaSuccess;
 }
 
 // The quant types the merged sibling launch dispatches per row (G2). The

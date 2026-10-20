@@ -32,7 +32,8 @@
 #include <sonicboom/planner/sonic_cuda_backend.h>
 #include <sonicboom/sx/exec.h>
 
-#include "../planner/autotune.h"  // B7 draft-length cost cache
+#include "../planner/autotune.h"        // B7 draft-length cost cache
+#include "../planner/mlir_autotune.h"    // V2 spec probe ratio cache (Q1 file)
 #include "mlir/IR/BuiltinTypes.h"
 
 #ifdef SONICBOOM_USE_CUDA
@@ -1371,16 +1372,24 @@ constexpr int64_t kSpecMaxDrafts = 7;
 constexpr int64_t kSpecBootstrapDrafts = 1;
 
 // SONICBOOM_SPEC selects the generation loop:
-//   off  (default) the plain greedy loop (B1's program, step per token);
+//   off  the plain greedy loop (B1's program, step per token);
 //   on   the speculative program: draft, verify, accept;
 //   auto the same program with the draft length decided by policy (B7).
-// Until B7 both values take the drafter's proposal unchanged.
-enum class SpecMode { Off, On, Auto };
+// Unset is V2's probe: the first generation call measures one plain decode
+// step against one k=1 verify step on this GPU (cached per SM in the Q1
+// autotune file) and picks auto below the threshold, off at or above it. The
+// probe is a startup cost, once per GPU; an explicit SONICBOOM_SPEC bypasses
+// it. Until the probe has decided, Undecided answers like Off, so the greedy
+// runtime is built (and the probe then rebuilds it if it selects auto).
+enum class SpecMode { Undecided, Off, On, Auto };
 
-static SpecMode spec_mode() {
+// The explicit environment choice. Undecided means "no override": the probe
+// decides, once, and stores the result in g_spec_mode.
+static SpecMode env_spec_mode() {
   static const SpecMode mode = [] {
     const char* e = std::getenv("SONICBOOM_SPEC");
-    if (!e || !*e || std::string_view(e) == "off") return SpecMode::Off;
+    if (!e || !*e) return SpecMode::Undecided;
+    if (std::string_view(e) == "off") return SpecMode::Off;
     if (std::string_view(e) == "on") return SpecMode::On;
     if (std::string_view(e) == "auto") return SpecMode::Auto;
     std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
@@ -1390,7 +1399,19 @@ static SpecMode spec_mode() {
   return mode;
 }
 
-static bool spec_enabled() { return spec_mode() != SpecMode::Off; }
+// V2's resolved choice (see spec_resolve_probe). Only read after the
+// environment left the mode undecided.
+static SpecMode g_spec_mode = SpecMode::Undecided;
+
+static SpecMode spec_mode() {
+  const SpecMode env = env_spec_mode();
+  return env != SpecMode::Undecided ? env : g_spec_mode;
+}
+
+static bool spec_enabled() {
+  const SpecMode m = spec_mode();
+  return m == SpecMode::On || m == SpecMode::Auto;
+}
 
 // Read the program back out of the lifted module. The program verifier has
 // already checked the shape; this only recovers the attributes the executor
@@ -2233,6 +2254,131 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
   return raw;
 }
 
+// V2: the startup probe behind an unset SONICBOOM_SPEC. One plain decode step
+// and one k=1 verify step are timed on this GPU (after untimed warm replays);
+// their ratio decides the generation loop, because it is the price of a verify
+// row relative to a plain step. A ratio below kSpecProbeAutoRatio means the
+// k=1 iteration costs less than that many plain steps, i.e. the acceptance the
+// length policy needs to come out ahead is under 50% (E(1,a) = 1 + a against
+// c1/c0 = ratio: profitable when a >= ratio - 1).
+//
+// The result is cached per SM in the Q1 autotune file under
+// ("spec_verify_ratio", "decode"), so only the first process on a GPU pays the
+// probe. SONICBOOM_SPEC_PROBE_MS="<plain_ms>,<verify_ms>" replaces the measured
+// pair (the test seam; measurement only, no kernel changes).
+constexpr double kSpecProbeAutoRatio = 1.5;
+
+// The probe measures whole replays: the captured plain step (position staging,
+// graph replay, token readback) against the captured 2-row verify step (token
+// + position staging, replay, sync). Both include the same host round-trip, so
+// the ratio compares the device work, not the launch overhead.
+static bool spec_probe_measure(const Gemma4Model& m, DecodeRuntime* rt,
+                               uint64_t n_ctx, uint64_t pos, double& plain_ms,
+                               double& verify_ms) {
+  if (!cuda_graph_decode_enabled() || !rt || !rt->prog) return false;
+  if (pos + 2 > n_ctx) return false;  // the k=1 verify appends 2 rows
+  planner::KvCacheSession session;
+  rt->cuda->publish_cache(session);
+  VerifyRuntime* vrt = get_verify_runtime(m, n_ctx, 2, session);
+  if (!vrt || !vrt->prog) return false;
+
+  auto ms_since = [](std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+  };
+  auto plain = [&](uint64_t p) -> double {
+    const auto t0 = std::chrono::steady_clock::now();
+    float tok = -1.0f;
+    if (!rt->cuda->set_pos(p) || !rt->prog->replay() ||
+        !rt->cuda->read_token(&tok))
+      return -1.0;
+    return ms_since(t0);
+  };
+  const uint64_t ids[2] = {1, 1};
+  auto verify = [&](uint64_t p) -> double {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!vrt->cuda->stage_prefill_tokens(
+            *vrt->prog, std::span<const uint64_t>(ids, 2)) ||
+        !vrt->cuda->stage_verify_pos(*vrt->prog, p, 2) ||
+        !vrt->prog->replay() || !vrt->prog->sync())
+      return -1.0;
+    return ms_since(t0);
+  };
+  // Warm both replays untimed (the verify capture's first replay included),
+  // then time one of each at the same position. The rows the probe writes are
+  // rows the caller is about to overwrite: prefill/decode writes every
+  // position before any attention extent can read it.
+  if (plain(pos) < 0.0 || verify(pos) < 0.0) return false;
+  const double p_ms = plain(pos);
+  const double v_ms = verify(pos);
+  if (!(p_ms > 0.0) || !(v_ms > 0.0)) return false;
+  plain_ms = p_ms;
+  verify_ms = v_ms;
+  return true;
+}
+
+static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
+  const char* e = std::getenv("SONICBOOM_SPEC_PROBE_MS");
+  if (!e || !*e) return false;
+  char* end = nullptr;
+  const double p = std::strtod(e, &end);
+  if (end == e || *end != ',') return false;
+  const char* v = end + 1;
+  char* end2 = nullptr;
+  const double q = std::strtod(v, &end2);
+  if (end2 == v || *end2 != '\0' || !(p > 0.0) || !(q > 0.0)) return false;
+  plain_ms = p;
+  verify_ms = q;
+  return true;
+}
+
+// Resolve the mode when SONICBOOM_SPEC was unset: load the cached ratio, or
+// measure it once and store it. Returns the runtime to decode with — `rt`
+// itself, unless auto was selected and this runtime was built (while the mode
+// was still undecided) with the greedy program, in which case it is rebuilt.
+// The rebuild is safe at both call sites: the probe runs before the runtime's
+// KV cache is published into a session, so no capture is bound to it yet.
+static DecodeRuntime* spec_resolve_probe(const Gemma4Model& m, DecodeRuntime* rt,
+                                         uint64_t n_ctx, uint64_t pos) {
+  if (!rt || env_spec_mode() != SpecMode::Undecided ||
+      g_spec_mode != SpecMode::Undecided)
+    return rt;
+  double ratio = 0.0;
+  bool measured = false;
+  if (const auto cached =
+          mlir_tune::lookup_ratio("spec_verify_ratio", "decode")) {
+    ratio = *cached;
+  } else {
+    double plain_ms = 0.0, verify_ms = 0.0;
+    if (spec_probe_injected(plain_ms, verify_ms)) {
+      ratio = verify_ms / plain_ms;
+    } else {
+      if (!spec_probe_measure(m, rt, n_ctx, pos, plain_ms, verify_ms))
+        return rt;  // no captured step (or no room): stay greedy, retry later
+      ratio = verify_ms / plain_ms;
+      measured = true;
+    }
+    (void)mlir_tune::store_ratio("spec_verify_ratio", "decode", ratio);
+  }
+  const SpecMode mode = ratio < kSpecProbeAutoRatio ? SpecMode::Auto
+                                                    : SpecMode::Off;
+  g_spec_mode = mode;
+  char line[80];
+  std::snprintf(line, sizeof(line), "spec probe: ratio=%.2f → %s\n", ratio,
+                mode == SpecMode::Auto ? "auto" : "off");
+  std::cerr << line;
+  if (measured) {
+    // The probe's rows=2 verify runtime is only a measurement; drop it so a
+    // decision for off does not keep a second set of device weights alive.
+    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, 2));
+  }
+  if (mode == SpecMode::Auto && !rt->program.speculative) {
+    g_decode_runtimes.erase(std::make_pair(&m, n_ctx));
+    return get_decode_runtime(m, n_ctx);
+  }
+  return rt;
+}
+
 bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
                          uint64_t n_ctx) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
@@ -2444,6 +2590,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // cached per (model, n_ctx); the first call builds + captures, later calls
   // only re-seed/re-stage the device params and replay.
   DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt) return 0;
+  rt = spec_resolve_probe(m, rt, n_ctx, start_pos);
   if (!rt) return 0;
 
   const auto t_loop0 = std::chrono::steady_clock::now();
@@ -2889,6 +3037,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   if (!dump_logits) {
     Phase _p("prefill:get_decode_runtime", phase_timing);
     rt = get_decode_runtime(m, n_ctx);
+    if (!rt) return 0;
+    // V2: with SONICBOOM_SPEC unset, settle the loop shape (probe or cached
+    // ratio) before the prefill/loop below reads rt->program.
+    Phase _pp("prefill:spec_probe", phase_timing);
+    rt = spec_resolve_probe(m, rt, n_ctx, start_pos);
     if (!rt) return 0;
   } else {
     Phase _p("prefill:build_decode_graph", phase_timing);

@@ -33,7 +33,8 @@
 // passes for the run, one fusion at a time, so the plan diff can say what each
 // contributes. The names are the pass class names in BoomPasses.cpp —
 // QuantizeOncePass, RmsNormQuantizePass, GeluMulQuantizePass,
-// SiluMulQuantizePass, BiasIntoGemvPass, ResidualAddIntoGemvPass (decode) and
+// SiluMulQuantizePass, BiasIntoGemvPass, ResidualAddIntoGemvPass,
+// FuseResidualEpiloguePass (decode) and
 // RmsNormMmqPass, GeluMulMmqPass, SiluMulMmqPass (prefill); a phase that does
 // not contain a named pass simply ignores it. A disabled pass can also remove a
 // later pass's fusion — the passes run in sequence over one graph, and the

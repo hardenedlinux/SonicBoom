@@ -71,6 +71,22 @@ bool nvtx_enabled() {
   return on;
 }
 
+// Verify matmul launch shape (V1 ablation). Default: one row-invariant batched
+// mmvq launch per projection over the step's k+1 query rows. With
+// SONICBOOM_SPEC_VERIFY_BATCH=0 the step instead runs one single-column gemv
+// launch per row — the pre-batching behavior. The two are bit-identical
+// (cuda_resident.h: the batched kernel's per-position arithmetic is the
+// single-column kernel's); only the launch shape, and how many times each
+// weight block is read, differ. The switch exists to measure what the batched
+// launch is worth; it is not a numerics mode.
+bool spec_verify_batch_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_VERIFY_BATCH");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return on;
+}
+
 bool attr_i(const GraphNodeDesc& n, std::string_view name, int64_t& out) {
   for (const auto& a : n.attributes)
     if (a.name == name && a.kind() == sx::AttrValueKind::Int) {
@@ -578,6 +594,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     case OpKind::RmsNorm: {
       int64_t nb = 0, dim_i = 0;
       int64_t vr = 0;
+      // `add_input` is set by fuse_residual_epilogue_pass: the residual of the
+      // Add that consumed this norm became a second activation input, and the
+      // norm kernel applies it in its apply loop (same f32 addition, one
+      // launch). Verify/batch forms keep the separate add; the pass does not
+      // match them.
+      int64_t add_idx = 0;
+      const float* add_p = nullptr;
+      if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
+          add_idx < int64_t(in.size()))
+        add_p = dev(in[add_idx]);
       if (verify_attr(vr)) {
         // Verify: one decode norm per row (the 1024-thread kernel decode runs;
         // the batched rms_norm_heads kernel uses a different thread count).
@@ -594,7 +620,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = nn::cuda::rms_norm_heads_dev(fweight(slot), dev(in[0]), eps, out,
                                           int(dim_i), int(nb));
       } else {
-        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n);
+        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, out_n,
+                                    add_p);
       }
       break;
     }
@@ -607,6 +634,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t dim_i = lc.head_dim;
       attr_i(*node, "dim", dim_i);
       int64_t vr = 0;
+      int64_t add_idx = 0;
+      const float* add_p = nullptr;
+      if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
+          add_idx < int64_t(in.size()))
+        add_p = dev(in[add_idx]);
       if (verify_attr(vr) && dim_i > 0) {
         // Verify: per row, the same heads kernel the decode row runs.
         if (vr <= 0 || out_n % int(vr) != 0 ||
@@ -622,7 +654,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         break;
       }
       ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
-                                        out_n / int(dim_i));
+                                        out_n / int(dim_i), add_p);
       break;
     }
     case OpKind::Rope: {
@@ -795,7 +827,18 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                      : std::span<const float>{};
         const float* add_p =
             has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
-        ok = quant::cuda::gemv_q8_1_batched_dev(qw, xq, out, int(vr));
+        if (spec_verify_batch_enabled()) {
+          ok = quant::cuda::gemv_q8_1_batched_dev(qw, xq, out, int(vr));
+        } else {
+          // Serial ablation: one decode gemv per query row (the activation row
+          // is [cols/32] q8_1 blocks, the output row is out_n/vr floats).
+          const int rows_out = int(out_n / vr);
+          const int bpr = int(qw.dims()[0] / 32);
+          ok = true;
+          for (int64_t r = 0; r < vr && ok; ++r)
+            ok = quant::cuda::gemv_q8_1_dev(qw, xq + r * bpr,
+                                            out + r * rows_out);
+        }
         if (ok && has_bias && !b.empty())
           ok = nn::cuda::add_bias_dev(b, out, out, out_n);
         if (ok && has_add) ok = nn::cuda::add_dev(add_p, out, out, out_n);

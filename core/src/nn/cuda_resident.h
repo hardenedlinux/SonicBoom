@@ -34,18 +34,22 @@
 
 namespace sonicboom::nn::cuda {
 
-// y[i] = (x[i] / sqrt(mean_j(x[j]^2) + eps)) * weight[i]; weight empty => 1.0.
-// x, y are device buffers of n floats; weight is a host span of n floats (or
-// empty). Mirrors nn::rms_norm / nn::cuda::rms_norm.
+// y[i] = (x[i] / sqrt(mean_j(x[j]^2) + eps)) * weight[i] [+ add[i]]; weight
+// empty => 1.0. x, y are device buffers of n floats; weight is a host span of
+// n floats (or empty). `add` is the optional residual epilogue of
+// fuse_residual_epilogue_pass (null => none), applied in the same launch.
+// Mirrors nn::rms_norm / nn::cuda::rms_norm plus the following nn::add.
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n);
+                  float* y, int n, const float* add = nullptr);
 
 // Per-head RMSNorm over `heads` heads of `head_dim` floats each:
 //   y[h*head_dim + i] = (x[h*head_dim + i] / sqrt(mean_i(x[h*head_dim+i]^2) + eps)) * weight[i]
+// [+ add[h*head_dim + i]]
 // `weight` is a single head_dim-length vector shared across heads (empty =>
 // unit). Mirrors exec.cpp's per-head nn::rms_norm loop.
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
-                        float* y, int head_dim, int heads);
+                        float* y, int head_dim, int heads,
+                        const float* add = nullptr);
 
 // GGML_GELU_FP16 tanh-GELU (fp16 round-trip), elementwise. x/y may alias.
 bool gelu_fp16_dev(const float* x, float* y, int n);

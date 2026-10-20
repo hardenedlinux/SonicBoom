@@ -403,9 +403,18 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 // 8), but that reordering is many orders below the fp32 rounding in the inv
 // conversion (same argument as rms_sum_sq_kernel), so the result is bit-identical
 // in practice — confirmed by the unchanged 64-step token stream.
-__global__ void rms_norm_fused_kernel(const float* __restrict__ x,
+// `add` is the optional residual epilogue (fuse_residual_epilogue_pass): the
+// add that consumed this norm's output is folded into the apply loop, so
+// y[i] = norm(x)[i] + add[i] in one launch. The apply of a separate add_kernel
+// is the same single f32 addition of the stored norm value, so the result is
+// bit-identical; __fadd_rn keeps the compiler from contracting that addition
+// into the preceding multiply. x/y/add may alias (the executor's buffer reuse
+// can place the result over either input): every index is read before it is
+// written, and the reduction completes before the apply.
+__global__ void rms_norm_fused_kernel(const float* x,
                                       const float* __restrict__ weight, int n,
-                                      float eps, float* __restrict__ y) {
+                                      float eps, float* y,
+                                      const float* add) {
   const int tid = threadIdx.x;
   double s = 0.0;
   for (int i = tid; i < n; i += blockDim.x) {
@@ -427,8 +436,15 @@ __global__ void rms_norm_fused_kernel(const float* __restrict__ x,
   }
   __syncthreads();
   const float iv = inv;
-  for (int i = tid; i < n; i += blockDim.x)
-    y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
+  if (add != nullptr) {
+    for (int i = tid; i < n; i += blockDim.x) {
+      const float nv = weight ? x[i] * iv * weight[i] : x[i] * iv;
+      y[i] = __fadd_rn(nv, add[i]);
+    }
+  } else {
+    for (int i = tid; i < n; i += blockDim.x)
+      y[i] = weight ? x[i] * iv * weight[i] : x[i] * iv;
+  }
 }
 
 // Per-head rms_norm fused (T4): one block per head. The sum-of-squares is a
@@ -440,13 +456,15 @@ __global__ void rms_norm_fused_kernel(const float* __restrict__ x,
 // within the fp32 tolerance of the CPU rms_norm_heads reference (the reordering
 // is far below the fp32 rounding applied to sum/head_dim). The apply is
 // elementwise so spreading it across the block does not change the result.
-__global__ void rms_heads_fused_kernel(const float* __restrict__ x,
+// `add` is the optional residual epilogue, as in rms_norm_fused_kernel: the
+// add folded into this norm's output is applied here, bit-identically.
+__global__ void rms_heads_fused_kernel(const float* x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
-                                       float* __restrict__ y) {
+                                       float* y, const float* add) {
   const int h = blockIdx.x;
-  const float* __restrict__ xh = x + (size_t)h * head_dim;
-  float* __restrict__ yh = y + (size_t)h * head_dim;
+  const float* xh = x + (size_t)h * head_dim;
+  float* yh = y + (size_t)h * head_dim;
   const int tid = threadIdx.x;
   double s = 0.0;
   for (int i = tid; i < head_dim; i += blockDim.x) {
@@ -468,8 +486,16 @@ __global__ void rms_heads_fused_kernel(const float* __restrict__ x,
   }
   __syncthreads();
   const float iv = inv;
-  for (int i = tid; i < head_dim; i += blockDim.x)
-    yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
+  if (add != nullptr) {
+    const float* __restrict__ ah = add + (size_t)h * head_dim;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+      const float nv = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
+      yh[i] = __fadd_rn(nv, ah[i]);
+    }
+  } else {
+    for (int i = tid; i < head_dim; i += blockDim.x)
+      yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
+  }
 }
 
 // GQA broadcast for n_k == 1 attention: dst[hq*d + i] = src[kv_h*d + i],
@@ -2192,7 +2218,7 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
 // and chains these back-to-back so activations stay resident.
 
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n) {
+                  float* y, int n, const float* add) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)n) return false;
@@ -2202,12 +2228,12 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     if (!d_w) return false;
   }
   SB_NOTE_LAUNCH(rms_norm_fused_kernel, 1, 1024, 0, cur_stream());
-  rms_norm_fused_kernel<<<1, 1024, 0, cur_stream()>>>(x, d_w, n, eps, y);
+  rms_norm_fused_kernel<<<1, 1024, 0, cur_stream()>>>(x, d_w, n, eps, y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
-                        float* y, int head_dim, int heads) {
+                        float* y, int head_dim, int heads, const float* add) {
   if (!available()) return false;
   if (head_dim <= 0 || heads <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)head_dim) return false;
@@ -2219,7 +2245,8 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
   SB_NOTE_LAUNCH(rms_heads_fused_kernel, heads, 256, 0, cur_stream());
-  rms_heads_fused_kernel<<<heads, 256, 0, cur_stream()>>>(x, d_w, head_dim, eps, y);
+  rms_heads_fused_kernel<<<heads, 256, 0, cur_stream()>>>(x, d_w, head_dim, eps,
+                                                         y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 

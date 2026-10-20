@@ -364,9 +364,12 @@ Its limits:
   rows with the same per-row kernels and reductions as plain decode, and KV
   entries computed from rejected drafts are rolled back by valid length. The
   emitted stream is bit-identical to greedy by construction
-  (`test_spec_invariance`, `test_spec_rollback`). `SONICBOOM_SPEC=off|on|auto`
-  (default off); `auto` chooses k from a measured verify-cost curve c(k) and an
-  acceptance-rate EMA. On the current benchmark traces `auto` selects k=0, so
+  (`test_spec_invariance`, `test_spec_rollback`). `SONICBOOM_SPEC=off|on|auto`;
+  unset runs a per-SM startup probe (verify/plain ratio; auto below 1.5, off
+  otherwise) and an explicit value bypasses it. `auto` chooses k from a
+  measured verify-cost curve c(k) and an acceptance-rate EMA. On sm_86 the
+  probe measures ~1.9, so the default is plain decode. On the benchmark traces
+  `auto` selects k=0, so
   it does not change any number in this README; fixed k=7 is slower than plain
   decode on them.
 - **GPU:** CUDA on sm_86. `CMAKE_CUDA_ARCHITECTURES` defaults to `native` (the

@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -44,9 +45,12 @@ namespace {
 // The file is a fixed-layout record array behind a 16-byte header. Records are
 // plain old data so a process can read them straight out of the mapping.
 constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
-constexpr uint32_t kVersion = 1;
+// Version 2 widens the op field from 16 to 32 bytes so a full op name (V2's
+// "spec_verify_ratio") fits; a version-1 file misses on lookup and is rewritten
+// by the first store, which is the cache's own reset path.
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kCapacity = 256;
-constexpr size_t kOpBytes = 16;
+constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
 
 struct Header {
@@ -66,7 +70,7 @@ struct Record {
 
 static_assert(sizeof(TileConfig) == 20, "TileConfig is five int32 fields");
 static_assert(sizeof(Header) == 16, "cache header layout");
-static_assert(sizeof(Record) == 96, "cache record layout");
+static_assert(sizeof(Record) == 112, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
 
@@ -284,6 +288,25 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
   return ok;
 }
 
+bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
+  if (!(ratio > 0.0)) return false;
+  const double milli = ratio * 1000.0;
+  if (milli < 1.0 || milli > 1048575.0) return false;
+  // The scalar lives in tile_m; the remaining fields are a fixed placeholder
+  // so the record is a well-formed TileConfig (see the header).
+  const TileConfig cfg{int32_t(std::llround(milli)), 1, 1, 1, 1};
+  return AutotuneCache::instance().store(op, shape, cfg);
+}
+
+std::optional<double> lookup_ratio(std::string_view op,
+                                   std::string_view shape) {
+  const auto rec = AutotuneCache::instance().lookup(op, shape);
+  if (!rec || rec->tile_n != 1 || rec->tile_k != 1 || rec->unroll != 1 ||
+      rec->vectorize != 1)
+    return std::nullopt;
+  return double(rec->tile_m) / 1000.0;
+}
+
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {
   // Rows bucket to the next power of two in [128, 16384]; the blocks-per-row
   // count already clusters the model's matvecs (8..64) and is kept exact.
@@ -293,18 +316,46 @@ std::string gemv_shape_class(int blocks_per_row, int num_rows) {
          std::to_string(rows_bucket);
 }
 
-TileConfig gemv_config(int blocks_per_row, int num_rows) {
-  if (!enabled()) return default_config("gemv");
-  static std::mutex mu;
-  static std::unordered_map<std::string, TileConfig> memo;
+namespace {
+std::mutex& gemv_memo_mutex() {
+  static std::mutex m;
+  return m;
+}
+std::unordered_map<std::string, GemvChoice>& gemv_memo() {
+  static std::unordered_map<std::string, GemvChoice> memo;
+  return memo;
+}
+} // namespace
+
+GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
+  if (!enabled()) return GemvChoice{default_config("gemv"), GemvSource::Default};
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
-  std::lock_guard<std::mutex> lock(mu);
-  if (const auto it = memo.find(key); it != memo.end()) return it->second;
-  TileConfig cfg =
-      AutotuneCache::instance().lookup("gemv", key).value_or(
-          default_config("gemv"));
-  memo.emplace(key, cfg);
-  return cfg;
+  {
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    const auto it = gemv_memo().find(key);
+    if (it != gemv_memo().end()) return it->second;
+  }
+  if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
+    const GemvChoice choice{*cached, GemvSource::Cache};
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo().emplace(key, choice);
+    return choice;
+  }
+  return GemvChoice{default_config("gemv"), GemvSource::Default};
+}
+
+bool gemv_choice_store(int blocks_per_row, int num_rows,
+                       const TileConfig& cfg) {
+  const std::string key = gemv_shape_class(blocks_per_row, num_rows);
+  {
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo()[key] = GemvChoice{cfg, GemvSource::Measured};
+  }
+  return AutotuneCache::instance().store("gemv", key, cfg);
+}
+
+TileConfig gemv_config(int blocks_per_row, int num_rows) {
+  return gemv_choice(blocks_per_row, num_rows).cfg;
 }
 
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {

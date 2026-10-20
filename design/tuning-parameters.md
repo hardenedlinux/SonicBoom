@@ -336,10 +336,19 @@ hand-written pair's — and that is what makes it the default choice.
 
 ## 11. Speculative decoding
 
-`SONICBOOM_SPEC=off|on|auto` (default off; parsed once per process). The loop
+`SONICBOOM_SPEC=off|on|auto` (parsed once per process). The loop
 is a `boom.program`; `off` and `on` are also the two arms of the
 "spec-policy" ablation group. `SONICBOOM_IR_PROGRAM=0` restores the
 hand-written decode loop for the non-speculative path.
+
+Unset is the V2 startup probe: the first generation call times one plain decode
+step against one k=1 verify step, stores `ratio = verify/plain` per SM in the
+Q1 autotune file (`spec_verify_ratio`), and selects `auto` below 1.5, `off` at
+or above it (the ratio is also the k=1 break-even acceptance: 1 + α ≥ ratio).
+An explicit `SONICBOOM_SPEC` value bypasses the probe and the cache. The probe
+logs `spec probe: ratio=X.XX → auto|off`. On sm_86 it measures ~1.9, so the
+default loop is the plain one; `SONICBOOM_SPEC_PROBE_MS="<plain_ms>,<verify_ms>"`
+replaces the timings (test seam, no kernel change).
 
 | constant | location | value | should depend on | how measured |
 |---|---|---|---|---|
@@ -348,6 +357,7 @@ hand-written decode loop for the non-speculative path.
 | α0 (EMA start) | `spec_alpha_update` | 0.5 | — | conservative prior; updated by accepted/drafted |
 | verify classes | planner | `verify_k1..k7`, one captured graph each | k | each is bit-identical to k+1 plain steps (§B3) |
 | c(k) cache | autotune `spec-length` | `v1\|model\|embedding\|ctx class` | GPU, model shape, context class | two passes per k, second timed; warm-up excluded from the EMA |
+| probe threshold | `gemma4_plan.cpp` | 1.5 | verify/plain cost ratio | one plain + one k=1 verify replay, cached per SM |
 
 Measured c(k), µs per verify step (Gemma e2560 / Qwen e896, context class m):
 Gemma 20014, 38731, 53163, 68038, 83519, 99153, 114756, 129926; Qwen 3243,
