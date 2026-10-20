@@ -774,10 +774,14 @@
   "One fused AdamW update: (new param, new m1, new m2). Same arithmetic as the
 device kernel (core/src/training/device_graph_kernels.cu): the moments see the
 raw gradient, the weight decay is decoupled and applied with the step, and the
-step counter is a 1-based int32 tensor."
+step counter is a 1-based int32 tensor. Inputs are [param, grad, m1, m2, step]
+plus an optional sixth one-element float32 lr tensor; that operand, when
+present, replaces the `lr` attribute."
   (let* ((p (car ts)) (g (cadr ts)) (m1 (caddr ts)) (m2 (cadddr ts))
          (step (car (cddddr ts)))
-         (lr (attr-ref attrs 'lr 1e-3))
+         (lr (if (>= (length ts) 6)
+                 (ctensor-item (list-ref ts 5))
+                 (attr-ref attrs 'lr 1e-3)))
          (beta1 (attr-ref attrs 'beta1 0.9))
          (beta2 (attr-ref attrs 'beta2 0.999))
          (eps (attr-ref attrs 'eps 1e-8))
@@ -1066,7 +1070,9 @@ axes TARGET has as 1, then reshape."
     (rope_bwd         1 ,first-input-type ,rope-bwd-kernel #f #f #f)
     (silu_mul_bwd     3 ,first-input-type ,silu-mul-bwd-kernel #f #f #f)
     (embedding_bwd    2 ,embedding-bwd-type ,embedding-bwd-kernel #f #f #f)
-    (adamw            5 ,first-input-type ,adamw-kernel #f #f #f)
+    ;; adamw takes [param, grad, m1, m2, step] and, in the lr-tensor form, a
+    ;; sixth one-element float32 input; both arities are recorded.
+    (adamw           (5 6) ,first-input-type ,adamw-kernel #f #f #f)
     (clip_grad_norm   n ,first-input-type ,clip-grad-norm-kernel #f #f #f)))
 
 ;; Ops whose kernel has an effect: always recorded while tracing and never
@@ -1081,8 +1087,11 @@ axes TARGET has as 1, then reshape."
 (define (op-arity op) (car (entry op)))
 
 (define (check-arity op n)
-  (unless (or (eq? 'n (op-arity op)) (= n (op-arity op)))
-    (error "op: wrong number of inputs" op n)))
+  (let ((want (op-arity op)))
+    (unless (cond ((eq? 'n want) #t)
+                  ((list? want) (and (memv n want) #t))
+                  (else (= n want)))
+      (error "op: wrong number of inputs" op n))))
 
 (define (op-type op types attrs)
   (check-arity op (length types))

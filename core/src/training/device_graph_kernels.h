@@ -92,6 +92,15 @@ bool graph_adamw_step(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
                       std::int64_t n, DevBuf step, float lr, float beta1,
                       float beta2, float eps, float weight_decay);
 
+// The lr-input form of the same update: the learning rate is read from a
+// one-element float32 device buffer instead of the host scalar, so it never
+// crosses to the host (a schedule can change it every step without a sync).
+bool graph_adamw_step_lr(DevBuf param_out, DevBuf m1_out, DevBuf m2_out,
+                         DevBuf param, DevBuf grad, DevBuf m1, DevBuf m2,
+                         std::int64_t n, DevBuf step, DevBuf lr,
+                         float beta1, float beta2, float eps,
+                         float weight_decay);
+
 // Global-norm clipping. graph_sumsq_acc adds sum(x^2) over N float32 elements
 // into ACC, a one-element double device buffer the caller has zeroed; the
 // block sums are combined with double atomics, so the accumulation is one pass

@@ -292,6 +292,15 @@ sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
                             sb_error **err_out);
 sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
                         float eps, float weight_decay, sb_error **err_out);
+
+/* The lr-input form: the learning rate is read from a one-element float32
+ * tensor (an sb_tensor handle, which is how a traced schedule carries the
+ * rate). The parameter's own buffers stay device-resident; only the single
+ * rate is read on the host. The handle's numel must be 1 and its dtype
+ * float32. */
+sb_status sb_param_step_lr(sb_param *p, const sb_tensor *lr, float beta1,
+                           float beta2, float eps, float weight_decay,
+                           sb_error **err_out);
 sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
                         size_t *written_out, sb_error **err_out);
 

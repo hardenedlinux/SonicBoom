@@ -101,13 +101,24 @@ which also keeps the per-row values in the graph)."
   "One fused AdamW update of PARAM from GRAD, with first/second moment state
 M1/M2 and the 1-based int32 STEP tensor. When PARAM/M1/M2 are leaves their
 value is replaced by the updated tensor, which the tracer syncs back to the
-caller's leaf after the segment runs. Returns (new-param new-m1 new-m2)."
-  (let ((outs (apply-op-multi 'adamw (list param grad m1 m2 step)
-                              `((lr (float ,lr)) (beta1 (float ,beta1))
-                                (beta2 (float ,beta2)) (eps (float ,eps))
-                                (weight_decay (float ,weight-decay)))
-                              (list (tensor-type param) (tensor-type m1)
-                                    (tensor-type m2)))))
+caller's leaf after the segment runs. Returns (new-param new-m1 new-m2).
+
+LR is either a number or a tensor. A number rides on the node as an attribute,
+so every distinct rate is a distinct graph; a tensor (a leaf, or a symbolic
+argument while tracing) is a sixth input, and one graph serves any schedule."
+  (let* ((lr-tensor? (not (number? lr)))
+         (args (if lr-tensor?
+                   (list param grad m1 m2 step lr)
+                   (list param grad m1 m2 step)))
+         (attrs (if lr-tensor?
+                    `((beta1 (float ,beta1)) (beta2 (float ,beta2))
+                      (eps (float ,eps)) (weight_decay (float ,weight-decay)))
+                    `((lr (float ,lr)) (beta1 (float ,beta1))
+                      (beta2 (float ,beta2)) (eps (float ,eps))
+                      (weight_decay (float ,weight-decay)))))
+         (outs (apply-op-multi 'adamw args attrs
+                               (list (tensor-type param) (tensor-type m1)
+                                     (tensor-type m2)))))
     (when (leaf? param) (set-leaf-value! param (car outs)))
     (when (leaf? m1) (set-leaf-value! m1 (cadr outs)))
     (when (leaf? m2) (set-leaf-value! m2 (caddr outs)))

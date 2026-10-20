@@ -1056,6 +1056,33 @@ sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
       err_out);
 }
 
+sb_status sb_param_step_lr(sb_param *p, const sb_tensor *lr, float beta1,
+                           float beta2, float eps, float weight_decay,
+                           sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!p || !lr)
+          return fail_arg(err_out);
+        if (lr->t.numel() != 1 || lr->t.dtype() != nt::ScalarType::Float) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "the learning rate must be a one-element float32 tensor");
+          return SB_ERR_BINDING;
+        }
+        sonicboom::training::AdamWConfig cfg;
+        cfg.lr = *static_cast<const float*>(lr->t.data_ptr());
+        cfg.beta1 = beta1;
+        cfg.beta2 = beta2;
+        cfg.eps = eps;
+        cfg.weight_decay = weight_decay;
+        if (!p->p->step(cfg)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, "AdamW update failed");
+          return SB_ERR_RUNTIME;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
 sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
                         size_t *written_out, sb_error **err_out) {
   return guard(

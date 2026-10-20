@@ -238,6 +238,94 @@ int main() {
   check(c, sb_param_numel(p, nullptr) == SB_ERR_INTERNAL,
         "null numel out-param rejected");
 
+  // lr-input form: sb_param_step_lr reads the rate from a one-element float32
+  // tensor. Two fresh parameters run the same gradient sequence, one updated
+  // with the scalar form and one with the tensor form, and must agree bit for
+  // bit (the same fused kernel and the same float -> double conversion).
+  sb_param* a = nullptr;
+  sb_param* b = nullptr;
+  check(c, sb_param_create(dims, 1, init.data(), init.size() * sizeof(float),
+                           &a, &err) == SB_OK,
+        "lr-input: create scalar-form parameter");
+  report_name(c, err, "lr-input create a");
+  check(c, sb_param_create(dims, 1, init.data(), init.size() * sizeof(float),
+                           &b, &err) == SB_OK,
+        "lr-input: create tensor-form parameter");
+  report_name(c, err, "lr-input create b");
+
+  const float schedule[10] = {0.05f, 0.02f, 0.01f, 0.005f, 0.002f,
+                              0.01f, 0.04f, 0.03f, 0.015f, 0.0075f};
+  std::vector<float> last_a, last_b;
+  bool lr_forms_agree = a && b;
+  for (std::size_t t = 1; lr_forms_agree && t <= 10; ++t) {
+    const std::vector<float> g = grad_at(t);
+    const float lr_t = schedule[t - 1];
+    check(c, sb_param_set_grad(a, g.data(), g.size() * sizeof(float), &err) ==
+                  SB_OK,
+          "lr-input: set_grad a");
+    report_name(c, err, "lr-input set_grad a");
+    check(c, sb_param_set_grad(b, g.data(), g.size() * sizeof(float), &err) ==
+                  SB_OK,
+          "lr-input: set_grad b");
+    report_name(c, err, "lr-input set_grad b");
+
+    check(c, sb_param_step(a, lr_t, b1, b2, eps, wd, &err) == SB_OK,
+          "lr-input: scalar step");
+    report_name(c, err, "lr-input scalar step");
+
+    const int64_t lr_dims[1] = {1};
+    sb_tensor* lr_tensor = nullptr;
+    check(c, sb_tensor_from_f32(lr_dims, 1, &lr_t, sizeof(lr_t), &lr_tensor,
+                                &err) == SB_OK,
+          "lr-input: lr tensor");
+    report_name(c, err, "lr-input lr tensor");
+    check(c, sb_param_step_lr(b, lr_tensor, b1, b2, eps, wd, &err) == SB_OK,
+          "lr-input: tensor step");
+    report_name(c, err, "lr-input tensor step");
+    sb_tensor_free(lr_tensor);
+
+    last_a.assign(kN, 0.0f);
+    last_b.assign(kN, 0.0f);
+    check(c, sb_param_read(a, last_a.data(), last_a.size() * sizeof(float),
+                           nullptr, &err) == SB_OK,
+          "lr-input: read a");
+    report_name(c, err, "lr-input read a");
+    check(c, sb_param_read(b, last_b.data(), last_b.size() * sizeof(float),
+                           nullptr, &err) == SB_OK,
+          "lr-input: read b");
+    report_name(c, err, "lr-input read b");
+    lr_forms_agree = std::memcmp(last_a.data(), last_b.data(),
+                                 last_a.size() * sizeof(float)) == 0;
+    check(c, lr_forms_agree, "lr-input matches the scalar form every step");
+  }
+  check(c, sb_param_step_count(a) == 10 && sb_param_step_count(b) == 10,
+        "lr-input: both forms advanced 10 steps");
+
+  // A learning-rate tensor with more than one element is rejected before the
+  // update, and leaves the step count alone.
+  {
+    const int64_t two[1] = {2};
+    const float vals[2] = {0.1f, 0.2f};
+    sb_tensor* lr_bad = nullptr;
+    check(c, sb_tensor_from_f32(two, 1, vals, sizeof(vals), &lr_bad, &err) ==
+                  SB_OK,
+          "lr-input: two-element tensor created");
+    report_name(c, err, "lr-input bad tensor");
+    const uint64_t before_steps = sb_param_step_count(b);
+    check(c, sb_param_step_lr(b, lr_bad, b1, b2, eps, wd, &err) ==
+                  SB_ERR_BINDING,
+          "lr-input: multi-element lr rejected");
+    if (err) {
+      sb_error_free(err);
+      err = nullptr;
+    }
+    check(c, sb_param_step_count(b) == before_steps,
+          "lr-input: rejected lr leaves the step count unchanged");
+    sb_tensor_free(lr_bad);
+  }
+
+  sb_param_free(a);
+  sb_param_free(b);
   sb_param_free(p);
 
   if (!c.ok) {
