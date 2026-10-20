@@ -82,6 +82,28 @@ public:
            std::vector<std::vector<std::byte>>* outputs,
            std::string* error);
 
+  // A resident input is one the graph updates on the device: an optimizer
+  // step's parameter/moment operand, whose result is written back into the
+  // same device buffer. Its value therefore survives from one run to the next,
+  // and a step does not have to upload it again.
+  bool input_is_resident(std::size_t index) const noexcept;
+
+  // Run one step with the resident state left on the device. The graph's
+  // resident inputs are uploaded by the first successful run (this call or a
+  // preceding run()); afterwards `input_data[i]` for a resident input may be
+  // null and its bytes are ignored — the device buffer already holds the state
+  // the previous step computed. Every other input is uploaded on every call.
+  // `input_sizes[i]` is still validated for every input.
+  //
+  // Only the outputs named by `download[0..num_download)` are copied back, in
+  // that order: a training step downloads the loss, not the parameters it keeps
+  // on the device. `outputs` receives exactly `num_download` vectors.
+  bool run_resident(const std::byte* const* input_data,
+                    const std::size_t* input_sizes,
+                    const std::size_t* download, std::size_t num_download,
+                    std::vector<std::vector<std::byte>>* outputs,
+                    std::string* error);
+
 private:
   DeviceTrainingGraph();
 

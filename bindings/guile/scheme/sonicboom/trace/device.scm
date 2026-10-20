@@ -101,11 +101,25 @@
       (error "sonicboom-device: count introspection failed" st))
     (u64-ref bv)))
 
+(define (query-resident exe index)
+  "True when the graph updates input INDEX in place on the device."
+  (let ((bv (make-bytevector 4 0))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_input_is_resident) exe index
+               (bytevector->pointer bv) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (fail "sonicboom-device: residency introspection failed" err-slot))
+      (not (zero? (bytevector-s32-native-ref bv 0))))))
+
 ;;; --- compile (cached per text) ----------------------------------------------
 
-;; Alist text -> (exe inputs outputs), compared with `equal?` so the same
-;; emitted text shares one compiled graph. A traced function has a handful of
-;; segments, so a list is the right size.
+;; Alist text -> segment, compared with `equal?` so the same emitted text
+;; shares one compiled graph. A traced function has a handful of segments, so
+;; a list is the right size. A segment is a vector:
+;;   #(exe inputs outputs resident? state-uploaded?)
+;; RESIDENT? is a list parallel to INPUTS; STATE-UPLOADED? is a one-element
+;; list used as a mutable flag (the first run uploads the leaf state, later
+;; runs leave it on the device).
 (define %segments '())
 
 (define (compiled-device-segments)
@@ -129,12 +143,13 @@
            (n-in (query-count exe 'in))
            (n-out (query-count exe 'out))
            (inputs (map (lambda (i) (query-info exe i 'in)) (iota n-in)))
-           (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out))))
+           (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out)))
+           (resident (map (lambda (i) (query-resident exe i)) (iota n-in))))
       (unless (every (lambda (d) (car d)) inputs)
         (error "sonicboom-device: the device graph does not name its inputs"))
       (unless (every (lambda (d) (car d)) outputs)
         (error "sonicboom-device: the device graph does not name its outputs"))
-      (list exe inputs outputs))))
+      (vector exe inputs outputs resident (list #f)))))
 
 (define (segment-for text)
   (or (assoc-ref %segments text)
@@ -186,12 +201,14 @@
 
 ;; A flat array of pointers as the C ABI takes `const void* const*`. The
 ;; bytevectors themselves are kept alive by the caller for the duration of the
-;; call; Guile's bytevectors do not move.
+;; call; Guile's bytevectors do not move. A #f entry becomes a null pointer
+;; (a resident input whose state is already on the device).
 (define (pointer-array bytevectors)
   (let* ((n (length bytevectors))
          (bv (make-bytevector (* 8 n) 0)))
     (for-each (lambda (b i)
-                (u64-set! bv (* 8 i) (pointer-address (bytevector->pointer b))))
+                (when b
+                  (u64-set! bv (* 8 i) (pointer-address (bytevector->pointer b)))))
               bytevectors (iota n))
     bv))
 
@@ -204,39 +221,56 @@
 
 (define (run-device-executable segment ins-alist)
   "Run one compiled segment with INPUTS (alist name → ctensor); returns the
-output alist in the executable's output order."
-  (match segment
-    ((exe inputs outputs)
-     (let* ((in-bvs
-             (map (match-lambda
-                    ((name dtype shape bytes)
-                     (let ((t (assoc-ref ins-alist name)))
-                       (unless t
-                         (error "sonicboom-device: no value for input" name))
-                       (encode-ctensor t dtype shape))))
-                  inputs))
-            (out-bvs (map (match-lambda ((_ _ _ bytes) (make-bytevector bytes 0)))
-                          outputs))
-            (in-ptr (pointer-array in-bvs))
-            (in-lens (u64-array (map (match-lambda ((_ _ _ b) b)) inputs)))
-            (out-ptr (pointer-array out-bvs))
-            (out-caps (u64-array (map (match-lambda ((_ _ _ b) b)) outputs)))
-            (out-lens (u64-array (map (lambda (_) 0) outputs)))
-            (err-slot (make-slot))
-            (st ((proc 'sb_run_multi) exe
-                 (bytevector->pointer in-ptr) (bytevector->pointer in-lens)
-                 (length inputs)
-                 (bytevector->pointer out-ptr) (bytevector->pointer out-caps)
-                 (length outputs)
-                 (bytevector->pointer out-lens) (slot-ptr err-slot))))
-       (unless (sb-status-ok? st)
-         (fail "sonicboom-device: run failed" err-slot))
-       (map (lambda (desc bv)
-              (match desc
-                ((name dtype shape _)
-                 (cons name (decode-ctensor dtype shape bv)))))
-            outputs out-bvs)))
-    (_ (error "sonicboom-device: bad segment record"))))
+output alist in the executable's output order.
+
+The first call uploads the whole leaf state. After it, an input the graph
+updates in place (a parameter or optimizer moment) stays on the device: it is
+neither encoded nor uploaded, and the next value comes back as one of the
+outputs. Every other input — the batch — is encoded and uploaded on every
+call."
+  (unless (and (vector? segment) (= 5 (vector-length segment)))
+    (error "sonicboom-device: bad segment record"))
+  (let* ((exe (vector-ref segment 0))
+         (inputs (vector-ref segment 1))
+         (outputs (vector-ref segment 2))
+         (resident (vector-ref segment 3))
+         (state (vector-ref segment 4))
+         (uploaded? (car state))
+         (in-bvs
+          (map (lambda (desc res)
+                 (match desc
+                   ((name dtype shape _)
+                    (if (and uploaded? res)
+                        #f
+                        (let ((t (assoc-ref ins-alist name)))
+                          (unless t
+                            (error "sonicboom-device: no value for input" name))
+                          (encode-ctensor t dtype shape))))))
+               inputs resident))
+         (out-bvs (map (match-lambda ((_ _ _ bytes) (make-bytevector bytes 0)))
+                       outputs))
+         (out-idx (iota (length outputs)))
+         (in-ptr (pointer-array in-bvs))
+         (in-lens (u64-array (map (match-lambda ((_ _ _ b) b)) inputs)))
+         (dl-idx (u64-array out-idx))
+         (out-ptr (pointer-array out-bvs))
+         (out-caps (u64-array (map (match-lambda ((_ _ _ b) b)) outputs)))
+         (out-lens (u64-array (map (lambda (_) 0) outputs)))
+         (err-slot (make-slot))
+         (st ((proc 'sb_run_resident) exe
+              (bytevector->pointer in-ptr) (bytevector->pointer in-lens)
+              (length inputs)
+              (bytevector->pointer dl-idx) (length outputs)
+              (bytevector->pointer out-ptr) (bytevector->pointer out-caps)
+              (bytevector->pointer out-lens) (slot-ptr err-slot))))
+    (unless (sb-status-ok? st)
+      (fail "sonicboom-device: run failed" err-slot))
+    (set-car! state #t)
+    (map (lambda (desc bv)
+           (match desc
+             ((name dtype shape _)
+              (cons name (decode-ctensor dtype shape bv)))))
+         outputs out-bvs)))
 
 (define (device-executor)
   "An executor (text inputs) → outputs for trace-function #:executor."

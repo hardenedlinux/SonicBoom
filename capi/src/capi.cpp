@@ -785,6 +785,100 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
       err_out);
 }
 
+sb_status sb_run_resident(sb_executable *exe, const void *const *input_data,
+                          const size_t *input_lens, size_t num_inputs,
+                          const size_t *output_indices, size_t num_outputs,
+                          void *const *output_data, const size_t *output_caps,
+                          size_t *output_lens, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !input_data || !input_lens || !output_data ||
+            !output_caps || (num_outputs != 0 && !output_indices))
+          return fail_arg(err_out);
+        if (!exe->is_device()) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "resident execution needs a device training graph");
+          return SB_ERR_BINDING;
+        }
+
+        const std::size_t in_count = exe->input_count();
+        if (num_inputs != in_count) {
+          std::string msg =
+              "graph takes " + std::to_string(in_count) +
+              " inputs, sb_run_resident got " + std::to_string(num_inputs);
+          set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+          return SB_ERR_BINDING;
+        }
+
+        for (size_t j = 0; j < num_outputs; ++j) {
+          const size_t i = output_indices[j];
+          if (i >= exe->output_count()) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      ("output index " + std::to_string(i) +
+                       " is out of range").c_str());
+            return SB_ERR_BINDING;
+          }
+          uint64_t need = exe->output_num_bytes(i);
+          if (!output_data[j] || output_caps[j] < need) {
+            std::string msg = "output " + std::to_string(i) +
+                              " has capacity " + std::to_string(output_caps[j]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+        }
+
+        std::vector<const std::byte *> ptrs(num_inputs, nullptr);
+        for (size_t i = 0; i < num_inputs; ++i) {
+          uint64_t need = exe->input_num_bytes(i);
+          if (input_lens[i] != need) {
+            std::string msg = "input " + std::to_string(i) + " is " +
+                              std::to_string(input_lens[i]) +
+                              " bytes, expected " + std::to_string(need);
+            set_error(err_out, SB_ERRKIND_BINDING, msg.c_str());
+            return SB_ERR_BINDING;
+          }
+          ptrs[i] = static_cast<const std::byte *>(input_data[i]);
+        }
+
+        std::vector<std::vector<std::byte>> outs;
+        std::string device_error;
+        if (!exe->device->run_resident(ptrs.data(), input_lens,
+                                       output_indices, num_outputs, &outs,
+                                       &device_error)) {
+          set_error(err_out, SB_ERRKIND_RUNTIME, device_error.c_str());
+          return SB_ERR_RUNTIME;
+        }
+        for (size_t j = 0; j < num_outputs; ++j) {
+          std::memcpy(output_data[j], outs[j].data(), outs[j].size());
+          if (output_lens)
+            output_lens[j] = outs[j].size();
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_input_is_resident(const sb_executable *exe, size_t index,
+                               int *resident_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !resident_out) return fail_arg(err_out);
+        if (!exe->is_device()) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "residency is a property of a device training graph");
+          return SB_ERR_BINDING;
+        }
+        if (index >= exe->input_count()) {
+          set_error(err_out, SB_ERRKIND_BINDING, "input index out of range");
+          return SB_ERR_BINDING;
+        }
+        *resident_out = exe->device->input_is_resident(index) ? 1 : 0;
+        return SB_OK;
+      },
+      err_out);
+}
+
 sb_status sb_execute(sb_executable *exe, sb_error **err_out) {
   return guard(
       [&]() -> sb_status {

@@ -41,6 +41,28 @@ bool dev_copy(DevBuf dst, DevBuf src, std::int64_t n);
 // Wait for every kernel submitted on the current stream.
 bool dev_sync();
 
+// The executor's private stream: one non-blocking stream per compiled graph,
+// pushed as the thread's current stream for the duration of a run. Work that
+// belongs to one graph is then ordered on one stream and the node launches can
+// be captured (the legacy default stream cannot).
+std::uint64_t dev_stream_create();
+void dev_stream_destroy(std::uint64_t stream);
+// Set the calling thread's current stream; returns the previous one.
+std::uint64_t dev_stream_push(std::uint64_t stream);
+void dev_stream_pop(std::uint64_t previous);
+
+// --- step capture -----------------------------------------------------------
+// Begin/end a capture of the node launches of one step on the current stream.
+// The captured region must not allocate or free device memory: every buffer is
+// a compile-time allocation, and the few kernels that need scratch take it from
+// the executor. `*exec_out` receives an instantiated graph to replay with
+// dev_graph_launch; dev_graph_free releases it. All are no-ops returning false
+// when the runtime refuses to capture on the current stream.
+bool dev_capture_begin();
+bool dev_capture_end(void** exec_out);
+bool dev_graph_launch(void* exec);
+void dev_graph_free(void* exec);
+
 // --- forward ----------------------------------------------------------------
 
 // out[r, :] = table[ids[r], :]; ids is int32, rows == number of ids.
@@ -67,8 +89,10 @@ bool graph_rope_inplace(DevBuf x, std::int64_t rows, std::int64_t heads,
                         float theta_base, float freq_scale);
 bool graph_silu_mul(DevBuf out, DevBuf g, DevBuf u, std::int64_t n);
 // Mean negative log-likelihood over rows; targets is int32, loss one float.
+// `scratch` is a device buffer of at least `rows` floats; the caller owns it so
+// a step can be captured (a per-call allocation would be illegal in a graph).
 bool graph_cross_entropy(DevBuf loss, DevBuf logits, DevBuf targets,
-                         std::int64_t rows, std::int64_t cols);
+                         std::int64_t rows, std::int64_t cols, DevBuf scratch);
 
 // out = a + b and out = a * b with numpy broadcasting. `a_strides`/`b_strides`
 // are aligned to the output rank, 0 on broadcast axes.

@@ -85,6 +85,7 @@ tools/baseline/real_prompt.txt
 
 # plan-record tools (tools/build_plan_*.sh build them)
 tools/plan_dump
+tools/bench_train
 tools/plan_diff
 
 *.log
