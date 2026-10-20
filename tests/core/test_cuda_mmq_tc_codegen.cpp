@@ -370,6 +370,41 @@ int main() {
     check(diff == 0, "token 0 row is bitwise independent of N");
   }
 
+  // ---- tile invariance (bitwise): every MMQ2 candidate must equal the
+  // smallest config. The autotuner accepts a tuned tile only on this contract,
+  // so the choice never changes numerics. ----
+  {
+    check(upload(act64), "tile-invariance activation upload");
+    std::vector<float> y(size_t(64) * M);
+    std::vector<uint32_t> want(y.size());
+    const MmqTcShape smallest{16, 16, 0};
+    check(run(smallest, b, M, K, 64), "smallest tile launches");
+    check(cudaDeviceSynchronize() == cudaSuccess, "smallest tile completes");
+    check(cudaMemcpy(y.data(), b.y, y.size() * 4, cudaMemcpyDeviceToHost) ==
+              cudaSuccess,
+          "smallest tile download");
+    for (size_t i = 0; i < y.size(); ++i) want[i] = std::bit_cast<uint32_t>(y[i]);
+    for (int bm : {16, 32, 64, 128})
+      for (int bn : {16, 32, 64}) {
+        if (bm == 16 && bn == 16) continue;
+        const MmqTcShape s{bm, bn, 0};
+        check(run(s, b, M, K, 64), "tile-invariance launch");
+        check(cudaDeviceSynchronize() == cudaSuccess,
+              "tile-invariance kernel completes");
+        check(cudaMemcpy(y.data(), b.y, y.size() * 4,
+                         cudaMemcpyDeviceToHost) == cudaSuccess,
+              "tile-invariance download");
+        size_t diff = 0;
+        for (size_t i = 0; i < y.size(); ++i)
+          if (std::bit_cast<uint32_t>(y[i]) != want[i]) ++diff;
+        if (diff)
+          std::cerr << "    tile " << bm << "x" << bn << ": " << diff
+                    << " elements differ from 16x16\n";
+        check(diff == 0, "tile output is bitwise equal to the 16x16 config");
+      }
+    std::printf("  tiles 16x16..128x64: bitwise identical\n");
+  }
+
   // ---- the JIT kept the generated kernel on disk ----
   const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
   if (cache_env == nullptr || std::string_view(cache_env) != "0") {

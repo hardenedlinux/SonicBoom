@@ -2827,12 +2827,125 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first
+// call for a class under SONICBOOM_AUTOTUNE=1 times the candidate grid on the
+// live buffers; a candidate is accepted only when its output matches the
+// smallest config (16x16) bit for bit, and the winner is persisted per SM.
+// Skipped inside CUDA-graph capture, where the host must not synchronize and a
+// JIT module load allocates: the class is tuned by the first uncaptured call.
+static compiler::MmqTcShape mmq_tc_shape_for(const mlir_tune::TileConfig& cfg,
+                                             int ds) {
+  compiler::MmqTcShape s;
+  s.bm = cfg.tile_m;
+  s.bn = cfg.tile_n;
+  s.ds = ds;
+  return s;
+}
+
+static compiler::MmqTcShape resolve_mmq_tc_shape(
+    const compiler::MmqTcShape& base, const void* xq, const void* wq,
+    const void* ws, float* y, int m_rows, int k, int n_tokens) {
+  const mlir_tune::MmqTcChoice choice =
+      mlir_tune::mmq_tc_choice(n_tokens, m_rows, k);
+  if (choice.resolved()) {
+    const compiler::MmqTcShape shape = mmq_tc_shape_for(choice.cfg, base.ds);
+    return compiler::mmq_tc_shape_supported(shape) ? shape : base;
+  }
+
+  cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
+      capture != cudaStreamCaptureStatusNone)
+    return base;
+
+  // The comparison window is a prefix of the output, capped at 64 MiB so the
+  // 151936-row logits projection does not turn every timed burst into a 300 MB
+  // device-to-host copy. The tiles partition both dimensions, so the prefix
+  // sees the same per-block code on every candidate; the token-tail guards are
+  // covered by the small-M classes, where the whole output fits.
+  constexpr size_t kMaxCompareBytes = size_t(64) << 20;
+  const size_t out_bytes = size_t(m_rows) * size_t(n_tokens) * sizeof(float);
+  const size_t cmp_bytes = std::min(out_bytes, kMaxCompareBytes);
+  std::vector<float> host_out(cmp_bytes / sizeof(float));
+
+  bool launch_ok = false;
+  // Each "launch" is a short burst of the same matmul: the runner times one
+  // launch per host wait, and a wait costs about as much as the smaller
+  // projections, so the burst amortizes that floor (the gemv width probe uses
+  // the same shape).
+  constexpr int kProbeReps = 16;
+  auto make_launch = [&](const compiler::MmqTcShape& shape) {
+    return mlir_tune::AutotuneRunner::Launch([&, shape] {
+      bool ok = true;
+      for (int i = 0; i < kProbeReps && ok; ++i)
+        ok = planner::glue::launch_mmq_tc(shape, xq, wq, ws, y, m_rows, k,
+                                          n_tokens);
+      launch_ok = ok;
+    });
+  };
+
+  const std::span<const mlir_tune::TileConfig> grid =
+      mlir_tune::mmq_tc_candidates();
+  std::vector<mlir_tune::TileConfig> candidates;
+  candidates.push_back(grid.front());  // the reference is never pruned
+  for (size_t i = 1; i < grid.size(); ++i) {
+    // Prune a token tile more than 4x the token count: its tail waste cannot
+    // win, and launching it only costs probe time.
+    if (grid[i].tile_n <= 4 * n_tokens) candidates.push_back(grid[i]);
+  }
+
+  mlir_tune::AutotuneRunner::Problem p;
+  p.candidates = std::move(candidates);
+  p.compile = [&](const mlir_tune::TileConfig& cfg)
+      -> std::optional<mlir_tune::AutotuneRunner::Launch> {
+    // Skip a config the generator does not cover (the runner then times the
+    // rest; a covered grid always leaves the reference in place).
+    const compiler::MmqTcShape shape = mmq_tc_shape_for(cfg, base.ds);
+    if (!compiler::mmq_tc_shape_supported(shape)) return std::nullopt;
+    return make_launch(shape);
+  };
+  p.output = host_out.data();
+  p.output_bytes = cmp_bytes;
+  p.sync = [&] {
+    if (!launch_ok) {
+      // A failed candidate must not look like a bit-identical fast one: poison
+      // the window and clear the sticky error so the caller's node still runs.
+      std::memset(host_out.data(), 0xFF, cmp_bytes);
+      cudaGetLastError();
+      return;
+    }
+    // The copy is enqueued behind the candidate on the same stream, so a burst
+    // pays one host wait; the copy is identical for every candidate and
+    // cancels in the ranking.
+    cudaError_t e = cudaMemcpyAsync(host_out.data(), y, cmp_bytes,
+                                    cudaMemcpyDeviceToHost, cur_stream());
+    if (e == cudaSuccess) e = cudaStreamSynchronize(cur_stream());
+    if (e != cudaSuccess) {
+      std::fprintf(stderr, "[autotune] matmul_q8_tc probe: %s\n",
+                   cudaGetErrorString(e));
+      std::memset(host_out.data(), 0xFF, cmp_bytes);
+      cudaGetLastError();
+    }
+  };
+  // 8 timed bursts of 16 launches, min: the tile differences are small and the
+  // choice is persisted, so the measurement must be stable.
+  p.iters = 8;
+  const auto best = mlir_tune::AutotuneRunner::run(p);
+  if (!best) return base;
+
+  const bool stored =
+      mlir_tune::mmq_tc_choice_store(n_tokens, m_rows, k, *best);
+  std::fprintf(stderr, "[autotune] matmul_q8_tc %s: tile_m=%d tile_n=%d%s\n",
+               mlir_tune::mmq_tc_shape_class(n_tokens, m_rows, k).c_str(),
+               best->tile_m, best->tile_n, stored ? "" : " [not persisted]");
+  const compiler::MmqTcShape shape = mmq_tc_shape_for(*best, base.ds);
+  return compiler::mmq_tc_shape_supported(shape) ? shape : base;
+}
+
 // MMQ1: the same operands as matmul_mmq_q8_dev, multiplied by the generated
 // int8 tensor-core kernel over the per-weight q8_1 copy (upload_tc_weight).
 // The activation is the fused quantizers' block_q8_1_mmq — the kernel reads the
 // same layout the ggml mmq kernel does — so the two paths differ only in the
-// weight representation. MMQ1 uses one tile class (64x64); the MMQ2 autotuner
-// extends the choice per shape.
+// weight representation. The tile class comes from the MMQ2 autotuner.
 bool matmul_mmq_tc_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
                        float* Y, int n, int ds) {
   if (!available() || !W.valid() || W.dims().size() != 2 || !yq || !Y || n <= 0)
@@ -2849,6 +2962,8 @@ bool matmul_mmq_tc_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
   compiler::MmqTcShape shape;
   shape.ds = ds;
   if (!compiler::mmq_tc_shape_supported(shape)) return false;
+  shape = resolve_mmq_tc_shape(shape, yq, tw.q, tw.s, Y, int(rows), int(cols),
+                               n);
   return planner::glue::launch_mmq_tc(shape, yq, tw.q, tw.s, Y, int(rows),
                                       int(cols), n);
 }
