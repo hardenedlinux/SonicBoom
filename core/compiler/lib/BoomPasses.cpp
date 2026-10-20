@@ -2632,9 +2632,16 @@ public:
 //     pass may spend, not what it allocates up front.
 //
 // `SONICBOOM_MMQ_TC=on` bypasses the budget for a machine with headroom to
-// verify the path; `=off` is the pre-MMQ1 behavior. A node keeps every
-// attribute it had (the runtime dispatches on `slot`/`ds`/`batch` exactly as
-// it does for quantized_matmul_q8) — only the operator name changes.
+// verify the path; `=off` is the pre-MMQ1 behavior (and the unset default). A
+// node keeps every attribute it had (the runtime dispatches on `slot`/`ds`/
+// `batch` exactly as it does for quantized_matmul_q8) — only the operator name
+// changes.
+//
+// Status: experimental and default off (boom-fix1 C5). Output is not
+// bit-identical to the ggml mmq path (first divergence at step 19 of 30 on two
+// prompts) and the q8_1 weight copies cost 8.5 bit/weight against Q4_K's 4.5.
+// The path exists for the fused prologue/epilogue seam the generated kernel
+// gives us, not for standalone matmul speed.
 class PrefillDispatchPass
     : public mlir::PassWrapper<PrefillDispatchPass,
                                mlir::OperationPass<boom::GraphOp>> {

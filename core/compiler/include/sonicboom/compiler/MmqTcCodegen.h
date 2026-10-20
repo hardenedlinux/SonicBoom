@@ -18,6 +18,14 @@
 
 // The generated q8_1 x q8_1 int8 tensor-core prefill matmul (Wave 4, MMQ1).
 //
+// Status: experimental and default off (boom-fix1 C5). The greedy stream is not
+// bit-identical to the ggml mmq path it replaces (first divergence at step 19
+// of 30 on two prompts), and its q8_1 weight copies read 8.5 bit/weight against
+// Q4_K's 4.5 — 3662 MiB for Gemma 4 E4B, over the 2048 MiB default budget. Its
+// intended use is the fused prologue/epilogue seam (GGUF quantize, SwiGLU,
+// residual, sibling merge), not standalone matmul speed, which the ggml kernel
+// already provides.
+//
 // Emitted in the GPU dialect and lowered through the same NVVM pipeline as the
 // dense GEMM and attention kernels:
 //
