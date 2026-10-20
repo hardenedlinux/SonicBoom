@@ -1093,6 +1093,125 @@ SpecCounters spec_counters() { return g_spec_counters; }
 void spec_counters_reset() { g_spec_counters = SpecCounters{}; }
 
 // ---------------------------------------------------------------------------
+// S4: per-step speculative diagnostics. SONICBOOM_SPEC_DIAG=1 records every
+// iteration of a speculative generation call into a 1024-entry ring — the
+// iteration's position, the proposal length k, how many drafts the verifier
+// accepted, how many tokens were emitted, and the n-gram length that produced
+// the proposal (0 for a miss, the forced bootstrap/warm-up steps and the
+// repeat-drafter seam) — plus a histogram of the call's emitted tokens, and
+// dumps both to stderr when the call returns. Recording is off by default and
+// allocates nothing; when on it is a handful of integer stores per iteration,
+// and the histogram is the only allocation (diagnostic runs are short).
+//
+// The point is the diagnosis the policy cannot make from its counters alone:
+// did the drafter miss (match_length 0), hit a short n-gram, or hit a long one
+// the policy chose not to verify? The token entropy separates a copy-heavy
+// stream (low entropy: the same few tokens recur, prompt lookup should hit) from
+// free-form text (high entropy: no repetition to look up).
+enum class SpecDiagKind : uint8_t {
+  Plain = 0,      // k == 0: the captured single-token decode step
+  Bootstrap,      // S2 forced exploration (k = kSpecBootstrapDrafts)
+  Warm,           // B7 cost warm-up (forced k)
+  Policy,         // the adaptive policy chose k
+  Fixed,          // spec=on: the drafter's fixed cap chose k
+};
+
+struct SpecDiagEntry {
+  uint64_t step, pos;
+  uint32_t k, accepted, emitted;
+  uint8_t ngram;  // the n-gram length that hit (2..4), 0 = no proposal
+  uint8_t kind;
+  uint32_t alpha_milli;  // the policy's acceptance EMA at decision time
+  uint64_t dt_us;        // wall time of this iteration (propose + step)
+};
+
+constexpr size_t kSpecDiagRing = 1024;
+
+struct SpecDiagState {
+  bool init = false;
+  bool enabled = false;
+  uint64_t total = 0;    // entries recorded this call (the ring keeps the last
+  uint64_t calls = 0;    // kSpecDiagRing of them)
+  SpecDiagEntry ring[kSpecDiagRing]{};
+  std::map<uint64_t, uint64_t> hist;  // emitted-token counts, this call
+};
+
+SpecDiagState& spec_diag() {
+  static SpecDiagState d;
+  return d;
+}
+
+static bool spec_diag_enabled() {
+  SpecDiagState& d = spec_diag();
+  if (!d.init) {
+    const char* e = std::getenv("SONICBOOM_SPEC_DIAG");
+    d.enabled = e != nullptr && std::string_view(e) == "1";
+    d.init = true;
+  }
+  return d.enabled;
+}
+
+static void spec_diag_record(uint64_t step, uint64_t pos, size_t k,
+                             size_t accepted, size_t emitted, size_t ngram,
+                             SpecDiagKind kind, double alpha,
+                             std::chrono::steady_clock::time_point iter_start) {
+  SpecDiagState& d = spec_diag();
+  SpecDiagEntry& e = d.ring[size_t(d.total % kSpecDiagRing)];
+  const double a = std::clamp(alpha, 0.0, 1.0);
+  const uint64_t dt_us = uint64_t(std::chrono::duration<double, std::micro>(
+                                      std::chrono::steady_clock::now() -
+                                      iter_start)
+                                      .count());
+  e = SpecDiagEntry{step, pos, uint32_t(k), uint32_t(accepted),
+                    uint32_t(emitted), uint8_t(ngram), uint8_t(kind),
+                    uint32_t(a * 1000.0 + 0.5), dt_us};
+  ++d.total;
+}
+
+static void spec_diag_emit(uint64_t token) {
+  ++spec_diag().hist[token];
+}
+
+// Dump this call's ring (oldest first) and summary. The entropy is Shannon
+// entropy in bits over the call's emitted token ids.
+static void spec_diag_dump(const char* strategy) {
+  SpecDiagState& d = spec_diag();
+  if (!d.enabled) return;
+  const char* kinds[] = {"plain", "bootstrap", "warm", "policy", "fixed"};
+  const uint64_t shown = std::min<uint64_t>(d.total, kSpecDiagRing);
+  const uint64_t first = d.total - shown;
+  std::fprintf(stderr, "[spec-diag] call=%llu strategy=%s steps=%llu shown=%llu\n",
+               (unsigned long long)++d.calls, strategy,
+               (unsigned long long)d.total, (unsigned long long)shown);
+  for (uint64_t i = first; i < d.total; ++i) {
+    const SpecDiagEntry& e = d.ring[size_t(i % kSpecDiagRing)];
+    std::fprintf(stderr,
+                 "[spec-diag] step=%llu pos=%llu k=%u acc=%u emit=%u n=%u "
+                 "alpha=%.3f dt_us=%llu kind=%s\n",
+                 (unsigned long long)e.step, (unsigned long long)e.pos, e.k,
+                 e.accepted, e.emitted, unsigned(e.ngram),
+                 double(e.alpha_milli) / 1000.0, (unsigned long long)e.dt_us,
+                 kinds[e.kind]);
+  }
+  uint64_t tokens = 0;
+  for (const auto& [id, count] : d.hist) tokens += count;
+  double entropy = 0.0;
+  if (tokens > 0) {
+    for (const auto& [id, count] : d.hist) {
+      const double p = double(count) / double(tokens);
+      entropy -= p * std::log2(p);
+    }
+  }
+  std::fprintf(stderr,
+               "[spec-diag] summary tokens=%llu distinct=%zu entropy_bits=%.3f "
+               "dropped=%llu\n",
+               (unsigned long long)tokens, d.hist.size(), entropy,
+               (unsigned long long)(d.total - shown));
+  d.total = 0;
+  d.hist.clear();
+}
+
+// ---------------------------------------------------------------------------
 // CUDA spine decode loop. Same token-stream contract as generate_spine, but the
 // plan is built against a CUDA-aware snapshot so every Sonic node with a *_dev
 // kernel is placed on the GPU (device-local) and only Softcap stays on the CPU
@@ -1472,6 +1591,12 @@ struct SpecLengthPolicy {
 // SONICBOOM_SPEC_BOOTSTRAP (default 50, 0 disables): number of adaptive
 // iterations after the cost warm-up that force k = 1. Parsed once per process,
 // like SONICBOOM_SPEC.
+//
+// S4 tried exploring with real drafter proposals and a lower default (8). It
+// was reverted with the rest of the S4 behavior changes: the measured cost of
+// one k=1 verify is 2.06 plain steps, so exploration only pays above ~100%
+// acceptance, and on the coding trace the experiments cost more than the
+// k=7 verifies they occasionally unlocked (see the S4 report section).
 static uint64_t spec_bootstrap_steps() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP");
@@ -1574,7 +1699,11 @@ static uint64_t run_spec_program_steps(
   // "ngram" is the program's prompt-lookup drafter; "repeat" is the test seam's
   // always-proposing drafter (the last token, cap times). Either way the
   // verifier decides, so the accepted stream is the plain greedy stream.
-  const std::string_view strategy =
+  // Own the string: the ternary between a const char* and a std::string
+  // materializes a temporary, so a string_view here would dangle as soon as the
+  // declaration ends. (The old code only read it in the next two lines, which
+  // hid the bug; the S4 diagnostic dump reads it at function end.)
+  const std::string strategy =
       strategy_override ? strategy_override : p.draft_strategy;
   const bool repeat = strategy == "repeat";
   if (!repeat && strategy != "ngram") {
@@ -1597,6 +1726,10 @@ static uint64_t run_spec_program_steps(
   uint64_t drafts[kSpecMaxDrafts];
   std::vector<uint64_t> feed;
   std::vector<int64_t> rows;
+  if (spec_diag_enabled()) {
+    spec_diag().total = 0;
+    spec_diag().hist.clear();
+  }
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -1615,6 +1748,8 @@ static uint64_t run_spec_program_steps(
     bool measure = false;      // ... whose time is c(k) (its second pass)
     bool finish_warm = false;  // the last measurement: persist after timing
     bool bootstrap_iter = false;  // a forced bootstrap verify (S3 abort input)
+    size_t match_n = 0;        // S4: n-gram length behind this proposal
+    SpecDiagKind diag_kind = SpecDiagKind::Fixed;
     if (repeat) {
       k = size_t(room);
       for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
@@ -1627,6 +1762,7 @@ static uint64_t run_spec_program_steps(
           // Forced drafts are proposals only; the verifier decides the run.
           k = size_t(policy.warm_next);
           warm = true;
+          diag_kind = SpecDiagKind::Warm;
           measure = policy.warm_primed;
           if (policy.warm_primed) {
             policy.warm_primed = false;
@@ -1653,15 +1789,30 @@ static uint64_t run_spec_program_steps(
           --policy.bootstrap_left;
           ++g_spec_counters.bootstrap_steps;
           bootstrap_iter = true;
+          diag_kind = SpecDiagKind::Bootstrap;
         } else {
-          k = size_t(drafter.propose(std::span<uint64_t>(
-              drafts, size_t(spec_choose_drafts(
-                          policy.alpha, policy.cost_us, int64_t(max_k))))));
+          k = drafter.propose(std::span<uint64_t>(
+                                  drafts, size_t(spec_choose_drafts(
+                                              policy.alpha, policy.cost_us,
+                                              int64_t(max_k)))),
+                              &match_n);
           ++g_spec_counters.policy_steps;
+          diag_kind = SpecDiagKind::Policy;
         }
       }
     } else {
-      k = drafter.propose(std::span<uint64_t>(drafts, size_t(room)));
+      k = drafter.propose(std::span<uint64_t>(drafts, size_t(room)), &match_n);
+    }
+
+    // S4: when the policy chooses k = 0 it never asks the drafter, which leaves
+    // "the tables had no match" and "a match existed but was not worth a
+    // verify" indistinguishable in the record. Probe anyway: propose reads the
+    // tables and does not mutate them, so the shadow lookup changes nothing.
+    if (spec_diag_enabled() && k == 0 && !repeat) {
+      uint64_t probe[kSpecMaxDrafts];
+      const size_t probe_room =
+          size_t(std::min<uint64_t>(uint64_t(cap), room));
+      (void)drafter.propose(std::span<uint64_t>(probe, probe_room), &match_n);
     }
 
     if (k == 0) {
@@ -1680,6 +1831,14 @@ static uint64_t run_spec_program_steps(
       rt.cuda->read_token(&next_f);
       const int64_t next = int64_t(next_f);
       if (next < 0) break;
+      // S4: a plain step is a proposal of length 0 (the drafter missed or the
+      // policy chose k = 0) that emits the verifier's own token.
+      if (spec_diag_enabled()) {
+        spec_diag_record(step, L, /*k=*/0, /*accepted=*/0, /*emitted=*/1,
+                         match_n, SpecDiagKind::Plain, policy.alpha,
+                         iter_start);
+        spec_diag_emit(uint64_t(next));
+      }
       // The fed token is now resident; the sampled one is emitted but not fed.
       ++L;
       tokens[step] = next;
@@ -1726,6 +1885,11 @@ static uint64_t run_spec_program_steps(
                         std::span<const int64_t>(rows.data(), rows.size()),
                         p.eos_tokens, step, limit,
                         std::span<uint64_t>(run, size_t(k) + 1));
+    if (spec_diag_enabled()) {
+      spec_diag_record(step, L, k, decision.accepted, decision.emitted,
+                       match_n, diag_kind, policy.alpha, iter_start);
+      for (size_t i = 0; i < decision.emitted; ++i) spec_diag_emit(run[i]);
+    }
     ++g_spec_counters.verify_steps;
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
@@ -1771,6 +1935,7 @@ static uint64_t run_spec_program_steps(
   // A run that ended before the warm-up finished stores what it measured; the
   // policy then compares only the lengths it has prices for.
   if (adaptive && policy.warm_next >= 0) spec_policy_store(policy);
+  spec_diag_dump(strategy.c_str());
   return step;
 }
 

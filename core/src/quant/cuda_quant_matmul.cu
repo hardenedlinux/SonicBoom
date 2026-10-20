@@ -23,6 +23,7 @@
 #include "../nn/cuda_stream.h"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
+#include "../planner/mlir_autotune.h"  // Q1 tile-config cache (opt-in)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
 #include "ggml_derived/mmvq_q8_1.cuh"
@@ -1246,6 +1247,18 @@ SONICBOOM_DEFINE_LEGACY_GEMV(q8_0, 34, dequant_q8_0_value)
 // needed); `_base` atomically accumulates, so y is zero-filled first.
 void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
                  int blocks_per_row, int num_rows) {
+  // Q1: the tuned tile config for this (gemv, shape class, SM). The winner is
+  // resolved once per process and memoized. `tile_m` selects the launch width
+  // of the one-thread-per-super-block kernel below — the only tile knob the
+  // current hand-written kernel exposes; `tile_k` is carried for the generated
+  // gemv and does not change this launch yet. With SONICBOOM_AUTOTUNE unset or
+  // 0 (the default) this is the static default (tile_m 256), which is exactly
+  // the pre-Q1 launch, so the gate-off path is unchanged.
+  const mlir_tune::TileConfig gemv_cfg =
+      mlir_tune::gemv_config(blocks_per_row, num_rows);
+  const int base_block =
+      (gemv_cfg.tile_m == 128 || gemv_cfg.tile_m == 512) ? gemv_cfg.tile_m
+                                                         : 256;
   if (blocks_per_row >= coop_min_blocks_per_row()) {
     const dim3 block(32, 8);
     const dim3 grid(1, (num_rows + 7) / 8);
@@ -1281,8 +1294,8 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
     // break capture. Ordered before the gemv kernels on the same stream.
     cudaMemsetAsync(yp, 0, (size_t)num_rows * sizeof(float), cur_stream());
     const int num_blocks = num_rows * blocks_per_row;
-    const dim3 block(256);
-    const dim3 grid((num_blocks + 255) / 256);
+    const dim3 block(base_block);
+    const dim3 grid((num_blocks + base_block - 1) / base_block);
     switch (qt) {
       case QuantType::Q3_K:
         SB_NOTE_LAUNCH(gemv_q3_K_base, grid, block, 0, cur_stream());

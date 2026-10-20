@@ -69,6 +69,11 @@ void NGramDrafter::push(std::span<const uint64_t> tokens) {
 }
 
 size_t NGramDrafter::propose(std::span<uint64_t> out) const {
+  return propose(out, nullptr);
+}
+
+size_t NGramDrafter::propose(std::span<uint64_t> out, size_t* matched_n) const {
+  if (matched_n) *matched_n = 0;
   const size_t k = std::min(out.size(), max_drafts_);
   if (k == 0 || hist_.size() < kMinN + 1) return 0;
   // Longest context first: a 4-gram hit is a more specific prediction than a
@@ -78,6 +83,7 @@ size_t NGramDrafter::propose(std::span<uint64_t> out) const {
     const uint64_t* suffix = &hist_[hist_.size() - n];
     const auto it = ngram_[n].find(ngram_key(suffix, n));
     if (it == ngram_[n].end()) continue;
+    if (matched_n) *matched_n = n;
     const size_t end = it->second;
     // The proposal is what followed that occurrence: history[end+1 .. L-1].
     const size_t count = std::min(k, hist_.size() - 1 - end);

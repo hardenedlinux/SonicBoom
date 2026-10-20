@@ -109,14 +109,30 @@ int main() {
     expect(d, want, "proposal clipped to max_drafts");
   }
 
-  // A match proposes only tokens that followed it in the history: [1,2,3,4]
-  // occurred at positions 0..3 with five tokens after it, so asking for eight
-  // returns those five and invents nothing.
+  // A match proposes only the tokens that followed it in the history:
+  // [1,2,3,4] occurred at positions 0..3 with five tokens after it, so asking
+  // for eight returns those five and invents nothing.
   {
     NGramDrafter d(8);
     d.push(std::vector<uint64_t>{1, 2, 3, 4, 5, 1, 2, 3, 4});
     const uint64_t want[] = {5, 1, 2, 3, 4};
-    expect(d, want, "proposal is bounded by the matched occurrence's run");
+    expect(d, want, "the proposal is bounded by the matched run");
+  }
+
+  // S4's measured structural limit, on the degenerate stream the code-edit
+  // trace collapses into (one token repeated): the most recent occurrence of
+  // the 4-gram ends one token back, so the proposal is exactly one token even
+  // though the repetition continues indefinitely. A chained proposal was tried
+  // against this (and reverted): proposal length was not the binding
+  // constraint — the verifier's per-row cost is (see the S4 report section).
+  {
+    NGramDrafter d(7);
+    d.push(std::vector<uint64_t>{7, 7, 7, 7, 7, 7});
+    uint64_t out[8];
+    size_t n4 = 0;
+    const size_t n = d.propose(std::span<uint64_t>(out, 7), &n4);
+    check(n == 1 && n4 == 4, "a one-token cycle proposes one token (n=4)");
+    check(out[0] == 7, "the proposed cycle token is the repeated one");
   }
 
   // Determinism: the same history gives the same proposal, and rebuilding the

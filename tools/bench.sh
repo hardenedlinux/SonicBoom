@@ -230,7 +230,7 @@ start_sm_sampler() {
 }
 
 report_sm_clock() {
-  [ -n "$sm_sampler_pid" ] && kill "$sm_sampler_pid" 2>/dev/null
+  [ -n "$sm_sampler_pid" ] && kill "$sm_sampler_pid" 2>/dev/null || true
   [ -n "$sm_samples" ] || return 0
   # The last sample can land while the process is being torn down; it is one
   # reading, so it is dropped rather than averaged over.
@@ -271,8 +271,11 @@ lock_clocks() {
     return 0
   fi
   if [ -z "$CLOCK_MHZ" ]; then
+    # `|| true`: the script runs under `set -e`, and a driver that cannot
+    # answer clocks.max.gr (or a non-root query that fails) must not abort the
+    # whole benchmark — that failure mode is exactly what this branch handles.
     CLOCK_MHZ=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader,nounits \
-                  2>/dev/null | sed -n '1p' | tr -d ' ')
+                  2>/dev/null | sed -n '1p' | tr -d ' ' || true)
   fi
   case "$CLOCK_MHZ" in
     ''|*[!0-9]*)
@@ -287,11 +290,15 @@ lock_clocks() {
     echo "           to pin it yourself: sudo nvidia-smi -lgc ${CLOCK_MHZ}"
     # Without the pin the "same clock on both sides" property is not something
     # this script enforced, so say what the clock actually is: what it reads at
-    # this moment, and (at exit) the range it ran over.
+    # this moment, and (at exit) the range it ran over. Both probes are
+    # best-effort: `|| true` keeps `set -e` from turning an unreadable clock
+    # into a failed run (the sampler below is the authoritative record).
     local now
-    now=$(sm_clock_mhz)
+    now=$(sm_clock_mhz || true)
     if [ -n "$now" ]; then
       echo "           SM clock now ${now} MHz (idle); min/median/max over the run reported at exit"
+    else
+      echo "           SM clock unreadable now; min/median/max over the run reported at exit"
     fi
   fi
 }

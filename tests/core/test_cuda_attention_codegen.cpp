@@ -172,6 +172,83 @@ struct Case {
   uint64_t window;
 };
 
+// D0: the generated prefill kernel's token stream must be bit-identical to
+// the hand-written tiled kernel on the same input, for every config the
+// runtime may resolve by default. At dps == 1 the S dot product is the same
+// one-warp mma chain; bc/br only choose tile boundaries, wh drops the (already
+// implicit) dps split and the async depth only stages copies, so all of them
+// are expected to match bit for bit. dps > 1 splits the dot product across
+// warps and is the one lever that is *not* identical; it is excluded from the
+// default search by attn_choice_bit_identical and checked separately here as
+// a self-test of this test's sensitivity (it must differ).
+void check_prefill_bit_identity(DeviceBufs &b, const std::vector<float> &qabs,
+                                const std::vector<float> &kseq,
+                                const std::vector<float> &vseq) {
+  struct Arm {
+    const char *name;
+    const char *impl;   // SONICBOOM_ATTN_IMPL
+    const char *cfg;    // SONICBOOM_ATTN_CODEGEN (nullptr = default shape)
+    bool identical;
+  };
+  const Arm arms[] = {
+      {"codegen default", "codegen", nullptr, true},
+      {"codegen 64,32,1", "codegen", "64,32,1", true},
+      {"codegen 32,16,1,as2", "codegen", "32,16,1,2", true},
+      {"codegen 64,32,1,as3", "codegen", "64,32,1,3", true},
+      {"codegen-wh 16,32", "codegen", "wh,16,32", true},
+      {"codegen dps2 64,32,2", "codegen", "64,32,2", false},
+  };
+  const Case cases[] = {{0, 512, 0}, {0, 512, 512}, {200, 300, 96}};
+
+  const char *old_impl = std::getenv("SONICBOOM_ATTN_IMPL");
+  const std::string old_impl_s = old_impl ? old_impl : "";
+  const char *old_cfg = std::getenv("SONICBOOM_ATTN_CODEGEN");
+  const std::string old_cfg_s = old_cfg ? old_cfg : "";
+
+  for (const Case &c : cases) {
+    unsetenv("SONICBOOM_ATTN_IMPL");
+    unsetenv("SONICBOOM_ATTN_CODEGEN");
+    setenv("SONICBOOM_ATTN_PREFILL", "own", 1);
+    std::vector<float> own;
+    const bool own_ok = run_case(b, qabs, kseq, vseq, c.start, c.n, c.window, own);
+    unsetenv("SONICBOOM_ATTN_PREFILL");
+    check(own_ok, "own tiled kernel runs for the bit-identity baseline");
+    if (!own_ok) break;
+    for (const Arm &a : arms) {
+      setenv("SONICBOOM_ATTN_IMPL", a.impl, 1);
+      if (a.cfg)
+        setenv("SONICBOOM_ATTN_CODEGEN", a.cfg, 1);
+      else
+        unsetenv("SONICBOOM_ATTN_CODEGEN");
+      std::vector<float> got;
+      const bool ok = run_case(b, qabs, kseq, vseq, c.start, c.n, c.window, got);
+      check(ok, "generated prefill kernel runs");
+      if (!ok) continue;
+      size_t diff = 0;
+      for (size_t i = 0; i < got.size(); ++i)
+        if (std::bit_cast<uint32_t>(got[i]) !=
+            std::bit_cast<uint32_t>(own[i]))
+          ++diff;
+      if ((diff == 0) != a.identical)
+        std::cerr << "    " << a.name << " start=" << c.start
+                  << " n=" << c.n << " window=" << c.window
+                  << " diff=" << diff << "/" << got.size() << "\n";
+      check((diff == 0) == a.identical,
+            a.identical
+                ? "generated prefill is bit-identical to the own tiled kernel"
+                : "dps>1 is detected as a different reduction order");
+    }
+  }
+  if (old_impl)
+    setenv("SONICBOOM_ATTN_IMPL", old_impl_s.c_str(), 1);
+  else
+    unsetenv("SONICBOOM_ATTN_IMPL");
+  if (old_cfg)
+    setenv("SONICBOOM_ATTN_CODEGEN", old_cfg_s.c_str(), 1);
+  else
+    unsetenv("SONICBOOM_ATTN_CODEGEN");
+}
+
 // The JIT writes the generated PTX to its disk cache only after generation
 // succeeds, and the runtime only launches a shape after the module loaded, so
 // the file proves the codegen path ran rather than silently falling back to
@@ -272,6 +349,9 @@ int main() {
             "(bitwise)");
     }
   }
+
+  // D0 prefill gate: generated prefill == own tiled kernel, bit for bit.
+  check_prefill_bit_identity(b, qabs, kseq, vseq);
 
   // Prove the generated kernels are what ran (see codegen_cache_hit): one
   // entry per mask kind the cases above exercised. A cache-disabled run

@@ -2890,13 +2890,17 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
   // columns; wider tiles buy occupancy only until the dynamic-smem limit
   // (96 KiB) or the 32-warp block limit is reached.
   if (gqa == 7 && head_dim == 64) {
-    // br = 64, bc = 32, dps = 1 (one warp, 12 KiB). bc = 32 is the tuner's
-    // measured winner for this class; since attn9 the generated prefill is
-    // bit-identical to the hand-written tiled kernel, so moving the class no
-    // longer changes the token stream.
+    // br = 64, bc = 16, dps = 1, two-buffer cp.async staging (one warp, 8
+    // KiB). Since attn9 the generated prefill is bit-identical to the
+    // hand-written tiled kernel at dps == 1 (attn_choice_bit_identical), so
+    // the default is the measured winner over that identical set: pp512 Qwen
+    // on the 3050 is 16933 tok/s here against 15057 for the synchronous
+    // 64x32 tile (3-run prefill_bench, SONICBOOM_AUTOTUNE=0). bc = 32 and the
+    // synchronous depth stay in the tuner's candidate set.
     shape.br = 64;
-    shape.bc = 32;
+    shape.bc = 16;
     shape.dps = 1;
+    shape.async_stages = 2;
   } else if (gqa == 4 && head_dim == 256) {
     shape.br = 64;
     shape.bc = 16;
@@ -2999,6 +3003,38 @@ std::string attn_choice_name(const AttnChoice &c) {
   return n;
 }
 
+// Does `c` reproduce the hand-written tiled kernel's token stream?
+//
+// At dps == 1 the S dot product is one warp's mma chain over the full
+// head_dim, exactly as in the own kernel; every other generated-kernel lever
+// moves no arithmetic between lanes:
+//   - br/bc only choose which 16-key sub-tile a key lands in, and sub-tile
+//     boundaries are absolute 16-key multiples in both kernels (own aligns its
+//     BK tiles to the same multiples), so the sub-tile sequence over the valid
+//     keys is the same; masked leading keys contribute exactly zero,
+//   - warp_head (wh) keeps the same per-row reduction, just without the dps
+//     split (dps is implicitly 1 there),
+//   - async_stages stages the same values through cp.async (a copy, no math),
+//   - exp2 is excluded from this function's callers entirely (see
+//     attn_exp2_enabled: it changes exp to exp2, an explicit numerics arm).
+// Splitting head_dim across dps warps sums per-warp partial dots, and that
+// association differs from the mma chain; measured on sm_86, d64/g7, causal
+// and windowed, start 0..200: every dps == 1 arm had 0 bitwise differences
+// against own, every dps > 1 arm differed on 30-80% of elements.
+//
+// The d256/d512 classes default to a dps > 1 kernel, i.e. they are already on
+// the non-identical arm relative to own; for them the conservative rule stays
+// (only as, and br under causal, may move) so a class never changes its
+// numbers twice at once.
+bool attn_choice_bit_identical(int head_dim, int gqa, bool window,
+                               const AttnChoice &def, const AttnChoice &c) {
+  if (c.impl == AttnImpl::Own) return true;  // it is the reference kernel
+  if (std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr) return true;
+  if (head_dim == 64 && gqa == 7) return c.dps == def.dps;
+  return c.impl == def.impl && c.bc == def.bc && c.dps == def.dps &&
+         c.wh == def.wh && (!window || c.br == def.br);
+}
+
 // The static per-shape-class choice: what auto used before the runtime tuner
 // existed, and what it still uses when tuning is off (SONICBOOM_AUTOTUNE=0)
 // or unavailable (graph capture). The tuner measures these same defaults
@@ -3013,12 +3049,16 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // there too (C7), but at d64 the hand-written split-KV kernel is faster
   // (513 keys: own 21.8 us vs generated 38.6; 4097 keys: 156.7 vs 181.4), so
   // this choice is the prefill table only.
+  // D0: at dps == 1 every generated lever (br, bc, wh, async depth) is
+  // bit-identical to own (attn_choice_bit_identical), so the static default is
+  // the measured winner over that identical set: the async-staged 64x16 tile
+  // (pp512 Qwen, 3050: 16933 tok/s vs 15057 for the synchronous 64x32).
   if (gqa == 7 && head_dim == 64) {
     if (const char *e = std::getenv("SONICBOOM_ATTN_PREFILL_D64");
         e != nullptr && std::string_view(e) == "own")
       return {AttnImpl::Own, 0, 0, 0};
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps};
+      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
     return {AttnImpl::Own, 0, 0, 0};
   }
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
@@ -3029,7 +3069,7 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // its own, separately switched implementation).
   if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps};
+      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
   }
   return {AttnImpl::Own, 0, 0, 0};
 }
@@ -3114,22 +3154,14 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   }
 
   std::vector<AttnChoice> cands{def};
-  const bool nonidentical =
-      std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr;
   auto add_candidate = [&](const compiler::AttentionShape &s, const AttnChoice &c) {
     if (!compiler::attention_shape_supported(s)) return;
     if (compiler::attention_shared_bytes(s) > max_smem) return;
     if (compiler::attention_block_threads(s) > max_threads) return;
-    // A different implementation, key-tile width, or head_dim split changes
-    // the f32 reduction association; under a window a different br also moves
-    // the key-tile alignment. Either changes the token stream, so those
-    // variants are opt-in (SONICBOOM_ATTN_TUNE_NONIDENTICAL) like the
-    // warp-head arm. Only the query-tile width (causal), the async depth and
-    // the tile height are numerics-neutral levers.
-    if (!nonidentical &&
-        (c.impl != def.impl || c.bc != def.bc || c.dps != def.dps ||
-         c.wh != def.wh || (window && c.br != def.br)))
-      return;
+    // Only candidates whose token stream matches the hand-written kernel (or
+    // the non-identical arm, when explicitly enabled) enter the search; see
+    // attn_choice_bit_identical for which levers qualify per shape class.
+    if (!attn_choice_bit_identical(head_dim, gqa, window, def, c)) return;
     for (const AttnChoice &x : cands)
       if (attn_same_choice(x, c)) return;
     cands.push_back(c);
@@ -3142,16 +3174,14 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
               head_dim, gqa, window, br, bc, dps, false, as);
           add_candidate(s, {AttnImpl::Codegen, br, bc, dps, false, as});
         }
-  // P-in-registers arm (warp per query head, no d split). Its S reduction
-  // association differs from the dps-split kernels, so it enters the search
-  // only when the non-token-identical arm is enabled; the measured default
-  // never switches to it otherwise.
-  if (std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr)
-    for (int bc : {16, 32, 48, 64}) {
-      const compiler::AttentionShape s =
-          attn_prefill_shape(head_dim, gqa, window, 16, bc, 1, true, 0);
-      add_candidate(s, {AttnImpl::Codegen, 16, bc, 1, true});
-    }
+  // P-in-registers arm (warp per query head, no d split). Its dps is 1, so it
+  // is bit-identical for the d64 class and opt-in elsewhere (see
+  // attn_choice_bit_identical); add_candidate applies that rule.
+  for (int bc : {16, 32, 48, 64}) {
+    const compiler::AttentionShape s =
+        attn_prefill_shape(head_dim, gqa, window, 16, bc, 1, true, 0);
+    add_candidate(s, {AttnImpl::Codegen, 16, bc, 1, true});
+  }
 
   AttnTuneBufs b;
   const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;
@@ -3308,9 +3338,15 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   bool have = false;
   const std::map<std::string, int> cached =
       ::sonicboom::tune::lookup("attention-prefill", key);
+  // A cached choice is still subject to the token-identity rule: a cache
+  // written while SONICBOOM_ATTN_TUNE_NONIDENTICAL was set must not pin a
+  // divergent config once the arm is off. A rejected entry forces a retune.
   if (!cached.empty() &&
-      attn_choice_from_values(cached, head_dim, gqa, window, choice))
+      attn_choice_from_values(cached, head_dim, gqa, window, choice) &&
+      attn_choice_bit_identical(head_dim, gqa, window, def, choice))
     have = true;
+  else
+    choice = def;
 
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
   if (!have) {
@@ -3581,6 +3617,13 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     (void)warned;
     attn_impl = "auto";
   }
+  // Prefill-only ablation switch (D0): SONICBOOM_ATTN_PREFILL=own reverts this
+  // leg to the hand-written tiled kernel for every shape class, leaving the
+  // decode leg's implementation untouched. "codegen" pins the generated
+  // default shape, "auto" (or unset) keeps the normal resolution.
+  if (const char *e = std::getenv("SONICBOOM_ATTN_PREFILL"); e != nullptr &&
+      (std::string_view(e) == "own" || std::string_view(e) == "codegen"))
+    attn_impl = e;
   std::optional<compiler::AttentionShape> shape;
   if (attn_impl == "codegen") {
     shape = attn_codegen_shape(head_dim, gqa, sliding_window != 0);
