@@ -4825,10 +4825,14 @@ DenseF32Err dense_f32_error(const float *y, size_t y_n,
 }
 
 // Time both arms at the canonical 512-token chunk and pick the fastest among
-// those that are no less accurate than the chunked arm. The chunked arm is the
-// incumbent: a Lt candidate must beat it by kDenseSwitchMargin, and a later
-// candidate must beat the current best by the same margin, so a class whose
-// arms are within noise keeps a stable pick.
+// those that are no less accurate than the chunked arm. A Lt candidate only has
+// to measure faster than the chunked arm: that arm pays a launch per
+// kDenseCublasWidth column block plus the split-K reduction and tail passes,
+// so replacing it with one call removes both the kernel time it measures and
+// the launches it costs (pp512: 7 launches per PLE projection). A later Lt
+// candidate must still beat the current best by kDenseCandidateMargin, so the
+// pick among Lt candidates — the ones whose times sit within noise of each
+// other — stays stable across cold tunes.
 //
 // Accuracy gate: the fp64-reference error of the chosen arm must not exceed
 // the chunked arm's (maxabs and rms both). The fastest Lt candidate is not
@@ -4887,6 +4891,7 @@ DenseF32Choice dense_f32_tune(int rows, int cols,
                  "maxabs=%.3e rms=%.3e\n",
                  rows, cols, kDenseTuneTokens, best_ms, base_err.maxabs,
                  base_err.rms);
+  bool best_is_lt = false;
   for (size_t i = 0; i < cands.size(); ++i) {
     ++candidate_count;
     // A longer sample than the other tuners': the contenders here sit within a
@@ -4900,8 +4905,9 @@ DenseF32Choice dense_f32_tune(int rows, int cols,
         cur_stream(), 4, 9);
     DenseF32Err err;
     if (!ref.empty()) err = dense_f32_error(y, y_n, ref);
-    const bool faster = ms > 0.0 && (best_ms < 0.0 ||
-                                     ms < best_ms * (1.0 - kDenseSwitchMargin));
+    const double margin = best_is_lt ? kDenseCandidateMargin : 0.0;
+    const bool faster =
+        ms > 0.0 && (best_ms < 0.0 || ms < best_ms * (1.0 - margin));
     // Without a reference (allocation failed) fall back to the time-only pick.
     const bool accurate =
         lt_only || ref.empty() ||
@@ -4917,6 +4923,7 @@ DenseF32Choice dense_f32_tune(int rows, int cols,
     if (!faster || !accurate) continue;
     best = {0, cands[i]};
     best_ms = ms;
+    best_is_lt = true;
   }
   planner::set_thread_recorder(saved);
   tune_s =
