@@ -504,6 +504,12 @@ RangeError transfer(Operation *op, llvm::ArrayRef<const RangeError *> in,
     const RangeError a = inRange(0);
     RangeError w = RangeError::unknown();
     if (auto fw = nodeWeight(op, facts)) w = *fw;
+    // Gemma 4's per-layer projection (ple_proj) names its weight by op kind,
+    // not by a `slot` attribute: it reads the model-wide PerLayerModelProj
+    // table, the weight the facts record at layer -1.
+    constexpr int64_t kPerLayerModelProj = 3;  // WeightSlot::PerLayerModelProj
+    if (!w.known && name == "boom.matvec_bf16")
+      if (auto fw = facts.weight(kPerLayerModelProj, -1)) w = *fw;
     for (size_t i = 1; i < in.size(); ++i)
       if (in[i] && boom::isBoomWeightQuantType(op->getOperand(i).getType()))
         w = RangeError::join(w, *in[i]);
