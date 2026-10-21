@@ -558,6 +558,15 @@ target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
 sb_add_cpp_test(test_blade_to_boom)
 
+# F2: the Boom data-flow analyses. Transfer functions on hand-checked
+# intervals, the reduction-safety rows against the standard forward-error
+# bounds, the dense-liveness comparison with the in-place marks, and the
+# read-only gate. Compiler-side and CPU-only.
+add_executable(test_boom_analysis test_boom_analysis.cpp)
+target_link_libraries(test_boom_analysis PRIVATE sonicboom sonicboom_compiler
+                                                     MLIRAsmParser)
+sb_add_cpp_test(test_boom_analysis)
+
 # Boom IR conversion test (design/mlir-migration.md §7a): Graph -> Boom IR ->
 # Graph over the real models, and the plan gate — the round-tripped graph, fed
 # back through record_{decode,prefill}_plan's GraphTransform seam, must produce

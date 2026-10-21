@@ -83,6 +83,7 @@ add_library(sonicboom_compiler STATIC
   lib/BoomVerify.cpp
   lib/BoomBuilder.cpp
   lib/BoomConversion.cpp
+  lib/BoomAnalysis.cpp
   lib/BladeToBoom.cpp
   lib/BoomPasses.cpp
   lib/GlueCodegen.cpp
@@ -128,6 +129,9 @@ target_link_libraries(sonicboom_compiler PRIVATE
   MLIRIR
   MLIRSideEffectInterfaces
   MLIRPass
+  # Data-flow analyses over Boom IR (BoomAnalysis.cpp): DataFlowSolver,
+  # the sparse forward/backward frameworks and DeadCodeAnalysis.
+  MLIRAnalysis
   # The generation program (BoomBuilder.cpp, BoomVerify.cpp) is an scf.while
   # with arith step arithmetic; both dialects must be resolvable in the context.
   MLIRSCFDialect
