@@ -49,6 +49,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace sonicboom::tune {
 
@@ -76,6 +77,16 @@ void store(std::string_view op, std::string_view key,
 
 // Drop the in-memory maps so the next lookup re-reads from disk.
 void clear_memory_cache();
+
+// Every choice recorded on disk for this device, sorted by (op, key), read
+// without tuning anything. sb-explain prints these; the format marker entry is
+// not a choice and is skipped.
+struct DiskChoice {
+  std::string op;
+  std::string key;
+  std::map<std::string, int> values;
+};
+std::vector<DiskChoice> disk_choices();
 
 #ifdef SONICBOOM_USE_CUDA
 // Median of `reps` individually timed launches after `warmups` untimed ones.

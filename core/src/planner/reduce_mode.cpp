@@ -16,6 +16,8 @@
 
 #include "reduce_mode.h"
 
+#include "decision_registry.h"
+
 #include <chrono>
 #include <cctype>
 #include <cstdio>
@@ -71,25 +73,43 @@ std::string sanitize(std::string_view in) {
 // verdict (a device that has never run the suite) DF32 is not selected: the
 // safe choice is F64, which is what the committed goldens encode.
 
-bool verdict_file_accepts(const std::string &path) {
+enum class Verdict { Absent, Accepted, Rejected };
+
+Verdict verdict_file(const std::string &path) {
   std::ifstream f(path);
   std::string line;
-  if (!std::getline(f, line)) return false;
-  return line.rfind("df32 accepted", 0) == 0;
+  if (!std::getline(f, line)) return Verdict::Absent;
+  if (line.rfind("df32 accepted", 0) == 0) return Verdict::Accepted;
+  if (line.rfind("df32 rejected", 0) == 0) return Verdict::Rejected;
+  return Verdict::Absent;
 }
 
-bool df32_accepted() {
+const char *verdict_name(Verdict verdict) {
+  switch (verdict) {
+    case Verdict::Accepted: return "accepted";
+    case Verdict::Rejected: return "rejected";
+    case Verdict::Absent: return "absent";
+  }
+  return "absent";
+}
+
+Verdict df32_verdict() {
   const std::string id = device_identity();
-  return verdict_file_accepts(decision_cache_root() + "/" + id +
-                              "/reduce-acceptance-v1");
+  return verdict_file(decision_cache_root() + "/" + id +
+                      "/reduce-acceptance-v1");
 }
 
 // The hosted kernels are measured in the same run, but their verdict is keyed
 // by the host (the CPU measurement and the CPU greedy streams), not by the
 // device.
-bool cpu_df32_accepted() {
-  return verdict_file_accepts(decision_cache_root() +
-                              "/cpu/reduce-acceptance-cpu-v1");
+Verdict cpu_df32_verdict() {
+  return verdict_file(decision_cache_root() + "/cpu/reduce-acceptance-cpu-v1");
+}
+
+void record_verdict(std::string_view scope, Verdict verdict) {
+  decisions::record("reduce.df32-acceptance", scope, verdict_name(verdict),
+                    verdict == Verdict::Absent ? decisions::Source::Default
+                                               : decisions::Source::Verdict);
 }
 
 // --- CPU measurement -------------------------------------------------------
@@ -219,7 +239,12 @@ std::optional<compiler::ReduceMode> reduce_mode_env() { return env_override(); }
 
 compiler::ReduceMode device_reduce_mode() {
   static const compiler::ReduceMode mode = [] {
-    if (auto env = env_override()) return *env;
+    if (auto env = env_override()) {
+      decisions::record("reduce.mode", "device",
+                        compiler::reduce_mode_name(*env),
+                        decisions::Source::Env, "SONICBOOM_REDUCE");
+      return *env;
+    }
 #if SONICBOOM_USE_CUDA
     int device = 0;
     if (cudaGetDevice(&device) == cudaSuccess) {
@@ -230,12 +255,23 @@ compiler::ReduceMode device_reduce_mode() {
           ratio > 0) {
         // The ratio is the affordability test; the recorded acceptance verdict
         // is the numerics test. Both must pass for DF32.
-        return ratio <= kMaxDoubleCostRatio || !df32_accepted()
-                   ? compiler::ReduceMode::F64
-                   : compiler::ReduceMode::Df32;
+        decisions::record("reduce.double-cost-ratio", "device",
+                          std::to_string(ratio), decisions::Source::Default);
+        const Verdict verdict = df32_verdict();
+        record_verdict("device", verdict);
+        const auto chosen =
+            ratio <= kMaxDoubleCostRatio || verdict != Verdict::Accepted
+                ? compiler::ReduceMode::F64
+                : compiler::ReduceMode::Df32;
+        decisions::record("reduce.mode", "device",
+                          compiler::reduce_mode_name(chosen),
+                          decisions::Source::Default, "SONICBOOM_REDUCE");
+        return chosen;
       }
     }
 #endif
+    decisions::record("reduce.mode", "device", "f64",
+                      decisions::Source::Default, "SONICBOOM_REDUCE");
     return compiler::ReduceMode::F64;
   }();
   return mode;
@@ -243,14 +279,28 @@ compiler::ReduceMode device_reduce_mode() {
 
 compiler::ReduceMode cpu_reduce_mode() {
   static const compiler::ReduceMode mode = [] {
-    if (auto env = env_override()) return *env;
+    if (auto env = env_override()) {
+      decisions::record("reduce.mode", "cpu",
+                        compiler::reduce_mode_name(*env),
+                        decisions::Source::Env, "SONICBOOM_REDUCE");
+      return *env;
+    }
     const compiler::ReduceMode measured = measure_cpu();
+    decisions::record("reduce.cpu-measurement", "cpu",
+                      compiler::reduce_mode_name(measured),
+                      decisions::Source::Measured);
+    const Verdict verdict = cpu_df32_verdict();
+    record_verdict("cpu", verdict);
     // The host is subject to the same two tests as the device: DF32 only when
     // the measurement says doubles are expensive here AND sb-numerics recorded
     // that DF32 is acceptable here.
-    if (measured == compiler::ReduceMode::Df32 && !cpu_df32_accepted())
-      return compiler::ReduceMode::F64;
-    return measured;
+    const compiler::ReduceMode chosen =
+        measured == compiler::ReduceMode::Df32 && verdict != Verdict::Accepted
+            ? compiler::ReduceMode::F64
+            : measured;
+    decisions::record("reduce.mode", "cpu", compiler::reduce_mode_name(chosen),
+                      decisions::Source::Measured, "SONICBOOM_REDUCE");
+    return chosen;
   }();
   return mode;
 }

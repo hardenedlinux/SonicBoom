@@ -16,6 +16,7 @@
 
 #include "autotune.h"
 
+#include "decision_registry.h"
 #include "reduce_mode.h"
 
 #include <sonicboom/runtime_features.h>
@@ -252,6 +253,22 @@ std::string cache_path(std::string_view op) {
   return cache_path_locked(std::string(op));
 }
 
+namespace {
+
+// The registry value form of a tuner pick: "k=v,k=v" in key order.
+std::string serialize_values(const std::map<std::string, int> &values) {
+  std::string out;
+  for (const auto &[name, value] : values) {
+    if (!out.empty()) out += ',';
+    out += name;
+    out += '=';
+    out += std::to_string(value);
+  }
+  return out;
+}
+
+} // namespace
+
 std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
   if (!enabled() || force()) return {};
   std::lock_guard<std::mutex> lk(g_mutex);
@@ -259,6 +276,9 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
   load_op_locked(op_s);
   const auto it = g_cache[op_s].find(std::string(key));
   if (it == g_cache[op_s].end()) return {};
+  planner::decisions::record("tune/" + op_s, key, serialize_values(it->second),
+                             planner::decisions::Source::Cached,
+                             "SONICBOOM_AUTOTUNE");
   return it->second;
 }
 
@@ -270,12 +290,49 @@ void store(std::string_view op, std::string_view key,
   load_op_locked(op_s);
   g_cache[op_s][std::string(key)] = values;
   write_op_locked(op_s);
+  planner::decisions::record("tune/" + op_s, key, serialize_values(values),
+                             planner::decisions::Source::Measured,
+                             "SONICBOOM_AUTOTUNE");
 }
 
 void clear_memory_cache() {
   std::lock_guard<std::mutex> lk(g_mutex);
   g_cache.clear();
   g_loaded.clear();
+}
+
+std::vector<DiskChoice> disk_choices() {
+  std::vector<DiskChoice> out;
+  std::lock_guard<std::mutex> lk(g_mutex);
+  const std::filesystem::path dir =
+      std::filesystem::path(cache_root()) / device_dir_locked();
+  std::error_code ec;
+  if (!std::filesystem::is_directory(dir, ec)) return out;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file(ec) || entry.path().extension() != ".json")
+      continue;
+    std::ifstream in(entry.path(), std::ios::binary);
+    if (!in) continue;
+    const std::string body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    std::map<std::string, std::map<std::string, int>> parsed;
+    parse_op_file(body, parsed);
+    const auto fmt = parsed.find("__format__");
+    if (fmt != parsed.end()) {
+      const auto v = fmt->second.find("v");
+      if (v == fmt->second.end() || v->second != kJsonFormatVersion) continue;
+    }
+    const std::string op = entry.path().stem().string();
+    for (auto &[key, values] : parsed) {
+      if (key == "__format__") continue;
+      out.push_back(DiskChoice{op, key, std::move(values)});
+    }
+  }
+  std::sort(out.begin(), out.end(), [](const DiskChoice &a, const DiskChoice &b) {
+    return a.op != b.op ? a.op < b.op : a.key < b.key;
+  });
+  return out;
 }
 
 double median_launch_ms(const std::function<bool()> &launch,

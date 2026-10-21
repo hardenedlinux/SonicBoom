@@ -33,6 +33,7 @@
 #include <sonicboom/sx/exec.h>
 
 #include "../planner/autotune.h"        // B7 draft-length cost cache
+#include "../planner/decision_registry.h"  // the plan-cache decision fingerprint
 #include "../planner/mlir_autotune.h"    // V2 spec probe ratio cache (Q1 file)
 #include "../planner/reduce_mode.h"      // the per-device reduction mode
 #include "mlir/IR/BuiltinTypes.h"
@@ -1295,15 +1296,24 @@ struct PlannerEnv {
   // same, but a cached segment's launches and captured graph belong to the
   // mode they were built under, so a mode change invalidates the cache.
   compiler::ReduceMode reduce;
+  // Fingerprint of every automatic decision recorded so far
+  // (planner/decision_registry.h). A cached segment's launches encode the
+  // decisions they were built under; when a later decision changes the set,
+  // the fingerprint changes and the entries above are dropped.
+  uint64_t decisions;
   friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
 };
 
 static PlannerEnv planner_env() {
-  return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
-                    quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
-                    compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
-                    compiler::vram_threshold_mb(),
-                    planner::device_reduce_mode()};
+  // The getters first (they record the decisions they resolve), then the
+  // fingerprint over the resulting set.
+  PlannerEnv env{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
+                 quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
+                 compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
+                 compiler::vram_threshold_mb(),
+                 planner::device_reduce_mode(), 0};
+  env.decisions = planner::decisions::fingerprint();
+  return env;
 }
 
 // The prefill segment cache is a runtime feature (plan_cache), so it can be

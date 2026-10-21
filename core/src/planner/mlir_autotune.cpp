@@ -16,6 +16,8 @@
 
 #include "mlir_autotune.h"
 
+#include "decision_registry.h"
+
 #include <sonicboom/runtime_features.h>
 
 #ifdef SONICBOOM_USE_CUDA
@@ -80,6 +82,29 @@ static_assert(sizeof(Header) == 16, "cache header layout");
 static_assert(sizeof(Record) == 112, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
+
+// The three choice enums share their value set; map it onto the registry's
+// source vocabulary (design/decision-registry.md).
+template <typename SourceT>
+planner::decisions::Source registry_source(SourceT source) {
+  switch (source) {
+    case SourceT::Cache: return planner::decisions::Source::Cached;
+    case SourceT::Measured: return planner::decisions::Source::Measured;
+    case SourceT::Skipped: return planner::decisions::Source::Skipped;
+    case SourceT::Default: break;
+  }
+  return planner::decisions::Source::Default;
+}
+
+// Every JIT-candidate pick is a decision for one device and shape class. The
+// env field names the switch that overrides the whole service; a single class
+// is overridden by retiming it (SONICBOOM_AUTOTUNE=force).
+void record_choice(std::string_view op, const std::string& shape_class,
+                   std::string_view value,
+                   planner::decisions::Source source) {
+  planner::decisions::record(op, shape_class, value, source,
+                             "SONICBOOM_AUTOTUNE");
+}
 
 std::string cache_dir() {
   if (const char* e = std::getenv("XDG_CACHE_HOME"); e && *e)
@@ -370,6 +395,46 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
   return ok;
 }
 
+std::vector<DiskRecord> disk_records() {
+  std::vector<DiskRecord> out;
+  const std::string file = cache_dir() + "/" + sm_file_name();
+  const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return out;
+  if (::flock(fd, LOCK_SH) == 0) {
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && st.st_size >= off_t(sizeof(Header))) {
+      const size_t bytes = std::min<size_t>(size_t(st.st_size), kFileBytes);
+      void* m = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) {
+        const Header* h = static_cast<const Header*>(m);
+        const size_t avail = (bytes - sizeof(Header)) / sizeof(Record);
+        const size_t count =
+            std::min<size_t>(h->count, std::min<size_t>(h->capacity, avail));
+        if (h->magic == kMagic && h->version == kVersion) {
+          const Record* recs = reinterpret_cast<const Record*>(h + 1);
+          out.reserve(count);
+          for (size_t i = 0; i < count; ++i) {
+            out.push_back(DiskRecord{
+                std::string(recs[i].op, ::strnlen(recs[i].op, kOpBytes)),
+                std::string(recs[i].shape,
+                            ::strnlen(recs[i].shape, kShapeBytes)),
+                recs[i].cfg});
+          }
+        }
+        ::munmap(m, bytes);
+      }
+    }
+    ::flock(fd, LOCK_UN);
+  }
+  ::close(fd);
+  std::sort(out.begin(), out.end(),
+            [](const DiskRecord& a, const DiskRecord& b) {
+              return a.op != b.op ? a.op < b.op
+                                  : a.shape_class < b.shape_class;
+            });
+  return out;
+}
+
 bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
   if (!(ratio > 0.0)) return false;
   const double milli = ratio * 1000.0;
@@ -377,7 +442,12 @@ bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
   // The scalar lives in tile_m; the remaining fields are a fixed placeholder
   // so the record is a well-formed TileConfig (see the header).
   const TileConfig cfg{int32_t(std::llround(milli)), 1, 1, 1, 1};
-  return AutotuneCache::instance().store(op, shape, cfg);
+  if (!AutotuneCache::instance().store(op, shape, cfg)) return false;
+  char value[32];
+  std::snprintf(value, sizeof(value), "%.3f", ratio);
+  planner::decisions::record(op, shape, value,
+                             planner::decisions::Source::Measured);
+  return true;
 }
 
 std::optional<double> lookup_ratio(std::string_view op,
@@ -386,7 +456,12 @@ std::optional<double> lookup_ratio(std::string_view op,
   if (!rec || rec->tile_n != 1 || rec->tile_k != 1 || rec->unroll != 1 ||
       rec->vectorize != 1)
     return std::nullopt;
-  return double(rec->tile_m) / 1000.0;
+  const double ratio = double(rec->tile_m) / 1000.0;
+  char value[32];
+  std::snprintf(value, sizeof(value), "%.3f", ratio);
+  planner::decisions::record(op, shape, value,
+                             planner::decisions::Source::Cached);
+  return ratio;
 }
 
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {
@@ -413,7 +488,12 @@ std::unordered_map<std::string, GemvChoice>& gemv_memo() {
 } // namespace
 
 GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
-  if (!enabled()) return GemvChoice{default_config("gemv"), GemvSource::Default};
+  if (!enabled()) {
+    record_choice("tune/gemv", gemv_shape_class(blocks_per_row, num_rows),
+                  default_config("gemv").to_string(),
+                  planner::decisions::Source::Default);
+    return GemvChoice{default_config("gemv"), GemvSource::Default};
+  }
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
   {
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
@@ -423,6 +503,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
   if (!force()) {
     if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
       const GemvChoice choice{*cached, GemvSource::Cache};
+      record_choice("tune/gemv", key, cached->to_string(),
+                    registry_source(choice.source));
       std::lock_guard<std::mutex> lock(gemv_memo_mutex());
       gemv_memo().emplace(key, choice);
       return choice;
@@ -433,6 +515,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
   // caller's per-launch check does not rebuild the probe problem every call.
   if (budget_exhausted()) {
     const GemvChoice choice{default_config("gemv"), GemvSource::Skipped};
+    record_choice("tune/gemv", key, choice.cfg.to_string(),
+                  registry_source(choice.source));
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
     gemv_memo().emplace(key, choice);
     return choice;
@@ -443,6 +527,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
 bool gemv_choice_store(int blocks_per_row, int num_rows,
                        const TileConfig& cfg) {
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
+  record_choice("tune/gemv", key, cfg.to_string(),
+                planner::decisions::Source::Measured);
   {
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
     gemv_memo()[key] = GemvChoice{cfg, GemvSource::Measured};
@@ -506,8 +592,13 @@ std::unordered_map<std::string, MmqTcChoice>& mmq_tc_memo() {
 } // namespace
 
 MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
-  if (!enabled())
+  if (!enabled()) {
+    record_choice("tune/matmul_q8_tc",
+                  mmq_tc_shape_class(m_tokens, n_rows, k),
+                  mmq_tc_default_config().to_string(),
+                  planner::decisions::Source::Default);
     return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
+  }
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
   {
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
@@ -519,6 +610,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
     if (const auto cached =
             AutotuneCache::instance().lookup("matmul_q8_tc", key)) {
       const MmqTcChoice choice{*cached, MmqTcSource::Cache};
+      record_choice("tune/matmul_q8_tc", key, cached->to_string(),
+                    registry_source(choice.source));
       std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
       mmq_tc_memo().emplace(key, choice);
       return choice;
@@ -528,6 +621,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
   // process, memoized so it is not probed again.
   if (budget_exhausted()) {
     const MmqTcChoice choice{mmq_tc_default_config(), MmqTcSource::Skipped};
+    record_choice("tune/matmul_q8_tc", key, choice.cfg.to_string(),
+                  registry_source(choice.source));
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
     mmq_tc_memo().emplace(key, choice);
     return choice;
@@ -538,6 +633,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
 bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
                          const TileConfig& cfg) {
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
+  record_choice("tune/matmul_q8_tc", key, cfg.to_string(),
+                planner::decisions::Source::Measured);
   {
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
     mmq_tc_memo()[key] = MmqTcChoice{cfg, MmqTcSource::Measured};
@@ -611,7 +708,12 @@ std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
 } // namespace
 
 AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
-  if (!enabled()) return AttnPrefillChoice{};
+  if (!enabled()) {
+    record_choice("tune/attn_prefill",
+                  attn_prefill_shape_class(head_dim, seq_len, n_heads),
+                  "dispatcher", planner::decisions::Source::Default);
+    return AttnPrefillChoice{};
+  }
   const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
@@ -623,6 +725,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
     if (const auto cached =
             AutotuneCache::instance().lookup("attn_prefill", key)) {
       const AttnPrefillChoice choice{*cached, AttnPrefillSource::Cache};
+      record_choice("tune/attn_prefill", key, cached->to_string(),
+                    registry_source(choice.source));
       std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
       attn_prefill_memo().emplace(key, choice);
       return choice;
@@ -633,6 +737,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
   // Skipped record keeps the class out of the allocation path as well.
   if (budget_exhausted()) {
     const AttnPrefillChoice choice{TileConfig{}, AttnPrefillSource::Skipped};
+    record_choice("tune/attn_prefill", key, "dispatcher",
+                  registry_source(choice.source));
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     attn_prefill_memo().emplace(key, choice);
     return choice;
@@ -643,6 +749,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
 bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
                                const TileConfig& cfg) {
   const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  record_choice("tune/attn_prefill", key, cfg.to_string(),
+                planner::decisions::Source::Measured);
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     attn_prefill_memo()[key] = AttnPrefillChoice{cfg, AttnPrefillSource::Measured};

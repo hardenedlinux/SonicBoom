@@ -138,6 +138,16 @@ class AutotuneCache {
   mutable std::string path_;  // resolved on the first path() call
 };
 
+// Every record in this SM's cache file, sorted by (op, shape class). Read
+// only: sb-explain prints them, and calling this never tunes or creates a
+// file. An absent file, an older version, or a corrupt header yields nothing.
+struct DiskRecord {
+  std::string op;
+  std::string shape_class;
+  TileConfig cfg;
+};
+std::vector<DiskRecord> disk_records();
+
 // V2 spec auto-detect: a scalar ratio record in the same per-SM file. The spec
 // probe measures one plain decode step against one k=1 verify step and stores
 // verify/plain here, so the decision is made once per GPU rather than once per

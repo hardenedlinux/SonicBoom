@@ -91,4 +91,7 @@ tools/plan_diff
 # numeric-acceptance tool (tools/build_sb_numerics.sh builds it)
 tools/sb-numerics
 
+# decision explainer (tools/build_sb_explain.sh builds it)
+tools/sb-explain
+
 *.log
