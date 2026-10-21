@@ -34,6 +34,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -126,14 +127,81 @@ bool is_step_counter(const TensorInfo &t) {
   return t.dtype == SB_DTYPE_INT32 && t.dims.empty();
 }
 
+// A CPU executable keeps no tensor names, so the document's (inputs ...) /
+// (outputs ...) sections, which list them in graph order, supply the names the
+// compiled tensors lack.
+std::vector<std::string> doc_names(const std::string &text, const char *section,
+                                   const char *entry) {
+  std::vector<std::string> names;
+  std::istringstream in(text);
+  std::string l;
+  bool inside = false;
+  while (std::getline(in, l)) {
+    if (!inside) {
+      if (l.find(section) == std::string::npos) continue;
+      inside = true;
+      continue;
+    }
+    if (l.find(entry) == std::string::npos) break;
+    const size_t b = l.find('"');
+    const size_t e = l.find('"', b + 1);
+    if (b == std::string::npos || e == std::string::npos) break;
+    names.push_back(l.substr(b + 1, e - b - 1));
+  }
+  return names;
+}
+
+std::vector<std::string> input_names(const std::vector<TensorInfo> &ins,
+                                     const std::string &text) {
+  const std::vector<std::string> doc = doc_names(text, "(inputs", "(input \"");
+  if (!doc.empty() && doc.size() != ins.size())
+    die("document lists " + std::to_string(doc.size()) + " inputs but the " +
+        "executable has " + std::to_string(ins.size()));
+  std::vector<std::string> names(ins.size());
+  for (size_t i = 0; i < ins.size(); ++i)
+    names[i] = !ins[i].name.empty() ? ins[i].name
+                                    : (i < doc.size() ? doc[i] : std::string());
+  return names;
+}
+
+// The AdamW nodes read (p, grad, m1, m2, step) and write (p', m1', m2'), so the
+// second and third operands are the first and second moment leaves.
+std::unordered_set<std::string> adamw_moments(const std::string &text) {
+  std::unordered_set<std::string> out;
+  std::istringstream lines(text);
+  std::string line;
+  while (std::getline(lines, line)) {
+    if (line.find("(node adamw") == std::string::npos) continue;
+    std::vector<std::string> q;
+    for (size_t p = 0; (p = line.find('"', p)) != std::string::npos;) {
+      const size_t e = line.find('"', p + 1);
+      if (e == std::string::npos) break;
+      q.push_back(line.substr(p + 1, e - p - 1));
+      p = e + 1;
+    }
+    if (q.size() != 8) continue;
+    out.insert(q[2]);
+    out.insert(q[3]);
+  }
+  return out;
+}
+
+// The AdamW moment inputs must start at zero. The update is
+// v' = beta2 * v + (1 - beta2) * g^2 and the step divides by sqrt(v'/bc2): a
+// random v entry makes the first term negative where g is small, and the sqrt
+// turns every such entry into NaN after the first step. Parameters and every
+// other f32 input keep their random start.
 void fill_initial(const std::vector<TensorInfo> &ins,
+                  const std::vector<std::string> &names,
+                  const std::unordered_set<std::string> &moments,
                   std::vector<std::vector<std::uint8_t>> &bufs) {
   bufs.resize(ins.size());
   for (size_t i = 0; i < ins.size(); ++i) {
     bufs[i].assign(ins[i].bytes, 0);
     if (is_batch(ins[i]) || is_step_counter(ins[i])) continue;  // per step
+    if (moments.count(names[i]) != 0) continue;  // zero, see above
     if (ins[i].dtype != SB_DTYPE_FLOAT32) continue;
-    Rng rng(name_seed(ins[i].name));
+    Rng rng(name_seed(names[i]));
     float *p = reinterpret_cast<float *>(bufs[i].data());
     const size_t n = ins[i].bytes / sizeof(float);
     for (size_t k = 0; k < n; ++k) p[k] = rng.uniform(-0.05f, 0.05f);
@@ -184,31 +252,9 @@ std::vector<int> output_to_input(const std::vector<TensorInfo> &ins,
                                  const std::vector<TensorInfo> &outs,
                                  const std::string &text) {
   std::vector<int> map(outs.size(), -1);
-  // A CPU executable does not retain value names (sb_compile compiles the CPU
-  // interpreter without them), so the document's (inputs ...) and (outputs ...)
-  // sections, which list them in graph order, supply the names the compiled
-  // tensors lack.
-  auto doc_names = [&text](const char *section, const char *entry) {
-    std::vector<std::string> names;
-    std::istringstream in(text);
-    std::string l;
-    bool inside = false;
-    while (std::getline(in, l)) {
-      if (!inside) {
-        if (l.find(section) == std::string::npos) continue;
-        inside = true;
-        continue;
-      }
-      if (l.find(entry) == std::string::npos) break;
-      const size_t b = l.find('"');
-      const size_t e = l.find('"', b + 1);
-      if (e == std::string::npos) break;
-      names.push_back(l.substr(b + 1, e - b - 1));
-    }
-    return names;
-  };
-  const std::vector<std::string> doc_inputs = doc_names("(inputs", "(input \"");
-  const std::vector<std::string> doc_outputs = doc_names("(outputs", "(output \"");
+  const std::vector<std::string> doc_inputs = doc_names(text, "(inputs", "(input \"");
+  const std::vector<std::string> doc_outputs =
+      doc_names(text, "(outputs", "(output \"");
   if (!doc_inputs.empty() && doc_inputs.size() != ins.size())
     die("document lists " + std::to_string(doc_inputs.size()) +
         " inputs but the executable has " + std::to_string(ins.size()));
@@ -288,7 +334,9 @@ Result run(sb_executable *exe, bool resident, const std::string &text,
     die("output 0 is not the loss");
 
   std::vector<std::vector<std::uint8_t>> bufs;
-  fill_initial(ins, bufs);
+  const auto moments = adamw_moments(text);
+  if (moments.empty()) die("the fixture has no AdamW moment leaves");
+  fill_initial(ins, input_names(ins, text), moments, bufs);
 
   std::uint64_t h2d = 0, d2h = 0;
   bool uploaded = false;
