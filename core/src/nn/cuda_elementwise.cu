@@ -4489,9 +4489,10 @@ bool matvec_bf16_lt_dev(cublasLtHandle_t lt, const uint16_t *d_w, int cols,
 // [rows, ncols] (ncols innermost); W is [rows, cols] row-major on device. The n
 // columns are repacked into fixed-width 128-column blocks so every cuBLAS call
 // has shape (m=128, n=rows, k=cols, lda=ldc=128) — the same per-column numerics
-// regardless of n or column offset.
-bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
-                           int rows, int ncols, bool strided) {
+// regardless of n or column offset. This is the ablation/default arm of
+// matvec_f32_cublas_dev below, which prefers the full-batch cuBLASLt arm.
+bool matvec_f32_sgemm_chunked(const float* d_w, int cols, const float* x,
+                              float* y, int rows, int ncols, bool strided) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
   float* xpack = nullptr;
@@ -4615,6 +4616,415 @@ bool dense_capturing() {
   cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
   return cudaStreamIsCapturing(cur_stream(), &st) != cudaSuccess ||
          st != cudaStreamCaptureStatusNone;
+}
+
+// --- f32 dense: full-batch cuBLASLt with a per-class algorithm --------------
+//
+// The f32 dense projection as one cuBLASLt matmul over every token, instead of
+// the fixed 128-column cublasSgemm chunks of matvec_f32_sgemm_chunked. The
+// chunking existed to make a token's numerics independent of the batch size:
+// every call had the same (m=rows, n=128, k=cols) shape, so cuBLAS selected
+// the same kernel and reduced in the same order for a one-token suffix and the
+// segment of a 512-token prefill. A fixed Lt algorithm gives the same
+// guarantee without the chunking -- the algorithm is chosen once per
+// (rows, cols) shape class and every batch size runs it, so a row's reduction
+// does not depend on n (measured on the 3050: n=130 vs n=512, 0/33280 and
+// 0/332800 elements differ for the two PLE shapes) -- and it removes the
+// per-128-token launch, the split-K reduce kernel, and the tail
+// pad/copyback passes.
+//
+// The algorithm is measured, not assumed: the heuristic's candidates are timed
+// against the chunked arm at the canonical 512-token chunk, once per shape
+// class per device, and the winner goes to the tune store (op "dense-f32") like
+// every other tuner choice. A candidate is only eligible if its fp64-reference
+// error does not exceed the chunked arm's, so a faster reduction order with
+// worse numerics cannot displace the current arm.
+// SONICBOOM_AUTOTUNE=0 keeps the chunked arm (the pre-T5 path; the static
+// default); SONICBOOM_DENSE_F32=lt|sgemm pins one arm.
+struct DenseF32Lt {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+  bool valid = false;
+};
+
+// -1 unset (tuned), 0 = sgemm chunks, 1 = Lt.
+int dense_f32_pin() {
+  static const int v = [] {
+    const char *e = std::getenv("SONICBOOM_DENSE_F32");
+    if (!e) return -1;
+    return std::string_view(e) == "sgemm" ? 0 : 1;
+  }();
+  return v;
+}
+
+// A: W (cols x rows column-major, OP_T); B: x (cols x n, OP_N); C/D: y
+// (rows x n). Same formulation and layouts as the chunked arm.
+bool dense_f32_lt_descs(cublasLtMatmulDesc_t *op, cublasLtMatrixLayout_t *ad,
+                        cublasLtMatrixLayout_t *bd,
+                        cublasLtMatrixLayout_t *cd, int rows, int cols,
+                        int ncols) {
+  if (cublasLtMatmulDescCreate(op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+  const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
+  return cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSA,
+                                        &tr_a, sizeof(tr_a)) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSB,
+                                        &tr_b, sizeof(tr_b)) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(ad, CUDA_R_32F, cols, rows, cols) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(bd, CUDA_R_32F, cols, ncols, cols) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(cd, CUDA_R_32F, rows, ncols, rows) ==
+             CUBLAS_STATUS_SUCCESS;
+}
+
+bool dense_f32_lt_launch(const DenseF32Lt &k, const float *d_w, int cols,
+                         const float *x, float *y, int rows, int ncols) {
+  cublasLtHandle_t lt = dense_lt_handle();
+  if (!lt || !k.valid) return false;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+  bool ok = dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, ncols);
+  if (ok) {
+    const float alpha = 1.0f, beta = 0.0f;
+    ok = cublasLtMatmul(lt, op, &alpha, d_w, ad, x, bd, &beta, y, cd, y, cd,
+                        &k.algo, g_dense_ws, k.workspace, cur_stream()) ==
+         CUBLAS_STATUS_SUCCESS;
+  }
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return ok;
+}
+
+// The heuristic's candidates for the class, built at the canonical chunk. The
+// order is the heuristic's timing model order and is stable for a given
+// device/driver, which is what lets the tune store remember a pick as an index.
+std::vector<DenseF32Lt> dense_f32_lt_candidates(cublasLtHandle_t lt, int rows,
+                                                int cols) {
+  std::vector<DenseF32Lt> out;
+  if (!g_dense_ws) return out;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+  if (!dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, kDenseTuneTokens)) {
+    if (ad) cublasLtMatrixLayoutDestroy(ad);
+    if (bd) cublasLtMatrixLayoutDestroy(bd);
+    if (cd) cublasLtMatrixLayoutDestroy(cd);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return out;
+  }
+  cublasLtMatmulPreference_t pref = nullptr;
+  if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+    size_t max_ws = kDenseCublasWorkspaceBytes;
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws));
+    cublasLtMatmulHeuristicResult_t heurs[8];
+    int found = 0;
+    if (cublasLtMatmulAlgoGetHeuristic(lt, op, ad, bd, cd, cd, pref, 8, heurs,
+                                       &found) == CUBLAS_STATUS_SUCCESS) {
+      for (int i = 0; i < found; ++i) {
+        if (heurs[i].state != CUBLAS_STATUS_SUCCESS ||
+            heurs[i].workspaceSize > kDenseCublasWorkspaceBytes)
+          continue;
+        out.push_back({heurs[i].algo, heurs[i].workspaceSize, true});
+      }
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+  }
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return out;
+}
+
+struct DenseF32Choice {
+  int impl = 1;  // 0 = full-batch Lt, 1 = chunked cublasSgemm (pre-T5)
+  DenseF32Lt lt;
+};
+
+// Deterministic operand fill for the tuning run: timing does not depend on the
+// values, but the accuracy gate needs non-zero operands, and a fixed pattern
+// keeps the tuning repeatable.
+std::vector<float> dense_f32_tune_operands(size_t n, uint32_t seed) {
+  std::vector<float> v(n);
+  for (float &f : v) {
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    f = float(seed % 2000) / 1000.0f - 1.0f;
+  }
+  return v;
+}
+
+__global__ void f32_to_f64_tune_kernel(const float *src, double *dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = (double)src[i];
+}
+
+struct DenseF32Err {
+  double maxabs = 0.0;
+  double rms = 0.0;
+};
+
+// fp64 reference for the tuning operands, fetched to host (token-major). Built
+// with a DGEMM on double copies of w/x, so the error of an arm is measured
+// against the same reference the report's numerics table uses.
+bool dense_f32_tune_reference(const float *w, const float *x, int rows,
+                              int cols, std::vector<double> &ref) {
+  const size_t w_n = size_t(rows) * size_t(cols);
+  const size_t x_n = size_t(cols) * size_t(kDenseTuneTokens);
+  const size_t y_n = size_t(rows) * size_t(kDenseTuneTokens);
+  double *dw = nullptr, *dx = nullptr, *dy = nullptr;
+  bool ok = cudaMalloc(&dw, w_n * 8) == cudaSuccess &&
+            cudaMalloc(&dx, x_n * 8) == cudaSuccess &&
+            cudaMalloc(&dy, y_n * 8) == cudaSuccess;
+  if (ok) {
+    const int tpb = 256;
+    f32_to_f64_tune_kernel<<<int((w_n + tpb - 1) / tpb), tpb, 0, cur_stream()>>>(
+        w, dw, int(w_n));
+    f32_to_f64_tune_kernel<<<int((x_n + tpb - 1) / tpb), tpb, 0, cur_stream()>>>(
+        x, dx, int(x_n));
+    const double one = 1.0, zero = 0.0;
+    ok = cublasDgemm(dense_cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, rows,
+                     kDenseTuneTokens, cols, &one, dw, cols, dx, cols, &zero,
+                     dy, rows) == CUBLAS_STATUS_SUCCESS;
+  }
+  if (ok) {
+    ref.resize(y_n);
+    cudaStreamSynchronize(cur_stream());
+    ok = cudaMemcpy(ref.data(), dy, y_n * 8, cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
+  }
+  if (dy) cudaFree(dy);
+  if (dx) cudaFree(dx);
+  if (dw) cudaFree(dw);
+  return ok;
+}
+
+// Error of the arm whose result is currently in y, against the reference.
+DenseF32Err dense_f32_error(const float *y, size_t y_n,
+                            const std::vector<double> &ref) {
+  DenseF32Err e;
+  std::vector<float> yh(y_n);
+  cudaStreamSynchronize(cur_stream());
+  if (cudaMemcpy(yh.data(), y, y_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+    return e;
+  double acc = 0.0;
+  for (size_t i = 0; i < y_n; ++i) {
+    const double d = std::fabs(double(yh[i]) - ref[i]);
+    if (d > e.maxabs) e.maxabs = d;
+    acc += d * d;
+  }
+  e.rms = std::sqrt(acc / double(y_n));
+  return e;
+}
+
+// Time both arms at the canonical 512-token chunk and pick the fastest among
+// those that are no less accurate than the chunked arm. The chunked arm is the
+// incumbent: a Lt candidate must beat it by kDenseSwitchMargin, and a later
+// candidate must beat the current best by the same margin, so a class whose
+// arms are within noise keeps a stable pick.
+//
+// Accuracy gate: the fp64-reference error of the chosen arm must not exceed
+// the chunked arm's (maxabs and rms both). The fastest Lt candidate is not
+// necessarily the one that wins: e.g. on the 3050 the down-projection winner
+// by time reduces in a different order and is ~1.85x the chunked arm's rms,
+// while the next candidate is both faster than the chunked arm and slightly
+// more accurate. A pinned Lt run (the ablation) skips the gate.
+DenseF32Choice dense_f32_tune(int rows, int cols,
+                              const std::vector<DenseF32Lt> &cands,
+                              bool lt_only, double &tune_s,
+                              int &candidate_count) {
+  DenseF32Choice best;
+  candidate_count = 0;
+  const size_t w_n = size_t(rows) * size_t(cols);
+  const size_t x_n = size_t(cols) * size_t(kDenseTuneTokens);
+  const size_t y_n = size_t(rows) * size_t(kDenseTuneTokens);
+  const auto t0 = std::chrono::steady_clock::now();
+  float *w = nullptr, *x = nullptr, *y = nullptr;
+  if (cudaMalloc(&w, w_n * 4) != cudaSuccess) return best;
+  if (cudaMalloc(&x, x_n * 4) != cudaSuccess) {
+    cudaFree(w);
+    return best;
+  }
+  if (cudaMalloc(&y, y_n * 4) != cudaSuccess) {
+    cudaFree(x);
+    cudaFree(w);
+    return best;
+  }
+  const std::vector<float> w_h = dense_f32_tune_operands(w_n, 12345);
+  const std::vector<float> x_h = dense_f32_tune_operands(x_n, 67890);
+  cudaMemcpyAsync(w, w_h.data(), w_n * 4, cudaMemcpyHostToDevice,
+                  cur_stream());
+  cudaMemcpyAsync(x, x_h.data(), x_n * 4, cudaMemcpyHostToDevice,
+                  cur_stream());
+  cudaMemsetAsync(y, 0, y_n * 4, cur_stream());
+  std::vector<double> ref;
+  if (!dense_f32_tune_reference(w, x, rows, cols, ref)) ref.clear();
+  planner::PlanRecorder *saved = planner::recorder();
+  planner::set_thread_recorder(nullptr);
+  // With lt_only (a pinned Lt measurement) the chunked arm is not the
+  // incumbent and the fastest Lt candidate wins without a margin.
+  double best_ms = -1.0;
+  DenseF32Err base_err;
+  if (!lt_only)
+    best_ms = ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return matvec_f32_sgemm_chunked(w, cols, x, y, rows, kDenseTuneTokens,
+                                          true);
+        },
+        cur_stream(), 2, 5);
+  if (!lt_only && !ref.empty()) base_err = dense_f32_error(y, y_n, ref);
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (verbose && !lt_only)
+    std::fprintf(stderr,
+                 "[autotune] dense-f32 m=%d k=%d n=%d sgemm=%.4f ms "
+                 "maxabs=%.3e rms=%.3e\n",
+                 rows, cols, kDenseTuneTokens, best_ms, base_err.maxabs,
+                 base_err.rms);
+  for (size_t i = 0; i < cands.size(); ++i) {
+    ++candidate_count;
+    // A longer sample than the other tuners': the contenders here sit within a
+    // few percent of the incumbent and the pick flips the plan record, so the
+    // decision must not follow the clock-ramp of the first milliseconds.
+    const double ms = ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return dense_f32_lt_launch(cands[i], w, cols, x, y, rows,
+                                     kDenseTuneTokens);
+        },
+        cur_stream(), 4, 9);
+    DenseF32Err err;
+    if (!ref.empty()) err = dense_f32_error(y, y_n, ref);
+    const bool faster = ms > 0.0 && (best_ms < 0.0 ||
+                                     ms < best_ms * (1.0 - kDenseSwitchMargin));
+    // Without a reference (allocation failed) fall back to the time-only pick.
+    const bool accurate =
+        lt_only || ref.empty() ||
+        (err.maxabs <= base_err.maxabs && err.rms <= base_err.rms);
+    if (verbose)
+      std::fprintf(stderr,
+                   "[autotune]   lt[%zu] ws=%zu = %.4f ms maxabs=%.3e "
+                   "rms=%.3e%s\n",
+                   i, cands[i].workspace, ms, err.maxabs, err.rms,
+                   !faster   ? " (not faster)"
+                   : !accurate ? " [rejected: less accurate than sgemm]"
+                               : "");
+    if (!faster || !accurate) continue;
+    best = {0, cands[i]};
+    best_ms = ms;
+  }
+  planner::set_thread_recorder(saved);
+  tune_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  cudaFree(y);
+  cudaFree(x);
+  cudaFree(w);
+  return best;
+}
+
+// Resolve the f32 dense arm for a (rows, cols) shape class: env pin, cached
+// pick, else a tuning run, else the chunked arm. The key never includes the
+// batch size. Tuning is skipped inside a capture (host timing is illegal
+// there) and the class is left unmemoized so a later launch can decide it.
+DenseF32Choice dense_f32_resolve(int rows, int cols) {
+  const DenseF32Choice def;  // chunked
+  const int pin = dense_f32_pin();
+  if (pin == 0) return def;
+  if (!::sonicboom::tune::enabled() && pin < 0) return def;
+  cublasLtHandle_t lt = dense_lt_handle();
+  if (!lt || !g_dense_ws) return def;
+  const std::string key = std::string("dense-f32-2|m") +
+                          std::to_string(rows) + "k" + std::to_string(cols);
+  static std::mutex mu;
+  static std::unordered_map<std::string, DenseF32Choice> memo;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = memo.find(key);
+    if (it != memo.end()) return it->second;
+  }
+
+  DenseF32Choice choice = def;
+  bool have = false;
+  if (pin < 0) {
+    const std::map<std::string, int> cached =
+        ::sonicboom::tune::lookup("dense-f32", key);
+    const auto impl = cached.find("impl");
+    const auto algo = cached.find("algo");
+    if (impl != cached.end() && impl->second == 1) {
+      have = true;  // the chunked arm, measured as the winner
+    } else if (impl != cached.end() && impl->second == 0 &&
+               algo != cached.end()) {
+      const std::vector<DenseF32Lt> cands =
+          dense_f32_lt_candidates(lt, rows, cols);
+      if (algo->second >= 0 && algo->second < int(cands.size())) {
+        choice = {0, cands[algo->second]};
+        have = true;
+      }
+    }
+  }
+
+  if (!have) {
+    if (dense_capturing()) return def;  // decide on a later, uncaptured launch
+    std::vector<DenseF32Lt> cands = dense_f32_lt_candidates(lt, rows, cols);
+    if (cands.empty()) {
+      std::lock_guard<std::mutex> lk(mu);
+      memo[key] = choice;
+      return choice;
+    }
+    double tune_s = 0.0;
+    int candidate_count = 0;
+    choice = dense_f32_tune(rows, cols, cands, pin == 1, tune_s,
+                            candidate_count);
+    if (pin == 1 && choice.impl != 0) {
+      // The pin forces the Lt arm (the ablation); a pinned measurement is not
+      // the class's decision, so it is not persisted.
+      choice = {0, cands.front()};
+    }
+    // The winner is an index into the candidate list: the cached record
+    // remembers the pick, never the opaque algorithm bytes.
+    int idx = 0;
+    if (choice.impl == 0)
+      for (size_t i = 0; i < cands.size(); ++i)
+        if (std::memcmp(&cands[i].algo, &choice.lt.algo,
+                        sizeof(choice.lt.algo)) == 0)
+          idx = int(i);
+    if (pin < 0) {
+      std::map<std::string, int> values{{"impl", choice.impl}, {"algo", idx}};
+      ::sonicboom::tune::store("dense-f32", key, values);
+    }
+    if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
+      std::fprintf(stderr,
+                   "[autotune] dense-f32 %s default=sgemm chosen=%s "
+                   "algo=%d candidates=%d tune=%.2f s%s\n",
+                   key.c_str(), choice.impl == 0 ? "lt" : "sgemm", idx,
+                   candidate_count, tune_s, pin < 0 ? "" : " [pinned]");
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    memo[key] = choice;
+  }
+  return choice;
+}
+
+bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
+                           int rows, int ncols, bool strided) {
+  cublasHandle_t h = dense_cublas_handle();
+  if (!h) return false;
+  // The full-batch arm reads the position-major activation in place; the
+  // non-strided layout keeps the chunked repack below.
+  if (strided) {
+    const DenseF32Choice c = dense_f32_resolve(rows, cols);
+    if (c.impl == 0 && dense_f32_lt_launch(c.lt, d_w, cols, x, y, rows, ncols))
+      return true;
+  }
+  return matvec_f32_sgemm_chunked(d_w, cols, x, y, rows, ncols, strided);
 }
 
 std::string dense_choice_name(const DenseChoice &c) {
