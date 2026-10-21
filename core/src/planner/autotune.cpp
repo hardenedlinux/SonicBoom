@@ -19,7 +19,6 @@
 #include "decision_registry.h"
 #include "reduce_mode.h"
 
-#include <sonicboom/numerics.h>
 #include <sonicboom/runtime_features.h>
 
 #include <algorithm>
@@ -57,15 +56,16 @@ std::string compute_device_dir() {
   // same way.
   std::string dir = planner::device_identity() + "-reduce-" +
                     compiler::reduce_mode_name(planner::device_reduce_mode());
-  // The numerics profile changes which kernels exist (f16 KV variants) and
-  // which are acceptable (TF32 dense), so its picks are its own. Strict keeps
-  // the historical directory name so every pre-profile pick stays valid and a
-  // strict run resolves the same choices it always did; standard gets a
-  // suffix. The two keys are disjoint either way.
-  if (sonicboom::numerics_profile() !=
-      sonicboom::NumericsProfile::Strict)
-    dir += std::string("-num-") +
-           sonicboom::numerics_profile_name(sonicboom::numerics_profile());
+  // The numerics profile is NOT part of the device directory. It belongs in
+  // the keys of the choices whose candidate set or kernel it actually changes
+  // — today exactly one: the prefill attention class, whose f16-KV variant is
+  // a distinct kernel (attn_tune_key carries the -kv16 marker). A profile-wide
+  // directory would instead force every other class (mmq tiles, dense arms,
+  // gemv widths) to retune under standard, and a cold retune picks differently
+  // from a warm cache for reasons that have nothing to do with the profile:
+  // measured on DeepSeek d=4, the two directories' mmq-j picks alone moved a
+  // prefill near-tie by 0.09 logits and flipped the first token. If a future
+  // TF32 dense candidate arm is added, its key must gain the profile too.
   return dir;
 }
 

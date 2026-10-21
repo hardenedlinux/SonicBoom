@@ -1434,13 +1434,19 @@ bool cublas_enabled() noexcept {
 // dp4a batched path wins on wall time (the fp16 dequant + upload overhead is not
 // amortized over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
 //
-// That speed rule is also a numerics boundary — the dp4a gemv and the fp16
-// tensor-core GEMM disagree — so under standard the threshold drops to
-// mmq_min_n(): a Q6_K projection (the only quant type that reaches this branch)
-// then goes through the fixed-width blocked GEMM at every batch size, and a
-// prompt position's columns come out the same whether it is prefilled in a 34-
-// token segment or in an 8-token prefix segment. Strict keeps 32 exactly as
-// before; its goldens predate the profile switch.
+// That speed rule is also a numerics boundary, and the threshold is the same in
+// both profiles. The dp4a batched gemv is bit-identical to n calls of the
+// single-column matvec (same q8_1 quantization, same vec_dot, same reduction
+// order), so a position's projection is identical whether it arrives through a
+// batched prefill segment or a one-token decode step. The cuBLAS fp16 GEMM is
+// not: it accumulates tensor-core fragments in a different order. Routing small
+// batches (n in [2, 32)) through it — which is what dropping the threshold to
+// mmq_min_n() under standard did — made the 4-token batch prefill and four
+// per-token decode steps disagree on DeepSeek-R1-Distill-Qwen-1.5B, whose
+// attn_v/ffn_down/output projections are Q6_K (the only quant type that reaches
+// this branch when mmq is enabled): the batch-4, prefix-reuse and top-1 gates
+// all failed. At n >= 32 the fixed-width 128-position blocking in
+// matmul_f16_cublas_dev keeps the GEMM itself segment-invariant.
 constexpr int kCublasMinN = 32;
 int cublas_min_n() {
   static int v = [] {
@@ -1448,7 +1454,6 @@ int cublas_min_n() {
       const int x = std::atoi(e);
       if (x > 0) return x;
     }
-    if (numerics_profile() == NumericsProfile::Standard) return mmq_min_n();
     return kCublasMinN;
   }();
   return v;

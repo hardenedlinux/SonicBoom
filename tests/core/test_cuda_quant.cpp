@@ -977,15 +977,21 @@ int main() {
   // kMmqMinN==2 change), which is approximate and validated end-to-end rather
   // than bit-exactly. This block targets the dp4a batched gemv (the n >= 2
   // fallback when mmq is disabled), which must be bit-identical to n calls of
-  // matvec_f32 — so unset GEMV_F32 (activate q8_1) and disable mmq to force it.
+  // matvec_f32 — so unset GEMV_F32 (activate q8_1), disable mmq, and disable
+  // cuBLAS to force it. cuBLAS must be pinned off explicitly: its fp16 GEMM is
+  // not bit-identical to the matvec by design, so leaving it reachable would
+  // make this check depend on the n threshold rather than on the dp4a kernel.
   unsetenv("SONICBOOM_GEMV_F32");
   setenv("SONICBOOM_MMQ", "0", 1);
+  setenv("SONICBOOM_CUBLAS", "0", 1);
   test_batched_q8_1_type(sbquant::QuantType::Q3_K, "q3_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q4_K, "q4_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q5_K, "q5_K", rng);
   test_batched_q8_1_type(sbquant::QuantType::Q6_K, "q6_K", rng);
   test_legacy_batched_q8_1_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_batched_q8_1_type(sbquant::QuantType::Q8_0, "q8_0", rng);
+  // Restore the default cuBLAS setting: the cuBLAS checks below exercise it.
+  unsetenv("SONICBOOM_CUBLAS");
 
   test_mmq_q6_type(rng);
   // Legacy mmq, K % MMQ_ITER_K == 0 (no pad plane) and K = 896 (one pad plane,
