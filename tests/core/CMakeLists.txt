@@ -266,6 +266,15 @@ target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
 sb_add_cpp_test(test_blade_to_boom)
 
+# F2: the Boom data-flow analyses. Transfer functions on hand-checked
+# intervals, the reduction-safety rows against the standard forward-error
+# bounds, the dense-liveness comparison with the in-place marks, and the
+# read-only gate. Compiler-side and CPU-only.
+add_executable(test_boom_analysis test_boom_analysis.cpp)
+target_link_libraries(test_boom_analysis PRIVATE sonicboom sonicboom_compiler
+                                                     MLIRAsmParser)
+sb_add_cpp_test(test_boom_analysis)
+
 # Graph -> Boom IR -> graph smoke test on the six model/mode cases: the
 # emitter's graph comes back structurally identical (tensor table and every
 # node field, in order), and therefore with the same model fingerprint. The
