@@ -3096,7 +3096,9 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // own keeps the prefill lead (pp512 on the 3050: 1.61 vs 1.86 ms per call,
   // 7 global layers), so the prefill table takes own. The decode leg has its
   // own, separately switched implementation; SONICBOOM_ATTN_PREFILL=codegen
-  // pins the generated kernel back for this leg.
+  // pins the generated kernel back for this leg. This table has no query
+  // count; the prefill dispatch keeps the generated 32x16 tile below q=128,
+  // where own loses.
   if (gqa == 4 && head_dim == 512) return {AttnImpl::Own, 0, 0, 0};
   if (gqa == 4 && head_dim == 256) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
@@ -3930,6 +3932,12 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
         const compiler::AttentionShape s = attn_prefill_shape(
             head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as);
         if (compiler::attention_shape_supported(s)) shape = s;
+      } else if (head_dim == 512 && gqa == 4 && !windowed && n < 128) {
+        // Own's d512 lead is an n >= 128 property. Below it the generated
+        // 32x16 tile wins: a prefix-reuse suffix prefill (q=64) measured
+        // 57.44 ms generated vs 58.89 own across the 7 global layers, while
+        // own takes over at q=128 (87.9 vs 89.6) and leads at q=512.
+        shape = attn_codegen_shape(head_dim, gqa, windowed);
       }
     }
   }

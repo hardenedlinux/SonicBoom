@@ -1377,7 +1377,7 @@ step 125 task 125 node 199 op flash_attention backend sonic stream s0
   buf in 2 t198 buffer b40 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t201 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 126 task 126 node 200 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -2889,7 +2889,7 @@ step 263 task 263 node 421 op flash_attention backend sonic stream s0
   buf in 2 t420 buffer b64 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t423 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 264 task 264 node 422 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -4401,7 +4401,7 @@ step 401 task 401 node 643 op flash_attention backend sonic stream s0
   buf in 2 t642 buffer b88 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t645 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 402 task 402 node 644 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -5913,7 +5913,7 @@ step 539 task 539 node 865 op flash_attention backend sonic stream s0
   buf in 2 t864 buffer b112 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t867 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 540 task 540 node 866 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -7185,7 +7185,7 @@ step 653 task 653 node 1045 op flash_attention backend sonic stream s0
   buf in 2 t864 buffer b112 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1047 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 654 task 654 node 1046 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -8457,7 +8457,7 @@ step 767 task 767 node 1225 op flash_attention backend sonic stream s0
   buf in 2 t864 buffer b112 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1227 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 768 task 768 node 1226 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
@@ -9729,7 +9729,7 @@ step 881 task 881 node 1405 op flash_attention backend sonic stream s0
   buf in 2 t864 buffer b112 offset 0 size 32768 shape [8,1024] dtype float32
   buf in_graph 3 t1 buffer b1 offset 0 size 64 shape [] dtype int64
   buf out 0 t1407 buffer b36 offset 0 size 131072 shape [8,4096] dtype float32
-  launch flash_attention_tiled_kernel<HEAD_DIM=512,BK=32,NW=4,QB=16,GQA=4> grid 1x2x1 block 512x1x1 smem 72448 stream s0
+  launch attn-d512-g4-causal-b32x16-dps8 grid 1x8x1 block 512x1x1 smem 90880 stream s0
 step 882 task 882 node 1406 op quantized_matmul backend sonic
   attr batch 8
   attr buf 2
