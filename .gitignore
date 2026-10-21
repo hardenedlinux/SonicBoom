@@ -97,6 +97,8 @@ tools/sb-explain
 
 # MOSS-Image bring-up driver (tools/build_sb_moss.sh builds it)
 tools/sb-moss
+# range/error analysis driver (tools/build_sb_range.sh builds it)
+tools/sb-range
 
 *.log
 

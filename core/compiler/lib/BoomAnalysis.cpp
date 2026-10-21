@@ -202,6 +202,14 @@ bool RangeFacts::save(llvm::StringRef path, std::string *error) const {
   return true;
 }
 
+void RangeFacts::mergeFrom(const RangeFacts &other) {
+  for (size_t i = 0; i < other.weights_.size(); ++i)
+    setWeight(other.weights_[i].slot, other.weights_[i].layer,
+              other.weight_ranges_[i]);
+  for (size_t i = 0; i < other.tensor_names_.size(); ++i)
+    setTensor(other.tensor_names_[i], other.tensor_ranges_[i]);
+}
+
 // --- IR helpers -------------------------------------------------------------
 
 namespace {
@@ -254,6 +262,22 @@ bool intAttr(Operation *op, llvm::StringRef name, int64_t &out) {
   return false;
 }
 
+// An integer attribute the emitter writes as a typed attribute or a pass writes
+// into the node_attrs record (BufferReusePass's inplace/buf are of the latter
+// kind: they are facts about the node, not part of the operator's vocabulary).
+bool nodeIntAttr(Operation *op, llvm::StringRef name, int64_t &out) {
+  if (intAttr(op, name, out)) return true;
+  if (auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs"))
+    for (mlir::Attribute a : attrs)
+      if (auto na = mlir::dyn_cast<boom::NodeAttr>(a))
+        if (na.getName() == name)
+          if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(na.getValue())) {
+            out = ia.getInt();
+            return true;
+          }
+  return false;
+}
+
 bool floatAttr(Operation *op, llvm::StringRef name, double &out) {
   if (auto a = op->getAttrOfType<mlir::FloatAttr>(name)) {
     out = a.getValueAsDouble();
@@ -270,6 +294,15 @@ bool floatAttr(Operation *op, llvm::StringRef name, double &out) {
 // program lifting derives from it.
 bool isUnit(Operation *op) {
   return mlir::isa<boom::GraphOp>(op) || mlir::isa<boom::StepOp>(op);
+}
+
+// A node's result tensor ids. The record is a DenseI64ArrayAttr (the builder's
+// getDenseI64ArrayAttr), not a generic ArrayAttr: reading it as the wrong type
+// silently loses every result id.
+llvm::ArrayRef<int64_t> resultIds(Operation *node) {
+  if (auto a = node->getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids"))
+    return a.asArrayRef();
+  return {};
 }
 
 llvm::ArrayRef<mlir::Attribute> unitTensors(Operation *op) {
@@ -304,10 +337,7 @@ llvm::StringRef blockArgName(mlir::BlockArgument arg) {
   if (!unit || !isUnit(unit)) return {};
   llvm::DenseSet<int64_t> producedSet;
   for (Operation &node : unitBody(unit))
-    if (auto ids = node.getAttrOfType<mlir::ArrayAttr>("result_ids"))
-      for (mlir::Attribute a : ids)
-        if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(a))
-          producedSet.insert(ia.getInt());
+    for (int64_t id : resultIds(&node)) producedSet.insert(id);
   llvm::SmallVector<int64_t, 32> freeIds;
   for (mlir::Attribute a : unitTensors(unit))
     if (auto d = mlir::dyn_cast<boom::TensorDescAttr>(a))
@@ -324,15 +354,13 @@ llvm::StringRef blockArgName(mlir::BlockArgument arg) {
 // The tensor-table name of a node's first result: the key a calibration fact
 // is stored under.
 llvm::StringRef resultName(Operation *node) {
-  auto ids = node->getAttrOfType<mlir::ArrayAttr>("result_ids");
-  if (!ids || ids.empty()) return {};
-  auto ia = mlir::dyn_cast<mlir::IntegerAttr>(ids[0]);
-  if (!ia) return {};
+  const llvm::ArrayRef<int64_t> ids = resultIds(node);
+  if (ids.empty()) return {};
   Operation *unit = node->getParentOp();
   if (!unit || !isUnit(unit)) return {};
   for (mlir::Attribute a : unitTensors(unit))
     if (auto d = mlir::dyn_cast<boom::TensorDescAttr>(a))
-      if (d.getId() == ia.getInt()) return d.getName();
+      if (d.getId() == ids[0]) return d.getName();
   return {};
 }
 
@@ -734,12 +762,10 @@ LiveAfter computeLiveAfter(Operation *unit) {
   llvm::DenseSet<int64_t> outputs;
   for (int64_t id : unitOutputs(unit)) outputs.insert(id);
   for (Operation &node : unitBody(unit)) {
-    auto ids = node.getAttrOfType<mlir::ArrayAttr>("result_ids");
-    if (!ids) continue;
-    for (auto [index, a] : llvm::enumerate(ids))
-      if (auto ia = mlir::dyn_cast<mlir::IntegerAttr>(a))
-        if (outputs.count(ia.getInt()) && index < node.getNumResults())
-          live.insert(node.getResult(index));
+    const auto ids = resultIds(&node);
+    for (size_t index = 0; index < ids.size() && index < node.getNumResults();
+         ++index)
+      if (outputs.count(ids[index])) live.insert(node.getResult(index));
   }
   out.liveAtEnd = live;
   llvm::SmallVector<Operation *> nodes;
@@ -756,12 +782,10 @@ LiveAfter computeLiveAfter(Operation *unit) {
 
 // The tensor id a node result carries, for graph-output membership.
 bool resultIsOutput(Operation *unit, Operation *node, unsigned index) {
-  auto ids = node->getAttrOfType<mlir::ArrayAttr>("result_ids");
-  if (!ids || index >= ids.size()) return false;
-  auto ia = mlir::dyn_cast<mlir::IntegerAttr>(ids[index]);
-  if (!ia) return false;
+  const auto ids = resultIds(node);
+  if (index >= ids.size()) return false;
   for (int64_t id : unitOutputs(unit))
-    if (id == ia.getInt()) return true;
+    if (id == ids[index]) return true;
   return false;
 }
 
@@ -804,6 +828,7 @@ AnalysisResult analyzeBoom(mlir::ModuleOp module, const RangeFacts &facts,
       continue;
     }
     const auto &last = analysis->last();
+    const std::string unitTag = unitKind(unit).str() + ":" + unitName(unit).str();
 
     // Walk the node list in order: a stable, deterministic report.
     size_t nodeIndex = 0;
@@ -817,7 +842,7 @@ AnalysisResult analyzeBoom(mlir::ModuleOp module, const RangeFacts &facts,
           {node.getAttrOfType<mlir::StringAttr>("node_name")
                ? node.getAttrOfType<mlir::StringAttr>("node_name").getValue().str()
                : std::string(node.getName().getStringRef()),
-           std::string(node.getName().getStringRef()), r});
+           std::string(node.getName().getStringRef()), r, unitTag});
       if (!r.known) {
         ++result.values_unknown;
         if (nodeIndex <= 4)
@@ -825,11 +850,15 @@ AnalysisResult analyzeBoom(mlir::ModuleOp module, const RangeFacts &facts,
                                  std::string(node.getName().getStringRef()));
       }
       auto it = last.find(&node);
-      if (it != last.end() && it->second.hasReduction)
-        result.reductions.push_back(it->second.reduction);
+      if (it != last.end() && it->second.hasReduction) {
+        ReductionReport rr = it->second.reduction;
+        rr.unit = unitTag;
+        result.reductions.push_back(std::move(rr));
+      }
     }
 
     // --- dense backward liveness vs BufferReusePass marks ---
+    size_t marks = 0;
     const LiveAfter liveAfter = computeLiveAfter(unit);
     mlir::dataflow::RunLivenessAnalysis valueLiveness(unit);
 
@@ -847,38 +876,43 @@ AnalysisResult analyzeBoom(mlir::ModuleOp module, const RangeFacts &facts,
             result.liveness.push_back(
                 {std::string(node.getName().getStringRef()), "analysis",
                  "MLIR's liveness calls a value dead that the per-position "
-                 "sweep has live after this node"});
+                 "sweep has live after this node",
+                 unitTag});
         }
       }
 
-      auto inplace = node.getAttrOfType<mlir::IntegerAttr>("inplace");
-      if (!inplace || inplace.getInt() == 0) continue;
+      int64_t inplace = 0;
+      if (!nodeIntAttr(&node, "inplace", inplace) || inplace == 0) continue;
+      ++marks;
       const std::string nodeName =
           node.getAttrOfType<mlir::StringAttr>("node_name")
               ? node.getAttrOfType<mlir::StringAttr>("node_name").getValue().str()
               : std::string(node.getName().getStringRef());
       if (node.getNumOperands() == 0) {
         result.liveness.push_back({nodeName, "unsound",
-                                   "inplace=1 on a node with no operand 0"});
+                                   "inplace=1 on a node with no operand 0",
+                                   unitTag});
         continue;
       }
       Value source = node.getOperand(0);
       if (source.getDefiningOp() == nullptr) {
         result.liveness.push_back(
-            {nodeName, "unsound", "inplace=1 borrows a block argument's buffer"});
+            {nodeName, "unsound", "inplace=1 borrows a block argument's buffer",
+             unitTag});
         continue;
       }
       if (operandIsGraphOutput(unit, &node, 0)) {
         result.liveness.push_back(
             {nodeName, "unsound",
-             "inplace=1 overwrites operand 0, which is a graph output"});
+             "inplace=1 overwrites operand 0, which is a graph output", unitTag});
         continue;
       }
       auto after = liveAfter.after.find(&node);
       if (after != liveAfter.after.end() && after->second.count(source)) {
         result.liveness.push_back(
             {nodeName, "unsound",
-             "operand 0 is live after this node (a later node reads it)"});
+             "operand 0 is live after this node (a later node reads it)",
+             unitTag});
         continue;
       }
       // Sound but stricter than liveness: the pass also requires a single use
@@ -888,8 +922,11 @@ AnalysisResult analyzeBoom(mlir::ModuleOp module, const RangeFacts &facts,
         result.liveness.push_back(
             {nodeName, "strict",
              "operand 0 has earlier uses; dense liveness allows the reuse, the "
-             "pass requires one use"});
+             "pass requires one use",
+             unitTag});
     }
+    result.notes.push_back("inplace marks checked: " + std::to_string(marks) +
+                           " (" + unitTag + ")");
   }
 
   result.ok = true;

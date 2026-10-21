@@ -27,6 +27,7 @@
 #include "sonicboom/compiler/BoomAnalysis.h"
 #include "sonicboom/compiler/BoomBuilder.h"
 #include "sonicboom/compiler/BoomOps.h"
+#include "sonicboom/compiler/BoomPasses.h"
 
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/MLIRContext.h"
@@ -345,6 +346,35 @@ int main() {
       }
       check(strict, "an earlier-but-not-later use is a strict note");
       check(!unsound, "an earlier-but-not-later use is not unsound");
+    }
+  }
+
+  // --- the marks the pipeline's pass actually emits ----------------------
+  {
+    // x, y in; s = add(x, y); t = mul(s, x); u = scale(t) out. The mul's
+    // operand 0 (s) is one node result with one use, its own result t is not
+    // an output: exactly one mark, and it is sound (nothing reads s after the
+    // mul). The scale cannot be marked because its result is the output.
+    Built b = build([](compiler::BoomBuilder &b) {
+      auto x = b.input("x", {4}, sx::DType::Float32);
+      auto y = b.input("y", {4}, sx::DType::Float32);
+      auto s = b.node(planner::OpKind::Add, {x, y}, "s", {4}, {});
+      auto t = b.node(planner::OpKind::Mul, {s, x}, "tm", {4}, {});
+      auto u = b.node(planner::OpKind::Scale, {t}, "u", {4},
+                      {sx::Attribute{"scale", 2.0}});
+      b.set_output(u);
+    });
+    if (!b.module) {
+      check(false, "marked graph builds");
+    } else {
+      check(compiler::markBufferReuse(*b.module), "BufferReusePass runs");
+      compiler::RangeFacts f;
+      const auto r = compiler::analyzeBoom(*b.module, f);
+      bool checked = false;
+      for (const auto &n : r.notes)
+        if (n.find("inplace marks checked: 1 ") == 0) checked = true;
+      check(checked, "the pass's in-place mark reaches the analysis");
+      check(r.liveness.empty(), "a sound mark produces no liveness row");
     }
   }
 

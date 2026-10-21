@@ -30,6 +30,7 @@
 #include <sonicboom/quant/quantized_matmul.h>
 
 #include "async_prefetch.h"
+#include "calibration.h"
 
 #include <algorithm>
 #include <cmath>
@@ -561,6 +562,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
   if (!ok)
     return std::unexpected(fail("Sonic kernel failed for node '" + node->name +
                                 "'"));
+
+  // boom-r4 F2: an enabled calibration run folds this tensor's extrema into the
+  // process-wide sink, keyed by the graph tensor name the Boom IR also carries.
+  if (out_td->dtype == sx::DType::Float32)
+    calibration::record(out_td->name.c_str(),
+                        std::span<const float>(
+                            reinterpret_cast<const float *>(out.data()),
+                            out.size() / sizeof(float)));
 
   // Side-effect-only nodes (KvAppend) have an orphaned dummy output the
   // planner drops from task.outputs; return zero outputs to match the task's
