@@ -3096,6 +3096,14 @@ const char *phaseName(planner::IrPassPhase phase) {
 
 } // namespace
 
+bool markBufferReuse(mlir::ModuleOp module) {
+  // The pass anchors on boom.graph, so it is scheduled on the nested op: a
+  // module-level addPass is rejected as an unsupported schedule.
+  mlir::PassManager pm(module.getContext());
+  pm.addNestedPass<boom::GraphOp>(std::make_unique<BufferReusePass>());
+  return mlir::succeeded(pm.run(module));
+}
+
 MmqTcMode mmq_tc_mode() {
   // Read on every call (not cached): the switch is an ablation input, and a
   // caller that changes it between runs must see the new value. Unset means

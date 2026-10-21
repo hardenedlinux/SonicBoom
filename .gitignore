@@ -94,4 +94,7 @@ tools/sb-numerics
 # decision explainer (tools/build_sb_explain.sh builds it)
 tools/sb-explain
 
+# range/error analysis driver (tools/build_sb_range.sh builds it)
+tools/sb-range
+
 *.log

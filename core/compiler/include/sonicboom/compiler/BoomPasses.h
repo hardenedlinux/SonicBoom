@@ -51,6 +51,13 @@ namespace sonicboom::compiler {
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
                    bool skip_kv_append_fusion = false);
 
+// Run BufferReusePass alone over every boom.graph in `module`, so a caller can
+// see the `inplace`/`buf` marks a full pipeline would produce on that node
+// list. Analysis tooling only (boom-r4 F2): the runtime never calls it — the
+// phase pipeline does — and a caller that runs it should do so on a clone, the
+// way the liveness comparison does.
+bool markBufferReuse(mlir::ModuleOp module);
+
 // The MMQ1 prefill dispatch switch (prefill_dispatch_pass), read from
 // SONICBOOM_MMQ_TC:
 //   off (default) — never rewrite: the ggml mmq path. This is the default

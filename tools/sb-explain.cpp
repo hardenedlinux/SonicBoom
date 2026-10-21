@@ -34,10 +34,20 @@
 
 #include <sonicboom/numerics.h>
 
+#include "analysis_driver.h"
+
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <map>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <unistd.h>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -79,22 +89,139 @@ void section(const char* title) {
   std::cout << "\n== " << title << " ==\n";
 }
 
+// The reduction rows, aggregated over the nodes that share an (op, K) pair:
+// the worst bound per column, and whether every node is provable under each
+// accumulation order. A row is a reduction kernel class; its nodes differ only
+// in the values the calibration measured.
+struct ReductionRow {
+  std::size_t nodes = 0;
+  double max_sum_abs = 0.0;
+  double max_err_seq = 0.0;
+  double max_err_tree = 0.0;
+  bool seq_all = true;
+  bool tree_all = true;
+};
+
+// Run the F2 analysis on MODEL with FACTS and print the facts it consumed and
+// the reduction-safety table it produced. Analysis only: the plan is unchanged.
+bool print_analysis(const std::string& model_path, const std::string& facts_path) {
+  const std::string out =
+      "/tmp/sb-explain-analysis-" + std::to_string(::getpid()) + ".txt";
+  std::string error;
+  if (!sb_tools::run_range_analysis(model_path, facts_path, out, &error)) {
+    std::cerr << "sb-explain: " << error << "\n";
+    std::remove(out.c_str());
+    return false;
+  }
+
+  std::ifstream in(out);
+  std::map<std::pair<std::string, long long>, ReductionRow> reductions;
+  std::vector<std::string> units, notes, liveness;
+  double epsilon = 0.0;
+  bool have_epsilon = false;
+  std::string line;
+  while (std::getline(in, line)) {
+    std::istringstream ss(line);
+    std::string kind;
+    ss >> kind;
+    if (kind == "reduction") {
+      std::string unit, node, op;
+      long long k = 0;
+      double sum_abs = 0.0, err_seq = 0.0, err_tree = 0.0;
+      int within_seq = 0, within_tree = 0;
+      ss >> unit >> node >> op >> k >> sum_abs >> err_seq >> err_tree >>
+          within_seq >> within_tree;
+      if (!ss) continue;
+      ReductionRow& row = reductions[{op, k}];
+      ++row.nodes;
+      row.max_sum_abs = std::max(row.max_sum_abs, sum_abs);
+      row.max_err_seq = std::max(row.max_err_seq, err_seq);
+      row.max_err_tree = std::max(row.max_err_tree, err_tree);
+      row.seq_all = row.seq_all && within_seq != 0;
+      row.tree_all = row.tree_all && within_tree != 0;
+    } else if (kind == "unit") {
+      units.push_back(line);
+      if (!have_epsilon) {
+        const auto at = line.find("epsilon=");
+        if (at != std::string::npos) {
+          epsilon = std::atof(line.c_str() + at + 8);
+          have_epsilon = true;
+        }
+      }
+    } else if (kind == "note") {
+      notes.push_back(line.substr(kind.size() + 1));
+    } else if (kind == "liveness") {
+      liveness.push_back(line);
+    }
+  }
+  in.close();
+  std::remove(out.c_str());
+
+  // The facts the analysis consumed: one bound per (slot, layer) weight, one
+  // interval per named activation.
+  std::size_t weight_facts = 0, tensor_facts = 0;
+  {
+    std::ifstream facts(facts_path);
+    std::string f;
+    while (std::getline(facts, f))
+      if (f.rfind("weight ", 0) == 0)
+        ++weight_facts;
+      else if (f.rfind("tensor ", 0) == 0)
+        ++tensor_facts;
+  }
+
+  std::cout << "facts: " << weight_facts << " weight bounds, " << tensor_facts
+            << " tensor intervals (" << facts_path << ")\n";
+  for (const auto& u : units) std::cout << u << "\n";
+  for (const auto& n : notes) std::cout << "  " << n << "\n";
+  std::cout << "reduction safety (eps = " << epsilon
+            << " relative to sum|ab|; seq = sequential f32, tree = blocked f32):\n";
+  std::printf("  %-26s %6s %5s %12s %12s %12s %-4s %-4s\n", "op", "K", "nodes",
+              "max sum|ab|", "seq bound", "tree bound", "seq", "tree");
+  for (const auto& [key, row] : reductions)
+    std::printf("  %-26s %6lld %5zu %12.6g %12.6g %12.6g %-4s %-4s\n",
+                key.first.c_str(), key.second, row.nodes, row.max_sum_abs,
+                row.max_err_seq, row.max_err_tree, row.seq_all ? "yes" : "NO",
+                row.tree_all ? "yes" : "NO");
+  if (liveness.empty()) {
+    std::cout << "liveness: no disagreement between the in-place marks and "
+                 "dense backward liveness\n";
+  } else {
+    std::cout << "liveness (" << liveness.size() << " row(s)):\n";
+    for (const auto& l : liveness) std::cout << "  " << l << "\n";
+  }
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   bool json = false;
+  std::string analysis_model, analysis_facts;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
     if (a == "-h" || a == "--help") {
-      std::cout << "usage: sb-explain [--json]\n"
+      std::cout << "usage: sb-explain [--json] [--analysis MODEL FACTS]\n"
                    "Print the automatic choices for this device: the env\n"
                    "overrides, the per-device caches, and the decision\n"
-                   "registry. --json prints the registry as JSON. Nothing is\n"
-                   "tuned; the only write is the registry itself.\n";
+                   "registry. --json prints the registry as JSON. --analysis\n"
+                   "adds the Boom range/error facts for MODEL with FACTS and\n"
+                   "the per-reduction accumulation-safety table (analysis\n"
+                   "only: the plan is unchanged). Nothing is tuned; the only\n"
+                   "write is the registry itself.\n";
       return 0;
     }
     if (a == "--json") {
       json = true;
+      continue;
+    }
+    if (a == "--analysis") {
+      if (i + 2 >= argc) {
+        std::cerr << "sb-explain: --analysis needs MODEL and FACTS\n";
+        return 2;
+      }
+      analysis_model = argv[++i];
+      analysis_facts = argv[++i];
       continue;
     }
     std::cerr << "sb-explain: unknown option " << a << "\n";
@@ -179,6 +306,11 @@ int main(int argc, char** argv) {
   std::cout << "gemv = " << gemv_default.to_string() << "\n"
             << "matmul_q8_tc = " << mmq_default.to_string() << "\n"
             << "attn_prefill = dispatcher shape\n";
+
+  if (!analysis_model.empty()) {
+    section("range/error analysis (facts for the reduction kernels)");
+    if (!print_analysis(analysis_model, analysis_facts)) return 1;
+  }
 
   if (sonicboom::planner::decisions::conflict_count() > 0) {
     std::cerr << "sb-explain: "

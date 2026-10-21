@@ -17,6 +17,7 @@
 #include <sonicboom/model/plan.h>
 
 #include <sonicboom/runtime_features.h>
+#include <sonicboom/compiler/BoomAnalysis.h>
 #include <sonicboom/compiler/BoomBuilder.h>
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomPasses.h>
@@ -214,8 +215,107 @@ struct GraphIr {
 // Boom IR -> the graph the plan is derived from. A lowering that fails is
 // reported and leaves an empty graph, which fails the plan — there is
 // deliberately no fallback that would plan something else.
+// boom-r4 F2: analysis only. With SONICBOOM_BOOM_ANALYSIS_FACTS naming a
+// RangeFacts file, run the Boom range/error and liveness analyses over the
+// module and append the report to SONICBOOM_BOOM_ANALYSIS_OUT (stderr when
+// unset). The analyses write no attribute, so the graph the lowering returns is
+// byte-identical to one built without this call; nothing here reads back into
+// the plan. SONICBOOM_BOOM_ANALYSIS_UNITS restricts the site: "graph" (the
+// post-pass graphs lowered here, the default) or "program" (the lifted
+// boom.program, whose step carries the same node list).
+bool envOn(const char *name) {
+  const char *e = std::getenv(name);
+  return e && *e && *e != '0';
+}
+
+void analysisReport(mlir::ModuleOp module, llvm::StringRef label,
+                    const compiler::RangeFacts &facts) {
+  const compiler::AnalysisResult r = compiler::analyzeBoom(module, facts);
+
+  const char *out_path = std::getenv("SONICBOOM_BOOM_ANALYSIS_OUT");
+  std::FILE *f = out_path && *out_path ? std::fopen(out_path, "a") : stderr;
+  if (!f) return;
+  std::fprintf(f, "unit %s values=%zu unknown=%zu reductions=%zu liveness=%zu "
+                  "epsilon=%g ok=%d facts_weights=%zu facts_tensors=%zu\n",
+               label.str().c_str(), r.values_analyzed, r.values_unknown,
+               r.reductions.size(), r.liveness.size(), r.epsilon, int(r.ok),
+               facts.weightCount(), facts.tensorCount());
+  for (const auto &n : r.notes)
+    std::fprintf(f, "note %s\n", n.c_str());
+  for (const auto &v : r.values) {
+    if (v.range.known)
+      std::fprintf(f, "value %s %s %s %.9g %.9g %.9g\n", v.unit.c_str(),
+                   v.node.c_str(), v.op.c_str(), v.range.lo, v.range.hi,
+                   v.range.err);
+    else
+      std::fprintf(f, "unknown %s %s %s\n", v.unit.c_str(), v.node.c_str(),
+                   v.op.c_str());
+  }
+  for (const auto &x : r.reductions)
+    std::fprintf(f, "reduction %s %s %s %lld %.9g %.9g %.9g %d %d\n",
+                 x.unit.c_str(), x.node.c_str(), x.op.c_str(), (long long)x.k,
+                 x.sum_abs, x.err_seq, x.err_tree, int(x.within_seq),
+                 int(x.within_tree));
+  for (const auto &l : r.liveness)
+    std::fprintf(f, "liveness %s %s %s %s\n", l.unit.c_str(), l.kind.c_str(),
+                 l.node.c_str(), l.why.c_str());
+  if (f != stderr) std::fclose(f);
+}
+
+void maybe_analyze(mlir::ModuleOp module, llvm::StringRef label) {
+  const char *facts_path = std::getenv("SONICBOOM_BOOM_ANALYSIS_FACTS");
+  if (!facts_path || !*facts_path) return;
+  const char *scope = std::getenv("SONICBOOM_BOOM_ANALYSIS_UNITS");
+  const llvm::StringRef units = scope && *scope ? llvm::StringRef(scope) : "graph";
+  if (units != "all" && units != label) return;
+
+  compiler::RangeFacts facts;
+  std::string error;
+  if (!facts.load(facts_path, &error)) {
+    std::cerr << "[boom-analysis] " << error << "\n";
+    return;
+  }
+
+  // Both clones below are discarded; the module the lowering reads is never
+  // touched. SONICBOOM_BOOM_ANALYSIS_MARK runs BufferReusePass on the clone, so
+  // the liveness comparison sees the marks a full pipeline would produce (the
+  // CPU path lowers the emitter's IR without the phase's passes).
+  const bool mark = envOn("SONICBOOM_BOOM_ANALYSIS_MARK");
+
+  if (units == "all" || units == label) {
+    if (mark) {
+      mlir::OwningOpRef<mlir::ModuleOp> clone(
+          mlir::cast<mlir::ModuleOp>(module->clone()));
+      if (compiler::markBufferReuse(*clone))
+        analysisReport(*clone, label, facts);
+      else
+        analysisReport(module, label, facts);
+    } else {
+      analysisReport(module, label, facts);
+    }
+  }
+
+  // The program form: lift a clone of a decode graph into boom.program and
+  // analyze its step (the same node list, with the same marks).
+  if (envOn("SONICBOOM_BOOM_ANALYSIS_PROGRAM")) {
+    bool has_decode = false;
+    module.walk([&](compiler::boom::GraphOp g) {
+      if (g.getGraphName() == "gemma4_decode") has_decode = true;
+    });
+    if (has_decode) {
+      mlir::OwningOpRef<mlir::ModuleOp> clone(
+          mlir::cast<mlir::ModuleOp>(module->clone()));
+      if (mark) compiler::markBufferReuse(*clone);
+      if (mlir::succeeded(compiler::addGreedyProgram(*clone, "analysis",
+                                                     "prefill", {1}, {}, 0)))
+        analysisReport(*clone, "boom.program", facts);
+    }
+  }
+}
+
 planner::Graph lower_graph(mlir::ModuleOp module,
                            uint64_t dynamic_extent = 0) {
+  maybe_analyze(module, "graph");
   auto graph = compiler::boomToGraph(module, dynamic_extent);
   if (!graph) {
     std::cerr << "[plan] Boom IR -> graph failed (diagnostic above)\n";
@@ -2103,6 +2203,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
       std::cerr << "[plan] lowering boom.program failed (diagnostic above)\n";
       return nullptr;
     }
+    maybe_analyze(*program_module, "program");
     rt->program = read_greedy_program(*program_module);
     if (!rt->program.valid) {
       std::cerr << "[plan] boom.program did not read back as a greedy loop\n";

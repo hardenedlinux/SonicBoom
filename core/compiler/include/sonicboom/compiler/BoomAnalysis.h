@@ -101,6 +101,10 @@ public:
   bool load(llvm::StringRef path, std::string *error);
   bool save(llvm::StringRef path, std::string *error) const;
 
+  // Fold every fact of `other` in (later entries win, so a calibrated tensor
+  // overrides a weight of the same name).
+  void mergeFrom(const RangeFacts &other);
+
   size_t weightCount() const { return weights_.size(); }
   size_t tensorCount() const { return tensor_names_.size(); }
 
@@ -132,6 +136,7 @@ private:
 struct ReductionReport {
   std::string node;
   std::string op;
+  std::string unit;  // "<kind>:<name>" of the graph/step it came from
   int64_t k = 0;
   double sum_abs = 0.0;
   double err_seq = 0.0;
@@ -147,6 +152,7 @@ struct LivenessCheck {
   std::string node;
   std::string kind;  // "unsound" | "strict" | "missed"
   std::string why;
+  std::string unit;  // "<kind>:<name>"
 };
 
 // What was proved about one node's first result, in node order. The op name is
@@ -155,6 +161,7 @@ struct ValueFact {
   std::string node;
   std::string op;
   RangeError range;
+  std::string unit;  // "<kind>:<name>"
 };
 
 struct AnalysisResult {
