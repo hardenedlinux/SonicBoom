@@ -247,6 +247,29 @@ int main() {
     }
   }
 
+  // --- the ple_proj weight, named by op kind rather than by slot ----------
+  {
+    Built b = build([](compiler::BoomBuilder &b) {
+      auto x = b.input("x", {4}, sx::DType::Float32);
+      auto m = b.node(planner::OpKind::MatvecBf16, {x}, "ple_proj", {4}, {});
+      b.set_output(m);
+    });
+    if (!b.module) {
+      check(false, "ple_proj graph builds");
+    } else {
+      compiler::RangeFacts f;
+      f.setTensor("x", compiler::RangeError::bounded(-1.0, 1.0, 0.0));
+      // WeightSlot::PerLayerModelProj = 3, recorded at layer -1.
+      f.setWeight(3, -1, compiler::RangeError::bounded(-0.5, 0.5, 0.0));
+      const auto r = compiler::analyzeBoom(*b.module, f);
+      const auto *v = fact(r, "matvec_bf16", "boom.matvec_bf16");
+      check(v != nullptr && v->range.known, "ple_proj's weight is resolved");
+      const auto *rr = reduction(r, "boom.matvec_bf16", 4);
+      check(rr != nullptr, "the ple_proj is a reduction row");
+      if (rr) near(rr->sum_abs, 4.0 * 1.0 * 0.5, "ple_proj sum|ab|");
+    }
+  }
+
   // --- a norm reduction ---------------------------------------------------
   {
     Built b = build([](compiler::BoomBuilder &b) {
