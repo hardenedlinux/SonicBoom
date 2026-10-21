@@ -165,6 +165,14 @@ bool write_file(const std::string& path, const std::string& text) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // The committed goldens record the hand-written plan: the JIT candidate
+  // tuner's picks are a per-device measurement decision (recorded with the
+  // other decisions, shown by sb-explain), not part of the plan-shape
+  // contract. Leaving it on would make the golden text depend on the timing of
+  // the cold run and on the JIT cache state, which is exactly what this test
+  // exists to exclude. The hand-written tuner stays on, so the golden's own
+  // generated-attention shape (what that tuner picked) is reproduced.
+  ::setenv("SONICBOOM_AUTOTUNE_JIT", "0", 1);
   bool write_goldens = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];

@@ -85,7 +85,10 @@ int main() {
     return 1;
   }
   set_env("XDG_CACHE_HOME", dir);
-  set_env("SONICBOOM_AUTOTUNE", nullptr);
+  set_env("SONICBOOM_AUTOTUNE", "0");
+  // The GPU section forces several cold retunes; lift the production cold
+  // budget so they are not cut short.
+  set_env("SONICBOOM_AUTOTUNE_BUDGET_MS", "0");
   mt::AutotuneCache::instance().reset_for_test();
   mt::attn_prefill_reset_for_test();
 
@@ -160,7 +163,7 @@ int main() {
   // --- gate and cache ----------------------------------------------------
   {
     mt::AttnPrefillChoice off = mt::attn_prefill_choice(128, 200, 14);
-    check(!off.resolved(), "gate unset: the class is unresolved");
+    check(!off.resolved(), "gate off: the class is unresolved");
 
     set_env("SONICBOOM_AUTOTUNE", "1");
     mt::attn_prefill_reset_for_test();
@@ -246,7 +249,7 @@ int main() {
       // bypassed by the pin. The tuner's reference is the same config.
       set_env("SONICBOOM_ATTN_CODEGEN", "64,16,1,2");
       set_env("SONICBOOM_ATTN_IMPL", nullptr);
-      set_env("SONICBOOM_AUTOTUNE", nullptr);
+      set_env("SONICBOOM_AUTOTUNE", "0");
       std::vector<float> ref;
       const bool ref_ok = run(ref);
       check(ref_ok, "the production-config reference runs");

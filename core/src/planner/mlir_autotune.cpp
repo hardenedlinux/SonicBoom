@@ -16,6 +16,8 @@
 
 #include "mlir_autotune.h"
 
+#include <sonicboom/runtime_features.h>
+
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -149,13 +151,83 @@ std::optional<TileConfig> TileConfig::from_string(std::string_view s) {
 }
 
 bool enabled() {
+  // Same default as the hand-written tuner (autotune.h): on unless =0, with
+  // the runtime `autotune` feature (SONICBOOM_FEATURE_DISABLE=autotune) as the
+  // ablation switch covering both services.
+  if (::sonicboom::runtime::feature_disabled(
+          ::sonicboom::runtime::Feature::Autotune))
+    return false;
+  // The JIT-candidate service has its own ablation switch, so a run can keep
+  // the hand-written tuner's choices and drop only the generated candidates
+  // (the plan-record goldens use it).
+  const char* j = std::getenv("SONICBOOM_AUTOTUNE_JIT");
+  if (j && std::strcmp(j, "0") == 0) return false;
   const char* e = std::getenv("SONICBOOM_AUTOTUNE");
-  return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "force") == 0);
+  return e == nullptr || std::strcmp(e, "0") != 0;
 }
 
 bool force() {
   const char* e = std::getenv("SONICBOOM_AUTOTUNE");
   return e && std::strcmp(e, "force") == 0;
+}
+
+namespace {
+
+// One budget per process, started lazily by the first unresolved class. A
+// warm process (every class cached) never calls budget_remaining_ms(), so it
+// never starts the clock. Both the runner and the per-class choice functions
+// consult this; the callers' confirmation re-measurement loops check it too, so
+// the total cold cost stays inside the budget.
+struct BudgetState {
+  bool started = false;
+  bool unlimited = false;
+  std::chrono::steady_clock::time_point start;
+  int64_t budget_ms = 0;
+};
+
+std::mutex& budget_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+BudgetState& budget_state() {
+  static BudgetState s;
+  return s;
+}
+
+int64_t configured_budget_ms() {
+  const char* e = std::getenv("SONICBOOM_AUTOTUNE_BUDGET_MS");
+  if (e && *e) {
+    char* tail = nullptr;
+    const long long v = std::strtoll(e, &tail, 10);
+    if (tail && *tail == '\0') return int64_t(v);
+  }
+  return 10000;  // a first run on a new device measures for at most ~10 s
+}
+
+} // namespace
+
+int64_t budget_remaining_ms() {
+  std::lock_guard<std::mutex> lock(budget_mutex());
+  BudgetState& s = budget_state();
+  if (!s.started) {
+    s.started = true;
+    s.start = std::chrono::steady_clock::now();
+    s.budget_ms = configured_budget_ms();
+    s.unlimited = s.budget_ms <= 0;
+  }
+  if (s.unlimited) return std::numeric_limits<int64_t>::max();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - s.start)
+                           .count();
+  return std::max<int64_t>(0, s.budget_ms - int64_t(elapsed));
+}
+
+bool budget_exhausted() { return budget_remaining_ms() <= 0; }
+
+void reset_budget_for_test() {
+  std::lock_guard<std::mutex> lock(budget_mutex());
+  budget_state() = BudgetState{};
 }
 
 int sm_version() {
@@ -356,6 +428,15 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
       return choice;
     }
   }
+  // Out of cold budget: keep the static default for this class for the rest of
+  // the process. Memoized as Skipped (which resolved() reports true) so the
+  // caller's per-launch check does not rebuild the probe problem every call.
+  if (budget_exhausted()) {
+    const GemvChoice choice{default_config("gemv"), GemvSource::Skipped};
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo().emplace(key, choice);
+    return choice;
+  }
   return GemvChoice{default_config("gemv"), GemvSource::Default};
 }
 
@@ -442,6 +523,14 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
       mmq_tc_memo().emplace(key, choice);
       return choice;
     }
+  }
+  // Out of cold budget: static default for this class for the rest of the
+  // process, memoized so it is not probed again.
+  if (budget_exhausted()) {
+    const MmqTcChoice choice{mmq_tc_default_config(), MmqTcSource::Skipped};
+    std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
+    mmq_tc_memo().emplace(key, choice);
+    return choice;
   }
   return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
 }
@@ -539,6 +628,15 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
       return choice;
     }
   }
+  // Out of cold budget: keep the dispatcher's own shape for this class. The
+  // empty cfg is rejected by the caller's apply(), so nothing is probed; the
+  // Skipped record keeps the class out of the allocation path as well.
+  if (budget_exhausted()) {
+    const AttnPrefillChoice choice{TileConfig{}, AttnPrefillSource::Skipped};
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    attn_prefill_memo().emplace(key, choice);
+    return choice;
+  }
   return AttnPrefillChoice{};
 }
 
@@ -560,6 +658,10 @@ void attn_prefill_reset_for_test() {
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   if (!enabled() || problem.candidates.empty() || !problem.compile)
     return std::nullopt;
+  // Every probe starts its own clock check: the cold budget is shared by every
+  // class tuned in this process, and an exhausted budget must not launch even
+  // the reference candidate (the caller already has its default).
+  if (budget_exhausted()) return std::nullopt;
 
   const int iters = problem.iters > 0 ? problem.iters : 5;
   std::vector<unsigned char> reference(problem.output_bytes);
@@ -585,7 +687,11 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
 
   // Compile and bit-check every other candidate before any timing: a
   // candidate that cannot compile or that writes a different window is out.
+  // Compiling a JIT candidate is the expensive part of a cold class, so the
+  // budget is checked between compilations; the reference and every candidate
+  // compiled so far stay in the race.
   for (size_t i = 1; i < problem.candidates.size(); ++i) {
+    if (budget_exhausted()) break;
     auto launch = problem.compile(problem.candidates[i]);
     if (!launch) continue;
     (*launch)();
@@ -604,7 +710,12 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   // load drift land on whichever end of the list ran first; at the few-percent
   // margins these tuners measure, that bias flipped the nomination between
   // processes. Each candidate keeps its fastest round.
+  int rounds = 0;
   for (int r = 0; r < iters; ++r) {
+    // The budget may expire mid-search; rank the rounds already measured. A
+    // class with no complete round is left unresolved (the caller keeps its
+    // default) rather than nominated from a partial one.
+    if (budget_exhausted()) break;
     const bool forward = (r & 1) == 0;
     for (size_t j = 0; j < entries.size(); ++j) {
       Entry& e = entries[forward ? j : entries.size() - 1 - j];
@@ -619,7 +730,9 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
           e.ns,
           std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
+    ++rounds;
   }
+  if (rounds == 0) return std::nullopt;
 
   // Strict <: on a tie the earlier candidate (candidate 0, the reference) wins,
   // so a marginal measurement keeps the known config.
@@ -628,8 +741,9 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
     if (entries[i].ns < entries[best].ns) best = i;
 
   if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE")) {
-    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d rounds\n",
-                 entries.size(), iters);
+    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d/%d rounds%s\n",
+                 entries.size(), rounds, iters,
+                 rounds < iters ? " (budget)" : "");
     for (const Entry& e : entries)
       std::fprintf(stderr, "  %d,%d,%d,%d,%d: %.4f ms%s\n", e.cfg.tile_m,
                    e.cfg.tile_n, e.cfg.tile_k, e.cfg.unroll, e.cfg.vectorize,

@@ -25,17 +25,39 @@
 // compile each candidate, time N iterations, keep a candidate only if its
 // output matches the reference bit for bit, and return the fastest.
 //
-// Gate: the runner is enabled by SONICBOOM_AUTOTUNE=1 (off by default);
-// SONICBOOM_AUTOTUNE=force additionally ignores the disk cache and retimes
-// every class. With the gate off nothing is compiled, timed, or stored, and
-// callers keep their static default. This is deliberately the opposite default of the
-// older sonicboom::tune service (autotune.h, which tunes already-compiled
-// hand-written kernels at runtime and is on unless SONICBOOM_AUTOTUNE=0):
-// compiling and launching JIT candidates is opt-in.
+// Gate: the runner is enabled by default, like the older sonicboom::tune
+// service (autotune.h). SONICBOOM_AUTOTUNE=0 disables it (nothing is compiled,
+// timed, or stored; callers keep their static default), and
+// SONICBOOM_AUTOTUNE=force retimes every class, ignoring the disk cache.
+// Disabling the runtime `autotune` feature does the same as =0.
+// SONICBOOM_AUTOTUNE_JIT=0 disables only this JIT-candidate service and leaves
+// the hand-written tuner on; it is the ablation for "generated kernel vs the
+// hand-written kernel the other tuner chose", and the mode the plan-record
+// goldens use so their text stays the hand-written plan.
+//
+// Cold budget: cold tuning (every class not in the disk cache) shares one
+// process-wide wall-clock budget, SONICBOOM_AUTOTUNE_BUDGET_MS (default 10000;
+// <= 0 means unlimited). When it runs out, the remaining classes keep their
+// static default for the life of the process and are not probed again, while
+// the classes tuned before it expired are persisted as usual. The clock starts
+// at the first unresolved class, so a process whose classes are all cached
+// spends nothing. The budget bounds a first run on a new device to ~10 s of
+// measurement instead of minutes; every choice is still decided once per
+// device and cached.
+//
+// Determinism: a cache hit is deterministic — the same record is applied on
+// every launch and in every process on the device. A cold measurement is
+// timing dependent, so two cold processes can disagree within the tuner's
+// resolution; the runner only ever picks a candidate whose output is
+// bit-identical to the static default, so a different pick changes the kernel's
+// launch geometry, never the token stream or the numerics.
 //
 // Cache location: $XDG_CACHE_HOME/sonicboom/autotune/sm_<NN>.bin, else
 // $HOME/.cache/sonicboom/autotune/sm_<NN>.bin, where <NN> is the device
-// compute capability × 10 (sm_86 for an RTX 3050; sm_00 without CUDA).
+// compute capability × 10 (sm_86 for an RTX 3050; sm_00 without CUDA). The
+// file is a versioned fixed-record array written in place under an exclusive
+// flock, so concurrent processes never see a torn update and a version bump
+// invalidates every record (the first store rewrites the file).
 //
 // Layer placement: internal runtime machinery (core/src/planner), not part of
 // the Layer 2 public headers; no MLIR/LLVM/CUDA types in this interface.
@@ -70,11 +92,22 @@ struct TileConfig {
 // whenever the gate is off, so AUTOTUNE=0 is the pre-Q1 code path.
 TileConfig default_config(std::string_view op);
 
-// SONICBOOM_AUTOTUNE=1 (exact string) enables the runner. Read per call.
-// SONICBOOM_AUTOTUNE=force also enables it and makes every per-class lookup
-// skip the disk cache, so each class is retimed in this process.
+// True unless SONICBOOM_AUTOTUNE=0, SONICBOOM_AUTOTUNE_JIT=0, or the
+// `autotune` runtime feature is disabled. Read per call, so a test can flip it
+// between sections.
 bool enabled();
+// SONICBOOM_AUTOTUNE=force: every per-class lookup skips the disk cache, so
+// each class is retimed in this process.
 bool force();
+
+// Wall-clock budget left for cold tuning in this process, in milliseconds
+// (0 when exhausted). Starts the clock on its first call; SONICBOOM_AUTOTUNE_
+// BUDGET_MS overrides the 10 s default (<= 0 = unlimited).
+int64_t budget_remaining_ms();
+bool budget_exhausted();
+
+// Restart the cold-tuning clock (tests only; the disk cache is untouched).
+void reset_budget_for_test();
 
 // Device compute capability × 10 (86, 89, 120); 0 when the build has no CUDA
 // or no device is visible. Cached after the first call.
@@ -125,6 +158,7 @@ enum class GemvSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct GemvChoice {
@@ -179,6 +213,7 @@ enum class MmqTcSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct MmqTcChoice {
@@ -237,6 +272,7 @@ enum class AttnPrefillSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct AttnPrefillChoice {
@@ -286,8 +322,10 @@ class AutotuneRunner {
     int iters = 5;
   };
 
-  // Fastest bit-identical candidate, or nullopt when the gate is off, no
-  // candidate compiles, or every candidate diverges from the reference.
+  // Fastest bit-identical candidate, or nullopt when the gate is off, the
+  // cold budget is exhausted before any round completes, no candidate
+  // compiles, or every candidate diverges from the reference. An expired
+  // budget stops the search and ranks the rounds already measured.
   static std::optional<TileConfig> run(const Problem& problem);
 };
 

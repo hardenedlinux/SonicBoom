@@ -3360,7 +3360,7 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
 //
 // The class key is (head_dim, seq_len bucket, query-head bucket) and the
 // choice lives in the mlir_tune per-SM cache under "attn_prefill", gated by
-// SONICBOOM_AUTOTUNE=1.
+// the autotune switch (on by default, SONICBOOM_AUTOTUNE=0 disables).
 //
 // Returns a shape with the winner's knobs applied, or nullopt to keep `base`
 // (gate off, capture, probe failure, no bit-identical winner).
@@ -3400,6 +3400,10 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
       mlir_tune::attn_prefill_choice(head_dim, n, n_heads_q);
   if (choice.resolved()) return apply(choice.cfg);
   if (attn_capturing()) return std::nullopt;  // host timing is illegal there
+  // Out of cold budget: keep the dispatcher's shape without allocating the
+  // probe buffers (the choice function memoizes a Skipped record, so this is
+  // reached once per class).
+  if (mlir_tune::budget_exhausted()) return std::nullopt;
 
   // Probe at the caller's query length (capped so the scratch stays small; a
   // class is a bucket, and any length inside it is a valid probe).
@@ -3544,12 +3548,22 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
     return launch_ok ? std::optional<double>(best_s) : std::nullopt;
   };
   TileConfig winner = production;
-  if (best && !(*best == production)) {
-    for (int i = 0; i < 3; ++i) (void)timed_burst(production);
+  // The confirmation re-measurement is part of the same cold budget. When the
+  // runner used it up, keep production rather than take a pick the confirmation
+  // never reproduced.
+  if (best && !(*best == production) && !mlir_tune::budget_exhausted()) {
+    for (int i = 0; i < 3; ++i) {
+      if (mlir_tune::budget_exhausted()) break;
+      (void)timed_burst(production);
+    }
     constexpr int kRounds = 5;
     double refs[kRounds] = {}, wins[kRounds] = {};
-    bool ok = true;
+    bool ok = !mlir_tune::budget_exhausted();
     for (int i = 0; i < kRounds && ok; ++i) {
+      if (mlir_tune::budget_exhausted()) {
+        ok = false;
+        break;
+      }
       if ((i & 1) == 0) {
         const auto r = timed_burst(production);
         const auto w = timed_burst(*best);

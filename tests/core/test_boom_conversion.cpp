@@ -489,6 +489,12 @@ int main(int argc, char** argv) {
   if (dump_dir.empty())
     dump_dir = std::filesystem::temp_directory_path() / "sonicboom-boom-ir";
 
+  // The committed goldens record the static kernel geometry: the JIT candidate
+  // tuner's picks are a per-device measurement decision, so leaving it on
+  // would make the golden text depend on the timing of the cold run and on
+  // the JIT cache state. Same rule as test_plan_record.
+  ::setenv("SONICBOOM_AUTOTUNE_JIT", "0", 1);
+
   // The dialect-level check first: it needs no model and no device, so a
   // CPU-only run still covers it. Its failures are reported before the gate
   // below, so a skip never hides one.

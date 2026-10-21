@@ -292,7 +292,9 @@ Full entries above; the list a future optimizer should read before starting:
 
 **Implemented (v0.0.3).** One service and one disk cache
 (`core/src/planner/autotune.{h,cpp}`,
-`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>/<op>.json`), shared by:
+`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>-reduce-<mode>/<op>.json`;
+version 1 files carry a `__format__` entry, are written by temp file + rename,
+and a different version is discarded on read), shared by:
 
 - **Attention prefill:** `own` versus generated `(br, bc, dps)` over every
   candidate the generator supports and whose shared memory fits. A candidate
@@ -311,6 +313,37 @@ a reused prefix resolves the same way as a full prefill. Tuning runs only
 outside CUDA-graph capture; a capture uses the cached or default choice. On the
 RTX 3050, first-use tuning cost 0.07–0.17 s per attention class, 1.05 s for the
 first dense-GEMM tune, and 0.1–2.5 ms per MMQ candidate group.
+
+**JIT candidate tuner (`mlir_tune`, on by default).** The second service times
+generated-kernel candidates (gemv launch width per blocks-per-row/row-bucket
+class; generated prefill-attention `br/bc/as` per head-dim/seq-bucket/head-bucket
+class; the generated int8 tensor-core matmul tile when `MMQ_TC` is on). It is
+gated by `SONICBOOM_AUTOTUNE` like the first service, plus
+`SONICBOOM_AUTOTUNE_JIT=0` to drop only the generated candidates, and stores
+into `~/.cache/sonicboom/autotune/sm_<NN>.bin` (fixed records, magic+version,
+written in place under an exclusive `flock`; a version bump is the reset path).
+
+*Determinism.* A candidate is accepted only if its output is bit-identical to
+the static default (candidate 0), so a pick changes launch geometry, never a
+token or a bit of a result. A warm cache is deterministic: one record per
+`(op, shape class, SM)`, applied identically in every process. A cold
+measurement is timing dependent, so two cold processes may pick different
+geometry within the tuner's 0.5% resolution; the pick is persisted on the
+first run and every later run reuses it. The committed plan-record goldens are
+recorded with `SONICBOOM_AUTOTUNE_JIT=0`, because they describe the
+hand-written plan's steps/launches and must not depend on a measurement.
+
+*Cold budget.* Cold classes share one process-wide wall-clock budget,
+`SONICBOOM_AUTOTUNE_BUDGET_MS` (default 10000, `<= 0` unlimited), started by
+the first unresolved class. The runner checks it between candidate
+compilations and between timing rounds (ranking the rounds already measured,
+and returning nothing if no round completed), the callers check it before
+their confirmation re-measurement, and an unresolved class is memoized as a
+`Skipped` static default so it is not retried. Measured on the RTX 3050:
+Gemma `test_generate` cold pays 1.48 s over `SONICBOOM_AUTOTUNE=0` (9 gemv +
+2 generated-attention classes, 15.85 vs 14.36 s wall); Qwen
+`test_qwen2_generate` cold pays 1.85 s (6 classes, 39.83 vs 37.98 s); a warm
+rerun performs no probes and is 38.11 s.
 
 **Next search space.** Parameters still static that have a shape- or
 device-dependent correct value:

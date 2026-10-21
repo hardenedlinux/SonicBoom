@@ -17,7 +17,7 @@
 // Q1/Q2 runner: with synthetic compile closures, the runner must pick the
 // fastest config that reproduces the reference output bit for bit, skip a
 // config that does not compile, and reject a faster config whose output
-// differs. It must do nothing unless SONICBOOM_AUTOTUNE=1.
+// differs. It must do nothing under SONICBOOM_AUTOTUNE=0.
 //
 // Q2 adds the real kernel: the first q8_1 gemv call for a shape class under the
 // gate times tile_m {256, 128, 512} on the live buffers, accepts a width only
@@ -99,6 +99,9 @@ void real_gemv_section() {
     return;
   }
   ::setenv("XDG_CACHE_HOME", tmpl, 1);
+  // This test measures several sections in one process; the 10 s cold budget
+  // is a production bound, not a test one.
+  ::setenv("SONICBOOM_AUTOTUNE_BUDGET_MS", "0", 1);
   mt::AutotuneCache::instance().reset_for_test();
 
   const uint64_t cols = 2560, rows = 2048;  // q3_K, blocks-per-row 10
@@ -115,7 +118,7 @@ void real_gemv_section() {
   for (auto& v : x) v = ud(rng);
 
   // Gate off: the pre-Q1 launch, and nothing is resolved or stored.
-  ::unsetenv("SONICBOOM_AUTOTUNE");
+  ::setenv("SONICBOOM_AUTOTUNE", "0", 1);
   check(sbquant::cuda::matvec_f32(W, x, y_off), "gate off: the gemv runs");
   check(mt::gemv_choice(bpr, int(rows)).source == mt::GemvSource::Default,
         "gate off: the class is not resolved");
@@ -177,7 +180,7 @@ int main() {
     });
   };
 
-  // Gate: unset and 0 do nothing (no compile, no timing).
+  // Gate: 0 does nothing (no compile, no timing); unset is on by default.
   {
     int compiled = 0;
     mt::AutotuneRunner::Problem gated = p;
@@ -186,7 +189,7 @@ int main() {
       return p.compile(c);
     };
     ::unsetenv("SONICBOOM_AUTOTUNE");
-    check(!mt::AutotuneRunner::run(gated), "gate unset: no run");
+    check(mt::enabled(), "gate unset: enabled by default");
     ::setenv("SONICBOOM_AUTOTUNE", "0", 1);
     check(!mt::AutotuneRunner::run(gated), "gate 0: no run");
     check(compiled == 0, "gate off compiles nothing");

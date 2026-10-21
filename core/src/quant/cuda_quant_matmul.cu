@@ -1325,9 +1325,9 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
   // resolved once per process and memoized. `tile_m` selects the launch width
   // of the one-thread-per-super-block kernel below — the only tile knob the
   // current hand-written kernel exposes; `tile_k` is carried for the generated
-  // gemv and does not change this launch yet. With SONICBOOM_AUTOTUNE unset or
-  // 0 (the default) this is the static default (tile_m 256), which is exactly
-  // the pre-Q1 launch, so the gate-off path is unchanged.
+  // gemv and does not change this launch yet. Under SONICBOOM_AUTOTUNE=0 (or
+  // before the class is resolved) this is the static default (tile_m 256),
+  // which is exactly the pre-Q1 launch, so the gate-off path is unchanged.
   const mlir_tune::TileConfig gemv_cfg =
       mlir_tune::gemv_config(blocks_per_row, num_rows);
   const int base_block =
@@ -2044,8 +2044,9 @@ static int gemv_warps_for_launch(const mlir_tune::TileConfig& cfg,
   return warps;
 }
 
-// Q2: resolve this shape class's launch width. The first call for a class under
-// SONICBOOM_AUTOTUNE=1 times the three candidate widths on the live buffers
+// Q2: resolve this shape class's launch width. The first call for an
+// unresolved class (autotune on, cold cache, budget left) times the three
+// candidate widths on the live buffers
 // through the Q1 runner, which accepts a width only when its output matches the
 // 256-thread launch bit for bit, and persists the winner. Skipped inside a CUDA
 // graph capture, where the host must not synchronize or launch probes; the
@@ -2063,6 +2064,18 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
   if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
     return gemv_warps_for_launch(choice.cfg, num_rows);
+
+  // Probe launches are not part of any run: a recorded plan must name the
+  // chosen kernel's grid, not the probes' (same rule as the dense and
+  // attention tuners). The caller's real launch happens after this returns,
+  // with the recorder restored.
+  struct RecorderGuard {
+    planner::PlanRecorder* saved;
+    RecorderGuard() : saved(planner::recorder()) {
+      planner::set_thread_recorder(nullptr);
+    }
+    ~RecorderGuard() { planner::set_thread_recorder(saved); }
+  } guard;
 
   static const mlir_tune::TileConfig kWidths[] = {
       mlir_tune::default_config("gemv"),
@@ -2128,7 +2141,10 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
   // that noise flips between processes and is persisted that way.
   const mlir_tune::TileConfig production = mlir_tune::default_config("gemv");
   mlir_tune::TileConfig winner = *best;
-  if (!(winner == production)) {
+  // The confirmation re-measurement is part of the same cold budget. When the
+  // runner used it up, keep production rather than take a pick the confirmation
+  // never reproduced.
+  if (!(winner == production) && !mlir_tune::budget_exhausted()) {
     // 100 launches per burst: 16 leaves a few percent of burst-to-burst jitter
     // on the short kernels, which reads as noise and rejects a real win.
     constexpr int kProbeReps = 100;
@@ -2155,8 +2171,13 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
     constexpr int kRounds = 5;
     double refs[kRounds] = {}, wins[kRounds] = {}, scratch = 0;
     bool ok = true;
-    for (int i = 0; i < 3 && ok; ++i) ok = timed_burst(production, scratch);
+    for (int i = 0; i < 3 && ok; ++i)
+      ok = !mlir_tune::budget_exhausted() && timed_burst(production, scratch);
     for (int i = 0; ok && i < kRounds; ++i) {
+      if (mlir_tune::budget_exhausted()) {
+        ok = false;  // unconfirmed: production is kept
+        break;
+      }
       ok = i % 2 == 0
                ? timed_burst(production, refs[i]) && timed_burst(winner, wins[i])
                : timed_burst(winner, wins[i]) && timed_burst(production, refs[i]);
@@ -2902,8 +2923,9 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first
-// call for a class under SONICBOOM_AUTOTUNE=1 times the candidate grid on the
-// live buffers; a candidate is accepted only when its output matches the
+// call for an unresolved class (autotune on, cold cache, budget left) times
+// the candidate grid on the live buffers; a candidate is accepted only when
+// its output matches the
 // smallest config (16x16) bit for bit, and the winner is persisted per SM.
 // Skipped inside CUDA-graph capture, where the host must not synchronize and a
 // JIT module load allocates: the class is tuned by the first uncaptured call.
@@ -2930,6 +2952,16 @@ static compiler::MmqTcShape resolve_mmq_tc_shape(
   if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
     return base;
+
+  // Probe launches are not part of any run (same rule as the gemv and
+  // attention tuners); the caller's real launch follows this function.
+  struct RecorderGuard {
+    planner::PlanRecorder* saved;
+    RecorderGuard() : saved(planner::recorder()) {
+      planner::set_thread_recorder(nullptr);
+    }
+    ~RecorderGuard() { planner::set_thread_recorder(saved); }
+  } guard;
 
   // The comparison window is a prefix of the output, capped at 64 MiB so the
   // 151936-row logits projection does not turn every timed burst into a 300 MB

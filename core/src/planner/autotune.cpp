@@ -161,6 +161,15 @@ void parse_op_file(std::string_view s,
   }
 }
 
+// On-disk schema version of each <op>.json file. The reserved entry
+// "__format__" records it next to the shape classes. A file without the entry
+// predates the marker and is read as version 1 (its entries mean the same);
+// a file with any other version is discarded, so a future change to a value's
+// meaning invalidates old picks instead of being misread. A store always
+// writes the current version, and the write is a temp file plus rename, so a
+// reader sees the whole old file or the whole new one.
+constexpr int kJsonFormatVersion = 1;
+
 void load_op_locked(const std::string &op) {
   if (g_loaded[op]) return;
   g_loaded[op] = true;
@@ -168,7 +177,14 @@ void load_op_locked(const std::string &op) {
   if (!in) return;
   const std::string body((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
-  parse_op_file(body, g_cache[op]);
+  auto &entries = g_cache[op];
+  parse_op_file(body, entries);
+  const auto fmt = entries.find("__format__");
+  if (fmt != entries.end()) {
+    const auto v = fmt->second.find("v");
+    if (v == fmt->second.end() || v->second != kJsonFormatVersion)
+      entries.clear();
+  }
 }
 
 void write_op_locked(const std::string &op) {
@@ -176,6 +192,7 @@ void write_op_locked(const std::string &op) {
   std::error_code ec;
   std::filesystem::create_directories(
       std::filesystem::path(path).parent_path(), ec);
+  g_cache[op]["__format__"] = {{"v", kJsonFormatVersion}};
   std::ostringstream os;
   os << "{\n";
   bool first_key = true;

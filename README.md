@@ -353,9 +353,14 @@ Its limits:
   attention and a bf16 dense GEMM. Generated kernels are checked against the
   hand-written ones they replace and are selected per shape class by a runtime
   tuner; the first tune of a shape class runs during warm-up (never inside
-  CUDA-graph capture) and is cached under `~/.cache/sonicboom/tune/`, keyed by
-  GPU, operator and shape class — never by prompt length or position.
-  `SONICBOOM_AUTOTUNE=0` uses the static defaults, `force` retunes. Generated
+  CUDA-graph capture) and is cached under `~/.cache/sonicboom/`, keyed by GPU,
+  operator and shape class — never by prompt length or position. The JIT
+  candidate tuner is on by default: each probe is bit-identity gated against
+  the static default, cold tuning shares one process-wide budget
+  (`SONICBOOM_AUTOTUNE_BUDGET_MS`, default 10 s, `<= 0` unlimited), and the
+  picks live in a versioned, flock-protected per-SM file. `SONICBOOM_AUTOTUNE=0`
+  uses the static defaults and `force` retunes (both services);
+  `SONICBOOM_AUTOTUNE_JIT=0` disables only the JIT service. Generated
   decode attention is the default decode path: it uses the hand-written
   split-KV pair's chunk rule, fused-multiply-add rounding and reduction order,
   so it reproduces the token stream bit-for-bit (`SONICBOOM_ATTN_DECODE=own`
