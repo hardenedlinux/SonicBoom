@@ -16,6 +16,8 @@
 
 #include <sonicboom/nn/norm.h>
 
+#include "cpu_reduce.h"
+
 #include <cmath>
 
 namespace sonicboom::nn {
@@ -25,15 +27,11 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
   if (y.size() < x.size()) return false;
   if (!weight.empty() && weight.size() < x.size()) return false;
 
-  // mean(x^2). Accumulate in double (ggml's ggml_float), but each product is the
-  // f32 x[i]*x[i] (ggml casts that rounded f32 product to double before adding),
-  // so the sum reproduces llama.cpp's rms_norm bit-for-bit.
-  double sum_sq = 0.0;
-  for (size_t i = 0; i < x.size(); ++i) {
-    const float v = x[i];
-    sum_sq += double(v * v);
-  }
-  const float inv = 1.0f / std::sqrt(float(sum_sq / double(x.size())) + eps);
+  // mean(x^2) by the process-wide reduction mode. The f64 mode is ggml's
+  // ggml_float accumulation, and each product is the f32 x[i]*x[i] (ggml casts
+  // that rounded f32 product to double before adding), so it reproduces
+  // llama.cpp's rms_norm bit-for-bit.
+  const float inv = 1.0f / std::sqrt(cpu_mean_sq(x) + eps);
 
   if (weight.empty()) {
     for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] * inv;
@@ -51,14 +49,8 @@ bool rms_norm_heads(std::span<float> x, std::span<const float> weight,
   const uint64_t heads = x.size() / head_dim;
   for (uint64_t h = 0; h < heads; ++h) {
     std::span<float> xh = x.subspan(h * head_dim, head_dim);
-    // mean(x^2), accumulated in double exactly as rms_norm does (each product is
-    // the f32 x[i]*x[i]).
-    double sum_sq = 0.0;
-    for (uint64_t i = 0; i < head_dim; ++i) {
-      const float v = xh[i];
-      sum_sq += double(v * v);
-    }
-    const float inv = 1.0f / std::sqrt(float(sum_sq / double(head_dim)) + eps);
+    // mean(x^2) by the process-wide reduction mode, exactly as rms_norm does.
+    const float inv = 1.0f / std::sqrt(cpu_mean_sq(xh) + eps);
     if (weight.empty()) {
       for (uint64_t i = 0; i < head_dim; ++i) xh[i] *= inv;
     } else {

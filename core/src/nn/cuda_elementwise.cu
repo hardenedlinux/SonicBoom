@@ -20,11 +20,13 @@
 
 #include "cuda_resident.h"
 #include "cuda_stream.h"
+#include "reduce_sum.cuh"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -100,36 +102,20 @@ __device__ inline float gelu_tanh_f32(float x) {
 // --- kernels ----------------------------------------------------------------
 
 // Parallel sum-of-squares: warp-shuffle + shared-memory block reduction. Each
-// thread accumulates a partial double sum over a strided slice of x, then the
-// block reduces the partials. Accumulation stays in double and each term is
-// still double(v * v) (float square) — identical per-term semantics to the CPU
-// rms_norm's sequential double sum (norm.cpp). Only the *order* of the double
-// adds changes, and that reordering is many orders below the fp32 rounding that
-// rms_inv_kernel applies when it converts sum/n to float, so the downstream
-// token stream is unchanged. This replaces a single-thread loop that serialized
-// ~2560 dependent double adds (~127 us) with a ~256-way reduction.
+// thread accumulates a partial sum over a strided slice of x, then the block
+// reduces the partials (reduce_sum.cuh). The accumulator is the device's
+// ReduceMode: f64 is the historical double path (each term is still the float
+// square widened to double, identical per-term semantics to the CPU rms_norm),
+// df32 is a double-float pair with the same tree, f32 is the plain-float
+// performance reference. Only the *order* of the adds changes across tree
+// widths, and that reordering is many orders below the fp32 rounding that the
+// inverse RMS applies when it converts sum/n to float.
+template <typename R>
 __global__ void rms_sum_sq_kernel(const float* __restrict__ x, int n,
-                                  double* __restrict__ out) {
-  const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  // Warp-level butterfly reduction.
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
-  // First warp reduces the per-warp partials and writes the single result.
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) *out = t;
-  }
+                                  void* __restrict__ out) {
+  __shared__ typename R::part_t wp[32];
+  const typename R::acc_t t = block_sum_sq<R>(x, n, wp);
+  if (threadIdx.x == 0) *static_cast<typename R::out_t*>(out) = R::to_out(t);
 }
 
 __global__ void rms_apply_kernel(const float* __restrict__ x,
@@ -413,29 +399,16 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 // into the preceding multiply. x/y/add may alias (the executor's buffer reuse
 // can place the result over either input): every index is read before it is
 // written, and the reduction completes before the apply.
+template <typename R>
 __global__ void rms_norm_fused_kernel(const float* x,
                                       const float* __restrict__ weight, int n,
                                       float eps, float* y,
                                       const float* add) {
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t wp[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
-  }
+  const typename R::acc_t t = block_sum_sq<R>(x, n, wp);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, n) + eps);
   __syncthreads();
   const float iv = inv;
   if (add != nullptr) {
@@ -460,6 +433,7 @@ __global__ void rms_norm_fused_kernel(const float* x,
 // elementwise so spreading it across the block does not change the result.
 // `add` is the optional residual epilogue, as in rms_norm_fused_kernel: the
 // add folded into this norm's output is applied here, bit-identically.
+template <typename R>
 __global__ void rms_heads_fused_kernel(const float* x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
@@ -468,24 +442,10 @@ __global__ void rms_heads_fused_kernel(const float* x,
   const float* xh = x + (size_t)h * head_dim;
   float* yh = y + (size_t)h * head_dim;
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < head_dim; i += blockDim.x) {
-    const float v = xh[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t wp[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(head_dim)) + eps);
-  }
+  const typename R::acc_t t = block_sum_sq<R>(xh, head_dim, wp);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, head_dim) + eps);
   __syncthreads();
   const float iv = inv;
   if (add != nullptr) {
@@ -497,6 +457,67 @@ __global__ void rms_heads_fused_kernel(const float* x,
   } else {
     for (int i = tid; i < head_dim; i += blockDim.x)
       yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
+  }
+}
+
+// Launch the reduction-mode instantiation of a norm kernel. The selection is
+// the device's ReduceMode (decided once per process), so the same grid/block
+// geometry runs for every mode. These are non-template functions around the
+// templated kernels: a template-template kernel name cannot be launched from a
+// template context portably (nvcc parses `Kernel<T><<<` as a type name there).
+inline void launch_rms_sum_sq(dim3 grid, int block, cudaStream_t st,
+                              const float* x, int n, void* out) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_sum_sq_kernel<SumDf32><<<grid, block, 0, st>>>(x, n, out);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_sum_sq_kernel<SumF32><<<grid, block, 0, st>>>(x, n, out);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_sum_sq_kernel<SumF64><<<grid, block, 0, st>>>(x, n, out);
+      break;
+  }
+}
+
+inline void launch_rms_norm_fused(dim3 grid, int block, cudaStream_t st,
+                                  const float* x, const float* w, int n,
+                                  float eps, float* y, const float* add) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_fused_kernel<SumDf32>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_norm_fused_kernel<SumF32>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_norm_fused_kernel<SumF64>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+  }
+}
+
+inline void launch_rms_heads_fused(dim3 grid, int block, cudaStream_t st,
+                                   const float* x, const float* w, int head_dim,
+                                   float eps, float* y, const float* add) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_heads_fused_kernel<SumDf32>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_heads_fused_kernel<SumF32>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_heads_fused_kernel<SumF64>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
   }
 }
 
@@ -1871,15 +1892,40 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
   if (cudaMemset(g_sum, 0, sizeof(double)) != cudaSuccess) return false;
 
   SB_NOTE_LAUNCH(rms_sum_sq_kernel, 1, 256, 0, cur_stream());
-  rms_sum_sq_kernel<<<1, 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), int(n), g_sum);
+  // The kernel writes the accumulator in its mode's representation (8 bytes
+  // for f64 and df32, 4 for f32); the mean is formed the same way the kernel's
+  // own mean_to_float does, so the apply sees one value either way.
+  launch_rms_sum_sq(dim3(1), 256, cur_stream(),
+                    static_cast<const float*>(d_x), int(n), g_sum);
   if (cudaGetLastError() != cudaSuccess) return false;
-  double sum = 0.0;
-  if (cudaMemcpy(&sum, g_sum, sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess)
-    return false;
-
-  // Reproduce the CPU's mean/rsqrt in double (mean) then float (sqrt/recip),
-  // matching norm.cpp bit-for-bit.
-  const float inv = 1.0f / std::sqrt(float(sum / double(n)) + eps);
+  const float mean = [&] {
+    switch (::sonicboom::planner::device_reduce_mode()) {
+      case ::sonicboom::compiler::ReduceMode::Df32: {
+        float2 pair{};
+        if (cudaMemcpy(&pair, g_sum, sizeof pair, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return pair.x / float(n) + pair.y / float(n);
+      }
+      case ::sonicboom::compiler::ReduceMode::F32: {
+        float s = 0.0f;
+        if (cudaMemcpy(&s, g_sum, sizeof s, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return s / float(n);
+      }
+      case ::sonicboom::compiler::ReduceMode::F64:
+      default: {
+        double s = 0.0;
+        if (cudaMemcpy(&s, g_sum, sizeof s, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return float(s / double(n));
+      }
+    }
+  }();
+  // mean then float (sqrt/recip), the CPU reference's rounding order.
+  const float inv = 1.0f / std::sqrt(mean + eps);
   SB_NOTE_LAUNCH(rms_apply_kernel, grid_for(int(n)), 256, 0, cur_stream());
   rms_apply_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), d_w,
                                               int(n), inv, static_cast<float*>(d_y));
@@ -2230,7 +2276,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     if (!d_w) return false;
   }
   SB_NOTE_LAUNCH(rms_norm_fused_kernel, 1, 1024, 0, cur_stream());
-  rms_norm_fused_kernel<<<1, 1024, 0, cur_stream()>>>(x, d_w, n, eps, y, add);
+  launch_rms_norm_fused(dim3(1), 1024, cur_stream(), x, d_w, n, eps, y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2247,8 +2293,8 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
   SB_NOTE_LAUNCH(rms_heads_fused_kernel, heads, 256, 0, cur_stream());
-  rms_heads_fused_kernel<<<heads, 256, 0, cur_stream()>>>(x, d_w, head_dim, eps,
-                                                         y, add);
+  launch_rms_heads_fused(heads, 256, cur_stream(), x, d_w, head_dim, eps, y,
+                         add);
   return cudaGetLastError() == cudaSuccess;
 }
 

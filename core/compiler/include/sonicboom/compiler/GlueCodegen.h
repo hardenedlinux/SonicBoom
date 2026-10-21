@@ -33,6 +33,8 @@
 // sequence (max tree, d = amax/127, roundf as add.rz(sign|0.5) + cvt.rzi), so
 // the region's output is byte-identical to the reference kernel's.
 
+#include <sonicboom/compiler/ReduceMode.h>
+
 #include <optional>
 #include <string>
 #include <string_view>
@@ -122,10 +124,14 @@ constexpr int kSliceScaleBlockThreads = 256;
 // 256 threads per block, no shared memory.
 constexpr int kGeluMulBlockThreads = 256;
 
-// Generate the region's PTX for compute capability `sm_arch` (86 = sm_86).
-// Returns nullopt, having printed the MLIR diagnostic, when the region has no
-// generator, the module fails to verify, or the downstream lowering fails.
-std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch);
+// Generate the region's PTX for compute capability `sm_arch` (86 = sm_86) and
+// reduction mode `mode`. F64 is the historical text; DF32 and F32 rewrite only
+// the reduction statements (see GlueCodegen.cpp), with the reduction tree shape
+// otherwise identical. Returns nullopt, having printed the MLIR diagnostic, when
+// the region has no generator, the module fails to verify, or the downstream
+// lowering fails.
+std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch,
+                                             ReduceMode mode = ReduceMode::F64);
 
 // Lower a textual GPU-dialect module (a container module holding one
 // gpu.module) to PTX assembly through the NVVM pipeline above. `link_libdevice`

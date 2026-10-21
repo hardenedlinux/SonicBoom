@@ -34,6 +34,7 @@
 
 #include "../planner/autotune.h"        // B7 draft-length cost cache
 #include "../planner/mlir_autotune.h"    // V2 spec probe ratio cache (Q1 file)
+#include "../planner/reduce_mode.h"      // the per-device reduction mode
 #include "mlir/IR/BuiltinTypes.h"
 
 #ifdef SONICBOOM_USE_CUDA
@@ -1290,6 +1291,10 @@ struct PlannerEnv {
   // segment planned under one setting is stale under another.
   compiler::AsyncPrefetchMode async_prefetch;
   int vram_threshold_mb;
+  // The norm kernels' reduction mode (compiler/ReduceMode.h). The graph is the
+  // same, but a cached segment's launches and captured graph belong to the
+  // mode they were built under, so a mode change invalidates the cache.
+  compiler::ReduceMode reduce;
   friend bool operator==(const PlannerEnv&, const PlannerEnv&) = default;
 };
 
@@ -1297,7 +1302,8 @@ static PlannerEnv planner_env() {
   return PlannerEnv{quant::cuda::q8_1_enabled(), quant::cuda::mmq_enabled(),
                     quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
                     compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
-                    compiler::vram_threshold_mb()};
+                    compiler::vram_threshold_mb(),
+                    planner::device_reduce_mode()};
 }
 
 // The prefill segment cache is a runtime feature (plan_cache), so it can be

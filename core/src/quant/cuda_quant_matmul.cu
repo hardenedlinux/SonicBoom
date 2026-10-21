@@ -22,6 +22,8 @@
 #include "cuda_resident.h"
 
 #include "../nn/cuda_stream.h"
+#include "../nn/reduce_sum.cuh"
+#include "../planner/reduce_mode.h"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // the generated MMQ1 tensor-core kernel
@@ -2288,28 +2290,18 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // once (kept in a register and reused by the amax butterfly), so the block
 // costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
 // thread runs a 32-iteration serial chain.
+template <typename R>
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t warp_part[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
-  }
+  const typename R::acc_t t =
+      sonicboom::nn::cuda::block_sum_sq<R>(x, n, warp_part);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, n) + eps);
   __syncthreads();
   const float iv = inv;
   const int nblocks = n / 32;
@@ -2339,8 +2331,22 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
     if (!d_w) return false;
   }
   SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, 1, 1024, 0, cur_stream());
-  rms_norm_quantize_q8_1_kernel<<<1, 1024, 0, cur_stream()>>>(
-      x, d_w, n, eps, reinterpret_cast<q8_1::block_q8_1*>(yq));
+  auto* y = reinterpret_cast<q8_1::block_q8_1*>(yq);
+  cudaStream_t st = cur_stream();
+  switch (sonicboom::planner::device_reduce_mode()) {
+    case sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumDf32>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+    case sonicboom::compiler::ReduceMode::F32:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF32>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+    default:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF64>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3117,6 +3123,7 @@ __device__ __forceinline__ void quantize_mmq_q8_1_block(
 // Phase A: the per-row `inv`. One 256-thread block per row, strided double
 // partials + warp shuffle + a warp-0 shared reduce — same tree and same fp32
 // rounding point as rms_heads_fused_kernel, so `inv` matches that kernel's.
+template <typename R>
 __global__ void __launch_bounds__(256) rms_norm_inv_kernel(
     const float* __restrict__ x, int dim, float eps,
     float* __restrict__ inv_out) {
@@ -3124,23 +3131,11 @@ __global__ void __launch_bounds__(256) rms_norm_inv_kernel(
   const int tid = threadIdx.x;
   const float* xrow = x + (size_t)token * dim;
 
-  double s = 0.0;
-  for (int k = tid; k < dim; k += blockDim.x) {
-    const float v = xrow[k];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv_out[token] = 1.0f / sqrtf(float(t / double(dim)) + eps);
-  }
+  __shared__ typename R::part_t warp_part[32];
+  const typename R::acc_t t =
+      sonicboom::nn::cuda::block_sum_sq<R>(xrow, dim, warp_part);
+  if (tid == 0)
+    inv_out[token] = 1.0f / sqrtf(R::mean_to_float(t, dim) + eps);
 }
 
 // Phase B: apply `inv` (and the optional norm weight) and quantize. 128 threads
@@ -3185,7 +3180,21 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
   if (!inv) return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
   SB_NOTE_LAUNCH(rms_norm_inv_kernel, n, 256, 0, cur_stream());
-  rms_norm_inv_kernel<<<n, 256, 0, cur_stream()>>>(x, dim, eps, inv);
+  cudaStream_t st = cur_stream();
+  switch (sonicboom::planner::device_reduce_mode()) {
+    case sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumDf32>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+    case sonicboom::compiler::ReduceMode::F32:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumF32>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+    default:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumF64>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+  }
   const dim3 grid(n, (dim / 128 + 3) / 4);  // one 128-element block per warp
   if (ds == mmq::DS4) {
     SB_NOTE_LAUNCH_TP("scale_quantize_mmq_q8_1_kernel", "ds=ds4", grid, 128, 0, cur_stream());

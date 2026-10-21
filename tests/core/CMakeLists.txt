@@ -194,6 +194,23 @@ set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_autoprobe
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
+# The committed token / plan goldens are recorded in the automatic reduction
+# mode (planner/reduce_mode.h). Run the same goldens with F64 forced, so the
+# F64 path stays a tested contract on every device: a device where DF32 is the
+# automatic choice must not be able to let an F64-path regression through
+# unnoticed. test_glue_codegen and test_cuda_elementwise are kernel-level and
+# cover the generated regions and the templated elementwise kernels in F64.
+foreach(test_name IN ITEMS test_generate test_qwen2_generate test_plan_record
+                            test_glue_codegen test_cuda_elementwise)
+  add_test(NAME ${test_name}_reduce_f64
+           COMMAND ${CMAKE_COMMAND} -E env
+                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                   SONICBOOM_REDUCE=f64
+                   $<TARGET_FILE:${test_name}>)
+  set_tests_properties(${test_name}_reduce_f64
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+endforeach()
+
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
 # measured 0.2-0.5% slower. Run the same greedy-stream checks with it on so the

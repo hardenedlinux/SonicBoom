@@ -16,6 +16,8 @@
 
 #include <sonicboom/nn/matmul.h>
 
+#include "cpu_reduce.h"
+
 #include <sonicboom/dtype.h>
 #include <sonicboom/thread_pool.h>
 
@@ -28,10 +30,8 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
   // is split across the pool deterministically (identical to the serial path).
   ThreadPool::instance().parallel_for(0, y.size(), [&](uint64_t jb, uint64_t je) {
     for (uint64_t j = jb; j < je; ++j) {
-      double acc = 0.0;
       const uint64_t base = j * cols;
-      for (uint64_t i = 0; i < cols; ++i) acc += double(W[base + i] * x[i]);
-      y[j] = float(acc);
+      y[j] = cpu_dot(W.subspan(base, cols), x.first(cols));
     }
   });
   return true;
@@ -45,12 +45,11 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols,
   // before the (double-accumulated) product, reproducing ggml_vec_dot_bf16 with
   // the caller's already-rounded activation.
   ThreadPool::instance().parallel_for(0, y.size(), [&](uint64_t jb, uint64_t je) {
+    // bf16 weights are widened to f32 before the product; the accumulator is
+    // the process-wide reduction mode (f64 by default, matching ggml).
     for (uint64_t j = jb; j < je; ++j) {
-      double acc = 0.0;
       const uint64_t base = j * cols;
-      for (uint64_t i = 0; i < cols; ++i)
-        acc += double(bf16_to_f32(W[base + i]) * x[i]);
-      y[j] = float(acc);
+      y[j] = cpu_dot_bf16(W.subspan(base, cols), x.first(cols));
     }
   });
   return true;

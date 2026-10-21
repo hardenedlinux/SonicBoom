@@ -16,6 +16,8 @@
 
 #include "autotune.h"
 
+#include "reduce_mode.h"
+
 #include <sonicboom/runtime_features.h>
 
 #include <algorithm>
@@ -45,45 +47,17 @@ std::unordered_map<std::string, std::map<std::string, std::map<std::string, int>
 std::unordered_map<std::string, bool> g_loaded;  // op -> file read already
 std::string g_device_dir;
 
-std::string sanitize(std::string_view in) {
-  std::string out;
-  out.reserve(in.size());
-  for (char c : in)
-    out.push_back(std::isalnum(static_cast<unsigned char>(c)) || c == '.' ||
-                          c == '_' || c == '-'
-                      ? c
-                      : '_');
-  return out;
-}
-
 std::string compute_device_dir() {
-#ifdef SONICBOOM_USE_CUDA
-  int dev = 0;
-  if (cudaGetDevice(&dev) != cudaSuccess) return "cpu";
-  cudaDeviceProp prop{};
-  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return "cpu";
-  const int arch = prop.major * 10 + prop.minor;
-  int driver = 0;
-  const std::string drv =
-      (cuDriverGetVersion(&driver) == CUDA_SUCCESS && driver > 0)
-          ? (std::to_string(driver / 1000) + "." +
-             std::to_string((driver % 1000) / 10))
-          : std::string("unknown");
-  return sanitize(prop.name) + "-sm" + std::to_string(arch) + "-" + drv;
-#else
-  return "cpu";
-#endif
+  // The reduction mode is part of the device identity: it changes the norm
+  // kernels' instruction mix, so a choice tuned under one mode must not be
+  // reused under another. The identity itself is shared with the reduction
+  // decision cache (planner/reduce_mode.h), so both trees key the device the
+  // same way.
+  return planner::device_identity() + "-reduce-" +
+         compiler::reduce_mode_name(planner::device_reduce_mode());
 }
 
-std::string cache_root() {
-  if (const char *e = std::getenv("SONICBOOM_TUNE_DIR"))
-    if (*e != '\0') return e;
-  if (const char *e = std::getenv("XDG_CACHE_HOME"))
-    if (*e != '\0') return std::string(e) + "/sonicboom/tune";
-  if (const char *e = std::getenv("HOME"))
-    if (*e != '\0') return std::string(e) + "/.cache/sonicboom/tune";
-  return ".sonicboom-tune";
-}
+std::string cache_root() { return planner::decision_cache_root(); }
 
 // Caller holds g_mutex (the public device_dir() is the locking entry point;
 // the cache-path helpers below run with the lock already held and must not
