@@ -101,6 +101,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 
 | decisions | override |
 |---|---|
+| numerics profile (f16 KV, TF32 dense) | `SONICBOOM_NUMERICS=strict\|standard` |
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
@@ -118,14 +119,16 @@ automatic choice, and the registry records which one applied.
 | `tune/attention-prefill`, `tune/attention-decode`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
 | `tune/gemv`, `tune/matmul_q8_tc`, `tune/attn_prefill`, `spec_verify_ratio` | shape class | per-SM JIT file |
 | `mmq.*`, `attention.*`, `dense.*`, `gemv.*`, `spec.*`, `train.*`, feature switches | device | seeded from the T0b table |
+| `numerics.profile` | process | registry (strict/standard, with its env/application origin) |
+| `kv.cache` | `n_ctx=<n>` | registry (storage dtype + the VRAM bytes it allocated) |
 
 ## Inspection: sb-explain and the C API
 
 `tools/build_sb_explain.sh` builds `tools/sb-explain` against
 `libsonicboom.so`. Without options it prints the device identity and cache
 paths, every `SONICBOOM_*` switch (value, default, meaning), the resolved
-reduction modes, the registry as a human table, the caches on disk, and the
-static JIT defaults. `--json` prints the registry as a JSON document. It tunes
+numerics profile and reduction modes, the registry as a human table, the
+caches on disk, and the static JIT defaults. `--json` prints the registry as a JSON document. It tunes
 nothing.
 
 The same two views are exported through the C ABI:

@@ -25,6 +25,7 @@
 #include <sonicboom/nn/norm.h>
 #include <sonicboom/nn/rope.h>
 #include <sonicboom/nn/cuda_elementwise.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
@@ -33,6 +34,7 @@
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
 #include "async_prefetch.h"
+#include "decision_registry.h"
 #include "device_allocator.h"
 #include "device_pool.h"
 #include "glue_jit.h"
@@ -376,9 +378,35 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
     // kernels address it as pos % n_slots and every window read spans at most
     // `window` resident slots.
     c.n_slots = (sl.window > 0) ? sl.window + kMaxVerifyRows : n_ctx;
-    c.bytes = c.n_slots * c.n_heads_kv * c.head_dim * sizeof(float);
+    // f16 KV under the standard numerics profile halves the cache's device
+    // bytes; the attention kernels read f16 and widen, and the append stores
+    // the same fp16-rounded values the f32 cache already held.
+    c.f16 = sonicboom::numerics_profile_f16_kv();
+    c.bytes = c.n_slots * c.n_heads_kv * c.head_dim *
+              (c.f16 ? sizeof(uint16_t) : sizeof(float));
     c.k_buf = g_alloc.allocate(c.bytes);
     c.v_buf = g_alloc.allocate(c.bytes);
+  }
+  {
+    // Record the storage decision and its VRAM cost. The dtype is the
+    // numerics profile's choice (f16 under standard), and the bytes are what
+    // that choice actually allocated for this context class. First record
+    // wins, so the cost shown is the process's first (usually decode) cache.
+    int64_t total = 0;
+    for (const KvCacheDev& c : *raw) total += 2 * int64_t(c.bytes);
+    planner::decisions::Entry e;
+    e.name = "kv.cache";
+    e.scope = "n_ctx=" + std::to_string(n_ctx);
+    e.value = raw->empty() ? "empty"
+                           : (raw->front().f16 ? "f16" : "f32");
+    e.source = planner::decisions::Source::Default;
+    e.inputs = "n_ctx=" + std::to_string(n_ctx) +
+               " layers=" + std::to_string(n_kv);
+    e.candidates = "f32|f16";
+    e.reason = "the numerics profile: standard stores f16, strict f32";
+    e.numerics = "f16 storage is exact for the fp16-rounded K/V values";
+    e.vram_bytes = total;
+    planner::decisions::record(e);
   }
   // The deleter frees each layer's device buffers, so whichever backend is the
   // last owner (after share_caches) deallocates exactly once.
@@ -416,8 +444,22 @@ bool SonicCudaBackend::read_cache_row(const KvCacheDev& cache, bool is_k,
   const uint64_t row = cache.n_heads_kv * cache.head_dim;
   const hal::Buffer& buf = is_k ? cache.k_buf : cache.v_buf;
   if (!buf || cache.n_slots == 0 || row == 0 || out.size() < row) return false;
-  const uint64_t byte_off = (pos % cache.n_slots) * row * sizeof(float);
-  return device::download(buf.id + byte_off, out.data(), row * sizeof(float));
+  if (!cache.f16) {
+    const uint64_t byte_off = (pos % cache.n_slots) * row * sizeof(float);
+    return device::download(buf.id + byte_off, out.data(), row * sizeof(float));
+  }
+  // f16 storage: download the packed row and widen exactly.
+  const uint64_t byte_off = (pos % cache.n_slots) * row * sizeof(uint16_t);
+  std::vector<uint16_t> packed(static_cast<size_t>(row));
+  if (!device::download(buf.id + byte_off, packed.data(),
+                        row * sizeof(uint16_t)))
+    return false;
+  for (uint64_t i = 0; i < row; ++i) {
+    _Float16 h;
+    std::memcpy(&h, &packed[size_t(i)], sizeof(h));
+    out[size_t(i)] = float(h);
+  }
+  return true;
 }
 
 std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
@@ -745,7 +787,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                   dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                   dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
                   reinterpret_cast<const uint64_t*>(pos_slot()), cache.n_slots,
-                  row_elems, int(r))) {
+                  row_elems, int(r), cache.f16)) {
             ok = false;
             break;
           }
@@ -755,7 +797,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
               reinterpret_cast<const uint64_t*>(pos_slot()), window,
               cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
               int(cache.head_dim), lc.sliding_window, float(attn_scale),
-              out + r * q_row, int(r));
+              out + r * q_row, int(r), cache.f16);
         }
         break;
       }
@@ -764,7 +806,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                      dev(in[1]), dev(in[2]),
                                      reinterpret_cast<const uint64_t*>(pos_slot()),
-                                     cache.n_slots, row_elems)) {
+                                     cache.n_slots, row_elems, 0, cache.f16)) {
           ok = false;
           break;
         }
@@ -776,7 +818,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_slot()), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, float(attn_scale), out);
+          lc.sliding_window, float(attn_scale), out, 0, cache.f16);
       break;
     }
     case OpKind::GqaBroadcast: {
@@ -1395,7 +1437,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             ok = nn::cuda::kv_append_dev(
                 kv_dst, kv_dst, out, out,
                 reinterpret_cast<const uint64_t*>(pos_slot()), kv->n_slots,
-                kv_row);
+                kv_row, 0, kv->f16);
           }
         };
         // The region is an optimization: a head wider than its shared stage
@@ -1444,7 +1486,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         void* args[] = {&xarg,   &warg,    &haswarg, &yarg,   &posarg, &dimarg,
                         &earg,   &fsarg,   &lbarg,   &ffarg,  &hpparg, &ropearg,
                         &castarg, &carg,   &slotsarg, &rowarg, &storearg};
-        ok = glue::launch(region, args, heads,
+        // The standard profile's cache holds f16: launch the store variant
+        // (distinct kernel and PTX cache entry) rather than writing f32.
+        const std::string launch_region =
+            kv_store != 0 && kv->f16 ? std::string(region) + "-kv16"
+                                     : std::string(region);
+        ok = glue::launch(launch_region, args, heads,
                           compiler::kHeadsNormRopeCastBlockThreads,
                           compiler::kHeadsNormRopeCastSharedBytes);
         if (!ok) reference();
@@ -1812,7 +1859,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           dev(in[0]), dev(in[1]), dev(in[2]), dev_mut(cache.k_buf.id),
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_slot()),
           cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
-          int(cache.head_dim), lc.sliding_window, float(attn_scale), out);
+          int(cache.head_dim), lc.sliding_window, float(attn_scale), out,
+          cache.f16);
       break;
     }
     case OpKind::KvAppend: {
@@ -1826,7 +1874,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           !nn::cuda::kv_append_batched_dev_pos(
               dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[0]),
               dev(in[1]), reinterpret_cast<const uint64_t*>(pos_slot()),
-              cache.n_slots, row_elems, int(nb))) {
+              cache.n_slots, row_elems, int(nb), cache.f16)) {
         ok = false;
         break;
       }

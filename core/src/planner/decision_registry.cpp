@@ -161,6 +161,7 @@ Source parse_source(std::string_view name) {
   if (name == "measured") return Source::Measured;
   if (name == "verdict") return Source::Verdict;
   if (name == "skipped") return Source::Skipped;
+  if (name == "application") return Source::Application;
   return Source::Default;
 }
 
@@ -203,6 +204,7 @@ std::string_view source_name(Source source) {
     case Source::Measured: return "measured";
     case Source::Verdict: return "verdict";
     case Source::Skipped: return "skipped";
+    case Source::Application: return "application";
   }
   return "unknown";
 }
@@ -473,6 +475,11 @@ void seed_static_knobs() {
 }
 
 std::string path() { return registry_path(); }
+
+void forget_for_test(std::string_view name, std::string_view scope) {
+  std::lock_guard<std::mutex> lock(registry_mutex());
+  registry().erase(Key{std::string(name), std::string(scope)});
+}
 
 void reset_for_test() {
   std::lock_guard<std::mutex> lock(registry_mutex());

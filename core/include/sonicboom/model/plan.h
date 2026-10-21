@@ -334,6 +334,19 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx = 0, bool use_prefill = true);
 
+// Teacher-forced scoring on the CUDA decode spine (test seam for the
+// numerics-profile acceptance gate, tools/sb-numerics). Every token is fed at
+// its own position through the non-greedy decode graph, whose raw [vocab]
+// logits reach the host; `sum_nll` accumulates the negative log-likelihood of
+// each next token under those logits and `n_scored` is the number of scored
+// positions (tokens.size() - 1 on success). `n_ctx` sizes the KV cache and is
+// raised to tokens.size() when smaller. Returns false without CUDA support, on
+// a runtime/execute failure, or for an out-of-vocabulary token id. This is
+// measurement only: it runs a throwaway runtime, not the cached greedy one, so
+// it never disturbs a session.
+bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
+                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored);
+
 // CUDA prefill + decode with prefix-cache reuse: the same token-stream contract
 // as generate_prefill_spine_cuda, but the KV cache persists in `session` across
 // calls. On each call it matches `prompt` against the session's token history

@@ -189,6 +189,11 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                 (list '* '* '* size_t '*)))
                (sb_load_params . ,(foreign-proc "sb_load_params" int
                                                 (list '* '* '* size_t '*)))
+               ;; numerics profile (process-wide, latched; see capi.h)
+               (sb_set_numerics_profile . ,(foreign-proc "sb_set_numerics_profile" int
+                                                         (list int '*)))
+               (sb_get_numerics_profile . ,(foreign-proc "sb_get_numerics_profile" int
+                                                         (list '* '*)))
                ;; inference (minimal LLM surface) — see capi.h sb_llm_*
                (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
                                                    (list '* '* '*)))

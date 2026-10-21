@@ -22,6 +22,7 @@
 #include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/planner/cost_model.h>
 #include <sonicboom/planner/draft_model.h>
 #include <sonicboom/planner/ir_passes.h>
@@ -256,7 +257,12 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
 // attribute): the row-invariant verify step of §B3. The backend then runs the
 // decode kernel per row, with the row-invariant batched mmvq for the quantized
 // matmuls — so row i is bit-identical to a plain decode step at pos+i.
-GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1) {
+// `softcap_output` false keeps the raw logits as the graph output even when the
+// model has a logit softcap. The softcap is monotonic (argmax unchanged), but it
+// is a lossy transform, so the perplexity scorer needs the raw distribution
+// while the logit dump and the sampler use the softcapped one.
+GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
+                       bool softcap_output = true) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -488,7 +494,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1) {
   mlir::Value out;
   if (greedy) {
     out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)}, {});
-  } else if (prof.softcap) {
+  } else if (prof.softcap && softcap_output) {
     out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(vocab)},
                  {attr_f("scale", double(cfg.final_logit_softcapping))});
   } else {
@@ -1296,6 +1302,10 @@ struct PlannerEnv {
   // same, but a cached segment's launches and captured graph belong to the
   // mode they were built under, so a mode change invalidates the cache.
   compiler::ReduceMode reduce;
+  // The numerics profile (sonicboom/numerics.h). It selects the KV-cache
+  // element type, which is part of the graphs' buffers, so a segment planned
+  // under one profile is stale under the other.
+  NumericsProfile numerics;
   // Fingerprint of every automatic decision recorded so far
   // (planner/decision_registry.h). A cached segment's launches encode the
   // decisions they were built under; when a later decision changes the set,
@@ -1311,7 +1321,7 @@ static PlannerEnv planner_env() {
                  quant::cuda::mmq_min_n(), compiler::mmq_tc_mode(),
                  compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
                  compiler::vram_threshold_mb(),
-                 planner::device_reduce_mode(), 0};
+                 planner::device_reduce_mode(), numerics_profile(), 0};
   planner::decisions::seed_static_knobs();
   env.decisions = planner::decisions::fingerprint();
   return env;
@@ -3026,6 +3036,37 @@ static void dump_logits_top2(const char* file, uint64_t step, uint64_t pos,
   if (file && f != stderr) std::fclose(f);
 }
 
+// A non-greedy CUDA decode runtime: the full [vocab] logits reach the host each
+// step, where the greedy graph reduces them to an argmax on the device. Built
+// per call — a throwaway runtime, not the cached greedy one. `raw_logits` keeps
+// the model's logit softcap off the output path: the logit dump wants the
+// softcapped distribution, the perplexity scorer wants the raw one.
+static std::unique_ptr<DecodeRuntime> build_eval_runtime(const Gemma4Model& m,
+                                                         uint64_t n_ctx,
+                                                         bool raw_logits) {
+  auto rt = std::make_unique<DecodeRuntime>();
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
+                              /*softcap_output=*/!raw_logits);
+  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
+                          quant::cuda::q8_1_enabled());
+  auto s = planner::CpuResourceProvider::snapshot();
+  if (!s) return nullptr;
+  rt->snap = std::move(*s);
+  planner::AnalyticalCpuCostModel cost(rt->snap);
+  auto p = planner::plan_execution(rt->graph, rt->snap, cost);
+  if (!p) return nullptr;
+  rt->plan = std::move(*p);
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx);
+  rt->cuda->bind_model(m);
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
 // Shared prefill + decode body. `prompt` is the tokens to actually prefill
 // (already the suffix when prefix reuse skipped a shared prefix); `session`, when
 // non-null, is the persistent prefix-cache session this run adopts/publishes its
@@ -3084,28 +3125,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     if (!rt) return 0;
   } else {
     Phase _p("prefill:build_decode_graph", phase_timing);
-    dump_rt = std::make_unique<DecodeRuntime>();
-    GraphIr dump_ir = emit_decode_ir(m, /*greedy=*/false);
-    dump_rt->graph = lower_graph(dump_ir, planner::IrPassPhase::Decode,
-                                 quant::cuda::q8_1_enabled());
-    auto s = planner::CpuResourceProvider::snapshot();
-    if (!s) return 0;
-    dump_rt->snap = std::move(*s);
-    {
-      Phase _pp("prefill:plan_execution", phase_timing);
-      planner::AnalyticalCpuCostModel cost(dump_rt->snap);
-      auto p = planner::plan_execution(dump_rt->graph, dump_rt->snap, cost);
-      if (!p) return 0;
-      dump_rt->plan = std::move(*p);
-    }
-    dump_rt->cpu = std::make_unique<planner::SonicBackend>(m, dump_rt->graph);
-    dump_rt->cuda = std::make_unique<planner::SonicCudaBackend>(
-        kv_cache_spec(m.config), dump_rt->graph, n_ctx);
-    dump_rt->cuda->bind_model(m);
-    dump_rt->exec = std::make_unique<planner::RuntimeExecutor>(
-        std::map<planner::BackendTag, planner::Backend*>{
-            {planner::BackendTag::Sonic, dump_rt->cuda.get()}});
-    route_host_tasks(*dump_rt->exec, dump_rt->plan, *dump_rt->cpu);
+    dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
+    if (!dump_rt) return 0;
     rt = dump_rt.get();
   }
   const planner::ResourceSnapshot& snap = rt->snap;
@@ -3590,6 +3611,71 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                   use_prefill, /*session=*/nullptr, prompt);
 }
 
+bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
+                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  if (m.weights.blocks.empty() || tokens.size() < 2) {
+    std::cerr << "[score] empty model (" << m.weights.blocks.size()
+              << " blocks) or short input (" << tokens.size() << ")\n";
+    return false;
+  }
+  const uint64_t vocab = m.config.vocab_size;
+  for (uint64_t t : tokens)
+    if (t >= vocab) {
+      std::cerr << "[score] token " << t << " outside vocab " << vocab << "\n";
+      return false;
+    }
+  if (n_ctx < tokens.size()) n_ctx = tokens.size();
+  // Teacher forcing on the non-greedy decode graph: token p is seeded and fed
+  // at position p, and the graph's full logits predict token p+1. This is the
+  // same per-token graph the greedy spine runs, so the score reflects exactly
+  // the profile's kernels (KV storage, reductions, dense precision).
+  std::unique_ptr<DecodeRuntime> rt =
+      build_eval_runtime(m, n_ctx, /*raw_logits=*/true);
+  if (!rt) {
+    std::cerr << "[score] eval runtime build failed\n";
+    return false;
+  }
+  std::vector<float> lf(vocab);
+  double sum = 0;
+  uint64_t scored = 0;
+  for (uint64_t p = 0; p + 1 < tokens.size(); ++p) {
+    rt->cuda->seed_token(tokens[p]);
+    rt->cuda->set_pos(p);
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_i64(tokens[p]));
+    in.push_back(encode_i64(p));
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (!res) {
+      std::cerr << "[score] step " << p
+                << " execute failed: " << res.error().message << "\n";
+      return false;
+    }
+    if (res->outputs.empty()) {
+      std::cerr << "[score] step " << p << " no outputs\n";
+      return false;
+    }
+    const sx::Bytes& lo = res->outputs[0];
+    if (lo.size() < vocab * sizeof(float)) {
+      std::cerr << "[score] step " << p << " logits too small: " << lo.size()
+                << " < " << vocab * sizeof(float) << "\n";
+      return false;
+    }
+    std::memcpy(lf.data(), lo.data(), vocab * sizeof(float));
+    float mx = -INFINITY;
+    for (uint64_t v = 0; v < vocab; ++v) mx = std::max(mx, lf[v]);
+    double se = 0.0;
+    for (uint64_t v = 0; v < vocab; ++v)
+      se += std::exp(double(lf[v]) - double(mx));
+    sum += (double(mx) + std::log(se)) - double(lf[tokens[p + 1]]);
+    ++scored;
+  }
+  sum_nll = sum;
+  n_scored = scored;
+  return scored > 0;
+}
+
 namespace {
 
 // Whether the reuse boundary is held back onto a prefill chunk boundary when a
@@ -3709,6 +3795,12 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
                                             uint64_t* n_reused_out) {
   if (n_reused_out) *n_reused_out = 0;
   return 0;  // built without CUDA: no device prefill is available
+}
+bool score_spine_cuda(const Gemma4Model&, std::span<const uint64_t>, uint64_t,
+                      double& sum_nll, uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  return false;  // built without CUDA: no device scoring
 }
 #endif
 

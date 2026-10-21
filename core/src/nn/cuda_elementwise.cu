@@ -29,6 +29,7 @@
 #include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
 
 #include <cuda_fp16.h>
+#include <type_traits>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
@@ -89,6 +90,21 @@ __device__ inline uint16_t float_to_bf16(float f) {
 // f32 -> bf16 -> f32 round-trip (matches bf16_to_f32(f32_to_bf16(v))).
 __device__ inline float bf16_roundtrip(float v) {
   return __uint_as_float(uint32_t(float_to_bf16(v)) << 16);
+}
+
+// --- KV-cache element type --------------------------------------------------
+//
+// The KV cache is f32 under the strict profile and f16 under standard. The
+// values were fp16-rounded before either storage form existed (the prep kernels
+// cast K and V through f16), so f16 storage is exact: widening a stored f16 is
+// the same value the f32 cache held. Every kernel that reads or writes the
+// cache goes through these two helpers and is templated on the element type;
+// the launch sites pick the instantiation from the cache's declared dtype.
+__device__ inline float kv_load(const float* p) { return *p; }
+__device__ inline float kv_load(const __half* p) { return __half2float(*p); }
+__device__ inline void kv_store(float* p, float v) { *p = v; }
+__device__ inline void kv_store(__half* p, float v) {
+  *p = __float2half_rn(v);
 }
 
 // ggml's ggml_gelu_f32, reproduced verbatim (constants + operation order) so the
@@ -554,9 +570,10 @@ __global__ void gqa_broadcast_kernel(const float* __restrict__ src,
 // fixed chunk order, so the whole result is deterministic (no float atomics).
 // It differs from the single-pass CPU reference only in fp32 summation order
 // (~1e-4 relative), inside the existing fp32 tolerance.
+template <typename KV>
 __global__ void decode_attention_split_kernel(const float* __restrict__ q,
-                                              const float* __restrict__ k_cache,
-                                              const float* __restrict__ v_cache,
+                                              const KV* __restrict__ k_cache,
+                                              const KV* __restrict__ v_cache,
                                               const uint64_t* __restrict__ pos,
                                               uint64_t n_slots, uint64_t chunk,
                                               uint64_t sliding_window,
@@ -598,9 +615,9 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   // per key.
   #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const float* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    const KV* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     float d = 0.0f;
-    for (int i = lane; i < head_dim; i += 32) d += qrow[i] * krow[i];
+    for (int i = lane; i < head_dim; i += 32) d += qrow[i] * kv_load(krow + i);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
       d += __shfl_down_sync(0xffffffffu, d, o);
@@ -641,11 +658,11 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   slot = (start + c0) % n_slots;
   #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const float* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    const KV* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
     const float p = srow[j];  // exp(score - local max)
 #pragma unroll
     for (int i = 0; i < 16; ++i)
-      if (i < dims_per_lane) acc[i] += p * vrow[lane + i * 32];
+      if (i < dims_per_lane) acc[i] += p * kv_load(vrow + lane + i * 32);
     if (++slot == n_slots) slot = 0;
   }
 
@@ -705,14 +722,15 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
 // Append one token's K/V row (row_elems floats) into the flat KV cache at slot
 // (pos % n_slots). Fixed grid == ceil(row_elems / 256); the slot offset is
 // computed in-kernel from a device-resident pos, so it is CUDA-Graph-capturable.
-__global__ void kv_append_kernel(float* __restrict__ dst,
+template <typename KV>
+__global__ void kv_append_kernel(KV* __restrict__ dst,
                                  const float* __restrict__ src,
                                  const uint64_t* __restrict__ pos,
                                  uint64_t n_slots, int row_elems) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= row_elems) return;
   const uint64_t off = (*pos % n_slots) * (uint64_t)row_elems;
-  dst[off + i] = src[i];
+  kv_store(dst + off + i, src[i]);
 }
 
 // --- flash attention (prefill) ----------------------------------------------
@@ -833,10 +851,11 @@ __global__ void flash_attention_kernel(const float* __restrict__ q,
 // shared donors) has read it, so the cache still holds the prior context while
 // this kernel runs. For start == 0 the prior range is empty and the accumulation
 // order over the batch keys is identical to flash_attention_kernel (bit-identical).
+template <typename KV>
 __global__ void flash_attention_chunk_kernel(
     const float* __restrict__ q, const float* __restrict__ k_batch,
-    const float* __restrict__ v_batch, const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache, uint64_t start, uint64_t n_slots,
+    const float* __restrict__ v_batch, const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache, uint64_t start, uint64_t n_slots,
     int n_heads_q, int n_heads_kv, int head_dim, uint64_t sliding_window,
     float scale, float* __restrict__ out) {
   extern __shared__ float s_sh[];  // [n_heads_q * FA_BK]
@@ -864,16 +883,30 @@ __global__ void flash_attention_chunk_kernel(
     // 1. warp-cooperative q·k dot per key; cache (prior) vs batch (chunk) source.
     for (int jj = 0; jj < jj_count; ++jj) {
       const uint64_t j = j0 + (uint64_t)jj;
-      const float* krow;
-      if (j < start) {
+      float dot = 0.0f;
+      if constexpr (std::is_same_v<KV, float>) {
+        // Strict (f32) path: textually the pre-profile kernel, so the fp32
+        // result stays bit-identical (restructuring changes FP contraction).
+        const KV* krow;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        } else {
+          const uint64_t bi = j - start;
+          krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        }
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+      } else if (j < start) {
         const uint64_t slot = j % n_slots;
-        krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        const KV* krow =
+            k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * kv_load(krow + d);
       } else {
         const uint64_t bi = j - start;
-        krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        const float* krow =
+            k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
       }
-      float dot = 0.0f;
-      for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1)
         dot += __shfl_down_sync(0xffffffffu, dot, o);
@@ -914,15 +947,27 @@ __global__ void flash_attention_chunk_kernel(
       float a = acc[di] * rescale;
       for (int jj = 0; jj < jj_count; ++jj) {
         const uint64_t j = j0 + (uint64_t)jj;
-        const float* vrow;
-        if (j < start) {
+        if constexpr (std::is_same_v<KV, float>) {
+          const KV* vrow;
+          if (j < start) {
+            const uint64_t slot = j % n_slots;
+            vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          } else {
+            const uint64_t bi = j - start;
+            vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          }
+          a += tile[jj] * vrow[d];
+        } else if (j < start) {
           const uint64_t slot = j % n_slots;
-          vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          const KV* vrow =
+              v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          a += tile[jj] * kv_load(vrow + d);
         } else {
           const uint64_t bi = j - start;
-          vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          const float* vrow =
+              v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          a += tile[jj] * vrow[d];
         }
-        a += tile[jj] * vrow[d];
       }
       acc[di] = a;
     }
@@ -942,10 +987,11 @@ __global__ void flash_attention_chunk_kernel(
 // a capturable CUDA Graph rather than a value baked into the node at capture
 // time. Identical numerics otherwise (the launch config is fixed by n/head
 // shapes, never by start).
+template <typename KV>
 __global__ void flash_attention_chunk_pos_kernel(
     const float* __restrict__ q, const float* __restrict__ k_batch,
-    const float* __restrict__ v_batch, const float* __restrict__ k_cache,
-    const float* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
+    const float* __restrict__ v_batch, const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
     uint64_t n_slots, int n_heads_q, int n_heads_kv, int head_dim,
     uint64_t sliding_window, float scale, float* __restrict__ out) {
   extern __shared__ float s_sh[];  // [n_heads_q * FA_BK]
@@ -973,16 +1019,31 @@ __global__ void flash_attention_chunk_pos_kernel(
 
     for (int jj = 0; jj < jj_count; ++jj) {
       const uint64_t j = j0 + (uint64_t)jj;
-      const float* krow;
-      if (j < start) {
+      float dot = 0.0f;
+      if constexpr (std::is_same_v<KV, float>) {
+        // Strict (f32) path: one pointer-select and one dot loop, textually the
+        // pre-profile kernel. Any restructuring here changes FP contraction and
+        // the fp32 result, so keep it verbatim.
+        const KV* krow;
+        if (j < start) {
+          const uint64_t slot = j % n_slots;
+          krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        } else {
+          const uint64_t bi = j - start;
+          krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        }
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+      } else if (j < start) {
         const uint64_t slot = j % n_slots;
-        krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        const KV* krow =
+            k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * kv_load(krow + d);
       } else {
         const uint64_t bi = j - start;
-        krow = k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        const float* krow =
+            k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
       }
-      float dot = 0.0f;
-      for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1)
         dot += __shfl_down_sync(0xffffffffu, dot, o);
@@ -1019,15 +1080,27 @@ __global__ void flash_attention_chunk_pos_kernel(
       float a = acc[di] * rescale;
       for (int jj = 0; jj < jj_count; ++jj) {
         const uint64_t j = j0 + (uint64_t)jj;
-        const float* vrow;
-        if (j < start) {
+        if constexpr (std::is_same_v<KV, float>) {
+          const KV* vrow;
+          if (j < start) {
+            const uint64_t slot = j % n_slots;
+            vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          } else {
+            const uint64_t bi = j - start;
+            vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          }
+          a += tile[jj] * vrow[d];
+        } else if (j < start) {
           const uint64_t slot = j % n_slots;
-          vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          const KV* vrow =
+              v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          a += tile[jj] * kv_load(vrow + d);
         } else {
           const uint64_t bi = j - start;
-          vrow = v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          const float* vrow =
+              v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
+          a += tile[jj] * vrow[d];
         }
-        a += tile[jj] * vrow[d];
       }
       acc[di] = a;
     }
@@ -1145,12 +1218,12 @@ __device__ __forceinline__ float fa_rsum4(float x) {
   return x;
 }
 
-template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
 __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
     flash_attention_tiled_kernel(
         const float* __restrict__ q, const float* __restrict__ k_batch,
-        const float* __restrict__ v_batch, const float* __restrict__ k_cache,
-        const float* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
+        const float* __restrict__ v_batch, const KV* __restrict__ k_cache,
+        const KV* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
         uint64_t n_slots, int n_heads_q, int n_heads_kv, int n,
         uint64_t sliding_window, float scale, float* __restrict__ out) {
   constexpr int V_STRIDE = BK + 2;  // pad the transposed V tile against bank conflicts
@@ -1226,37 +1299,41 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
       const int kk = idx / HEAD_DIM;
       const int d = idx % HEAD_DIM;
       const uint64_t j = j0 + (uint64_t)kk;
-      float kv = 0.0f;
+      // Both sources are fp16-rounded: the cache under f16 storage is already
+      // __half, the f32 batch row is converted here.
+      __half kv = __float2half_rn(0.0f);
       if (j <= key_end) {
-        const float* row;
         if (j < start) {
           const uint64_t slot = j % n_slots;
-          row = k_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+          kv = __float2half_rn(
+              kv_load(k_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) *
+                                    HEAD_DIM + d));
         } else {
           const uint64_t bi = j - start;
-          row = k_batch + (bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+          kv = __float2half_rn(
+              k_batch[(bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM + d]);
         }
-        kv = row[d];
       }
-      k_tile[kk * HEAD_DIM + d] = __float2half_rn(kv);
+      k_tile[kk * HEAD_DIM + d] = kv;
     }
     for (int idx = threadIdx.x; idx < BK * HEAD_DIM; idx += blockDim.x) {
       const int kk = idx / HEAD_DIM;
       const int d = idx % HEAD_DIM;
       const uint64_t j = j0 + (uint64_t)kk;
-      float vv = 0.0f;
+      __half vv = __float2half_rn(0.0f);
       if (j <= key_end) {
-        const float* row;
         if (j < start) {
           const uint64_t slot = j % n_slots;
-          row = v_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+          vv = __float2half_rn(
+              kv_load(v_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) *
+                                    HEAD_DIM + d));
         } else {
           const uint64_t bi = j - start;
-          row = v_batch + (bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM;
+          vv = __float2half_rn(
+              v_batch[(bi * (uint64_t)n_heads_kv + blockIdx.y) * HEAD_DIM + d]);
         }
-        vv = row[d];
       }
-      v_tile[d * V_STRIDE + kk] = __float2half_rn(vv);
+      v_tile[d * V_STRIDE + kk] = vv;
     }
     __syncthreads();
 
@@ -1806,7 +1883,8 @@ __global__ void copyback_chunk_kernel(const float* __restrict__ src,
 // Append n consecutive rows into the flat KV cache. Each thread copies one
 // element of one row; the slot is (start_pos + row) % n_slots (a wrap-free run,
 // so consecutive). src is [n, row_elems] position-major.
-__global__ void kv_append_batched_kernel(float* __restrict__ dst,
+template <typename KV>
+__global__ void kv_append_batched_kernel(KV* __restrict__ dst,
                                          const float* __restrict__ src,
                                          uint64_t start_pos, uint64_t n_slots,
                                          int row_elems, int n) {
@@ -1816,12 +1894,13 @@ __global__ void kv_append_batched_kernel(float* __restrict__ dst,
   const int row = idx / row_elems;
   const int e = idx - row * row_elems;
   const uint64_t slot = (start_pos + (uint64_t)row) % n_slots;
-  dst[slot * (uint64_t)row_elems + (uint64_t)e] = src[idx];
+  kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[idx]);
 }
 
 // Device-position variant of kv_append_batched_kernel: `start_pos` is a DEVICE
 // uint64_t read in-kernel (CUDA Graphs for chunked prefill).
-__global__ void kv_append_batched_pos_kernel(float* __restrict__ dst,
+template <typename KV>
+__global__ void kv_append_batched_pos_kernel(KV* __restrict__ dst,
                                              const float* __restrict__ src,
                                              const uint64_t* __restrict__ start_pos,
                                              uint64_t n_slots, int row_elems,
@@ -1832,7 +1911,7 @@ __global__ void kv_append_batched_pos_kernel(float* __restrict__ dst,
   const int row = idx / row_elems;
   const int e = idx - row * row_elems;
   const uint64_t slot = (*start_pos + (uint64_t)row) % n_slots;
-  dst[slot * (uint64_t)row_elems + (uint64_t)e] = src[idx];
+  kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[idx]);
 }
 
 } // namespace
@@ -2636,7 +2715,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
-                          float scale, float* out, int pos_offset) {
+                          float scale, float* out, int pos_offset, bool kv_f16) {
   if (!available()) return false;
   if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || head_dim > 512 ||
       !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0 ||
@@ -2677,6 +2756,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
     dsh.gqa = group_q;
     dsh.window_mask = sliding_window != 0;
     dsh.decode = true;
+    dsh.kv_f16 = kv_f16;
     dsh.exp2 = std::getenv("SONICBOOM_ATTN_EXP2") != nullptr;
     if (want_codegen && compiler::attention_shape_supported(dsh) &&
         n_heads_q % n_heads_kv == 0) {
@@ -2798,10 +2878,19 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
   const size_t smem = (size_t)group_q * chunk * sizeof(float);
   SB_NOTE_LAUNCH(decode_attention_split_kernel, (unsigned)(n_chunks * (uint64_t)n_heads_kv), group_q * 32, smem, cur_stream());
-  decode_attention_split_kernel<<<(unsigned)(n_chunks * (uint64_t)n_heads_kv),
-                                  group_q * 32, smem, cur_stream()>>>(
-      q, k_cache, v_cache, pos, n_slots, chunk, sliding_window, n_heads_q,
-      n_heads_kv, head_dim, scale, partial);
+  const unsigned split_grid =
+      (unsigned)(n_chunks * (uint64_t)n_heads_kv);
+  if (kv_f16)
+    decode_attention_split_kernel<<<split_grid, group_q * 32, smem,
+                                    cur_stream()>>>(
+        q, reinterpret_cast<const __half*>(k_cache),
+        reinterpret_cast<const __half*>(v_cache), pos, n_slots, chunk,
+        sliding_window, n_heads_q, n_heads_kv, head_dim, scale, partial);
+  else
+    decode_attention_split_kernel<<<split_grid, group_q * 32, smem,
+                                    cur_stream()>>>(
+        q, k_cache, v_cache, pos, n_slots, chunk, sliding_window, n_heads_q,
+        n_heads_kv, head_dim, scale, partial);
   SB_NOTE_LAUNCH(decode_attention_merge_kernel, (unsigned)n_heads_q, head_dim, 0, cur_stream());
   decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim, 0, cur_stream()>>>(
       partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
@@ -2815,7 +2904,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems, int pos_offset) {
+                   int row_elems, int pos_offset, bool dst_f16) {
   if (!available()) return false;
   if (row_elems <= 0 || !dst_k || !dst_v || !src_k || !src_v || !pos ||
       n_slots == 0 || pos_offset < 0)
@@ -2823,11 +2912,19 @@ bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
   pos += pos_offset;  // B3 verify: append row `pos_offset` at its position
   const int grid = grid_for(row_elems);
   SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
-  kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_k, src_k, pos, n_slots,
-                                                   row_elems);
-  SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
-  kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_v, src_v, pos, n_slots,
-                                                   row_elems);
+  if (dst_f16) {
+    kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_k), src_k, pos, n_slots, row_elems);
+    SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
+    kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_v), src_v, pos, n_slots, row_elems);
+  } else {
+    kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_k, src_k, pos,
+                                                     n_slots, row_elems);
+    SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
+    kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_v, src_v, pos,
+                                                     n_slots, row_elems);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2856,7 +2953,7 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
                                uint64_t n_slots, int n, int n_heads_q,
                                int n_heads_kv, int head_dim,
                                uint64_t sliding_window, float scale,
-                               float* out) {
+                               float* out, bool kv_f16) {
   if (!available()) return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
     return false;
@@ -2866,16 +2963,22 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   SB_NOTE_LAUNCH(flash_attention_chunk_kernel, n, n_heads_q * 32, smem, cur_stream());
-  flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
-      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
-      n_heads_kv, head_dim, sliding_window, scale, out);
+  if (kv_f16)
+    flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, reinterpret_cast<const __half*>(k_cache),
+        reinterpret_cast<const __half*>(v_cache), start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
+  else
+    flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
   return cudaGetLastError() == cudaSuccess;
 }
 
-template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
 bool launch_tiled_flash_attention(const float* q, const float* k_batch,
-                                  const float* v_batch, const float* k_cache,
-                                  const float* v_cache, const uint64_t* start,
+                                  const float* v_batch, const void* k_cache,
+                                  const void* v_cache, const uint64_t* start,
                                   uint64_t n_slots, int n, int n_heads_q,
                                   int n_heads_kv, uint64_t sliding_window,
                                   float scale, float* out) {
@@ -2886,7 +2989,7 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
   constexpr int smem_bytes = HEAD_DIM * (2 * BK + 2) * (int)sizeof(__half) +
                              P_ELEMS * (int)sizeof(__half) +
                              (RS_ELEMS + L_ELEMS) * (int)sizeof(float);
-  auto kfn = flash_attention_tiled_kernel<HEAD_DIM, BK, NW, QB, GQA>;
+  auto kfn = flash_attention_tiled_kernel<KV, HEAD_DIM, BK, NW, QB, GQA>;
   static bool configured = false;
   if (!configured) {
     cudaFuncSetAttribute((const void*)kfn,
@@ -2900,9 +3003,29 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
                                                                  {"QB", QB}, {"GQA", GQA}}),
                     dim3(grid_x, n_heads_kv), threads, smem_bytes, cur_stream());
   kfn<<<dim3(grid_x, n_heads_kv), threads, smem_bytes, cur_stream()>>>(
-      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q, n_heads_kv,
+      q, k_batch, v_batch, static_cast<const KV*>(k_cache),
+      static_cast<const KV*>(v_cache), start, n_slots, n_heads_q, n_heads_kv,
       n, sliding_window, scale, out);
   return cudaGetLastError() == cudaSuccess;
+}
+
+// f32 vs f16 KV cache arm for the hand-written tiled kernel.
+template <int HEAD_DIM, int BK, int NW, int QB, int GQA>
+bool launch_tiled_flash_attention_kv(const float* q, const float* k_batch,
+                                     const float* v_batch,
+                                     const float* k_cache,
+                                     const float* v_cache,
+                                     const uint64_t* start, uint64_t n_slots,
+                                     int n, int n_heads_q, int n_heads_kv,
+                                     uint64_t sliding_window, float scale,
+                                     float* out, bool kv_f16) {
+  if (kv_f16)
+    return launch_tiled_flash_attention<__half, HEAD_DIM, BK, NW, QB, GQA>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  return launch_tiled_flash_attention<float, HEAD_DIM, BK, NW, QB, GQA>(
+      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+      n_heads_kv, sliding_window, scale, out);
 }
 
 namespace {
@@ -3066,6 +3189,8 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
                          uint64_t n_slots, int n, int n_heads_q,
                          int n_heads_kv, uint64_t sliding_window, float scale,
                          float *out) {
+  // `shape` already carries kv_f16: the caller builds it from the profile, so
+  // the region identity, the staging path and the shared-memory budget agree.
   const float *q_p = q, *kb_p = k_batch, *vb_p = v_batch, *kc_p = k_cache,
               *vc_p = v_cache;
   const uint64_t *start_p = start;
@@ -3221,19 +3346,19 @@ bool attn_launch_own(int head_dim, int gqa, const float *q,
                      const float *k_cache, const float *v_cache,
                      const uint64_t *start, uint64_t n_slots, int n,
                      int n_heads_q, int n_heads_kv, uint64_t sliding_window,
-                     float scale, float *out) {
+                     float scale, float *out, bool kv_f16 = false) {
   if (gqa == 4 && head_dim == 256)
-    return launch_tiled_flash_attention<256, 64, 2, 32, 4>(
+    return launch_tiled_flash_attention_kv<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
   if (gqa == 4 && head_dim == 512)
-    return launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+    return launch_tiled_flash_attention_kv<512, 32, 4, 16, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
   if (gqa == 7 && head_dim == 64)
-    return launch_tiled_flash_attention<64, 64, 2, 32, 7>(
+    return launch_tiled_flash_attention_kv<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
   return false;
 }
 
@@ -3280,7 +3405,7 @@ struct AttnTuneBufs {
 
 AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
                              int n_heads_kv, uint64_t window_len, bool window,
-                             const AttnChoice &def, double &tune_s,
+                             const AttnChoice &def, bool kv_f16, double &tune_s,
                              int &candidate_count) {
   const auto t0 = std::chrono::steady_clock::now();
   candidate_count = 0;
@@ -3318,7 +3443,11 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
       if (attn_same_choice(x, c)) return;
     cands.push_back(c);
   };
-  for (int as : {0, 2, 3})
+  // f16 KV forces synchronous staging (the generated kernel cannot cp.async a
+  // mixed f16-cache / f32-batch tile), so only the as = 0 candidates exist.
+  const std::vector<int> stages = kv_f16 ? std::vector<int>{0}
+                                         : std::vector<int>{0, 2, 3};
+  for (int as : stages)
     for (int dps : {1, 2, 4, 8})
       for (int bc : {16, 32, 48, 64})
         for (int br : {16, 32, 48, 64})
@@ -3380,10 +3509,11 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
     if (c.impl == AttnImpl::Own)
       return attn_launch_own(head_dim, gqa, b.q, b.kb, b.vb, b.kc, b.vc,
                              b.start, slots, queries, n_heads_q, n_heads_kv, w,
-                             scale, b.out);
-    const compiler::AttentionShape s = attn_prefill_shape(
+                             scale, b.out, kv_f16);
+    compiler::AttentionShape s = attn_prefill_shape(
         head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
         c.qs == 0, c.hf);
+    s.kv_f16 = kv_f16;
     return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start, slots,
                                queries, n_heads_q, n_heads_kv, w, scale, b.out);
   };
@@ -3789,7 +3919,7 @@ bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
 // shape class (head count included) and the generated-code version; it never
 // includes the batch size or position.
 AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
-                        bool window, uint64_t window_len) {
+                        bool window, uint64_t window_len, bool kv_f16) {
   const AttnChoice def = attn_default_choice(head_dim, gqa, window);
   if (!::sonicboom::tune::enabled()) return def;
   // Only the classes the generator covers can be tuned; the rest keep own.
@@ -3831,7 +3961,7 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     double tune_s = 0.0;
     int candidate_count = 0;
     choice = attn_tune_prefill(head_dim, gqa, n_heads_q, n_heads_kv, window_len,
-                               window, def, tune_s, candidate_count);
+                               window, def, kv_f16, tune_s, candidate_count);
     std::map<std::string, int> values{
         {"impl", choice.impl == AttnImpl::Codegen ? 1 : 0},
         {"br", choice.br},
@@ -4053,7 +4183,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t n_slots, int n, int n_heads_q,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
-                                   float* out) {
+                                   float* out, bool kv_f16) {
   if (!available()) return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
     return false;
@@ -4105,22 +4235,27 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
       (std::string_view(e) == "own" || std::string_view(e) == "codegen"))
     attn_impl = e;
   std::optional<compiler::AttentionShape> shape;
+  auto with_kv = [&](std::optional<compiler::AttentionShape> s) {
+    if (s) s->kv_f16 = kv_f16;
+    return s;
+  };
   if (attn_impl == "codegen") {
-    shape = attn_codegen_shape(head_dim, gqa, sliding_window != 0);
+    shape = with_kv(attn_codegen_shape(head_dim, gqa, sliding_window != 0));
   } else if (attn_impl == "auto") {
     const bool windowed = sliding_window != 0;
     if (std::getenv("SONICBOOM_ATTN_CODEGEN") != nullptr &&
         attn_default_choice(head_dim, gqa, windowed).impl == AttnImpl::Codegen) {
       // Explicit tile pin (the Stage 3c sweep): codegen at that config. The
       // pin does not move a class whose measured default is own.
-      shape = attn_codegen_shape(head_dim, gqa, windowed);
+      shape = with_kv(attn_codegen_shape(head_dim, gqa, windowed));
     } else {
       const AttnChoice c = attn_resolve(head_dim, gqa, n_heads_q, n_heads_kv,
-                                        windowed, sliding_window);
+                                        windowed, sliding_window, kv_f16);
       if (c.impl == AttnImpl::Codegen) {
-        const compiler::AttentionShape s = attn_prefill_shape(
+        compiler::AttentionShape s = attn_prefill_shape(
             head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
             c.qs == 0, c.hf);
+        s.kv_f16 = kv_f16;
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
@@ -4178,27 +4313,27 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   }
 
   if (gqa == 4 && head_dim == 256) {
-    const bool ok = launch_tiled_flash_attention<256, 64, 2, 32, 4>(
+    const bool ok = launch_tiled_flash_attention_kv<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
     if (ok)
       attn_trace_own<256, 64, 2, 32, 4>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
     return ok;
   }
   if (gqa == 4 && head_dim == 512) {
-    const bool ok = launch_tiled_flash_attention<512, 32, 4, 16, 4>(
+    const bool ok = launch_tiled_flash_attention_kv<512, 32, 4, 16, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
     if (ok)
       attn_trace_own<512, 32, 4, 16, 4>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
     return ok;
   }
   if (gqa == 7 && head_dim == 64) {
-    const bool ok = launch_tiled_flash_attention<64, 64, 2, 32, 7>(
+    const bool ok = launch_tiled_flash_attention_kv<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out);
+        n_heads_kv, sliding_window, scale, out, kv_f16);
     if (ok)
       attn_trace_own<64, 64, 2, 32, 7>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
@@ -4207,9 +4342,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
 
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
   SB_NOTE_LAUNCH(flash_attention_chunk_pos_kernel, n, n_heads_q * 32, smem, cur_stream());
-  flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
-      q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
-      n_heads_kv, head_dim, sliding_window, scale, out);
+  if (kv_f16)
+    flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, reinterpret_cast<const __half*>(k_cache),
+        reinterpret_cast<const __half*>(v_cache), start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
+  else
+    flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -5433,35 +5574,57 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
 
 bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
                            const float* src_v, uint64_t start_pos,
-                           uint64_t n_slots, int row_elems, int n) {
+                           uint64_t n_slots, int row_elems, int n,
+                           bool dst_f16) {
   if (!available()) return false;
   if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
       n_slots == 0)
     return false;
   const int grid = grid_for(row_elems * n);
   SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
-  kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
-      dst_k, src_k, start_pos, n_slots, row_elems, n);
-  SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
-  kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
-      dst_v, src_v, start_pos, n_slots, row_elems, n);
+  if (dst_f16) {
+    kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_k), src_k, start_pos, n_slots, row_elems,
+        n);
+    SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
+    kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_v), src_v, start_pos, n_slots, row_elems,
+        n);
+  } else {
+    kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_k, src_k, start_pos, n_slots, row_elems, n);
+    SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
+    kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_v, src_v, start_pos, n_slots, row_elems, n);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
                                const float* src_v, const uint64_t* start_pos,
-                               uint64_t n_slots, int row_elems, int n) {
+                               uint64_t n_slots, int row_elems, int n,
+                               bool dst_f16) {
   if (!available()) return false;
   if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
       !start_pos || n_slots == 0)
     return false;
   const int grid = grid_for(row_elems * n);
   SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-  kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-      dst_k, src_k, start_pos, n_slots, row_elems, n);
-  SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-  kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-      dst_v, src_v, start_pos, n_slots, row_elems, n);
+  if (dst_f16) {
+    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_k), src_k, start_pos, n_slots, row_elems,
+        n);
+    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
+    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_v), src_v, start_pos, n_slots, row_elems,
+        n);
+  } else {
+    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_k, src_k, start_pos, n_slots, row_elems, n);
+    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
+    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_v, src_v, start_pos, n_slots, row_elems, n);
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 

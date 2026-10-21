@@ -53,6 +53,21 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/train/test-lr-schedule.scm)
 
+  # The numerics profile binding, once per profile: the environment names the
+  # profile the process must run under, and the test checks the latched value
+  # rather than assuming a default.
+  foreach(profile IN ITEMS strict standard)
+    add_test(
+      NAME guile-numerics-${profile}
+      COMMAND ${CMAKE_COMMAND} -E env
+              GUILE_AUTO_COMPILE=0
+              LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+              SONICBOOM_NUMERICS=${profile}
+              ${GUILE_EXECUTABLE} --no-auto-compile
+              -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-numerics.scm)
+  endforeach()
+
   # guile-nn loads libsonicboom.so (built by the `sonicboom` target), so put its
   # directory on LD_LIBRARY_PATH for the dynamic-link call.
   add_test(

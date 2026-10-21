@@ -136,13 +136,24 @@ struct AttentionShape {
   // is an opt-in arm (SONICBOOM_ATTN_EXP2).
   bool exp2 = false;
 
+  // The KV cache is f16 instead of f32 (the standard numerics profile). The
+  // batch K/V of the current chunk stay f32, so the staging reads the two
+  // sources with different element types; the generated kernel then stages
+  // synchronously (cp.async copies raw bytes and cannot convert a mixed
+  // source, and an f16 cache tile needs a widening load anyway). The values
+  // read are the same fp16-rounded numbers in both cases, so the kernel's
+  // arithmetic is unchanged; only the staging path differs. Part of the
+  // region identity (the JIT cache key).
+  bool kv_f16 = false;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
            dps == o.dps && decode == o.decode && warp_head == o.warp_head &&
            gqa_pack == o.gqa_pack && q_in_reg == o.q_in_reg &&
            head_fast == o.head_fast &&
-           async_stages == o.async_stages && exp2 == o.exp2;
+           async_stages == o.async_stages && exp2 == o.exp2 &&
+           kv_f16 == o.kv_f16;
   }
 };
 

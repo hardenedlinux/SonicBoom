@@ -35,8 +35,10 @@ namespace sonicboom::planner {
 // One KV layer's persistent device-resident cache (moved here from
 // SonicCudaBackend so a session can own it). K is RoPE'd + per-head-normed then
 // fp16-rounded; V per-head-normed then fp16-rounded. Flat
-// [n_slots, n_heads_kv, head_dim] in f32; slot for absolute position j is
-// `j % n_slots`.
+// [n_slots, n_heads_kv, head_dim]; slot for absolute position j is
+// `j % n_slots`. Element type: f32 under the strict numerics profile, f16
+// under standard (`f16`). Reading an f16 row and widening is exact, since the
+// values were fp16-rounded before either storage existed.
 struct KvCacheDev {
   hal::Buffer k_buf;
   hal::Buffer v_buf;
@@ -44,6 +46,7 @@ struct KvCacheDev {
   uint64_t n_slots = 0;
   uint64_t n_heads_kv = 0;
   uint64_t head_dim = 0;
+  bool f16 = false;    // element type of k_buf/v_buf (standard profile)
 };
 
 // Static KV-cache geometry the CUDA backend needs to allocate and index the

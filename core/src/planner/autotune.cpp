@@ -19,6 +19,7 @@
 #include "decision_registry.h"
 #include "reduce_mode.h"
 
+#include <sonicboom/numerics.h>
 #include <sonicboom/runtime_features.h>
 
 #include <algorithm>
@@ -54,8 +55,18 @@ std::string compute_device_dir() {
   // reused under another. The identity itself is shared with the reduction
   // decision cache (planner/reduce_mode.h), so both trees key the device the
   // same way.
-  return planner::device_identity() + "-reduce-" +
-         compiler::reduce_mode_name(planner::device_reduce_mode());
+  std::string dir = planner::device_identity() + "-reduce-" +
+                    compiler::reduce_mode_name(planner::device_reduce_mode());
+  // The numerics profile changes which kernels exist (f16 KV variants) and
+  // which are acceptable (TF32 dense), so its picks are its own. Strict keeps
+  // the historical directory name so every pre-profile pick stays valid and a
+  // strict run resolves the same choices it always did; standard gets a
+  // suffix. The two keys are disjoint either way.
+  if (sonicboom::numerics_profile() !=
+      sonicboom::NumericsProfile::Strict)
+    dir += std::string("-num-") +
+           sonicboom::numerics_profile_name(sonicboom::numerics_profile());
+  return dir;
 }
 
 std::string cache_root() { return planner::decision_cache_root(); }

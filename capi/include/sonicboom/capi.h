@@ -430,6 +430,39 @@ sb_status sb_load_params(const char *path, const char *const *names,
                          sb_tensor *const *params, size_t count,
                          sb_error **err_out);
 
+/* --- Numerics profile ------------------------------------------------------ */
+
+/* The two numerics profiles (see core/include/sonicboom/numerics.h):
+ *
+ *   SB_NUMERICS_STRICT   -- the v0/v1 reference semantics. Every reduction is
+ *                           identical to the historical binary; the KV cache
+ *                           keeps f32; no TF32/DF32 substitutions.
+ *   SB_NUMERICS_STANDARD -- the performance profile. Bit-identical to strict
+ *                           unless a substitution is enabled for it; today
+ *                           that is f16 KV storage (exact for the values the
+ *                           cache holds) and the profile's other candidates.
+ *
+ * The profile is process-wide and latched: the first inference or explicit
+ * set wins, because it is part of the plan, autotune and codegen cache keys.
+ * Until it is set the process uses the SONICBOOM_NUMERICS environment variable
+ * ("strict" or "standard"), then SB_NUMERICS_STANDARD.
+ *
+ * sb_get_numerics_profile returns the effective profile (the latched value, or
+ * the environment/default value before the first latch). */
+typedef enum sb_numerics_profile {
+  SB_NUMERICS_STRICT = 0,
+  SB_NUMERICS_STANDARD = 1,
+} sb_numerics_profile;
+
+/* Request a profile for this process. Returns SB_ERR_UNSUPPORTED (with a
+ * message naming both profiles) if a different profile is already latched;
+ * setting the already-effective profile is a no-op success. Call before the
+ * first model load or inference for the setting to apply everywhere. */
+sb_status sb_set_numerics_profile(sb_numerics_profile profile,
+                                  sb_error **err_out);
+sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
+                                  sb_error **err_out);
+
 /* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
 /* A thin facade over the Layer 2 model loader + planner spine, exposing the
  * smallest inference set the first binding (Guile) needs: model load/free,

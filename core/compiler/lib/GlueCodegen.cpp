@@ -1878,11 +1878,68 @@ std::string reduce_variant_text(std::string_view text, ReduceMode mode) {
   return rw.run(text);
 }
 
+// The standard profile's KV cache holds f16; heads_norm_rope_cast's cache-row
+// stores are the only places a glue region writes it. Rewriting the three store
+// blocks: the pointer GEPs index f16 elements and the stored value is the
+// fp16-rounded result truncated back to f16. `%r0`/`%r1`/`%r2` are already
+// fp16-round-tripped on a `do_cast` chain, so the truncf is exact there; on a
+// chain without the cast it rounds once at the store, which is what the
+// reference kv_append<__half> does. Returns empty if a pattern does not match
+// exactly once — a silently unrewritten store would write f32 into an f16
+// cache, so the caller treats that as "no generator".
+std::string kv16_variant_text(std::string text) {
+  auto replace_once = [&](std::string_view from, std::string_view to) {
+    const std::size_t at = text.find(from);
+    if (at == std::string::npos) return false;
+    if (text.find(from, at + 1) != std::string::npos) return false;
+    text.replace(at, from.size(), to);
+    return true;
+  };
+  if (!replace_once(
+          "%cptr = llvm.getelementptr %cache[%cbase] : (!llvm.ptr, i64) -> "
+          "!llvm.ptr, f32",
+          "%cptr = llvm.getelementptr %cache[%cbase] : (!llvm.ptr, i64) -> "
+          "!llvm.ptr, f16"))
+    return {};
+  if (!replace_once(
+          "%cp0 = llvm.getelementptr %cptr[%tid_i] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f32\n            llvm.store %r0, %cp0 : f32, !llvm.ptr",
+          "%ch0 = arith.truncf %r0 : f32 to f16\n"
+          "            %cp0 = llvm.getelementptr %cptr[%tid_i] : (!llvm.ptr, "
+          "i32) -> !llvm.ptr, f16\n"
+          "            llvm.store %ch0, %cp0 : f16, !llvm.ptr"))
+    return {};
+  if (!replace_once(
+          "%cp1 = llvm.getelementptr %cph[%tid_i] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f32\n            llvm.store %r1, %cp1 : f32, !llvm.ptr",
+          "%cp1 = llvm.getelementptr %cph[%tid_i] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f16\n"
+          "            %ch1 = arith.truncf %r1 : f32 to f16\n"
+          "            llvm.store %ch1, %cp1 : f16, !llvm.ptr"))
+    return {};
+  if (!replace_once(
+          "%cph = llvm.getelementptr %cptr[%half] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f32",
+          "%cph = llvm.getelementptr %cptr[%half] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f16"))
+    return {};
+  if (!replace_once(
+          "%cp2 = llvm.getelementptr %cptr[%k2i] : (!llvm.ptr, i32) -> "
+          "!llvm.ptr, f32\n            llvm.store %r2, %cp2 : f32, !llvm.ptr",
+          "%ch2 = arith.truncf %r2 : f32 to f16\n"
+          "            %cp2 = llvm.getelementptr %cptr[%k2i] : (!llvm.ptr, "
+          "i32) -> !llvm.ptr, f16\n"
+          "            llvm.store %ch2, %cp2 : f16, !llvm.ptr"))
+    return {};
+  return text;
+}
+
 } // namespace
 
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
-std::string region_text(GlueRegionKind kind, int sm_arch, ReduceMode mode) {
+std::string region_text(GlueRegionKind kind, int sm_arch, ReduceMode mode,
+                        bool kv_f16) {
   const char *text = nullptr;
   switch (kind) {
     case GlueRegionKind::RmsNormQuantizeQ8_1:
@@ -1908,7 +1965,14 @@ std::string region_text(GlueRegionKind kind, int sm_arch, ReduceMode mode) {
 
   // F64 returns the literal text; the other modes rewrite the reduction
   // statements before the chip substitution.
-  const std::string variant = reduce_variant_text(text, mode);
+  std::string variant = reduce_variant_text(text, mode);
+  if (kv_f16) {
+    // Only the attention prep stores a cache row; asking for the f16 variant
+    // of any other region is a caller error.
+    if (kind != GlueRegionKind::HeadsNormRopeCast) return {};
+    variant = kv16_variant_text(std::move(variant));
+    if (variant.empty()) return {};
+  }
   const std::string chip = "sm_" + std::to_string(sm_arch);
   std::string out;
   out.reserve(variant.size() + chip.size());
@@ -2037,8 +2101,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
 }
 
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch,
-                                             ReduceMode mode) {
-  const std::string text = region_text(kind, sm_arch, mode);
+                                             ReduceMode mode, bool kv_f16) {
+  const std::string text = region_text(kind, sm_arch, mode, kv_f16);
   if (text.empty()) {
     std::fprintf(stderr, "glue codegen: region '%s' has no generator\n",
                  glue_region_name(kind));

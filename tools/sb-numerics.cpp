@@ -12,6 +12,18 @@
 //   sb-numerics            compare F64 against DF32 and print the verdict
 //   sb-numerics dump FILE  run this process's mode once and write its dump
 //
+// boom-r4 M1 adds the numerics-PROFILE acceptance gate (strict vs standard):
+//
+//   sb-numerics profile            run both profiles and print the gate table
+//   sb-numerics profile-dump FILE MODEL   run this process's profile once
+//
+// The profile gate measures perplexity (teacher-forced NLL on a fixed >= 20k
+// token local corpus per model, relative delta <= 0.5%), top-1 agreement over
+// 50 prompts (>= 99%), and, within each profile, 3-run greedy determinism,
+// batch-of-4 invariance (a 4-token prefill vs four per-token steps) and prefix
+// reuse vs full prefill — all bit-identical. The cross-profile first divergent
+// greedy step is informational.
+//
 // What is measured:
 //   * per T0a kernel: max ulp to the F64-mode output (the output dtype's ulp),
 //     the fraction of elements that differ, and the max / relative error
@@ -34,6 +46,7 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/nn/matmul.h>
 #include <sonicboom/nn/norm.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include <sonicboom/vocab/vocab.h>
 
@@ -46,6 +59,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -53,6 +67,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -846,6 +861,394 @@ int finish(Dump& f64, Dump& df32, bool any_model) {
   return ok ? 0 : 1;
 }
 
+// --- numerics-profile acceptance gate (boom-r4 M1) -------------------------
+
+struct ProfileModel {
+  const char* env;
+  const char* rel;
+  const char* tag;
+};
+
+constexpr ProfileModel kProfileModels[] = {
+    {"SONICBOOM_GEMMA_GGUF", "gemma-4-E4B-it-Q3_K_M.gguf", "gemma"},
+    {"SONICBOOM_QWEN_GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf", "qwen"},
+    {"SONICBOOM_DEEPSEEK_GGUF", "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf",
+     "deepseek"},
+};
+
+// The fixed local corpus: the repository's own prose, in a fixed file order, so
+// every process and every model scores the same text. 24k tokens is the scored
+// span (the gate asks for >= 20k); the text is longer so all three tokenizers
+// reach it. SONICBOOM_PPL_TOKENS overrides the span for smoke runs; the
+// recorded gate numbers always use the default.
+uint64_t ppl_token_budget() {
+  if (const char* e = std::getenv("SONICBOOM_PPL_TOKENS")) {
+    const long v = std::atol(e);
+    if (v > 0) return uint64_t(v);
+  }
+  return 24000;
+}
+
+std::string read_text_file(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return {};
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+std::string profile_corpus_text() {
+  std::vector<std::string> roots = {".", ".."};
+  std::string root;
+  for (const auto& r : roots) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(r + "/design", ec)) {
+      root = r;
+      break;
+    }
+  }
+  if (root.empty()) return {};
+  std::vector<std::string> files;
+  for (const char* f : {"README.md", "CLAUDE.md"}) {
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(root + "/" + f, ec))
+      files.push_back(root + "/" + f);
+  }
+  std::vector<std::string> design;
+  std::error_code ec;
+  for (const auto& e :
+       std::filesystem::directory_iterator(root + "/design", ec)) {
+    if (e.is_regular_file() && e.path().extension() == ".md")
+      design.push_back(e.path().string());
+  }
+  std::sort(design.begin(), design.end());
+  files.insert(files.end(), design.begin(), design.end());
+  std::string text;
+  for (const auto& f : files) {
+    text += read_text_file(f);
+    text += "\n";
+    if (text.size() >= 400000) break;
+  }
+  return text;
+}
+
+struct ProfileResult {
+  std::string model;
+  std::string profile;
+  double sum_nll = 0;
+  uint64_t n_scored = 0;
+  std::map<int, uint64_t> top1;
+  std::array<std::vector<int64_t>, 3> runs;
+  std::vector<int64_t> batch4;
+  std::vector<int64_t> batch4_single;
+  std::vector<int64_t> reuse_full;
+  std::vector<int64_t> reuse_session;
+};
+
+bool write_profile_dump(const ProfileResult& r, const std::string& path) {
+  std::ofstream out(path, std::ios::trunc);
+  if (!out) return false;
+  auto vec = [&](const char* key, const std::vector<int64_t>& v) {
+    out << key;
+    for (int64_t t : v) out << ' ' << t;
+    out << '\n';
+  };
+  out << "profile " << r.profile << '\n';
+  out << "model " << r.model << '\n';
+  out << "ppl " << std::setprecision(17) << r.sum_nll << ' ' << r.n_scored
+      << '\n';
+  for (const auto& [i, t] : r.top1) out << "top1 " << i << ' ' << t << '\n';
+  for (int i = 0; i < 3; ++i) vec(("run" + std::to_string(i)).c_str(),
+                                  r.runs[i]);
+  vec("batch4", r.batch4);
+  vec("batch4_single", r.batch4_single);
+  vec("reuse_full", r.reuse_full);
+  vec("reuse_session", r.reuse_session);
+  return bool(out);
+}
+
+bool read_profile_dump(const std::string& path, ProfileResult& r) {
+  std::ifstream in(path);
+  if (!in) return false;
+  std::string line;
+  while (std::getline(in, line)) {
+    std::istringstream ss(line);
+    std::string key;
+    ss >> key;
+    if (key.empty()) continue;
+    if (key == "profile") {
+      ss >> r.profile;
+    } else if (key == "model") {
+      ss >> r.model;
+    } else if (key == "ppl") {
+      ss >> r.sum_nll >> r.n_scored;
+    } else if (key == "top1") {
+      int i = 0;
+      uint64_t t = 0;
+      if (ss >> i >> t) r.top1[i] = t;
+    } else if (key.rfind("run", 0) == 0) {
+      const int i = key.size() > 3 ? std::atoi(key.c_str() + 3) : -1;
+      if (i < 0 || i > 2) return false;
+      int64_t t = 0;
+      while (ss >> t) r.runs[size_t(i)].push_back(t);
+    } else {
+      std::vector<int64_t>* v = key == "batch4"          ? &r.batch4
+                                : key == "batch4_single" ? &r.batch4_single
+                                : key == "reuse_full"    ? &r.reuse_full
+                                : key == "reuse_session" ? &r.reuse_session
+                                                         : nullptr;
+      if (v == nullptr) return false;
+      int64_t t = 0;
+      while (ss >> t) v->push_back(t);
+    }
+  }
+  return !r.profile.empty() && !r.model.empty();
+}
+
+// Run one model under this process's profile and fill `r`.
+bool run_profile_model(const std::string& path, const char* tag, bool cuda,
+                       ProfileResult& r) {
+  Loaded l;
+  if (!load(path, tag, l)) return false;
+  r.model = tag;
+  r.profile = sonicboom::numerics_profile_name(
+      sonicboom::numerics_profile());
+
+  // Perplexity: the fixed corpus, teacher-forced through the CUDA spine. The
+  // CPU oracle is not used: the profile's kernel choices are on the device.
+  if (cuda) {
+    const std::string text = profile_corpus_text();
+    if (!text.empty()) {
+      auto ids = encode(l, text);
+      const uint64_t budget = ppl_token_budget();
+      if (ids.size() > budget) ids.resize(budget);
+      std::printf("  ppl corpus: %zu tokens\n", ids.size());
+      std::fflush(stdout);
+      if (ids.size() >= 1000 &&
+          sbmodel::score_spine_cuda(l.model, ids, ids.size(), r.sum_nll,
+                                    r.n_scored))
+        std::printf("  ppl: sum_nll=%.3f over %llu tokens\n", r.sum_nll,
+                    (unsigned long long)r.n_scored);
+      else
+        std::printf("  ppl: scoring failed\n");
+      std::fflush(stdout);
+    }
+  }
+
+  // Top-1 over 50 prompts (first greedy token).
+  for (int i = 0; i < 50; ++i) {
+    const std::string text = std::string(kPrompts[i % 3]) + " (" +
+                             std::to_string(i) + ")";
+    auto prompt = encode(l, text);
+    if (prompt.empty()) continue;
+    std::vector<int64_t> one(1, -1);
+    const uint64_t n = cuda ? sbmodel::generate_prefill_spine_cuda(
+                                  l.model, prompt, 0, one, 0, true)
+                            : sbmodel::generate_prefill_spine(
+                                  l.model, prompt, 0, one, 0, true);
+    if (n != 0) r.top1[i] = uint64_t(one[0]);
+  }
+
+  // 3-run greedy determinism on one fixed prompt.
+  auto prompt = encode(l, kPrompts[2]);
+  if (!prompt.empty()) {
+    for (int run = 0; run < 3; ++run) {
+      std::vector<int64_t> toks(64, -1);
+      const uint64_t n = cuda ? sbmodel::generate_prefill_spine_cuda(
+                                    l.model, prompt, 0, toks, 0, true)
+                              : sbmodel::generate_prefill_spine(
+                                    l.model, prompt, 0, toks, 0, true);
+      toks.resize(n);
+      r.runs[size_t(run)] = std::move(toks);
+    }
+  }
+
+  // Batch-of-four invariance: a 4-token batch prefill vs four per-token steps.
+  auto p4 = encode(l, "The quick brown fox");
+  if (p4.size() > 4) p4.resize(4);
+  if (p4.size() == 4) {
+    std::vector<int64_t> a(16, -1), b(16, -1);
+    uint64_t na = cuda ? sbmodel::generate_prefill_spine_cuda(l.model, p4, 0, a,
+                                                              0, true)
+                       : sbmodel::generate_prefill_spine(l.model, p4, 0, a, 0,
+                                                         true);
+    uint64_t nb = cuda ? sbmodel::generate_prefill_spine_cuda(l.model, p4, 0, b,
+                                                              0, false)
+                       : sbmodel::generate_prefill_spine(l.model, p4, 0, b, 0,
+                                                         false);
+    a.resize(na);
+    b.resize(nb);
+    r.batch4 = std::move(a);
+    r.batch4_single = std::move(b);
+  }
+
+  // Prefix reuse vs full prefill, on the CUDA session path.
+  if (cuda) {
+    auto ps = encode(l, "Explain in one sentence why the sky is blue.");
+    if (ps.size() > 8) ps.resize(8);
+    auto full = ps;
+    for (int i = 0; i < 6; ++i) full.push_back(ps[size_t(i) % ps.size()]);
+    std::vector<int64_t> direct(16, -1);
+    const uint64_t nd = sbmodel::generate_prefill_spine_cuda(l.model, full, 0,
+                                                             direct, 0, true);
+    direct.resize(nd);
+    sonicboom::planner::KvCacheSession session;
+    session.n_ctx = 128;
+    std::vector<int64_t> da(1, -1), reused(16, -1);
+    sbmodel::generate_prefill_spine_cuda_prefix(l.model, ps, 0, da, session,
+                                                true);
+    const uint64_t nr = sbmodel::generate_prefill_spine_cuda_prefix(
+        l.model, full, 0, reused, session, true);
+    reused.resize(nr);
+    r.reuse_full = std::move(direct);
+    r.reuse_session = std::move(reused);
+  }
+  return true;
+}
+
+std::string vec_join(const std::vector<int64_t>& v) {
+  std::string s;
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (i) s += ',';
+    s += std::to_string(v[i]);
+  }
+  return s;
+}
+
+// First index at which two token streams differ (== size when they agree).
+size_t first_divergence(const std::vector<int64_t>& a,
+                        const std::vector<int64_t>& b) {
+  const size_t n = std::min(a.size(), b.size());
+  for (size_t i = 0; i < n; ++i)
+    if (a[i] != b[i]) return i;
+  return n;
+}
+
+// Compare a strict and a standard dump for one model; returns the gate verdict
+// (and prints the row).
+bool compare_profile_pair(const ProfileResult& strict,
+                          const ProfileResult& standard) {
+  const auto ppl = [](const ProfileResult& r) {
+    return r.n_scored == 0 ? 0.0 : std::exp(r.sum_nll / double(r.n_scored));
+  };
+  const double ps = ppl(strict), pt = ppl(standard);
+  const bool ppl_ok = ps > 0.0 && std::abs(pt - ps) / ps <= 0.005;
+  size_t agree = 0, total = 0;
+  for (const auto& [i, t] : strict.top1) {
+    auto it = standard.top1.find(i);
+    if (it == standard.top1.end()) continue;
+    ++total;
+    if (it->second == t) ++agree;
+  }
+  const double top1 = total ? double(agree) / double(total) : 0.0;
+  const bool top1_ok = total >= 50 && top1 >= 0.99;
+
+  const bool det_ok = strict.runs[0] == strict.runs[1] &&
+                      strict.runs[0] == strict.runs[2] &&
+                      standard.runs[0] == standard.runs[1] &&
+                      standard.runs[0] == standard.runs[2];
+  const bool batch_ok = strict.batch4 == strict.batch4_single &&
+                        standard.batch4 == standard.batch4_single;
+  const bool reuse_ok = strict.reuse_full == strict.reuse_session &&
+                        standard.reuse_full == standard.reuse_session;
+  const size_t div = first_divergence(strict.runs[0], standard.runs[0]);
+
+  std::printf("  %-8s ppl strict=%.4f standard=%.4f delta=%+.3f%% %s | "
+              "top1 %zu/%zu %.1f%% %s | det %s batch4 %s reuse %s | "
+              "first divergence step %zu\n",
+              strict.model.c_str(), ps, pt, ps > 0 ? 100.0 * (pt - ps) / ps : 0.0,
+              ppl_ok ? "OK" : "FAIL", agree, total,
+              total ? 100.0 * top1 : 0.0, top1_ok ? "OK" : "FAIL",
+              det_ok ? "OK" : "FAIL", batch_ok ? "OK" : "FAIL",
+              reuse_ok ? "OK" : "FAIL", div);
+  std::fflush(stdout);
+  return ppl_ok && top1_ok && det_ok && batch_ok && reuse_ok;
+}
+
+int profile_dump_mode(const std::string& out_path, const std::string& model) {
+  const ProfileModel* spec = nullptr;
+  for (const auto& s : kProfileModels)
+    if (model == s.tag) spec = &s;
+  if (spec == nullptr) {
+    std::fprintf(stderr, "sb-numerics: unknown model '%s'\n", model.c_str());
+    return 2;
+  }
+  const std::string path = find_model(spec->env, spec->rel);
+  if (path.empty()) {
+    std::printf("  (skipped: %s model not found)\n", spec->tag);
+    return 0;
+  }
+  ProfileResult r;
+  const bool cuda = have_cuda();
+  if (!run_profile_model(path, spec->tag, cuda, r)) {
+    std::fprintf(stderr, "sb-numerics: %s failed to load/run\n", spec->tag);
+    return 2;
+  }
+  if (!write_profile_dump(r, out_path)) {
+    std::fprintf(stderr, "sb-numerics: cannot write %s\n", out_path.c_str());
+    return 2;
+  }
+  std::printf("  wrote %s\n", out_path.c_str());
+  return 0;
+}
+
+bool run_profile_child(const std::string& self, const char* profile,
+                       const std::string& out, const char* model) {
+  std::string cmd = "LC_ALL=C SONICBOOM_NUMERICS=";
+  cmd += profile;
+  cmd += " '";
+  cmd += self;
+  cmd += "' profile-dump '";
+  cmd += out;
+  cmd += "' '";
+  cmd += model;
+  cmd += "'";
+  std::printf("  running %s profile for %s...\n", profile, model);
+  std::fflush(stdout);
+  const int rc = std::system(cmd.c_str());
+  if (rc != 0) {
+    std::fprintf(stderr, "sb-numerics: %s/%s run failed (%d)\n", profile,
+                 model, rc);
+    return false;
+  }
+  return true;
+}
+
+int profile_gate(const std::string& self_in) {
+  if (!have_cuda()) {
+    std::cout << "  (skipped: no CUDA device; the profile gate is a device "
+                 "measurement)\n";
+    std::cout << "sb-numerics profile OK\n";
+    return 0;
+  }
+  const std::string self = std::filesystem::absolute(self_in).string();
+  bool ok = true;
+  bool any = false;
+  std::printf("profile gate (strict vs standard)\n");
+  for (const auto& spec : kProfileModels) {
+    if (find_model(spec.env, spec.rel).empty()) {
+      std::printf("  (skipped: %s model not found)\n", spec.tag);
+      continue;
+    }
+    const std::string s_path =
+        std::string("/tmp/sb-numerics-profile-strict-") + spec.tag + ".dump";
+    const std::string t_path =
+        std::string("/tmp/sb-numerics-profile-standard-") + spec.tag + ".dump";
+    if (!run_profile_child(self, "strict", s_path, spec.tag)) return 2;
+    if (!run_profile_child(self, "standard", t_path, spec.tag)) return 2;
+    ProfileResult a, b;
+    if (!read_profile_dump(s_path, a) || !read_profile_dump(t_path, b)) {
+      std::fprintf(stderr, "sb-numerics: cannot read %s / %s\n",
+                   s_path.c_str(), t_path.c_str());
+      return 2;
+    }
+    any = true;
+    ok = compare_profile_pair(a, b) && ok;
+  }
+  if (!any) std::cout << "  (skipped: no models found)\n";
+  std::printf("sb-numerics profile %s\n", ok ? "ACCEPTED" : "REJECTED");
+  return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -855,6 +1258,22 @@ int main(int argc, char** argv) {
       return 2;
     }
     return dump_mode(argv[2], argc == 4 ? argv[3] : "");
+  }
+  if (argc >= 2 && std::string_view(argv[1]) == "profile") {
+    if (argc != 2) {
+      std::fprintf(stderr, "usage: %s profile\n", argv[0]);
+      return 2;
+    }
+    return profile_gate(argv[0]);
+  }
+  if (argc >= 2 && std::string_view(argv[1]) == "profile-dump") {
+    if (argc != 4) {
+      std::fprintf(stderr, "usage: %s profile-dump <file> "
+                           "<gemma|qwen|deepseek>\n",
+                   argv[0]);
+      return 2;
+    }
+    return profile_dump_mode(argv[2], argv[3]);
   }
   if (argc >= 2 && std::string_view(argv[1]) == "compare") {
     // compare <f64.dump> <df32.dump> [<f64.dump> <df32.dump> ...]
@@ -879,7 +1298,9 @@ int main(int argc, char** argv) {
     return finish(f64, df32, any_model);
   }
   if (argc != 1) {
-    std::fprintf(stderr, "usage: %s [dump <file> [model]] | compare <a> <b>...\n",
+    std::fprintf(stderr,
+                 "usage: %s [dump <file> [model]] | compare <a> <b>... | "
+                 "profile | profile-dump <file> <model>\n",
                  argv[0]);
     return 2;
   }

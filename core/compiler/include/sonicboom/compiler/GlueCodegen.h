@@ -130,8 +130,15 @@ constexpr int kGeluMulBlockThreads = 256;
 // otherwise identical. Returns nullopt, having printed the MLIR diagnostic, when
 // the region has no generator, the module fails to verify, or the downstream
 // lowering fails.
+//
+// `kv_f16` requests the f16-KV-cache variant of heads_norm_rope_cast: the
+// region's cache-row stores write f16 instead of f32 (the standard numerics
+// profile's cache element type). The values are the same fp16-rounded ones the
+// f32 store wrote, so the variant changes the store width only. No other
+// region has a cache, so kv_f16 with any other kind returns nullopt.
 std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch,
-                                             ReduceMode mode = ReduceMode::F64);
+                                             ReduceMode mode = ReduceMode::F64,
+                                             bool kv_f16 = false);
 
 // Lower a textual GPU-dialect module (a container module holding one
 // gpu.module) to PTX assembly through the NVVM pipeline above. `link_libdevice`

@@ -55,6 +55,7 @@ enum class Source {
   Measured,  // timed in this process
   Verdict,   // an acceptance verdict recorded by a measurement run
   Skipped,   // the cold-tuning budget expired; the static default stands
+  Application, // the embedding application selected it through an API call
 };
 
 std::string_view source_name(Source source);
@@ -125,5 +126,10 @@ void reset_for_test();
 // Tests only: drop the in-memory registry but keep the persisted file, so the
 // next call reloads it exactly as a new process would.
 void drop_memory_for_test();
+
+// Tests only: forget one in-memory record (the persisted file is untouched).
+// Used when a process-global latch is reset within a test process, so the
+// second resolution is recorded rather than counted as a conflict.
+void forget_for_test(std::string_view name, std::string_view scope);
 
 } // namespace sonicboom::planner::decisions

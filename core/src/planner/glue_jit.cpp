@@ -43,6 +43,19 @@
 namespace sonicboom::planner::glue {
 namespace {
 
+// A region name may carry the "-kv16" suffix: the f16-KV-cache variant of the
+// region (standard numerics profile). Strip it and report the variant.
+std::string_view region_base(std::string_view region, bool &kv_f16) {
+  constexpr std::string_view kSuffix = "-kv16";
+  kv_f16 = false;
+  if (region.size() > kSuffix.size() &&
+      region.substr(region.size() - kSuffix.size()) == kSuffix) {
+    kv_f16 = true;
+    region.remove_suffix(kSuffix.size());
+  }
+  return region;
+}
+
 #if SONICBOOM_USE_CUDA
 
 struct LoadedKernel {
@@ -164,15 +177,17 @@ std::string validate_entry(const std::string &text, const std::string &region,
 
 // The PTX for the region on this device: the disk cache first (a warm file is
 // the whole point — the MLIR pipeline is ~100 ms), the compiler on a miss.
-std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
+std::string region_ptx(compiler::GlueRegionKind kind, int arch, bool kv_f16) {
   if (arch <= 0) return {};
   // The reduction mode is part of the kernel's identity: it changes the PTX, so
   // it selects a distinct cache entry (the F64 name is unchanged, keeping the
-  // historical entries valid).
+  // historical entries valid). The f16-KV variant is likewise distinct: its
+  // cache stores have a different element type.
   const compiler::ReduceMode mode = device_reduce_mode();
   std::string region = compiler::glue_region_name(kind);
   if (mode != compiler::ReduceMode::F64)
     region += std::string("-") + compiler::reduce_mode_name(mode);
+  if (kv_f16) region += "-kv16";
   // SONICBOOM_GLUE_CACHE=0 bypasses the disk cache (read and write): the
   // ablation for "is this the cached kernel or the one this compiler builds".
   static const bool use_cache = [] {
@@ -190,7 +205,7 @@ std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
                    path.c_str());
     }
   }
-  auto generated = compiler::generate_glue_ptx(kind, arch, mode);
+  auto generated = compiler::generate_glue_ptx(kind, arch, mode, kv_f16);
   if (!generated) return {};
   if (use_cache)
     write_file(path, make_entry(region, arch, compiler::glue_codegen_version(),
@@ -210,9 +225,12 @@ bool use_disk_cache() {
 
 std::string attention_region_name(const compiler::AttentionShape &shape) {
   const std::string mask = shape.window_mask ? "-window" : "-causal";
+  // f16 KV storage is a distinct kernel: its cache reads have a different
+  // element type, so the entry must not be shared with the f32 cache kernel.
+  const std::string kv = shape.kv_f16 ? "-kv16" : "";
   if (shape.decode)
     return "attn-dec-d" + std::to_string(shape.head_dim) + "-g" +
-           std::to_string(shape.gqa) + mask;
+           std::to_string(shape.gqa) + mask + kv;
   return "attn-d" + std::to_string(shape.head_dim) + "-g" +
          std::to_string(shape.gqa) + mask + "-b" + std::to_string(shape.br) +
          "x" + std::to_string(shape.bc) + "-dps" + std::to_string(shape.dps) +
@@ -222,7 +240,7 @@ std::string attention_region_name(const compiler::AttentionShape &shape) {
          (shape.gqa_pack > 1 ? "-p" + std::to_string(shape.gqa_pack) : "") +
          (shape.q_in_reg ? "" : "-qs") +
          (shape.head_fast ? "-hf" : "") +
-         (shape.exp2 ? "-x2" : "");
+         (shape.exp2 ? "-x2" : "") + kv;
 }
 
 // The generated attention kernel's PTX: disk cache first, generator on a miss.
@@ -380,10 +398,12 @@ const char *cu_error(CUresult r) {
 }
 
 bool load(std::string_view region, LoadedKernel &out) {
-  const auto kind = compiler::glue_region_kind_from_name(region);
+  bool kv_f16 = false;
+  const auto kind =
+      compiler::glue_region_kind_from_name(region_base(region, kv_f16));
   if (!kind) return false;
   const int arch = sm_arch();
-  const std::string ptx = region_ptx(*kind, arch);
+  const std::string ptx = region_ptx(*kind, arch, kv_f16);
   if (ptx.empty()) {
     std::fprintf(stderr, "glue JIT: no PTX for region '%.*s'\n",
                  int(region.size()), region.data());
@@ -447,10 +467,15 @@ bool load_attention(const compiler::AttentionShape &shape,
   // raised: the driver reserves part of the 48 KiB default on sm_86, so a
   // kernel that asks for exactly 49152 B is rejected without the attribute
   // (the runtime tuner's b16x32-dps4 candidates hit this).
-  if (shared_bytes >= 48 * 1024)
-    cuFuncSetAttribute(out.function,
-                       CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                       shared_bytes);
+  if (shared_bytes >= 48 * 1024) {
+    const CUresult ar = cuFuncSetAttribute(
+        out.function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+        shared_bytes);
+    if (ar != CUDA_SUCCESS)
+      std::fprintf(stderr,
+                   "glue JIT: cuFuncSetAttribute(%d) failed for '%.*s': %s\n",
+                   shared_bytes, int(key.size()), key.data(), cu_error(ar));
+  }
   return true;
 }
 
@@ -459,7 +484,9 @@ bool load_attention(const compiler::AttentionShape &shape,
 } // namespace
 
 bool known_region(std::string_view region) {
-  return compiler::glue_region_kind_from_name(region).has_value();
+  bool kv_f16 = false;
+  return compiler::glue_region_kind_from_name(region_base(region, kv_f16))
+      .has_value();
 }
 
 bool launch(std::string_view region, void *const *args, int blocks, int threads,
@@ -484,9 +511,11 @@ bool launch(std::string_view region, void *const *args, int blocks, int threads,
   // a fused region's launch like any other, or a recorded plan undercounts the
   // launches the run actually performed.
   if (auto *rec = sonicboom::planner::recorder()) {
-    const auto kind = compiler::glue_region_kind_from_name(region);
+    bool kv_f16 = false;
+    const auto kind =
+        compiler::glue_region_kind_from_name(region_base(region, kv_f16));
     const std::string_view kernel =
-        kind ? compiler::glue_kernel_entry(*kind) : region;
+        kind ? compiler::glue_kernel_entry(*kind) : region_base(region, kv_f16);
     rec->add_launch(kernel, "", unsigned(blocks), 1, 1, unsigned(threads), 1, 1,
                     static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
@@ -545,8 +574,11 @@ bool launch_attention(const compiler::AttentionShape &shape,
       unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
       const_cast<void **>(args), nullptr);
   if (r != CUDA_SUCCESS) {
-    std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
-                 key.c_str(), cu_error(r));
+    std::fprintf(stderr,
+                 "glue JIT: cuLaunchKernel failed for '%s' (grid %dx%d, %d "
+                 "threads, %d B smem): %s\n",
+                 key.c_str(), grid_x, grid_y, threads, shared_bytes,
+                 cu_error(r));
     return false;
   }
   return true;

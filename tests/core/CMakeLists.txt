@@ -283,6 +283,40 @@ add_test(NAME test_deepseek_generate_reduce_f64
 set_tests_properties(test_deepseek_generate_reduce_f64
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
+# Both numerics profiles are tested contracts (core/include/sonicboom/numerics.h).
+# Strict is the historical semantics and compares the historical goldens
+# (pN.golden, kGolden); standard is the default and has its own goldens
+# (pN.standard.golden). Each binary also checks batch invariance and prefix
+# reuse internally, so those hold under both profiles. The base entries above
+# run under the default profile; these name it explicitly so an environment
+# change cannot silently move what is checked.
+foreach(profile IN ITEMS strict standard)
+  add_test(NAME test_generate_numerics_${profile}
+           COMMAND ${CMAKE_COMMAND} -E env
+                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                   SONICBOOM_NUMERICS=${profile}
+                   $<TARGET_FILE:test_generate>)
+  set_tests_properties(test_generate_numerics_${profile}
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
+  add_test(NAME test_qwen2_generate_numerics_${profile}
+           COMMAND ${CMAKE_COMMAND} -E env
+                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                   SONICBOOM_NUMERICS=${profile}
+                   $<TARGET_FILE:test_qwen2_generate>)
+  set_tests_properties(test_qwen2_generate_numerics_${profile}
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
+  add_test(NAME test_deepseek_generate_numerics_${profile}
+           COMMAND ${CMAKE_COMMAND} -E env
+                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                   SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
+                   SONICBOOM_NUMERICS=${profile}
+                   $<TARGET_FILE:test_qwen2_generate>)
+  set_tests_properties(test_deepseek_generate_numerics_${profile}
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+endforeach()
+
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
 if(SONICBOOM_USE_CUDA)
