@@ -1873,9 +1873,16 @@ public:
 
     auto add_attr = [&](mlir::Operation *op, llvm::StringRef name,
                         int64_t value) {
+      // Replace an entry of the same name rather than appending: a node that
+      // already carries the mark (the pass run twice, or over a graph a caller
+      // marked) must not end with a duplicate, which the verifier rejects.
       llvm::SmallVector<mlir::Attribute> entries;
       if (auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs"))
-        entries.append(attrs.begin(), attrs.end());
+        for (mlir::Attribute a : attrs) {
+          const auto na = mlir::dyn_cast<boom::NodeAttr>(a);
+          if (na && na.getName() == name) continue;
+          entries.push_back(a);
+        }
       entries.push_back(boom::NodeAttr::get(
           view.ctx(), name, builder.getI32IntegerAttr(int32_t(value))));
       op->setAttr("node_attrs", builder.getArrayAttr(entries));
