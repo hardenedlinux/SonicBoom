@@ -1,5 +1,9 @@
 # SonicBoom S-Expr v0.1 → MLIR Lowering
 
+Status: **superseded**. The S-Expr → MLIR lowering it describes
+(`core/src/sx/lowering.cpp` and friends) was retired; S-Expr now lowers to Boom
+IR and runs through `core/src/exec/cpu_executor.cpp`.
+
 This document records the design of the S-Expr → MLIR lowering: it turns a
 validated `sx::Document` (see `s-expr-v0-spec.md`) into a **verified MLIR
 module** and returns its textual form. It is the link in the pipeline

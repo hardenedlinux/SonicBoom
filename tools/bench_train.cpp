@@ -15,10 +15,12 @@
 // graph is captured by the core when SONICBOOM_TRAIN_GRAPH is not "0"; the
 // numbers below therefore separate resident state from graph replay.
 //
-//   bench_train [--fixture PATH] [--gate-steps N] [--timed-steps N]
+//   bench_train [--fixture PATH] [--gate-steps N] [--timed-steps N] [--cpu]
+//               [--loss-trace]
 //
 // Prints, per mode: ms/step, host->device and device->host bytes per step, and
-// an FNV-1a hash of the loss sequence.
+// an FNV-1a hash of the loss sequence. `--loss-trace` prints each step's loss
+// on stderr, which is what the CPU/device numerical comparison reads.
 
 #include <sonicboom/capi.h>
 
@@ -162,6 +164,8 @@ std::uint64_t fnv1a(const std::vector<std::uint8_t> &b, std::uint64_t h = 146959
   return h;
 }
 
+bool g_loss_trace = false;
+
 struct Result {
   std::vector<std::vector<std::uint8_t>> last_loss;   // one vector
   std::vector<std::vector<std::uint8_t>> final_outputs;
@@ -180,8 +184,45 @@ std::vector<int> output_to_input(const std::vector<TensorInfo> &ins,
                                  const std::vector<TensorInfo> &outs,
                                  const std::string &text) {
   std::vector<int> map(outs.size(), -1);
+  // A CPU executable does not retain value names (sb_compile compiles the CPU
+  // interpreter without them), so the document's (inputs ...) and (outputs ...)
+  // sections, which list them in graph order, supply the names the compiled
+  // tensors lack.
+  auto doc_names = [&text](const char *section, const char *entry) {
+    std::vector<std::string> names;
+    std::istringstream in(text);
+    std::string l;
+    bool inside = false;
+    while (std::getline(in, l)) {
+      if (!inside) {
+        if (l.find(section) == std::string::npos) continue;
+        inside = true;
+        continue;
+      }
+      if (l.find(entry) == std::string::npos) break;
+      const size_t b = l.find('"');
+      const size_t e = l.find('"', b + 1);
+      if (e == std::string::npos) break;
+      names.push_back(l.substr(b + 1, e - b - 1));
+    }
+    return names;
+  };
+  const std::vector<std::string> doc_inputs = doc_names("(inputs", "(input \"");
+  const std::vector<std::string> doc_outputs = doc_names("(outputs", "(output \"");
+  if (!doc_inputs.empty() && doc_inputs.size() != ins.size())
+    die("document lists " + std::to_string(doc_inputs.size()) +
+        " inputs but the executable has " + std::to_string(ins.size()));
+  if (!doc_outputs.empty() && doc_outputs.size() != outs.size())
+    die("document lists " + std::to_string(doc_outputs.size()) +
+        " outputs but the executable has " + std::to_string(outs.size()));
   std::unordered_map<std::string, int> in_by_name;
-  for (size_t i = 0; i < ins.size(); ++i) in_by_name[ins[i].name] = int(i);
+  for (size_t i = 0; i < ins.size(); ++i) {
+    const std::string name = !ins[i].name.empty()
+                                 ? ins[i].name
+                                 : (i < doc_inputs.size() ? doc_inputs[i]
+                                                          : std::string());
+    in_by_name[name] = int(i);
+  }
   std::unordered_map<std::string, std::string> out_to_leaf;
   std::istringstream lines(text);
   std::string line;
@@ -204,7 +245,11 @@ std::vector<int> output_to_input(const std::vector<TensorInfo> &ins,
   }
   if (!saw_adamw) die("the fixture has no AdamW nodes to map outputs by");
   for (size_t o = 0; o < outs.size(); ++o) {
-    auto it = out_to_leaf.find(outs[o].name);
+    const std::string name = !outs[o].name.empty()
+                                 ? outs[o].name
+                                 : (o < doc_outputs.size() ? doc_outputs[o]
+                                                           : std::string());
+    auto it = out_to_leaf.find(name);
     if (it == out_to_leaf.end()) continue;
     auto in = in_by_name.find(it->second);
     if (in == in_by_name.end())
@@ -226,13 +271,17 @@ Result run(sb_executable *exe, bool resident, const std::string &text,
            int gate_steps, int timed_steps, int repeats) {
   auto ins = query(exe, true);
   auto outs = query(exe, false);
+  // Residency is a device-graph property; the full shape and the CPU executor
+  // never consult it.
   std::vector<bool> res(ins.size(), false);
-  for (size_t i = 0; i < ins.size(); ++i) {
-    int r = 0;
-    Err err;
-    if (sb_input_is_resident(exe, i, &r, &err.e) != SB_OK)
-      die("residency: " + err.text());
-    res[i] = r != 0;
+  if (resident) {
+    for (size_t i = 0; i < ins.size(); ++i) {
+      int r = 0;
+      Err err;
+      if (sb_input_is_resident(exe, i, &r, &err.e) != SB_OK)
+        die("residency: " + err.text());
+      res[i] = r != 0;
+    }
   }
   auto map = output_to_input(ins, outs, text);
   if (map.empty() || map[0] >= 0 || outs[0].bytes != 4)
@@ -318,6 +367,11 @@ Result run(sb_executable *exe, bool resident, const std::string &text,
       if (out_idx[k] == 0) {
         loss_hash = fnv1a(out_bufs[k], loss_hash);
         result.last_loss = {out_bufs[k]};
+        if (g_loss_trace && out_bufs[k].size() == sizeof(float)) {
+          float v = 0.0f;
+          std::memcpy(&v, out_bufs[k].data(), sizeof(v));
+          std::fprintf(stderr, "loss-trace step=%u loss=%.9g\n", step, v);
+        }
       }
     }
     return out_bufs;
@@ -358,16 +412,27 @@ Result run(sb_executable *exe, bool resident, const std::string &text,
 
 } // namespace
 
+// The last gate step's loss value (a one-element f32 output).
+float loss_value(const Result &r) {
+  float v = 0.0f;
+  if (r.last_loss.size() == 1 && r.last_loss[0].size() == sizeof(v))
+    std::memcpy(&v, r.last_loss[0].data(), sizeof(v));
+  return v;
+}
+
 int main(int argc, char **argv) {
   const char *fixture = "tests/data/train/tiny-train.sx";
   int gate_steps = 50;
   int timed_steps = 20;
   int repeats = 3;
+  bool cpu = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--fixture") && i + 1 < argc) fixture = argv[++i];
     else if (!std::strcmp(argv[i], "--gate-steps") && i + 1 < argc) gate_steps = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--timed-steps") && i + 1 < argc) timed_steps = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--repeats") && i + 1 < argc) repeats = std::atoi(argv[++i]);
+    else if (!std::strcmp(argv[i], "--cpu")) cpu = true;
+    else if (!std::strcmp(argv[i], "--loss-trace")) g_loss_trace = true;
     else die(std::string("unknown argument ") + argv[i]);
   }
   const std::string text = read_file(fixture);
@@ -382,11 +447,29 @@ int main(int argc, char **argv) {
     if (sb_parse(text.data(), text.size(), &doc, &err.e) != SB_OK)
       die("parse: " + err.text());
     Err err2;
-    const sb_status st = sb_compile_device(doc, &exe, &err2.e);
+    const sb_status st = cpu ? sb_compile(doc, "", &exe, &err2.e)
+                             : sb_compile_device(doc, &exe, &err2.e);
     sb_document_free(doc);
     if (st != SB_OK) die("compile: " + err2.text());
     return exe;
   };
+
+  // CPU executor: the tracer's full call shape only (there is no resident
+  // state and no CUDA graph on the host path). The loss value printed here is
+  // the cross-backend gate against the device executor's.
+  if (cpu) {
+    sb_executable *exe = compile();
+    const Result r = run(exe, false, text, gate_steps, timed_steps, repeats);
+    std::fprintf(stdout, "backend=cpu mode=full graph=off steps=%d ms/step=%.4f "
+                         "h2d/step=%llu d2h/step=%llu loss_hash=%016llx "
+                         "loss=%.9g\n",
+                 gate_steps, r.ms_per_step,
+                 static_cast<unsigned long long>(r.h2d_per_step),
+                 static_cast<unsigned long long>(r.d2h_per_step),
+                 static_cast<unsigned long long>(r.loss_hash), loss_value(r));
+    sb_executable_free(exe);
+    return 0;
+  }
 
   sb_executable *full = compile();
   sb_executable *resident = compile();
@@ -399,17 +482,21 @@ int main(int argc, char **argv) {
   for (const auto &b : res_r.last_loss) lh_res = fnv1a(b, lh_res);
   (void)lh_full; (void)lh_res;
   std::fprintf(stdout, "mode=full      graph=%s steps=%d ms/step=%.4f "
-                       "h2d/step=%llu d2h/step=%llu loss_hash=%016llx\n",
+                       "h2d/step=%llu d2h/step=%llu loss_hash=%016llx "
+                       "loss=%.9g\n",
                graph_on ? "on" : "off", gate_steps, full_r.ms_per_step,
                static_cast<unsigned long long>(full_r.h2d_per_step),
                static_cast<unsigned long long>(full_r.d2h_per_step),
-               static_cast<unsigned long long>(full_r.loss_hash));
+               static_cast<unsigned long long>(full_r.loss_hash),
+               loss_value(full_r));
   std::fprintf(stdout, "mode=resident  graph=%s steps=%d ms/step=%.4f "
-                       "h2d/step=%llu d2h/step=%llu loss_hash=%016llx\n",
+                       "h2d/step=%llu d2h/step=%llu loss_hash=%016llx "
+                       "loss=%.9g\n",
                graph_on ? "on" : "off", gate_steps, res_r.ms_per_step,
                static_cast<unsigned long long>(res_r.h2d_per_step),
                static_cast<unsigned long long>(res_r.d2h_per_step),
-               static_cast<unsigned long long>(res_r.loss_hash));
+               static_cast<unsigned long long>(res_r.loss_hash),
+               loss_value(res_r));
 
   // Cross-shape gate: the loss bytes of the last gate step, and every output
   // of the step after it.

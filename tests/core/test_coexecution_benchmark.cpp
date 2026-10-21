@@ -29,7 +29,7 @@
 // not, so mixed is not directly comparable to the sum of the alone rows.
 
 #include <sonicboom/planner/backend.h>
-#include <sonicboom/planner/native_torch_backend.h>
+#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/runtime_executor.h>
@@ -217,7 +217,7 @@ int main() {
   check(plan_softmax.has_value(), "softmax plan succeeds");
   if (!plan_softmax)
     return 1;
-  auto nt = pl::NativeTorchBackend::compile(*g_softmax);
+  auto nt = pl::CpuKernelBackend::compile(*g_softmax);
   check(nt.has_value(), "native backend compiles");
   if (!nt)
     return 1;
@@ -260,7 +260,7 @@ int main() {
   if (!relu_slice)
     return 1;
   auto cpu_mixed = pl::CpuBackend::compile(*relu_slice, {});
-  auto nt_mixed = pl::NativeTorchBackend::compile(*g_mixed);
+  auto nt_mixed = pl::CpuKernelBackend::compile(*g_mixed);
   check(cpu_mixed.has_value() && nt_mixed.has_value(), "mixed backends compile");
   if (!cpu_mixed || !nt_mixed)
     return 1;
@@ -342,7 +342,7 @@ int main() {
               << " mlir nodes); per-node model would emit " << n_nodes
               << " tasks\n";
 
-    auto nt_chain = pl::NativeTorchBackend::compile(*g);
+    auto nt_chain = pl::CpuKernelBackend::compile(*g);
     check(nt_chain.has_value(), "chain native backend compiles");
     if (!nt_chain)
       return 1;

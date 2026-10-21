@@ -15,14 +15,14 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // CPU co-execution integration test (Stage 3): a two-node graph `softmax → relu`
-// is planned into two compute tasks, softmax routed to NativeTorchBackend and
+// is planned into two compute tasks, softmax routed to CpuKernelBackend and
 // relu routed to the MLIR CpuBackend on a sliced sub-document, then executed
 // end-to-end with an intermediate tensor handed off by TensorId. Verifies the
 // numeric result, the intermediate tensor's shape/dtype in the plan, and two
 // error paths (dispatch exception → RuntimeError; byte-count mismatch → error).
 
 #include <sonicboom/planner/backend.h>
-#include <sonicboom/planner/native_torch_backend.h>
+#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/runtime_executor.h>
@@ -82,7 +82,7 @@ const char* SOFTMAX_RELU =
     "     (outputs (\"z\" (tensor float32 (shape 2 3))))))))";
 
 // Softmax with an out-of-range axis: the dispatch throws a c10 exception, which
-// NativeTorchBackend must map to a RuntimeError (never a crash/abort).
+// CpuKernelBackend must map to a RuntimeError (never a crash/abort).
 const char* BAD_AXIS =
     "(sonicboom-s-expr (version 0 1) (graph (name \"bad_axis\")"
     " (inputs (input \"x\" (tensor float32 (shape 2 3))))"
@@ -161,7 +161,7 @@ int main() {
   if (!cpu)
     return 1;
 
-  auto nt = pl::NativeTorchBackend::compile(*g);
+  auto nt = pl::CpuKernelBackend::compile(*g);
   check(nt.has_value(), "native-torch backend compiles");
   if (!nt)
     return 1;
@@ -216,7 +216,7 @@ int main() {
     if (!bad_plan)
       return 1;
 
-    auto bad_nt = pl::NativeTorchBackend::compile(*bad_g);
+    auto bad_nt = pl::CpuKernelBackend::compile(*bad_g);
     check(bad_nt.has_value(), "bad-axis native backend compiles");
     if (!bad_nt)
       return 1;

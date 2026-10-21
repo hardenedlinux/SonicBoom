@@ -18,18 +18,14 @@
 
 // SonicBoom S-Expr v0.1 → CPU execution (public facade).
 //
-// DEPRECATED: this MLIR/linalg pipeline is the v0 CPU route being retired.
-// Boom IR carries the same seven-op vocabulary and the Blade → Boom → graph
-// route owns new work, but its executor is CUDA-only today, so this path
-// remains the CPU execution behind sb_compile. SONICBOOM_SX_LINALG=0 disables
-// it and fails compilation with a clear error.
-//
-// This header is deliberately MLIR-free. The MLIR pass pipeline and LLVM JIT
-// live behind this boundary in core/src/sx/exec.cpp: `Executable::compile`
-// lowers a validated Document into an MLIR module, runs the CPU lowering
-// pipeline (one-shot bufferize → linalg-to-loops → … → LLVM dialect), and JITs
-// it into a callable native function. `run` executes that function over raw
-// little-endian tensor buffers.
+// This header is deliberately implementation-free. Behind it,
+// core/src/exec/cpu_executor.cpp lowers a validated Document through Boom IR
+// (Blade → Boom → BufferReusePass → planner::Graph), assigns one host buffer
+// per graph tensor, and runs the nodes with SonicBoom's CPU kernels
+// (nn::* / training::*), native-torch CPU kernels through the Layer 1
+// direct-call adapter, and inline data movement. `run` executes the graph over
+// raw little-endian tensor buffers. There is no MLIR lowering or JIT on this
+// path; MLIR is only the IR the Boom passes operate on.
 //
 // v0 execution scope: one or more float32 graph inputs and one or more float32
 // graph outputs (the ResNet-18 example and the Add/Relu smoke graphs have a

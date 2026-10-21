@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -404,7 +404,7 @@ target_link_libraries(test_e2e_load PRIVATE sonicboom)
 
 # Integration tests: parse the frozen ResNet-18 S-Expr v0.1 example document.
 # They need the repository root to locate the example file at build/run time.
-foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir test_s_expr_resnet18_exec test_onnx_import_resnet18_exec test_planner_acceptance)
+foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_onnx_import_resnet18_exec test_planner_acceptance)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE

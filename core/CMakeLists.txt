@@ -23,6 +23,14 @@ file(GLOB_RECURSE SONICBOOM_ADAPTER_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_SX_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/sx/*.cpp)
 
+# CPU Boom executor (core/src/exec/): the CPU peer of the device training graph
+# executor. Blade -> Boom IR -> BufferReusePass -> planner::Graph, then host
+# buffers and CPU kernels (SonicBoom nn::/training::, native-torch CPU kernels
+# through the Layer 1 direct-call adapter, and inline data movement). It backs
+# the MLIR-free sx::Executable facade in <sonicboom/sx/exec.h>.
+file(GLOB_RECURSE SONICBOOM_EXEC_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/exec/*.cpp)
+
 # Static execution planner (core/src/planner/). Pure SonicBoom C++ that
 # consumes the sx IR and the sx::Executable facade; no MLIR/LLVM/ATen/c10
 # headers (the public facade in <sonicboom/sx/exec.h> is MLIR-free).
@@ -104,6 +112,7 @@ file(GLOB_RECURSE SONICBOOM_TRAINING_SOURCES CONFIGURE_DEPENDS
 add_library(sonicboom SHARED
   ${SONICBOOM_ADAPTER_SOURCES}
   ${SONICBOOM_SX_SOURCES}
+  ${SONICBOOM_EXEC_SOURCES}
   ${SONICBOOM_PLANNER_SOURCES}
   ${SONICBOOM_AUTOGRAD_SOURCES}
   ${SONICBOOM_GGUF_SOURCES}
@@ -235,10 +244,12 @@ if(SONICBOOM_USE_VULKAN)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/vulkan_backend.cpp)
 endif()
 
-# MLIRIR provides MLIRContext / ModuleOp / BuiltinDialect and the asm printer;
-# its transitive LLVM dependencies (MLIRSupport, LLVMSupport, …) come via the
-# official dependency graph. Linked PRIVATE so MLIR types never leak into
-# Layer 2 public headers.
+# The core itself now only touches MLIR through MLIRContext (the Blade → Boom
+# and Boom → graph passes live in sonicboom_compiler, linked below with their
+# own dialect/pass dependencies). MLIRIR provides MLIRContext and the builtin
+# dialect; its transitive MLIRSupport/LLVMSupport come via the official
+# dependency graph. Linked PRIVATE so MLIR types never leak into Layer 2 public
+# headers.
 #
 # The installed MLIR targets export only INTERFACE_LINK_LIBRARIES (no
 # INTERFACE_INCLUDE_DIRECTORIES), so the include path must be added explicitly
@@ -246,43 +257,7 @@ endif()
 # ${MLIR_INCLUDE_DIRS} = <install-prefix>/include, covering both mlir/ and llvm/.
 #
 # MLIR is required (root CMakeLists.txt), so this is unconditional.
-# S-Expr → MLIR lowering dialects (core/src/sx/lowering.cpp).
-target_link_libraries(sonicboom PRIVATE
-  MLIRIR
-  MLIRFuncDialect
-  MLIRArithDialect
-  MLIRTensorDialect
-  MLIRLinalgDialect
-  # CPU JIT execution (core/src/sx/exec.cpp): the lowering pipeline dialects
-  # and passes (bufferize → linalg-to-loops → … → LLVM dialect).
-  MLIRBufferizationDialect
-  MLIRBufferizationTransforms
-  MLIRBufferizationToMemRef
-  MLIRLinalgTransforms
-  # One-shot-bufferize external models for arith/tensor (constants) and the
-  # func.func boundary live in the *Transforms libraries below.
-  MLIRArithTransforms
-  MLIRTensorTransforms
-  MLIRSCFDialect
-  MLIRSCFToControlFlow
-  MLIRMemRefDialect
-  MLIRMemRefTransforms
-  MLIRAffineDialect
-  MLIRAffineToStandard
-  MLIRControlFlowDialect
-  MLIRControlFlowToLLVM
-  MLIRArithToLLVM
-  MLIRMemRefToLLVM
-  MLIRFuncToLLVM
-  MLIRReconcileUnrealizedCasts
-  MLIRLLVMDialect
-  # MLIR ExecutionEngine (JIT) + the builtin/LLVM LLVM-IR translations it needs.
-  MLIRExecutionEngine
-  MLIRBuiltinToLLVMIRTranslation
-  MLIRLLVMToLLVMIRTranslation
-  # Native (x86-64) target asm parser for InitializeNativeTargetAsmParser;
-  # the X86 target/desc/info libs come transitively via MLIRExecutionEngine.
-  LLVMX86AsmParser)
+target_link_libraries(sonicboom PRIVATE MLIRIR)
 target_include_directories(sonicboom PRIVATE ${MLIR_INCLUDE_DIRS})
 
 # The compiler library: the Boom MLIR dialect and the Boom IR passes

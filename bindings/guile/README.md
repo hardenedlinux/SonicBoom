@@ -249,9 +249,9 @@ Documented endpoints:
 
 ## (sonicboom trace lower) — traced graphs on the runtime
 
-Lowers a traced forward graph onto the op set the runtime's MLIR path accepts
-(`relu add reshape conv max_pool reduce_mean gemm`, `core/src/sx/lowering.cpp`)
-and executes it through `libsonicboom.so`.
+Lowers a traced forward graph onto the op set the runtime's CPU path accepts
+(`relu add reshape conv max_pool reduce_mean gemm`,
+`core/src/exec/cpu_executor.cpp`) and executes it through `libsonicboom.so`.
 
 - `trace-graph proc arg ...` — trace `proc` and return the document datum
 - `traced->s-expr graph` — the lowered document *text*; raises an error naming the op for any node with no lowering

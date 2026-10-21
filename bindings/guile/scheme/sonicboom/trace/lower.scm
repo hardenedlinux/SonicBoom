@@ -4,8 +4,10 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
 ;;; The tracer records a graph over its own operator vocabulary (`matmul`,
-;;; `relu`, `add`, ...). The S-Expr v0.1 runtime accepts a much smaller,
-;;; MLIR-lowered set (core/src/sx/lowering.cpp `lowerers()`):
+;;; `relu`, `add`, ...). The S-Expr v0.1 runtime accepts a much smaller set —
+;;; the operators the CPU Boom executor lowers (core/src/exec/cpu_executor.cpp;
+;;; the frozen vocabulary is still the seven ops the parser and planner call
+;;; "MLIR-routed", now executed directly):
 ;;;
 ;;;   relu add reshape conv max_pool reduce_mean gemm
 ;;;
