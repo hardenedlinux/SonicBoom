@@ -94,20 +94,26 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const int DPS = WH ? 1 : sh.dps;
   const int DC = D / DPS;     // output columns per warp
   const int WROW = BR / 16;   // 16-row query chunks per block
-  const int NW = WH ? GQA : WROW * DPS;  // warps per block
+  // Query heads per block (GQA packing). The warp-head variant packs one warp
+  // per query head already, so its pack factor is implicit.
+  const int PACK = WH ? 1 : sh.gqa_pack;
+  const int NW = WH ? GQA : WROW * DPS * PACK;  // warps per block
   const int THREADS = NW * 32;
   const int SUBS = BC / 16;
   const int NT = DC / 8;   // output n-tiles of 8 columns per warp
   const int KT = DC / 16;  // Q/K k-steps of 16 per warp
   // Rows of the staged Q tile: one 16-row tile per query head (warp-head
-  // variant) or one br-row tile shared by every warp.
-  const int QROWS = WH ? GQA * BR : BR;
+  // variant) or gqa_pack br-row tiles, one per packed query head.
+  const int QROWS = WH ? GQA * BR : PACK * BR;
   // cp.async staging pipeline (C4). Zero keeps the synchronous staging.
   // ABUF is the number of f32 prefetch buffers: a depth-S pipeline holds the
   // tile being converted/consumed plus S-1 tiles in flight, and the f32
   // buffers are the only per-stage shared-memory cost.
   const bool ASYNC = sh.async_stages >= 2;
   const int ABUF = ASYNC ? sh.async_stages - 1 : 0;
+  // Q fragments held in registers across the key loop (default) or reloaded
+  // from the staged Q tile per key tile.
+  const bool QREG = sh.q_in_reg;
   // exp2 softmax (opt-in): fold log2(e) into the score scale and exponentiate
   // in log2 units. `scl` is the score scale either way.
   const bool EXP2 = sh.exp2;
@@ -180,16 +186,23 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const int qBytes = QROWS * QD * 2;
   const int kByteOff = qBytes;
   const int vByteOff = kByteOff + D * KBC * 2;
-  const int sByteOff = vByteOff + BC * QD * 2;
+  const int afterV = vByteOff + BC * QD * 2;
+  // The partial-S buffer is only live after every warp has loaded its Q
+  // fragments, so it reuses the Q staging bytes when it fits (traffic and
+  // capacity both); the barrier after the fragment loads orders the handoff.
+  // It cannot share the region with the cp.async buffers: those are written
+  // from the prologue on.
+  const int sBytes = DPS > 1 ? DPS * QROWS * BC * 4 : 0;
+  const int abBytes = ASYNC ? ABUF * 2 * BC * D * 4 : 0;
+  const bool abOverlap = ASYNC && abBytes <= qBytes && QREG;
+  const bool sOverlap = !abOverlap && sBytes > 0 && sBytes <= qBytes && QREG;
+  const int sByteOff = sOverlap ? 0 : afterV;
   // The cp.async variant needs ABUF f32 stage buffers of K|V tile data. Q is
   // staged once and then lives in registers for the whole key-tile loop, so
   // when the stage buffers fit in Q's bytes they reuse that region (no extra
   // shared memory); a barrier after the Q fragment loads makes the handoff
   // safe. Larger stage buffers append after the partial-S buffer.
-  const int sBytes = DPS > 1 ? DPS * BR * BC * 4 : 0;
-  const int abBytes = ASYNC ? ABUF * 2 * BC * D * 4 : 0;
-  const bool abOverlap = ASYNC && abBytes <= qBytes;
-  const int aByteOff = abOverlap ? 0 : sByteOff + sBytes;
+  const int aByteOff = abOverlap ? 0 : afterV + (sOverlap ? 0 : sBytes);
   ci("xkb", kByteOff);
   ci("xvb", vByteOff);
   ci("xsb", sByteOff);
@@ -203,8 +216,10 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       "%out: !llvm.ptr) kernel {";
 
   const std::string tid = e.val("gpu.thread_id x");
-  const std::string bx = e.val("gpu.block_id x");
-  const std::string by = e.val("gpu.block_id y");
+  // head_fast swaps the two grid dimensions: bx still means the query tile
+  // and by the head throughout, only the launch order changes.
+  const std::string bx = e.val(sh.head_fast ? "gpu.block_id y" : "gpu.block_id x");
+  const std::string by = e.val(sh.head_fast ? "gpu.block_id x" : "gpu.block_id y");
   const std::string smem =
       e.val("gpu.dynamic_shared_memory : memref<?xi8, "
             "#gpu.address_space<workgroup>>");
@@ -227,7 +242,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       DPS > 1 ? e.val("memref.view " + smem + "[" + C["xsb"] +
                       "][] : memref<?xi8, "
                       "#gpu.address_space<workgroup>> to memref<" +
-                      s(DPS) + "x" + s(BR) + "x" + s(BC) +
+                      s(DPS) + "x" + s(QROWS) + "x" + s(BC) +
                       "xf32, #gpu.address_space<workgroup>>")
               : std::string();
   // [ABUF][K tile | V tile] f32 staging buffers for the cp.async pipeline,
@@ -277,13 +292,22 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   if (DPS != 1) c32("cdps", DPS);
   // Warp-head: every warp covers the block's one 16-row chunk and the whole
   // head_dim; the warp index selects its query head instead.
+  // With GQA packing the warp index also selects which packed query head the
+  // warp serves: warp = headloc * (WROW * DPS) + rowchunk * DPS + dchunk.
+  std::string headloc = C["c0"];
+  std::string wrem = warp;
+  if (!WH && PACK > 1) {
+    const std::string wd = e.val("arith.constant " + s(WROW * DPS) + " : i32");
+    headloc = e.val("arith.divui " + warp + ", " + wd + " : i32");
+    wrem = e.val("arith.remui " + warp + ", " + wd + " : i32");
+  }
   const std::string rowchunk = WH ? C["c0"]
       : DPS == 1
-      ? warp
-      : e.val("arith.divui " + warp + ", " + C["cdps"] + " : i32");
+      ? wrem
+      : e.val("arith.divui " + wrem + ", " + C["cdps"] + " : i32");
   const std::string dchunk = DPS == 1
       ? C["c0"]
-      : e.val("arith.remui " + warp + ", " + C["cdps"] + " : i32");
+      : e.val("arith.remui " + wrem + ", " + C["cdps"] + " : i32");
   const std::string dbase = DPS == 1
       ? C["c0"]
       : e.val("arith.muli " + dchunk + ", " +
@@ -308,16 +332,21 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string divc =
       GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
   // Grid y is the KV head in the warp-head variant (each warp takes one of its
-  // gqa query heads) and the query head otherwise.
-  const std::string hkv =
-      WH ? by_i : e.val("arith.divui " + by_i + ", " + divc + " : i32");
-  const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
+  // gqa query heads); otherwise it is the packed query-head group, which
+  // covers gqa_pack consecutive query heads of one KV head.
   std::string hq = by_i;
   if (WH) {
     const std::string gqac = GQA == 4 ? C["c4"] : GQA == 7 ? C["c7"] : C["gqa"];
     hq = e.val("arith.muli " + by_i + ", " + gqac + " : i32");
     hq = e.val("arith.addi " + hq + ", " + warp + " : i32");
+  } else if (PACK > 1) {
+    const std::string packc = e.val("arith.constant " + s(PACK) + " : i32");
+    hq = e.val("arith.muli " + by_i + ", " + packc + " : i32");
+    hq = e.val("arith.addi " + hq + ", " + headloc + " : i32");
   }
+  const std::string hkv =
+      WH ? by_i : e.val("arith.divui " + hq + ", " + divc + " : i32");
+  const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
   const std::string hq64 = e.val("arith.extui " + hq + " : i32 to i64");
   const std::string g64 = e.val("arith.extsi " + g + " : i32 to i64");
   const std::string tc64 = e.val("arith.extsi " + tc + " : i32 to i64");
@@ -348,6 +377,21 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string gqac =
           GQA == 4 ? C["c4"] : GQA == 7 ? C["c7"] : C["gqa"];
       std::string hd = e.val("arith.muli " + by_i + ", " + gqac + " : i32");
+      hd = e.val("arith.addi " + hd + ", " + hloc + " : i32");
+      staged_hd64 = e.val("arith.extui " + hd + " : i32 to i64");
+    } else if (PACK > 1) {
+      // Staged row kk belongs to packed head kk/BR at row kk%BR.
+      const std::string kk32 =
+          e.val("arith.index_cast " + kk + " : index to i32");
+      const std::string hloc =
+          e.val("arith.divui " + kk32 + ", " + C["cbr"] + " : i32");
+      const std::string rloc =
+          e.val("arith.remui " + kk32 + ", " + C["cbr"] + " : i32");
+      const std::string rloc64 =
+          e.val("arith.extsi " + rloc + " : i32 to i64");
+      qrow = e.val("arith.addi " + bxbr + ", " + rloc64 + " : i64");
+      const std::string packc = e.val("arith.constant " + s(PACK) + " : i32");
+      std::string hd = e.val("arith.muli " + by_i + ", " + packc + " : i32");
       hd = e.val("arith.addi " + hd + ", " + hloc + " : i32");
       staged_hd64 = e.val("arith.extui " + hd + " : i32 to i64");
     } else {
@@ -387,31 +431,51 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // ---- Q fragments (invariant across key tiles) ---------------------------
   // Each warp loads its 16 query rows over its DC-column slice of head_dim
   // and holds them in registers for the whole key-tile loop.
-  const std::string qrow16 =
-      e.val("arith.muli " + (WH ? warp : rowchunk) + ", " + C["c16"] +
-            " : i32");
-  std::vector<std::string> aq;
-  for (int k0 = 0; k0 < DC; k0 += 16) {
-    std::string row = e.val("arith.addi " + qrow16 + ", " + lane15 + " : i32");
-    std::string col = e.val("arith.muli " + lsh16 + ", " + C["c8"] + " : i32");
-    if (k0 != 0) {
-      const std::string kc = e.val("arith.constant " + s(k0) + " : i32");
-      col = e.val("arith.addi " + col + ", " + kc + " : i32");
-    }
-    if (DPS != 1)
-      col = e.val("arith.addi " + col + ", " + dbase + " : i32");
-    const std::string ri = e.val("arith.index_cast " + row + " : i32 to index");
-    const std::string ci2 = e.val("arith.index_cast " + col + " : i32 to index");
-    aq.push_back(e.val("nvgpu.ldmatrix " + qmem + "[" + ri + ", " + ci2 +
-                       "] {numTiles = 4 : i32, transpose = false} : memref<" +
-                       s(QROWS) + "x" + s(QD) +
-                       "xf16, #gpu.address_space<workgroup>> -> "
-                       "vector<4x2xf16>"));
+  std::string qbase = WH ? warp : rowchunk;
+  if (!WH && PACK > 1) {
+    // 16-row chunk index within the packed Q tile: one tile of WROW chunks
+    // per packed head.
+    const std::string wrowc = e.val("arith.constant " + s(WROW) + " : i32");
+    qbase = e.val("arith.muli " + headloc + ", " + wrowc + " : i32");
+    qbase = e.val("arith.addi " + qbase + ", " + rowchunk + " : i32");
   }
+  const std::string qrow16 =
+      e.val("arith.muli " + qbase + ", " + C["c16"] + " : i32");
+  // The warp's Q fragments: 16 rows x DC columns, KT ldmatrix of 4 tiles.
+  // With q_in_reg they are emitted once and held in registers for the whole
+  // key loop; without it every key tile reloads them from the staged Q tile
+  // (llama.cpp's Q_in_reg=false), trading KT ldmatrix per tile for the
+  // dc/4 registers the fragments would occupy.
+  const auto emit_qfrags = [&]() {
+    std::vector<std::string> out;
+    for (int k0 = 0; k0 < DC; k0 += 16) {
+      std::string row = e.val("arith.addi " + qrow16 + ", " + lane15 + " : i32");
+      std::string col = e.val("arith.muli " + lsh16 + ", " + C["c8"] + " : i32");
+      if (k0 != 0) {
+        const std::string kc = e.val("arith.constant " + s(k0) + " : i32");
+        col = e.val("arith.addi " + col + ", " + kc + " : i32");
+      }
+      if (DPS != 1)
+        col = e.val("arith.addi " + col + ", " + dbase + " : i32");
+      const std::string ri =
+          e.val("arith.index_cast " + row + " : i32 to index");
+      const std::string ci2 =
+          e.val("arith.index_cast " + col + " : i32 to index");
+      out.push_back(e.val("nvgpu.ldmatrix " + qmem + "[" + ri + ", " + ci2 +
+                          "] {numTiles = 4 : i32, transpose = false} : memref<" +
+                          s(QROWS) + "x" + s(QD) +
+                          "xf16, #gpu.address_space<workgroup>> -> "
+                          "vector<4x2xf16>"));
+    }
+    return out;
+  };
+  std::vector<std::string> aq =
+      QREG ? emit_qfrags() : std::vector<std::string>();
   // Every warp holds its Q fragments now; the Q staging region can be reused
-  // by the cp.async stage buffers (see the shared-memory layout above). The
-  // barrier orders the last Q read before the first stage copy.
-  if (ASYNC && abOverlap) e.op("gpu.barrier");
+  // by the cp.async stage buffers or the partial-S buffer (see the
+  // shared-memory layout above). The barrier orders the last Q read before
+  // the first write to that region.
+  if (sOverlap || (ASYNC && abOverlap)) e.op("gpu.barrier");
 
   // ---- key-tile loop bounds ----------------------------------------------
   // n_blk = min(BR, n - bx*BR); the last absolute key this block sees is
@@ -742,6 +806,10 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   e.op("gpu.barrier");
   }
 
+  // q_in_reg = false: reload this warp's Q fragments from the staged Q tile
+  // for every key tile (the tile stays live, so no overlap aliasing).
+  if (!QREG) aq = emit_qfrags();
+
   // ---- S = Q K^T for every sub-tile --------------------------------------
   // Each warp accumulates S over its DC-column slice of head_dim. With the
   // head_dim split across warps (DPS > 1) the partials go through shared
@@ -787,8 +855,15 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // slice; the barrier below makes all of them visible before the sums.
   std::string prow0i, prow1i, pdchi, ptc2i, ptc2p1i;
   if (DPS > 1) {
+    // Block row = packed-head tile base + within-head 16-row chunk.
+    std::string srowbase = rowchunk;
+    if (PACK > 1) {
+      const std::string wrowc = e.val("arith.constant " + s(WROW) + " : i32");
+      srowbase = e.val("arith.muli " + headloc + ", " + wrowc + " : i32");
+      srowbase = e.val("arith.addi " + srowbase + ", " + rowchunk + " : i32");
+    }
     const std::string rowchunk16 =
-        e.val("arith.muli " + rowchunk + ", " + C["c16"] + " : i32");
+        e.val("arith.muli " + srowbase + ", " + C["c16"] + " : i32");
     const std::string prow0 = e.val("arith.addi " + rowchunk16 + ", " + g +
                                     " : i32");
     const std::string prow1 =
@@ -805,7 +880,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     pdchi = idx(dchunk);
     ptc2i = idx(tc2);
     ptc2p1i = idx(tc2p1);
-    const std::string stype = " : memref<" + s(DPS) + "x" + s(BR) + "x" +
+    const std::string stype = " : memref<" + s(DPS) + "x" + s(QROWS) + "x" +
                               s(BC) + "xf32, #gpu.address_space<workgroup>>";
     for (int sub = 0; sub < SUBS; ++sub) {
       const int key_off = sub * 16;
@@ -847,7 +922,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       sf11 = ext(s1v[sub], 1, 1);
     } else {
       const std::string stype =
-          " : memref<" + s(DPS) + "x" + s(BR) + "x" + s(BC) +
+          " : memref<" + s(DPS) + "x" + s(QROWS) + "x" + s(BC) +
           "xf32, #gpu.address_space<workgroup>>";
       const auto sum_d = [&](const std::string &ri,
                              const std::string &ci) -> std::string {
@@ -1591,10 +1666,11 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
 
 bool attention_shape_supported(const AttentionShape &shape) {
   // 16-row sub-tiles and 8/16-wide mma tiles fix the granularity. Each warp
-  // owns head_dim/dps output columns — 8/16-wide fragments, so that slice, not
-  // head_dim, is what bounds the register budget (128 columns = 16 f32
-  // fragments per thread; wider needs a different accumulation). The staging
-  // is Q + K + V plus the f32 partial-S buffer when the head_dim is split.
+  // owns head_dim/dps output columns — 8-wide fragments, so that slice, not
+  // head_dim, is what bounds the register budget: dc/2 f32 registers per lane
+  // for the accumulator, up to dc = 256 (128 registers, the largest slice that
+  // still leaves room for the Q fragments; see the dc check below). The
+  // staging is Q + K + V plus the f32 partial-S buffer when head_dim is split.
   if (shape.head_dim <= 0 || shape.gqa <= 0) return false;
   // The cp.async pipeline has synchronous depth 0 (off) or 2/3 stages.
   if (shape.async_stages != 0 && shape.async_stages != 2 &&
@@ -1619,12 +1695,20 @@ bool attention_shape_supported(const AttentionShape &shape) {
   }
   if (shape.br < 16 || shape.br > 64 || shape.br % 16 != 0) return false;
   if (shape.bc < 16 || shape.bc > 64 || shape.bc % 16 != 0) return false;
+  // GQA packing: whole query-head groups only (one KV head per block).
+  if (shape.gqa_pack < 1 || shape.gqa_pack > shape.gqa ||
+      shape.gqa % shape.gqa_pack != 0)
+    return false;
   const int dps = shape.dps;
   if (dps != 1 && dps != 2 && dps != 4 && dps != 8) return false;
   if (shape.head_dim % dps != 0) return false;
   const int dc = shape.head_dim / dps;
-  if (dc < 16 || dc % 16 != 0 || dc / 8 > 16) return false;
-  if ((shape.br / 16) * dps > 32) return false;
+  // The f32 output accumulator is dc/2 registers per lane (NT = dc/8
+  // fragments of 4). dc = 256 costs 128 of them and leaves room for the
+  // dps = 1 Q fragments (kt = dc/16 fragments of 4); the pre-split limit of
+  // 128 columns was a register-budget rule, not a structural one.
+  if (dc < 16 || dc % 16 != 0 || dc / 8 > 32) return false;
+  if ((shape.br / 16) * dps * shape.gqa_pack > 32) return false;
   // Up to 96 KiB of dynamic shared memory; the loader raises the per-function
   // limit above 48 KiB.
   return attention_shared_bytes(shape) <= 96 * 1024;
@@ -1633,13 +1717,14 @@ bool attention_shape_supported(const AttentionShape &shape) {
 int attention_block_threads(const AttentionShape &shape) {
   if (shape.decode) return 32;  // one warp for the partial kernel
   if (shape.warp_head) return shape.gqa * 32;  // one warp per query head
-  return (shape.br / 16) * shape.dps * 32;
+  return (shape.br / 16) * shape.dps * shape.gqa_pack * 32;
 }
 
 int attention_shared_bytes(const AttentionShape &shape) {
   // Decode: the fixed score view the partial kernel stages the chunk in.
   if (shape.decode) return 4 * kAttentionDecodeMaxChunk;
-  const int qrows = shape.warp_head ? shape.gqa * shape.br : shape.br;
+  const int qrows = shape.warp_head ? shape.gqa * shape.br
+                                    : shape.gqa_pack * shape.br;
   // Every f16 tile row carries the 8-element bank-conflict pad (see
   // attention_region_text).
   const int q = 2 * qrows * (shape.head_dim + 8);
@@ -1648,15 +1733,20 @@ int attention_shared_bytes(const AttentionShape &shape) {
   // Partial-S exchange buffer (one f32 per row x key per d-slice). The
   // warp-head variant has none: S stays in the warp that produced it.
   const int sp = !shape.warp_head && shape.dps > 1
-                     ? 4 * shape.dps * shape.br * shape.bc
+                     ? 4 * shape.dps * qrows * shape.bc
                      : 0;
   // cp.async prefetch buffers: async_stages-1 buffers of one K|V f32 tile,
-  // reusing the Q tile's bytes when they fit (Q is in registers by then).
+  // reusing the Q tile's bytes when they fit (Q is in registers by then). The
+  // partial-S buffer reuses those same bytes when cp.async does not.
   const int ab = shape.async_stages >= 2
                      ? (shape.async_stages - 1) * 2 * shape.bc *
                            shape.head_dim * 4
                      : 0;
-  return q + k + v + sp + (ab <= q ? 0 : ab);
+  // Both aliases need the Q tile to be dead after the fragment loads, which
+  // q_in_reg = false rules out (it reloads Q from the tile every key tile).
+  const bool abOverlap = ab > 0 && ab <= q && shape.q_in_reg;
+  const bool sOverlap = !abOverlap && sp > 0 && sp <= q && shape.q_in_reg;
+  return q + k + v + (sOverlap ? 0 : sp) + (abOverlap ? 0 : ab);
 }
 
 std::optional<std::string> generate_attention_ptx(const AttentionShape &shape,
@@ -1684,7 +1774,11 @@ std::string attention_codegen_version() {
   // wavefronts); attn5: cp.async K/V staging pipeline (f32 prefetch buffers
   // converted to the f16 mma tiles in shared memory); attn4: warp-head
   // variant (S and P stay in registers; br fixed at 16).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn9";
+  // attn10: GQA packing (gqa_pack query heads per block, bit-identical: each
+  // head keeps its own warp roles and arithmetic) and the partial-S buffer
+  // aliased into the dead Q staging bytes. attn11: Q-fragment reload arm
+  // (q_in_reg = false) and the head-fast grid order (head_fast).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn11";
 }
 
 } // namespace sonicboom::compiler

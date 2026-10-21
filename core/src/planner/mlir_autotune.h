@@ -256,16 +256,23 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
 // Classes cover the generator's defaulted head_dims {32,64,128,256,512}; the
 // production dps for 256/512 is 4/8 (dc = 64 in every shipped class).
 //
-// Shape class: head_dim exact; the query length (the prefill chunk size) and
-// the query-head count are bucketed, so a class is tuned once per GPU and
-// reused across launches in the same bucket.
-std::string attn_prefill_seq_bucket(int seq_len);
+// Shape class: head_dim exact, query-head count bucketed. The query length is
+// NOT part of the class. One kernel per static shape class (run rule R1): if
+// the tile were chosen per prefill chunk length, the same row would run in a
+// different tile -- and so a different reduction order -- depending on which
+// chunk it lands in, which breaks the prefix-reuse token-identity contract
+// (measured: a per-length choice made row 229 of a 130-row chunk differ from
+// the same row computed alone by 5e-7). The class is tuned once per GPU on a
+// fixed probe length and reused for every launch of that class.
 std::string attn_prefill_heads_bucket(int n_heads);
 
-// "<head_dim>/<seq_len_bucket>/<num_heads_bucket>" (the cache's shape field;
-// the op field is "attn_prefill", so the combined name is
-// "attn_prefill/<head_dim>/<seq_len_bucket>/<num_heads_bucket>").
-std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads);
+// "<head_dim>/<num_heads_bucket>/<production>" (the cache's shape field; the
+// op field is "attn_prefill"). `production` is the dispatcher's own shape
+// signature (br, bc, dps, as, packing, grid order): it names the reference
+// the winner was measured against, so a changed default retimes the class
+// instead of shadowing it with a pick made against the old reference.
+std::string attn_prefill_shape_class(int head_dim, int n_heads,
+                                     std::string_view production);
 
 // Head dims the generated prefill kernel has defaulted shape classes for.
 bool attn_prefill_tunable(int head_dim);
@@ -295,11 +302,13 @@ struct AttnPrefillChoice {
 // tune the class with AutotuneRunner (candidates from
 // attn_prefill_candidates(), the first as reference) and then call
 // attn_prefill_choice_store.
-AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads);
+AttnPrefillChoice attn_prefill_choice(int head_dim, int n_heads,
+                                     std::string_view production);
 
 // Memoize a measured winner and persist it for the SM. True when the file
 // write succeeded.
-bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+bool attn_prefill_choice_store(int head_dim, int n_heads,
+                               std::string_view production,
                                const TileConfig& cfg);
 
 // Drop the in-process memo (tests; the disk cache is untouched).

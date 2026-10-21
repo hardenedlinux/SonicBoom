@@ -54,10 +54,12 @@ constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // meaning from (tile_seq, tile_head) to (br, dc, bc, as), so a version-2
 // record must not be applied to the new grid. Version 4 splits gemv rows
 // above 16384 into their own buckets, so a version-3 "bprN-r16384" record
-// would be applied to a class it was not measured for. An older file misses
-// on lookup and is rewritten by the first store, which is the cache's own
-// reset path.
-constexpr uint32_t kVersion = 4;
+// would be applied to a class it was not measured for. Version 5 drops the
+// query-length bucket from the "attn_prefill" class key (one kernel per shape
+// class; run rule R1), so a version-4 record names a class that no longer
+// exists. An older file misses on lookup and is rewritten by the first store,
+// which is the cache's own reset path.
+constexpr uint32_t kVersion = 5;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
@@ -696,24 +698,16 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
 
 // --- Q3: prefill attention shape classes -----------------------------------
 
-std::string attn_prefill_seq_bucket(int seq_len) {
-  if (seq_len < 64) return "1-63";
-  if (seq_len < 128) return "64-127";
-  if (seq_len < 256) return "128-255";
-  if (seq_len < 512) return "256-511";
-  if (seq_len < 1024) return "512-1023";
-  return "1024+";
-}
-
 std::string attn_prefill_heads_bucket(int n_heads) {
   if (n_heads < 8) return "1-7";
   if (n_heads < 16) return "8-15";
   return "16+";
 }
 
-std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads) {
-  return std::to_string(head_dim) + "/" + attn_prefill_seq_bucket(seq_len) +
-         "/" + attn_prefill_heads_bucket(n_heads);
+std::string attn_prefill_shape_class(int head_dim, int n_heads,
+                                     std::string_view production) {
+  return std::to_string(head_dim) + "/" + attn_prefill_heads_bucket(n_heads) +
+         "/" + std::string(production);
 }
 
 bool attn_prefill_tunable(int head_dim) {
@@ -759,15 +753,16 @@ std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
 }
 } // namespace
 
-AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
+AttnPrefillChoice attn_prefill_choice(int head_dim, int n_heads,
+                                     std::string_view production) {
   if (!enabled()) {
     record_choice("tune/attn_prefill",
-                  attn_prefill_shape_class(head_dim, seq_len, n_heads),
+                  attn_prefill_shape_class(head_dim, n_heads, production),
                   "dispatcher", planner::decisions::Source::Default,
                   "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
     return AttnPrefillChoice{};
   }
-  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  const std::string key = attn_prefill_shape_class(head_dim, n_heads, production);
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     const auto it = attn_prefill_memo().find(key);
@@ -801,9 +796,10 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
   return AttnPrefillChoice{};
 }
 
-bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+bool attn_prefill_choice_store(int head_dim, int n_heads,
+                               std::string_view production,
                                const TileConfig& cfg) {
-  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  const std::string key = attn_prefill_shape_class(head_dim, n_heads, production);
   record_choice("tune/attn_prefill", key, cfg.to_string(),
                 planner::decisions::Source::Measured,
                 "production|br{16,32,64}xbc{production,32}xas{production,0,2}");

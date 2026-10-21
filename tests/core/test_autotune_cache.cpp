@@ -164,7 +164,7 @@ int main() {
               mskip.cfg == mt::mmq_tc_default_config(),
           "mmq: an exhausted budget resolves to the static default");
     const mt::AttnPrefillChoice as =
-        mt::attn_prefill_choice(128, 8192, 16);
+        mt::attn_prefill_choice(128, 16, "prod");
     check(as.resolved() && as.source == mt::AttnPrefillSource::Skipped &&
               as.cfg.tile_m == 0,
           "attn: an exhausted budget resolves to the dispatcher shape");

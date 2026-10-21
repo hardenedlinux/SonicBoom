@@ -219,6 +219,9 @@ std::string attention_region_name(const compiler::AttentionShape &shape) {
          (shape.warp_head ? "-wh" : "") +
          (shape.async_stages >= 2 ? "-as" + std::to_string(shape.async_stages)
                                   : "") +
+         (shape.gqa_pack > 1 ? "-p" + std::to_string(shape.gqa_pack) : "") +
+         (shape.q_in_reg ? "" : "-qs") +
+         (shape.head_fast ? "-hf" : "") +
          (shape.exp2 ? "-x2" : "");
 }
 

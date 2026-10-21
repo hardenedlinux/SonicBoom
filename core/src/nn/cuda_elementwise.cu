@@ -34,6 +34,7 @@
 #include <cublasLt.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -2940,7 +2941,8 @@ bool attn_exp2_enabled() {
 // async_stages stayed 0 while the other fields were set). Assign explicitly.
 compiler::AttentionShape attn_prefill_shape(int head_dim, int gqa, bool window,
                                             int br, int bc, int dps, bool wh,
-                                            int as) {
+                                            int as, int pack = 1,
+                                            bool qreg = true, int hf = 0) {
   compiler::AttentionShape s;
   s.head_dim = head_dim;
   s.gqa = gqa;
@@ -2950,6 +2952,9 @@ compiler::AttentionShape attn_prefill_shape(int head_dim, int gqa, bool window,
   s.dps = dps;
   s.warp_head = wh;
   s.async_stages = as;
+  s.gqa_pack = pack;
+  s.q_in_reg = qreg;
+  s.head_fast = hf != 0;
   s.exp2 = attn_exp2_enabled();
   return s;
 }
@@ -2977,13 +2982,37 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
     shape.dps = 1;
     shape.async_stages = 2;
   } else if (gqa == 4 && head_dim == 256) {
-    shape.br = 64;
+    // T4 measured (wide bench, 3050): packing all four query heads of a KV
+    // head into one block and pipelining the K/V staging beats every unpacked
+    // tile on both query lengths -- pp512 0.325 ms (0.635 for the previous
+    // 64x16 sync tile), 2048 queries 1.652 ms (3.447). bc/dps are unchanged
+    // from the previous default, so the reduction order and the token stream
+    // are unchanged.
+    shape.br = 16;
     shape.bc = 16;
-    shape.dps = 4;  // 16 warps, 64 KiB
+    shape.dps = 4;  // 16 warps, 53 KiB
+    shape.async_stages = 2;
+    shape.gqa_pack = 4;
   } else if (gqa == 4 && head_dim == 512) {
-    shape.br = 32;
+    // T4 measured (wide bench, 3050): the hand-written kernel wins this
+    // class, and no legal generated tile beats it. Counting only shapes that
+    // really generate -- a tile over the shared-memory gate silently falls
+    // back to own, which makes several rows look like wins -- the best
+    // generated shape, 16x16 pack2 dps8, is 1.717 ms at q=512 and 27.19 ms
+    // at q=2048 against own 1.603/20.25; 32x16 dps8 is 1.883/28.22. The
+    // 96 KiB budget is what binds: gqa_pack >= 3 needs 107.8 KiB (q 65.0 +
+    // k 24.0 + v 16.3), and the cp.async f32 prefetch buffer is 64 KiB,
+    // which cannot alias the 33 KiB Q tile at pack 2 / dps 8 (140 KiB), so
+    // every legal d512 shape stages synchronously. The dispatcher resolves
+    // the class to own (attn_default_choice); this shape is the reference
+    // the explicit SONICBOOM_ATTN_IMPL=codegen arm and the tuner measure
+    // against. dps 8 keeps dc = 64 (the previously shipped d512 split) and
+    // packing is bit-identical per head, so the codegen arm's token stream
+    // is unchanged from the old 32x16 dps8 default.
+    shape.br = 16;
     shape.bc = 16;
-    shape.dps = 8;  // 16 warps, 80 KiB
+    shape.dps = 8;       // dc = 64, 16 warps
+    shape.gqa_pack = 2;  // q rows 32 -> 74.5 KiB, the largest legal pack
   } else {
     return std::nullopt;
   }
@@ -3001,7 +3030,7 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
       attn_codegen_default_shape(head_dim, gqa, window);
   if (!shape) return std::nullopt;
   if (const char *e = std::getenv("SONICBOOM_ATTN_CODEGEN")) {
-    int br = 0, bc = 0, dps = 0, as = 0;
+    int br = 0, bc = 0, dps = 0, as = 0, pack = 1, qs = 0, hf = 0;
     if (std::sscanf(e, "wh,%d,%d,%d", &br, &bc, &as) >= 2 && br > 0 && bc > 0) {
       // P-in-registers (warp-head) arm: br must be 16, dps is implicit. The
       // optional third value is the cp.async pipeline depth.
@@ -3010,12 +3039,20 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
       shape->bc = bc;
       shape->dps = 1;
       shape->async_stages = as;
-    } else if (std::sscanf(e, "%d,%d,%d,%d", &br, &bc, &dps, &as) >= 3 &&
+    } else if (std::sscanf(e, "%d,%d,%d,%d,%d,%d,%d", &br, &bc, &dps, &as,
+                           &pack, &qs, &hf) >= 3 &&
                br > 0 && bc > 0 && dps > 0) {
+      // Optional fourth value: cp.async depth; fifth: GQA packing; sixth:
+      // nonzero reloads Q fragments per key tile instead of holding them in
+      // registers; seventh: nonzero puts the head in blockIdx.x (head-fast
+      // grid order).
       shape->br = br;
       shape->bc = bc;
       shape->dps = dps;
       shape->async_stages = as;
+      shape->gqa_pack = pack;
+      shape->q_in_reg = qs == 0;
+      shape->head_fast = hf != 0;
     }
   }
   if (!compiler::attention_shape_supported(*shape)) return std::nullopt;
@@ -3039,11 +3076,18 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
   void *args[] = {&q_p,      &kb_p,    &vb_p,   &kc_p,   &vc_p,  &start_p,
                   &nslots_p, &nhq_p,   &nhkv_p, &n_p,    &window_p,
                   &scale_p,  &out_p};
-  const int grid_x = (n + shape.br - 1) / shape.br;
+  const int tiles = (n + shape.br - 1) / shape.br;
   // Warp-head blocks are (query tile, KV head): each warp covers one of the
-  // KV head's query heads.
-  const int grid_y = shape.warp_head ? n_heads_kv : n_heads_q;
-  return planner::glue::launch_attention(shape, args, grid_x, grid_y);
+  // KV head's query heads. Packed blocks are (query tile, query-head group).
+  const int heads = shape.warp_head
+                        ? n_heads_kv
+                        : n_heads_q / std::max(1, shape.gqa_pack);
+  // head_fast puts the head in blockIdx.x so the blocks launched together
+  // share one K/V range; the kernel reads the two ids the same way either
+  // way.
+  return planner::glue::launch_attention(
+      shape, args, shape.head_fast ? heads : tiles,
+      shape.head_fast ? tiles : heads);
 }
 
 // Prefill implementation choice for a shape class: the hand-written kernel
@@ -3060,13 +3104,21 @@ struct AttnChoice {
   // cp.async staging pipeline depth (0 = synchronous staging). Token streams
   // are bit-identical to the synchronous staging.
   int as = 0;
+  // GQA packing: query heads per block (bit-identical; see AttentionShape).
+  int pack = 1;
+  // Reload Q fragments per key tile instead of holding them in registers
+  // (bit-identical; see AttentionShape::q_in_reg).
+  int qs = 0;
+  // Head-fast grid order (bit-identical; see AttentionShape::head_fast).
+  int hf = 0;
 };
 
 bool attn_same_choice(const AttnChoice &a, const AttnChoice &b) {
   if (a.impl != b.impl) return false;
   if (a.wh != b.wh) return false;
   return a.impl == AttnImpl::Own ||
-         (a.br == b.br && a.bc == b.bc && a.dps == b.dps && a.as == b.as);
+         (a.br == b.br && a.bc == b.bc && a.dps == b.dps && a.as == b.as &&
+          a.pack == b.pack && a.qs == b.qs && a.hf == b.hf);
 }
 
 std::string attn_choice_name(const AttnChoice &c) {
@@ -3075,6 +3127,9 @@ std::string attn_choice_name(const AttnChoice &c) {
                   std::to_string(c.br) + "," + std::to_string(c.bc) + "," +
                   std::to_string(c.dps);
   if (c.as >= 2) n += ",as" + std::to_string(c.as);
+  if (c.pack > 1) n += ",p" + std::to_string(c.pack);
+  if (c.qs) n += ",qs";
+  if (c.hf) n += ",hf";
   return n;
 }
 
@@ -3133,23 +3188,29 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
         e != nullptr && std::string_view(e) == "own")
       return {AttnImpl::Own, 0, 0, 0};
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
+      return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+              s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+              s->head_fast ? 1 : 0};
     return {AttnImpl::Own, 0, 0, 0};
   }
-  // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
-  // (0.318/0.231 ms vs own 0.424/0.243).
-  // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
-  // own keeps a prefill lead at q >= 128 (1.62 vs 1.86 ms per call at
-  // pp512), but the class must stay on one kernel: a prefix-reuse suffix
-  // prefill must be bit-identical to the same rows of a full prefill, and
-  // the two kernels are not (q=64: 57.44 ms generated vs 58.94 own). Gating
-  // own at q >= 128 mixed them by n and diverged test_prefix_cache, so the
-  // static table keeps codegen here and the tune-time measurement decides
-  // the generated tile for the prefill leg.
-  if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
+  // d256: T4 measured codegen (16x16, dps 4, pack 4, double-buffered) at
+  // 0.325 ms per call at q=512 and 1.652 at q=2048 against own 0.753/3.563.
+  if (gqa == 4 && head_dim == 256) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
+      return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+              s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+              s->head_fast ? 1 : 0};
   }
+  // d512: own wins the prefill leg, and no legal generated tile beats it
+  // (best generated 1.717/27.19 ms vs own 1.603/20.25 at q=512/2048; see
+  // attn_codegen_default_shape for why the 96 KiB budget rules out packing
+  // and cp.async at this head width). The class is uniform over the query
+  // length -- one kernel per shape class -- so a prefix-reuse suffix prefill
+  // uses the same kernel as the full prefill it extends. The generated
+  // kernel stays reachable through SONICBOOM_ATTN_IMPL=codegen for
+  // measurement. The token stream moves relative to the previous generated
+  // default: flagged intended in the T4 report. Every other class keeps the
+  // hand-written kernel too.
   return {AttnImpl::Own, 0, 0, 0};
 }
 
@@ -3237,6 +3298,9 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
     if (!compiler::attention_shape_supported(s)) return;
     if (compiler::attention_shared_bytes(s) > max_smem) return;
     if (compiler::attention_block_threads(s) > max_threads) return;
+    // 16 warps is the largest block the register file holds (see the Q3
+    // apply()); a wider candidate would only time a failed launch.
+    if (compiler::attention_block_threads(s) > 512) return;
     // Only candidates whose token stream matches the hand-written kernel (or
     // the non-identical arm, when explicitly enabled) enter the search; see
     // attn_choice_bit_identical for which levers qualify per shape class.
@@ -3248,11 +3312,15 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   for (int as : {0, 2, 3})
     for (int dps : {1, 2, 4, 8})
       for (int bc : {16, 32, 48, 64})
-        for (int br : {16, 32, 48, 64}) {
-          const compiler::AttentionShape s = attn_prefill_shape(
-              head_dim, gqa, window, br, bc, dps, false, as);
-          add_candidate(s, {AttnImpl::Codegen, br, bc, dps, false, as});
-        }
+        for (int br : {16, 32, 48, 64})
+          for (int pack : {1, gqa})
+            for (int qs : {0, 1}) {
+              const compiler::AttentionShape s = attn_prefill_shape(
+                  head_dim, gqa, window, br, bc, dps, false, as, pack,
+                  qs == 0);
+              add_candidate(
+                  s, {AttnImpl::Codegen, br, bc, dps, false, as, pack, qs});
+            }
   // P-in-registers arm (warp per query head, no d split). Its dps is 1, so it
   // is bit-identical for the d64 class and opt-in elsewhere (see
   // attn_choice_bit_identical); add_candidate applies that rule.
@@ -3305,7 +3373,8 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
                              b.start, kAttnTuneSlots, kAttnTuneQueries,
                              n_heads_q, n_heads_kv, w, scale, b.out);
     const compiler::AttentionShape s = attn_prefill_shape(
-        head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as);
+        head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
+        c.qs == 0, c.hf);
     return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
                                kAttnTuneSlots, kAttnTuneQueries, n_heads_q,
                                n_heads_kv, w, scale, b.out);
@@ -3373,6 +3442,16 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   if (!mlir_tune::attn_prefill_tunable(head_dim)) return std::nullopt;
   if (!mlir_tune::enabled()) return std::nullopt;
 
+  // The decision inputs of the class's static default: the tile knobs plus
+  // the packing/grid order the candidates inherit from it. Part of the cache
+  // key, so changing the default retimes the class instead of leaving a pick
+  // measured against the old reference in place. The query length is not.
+  const std::string prod_key =
+      "b" + std::to_string(base.br) + "x" + std::to_string(base.bc) + "-dps" +
+      std::to_string(base.dps) + "-as" + std::to_string(base.async_stages) +
+      "-p" + std::to_string(base.gqa_pack) + (base.head_fast ? "-hf" : "") +
+      (base.q_in_reg ? "" : "-qs");
+
   auto apply = [&](const TileConfig &cfg)
       -> std::optional<compiler::AttentionShape> {
     if (cfg.tile_m <= 0 || cfg.tile_n <= 0 || head_dim % cfg.tile_n != 0)
@@ -3389,6 +3468,13 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
     s.warp_head = false;
     if (!compiler::attention_shape_supported(s)) return std::nullopt;
     if (compiler::attention_shared_bytes(s) > 96 * 1024) return std::nullopt;
+    // The generator's support rules allow 32-warp blocks, but this device's
+    // register file does not hold them: at 24-32 warps a block needs more
+    // registers than the SM's 64K (measured: 768-thread d512 and 1024-thread
+    // d256 pack4 cuLaunchKernel back with CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES).
+    // 16 warps is the largest block that launches, so a stored choice from an
+    // older grid cannot turn a class into a silent hand-written fallback.
+    if (compiler::attention_block_threads(s) > 512) return std::nullopt;
     return s;
   };
   // The dispatcher's own shape: the bit-identity reference and the default we
@@ -3397,7 +3483,7 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
                               base.async_stages, 1};
 
   const mlir_tune::AttnPrefillChoice choice =
-      mlir_tune::attn_prefill_choice(head_dim, n, n_heads_q);
+      mlir_tune::attn_prefill_choice(head_dim, n_heads_q, prod_key);
   if (choice.resolved()) return apply(choice.cfg);
   if (attn_capturing()) return std::nullopt;  // host timing is illegal there
   // Out of cold budget: keep the dispatcher's shape without allocating the
@@ -3405,9 +3491,12 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   // reached once per class).
   if (mlir_tune::budget_exhausted()) return std::nullopt;
 
-  // Probe at the caller's query length (capped so the scratch stays small; a
-  // class is a bucket, and any length inside it is a valid probe).
-  const int probe_n = std::min(n, 1024);
+  // Probe at a fixed query length, not the caller's: the class key has no
+  // query length (one kernel per class, R1), so the first caller's n must not
+  // decide what every later launch of the class runs. 512 rows is a prefill-
+  // sized burst (the class is the prefill kernel) and keeps the scratch small.
+  constexpr int kQ3ProbeQueries = 512;
+  const int probe_n = kQ3ProbeQueries;
   const size_t q_n = size_t(probe_n) * size_t(n_heads_q) * size_t(head_dim);
   const size_t kv_n = size_t(probe_n) * size_t(n_heads_kv) * size_t(head_dim);
   const size_t c_n = size_t(kAttnTuneSlots) * size_t(n_heads_kv) *
@@ -3602,12 +3691,14 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   planner::set_thread_recorder(saved_rec);
 
   const bool stored =
-      mlir_tune::attn_prefill_choice_store(head_dim, n, n_heads_q, winner);
+      mlir_tune::attn_prefill_choice_store(head_dim, n_heads_q, prod_key,
+                                          winner);
   if (verbose)
     std::fprintf(stderr,
                  "[autotune] %s: br=%d dc=%d bc=%d as=%d%s\n",
                  ("attn_prefill/" +
-                  mlir_tune::attn_prefill_shape_class(head_dim, n, n_heads_q))
+                  mlir_tune::attn_prefill_shape_class(head_dim, n_heads_q,
+                                                      prod_key))
                      .c_str(),
                  winner.tile_m, winner.tile_n, winner.tile_k, winner.unroll,
                  stored ? "" : " [not persisted]");
@@ -3618,13 +3709,19 @@ std::mutex g_attn_choice_mutex;
 std::unordered_map<std::string, AttnChoice> g_attn_choice;
 
 std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
-                          bool window, uint64_t window_len) {
+                          bool window, uint64_t window_len,
+                          const AttnChoice &def) {
   std::string k = compiler::attention_codegen_version();
   k += "|prefill-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
        "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
        "-m" + (window ? "window" : "causal");
   if (window) k += "-w" + std::to_string(window_len);
   if (attn_exp2_enabled()) k += "-x2";
+  // The default the choice was measured against is a decision input: a new
+  // default (a different tile, packing or grid order) must retune the class
+  // rather than be shadowed by the old pick. The batch size and position are
+  // still never part of the key.
+  k += "|dflt-" + attn_choice_name(def);
   return k;
 }
 
@@ -3642,14 +3739,18 @@ bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
     out = {AttnImpl::Own, 0, 0, 0};
     return true;
   }
-  int br = 0, bc = 0, dps = 0, wh = 0, as = 0;
+  int br = 0, bc = 0, dps = 0, wh = 0, as = 0, pack = 1, qs = 0, hf = 0;
   if (!get("br", br) || !get("bc", bc) || !get("dps", dps)) return false;
   (void)get("wh", wh);
   (void)get("as", as);
+  (void)get("pack", pack);
+  (void)get("qs", qs);
+  (void)get("hf", hf);
   const compiler::AttentionShape s = attn_prefill_shape(
-      head_dim, gqa, window, br, bc, dps, wh != 0, as);
+      head_dim, gqa, window, br, bc, dps, wh != 0, as, pack, qs == 0,
+      hf);
   if (!compiler::attention_shape_supported(s)) return false;
-  out = {AttnImpl::Codegen, br, bc, dps, wh != 0, as};
+  out = {AttnImpl::Codegen, br, bc, dps, wh != 0, as, pack, qs, hf};
   return true;
 }
 
@@ -3672,8 +3773,8 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
       std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") == nullptr)
     return def;
 
-  const std::string key =
-      attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv, window, window_len);
+  const std::string key = attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv,
+                                        window, window_len, def);
   {
     std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
     const auto it = g_attn_choice.find(key);
@@ -3707,7 +3808,10 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
         {"bc", choice.bc},
         {"dps", choice.dps},
         {"wh", choice.wh ? 1 : 0},
-        {"as", choice.as}};
+        {"as", choice.as},
+        {"pack", choice.pack},
+        {"hf", choice.hf},
+        {"qs", choice.qs}};
     ::sonicboom::tune::store("attention-prefill", key, values);
     if (verbose)
       std::fprintf(stderr,
@@ -3985,7 +4089,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                         windowed, sliding_window);
       if (c.impl == AttnImpl::Codegen) {
         const compiler::AttentionShape s = attn_prefill_shape(
-            head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as);
+            head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
+            c.qs == 0, c.hf);
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
@@ -4007,7 +4112,9 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
   // A shape without a generator (or a failed compile) falls through to the
-  // hand-written kernels below.
+  // hand-written kernels below. A shape that compiles but cannot launch (a
+  // tile whose register demand exceeds the block's budget) lands here too,
+  // which would otherwise be invisible in a timing run: say so once.
   if (shape &&
       attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache, start,
                           n_slots, n, n_heads_q, n_heads_kv, sliding_window,
@@ -4018,6 +4125,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           std::to_string(shape->bc) + "," + std::to_string(shape->dps);
       if (shape->async_stages >= 2)
         cfg += ",as" + std::to_string(shape->async_stages);
+      if (shape->gqa_pack > 1) cfg += ",p" + std::to_string(shape->gqa_pack);
+      if (shape->head_fast) cfg += ",hf";
       if (shape->exp2) cfg += ",x2";
       attn_trace_prefill(
           attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
@@ -4027,6 +4136,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           (size_t)compiler::attention_shared_bytes(*shape));
     }
     return true;
+  }
+  if (shape) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      std::fprintf(stderr,
+                   "[attention] generated prefill kernel b%dx%d-dps%d-p%d%s "
+                   "did not launch; falling back to the hand-written kernel\n",
+                   shape->br, shape->bc, shape->dps, shape->gqa_pack,
+                   shape->head_fast ? "-hf" : "");
   }
 
   if (gqa == 4 && head_dim == 256) {
