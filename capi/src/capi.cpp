@@ -45,6 +45,10 @@
 // core/src is a private include directory for this target (core/CMakeLists):
 // the decision registry is internal runtime state, not a Layer 2 header.
 #include "planner/decision_registry.h"
+// Generated at build time (cmake/WriteBuildTag.cmake, a private include
+// directory of this target): the revision the library was built from. It is
+// rewritten only when the revision changes.
+#include "sb_build_tag.h"
 
 #include <cmath>
 #include <cstddef>
@@ -266,13 +270,18 @@ uint64_t tensor_num_bytes(const sx::TensorType &t) {
 
 // --- Build info -------------------------------------------------------------
 
-// The SB_BUILD_* macros are defined by capi/CMakeLists.txt with values resolved
-// at configure time in the top-level CMakeLists.txt. The fallbacks keep the file
-// compilable on its own (e.g. a syntax-only check) — a library built that way
-// reports the truth about its own ignorance rather than a plausible guess.
+// The SB_BUILD_* macros are defined by capi/CMakeLists.txt. The revision comes
+// from the generated sb_build_tag.h, written at build time so it follows the
+// checkout instead of the last configure; the rest are resolved at configure
+// time in the top-level CMakeLists.txt. The fallbacks keep the file compilable
+// on its own (e.g. a syntax-only check) — a library built that way reports the
+// truth about its own ignorance rather than a plausible guess.
 
 #ifndef SB_BUILD_GIT
 #define SB_BUILD_GIT "unknown"
+#endif
+#ifndef SB_BUILD_GIT_TAG
+#define SB_BUILD_GIT_TAG "unknown"
 #endif
 #ifndef SB_BUILD_TYPE
 #define SB_BUILD_TYPE ""

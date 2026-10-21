@@ -17,19 +17,22 @@ target_include_directories(sonicboom_capi
   # sb_explain_*), never re-exposed through capi.h.
   PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${CMAKE_SOURCE_DIR}/core/src)
 
-# Build info for sb_build_info(). The values are resolved once in the top-level
-# CMakeLists.txt — the commit, the CUDA architectures nvcc really compiles, the
-# LLVM/MLIR that was linked — and compiled in as string literals; see capi.h.
-# The platform comes from the compiler's own target, so it follows a cross
-# build rather than the builder's uname.
+# Build info for sb_build_info(). The commit and tag come from the generated
+# header written at build time by cmake/WriteBuildTag.cmake (rewritten only when
+# the revision changes, so an unchanged build does not recompile this object);
+# the CUDA architectures nvcc really compiles and the LLVM/MLIR that was linked
+# are resolved in the top-level CMakeLists.txt and compiled in as string
+# literals; see capi.h. The platform comes from the compiler's own target, so it
+# follows a cross build rather than the builder's uname.
+add_dependencies(sonicboom_capi sonicboom_build_tag)
+target_include_directories(sonicboom_capi PRIVATE
+  ${CMAKE_BINARY_DIR}/generated)
 if(CMAKE_SYSTEM_PROCESSOR)
   set(SONICBOOM_BUILD_PLATFORM "${CMAKE_SYSTEM_PROCESSOR}")
 else()
   set(SONICBOOM_BUILD_PLATFORM "unknown")
 endif()
 target_compile_definitions(sonicboom_capi PRIVATE
-  SB_BUILD_GIT="${SONICBOOM_BUILD_GIT}"
-  SB_BUILD_GIT_TAG="${SONICBOOM_BUILD_GIT_TAG}"
   SB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
   SB_BUILD_CUDA_ENABLED=$<IF:$<BOOL:${SONICBOOM_USE_CUDA}>,1,0>
   SB_BUILD_CUDA_ARCHS="${SONICBOOM_BUILD_CUDA_ARCHS}"
