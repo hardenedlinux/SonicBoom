@@ -136,9 +136,8 @@ int main(int argc, char** argv) {
   section("numerics profile");
   std::cout << sonicboom::numerics_profile_name(numerics) << "\n"
             << (numerics == sonicboom::NumericsProfile::Strict
-                    ? "  f32 KV; no TF32; f64 reductions; fp64-gated dense\n"
-                    : "  f16 KV; TF32 dense where the standard gate accepts; "
-                      "standard acceptance gate (ppl, top-1)\n");
+                    ? "  f32 KV; f64 reductions; fp64-gated dense\n"
+                    : "  f16 KV; standard acceptance gate (ppl, top-1)\n");
 
   section("reduce mode");
   std::cout << "device: "

@@ -18,12 +18,11 @@
 
 // The numerics profile: which numeric contract the runtime executes under.
 //
-//   strict    the historical behavior, unchanged: f32 KV storage, no TF32,
-//             f64 reductions on sm_86, fp64-gated dense. Every golden that
+//   strict    the historical behavior, unchanged: f32 KV storage, f64
+//             reductions on sm_86, fp64-gated dense. Every golden that
 //             predates the profile switch is a strict golden.
 //   standard  the default. f16 KV storage (the values stored were already
-//             fp16-rounded, so the storage change is exact), TF32 allowed for
-//             f32 dense where the acceptance gate passes it, and the device
+//             fp16-rounded, so the storage change is exact) and the device
 //             reduction mode as resolved for the device. It is deterministic
 //             and batch-invariant on a given device exactly as strict is; the
 //             two profiles may differ from each other, and standard is the
@@ -36,9 +35,13 @@
 //   SONICBOOM_NUMERICS=strict|standard   the test/CI switch
 //   otherwise                       standard
 //
-// The resolved profile is part of the plan cache key, the autotune cache key
-// and the glue/attention PTX cache keys, and it is recorded in the decision
-// registry, so a cache written under one profile can never serve the other.
+// The resolved profile is part of the plan cache key, the attention class's
+// tune key (its f16-KV variant is a distinct kernel) and the glue/attention
+// PTX cache keys; it is recorded in the decision registry. It is deliberately
+// not part of the whole autotune device directory: a profile-wide directory
+// would retune every unrelated class (mmq tiles, dense arms, gemv widths) and
+// replace timing-stable picks with fresh ones. Each class's key must carry the
+// profile only when the profile changes that class's kernel or candidates.
 //
 // The switch is process-global and latched at first use: set it before the
 // library builds its first runtime. A later set with a different value is
@@ -77,10 +80,10 @@ bool set_numerics_profile(NumericsProfile profile, std::string *error);
 
 // The profile's consequences, in one place so no caller re-derives them:
 //   standard stores the KV cache in f16 (the values were fp16-rounded already)
-//   and may select TF32 dense candidates that passed the standard gate;
-//   strict does neither.
+//   and launches the f16-KV attention variants; strict does neither. This is
+//   the profile's only arithmetic difference today: the dense and matmul
+//   thresholds are the same in both profiles.
 bool numerics_profile_f16_kv();
-bool numerics_profile_allows_tf32_dense();
 
 // Tests only: forget the resolution, so the next call re-reads the
 // environment. The registry record is dropped with it.

@@ -127,9 +127,8 @@ NumericsProfile numerics_profile() {
   entry.reason = origin.reason;
   entry.numerics =
       chosen == NumericsProfile::Strict
-          ? "historical contract: f32 KV; no TF32; f64 reductions; fp64-gated dense"
-          : "f16 KV storage; TF32 dense where the standard gate accepts it; "
-            "standard acceptance gate (ppl, top-1)";
+          ? "historical contract: f32 KV; f64 reductions; fp64-gated dense"
+          : "f16 KV storage; the standard acceptance gate (ppl, top-1)";
   planner::decisions::record(entry);
 
   s.profile = chosen;
@@ -138,10 +137,6 @@ NumericsProfile numerics_profile() {
 }
 
 bool numerics_profile_f16_kv() {
-  return numerics_profile() == NumericsProfile::Standard;
-}
-
-bool numerics_profile_allows_tf32_dense() {
   return numerics_profile() == NumericsProfile::Standard;
 }
 
