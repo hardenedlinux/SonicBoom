@@ -102,6 +102,16 @@ __device__ inline float bf16_roundtrip(float v) {
 // the launch sites pick the instantiation from the cache's declared dtype.
 __device__ inline float kv_load(const float* p) { return *p; }
 __device__ inline float kv_load(const __half* p) { return __half2float(*p); }
+// Batch (chunk) K/V rows are always f32. Under f16 KV storage the cache append
+// rounds them to f16, so attention must read them through the same rounding:
+// otherwise a fresh prefill (all keys from the batch) sees unrounded values
+// while a cache-reuse prefill sees rounded ones, and the two take different
+// tokens. The strict (f32) instantiation keeps the raw value.
+template <typename KV>
+__device__ inline float kv_load_batch(const float* p) {
+  if constexpr (std::is_same_v<KV, float>) return *p;
+  return __half2float(__float2half_rn(*p));
+}
 __device__ inline void kv_store(float* p, float v) { *p = v; }
 __device__ inline void kv_store(__half* p, float v) {
   *p = __float2half_rn(v);
@@ -905,7 +915,8 @@ __global__ void flash_attention_chunk_kernel(
         const uint64_t bi = j - start;
         const float* krow =
             k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+        for (int d = lane; d < head_dim; d += 32)
+          dot += qrow[d] * kv_load_batch<KV>(krow + d);
       }
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1)
@@ -966,7 +977,7 @@ __global__ void flash_attention_chunk_kernel(
           const uint64_t bi = j - start;
           const float* vrow =
               v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * vrow[d];
+          a += tile[jj] * kv_load_batch<KV>(vrow + d);
         }
       }
       acc[di] = a;
@@ -1042,7 +1053,8 @@ __global__ void flash_attention_chunk_pos_kernel(
         const uint64_t bi = j - start;
         const float* krow =
             k_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * krow[d];
+        for (int d = lane; d < head_dim; d += 32)
+          dot += qrow[d] * kv_load_batch<KV>(krow + d);
       }
       #pragma unroll
       for (int o = 16; o > 0; o >>= 1)
@@ -1099,7 +1111,7 @@ __global__ void flash_attention_chunk_pos_kernel(
           const uint64_t bi = j - start;
           const float* vrow =
               v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * vrow[d];
+          a += tile[jj] * kv_load_batch<KV>(vrow + d);
         }
       }
       acc[di] = a;
