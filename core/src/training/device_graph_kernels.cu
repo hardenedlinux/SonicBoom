@@ -473,6 +473,10 @@ void dev_stream_pop(std::uint64_t previous) {
       reinterpret_cast<cudaStream_t>(previous);
 }
 
+std::uint64_t dev_stream_current() {
+  return reinterpret_cast<std::uint64_t>(cur_stream());
+}
+
 bool dev_capture_begin() {
   if (cudaStreamBeginCapture(cur_stream(), cudaStreamCaptureModeThreadLocal) !=
       cudaSuccess)

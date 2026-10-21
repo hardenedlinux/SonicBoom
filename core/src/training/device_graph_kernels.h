@@ -50,6 +50,9 @@ void dev_stream_destroy(std::uint64_t stream);
 // Set the calling thread's current stream; returns the previous one.
 std::uint64_t dev_stream_push(std::uint64_t stream);
 void dev_stream_pop(std::uint64_t previous);
+// The calling thread's current stream, as a handle (for a kernel provider that
+// runs on the same stream outside this file, e.g. layer1/adapter/aten_direct).
+std::uint64_t dev_stream_current();
 
 // --- step capture -----------------------------------------------------------
 // Begin/end a capture of the node launches of one step on the current stream.

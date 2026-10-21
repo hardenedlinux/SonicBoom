@@ -40,6 +40,10 @@
 #include "backward_internal.h"
 #include "device_graph_kernels.h"
 
+// Direct native-torch kernel calls for the ops the switch selects
+// (SONICBOOM_TRAIN_ATEN); the header is ATen-free on purpose.
+#include "../../layer1/adapter/aten_direct.h"
+
 #include "../planner/device_pool.h"
 
 #include "sonicboom/compiler/BladeToBoom.h"
@@ -247,6 +251,11 @@ struct DeviceTrainingGraph::Impl {
   bool capture_enabled = false;
   bool capture_failed = false;
   void* graph_exec = nullptr;
+  // The switch values the captured graph was recorded with. A captured launch
+  // bakes in the per-execution switches it read (which adamw rate operand, and
+  // which kernel provider), so a run under a different configuration must
+  // invalidate the graph instead of replaying it.
+  std::string captured_key;
 
   // The training step's own stream (0 when the build has no CUDA).
   std::uint64_t stream = 0;
@@ -389,6 +398,11 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
         return fail("expects a [rows, dim] table and 1-D indices");
       if (tensor(n.inputs[1]).dtype != sx::DType::Int32)
         return fail("indices must be int32");
+      if (detail::aten_direct_enabled("index_select") &&
+          detail::aten_direct_index_select(buf(n.outputs[0]), buf(n.inputs[0]),
+                                   buf(n.inputs[1]), ids[0], table[0],
+                                   table[1], detail::dev_stream_current()))
+        return true;
       if (!detail::graph_index_select(buf(n.outputs[0]), buf(n.inputs[0]),
                                       buf(n.inputs[1]), ids[0], table[1]))
         return fail("kernel launch failed");
@@ -435,16 +449,29 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
                                   buf(n.inputs[1]), sa.data(), sb.data(),
                                   out.data(),
                                   static_cast<std::int64_t>(out.size()), n_out)
-              : detail::graph_mul(buf(n.outputs[0]), buf(n.inputs[0]),
-                                  buf(n.inputs[1]), sa.data(), sb.data(),
-                                  out.data(),
-                                  static_cast<std::int64_t>(out.size()), n_out);
+              : (detail::aten_direct_enabled("mul") &&
+                         detail::aten_direct_mul(buf(n.outputs[0]), buf(n.inputs[0]),
+                                         buf(n.inputs[1]), sa.data(), sb.data(),
+                                         out.data(),
+                                         static_cast<std::int64_t>(out.size()),
+                                         n_out, detail::dev_stream_current())
+                     ? true
+                     : detail::graph_mul(buf(n.outputs[0]), buf(n.inputs[0]),
+                                         buf(n.inputs[1]), sa.data(), sb.data(),
+                                         out.data(),
+                                         static_cast<std::int64_t>(out.size()),
+                                         n_out));
       return ok ? true : fail("kernel launch failed");
     }
     case OpKind::Softmax: {
       if (!arity(1, 1)) return false;
       const auto in = shape(n.inputs[0]);
       const std::int64_t cols = in.empty() ? 1 : in.back();
+      if (detail::aten_direct_enabled("softmax") &&
+          detail::aten_direct_softmax(buf(n.outputs[0]), buf(n.inputs[0]),
+                              numel(n.inputs[0]) / cols, cols,
+                              detail::dev_stream_current()))
+        return true;
       if (!detail::graph_softmax(buf(n.outputs[0]), buf(n.inputs[0]),
                                  numel(n.inputs[0]) / cols, cols))
         return fail("kernel launch failed");
@@ -856,11 +883,22 @@ private:
 // instantiated: record the launches, instantiate once, and replay. After that
 // the instantiated graph is launched directly. With capture off, or when the
 // runtime refuses to capture this stream, the nodes launch one by one.
+// The per-execution switches a node launch reads. Two of them change which
+// kernel or which operand the step uses, so a graph captured under one
+// configuration must not be replayed under another.
+std::string launch_config_key() {
+  const char* aten = std::getenv("SONICBOOM_TRAIN_ATEN");
+  std::string key = aten ? aten : "";
+  key += '|';
+  key += adamw_lr_attr_mode() ? '1' : '0';
+  return key;
+}
+
 bool execute_nodes(const Graph& graph,
                    const std::vector<std::uint64_t>& buffers,
                    std::uint64_t ce_scratch, bool capture_enabled,
                    bool* capture_failed, void** graph_exec,
-                   std::string* error) {
+                   std::string* captured_key, std::string* error) {
   const NodeContext ctx{graph, buffers, ce_scratch};
   auto launch_all = [&]() {
     for (const GraphNodeDesc& n : graph.nodes) {
@@ -873,7 +911,14 @@ bool execute_nodes(const Graph& graph,
     return true;
   };
 
-  if (*graph_exec != nullptr) return detail::dev_graph_launch(*graph_exec);
+  const std::string key = launch_config_key();
+  if (*graph_exec != nullptr) {
+    if (*captured_key == key) return detail::dev_graph_launch(*graph_exec);
+    // Re-record under the new configuration; the old launches are not valid.
+    detail::dev_graph_free(*graph_exec);
+    *graph_exec = nullptr;
+    captured_key->clear();
+  }
   if (!capture_enabled || *capture_failed) return launch_all();
 
   if (!detail::dev_capture_begin()) {
@@ -891,6 +936,7 @@ bool execute_nodes(const Graph& graph,
     *capture_failed = true;
     return launch_all();
   }
+  *captured_key = key;
   return detail::dev_graph_launch(*graph_exec);
 }
 #endif
@@ -1178,7 +1224,7 @@ bool DeviceTrainingGraph::run(const std::byte* const* input_data,
   }
 
   if (!execute_nodes(s.graph, s.buffers, s.ce_scratch, s.capture_enabled,
-                     &s.capture_failed, &s.graph_exec, error))
+                     &s.capture_failed, &s.graph_exec, &s.captured_key, error))
     return false;
 
   if (!detail::dev_sync()) {
@@ -1272,7 +1318,7 @@ bool DeviceTrainingGraph::run_resident(
   }
 
   if (!execute_nodes(s.graph, s.buffers, s.ce_scratch, s.capture_enabled,
-                     &s.capture_failed, &s.graph_exec, error))
+                     &s.capture_failed, &s.graph_exec, &s.captured_key, error))
     return false;
 
   if (!detail::dev_sync()) {
