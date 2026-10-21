@@ -18,6 +18,12 @@
 
 // SonicBoom S-Expr v0.1 → CPU execution (public facade).
 //
+// DEPRECATED: this MLIR/linalg pipeline is the v0 CPU route being retired.
+// Boom IR carries the same seven-op vocabulary and the Blade → Boom → graph
+// route owns new work, but its executor is CUDA-only today, so this path
+// remains the CPU execution behind sb_compile. SONICBOOM_SX_LINALG=0 disables
+// it and fails compilation with a clear error.
+//
 // This header is deliberately MLIR-free. The MLIR pass pipeline and LLVM JIT
 // live behind this boundary in core/src/sx/exec.cpp: `Executable::compile`
 // lowers a validated Document into an MLIR module, runs the CPU lowering

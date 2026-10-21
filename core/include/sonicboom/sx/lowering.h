@@ -18,6 +18,11 @@
 
 // SonicBoom S-Expr v0.1 → MLIR lowering (public facade).
 //
+// DEPRECATED: the v0 MLIR/linalg pipeline is being retired in favour of Boom IR.
+// It stays reachable only because sb_compile's CPU execution is part of the
+// stable C ABI and no CPU Boom executor exists yet. SONICBOOM_SX_LINALG=0
+// disables the lowering (and Executable::compile) with a clear error.
+//
 // This header is deliberately MLIR-free: the actual MLIR types, dialect
 // registration and module construction live behind this boundary in
 // core/src/sx/lowering.cpp. The public surface returns the textual form of a

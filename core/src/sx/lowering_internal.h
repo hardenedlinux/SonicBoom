@@ -26,11 +26,28 @@
 #include <mlir/IR/MLIRContext.h>
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace sonicboom::sx {
+
+// The v0 MLIR/linalg CPU pipeline is deprecated. Boom IR carries the same
+// seven-op vocabulary (BoomOps.td: conv, relu, add, max_pool, reduce_mean,
+// reshape, gemm), but the Blade -> Boom -> graph route executes only on CUDA
+// (DeviceTrainingGraph), no CPU Boom executor exists, and `sb_compile`'s CPU
+// execution is part of the stable C ABI — so the path cannot be deleted yet.
+// SONICBOOM_SX_LINALG=0 retires it explicitly (compilation fails with a clear
+// error) for a build or run that only uses the device route; it is the switch
+// the removal will flip.
+inline bool linalg_cpu_path_enabled() {
+  const char* raw = std::getenv("SONICBOOM_SX_LINALG");
+  if (!raw) return true;
+  const std::string_view v{raw};
+  return !(v == "0" || v == "off" || v == "none");
+}
 
 // Raw little-endian bytes for one external weight tensor, keyed by parameter
 // name. The byte count must equal numel(type) * dtype_size(type).

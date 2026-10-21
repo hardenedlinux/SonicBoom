@@ -244,6 +244,11 @@ Executable::~Executable() = default;
 
 std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
     const Document& doc, const std::unordered_map<std::string, Bytes>& weights) {
+  if (!linalg_cpu_path_enabled())
+    return std::unexpected(make_error(
+        ExecErrorKind::Compile,
+        "the S-Expr v0 MLIR/linalg CPU path is retired "
+        "(SONICBOOM_SX_LINALG=0); no CPU Boom executor exists yet"));
   const Graph& g = doc.graph;
 
   // v0 execution scope: one or more float32 inputs, one or more float32 outputs.
