@@ -18,14 +18,14 @@
 //
 // This is NOT the hand-authored fixture. It loads the S-Expr + sidecar emitted
 // by the offline importer (`tools/onnx2sx`) from `<repo>/build/import/`, feeds
-// the deterministic input (design/resnet18.input.bin, seed 1234) through the
+// the deterministic input (tests/data/resnet18.input.bin, seed 1234) through the
 // JITted executable, and compares the [1,1000] logits against the independent
-// ONNX reference (design/resnet18.reference.bin, onnx.reference.ReferenceEvaluator).
+// ONNX reference (tests/data/resnet18.reference.bin, onnx.reference.ReferenceEvaluator).
 // It reports max absolute/relative error and asserts the argmax and a loose
 // tolerance — the same comparison as the frozen-fixture test, but over imported
 // artifacts rather than the hand-authored example.
 //
-// Run the importer first (see design/onnx-to-s-expr-importer.md):
+// Run the importer first (see docs/onnx-to-s-expr-importer.md):
 //
 //   PYTHONPATH=tools models/.venv/bin/python -m onnx2sx models/resnet18.onnx \
 //       -o build/import/resnet18.sx --weights-dir build/import
@@ -80,7 +80,7 @@ std::vector<float> as_floats(const sx::Bytes& b) {
 } // namespace
 
 // Every artifact this test reads is generated, not committed (the importer's
-// output under build/, the reference sidecars under design/). Exit with this
+// output under build/, the reference sidecars under tests/data/). Exit with this
 // code — registered as CTest's SKIP_RETURN_CODE for this test — instead of
 // failing on a fresh checkout that has not run the generators.
 static constexpr int kSkipReturnCode = 77;
@@ -89,12 +89,12 @@ int main() {
   const std::string root = SONICBOOM_SRC_DIR;
   const std::string import_dir = root + "/build/import";
   const std::string sx_path = import_dir + "/resnet18.sx";
-  const std::string design = root + "/design";
+  const std::string data = root + "/tests/data";
 
   // 0. Fixture gate: skip cleanly when the generated artifacts are absent.
   for (const std::string& path :
        {sx_path, import_dir + "/resnet18.weights.bin",
-        design + "/resnet18.input.bin", design + "/resnet18.reference.bin"}) {
+        data + "/resnet18.input.bin", data + "/resnet18.reference.bin"}) {
     std::ifstream probe(path, std::ios::binary);
     if (!probe) {
       std::cout << "SKIP: " << path << " is missing\n"
@@ -134,7 +134,7 @@ int main() {
 
   // 3. Load the deterministic input (same seed 1234 as the reference).
   sx::Bytes input;
-  if (!read_file(design + "/resnet18.input.bin", input)) {
+  if (!read_file(data + "/resnet18.input.bin", input)) {
     std::cerr << "cannot read resnet18.input.bin\n";
     return 1;
   }
@@ -165,7 +165,7 @@ int main() {
 
   // 6. Compare against the independent ONNX reference.
   std::vector<std::byte> ref_bytes;
-  if (!read_file(design + "/resnet18.reference.bin", ref_bytes)) {
+  if (!read_file(data + "/resnet18.reference.bin", ref_bytes)) {
     std::cerr << "cannot read resnet18.reference.bin\n";
     return 1;
   }

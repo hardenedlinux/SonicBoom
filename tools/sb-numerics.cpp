@@ -876,11 +876,15 @@ constexpr ProfileModel kProfileModels[] = {
      "deepseek"},
 };
 
-// The fixed local corpus: the repository's own prose, in a fixed file order, so
-// every process and every model scores the same text. 24k tokens is the scored
-// span (the gate asks for >= 20k); the text is longer so all three tokenizers
-// reach it. SONICBOOM_PPL_TOKENS overrides the span for smoke runs; the
-// recorded gate numbers always use the default.
+// The fixed local corpus: a committed public-domain text
+// (tests/data/ppl_corpus.txt), so every process and every model scores the same
+// text and the corpus does not depend on the repository's own documentation.
+// Project Gutenberg eBook #1342, "Pride and Prejudice" by Jane Austen
+// (https://www.gutenberg.org/files/1342/1342-0.txt, retrieved 2026-10-22;
+// public domain in the United States). 24k tokens is the scored span (the gate
+// asks for >= 20k); the text is longer so all three tokenizers reach it.
+// SONICBOOM_PPL_TOKENS overrides the span for smoke runs; the recorded gate
+// numbers always use the default.
 uint64_t ppl_token_budget() {
   if (const char* e = std::getenv("SONICBOOM_PPL_TOKENS")) {
     const long v = std::atol(e);
@@ -898,37 +902,13 @@ std::string read_text_file(const std::string& path) {
 
 std::string profile_corpus_text() {
   std::vector<std::string> roots = {".", ".."};
-  std::string root;
   for (const auto& r : roots) {
     std::error_code ec;
-    if (std::filesystem::is_directory(r + "/design", ec)) {
-      root = r;
-      break;
-    }
+    const std::string path = r + "/tests/data/ppl_corpus.txt";
+    if (std::filesystem::is_regular_file(path, ec))
+      return read_text_file(path);
   }
-  if (root.empty()) return {};
-  std::vector<std::string> files;
-  for (const char* f : {"README.md", "CLAUDE.md"}) {
-    std::error_code ec;
-    if (std::filesystem::is_regular_file(root + "/" + f, ec))
-      files.push_back(root + "/" + f);
-  }
-  std::vector<std::string> design;
-  std::error_code ec;
-  for (const auto& e :
-       std::filesystem::directory_iterator(root + "/design", ec)) {
-    if (e.is_regular_file() && e.path().extension() == ".md")
-      design.push_back(e.path().string());
-  }
-  std::sort(design.begin(), design.end());
-  files.insert(files.end(), design.begin(), design.end());
-  std::string text;
-  for (const auto& f : files) {
-    text += read_text_file(f);
-    text += "\n";
-    if (text.size() >= 400000) break;
-  }
-  return text;
+  return {};
 }
 
 struct ProfileResult {

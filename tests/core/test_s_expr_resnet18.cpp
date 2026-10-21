@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // test_s_expr_resnet18.cpp — integration test: parse the frozen ResNet-18
-// S-Expr v0.1 example document (design/s-expr-v0-resnet18.example.sx) end to
+// S-Expr v0.1 example document (tests/data/s-expr-v0-resnet18.example.sx) end to
 // end and verify it validates. No <cassert>: Release build disables it.
 
 #include <sonicboom/sx/parser.h>
@@ -31,7 +31,7 @@
 
 int main() {
   const std::string path =
-      std::string(SONICBOOM_SRC_DIR) + "/design/s-expr-v0-resnet18.example.sx";
+      std::string(SONICBOOM_SRC_DIR) + "/tests/data/s-expr-v0-resnet18.example.sx";
   std::ifstream in(path);
   if (!in) {
     std::cerr << "cannot open " << path << "\n";

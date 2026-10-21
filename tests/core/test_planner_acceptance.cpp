@@ -49,7 +49,7 @@ void check(bool ok, const char* what) {
 
 int main() {
   const std::string fixture =
-      std::string(SONICBOOM_SRC_DIR) + "/design/s-expr-v0-resnet18.example.sx";
+      std::string(SONICBOOM_SRC_DIR) + "/tests/data/s-expr-v0-resnet18.example.sx";
 
   std::ifstream in(fixture);
   if (!in) {
