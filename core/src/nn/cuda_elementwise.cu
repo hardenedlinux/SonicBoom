@@ -972,12 +972,16 @@ __global__ void flash_attention_chunk_kernel(
           const uint64_t slot = j % n_slots;
           const KV* vrow =
               v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * kv_load(vrow + d);
+          // Explicit FMA: nvcc contracts the f32 instantiation's `a += t*v`
+          // into FFMA but not the f16 one, which then rounds the V
+          // accumulation 1 ulp differently from strict even though the values
+          // are identical. __fmaf_rn pins both to the same FFMA.
+          a = __fmaf_rn(tile[jj], kv_load(vrow + d), a);
         } else {
           const uint64_t bi = j - start;
           const float* vrow =
               v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * kv_load_batch<KV>(vrow + d);
+          a = __fmaf_rn(tile[jj], kv_load_batch<KV>(vrow + d), a);
         }
       }
       acc[di] = a;
@@ -1106,12 +1110,16 @@ __global__ void flash_attention_chunk_pos_kernel(
           const uint64_t slot = j % n_slots;
           const KV* vrow =
               v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * kv_load(vrow + d);
+          // Explicit FMA: nvcc contracts the f32 instantiation's `a += t*v`
+          // into FFMA but not the f16 one, which then rounds the V
+          // accumulation 1 ulp differently from strict even though the values
+          // are identical. __fmaf_rn pins both to the same FFMA.
+          a = __fmaf_rn(tile[jj], kv_load(vrow + d), a);
         } else {
           const uint64_t bi = j - start;
           const float* vrow =
               v_batch + (bi * (uint64_t)n_heads_kv + kv_h) * head_dim;
-          a += tile[jj] * kv_load_batch<KV>(vrow + d);
+          a = __fmaf_rn(tile[jj], kv_load_batch<KV>(vrow + d), a);
         }
       }
       acc[di] = a;
@@ -3873,13 +3881,18 @@ std::mutex g_attn_choice_mutex;
 std::unordered_map<std::string, AttnChoice> g_attn_choice;
 
 std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
-                          bool window, uint64_t window_len,
+                          bool window, uint64_t window_len, bool kv_f16,
                           const AttnChoice &def) {
   std::string k = compiler::attention_codegen_version();
   k += "|prefill-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
        "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
        "-m" + (window ? "window" : "causal");
   if (window) k += "-w" + std::to_string(window_len);
+  // The f16-KV variant is a distinct generated kernel (it widens __half and
+  // stores f16), so its tile ranking is its own. The marker is appended only
+  // under the standard profile, which keeps every strict key byte-identical to
+  // the pre-profile ones.
+  if (kv_f16) k += "-kv16";
   if (attn_exp2_enabled()) k += "-x2";
   // The default the choice was measured against is a decision input: a new
   // default (a different tile, packing or grid order) must retune the class
@@ -3946,7 +3959,7 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     return def;
 
   const std::string key = attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv,
-                                        window, window_len, def);
+                                        window, window_len, kv_f16, def);
   {
     std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
     const auto it = g_attn_choice.find(key);
@@ -4363,7 +4376,13 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
         n_heads_kv, head_dim, sliding_window, scale, out);
-  return cudaGetLastError() == cudaSuccess;
+  const bool ok_scalar = cudaGetLastError() == cudaSuccess;
+  if (ok_scalar)
+    attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                       sliding_window, kv_f16 ? "own-scalar-kv16" : "own-scalar",
+                       "warp/head", 1, FA_BK, n, n_heads_q, n_heads_q * 32,
+                       smem);
+  return ok_scalar;
 }
 
 bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,

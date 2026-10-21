@@ -337,7 +337,11 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 // Teacher-forced scoring on the CUDA decode spine (test seam for the
 // numerics-profile acceptance gate, tools/sb-numerics). Every token is fed at
 // its own position through the non-greedy decode graph, whose raw [vocab]
-// logits reach the host; `sum_nll` accumulates the negative log-likelihood of
+// logits reach the host. The model's logit softcap is then applied to them on
+// the host (models without one, e.g. Qwen2, score the raw logits), so the
+// scored distribution is the model's own — the one HF and llama.cpp also fold
+// into their perplexity — not a sharper uncapped one. `sum_nll` accumulates the
+// negative log-likelihood of
 // each next token under those logits and `n_scored` is the number of scored
 // positions (tokens.size() - 1 on success). `n_ctx` sizes the KV cache and is
 // raised to tokens.size() when smaller. Returns false without CUDA support, on

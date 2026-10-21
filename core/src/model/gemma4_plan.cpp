@@ -259,8 +259,10 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
 // matmuls — so row i is bit-identical to a plain decode step at pos+i.
 // `softcap_output` false keeps the raw logits as the graph output even when the
 // model has a logit softcap. The softcap is monotonic (argmax unchanged), but it
-// is a lossy transform, so the perplexity scorer needs the raw distribution
-// while the logit dump and the sampler use the softcapped one.
+// is a lossy transform: the sampler and the logit dump take the capped graph
+// output, while the perplexity scorer takes the raw output and applies the cap
+// on the host instead (see score_spine_cuda) — same distribution, one less
+// device op.
 GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
                        bool softcap_output = true) {
   using namespace planner;
@@ -3040,7 +3042,8 @@ static void dump_logits_top2(const char* file, uint64_t step, uint64_t pos,
 // step, where the greedy graph reduces them to an argmax on the device. Built
 // per call — a throwaway runtime, not the cached greedy one. `raw_logits` keeps
 // the model's logit softcap off the output path: the logit dump wants the
-// softcapped distribution, the perplexity scorer wants the raw one.
+// softcapped distribution from the graph, the perplexity scorer wants the raw
+// one so it can apply the cap itself (f32, host) before the softmax.
 static std::unique_ptr<DecodeRuntime> build_eval_runtime(const Gemma4Model& m,
                                                          uint64_t n_ctx,
                                                          bool raw_logits) {
@@ -3435,8 +3438,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         first = nn::argmax(logits);
         if (dump_logits) {
           std::vector<float> capped(vocab);
-          nn::softcap(logits, m.config.final_logit_softcapping, capped);
-          dump_logits_top2(dump_logits_file, /*step=*/0, start_pos + n, capped);
+          const float cap = m.config.final_logit_softcapping;
+          const float* z = logits.data();
+          if (cap > 0.0f && nn::softcap(logits, cap, capped)) z = capped.data();
+          dump_logits_top2(dump_logits_file, /*step=*/0, start_pos + n,
+                           std::span<const float>(z, vocab));
         }
       }
       off += nseg;
@@ -3638,6 +3644,16 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
     return false;
   }
   std::vector<float> lf(vocab);
+  // The model's distribution is the softcapped one. Gemma defines its output
+  // logits as cap * tanh(logits / cap) — HF's GemmaForCausalLM applies it inside
+  // forward, and llama.cpp applies it in-graph (src/models/gemma4.cpp, the
+  // result_output node) before the logits leave the model — so the scored
+  // distribution, and any perplexity compared against the baseline, must be the
+  // capped one. The graph still emits the raw logits (raw_logits=true) and the
+  // cap is applied here in f32: same arithmetic as the baseline's CPU pass, no
+  // extra device op, and the raw distribution stays available for diagnostics.
+  const float cap = m.config.final_logit_softcapping;
+  std::vector<float> capped(vocab);
   double sum = 0;
   uint64_t scored = 0;
   for (uint64_t p = 0; p + 1 < tokens.size(); ++p) {
@@ -3663,12 +3679,14 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
       return false;
     }
     std::memcpy(lf.data(), lo.data(), vocab * sizeof(float));
+    const float* z = lf.data();
+    if (cap > 0.0f && nn::softcap(lf, cap, capped)) z = capped.data();
     float mx = -INFINITY;
-    for (uint64_t v = 0; v < vocab; ++v) mx = std::max(mx, lf[v]);
+    for (uint64_t v = 0; v < vocab; ++v) mx = std::max(mx, z[v]);
     double se = 0.0;
     for (uint64_t v = 0; v < vocab; ++v)
-      se += std::exp(double(lf[v]) - double(mx));
-    sum += (double(mx) + std::log(se)) - double(lf[tokens[p + 1]]);
+      se += std::exp(double(z[v]) - double(mx));
+    sum += (double(mx) + std::log(se)) - double(z[tokens[p + 1]]);
     ++scored;
   }
   sum_nll = sum;
