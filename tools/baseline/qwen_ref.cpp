@@ -7,8 +7,8 @@
 // the goldens it reads are this tool's output, checked into tests/data/qwen2/.
 //
 // The prompt is read from a file so the shell never touches it, and tokenized
-// without special tokens (the Qwen2 tokenizer sets add_bos_token = false, and
-// SonicBoom's own tokenizer inserts none) — that is the exact byte sequence
+// with the vocabulary's own BOS rule (add_special; Qwen2.5 sets add_bos_token =
+// false, DeepSeek-R1-Distill-Qwen sets it true) — that is the exact id sequence
 // SonicBoom's GGUF tokenizer is expected to reproduce.
 //
 // Greedy decode: the prompt is prefilled in one batch (logits only on its last
@@ -104,11 +104,15 @@ int main(int argc, char** argv) {
   const llama_vocab* vocab = llama_model_get_vocab(model);
   const int n_vocab = llama_vocab_n_tokens(vocab);
 
-  // Tokenize without specials; `parse_special` is false too, so a prompt made of
-  // plain text is a pure byte-level encode (matching the SonicBoom path).
+  // Tokenize with the vocabulary's own special-token contract: add_special adds
+  // BOS only when the GGUF says add_bos_token, which is what SonicBoom's
+  // tokenizer does (Qwen2.5 has it off; DeepSeek-R1-Distill-Qwen has it on).
+  // `parse_special` stays false, so a prompt made of plain text is not scanned
+  // for literal special tokens; the special-token rule is the file's, not this
+  // tool's.
   std::vector<llama_token> ptoks(prompt.size() + 8);
   int n_p = llama_tokenize(vocab, prompt.data(), int(prompt.size()), ptoks.data(),
-                           int(ptoks.size()), /*add_special=*/false,
+                           int(ptoks.size()), /*add_special=*/true,
                            /*parse_special=*/false);
   if (n_p < 0) {
     fprintf(stderr, "tokenize failed (needs %d tokens)\n", -n_p);

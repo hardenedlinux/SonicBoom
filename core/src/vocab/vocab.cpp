@@ -69,12 +69,15 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
     v.kind = TokenizerKind::Gemma4;
   } else if (model->s == "gpt2") {
     // A gpt2 model is byte-level BPE; the pre-tokenizer decides how its words
-    // are cut. Only the qwen2 pattern is implemented.
+    // are cut. Only the qwen2 pattern is implemented; llama.cpp groups these
+    // four names onto that same pattern, so an alias is the same tokenizer, not
+    // a different one (DeepSeek-R1-Distill-Qwen names it 'deepseek-r1-qwen').
     const Value* pre = reader.find("tokenizer.ggml.pre");
     const std::string pre_s = pre ? pre->s : std::string();
-    if (pre_s != "qwen2") {
+    if (pre_s != "qwen2" && pre_s != "deepseek-r1-qwen" && pre_s != "kormo" &&
+        pre_s != "f2llmv2") {
       return std::unexpected("unsupported gpt2 pre-tokenizer '" + pre_s +
-                             "' (expected 'qwen2')");
+                             "' (expected 'qwen2' or an alias of it)");
     }
     v.kind = TokenizerKind::Gpt2Qwen2;
   } else {

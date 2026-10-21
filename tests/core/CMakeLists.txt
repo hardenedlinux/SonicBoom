@@ -260,6 +260,29 @@ add_test(NAME test_qwen2_generate_decode_chunk
 set_tests_properties(test_qwen2_generate_decode_chunk
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
+# The third model (T8): DeepSeek-R1-Distill-Qwen-1.5B is Qwen2 architecture, so
+# it runs the same executable and the same checks against its own fixture
+# directory — its prompts, its llama.cpp references and its token goldens. The
+# directory's `model` file names the GGUF, so nothing here is model-specific
+# beyond the data path. Skips cleanly (exit 0) when the GGUF is absent.
+add_test(NAME test_deepseek_generate
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
+                 $<TARGET_FILE:test_qwen2_generate>)
+set_tests_properties(test_deepseek_generate
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
+# The same token goldens with the F64 reduction path forced (see above).
+add_test(NAME test_deepseek_generate_reduce_f64
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
+                 SONICBOOM_REDUCE=f64
+                 $<TARGET_FILE:test_qwen2_generate>)
+set_tests_properties(test_deepseek_generate_reduce_f64
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
 # runtime it skips cleanly (exit 0) when no CUDA device is present.
 if(SONICBOOM_USE_CUDA)

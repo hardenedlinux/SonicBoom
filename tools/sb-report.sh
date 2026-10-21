@@ -24,8 +24,9 @@ export LC_ALL=C LANG=C
 # failed golden check makes the script exit 1 (a host with no Guile still exits
 # 0). --no-golden / --no-bench skip the two sections when they are not wanted.
 #
-# Usage: tools/sb-report.sh --gemma PATH [--qwen PATH] [--json] [--lib PATH]
-#                           [--runs N] [--build] [--no-golden] [--no-bench]
+# Usage: tools/sb-report.sh --gemma PATH [--qwen PATH] [--deepseek PATH]
+#                           [--json] [--lib PATH] [--runs N] [--build]
+#                           [--no-golden] [--no-bench]
 # Env:   SONICBOOM_LIB=/path/to/libsonicboom.so   (default <repo>/build/core/libsonicboom.so)
 #        LLAMA_BENCH=/path/to/llama-bench        (passed through; adds llama.cpp)
 set -uo pipefail
@@ -35,6 +36,7 @@ JSON=0
 LIB="${SONICBOOM_LIB:-}"
 GEMMA=""
 QWEN=""
+DEEPSEEK=""
 RUNS=3
 BUILD=0
 GOLDEN=1
@@ -46,11 +48,12 @@ while [ $# -gt 0 ]; do
     --lib)  LIB="$2"; shift 2 ;;
     --gemma) GEMMA="$2"; shift 2 ;;
     --qwen)  QWEN="$2"; shift 2 ;;
+    --deepseek) DEEPSEEK="$2"; shift 2 ;;
     --runs)  RUNS="$2"; shift 2 ;;
     --build) BUILD=1; shift ;;
     --no-golden) GOLDEN=0; shift ;;
     --no-bench)  BENCH=0; shift ;;
-    -h|--help) sed -n '3,27p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -171,16 +174,17 @@ fi
 # A model is required: the report exists to bind a number to the machine and
 # binary that produced it, so "no model, no numbers" is an error, not an empty
 # section. --no-golden / --no-bench still require a model; they only skip work.
-if [ -z "$GEMMA" ] && [ -z "$QWEN" ]; then
-  echo "sb-report: no model given — pass --gemma PATH and/or --qwen PATH" >&2
+if [ -z "$GEMMA" ] && [ -z "$QWEN" ] && [ -z "$DEEPSEEK" ]; then
+  echo "sb-report: no model given — pass --gemma PATH, --qwen PATH and/or --deepseek PATH" >&2
   echo "           the report runs the golden checks and the canonical bench against it" >&2
   exit 2
 fi
-for m in "$GEMMA" "$QWEN"; do
+for m in "$GEMMA" "$QWEN" "$DEEPSEEK"; do
   [ -z "$m" ] || [ -f "$m" ] || { echo "sb-report: model not found: $m" >&2; exit 2; }
 done
 [ -z "$GEMMA" ] || export SONICBOOM_GEMMA_GGUF="$GEMMA"
 [ -z "$QWEN" ]  || export SONICBOOM_QWEN_GGUF="$QWEN"
+[ -z "$DEEPSEEK" ] || export SONICBOOM_DEEPSEEK_GGUF="$DEEPSEEK"
 
 GOLDEN_FAIL=0
 golden_run() { # LABEL CTEST_REGEX
@@ -203,6 +207,7 @@ if [ "$GOLDEN" = 1 ]; then
   [ -n "$GEMMA" ] && golden_run gemma_plan_cache '^test_plan_cache$'
   [ -n "$GEMMA" ] && golden_run cuda_elementwise '^test_cuda_elementwise$'
   [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate$'
+  [ -n "$DEEPSEEK" ] && golden_run deepseek_tokens '^test_deepseek_generate$'
   if [ -n "$GEMMA" ] && [ -n "$QWEN" ]; then
     golden_run golden_plans '^test_boom_conversion$'
   else
@@ -239,6 +244,7 @@ if [ "$BENCH" = 1 ]; then
   }
   [ -n "$GEMMA" ] && bench_one gemma "$GEMMA"
   [ -n "$QWEN" ]  && bench_one qwen "$QWEN"
+  [ -n "$DEEPSEEK" ] && bench_one deepseek "$DEEPSEEK"
 fi
 
 # --- render -----------------------------------------------------------------

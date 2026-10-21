@@ -43,6 +43,7 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul.h>
+#include <sonicboom/quant/quantized_matmul_cuda.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -89,6 +90,12 @@ const Case kCases[] = {
      "qwen2.5-0.5b-instruct-q4_k_m.gguf", "decode", 512, 0, 1},
     {"qwen2-prefill", "SONICBOOM_QWEN_GGUF",
      "qwen2.5-0.5b-instruct-q4_k_m.gguf", "prefill", 0, 8, 0},
+    // Third model: Qwen2 architecture at a different size, so it exercises the
+    // same planner path with different shapes; no model-specific code.
+    {"deepseek-r1-decode", "SONICBOOM_DEEPSEEK_GGUF",
+     "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf", "decode", 512, 0, 1},
+    {"deepseek-r1-prefill", "SONICBOOM_DEEPSEEK_GGUF",
+     "DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf", "prefill", 0, 8, 0},
 };
 
 std::string find_model(const Case& c) {
@@ -153,6 +160,17 @@ void report_diff(const std::string& want, const std::string& got,
             << "    " << got_label << ": " << b[i] << "\n";
 }
 
+// The device weight/tokenizer caches are process-global and keyed by host
+// addresses. A case's model (and its host weight memory) dies at the end of its
+// iteration, so the next case must drop the caches first: otherwise the mapped
+// per-layer-embedding registration of the dead model still covers freed host
+// memory, and the driver then fails unrelated later cudaMalloc calls with
+// "resource already mapped" (208) — which truncates the next recording.
+// quant::cuda::clear_cache is the documented teardown for a model reload.
+struct CudaCacheGuard {
+  ~CudaCacheGuard() { sonicboom::quant::cuda::clear_cache(); }
+};
+
 bool write_file(const std::string& path, const std::string& text) {
   std::filesystem::create_directories(
       std::filesystem::path(path).parent_path());
@@ -194,6 +212,7 @@ int main(int argc, char** argv) {
 
   int ran = 0;
   for (const Case& c : kCases) {
+    CudaCacheGuard cache_guard;  // drops this case's caches when it goes out of scope
     const std::string path = find_model(c);
     if (path.empty()) {
       std::cout << "(" << c.name << ": skipped, " << c.env << " unset and models/"

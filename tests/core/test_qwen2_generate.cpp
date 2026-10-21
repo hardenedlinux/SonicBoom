@@ -63,6 +63,18 @@
 //     test_qwen2_generate --write-goldens
 //
 // and commit the result; a CLI-visible token change then shows up as a diff.
+//
+// --- Fixture directories ----------------------------------------------------
+//
+// The fixtures and the model they describe live together: the directory is
+// tests/data/qwen2/ by default and SONICBOOM_QWEN_DATA names another (the
+// DeepSeek-R1-Distill-Qwen-1.5B fixtures, tests/data/deepseek-r1-qwen15b/,
+// reuse this executable because the model is the same Qwen2 architecture). A
+// directory may carry a `model` file holding the GGUF path its fixtures were
+// recorded against; that file binds the directory to its model, so an ambient
+// SONICBOOM_QWEN_GGUF meant for another fixture set cannot leak in. Nothing in
+// the code is model-specific: the architecture dispatch and the data decide
+// everything.
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/exec.h>
@@ -99,8 +111,42 @@ void check(bool ok, const std::string& what) {
   }
 }
 
-std::string find_model() {
+std::string data_dir() {
+  if (const char* env = std::getenv("SONICBOOM_QWEN_DATA")) return env;
+#ifdef SONICBOOM_SRC_DIR
+  return std::string(SONICBOOM_SRC_DIR) + "/tests/data/qwen2";
+#else
+  return "tests/data/qwen2";
+#endif
+}
+
+// The first line of `path`, trailing whitespace stripped; "" when absent.
+std::string first_line(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  if (!std::getline(f, line)) return {};
+  while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+  return line;
+}
+
+// Model lookup for one fixture directory: the fixtures decide the model. The
+// `model` file (see above) is tried first so a directory's fixtures cannot be
+// run against whichever model an ambient SONICBOOM_QWEN_GGUF happens to name;
+// without one (the default qwen2 directory) the pre-existing Qwen2.5 lookup
+// applies unchanged.
+std::string find_model(const std::string& dir) {
   std::vector<std::string> candidates;
+  const std::string named = first_line(dir + "/model");
+  if (!named.empty()) {
+    if (std::filesystem::path(named).is_absolute()) {
+      candidates.push_back(named);
+    } else {
+#ifdef SONICBOOM_SRC_DIR
+      candidates.push_back(std::string(SONICBOOM_SRC_DIR) + "/" + named);
+#endif
+      candidates.push_back(named);
+    }
+  }
   if (const char* env = std::getenv("SONICBOOM_QWEN_GGUF")) candidates.push_back(env);
 #ifdef SONICBOOM_SRC_DIR
   candidates.push_back(std::string(SONICBOOM_SRC_DIR) +
@@ -110,14 +156,6 @@ std::string find_model() {
   for (const auto& c : candidates)
     if (std::filesystem::exists(c)) return c;
   return {};
-}
-
-std::string data_dir() {
-#ifdef SONICBOOM_SRC_DIR
-  return std::string(SONICBOOM_SRC_DIR) + "/tests/data/qwen2";
-#else
-  return "tests/data/qwen2";
-#endif
 }
 
 std::string read_file(const std::string& path) {
@@ -264,9 +302,10 @@ int main(int argc, char** argv) {
     }
   }
 
-  const std::string path = find_model();
+  const std::string dir = data_dir();
+  const std::string path = find_model(dir);
   if (path.empty()) {
-    std::cout << "  (skipped: Qwen2.5 model not found)\n";
+    std::cout << "  (skipped: no GGUF for " << dir << ")\n";
     std::cout << "test_qwen2_generate OK\n";
     return 0;
   }
@@ -302,7 +341,6 @@ int main(int argc, char** argv) {
   // A divergence deeper than this in llama.cpp's ranking (or with a larger gap
   // to its top-1) is a model difference, not a near-tie.
   constexpr double kNearTieGap = 0.25;
-  const std::string dir = data_dir();
 
   // Kept for the Stage-5 CUDA section below: each prompt's CPU spine stream, the
   // same prompts' token ids, and llama.cpp's per-step ranking.
@@ -387,6 +425,15 @@ int main(int argc, char** argv) {
     got_slow.resize(n2);
     check(got_slow == got,
           "p" + std::to_string(p) + ": batched prefill == per-token spine");
+  }
+
+  // A prompt that failed the tokenizer check above never reaches the model, so
+  // there is nothing for the stages below to run (they index prompts[0]); report
+  // the failures instead of dereferencing an empty vector.
+  if (prompts.empty()) {
+    std::cerr << "test_qwen2_generate FAILED: " << g_failures
+              << " check(s), no prompt reached the model\n";
+    return 1;
   }
 
   // --- Stage 5: the CUDA path and prefix-cache reuse -------------------------
