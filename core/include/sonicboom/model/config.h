@@ -22,8 +22,8 @@
 // Gemma 4 model configuration and per-layer execution plan (Phase 5A).
 //
 // These are the frozen model facts read from the target GGUF
-// (models/gemma-4-E4B-it-Q3_K_M.gguf); see design/gemma4-model-map.md. The
-// values are validated by the loader against the metadata and the tensor
+// (models/gemma-4-E4B-it-Q3_K_M.gguf). The values are validated by the loader
+// against the metadata and the tensor
 // directory, never taken on faith.
 
 namespace sonicboom::model {

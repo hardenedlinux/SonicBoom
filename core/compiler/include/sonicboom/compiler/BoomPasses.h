@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The Boom IR pass pipeline's entry point (design/mlir-migration.md §7c): one
+// The Boom IR pass pipeline's entry point (docs/boom-ir.md): one
 // phase's passes, run over a module the emitter built.
 //
 // A plan site holds the IR — it builds the module, runs this, and lowers the

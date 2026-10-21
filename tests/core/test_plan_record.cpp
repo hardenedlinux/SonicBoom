@@ -14,8 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Execution-plan record acceptance (design/mlir-migration.md, step (b)
-// groundwork). Two properties per model/mode case:
+// Execution-plan record acceptance (the plan format,
+// docs/static-execution-plan-format-v0.md). Two properties per model/mode case:
 //
 //   1. Determinism — recording and serializing the same plan twice yields
 //      byte-identical text. This is what makes the record diffable at all;

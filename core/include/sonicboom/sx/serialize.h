@@ -17,7 +17,7 @@
 #pragma once
 
 // S-Expr v0.1 printer: the inverse of `parse_document`. Serializes a Document
-// back to the frozen text format (see design/s-expr-v0-spec.md), losslessly
+// back to the frozen text format (see docs/s-expr-v0-spec.md), losslessly
 // round-tripping whatever the parser accepts. Pure SonicBoom C++ — no MLIR,
 // Guile, or native-torch.
 

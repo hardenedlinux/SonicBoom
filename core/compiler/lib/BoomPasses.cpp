@@ -14,8 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The planner's fusion passes, as MLIR passes over Boom IR
-// (design/mlir-migration.md §7c, step (c) of the migration).
+// The planner's fusion passes, as MLIR passes over Boom IR (docs/boom-ir.md).
 //
 // Every pass here is the port of one pass in the planner's deleted Graph
 // rewrites (core/src/planner/rewrites.cpp), in that pass's place in its phase's
@@ -1965,7 +1964,7 @@ public:
 // is a private one here as it is in rewrites.cpp, and a `ds < 0` weight type is
 // a hard-coded "no mmq layout" answer. When weight formats enter the type
 // system these become type properties and the predicate goes away (see the
-// weight-format design note, design/weight-quant-format.md).
+// weight-format design note, docs/weight-quant-format.md).
 class RmsNormMmqPass
     : public mlir::PassWrapper<RmsNormMmqPass, mlir::OperationPass<boom::GraphOp>> {
 public:
@@ -2967,8 +2966,8 @@ bool parseDisabledPasses(DisabledPasses &out) {
 
 //--- the pipeline -----------------------------------------------------------
 
-// A phase's passes, in the phase's execution order (design/mlir-migration.md
-// §2): the port of each Graph rewrite in planner/rewrites.cpp, in that pass's
+// A phase's passes, in the phase's execution order (docs/boom-ir.md): the port
+// of each Graph rewrite in planner/rewrites.cpp, in that pass's
 // place in the order and with its preconditions. Both phases run entirely here,
 // and the Graph rewrites are gone, so this is the emitter's only rewrite path.
 void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,

@@ -3,7 +3,7 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; Checks an S-Expr document against design/s-expr-v0.2-draft.md:
+;;; Checks an S-Expr document against docs/s-expr-v0.2-draft.md:
 ;;;
 ;;;   - structure: sole top-level form, version (0 1) or (0 2), one graph,
 ;;;     known sections only, well-formed inputs / outputs / parameters / nodes;

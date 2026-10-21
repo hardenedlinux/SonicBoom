@@ -6,7 +6,7 @@
 ;;; A backend is a record of procedures. The service (sessions, engine, the
 ;;; HTTP app) only talks to a backend through the procedures exported here,
 ;;; so the mock backend can be replaced by a libsonicboom one without touching
-;;; anything above this module. design/route2-capi-draft.md maps each
+;;; anything above this module. docs/capi.md maps each
 ;;; procedure to the C ABI the libsonicboom backend will call.
 ;;;
 ;;;   load-model   config alist           -> model

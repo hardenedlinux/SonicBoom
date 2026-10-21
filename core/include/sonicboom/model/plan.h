@@ -391,7 +391,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 // `transform`, when given, is applied to the graph the emitter built — after the
 // graph-level fusion passes, before the execution plan is derived from it. It is
 // the seam for putting the planned graph through another representation and back
-// (the Boom IR round trip, design/mlir-migration.md §7a) and requiring the plan
+// (the Boom IR round trip, docs/boom-ir.md) and requiring the plan
 // that follows to be the same plan; it is not a place to change what runs.
 //
 // The overloads are overloads rather than one function with a defaulted

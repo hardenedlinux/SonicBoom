@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //===----------------------------------------------------------------------===//
-// Boom IR value types (design/mlir-migration.md §6.2).
+// Boom IR value types (docs/boom-ir.md).
 //
 //   !boom.tensor<[4096, 2048], "float32">   a plain tensor value
 //   !boom.q8_1<[256, 2048]>                 an activation in the q8_1 activation

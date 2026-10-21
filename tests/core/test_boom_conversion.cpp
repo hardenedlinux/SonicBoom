@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Graph <-> Boom IR round trip acceptance (design/mlir-migration.md §7a).
+// Graph <-> Boom IR round trip acceptance (docs/boom-ir.md).
 //
 // The conversion is a translation, not a transformation: a graph that goes
 // through Boom IR and back must be the graph that went in — every tensor field,

@@ -16,7 +16,7 @@
 
 #pragma once
 
-// The decision registry (design/decision-registry.md).
+// The decision registry (docs/decision-registry.md).
 //
 // Every automatic choice — a reduction mode, a hand-written tuner's pick, a
 // JIT candidate's tile — is decided once per device or per static shape class

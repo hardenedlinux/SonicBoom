@@ -6,7 +6,7 @@
 ;;; Every mechanism of the tracing prototype that is not portable R7RS-small
 ;;; lives here; the other trace modules reach them only through this
 ;;; interface. Porting the prototype to another Scheme means re-implementing
-;;; this file (see "Porting guide" in design/guile-tracing-prototype.md), plus
+;;; this file (see the tracing prototype's porting guide), plus
 ;;; the mechanical library translations listed there.
 ;;;
 ;;; Run time

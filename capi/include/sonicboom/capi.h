@@ -480,7 +480,7 @@ sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
  *    sb_llm_model_arch, and the model's own stop tokens with sb_llm_model_eos —
  *    a caller that formats prompts per family takes both from the model rather
  *    than assuming.
- * These gaps are recorded in the post-v1 list (design/benchmark.md). */
+ * These gaps are recorded in the post-v1 list. */
 
 typedef struct sb_llm_model sb_llm_model;
 typedef struct sb_llm_session sb_llm_session;

@@ -133,9 +133,9 @@ tests).
 LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
   tools/bench.sh models/gemma-4-E4B-it-Q3_K_M.gguf
 
-# one metric by hand, e.g. decode at depth 512
-tools/baseline/longctx_bench --model models/gemma-4-E4B-it-Q3_K_M.gguf \
-  --depth 512 --steps 64
+# one metric by hand, e.g. decode at depth 512 (model from SONICBOOM_GEMMA_GGUF)
+SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
+  tools/baseline/longctx_bench --depth 512 --steps 64
 
 # baseline (llama.cpp, same GGUF and machine)
 $LLAMA_ROOT/build-cuda/bin/llama-bench \

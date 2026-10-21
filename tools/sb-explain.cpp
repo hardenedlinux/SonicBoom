@@ -21,7 +21,7 @@
 //   2. the per-device caches: the hand-written tuner's <op>.json choices and
 //      the JIT candidate tuner's sm_<NN>.bin records;
 //   3. the decision registry for the decisions this process resolves
-//      (design/decision-registry.md).
+//      (docs/decision-registry.md).
 //
 // It never tunes: the JIT cache is only read, and the reduce-mode entries come
 // from the same once-per-process functions the runtime uses. Exit 0 on

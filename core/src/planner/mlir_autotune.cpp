@@ -86,7 +86,7 @@ static_assert(sizeof(Record) == 112, "cache record layout");
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
 
 // The three choice enums share their value set; map it onto the registry's
-// source vocabulary (design/decision-registry.md).
+// source vocabulary (docs/decision-registry.md).
 template <typename SourceT>
 planner::decisions::Source registry_source(SourceT source) {
   switch (source) {

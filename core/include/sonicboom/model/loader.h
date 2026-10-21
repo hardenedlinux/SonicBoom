@@ -25,8 +25,8 @@
 #include <sonicboom/model/config.h>
 #include <sonicboom/model/weights.h>
 
-// Gemma 4 model loader (Phase 5A): bind the frozen model facts (design/
-// gemma4-model-map.md) to a validated in-memory model — explicit config, bound
+// Gemma 4 model loader (Phase 5A): bind the frozen model facts to a validated
+// in-memory model — explicit config, bound
 // weights, and a 42-layer execution plan. Pure C++23; depends only on the GGUF
 // reader and the quant representation, never on ggml/llama.cpp.
 

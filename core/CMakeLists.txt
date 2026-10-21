@@ -238,7 +238,7 @@ endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;
 # building with SONICBOOM_USE_VULKAN=ON compiles the zero-kernel scaffold that
-# backend authors use as a template (see design/backend-author-guide.md).
+# backend authors use as a template (see docs/backend-author-guide.md).
 if(SONICBOOM_USE_VULKAN)
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/vulkan_backend.cpp)

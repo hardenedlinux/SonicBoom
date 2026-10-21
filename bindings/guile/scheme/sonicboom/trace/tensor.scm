@@ -3,7 +3,7 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; Research prototype (see design/guile-tracing-prototype.md). Pure Scheme; no
+;;; Research prototype. Pure Scheme; no
 ;;; libsonicboom. A concrete tensor ("ctensor") is a dtype, a static shape and a
 ;;; flat row-major vector of Scheme values: inexact reals for float dtypes, exact
 ;;; integers for integer dtypes, booleans for `bool`. It exists only so that the

@@ -326,7 +326,7 @@ std::string dump_json() {
 
 namespace {
 
-// One row of the T0b knob table (design/decision-registry.md). `fallback` is
+// One row of the T0b knob table (docs/decision-registry.md). `fallback` is
 // the value the runtime uses with the variable unset; the extra text is what
 // sb-explain shows next to the decision.
 struct KnobRow {

@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// The decision registry (design/decision-registry.md): one decision per
+// The decision registry (docs/decision-registry.md): one decision per
 // (name, scope), conflicts counted and dropped, a fingerprint that follows the
 // decision set, and the automatic choices — the hand-written tuner's picks and
 // the JIT candidate tuner's cached/skipped classes — recorded as they resolve.

@@ -470,7 +470,7 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_o
 endforeach()
 
 # The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
-# input / reference sidecars under design/, and the importer's output under
+# input / reference sidecars under tests/data/, and the importer's output under
 # build/import/), none of which is committed — see .gitignore. On a fresh
 # checkout they exit 77 with a message naming the file and the generator, so
 # CTest reports them as Skipped rather than Failed.
@@ -548,7 +548,7 @@ add_executable(test_draft_model_interface test_draft_model_interface.cpp)
 target_link_libraries(test_draft_model_interface PRIVATE sonicboom)
 sb_add_cpp_test(test_draft_model_interface)
 
-# Blade -> Boom IR lowering test (design/mlir-migration.md §6.4 / §7d): the
+# Blade -> Boom IR lowering test (docs/boom-ir.md): the
 # direct document lowering must build the same IR as
 # graphToBoom(adapt_graph(doc)) for hand-written v0.1 documents, including
 # parameters, external sidecars, every attribute kind and the q8_1 layout.
@@ -558,7 +558,7 @@ target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
 sb_add_cpp_test(test_blade_to_boom)
 
-# Boom IR conversion test (design/mlir-migration.md §7a): Graph -> Boom IR ->
+# Boom IR conversion test (docs/boom-ir.md): Graph -> Boom IR ->
 # Graph over the real models, and the plan gate — the round-tripped graph, fed
 # back through record_{decode,prefill}_plan's GraphTransform seam, must produce
 # the golden plan (tests/data/plans/) byte for byte. Needs the repository root

@@ -30,7 +30,7 @@ namespace sonicboom::model {
 namespace {
 
 // ggml type ids the target model uses (re-declared from the format; see the
-// GGUF reader's type table and design/gguf-reader.md).
+// GGUF reader's type table and docs/gguf-reader.md).
 constexpr uint32_t kF32 = 0;
 constexpr uint32_t kBF16 = 30;
 constexpr uint32_t kQ3K = 11;

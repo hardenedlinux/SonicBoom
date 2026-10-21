@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Which Boom IR pipeline a plan is built through (design/mlir-migration.md §7c).
+// Which Boom IR pipeline a plan is built through (docs/boom-ir.md).
 //
 // This is the only rewrite path. The passes were ported from the planner's
 // Graph rewrites, one pass at a time, until the port was complete — the plan
@@ -54,7 +54,7 @@
 namespace sonicboom::planner {
 
 // Which phase's pipeline to run. The two the emitter builds differ in their
-// pass list and nothing else (design/mlir-migration.md §2 lists both).
+// pass list and nothing else (docs/boom-ir.md lists both).
 //
 // Verify is the speculative-decoding verify step (B3): the decode pipeline
 // except that FuseKvAppendIntoPrep leaves the KV append on the attention node.

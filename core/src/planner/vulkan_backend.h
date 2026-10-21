@@ -27,7 +27,7 @@
 // It deliberately lives under core/src/ (internal), not the public Layer 2 tree:
 // a community backend is a plugin (libsonicboom-backend-vulkan.so in the Step 4
 // layout), and its declaration is not part of the stable runtime interface. See
-// design/backend-author-guide.md.
+// docs/backend-author-guide.md.
 
 #include <sonicboom/planner/backend.h>
 

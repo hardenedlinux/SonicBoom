@@ -118,10 +118,6 @@ the build that produced it.
   (Qwen); `tools/bench.sh` prints its own clock readings, because the GPU is
   not power-capped on this host. Decode moves by about 1% between runs at
   these clocks.
-- Decode at 512/2048/4100-token depth, the per-kernel breakdowns, and the older
-  hand-rolled measurements are in [`design/benchmark.md`](design/benchmark.md);
-  they were taken on earlier code and on different harnesses, so they are
-  history, not a comparison.
 
 ### Benchmark conditions
 
@@ -140,8 +136,8 @@ the build that produced it.
 The comparison is against llama.cpp at the commit above; newer versions may be
 faster or slower. The Qwen2 greedy token stream agrees with llama.cpp except at
 llama.cpp's own near-ties, where a different prefill batch geometry flips the
-last-place logits (first divergent step and top-1/top-2 margin recorded in
-`design/benchmark.md`).
+last-place logits (first divergent step and top-1/top-2 margin recorded by the
+tests).
 
 ### Community results
 
@@ -500,8 +496,7 @@ a different major is a warning, not an error (see `CMakeLists.txt`).
 The research route keeps PyTorch's eager style without Python's limits. It is
 built on two Scheme features that Python lacks: hygienic macros and delimited
 continuations. It currently ships as a pure-Guile research prototype in
-[`bindings/guile/scheme/sonicboom/trace`](bindings/guile/scheme/sonicboom/trace),
-documented in [`design/guile-tracing-prototype.md`](design/guile-tracing-prototype.md).
+[`bindings/guile/scheme/sonicboom/trace`](bindings/guile/scheme/sonicboom/trace).
 
 - **Data-dependent control flow without graph breaks.** A code walker written
   entirely in `syntax-rules` rewrites `if`, `cond`, `case`, `and`, `or`, `do`
@@ -573,8 +568,7 @@ Two routes share this core:
   `(sonicboom train)` give a minimal PyTorch/Keras-like API with native-torch
   reverse-mode autograd. Models can be exported as an S-Expr graph plus
   weights (`model-export!`) and run by the standalone C++ loader through the
-  S-Expr → MLIR path, with no Guile or Python involved. See
-  [`design/guile-ai-framework-progress.md`](design/guile-ai-framework-progress.md).
+  S-Expr → MLIR path, with no Guile or Python involved.
 
 ---
 
