@@ -101,11 +101,28 @@
       (error "sonicboom-device: count introspection failed" st))
     (u64-ref bv)))
 
+(define (query-resident exe index)
+  "True when the graph updates input INDEX in place on the device."
+  (let ((bv (make-bytevector 4 0))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_input_is_resident) exe index
+               (bytevector->pointer bv) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (fail "sonicboom-device: residency introspection failed" err-slot))
+      (not (zero? (bytevector-s32-native-ref bv 0))))))
+
 ;;; --- compile (cached per text) ----------------------------------------------
 
-;; Alist text -> (exe inputs outputs), compared with `equal?` so the same
-;; emitted text shares one compiled graph. A traced function has a handful of
-;; segments, so a list is the right size.
+;; Alist text -> segment, compared with `equal?` so the same emitted text
+;; shares one compiled graph. A traced function has a handful of segments, so
+;; a list is the right size. A segment is a vector:
+;;   #(exe inputs outputs resident? state text)
+;; RESIDENT? is a list parallel to INPUTS; STATE is (uploaded? . snapshot), a
+;; mutable pair: UPLOADED? records that the device holds this segment's
+;; resident inputs and SNAPSHOT holds, per resident input, the bytes of the
+;; value the device held after the last run (the input's own bytes for an input
+;; the graph does not update). A call whose resident bytes differ from the
+;; snapshot is running on a different head state; see run-device-executable.
 (define %segments '())
 
 (define (compiled-device-segments)
@@ -129,18 +146,32 @@
            (n-in (query-count exe 'in))
            (n-out (query-count exe 'out))
            (inputs (map (lambda (i) (query-info exe i 'in)) (iota n-in)))
-           (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out))))
+           (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out)))
+           (resident (map (lambda (i) (query-resident exe i)) (iota n-in))))
       (unless (every (lambda (d) (car d)) inputs)
         (error "sonicboom-device: the device graph does not name its inputs"))
       (unless (every (lambda (d) (car d)) outputs)
         (error "sonicboom-device: the device graph does not name its outputs"))
-      (list exe inputs outputs))))
+      (vector exe inputs outputs resident (list #f '()) text))))
 
 (define (segment-for text)
   (or (assoc-ref %segments text)
       (let ((s (compile-device text)))
         (set! %segments (acons text s %segments))
         s)))
+
+(define (reset-segment! text)
+  "Replace the cached executable for TEXT with a freshly compiled one.
+
+The C ABI keeps the resident inputs in their device buffers and ignores their
+bytes once a run has uploaded them, so a cached executable cannot be pointed at
+a different head state. A fresh executable starts with nothing uploaded, and
+its first run uploads the whole leaf state (see run-device-executable)."
+  (let ((old (assoc-ref %segments text)))
+    (when old
+      ((proc 'sb_executable_free) (vector-ref old 0))))
+  (set! %segments (filter (lambda (p) (not (equal? (car p) text))) %segments))
+  (segment-for text))
 
 ;;; --- ctensor <-> little-endian bytes ----------------------------------------
 
@@ -186,12 +217,14 @@
 
 ;; A flat array of pointers as the C ABI takes `const void* const*`. The
 ;; bytevectors themselves are kept alive by the caller for the duration of the
-;; call; Guile's bytevectors do not move.
+;; call; Guile's bytevectors do not move. A #f entry becomes a null pointer
+;; (a resident input whose state is already on the device).
 (define (pointer-array bytevectors)
   (let* ((n (length bytevectors))
          (bv (make-bytevector (* 8 n) 0)))
     (for-each (lambda (b i)
-                (u64-set! bv (* 8 i) (pointer-address (bytevector->pointer b))))
+                (when b
+                  (u64-set! bv (* 8 i) (pointer-address (bytevector->pointer b)))))
               bytevectors (iota n))
     bv))
 
@@ -202,41 +235,97 @@
 
 ;;; --- execute ----------------------------------------------------------------
 
+(define (encode-inputs inputs ins-alist)
+  "One entry per input: its encoded bytes."
+  (map (lambda (desc)
+         (let ((t (assoc-ref ins-alist (car desc))))
+           (unless t
+             (error "sonicboom-device: no value for input" (car desc)))
+           (match desc
+             ((name dtype shape _)
+              (encode-ctensor t dtype shape)))))
+       inputs))
+
+(define (resident-synced? state resident encoded)
+  "True when the device holds the resident inputs' current ENCODED bytes."
+  (and (car state)
+       (= (length encoded) (length (cdr state)))
+       (every (lambda (res bv snap) (or (not res) (equal? bv snap)))
+              resident encoded (cdr state))))
+
+(define (run-executable segment encoded synced?)
+  "Run SEGMENT with ENCODED (the resident inputs' bytes, #f when synced), and
+record the resident state the device holds afterwards."
+  (let* ((exe (vector-ref segment 0))
+         (inputs (vector-ref segment 1))
+         (outputs (vector-ref segment 2))
+         (resident (vector-ref segment 3))
+         (state (vector-ref segment 4))
+         (in-bvs (map (lambda (bv res)
+                        (if (and synced? res) #f bv))
+                      encoded resident))
+         (out-bvs (map (match-lambda ((_ _ _ bytes) (make-bytevector bytes 0)))
+                       outputs))
+         (out-idx (iota (length outputs)))
+         (in-ptr (pointer-array in-bvs))
+         (in-lens (u64-array (map (match-lambda ((_ _ _ b) b)) inputs)))
+         (dl-idx (u64-array out-idx))
+         (out-ptr (pointer-array out-bvs))
+         (out-caps (u64-array (map (match-lambda ((_ _ _ b) b)) outputs)))
+         (out-lens (u64-array (map (lambda (_) 0) outputs)))
+         (err-slot (make-slot))
+         (st ((proc 'sb_run_resident) exe
+              (bytevector->pointer in-ptr) (bytevector->pointer in-lens)
+              (length inputs)
+              (bytevector->pointer dl-idx) (length outputs)
+              (bytevector->pointer out-ptr) (bytevector->pointer out-caps)
+              (bytevector->pointer out-lens) (slot-ptr err-slot))))
+    (unless (sb-status-ok? st)
+      (fail "sonicboom-device: run failed" err-slot))
+    (let ((out-alist (map (lambda (desc bv)
+                            (match desc
+                              ((name dtype shape _) (cons name bv))))
+                          outputs out-bvs)))
+      ;; What the device holds now: an updated resident input comes back as an
+      ;; output under its own name; anything else is still what was uploaded.
+      (set-car! (cdr state)
+                (map (lambda (desc res bv)
+                       (and res (or (assoc-ref out-alist (car desc)) bv)))
+                     inputs resident encoded))
+      (set-car! state #t)
+      (map (lambda (desc bv)
+             (match desc
+               ((name dtype shape _)
+                (cons name (decode-ctensor dtype shape bv)))))
+           outputs out-bvs))))
+
 (define (run-device-executable segment ins-alist)
   "Run one compiled segment with INPUTS (alist name → ctensor); returns the
-output alist in the executable's output order."
-  (match segment
-    ((exe inputs outputs)
-     (let* ((in-bvs
-             (map (match-lambda
-                    ((name dtype shape bytes)
-                     (let ((t (assoc-ref ins-alist name)))
-                       (unless t
-                         (error "sonicboom-device: no value for input" name))
-                       (encode-ctensor t dtype shape))))
-                  inputs))
-            (out-bvs (map (match-lambda ((_ _ _ bytes) (make-bytevector bytes 0)))
-                          outputs))
-            (in-ptr (pointer-array in-bvs))
-            (in-lens (u64-array (map (match-lambda ((_ _ _ b) b)) inputs)))
-            (out-ptr (pointer-array out-bvs))
-            (out-caps (u64-array (map (match-lambda ((_ _ _ b) b)) outputs)))
-            (out-lens (u64-array (map (lambda (_) 0) outputs)))
-            (err-slot (make-slot))
-            (st ((proc 'sb_run_multi) exe
-                 (bytevector->pointer in-ptr) (bytevector->pointer in-lens)
-                 (length inputs)
-                 (bytevector->pointer out-ptr) (bytevector->pointer out-caps)
-                 (length outputs)
-                 (bytevector->pointer out-lens) (slot-ptr err-slot))))
-       (unless (sb-status-ok? st)
-         (fail "sonicboom-device: run failed" err-slot))
-       (map (lambda (desc bv)
-              (match desc
-                ((name dtype shape _)
-                 (cons name (decode-ctensor dtype shape bv)))))
-            outputs out-bvs)))
-    (_ (error "sonicboom-device: bad segment record"))))
+output alist in the executable's output order.
+
+The first call uploads the whole leaf state. After it, an input the graph
+updates in place (a parameter or optimizer moment) stays on the device: it is
+neither encoded nor uploaded, and the next value comes back as one of the
+outputs. Every other input — the batch — is encoded and uploaded on every
+call.
+
+A cached segment is shared by every call that emits the same text, including
+calls on a different head state (fresh parameter tensors of the same shape).
+The C ABI keeps a resident input in its device buffer and ignores the caller's
+bytes once it has been uploaded, so such a call is detected here by comparing
+the resident bytes with the state the device was left in, and the executable is
+rebuilt so the first run uploads the new head state."
+  (unless (and (vector? segment) (= 6 (vector-length segment)))
+    (error "sonicboom-device: bad segment record"))
+  (let* ((inputs (vector-ref segment 1))
+         (resident (vector-ref segment 3))
+         (state (vector-ref segment 4))
+         (encoded (encode-inputs inputs ins-alist))
+         (synced? (resident-synced? state resident encoded)))
+    (if (and (car state) (not synced?))
+        (run-device-executable (reset-segment! (vector-ref segment 5))
+                               ins-alist)
+        (run-executable segment encoded synced?))))
 
 (define (device-executor)
   "An executor (text inputs) → outputs for trace-function #:executor."

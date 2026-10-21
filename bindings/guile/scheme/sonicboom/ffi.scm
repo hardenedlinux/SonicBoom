@@ -144,6 +144,11 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_run_multi . ,(foreign-proc "sb_run_multi" int
                                               (list '* '* '* size_t '* '* size_t
                                                     '* '*)))
+               (sb_run_resident . ,(foreign-proc "sb_run_resident" int
+                                                 (list '* '* '* size_t '* size_t
+                                                       '* '* '* '*)))
+               (sb_input_is_resident . ,(foreign-proc "sb_input_is_resident" int
+                                                      (list '* size_t '* '*)))
                (sb_bind_input . ,(foreign-proc "sb_bind_input" int
                                                (list '* '* size_t '*)))
                (sb_execute . ,(foreign-proc "sb_execute" int (list '* '*)))

@@ -40,6 +40,12 @@
 #include "backward_internal.h"
 #include "device_graph_kernels.h"
 
+// Direct native-torch kernel calls for the ops the switch selects
+// (SONICBOOM_TRAIN_ATEN); the header is ATen-free on purpose.
+#include "../../layer1/adapter/aten_direct.h"
+
+#include "../planner/device_pool.h"
+
 #include "sonicboom/compiler/BladeToBoom.h"
 #include "sonicboom/compiler/BoomConversion.h"
 #include "sonicboom/compiler/BoomPasses.h"
@@ -221,15 +227,46 @@ bool parameter_bytes(const sx::Parameter& p, std::vector<std::byte>* out,
 struct DeviceTrainingGraph::Impl {
   Graph graph;
   std::vector<std::uint64_t> buffers;  // by tensor id (planner ids are dense)
+  // One device allocation per buffer slot. A slot is shared by the tensors the
+  // Training phase's BufferReusePass put in one buffer class (or by an
+  // in-place mark), and by an optimizer update's operand and result, so this is
+  // where memory is released.
+  std::vector<std::uint64_t> slot_buffers;
   std::vector<TensorId> input_ids;
   std::vector<TensorId> output_ids;
   std::vector<DeviceTensorInfo> input_info;
   std::vector<DeviceTensorInfo> output_info;
 
+  // Resident inputs: the graph writes the next value of these back into their
+  // own device buffers (the optimizer update), so their host bytes are needed
+  // once. `state_uploaded` says a run has already filled them.
+  std::vector<bool> resident_input;
+  bool state_uploaded = false;
+
+  // Scratch for the cross-entropy reduction, sized at compile; a kernel that
+  // allocated here would make the step uncapturable.
+  std::uint64_t ce_scratch = 0;
+
+  // CUDA-graph capture of the node launches (SONICBOOM_TRAIN_GRAPH).
+  bool capture_enabled = false;
+  bool capture_failed = false;
+  void* graph_exec = nullptr;
+  // The switch values the captured graph was recorded with. A captured launch
+  // bakes in the per-execution switches it read (which adamw rate operand, and
+  // which kernel provider), so a run under a different configuration must
+  // invalidate the graph instead of replaying it.
+  std::string captured_key;
+
+  // The training step's own stream (0 when the build has no CUDA).
+  std::uint64_t stream = 0;
+
   ~Impl() {
 #ifdef SONICBOOM_USE_CUDA
-    for (std::uint64_t b : buffers)
+    if (graph_exec != nullptr) detail::dev_graph_free(graph_exec);
+    for (std::uint64_t b : slot_buffers)
       if (b != 0) detail::dev_free(b);
+    if (ce_scratch != 0) detail::dev_free(ce_scratch);
+    if (stream != 0) detail::dev_stream_destroy(stream);
 #endif
   }
 
@@ -265,6 +302,7 @@ namespace {
 struct NodeContext {
   const Graph& graph;
   const std::vector<std::uint64_t>& buffers;
+  std::uint64_t ce_scratch = 0;
 };
 
 // SONICBOOM_ADAMW_LR_ATTR=1 restores the pre-lr-tensor behaviour: a sixth
@@ -360,6 +398,11 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
         return fail("expects a [rows, dim] table and 1-D indices");
       if (tensor(n.inputs[1]).dtype != sx::DType::Int32)
         return fail("indices must be int32");
+      if (detail::aten_direct_enabled("index_select") &&
+          detail::aten_direct_index_select(buf(n.outputs[0]), buf(n.inputs[0]),
+                                   buf(n.inputs[1]), ids[0], table[0],
+                                   table[1], detail::dev_stream_current()))
+        return true;
       if (!detail::graph_index_select(buf(n.outputs[0]), buf(n.inputs[0]),
                                       buf(n.inputs[1]), ids[0], table[1]))
         return fail("kernel launch failed");
@@ -406,16 +449,29 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
                                   buf(n.inputs[1]), sa.data(), sb.data(),
                                   out.data(),
                                   static_cast<std::int64_t>(out.size()), n_out)
-              : detail::graph_mul(buf(n.outputs[0]), buf(n.inputs[0]),
-                                  buf(n.inputs[1]), sa.data(), sb.data(),
-                                  out.data(),
-                                  static_cast<std::int64_t>(out.size()), n_out);
+              : (detail::aten_direct_enabled("mul") &&
+                         detail::aten_direct_mul(buf(n.outputs[0]), buf(n.inputs[0]),
+                                         buf(n.inputs[1]), sa.data(), sb.data(),
+                                         out.data(),
+                                         static_cast<std::int64_t>(out.size()),
+                                         n_out, detail::dev_stream_current())
+                     ? true
+                     : detail::graph_mul(buf(n.outputs[0]), buf(n.inputs[0]),
+                                         buf(n.inputs[1]), sa.data(), sb.data(),
+                                         out.data(),
+                                         static_cast<std::int64_t>(out.size()),
+                                         n_out));
       return ok ? true : fail("kernel launch failed");
     }
     case OpKind::Softmax: {
       if (!arity(1, 1)) return false;
       const auto in = shape(n.inputs[0]);
       const std::int64_t cols = in.empty() ? 1 : in.back();
+      if (detail::aten_direct_enabled("softmax") &&
+          detail::aten_direct_softmax(buf(n.outputs[0]), buf(n.inputs[0]),
+                              numel(n.inputs[0]) / cols, cols,
+                              detail::dev_stream_current()))
+        return true;
       if (!detail::graph_softmax(buf(n.outputs[0]), buf(n.inputs[0]),
                                  numel(n.inputs[0]) / cols, cols))
         return fail("kernel launch failed");
@@ -467,7 +523,8 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
       if (tensor(n.inputs[1]).dtype != sx::DType::Int32)
         return fail("targets must be int32");
       if (!detail::graph_cross_entropy(buf(n.outputs[0]), buf(n.inputs[0]),
-                                       buf(n.inputs[1]), logits[0], logits[1]))
+                                       buf(n.inputs[1]), logits[0], logits[1],
+                                       s.ce_scratch))
         return fail("kernel launch failed");
       return true;
     }
@@ -806,6 +863,84 @@ bool validate_node(const Graph& g, const GraphNodeDesc& n, std::string* error) {
   }
 }
 
+#ifdef SONICBOOM_USE_CUDA
+// Point the calling thread at the graph's own stream for a run, so an upload,
+// the node launches and a download are ordered together and the launches can
+// be captured.
+class StreamGuard {
+public:
+  explicit StreamGuard(std::uint64_t stream)
+      : previous_(detail::dev_stream_push(stream)) {}
+  ~StreamGuard() { detail::dev_stream_pop(previous_); }
+  StreamGuard(const StreamGuard&) = delete;
+  StreamGuard& operator=(const StreamGuard&) = delete;
+
+private:
+  std::uint64_t previous_;
+};
+
+// Launch every node of one step. Capture is enabled and the graph is not yet
+// instantiated: record the launches, instantiate once, and replay. After that
+// the instantiated graph is launched directly. With capture off, or when the
+// runtime refuses to capture this stream, the nodes launch one by one.
+// The per-execution switches a node launch reads. Two of them change which
+// kernel or which operand the step uses, so a graph captured under one
+// configuration must not be replayed under another.
+std::string launch_config_key() {
+  const char* aten = std::getenv("SONICBOOM_TRAIN_ATEN");
+  std::string key = aten ? aten : "";
+  key += '|';
+  key += adamw_lr_attr_mode() ? '1' : '0';
+  return key;
+}
+
+bool execute_nodes(const Graph& graph,
+                   const std::vector<std::uint64_t>& buffers,
+                   std::uint64_t ce_scratch, bool capture_enabled,
+                   bool* capture_failed, void** graph_exec,
+                   std::string* captured_key, std::string* error) {
+  const NodeContext ctx{graph, buffers, ce_scratch};
+  auto launch_all = [&]() {
+    for (const GraphNodeDesc& n : graph.nodes) {
+      std::string why;
+      if (!dispatch_node(ctx, n, &why)) {
+        if (error) *error = why;
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const std::string key = launch_config_key();
+  if (*graph_exec != nullptr) {
+    if (*captured_key == key) return detail::dev_graph_launch(*graph_exec);
+    // Re-record under the new configuration; the old launches are not valid.
+    detail::dev_graph_free(*graph_exec);
+    *graph_exec = nullptr;
+    captured_key->clear();
+  }
+  if (!capture_enabled || *capture_failed) return launch_all();
+
+  if (!detail::dev_capture_begin()) {
+    *capture_failed = true;
+    return launch_all();
+  }
+  if (!launch_all()) {
+    // Close the recording so the stream is usable again, then discard it.
+    void* discarded = nullptr;
+    detail::dev_capture_end(&discarded);
+    detail::dev_graph_free(discarded);
+    return false;
+  }
+  if (!detail::dev_capture_end(graph_exec)) {
+    *capture_failed = true;
+    return launch_all();
+  }
+  *captured_key = key;
+  return detail::dev_graph_launch(*graph_exec);
+}
+#endif
+
 } // namespace
 
 // --- compile ----------------------------------------------------------------
@@ -837,18 +972,158 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
   std::map<std::string, const sx::Parameter*> params;
   for (const sx::Parameter& p : doc.graph.parameters) params[p.name] = &p;
 
-  s.buffers.assign(g.tensors.size(), 0);
-  for (const TensorDesc& t : g.tensors) {
-    if (t.size_bytes == 0)
-      return std::unexpected("tensor '" + t.name + "' has no storage");
-    const std::uint64_t b = detail::dev_alloc(t.size_bytes);
-    if (b == 0)
-      return std::unexpected("cannot allocate " +
-                             std::to_string(t.size_bytes) + " bytes for tensor '" +
-                             t.name + "'");
-    s.buffers[t.id.value] = b;
+  // --- buffer slots ---------------------------------------------------------
+  //
+  // The Training phase's BufferReusePass records, on each single-result node,
+  // the buffer class its result belongs to (`buf`) and whether it may be
+  // written over operand 0 (`inplace`). Class members are never live at the
+  // same time, so they share one allocation; a tensor with no mark (an input,
+  // a constant, one of a multi-result node's results) gets its own.
+  //
+  // An optimizer update is a pure function of (param, grad, m1, m2) written to
+  // three results, and its kernel reads an element's operands before writing
+  // that element, so a result may target its operand's buffer. When that
+  // operand is a graph input whose last use is this update, the result is
+  // written into the input in place: the parameter and moments then survive on
+  // the device from step to step and need no upload.
+  std::vector<int64_t> slot_of(g.tensors.size(), -1);
+  std::vector<std::uint64_t> slot_bytes;
+  auto new_slot = [&](std::uint64_t bytes) {
+    slot_bytes.push_back(bytes);
+    return static_cast<int64_t>(slot_bytes.size()) - 1;
+  };
+  std::map<int64_t, int64_t> class_slot;
+
+  std::vector<int64_t> last_use(g.tensors.size(), -1);
+  for (std::size_t i = 0; i < g.nodes.size(); ++i)
+    for (TensorId in : g.nodes[i].inputs) last_use[in.value] = int64_t(i);
+
+  for (std::size_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& n = g.nodes[i];
+    if (n.outputs.size() != 1) continue;  // a multi-result node: own buffers
+    const TensorId rid = n.outputs[0];
+    const std::uint64_t bytes = g.tensors[rid.value].size_bytes;
+    if (bytes == 0)
+      return std::unexpected("tensor '" + g.tensors[rid.value].name +
+                             "' has no storage");
+    int64_t slot = -1;
+    if (int_attr(n, "inplace", 0) == 1 && !n.inputs.empty() &&
+        slot_of[n.inputs[0].value] >= 0)
+      slot = slot_of[n.inputs[0].value];
+    if (slot < 0) {
+      const int64_t cls = int_attr(n, "buf", -1);
+      if (cls >= 0) {
+        auto it = class_slot.find(cls);
+        if (it == class_slot.end())
+          it = class_slot.emplace(cls, new_slot(bytes)).first;
+        slot = it->second;
+      }
+    }
+    if (slot < 0) slot = new_slot(bytes);
+    slot_of[rid.value] = slot;
+    slot_bytes[slot] = std::max(slot_bytes[slot], bytes);
+  }
+  for (std::size_t t = 0; t < g.tensors.size(); ++t) {
+    if (slot_of[t] >= 0) continue;
+    if (g.tensors[t].size_bytes == 0)
+      return std::unexpected("tensor '" + g.tensors[t].name +
+                             "' has no storage");
+    slot_of[t] = new_slot(g.tensors[t].size_bytes);
   }
 
+  s.resident_input.assign(g.inputs.size(), false);
+  std::vector<int64_t> input_pos(g.tensors.size(), -1);
+  for (std::size_t i = 0; i < g.inputs.size(); ++i)
+    input_pos[g.inputs[i].value] = int64_t(i);
+  for (std::size_t i = 0; i < g.nodes.size(); ++i) {
+    const GraphNodeDesc& n = g.nodes[i];
+    if (n.op != OpKind::AdamW || n.outputs.size() != 3 || n.inputs.size() < 4)
+      continue;
+    // AdamW: (param, grad, m1, m2, step[, lr]) -> (param', m1', m2').
+    static constexpr int kCarry[3][2] = {{0, 0}, {2, 1}, {3, 2}};
+    for (const auto& c : kCarry) {
+      const TensorId in = n.inputs[c[0]];
+      const TensorId out = n.outputs[c[1]];
+      if (input_pos[in.value] < 0) continue;
+      if (last_use[in.value] != int64_t(i)) continue;
+      if (g.tensors[in.value].size_bytes != g.tensors[out.value].size_bytes)
+        continue;
+      slot_of[out.value] = slot_of[in.value];
+      s.resident_input[static_cast<std::size_t>(input_pos[in.value])] = true;
+    }
+  }
+
+  // One allocation per slot some tensor still uses. A result moved onto its
+  // operand's slot above leaves its own slot unreferenced, so it is dropped.
+  std::vector<int64_t> slot_remap(slot_bytes.size(), -1);
+  s.buffers.assign(g.tensors.size(), 0);
+  for (std::size_t t = 0; t < g.tensors.size(); ++t) {
+    const int64_t sl = slot_of[t];
+    if (slot_remap[sl] < 0) {
+      const std::uint64_t b = detail::dev_alloc(slot_bytes[sl]);
+      if (b == 0)
+        return std::unexpected("cannot allocate " +
+                               std::to_string(slot_bytes[sl]) +
+                               " bytes for tensor '" + g.tensors[t].name + "'");
+      slot_remap[sl] = int64_t(s.slot_buffers.size());
+      s.slot_buffers.push_back(b);
+    }
+    s.buffers[t] = s.slot_buffers[slot_remap[sl]];
+  }
+
+  // Cross-entropy reads its whole row set before reducing; the scratch is a
+  // compile-time allocation so that a step allocates nothing (CUDA graphs).
+  std::int64_t ce_rows = 0;
+  bool has_clip = false;
+  for (const GraphNodeDesc& n : g.nodes) {
+    if (n.op == OpKind::CrossEntropy && !n.inputs.empty()) {
+      const auto& shape = g.tensors[n.inputs[0].value].shape;
+      if (shape.size() == 2) ce_rows = std::max(ce_rows, shape[0]);
+    }
+    if (n.op == OpKind::ClipGradNorm) has_clip = true;
+  }
+  if (ce_rows > 0) {
+    s.ce_scratch = detail::dev_alloc(static_cast<std::uint64_t>(ce_rows) *
+                                     sizeof(float));
+    if (s.ce_scratch == 0)
+      return std::unexpected("cannot allocate the cross-entropy scratch");
+  }
+  // A few backward kernels take row scratch from the planner's device pool,
+  // whose first acquire for a size is a cudaMalloc. A captured step may not
+  // allocate, so every size those kernels will ask for is warmed here (the
+  // release leaves the handle in the pool).
+  for (const GraphNodeDesc& n : g.nodes) {
+    if (n.inputs.empty()) continue;
+    const auto& sh = g.tensors[n.inputs[0].value].shape;
+    std::int64_t rows = 0;
+    if (n.op == OpKind::CrossEntropyBwd && sh.size() == 2) {
+      rows = sh[0];
+    } else if (n.op == OpKind::RmsNormBwd && !sh.empty()) {
+      std::int64_t total = 1;
+      for (std::int64_t d : sh) total *= d;
+      if (sh.back() > 0) rows = total / sh.back();
+    }
+    if (rows <= 0) continue;
+    const std::uint64_t bytes =
+        static_cast<std::uint64_t>(rows) * sizeof(float);
+    const std::uint64_t h = planner::device::acquire(bytes);
+    if (h != 0) planner::device::release(h, bytes);
+  }
+  // A global-norm clip allocates its accumulator per execution, which a
+  // captured step cannot do; its graph keeps the direct path.
+  const char* train_graph = std::getenv("SONICBOOM_TRAIN_GRAPH");
+  s.capture_enabled =
+      !(train_graph != nullptr && train_graph[0] == '0' &&
+        train_graph[1] == '\0') &&
+      !has_clip;
+
+#ifdef SONICBOOM_USE_CUDA
+  // The step's stream. Constants are uploaded on it (synchronously, before the
+  // first run), so nothing is left in flight on another stream.
+  s.stream = detail::dev_stream_create();
+  if (s.stream == 0)
+    return std::unexpected("cannot create the training step's CUDA stream");
+#endif
   for (const TensorDesc& t : g.tensors) {
     if (!t.is_constant) continue;
     auto it = params.find(t.name);
@@ -864,8 +1139,14 @@ DeviceTrainingGraph::compile(const sx::Document& doc) {
                              std::to_string(t.size_bytes) + " bytes but its " +
                              "parameter holds " +
                              std::to_string(bytes.size()));
-    if (!detail::dev_upload(s.buffers[t.id.value], bytes.data(), bytes.size()))
+#ifdef SONICBOOM_USE_CUDA
+    StreamGuard guard(s.stream);
+    if (!detail::dev_upload(s.buffers[t.id.value], bytes.data(), bytes.size()) ||
+        !detail::dev_sync())
       return std::unexpected("cannot upload constant '" + t.name + "'");
+#else
+    (void)bytes;
+#endif
   }
 
   auto info_of = [&](TensorId id) {
@@ -931,32 +1212,127 @@ bool DeviceTrainingGraph::run(const std::byte* const* input_data,
                  s.input_info[i].name + "') is null";
       return false;
     }
+  }
+
+  StreamGuard guard(s.stream);
+  for (std::size_t i = 0; i < s.input_ids.size(); ++i) {
     if (!detail::dev_upload(s.buffers[s.input_ids[i].value], input_data[i],
-                            want)) {
+                            s.input_info[i].num_bytes)) {
       if (error) *error = "cannot upload input " + std::to_string(i);
       return false;
     }
   }
 
-  const NodeContext ctx{s.graph, s.buffers};
-  for (const GraphNodeDesc& n : s.graph.nodes) {
-    std::string why;
-    if (!dispatch_node(ctx, n, &why)) {
-      if (error) *error = why;
-      return false;
-    }
-  }
+  if (!execute_nodes(s.graph, s.buffers, s.ce_scratch, s.capture_enabled,
+                     &s.capture_failed, &s.graph_exec, &s.captured_key, error))
+    return false;
 
   if (!detail::dev_sync()) {
     if (error) *error = "device synchronization failed";
     return false;
   }
+  s.state_uploaded = true;
 
   std::vector<std::vector<std::byte>> result(s.output_ids.size());
   for (std::size_t i = 0; i < s.output_ids.size(); ++i) {
     const std::uint64_t bytes = s.output_info[i].num_bytes;
     result[i].resize(bytes);
     if (!detail::dev_download(s.buffers[s.output_ids[i].value], result[i].data(),
+                              bytes)) {
+      if (error)
+        *error = "cannot download output " + std::to_string(i) + " ('" +
+                 s.output_info[i].name + "')";
+      return false;
+    }
+  }
+  if (!detail::dev_sync()) {
+    if (error) *error = "device synchronization failed";
+    return false;
+  }
+
+  *outputs = std::move(result);
+  return true;
+#endif
+}
+
+bool DeviceTrainingGraph::input_is_resident(std::size_t index) const noexcept {
+  return index < impl_->resident_input.size() && impl_->resident_input[index];
+}
+
+bool DeviceTrainingGraph::run_resident(
+    const std::byte* const* input_data, const std::size_t* input_sizes,
+    const std::size_t* download, std::size_t num_download,
+    std::vector<std::vector<std::byte>>* outputs, std::string* error) {
+#ifndef SONICBOOM_USE_CUDA
+  if (error) *error = "SonicBoom was built without CUDA";
+  return false;
+#else
+  Impl& s = *impl_;
+  if (input_data == nullptr || input_sizes == nullptr || outputs == nullptr ||
+      (num_download != 0 && download == nullptr)) {
+    if (error) *error = "run_resident: null argument";
+    return false;
+  }
+  if (s.input_info.size() != s.input_ids.size()) {
+    if (error) *error = "run_resident: malformed compiled graph";
+    return false;
+  }
+  for (std::size_t j = 0; j < num_download; ++j) {
+    if (download[j] >= s.output_ids.size()) {
+      if (error)
+        *error = "run_resident: output index " +
+                 std::to_string(download[j]) + " is out of range";
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < s.input_ids.size(); ++i) {
+    const std::uint64_t want = s.input_info[i].num_bytes;
+    if (input_sizes[i] != want) {
+      if (error)
+        *error = "input " + std::to_string(i) + " ('" +
+                 s.input_info[i].name + "') is " +
+                 std::to_string(input_sizes[i]) + " bytes, expected " +
+                 std::to_string(want);
+      return false;
+    }
+    const bool held = i < s.resident_input.size() && s.resident_input[i] &&
+                      s.state_uploaded;
+    if (!held && input_data[i] == nullptr && want != 0) {
+      if (error)
+        *error = "input " + std::to_string(i) + " ('" +
+                 s.input_info[i].name + "') is null and not resident";
+      return false;
+    }
+  }
+
+  StreamGuard guard(s.stream);
+  for (std::size_t i = 0; i < s.input_ids.size(); ++i) {
+    if (i < s.resident_input.size() && s.resident_input[i] &&
+        s.state_uploaded)
+      continue;  // the previous step's update is already on the device
+    if (!detail::dev_upload(s.buffers[s.input_ids[i].value], input_data[i],
+                            s.input_info[i].num_bytes)) {
+      if (error) *error = "cannot upload input " + std::to_string(i);
+      return false;
+    }
+  }
+
+  if (!execute_nodes(s.graph, s.buffers, s.ce_scratch, s.capture_enabled,
+                     &s.capture_failed, &s.graph_exec, &s.captured_key, error))
+    return false;
+
+  if (!detail::dev_sync()) {
+    if (error) *error = "device synchronization failed";
+    return false;
+  }
+  s.state_uploaded = true;
+
+  std::vector<std::vector<std::byte>> result(num_download);
+  for (std::size_t j = 0; j < num_download; ++j) {
+    const std::size_t i = download[j];
+    const std::uint64_t bytes = s.output_info[i].num_bytes;
+    result[j].resize(bytes);
+    if (!detail::dev_download(s.buffers[s.output_ids[i].value], result[j].data(),
                               bytes)) {
       if (error)
         *error = "cannot download output " + std::to_string(i) + " ('" +

@@ -828,6 +828,11 @@ std::string lower_into_module(MLIRContext& ctx, ModuleOp module,
 }
 
 std::expected<std::string, LoweringError> lower_to_mlir(const Document& doc) {
+  if (!linalg_cpu_path_enabled())
+    return std::unexpected(LoweringError{
+        LoweringErrorKind::Operator,
+        "the S-Expr v0 MLIR/linalg CPU path is retired "
+        "(SONICBOOM_SX_LINALG=0); no CPU Boom executor exists yet"});
   MLIRContext context;
   context.getOrLoadDialect<func::FuncDialect>();
   context.getOrLoadDialect<arith::ArithDialect>();

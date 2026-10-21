@@ -449,6 +449,70 @@ bool dev_copy(DevBuf dst, DevBuf src, std::int64_t n) {
 
 bool dev_sync() { return cudaStreamSynchronize(cur_stream()) == cudaSuccess; }
 
+std::uint64_t dev_stream_create() {
+  cudaStream_t s = nullptr;
+  if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess)
+    return 0;
+  return reinterpret_cast<std::uint64_t>(s);
+}
+
+void dev_stream_destroy(std::uint64_t stream) {
+  if (stream != 0)
+    cudaStreamDestroy(reinterpret_cast<cudaStream_t>(stream));
+}
+
+std::uint64_t dev_stream_push(std::uint64_t stream) {
+  auto& cur = ::sonicboom::cuda::sb_current_stream();
+  const std::uint64_t previous = reinterpret_cast<std::uint64_t>(cur);
+  cur = reinterpret_cast<cudaStream_t>(stream);
+  return previous;
+}
+
+void dev_stream_pop(std::uint64_t previous) {
+  ::sonicboom::cuda::sb_current_stream() =
+      reinterpret_cast<cudaStream_t>(previous);
+}
+
+std::uint64_t dev_stream_current() {
+  return reinterpret_cast<std::uint64_t>(cur_stream());
+}
+
+bool dev_capture_begin() {
+  if (cudaStreamBeginCapture(cur_stream(), cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess)
+    return false;
+  // Kernels that stage scratch through the device pool take the shortcut the
+  // planner's own capture scope takes: no host wait, no allocation.
+  ::sonicboom::cuda::sb_capturing() = true;
+  return true;
+}
+
+bool dev_capture_end(void** exec_out) {
+  ::sonicboom::cuda::sb_capturing() = false;
+  if (exec_out == nullptr) return false;
+  *exec_out = nullptr;
+  cudaGraph_t graph = nullptr;
+  if (cudaStreamEndCapture(cur_stream(), &graph) != cudaSuccess) return false;
+  if (graph == nullptr) return false;
+  cudaGraphExec_t exec = nullptr;
+  const cudaError_t st = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+  cudaGraphDestroy(graph);
+  if (st != cudaSuccess) return false;
+  *exec_out = reinterpret_cast<void*>(exec);
+  return true;
+}
+
+bool dev_graph_launch(void* exec) {
+  if (exec == nullptr) return false;
+  return cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(exec),
+                         cur_stream()) == cudaSuccess;
+}
+
+void dev_graph_free(void* exec) {
+  if (exec != nullptr)
+    cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(exec));
+}
+
 // --- forward ----------------------------------------------------------------
 
 bool graph_index_select(DevBuf out, DevBuf table, DevBuf ids, std::int64_t rows,
@@ -521,18 +585,15 @@ bool graph_silu_mul(DevBuf out, DevBuf g, DevBuf u, std::int64_t n) {
 }
 
 bool graph_cross_entropy(DevBuf loss, DevBuf logits, DevBuf targets,
-                         std::int64_t rows, std::int64_t cols) {
+                         std::int64_t rows, std::int64_t cols, DevBuf scratch) {
   if (rows <= 0 || cols <= 0) return false;
-  DevBuf scratch = dev_alloc(static_cast<std::uint64_t>(rows) * sizeof(float));
   if (scratch == 0) return false;
   ce_row_kernel<<<static_cast<unsigned>(rows), kThreads, 0, cur_stream()>>>(
       ptr<const float>(logits), ptr<const int32_t>(targets), ptr<float>(scratch),
       cols);
   ce_mean_kernel<<<1, kThreads, 0, cur_stream()>>>(ptr<const float>(scratch),
                                                    ptr<float>(loss), rows);
-  const bool good = ok();
-  dev_free(scratch);
-  return good;
+  return ok();
 }
 
 bool graph_add(DevBuf out, DevBuf a, DevBuf b, const std::int64_t* a_strides,

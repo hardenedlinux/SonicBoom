@@ -240,6 +240,29 @@ sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
                        size_t num_outputs, size_t *output_lens,
                        sb_error **err_out);
 
+/* Resident training step. A device training graph keeps the parameters and
+ * optimizer state the optimizer updates in their device buffers across steps
+ * (see sb_input_is_resident). The first successful run — sb_run_multi or
+ * sb_run_resident — uploads them; afterwards `input_data[i]` for a resident
+ * input may be NULL and its bytes are ignored. Every other input is uploaded on
+ * every call, and `input_lens[i]` is still validated for all of them.
+ *
+ * Only the outputs named by `output_indices[0..num_outputs)` are copied back,
+ * in that order: a step that keeps its state on the device downloads the loss,
+ * not the parameters. `num_outputs` is therefore independent of
+ * sb_output_count. On failure no result buffer is modified. */
+sb_status sb_run_resident(sb_executable *exe, const void *const *input_data,
+                          const size_t *input_lens, size_t num_inputs,
+                          const size_t *output_indices, size_t num_outputs,
+                          void *const *output_data, const size_t *output_caps,
+                          size_t *output_lens, sb_error **err_out);
+
+/* 1 when input `index` is resident in the sense above (the graph writes its
+ * next value back into the same device buffer), 0 otherwise. Fails with
+ * SB_ERR_BINDING for a non-device executable or an index out of range. */
+sb_status sb_input_is_resident(const sb_executable *exe, size_t index,
+                               int *resident_out, sb_error **err_out);
+
 /* --- Release --------------------------------------------------------------- */
 
 void sb_document_free(sb_document *doc);

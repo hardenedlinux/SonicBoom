@@ -370,8 +370,11 @@ bool cross_entropy_bwd_dev(std::uint64_t loss, std::uint64_t dlogits,
                                      reinterpret_cast<float*>(loss), rows);
   const bool good = ok();
   // The scratch returns to the pool after the reduction has finished; the
-  // training loop is step-synchronous, so this is not on a hot path.
-  cudaStreamSynchronize(s);
+  // training loop is step-synchronous, so this is not on a hot path. Under
+  // CUDA-graph capture there is no host wait to take: the release is ordered
+  // on the captured stream by the kernels that use it, and the pool must not
+  // allocate (the executor warms the sizes it needs before capturing).
+  if (!::sonicboom::cuda::sb_capturing()) cudaStreamSynchronize(s);
   planner::device::release(scratch, scratch_bytes);
   return good;
 }
@@ -397,7 +400,8 @@ bool rmsnorm_bwd_dev(std::uint64_t dX, std::uint64_t dW, std::uint64_t x,
       reinterpret_cast<const float*>(inv), reinterpret_cast<float*>(dW), rows,
       dim);
   const bool good = ok();
-  cudaStreamSynchronize(s);
+  // As in cross_entropy_bwd_dev: a captured step cannot wait on the host.
+  if (!::sonicboom::cuda::sb_capturing()) cudaStreamSynchronize(s);
   planner::device::release(inv, inv_bytes);
   return good;
 }

@@ -3093,9 +3093,13 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
   // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
   // (0.318/0.231 ms vs own 0.424/0.243).
   // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
-  // own keeps a 13% prefill lead. The static table keeps codegen here; the
-  // tune-time measurement decides for the prefill leg (the decode leg has
-  // its own, separately switched implementation).
+  // own keeps a prefill lead at q >= 128 (1.62 vs 1.86 ms per call at
+  // pp512), but the class must stay on one kernel: a prefix-reuse suffix
+  // prefill must be bit-identical to the same rows of a full prefill, and
+  // the two kernels are not (q=64: 57.44 ms generated vs 58.94 own). Gating
+  // own at q >= 128 mixed them by n and diverged test_prefix_cache, so the
+  // static table keeps codegen here and the tune-time measurement decides
+  // the generated tile for the prefill leg.
   if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
       return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
