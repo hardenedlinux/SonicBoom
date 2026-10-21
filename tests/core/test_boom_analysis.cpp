@@ -368,6 +368,20 @@ int main() {
       check(false, "marked graph builds");
     } else {
       check(compiler::markBufferReuse(*b.module), "BufferReusePass runs");
+      // Running it again must replace the marks, not stack a second copy (the
+      // verifier rejects duplicate node_attrs names).
+      check(compiler::markBufferReuse(*b.module), "BufferReusePass re-runs");
+      bool duplicates = false;
+      b.module->walk([&](mlir::Operation *op) {
+        if (auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs")) {
+          size_t inplace = 0;
+          for (mlir::Attribute a : attrs)
+            if (auto na = mlir::dyn_cast<boom::NodeAttr>(a))
+              if (na.getName() == "inplace") ++inplace;
+          if (inplace > 1) duplicates = true;
+        }
+      });
+      check(!duplicates, "a second pass run leaves one inplace entry per node");
       compiler::RangeFacts f;
       const auto r = compiler::analyzeBoom(*b.module, f);
       bool checked = false;
