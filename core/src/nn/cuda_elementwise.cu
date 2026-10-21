@@ -3242,11 +3242,20 @@ bool attn_launch_own(int head_dim, int gqa, const float *q,
 // The class default is timed once per (shape class, GPU) and every supported
 // generated (br, bc, dps) plus "own" is timed against it; the winner is
 // persisted in the autotune cache (planner/autotune.h) and reused. The
-// synthetic call is a canonical prefill chunk at position 0, so the search
-// never sees the caller's batch size or position and a reused prefix resolves
-// to the same config as a full prefill (batch invariance).
-constexpr int kAttnTuneQueries = 256;
-constexpr uint64_t kAttnTuneSlots = 256;
+// synthetic call is a causal prefill at position 0, so the search never sees
+// the caller's batch size or position and a reused prefix resolves to the
+// same config as a full prefill (batch invariance).
+//
+// Two canonical lengths are timed and their times summed for one decision per
+// class. The tile ranking is not monotone in length: on sm_86 the d64 class
+// favours GQA packing at 256 queries (16x32, pack 7: 0.0431 vs 0.0451 ms) and
+// the default 64x16 tile at 512 (0.0973 vs 0.1075), so a 256-only tuning
+// picked a tile that lost at pp512. Summing keeps one kernel per class while
+// measuring it at both ends of the prefill range.
+constexpr int kAttnTuneLengths[] = {256, 512};
+constexpr int kAttnTuneMaxQueries = 512;
+constexpr size_t kAttnTuneLengthCount =
+    sizeof(kAttnTuneLengths) / sizeof(kAttnTuneLengths[0]);
 // A candidate must beat the class default by this fraction to replace it.
 // The defaults are the measured 3050 winners; the margin keeps a re-measurement
 // of equal kernels from changing the default token stream.
@@ -3331,9 +3340,9 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   }
 
   AttnTuneBufs b;
-  const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;
-  const size_t kv_n = size_t(kAttnTuneQueries) * n_heads_kv * head_dim;
-  const size_t c_n = size_t(kAttnTuneSlots) * n_heads_kv * head_dim;
+  const size_t q_n = size_t(kAttnTuneMaxQueries) * n_heads_q * head_dim;
+  const size_t kv_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
+  const size_t c_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
@@ -3367,17 +3376,28 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
 
   const float scale = 1.0f / std::sqrt(float(head_dim));
   const uint64_t w = window ? window_len : 0;
-  auto launch = [&](const AttnChoice &c) {
+  auto launch = [&](const AttnChoice &c, uint64_t slots, int queries) {
     if (c.impl == AttnImpl::Own)
       return attn_launch_own(head_dim, gqa, b.q, b.kb, b.vb, b.kc, b.vc,
-                             b.start, kAttnTuneSlots, kAttnTuneQueries,
-                             n_heads_q, n_heads_kv, w, scale, b.out);
+                             b.start, slots, queries, n_heads_q, n_heads_kv, w,
+                             scale, b.out);
     const compiler::AttentionShape s = attn_prefill_shape(
         head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
         c.qs == 0, c.hf);
-    return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
-                               kAttnTuneSlots, kAttnTuneQueries, n_heads_q,
-                               n_heads_kv, w, scale, b.out);
+    return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start, slots,
+                               queries, n_heads_q, n_heads_kv, w, scale, b.out);
+  };
+  // The sum over the canonical lengths; a candidate that cannot launch at one
+  // of them cannot be chosen (-1).
+  auto time_choice = [&](const AttnChoice &c) {
+    double total = 0.0;
+    for (int n : kAttnTuneLengths) {
+      const double ms = ::sonicboom::tune::median_launch_ms(
+          [&] { return launch(c, uint64_t(n), n); }, cur_stream(), 2, 5);
+      if (!(ms > 0.0)) return -1.0;
+      total += ms;
+    }
+    return total;
   };
 
   candidate_count = int(cands.size());
@@ -3387,17 +3407,15 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   // (same rule as the dense tuner).
   planner::PlanRecorder *saved_rec = planner::recorder();
   planner::set_thread_recorder(nullptr);
-  const double def_ms =
-      ::sonicboom::tune::median_launch_ms([&] { return launch(def); },
-                                          cur_stream(), 2, 5);
+  const double def_ms = time_choice(def);
   AttnChoice best = def;
   double best_ms = def_ms;
   for (size_t i = 1; i < cands.size(); ++i) {
-    const double ms =
-        ::sonicboom::tune::median_launch_ms([&] { return launch(cands[i]); },
-                                            cur_stream(), 2, 5);
+    const double ms = time_choice(cands[i]);
     if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
-      std::fprintf(stderr, "[autotune]   attn cand %s %.4f ms (best %.4f)\n",
+      std::fprintf(stderr,
+                   "[autotune]   attn cand %s %.4f ms summed over lengths "
+                   "(best %.4f)\n",
                    attn_choice_name(cands[i]).c_str(), ms, best_ms);
     if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
       best = cands[i];
@@ -3496,10 +3514,14 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   // decide what every later launch of the class runs. 512 rows is a prefill-
   // sized burst (the class is the prefill kernel) and keeps the scratch small.
   constexpr int kQ3ProbeQueries = 512;
+  // Fixed synthetic cache extent, unchanged by the d64 workload fix above: the
+  // Q3 runner only ranks tile shapes against each other and its picks are
+  // gated bit-identical, so changing its extent would be an unrelated retune.
+  constexpr uint64_t kQ3ProbeSlots = 256;
   const int probe_n = kQ3ProbeQueries;
   const size_t q_n = size_t(probe_n) * size_t(n_heads_q) * size_t(head_dim);
   const size_t kv_n = size_t(probe_n) * size_t(n_heads_kv) * size_t(head_dim);
-  const size_t c_n = size_t(kAttnTuneSlots) * size_t(n_heads_kv) *
+  const size_t c_n = size_t(kQ3ProbeSlots) * size_t(n_heads_kv) *
                      size_t(head_dim);
   AttnTuneBufs b;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
@@ -3563,7 +3585,7 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
       bool ran = true;
       for (int i = 0; i < kQ3ProbeReps && ran; ++i)
         ran = attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
-                                  kAttnTuneSlots, probe_n, n_heads_q,
+                                  kQ3ProbeSlots, probe_n, n_heads_q,
                                   n_heads_kv, sliding_window, scale, b.out);
       launch_ok = ran;
     });
@@ -3722,6 +3744,14 @@ std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   // rather than be shadowed by the old pick. The batch size and position are
   // still never part of the key.
   k += "|dflt-" + attn_choice_name(def);
+  // The tuning workload is a decision input too: the d64 class ranks its
+  // candidates differently at 256 and 512 queries, so a pick measured over a
+  // different set of lengths must not shadow the retune.
+  k += "|wl";
+  for (size_t i = 0; i < kAttnTuneLengthCount; ++i) {
+    if (i != 0) k += "+";
+    k += std::to_string(kAttnTuneLengths[i]);
+  }
   return k;
 }
 
@@ -4946,7 +4976,11 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
   if (!::sonicboom::tune::enabled() && pin < 0) return def;
   cublasLtHandle_t lt = dense_lt_handle();
   if (!lt || !g_dense_ws) return def;
-  const std::string key = std::string("dense-f32-2|m") +
+  // The trailing number is the policy version: T9 stopped requiring a Lt
+  // candidate to beat the chunked arm by kDenseCandidateMargin, so a pick
+  // cached under the old rule (e.g. "down stays chunked") is not a decision
+  // this code would make. Bumping it retimes once per class per device.
+  const std::string key = std::string("dense-f32-3|m") +
                           std::to_string(rows) + "k" + std::to_string(cols);
   static std::mutex mu;
   static std::unordered_map<std::string, DenseF32Choice> memo;

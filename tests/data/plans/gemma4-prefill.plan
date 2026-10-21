@@ -243,7 +243,7 @@ step 21 task 21 node 31 op fused_region backend sonic stream s0
   buf in 1 t32 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t34 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 22 task 22 node 33 op matvec_f32 backend sonic stream s0
+step 22 task 22 node 33 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -251,8 +251,6 @@ step 22 task 22 node 33 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t27 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t35 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 23 task 23 node 35 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -493,7 +491,7 @@ step 44 task 44 node 68 op fused_region backend sonic stream s0
   buf in 1 t69 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t71 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 45 task 45 node 70 op matvec_f32 backend sonic stream s0
+step 45 task 45 node 70 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -501,8 +499,6 @@ step 45 task 45 node 70 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t64 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t72 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 46 task 46 node 72 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -743,7 +739,7 @@ step 67 task 67 node 105 op fused_region backend sonic stream s0
   buf in 1 t106 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t108 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 68 task 68 node 107 op matvec_f32 backend sonic stream s0
+step 68 task 68 node 107 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -751,8 +747,6 @@ step 68 task 68 node 107 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t101 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t109 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 69 task 69 node 109 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -993,7 +987,7 @@ step 90 task 90 node 142 op fused_region backend sonic stream s0
   buf in 1 t143 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t145 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 91 task 91 node 144 op matvec_f32 backend sonic stream s0
+step 91 task 91 node 144 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -1001,8 +995,6 @@ step 91 task 91 node 144 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t138 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t146 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 92 task 92 node 146 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -1243,7 +1235,7 @@ step 113 task 113 node 179 op fused_region backend sonic stream s0
   buf in 1 t180 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t182 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 114 task 114 node 181 op matvec_f32 backend sonic stream s0
+step 114 task 114 node 181 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -1251,8 +1243,6 @@ step 114 task 114 node 181 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t175 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t183 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 115 task 115 node 183 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -1493,7 +1483,7 @@ step 136 task 136 node 216 op fused_region backend sonic stream s0
   buf in 1 t217 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t219 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 137 task 137 node 218 op matvec_f32 backend sonic stream s0
+step 137 task 137 node 218 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -1501,8 +1491,6 @@ step 137 task 137 node 218 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t212 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t220 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 138 task 138 node 220 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -1743,7 +1731,7 @@ step 159 task 159 node 253 op fused_region backend sonic stream s0
   buf in 1 t254 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t256 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 160 task 160 node 255 op matvec_f32 backend sonic stream s0
+step 160 task 160 node 255 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -1751,8 +1739,6 @@ step 160 task 160 node 255 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t249 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t257 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 161 task 161 node 257 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -1993,7 +1979,7 @@ step 182 task 182 node 290 op fused_region backend sonic stream s0
   buf in 1 t291 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t293 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 183 task 183 node 292 op matvec_f32 backend sonic stream s0
+step 183 task 183 node 292 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -2001,8 +1987,6 @@ step 183 task 183 node 292 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t286 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t294 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 184 task 184 node 294 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -2243,7 +2227,7 @@ step 205 task 205 node 327 op fused_region backend sonic stream s0
   buf in 1 t328 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t330 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 206 task 206 node 329 op matvec_f32 backend sonic stream s0
+step 206 task 206 node 329 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -2251,8 +2235,6 @@ step 206 task 206 node 329 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t323 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t331 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 207 task 207 node 331 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -2493,7 +2475,7 @@ step 228 task 228 node 364 op fused_region backend sonic stream s0
   buf in 1 t365 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t367 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 229 task 229 node 366 op matvec_f32 backend sonic stream s0
+step 229 task 229 node 366 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -2501,8 +2483,6 @@ step 229 task 229 node 366 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t360 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t368 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 230 task 230 node 368 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -2743,7 +2723,7 @@ step 251 task 251 node 401 op fused_region backend sonic stream s0
   buf in 1 t402 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t404 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 252 task 252 node 403 op matvec_f32 backend sonic stream s0
+step 252 task 252 node 403 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -2751,8 +2731,6 @@ step 252 task 252 node 403 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t397 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t405 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 253 task 253 node 405 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -2993,7 +2971,7 @@ step 274 task 274 node 438 op fused_region backend sonic stream s0
   buf in 1 t439 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t441 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 275 task 275 node 440 op matvec_f32 backend sonic stream s0
+step 275 task 275 node 440 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -3001,8 +2979,6 @@ step 275 task 275 node 440 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t434 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t442 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 276 task 276 node 442 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -3243,7 +3219,7 @@ step 297 task 297 node 475 op fused_region backend sonic stream s0
   buf in 1 t476 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t478 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 298 task 298 node 477 op matvec_f32 backend sonic stream s0
+step 298 task 298 node 477 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -3251,8 +3227,6 @@ step 298 task 298 node 477 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t471 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t479 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 299 task 299 node 479 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -3493,7 +3467,7 @@ step 320 task 320 node 512 op fused_region backend sonic stream s0
   buf in 1 t513 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t515 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 321 task 321 node 514 op matvec_f32 backend sonic stream s0
+step 321 task 321 node 514 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -3501,8 +3475,6 @@ step 321 task 321 node 514 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t508 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t516 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 322 task 322 node 516 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -3743,7 +3715,7 @@ step 343 task 343 node 549 op fused_region backend sonic stream s0
   buf in 1 t550 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t552 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 344 task 344 node 551 op matvec_f32 backend sonic stream s0
+step 344 task 344 node 551 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -3751,8 +3723,6 @@ step 344 task 344 node 551 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t545 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t553 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 345 task 345 node 553 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -3993,7 +3963,7 @@ step 366 task 366 node 586 op fused_region backend sonic stream s0
   buf in 1 t587 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t589 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 367 task 367 node 588 op matvec_f32 backend sonic stream s0
+step 367 task 367 node 588 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -4001,8 +3971,6 @@ step 367 task 367 node 588 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t582 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t590 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 368 task 368 node 590 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -4243,7 +4211,7 @@ step 389 task 389 node 623 op fused_region backend sonic stream s0
   buf in 1 t624 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t626 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 390 task 390 node 625 op matvec_f32 backend sonic stream s0
+step 390 task 390 node 625 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -4251,8 +4219,6 @@ step 390 task 390 node 625 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t619 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t627 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 391 task 391 node 627 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -4493,7 +4459,7 @@ step 412 task 412 node 660 op fused_region backend sonic stream s0
   buf in 1 t661 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t663 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 413 task 413 node 662 op matvec_f32 backend sonic stream s0
+step 413 task 413 node 662 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -4501,8 +4467,6 @@ step 413 task 413 node 662 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t656 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t664 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 414 task 414 node 664 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -4743,7 +4707,7 @@ step 435 task 435 node 697 op fused_region backend sonic stream s0
   buf in 1 t698 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t700 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 436 task 436 node 699 op matvec_f32 backend sonic stream s0
+step 436 task 436 node 699 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -4751,8 +4715,6 @@ step 436 task 436 node 699 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t693 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t701 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 437 task 437 node 701 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -4993,7 +4955,7 @@ step 458 task 458 node 734 op fused_region backend sonic stream s0
   buf in 1 t735 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t737 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 459 task 459 node 736 op matvec_f32 backend sonic stream s0
+step 459 task 459 node 736 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -5001,8 +4963,6 @@ step 459 task 459 node 736 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t730 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t738 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 460 task 460 node 738 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -5243,7 +5203,7 @@ step 481 task 481 node 771 op fused_region backend sonic stream s0
   buf in 1 t772 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t774 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 482 task 482 node 773 op matvec_f32 backend sonic stream s0
+step 482 task 482 node 773 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -5251,8 +5211,6 @@ step 482 task 482 node 773 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t767 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t775 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 483 task 483 node 775 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -5493,7 +5451,7 @@ step 504 task 504 node 808 op fused_region backend sonic stream s0
   buf in 1 t809 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t811 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 505 task 505 node 810 op matvec_f32 backend sonic stream s0
+step 505 task 505 node 810 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -5501,8 +5459,6 @@ step 505 task 505 node 810 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t804 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t812 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 506 task 506 node 812 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -5743,7 +5699,7 @@ step 527 task 527 node 845 op fused_region backend sonic stream s0
   buf in 1 t846 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t848 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 528 task 528 node 847 op matvec_f32 backend sonic stream s0
+step 528 task 528 node 847 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -5751,8 +5707,6 @@ step 528 task 528 node 847 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t841 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t849 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 529 task 529 node 849 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -5993,7 +5947,7 @@ step 550 task 550 node 882 op fused_region backend sonic stream s0
   buf in 1 t883 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t885 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 551 task 551 node 884 op matvec_f32 backend sonic stream s0
+step 551 task 551 node 884 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -6001,8 +5955,6 @@ step 551 task 551 node 884 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t878 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t886 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 552 task 552 node 886 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -6203,7 +6155,7 @@ step 569 task 569 node 912 op fused_region backend sonic stream s0
   buf in 1 t913 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t915 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 570 task 570 node 914 op matvec_f32 backend sonic stream s0
+step 570 task 570 node 914 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -6211,8 +6163,6 @@ step 570 task 570 node 914 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t908 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t916 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 571 task 571 node 916 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -6413,7 +6363,7 @@ step 588 task 588 node 942 op fused_region backend sonic stream s0
   buf in 1 t943 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t945 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 589 task 589 node 944 op matvec_f32 backend sonic stream s0
+step 589 task 589 node 944 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -6421,8 +6371,6 @@ step 589 task 589 node 944 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t938 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t946 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 590 task 590 node 946 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -6623,7 +6571,7 @@ step 607 task 607 node 972 op fused_region backend sonic stream s0
   buf in 1 t973 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t975 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 608 task 608 node 974 op matvec_f32 backend sonic stream s0
+step 608 task 608 node 974 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -6631,8 +6579,6 @@ step 608 task 608 node 974 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t968 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t976 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 609 task 609 node 976 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -6833,7 +6779,7 @@ step 626 task 626 node 1002 op fused_region backend sonic stream s0
   buf in 1 t1003 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1005 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 627 task 627 node 1004 op matvec_f32 backend sonic stream s0
+step 627 task 627 node 1004 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -6841,8 +6787,6 @@ step 627 task 627 node 1004 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t998 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1006 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 628 task 628 node 1006 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -7043,7 +6987,7 @@ step 645 task 645 node 1032 op fused_region backend sonic stream s0
   buf in 1 t1033 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1035 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 646 task 646 node 1034 op matvec_f32 backend sonic stream s0
+step 646 task 646 node 1034 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -7051,8 +6995,6 @@ step 646 task 646 node 1034 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1028 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1036 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 647 task 647 node 1036 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -7253,7 +7195,7 @@ step 664 task 664 node 1062 op fused_region backend sonic stream s0
   buf in 1 t1063 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1065 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 665 task 665 node 1064 op matvec_f32 backend sonic stream s0
+step 665 task 665 node 1064 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -7261,8 +7203,6 @@ step 665 task 665 node 1064 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1058 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1066 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 666 task 666 node 1066 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -7463,7 +7403,7 @@ step 683 task 683 node 1092 op fused_region backend sonic stream s0
   buf in 1 t1093 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1095 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 684 task 684 node 1094 op matvec_f32 backend sonic stream s0
+step 684 task 684 node 1094 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -7471,8 +7411,6 @@ step 684 task 684 node 1094 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1088 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1096 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 685 task 685 node 1096 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -7673,7 +7611,7 @@ step 702 task 702 node 1122 op fused_region backend sonic stream s0
   buf in 1 t1123 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1125 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 703 task 703 node 1124 op matvec_f32 backend sonic stream s0
+step 703 task 703 node 1124 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -7681,8 +7619,6 @@ step 703 task 703 node 1124 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1118 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1126 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 704 task 704 node 1126 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -7883,7 +7819,7 @@ step 721 task 721 node 1152 op fused_region backend sonic stream s0
   buf in 1 t1153 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1155 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 722 task 722 node 1154 op matvec_f32 backend sonic stream s0
+step 722 task 722 node 1154 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -7891,8 +7827,6 @@ step 722 task 722 node 1154 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1148 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1156 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 723 task 723 node 1156 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -8093,7 +8027,7 @@ step 740 task 740 node 1182 op fused_region backend sonic stream s0
   buf in 1 t1183 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1185 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 741 task 741 node 1184 op matvec_f32 backend sonic stream s0
+step 741 task 741 node 1184 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -8101,8 +8035,6 @@ step 741 task 741 node 1184 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1178 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1186 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 742 task 742 node 1186 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -8303,7 +8235,7 @@ step 759 task 759 node 1212 op fused_region backend sonic stream s0
   buf in 1 t1213 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1215 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 760 task 760 node 1214 op matvec_f32 backend sonic stream s0
+step 760 task 760 node 1214 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -8311,8 +8243,6 @@ step 760 task 760 node 1214 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1208 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1216 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 761 task 761 node 1216 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -8513,7 +8443,7 @@ step 778 task 778 node 1242 op fused_region backend sonic stream s0
   buf in 1 t1243 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1245 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 779 task 779 node 1244 op matvec_f32 backend sonic stream s0
+step 779 task 779 node 1244 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -8521,8 +8451,6 @@ step 779 task 779 node 1244 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1238 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1246 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 780 task 780 node 1246 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -8723,7 +8651,7 @@ step 797 task 797 node 1272 op fused_region backend sonic stream s0
   buf in 1 t1273 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1275 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 798 task 798 node 1274 op matvec_f32 backend sonic stream s0
+step 798 task 798 node 1274 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -8731,8 +8659,6 @@ step 798 task 798 node 1274 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1268 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1276 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 799 task 799 node 1276 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -8933,7 +8859,7 @@ step 816 task 816 node 1302 op fused_region backend sonic stream s0
   buf in 1 t1303 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1305 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 817 task 817 node 1304 op matvec_f32 backend sonic stream s0
+step 817 task 817 node 1304 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -8941,8 +8867,6 @@ step 817 task 817 node 1304 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1298 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1306 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 818 task 818 node 1306 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -9143,7 +9067,7 @@ step 835 task 835 node 1332 op fused_region backend sonic stream s0
   buf in 1 t1333 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1335 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 836 task 836 node 1334 op matvec_f32 backend sonic stream s0
+step 836 task 836 node 1334 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -9151,8 +9075,6 @@ step 836 task 836 node 1334 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1328 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1336 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 837 task 837 node 1336 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -9353,7 +9275,7 @@ step 854 task 854 node 1362 op fused_region backend sonic stream s0
   buf in 1 t1363 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1365 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 855 task 855 node 1364 op matvec_f32 backend sonic stream s0
+step 855 task 855 node 1364 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -9361,8 +9283,6 @@ step 855 task 855 node 1364 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1358 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1366 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 856 task 856 node 1366 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -9563,7 +9483,7 @@ step 873 task 873 node 1392 op fused_region backend sonic stream s0
   buf in 1 t1393 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1395 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 874 task 874 node 1394 op matvec_f32 backend sonic stream s0
+step 874 task 874 node 1394 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -9571,8 +9491,6 @@ step 874 task 874 node 1394 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1388 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1396 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 875 task 875 node 1396 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul
@@ -9773,7 +9691,7 @@ step 892 task 892 node 1422 op fused_region backend sonic stream s0
   buf in 1 t1423 buffer b17 offset 0 size 8192 shape [8,256] dtype float32
   buf out 0 t1425 buffer b18 offset 0 size 8192 shape [8,256] dtype float32
   launch rms_norm_add grid 8x1x1 block 256x1x1 smem 512 stream s0
-step 893 task 893 node 1424 op matvec_f32 backend sonic stream s0
+step 893 task 893 node 1424 op matvec_f32 backend sonic
   attr batch 8
   attr buf 12
   attr dense_layout strided
@@ -9781,8 +9699,6 @@ step 893 task 893 node 1424 op matvec_f32 backend sonic stream s0
   attr slot 21
   buf in 0 t1418 buffer b10 offset 0 size 81920 shape [8,2560] dtype float32
   buf out 0 t1426 buffer b16 offset 0 size 8192 shape [8,256] dtype float32
-  launch pad_f32_tail_kernel grid 1280x1x1 block 256x1x1 smem 0 stream s0
-  launch copyback_tail_kernel grid 8x1x1 block 256x1x1 smem 0 stream s0
 step 894 task 894 node 1426 op fused_region backend sonic stream s0
   attr buf 13
   attr fused_region gelu_mul

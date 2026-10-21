@@ -189,8 +189,12 @@ int main(int argc, char** argv) {
   // contract. Leaving it on would make the golden text depend on the timing of
   // the cold run and on the JIT cache state, which is exactly what this test
   // exists to exclude. The hand-written tuner stays on, so the golden's own
-  // generated-attention shape (what that tuner picked) is reproduced.
+  // generated-attention shape (what that tuner picked) is reproduced. The f32
+  // dense arm is pinned because its two arms launch different kernels: the
+  // golden records the Lt arm (no vendor tail kernels), independent of the
+  // device's dense tune cache.
   ::setenv("SONICBOOM_AUTOTUNE_JIT", "0", 1);
+  ::setenv("SONICBOOM_DENSE_F32", "lt", 1);
   bool write_goldens = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
