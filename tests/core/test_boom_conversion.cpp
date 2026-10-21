@@ -54,6 +54,7 @@
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/planner/graph.h>
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul.h>
@@ -642,8 +643,15 @@ int main(int argc, char** argv) {
 
     // The golden gate. Same device-line rule as test_plan_record: the record
     // carries the device it was taken on, and part of the plan (the
-    // decode-attention split-KV grid) is sized from the SM count.
-    const std::string gpath = src_path("tests/data/plans/" + std::string(c.name) + ".plan");
+    // decode-attention split-KV grid) is sized from the SM count. Same
+    // per-profile rule too: strict keeps <name>.plan, standard uses
+    // <name>.standard.plan (f16 KV launches different attention variants).
+    const std::string suffix =
+        sonicboom::numerics_profile() == sonicboom::NumericsProfile::Standard
+            ? ".standard"
+            : "";
+    const std::string gpath =
+        src_path("tests/data/plans/" + std::string(c.name) + suffix + ".plan");
     const std::string golden = read_file(gpath);
     if (golden.empty()) {
       fail(std::string(c.name) + ": golden missing or empty: " + gpath);

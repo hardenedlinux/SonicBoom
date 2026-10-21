@@ -40,6 +40,7 @@
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/loader.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul.h>
@@ -111,10 +112,20 @@ std::string find_model(const Case& c) {
 }
 
 std::string golden_path(const Case& c) {
+  // One golden per numerics profile. Strict keeps the historical <name>.plan
+  // names, so its bytes stay comparable with every pre-profile run; standard
+  // records <name>.standard.plan, because f16 KV changes the launched attention
+  // variants (`-kv16` classes) and their smem. The two profiles are allowed to
+  // differ, so neither file may stand in for the other.
+  const std::string suffix =
+      sonicboom::numerics_profile() == sonicboom::NumericsProfile::Standard
+          ? ".standard"
+          : "";
 #ifdef SONICBOOM_SRC_DIR
-  return std::string(SONICBOOM_SRC_DIR) + "/tests/data/plans/" + c.name + ".plan";
+  return std::string(SONICBOOM_SRC_DIR) + "/tests/data/plans/" + c.name + suffix +
+         ".plan";
 #else
-  return std::string("tests/data/plans/") + c.name + ".plan";
+  return std::string("tests/data/plans/") + c.name + suffix + ".plan";
 #endif
 }
 
