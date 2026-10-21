@@ -78,24 +78,38 @@ void section(const char* title) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  bool json = false;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
     if (a == "-h" || a == "--help") {
-      std::cout << "usage: sb-explain\n"
+      std::cout << "usage: sb-explain [--json]\n"
                    "Print the automatic choices for this device: the env\n"
                    "overrides, the per-device caches, and the decision\n"
-                   "registry. Nothing is tuned or written.\n";
+                   "registry. --json prints the registry as JSON. Nothing is\n"
+                   "tuned; the only write is the registry itself.\n";
       return 0;
+    }
+    if (a == "--json") {
+      json = true;
+      continue;
     }
     std::cerr << "sb-explain: unknown option " << a << "\n";
     return 2;
   }
 
   // The device and host decisions (recorded into the registry as a side
-  // effect of resolving them once, exactly as the runtime would).
+  // effect of resolving them once, exactly as the runtime would), then the
+  // static knob table, so the registry covers every algorithm-selecting
+  // variable.
   const std::string identity = sonicboom::planner::device_identity();
   const auto device_mode = sonicboom::planner::device_reduce_mode();
   const auto cpu_mode = sonicboom::planner::cpu_reduce_mode();
+  sonicboom::planner::decisions::seed_static_knobs();
+
+  if (json) {
+    std::cout << sonicboom::planner::decisions::dump_json();
+    return sonicboom::planner::decisions::conflict_count() > 0 ? 2 : 0;
+  }
 
   std::cout << "device: " << identity << "\n"
             << "tune cache: " << sonicboom::planner::decision_cache_root()

@@ -267,6 +267,29 @@ std::string serialize_values(const std::map<std::string, int> &values) {
   return out;
 }
 
+void record_pick(std::string_view op, std::string_view key,
+                 const std::map<std::string, int> &values,
+                 planner::decisions::Source source) {
+  planner::decisions::Entry entry;
+  entry.name = "tune/" + std::string(op);
+  entry.scope = std::string(key);
+  entry.value = serialize_values(values);
+  entry.source = source;
+  entry.env = "SONICBOOM_AUTOTUNE";
+  // The caller holds g_mutex; use the locked accessor.
+  entry.inputs = "device=" + device_dir_locked() + ", class=" +
+                 std::string(key);
+  entry.candidates =
+      source == planner::decisions::Source::Cached
+          ? "the recorded pick"
+          : "the tuner's eager-warm-up sweep";
+  entry.reason = source == planner::decisions::Source::Cached
+                     ? "per-device JSON cache record"
+                     : "timed in the eager warm-up (3% win required)";
+  entry.numerics = "kernel-specific; gated by the owning test suite";
+  planner::decisions::record(entry);
+}
+
 } // namespace
 
 std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
@@ -276,9 +299,7 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
   load_op_locked(op_s);
   const auto it = g_cache[op_s].find(std::string(key));
   if (it == g_cache[op_s].end()) return {};
-  planner::decisions::record("tune/" + op_s, key, serialize_values(it->second),
-                             planner::decisions::Source::Cached,
-                             "SONICBOOM_AUTOTUNE");
+  record_pick(op_s, key, it->second, planner::decisions::Source::Cached);
   return it->second;
 }
 
@@ -290,9 +311,7 @@ void store(std::string_view op, std::string_view key,
   load_op_locked(op_s);
   g_cache[op_s][std::string(key)] = values;
   write_op_locked(op_s);
-  planner::decisions::record("tune/" + op_s, key, serialize_values(values),
-                             planner::decisions::Source::Measured,
-                             "SONICBOOM_AUTOTUNE");
+  record_pick(op_s, key, values, planner::decisions::Source::Measured);
 }
 
 void clear_memory_cache() {

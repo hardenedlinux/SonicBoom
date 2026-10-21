@@ -18,16 +18,20 @@
 
 // The decision registry (design/decision-registry.md).
 //
-// Every automatic choice — the reduction mode, a hand-written tuner's pick, a
+// Every automatic choice — a reduction mode, a hand-written tuner's pick, a
 // JIT candidate's tile — is decided once per device or per static shape class
-// and recorded here with the source that decided it and the environment
-// variable that can override it. The registry is the in-process truth that
-// sb-explain prints; the disk caches hold the same decisions across processes.
+// and recorded here with its inputs, the candidates considered, the reason it
+// won, its resource costs and the environment variable that can override it.
+// The registry is the in-process truth that sb-explain and the C API print;
+// the disk file keeps the same records across processes, in the per-device
+// decision directory the autotune caches use.
 //
-// The first record for a (name, scope) pair wins. Recording the same value
-// again is a no-op; recording a different value is a conflict: the original
-// stays and the conflict is counted, so a nondeterministic choice shows up in
-// sb-explain instead of silently changing the plan mid-session.
+// The first record for a (name, scope) pair in a process wins. Recording the
+// same value again is a no-op; recording a different value is a conflict: the
+// original stays and the conflict is counted, so a nondeterministic choice
+// shows up instead of silently changing the plan mid-session. A record loaded
+// from disk is historical: this process may resolve the same (name, scope)
+// differently (another env, another measurement) and its record replaces it.
 //
 // fingerprint() hashes the recorded (name, scope, value) triples. The plan
 // cache carries it, so a decision that changes invalidates cached plans keyed
@@ -61,30 +65,65 @@ struct Entry {
   std::string value;  // the chosen value, in its serialized form
   Source source = Source::Default;
   std::string env;    // override variable, empty when there is none
+
+  // Why the choice was made, for sb-explain.
+  std::string inputs;      // device facts / shape class the decision used
+  std::string candidates;  // alternatives considered, "|"-separated
+  std::string reason;      // the rule that picked the value
+  std::string numerics;    // numerics class (bit-identical, fp64 bound, ...)
+
+  // Declared resource costs, so a solver can choose jointly later.
+  int64_t vram_bytes = 0;
+  int64_t tuning_ms = 0;
+
+  // False when the entry was loaded from the persisted registry: this process
+  // may replace it.
+  bool current = true;
 };
 
-// Record the decision for (name, scope). True when it was stored or already
-// present with the same value; false on a conflicting value, which is counted
-// and dropped.
+// Record the decision for (name, scope) with the short form (no inputs,
+// candidates or costs). True when it was stored or already present with the
+// same value; false on a conflicting value, which is counted and dropped.
 bool record(std::string_view name, std::string_view scope,
             std::string_view value, Source source,
             std::string_view env = {});
 
-// Every recorded decision, sorted by (name, scope).
+// Record the full decision. `current` is ignored (records are always current).
+// Same return convention as the short form; a historical entry is replaced.
+bool record(const Entry& entry);
+
+// Every decision (current over historical), sorted by (name, scope).
 std::vector<Entry> snapshot();
 
-// The number of conflicting records dropped since the process started.
+// The number of conflicting current-process records dropped.
 std::size_t conflict_count();
 
 // FNV-1a of the sorted (name, scope, value) triples; 0 when no decision has
-// been recorded. Stable across processes for the same decision set.
+// been recorded.
 uint64_t fingerprint();
 
-// The textual dump sb-explain prints for the in-process decisions:
-//   <name> <scope> = <value> [source] [env=<VAR>]
+// The human table and the JSON form sb-explain / sb_explain_table and
+// sb_explain_json print:
+//   name scope = value [source] env=VAR reason="..."
+// and one JSON object per decision.
 std::string dump_text();
+std::string dump_json();
 
-// Tests only.
+// Record the algorithm-selecting environment knobs (the T0b table) for this
+// device, once per process: the env value when set, the static default
+// otherwise. sb-explain and planner_env() call this; the resolved per-class
+// choices the knobs select are recorded where they are made.
+void seed_static_knobs();
+
+// The persisted registry for this device:
+// <decision root>/<device>/decisions.jsonl.
+std::string path();
+
+// Tests only: drop the in-memory registry and this device's persisted file.
 void reset_for_test();
+
+// Tests only: drop the in-memory registry but keep the persisted file, so the
+// next call reloads it exactly as a new process would.
+void drop_memory_for_test();
 
 } // namespace sonicboom::planner::decisions

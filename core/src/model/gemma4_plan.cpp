@@ -1312,6 +1312,7 @@ static PlannerEnv planner_env() {
                  compiler::mmq_tc_max_mb(), compiler::async_prefetch_mode(),
                  compiler::vram_threshold_mb(),
                  planner::device_reduce_mode(), 0};
+  planner::decisions::seed_static_knobs();
   env.decisions = planner::decisions::fingerprint();
   return env;
 }

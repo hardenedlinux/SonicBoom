@@ -96,14 +96,60 @@ planner::decisions::Source registry_source(SourceT source) {
   return planner::decisions::Source::Default;
 }
 
+std::string join_candidates(std::span<const TileConfig> grid) {
+  std::string out;
+  for (const TileConfig& cfg : grid) {
+    if (!out.empty()) out += '|';
+    out += cfg.to_string();
+  }
+  return out;
+}
+
 // Every JIT-candidate pick is a decision for one device and shape class. The
 // env field names the switch that overrides the whole service; a single class
 // is overridden by retiming it (SONICBOOM_AUTOTUNE=force).
 void record_choice(std::string_view op, const std::string& shape_class,
                    std::string_view value,
-                   planner::decisions::Source source) {
-  planner::decisions::record(op, shape_class, value, source,
-                             "SONICBOOM_AUTOTUNE");
+                   planner::decisions::Source source,
+                   std::string_view candidates, int64_t tuning_ms = 0) {
+  planner::decisions::Entry entry;
+  entry.name = std::string(op);
+  entry.scope = shape_class;
+  entry.value = std::string(value);
+  entry.source = source;
+  entry.env = "SONICBOOM_AUTOTUNE";
+  entry.inputs = "sm=" + std::to_string(sm_version()) + ", class=" + shape_class;
+  entry.candidates = std::string(candidates);
+  entry.reason =
+      source == planner::decisions::Source::Cached
+          ? "per-SM cache record"
+          : source == planner::decisions::Source::Measured
+                ? "fastest candidate within the bit-identity gate"
+                : source == planner::decisions::Source::Skipped
+                      ? "cold budget exhausted: static default"
+                      : "static default";
+  entry.numerics = "bit-identical to candidates[0] (the static default)";
+  entry.tuning_ms = tuning_ms;
+  planner::decisions::record(entry);
+}
+
+// The spec probe stores a measured acceptance ratio rather than a tile; it is
+// still one decision per device and shape class, so it uses the same record.
+void record_ratio(std::string_view op, std::string_view shape,
+                  std::string_view value, planner::decisions::Source source) {
+  planner::decisions::Entry entry;
+  entry.name = std::string(op);
+  entry.scope = std::string(shape);
+  entry.value = std::string(value);
+  entry.source = source;
+  entry.env = "SONICBOOM_SPEC";
+  entry.inputs = "sm=" + std::to_string(sm_version()) + ", class=" +
+                 std::string(shape);
+  entry.reason = source == planner::decisions::Source::Cached
+                     ? "per-SM cache record"
+                     : "measured in this process";
+  entry.numerics = "informational: the ratio selects the spec path, not arithmetic";
+  planner::decisions::record(entry);
 }
 
 std::string cache_dir() {
@@ -445,8 +491,7 @@ bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
   if (!AutotuneCache::instance().store(op, shape, cfg)) return false;
   char value[32];
   std::snprintf(value, sizeof(value), "%.3f", ratio);
-  planner::decisions::record(op, shape, value,
-                             planner::decisions::Source::Measured);
+  record_ratio(op, shape, value, planner::decisions::Source::Measured);
   return true;
 }
 
@@ -459,8 +504,7 @@ std::optional<double> lookup_ratio(std::string_view op,
   const double ratio = double(rec->tile_m) / 1000.0;
   char value[32];
   std::snprintf(value, sizeof(value), "%.3f", ratio);
-  planner::decisions::record(op, shape, value,
-                             planner::decisions::Source::Cached);
+  record_ratio(op, shape, value, planner::decisions::Source::Cached);
   return ratio;
 }
 
@@ -491,7 +535,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
   if (!enabled()) {
     record_choice("tune/gemv", gemv_shape_class(blocks_per_row, num_rows),
                   default_config("gemv").to_string(),
-                  planner::decisions::Source::Default);
+                  planner::decisions::Source::Default,
+                  join_candidates(gemv_candidates()));
     return GemvChoice{default_config("gemv"), GemvSource::Default};
   }
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
@@ -504,7 +549,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
     if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
       const GemvChoice choice{*cached, GemvSource::Cache};
       record_choice("tune/gemv", key, cached->to_string(),
-                    registry_source(choice.source));
+                    registry_source(choice.source),
+                    join_candidates(gemv_candidates()));
       std::lock_guard<std::mutex> lock(gemv_memo_mutex());
       gemv_memo().emplace(key, choice);
       return choice;
@@ -516,7 +562,8 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
   if (budget_exhausted()) {
     const GemvChoice choice{default_config("gemv"), GemvSource::Skipped};
     record_choice("tune/gemv", key, choice.cfg.to_string(),
-                  registry_source(choice.source));
+                  registry_source(choice.source),
+                  join_candidates(gemv_candidates()));
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
     gemv_memo().emplace(key, choice);
     return choice;
@@ -528,7 +575,8 @@ bool gemv_choice_store(int blocks_per_row, int num_rows,
                        const TileConfig& cfg) {
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
   record_choice("tune/gemv", key, cfg.to_string(),
-                planner::decisions::Source::Measured);
+                planner::decisions::Source::Measured,
+                join_candidates(gemv_candidates()));
   {
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
     gemv_memo()[key] = GemvChoice{cfg, GemvSource::Measured};
@@ -596,7 +644,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
     record_choice("tune/matmul_q8_tc",
                   mmq_tc_shape_class(m_tokens, n_rows, k),
                   mmq_tc_default_config().to_string(),
-                  planner::decisions::Source::Default);
+                  planner::decisions::Source::Default,
+                  join_candidates(mmq_tc_candidates()));
     return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
   }
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
@@ -611,7 +660,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
             AutotuneCache::instance().lookup("matmul_q8_tc", key)) {
       const MmqTcChoice choice{*cached, MmqTcSource::Cache};
       record_choice("tune/matmul_q8_tc", key, cached->to_string(),
-                    registry_source(choice.source));
+                    registry_source(choice.source),
+                    join_candidates(mmq_tc_candidates()));
       std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
       mmq_tc_memo().emplace(key, choice);
       return choice;
@@ -622,7 +672,8 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
   if (budget_exhausted()) {
     const MmqTcChoice choice{mmq_tc_default_config(), MmqTcSource::Skipped};
     record_choice("tune/matmul_q8_tc", key, choice.cfg.to_string(),
-                  registry_source(choice.source));
+                  registry_source(choice.source),
+                  join_candidates(mmq_tc_candidates()));
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
     mmq_tc_memo().emplace(key, choice);
     return choice;
@@ -634,7 +685,8 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
                          const TileConfig& cfg) {
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
   record_choice("tune/matmul_q8_tc", key, cfg.to_string(),
-                planner::decisions::Source::Measured);
+                planner::decisions::Source::Measured,
+                join_candidates(mmq_tc_candidates()));
   {
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
     mmq_tc_memo()[key] = MmqTcChoice{cfg, MmqTcSource::Measured};
@@ -711,7 +763,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
   if (!enabled()) {
     record_choice("tune/attn_prefill",
                   attn_prefill_shape_class(head_dim, seq_len, n_heads),
-                  "dispatcher", planner::decisions::Source::Default);
+                  "dispatcher", planner::decisions::Source::Default,
+                  "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
     return AttnPrefillChoice{};
   }
   const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
@@ -726,7 +779,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
             AutotuneCache::instance().lookup("attn_prefill", key)) {
       const AttnPrefillChoice choice{*cached, AttnPrefillSource::Cache};
       record_choice("tune/attn_prefill", key, cached->to_string(),
-                    registry_source(choice.source));
+                    registry_source(choice.source),
+                    "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
       std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
       attn_prefill_memo().emplace(key, choice);
       return choice;
@@ -738,7 +792,8 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
   if (budget_exhausted()) {
     const AttnPrefillChoice choice{TileConfig{}, AttnPrefillSource::Skipped};
     record_choice("tune/attn_prefill", key, "dispatcher",
-                  registry_source(choice.source));
+                  registry_source(choice.source),
+                  "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     attn_prefill_memo().emplace(key, choice);
     return choice;
@@ -750,7 +805,8 @@ bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
                                const TileConfig& cfg) {
   const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
   record_choice("tune/attn_prefill", key, cfg.to_string(),
-                planner::decisions::Source::Measured);
+                planner::decisions::Source::Measured,
+                "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     attn_prefill_memo()[key] = AttnPrefillChoice{cfg, AttnPrefillSource::Measured};

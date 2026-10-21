@@ -2,119 +2,149 @@
 
 Every automatic choice SonicBoom makes for execution — a reduction mode, a
 kernel tile, an algorithm switch — is a *decision*. This document defines how
-those decisions are made, keyed, recorded, overridden and inspected.
+those decisions are made, keyed, recorded, overridden, inspected, and costed.
 
-The rule it implements:
+The rule it implements: every automatic choice is decided once per device (or
+per static shape class), recorded in the registry, keyed into the plan cache
+and the autotune cache, overridable by env, and shown by `sb-explain` and the
+C API.
 
-> Every automatic choice is decided once per device (or per static shape
-> class), recorded in the decision registry, keyed into the plan cache and the
-> autotune cache, overridable by env, and shown by `sb-explain`.
+## The decision record
 
-## Identity and scope
+A decision is `(name, scope)` plus:
+| field | meaning |
+|---|---|
+| `value` | the chosen value, serialized (`f64`, `j=64,split=2`, `br32xbc32`, ...) |
+| `source` | `default`, `env`, `cached`, `measured`, `verdict`, `skipped` |
+| `env` | the variable that overrides it (empty when none) |
+| `inputs` | the facts it used: device identity, SM version, shape class, measured ratio |
+| `candidates` | the alternatives considered, `\|`-separated |
+| `reason` | the rule that picked the value |
+| `numerics` | the numerics class: bit-identical, token-identical, fp64-ref bound, informational |
+| `vram_bytes` | declared device-memory cost (0 = unknown) |
+| `tuning_ms` | declared first-run tuning cost (0 = none) |
 
-A decision is identified by `(name, scope)`:
-
-- `name` names the choice (`reduce.mode`, `tune/gemv`, ...).
-- `scope` is `device`, `cpu`, or a static shape class (`bpr10-r2048`,
-  `64/512-1023/8-15`, ...). Shape classes bucket the problem coarsely; they
-  never contain a batch size or a KV position, so a reused prefix and a full
-  prefill resolve the same way.
+`name` names the choice (`reduce.mode`, `tune/gemv`, `mmq.min-n`, ...).
+`scope` is `device`, `cpu`, or a static shape class (`bpr10-r2048`,
+`64/512-1023/8-15`). Shape classes bucket coarsely and never contain a batch
+size or a KV position, so a reused prefix and a full prefill resolve the same
+way (R1: no algorithm selected by `n` inside a class).
 
 The first record for a `(name, scope)` pair wins. Repeating the same value is a
-no-op (the common case: a memoized per-process lookup); repeating a different
-value is a conflict, counted and dropped rather than silently replacing an
-earlier decision. `sb-explain` prints the conflict count and exits 2 if any.
+no-op; a different value is a conflict, counted and dropped rather than
+silently replacing an earlier decision. `sb-explain` exits 2 if any conflict
+was dropped.
 
-## Sources and precedence
+## Persistence and precedence
 
-| source | meaning |
-|---|---|
-| `env` | an environment variable forced the value |
-| `cached` | a record read from the per-device cache |
-| `measured` | timed in this process |
-| `verdict` | an acceptance verdict recorded by `tools/sb-numerics` |
-| `skipped` | the cold-tuning budget expired; the static default stands |
-| `default` | the static default, with no measurement and no cached pick |
+One registry per device, persisted as JSONL at
+`<decision root>/<device>/decisions.jsonl` (header line + one record per line,
+temp file + rename). A new process loads it as *historical*: the dump marks
+those records `(persisted)`, and this process may replace them when it resolves
+the same pair differently.
 
-Precedence, highest first: environment override, process memo, disk record,
-static default. `SONICBOOM_AUTOTUNE=force` skips the disk record so the class is
-retimed; `SONICBOOM_AUTOTUNE=0` skips measurement entirely and keeps the
-defaults.
+Precedence, highest first: environment override → process memo → persisted
+record → static default. `SONICBOOM_AUTOTUNE=force` skips the disk record so
+the class is retimed; `=0` skips measurement and keeps the defaults.
 
 ## Cache keys
 
-Two services persist decisions across processes:
-
 - **Hand-written tuner** (`core/src/planner/autotune.{h,cpp}`):
-  `<decision root>/<gpu>-sm<arch>-<driver>-reduce-<mode>/<op>.json`. The device
-  identity and the reduction mode are part of the key; a record is keyed by its
-  shape class. Versioned JSON (`__format__`), written by temp file + rename.
+  `<decision root>/<gpu>-sm<arch>-<driver>-reduce-<mode>/<op>.json`. Device
+  identity and reduction mode are part of the key; entries are keyed by shape
+  class. Versioned JSON (`__format__`), temp file + rename.
 - **JIT candidate tuner** (`core/src/planner/mlir_autotune.{h,cpp}`):
   `<cache>/sonicboom/autotune/sm_<NN>.bin`, one versioned fixed-record file per
-  compute capability, flock-protected. Records are keyed by `(op, shape
-  class)`.
+  compute capability, flock-protected, keyed by `(op, shape class)`.
+- **Spec ratio**: the `spec_verify_ratio` record in the per-SM JIT file.
+- **Plan cache**: `PlannerEnv` carries `decisions::fingerprint()`, an FNV-1a
+  hash of the sorted `(name, scope, value)` triples. A new decision changes the
+  fingerprint and invalidates cached prefill segments. Plan-record goldens pin
+  `SONICBOOM_AUTOTUNE_JIT=0` because their text is static kernel geometry, not
+  a per-device measurement.
 
 The decision root is `$SONICBOOM_TUNE_DIR`, else
-`$XDG_CACHE_HOME/sonicboom/tune`, else `$HOME/.cache/sonicboom/tune`
-(`SONICBOOM_TUNE_DIR` is the test seam; `XDG_CACHE_HOME` covers both services).
+`$XDG_CACHE_HOME/sonicboom/tune`, else `$HOME/.cache/sonicboom/tune`.
 
-The **plan cache** (prefill segments, `PlannerEnv` in
-`core/src/model/gemma4_plan.cpp`) carries `decisions::fingerprint()`: an FNV-1a
-hash of the sorted `(name, scope, value)` triples recorded so far. A newly
-recorded decision changes the fingerprint, invalidates the cached segments,
-and makes the next segment build use the new set. Plan-record goldens pin
-`SONICBOOM_AUTOTUNE_JIT=0` because their text is the static kernel geometry,
-not a per-device measurement.
+## Variables, constraints, objective
+
+- **Variables**: reduction mode, spec probe, autotune level, MMQ (`enabled`,
+  `j`, `decomp`, `min-n`), attention (impl, prefill, decode, chunk), dense
+  (cuBLAS, Lt, GEMM, min-n), gemv width, async prefetch, CUDA graphs, training
+  switches. The static T0b table is seeded by `seed_static_knobs()`.
+- **Constraints**: R1 (one kernel per class, chosen by device and class only);
+  each entry's numerics gate (bit-identical preferred, else fp64-ref error ≤
+  current with top-1 ≥ 99%); cache keys contain every variable that changes a
+  graph; no `cudaMalloc` in a capture; VRAM ≤ the device budget.
+- **Objective**: minimize kernel time for the model at the operating shape
+  (Gemma pp512 kernel time at or below the llama.cpp baseline, decode not
+  regressed), subject to the constraints above.
+
+### Interactions
+
+- **VRAM budget** couples async prefetch (its staged buffers), MMQ tensor-core
+  `q8_1` copies (weight conversion cache, `SONICBOOM_MMQ_TC_MAX_MB`), CUDA-graph
+  capture reuse (one capture per prefill shape), and the KV cache size
+  (`n_ctx`). Each new resident buffer shrinks the KV budget; a joint solver
+  must price them together.
+- **MMQ decomposition/tile** changes summation order, so it is class-wide and
+  also pins which plan is reusable for prefix reuse.
+- **Attention chunk** interacts with the window (SWA) and split-KV; changing it
+  changes the split and therefore token identity, so only the identity rule is
+  automatic (R1).
+- **Reduction mode** changes the norm kernels' instruction mix and is part of
+  the hand-written tuner's device key.
+- **Spec mode** depends on the verify/plain step ratio, which depends on the
+  MMQ and attention choices; the probe must run after those are resolved.
 
 ## Environment overrides
-
-Each decision type has a switch that overrides it wholesale:
 
 | decisions | override |
 |---|---|
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
-| JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0` (defaults), `SONICBOOM_AUTOTUNE_BUDGET_MS` |
-| spec probe ratio | `SONICBOOM_SPEC=off\|on\|auto` (auto uses the record) |
+| JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
+| spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto`, `SONICBOOM_SPEC_PROBE_MS` |
+| the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 
-The static algorithm switches (`SONICBOOM_MMQ`, `SONICBOOM_ATTN_PREFILL`, ...)
-keep their documented meaning; `sb-explain` prints each one with its default
-and whether it is set.
+No algorithm-selecting variable has to be set by hand: each has a default or an
+automatic choice, and the registry records which one applied.
 
-## Current inventory
+## Inventory
 
-| name | scope | stored in |
+| name | scope | storage |
 |---|---|---|
-| `reduce.mode`, `reduce.df32-acceptance`, `reduce.double-cost-ratio`, `reduce.cpu-measurement` | device / cpu | registry (verdict files on disk) |
+| `reduce.mode`, `reduce.df32-acceptance`, `reduce.double-cost-ratio`, `reduce.cpu-measurement` | device / cpu | registry + verdict file |
 | `tune/attention-prefill`, `tune/attention-decode`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
-| `tune/gemv`, `tune/matmul_q8_tc`, `tune/attn_prefill` | shape class | per-SM JIT file |
-| `spec_verify_ratio` | `decode` | per-SM JIT file |
+| `tune/gemv`, `tune/matmul_q8_tc`, `tune/attn_prefill`, `spec_verify_ratio` | shape class | per-SM JIT file |
+| `mmq.*`, `attention.*`, `dense.*`, `gemv.*`, `spec.*`, `train.*`, feature switches | device | seeded from the T0b table |
 
-## sb-explain
+## Inspection: sb-explain and the C API
 
 `tools/build_sb_explain.sh` builds `tools/sb-explain` against
-`libsonicboom.so`. It prints, without tuning or writing anything:
+`libsonicboom.so`. Without options it prints the device identity and cache
+paths, every `SONICBOOM_*` switch (value, default, meaning), the resolved
+reduction modes, the registry as a human table, the caches on disk, and the
+static JIT defaults. `--json` prints the registry as a JSON document. It tunes
+nothing.
 
-1. the device identity and both cache paths;
-2. every relevant `SONICBOOM_*` switch with its current value, default and
-   meaning;
-3. the resolved reduction modes;
-4. the decision registry for the decisions the tool itself resolves;
-5. the hand-written tuner choices on disk;
-6. the JIT candidate records on disk;
-7. the static JIT defaults.
+The same two views are exported through the C ABI:
 
-Run it before a benchmark to confirm which decisions a run will use; pair it
-with `SONICBOOM_AUTOTUNE=force` to see the picks after a retime.
+```c
+sb_status sb_explain_table(char *buf, size_t cap, size_t *len_out, sb_error **);
+sb_status sb_explain_json (char *buf, size_t cap, size_t *len_out, sb_error **);
+```
+
+Two-call sizing: a NULL/short buffer yields `SB_ERR_BINDING` and the byte count
+in `*len_out`.
 
 ## Adding a decision
 
 1. Give it a stable `name` and a scope that is a device or a static class —
-   never a live batch size or position.
-2. Resolve it once (function-local static or a memo keyed by the class).
-3. Record it with `planner::decisions::record(name, scope, value, source, env)`
-   at every path that resolves it: env override, cache hit, measurement,
-   static default.
-4. Persist it in a cache keyed by device identity (and the reduction mode when
+   never a live batch size or position; resolve it once.
+2. Record a full `Entry` at every path that resolves it: env override, cache
+   hit, measurement, static default; declare its candidates, reason, numerics
+   class and VRAM and tuning costs.
+3. Persist it in a cache keyed by device identity (and the reduction mode when
    the kernel's instruction mix depends on it).
-5. Add its environment override to the `sb-explain` table and to this file.
+4. Add its environment override to the `sb-explain` table and to this file.

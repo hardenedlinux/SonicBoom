@@ -107,9 +107,18 @@ Verdict cpu_df32_verdict() {
 }
 
 void record_verdict(std::string_view scope, Verdict verdict) {
-  decisions::record("reduce.df32-acceptance", scope, verdict_name(verdict),
-                    verdict == Verdict::Absent ? decisions::Source::Default
-                                               : decisions::Source::Verdict);
+  decisions::Entry entry;
+  entry.name = "reduce.df32-acceptance";
+  entry.scope = std::string(scope);
+  entry.value = verdict_name(verdict);
+  entry.source = verdict == Verdict::Absent ? decisions::Source::Default
+                                            : decisions::Source::Verdict;
+  entry.inputs = "tools/sb-numerics acceptance suite";
+  entry.reason = verdict == Verdict::Absent
+                     ? "no verdict recorded: f64 is the safe choice"
+                     : "verdict recorded per device by sb-numerics";
+  entry.numerics = "max ulp <= 1, top-1 >= 99.9%, fp64-ref error <= 2x f64";
+  decisions::record(entry);
 }
 
 // --- CPU measurement -------------------------------------------------------
@@ -162,7 +171,12 @@ double best_ns(F&& body) {
   return best;
 }
 
-compiler::ReduceMode measure_cpu() {
+struct CpuMeasure {
+  compiler::ReduceMode mode = compiler::ReduceMode::F64;
+  double ratio = 0.0;  // f64 ns / df32 ns; > 1 means f64 is more expensive
+};
+
+CpuMeasure measure_cpu() {
   constexpr int n = 2560;
   constexpr int reps = 512;
   for (int i = 0; i < n; ++i) {
@@ -172,10 +186,11 @@ compiler::ReduceMode measure_cpu() {
   const double ns64 = best_ns([&] { return time_f64(n, reps); });
   const double nsdf =
       best_ns([&] { return time_df32(n, reps); });
-  if (nsdf <= 0.0) return compiler::ReduceMode::F64;
-  const double ratio = ns64 / nsdf;  // >1: f64 is the more expensive one
-  return ratio <= kMaxDoubleCostRatio ? compiler::ReduceMode::F64
-                                      : compiler::ReduceMode::Df32;
+  if (nsdf <= 0.0) return {};
+  const double ratio = ns64 / nsdf;
+  return CpuMeasure{ratio <= kMaxDoubleCostRatio ? compiler::ReduceMode::F64
+                                                 : compiler::ReduceMode::Df32,
+                    ratio};
 }
 
 } // namespace
@@ -237,12 +252,37 @@ bool record_df32_acceptance(bool accepted, std::string *error) {
 
 std::optional<compiler::ReduceMode> reduce_mode_env() { return env_override(); }
 
+namespace {
+
+void record_mode(std::string_view scope, compiler::ReduceMode chosen,
+                 decisions::Source source, std::string inputs,
+                 std::string reason, int64_t tuning_ms = 0) {
+  decisions::Entry entry;
+  entry.name = "reduce.mode";
+  entry.scope = std::string(scope);
+  entry.value = compiler::reduce_mode_name(chosen);
+  entry.source = source;
+  entry.env = "SONICBOOM_REDUCE";
+  entry.inputs = std::move(inputs);
+  entry.candidates = "f64|df32|f32";
+  entry.reason = std::move(reason);
+  entry.numerics =
+      chosen == compiler::ReduceMode::F64
+          ? "f64 reference"
+          : chosen == compiler::ReduceMode::Df32
+                ? "two-sum f32 pair; acceptance verdict gates selection"
+                : "f32 reference only; never automatic";
+  entry.tuning_ms = tuning_ms;
+  decisions::record(entry);
+}
+
+} // namespace
+
 compiler::ReduceMode device_reduce_mode() {
   static const compiler::ReduceMode mode = [] {
     if (auto env = env_override()) {
-      decisions::record("reduce.mode", "device",
-                        compiler::reduce_mode_name(*env),
-                        decisions::Source::Env, "SONICBOOM_REDUCE");
+      record_mode("device", *env, decisions::Source::Env, "env override",
+                  "SONICBOOM_REDUCE set explicitly");
       return *env;
     }
 #if SONICBOOM_USE_CUDA
@@ -263,15 +303,22 @@ compiler::ReduceMode device_reduce_mode() {
             ratio <= kMaxDoubleCostRatio || verdict != Verdict::Accepted
                 ? compiler::ReduceMode::F64
                 : compiler::ReduceMode::Df32;
-        decisions::record("reduce.mode", "device",
-                          compiler::reduce_mode_name(chosen),
-                          decisions::Source::Default, "SONICBOOM_REDUCE");
+        record_mode("device", chosen, decisions::Source::Default,
+                    "singleToDoublePrecisionPerfRatio=" +
+                        std::to_string(ratio) + ", df32 verdict=" +
+                        verdict_name(verdict),
+                    ratio <= kMaxDoubleCostRatio
+                        ? "double cost ratio <= 4: f64 is affordable"
+                        : verdict != Verdict::Accepted
+                              ? "df32 not accepted on this device: f64"
+                              : "df32 accepted and doubles expensive: df32");
         return chosen;
       }
     }
 #endif
-    decisions::record("reduce.mode", "device", "f64",
-                      decisions::Source::Default, "SONICBOOM_REDUCE");
+    record_mode("device", compiler::ReduceMode::F64,
+                decisions::Source::Default, "no CUDA device visible",
+                "device properties unavailable: f64");
     return compiler::ReduceMode::F64;
   }();
   return mode;
@@ -280,26 +327,45 @@ compiler::ReduceMode device_reduce_mode() {
 compiler::ReduceMode cpu_reduce_mode() {
   static const compiler::ReduceMode mode = [] {
     if (auto env = env_override()) {
-      decisions::record("reduce.mode", "cpu",
-                        compiler::reduce_mode_name(*env),
-                        decisions::Source::Env, "SONICBOOM_REDUCE");
+      record_mode("cpu", *env, decisions::Source::Env, "env override",
+                  "SONICBOOM_REDUCE set explicitly");
       return *env;
     }
-    const compiler::ReduceMode measured = measure_cpu();
-    decisions::record("reduce.cpu-measurement", "cpu",
-                      compiler::reduce_mode_name(measured),
-                      decisions::Source::Measured);
+    const auto started = std::chrono::steady_clock::now();
+    const CpuMeasure measured = measure_cpu();
+    const int64_t tuning_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    decisions::Entry measurement;
+    measurement.name = "reduce.cpu-measurement";
+    measurement.scope = "cpu";
+    measurement.value = compiler::reduce_mode_name(measured.mode);
+    measurement.source = decisions::Source::Measured;
+    measurement.inputs = "f64/df32 cost ratio=" +
+                         std::to_string(measured.ratio);
+    measurement.reason = "measured on this host";
+    measurement.tuning_ms = tuning_ms;
+    decisions::record(measurement);
     const Verdict verdict = cpu_df32_verdict();
     record_verdict("cpu", verdict);
     // The host is subject to the same two tests as the device: DF32 only when
     // the measurement says doubles are expensive here AND sb-numerics recorded
     // that DF32 is acceptable here.
     const compiler::ReduceMode chosen =
-        measured == compiler::ReduceMode::Df32 && verdict != Verdict::Accepted
+        measured.mode == compiler::ReduceMode::Df32 &&
+                verdict != Verdict::Accepted
             ? compiler::ReduceMode::F64
-            : measured;
-    decisions::record("reduce.mode", "cpu", compiler::reduce_mode_name(chosen),
-                      decisions::Source::Measured, "SONICBOOM_REDUCE");
+            : measured.mode;
+    record_mode("cpu", chosen, decisions::Source::Measured,
+                "f64/df32 cost ratio=" + std::to_string(measured.ratio) +
+                    ", df32 verdict=" + verdict_name(verdict),
+                measured.mode == compiler::ReduceMode::Df32
+                    ? (verdict == Verdict::Accepted
+                           ? "doubles expensive on this host and df32 accepted"
+                           : "df32 not accepted on this host: f64")
+                    : "double cost ratio <= 4: f64 is affordable",
+                tuning_ms);
     return chosen;
   }();
   return mode;

@@ -103,6 +103,80 @@ int main() {
   check(dump.find("conflicting") != std::string::npos,
         "the dump reports the dropped conflict");
 
+  // --- a full decision: inputs, candidates, reason, costs, persistence ------
+  {
+    dr::Entry entry;
+    entry.name = "attention.decode";
+    entry.scope = "d256-gqa4";
+    entry.value = "codegen chunk=16";
+    entry.source = dr::Source::Measured;
+    entry.env = "SONICBOOM_ATTN_DECODE";
+    entry.inputs = "sm=86, class=d256-gqa4";
+    entry.candidates = "own|codegen";
+    entry.reason = "the measured arm within the token-identity gate";
+    entry.numerics = "token-identical";
+    entry.vram_bytes = 4096;
+    entry.tuning_ms = 7;
+    check(dr::record(entry), "the full decision is stored");
+    const std::string text = dr::dump_text();
+    check(text.find("reason=\"the measured arm within the token-identity gate\"") !=
+              std::string::npos &&
+              text.find("vram_bytes=4096") != std::string::npos &&
+              text.find("tuning_ms=7") != std::string::npos,
+          "the human table carries the reason and the declared costs");
+    const std::string json = dr::dump_json();
+    check(json.find("\"name\":\"attention.decode\"") != std::string::npos &&
+              json.find("\"scope\":\"d256-gqa4\"") != std::string::npos &&
+              json.find("\"vram_bytes\":4096") != std::string::npos &&
+              json.find("\"tuning_ms\":7") != std::string::npos,
+          "the JSON carries the same decision");
+
+    // A new process reloads the persisted record as historical: the dump marks
+    // it, and this process may replace it with a different (env) value.
+    const fs::path persisted = dr::path();
+    check(fs::exists(persisted), "the decision is persisted for the device");
+    dr::drop_memory_for_test();
+    const auto reloaded = dr::snapshot();
+    const dr::Entry* hist = find(reloaded, "attention.decode", "d256-gqa4");
+    check(hist && !hist->current && hist->vram_bytes == 4096 &&
+              hist->reason == "the measured arm within the token-identity gate",
+          "a persisted record reloads with its metadata");
+    check(dr::dump_text().find("(persisted)") != std::string::npos,
+          "the table marks a reloaded record");
+    dr::Entry override_entry = entry;
+    override_entry.value = "own";
+    override_entry.source = dr::Source::Env;
+    check(dr::record(override_entry),
+          "this process replaces the historical record");
+    check(dr::conflict_count() == 0,
+          "replacing a historical record is not a conflict");
+    check(find(dr::snapshot(), "attention.decode", "d256-gqa4")->source ==
+              dr::Source::Env,
+          "the new record wins");
+    dr::reset_for_test();
+  }
+
+  // --- the T0b knob table is a set of decisions ------------------------------
+  {
+    dr::reset_for_test();
+    ::unsetenv("SONICBOOM_MMQ");
+    ::setenv("SONICBOOM_MMQ_MIN_N", "4", 1);
+    dr::seed_static_knobs();
+    const auto entries = dr::snapshot();
+    const dr::Entry* mmq = find(entries, "mmq.enabled", "device");
+    check(mmq && mmq->source == dr::Source::Default && mmq->value == "on" &&
+              mmq->env == "SONICBOOM_MMQ",
+          "an unset knob records its static default");
+    const dr::Entry* min_n = find(entries, "mmq.min-n", "device");
+    check(min_n && min_n->source == dr::Source::Env && min_n->value == "4",
+          "a set knob records the env override");
+    dr::seed_static_knobs();
+    check(dr::conflict_count() == 0,
+          "seeding twice is idempotent, not a conflict");
+    ::unsetenv("SONICBOOM_MMQ_MIN_N");
+    dr::reset_for_test();
+  }
+
   // --- the hand-written tuner records its picks -----------------------------
   {
     dr::reset_for_test();

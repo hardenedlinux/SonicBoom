@@ -13,7 +13,9 @@ add_library(sonicboom_capi OBJECT src/capi.cpp)
 # private implementation dependency (never re-exposed).
 target_include_directories(sonicboom_capi
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-  PRIVATE ${CMAKE_SOURCE_DIR}/core/include)
+  # core/src is private internal state (the decision registry, printed by
+  # sb_explain_*), never re-exposed through capi.h.
+  PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${CMAKE_SOURCE_DIR}/core/src)
 
 # Build info for sb_build_info(). The values are resolved once in the top-level
 # CMakeLists.txt — the commit, the CUDA architectures nvcc really compiles, the

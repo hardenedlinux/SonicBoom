@@ -42,6 +42,10 @@
 #include <sonicboom/training/param.h>
 #include <sonicboom/vocab/vocab.h>
 
+// core/src is a private include directory for this target (core/CMakeLists):
+// the decision registry is internal runtime state, not a Layer 2 header.
+#include "planner/decision_registry.h"
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -2107,6 +2111,51 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
         }
         *n_out = n;
         return SB_OK;
+      },
+      err_out);
+}
+
+// --- Decision registry -----------------------------------------------------
+
+namespace {
+
+// The shared buffer contract of the two explain calls: *len_out always gets
+// the needed byte count (including the NUL), so a caller with a NULL buffer or
+// a short one can size and retry from the same status.
+sb_status copy_explain_text(const std::string &text, char *buf, size_t cap,
+                            size_t *len_out, sb_error **err_out) {
+  if (len_out == nullptr) return fail_arg(err_out);
+  const size_t need = text.size() + 1;
+  *len_out = need;
+  if (buf == nullptr || cap < need) {
+    set_error(err_out, SB_ERRKIND_BINDING,
+              "sb_explain: buffer too small (see *len_out)");
+    return SB_ERR_BINDING;
+  }
+  std::memcpy(buf, text.c_str(), need);
+  return SB_OK;
+}
+
+} // namespace
+
+sb_status sb_explain_table(char *buf, size_t cap, size_t *len_out,
+                           sb_error **err_out) {
+  return guard(
+      [&] {
+        planner::decisions::seed_static_knobs();
+        return copy_explain_text(planner::decisions::dump_text(), buf, cap,
+                                 len_out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_explain_json(char *buf, size_t cap, size_t *len_out,
+                          sb_error **err_out) {
+  return guard(
+      [&] {
+        planner::decisions::seed_static_knobs();
+        return copy_explain_text(planner::decisions::dump_json(), buf, cap,
+                                 len_out, err_out);
       },
       err_out);
 }
