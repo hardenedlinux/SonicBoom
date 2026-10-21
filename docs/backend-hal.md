@@ -16,7 +16,7 @@ runtime to make v0 correct, and now needs to be generalized so that:
    HAL.
 2. **First-party backends are CPU and CUDA only.** Vulkan is a community target;
    the architecture must permit it and keep the bar for a third-party backend low.
-3. **ggml is not integrated** (llama.cpp is a marketing comparison target, not a
+3. **ggml is not integrated** (llama.cpp is the reference baseline, not a
    dependency). The HAL may draw on ggml's backend interface and IREE's HAL for
    shape, but it is SonicBoom's own.
 4. **Implementation precedence: MLIR > graph optimization (planner passes / pattern
@@ -423,7 +423,7 @@ Deliverable 2 (CUDA backend → `libsonicboom-backend-cuda.so`, dlopen'd) is
    restructuring `third_party/native-torch/CMakeLists.txt` into `aten_core`
    (CPU-only) + `aten_core_cuda` (the CUDA globs + `RegisterCUDA*` generated
    files).
-   **Migration-manifest gate (corrected):** `design/native-torch-migration.md`
+   **Migration-manifest gate (corrected):** the native-torch migration manifest
    **exists**, but it classifies the CUDA sources as **deferred / EXCLUDE for v0**
    (`aten/src/ATen/cuda/**`, `native/cuda/**`, `c10/cuda/**` — see its CUDA
    section), with a "reopen condition" that CUDA becomes a separate amendment
@@ -480,7 +480,7 @@ Ordered, each step independently buildable/testable:
 4. **Step 3 — community-backend scaffolding.** Vulkan stub (compiles, registers,
    discovered, zero ops → full CPU fallback; no real Vulkan compute; default off);
    op-level consistency suite runnable against any backend vs the CPU reference
-   (CUDA must pass); `design/backend-author-guide.md`.
+   (CUDA must pass); [`backend-author-guide.md`](backend-author-guide.md).
 5. **Step 4 — runtime loading.** CUDA backend → `libsonicboom-backend-cuda.so`,
    dlopen'd; `SONICBOOM_USE_CUDA=OFF` build with no CUDA references and clean
    `ctest` (CUDA tests skipped). Resolve the §3.2 native-torch split; stop and

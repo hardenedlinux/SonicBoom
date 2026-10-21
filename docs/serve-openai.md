@@ -4,10 +4,10 @@ Status: **prototype**, with two implementations of the backend protocol. The
 default `--backend real` drives a GGUF through libsonicboom's C ABI (the Guile
 binding), and `--backend mock` is the deterministic in-process backend the
 tests use. The application layer of the production inference route (Route 2 /
-Path 2 of `design/execution-paths.md`): an HTTP service speaking the OpenAI
+Path 2): an HTTP service speaking the OpenAI
 chat-completions API, written in Guile on GNU Artanis. The backend interface is
 the one a libsonicboom backend implements; its C ABI is drafted in
-`design/route2-capi-draft.md`.
+[`capi.md`](capi.md).
 
 ## 1. Layout
 
@@ -202,7 +202,7 @@ Streaming over Artanis: Artanis has no streaming body; `sse.scm` streams by
 switching the connection to its own Ragnarok protocol for one response, and
 the WebSocket replies are generated in a thread so the connection task can
 write each chunk. Details, and the Artanis changes that would replace both
-workarounds: `design/artanis-streaming-notes.md`.
+workarounds: [`artanis-streaming-notes.md`](artanis-streaming-notes.md).
 
 Options: `--backend real|mock`, `--model`, `--model-id`, `--host`, `--port`,
 `--queue`, `--max-sessions`, `--token-budget`, `--context-length`,

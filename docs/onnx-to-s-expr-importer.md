@@ -22,7 +22,7 @@ S-Expr v0.1 remains the canonical interchange format. The importer is a
 - Its output is ordinary S-Expr v0.1 text — it does **not** bypass the parser or
   the validator, and it introduces **no new syntax**.
 - The generated document is parsed/validated/lowered by exactly the same code
-  that consumes the hand-authored fixture (`design/s-expr-v0-resnet18.example.sx`).
+  that consumes the hand-authored fixture (`tests/data/s-expr-v0-resnet18.example.sx`).
 - Nothing in this tool is linked into `libsonicboom.so`; the C ABI and Layer 2
   interfaces are unchanged, and no ONNX/protobuf/MLIR/LLVM/ATen/c10 type appears
   in them.
@@ -50,7 +50,7 @@ C++ dependency, no coupling between the ONNX reader and the core.
 | `tools/onnx2sx/__init__.py` / `__main__.py` | `python -m onnx2sx` entry point |
 | `tools/onnx2sx/test_importer.py` | 16 unit tests over programmatic ONNX fixtures |
 | `tests/core/test_onnx_import_resnet18_exec.cpp` | end-to-end: imported ResNet-18 vs reference |
-| `design/onnx-to-s-expr-importer.md` | this document |
+| `docs/onnx-to-s-expr-importer.md` | this document |
 
 ## Supported subset
 
@@ -107,7 +107,7 @@ The sidecar's byte ordering is `np.ascontiguousarray(arr).tobytes()`
 (little-endian on all supported hosts); offsets/lengths are recomputed from the
 accumulated blob so they are always self-consistent. The importer's ResNet-18
 sidecar is byte-identical to the reference generator's
-`design/resnet18.weights.bin`, confirming exact ordering.
+`tests/data/resnet18.weights.bin`, confirming exact ordering.
 
 ## Shape inference
 

@@ -5,7 +5,7 @@ of the Guile inference service (`bindings/guile/scheme/sonicboom/serve/backend.s
 to the C ABI that `libsonicboom.so` would need to export, so the mock backend
 can be replaced by a libsonicboom one without changing the service.
 
-"Route 2" is Path 2 of `design/execution-paths.md`: GGUF → model loader →
+"Route 2" is Path 2 of the execution-path plan: GGUF → model loader →
 planner spine → native-torch / hand-written CUDA / MLIR kernels (Gemma 4 E4B
 today). The functions below are a facade over that path. They follow
 `capi/include/sonicboom/capi.h` and the C API rules of `CLAUDE.md`:

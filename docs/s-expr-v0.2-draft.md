@@ -136,8 +136,8 @@ without parsing names. It is reserved and not used by the prototype.
 - **Readers.** A v0.1 reader that ignores the attribute still computes the
   same result.
 
-Whether native-torch actually has a kernel for each name is recorded in
-`design/guile-tracing-prototype.md`, §4.17.
+Whether native-torch actually has a kernel for each name is recorded in the
+Guile tracing prototype notes.
 
 **Minimal example:**
 

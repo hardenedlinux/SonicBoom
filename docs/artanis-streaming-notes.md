@@ -1,7 +1,7 @@
 # GNU Artanis: streaming support, and the changes it would need
 
 Findings from building the OpenAI-compatible service
-(`bindings/guile/scheme/sonicboom/serve/`, see `design/serve-openai.md`) on
+(`bindings/guile/scheme/sonicboom/serve/`, see [`serve-openai.md`](serve-openai.md)) on
 GNU Artanis. Artanis itself was **not** modified; the service works around
 each point inside `serve/`. This note lists what Artanis would need so the
 workarounds can go.
