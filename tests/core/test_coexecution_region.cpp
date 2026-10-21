@@ -27,7 +27,7 @@
 // output, and a byte-count mismatch) and B (a missing MLIR backend).
 
 #include <sonicboom/planner/backend.h>
-#include <sonicboom/planner/native_torch_backend.h>
+#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/runtime_executor.h>
@@ -232,7 +232,7 @@ int main() {
     auto region_doc = region_slice(*doc, *g, *t_z);
     check(region_doc.has_value(), "A: region slices");
     auto cpu = pl::CpuBackend::compile(*region_doc, {});
-    auto nt = pl::NativeTorchBackend::compile(*g);
+    auto nt = pl::CpuKernelBackend::compile(*g);
     check(cpu && nt, "A: backends compile");
     if (!(cpu && nt))
       return 1;
@@ -289,7 +289,7 @@ int main() {
           "B: region z is native");
 
     auto cpu = pl::CpuBackend::compile(*region_slice(*doc, *g, *t_a), {});
-    auto nt = pl::NativeTorchBackend::compile(*g);
+    auto nt = pl::CpuKernelBackend::compile(*g);
     check(cpu && nt, "B: backends compile");
     if (!(cpu && nt))
       return 1;
@@ -344,7 +344,7 @@ int main() {
     check(t_z->dependencies.size() == 2, "C: region depends on both native tasks");
 
     auto cpu = pl::CpuBackend::compile(*region_slice(*doc, *g, *t_z), {});
-    auto nt = pl::NativeTorchBackend::compile(*g);
+    auto nt = pl::CpuKernelBackend::compile(*g);
     check(cpu && nt, "C: backends compile");
     if (!(cpu && nt))
       return 1;
@@ -382,7 +382,7 @@ int main() {
       return 1;
 
     auto cpu = pl::CpuBackend::compile(*region_slice(*doc, *g, *t_z), {});
-    auto nt = pl::NativeTorchBackend::compile(*g);
+    auto nt = pl::CpuKernelBackend::compile(*g);
     check(cpu && nt, "D: backends compile");
     if (!(cpu && nt))
       return 1;
@@ -429,7 +429,7 @@ int main() {
 
     auto cpu_a = pl::CpuBackend::compile(*region_slice(*doc, *g, *t_a), {});
     auto cpu_z = pl::CpuBackend::compile(*region_slice(*doc, *g, *t_z), {});
-    auto nt = pl::NativeTorchBackend::compile(*g);
+    auto nt = pl::CpuKernelBackend::compile(*g);
     check(cpu_a && cpu_z && nt, "F: backends compile");
     if (!(cpu_a && cpu_z && nt))
       return 1;

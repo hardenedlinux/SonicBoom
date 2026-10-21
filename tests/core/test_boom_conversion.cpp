@@ -489,6 +489,16 @@ int main(int argc, char** argv) {
   if (dump_dir.empty())
     dump_dir = std::filesystem::temp_directory_path() / "sonicboom-boom-ir";
 
+  // The committed goldens record the static kernel geometry: the JIT candidate
+  // tuner's picks are a per-device measurement decision, so leaving it on
+  // would make the golden text depend on the timing of the cold run and on
+  // the JIT cache state. Same rule as test_plan_record. The f32 dense arm is
+  // the same kind of decision (its two arms launch different kernels), so the
+  // golden pins the Lt arm rather than recording whatever the device's tune
+  // cache currently holds.
+  ::setenv("SONICBOOM_AUTOTUNE_JIT", "0", 1);
+  ::setenv("SONICBOOM_DENSE_F32", "lt", 1);
+
   // The dialect-level check first: it needs no model and no device, so a
   // CPU-only run still covers it. Its failures are reported before the gate
   // below, so a skip never hides one.

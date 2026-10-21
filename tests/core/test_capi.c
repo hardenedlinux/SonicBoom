@@ -257,12 +257,58 @@ static void test_llm_prefill_full_reuse(void) {
   sb_llm_model_free(model);
 }
 
+/* The decision registry is readable through the C ABI as a table and as JSON,
+ * with the same two-call sizing contract as the other string calls. */
+static void test_explain(void) {
+  size_t need = 0;
+  sb_error *err = NULL;
+  check(sb_explain_table(NULL, 0, &need, &err) == SB_ERR_BINDING,
+        "explain: a NULL buffer reports the needed size");
+  check(need > 1, "explain: the table has content");
+  check(sb_error_get_kind(err) == SB_ERRKIND_BINDING,
+        "explain: the short-buffer error is a binding error");
+  sb_error_free(err);
+  err = NULL;
+
+  char *table = (char *)malloc(need);
+  check(table != NULL, "explain: the table buffer allocates");
+  if (table != NULL) {
+    size_t written = 0;
+    check(sb_explain_table(table, need, &written, &err) == SB_OK,
+          "explain: the table fits the reported size");
+    check(written == need && table[written - 1] == '\0',
+          "explain: the table is NUL-terminated");
+    check(strstr(table, "mmq.enabled device = ") != NULL &&
+              strstr(table, "reason=\"") != NULL,
+          "explain: the table names a decision and its reason");
+    free(table);
+  }
+
+  need = 0;
+  check(sb_explain_json(NULL, 0, &need, &err) == SB_ERR_BINDING,
+        "explain: the JSON reports the needed size");
+  char *json = (char *)malloc(need);
+  check(json != NULL, "explain: the JSON buffer allocates");
+  if (json != NULL) {
+    size_t written = 0;
+    check(sb_explain_json(json, need, &written, &err) == SB_OK,
+          "explain: the JSON fits the reported size");
+    check(strstr(json, "\"decisions\": [") != NULL &&
+              strstr(json, "\"vram_bytes\":") != NULL &&
+              strstr(json, "\"tuning_ms\":") != NULL,
+          "explain: the JSON carries decisions and their declared costs");
+    free(json);
+  }
+  sb_error_free(err);
+}
+
 int main(void) {
   test_end_to_end();
   test_binding_error();
   test_parse_error();
   test_error_slot_reuse();
   test_llm_prefill_full_reuse();
+  test_explain();
 
   if (g_failures == 0) {
     printf("test_capi OK (C ABI parse/compile/bind/execute/retrieve/release)\n");

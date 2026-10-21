@@ -160,6 +160,11 @@ target_link_libraries(sonicboom_compiler PRIVATE
   # The llvm dialect's own translation (llvm.mlir.constant et al.).
   MLIRLLVMIRToLLVMTranslation
   MLIRTargetLLVMIRExport
+  # GlueCodegen registers the builtin/LLVM dialect translations into the
+  # context's registry (register{Builtin,LLVM}DialectTranslation) before the
+  # NVVM-to-PTX serializer runs; those symbols live in these two libraries.
+  MLIRBuiltinToLLVMIRTranslation
+  MLIRLLVMToLLVMIRTranslation
   MLIRArithToLLVM
   MLIRControlFlowToLLVM
   MLIRSCFToControlFlow

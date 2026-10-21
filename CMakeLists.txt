@@ -165,39 +165,76 @@ if(LLVM_VERSION_MAJOR AND NOT LLVM_VERSION_MAJOR EQUAL 23)
     "treat resulting compile/runtime failures as untriaged until it runs on 23.")
 endif()
 
-# Build info. Everything sb_build_info() reports is resolved here, once, and
-# compiled into the library, so a benchmark result or a bug report can name the
-# exact binary. See capi/include/sonicboom/capi.h.
-set(SONICBOOM_BUILD_GIT "unknown")
-set(SONICBOOM_BUILD_GIT_TAG "unknown")
+# Build info. Everything sb_build_info() reports is compiled into the library,
+# so a benchmark result or a bug report can name the exact binary. See
+# capi/include/sonicboom/capi.h.
+#
+# The revision (SB_BUILD_GIT / SB_BUILD_GIT_TAG) is resolved at BUILD time, not
+# at configure time: a configure-time constant goes stale as soon as the next
+# commit lands in a tree that is not re-configured. cmake/WriteBuildTag.cmake
+# rewrites the generated header only when its content changes, so rebuilding
+# after a no-op (or a build of an unchanged revision) neither recompiles capi.cpp
+# nor relinks libsonicboom.so.
+set(SONICBOOM_BUILD_TAG_HEADER "${CMAKE_BINARY_DIR}/generated/sb_build_tag.h")
+set(SONICBOOM_BUILD_TAG_SCRIPT "${CMAKE_SOURCE_DIR}/cmake/WriteBuildTag.cmake")
 find_package(Git QUIET)
-if(GIT_FOUND)
-  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+
+# What a new revision looks like to the build system: the ref HEAD points at
+# (rewritten by a commit), HEAD itself (a detached checkout), the index (a
+# commit or a staged change), and packed-refs (a branch packed by gc). The
+# header is a custom-command output on these, so the build that follows a
+# commit resolves the new revision in the same run — the objects that include
+# the header recompile then, not one build later. Uncommitted worktree edits
+# are not in this list; they are picked up by the next build or reconfigure.
+set(SONICBOOM_BUILD_TAG_DEPS "${SONICBOOM_BUILD_TAG_SCRIPT}")
+if(GIT_EXECUTABLE)
+  execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --absolute-git-dir
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                  OUTPUT_VARIABLE _sb_git OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET RESULT_VARIABLE _sb_git_rc)
-  if(_sb_git_rc EQUAL 0 AND _sb_git)
-    set(SONICBOOM_BUILD_GIT "${_sb_git}")
-    execute_process(COMMAND ${GIT_EXECUTABLE} status --porcelain
-                            --untracked-files=no
-                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                    OUTPUT_VARIABLE _sb_git_dirty
-                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-    if(_sb_git_dirty)
-      set(SONICBOOM_BUILD_GIT "${SONICBOOM_BUILD_GIT}-dirty")
+                  OUTPUT_VARIABLE _sb_git_dir
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  ERROR_QUIET RESULT_VARIABLE _sb_git_dir_rc)
+  if(_sb_git_dir_rc EQUAL 0 AND _sb_git_dir)
+    list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/HEAD"
+                "${_sb_git_dir}/index")
+    # These two may legitimately not exist (a fully packed repository, a
+    # packed-away branch); a dependency on a missing file would make the build
+    # fail, so only real ones are listed.
+    if(EXISTS "${_sb_git_dir}/packed-refs")
+      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/packed-refs")
     endif()
-    # The tag is the human name of the same revision (`git describe` adds the
-    # commit distance when HEAD is past the last tag); a bare commit cannot say
-    # which release a build belongs to.
-    execute_process(COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+    execute_process(COMMAND ${GIT_EXECUTABLE} symbolic-ref -q HEAD
                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                    OUTPUT_VARIABLE _sb_git_tag OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET RESULT_VARIABLE _sb_tag_rc)
-    if(_sb_tag_rc EQUAL 0 AND _sb_git_tag)
-      set(SONICBOOM_BUILD_GIT_TAG "${_sb_git_tag}")
+                    OUTPUT_VARIABLE _sb_git_ref
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET RESULT_VARIABLE _sb_git_ref_rc)
+    if(_sb_git_ref_rc EQUAL 0 AND _sb_git_ref AND
+       EXISTS "${_sb_git_dir}/${_sb_git_ref}")
+      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/${_sb_git_ref}")
     endif()
   endif()
 endif()
+
+# Populate the header at configure time too, so the file exists before the
+# first compile and is correct straight after configuring.
+execute_process(COMMAND ${CMAKE_COMMAND}
+                        -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+                        -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+                        -DOUTPUT=${SONICBOOM_BUILD_TAG_HEADER}
+                        -P ${SONICBOOM_BUILD_TAG_SCRIPT}
+                RESULT_VARIABLE _sb_tag_rc)
+if(NOT _sb_tag_rc EQUAL 0)
+  message(FATAL_ERROR "failed to write ${SONICBOOM_BUILD_TAG_HEADER}")
+endif()
+add_custom_command(OUTPUT ${SONICBOOM_BUILD_TAG_HEADER}
+  COMMAND ${CMAKE_COMMAND}
+          -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+          -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
+          -DOUTPUT=${SONICBOOM_BUILD_TAG_HEADER}
+          -P ${SONICBOOM_BUILD_TAG_SCRIPT}
+  DEPENDS ${SONICBOOM_BUILD_TAG_DEPS}
+  COMMENT "sonicboom: resolving build tag"
+  VERBATIM)
+add_custom_target(sonicboom_build_tag DEPENDS ${SONICBOOM_BUILD_TAG_HEADER})
 
 # CPU architectures. CMAKE_CUDA_ARCHITECTURES may be a token ('native', 'all',
 # 'all-major') that only nvcc resolves, and it resolves it per compilation — so

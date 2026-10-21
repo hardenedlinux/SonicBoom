@@ -18,7 +18,7 @@
 
 #include <sonicboom/planner/cost_model.h>
 #include <sonicboom/planner/graph.h>
-#include <sonicboom/planner/native_torch_backend.h>
+#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/sx/parser.h>
@@ -120,10 +120,10 @@ std::expected<Model, ModelError> Model::compile(const sx::Document& doc,
     model.output_types_.push_back(*tt);
   }
 
-  // One NativeTorchBackend serves every native-torch node (the backend resolves
-  // the node per task); every MLIR region gets its own CpuBackend compiled from
-  // a slice_region sub-document (or the whole document for the homogeneous
-  // path, which emits a single WholeGraph task).
+  // One CpuKernelBackend serves every per-node CPU kernel task (it resolves the
+  // node per task); every MLIR region gets its own CpuBackend compiled from a
+  // slice_region sub-document (or the whole document for the homogeneous path,
+  // which emits a single WholeGraph task).
   bool has_native = false;
   for (const auto& t : model.plan_.tasks)
     if (t.kind == planner::TaskKind::Compute && t.as_compute() &&
@@ -132,7 +132,7 @@ std::expected<Model, ModelError> Model::compile(const sx::Document& doc,
 
   std::map<planner::BackendTag, planner::Backend*> tag_map;
   if (has_native) {
-    auto nt = planner::NativeTorchBackend::compile(*graph);
+    auto nt = planner::CpuKernelBackend::compile(*graph);
     if (!nt)
       return std::unexpected(ModelError{"compile", nt.error().message});
     tag_map[planner::BackendTag::NativeTorch] = nt->get();
@@ -164,8 +164,9 @@ std::expected<Model, ModelError> Model::compile(const sx::Document& doc,
     model.backends_.push_back(std::move(*cpu));
   }
 
-  // Wire the executor: native-torch via the tag map, each MLIR region via a
-  // per-task backend (the Mlir tag alone is ambiguous across multiple regions).
+  // Wire the executor: the per-node CPU kernel backend via the tag map, each
+  // MLIR region via a per-task backend (the Mlir tag alone is ambiguous across
+  // multiple regions).
   auto executor = std::make_unique<planner::RuntimeExecutor>(std::move(tag_map));
   for (auto [tid, be] : mlir_task_backends)
     executor->set_task_backend(tid, be);

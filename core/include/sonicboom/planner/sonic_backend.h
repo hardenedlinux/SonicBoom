@@ -17,7 +17,8 @@
 #pragma once
 
 // SonicBackend (Phase 6): the third execution backend, alongside CpuBackend
-// (MLIR JIT) and NativeTorchBackend (native-torch dispatcher). It executes
+// (whole-region sx::Executable) and CpuKernelBackend (one node per task). It
+// executes
 // Sonic-routed compute tasks — one transformer node per task — by dispatching to
 // the SonicBoom-owned nn::* / quant::* kernels, reading weights straight from
 // the bound Gemma 4 model via the (layer, slot) attributes baked by the plan

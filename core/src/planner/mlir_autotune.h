@@ -25,17 +25,39 @@
 // compile each candidate, time N iterations, keep a candidate only if its
 // output matches the reference bit for bit, and return the fastest.
 //
-// Gate: the runner is enabled by SONICBOOM_AUTOTUNE=1 (off by default);
-// SONICBOOM_AUTOTUNE=force additionally ignores the disk cache and retimes
-// every class. With the gate off nothing is compiled, timed, or stored, and
-// callers keep their static default. This is deliberately the opposite default of the
-// older sonicboom::tune service (autotune.h, which tunes already-compiled
-// hand-written kernels at runtime and is on unless SONICBOOM_AUTOTUNE=0):
-// compiling and launching JIT candidates is opt-in.
+// Gate: the runner is enabled by default, like the older sonicboom::tune
+// service (autotune.h). SONICBOOM_AUTOTUNE=0 disables it (nothing is compiled,
+// timed, or stored; callers keep their static default), and
+// SONICBOOM_AUTOTUNE=force retimes every class, ignoring the disk cache.
+// Disabling the runtime `autotune` feature does the same as =0.
+// SONICBOOM_AUTOTUNE_JIT=0 disables only this JIT-candidate service and leaves
+// the hand-written tuner on; it is the ablation for "generated kernel vs the
+// hand-written kernel the other tuner chose", and the mode the plan-record
+// goldens use so their text stays the hand-written plan.
+//
+// Cold budget: cold tuning (every class not in the disk cache) shares one
+// process-wide wall-clock budget, SONICBOOM_AUTOTUNE_BUDGET_MS (default 10000;
+// <= 0 means unlimited). When it runs out, the remaining classes keep their
+// static default for the life of the process and are not probed again, while
+// the classes tuned before it expired are persisted as usual. The clock starts
+// at the first unresolved class, so a process whose classes are all cached
+// spends nothing. The budget bounds a first run on a new device to ~10 s of
+// measurement instead of minutes; every choice is still decided once per
+// device and cached.
+//
+// Determinism: a cache hit is deterministic — the same record is applied on
+// every launch and in every process on the device. A cold measurement is
+// timing dependent, so two cold processes can disagree within the tuner's
+// resolution; the runner only ever picks a candidate whose output is
+// bit-identical to the static default, so a different pick changes the kernel's
+// launch geometry, never the token stream or the numerics.
 //
 // Cache location: $XDG_CACHE_HOME/sonicboom/autotune/sm_<NN>.bin, else
 // $HOME/.cache/sonicboom/autotune/sm_<NN>.bin, where <NN> is the device
-// compute capability × 10 (sm_86 for an RTX 3050; sm_00 without CUDA).
+// compute capability × 10 (sm_86 for an RTX 3050; sm_00 without CUDA). The
+// file is a versioned fixed-record array written in place under an exclusive
+// flock, so concurrent processes never see a torn update and a version bump
+// invalidates every record (the first store rewrites the file).
 //
 // Layer placement: internal runtime machinery (core/src/planner), not part of
 // the Layer 2 public headers; no MLIR/LLVM/CUDA types in this interface.
@@ -70,11 +92,22 @@ struct TileConfig {
 // whenever the gate is off, so AUTOTUNE=0 is the pre-Q1 code path.
 TileConfig default_config(std::string_view op);
 
-// SONICBOOM_AUTOTUNE=1 (exact string) enables the runner. Read per call.
-// SONICBOOM_AUTOTUNE=force also enables it and makes every per-class lookup
-// skip the disk cache, so each class is retimed in this process.
+// True unless SONICBOOM_AUTOTUNE=0, SONICBOOM_AUTOTUNE_JIT=0, or the
+// `autotune` runtime feature is disabled. Read per call, so a test can flip it
+// between sections.
 bool enabled();
+// SONICBOOM_AUTOTUNE=force: every per-class lookup skips the disk cache, so
+// each class is retimed in this process.
 bool force();
+
+// Wall-clock budget left for cold tuning in this process, in milliseconds
+// (0 when exhausted). Starts the clock on its first call; SONICBOOM_AUTOTUNE_
+// BUDGET_MS overrides the 10 s default (<= 0 = unlimited).
+int64_t budget_remaining_ms();
+bool budget_exhausted();
+
+// Restart the cold-tuning clock (tests only; the disk cache is untouched).
+void reset_budget_for_test();
 
 // Device compute capability × 10 (86, 89, 120); 0 when the build has no CUDA
 // or no device is visible. Cached after the first call.
@@ -105,6 +138,16 @@ class AutotuneCache {
   mutable std::string path_;  // resolved on the first path() call
 };
 
+// Every record in this SM's cache file, sorted by (op, shape class). Read
+// only: sb-explain prints them, and calling this never tunes or creates a
+// file. An absent file, an older version, or a corrupt header yields nothing.
+struct DiskRecord {
+  std::string op;
+  std::string shape_class;
+  TileConfig cfg;
+};
+std::vector<DiskRecord> disk_records();
+
 // V2 spec auto-detect: a scalar ratio record in the same per-SM file. The spec
 // probe measures one plain decode step against one k=1 verify step and stores
 // verify/plain here, so the decision is made once per GPU rather than once per
@@ -125,6 +168,7 @@ enum class GemvSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct GemvChoice {
@@ -179,6 +223,7 @@ enum class MmqTcSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct MmqTcChoice {
@@ -211,16 +256,23 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
 // Classes cover the generator's defaulted head_dims {32,64,128,256,512}; the
 // production dps for 256/512 is 4/8 (dc = 64 in every shipped class).
 //
-// Shape class: head_dim exact; the query length (the prefill chunk size) and
-// the query-head count are bucketed, so a class is tuned once per GPU and
-// reused across launches in the same bucket.
-std::string attn_prefill_seq_bucket(int seq_len);
+// Shape class: head_dim exact, query-head count bucketed. The query length is
+// NOT part of the class. One kernel per static shape class (run rule R1): if
+// the tile were chosen per prefill chunk length, the same row would run in a
+// different tile -- and so a different reduction order -- depending on which
+// chunk it lands in, which breaks the prefix-reuse token-identity contract
+// (measured: a per-length choice made row 229 of a 130-row chunk differ from
+// the same row computed alone by 5e-7). The class is tuned once per GPU on a
+// fixed probe length and reused for every launch of that class.
 std::string attn_prefill_heads_bucket(int n_heads);
 
-// "<head_dim>/<seq_len_bucket>/<num_heads_bucket>" (the cache's shape field;
-// the op field is "attn_prefill", so the combined name is
-// "attn_prefill/<head_dim>/<seq_len_bucket>/<num_heads_bucket>").
-std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads);
+// "<head_dim>/<num_heads_bucket>/<production>" (the cache's shape field; the
+// op field is "attn_prefill"). `production` is the dispatcher's own shape
+// signature (br, bc, dps, as, packing, grid order): it names the reference
+// the winner was measured against, so a changed default retimes the class
+// instead of shadowing it with a pick made against the old reference.
+std::string attn_prefill_shape_class(int head_dim, int n_heads,
+                                     std::string_view production);
 
 // Head dims the generated prefill kernel has defaulted shape classes for.
 bool attn_prefill_tunable(int head_dim);
@@ -237,6 +289,7 @@ enum class AttnPrefillSource {
   Default,   // gate off, or the class is not resolved yet
   Cache,     // loaded from the per-SM cache file
   Measured,  // the runner timed it in this process
+  Skipped,   // the cold-tuning budget is exhausted: static default, no probe
 };
 
 struct AttnPrefillChoice {
@@ -249,11 +302,13 @@ struct AttnPrefillChoice {
 // tune the class with AutotuneRunner (candidates from
 // attn_prefill_candidates(), the first as reference) and then call
 // attn_prefill_choice_store.
-AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads);
+AttnPrefillChoice attn_prefill_choice(int head_dim, int n_heads,
+                                     std::string_view production);
 
 // Memoize a measured winner and persist it for the SM. True when the file
 // write succeeded.
-bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+bool attn_prefill_choice_store(int head_dim, int n_heads,
+                               std::string_view production,
                                const TileConfig& cfg);
 
 // Drop the in-process memo (tests; the disk cache is untouched).
@@ -286,8 +341,10 @@ class AutotuneRunner {
     int iters = 5;
   };
 
-  // Fastest bit-identical candidate, or nullopt when the gate is off, no
-  // candidate compiles, or every candidate diverges from the reference.
+  // Fastest bit-identical candidate, or nullopt when the gate is off, the
+  // cold budget is exhausted before any round completes, no candidate
+  // compiles, or every candidate diverges from the reference. An expired
+  // budget stops the search and ranks the rounds already measured.
   static std::optional<TileConfig> run(const Problem& problem);
 };
 

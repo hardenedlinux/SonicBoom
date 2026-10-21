@@ -86,6 +86,35 @@ struct AttentionShape {
   // arm.
   bool warp_head = false;
 
+  // Query heads packed into one block (GQA packing), 1 <= gqa_pack <= gqa and
+  // gqa % gqa_pack == 0. A block still covers one br-row query tile, but for
+  // gqa_pack consecutive query heads that share the same K/V head, so the K/V
+  // tile staged in shared memory is read from global memory once for all of
+  // them instead of once per query head (traffic / gqa_pack). Each head's rows
+  // keep their own warp roles and the same per-warp arithmetic, so the output
+  // is bit-identical to the unpacked kernel. The grid's y dimension becomes
+  // n_heads_q / gqa_pack. Warp-head blocks are already packed (one warp per
+  // query head) and ignore this field.
+  int gqa_pack = 1;
+
+  // Keep the Q fragments in registers across the key-tile loop (default), or
+  // reload them from the staged Q tile in every key tile. Reloading costs KT
+  // ldmatrix per tile but frees the dc/4 registers the fragments occupy, which
+  // is what lets a dc = 256 slice (dps = 2 at head_dim 512) run without
+  // spilling. Same values either way, so the output is bit-identical.
+  bool q_in_reg = true;
+
+  // Grid order. Default: blockIdx.x = query tile, blockIdx.y = head, so
+  // consecutive blocks walk the query tiles of one head. head_fast: the two
+  // dimensions swap (blockIdx.x = head, blockIdx.y = query tile), so the
+  // blocks launched together cover all heads of one query tile and read the
+  // same K/V range at the same time (one DRAM read serves all of them through
+  // L2). Which block does which tile is the only change -- the block's
+  // arithmetic is untouched, so the output is bit-identical. It pays when a
+  // block reads its K/V range from global memory once per head (small br or
+  // packed blocks); it is neutral when enough rows share the tile already.
+  bool head_fast = false;
+
   // cp.async pipeline depth for the K/V staging (0 = synchronous staging, the
   // default; 2 or 3 = pipeline stages). The KV cache and batch buffers are
   // f32 and the mma operands are f16, so cp.async cannot write the mma tiles
@@ -111,6 +140,8 @@ struct AttentionShape {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
            dps == o.dps && decode == o.decode && warp_head == o.warp_head &&
+           gqa_pack == o.gqa_pack && q_in_reg == o.q_in_reg &&
+           head_fast == o.head_fast &&
            async_stages == o.async_stages && exp2 == o.exp2;
   }
 };

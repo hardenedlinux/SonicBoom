@@ -75,7 +75,8 @@ std::expected<sx::Document, PlannerError> slice_impl(
     return std::unexpected(slice_err("slice keeps no nodes"));
 
   // Values produced *inside the slice* = outputs of kept nodes only. Outputs of
-  // excluded nodes (e.g. the native-torch softmax feeding this region) are NOT
+  // excluded nodes (e.g. the per-node CPU kernel softmax feeding this region)
+  // are NOT
   // produced here, so they surface as graph inputs below.
   std::unordered_set<std::string> produced;
   for (const auto* n : kept)

@@ -18,7 +18,7 @@
 // records keyed by (op, shape class), updates a key in place, misses cleanly,
 // and lives at $XDG_CACHE_HOME/sonicboom/autotune/sm_<NN>.bin. TileConfig's
 // text form round-trips and rejects malformed input. The cache itself is not
-// gated (the runner is), so this works with SONICBOOM_AUTOTUNE unset.
+// gated (the runner is), so this works with SONICBOOM_AUTOTUNE unset or 0.
 
 #include "../../core/src/planner/mlir_autotune.h"
 
@@ -26,6 +26,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 
 namespace mt = sonicboom::mlir_tune;
 
@@ -132,11 +133,49 @@ int main() {
     check(mt::gemv_config(99, 3000) == b, "gate on: cached winner is used");
     ::setenv("SONICBOOM_AUTOTUNE", "0", 1);
     check(!mt::enabled(), "SONICBOOM_AUTOTUNE=0 disables");
+    ::setenv("SONICBOOM_AUTOTUNE", "1", 1);
+    ::setenv("SONICBOOM_AUTOTUNE_JIT", "0", 1);
+    check(!mt::enabled(), "SONICBOOM_AUTOTUNE_JIT=0 disables the JIT service");
+    ::unsetenv("SONICBOOM_AUTOTUNE_JIT");
+    ::setenv("SONICBOOM_AUTOTUNE", "0", 1);
     check(mt::gemv_config(99, 3000) == mt::default_config("gemv"),
           "gate off: the static default, never the cache");
     ::unsetenv("SONICBOOM_AUTOTUNE");
-    check(mt::gemv_config(99, 3000) == mt::default_config("gemv"),
-          "gate unset: the static default");
+    check(mt::enabled(), "gate unset: enabled by default");
+    check(mt::gemv_config(99, 3000) == b,
+          "gate unset: the cached winner is used");
+  }
+
+  // The cold budget: an exhausted budget resolves a fresh class to the static
+  // default (Skipped, so the caller does not probe) instead of measuring it.
+  {
+    ::unsetenv("SONICBOOM_AUTOTUNE");
+    ::setenv("SONICBOOM_AUTOTUNE_BUDGET_MS", "1", 1);
+    mt::reset_budget_for_test();
+    check(mt::budget_remaining_ms() <= 1, "the budget counts down from 1 ms");
+    ::usleep(5000);
+    check(mt::budget_exhausted(), "the budget is exhausted after 5 ms");
+    const mt::GemvChoice skipped = mt::gemv_choice(77, 3000);
+    check(skipped.resolved() && skipped.source == mt::GemvSource::Skipped &&
+              skipped.cfg == mt::default_config("gemv"),
+          "gemv: an exhausted budget resolves to the static default");
+    const mt::MmqTcChoice mskip = mt::mmq_tc_choice(1024, 896, 896);
+    check(mskip.resolved() && mskip.source == mt::MmqTcSource::Skipped &&
+              mskip.cfg == mt::mmq_tc_default_config(),
+          "mmq: an exhausted budget resolves to the static default");
+    const mt::AttnPrefillChoice as =
+        mt::attn_prefill_choice(128, 16, "prod");
+    check(as.resolved() && as.source == mt::AttnPrefillSource::Skipped &&
+              as.cfg.tile_m == 0,
+          "attn: an exhausted budget resolves to the dispatcher shape");
+    // A later, larger budget still cannot revive the classes this process
+    // already resolved as Skipped, nor is the clock restarted.
+    ::setenv("SONICBOOM_AUTOTUNE_BUDGET_MS", "10000", 1);
+    check(mt::budget_exhausted(), "the budget is a one-shot process clock");
+    check(mt::gemv_choice(77, 3000).source == mt::GemvSource::Skipped,
+          "a skipped class stays skipped");
+    ::unsetenv("SONICBOOM_AUTOTUNE_BUDGET_MS");
+    mt::reset_budget_for_test();
   }
 
   // MMQ2: the generated int8 tensor-core matmul's shape class, candidate grid,
@@ -180,7 +219,7 @@ int main() {
     check(mt::mmq_tc_default_config() == (mt::TileConfig{64, 64, 32, 1, 1}),
           "mmq: the static default is the MMQ1 tile");
 
-    ::unsetenv("SONICBOOM_AUTOTUNE");
+    ::setenv("SONICBOOM_AUTOTUNE", "0", 1);
     check(mt::mmq_tc_choice(512, 4864, 896).cfg == mt::mmq_tc_default_config(),
           "mmq gate off: the static default");
     check(!mt::mmq_tc_choice(512, 4864, 896).resolved(),

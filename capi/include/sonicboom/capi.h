@@ -543,6 +543,23 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
                         sb_llm_token_cb cb, void *user, uint32_t *n_out,
                         sb_error **err_out);
 
+/* --- Decision registry (diagnostics) ---------------------------------------
+ *
+ * The runtime resolves every automatic choice -- reduction mode, spec probe,
+ * MMQ/attention implementation and tiles, dense path, async prefetch, the
+ * training switches -- once per device or static shape class, and records it
+ * with its inputs, the candidates considered, the reason, the numerics class
+ * and its declared resource costs (VRAM bytes, first-run tuning ms). These two
+ * calls dump that registry for the current device (the per-device persisted
+ * records plus what this process has resolved), as the same human table
+ * tools/sb-explain prints or as a JSON document. No C++ type crosses the
+ * boundary. Two-call sizing: pass buf NULL or cap too small to get the needed
+ * byte count (including the NUL) in *len_out and SB_ERR_BINDING. */
+sb_status sb_explain_table(char *buf, size_t cap, size_t *len_out,
+                           sb_error **err_out);
+sb_status sb_explain_json(char *buf, size_t cap, size_t *len_out,
+                          sb_error **err_out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

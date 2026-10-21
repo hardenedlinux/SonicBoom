@@ -164,7 +164,7 @@ int main() {
         "core/src/planner/partition.cpp",
         "core/src/planner/device_pool.cpp",
         "core/src/planner/transfer_scheduler.cpp",
-        "core/src/planner/native_torch_backend.cpp",
+        "core/src/planner/runtime.cpp",
         "core/src/autograd/autograd.cpp",
     };
     size_t calls = 0, hits = 0, drafted = 0;

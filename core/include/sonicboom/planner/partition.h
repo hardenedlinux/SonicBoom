@@ -38,9 +38,12 @@ namespace sonicboom::planner {
 // cannot route a task; Sonic is the Phase 6 transformer backend (also CPU in
 // M2, later GPU in M3).
 enum class BackendTag : uint8_t {
-  Mlir,        // sx::Executable (CpuBackend), 7-op set; deprecated, no
-               // shipped model plan routes to it (see SONICBOOM_SX_LINALG)
-  NativeTorch, // nt::OperatorHandle dispatcher (NativeTorchBackend)
+  Mlir,        // a whole region as one sx::Executable (CpuBackend), compiled
+               // from a frozen 7-op S-Expr slice, run by the CPU Boom executor
+  NativeTorch, // one node per task (CpuKernelBackend), run by the CPU Boom
+               // executor. The tag name and its "native_torch" IR spelling are
+               // kept for plan/IR compatibility; no native-torch dispatcher
+               // stands behind it any more.
   Sonic,       // nn::*/quant::* kernels (SonicBackend), the transformer path
 };
 const char* backend_tag_name(BackendTag t) noexcept;

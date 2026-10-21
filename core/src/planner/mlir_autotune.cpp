@@ -16,6 +16,10 @@
 
 #include "mlir_autotune.h"
 
+#include "decision_registry.h"
+
+#include <sonicboom/runtime_features.h>
+
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>
 #endif
@@ -50,10 +54,12 @@ constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // meaning from (tile_seq, tile_head) to (br, dc, bc, as), so a version-2
 // record must not be applied to the new grid. Version 4 splits gemv rows
 // above 16384 into their own buckets, so a version-3 "bprN-r16384" record
-// would be applied to a class it was not measured for. An older file misses
-// on lookup and is rewritten by the first store, which is the cache's own
-// reset path.
-constexpr uint32_t kVersion = 4;
+// would be applied to a class it was not measured for. Version 5 drops the
+// query-length bucket from the "attn_prefill" class key (one kernel per shape
+// class; run rule R1), so a version-4 record names a class that no longer
+// exists. An older file misses on lookup and is rewritten by the first store,
+// which is the cache's own reset path.
+constexpr uint32_t kVersion = 5;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 48;
@@ -78,6 +84,75 @@ static_assert(sizeof(Header) == 16, "cache header layout");
 static_assert(sizeof(Record) == 112, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
+
+// The three choice enums share their value set; map it onto the registry's
+// source vocabulary (design/decision-registry.md).
+template <typename SourceT>
+planner::decisions::Source registry_source(SourceT source) {
+  switch (source) {
+    case SourceT::Cache: return planner::decisions::Source::Cached;
+    case SourceT::Measured: return planner::decisions::Source::Measured;
+    case SourceT::Skipped: return planner::decisions::Source::Skipped;
+    case SourceT::Default: break;
+  }
+  return planner::decisions::Source::Default;
+}
+
+std::string join_candidates(std::span<const TileConfig> grid) {
+  std::string out;
+  for (const TileConfig& cfg : grid) {
+    if (!out.empty()) out += '|';
+    out += cfg.to_string();
+  }
+  return out;
+}
+
+// Every JIT-candidate pick is a decision for one device and shape class. The
+// env field names the switch that overrides the whole service; a single class
+// is overridden by retiming it (SONICBOOM_AUTOTUNE=force).
+void record_choice(std::string_view op, const std::string& shape_class,
+                   std::string_view value,
+                   planner::decisions::Source source,
+                   std::string_view candidates, int64_t tuning_ms = 0) {
+  planner::decisions::Entry entry;
+  entry.name = std::string(op);
+  entry.scope = shape_class;
+  entry.value = std::string(value);
+  entry.source = source;
+  entry.env = "SONICBOOM_AUTOTUNE";
+  entry.inputs = "sm=" + std::to_string(sm_version()) + ", class=" + shape_class;
+  entry.candidates = std::string(candidates);
+  entry.reason =
+      source == planner::decisions::Source::Cached
+          ? "per-SM cache record"
+          : source == planner::decisions::Source::Measured
+                ? "fastest candidate within the bit-identity gate"
+                : source == planner::decisions::Source::Skipped
+                      ? "cold budget exhausted: static default"
+                      : "static default";
+  entry.numerics = "bit-identical to candidates[0] (the static default)";
+  entry.tuning_ms = tuning_ms;
+  planner::decisions::record(entry);
+}
+
+// The spec probe stores a measured acceptance ratio rather than a tile; it is
+// still one decision per device and shape class, so it uses the same record.
+void record_ratio(std::string_view op, std::string_view shape,
+                  std::string_view value, planner::decisions::Source source) {
+  planner::decisions::Entry entry;
+  entry.name = std::string(op);
+  entry.scope = std::string(shape);
+  entry.value = std::string(value);
+  entry.source = source;
+  entry.env = "SONICBOOM_SPEC";
+  entry.inputs = "sm=" + std::to_string(sm_version()) + ", class=" +
+                 std::string(shape);
+  entry.reason = source == planner::decisions::Source::Cached
+                     ? "per-SM cache record"
+                     : "measured in this process";
+  entry.numerics = "informational: the ratio selects the spec path, not arithmetic";
+  planner::decisions::record(entry);
+}
 
 std::string cache_dir() {
   if (const char* e = std::getenv("XDG_CACHE_HOME"); e && *e)
@@ -149,13 +224,83 @@ std::optional<TileConfig> TileConfig::from_string(std::string_view s) {
 }
 
 bool enabled() {
+  // Same default as the hand-written tuner (autotune.h): on unless =0, with
+  // the runtime `autotune` feature (SONICBOOM_FEATURE_DISABLE=autotune) as the
+  // ablation switch covering both services.
+  if (::sonicboom::runtime::feature_disabled(
+          ::sonicboom::runtime::Feature::Autotune))
+    return false;
+  // The JIT-candidate service has its own ablation switch, so a run can keep
+  // the hand-written tuner's choices and drop only the generated candidates
+  // (the plan-record goldens use it).
+  const char* j = std::getenv("SONICBOOM_AUTOTUNE_JIT");
+  if (j && std::strcmp(j, "0") == 0) return false;
   const char* e = std::getenv("SONICBOOM_AUTOTUNE");
-  return e && (std::strcmp(e, "1") == 0 || std::strcmp(e, "force") == 0);
+  return e == nullptr || std::strcmp(e, "0") != 0;
 }
 
 bool force() {
   const char* e = std::getenv("SONICBOOM_AUTOTUNE");
   return e && std::strcmp(e, "force") == 0;
+}
+
+namespace {
+
+// One budget per process, started lazily by the first unresolved class. A
+// warm process (every class cached) never calls budget_remaining_ms(), so it
+// never starts the clock. Both the runner and the per-class choice functions
+// consult this; the callers' confirmation re-measurement loops check it too, so
+// the total cold cost stays inside the budget.
+struct BudgetState {
+  bool started = false;
+  bool unlimited = false;
+  std::chrono::steady_clock::time_point start;
+  int64_t budget_ms = 0;
+};
+
+std::mutex& budget_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+BudgetState& budget_state() {
+  static BudgetState s;
+  return s;
+}
+
+int64_t configured_budget_ms() {
+  const char* e = std::getenv("SONICBOOM_AUTOTUNE_BUDGET_MS");
+  if (e && *e) {
+    char* tail = nullptr;
+    const long long v = std::strtoll(e, &tail, 10);
+    if (tail && *tail == '\0') return int64_t(v);
+  }
+  return 10000;  // a first run on a new device measures for at most ~10 s
+}
+
+} // namespace
+
+int64_t budget_remaining_ms() {
+  std::lock_guard<std::mutex> lock(budget_mutex());
+  BudgetState& s = budget_state();
+  if (!s.started) {
+    s.started = true;
+    s.start = std::chrono::steady_clock::now();
+    s.budget_ms = configured_budget_ms();
+    s.unlimited = s.budget_ms <= 0;
+  }
+  if (s.unlimited) return std::numeric_limits<int64_t>::max();
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - s.start)
+                           .count();
+  return std::max<int64_t>(0, s.budget_ms - int64_t(elapsed));
+}
+
+bool budget_exhausted() { return budget_remaining_ms() <= 0; }
+
+void reset_budget_for_test() {
+  std::lock_guard<std::mutex> lock(budget_mutex());
+  budget_state() = BudgetState{};
 }
 
 int sm_version() {
@@ -298,6 +443,46 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
   return ok;
 }
 
+std::vector<DiskRecord> disk_records() {
+  std::vector<DiskRecord> out;
+  const std::string file = cache_dir() + "/" + sm_file_name();
+  const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return out;
+  if (::flock(fd, LOCK_SH) == 0) {
+    struct stat st {};
+    if (::fstat(fd, &st) == 0 && st.st_size >= off_t(sizeof(Header))) {
+      const size_t bytes = std::min<size_t>(size_t(st.st_size), kFileBytes);
+      void* m = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
+      if (m != MAP_FAILED) {
+        const Header* h = static_cast<const Header*>(m);
+        const size_t avail = (bytes - sizeof(Header)) / sizeof(Record);
+        const size_t count =
+            std::min<size_t>(h->count, std::min<size_t>(h->capacity, avail));
+        if (h->magic == kMagic && h->version == kVersion) {
+          const Record* recs = reinterpret_cast<const Record*>(h + 1);
+          out.reserve(count);
+          for (size_t i = 0; i < count; ++i) {
+            out.push_back(DiskRecord{
+                std::string(recs[i].op, ::strnlen(recs[i].op, kOpBytes)),
+                std::string(recs[i].shape,
+                            ::strnlen(recs[i].shape, kShapeBytes)),
+                recs[i].cfg});
+          }
+        }
+        ::munmap(m, bytes);
+      }
+    }
+    ::flock(fd, LOCK_UN);
+  }
+  ::close(fd);
+  std::sort(out.begin(), out.end(),
+            [](const DiskRecord& a, const DiskRecord& b) {
+              return a.op != b.op ? a.op < b.op
+                                  : a.shape_class < b.shape_class;
+            });
+  return out;
+}
+
 bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
   if (!(ratio > 0.0)) return false;
   const double milli = ratio * 1000.0;
@@ -305,7 +490,11 @@ bool store_ratio(std::string_view op, std::string_view shape, double ratio) {
   // The scalar lives in tile_m; the remaining fields are a fixed placeholder
   // so the record is a well-formed TileConfig (see the header).
   const TileConfig cfg{int32_t(std::llround(milli)), 1, 1, 1, 1};
-  return AutotuneCache::instance().store(op, shape, cfg);
+  if (!AutotuneCache::instance().store(op, shape, cfg)) return false;
+  char value[32];
+  std::snprintf(value, sizeof(value), "%.3f", ratio);
+  record_ratio(op, shape, value, planner::decisions::Source::Measured);
+  return true;
 }
 
 std::optional<double> lookup_ratio(std::string_view op,
@@ -314,7 +503,11 @@ std::optional<double> lookup_ratio(std::string_view op,
   if (!rec || rec->tile_n != 1 || rec->tile_k != 1 || rec->unroll != 1 ||
       rec->vectorize != 1)
     return std::nullopt;
-  return double(rec->tile_m) / 1000.0;
+  const double ratio = double(rec->tile_m) / 1000.0;
+  char value[32];
+  std::snprintf(value, sizeof(value), "%.3f", ratio);
+  record_ratio(op, shape, value, planner::decisions::Source::Cached);
+  return ratio;
 }
 
 std::string gemv_shape_class(int blocks_per_row, int num_rows) {
@@ -341,7 +534,13 @@ std::unordered_map<std::string, GemvChoice>& gemv_memo() {
 } // namespace
 
 GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
-  if (!enabled()) return GemvChoice{default_config("gemv"), GemvSource::Default};
+  if (!enabled()) {
+    record_choice("tune/gemv", gemv_shape_class(blocks_per_row, num_rows),
+                  default_config("gemv").to_string(),
+                  planner::decisions::Source::Default,
+                  join_candidates(gemv_candidates()));
+    return GemvChoice{default_config("gemv"), GemvSource::Default};
+  }
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
   {
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
@@ -351,10 +550,25 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
   if (!force()) {
     if (const auto cached = AutotuneCache::instance().lookup("gemv", key)) {
       const GemvChoice choice{*cached, GemvSource::Cache};
+      record_choice("tune/gemv", key, cached->to_string(),
+                    registry_source(choice.source),
+                    join_candidates(gemv_candidates()));
       std::lock_guard<std::mutex> lock(gemv_memo_mutex());
       gemv_memo().emplace(key, choice);
       return choice;
     }
+  }
+  // Out of cold budget: keep the static default for this class for the rest of
+  // the process. Memoized as Skipped (which resolved() reports true) so the
+  // caller's per-launch check does not rebuild the probe problem every call.
+  if (budget_exhausted()) {
+    const GemvChoice choice{default_config("gemv"), GemvSource::Skipped};
+    record_choice("tune/gemv", key, choice.cfg.to_string(),
+                  registry_source(choice.source),
+                  join_candidates(gemv_candidates()));
+    std::lock_guard<std::mutex> lock(gemv_memo_mutex());
+    gemv_memo().emplace(key, choice);
+    return choice;
   }
   return GemvChoice{default_config("gemv"), GemvSource::Default};
 }
@@ -362,6 +576,9 @@ GemvChoice gemv_choice(int blocks_per_row, int num_rows) {
 bool gemv_choice_store(int blocks_per_row, int num_rows,
                        const TileConfig& cfg) {
   const std::string key = gemv_shape_class(blocks_per_row, num_rows);
+  record_choice("tune/gemv", key, cfg.to_string(),
+                planner::decisions::Source::Measured,
+                join_candidates(gemv_candidates()));
   {
     std::lock_guard<std::mutex> lock(gemv_memo_mutex());
     gemv_memo()[key] = GemvChoice{cfg, GemvSource::Measured};
@@ -425,8 +642,14 @@ std::unordered_map<std::string, MmqTcChoice>& mmq_tc_memo() {
 } // namespace
 
 MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
-  if (!enabled())
+  if (!enabled()) {
+    record_choice("tune/matmul_q8_tc",
+                  mmq_tc_shape_class(m_tokens, n_rows, k),
+                  mmq_tc_default_config().to_string(),
+                  planner::decisions::Source::Default,
+                  join_candidates(mmq_tc_candidates()));
     return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
+  }
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
   {
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
@@ -438,10 +661,24 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
     if (const auto cached =
             AutotuneCache::instance().lookup("matmul_q8_tc", key)) {
       const MmqTcChoice choice{*cached, MmqTcSource::Cache};
+      record_choice("tune/matmul_q8_tc", key, cached->to_string(),
+                    registry_source(choice.source),
+                    join_candidates(mmq_tc_candidates()));
       std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
       mmq_tc_memo().emplace(key, choice);
       return choice;
     }
+  }
+  // Out of cold budget: static default for this class for the rest of the
+  // process, memoized so it is not probed again.
+  if (budget_exhausted()) {
+    const MmqTcChoice choice{mmq_tc_default_config(), MmqTcSource::Skipped};
+    record_choice("tune/matmul_q8_tc", key, choice.cfg.to_string(),
+                  registry_source(choice.source),
+                  join_candidates(mmq_tc_candidates()));
+    std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
+    mmq_tc_memo().emplace(key, choice);
+    return choice;
   }
   return MmqTcChoice{mmq_tc_default_config(), MmqTcSource::Default};
 }
@@ -449,6 +686,9 @@ MmqTcChoice mmq_tc_choice(int m_tokens, int n_rows, int k) {
 bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
                          const TileConfig& cfg) {
   const std::string key = mmq_tc_shape_class(m_tokens, n_rows, k);
+  record_choice("tune/matmul_q8_tc", key, cfg.to_string(),
+                planner::decisions::Source::Measured,
+                join_candidates(mmq_tc_candidates()));
   {
     std::lock_guard<std::mutex> lock(mmq_tc_memo_mutex());
     mmq_tc_memo()[key] = MmqTcChoice{cfg, MmqTcSource::Measured};
@@ -458,24 +698,16 @@ bool mmq_tc_choice_store(int m_tokens, int n_rows, int k,
 
 // --- Q3: prefill attention shape classes -----------------------------------
 
-std::string attn_prefill_seq_bucket(int seq_len) {
-  if (seq_len < 64) return "1-63";
-  if (seq_len < 128) return "64-127";
-  if (seq_len < 256) return "128-255";
-  if (seq_len < 512) return "256-511";
-  if (seq_len < 1024) return "512-1023";
-  return "1024+";
-}
-
 std::string attn_prefill_heads_bucket(int n_heads) {
   if (n_heads < 8) return "1-7";
   if (n_heads < 16) return "8-15";
   return "16+";
 }
 
-std::string attn_prefill_shape_class(int head_dim, int seq_len, int n_heads) {
-  return std::to_string(head_dim) + "/" + attn_prefill_seq_bucket(seq_len) +
-         "/" + attn_prefill_heads_bucket(n_heads);
+std::string attn_prefill_shape_class(int head_dim, int n_heads,
+                                     std::string_view production) {
+  return std::to_string(head_dim) + "/" + attn_prefill_heads_bucket(n_heads) +
+         "/" + std::string(production);
 }
 
 bool attn_prefill_tunable(int head_dim) {
@@ -521,9 +753,16 @@ std::unordered_map<std::string, AttnPrefillChoice>& attn_prefill_memo() {
 }
 } // namespace
 
-AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
-  if (!enabled()) return AttnPrefillChoice{};
-  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+AttnPrefillChoice attn_prefill_choice(int head_dim, int n_heads,
+                                     std::string_view production) {
+  if (!enabled()) {
+    record_choice("tune/attn_prefill",
+                  attn_prefill_shape_class(head_dim, n_heads, production),
+                  "dispatcher", planner::decisions::Source::Default,
+                  "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
+    return AttnPrefillChoice{};
+  }
+  const std::string key = attn_prefill_shape_class(head_dim, n_heads, production);
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     const auto it = attn_prefill_memo().find(key);
@@ -534,17 +773,36 @@ AttnPrefillChoice attn_prefill_choice(int head_dim, int seq_len, int n_heads) {
     if (const auto cached =
             AutotuneCache::instance().lookup("attn_prefill", key)) {
       const AttnPrefillChoice choice{*cached, AttnPrefillSource::Cache};
+      record_choice("tune/attn_prefill", key, cached->to_string(),
+                    registry_source(choice.source),
+                    "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
       std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
       attn_prefill_memo().emplace(key, choice);
       return choice;
     }
   }
+  // Out of cold budget: keep the dispatcher's own shape for this class. The
+  // empty cfg is rejected by the caller's apply(), so nothing is probed; the
+  // Skipped record keeps the class out of the allocation path as well.
+  if (budget_exhausted()) {
+    const AttnPrefillChoice choice{TileConfig{}, AttnPrefillSource::Skipped};
+    record_choice("tune/attn_prefill", key, "dispatcher",
+                  registry_source(choice.source),
+                  "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
+    std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
+    attn_prefill_memo().emplace(key, choice);
+    return choice;
+  }
   return AttnPrefillChoice{};
 }
 
-bool attn_prefill_choice_store(int head_dim, int seq_len, int n_heads,
+bool attn_prefill_choice_store(int head_dim, int n_heads,
+                               std::string_view production,
                                const TileConfig& cfg) {
-  const std::string key = attn_prefill_shape_class(head_dim, seq_len, n_heads);
+  const std::string key = attn_prefill_shape_class(head_dim, n_heads, production);
+  record_choice("tune/attn_prefill", key, cfg.to_string(),
+                planner::decisions::Source::Measured,
+                "production|br{16,32,64}xbc{production,32}xas{production,0,2}");
   {
     std::lock_guard<std::mutex> lock(attn_prefill_memo_mutex());
     attn_prefill_memo()[key] = AttnPrefillChoice{cfg, AttnPrefillSource::Measured};
@@ -560,6 +818,10 @@ void attn_prefill_reset_for_test() {
 std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   if (!enabled() || problem.candidates.empty() || !problem.compile)
     return std::nullopt;
+  // Every probe starts its own clock check: the cold budget is shared by every
+  // class tuned in this process, and an exhausted budget must not launch even
+  // the reference candidate (the caller already has its default).
+  if (budget_exhausted()) return std::nullopt;
 
   const int iters = problem.iters > 0 ? problem.iters : 5;
   std::vector<unsigned char> reference(problem.output_bytes);
@@ -585,7 +847,11 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
 
   // Compile and bit-check every other candidate before any timing: a
   // candidate that cannot compile or that writes a different window is out.
+  // Compiling a JIT candidate is the expensive part of a cold class, so the
+  // budget is checked between compilations; the reference and every candidate
+  // compiled so far stay in the race.
   for (size_t i = 1; i < problem.candidates.size(); ++i) {
+    if (budget_exhausted()) break;
     auto launch = problem.compile(problem.candidates[i]);
     if (!launch) continue;
     (*launch)();
@@ -604,7 +870,12 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
   // load drift land on whichever end of the list ran first; at the few-percent
   // margins these tuners measure, that bias flipped the nomination between
   // processes. Each candidate keeps its fastest round.
+  int rounds = 0;
   for (int r = 0; r < iters; ++r) {
+    // The budget may expire mid-search; rank the rounds already measured. A
+    // class with no complete round is left unresolved (the caller keeps its
+    // default) rather than nominated from a partial one.
+    if (budget_exhausted()) break;
     const bool forward = (r & 1) == 0;
     for (size_t j = 0; j < entries.size(); ++j) {
       Entry& e = entries[forward ? j : entries.size() - 1 - j];
@@ -619,7 +890,9 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
           e.ns,
           std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
     }
+    ++rounds;
   }
+  if (rounds == 0) return std::nullopt;
 
   // Strict <: on a tie the earlier candidate (candidate 0, the reference) wins,
   // so a marginal measurement keeps the known config.
@@ -628,8 +901,9 @@ std::optional<TileConfig> AutotuneRunner::run(const Problem& problem) {
     if (entries[i].ns < entries[best].ns) best = i;
 
   if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE")) {
-    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d rounds\n",
-                 entries.size(), iters);
+    std::fprintf(stderr, "[autotune] runner: %zu candidates, %d/%d rounds%s\n",
+                 entries.size(), rounds, iters,
+                 rounds < iters ? " (budget)" : "");
     for (const Entry& e : entries)
       std::fprintf(stderr, "  %d,%d,%d,%d,%d: %.4f ms%s\n", e.cfg.tile_m,
                    e.cfg.tile_n, e.cfg.tile_k, e.cfg.unroll, e.cfg.vectorize,

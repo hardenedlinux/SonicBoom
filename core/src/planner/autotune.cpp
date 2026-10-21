@@ -16,6 +16,9 @@
 
 #include "autotune.h"
 
+#include "decision_registry.h"
+#include "reduce_mode.h"
+
 #include <sonicboom/runtime_features.h>
 
 #include <algorithm>
@@ -45,45 +48,17 @@ std::unordered_map<std::string, std::map<std::string, std::map<std::string, int>
 std::unordered_map<std::string, bool> g_loaded;  // op -> file read already
 std::string g_device_dir;
 
-std::string sanitize(std::string_view in) {
-  std::string out;
-  out.reserve(in.size());
-  for (char c : in)
-    out.push_back(std::isalnum(static_cast<unsigned char>(c)) || c == '.' ||
-                          c == '_' || c == '-'
-                      ? c
-                      : '_');
-  return out;
-}
-
 std::string compute_device_dir() {
-#ifdef SONICBOOM_USE_CUDA
-  int dev = 0;
-  if (cudaGetDevice(&dev) != cudaSuccess) return "cpu";
-  cudaDeviceProp prop{};
-  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return "cpu";
-  const int arch = prop.major * 10 + prop.minor;
-  int driver = 0;
-  const std::string drv =
-      (cuDriverGetVersion(&driver) == CUDA_SUCCESS && driver > 0)
-          ? (std::to_string(driver / 1000) + "." +
-             std::to_string((driver % 1000) / 10))
-          : std::string("unknown");
-  return sanitize(prop.name) + "-sm" + std::to_string(arch) + "-" + drv;
-#else
-  return "cpu";
-#endif
+  // The reduction mode is part of the device identity: it changes the norm
+  // kernels' instruction mix, so a choice tuned under one mode must not be
+  // reused under another. The identity itself is shared with the reduction
+  // decision cache (planner/reduce_mode.h), so both trees key the device the
+  // same way.
+  return planner::device_identity() + "-reduce-" +
+         compiler::reduce_mode_name(planner::device_reduce_mode());
 }
 
-std::string cache_root() {
-  if (const char *e = std::getenv("SONICBOOM_TUNE_DIR"))
-    if (*e != '\0') return e;
-  if (const char *e = std::getenv("XDG_CACHE_HOME"))
-    if (*e != '\0') return std::string(e) + "/sonicboom/tune";
-  if (const char *e = std::getenv("HOME"))
-    if (*e != '\0') return std::string(e) + "/.cache/sonicboom/tune";
-  return ".sonicboom-tune";
-}
+std::string cache_root() { return planner::decision_cache_root(); }
 
 // Caller holds g_mutex (the public device_dir() is the locking entry point;
 // the cache-path helpers below run with the lock already held and must not
@@ -187,6 +162,15 @@ void parse_op_file(std::string_view s,
   }
 }
 
+// On-disk schema version of each <op>.json file. The reserved entry
+// "__format__" records it next to the shape classes. A file without the entry
+// predates the marker and is read as version 1 (its entries mean the same);
+// a file with any other version is discarded, so a future change to a value's
+// meaning invalidates old picks instead of being misread. A store always
+// writes the current version, and the write is a temp file plus rename, so a
+// reader sees the whole old file or the whole new one.
+constexpr int kJsonFormatVersion = 1;
+
 void load_op_locked(const std::string &op) {
   if (g_loaded[op]) return;
   g_loaded[op] = true;
@@ -194,7 +178,14 @@ void load_op_locked(const std::string &op) {
   if (!in) return;
   const std::string body((std::istreambuf_iterator<char>(in)),
                          std::istreambuf_iterator<char>());
-  parse_op_file(body, g_cache[op]);
+  auto &entries = g_cache[op];
+  parse_op_file(body, entries);
+  const auto fmt = entries.find("__format__");
+  if (fmt != entries.end()) {
+    const auto v = fmt->second.find("v");
+    if (v == fmt->second.end() || v->second != kJsonFormatVersion)
+      entries.clear();
+  }
 }
 
 void write_op_locked(const std::string &op) {
@@ -202,6 +193,7 @@ void write_op_locked(const std::string &op) {
   std::error_code ec;
   std::filesystem::create_directories(
       std::filesystem::path(path).parent_path(), ec);
+  g_cache[op]["__format__"] = {{"v", kJsonFormatVersion}};
   std::ostringstream os;
   os << "{\n";
   bool first_key = true;
@@ -261,6 +253,45 @@ std::string cache_path(std::string_view op) {
   return cache_path_locked(std::string(op));
 }
 
+namespace {
+
+// The registry value form of a tuner pick: "k=v,k=v" in key order.
+std::string serialize_values(const std::map<std::string, int> &values) {
+  std::string out;
+  for (const auto &[name, value] : values) {
+    if (!out.empty()) out += ',';
+    out += name;
+    out += '=';
+    out += std::to_string(value);
+  }
+  return out;
+}
+
+void record_pick(std::string_view op, std::string_view key,
+                 const std::map<std::string, int> &values,
+                 planner::decisions::Source source) {
+  planner::decisions::Entry entry;
+  entry.name = "tune/" + std::string(op);
+  entry.scope = std::string(key);
+  entry.value = serialize_values(values);
+  entry.source = source;
+  entry.env = "SONICBOOM_AUTOTUNE";
+  // The caller holds g_mutex; use the locked accessor.
+  entry.inputs = "device=" + device_dir_locked() + ", class=" +
+                 std::string(key);
+  entry.candidates =
+      source == planner::decisions::Source::Cached
+          ? "the recorded pick"
+          : "the tuner's eager-warm-up sweep";
+  entry.reason = source == planner::decisions::Source::Cached
+                     ? "per-device JSON cache record"
+                     : "timed in the eager warm-up (3% win required)";
+  entry.numerics = "kernel-specific; gated by the owning test suite";
+  planner::decisions::record(entry);
+}
+
+} // namespace
+
 std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
   if (!enabled() || force()) return {};
   std::lock_guard<std::mutex> lk(g_mutex);
@@ -268,6 +299,7 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
   load_op_locked(op_s);
   const auto it = g_cache[op_s].find(std::string(key));
   if (it == g_cache[op_s].end()) return {};
+  record_pick(op_s, key, it->second, planner::decisions::Source::Cached);
   return it->second;
 }
 
@@ -279,12 +311,47 @@ void store(std::string_view op, std::string_view key,
   load_op_locked(op_s);
   g_cache[op_s][std::string(key)] = values;
   write_op_locked(op_s);
+  record_pick(op_s, key, values, planner::decisions::Source::Measured);
 }
 
 void clear_memory_cache() {
   std::lock_guard<std::mutex> lk(g_mutex);
   g_cache.clear();
   g_loaded.clear();
+}
+
+std::vector<DiskChoice> disk_choices() {
+  std::vector<DiskChoice> out;
+  std::lock_guard<std::mutex> lk(g_mutex);
+  const std::filesystem::path dir =
+      std::filesystem::path(cache_root()) / device_dir_locked();
+  std::error_code ec;
+  if (!std::filesystem::is_directory(dir, ec)) return out;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) break;
+    if (!entry.is_regular_file(ec) || entry.path().extension() != ".json")
+      continue;
+    std::ifstream in(entry.path(), std::ios::binary);
+    if (!in) continue;
+    const std::string body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    std::map<std::string, std::map<std::string, int>> parsed;
+    parse_op_file(body, parsed);
+    const auto fmt = parsed.find("__format__");
+    if (fmt != parsed.end()) {
+      const auto v = fmt->second.find("v");
+      if (v == fmt->second.end() || v->second != kJsonFormatVersion) continue;
+    }
+    const std::string op = entry.path().stem().string();
+    for (auto &[key, values] : parsed) {
+      if (key == "__format__") continue;
+      out.push_back(DiskChoice{op, key, std::move(values)});
+    }
+  }
+  std::sort(out.begin(), out.end(), [](const DiskChoice &a, const DiskChoice &b) {
+    return a.op != b.op ? a.op < b.op : a.key < b.key;
+  });
+  return out;
 }
 
 double median_launch_ms(const std::function<bool()> &launch,

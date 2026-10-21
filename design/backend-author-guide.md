@@ -55,8 +55,8 @@ tag. The concrete backends today are:
 
 | Backend | Tag | Device | Notes |
 |---|---|---|---|
-| `CpuBackend` | `Mlir` | CPU | MLIR JIT (7-op lowering set) |
-| `NativeTorchBackend` | `NativeTorch` | CPU | native-torch boxed dispatcher |
+| `CpuBackend` | `Mlir` | CPU | whole-region Boom IR executor (`core/src/exec/cpu_executor.cpp`) |
+| `CpuKernelBackend` | `NativeTorch` | CPU | one graph node per task, through the same executor (the tag name is kept for plan/IR spelling) |
 | `SonicBackend` | `Sonic` | CPU | transformer ops (`nn::*`/`quant::*` CPU kernels) |
 | `SonicCudaBackend` | `Sonic` (device) | GPU | transformer ops (`nn::cuda::*`/`quant::cuda::*` kernels) |
 

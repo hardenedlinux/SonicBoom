@@ -14,13 +14,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// test_s_expr_exec.cpp — Stage A: real CPU JIT execution (Add + Relu).
+// test_s_expr_exec.cpp — S-Expr → CPU Boom executor execution.
 //
-// Proves the end-to-end S-Expr → MLIR → LLVM → JIT path produces a callable
-// native function and computes correct results, against an independently
-// hand-computed reference (no placeholder, no hardcoded JIT output). It also
-// exercises the v0 execution-scope guards (at-least-one f32 input, single f32
-// output), a two-input merge graph, and the input-buffer size check.
+// Proves the end-to-end S-Expr → Boom IR → planner graph → CPU kernel path
+// computes correct results, against an independently hand-computed reference.
+// It also exercises the v0 execution-scope guards (at-least-one f32 input,
+// single f32 output), a two-input merge graph, the input-buffer size check, and
+// the operator/attribute validation that must reject malformed documents at
+// compile time.
 
 #include <sonicboom/sx/exec.h>
 #include <sonicboom/sx/parser.h>
@@ -29,6 +30,8 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace sx = sonicboom::sx;
@@ -54,6 +57,43 @@ std::vector<float> unpack(const sx::Bytes& b) {
   std::vector<float> v(b.size() / sizeof(float));
   std::memcpy(v.data(), b.data(), b.size());
   return v;
+}
+
+// Zero-filled buffers for every `:external` parameter, so a compile reaches
+// structural validation without sidecars on disk.
+std::unordered_map<std::string, sx::Bytes> external_weights(
+    const sx::Document& doc) {
+  std::unordered_map<std::string, sx::Bytes> weights;
+  for (const auto& p : doc.graph.parameters) {
+    if (!std::holds_alternative<sx::ExternalData>(p.data)) continue;
+    auto bytes = sx::tensor_byte_size(p.type);
+    if (bytes) weights[p.name] = sx::Bytes(static_cast<std::size_t>(*bytes));
+  }
+  return weights;
+}
+
+// Compile `src` and require a Compile error whose message contains `needle`.
+// Malformed attributes and unsupported shapes must fail cleanly at compile
+// time, never index out of bounds at run time.
+void expect_compile_error(const std::string& src, const std::string& needle,
+                          const char* what) {
+  auto doc = sx::parse_document(src);
+  if (!doc) {
+    std::cerr << "  FAIL: " << what << " (unexpected parse error: "
+              << doc.error().message << ")\n";
+    ++g_failures;
+    return;
+  }
+  auto exe = sx::Executable::compile(*doc, external_weights(*doc));
+  if (exe) {
+    std::cerr << "  FAIL: " << what << " (expected a compile error)\n";
+    ++g_failures;
+    return;
+  }
+  check(exe.error().kind == sx::ExecErrorKind::Compile,
+        (std::string(what) + ": error kind is Compile").c_str());
+  check(exe.error().message.find(needle) != std::string::npos,
+        (std::string(what) + ": message contains \"" + needle + "\"").c_str());
 }
 
 // z = relu(x + b), single f32 input/output, shape [8].
@@ -268,6 +308,78 @@ void test_overflow_rejected() {
         "overflow: message mentions overflow");
 }
 
+// 6. An operator outside the executor vocabulary → Compile error naming it.
+void test_unsupported_op() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 2))))"
+      " (outputs (output \"c\")) (parameters)"
+      " (nodes (node foo (inputs \"a\")"
+      "   (outputs (\"c\" (tensor float32 (shape 2))))))))",
+      "unsupported operator 'foo'", "unsupported op");
+}
+
+// 7. Conv with an empty strides attr → Compile error, never OOB.
+void test_conv_empty_strides() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"x\" (tensor float32 (shape 1 3 4 4))))"
+      " (outputs (output \"y\"))"
+      " (parameters"
+      "   (parameter \"w\" (tensor float32 (shape 2 3 2 2))"
+      "     (data :external \"w.bin\" 0 96))"
+      "   (parameter \"b\" (tensor float32 (shape 2))"
+      "     (data :external \"b.bin\" 0 8)))"
+      " (nodes (node conv (inputs \"x\" \"w\" \"b\")"
+      "   (outputs (\"y\" (tensor float32 (shape 1 2 3 3))))"
+      "   (attrs (strides (ints)))))))",
+      "conv strides must have 2 entries", "conv empty strides");
+}
+
+// 8. Conv with an empty dilations attr → Compile error, never OOB.
+void test_conv_empty_dilations() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"x\" (tensor float32 (shape 1 3 4 4))))"
+      " (outputs (output \"y\"))"
+      " (parameters"
+      "   (parameter \"w\" (tensor float32 (shape 2 3 2 2))"
+      "     (data :external \"w.bin\" 0 96))"
+      "   (parameter \"b\" (tensor float32 (shape 2))"
+      "     (data :external \"b.bin\" 0 8)))"
+      " (nodes (node conv (inputs \"x\" \"w\" \"b\")"
+      "   (outputs (\"y\" (tensor float32 (shape 1 2 3 3))))"
+      "   (attrs (dilations (ints)))))))",
+      "dilations", "conv empty dilations");
+}
+
+// 9. Gemm with a rank-3 input → Compile error (v0 gemm is strictly 2-D).
+void test_gemm_rank_mismatch() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 1 2 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters"
+      "   (parameter \"b\" (tensor float32 (shape 3 4))"
+      "     (data :external \"b.bin\" 0 48)))"
+      " (nodes (node gemm (inputs \"a\" \"b\")"
+      "   (outputs (\"c\" (tensor float32 (shape 1 2 4))))))))",
+      "gemm requires rank-2 A and B", "gemm rank mismatch");
+}
+
+// 10. ReduceMean with a duplicated axis → Compile error (no divisor bloat).
+void test_reduce_mean_duplicate_axes() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 4 3 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters (parameter \"axes\" (tensor int64 (shape 2))"
+      "   (data :values 1 1)))"
+      " (nodes (node reduce_mean (inputs \"a\" \"axes\")"
+      "   (outputs (\"c\" (tensor float32 (shape 4 1 3))))))))",
+      "reduce_mean has duplicate axes", "reduce_mean duplicate axes");
+}
+
 } // namespace
 
 int main() {
@@ -276,9 +388,14 @@ int main() {
   test_binding_size_check();
   test_max_pool_neg_inf_pad();
   test_overflow_rejected();
+  test_unsupported_op();
+  test_conv_empty_strides();
+  test_conv_empty_dilations();
+  test_gemm_rank_mismatch();
+  test_reduce_mean_duplicate_axes();
 
   if (g_failures == 0) {
-    std::cout << "test_s_expr_exec OK (5 cases)\n";
+    std::cout << "test_s_expr_exec OK (10 cases)\n";
     return 0;
   }
   std::cerr << "test_s_expr_exec FAILED: " << g_failures << " check(s)\n";

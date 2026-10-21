@@ -22,6 +22,8 @@
 #include "cuda_resident.h"
 
 #include "../nn/cuda_stream.h"
+#include "../nn/reduce_sum.cuh"
+#include "../planner/reduce_mode.h"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // the generated MMQ1 tensor-core kernel
@@ -1323,9 +1325,9 @@ void launch_gemv(QuantType qt, const uint8_t* wp, const float* xp, float* yp,
   // resolved once per process and memoized. `tile_m` selects the launch width
   // of the one-thread-per-super-block kernel below — the only tile knob the
   // current hand-written kernel exposes; `tile_k` is carried for the generated
-  // gemv and does not change this launch yet. With SONICBOOM_AUTOTUNE unset or
-  // 0 (the default) this is the static default (tile_m 256), which is exactly
-  // the pre-Q1 launch, so the gate-off path is unchanged.
+  // gemv and does not change this launch yet. Under SONICBOOM_AUTOTUNE=0 (or
+  // before the class is resolved) this is the static default (tile_m 256),
+  // which is exactly the pre-Q1 launch, so the gate-off path is unchanged.
   const mlir_tune::TileConfig gemv_cfg =
       mlir_tune::gemv_config(blocks_per_row, num_rows);
   const int base_block =
@@ -2042,8 +2044,9 @@ static int gemv_warps_for_launch(const mlir_tune::TileConfig& cfg,
   return warps;
 }
 
-// Q2: resolve this shape class's launch width. The first call for a class under
-// SONICBOOM_AUTOTUNE=1 times the three candidate widths on the live buffers
+// Q2: resolve this shape class's launch width. The first call for an
+// unresolved class (autotune on, cold cache, budget left) times the three
+// candidate widths on the live buffers
 // through the Q1 runner, which accepts a width only when its output matches the
 // 256-thread launch bit for bit, and persists the winner. Skipped inside a CUDA
 // graph capture, where the host must not synchronize or launch probes; the
@@ -2061,6 +2064,18 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
   if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
     return gemv_warps_for_launch(choice.cfg, num_rows);
+
+  // Probe launches are not part of any run: a recorded plan must name the
+  // chosen kernel's grid, not the probes' (same rule as the dense and
+  // attention tuners). The caller's real launch happens after this returns,
+  // with the recorder restored.
+  struct RecorderGuard {
+    planner::PlanRecorder* saved;
+    RecorderGuard() : saved(planner::recorder()) {
+      planner::set_thread_recorder(nullptr);
+    }
+    ~RecorderGuard() { planner::set_thread_recorder(saved); }
+  } guard;
 
   static const mlir_tune::TileConfig kWidths[] = {
       mlir_tune::default_config("gemv"),
@@ -2126,7 +2141,10 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
   // that noise flips between processes and is persisted that way.
   const mlir_tune::TileConfig production = mlir_tune::default_config("gemv");
   mlir_tune::TileConfig winner = *best;
-  if (!(winner == production)) {
+  // The confirmation re-measurement is part of the same cold budget. When the
+  // runner used it up, keep production rather than take a pick the confirmation
+  // never reproduced.
+  if (!(winner == production) && !mlir_tune::budget_exhausted()) {
     // 100 launches per burst: 16 leaves a few percent of burst-to-burst jitter
     // on the short kernels, which reads as noise and rejects a real win.
     constexpr int kProbeReps = 100;
@@ -2153,8 +2171,13 @@ static int resolve_gemv_warps(QuantType qt, const uint8_t* wp,
     constexpr int kRounds = 5;
     double refs[kRounds] = {}, wins[kRounds] = {}, scratch = 0;
     bool ok = true;
-    for (int i = 0; i < 3 && ok; ++i) ok = timed_burst(production, scratch);
+    for (int i = 0; i < 3 && ok; ++i)
+      ok = !mlir_tune::budget_exhausted() && timed_burst(production, scratch);
     for (int i = 0; ok && i < kRounds; ++i) {
+      if (mlir_tune::budget_exhausted()) {
+        ok = false;  // unconfirmed: production is kept
+        break;
+      }
       ok = i % 2 == 0
                ? timed_burst(production, refs[i]) && timed_burst(winner, wins[i])
                : timed_burst(winner, wins[i]) && timed_burst(production, refs[i]);
@@ -2288,28 +2311,18 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // once (kept in a register and reused by the amax butterfly), so the block
 // costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
 // thread runs a 32-iteration serial chain.
+template <typename R>
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t warp_part[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
-  }
+  const typename R::acc_t t =
+      sonicboom::nn::cuda::block_sum_sq<R>(x, n, warp_part);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, n) + eps);
   __syncthreads();
   const float iv = inv;
   const int nblocks = n / 32;
@@ -2339,8 +2352,22 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
     if (!d_w) return false;
   }
   SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, 1, 1024, 0, cur_stream());
-  rms_norm_quantize_q8_1_kernel<<<1, 1024, 0, cur_stream()>>>(
-      x, d_w, n, eps, reinterpret_cast<q8_1::block_q8_1*>(yq));
+  auto* y = reinterpret_cast<q8_1::block_q8_1*>(yq);
+  cudaStream_t st = cur_stream();
+  switch (sonicboom::planner::device_reduce_mode()) {
+    case sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumDf32>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+    case sonicboom::compiler::ReduceMode::F32:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF32>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+    default:
+      rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF64>
+          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+      break;
+  }
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2896,8 +2923,9 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first
-// call for a class under SONICBOOM_AUTOTUNE=1 times the candidate grid on the
-// live buffers; a candidate is accepted only when its output matches the
+// call for an unresolved class (autotune on, cold cache, budget left) times
+// the candidate grid on the live buffers; a candidate is accepted only when
+// its output matches the
 // smallest config (16x16) bit for bit, and the winner is persisted per SM.
 // Skipped inside CUDA-graph capture, where the host must not synchronize and a
 // JIT module load allocates: the class is tuned by the first uncaptured call.
@@ -2924,6 +2952,16 @@ static compiler::MmqTcShape resolve_mmq_tc_shape(
   if (cudaStreamIsCapturing(cur_stream(), &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
     return base;
+
+  // Probe launches are not part of any run (same rule as the gemv and
+  // attention tuners); the caller's real launch follows this function.
+  struct RecorderGuard {
+    planner::PlanRecorder* saved;
+    RecorderGuard() : saved(planner::recorder()) {
+      planner::set_thread_recorder(nullptr);
+    }
+    ~RecorderGuard() { planner::set_thread_recorder(saved); }
+  } guard;
 
   // The comparison window is a prefix of the output, capped at 64 MiB so the
   // 151936-row logits projection does not turn every timed burst into a 300 MB
@@ -3117,6 +3155,7 @@ __device__ __forceinline__ void quantize_mmq_q8_1_block(
 // Phase A: the per-row `inv`. One 256-thread block per row, strided double
 // partials + warp shuffle + a warp-0 shared reduce — same tree and same fp32
 // rounding point as rms_heads_fused_kernel, so `inv` matches that kernel's.
+template <typename R>
 __global__ void __launch_bounds__(256) rms_norm_inv_kernel(
     const float* __restrict__ x, int dim, float eps,
     float* __restrict__ inv_out) {
@@ -3124,23 +3163,11 @@ __global__ void __launch_bounds__(256) rms_norm_inv_kernel(
   const int tid = threadIdx.x;
   const float* xrow = x + (size_t)token * dim;
 
-  double s = 0.0;
-  for (int k = tid; k < dim; k += blockDim.x) {
-    const float v = xrow[k];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv_out[token] = 1.0f / sqrtf(float(t / double(dim)) + eps);
-  }
+  __shared__ typename R::part_t warp_part[32];
+  const typename R::acc_t t =
+      sonicboom::nn::cuda::block_sum_sq<R>(xrow, dim, warp_part);
+  if (tid == 0)
+    inv_out[token] = 1.0f / sqrtf(R::mean_to_float(t, dim) + eps);
 }
 
 // Phase B: apply `inv` (and the optional norm weight) and quantize. 128 threads
@@ -3185,7 +3212,21 @@ bool rms_norm_quantize_mmq_q8_1_dev(std::span<const float> weight, const float* 
   if (!inv) return false;
   auto* y = reinterpret_cast<mmq::block_q8_1_mmq*>(yq);
   SB_NOTE_LAUNCH(rms_norm_inv_kernel, n, 256, 0, cur_stream());
-  rms_norm_inv_kernel<<<n, 256, 0, cur_stream()>>>(x, dim, eps, inv);
+  cudaStream_t st = cur_stream();
+  switch (sonicboom::planner::device_reduce_mode()) {
+    case sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumDf32>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+    case sonicboom::compiler::ReduceMode::F32:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumF32>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+    default:
+      rms_norm_inv_kernel<sonicboom::nn::cuda::SumF64>
+          <<<n, 256, 0, st>>>(x, dim, eps, inv);
+      break;
+  }
   const dim3 grid(n, (dim / 128 + 3) / 4);  // one 128-element block per warp
   if (ds == mmq::DS4) {
     SB_NOTE_LAUNCH_TP("scale_quantize_mmq_q8_1_kernel", "ds=ds4", grid, 128, 0, cur_stream());

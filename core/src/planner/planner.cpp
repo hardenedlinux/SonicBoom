@@ -116,7 +116,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
 
   // M3 placement seam: route a node to the GPU (device-local) only when it
   // dispatches to the Sonic backend AND a usable GPU device that supports its op
-  // is present; every other backend (MLIR JIT, native-torch dispatcher) is
+  // is present; every other backend (the two CPU Boom-executor backends) is
   // CPU-only in v0, so those nodes stay on the CPU (host). Tying placement to
   // backend keeps it consistent with routing — the shared `Add` operator is MLIR
   // by default (→ CPU) but is pinned to Sonic by the Gemma 4 emitter (→ GPU).

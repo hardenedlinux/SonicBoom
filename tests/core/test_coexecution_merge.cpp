@@ -33,7 +33,7 @@
 //   - a task with no registered backend fails with a RuntimeError (no crash).
 
 #include <sonicboom/planner/backend.h>
-#include <sonicboom/planner/native_torch_backend.h>
+#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/planner/runtime_executor.h>
@@ -228,7 +228,7 @@ int main() {
   if (!cpu)
     return 1;
 
-  auto nt = pl::NativeTorchBackend::compile(*g);
+  auto nt = pl::CpuKernelBackend::compile(*g);
   check(nt.has_value(), "native-torch backend compiles");
   if (!nt)
     return 1;

@@ -16,6 +16,8 @@
 
 #include "glue_jit.h"
 
+#include "reduce_mode.h"
+
 #include <sonicboom/compiler/GemmCodegen.h>
 #include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/planner/plan_record.h>
@@ -164,7 +166,13 @@ std::string validate_entry(const std::string &text, const std::string &region,
 // the whole point — the MLIR pipeline is ~100 ms), the compiler on a miss.
 std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
   if (arch <= 0) return {};
-  const std::string region = compiler::glue_region_name(kind);
+  // The reduction mode is part of the kernel's identity: it changes the PTX, so
+  // it selects a distinct cache entry (the F64 name is unchanged, keeping the
+  // historical entries valid).
+  const compiler::ReduceMode mode = device_reduce_mode();
+  std::string region = compiler::glue_region_name(kind);
+  if (mode != compiler::ReduceMode::F64)
+    region += std::string("-") + compiler::reduce_mode_name(mode);
   // SONICBOOM_GLUE_CACHE=0 bypasses the disk cache (read and write): the
   // ablation for "is this the cached kernel or the one this compiler builds".
   static const bool use_cache = [] {
@@ -182,7 +190,7 @@ std::string region_ptx(compiler::GlueRegionKind kind, int arch) {
                    path.c_str());
     }
   }
-  auto generated = compiler::generate_glue_ptx(kind, arch);
+  auto generated = compiler::generate_glue_ptx(kind, arch, mode);
   if (!generated) return {};
   if (use_cache)
     write_file(path, make_entry(region, arch, compiler::glue_codegen_version(),
@@ -211,6 +219,9 @@ std::string attention_region_name(const compiler::AttentionShape &shape) {
          (shape.warp_head ? "-wh" : "") +
          (shape.async_stages >= 2 ? "-as" + std::to_string(shape.async_stages)
                                   : "") +
+         (shape.gqa_pack > 1 ? "-p" + std::to_string(shape.gqa_pack) : "") +
+         (shape.q_in_reg ? "" : "-qs") +
+         (shape.head_fast ? "-hf" : "") +
          (shape.exp2 ? "-x2" : "");
 }
 

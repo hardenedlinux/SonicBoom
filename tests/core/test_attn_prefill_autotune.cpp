@@ -85,23 +85,18 @@ int main() {
     return 1;
   }
   set_env("XDG_CACHE_HOME", dir);
-  set_env("SONICBOOM_AUTOTUNE", nullptr);
+  set_env("SONICBOOM_AUTOTUNE", "0");
+  // The GPU section forces several cold retunes; lift the production cold
+  // budget so they are not cut short.
+  set_env("SONICBOOM_AUTOTUNE_BUDGET_MS", "0");
   mt::AutotuneCache::instance().reset_for_test();
   mt::attn_prefill_reset_for_test();
 
   // --- the shape-class key -----------------------------------------------
   {
-    const struct {
-      int seq_len;
-      const char *want;
-    } seq[] = {{1, "1-63"},     {63, "1-63"},   {64, "64-127"},
-               {127, "64-127"}, {128, "128-255"}, {255, "128-255"},
-               {256, "256-511"}, {511, "256-511"}, {512, "512-1023"},
-               {1023, "512-1023"}, {1024, "1024+"}, {8192, "1024+"}};
-    for (const auto &c : seq)
-      check(mt::attn_prefill_seq_bucket(c.seq_len) == c.want,
-            "seq bucket for " + std::to_string(c.seq_len) + " is " + c.want);
-
+    // One kernel per shape class (R1): the query length is not part of the
+    // key, so the same class cannot be tuned to a different tile for a 1-row
+    // chunk than for a 512-row prefill.
     check(mt::attn_prefill_heads_bucket(1) == "1-7" &&
               mt::attn_prefill_heads_bucket(7) == "1-7",
           "1..7 query heads bucket to 1-7");
@@ -112,8 +107,8 @@ int main() {
               mt::attn_prefill_heads_bucket(32) == "16+",
           "16+ query heads bucket to 16+");
 
-    check(mt::attn_prefill_shape_class(64, 512, 14) == "64/512-1023/8-15",
-          "shape class is <head_dim>/<seq bucket>/<heads bucket>");
+    check(mt::attn_prefill_shape_class(64, 14, "prod") == "64/8-15/prod",
+          "shape class is <head_dim>/<heads bucket>/<production>");
   }
 
   // --- candidates: production first, real (br, bc, as) neighbours --------
@@ -159,23 +154,23 @@ int main() {
 
   // --- gate and cache ----------------------------------------------------
   {
-    mt::AttnPrefillChoice off = mt::attn_prefill_choice(128, 200, 14);
-    check(!off.resolved(), "gate unset: the class is unresolved");
+    mt::AttnPrefillChoice off = mt::attn_prefill_choice(128, 14, "prod");
+    check(!off.resolved(), "gate off: the class is unresolved");
 
     set_env("SONICBOOM_AUTOTUNE", "1");
     mt::attn_prefill_reset_for_test();
-    mt::AttnPrefillChoice cold = mt::attn_prefill_choice(128, 200, 14);
+    mt::AttnPrefillChoice cold = mt::attn_prefill_choice(128, 14, "prod");
     check(!cold.resolved(), "gate on, cold cache: the class is unresolved");
 
     const mt::TileConfig winner{64, 64, 32, 2, 1};
-    check(mt::attn_prefill_choice_store(128, 200, 14, winner),
+    check(mt::attn_prefill_choice_store(128, 14, "prod", winner),
           "the winner is persisted");
     mt::attn_prefill_reset_for_test();
-    mt::AttnPrefillChoice warm = mt::attn_prefill_choice(128, 200, 14);
+    mt::AttnPrefillChoice warm = mt::attn_prefill_choice(128, 14, "prod");
     check(warm.resolved() && warm.cfg == winner &&
               warm.source == mt::AttnPrefillSource::Cache,
           "a second process reads the winner from the per-SM cache");
-    const std::string cls = mt::attn_prefill_shape_class(128, 200, 14);
+    const std::string cls = mt::attn_prefill_shape_class(128, 14, "prod");
     check(mt::AutotuneCache::instance().lookup("attn_prefill", cls) == winner,
           "the cache record lives under op \"attn_prefill\"");
     set_env("SONICBOOM_AUTOTUNE", nullptr);
@@ -246,7 +241,7 @@ int main() {
       // bypassed by the pin. The tuner's reference is the same config.
       set_env("SONICBOOM_ATTN_CODEGEN", "64,16,1,2");
       set_env("SONICBOOM_ATTN_IMPL", nullptr);
-      set_env("SONICBOOM_AUTOTUNE", nullptr);
+      set_env("SONICBOOM_AUTOTUNE", "0");
       std::vector<float> ref;
       const bool ref_ok = run(ref);
       check(ref_ok, "the production-config reference runs");
@@ -265,7 +260,13 @@ int main() {
                 std::memcmp(ref.data(), tuned.data(), q_n * 4) == 0,
             "the Q3 pick is bit-identical to the production reference");
 
-      const std::string cls = mt::attn_prefill_shape_class(D, N, NHQ);
+      // The runtime builds the class key from its own production signature
+      // (the static default's knobs); read it back from the store instead of
+      // duplicating the format here.
+      std::string cls;
+      for (const mt::DiskRecord &r : mt::disk_records())
+        if (r.op == "attn_prefill") cls = r.shape_class;
+      check(!cls.empty(), "the tuned class is in the attn_prefill store");
       const std::vector<mt::TileConfig> grid = mt::attn_prefill_candidates(
           D, mt::TileConfig{64, 64, 16, 2, 1});
       std::optional<mt::TileConfig> rec =

@@ -2,10 +2,12 @@
 // and the narrow Qwen head.
 //
 // The Gemma-family attention heads are wider than a warp's mma accumulator
-// budget: head_dim 256 (sliding-window head) and 512 (global head). The
-// generator therefore splits head_dim across `dps` warps (256 -> 4 x 64,
-// 512 -> 8 x 64), exchanges the partial S through shared memory and sums the
-// slices in warp order. The Qwen2.5 head (head_dim 64, GQA 7) fits one warp
+// budget at the original 128-column slice: head_dim 256 (sliding-window head)
+// and 512 (global head). The generator can split head_dim across `dps` warps
+// (dc = head_dim/dps up to 256 columns, which needs no shared-memory S
+// exchange at 256 -> 1 and only a 2-way one at 512 -> 2). With dps > 1 it
+// exchanges the partial S through shared memory and sums the slices in warp
+// order. The Qwen2.5 head (head_dim 64, GQA 7) fits one warp
 // and is covered by the same test: its generated kernel is checked against
 // fp64 and the batch-invariance contract like the wide heads. Since attn9
 // its prefill is the class default and is bit-identical to the hand-written
@@ -65,10 +67,11 @@ float f16r(float x) {
 }
 
 // Absolute positions the streams cover. The benchmark mode also runs a decode
-// step at start = 512 (the d512 canonical depth), so the streams must reach
-// past it.
-constexpr int TOTAL = 1024;
-constexpr uint64_t NSLOTS = 1024;
+// step at start = 512 (the d512 canonical depth) and can prefill up to 2048
+// queries against a 2048-key prefix (the pp2048 comparison), so the streams
+// must reach past them.
+constexpr int TOTAL = 4096;
+constexpr uint64_t NSLOTS = 4096;
 
 struct Cfg {
   int d;
@@ -262,6 +265,38 @@ bool codegen_cache_hit(const char *region) {
   return body.find("mma.sync") != std::string::npos;
 }
 
+// Any cached generated kernel for this shape class (mask kind included): the
+// Q3 tuner may have chosen a non-default tile for the class, and the check's
+// meaning is "the generator compiled and cached a kernel for this class", not
+// "the tuner happened to keep the default".
+bool codegen_cache_hit_class(const char *prefix) {
+  const char *home = std::getenv("HOME");
+  if (!home) return false;
+  int major = 0, minor = 0;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) !=
+          cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) !=
+          cudaSuccess)
+    return false;
+  const std::string suffix = "-sm" + std::to_string(major * 10 + minor) + ".ptx";
+  const std::filesystem::path dir =
+      std::filesystem::path(home) / ".cache" / "sonicboom" / "kernels";
+  std::error_code ec;
+  for (const auto &e : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) return false;
+    const std::string name = e.path().filename().string();
+    if (name.rfind(prefix, 0) != 0 ||
+        name.size() < suffix.size() ||
+        name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+      continue;
+    std::ifstream in(e.path(), std::ios::binary);
+    const std::string body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    if (body.find("mma.sync") != std::string::npos) return true;
+  }
+  return false;
+}
+
 struct ShapeCase {
   Cfg cfg;
   const char *causal_region;
@@ -306,15 +341,48 @@ int run_bench(int prefill_n) {
     else if (c.d == 256)
       configs = {"32,32,2", "32,32,4", "32,64,2", "16,32,2",
                  "48,32,4", "64,32,2", "64,16,4", "32,16,4",
+                 // No d split (dc = head_dim): the S exchange and its
+                 // per-key-tile barrier disappear. br=64 at dps=1 is a
+                 // 4-warp block, the shape the reference kernel uses.
+                 "64,16,1", "64,32,1", "32,16,1", "48,16,1",
+                 // 2-way split: half the exchange of the default.
+                 "64,16,2", "64,32,2", "32,16,2",
                  // P-in-registers arm (warp-head; br is fixed at 16).
                  "wh,16,16", "wh,16,32", "wh,16,48",
                  // cp.async staging pipeline (br,bc,dps,stages); the d256
                  // br=64 dps=4 stage buffer reuses the (dead) Q tile, so the
                  // pipelined arm fits without extra shared memory.
-                 "64,16,4,2", "64,16,2,2", "16,16,2,3"};
+                 "64,16,4,2", "64,16,2,2", "16,16,2,3",
+                 // GQA packing (br,bc,dps,stages,pack): one K/V tile serves
+                 // `pack` query heads of the same KV head.
+                 "16,16,4,0,4", "16,16,4,2,4", "16,16,2,2,4",
+                 "16,16,8,2,4", "16,32,4,0,4", "16,16,4,0,2",
+                 "16,16,4,2,2", "32,16,4,2,2"};
     else
       configs = {"16,16,4", "16,16,8", "32,16,8",
-                 "32,16,4"};
+                 "32,16,4",
+                 // dc = 256 slices: the d512 head needs at least a 2-way
+                 // split (a full head_dim slice would be 256 f32 registers).
+                 "32,16,2", "32,32,2", "16,16,2", "16,32,2",
+                 "32,32,4", "16,16,4", "16,32,4",
+                 // GQA packing (br,bc,dps,stages,pack): pack=2 is the largest
+                 // that fits the 96 KiB budget (64 Q rows of d512 = 66.5 KB).
+                 "16,16,8,0,2", "16,16,4,0,2", "16,16,2,0,2",
+                 "16,16,8,2,2",
+                 // Q fragments reloaded per key tile (sixth value): frees
+                 // dc/4 registers, so the 2-way split (llama's np = 2) can
+                 // run without spilling.
+                 "32,16,2,0,1,1", "48,16,2,0,1,1", "32,16,2,0,2,1",
+                 "16,16,2,0,2,1", "32,16,8,0,1,1",
+                 // Wider key tile: halves the per-tile barrier/exchange
+                 // count. bc=32 only fits unpacked at d512 (pack=2 x 64 Q
+                 // rows does not).
+                 "16,32,8", "48,16,8",
+                 // Head-fast grid order (seventh value): the head index in
+                 // blockIdx.x so the blocks launched together share one K/V
+                 // range through L2.
+                 "32,16,8,0,1,0,1", "48,16,8,0,1,0,1", "16,16,8,0,2,0,1",
+                 "32,16,4,0,1,0,1", "16,16,4,0,4,0,1"};
 
     struct Run {
       const char *impl;
@@ -424,14 +492,28 @@ int main(int argc, char **argv) {
       std::string_view(argv[3]) == "tokens")
     return run_tokens(argv[2], argc > 4 ? argv[4] : nullptr);
   setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
+  // A caller's tile pin must survive the per-shape sub-tests below: they set
+  // SONICBOOM_ATTN_CODEGEN to exercise specific arms and then go back to the
+  // class default. Restore the caller's value there instead of dropping it,
+  // otherwise every shape class after the first loses the pin.
+  const char *const pin_env = std::getenv("SONICBOOM_ATTN_CODEGEN");
+  const std::string pin_saved = pin_env ? pin_env : std::string();
+  const auto restore_pin = [&] {
+    if (pin_env)
+      setenv("SONICBOOM_ATTN_CODEGEN", pin_saved.c_str(), 1);
+    else
+      unsetenv("SONICBOOM_ATTN_CODEGEN");
+  };
 
   const ShapeCase shapes[] = {
-      {{64, 2, 7, 14}, "attn-d64-g7-causal-b64x32-dps1",
-       "attn-d64-g7-window-b64x32-dps1", true},
-      {{256, 2, 4, 8}, "attn-d256-g4-causal-b64x16-dps4",
-       "attn-d256-g4-window-b64x16-dps4"},
-      {{512, 2, 4, 8}, "attn-d512-g4-causal-b32x16-dps8",
-       "attn-d512-g4-window-b32x16-dps8"},
+      {{64, 2, 7, 14}, "attn-d64-g7-causal-", "attn-d64-g7-window-", true},
+      {{256, 2, 4, 8}, "attn-d256-g4-causal-", "attn-d256-g4-window-", true},
+      // d512 resolves to the hand-written kernel in the static table: T4
+      // measured every legal generated tile slower than own (see
+      // attn_codegen_default_shape). The correctness cases above still pin
+      // SONICBOOM_ATTN_IMPL=codegen, so this class still compiles and caches
+      // its generated kernel for the sweep and for the codegen arm.
+      {{512, 2, 4, 8}, "attn-d512-g4-causal-", "attn-d512-g4-window-", false},
   };
   // Both mask kinds, including the windowed row 229 reused from a 130-query
   // chunk so the batch-invariance comparison below has a windowed baseline.
@@ -515,9 +597,14 @@ int main(int argc, char **argv) {
           if (std::bit_cast<uint32_t>(got[z]) !=
               std::bit_cast<uint32_t>(base[z]))
             ++diff;
-        if (diff)
+        if (diff) {
+          double mad = 0.0;
+          for (size_t z = 0; z < base.size() && z < got.size(); ++z)
+            mad = std::max(mad, std::fabs(double(got[z]) - double(base[z])));
           std::cerr << "    d=" << c.d << " window=" << cc.window << ": "
-                    << diff << "/" << base.size() << " elements differ\n";
+                    << diff << "/" << base.size() << " elements differ, maxabs="
+                    << mad << "\n";
+        }
         check(diff == 0,
               "batch invariance: row 229 alone == row 229 of the 130-row "
               "chunk (bitwise)");
@@ -538,6 +625,37 @@ int main(int argc, char **argv) {
               << "\n";
     check(cg_err <= own_err * 1.01,
           "generated attention fp64 error within 1% of hand-written's");
+
+    // GQA packing shares one staged K/V tile across gqa_pack query heads of
+    // the same KV head. Each head keeps its own warp roles and arithmetic, so
+    // the output must be bit-identical to the unpacked kernel; check it on
+    // every case, both mask kinds included.
+    if (c.d == 256 || c.d == 512) {
+      const char *plain = c.d == 256 ? "16,16,4,2" : "16,16,8,0";
+      const char *packed = c.d == 256 ? "16,16,4,2,4" : "16,16,8,0,2";
+      for (const Case &cc : cases) {
+        setenv("SONICBOOM_ATTN_CODEGEN", plain, 1);
+        std::vector<float> a, p;
+        const bool ra =
+            run_case(c, b, qabs, kseq, vseq, cc.start, cc.n, cc.window, a);
+        setenv("SONICBOOM_ATTN_CODEGEN", packed, 1);
+        const bool rp =
+            run_case(c, b, qabs, kseq, vseq, cc.start, cc.n, cc.window, p);
+        size_t diff = 0;
+        if (ra && rp && a.size() == p.size())
+          for (size_t z = 0; z < a.size(); ++z)
+            if (std::bit_cast<uint32_t>(a[z]) !=
+                std::bit_cast<uint32_t>(p[z]))
+              ++diff;
+        if (diff || !ra || !rp)
+          std::cerr << "    d=" << c.d << " start=" << cc.start
+                    << " n=" << cc.n << " window=" << cc.window
+                    << " pack diff=" << diff << "\n";
+        check(ra && rp && a.size() == p.size() && diff == 0,
+              "GQA packing is bit-identical to the unpacked kernel");
+      }
+      restore_pin();
+    }
 
     // The default (no SONICBOOM_ATTN_IMPL) must resolve to the same kernel
     // auto_pick selects for this class; compare a full causal chunk bitwise.
@@ -600,7 +718,7 @@ int main(int argc, char **argv) {
         check(ra && rs && got_s.size() == got_a.size() && diff == 0,
               "cp.async staging is bit-identical to synchronous staging");
       }
-      unsetenv("SONICBOOM_ATTN_CODEGEN");
+      restore_pin();
     }
 
     // C6: the opt-in exp2 softmax arm (folded log2(e) scale, exp2) is not
@@ -614,7 +732,7 @@ int main(int argc, char **argv) {
     // still break; the per-case comparison against the exp path is printed.
     double exp2_err = 0.0;
     setenv("SONICBOOM_ATTN_EXP2", "1", 1);
-    unsetenv("SONICBOOM_ATTN_CODEGEN");
+    restore_pin();
     setenv("SONICBOOM_ATTN_IMPL", "codegen", 1);
     for (const Case &cc : cases) {
       std::vector<float> got;
@@ -647,9 +765,9 @@ int main(int argc, char **argv) {
 
     const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
     if (cache_env == nullptr || std::string_view(cache_env) != "0") {
-      check(codegen_cache_hit(sc.causal_region),
+      check(codegen_cache_hit_class(sc.causal_region),
             "the causal wide-head kernel was compiled and cached");
-      check(codegen_cache_hit(sc.window_region),
+      check(codegen_cache_hit_class(sc.window_region),
             "the window wide-head kernel was compiled and cached");
     }
   }

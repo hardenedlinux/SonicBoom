@@ -20,11 +20,13 @@
 
 #include "cuda_resident.h"
 #include "cuda_stream.h"
+#include "reduce_sum.cuh"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -32,6 +34,7 @@
 #include <cublasLt.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -100,36 +103,20 @@ __device__ inline float gelu_tanh_f32(float x) {
 // --- kernels ----------------------------------------------------------------
 
 // Parallel sum-of-squares: warp-shuffle + shared-memory block reduction. Each
-// thread accumulates a partial double sum over a strided slice of x, then the
-// block reduces the partials. Accumulation stays in double and each term is
-// still double(v * v) (float square) — identical per-term semantics to the CPU
-// rms_norm's sequential double sum (norm.cpp). Only the *order* of the double
-// adds changes, and that reordering is many orders below the fp32 rounding that
-// rms_inv_kernel applies when it converts sum/n to float, so the downstream
-// token stream is unchanged. This replaces a single-thread loop that serialized
-// ~2560 dependent double adds (~127 us) with a ~256-way reduction.
+// thread accumulates a partial sum over a strided slice of x, then the block
+// reduces the partials (reduce_sum.cuh). The accumulator is the device's
+// ReduceMode: f64 is the historical double path (each term is still the float
+// square widened to double, identical per-term semantics to the CPU rms_norm),
+// df32 is a double-float pair with the same tree, f32 is the plain-float
+// performance reference. Only the *order* of the adds changes across tree
+// widths, and that reordering is many orders below the fp32 rounding that the
+// inverse RMS applies when it converts sum/n to float.
+template <typename R>
 __global__ void rms_sum_sq_kernel(const float* __restrict__ x, int n,
-                                  double* __restrict__ out) {
-  const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  // Warp-level butterfly reduction.
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
-  // First warp reduces the per-warp partials and writes the single result.
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) *out = t;
-  }
+                                  void* __restrict__ out) {
+  __shared__ typename R::part_t wp[32];
+  const typename R::acc_t t = block_sum_sq<R>(x, n, wp);
+  if (threadIdx.x == 0) *static_cast<typename R::out_t*>(out) = R::to_out(t);
 }
 
 __global__ void rms_apply_kernel(const float* __restrict__ x,
@@ -413,29 +400,16 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 // into the preceding multiply. x/y/add may alias (the executor's buffer reuse
 // can place the result over either input): every index is read before it is
 // written, and the reduction completes before the apply.
+template <typename R>
 __global__ void rms_norm_fused_kernel(const float* x,
                                       const float* __restrict__ weight, int n,
                                       float eps, float* y,
                                       const float* add) {
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < n; i += blockDim.x) {
-    const float v = x[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t wp[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(n)) + eps);
-  }
+  const typename R::acc_t t = block_sum_sq<R>(x, n, wp);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, n) + eps);
   __syncthreads();
   const float iv = inv;
   if (add != nullptr) {
@@ -460,6 +434,7 @@ __global__ void rms_norm_fused_kernel(const float* x,
 // elementwise so spreading it across the block does not change the result.
 // `add` is the optional residual epilogue, as in rms_norm_fused_kernel: the
 // add folded into this norm's output is applied here, bit-identically.
+template <typename R>
 __global__ void rms_heads_fused_kernel(const float* x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
@@ -468,24 +443,10 @@ __global__ void rms_heads_fused_kernel(const float* x,
   const float* xh = x + (size_t)h * head_dim;
   float* yh = y + (size_t)h * head_dim;
   const int tid = threadIdx.x;
-  double s = 0.0;
-  for (int i = tid; i < head_dim; i += blockDim.x) {
-    const float v = xh[i];
-    s += double(v * v);
-  }
-  for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-  __shared__ double warp_part[32];
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  if (lane == 0) warp_part[warp] = s;
-  __syncthreads();
+  __shared__ typename R::part_t wp[32];
   __shared__ float inv;
-  if (warp == 0) {
-    const int nwarps = (blockDim.x + 31) >> 5;
-    double t = (lane < nwarps) ? warp_part[lane] : 0.0;
-    for (int o = 16; o > 0; o >>= 1) t += __shfl_down_sync(0xffffffffu, t, o);
-    if (lane == 0) inv = 1.0f / sqrtf(float(t / double(head_dim)) + eps);
-  }
+  const typename R::acc_t t = block_sum_sq<R>(xh, head_dim, wp);
+  if (tid == 0) inv = 1.0f / sqrtf(R::mean_to_float(t, head_dim) + eps);
   __syncthreads();
   const float iv = inv;
   if (add != nullptr) {
@@ -497,6 +458,67 @@ __global__ void rms_heads_fused_kernel(const float* x,
   } else {
     for (int i = tid; i < head_dim; i += blockDim.x)
       yh[i] = weight ? xh[i] * iv * weight[i] : xh[i] * iv;
+  }
+}
+
+// Launch the reduction-mode instantiation of a norm kernel. The selection is
+// the device's ReduceMode (decided once per process), so the same grid/block
+// geometry runs for every mode. These are non-template functions around the
+// templated kernels: a template-template kernel name cannot be launched from a
+// template context portably (nvcc parses `Kernel<T><<<` as a type name there).
+inline void launch_rms_sum_sq(dim3 grid, int block, cudaStream_t st,
+                              const float* x, int n, void* out) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_sum_sq_kernel<SumDf32><<<grid, block, 0, st>>>(x, n, out);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_sum_sq_kernel<SumF32><<<grid, block, 0, st>>>(x, n, out);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_sum_sq_kernel<SumF64><<<grid, block, 0, st>>>(x, n, out);
+      break;
+  }
+}
+
+inline void launch_rms_norm_fused(dim3 grid, int block, cudaStream_t st,
+                                  const float* x, const float* w, int n,
+                                  float eps, float* y, const float* add) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_norm_fused_kernel<SumDf32>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_norm_fused_kernel<SumF32>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_norm_fused_kernel<SumF64>
+          <<<grid, block, 0, st>>>(x, w, n, eps, y, add);
+      break;
+  }
+}
+
+inline void launch_rms_heads_fused(dim3 grid, int block, cudaStream_t st,
+                                   const float* x, const float* w, int head_dim,
+                                   float eps, float* y, const float* add) {
+  switch (::sonicboom::planner::device_reduce_mode()) {
+    case ::sonicboom::compiler::ReduceMode::Df32:
+      rms_heads_fused_kernel<SumDf32>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F32:
+      rms_heads_fused_kernel<SumF32>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
+    case ::sonicboom::compiler::ReduceMode::F64:
+    default:
+      rms_heads_fused_kernel<SumF64>
+          <<<grid, block, 0, st>>>(x, w, head_dim, eps, y, add);
+      break;
   }
 }
 
@@ -1871,15 +1893,40 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
   if (cudaMemset(g_sum, 0, sizeof(double)) != cudaSuccess) return false;
 
   SB_NOTE_LAUNCH(rms_sum_sq_kernel, 1, 256, 0, cur_stream());
-  rms_sum_sq_kernel<<<1, 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), int(n), g_sum);
+  // The kernel writes the accumulator in its mode's representation (8 bytes
+  // for f64 and df32, 4 for f32); the mean is formed the same way the kernel's
+  // own mean_to_float does, so the apply sees one value either way.
+  launch_rms_sum_sq(dim3(1), 256, cur_stream(),
+                    static_cast<const float*>(d_x), int(n), g_sum);
   if (cudaGetLastError() != cudaSuccess) return false;
-  double sum = 0.0;
-  if (cudaMemcpy(&sum, g_sum, sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess)
-    return false;
-
-  // Reproduce the CPU's mean/rsqrt in double (mean) then float (sqrt/recip),
-  // matching norm.cpp bit-for-bit.
-  const float inv = 1.0f / std::sqrt(float(sum / double(n)) + eps);
+  const float mean = [&] {
+    switch (::sonicboom::planner::device_reduce_mode()) {
+      case ::sonicboom::compiler::ReduceMode::Df32: {
+        float2 pair{};
+        if (cudaMemcpy(&pair, g_sum, sizeof pair, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return pair.x / float(n) + pair.y / float(n);
+      }
+      case ::sonicboom::compiler::ReduceMode::F32: {
+        float s = 0.0f;
+        if (cudaMemcpy(&s, g_sum, sizeof s, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return s / float(n);
+      }
+      case ::sonicboom::compiler::ReduceMode::F64:
+      default: {
+        double s = 0.0;
+        if (cudaMemcpy(&s, g_sum, sizeof s, cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+          return 0.0f;
+        return float(s / double(n));
+      }
+    }
+  }();
+  // mean then float (sqrt/recip), the CPU reference's rounding order.
+  const float inv = 1.0f / std::sqrt(mean + eps);
   SB_NOTE_LAUNCH(rms_apply_kernel, grid_for(int(n)), 256, 0, cur_stream());
   rms_apply_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), d_w,
                                               int(n), inv, static_cast<float*>(d_y));
@@ -2230,7 +2277,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     if (!d_w) return false;
   }
   SB_NOTE_LAUNCH(rms_norm_fused_kernel, 1, 1024, 0, cur_stream());
-  rms_norm_fused_kernel<<<1, 1024, 0, cur_stream()>>>(x, d_w, n, eps, y, add);
+  launch_rms_norm_fused(dim3(1), 1024, cur_stream(), x, d_w, n, eps, y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2247,8 +2294,8 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
   SB_NOTE_LAUNCH(rms_heads_fused_kernel, heads, 256, 0, cur_stream());
-  rms_heads_fused_kernel<<<heads, 256, 0, cur_stream()>>>(x, d_w, head_dim, eps,
-                                                         y, add);
+  launch_rms_heads_fused(heads, 256, cur_stream(), x, d_w, head_dim, eps, y,
+                         add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2894,7 +2941,8 @@ bool attn_exp2_enabled() {
 // async_stages stayed 0 while the other fields were set). Assign explicitly.
 compiler::AttentionShape attn_prefill_shape(int head_dim, int gqa, bool window,
                                             int br, int bc, int dps, bool wh,
-                                            int as) {
+                                            int as, int pack = 1,
+                                            bool qreg = true, int hf = 0) {
   compiler::AttentionShape s;
   s.head_dim = head_dim;
   s.gqa = gqa;
@@ -2904,6 +2952,9 @@ compiler::AttentionShape attn_prefill_shape(int head_dim, int gqa, bool window,
   s.dps = dps;
   s.warp_head = wh;
   s.async_stages = as;
+  s.gqa_pack = pack;
+  s.q_in_reg = qreg;
+  s.head_fast = hf != 0;
   s.exp2 = attn_exp2_enabled();
   return s;
 }
@@ -2931,13 +2982,37 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
     shape.dps = 1;
     shape.async_stages = 2;
   } else if (gqa == 4 && head_dim == 256) {
-    shape.br = 64;
+    // T4 measured (wide bench, 3050): packing all four query heads of a KV
+    // head into one block and pipelining the K/V staging beats every unpacked
+    // tile on both query lengths -- pp512 0.325 ms (0.635 for the previous
+    // 64x16 sync tile), 2048 queries 1.652 ms (3.447). bc/dps are unchanged
+    // from the previous default, so the reduction order and the token stream
+    // are unchanged.
+    shape.br = 16;
     shape.bc = 16;
-    shape.dps = 4;  // 16 warps, 64 KiB
+    shape.dps = 4;  // 16 warps, 53 KiB
+    shape.async_stages = 2;
+    shape.gqa_pack = 4;
   } else if (gqa == 4 && head_dim == 512) {
-    shape.br = 32;
+    // T4 measured (wide bench, 3050): the hand-written kernel wins this
+    // class, and no legal generated tile beats it. Counting only shapes that
+    // really generate -- a tile over the shared-memory gate silently falls
+    // back to own, which makes several rows look like wins -- the best
+    // generated shape, 16x16 pack2 dps8, is 1.717 ms at q=512 and 27.19 ms
+    // at q=2048 against own 1.603/20.25; 32x16 dps8 is 1.883/28.22. The
+    // 96 KiB budget is what binds: gqa_pack >= 3 needs 107.8 KiB (q 65.0 +
+    // k 24.0 + v 16.3), and the cp.async f32 prefetch buffer is 64 KiB,
+    // which cannot alias the 33 KiB Q tile at pack 2 / dps 8 (140 KiB), so
+    // every legal d512 shape stages synchronously. The dispatcher resolves
+    // the class to own (attn_default_choice); this shape is the reference
+    // the explicit SONICBOOM_ATTN_IMPL=codegen arm and the tuner measure
+    // against. dps 8 keeps dc = 64 (the previously shipped d512 split) and
+    // packing is bit-identical per head, so the codegen arm's token stream
+    // is unchanged from the old 32x16 dps8 default.
+    shape.br = 16;
     shape.bc = 16;
-    shape.dps = 8;  // 16 warps, 80 KiB
+    shape.dps = 8;       // dc = 64, 16 warps
+    shape.gqa_pack = 2;  // q rows 32 -> 74.5 KiB, the largest legal pack
   } else {
     return std::nullopt;
   }
@@ -2955,7 +3030,7 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
       attn_codegen_default_shape(head_dim, gqa, window);
   if (!shape) return std::nullopt;
   if (const char *e = std::getenv("SONICBOOM_ATTN_CODEGEN")) {
-    int br = 0, bc = 0, dps = 0, as = 0;
+    int br = 0, bc = 0, dps = 0, as = 0, pack = 1, qs = 0, hf = 0;
     if (std::sscanf(e, "wh,%d,%d,%d", &br, &bc, &as) >= 2 && br > 0 && bc > 0) {
       // P-in-registers (warp-head) arm: br must be 16, dps is implicit. The
       // optional third value is the cp.async pipeline depth.
@@ -2964,12 +3039,20 @@ std::optional<compiler::AttentionShape> attn_codegen_shape(int head_dim,
       shape->bc = bc;
       shape->dps = 1;
       shape->async_stages = as;
-    } else if (std::sscanf(e, "%d,%d,%d,%d", &br, &bc, &dps, &as) >= 3 &&
+    } else if (std::sscanf(e, "%d,%d,%d,%d,%d,%d,%d", &br, &bc, &dps, &as,
+                           &pack, &qs, &hf) >= 3 &&
                br > 0 && bc > 0 && dps > 0) {
+      // Optional fourth value: cp.async depth; fifth: GQA packing; sixth:
+      // nonzero reloads Q fragments per key tile instead of holding them in
+      // registers; seventh: nonzero puts the head in blockIdx.x (head-fast
+      // grid order).
       shape->br = br;
       shape->bc = bc;
       shape->dps = dps;
       shape->async_stages = as;
+      shape->gqa_pack = pack;
+      shape->q_in_reg = qs == 0;
+      shape->head_fast = hf != 0;
     }
   }
   if (!compiler::attention_shape_supported(*shape)) return std::nullopt;
@@ -2993,11 +3076,18 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
   void *args[] = {&q_p,      &kb_p,    &vb_p,   &kc_p,   &vc_p,  &start_p,
                   &nslots_p, &nhq_p,   &nhkv_p, &n_p,    &window_p,
                   &scale_p,  &out_p};
-  const int grid_x = (n + shape.br - 1) / shape.br;
+  const int tiles = (n + shape.br - 1) / shape.br;
   // Warp-head blocks are (query tile, KV head): each warp covers one of the
-  // KV head's query heads.
-  const int grid_y = shape.warp_head ? n_heads_kv : n_heads_q;
-  return planner::glue::launch_attention(shape, args, grid_x, grid_y);
+  // KV head's query heads. Packed blocks are (query tile, query-head group).
+  const int heads = shape.warp_head
+                        ? n_heads_kv
+                        : n_heads_q / std::max(1, shape.gqa_pack);
+  // head_fast puts the head in blockIdx.x so the blocks launched together
+  // share one K/V range; the kernel reads the two ids the same way either
+  // way.
+  return planner::glue::launch_attention(
+      shape, args, shape.head_fast ? heads : tiles,
+      shape.head_fast ? tiles : heads);
 }
 
 // Prefill implementation choice for a shape class: the hand-written kernel
@@ -3014,13 +3104,21 @@ struct AttnChoice {
   // cp.async staging pipeline depth (0 = synchronous staging). Token streams
   // are bit-identical to the synchronous staging.
   int as = 0;
+  // GQA packing: query heads per block (bit-identical; see AttentionShape).
+  int pack = 1;
+  // Reload Q fragments per key tile instead of holding them in registers
+  // (bit-identical; see AttentionShape::q_in_reg).
+  int qs = 0;
+  // Head-fast grid order (bit-identical; see AttentionShape::head_fast).
+  int hf = 0;
 };
 
 bool attn_same_choice(const AttnChoice &a, const AttnChoice &b) {
   if (a.impl != b.impl) return false;
   if (a.wh != b.wh) return false;
   return a.impl == AttnImpl::Own ||
-         (a.br == b.br && a.bc == b.bc && a.dps == b.dps && a.as == b.as);
+         (a.br == b.br && a.bc == b.bc && a.dps == b.dps && a.as == b.as &&
+          a.pack == b.pack && a.qs == b.qs && a.hf == b.hf);
 }
 
 std::string attn_choice_name(const AttnChoice &c) {
@@ -3029,6 +3127,9 @@ std::string attn_choice_name(const AttnChoice &c) {
                   std::to_string(c.br) + "," + std::to_string(c.bc) + "," +
                   std::to_string(c.dps);
   if (c.as >= 2) n += ",as" + std::to_string(c.as);
+  if (c.pack > 1) n += ",p" + std::to_string(c.pack);
+  if (c.qs) n += ",qs";
+  if (c.hf) n += ",hf";
   return n;
 }
 
@@ -3087,23 +3188,29 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
         e != nullptr && std::string_view(e) == "own")
       return {AttnImpl::Own, 0, 0, 0};
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
+      return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+              s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+              s->head_fast ? 1 : 0};
     return {AttnImpl::Own, 0, 0, 0};
   }
-  // d256: codegen with br=64, bc=16, dps=4 is faster on both legs
-  // (0.318/0.231 ms vs own 0.424/0.243).
-  // d512: codegen with br=32, bc=16, dps=8 wins decode (0.566 vs 0.704);
-  // own keeps a prefill lead at q >= 128 (1.62 vs 1.86 ms per call at
-  // pp512), but the class must stay on one kernel: a prefix-reuse suffix
-  // prefill must be bit-identical to the same rows of a full prefill, and
-  // the two kernels are not (q=64: 57.44 ms generated vs 58.94 own). Gating
-  // own at q >= 128 mixed them by n and diverged test_prefix_cache, so the
-  // static table keeps codegen here and the tune-time measurement decides
-  // the generated tile for the prefill leg.
-  if (gqa == 4 && (head_dim == 256 || head_dim == 512)) {
+  // d256: T4 measured codegen (16x16, dps 4, pack 4, double-buffered) at
+  // 0.325 ms per call at q=512 and 1.652 at q=2048 against own 0.753/3.563.
+  if (gqa == 4 && head_dim == 256) {
     if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
-      return {AttnImpl::Codegen, s->br, s->bc, s->dps, false, s->async_stages};
+      return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+              s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+              s->head_fast ? 1 : 0};
   }
+  // d512: own wins the prefill leg, and no legal generated tile beats it
+  // (best generated 1.717/27.19 ms vs own 1.603/20.25 at q=512/2048; see
+  // attn_codegen_default_shape for why the 96 KiB budget rules out packing
+  // and cp.async at this head width). The class is uniform over the query
+  // length -- one kernel per shape class -- so a prefix-reuse suffix prefill
+  // uses the same kernel as the full prefill it extends. The generated
+  // kernel stays reachable through SONICBOOM_ATTN_IMPL=codegen for
+  // measurement. The token stream moves relative to the previous generated
+  // default: flagged intended in the T4 report. Every other class keeps the
+  // hand-written kernel too.
   return {AttnImpl::Own, 0, 0, 0};
 }
 
@@ -3135,11 +3242,20 @@ bool attn_launch_own(int head_dim, int gqa, const float *q,
 // The class default is timed once per (shape class, GPU) and every supported
 // generated (br, bc, dps) plus "own" is timed against it; the winner is
 // persisted in the autotune cache (planner/autotune.h) and reused. The
-// synthetic call is a canonical prefill chunk at position 0, so the search
-// never sees the caller's batch size or position and a reused prefix resolves
-// to the same config as a full prefill (batch invariance).
-constexpr int kAttnTuneQueries = 256;
-constexpr uint64_t kAttnTuneSlots = 256;
+// synthetic call is a causal prefill at position 0, so the search never sees
+// the caller's batch size or position and a reused prefix resolves to the
+// same config as a full prefill (batch invariance).
+//
+// Two canonical lengths are timed and their times summed for one decision per
+// class. The tile ranking is not monotone in length: on sm_86 the d64 class
+// favours GQA packing at 256 queries (16x32, pack 7: 0.0431 vs 0.0451 ms) and
+// the default 64x16 tile at 512 (0.0973 vs 0.1075), so a 256-only tuning
+// picked a tile that lost at pp512. Summing keeps one kernel per class while
+// measuring it at both ends of the prefill range.
+constexpr int kAttnTuneLengths[] = {256, 512};
+constexpr int kAttnTuneMaxQueries = 512;
+constexpr size_t kAttnTuneLengthCount =
+    sizeof(kAttnTuneLengths) / sizeof(kAttnTuneLengths[0]);
 // A candidate must beat the class default by this fraction to replace it.
 // The defaults are the measured 3050 winners; the margin keeps a re-measurement
 // of equal kernels from changing the default token stream.
@@ -3191,6 +3307,9 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
     if (!compiler::attention_shape_supported(s)) return;
     if (compiler::attention_shared_bytes(s) > max_smem) return;
     if (compiler::attention_block_threads(s) > max_threads) return;
+    // 16 warps is the largest block the register file holds (see the Q3
+    // apply()); a wider candidate would only time a failed launch.
+    if (compiler::attention_block_threads(s) > 512) return;
     // Only candidates whose token stream matches the hand-written kernel (or
     // the non-identical arm, when explicitly enabled) enter the search; see
     // attn_choice_bit_identical for which levers qualify per shape class.
@@ -3202,11 +3321,15 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   for (int as : {0, 2, 3})
     for (int dps : {1, 2, 4, 8})
       for (int bc : {16, 32, 48, 64})
-        for (int br : {16, 32, 48, 64}) {
-          const compiler::AttentionShape s = attn_prefill_shape(
-              head_dim, gqa, window, br, bc, dps, false, as);
-          add_candidate(s, {AttnImpl::Codegen, br, bc, dps, false, as});
-        }
+        for (int br : {16, 32, 48, 64})
+          for (int pack : {1, gqa})
+            for (int qs : {0, 1}) {
+              const compiler::AttentionShape s = attn_prefill_shape(
+                  head_dim, gqa, window, br, bc, dps, false, as, pack,
+                  qs == 0);
+              add_candidate(
+                  s, {AttnImpl::Codegen, br, bc, dps, false, as, pack, qs});
+            }
   // P-in-registers arm (warp per query head, no d split). Its dps is 1, so it
   // is bit-identical for the d64 class and opt-in elsewhere (see
   // attn_choice_bit_identical); add_candidate applies that rule.
@@ -3217,9 +3340,9 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   }
 
   AttnTuneBufs b;
-  const size_t q_n = size_t(kAttnTuneQueries) * n_heads_q * head_dim;
-  const size_t kv_n = size_t(kAttnTuneQueries) * n_heads_kv * head_dim;
-  const size_t c_n = size_t(kAttnTuneSlots) * n_heads_kv * head_dim;
+  const size_t q_n = size_t(kAttnTuneMaxQueries) * n_heads_q * head_dim;
+  const size_t kv_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
+  const size_t c_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
@@ -3253,16 +3376,28 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
 
   const float scale = 1.0f / std::sqrt(float(head_dim));
   const uint64_t w = window ? window_len : 0;
-  auto launch = [&](const AttnChoice &c) {
+  auto launch = [&](const AttnChoice &c, uint64_t slots, int queries) {
     if (c.impl == AttnImpl::Own)
       return attn_launch_own(head_dim, gqa, b.q, b.kb, b.vb, b.kc, b.vc,
-                             b.start, kAttnTuneSlots, kAttnTuneQueries,
-                             n_heads_q, n_heads_kv, w, scale, b.out);
+                             b.start, slots, queries, n_heads_q, n_heads_kv, w,
+                             scale, b.out);
     const compiler::AttentionShape s = attn_prefill_shape(
-        head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as);
-    return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
-                               kAttnTuneSlots, kAttnTuneQueries, n_heads_q,
-                               n_heads_kv, w, scale, b.out);
+        head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
+        c.qs == 0, c.hf);
+    return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start, slots,
+                               queries, n_heads_q, n_heads_kv, w, scale, b.out);
+  };
+  // The sum over the canonical lengths; a candidate that cannot launch at one
+  // of them cannot be chosen (-1).
+  auto time_choice = [&](const AttnChoice &c) {
+    double total = 0.0;
+    for (int n : kAttnTuneLengths) {
+      const double ms = ::sonicboom::tune::median_launch_ms(
+          [&] { return launch(c, uint64_t(n), n); }, cur_stream(), 2, 5);
+      if (!(ms > 0.0)) return -1.0;
+      total += ms;
+    }
+    return total;
   };
 
   candidate_count = int(cands.size());
@@ -3272,17 +3407,15 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   // (same rule as the dense tuner).
   planner::PlanRecorder *saved_rec = planner::recorder();
   planner::set_thread_recorder(nullptr);
-  const double def_ms =
-      ::sonicboom::tune::median_launch_ms([&] { return launch(def); },
-                                          cur_stream(), 2, 5);
+  const double def_ms = time_choice(def);
   AttnChoice best = def;
   double best_ms = def_ms;
   for (size_t i = 1; i < cands.size(); ++i) {
-    const double ms =
-        ::sonicboom::tune::median_launch_ms([&] { return launch(cands[i]); },
-                                            cur_stream(), 2, 5);
+    const double ms = time_choice(cands[i]);
     if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
-      std::fprintf(stderr, "[autotune]   attn cand %s %.4f ms (best %.4f)\n",
+      std::fprintf(stderr,
+                   "[autotune]   attn cand %s %.4f ms summed over lengths "
+                   "(best %.4f)\n",
                    attn_choice_name(cands[i]).c_str(), ms, best_ms);
     if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
       best = cands[i];
@@ -3314,7 +3447,7 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
 //
 // The class key is (head_dim, seq_len bucket, query-head bucket) and the
 // choice lives in the mlir_tune per-SM cache under "attn_prefill", gated by
-// SONICBOOM_AUTOTUNE=1.
+// the autotune switch (on by default, SONICBOOM_AUTOTUNE=0 disables).
 //
 // Returns a shape with the winner's knobs applied, or nullopt to keep `base`
 // (gate off, capture, probe failure, no bit-identical winner).
@@ -3326,6 +3459,16 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   if (n <= 0 || base.warp_head) return std::nullopt;
   if (!mlir_tune::attn_prefill_tunable(head_dim)) return std::nullopt;
   if (!mlir_tune::enabled()) return std::nullopt;
+
+  // The decision inputs of the class's static default: the tile knobs plus
+  // the packing/grid order the candidates inherit from it. Part of the cache
+  // key, so changing the default retimes the class instead of leaving a pick
+  // measured against the old reference in place. The query length is not.
+  const std::string prod_key =
+      "b" + std::to_string(base.br) + "x" + std::to_string(base.bc) + "-dps" +
+      std::to_string(base.dps) + "-as" + std::to_string(base.async_stages) +
+      "-p" + std::to_string(base.gqa_pack) + (base.head_fast ? "-hf" : "") +
+      (base.q_in_reg ? "" : "-qs");
 
   auto apply = [&](const TileConfig &cfg)
       -> std::optional<compiler::AttentionShape> {
@@ -3343,6 +3486,13 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
     s.warp_head = false;
     if (!compiler::attention_shape_supported(s)) return std::nullopt;
     if (compiler::attention_shared_bytes(s) > 96 * 1024) return std::nullopt;
+    // The generator's support rules allow 32-warp blocks, but this device's
+    // register file does not hold them: at 24-32 warps a block needs more
+    // registers than the SM's 64K (measured: 768-thread d512 and 1024-thread
+    // d256 pack4 cuLaunchKernel back with CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES).
+    // 16 warps is the largest block that launches, so a stored choice from an
+    // older grid cannot turn a class into a silent hand-written fallback.
+    if (compiler::attention_block_threads(s) > 512) return std::nullopt;
     return s;
   };
   // The dispatcher's own shape: the bit-identity reference and the default we
@@ -3351,16 +3501,27 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
                               base.async_stages, 1};
 
   const mlir_tune::AttnPrefillChoice choice =
-      mlir_tune::attn_prefill_choice(head_dim, n, n_heads_q);
+      mlir_tune::attn_prefill_choice(head_dim, n_heads_q, prod_key);
   if (choice.resolved()) return apply(choice.cfg);
   if (attn_capturing()) return std::nullopt;  // host timing is illegal there
+  // Out of cold budget: keep the dispatcher's shape without allocating the
+  // probe buffers (the choice function memoizes a Skipped record, so this is
+  // reached once per class).
+  if (mlir_tune::budget_exhausted()) return std::nullopt;
 
-  // Probe at the caller's query length (capped so the scratch stays small; a
-  // class is a bucket, and any length inside it is a valid probe).
-  const int probe_n = std::min(n, 1024);
+  // Probe at a fixed query length, not the caller's: the class key has no
+  // query length (one kernel per class, R1), so the first caller's n must not
+  // decide what every later launch of the class runs. 512 rows is a prefill-
+  // sized burst (the class is the prefill kernel) and keeps the scratch small.
+  constexpr int kQ3ProbeQueries = 512;
+  // Fixed synthetic cache extent, unchanged by the d64 workload fix above: the
+  // Q3 runner only ranks tile shapes against each other and its picks are
+  // gated bit-identical, so changing its extent would be an unrelated retune.
+  constexpr uint64_t kQ3ProbeSlots = 256;
+  const int probe_n = kQ3ProbeQueries;
   const size_t q_n = size_t(probe_n) * size_t(n_heads_q) * size_t(head_dim);
   const size_t kv_n = size_t(probe_n) * size_t(n_heads_kv) * size_t(head_dim);
-  const size_t c_n = size_t(kAttnTuneSlots) * size_t(n_heads_kv) *
+  const size_t c_n = size_t(kQ3ProbeSlots) * size_t(n_heads_kv) *
                      size_t(head_dim);
   AttnTuneBufs b;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
@@ -3424,7 +3585,7 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
       bool ran = true;
       for (int i = 0; i < kQ3ProbeReps && ran; ++i)
         ran = attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start,
-                                  kAttnTuneSlots, probe_n, n_heads_q,
+                                  kQ3ProbeSlots, probe_n, n_heads_q,
                                   n_heads_kv, sliding_window, scale, b.out);
       launch_ok = ran;
     });
@@ -3498,12 +3659,22 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
     return launch_ok ? std::optional<double>(best_s) : std::nullopt;
   };
   TileConfig winner = production;
-  if (best && !(*best == production)) {
-    for (int i = 0; i < 3; ++i) (void)timed_burst(production);
+  // The confirmation re-measurement is part of the same cold budget. When the
+  // runner used it up, keep production rather than take a pick the confirmation
+  // never reproduced.
+  if (best && !(*best == production) && !mlir_tune::budget_exhausted()) {
+    for (int i = 0; i < 3; ++i) {
+      if (mlir_tune::budget_exhausted()) break;
+      (void)timed_burst(production);
+    }
     constexpr int kRounds = 5;
     double refs[kRounds] = {}, wins[kRounds] = {};
-    bool ok = true;
+    bool ok = !mlir_tune::budget_exhausted();
     for (int i = 0; i < kRounds && ok; ++i) {
+      if (mlir_tune::budget_exhausted()) {
+        ok = false;
+        break;
+      }
       if ((i & 1) == 0) {
         const auto r = timed_burst(production);
         const auto w = timed_burst(*best);
@@ -3542,12 +3713,14 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   planner::set_thread_recorder(saved_rec);
 
   const bool stored =
-      mlir_tune::attn_prefill_choice_store(head_dim, n, n_heads_q, winner);
+      mlir_tune::attn_prefill_choice_store(head_dim, n_heads_q, prod_key,
+                                          winner);
   if (verbose)
     std::fprintf(stderr,
                  "[autotune] %s: br=%d dc=%d bc=%d as=%d%s\n",
                  ("attn_prefill/" +
-                  mlir_tune::attn_prefill_shape_class(head_dim, n, n_heads_q))
+                  mlir_tune::attn_prefill_shape_class(head_dim, n_heads_q,
+                                                      prod_key))
                      .c_str(),
                  winner.tile_m, winner.tile_n, winner.tile_k, winner.unroll,
                  stored ? "" : " [not persisted]");
@@ -3558,13 +3731,27 @@ std::mutex g_attn_choice_mutex;
 std::unordered_map<std::string, AttnChoice> g_attn_choice;
 
 std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
-                          bool window, uint64_t window_len) {
+                          bool window, uint64_t window_len,
+                          const AttnChoice &def) {
   std::string k = compiler::attention_codegen_version();
   k += "|prefill-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
        "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
        "-m" + (window ? "window" : "causal");
   if (window) k += "-w" + std::to_string(window_len);
   if (attn_exp2_enabled()) k += "-x2";
+  // The default the choice was measured against is a decision input: a new
+  // default (a different tile, packing or grid order) must retune the class
+  // rather than be shadowed by the old pick. The batch size and position are
+  // still never part of the key.
+  k += "|dflt-" + attn_choice_name(def);
+  // The tuning workload is a decision input too: the d64 class ranks its
+  // candidates differently at 256 and 512 queries, so a pick measured over a
+  // different set of lengths must not shadow the retune.
+  k += "|wl";
+  for (size_t i = 0; i < kAttnTuneLengthCount; ++i) {
+    if (i != 0) k += "+";
+    k += std::to_string(kAttnTuneLengths[i]);
+  }
   return k;
 }
 
@@ -3582,14 +3769,18 @@ bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
     out = {AttnImpl::Own, 0, 0, 0};
     return true;
   }
-  int br = 0, bc = 0, dps = 0, wh = 0, as = 0;
+  int br = 0, bc = 0, dps = 0, wh = 0, as = 0, pack = 1, qs = 0, hf = 0;
   if (!get("br", br) || !get("bc", bc) || !get("dps", dps)) return false;
   (void)get("wh", wh);
   (void)get("as", as);
+  (void)get("pack", pack);
+  (void)get("qs", qs);
+  (void)get("hf", hf);
   const compiler::AttentionShape s = attn_prefill_shape(
-      head_dim, gqa, window, br, bc, dps, wh != 0, as);
+      head_dim, gqa, window, br, bc, dps, wh != 0, as, pack, qs == 0,
+      hf);
   if (!compiler::attention_shape_supported(s)) return false;
-  out = {AttnImpl::Codegen, br, bc, dps, wh != 0, as};
+  out = {AttnImpl::Codegen, br, bc, dps, wh != 0, as, pack, qs, hf};
   return true;
 }
 
@@ -3612,8 +3803,8 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
       std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") == nullptr)
     return def;
 
-  const std::string key =
-      attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv, window, window_len);
+  const std::string key = attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv,
+                                        window, window_len, def);
   {
     std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
     const auto it = g_attn_choice.find(key);
@@ -3647,7 +3838,10 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
         {"bc", choice.bc},
         {"dps", choice.dps},
         {"wh", choice.wh ? 1 : 0},
-        {"as", choice.as}};
+        {"as", choice.as},
+        {"pack", choice.pack},
+        {"hf", choice.hf},
+        {"qs", choice.qs}};
     ::sonicboom::tune::store("attention-prefill", key, values);
     if (verbose)
       std::fprintf(stderr,
@@ -3925,7 +4119,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                         windowed, sliding_window);
       if (c.impl == AttnImpl::Codegen) {
         const compiler::AttentionShape s = attn_prefill_shape(
-            head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as);
+            head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
+            c.qs == 0, c.hf);
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
@@ -3947,7 +4142,9 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
 
   // Stage 3 generated FA-2 kernel, for the shape classes the generator covers.
   // A shape without a generator (or a failed compile) falls through to the
-  // hand-written kernels below.
+  // hand-written kernels below. A shape that compiles but cannot launch (a
+  // tile whose register demand exceeds the block's budget) lands here too,
+  // which would otherwise be invisible in a timing run: say so once.
   if (shape &&
       attn_launch_codegen(*shape, q, k_batch, v_batch, k_cache, v_cache, start,
                           n_slots, n, n_heads_q, n_heads_kv, sliding_window,
@@ -3958,6 +4155,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           std::to_string(shape->bc) + "," + std::to_string(shape->dps);
       if (shape->async_stages >= 2)
         cfg += ",as" + std::to_string(shape->async_stages);
+      if (shape->gqa_pack > 1) cfg += ",p" + std::to_string(shape->gqa_pack);
+      if (shape->head_fast) cfg += ",hf";
       if (shape->exp2) cfg += ",x2";
       attn_trace_prefill(
           attn_trace_read_start(start), n, head_dim, gqa, sliding_window,
@@ -3967,6 +4166,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
           (size_t)compiler::attention_shared_bytes(*shape));
     }
     return true;
+  }
+  if (shape) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      std::fprintf(stderr,
+                   "[attention] generated prefill kernel b%dx%d-dps%d-p%d%s "
+                   "did not launch; falling back to the hand-written kernel\n",
+                   shape->br, shape->bc, shape->dps, shape->gqa_pack,
+                   shape->head_fast ? "-hf" : "");
   }
 
   if (gqa == 4 && head_dim == 256) {
@@ -4311,9 +4519,10 @@ bool matvec_bf16_lt_dev(cublasLtHandle_t lt, const uint16_t *d_w, int cols,
 // [rows, ncols] (ncols innermost); W is [rows, cols] row-major on device. The n
 // columns are repacked into fixed-width 128-column blocks so every cuBLAS call
 // has shape (m=128, n=rows, k=cols, lda=ldc=128) — the same per-column numerics
-// regardless of n or column offset.
-bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
-                           int rows, int ncols, bool strided) {
+// regardless of n or column offset. This is the ablation/default arm of
+// matvec_f32_cublas_dev below, which prefers the full-batch cuBLASLt arm.
+bool matvec_f32_sgemm_chunked(const float* d_w, int cols, const float* x,
+                              float* y, int rows, int ncols, bool strided) {
   cublasHandle_t h = dense_cublas_handle();
   if (!h) return false;
   float* xpack = nullptr;
@@ -4437,6 +4646,426 @@ bool dense_capturing() {
   cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
   return cudaStreamIsCapturing(cur_stream(), &st) != cudaSuccess ||
          st != cudaStreamCaptureStatusNone;
+}
+
+// --- f32 dense: full-batch cuBLASLt with a per-class algorithm --------------
+//
+// The f32 dense projection as one cuBLASLt matmul over every token, instead of
+// the fixed 128-column cublasSgemm chunks of matvec_f32_sgemm_chunked. The
+// chunking existed to make a token's numerics independent of the batch size:
+// every call had the same (m=rows, n=128, k=cols) shape, so cuBLAS selected
+// the same kernel and reduced in the same order for a one-token suffix and the
+// segment of a 512-token prefill. A fixed Lt algorithm gives the same
+// guarantee without the chunking -- the algorithm is chosen once per
+// (rows, cols) shape class and every batch size runs it, so a row's reduction
+// does not depend on n (measured on the 3050: n=130 vs n=512, 0/33280 and
+// 0/332800 elements differ for the two PLE shapes) -- and it removes the
+// per-128-token launch, the split-K reduce kernel, and the tail
+// pad/copyback passes.
+//
+// The algorithm is measured, not assumed: the heuristic's candidates are timed
+// against the chunked arm at the canonical 512-token chunk, once per shape
+// class per device, and the winner goes to the tune store (op "dense-f32") like
+// every other tuner choice. A candidate is only eligible if its fp64-reference
+// error does not exceed the chunked arm's, so a faster reduction order with
+// worse numerics cannot displace the current arm.
+// SONICBOOM_AUTOTUNE=0 keeps the chunked arm (the pre-T5 path; the static
+// default); SONICBOOM_DENSE_F32=lt|sgemm pins one arm.
+struct DenseF32Lt {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+  bool valid = false;
+};
+
+// -1 unset (tuned), 0 = sgemm chunks, 1 = Lt.
+int dense_f32_pin() {
+  static const int v = [] {
+    const char *e = std::getenv("SONICBOOM_DENSE_F32");
+    if (!e) return -1;
+    return std::string_view(e) == "sgemm" ? 0 : 1;
+  }();
+  return v;
+}
+
+// A: W (cols x rows column-major, OP_T); B: x (cols x n, OP_N); C/D: y
+// (rows x n). Same formulation and layouts as the chunked arm.
+bool dense_f32_lt_descs(cublasLtMatmulDesc_t *op, cublasLtMatrixLayout_t *ad,
+                        cublasLtMatrixLayout_t *bd,
+                        cublasLtMatrixLayout_t *cd, int rows, int cols,
+                        int ncols) {
+  if (cublasLtMatmulDescCreate(op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+  const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
+  return cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSA,
+                                        &tr_a, sizeof(tr_a)) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSB,
+                                        &tr_b, sizeof(tr_b)) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(ad, CUDA_R_32F, cols, rows, cols) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(bd, CUDA_R_32F, cols, ncols, cols) ==
+             CUBLAS_STATUS_SUCCESS &&
+         cublasLtMatrixLayoutCreate(cd, CUDA_R_32F, rows, ncols, rows) ==
+             CUBLAS_STATUS_SUCCESS;
+}
+
+bool dense_f32_lt_launch(const DenseF32Lt &k, const float *d_w, int cols,
+                         const float *x, float *y, int rows, int ncols) {
+  cublasLtHandle_t lt = dense_lt_handle();
+  if (!lt || !k.valid) return false;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+  bool ok = dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, ncols);
+  if (ok) {
+    const float alpha = 1.0f, beta = 0.0f;
+    ok = cublasLtMatmul(lt, op, &alpha, d_w, ad, x, bd, &beta, y, cd, y, cd,
+                        &k.algo, g_dense_ws, k.workspace, cur_stream()) ==
+         CUBLAS_STATUS_SUCCESS;
+  }
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return ok;
+}
+
+// The heuristic's candidates for the class, built at the canonical chunk. The
+// order is the heuristic's timing model order and is stable for a given
+// device/driver, which is what lets the tune store remember a pick as an index.
+std::vector<DenseF32Lt> dense_f32_lt_candidates(cublasLtHandle_t lt, int rows,
+                                                int cols) {
+  std::vector<DenseF32Lt> out;
+  if (!g_dense_ws) return out;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
+  if (!dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, kDenseTuneTokens)) {
+    if (ad) cublasLtMatrixLayoutDestroy(ad);
+    if (bd) cublasLtMatrixLayoutDestroy(bd);
+    if (cd) cublasLtMatrixLayoutDestroy(cd);
+    if (op) cublasLtMatmulDescDestroy(op);
+    return out;
+  }
+  cublasLtMatmulPreference_t pref = nullptr;
+  if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+    size_t max_ws = kDenseCublasWorkspaceBytes;
+    cublasLtMatmulPreferenceSetAttribute(
+        pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &max_ws, sizeof(max_ws));
+    cublasLtMatmulHeuristicResult_t heurs[8];
+    int found = 0;
+    if (cublasLtMatmulAlgoGetHeuristic(lt, op, ad, bd, cd, cd, pref, 8, heurs,
+                                       &found) == CUBLAS_STATUS_SUCCESS) {
+      for (int i = 0; i < found; ++i) {
+        if (heurs[i].state != CUBLAS_STATUS_SUCCESS ||
+            heurs[i].workspaceSize > kDenseCublasWorkspaceBytes)
+          continue;
+        out.push_back({heurs[i].algo, heurs[i].workspaceSize, true});
+      }
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+  }
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return out;
+}
+
+struct DenseF32Choice {
+  int impl = 1;  // 0 = full-batch Lt, 1 = chunked cublasSgemm (pre-T5)
+  DenseF32Lt lt;
+};
+
+// Deterministic operand fill for the tuning run: timing does not depend on the
+// values, but the accuracy gate needs non-zero operands, and a fixed pattern
+// keeps the tuning repeatable.
+std::vector<float> dense_f32_tune_operands(size_t n, uint32_t seed) {
+  std::vector<float> v(n);
+  for (float &f : v) {
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    f = float(seed % 2000) / 1000.0f - 1.0f;
+  }
+  return v;
+}
+
+__global__ void f32_to_f64_tune_kernel(const float *src, double *dst, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = (double)src[i];
+}
+
+struct DenseF32Err {
+  double maxabs = 0.0;
+  double rms = 0.0;
+};
+
+// fp64 reference for the tuning operands, fetched to host (token-major). Built
+// with a DGEMM on double copies of w/x, so the error of an arm is measured
+// against the same reference the report's numerics table uses.
+bool dense_f32_tune_reference(const float *w, const float *x, int rows,
+                              int cols, std::vector<double> &ref) {
+  const size_t w_n = size_t(rows) * size_t(cols);
+  const size_t x_n = size_t(cols) * size_t(kDenseTuneTokens);
+  const size_t y_n = size_t(rows) * size_t(kDenseTuneTokens);
+  double *dw = nullptr, *dx = nullptr, *dy = nullptr;
+  bool ok = cudaMalloc(&dw, w_n * 8) == cudaSuccess &&
+            cudaMalloc(&dx, x_n * 8) == cudaSuccess &&
+            cudaMalloc(&dy, y_n * 8) == cudaSuccess;
+  if (ok) {
+    const int tpb = 256;
+    f32_to_f64_tune_kernel<<<int((w_n + tpb - 1) / tpb), tpb, 0, cur_stream()>>>(
+        w, dw, int(w_n));
+    f32_to_f64_tune_kernel<<<int((x_n + tpb - 1) / tpb), tpb, 0, cur_stream()>>>(
+        x, dx, int(x_n));
+    const double one = 1.0, zero = 0.0;
+    ok = cublasDgemm(dense_cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, rows,
+                     kDenseTuneTokens, cols, &one, dw, cols, dx, cols, &zero,
+                     dy, rows) == CUBLAS_STATUS_SUCCESS;
+  }
+  if (ok) {
+    ref.resize(y_n);
+    cudaStreamSynchronize(cur_stream());
+    ok = cudaMemcpy(ref.data(), dy, y_n * 8, cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
+  }
+  if (dy) cudaFree(dy);
+  if (dx) cudaFree(dx);
+  if (dw) cudaFree(dw);
+  return ok;
+}
+
+// Error of the arm whose result is currently in y, against the reference.
+DenseF32Err dense_f32_error(const float *y, size_t y_n,
+                            const std::vector<double> &ref) {
+  DenseF32Err e;
+  std::vector<float> yh(y_n);
+  cudaStreamSynchronize(cur_stream());
+  if (cudaMemcpy(yh.data(), y, y_n * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
+    return e;
+  double acc = 0.0;
+  for (size_t i = 0; i < y_n; ++i) {
+    const double d = std::fabs(double(yh[i]) - ref[i]);
+    if (d > e.maxabs) e.maxabs = d;
+    acc += d * d;
+  }
+  e.rms = std::sqrt(acc / double(y_n));
+  return e;
+}
+
+// Time both arms at the canonical 512-token chunk and pick the fastest among
+// those that are no less accurate than the chunked arm. A Lt candidate only has
+// to measure faster than the chunked arm: that arm pays a launch per
+// kDenseCublasWidth column block plus the split-K reduction and tail passes,
+// so replacing it with one call removes both the kernel time it measures and
+// the launches it costs (pp512: 7 launches per PLE projection). A later Lt
+// candidate must still beat the current best by kDenseCandidateMargin, so the
+// pick among Lt candidates — the ones whose times sit within noise of each
+// other — stays stable across cold tunes.
+//
+// Accuracy gate: the fp64-reference error of the chosen arm must not exceed
+// the chunked arm's (maxabs and rms both). The fastest Lt candidate is not
+// necessarily the one that wins: e.g. on the 3050 the down-projection winner
+// by time reduces in a different order and is ~1.85x the chunked arm's rms,
+// while the next candidate is both faster than the chunked arm and slightly
+// more accurate. A pinned Lt run (the ablation) skips the gate.
+DenseF32Choice dense_f32_tune(int rows, int cols,
+                              const std::vector<DenseF32Lt> &cands,
+                              bool lt_only, double &tune_s,
+                              int &candidate_count) {
+  DenseF32Choice best;
+  candidate_count = 0;
+  const size_t w_n = size_t(rows) * size_t(cols);
+  const size_t x_n = size_t(cols) * size_t(kDenseTuneTokens);
+  const size_t y_n = size_t(rows) * size_t(kDenseTuneTokens);
+  const auto t0 = std::chrono::steady_clock::now();
+  float *w = nullptr, *x = nullptr, *y = nullptr;
+  if (cudaMalloc(&w, w_n * 4) != cudaSuccess) return best;
+  if (cudaMalloc(&x, x_n * 4) != cudaSuccess) {
+    cudaFree(w);
+    return best;
+  }
+  if (cudaMalloc(&y, y_n * 4) != cudaSuccess) {
+    cudaFree(x);
+    cudaFree(w);
+    return best;
+  }
+  const std::vector<float> w_h = dense_f32_tune_operands(w_n, 12345);
+  const std::vector<float> x_h = dense_f32_tune_operands(x_n, 67890);
+  cudaMemcpyAsync(w, w_h.data(), w_n * 4, cudaMemcpyHostToDevice,
+                  cur_stream());
+  cudaMemcpyAsync(x, x_h.data(), x_n * 4, cudaMemcpyHostToDevice,
+                  cur_stream());
+  cudaMemsetAsync(y, 0, y_n * 4, cur_stream());
+  std::vector<double> ref;
+  if (!dense_f32_tune_reference(w, x, rows, cols, ref)) ref.clear();
+  planner::PlanRecorder *saved = planner::recorder();
+  planner::set_thread_recorder(nullptr);
+  // With lt_only (a pinned Lt measurement) the chunked arm is not the
+  // incumbent and the fastest Lt candidate wins without a margin.
+  double best_ms = -1.0;
+  DenseF32Err base_err;
+  if (!lt_only)
+    best_ms = ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return matvec_f32_sgemm_chunked(w, cols, x, y, rows, kDenseTuneTokens,
+                                          true);
+        },
+        cur_stream(), 2, 5);
+  if (!lt_only && !ref.empty()) base_err = dense_f32_error(y, y_n, ref);
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (verbose && !lt_only)
+    std::fprintf(stderr,
+                 "[autotune] dense-f32 m=%d k=%d n=%d sgemm=%.4f ms "
+                 "maxabs=%.3e rms=%.3e\n",
+                 rows, cols, kDenseTuneTokens, best_ms, base_err.maxabs,
+                 base_err.rms);
+  bool best_is_lt = false;
+  for (size_t i = 0; i < cands.size(); ++i) {
+    ++candidate_count;
+    // A longer sample than the other tuners': the contenders here sit within a
+    // few percent of the incumbent and the pick flips the plan record, so the
+    // decision must not follow the clock-ramp of the first milliseconds.
+    const double ms = ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return dense_f32_lt_launch(cands[i], w, cols, x, y, rows,
+                                     kDenseTuneTokens);
+        },
+        cur_stream(), 4, 9);
+    DenseF32Err err;
+    if (!ref.empty()) err = dense_f32_error(y, y_n, ref);
+    const double margin = best_is_lt ? kDenseCandidateMargin : 0.0;
+    const bool faster =
+        ms > 0.0 && (best_ms < 0.0 || ms < best_ms * (1.0 - margin));
+    // Without a reference (allocation failed) fall back to the time-only pick.
+    const bool accurate =
+        lt_only || ref.empty() ||
+        (err.maxabs <= base_err.maxabs && err.rms <= base_err.rms);
+    if (verbose)
+      std::fprintf(stderr,
+                   "[autotune]   lt[%zu] ws=%zu = %.4f ms maxabs=%.3e "
+                   "rms=%.3e%s\n",
+                   i, cands[i].workspace, ms, err.maxabs, err.rms,
+                   !faster   ? " (not faster)"
+                   : !accurate ? " [rejected: less accurate than sgemm]"
+                               : "");
+    if (!faster || !accurate) continue;
+    best = {0, cands[i]};
+    best_ms = ms;
+    best_is_lt = true;
+  }
+  planner::set_thread_recorder(saved);
+  tune_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  cudaFree(y);
+  cudaFree(x);
+  cudaFree(w);
+  return best;
+}
+
+// Resolve the f32 dense arm for a (rows, cols) shape class: env pin, cached
+// pick, else a tuning run, else the chunked arm. The key never includes the
+// batch size. Tuning is skipped inside a capture (host timing is illegal
+// there) and the class is left unmemoized so a later launch can decide it.
+DenseF32Choice dense_f32_resolve(int rows, int cols) {
+  const DenseF32Choice def;  // chunked
+  const int pin = dense_f32_pin();
+  if (pin == 0) return def;
+  if (!::sonicboom::tune::enabled() && pin < 0) return def;
+  cublasLtHandle_t lt = dense_lt_handle();
+  if (!lt || !g_dense_ws) return def;
+  // The trailing number is the policy version: T9 stopped requiring a Lt
+  // candidate to beat the chunked arm by kDenseCandidateMargin, so a pick
+  // cached under the old rule (e.g. "down stays chunked") is not a decision
+  // this code would make. Bumping it retimes once per class per device.
+  const std::string key = std::string("dense-f32-3|m") +
+                          std::to_string(rows) + "k" + std::to_string(cols);
+  static std::mutex mu;
+  static std::unordered_map<std::string, DenseF32Choice> memo;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    const auto it = memo.find(key);
+    if (it != memo.end()) return it->second;
+  }
+
+  DenseF32Choice choice = def;
+  bool have = false;
+  if (pin < 0) {
+    const std::map<std::string, int> cached =
+        ::sonicboom::tune::lookup("dense-f32", key);
+    const auto impl = cached.find("impl");
+    const auto algo = cached.find("algo");
+    if (impl != cached.end() && impl->second == 1) {
+      have = true;  // the chunked arm, measured as the winner
+    } else if (impl != cached.end() && impl->second == 0 &&
+               algo != cached.end()) {
+      const std::vector<DenseF32Lt> cands =
+          dense_f32_lt_candidates(lt, rows, cols);
+      if (algo->second >= 0 && algo->second < int(cands.size())) {
+        choice = {0, cands[algo->second]};
+        have = true;
+      }
+    }
+  }
+
+  if (!have) {
+    if (dense_capturing()) return def;  // decide on a later, uncaptured launch
+    std::vector<DenseF32Lt> cands = dense_f32_lt_candidates(lt, rows, cols);
+    if (cands.empty()) {
+      std::lock_guard<std::mutex> lk(mu);
+      memo[key] = choice;
+      return choice;
+    }
+    double tune_s = 0.0;
+    int candidate_count = 0;
+    choice = dense_f32_tune(rows, cols, cands, pin == 1, tune_s,
+                            candidate_count);
+    if (pin == 1 && choice.impl != 0) {
+      // The pin forces the Lt arm (the ablation); a pinned measurement is not
+      // the class's decision, so it is not persisted.
+      choice = {0, cands.front()};
+    }
+    // The winner is an index into the candidate list: the cached record
+    // remembers the pick, never the opaque algorithm bytes.
+    int idx = 0;
+    if (choice.impl == 0)
+      for (size_t i = 0; i < cands.size(); ++i)
+        if (std::memcmp(&cands[i].algo, &choice.lt.algo,
+                        sizeof(choice.lt.algo)) == 0)
+          idx = int(i);
+    if (pin < 0) {
+      std::map<std::string, int> values{{"impl", choice.impl}, {"algo", idx}};
+      ::sonicboom::tune::store("dense-f32", key, values);
+    }
+    if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
+      std::fprintf(stderr,
+                   "[autotune] dense-f32 %s default=sgemm chosen=%s "
+                   "algo=%d candidates=%d tune=%.2f s%s\n",
+                   key.c_str(), choice.impl == 0 ? "lt" : "sgemm", idx,
+                   candidate_count, tune_s, pin < 0 ? "" : " [pinned]");
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    memo[key] = choice;
+  }
+  return choice;
+}
+
+bool matvec_f32_cublas_dev(const float* d_w, int cols, const float* x, float* y,
+                           int rows, int ncols, bool strided) {
+  cublasHandle_t h = dense_cublas_handle();
+  if (!h) return false;
+  // The full-batch arm reads the position-major activation in place; the
+  // non-strided layout keeps the chunked repack below.
+  if (strided) {
+    const DenseF32Choice c = dense_f32_resolve(rows, cols);
+    if (c.impl == 0 && dense_f32_lt_launch(c.lt, d_w, cols, x, y, rows, ncols))
+      return true;
+  }
+  return matvec_f32_sgemm_chunked(d_w, cols, x, y, rows, ncols, strided);
 }
 
 std::string dense_choice_name(const DenseChoice &c) {

@@ -1,5 +1,10 @@
 # SonicBoom End-to-End CPU Execution MVP
 
+Status: **superseded**. The S-Expr → MLIR/linalg → LLVM JIT CPU path described
+here, and the lowering files it lists, were retired; the CPU path behind the
+unchanged `sx::Executable` facade is now the Boom IR executor,
+`core/src/exec/cpu_executor.cpp`.
+
 This document records the design and results of the **End-to-End CPU Execution
 MVP**: a complete, working CPU execution path from the frozen S-Expr v0.1
 format through MLIR compilation and JIT execution to correct ResNet-18

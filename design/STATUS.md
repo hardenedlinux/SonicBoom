@@ -40,10 +40,16 @@
   construction.
 - **Per-GPU runtime autotune** for attention prefill/decode, MMQ tile and
   decomposition, and the dense GEMM vs cuBLASLt choice. One service, one disk
-  cache (`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>/<op>.json`), keyed
-  by GPU, operator and shape class — never by batch size or position. Choices
-  need a 3% win to replace a default. `SONICBOOM_AUTOTUNE=0` uses the static
-  defaults; `force` retunes. The MMQ static rule is upstream's
+  cache (`~/.cache/sonicboom/tune/<gpu>-sm<arch>-<driver>-reduce-<mode>/<op>.json`,
+  versioned JSON written by temp file + rename), keyed by GPU, operator and
+  shape class — never by batch size or position. Choices need a 3% win to
+  replace a default. `SONICBOOM_AUTOTUNE=0` uses the static defaults; `force`
+  retunes. The generated-kernel (JIT candidate) tuner is on by default too:
+  every probe is bit-identity gated against the static default, cold tuning is
+  capped by one process-wide budget (`SONICBOOM_AUTOTUNE_BUDGET_MS`, default
+  10 s, `<= 0` unlimited), and picks live in a versioned, flock-protected
+  per-SM file (`~/.cache/sonicboom/autotune/sm_<NN>.bin`).
+  `SONICBOOM_AUTOTUNE_JIT=0` disables only the JIT service. The MMQ static rule is upstream's
   smallest-J-minimizing-`ceil(n/J)` over `{8..128}` (including 56, 72, 88, 104
   and 120), and every one of those Js has a dispatch case.
 - **MMQ at upstream build parity:** wide tiles use

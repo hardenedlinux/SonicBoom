@@ -89,7 +89,11 @@
 
 #include <cstdio>
 #include <filesystem>
+#include <map>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace sonicboom::compiler {
 namespace {
@@ -1427,9 +1431,458 @@ constexpr const char *kGeluMul = R"MLIR(module attributes {gpu.container_module}
   }
 })MLIR";
 
+// --- ReduceMode variants of the reduction sections --------------------------
+//
+// The f64 region text above is the reference and is emitted byte-for-byte for
+// ReduceMode::F64. The DF32 and F32 texts are derived from it by rewriting only
+// the reduction statements:
+//
+//   * the loop accumulator becomes a (hi, lo) pair of f32 (TwoSum) or a plain
+//     f32, over the same strided slice and the same shuffle-down tree;
+//   * the f64 tree's two-b32 shuffle (a double shuffled as its two halves)
+//     becomes two f32 shuffles of the pair (or one f32 shuffle);
+//   * the shared warp partials become two f32 arrays at bytes 0 and 128 (or
+//     one at 0); the inverse-RMS slot at byte 256 is unchanged, so the kernel's
+//     dynamic shared-memory size stays 512 bytes;
+//   * the mean is formed as (hi/n + lo/n) (or sum/n) in f32 before eps.
+//
+// The rewrite is scoped: the loop is recognised by its iter_args, and the tree
+// from the `arith.bitcast ... : f64 to i64` that starts an extraction through
+// the final `arith.truncf ... : f64 to f32`. i64/i32 statements outside that
+// scope (the regions' address arithmetic) are copied untouched.
+
+namespace {
+
+std::string_view trim_ws(std::string_view s) {
+  while (!s.empty() &&
+         (s.front() == ' ' || s.front() == '\t' || s.front() == '\r'))
+    s.remove_prefix(1);
+  while (!s.empty() &&
+         (s.back() == ' ' || s.back() == '\t' || s.back() == '\r'))
+    s.remove_suffix(1);
+  return s;
+}
+
+struct Stmt {
+  std::string indent;
+  std::string lhs;
+  std::string rhs;
+  std::string op;
+};
+
+Stmt parse_stmt(std::string_view line) {
+  Stmt s;
+  std::size_t i = 0;
+  while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+  s.indent.assign(line.substr(0, i));
+  const std::string_view body = line.substr(i);
+  const std::size_t eq = body.find(" = ");
+  if (eq == std::string_view::npos) {
+    s.rhs.assign(trim_ws(body));
+  } else {
+    s.lhs.assign(trim_ws(body.substr(0, eq)));
+    s.rhs.assign(trim_ws(body.substr(eq + 3)));
+  }
+  const std::size_t sp = s.rhs.find(' ');
+  s.op = s.rhs.substr(0, sp == std::string::npos ? s.rhs.size() : sp);
+  return s;
+}
+
+bool contains(std::string_view s, std::string_view sub) {
+  return s.find(sub) != std::string_view::npos;
+}
+
+std::string replace_all(std::string s, std::string_view from,
+                        std::string_view to) {
+  std::size_t pos = 0;
+  while ((pos = s.find(from, pos)) != std::string::npos) {
+    s.replace(pos, from.size(), to);
+    pos += to.size();
+  }
+  return s;
+}
+
+// The SSA operands of a statement: the whitespace/comma separated `%` tokens
+// before the `:` type list.
+std::vector<std::string> operands_of(std::string_view rhs) {
+  std::vector<std::string> out;
+  const std::size_t sp = rhs.find(' ');
+  if (sp == std::string_view::npos) return out;
+  std::string_view rest = rhs.substr(sp + 1);
+  if (const std::size_t colon = rest.find(':');
+      colon != std::string_view::npos)
+    rest = rest.substr(0, colon);
+  std::size_t i = 0;
+  while (i < rest.size()) {
+    while (i < rest.size() && (rest[i] == ' ' || rest[i] == ',')) ++i;
+    const std::size_t b = i;
+    while (i < rest.size() && rest[i] != ' ' && rest[i] != ',') ++i;
+    const std::string_view tok = rest.substr(b, i - b);
+    if (!tok.empty() && tok.front() == '%') out.emplace_back(tok);
+  }
+  return out;
+}
+
+struct ReduceRewriter {
+  ReduceMode mode;
+  std::map<std::string, std::pair<std::string, std::string>> pair;
+  std::string zero_src;  // the text's %c0 (f64), used by iter_args init
+  std::string zero_hi;
+  std::string zero_lo;
+  std::string pending_src;
+  std::string shuf_hi;
+  std::string shuf_lo;
+  std::string wpart;
+  std::string wpart_lo;
+  bool in_loop = false;
+  bool in_tree = false;
+  int uid = 0;
+
+  bool df() const { return mode == ReduceMode::Df32; }
+
+  // Rewritten values get fresh names: the region texts reuse simple names
+  // (%s0, %na) that also name values outside the reduction in other regions.
+  static std::string pref(const std::string &v) {
+    return v.empty() || v[0] != '%' ? v : "%sbr_" + v.substr(1);
+  }
+
+  std::pair<std::string, std::string> names_of(const std::string &v) {
+    const auto it = pair.find(v);
+    if (it != pair.end()) return it->second;
+    // A bare f32 value used where a pair is expected is its own high limb.
+    return {v, df() ? zero_lo : std::string()};
+  }
+
+  // TwoSum (Knuth), the same operation order as compiler::df32_add (or
+  // df32_add_float when `b_is_float`): the pair (res_s, res_e) is the value of
+  // a + b with the round-off folded into the low limb.
+  void emit_df_add(std::string &out, const std::string &ind,
+                   const std::string &orig, const std::string &ahi,
+                   const std::string &alo, const std::string &bhi,
+                   const std::string &blo, bool b_is_float = false) {
+    const std::string res = pref(orig);
+    out += ind + res + "_s = arith.addf " + ahi + ", " + bhi + " : f32\n";
+    out += ind + res + "_v = arith.subf " + res + "_s, " + ahi + " : f32\n";
+    out += ind + res + "_d = arith.subf " + res + "_s, " + res + "_v : f32\n";
+    out += ind + res + "_e2 = arith.subf " + ahi + ", " + res + "_d : f32\n";
+    out += ind + res + "_e3 = arith.subf " + bhi + ", " + res + "_v : f32\n";
+    out += ind + res + "_e4 = arith.addf " + res + "_e2, " + res + "_e3 : f32\n";
+    if (b_is_float) {
+      out += ind + res + "_e = arith.addf " + res + "_e4, " + alo + " : f32\n";
+    } else {
+      out += ind + res + "_e5 = arith.addf " + alo + ", " + blo + " : f32\n";
+      out +=
+          ind + res + "_e = arith.addf " + res + "_e4, " + res + "_e5 : f32\n";
+    }
+    pair[orig] = {res + "_s", res + "_e"};
+  }
+
+  std::string run(std::string_view text);
+};
+
+std::string ReduceRewriter::run(std::string_view text) {
+  std::vector<std::string_view> lines;
+  std::size_t start = 0;
+  while (start < text.size()) {
+    const std::size_t nl = text.find('\n', start);
+    if (nl == std::string_view::npos) {
+      lines.push_back(text.substr(start));
+      break;
+    }
+    lines.push_back(text.substr(start, nl - start));
+    start = nl + 1;
+  }
+  const bool d = df();
+  std::string out;
+  out.reserve(text.size() + text.size() / 2);
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    const std::string_view line = lines[i];
+    const Stmt s = parse_stmt(line);
+    const std::string &ind = s.indent;
+    const std::string_view t = trim_ws(line);
+
+    // The f64 zero constant (shared by both trees).
+    if (s.rhs == "arith.constant 0.0 : f64") {
+      zero_src = s.lhs;
+      zero_hi = pref(s.lhs);
+      out += ind + zero_hi + " = arith.constant 0.0 : f32\n";
+      if (d) {
+        zero_lo = zero_hi + "_lo";
+        out += ind + zero_lo + " = arith.constant 0.0 : f32\n";
+        pair[s.lhs] = {zero_hi, zero_lo};
+      } else {
+        pair[s.lhs] = {zero_hi, std::string()};
+      }
+      continue;
+    }
+
+    // The reduction loop header.
+    if (contains(s.rhs, "iter_args(") && contains(s.rhs, "-> (f64)")) {
+      std::string acc;
+      const std::size_t p = s.rhs.find("iter_args(");
+      const std::size_t q = s.rhs.find(" = ", p);
+      if (p != std::string::npos && q != std::string::npos)
+        acc = s.rhs.substr(p + 10, q - (p + 10));
+      const std::string res_hi = pref(s.lhs);
+      const std::string res_lo = res_hi + "_lo";
+      const std::string acc_hi = pref(acc);
+      const std::string acc_lo = acc_hi + "_lo";
+      std::string rhs = s.rhs;
+      if (d) {
+        rhs = replace_all(rhs, "iter_args(" + acc + " = " + zero_src + ")",
+                          "iter_args(" + acc_hi + " = " + zero_hi + ", " +
+                              acc_lo + " = " + zero_lo + ")");
+        rhs = replace_all(rhs, "-> (f64)", "-> (f32, f32)");
+        out += ind + res_hi + ", " + res_lo + " = " + rhs + "\n";
+        pair[s.lhs] = {res_hi, res_lo};
+        pair[acc] = {acc_hi, acc_lo};
+      } else {
+        rhs = replace_all(rhs, "iter_args(" + acc + " = " + zero_src + ")",
+                          "iter_args(" + acc_hi + " = " + zero_hi + ")");
+        rhs = replace_all(rhs, "-> (f64)", "-> (f32)");
+        out += ind + res_hi + " = " + rhs + "\n";
+        pair[s.lhs] = {res_hi, std::string()};
+        pair[acc] = {acc_hi, std::string()};
+      }
+      in_loop = true;
+      continue;
+    }
+
+    // The loop's closing brace starts the first tree.
+    if (t == "}") {
+      out += std::string(line) + "\n";
+      if (in_loop) {
+        in_loop = false;
+        in_tree = true;
+      }
+      continue;
+    }
+
+    if (in_loop) {
+      if (s.op == "scf.yield") {
+        const auto ops = operands_of(s.rhs);
+        const auto a = names_of(ops.at(0));
+        if (d)
+          out +=
+              ind + "scf.yield " + a.first + ", " + a.second + " : f32, f32\n";
+        else
+          out += ind + "scf.yield " + a.first + " : f32\n";
+        continue;
+      }
+      if (s.op == "arith.extf" && contains(s.rhs, "f32 to f64")) {
+        const auto ops = operands_of(s.rhs);
+        pair[s.lhs] = {ops.empty() ? s.lhs : ops[0],
+                       d ? zero_lo : std::string()};
+        continue;
+      }
+      if (s.op == "arith.addf" && contains(s.rhs, ": f64")) {
+        const auto ops = operands_of(s.rhs);
+        const auto a = names_of(ops.at(0));
+        const auto b = names_of(ops.at(1));
+        if (d)
+          emit_df_add(out, ind, s.lhs, a.first, a.second, b.first, b.second,
+                      true);
+        else {
+          const std::string r = pref(s.lhs);
+          out += ind + r + " = arith.addf " + a.first + ", " + b.first +
+                 " : f32\n";
+          pair[s.lhs] = {r, std::string()};
+        }
+        continue;
+      }
+      out += std::string(line) + "\n";
+      continue;
+    }
+
+    if (!in_tree) {
+      out += std::string(line) + "\n";
+      continue;
+    }
+
+    // --- inside the reduction tree -------------------------------------
+    if (s.op == "arith.bitcast" && contains(s.rhs, "f64 to i64")) {
+      const auto ops = operands_of(s.rhs);
+      if (!ops.empty()) pending_src = ops[0];
+      continue;
+    }
+    if (s.op == "arith.bitcast" && contains(s.rhs, "i64 to f64")) continue;
+    if (s.op == "arith.trunci" && contains(s.rhs, "i64 to i32")) continue;
+    if (s.op == "arith.shrui" && contains(s.rhs, ": i64")) continue;
+    if (s.op == "arith.extui" && contains(s.rhs, "i32 to i64")) continue;
+    if (s.op == "arith.shli" && contains(s.rhs, ": i64")) continue;
+    if (s.op == "arith.ori" && contains(s.rhs, ": i64")) continue;
+
+    if (s.op == "gpu.shuffle") {
+      const auto ops = operands_of(s.rhs);
+      const std::string delta = ops.size() > 1 ? ops[1] : "%c16i";
+      // The f64 pair shuffles as two consecutive b32 shuffles.
+      if (i + 1 < lines.size() &&
+          parse_stmt(lines[i + 1]).op == "gpu.shuffle")
+        ++i;
+      const auto src = pair.count(pending_src)
+                           ? pair[pending_src]
+                           : std::make_pair(pending_src,
+                                            d ? zero_lo : std::string());
+      // gpu.shuffle is an i32 operation: each limb is bitcast in and out.
+      const std::string u = std::to_string(uid++);
+      shuf_hi = "%sbh" + u;
+      out += ind + "%sbi" + u + " = arith.bitcast " + src.first +
+             " : f32 to i32\n";
+      out += ind + "%sbu" + u + ", %sbp" + u + " = gpu.shuffle down %sbi" + u +
+             ", " + delta + ", %wid : i32\n";
+      out += ind + shuf_hi + " = arith.bitcast %sbu" + u + " : i32 to f32\n";
+      if (d) {
+        shuf_lo = "%sbl" + u;
+        out += ind + "%sbj" + u + " = arith.bitcast " + src.second +
+               " : f32 to i32\n";
+        out += ind + "%sbv" + u + ", %sbq" + u + " = gpu.shuffle down %sbj" +
+               u + ", " + delta + ", %wid : i32\n";
+        out += ind + shuf_lo + " = arith.bitcast %sbv" + u + " : i32 to f32\n";
+      } else {
+        shuf_lo.clear();
+      }
+      continue;
+    }
+
+    if (s.op == "arith.addf" && contains(s.rhs, ": f64")) {
+      const auto ops = operands_of(s.rhs);
+      const auto a = names_of(ops.at(0));
+      if (d)
+        emit_df_add(out, ind, s.lhs, a.first, a.second, shuf_hi, shuf_lo);
+      else {
+        const std::string r = pref(s.lhs);
+        out += ind + r + " = arith.addf " + a.first + ", " + shuf_hi +
+               " : f32\n";
+        pair[s.lhs] = {r, std::string()};
+      }
+      continue;
+    }
+
+    if (s.op == "memref.view" && contains(s.rhs, "32xf64")) {
+      const std::string hi = replace_all(s.rhs, "32xf64", "32xf32");
+      const std::string view_hi = pref(s.lhs);
+      out += ind + view_hi + " = " + hi + "\n";
+      if (d) {
+        const std::size_t b = s.rhs.find('[');
+        const std::size_t e = s.rhs.find(']', b);
+        const std::string idx =
+            b == std::string::npos ? std::string()
+                                   : s.rhs.substr(b + 1, e - (b + 1));
+        out += ind + "%sbr_c128idx = arith.constant 128 : index\n";
+        wpart_lo = view_hi + "_lo";
+        out += ind + wpart_lo + " = " +
+               replace_all(hi, "[" + idx + "]", "[%sbr_c128idx]") + "\n";
+      }
+      wpart = view_hi;
+      continue;
+    }
+
+    if (s.op == "memref.store" && contains(s.rhs, "32xf64")) {
+      const std::string hi = replace_all(s.rhs, "32xf64", "32xf32");
+      const std::size_t op = hi.find("memref.store ");
+      const std::size_t comma = hi.find(", ", op);
+      const std::string val = hi.substr(op + 13, comma - (op + 13));
+      const std::size_t b = hi.find('[', comma);
+      const std::string tail = hi.substr(b);
+      const auto p = names_of(val);
+      out += ind + "memref.store " + p.first + ", " + wpart + tail + "\n";
+      if (d)
+        out +=
+            ind + "memref.store " + p.second + ", " + wpart_lo + tail + "\n";
+      continue;
+    }
+
+    if (s.op == "memref.load" && contains(s.rhs, "32xf64")) {
+      const std::string hi = replace_all(s.rhs, "32xf64", "32xf32");
+      const std::size_t op = hi.find("memref.load ");
+      const std::size_t b = hi.find('[', op);
+      const std::string tail = hi.substr(b);
+      const std::string r = pref(s.lhs);
+      out += ind + r + " = memref.load " + wpart + tail + "\n";
+      if (d) {
+        out += ind + r + "_lo = memref.load " + wpart_lo + tail + "\n";
+        pair[s.lhs] = {r, r + "_lo"};
+      } else {
+        pair[s.lhs] = {r, std::string()};
+      }
+      continue;
+    }
+
+    if (s.op == "arith.select" && contains(s.rhs, ": f64")) {
+      const auto ops = operands_of(s.rhs);
+      const std::string r = pref(s.lhs);
+      const auto a = names_of(ops.at(1));
+      const auto z = names_of(ops.at(2));
+      if (!d) {
+        out += ind + r + " = arith.select " + ops.at(0) + ", " + a.first +
+               ", " + z.first + " : f32\n";
+        pair[s.lhs] = {r, std::string()};
+        continue;
+      }
+      out += ind + r + " = arith.select " + ops.at(0) + ", " + a.first + ", " +
+             z.first + " : f32\n";
+      out += ind + r + "_lo = arith.select " + ops.at(0) + ", " + a.second +
+             ", " + z.second + " : f32\n";
+      pair[s.lhs] = {r, r + "_lo"};
+      continue;
+    }
+
+    if (s.op == "arith.sitofp" && contains(s.rhs, "to f64")) {
+      const std::string r = pref(s.lhs);
+      out += ind + r + " = " + replace_all(s.rhs, "to f64", "to f32") + "\n";
+      pair[s.lhs] = {r, std::string()};
+      continue;
+    }
+
+    if (s.op == "arith.divf" && contains(s.rhs, ": f64")) {
+      const auto ops = operands_of(s.rhs);
+      const auto a = names_of(ops.at(0));
+      const std::string fn =
+          ops.size() > 1 ? names_of(ops[1]).first : "%sbr_fn";
+      const std::string r = pref(s.lhs);
+      if (!d) {
+        out += ind + r + " = arith.divf " + a.first + ", " + fn + " : f32\n";
+        pair[s.lhs] = {r, std::string()};
+        continue;
+      }
+      out += ind + r + "_h = arith.divf " + a.first + ", " + fn + " : f32\n";
+      out += ind + r + "_l = arith.divf " + a.second + ", " + fn + " : f32\n";
+      pair[s.lhs] = {r + "_h", r + "_l"};
+      continue;
+    }
+
+    if (s.op == "arith.truncf" && contains(s.rhs, "f64 to f32")) {
+      // The boundary value: the regions' outer statements (eps add, sqrt,
+      // reciprocal, the quantize phase) refer to this name, so it keeps it.
+      const auto ops = operands_of(s.rhs);
+      const auto a = names_of(ops.at(0));
+      if (d)
+        out += ind + s.lhs + " = arith.addf " + a.first + ", " + a.second +
+               " : f32\n";
+      else
+        out += ind + s.lhs + " = arith.addf " + a.first + ", " + zero_hi +
+               " : f32\n";
+      in_tree = false;
+      continue;
+    }
+
+    out += std::string(line) + "\n";
+  }
+  return out;
+}
+
+std::string reduce_variant_text(std::string_view text, ReduceMode mode) {
+  if (mode == ReduceMode::F64) return std::string(text);
+  ReduceRewriter rw;
+  rw.mode = mode;
+  return rw.run(text);
+}
+
+} // namespace
+
 // The region text for `kind`, with the target chip substituted. Empty when the
 // kind has no generator.
-std::string region_text(GlueRegionKind kind, int sm_arch) {
+std::string region_text(GlueRegionKind kind, int sm_arch, ReduceMode mode) {
   const char *text = nullptr;
   switch (kind) {
     case GlueRegionKind::RmsNormQuantizeQ8_1:
@@ -1453,10 +1906,13 @@ std::string region_text(GlueRegionKind kind, int sm_arch) {
   }
   if (text == nullptr) return {};
 
+  // F64 returns the literal text; the other modes rewrite the reduction
+  // statements before the chip substitution.
+  const std::string variant = reduce_variant_text(text, mode);
   const std::string chip = "sm_" + std::to_string(sm_arch);
   std::string out;
-  out.reserve(std::char_traits<char>::length(text) + chip.size());
-  const std::string_view view(text);
+  out.reserve(variant.size() + chip.size());
+  const std::string_view view(variant);
   const std::string_view placeholder = "%CHIP%";
   std::size_t pos = 0;
   while (true) {
@@ -1580,9 +2036,9 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
   return "?";
 }
 
-std::optional<std::string> generate_glue_ptx(GlueRegionKind kind,
-                                             int sm_arch) {
-  const std::string text = region_text(kind, sm_arch);
+std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch,
+                                             ReduceMode mode) {
+  const std::string text = region_text(kind, sm_arch, mode);
   if (text.empty()) {
     std::fprintf(stderr, "glue codegen: region '%s' has no generator\n",
                  glue_region_name(kind));
@@ -1723,7 +2179,7 @@ std::string glue_codegen_version() {
   // does not record. (The cache also stores a hash of the generated text and
   // ignores an entry whose body does not match, so a stale entry cannot run
   // even without a bump; this keeps the two checks independent.)
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue3";
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-glue4";
 }
 
 } // namespace sonicboom::compiler

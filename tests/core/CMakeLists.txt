@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_lowering test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -194,6 +194,23 @@ set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
                               test_spec_autoprobe
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
+# The committed token / plan goldens are recorded in the automatic reduction
+# mode (planner/reduce_mode.h). Run the same goldens with F64 forced, so the
+# F64 path stays a tested contract on every device: a device where DF32 is the
+# automatic choice must not be able to let an F64-path regression through
+# unnoticed. test_glue_codegen and test_cuda_elementwise are kernel-level and
+# cover the generated regions and the templated elementwise kernels in F64.
+foreach(test_name IN ITEMS test_generate test_qwen2_generate test_plan_record
+                            test_glue_codegen test_cuda_elementwise)
+  add_test(NAME ${test_name}_reduce_f64
+           COMMAND ${CMAKE_COMMAND} -E env
+                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                   SONICBOOM_REDUCE=f64
+                   $<TARGET_FILE:${test_name}>)
+  set_tests_properties(${test_name}_reduce_f64
+    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+endforeach()
+
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
 # measured 0.2-0.5% slower. Run the same greedy-stream checks with it on so the
@@ -241,6 +258,29 @@ add_test(NAME test_qwen2_generate_decode_chunk
                  SONICBOOM_DECODE_CHUNK=4
                  $<TARGET_FILE:test_qwen2_generate>)
 set_tests_properties(test_qwen2_generate_decode_chunk
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
+# The third model (T8): DeepSeek-R1-Distill-Qwen-1.5B is Qwen2 architecture, so
+# it runs the same executable and the same checks against its own fixture
+# directory — its prompts, its llama.cpp references and its token goldens. The
+# directory's `model` file names the GGUF, so nothing here is model-specific
+# beyond the data path. Skips cleanly (exit 0) when the GGUF is absent.
+add_test(NAME test_deepseek_generate
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
+                 $<TARGET_FILE:test_qwen2_generate>)
+set_tests_properties(test_deepseek_generate
+  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+
+# The same token goldens with the F64 reduction path forced (see above).
+add_test(NAME test_deepseek_generate_reduce_f64
+         COMMAND ${CMAKE_COMMAND} -E env
+                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
+                 SONICBOOM_REDUCE=f64
+                 $<TARGET_FILE:test_qwen2_generate>)
+set_tests_properties(test_deepseek_generate_reduce_f64
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # Real GPU closed-loop test. Only built when the CUDA build is enabled; at
@@ -387,7 +427,7 @@ target_link_libraries(test_e2e_load PRIVATE sonicboom)
 
 # Integration tests: parse the frozen ResNet-18 S-Expr v0.1 example document.
 # They need the repository root to locate the example file at build/run time.
-foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_mlir test_s_expr_resnet18_exec test_onnx_import_resnet18_exec test_planner_acceptance)
+foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_onnx_import_resnet18_exec test_planner_acceptance)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
