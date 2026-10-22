@@ -82,7 +82,9 @@ bool set_numerics_profile(NumericsProfile profile, std::string *error);
 //   standard stores the KV cache in f16 (the values were fp16-rounded already)
 //   and launches the f16-KV attention variants; strict does neither. This is
 //   the profile's only arithmetic difference today: the dense and matmul
-//   thresholds are the same in both profiles.
+//   thresholds are the same in both profiles (the TF32 dense arm is not a
+//   profile default -- it is gate-blocked, reachable only through
+//   SONICBOOM_DENSE_F32=tf32).
 bool numerics_profile_f16_kv();
 
 // Tests only: forget the resolution, so the next call re-reads the

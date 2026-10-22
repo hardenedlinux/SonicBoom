@@ -4859,19 +4859,37 @@ bool dense_capturing() {
 // error does not exceed the chunked arm's, so a faster reduction order with
 // worse numerics cannot displace the current arm.
 // SONICBOOM_AUTOTUNE=0 keeps the chunked arm (the pre-T5 path; the static
-// default); SONICBOOM_DENSE_F32=lt|sgemm pins one arm.
+// default); SONICBOOM_DENSE_F32=lt|sgemm|tf32 pins one arm.
+//
+// TF32 (CUBLAS_COMPUTE_32F_FAST_TF32) is a measurement arm only, reachable
+// through SONICBOOM_DENSE_F32=tf32; it is not admitted to either profile. On
+// the reference 3050 it is 1.5-2x the fp32 arm on both PLE shape classes
+// (0.100 vs 0.205 ms at m256k2560, 0.099 vs 0.154 at m2560k256) and worth
+// +1.8% on Gemma pp512 (interleaved, 3 runs). It is not a default because the
+// f32 dense arm is one of the near-ties the standard gate resolves by bit
+// identity: the gate run that admitted TF32 flipped one greedy token on gemma
+// prompt 3, and a control with the fp32 arm pinned flipped the same token, so
+// the flip was not attributable to TF32 and the arm never got a clean gate of
+// its own. Admit it again only with a gate run that isolates it (see the
+// boom-r4 M5 notes).
 struct DenseF32Lt {
   cublasLtMatmulAlgo_t algo{};
   size_t workspace = 0;
   bool valid = false;
+  // TF32 tensor-core arm; reachable only through the SONICBOOM_DENSE_F32=tf32
+  // pin, never part of the tuned list (see dense_f32_resolve).
+  bool tf32 = false;
 };
 
-// -1 unset (tuned), 0 = sgemm chunks, 1 = Lt.
+// -1 unset (tuned), 0 = sgemm chunks, 1 = fp32 Lt, 2 = Lt/TF32 (pinned arms).
 int dense_f32_pin() {
   static const int v = [] {
     const char *e = std::getenv("SONICBOOM_DENSE_F32");
     if (!e) return -1;
-    return std::string_view(e) == "sgemm" ? 0 : 1;
+    const std::string_view s(e);
+    if (s == "sgemm") return 0;
+    if (s == "tf32") return 2;
+    return 1;
   }();
   return v;
 }
@@ -4881,8 +4899,10 @@ int dense_f32_pin() {
 bool dense_f32_lt_descs(cublasLtMatmulDesc_t *op, cublasLtMatrixLayout_t *ad,
                         cublasLtMatrixLayout_t *bd,
                         cublasLtMatrixLayout_t *cd, int rows, int cols,
-                        int ncols) {
-  if (cublasLtMatmulDescCreate(op, CUBLAS_COMPUTE_32F, CUDA_R_32F) !=
+                        int ncols, bool tf32 = false) {
+  const cublasComputeType_t compute =
+      tf32 ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
+  if (cublasLtMatmulDescCreate(op, compute, CUDA_R_32F) !=
       CUBLAS_STATUS_SUCCESS)
     return false;
   const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
@@ -4906,7 +4926,8 @@ bool dense_f32_lt_launch(const DenseF32Lt &k, const float *d_w, int cols,
   if (!lt || !k.valid) return false;
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
-  bool ok = dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, ncols);
+  bool ok =
+      dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, ncols, k.tf32);
   if (ok) {
     const float alpha = 1.0f, beta = 0.0f;
     ok = cublasLtMatmul(lt, op, &alpha, d_w, ad, x, bd, &beta, y, cd, y, cd,
@@ -4924,12 +4945,13 @@ bool dense_f32_lt_launch(const DenseF32Lt &k, const float *d_w, int cols,
 // order is the heuristic's timing model order and is stable for a given
 // device/driver, which is what lets the tune store remember a pick as an index.
 std::vector<DenseF32Lt> dense_f32_lt_candidates(cublasLtHandle_t lt, int rows,
-                                                int cols) {
+                                                int cols, bool tf32 = false) {
   std::vector<DenseF32Lt> out;
   if (!g_dense_ws) return out;
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, cd = nullptr;
-  if (!dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, kDenseTuneTokens)) {
+  if (!dense_f32_lt_descs(&op, &ad, &bd, &cd, rows, cols, kDenseTuneTokens,
+                          tf32)) {
     if (ad) cublasLtMatrixLayoutDestroy(ad);
     if (bd) cublasLtMatrixLayoutDestroy(bd);
     if (cd) cublasLtMatrixLayoutDestroy(cd);
@@ -4949,7 +4971,7 @@ std::vector<DenseF32Lt> dense_f32_lt_candidates(cublasLtHandle_t lt, int rows,
         if (heurs[i].state != CUBLAS_STATUS_SUCCESS ||
             heurs[i].workspaceSize > kDenseCublasWorkspaceBytes)
           continue;
-        out.push_back({heurs[i].algo, heurs[i].workspaceSize, true});
+        out.push_back({heurs[i].algo, heurs[i].workspaceSize, true, tf32});
       }
     }
     cublasLtMatmulPreferenceDestroy(pref);
@@ -5128,14 +5150,18 @@ DenseF32Choice dense_f32_tune(int rows, int cols,
     const bool faster =
         ms > 0.0 && (best_ms < 0.0 || ms < best_ms * (1.0 - margin));
     // Without a reference (allocation failed) fall back to the time-only pick.
+    // A TF32 candidate is not comparable to the fp32 incumbent's error (it
+    // rounds the operands to 10 bits), so it is exempt; TF32 only appears in
+    // the pinned measurement list, which skips the gate anyway.
     const bool accurate =
-        lt_only || ref.empty() ||
+        lt_only || ref.empty() || cands[i].tf32 ||
         (err.maxabs <= base_err.maxabs && err.rms <= base_err.rms);
     if (verbose)
       std::fprintf(stderr,
-                   "[autotune]   lt[%zu] ws=%zu = %.4f ms maxabs=%.3e "
+                   "[autotune]   lt[%zu]%s ws=%zu = %.4f ms maxabs=%.3e "
                    "rms=%.3e%s\n",
-                   i, cands[i].workspace, ms, err.maxabs, err.rms,
+                   i, cands[i].tf32 ? " tf32" : "", cands[i].workspace, ms,
+                   err.maxabs, err.rms,
                    !faster   ? " (not faster)"
                    : !accurate ? " [rejected: less accurate than sgemm]"
                                : "");
@@ -5165,18 +5191,52 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
   if (!::sonicboom::tune::enabled() && pin < 0) return def;
   cublasLtHandle_t lt = dense_lt_handle();
   if (!lt || !g_dense_ws) return def;
+
   // The trailing number is the policy version: T9 stopped requiring a Lt
   // candidate to beat the chunked arm by kDenseCandidateMargin, so a pick
   // cached under the old rule (e.g. "down stays chunked") is not a decision
-  // this code would make. Bumping it retimes once per class per device.
-  const std::string key = std::string("dense-f32-3|m") +
-                          std::to_string(rows) + "k" + std::to_string(cols);
+  // this code would make. Bumping it retimes once per class per device. The
+  // pinned TF32 measurement arm gets its own key so it never becomes the
+  // class's decision.
+  const std::string key =
+      pin == 2
+          ? "dense-f32-tf32-pin|m" + std::to_string(rows) + "k" +
+                std::to_string(cols)
+          : "dense-f32-3|m" + std::to_string(rows) + "k" +
+                std::to_string(cols);
+  // The heuristic's order is stable, so the cached (impl, algo) pair indexes
+  // this list. The list is the fp32 candidates for the tuned decision; the TF32
+  // list exists only under the pin.
+  const auto build_cands = [&] {
+    return dense_f32_lt_candidates(lt, rows, cols);
+  };
   static std::mutex mu;
   static std::unordered_map<std::string, DenseF32Choice> memo;
   {
     std::lock_guard<std::mutex> lk(mu);
     const auto it = memo.find(key);
     if (it != memo.end()) return it->second;
+  }
+
+  // A pinned TF32 measurement (the ablation): TF32-only list, time-only pick,
+  // never persisted -- it is not the class's decision and works under either
+  // profile so the two arms can be compared directly.
+  if (pin == 2) {
+    const std::vector<DenseF32Lt> c =
+        dense_f32_lt_candidates(lt, rows, cols, true);
+    if (c.empty() || dense_capturing()) return def;
+    double tune_s = 0.0;
+    int candidate_count = 0;
+    dense_f32_tune(rows, cols, c, true, tune_s, candidate_count);
+    if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
+      std::fprintf(stderr,
+                   "[autotune] dense-f32 m=%dk%d tf32-only candidates=%d "
+                   "tune=%.2f s [pinned]\n",
+                   rows, cols, candidate_count, tune_s);
+    const DenseF32Choice pinned{0, c.front()};
+    std::lock_guard<std::mutex> lk(mu);
+    memo[key] = pinned;
+    return pinned;
   }
 
   DenseF32Choice choice = def;
@@ -5190,8 +5250,7 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
       have = true;  // the chunked arm, measured as the winner
     } else if (impl != cached.end() && impl->second == 0 &&
                algo != cached.end()) {
-      const std::vector<DenseF32Lt> cands =
-          dense_f32_lt_candidates(lt, rows, cols);
+      const std::vector<DenseF32Lt> cands = build_cands();
       if (algo->second >= 0 && algo->second < int(cands.size())) {
         choice = {0, cands[algo->second]};
         have = true;
@@ -5201,7 +5260,7 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
 
   if (!have) {
     if (dense_capturing()) return def;  // decide on a later, uncaptured launch
-    std::vector<DenseF32Lt> cands = dense_f32_lt_candidates(lt, rows, cols);
+    std::vector<DenseF32Lt> cands = build_cands();
     if (cands.empty()) {
       std::lock_guard<std::mutex> lk(mu);
       memo[key] = choice;
@@ -5212,27 +5271,35 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
     choice = dense_f32_tune(rows, cols, cands, pin == 1, tune_s,
                             candidate_count);
     if (pin == 1 && choice.impl != 0) {
-      // The pin forces the Lt arm (the ablation); a pinned measurement is not
-      // the class's decision, so it is not persisted.
-      choice = {0, cands.front()};
+      // The pin forces the fp32 Lt arm (the ablation); a pinned measurement is
+      // not the class's decision, so it is not persisted.
+      choice = DenseF32Choice{0, cands.front()};
     }
     // The winner is an index into the candidate list: the cached record
-    // remembers the pick, never the opaque algorithm bytes.
+    // remembers the pick, never the opaque algorithm bytes. The compute type is
+    // part of the identity -- the heuristic can name the same algorithm for the
+    // fp32 and TF32 lists.
     int idx = 0;
     if (choice.impl == 0)
       for (size_t i = 0; i < cands.size(); ++i)
         if (std::memcmp(&cands[i].algo, &choice.lt.algo,
-                        sizeof(choice.lt.algo)) == 0)
+                        sizeof(choice.lt.algo)) == 0 &&
+            cands[i].tf32 == choice.lt.tf32)
           idx = int(i);
     if (pin < 0) {
-      std::map<std::string, int> values{{"impl", choice.impl}, {"algo", idx}};
+      std::map<std::string, int> values{{"impl", choice.impl},
+                                        {"algo", idx},
+                                        {"tf32", choice.lt.tf32 ? 1 : 0}};
       ::sonicboom::tune::store("dense-f32", key, values);
     }
     if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
       std::fprintf(stderr,
                    "[autotune] dense-f32 %s default=sgemm chosen=%s "
                    "algo=%d candidates=%d tune=%.2f s%s\n",
-                   key.c_str(), choice.impl == 0 ? "lt" : "sgemm", idx,
+                   key.c_str(),
+                   choice.impl == 0 ? (choice.lt.tf32 ? "lt/tf32" : "lt")
+                                    : "sgemm",
+                   idx,
                    candidate_count, tune_s, pin < 0 ? "" : " [pinned]");
   }
 
