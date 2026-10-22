@@ -20,9 +20,14 @@
 
 #include "moss_dit_kernels.h"
 
+#include "../nn/cuda_resident.h"
+
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+
+#include <cstdlib>
+#include <cstring>
 
 namespace sonicboom::moss::cuda_dit {
 namespace {
@@ -610,6 +615,24 @@ void sdpa_release_scratch() {
 bool sdpa_full(const float* q, const float* k, const float* v, int tokens,
                int heads, int head_dim, float scale, float* out) {
   if (tokens <= 0) return true;
+  // Above kSdpaMaxTokens the score-matrix GEMM path cannot run (the per-head
+  // [tokens, tokens] plane no longer fits the scratch budget) and this regime
+  // used to fall through to the scalar fused kernel. Route it instead to the
+  // shared tiled tensor-core flash attention in nn/cuda -- the same kernel the
+  // LLM prefill path uses -- for the DiT shape class (head_dim 128, no GQA,
+  // non-causal full attention). At or below the cap, where the score matrix
+  // fits, the materialized GEMM path stays the choice. The paths below remain
+  // the fallback for a shape class the tiled kernel does not cover.
+  // SONICBOOM_DIT_ATTN=scalar forces the fallback for an A/B run without
+  // rebuilding.
+  static const bool force_scalar = [] {
+    const char* v = std::getenv("SONICBOOM_DIT_ATTN");
+    return v != nullptr && std::strcmp(v, "scalar") == 0;
+  }();
+  if (tokens > kSdpaMaxTokens && !force_scalar &&
+      nn::cuda::flash_attention_full_dev(q, k, v, tokens, heads, head_dim,
+                                         scale, out))
+    return true;
   cublasHandle_t h = sdpa_cublas();
   if (h == nullptr || tokens > kSdpaMaxTokens || head_dim % 32 != 0 ||
       head_dim > 32 * 8)

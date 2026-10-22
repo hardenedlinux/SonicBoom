@@ -76,6 +76,26 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto`, `SONICBOOM_SPEC_PROBE_MS` |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
+| MOSS-Image DiT full attention | `SONICBOOM_DIT_ATTN=scalar` (force the pre-fattn fallback) |
+
+The DiT attention choice is a static shape-class mapping, not a measured
+per-device pick: `(head_dim 128, one K/V head per query head, non-causal)` takes
+the shared tiled mma kernel `flash_attention_full_dev` (the LLM prefill
+kernel's full-attention mode) above `kSdpaMaxTokens = 2048` sequence positions,
+and the score-matrix cuBLAS f16 GEMM path at or below it, where the scratch a
+per-head `[tokens, tokens]` plane needs still fits. The split is set by that
+scratch capacity, not by timing; within each regime the kernel is fixed for the
+shape class. The env switch exists for A/B runs only.
+
+This token-count split is a **documented exception to R1**. R1 forbids
+selecting an algorithm by `n` inside a shape class because a reused prefix
+would then execute a different code path than the full prefill. Here the two
+regimes are distinct shape classes separated by a capacity boundary (the score
+matrix fits the scratch budget or it does not), not one class tuned by size;
+the DiT has no prefix reuse and no KV cache, so no two calls must share a
+path, and each resolution deterministically maps to one regime. A resolution
+whose token count crosses the boundary therefore changes path once, at a fixed
+point, reproducibly.
 
 No algorithm-selecting variable has to be set by hand: each has a default or an
 automatic choice, and the registry records which one applied.

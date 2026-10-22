@@ -1238,7 +1238,13 @@ __device__ __forceinline__ float fa_rsum4(float x) {
   return x;
 }
 
-template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
+// CAUSAL = true is the LLM prefill contract: a query at absolute position p
+// attends to keys in [max(0, p - window + 1), p]. CAUSAL = false is dense full
+// attention (no mask, no window): every query attends to all keys in
+// [start, start + n), which is the image-token block of a DiT. The key range
+// and the mask are compile-time, so the full path carries no mask arithmetic.
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA,
+          bool CAUSAL = true>
 __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
     flash_attention_tiled_kernel(
         const float* __restrict__ q, const float* __restrict__ k_batch,
@@ -1271,7 +1277,9 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
   const int g = lane >> 2;  // fragment group 0..7
   const int t = lane & 3;   // thread in group 0..3
 
-  const uint64_t start = *start_ptr;
+  // The full-attention entry has no KV cache and no absolute position: start
+  // is 0 and start_ptr is null, so it must never be dereferenced.
+  const uint64_t start = CAUSAL ? *start_ptr : 0;
 
   // online-softmax state for the two rows this thread owns (g, g+8), used only
   // by the dim_slice==0 warps (phase 1).
@@ -1290,10 +1298,13 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
 
   const uint64_t abs_pb = start + (uint64_t)blockIdx.x * QB;
   const int n_blk = (n - blockIdx.x * QB < QB) ? (n - blockIdx.x * QB) : QB;
-  const uint64_t key_end = abs_pb + (uint64_t)n_blk - 1;  // last query (absolute)
+  // Causal: the last key any query in this segment attends is its last query.
+  // Full: every query attends to the whole key range [start, start + n).
+  const uint64_t key_end = CAUSAL ? abs_pb + (uint64_t)n_blk - 1
+                                  : start + (uint64_t)n - 1;
   // key_start: earliest key any query in this segment attends.
   const uint64_t key_start =
-      (sliding_window > 0 && abs_pb >= sliding_window)
+      (CAUSAL && sliding_window > 0 && abs_pb >= sliding_window)
           ? (abs_pb - sliding_window + 1)
           : 0;
   // Align the key-tile start down to a BK multiple so tile boundaries are global
@@ -1375,15 +1386,34 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
         }
 
         // 2. scale + causal/window mask. Keys jb, jb+1 (s0) and jb+8, jb+9 (s1).
-        const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
-        s0[0] = (jb > p0 || jb < low0) ? -1e30f : s0[0] * scale;
-        s0[1] = (jb + 1 > p0 || jb + 1 < low0) ? -1e30f : s0[1] * scale;
-        s1[0] = (jb + 8 > p0 || jb + 8 < low0) ? -1e30f : s1[0] * scale;
-        s1[1] = (jb + 9 > p0 || jb + 9 < low0) ? -1e30f : s1[1] * scale;
-        s0[2] = (jb > p1 || jb < low1) ? -1e30f : s0[2] * scale;
-        s0[3] = (jb + 1 > p1 || jb + 1 < low1) ? -1e30f : s0[3] * scale;
-        s1[2] = (jb + 8 > p1 || jb + 8 < low1) ? -1e30f : s1[2] * scale;
-        s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
+        if constexpr (CAUSAL) {
+          const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
+          s0[0] = (jb > p0 || jb < low0) ? -1e30f : s0[0] * scale;
+          s0[1] = (jb + 1 > p0 || jb + 1 < low0) ? -1e30f : s0[1] * scale;
+          s1[0] = (jb + 8 > p0 || jb + 8 < low0) ? -1e30f : s1[0] * scale;
+          s1[1] = (jb + 9 > p0 || jb + 9 < low0) ? -1e30f : s1[1] * scale;
+          s0[2] = (jb > p1 || jb < low1) ? -1e30f : s0[2] * scale;
+          s0[3] = (jb + 1 > p1 || jb + 1 < low1) ? -1e30f : s0[3] * scale;
+          s1[2] = (jb + 8 > p1 || jb + 8 < low1) ? -1e30f : s1[2] * scale;
+          s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
+        } else {
+          // Full attention: every key in [start, start + n) is attended, so the
+          // only mask is the end of the key range. The loop steps the keys in
+          // BK tiles, so the final tile may be partial: keys past key_end load a
+          // zero-filled K row, and their score of 0 would otherwise enter the
+          // softmax denominator (inflating l and shrinking the output). In the
+          // causal path j <= key_end already implies j <= p, so no such tail
+          // exists there.
+          const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
+          s0[0] = (jb > key_end) ? -1e30f : s0[0] * scale;
+          s0[1] = (jb + 1 > key_end) ? -1e30f : s0[1] * scale;
+          s1[0] = (jb + 8 > key_end) ? -1e30f : s1[0] * scale;
+          s1[1] = (jb + 9 > key_end) ? -1e30f : s1[1] * scale;
+          s0[2] = (jb > key_end) ? -1e30f : s0[2] * scale;
+          s0[3] = (jb + 1 > key_end) ? -1e30f : s0[3] * scale;
+          s1[2] = (jb + 8 > key_end) ? -1e30f : s1[2] * scale;
+          s1[3] = (jb + 9 > key_end) ? -1e30f : s1[3] * scale;
+        }
 
         // 3. online-softmax: row max over the 16 keys (reduce over the group).
         const float mx0 = fa_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
@@ -2995,7 +3025,8 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
-template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA,
+          bool CAUSAL = true>
 bool launch_tiled_flash_attention(const float* q, const float* k_batch,
                                   const float* v_batch, const void* k_cache,
                                   const void* v_cache, const uint64_t* start,
@@ -3009,7 +3040,8 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
   constexpr int smem_bytes = HEAD_DIM * (2 * BK + 2) * (int)sizeof(__half) +
                              P_ELEMS * (int)sizeof(__half) +
                              (RS_ELEMS + L_ELEMS) * (int)sizeof(float);
-  auto kfn = flash_attention_tiled_kernel<KV, HEAD_DIM, BK, NW, QB, GQA>;
+  auto kfn =
+      flash_attention_tiled_kernel<KV, HEAD_DIM, BK, NW, QB, GQA, CAUSAL>;
   static bool configured = false;
   if (!configured) {
     cudaFuncSetAttribute((const void*)kfn,
@@ -3046,6 +3078,69 @@ bool launch_tiled_flash_attention_kv(const float* q, const float* k_batch,
   return launch_tiled_flash_attention<float, HEAD_DIM, BK, NW, QB, GQA>(
       q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
       n_heads_kv, sliding_window, scale, out);
+}
+
+// Dense full attention (no mask, no window, no KV cache): every query attends
+// to every key. This is the DiT block's shape class — head_dim 128 with one
+// K/V head per query head — reusing the same tiled mma kernel as the causal
+// LLM prefill path. There is no fallback here: false means the shape class has
+// no instantiation, and the caller (core/src/model/moss_dit_cuda.cu) keeps its
+// own scalar/GEMM path.
+bool flash_attention_full_dev(const float* q, const float* k, const float* v,
+                              int n, int n_heads, int head_dim, float scale,
+                              float* out) {
+  if (!available()) return false;
+  if (n <= 0 || n_heads <= 0 || head_dim <= 0) return false;
+  if (!q || !k || !v || !out) return false;
+  if (head_dim % 32 != 0 || head_dim > 512) return false;
+  if (n_heads > 32) return false;  // 16-query m-tiles per block, 1024-thread cap
+  // Tile choice: QB = 128 queries, BK = 64 keys, NW = 2 (each 16-query m-tile
+  // is split across two warps, one per 64-dim half of head_dim). A QB = 256,
+  // NW = 1 block needs 16 accumulator fragments per thread and spills (120 B
+  // stack frame against the 128-register cap of a 512-thread block); NW = 2
+  // halves the accumulator to 4 fragments and keeps the block at 512 threads,
+  // 52 KiB of smem. The tile config is a constant of the shape class, never of
+  // n.
+  if (head_dim == 128)
+    return launch_tiled_flash_attention<float, 128, 64, 2, 128, 1, false>(
+        q, k, v, nullptr, nullptr, nullptr, /*n_slots=*/0, n, n_heads, n_heads,
+        /*sliding_window=*/0, scale, out);
+  return false;
+}
+
+// Host-facing counterpart of flash_attention_full_dev. q/k/v/out are plain
+// [n, n_heads, head_dim] host spans; the inputs are staged into the shared
+// scratch buffers and the result is copied back. This is the entry the
+// differential test uses, so the tiled full-attention kernel is exercised
+// through the same device pointers the DiT path hands it.
+bool flash_attention_full(std::span<const float> q, std::span<const float> k,
+                          std::span<const float> v, uint64_t n,
+                          uint64_t n_heads, uint64_t head_dim, float scale,
+                          std::span<float> out) {
+  if (!available()) return false;
+  if (n == 0 || n_heads == 0 || head_dim == 0) return false;
+  const size_t total = (size_t)n * n_heads * head_dim;
+  if (q.size() < total || k.size() < total || v.size() < total ||
+      out.size() < total)
+    return false;
+  const size_t bytes = total * sizeof(float);
+  void* d_q = grow_scratch(g_dx, g_dx_bytes, bytes);
+  void* d_k = grow_scratch(g_db, g_db_bytes, bytes);
+  void* d_v = grow_scratch(g_dy, g_dy_bytes, bytes);
+  void* d_o = grow_scratch(g_dff, g_dff_bytes, bytes);
+  if (!d_q || !d_k || !d_v || !d_o) return false;
+  if (cudaMemcpy(d_q, q.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_k, k.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_v, v.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  if (!flash_attention_full_dev(static_cast<const float*>(d_q),
+                                static_cast<const float*>(d_k),
+                                static_cast<const float*>(d_v), (int)n,
+                                (int)n_heads, (int)head_dim, scale,
+                                static_cast<float*>(d_o)))
+    return false;
+  return cudaMemcpy(out.data(), d_o, bytes, cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
 }
 
 namespace {

@@ -332,6 +332,27 @@ void test_flash_attention(std::mt19937& rng) {
           "CPU sdpa (head_dim=512) returns true");
     check_cmp("cuda::flash_attention (head_dim=512) matches CPU", y, yr);
   }
+
+  // Full (non-causal) attention over a dense batch: the DiT shape class,
+  // head_dim 128 with one K/V head per query head. n=300 exercises a partial
+  // third 128-query tile and a partial final 64-key tile; n=65 is the edge
+  // where the key loop is one full and one partial tile and the query tile is
+  // partial as well.
+  for (const uint64_t n : {uint64_t(65), uint64_t(300)}) {
+    const uint64_t heads = 24, hd = 128;
+    const size_t total = n * heads * hd;
+    std::vector<float> q(total), k(total), v(total), y(total), yr(total);
+    for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    const float scale = 1.0f / std::sqrt(float(hd));
+    check(sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y),
+          "cuda::flash_attention_full (head_dim=128) returns true");
+    check(sbnn::scaled_dot_product_attention(q, n, k, v, n, heads, heads, hd,
+                                             false, 0, 0.0f, scale, yr),
+          "CPU sdpa (full, non-causal) returns true");
+    check_cmp("cuda::flash_attention_full matches CPU", y, yr);
+  }
 }
 
 } // namespace

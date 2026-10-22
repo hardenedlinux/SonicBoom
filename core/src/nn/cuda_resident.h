@@ -150,6 +150,17 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
                          int head_dim, uint64_t sliding_window, float scale,
                          float* out);
 
+// Dense full attention (non-causal, no window, no KV cache): every query
+// attends to every key in [0, n). Same tiled tensor-core kernel as the causal
+// prefill path, with the mask and per-query key range compiled out. Shape
+// class: head_dim 128, one K/V head per query head, n_q == n_kv == n. q/k/v are
+// [n, n_heads, head_dim] f32 (K/V are rounded to f16 in the kernel, matching
+// the causal path); out is [n, n_heads, head_dim] f32. Returns false when the
+// shape class has no instantiation.
+bool flash_attention_full_dev(const float* q, const float* k, const float* v,
+                              int n, int n_heads, int head_dim, float scale,
+                              float* out);
+
 // Chunked-prefill flash attention: n queries at absolute positions
 // [start, start+n) each attend over [start_key, p] where start_key = max(0,
 // p - window + 1). Keys in [start_key, start) are prior context read from the
