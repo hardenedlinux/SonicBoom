@@ -2748,7 +2748,16 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // like the dense path's kDenseCublasWidth blocking. The strict profile keeps the
 // historical single GEMM byte for byte, because its goldens predate the profile
 // switch. SONICBOOM_CUBLAS_F16_BLOCK=0 restores the single GEMM for A/B.
-constexpr int kCublasF16BlockWidth = 128;
+// Width = the prefill segment extent (kDefaultPrefillChunk, and Gemma's SWA
+// ring, both 512). A full segment is then one GEMM at the same n the strict
+// profile's single GEMM runs at, so the two agree on every full segment instead
+// of differing by cuBLAS's n-dependent reduction order. Batch invariance is
+// unchanged: every GEMM is still a fixed-width block, and a short final segment
+// pads to 512 exactly as a short batch padded to 128 before. Measured at 128:
+// boom-r5's prefill corpus gate put standard at +0.58% (Qwen) / +1.50%
+// (DeepSeek) corpus ppl vs strict, with the difference vanishing at every
+// non-tail position once the block width matched the segment.
+constexpr int kCublasF16BlockWidth = 512;
 
 bool cublas_f16_blocking_enabled() {
   static const bool enabled = [] {

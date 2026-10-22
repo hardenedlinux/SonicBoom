@@ -3627,10 +3627,27 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                   use_prefill, /*session=*/nullptr, prompt);
 }
 
-bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
-                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored) {
+namespace {
+
+// Shared teacher-forced scoring loop. Fills `trace` when non-null (top_k > 0):
+// one row per scored position with the full-distribution logsumexp, the argmax
+// and the k largest scored logits. A min-heap keeps the head without sorting
+// the vocabulary; the rows are then emitted descending.
+bool score_spine_cuda_impl(const Gemma4Model& m,
+                           std::span<const uint64_t> tokens, uint64_t n_ctx,
+                           ScoreTrace* trace, size_t top_k, double& sum_nll,
+                           uint64_t& n_scored) {
   sum_nll = 0;
   n_scored = 0;
+  if (trace) {
+    trace->top_k = 0;
+    trace->vocab = 0;
+    trace->target.clear();
+    trace->top.clear();
+    trace->log_z.clear();
+    trace->logits.clear();
+    trace->ids.clear();
+  }
   if (m.weights.blocks.empty() || tokens.size() < 2) {
     std::cerr << "[score] empty model (" << m.weights.blocks.size()
               << " blocks) or short input (" << tokens.size() << ")\n";
@@ -3642,6 +3659,16 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
       std::cerr << "[score] token " << t << " outside vocab " << vocab << "\n";
       return false;
     }
+  if (trace && top_k > 0) {
+    trace->top_k = std::min(top_k, size_t(vocab));
+    trace->vocab = vocab;
+    const size_t rows = size_t(tokens.size() - 1);
+    trace->target.reserve(rows);
+    trace->top.reserve(rows);
+    trace->log_z.reserve(rows);
+    trace->logits.reserve(rows * trace->top_k);
+    trace->ids.reserve(rows * trace->top_k);
+  }
   if (n_ctx < tokens.size()) n_ctx = tokens.size();
   // Teacher forcing on the non-greedy decode graph: token p is seeded and fed
   // at position p, and the graph's full logits predict token p+1. This is the
@@ -3664,6 +3691,17 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
   // extra device op, and the raw distribution stays available for diagnostics.
   const float cap = m.config.final_logit_softcapping;
   std::vector<float> capped(vocab);
+  struct HeadItem {
+    float logit;
+    uint32_t id;
+  };
+  struct HeadWorse {
+    bool operator()(const HeadItem& a, const HeadItem& b) const {
+      return a.logit > b.logit;  // min-heap on logit
+    }
+  };
+  std::vector<HeadItem> head;
+  if (trace && trace->top_k > 0) head.reserve(trace->top_k);
   double sum = 0;
   uint64_t scored = 0;
   for (uint64_t p = 0; p + 1 < tokens.size(); ++p) {
@@ -3696,12 +3734,283 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
     double se = 0.0;
     for (uint64_t v = 0; v < vocab; ++v)
       se += std::exp(double(z[v]) - double(mx));
-    sum += (double(mx) + std::log(se)) - double(z[tokens[p + 1]]);
+    const double log_z = double(mx) + std::log(se);
+    sum += log_z - double(z[tokens[p + 1]]);
+    if (trace && trace->top_k > 0) {
+      const size_t k = trace->top_k;
+      head.clear();
+      for (uint64_t v = 0; v < vocab; ++v) {
+        const HeadItem item{z[v], uint32_t(v)};
+        if (head.size() < k) {
+          head.push_back(item);
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        } else if (item.logit > head.front().logit) {
+          std::pop_heap(head.begin(), head.end(), HeadWorse{});
+          head.back() = item;
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        }
+      }
+      std::sort(head.begin(), head.end(),
+                [](const HeadItem& a, const HeadItem& b) {
+                  return a.logit > b.logit;
+                });
+      trace->target.push_back(uint32_t(tokens[p + 1]));
+      trace->top.push_back(head.empty() ? 0u : head.front().id);
+      trace->log_z.push_back(float(log_z));
+      for (const HeadItem& h : head) {
+        trace->logits.push_back(h.logit);
+        trace->ids.push_back(h.id);
+      }
+    }
     ++scored;
   }
   sum_nll = sum;
   n_scored = scored;
+  if (trace)
+    trace->top_k = (trace->top_k && scored) ? trace->top_k : 0;
   return scored > 0;
+}
+
+}  // namespace
+
+bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
+                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored) {
+  return score_spine_cuda_impl(m, tokens, n_ctx, /*trace=*/nullptr, 0, sum_nll,
+                               n_scored);
+}
+
+bool score_spine_cuda_trace(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, uint64_t n_ctx,
+                            size_t top_k, ScoreTrace& trace, double& sum_nll,
+                            uint64_t& n_scored) {
+  return score_spine_cuda_impl(m, tokens, n_ctx, &trace, top_k, sum_nll,
+                               n_scored);
+}
+
+namespace {
+
+// Prefill-path corpus scoring (gate v2). The corpus is run through the same
+// chunked prefill segments generation uses — same IR, same lowering phase, same
+// planner and kernels — and every segment's hidden columns are projected
+// through the lm-head, so prefill-only kernel choices are visible in the scored
+// distribution. Segment boundaries follow prefill_decode_cuda_impl exactly
+// (absolute multiples of the ring/chunk), and the deferred KV append of each
+// segment is what the next segment attends over. No CUDA-graph replay: this
+// path needs each segment's hidden output on the host, and a replay does not
+// surface it.
+bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
+                                   std::span<const uint64_t> tokens,
+                                   uint64_t n_ctx, size_t top_k,
+                                   ScoreTrace* trace, double& sum_nll,
+                                   uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  if (trace) {
+    trace->top_k = 0;
+    trace->vocab = 0;
+    trace->target.clear();
+    trace->top.clear();
+    trace->log_z.clear();
+    trace->logits.clear();
+    trace->ids.clear();
+  }
+  if (m.weights.blocks.empty() || tokens.size() < 2) {
+    std::cerr << "[score-prefill] empty model (" << m.weights.blocks.size()
+              << " blocks) or short input (" << tokens.size() << ")\n";
+    return false;
+  }
+  const uint64_t vocab = m.config.vocab_size;
+  for (uint64_t t : tokens)
+    if (t >= vocab) {
+      std::cerr << "[score-prefill] token " << t << " outside vocab " << vocab
+                << "\n";
+      return false;
+    }
+  if (trace && top_k > 0) {
+    trace->top_k = std::min(top_k, size_t(vocab));
+    trace->vocab = vocab;
+    const size_t rows = size_t(tokens.size() - 1);
+    trace->target.reserve(rows);
+    trace->top.reserve(rows);
+    trace->log_z.reserve(rows);
+    trace->logits.reserve(rows * trace->top_k);
+    trace->ids.reserve(rows * trace->top_k);
+  }
+  if (n_ctx < tokens.size()) n_ctx = tokens.size();
+
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt) {
+    std::cerr << "[score-prefill] decode runtime build failed\n";
+    return false;
+  }
+  const planner::ResourceSnapshot& snap = rt->snap;
+  planner::AnalyticalCpuCostModel cost(snap);
+
+  const uint64_t d = m.config.embedding_length;
+  const uint64_t n = tokens.size();
+  const uint64_t chunk = (m.config.sliding_window > 0)
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  const bool symbolic_plans =
+      runtime::feature_enabled(runtime::Feature::SymbolicPrefill);
+  const uint64_t mmq_min_n =
+      std::max<uint64_t>(uint64_t(quant::cuda::mmq_min_n()), 1);
+  auto plan_extent_for = [&](uint64_t nseg) -> uint64_t {
+    if (!symbolic_plans) return nseg;
+    return nseg >= mmq_min_n ? chunk : mmq_min_n - 1;
+  };
+  // One segment per shape class, owned by this call.
+  std::map<uint64_t, std::unique_ptr<PrefillSegment>> segs;
+  auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
+    const uint64_t extent = plan_extent_for(nseg);
+    auto it = segs.find(extent);
+    if (it != segs.end()) return it->second.get();
+    auto seg = std::make_unique<PrefillSegment>();
+    GraphIr seg_ir = emit_prefill_ir(m, extent, symbolic_plans);
+    seg->graph = lower_graph(
+        seg_ir, planner::IrPassPhase::Prefill,
+        quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+            extent >= mmq_min_n,
+        symbolic_plans ? extent : 0,
+        /*skip_kv_append_fusion=*/false,
+        /*fuse_silu_mul=*/numerics_profile() == NumericsProfile::Standard);
+    if (seg->graph.nodes.empty()) {
+      std::cerr << "[score-prefill] n=" << nseg << " graph lowering failed\n";
+      return nullptr;
+    }
+    auto pplan = planner::plan_execution(seg->graph, snap, cost);
+    if (!pplan) {
+      std::cerr << "[score-prefill] n=" << nseg << " plan failed\n";
+      return nullptr;
+    }
+    seg->plan = std::move(*pplan);
+    seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
+    seg->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), seg->graph, n_ctx);
+    seg->cuda->bind_model(m);
+    seg->cuda->share_caches(*rt->cuda);
+    seg->exec = std::make_unique<planner::RuntimeExecutor>(
+        std::map<planner::BackendTag, planner::Backend*>{
+            {planner::BackendTag::Sonic, seg->cuda.get()}});
+    route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
+    PrefillSegment* raw = seg.get();
+    segs.emplace(extent, std::move(seg));
+    return raw;
+  };
+
+  struct HeadItem {
+    float logit;
+    uint32_t id;
+  };
+  struct HeadWorse {
+    bool operator()(const HeadItem& a, const HeadItem& b) const {
+      return a.logit > b.logit;  // min-heap on logit
+    }
+  };
+  std::vector<HeadItem> head;
+  if (trace && trace->top_k > 0) head.reserve(trace->top_k);
+  std::vector<float> logits(vocab);
+  double sum = 0;
+  uint64_t scored = 0;
+  for (uint64_t off = 0; off < n;) {
+    const uint64_t pos = off;
+    uint64_t nseg = std::min(chunk, n - off);
+    const uint64_t rem = pos % chunk;
+    if (rem != 0 && chunk - rem < nseg) nseg = chunk - rem;
+    PrefillSegment* seg = segment_for(nseg);
+    if (!seg) return false;
+    seg->cuda->set_prefill_tokens(tokens.subspan(off, nseg));
+    seg->cuda->set_pos(pos);
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_tokens(tokens.subspan(off, nseg)));
+    in.push_back(encode_i64(pos));
+    auto res = seg->exec->execute(seg->plan, snap, in,
+                                  /*segment_extent=*/nseg);
+    if (!res) {
+      std::cerr << "[score-prefill] segment off=" << off
+                << " execute failed: " << res.error().message << "\n";
+      return false;
+    }
+    if (res->outputs.empty()) {
+      std::cerr << "[score-prefill] segment off=" << off << " no outputs\n";
+      return false;
+    }
+    const sx::Bytes& hidden_b = res->outputs[0];
+    if (hidden_b.size() < uint64_t(d) * nseg * sizeof(float)) {
+      std::cerr << "[score-prefill] hidden too small: " << hidden_b.size()
+                << " < " << uint64_t(d) * nseg * sizeof(float) << "\n";
+      return false;
+    }
+    const float* hf = reinterpret_cast<const float*>(hidden_b.data());
+    for (uint64_t i = 0; i < nseg; ++i) {
+      const uint64_t p = off + i;
+      if (p + 1 >= n) continue;  // the final corpus column has no target
+      // lm_head applies the model's own logit softcap; the result is the
+      // scored distribution (no second cap).
+      if (!lm_head(m, std::span<const float>(hf + i * d, d), logits,
+                   quant::MatmulBackend::Cuda)) {
+        std::cerr << "[score-prefill] lm_head failed at position " << p << "\n";
+        return false;
+      }
+      const float* z = logits.data();
+      float mx = -INFINITY;
+      for (uint64_t v = 0; v < vocab; ++v) mx = std::max(mx, z[v]);
+      // One pass over the vocabulary does the softmax sum and, when tracing,
+      // the top-k heap. expf (not exp(double)) matters at corpus scale: the
+      // gate scores 24k positions over a 100k-260k vocabulary, where the double
+      // transcendental would dominate the run; the sum is still accumulated in
+      // double, so log_z keeps its precision.
+      double se = 0.0;
+      const size_t k = (trace && trace->top_k > 0) ? trace->top_k : 0;
+      if (k) head.clear();
+      for (uint64_t v = 0; v < vocab; ++v) {
+        const float zz = z[v];
+        se += double(std::exp(zz - mx));
+        if (k == 0) continue;
+        const HeadItem item{zz, uint32_t(v)};
+        if (head.size() < k) {
+          head.push_back(item);
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        } else if (item.logit > head.front().logit) {
+          std::pop_heap(head.begin(), head.end(), HeadWorse{});
+          head.back() = item;
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        }
+      }
+      const double log_z = double(mx) + std::log(se);
+      sum += log_z - double(z[tokens[p + 1]]);
+      if (k) {
+        std::sort(head.begin(), head.end(),
+                  [](const HeadItem& a, const HeadItem& b) {
+                    return a.logit > b.logit;
+                  });
+        trace->target.push_back(uint32_t(tokens[p + 1]));
+        trace->top.push_back(head.empty() ? 0u : head.front().id);
+        trace->log_z.push_back(float(log_z));
+        for (const HeadItem& h : head) {
+          trace->logits.push_back(h.logit);
+          trace->ids.push_back(h.id);
+        }
+      }
+      ++scored;
+    }
+    off += nseg;
+  }
+  sum_nll = sum;
+  n_scored = scored;
+  if (trace) trace->top_k = (trace->top_k && scored) ? trace->top_k : 0;
+  return scored > 0 && scored == tokens.size() - 1;
+}
+
+}  // namespace
+
+bool score_spine_cuda_prefill_trace(const Gemma4Model& m,
+                                    std::span<const uint64_t> tokens,
+                                    uint64_t n_ctx, size_t top_k,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored) {
+  return score_spine_cuda_prefill_impl(m, tokens, n_ctx, top_k, &trace,
+                                       sum_nll, n_scored);
 }
 
 namespace {
@@ -3826,6 +4135,23 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
 }
 bool score_spine_cuda(const Gemma4Model&, std::span<const uint64_t>, uint64_t,
                       double& sum_nll, uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  return false;  // built without CUDA: no device scoring
+}
+bool score_spine_cuda_trace(const Gemma4Model&, std::span<const uint64_t>,
+                            uint64_t, size_t, ScoreTrace& trace,
+                            double& sum_nll, uint64_t& n_scored) {
+  trace = ScoreTrace{};
+  sum_nll = 0;
+  n_scored = 0;
+  return false;  // built without CUDA: no device scoring
+}
+bool score_spine_cuda_prefill_trace(const Gemma4Model&,
+                                    std::span<const uint64_t>, uint64_t, size_t,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored) {
+  trace = ScoreTrace{};
   sum_nll = 0;
   n_scored = 0;
   return false;  // built without CUDA: no device scoring

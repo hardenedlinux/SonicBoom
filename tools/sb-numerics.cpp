@@ -75,6 +75,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace sbgguf = sonicboom::gguf;
@@ -884,8 +885,19 @@ constexpr ProfileModel kProfileModels[] = {
 //                                    row is skipped when it is not set
 //   token_budget=24000               scored token span (gate wants >= 20k)
 //   ppl_max_delta_pct=0.5            strict-vs-standard relative ppl gate
-//   top1_min_prompts=50              prompts compared for top-1
-//   top1_min=0.99                    required top-1 agreement
+//   kl_mean_max=5e-4                 mean KL(standard || strict) over every
+//                                    scored corpus position
+//   same_top_min=0.99                same-top-token rate over every position
+//   trace_top_k=512                  per-position head exported for the KL
+//   trace_top_k=512                  per-position head exported for KL
+//   ppl_path=prefill                corpus path; "prefill" or "decode"
+//   gate=profile                    "profile" (strict vs standard) or "arm"
+//                                    (standard baseline vs standard + pin,
+//                                    envs read from strict_env/standard_env)
+//   models=deepseek                 optional comma list; empty = all models
+//   top1_min_prompts=50              prompts compared for top-1 (informational
+//                                    since gate v2)
+//   top1_min=0.99                    required top-1 agreement (informational)
 //
 // The defaults below are the published gate. SONICBOOM_PPL_CORPUS overrides the
 // corpus for one-off runs and SONICBOOM_PPL_TOKENS the span; the recorded gate
@@ -894,8 +906,31 @@ struct ProfileGateConfig {
   std::string corpus;
   uint64_t token_budget = 24000;
   double ppl_max_delta_pct = 0.5;
+  double kl_mean_max = 5e-4;
+  double same_top_min = 0.99;
+  size_t trace_top_k = 512;
+  // Corpus scoring path: "prefill" (default; every corpus column through the
+  // chunked prefill segments, so prefill-only kernels are visible) or "decode"
+  // (the per-token decode graph, the pre-boom-r5 gate's path).
+  std::string ppl_path = "prefill";
   size_t top1_min_prompts = 50;
   double top1_min = 0.99;
+  // "profile" (default): strict vs standard, the profile acceptance gate.
+  // "arm": standard baseline vs standard + an arm pin, both under the standard
+  // profile. The reference child runs with `strict_env` (baseline pins) and the
+  // tested child with `standard_env` (baseline pins + the arm), so a parked arm
+  // (TF32 dense, f32 tree reduce, df32, d128 prefill attention) is judged by
+  // the same gate-v2 metrics against the standard default it would replace.
+  std::string gate = "profile";
+  // Optional comma-separated model tags for an arm run (e.g. "deepseek" when
+  // the arm's switch only exists on one architecture). Empty = every model.
+  std::string models;
+  // Extra environment for each profile's child, e.g. a pinned arm under test:
+  //   standard_env=SONICBOOM_ATTN_D128=codegen SONICBOOM_TUNE_DIR=/tmp/arm-a
+  // Set strict_env too when the parent environment could leak an arm into the
+  // strict side; the gate then pins both explicitly.
+  std::string strict_env;
+  std::string standard_env;
 };
 
 ProfileGateConfig load_profile_config() {
@@ -923,12 +958,31 @@ ProfileGateConfig load_profile_config() {
     } else if (key == "ppl_max_delta_pct") {
       const double v = std::atof(val.c_str());
       if (v > 0.0) cfg.ppl_max_delta_pct = v;
+    } else if (key == "kl_mean_max") {
+      const double v = std::atof(val.c_str());
+      if (v > 0.0) cfg.kl_mean_max = v;
+    } else if (key == "same_top_min") {
+      const double v = std::atof(val.c_str());
+      if (v > 0.0) cfg.same_top_min = v;
+    } else if (key == "models") {
+      cfg.models = val;
+    } else if (key == "gate") {
+      if (val == "profile" || val == "arm") cfg.gate = val;
+    } else if (key == "ppl_path") {
+      if (val == "prefill" || val == "decode") cfg.ppl_path = val;
+    } else if (key == "trace_top_k") {
+      const long v = std::atol(val.c_str());
+      if (v > 0) cfg.trace_top_k = size_t(v);
     } else if (key == "top1_min_prompts") {
       const long v = std::atol(val.c_str());
       if (v > 0) cfg.top1_min_prompts = size_t(v);
     } else if (key == "top1_min") {
       const double v = std::atof(val.c_str());
       if (v > 0.0) cfg.top1_min = v;
+    } else if (key == "strict_env") {
+      cfg.strict_env = val;
+    } else if (key == "standard_env") {
+      cfg.standard_env = val;
     } else {
       std::fprintf(stderr, "sb-numerics: profile config: unknown key '%s'\n",
                    key.c_str());
@@ -983,6 +1037,71 @@ struct ProfileResult {
   std::vector<int64_t> reuse_full;
   std::vector<int64_t> reuse_session;
 };
+
+// Binary per-position distribution trace (`sb-numerics profile-dump` writes one
+// per profile). Layout: 8-byte magic, u64 vocab, u64 rows, u64 k, then rows
+// u32 targets, rows u32 argmaxes, rows f32 logsumexps, rows*k u32 ids and
+// rows*k f32 logits. The head is descending; every unlisted logit is <= the
+// k-th entry.
+constexpr char kTraceMagic[8] = {'S', 'B', 'T', 'R', 'A', '1', '0', '0'};
+
+bool write_score_trace(const sbmodel::ScoreTrace& t, const std::string& path) {
+  const uint64_t rows = t.target.size();
+  const uint64_t k = t.top_k;
+  if (k == 0 || t.top.size() != rows || t.log_z.size() != rows ||
+      t.ids.size() != rows * k || t.logits.size() != rows * k)
+    return false;
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) return false;
+  out.write(kTraceMagic, sizeof kTraceMagic);
+  out.write(reinterpret_cast<const char*>(&t.vocab), sizeof t.vocab);
+  out.write(reinterpret_cast<const char*>(&rows), sizeof rows);
+  out.write(reinterpret_cast<const char*>(&k), sizeof k);
+  out.write(reinterpret_cast<const char*>(t.target.data()),
+            std::streamsize(rows * sizeof(uint32_t)));
+  out.write(reinterpret_cast<const char*>(t.top.data()),
+            std::streamsize(rows * sizeof(uint32_t)));
+  out.write(reinterpret_cast<const char*>(t.log_z.data()),
+            std::streamsize(rows * sizeof(float)));
+  out.write(reinterpret_cast<const char*>(t.ids.data()),
+            std::streamsize(rows * k * sizeof(uint32_t)));
+  out.write(reinterpret_cast<const char*>(t.logits.data()),
+            std::streamsize(rows * k * sizeof(float)));
+  return bool(out);
+}
+
+bool read_score_trace(const std::string& path, sbmodel::ScoreTrace& t) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  char magic[8];
+  uint64_t rows = 0, k = 0;
+  in.read(magic, sizeof magic);
+  if (!in || std::memcmp(magic, kTraceMagic, sizeof magic) != 0) return false;
+  in.read(reinterpret_cast<char*>(&t.vocab), sizeof t.vocab);
+  in.read(reinterpret_cast<char*>(&rows), sizeof rows);
+  in.read(reinterpret_cast<char*>(&k), sizeof k);
+  // Bound the allocation: a trace cannot exceed the model's vocabulary positions
+  // and the gate's own head size by a wide margin.
+  if (!in || rows == 0 || k == 0 || k > 1u << 20 || rows > (1u << 26))
+    return false;
+  t.top_k = size_t(k);
+  t.target.resize(rows);
+  t.top.resize(rows);
+  t.log_z.resize(rows);
+  t.ids.resize(rows * k);
+  t.logits.resize(rows * k);
+  auto read = [&](void* p, size_t bytes) {
+    in.read(reinterpret_cast<char*>(p), std::streamsize(bytes));
+    return bool(in);
+  };
+  if (!read(t.target.data(), rows * sizeof(uint32_t)) ||
+      !read(t.top.data(), rows * sizeof(uint32_t)) ||
+      !read(t.log_z.data(), rows * sizeof(float)) ||
+      !read(t.ids.data(), rows * k * sizeof(uint32_t)) ||
+      !read(t.logits.data(), rows * k * sizeof(float)))
+    return false;
+  return true;
+}
 
 bool write_profile_dump(const ProfileResult& r, const std::string& path) {
   std::ofstream out(path, std::ios::trunc);
@@ -1044,9 +1163,11 @@ bool read_profile_dump(const std::string& path, ProfileResult& r) {
   return !r.profile.empty() && !r.model.empty();
 }
 
-// Run one model under this process's profile and fill `r`.
+// Run one model under this process's profile and fill `r`. When `trace_path`
+// is non-empty the corpus scoring also writes the per-position distribution
+// head there (gate v2's KL input).
 bool run_profile_model(const std::string& path, const char* tag, bool cuda,
-                       ProfileResult& r) {
+                       ProfileResult& r, const std::string& trace_path) {
   Loaded l;
   if (!load(path, tag, l)) return false;
   r.model = tag;
@@ -1063,9 +1184,32 @@ bool run_profile_model(const std::string& path, const char* tag, bool cuda,
       if (ids.size() > budget) ids.resize(budget);
       std::printf("  ppl corpus: %zu tokens\n", ids.size());
       std::fflush(stdout);
-      if (ids.size() >= 1000 &&
-          sbmodel::score_spine_cuda(l.model, ids, ids.size(), r.sum_nll,
-                                    r.n_scored))
+      bool ok = false;
+      if (ids.size() >= 1000 && !trace_path.empty()) {
+        const char* path_env = std::getenv("SONICBOOM_PPL_PATH");
+        const bool prefill =
+            !(path_env && std::string_view(path_env) == "decode");
+        std::printf("  ppl path: %s\n", prefill ? "prefill" : "decode");
+        std::fflush(stdout);
+        sbmodel::ScoreTrace trace;
+        ok = prefill ? sbmodel::score_spine_cuda_prefill_trace(
+                           l.model, ids, ids.size(),
+                           profile_config().trace_top_k, trace, r.sum_nll,
+                           r.n_scored)
+                     : sbmodel::score_spine_cuda_trace(
+                           l.model, ids, ids.size(),
+                           profile_config().trace_top_k, trace, r.sum_nll,
+                           r.n_scored);
+        if (ok && !write_score_trace(trace, trace_path)) {
+          std::fprintf(stderr, "sb-numerics: cannot write trace %s\n",
+                       trace_path.c_str());
+          ok = false;
+        }
+      } else if (ids.size() >= 1000) {
+        ok = sbmodel::score_spine_cuda(l.model, ids, ids.size(), r.sum_nll,
+                                       r.n_scored);
+      }
+      if (ok)
         std::printf("  ppl: sum_nll=%.3f over %llu tokens\n", r.sum_nll,
                     (unsigned long long)r.n_scored);
       else
@@ -1170,10 +1314,84 @@ size_t first_divergence(const std::vector<int64_t>& a,
   return n;
 }
 
+// Per-position KL(standard || strict) from the two exported heads. The strict
+// head is converted to a lookup; a standard head id that strict did not export
+// gets strict's k-th logit, the largest value any unexported strict logit can
+// have, so every such term is a lower bound on the true KL (reported with the
+// standard head mass, which bounds what was omitted).
+struct KlSummary {
+  bool ok = false;
+  size_t n = 0;
+  double mean = 0, median = 0, p99 = 0, p999 = 0, max = 0;
+  double min_head_mass = 1.0;
+  size_t top_mismatch = 0;
+};
+
+KlSummary compare_traces(const sbmodel::ScoreTrace& strict,
+                         const sbmodel::ScoreTrace& standard) {
+  KlSummary s;
+  if (strict.top_k == 0 || standard.top_k == 0 ||
+      strict.target.size() != standard.target.size() ||
+      strict.top_k != standard.top_k)
+    return s;
+  const size_t n = standard.target.size();
+  const size_t k = standard.top_k;
+  std::vector<double> kls;
+  kls.reserve(n);
+  std::unordered_map<uint32_t, float> strict_head;
+  strict_head.reserve(k * 2);
+  for (size_t row = 0; row < n; ++row) {
+    if (strict.target[row] != standard.target[row]) return s;
+    strict_head.clear();
+    const size_t bo = row * k;
+    for (size_t i = 0; i < k; ++i)
+      strict_head[strict.ids[bo + i]] = strict.logits[bo + i];
+    const float strict_floor = strict.logits[bo + k - 1];
+    const double log_zs = strict.log_z[row];
+    const double log_zt = standard.log_z[row];
+    double kl = 0;
+    double mass = 0;
+    for (size_t i = 0; i < k; ++i) {
+      const double lt = standard.logits[bo + i];
+      const double pt = std::exp(lt - log_zt);
+      auto it = strict_head.find(standard.ids[bo + i]);
+      const double ls = (it != strict_head.end()) ? it->second : strict_floor;
+      kl += pt * ((lt - log_zt) - (ls - log_zs));
+      mass += pt;
+    }
+    kls.push_back(std::max(0.0, kl));
+    s.min_head_mass = std::min(s.min_head_mass, mass);
+    if (strict.top[row] != standard.top[row]) ++s.top_mismatch;
+  }
+  if (kls.empty()) return s;
+  std::sort(kls.begin(), kls.end());
+  auto q = [&](double p) {
+    const size_t i = std::min(kls.size() - 1,
+                              size_t(p * double(kls.size() - 1) + 0.5));
+    return kls[i];
+  };
+  double sum = 0;
+  for (double v : kls) sum += v;
+  s.n = kls.size();
+  s.mean = sum / double(kls.size());
+  s.median = q(0.5);
+  s.p99 = q(0.99);
+  s.p999 = q(0.999);
+  s.max = kls.back();
+  s.ok = true;
+  return s;
+}
+
 // Compare a strict and a standard dump for one model; returns the gate verdict
-// (and prints the row).
+// (and prints the row). Gate v2 (boom-r5 M1) judges the standard profile by the
+// full-corpus distribution: relative ppl delta, mean KL over every scored
+// position and the same-top-token rate. The old 50-prompt top-1 is printed for
+// information only. Determinism, batch-4 and prefix reuse remain hard.
 bool compare_profile_pair(const ProfileResult& strict,
-                          const ProfileResult& standard) {
+                          const ProfileResult& standard,
+                          const sbmodel::ScoreTrace& strict_trace,
+                          const sbmodel::ScoreTrace& standard_trace,
+                          bool arm = false) {
   const auto ppl = [](const ProfileResult& r) {
     return r.n_scored == 0 ? 0.0 : std::exp(r.sum_nll / double(r.n_scored));
   };
@@ -1189,7 +1407,13 @@ bool compare_profile_pair(const ProfileResult& strict,
     if (it->second == t) ++agree;
   }
   const double top1 = total ? double(agree) / double(total) : 0.0;
-  const bool top1_ok = total >= cfg.top1_min_prompts && top1 >= cfg.top1_min;
+
+  const KlSummary kl = compare_traces(strict_trace, standard_trace);
+  const double same_top =
+      kl.ok && kl.n ? double(kl.n - kl.top_mismatch) / double(kl.n) : 0.0;
+  const double kl_mean = kl.ok ? kl.mean : INFINITY;
+  const bool kl_ok = kl.ok && kl.n > 0 && kl_mean <= cfg.kl_mean_max;
+  const bool same_top_ok = kl.ok && same_top >= cfg.same_top_min;
 
   const bool det_ok = strict.runs[0] == strict.runs[1] &&
                       strict.runs[0] == strict.runs[2] &&
@@ -1201,19 +1425,26 @@ bool compare_profile_pair(const ProfileResult& strict,
                         standard.reuse_full == standard.reuse_session;
   const size_t div = first_divergence(strict.runs[0], standard.runs[0]);
 
-  std::printf("  %-8s ppl strict=%.4f standard=%.4f delta=%+.3f%% %s | "
-              "top1 %zu/%zu %.1f%% %s | det %s batch4 %s reuse %s | "
+  std::printf("  %-8s ppl %s=%.4f %s=%.4f delta=%+.3f%% %s | "
+              "KL mean=%.3e med=%.3e p99=%.3e p99.9=%.3e max=%.3e %s "
+              "(head mass min %.9f) | same-top %.4f%% %s | "
+              "det %s batch4 %s reuse %s | top1(info) %zu/%zu %.1f%% | "
               "first divergence step %zu\n",
-              strict.model.c_str(), ps, pt, ps > 0 ? 100.0 * (pt - ps) / ps : 0.0,
-              ppl_ok ? "OK" : "FAIL", agree, total,
-              total ? 100.0 * top1 : 0.0, top1_ok ? "OK" : "FAIL",
+              strict.model.c_str(), arm ? "base" : "strict", ps,
+              arm ? "arm" : "standard", pt,
+              ps > 0 ? 100.0 * (pt - ps) / ps : 0.0,
+              ppl_ok ? "OK" : "FAIL", kl.mean, kl.median, kl.p99, kl.p999,
+              kl.max, kl_ok ? "OK" : "FAIL", kl.min_head_mass,
+              100.0 * same_top, same_top_ok ? "OK" : "FAIL",
               det_ok ? "OK" : "FAIL", batch_ok ? "OK" : "FAIL",
-              reuse_ok ? "OK" : "FAIL", div);
+              reuse_ok ? "OK" : "FAIL", agree, total,
+              total ? 100.0 * top1 : 0.0, div);
   std::fflush(stdout);
-  return ppl_ok && top1_ok && det_ok && batch_ok && reuse_ok;
+  return ppl_ok && kl_ok && same_top_ok && det_ok && batch_ok && reuse_ok;
 }
 
-int profile_dump_mode(const std::string& out_path, const std::string& model) {
+int profile_dump_mode(const std::string& out_path, const std::string& model,
+                      const std::string& trace_path) {
   const ProfileModel* spec = nullptr;
   for (const auto& s : kProfileModels)
     if (model == s.tag) spec = &s;
@@ -1228,7 +1459,7 @@ int profile_dump_mode(const std::string& out_path, const std::string& model) {
   }
   ProfileResult r;
   const bool cuda = have_cuda();
-  if (!run_profile_model(path, spec->tag, cuda, r)) {
+  if (!run_profile_model(path, spec->tag, cuda, r, trace_path)) {
     std::fprintf(stderr, "sb-numerics: %s failed to load/run\n", spec->tag);
     return 2;
   }
@@ -1241,9 +1472,16 @@ int profile_dump_mode(const std::string& out_path, const std::string& model) {
 }
 
 bool run_profile_child(const std::string& self, const char* profile,
-                       const std::string& out, const char* model) {
+                       const std::string& out, const char* model,
+                       const std::string& trace, const std::string& extra_env) {
   std::string cmd = "LC_ALL=C SONICBOOM_NUMERICS=";
   cmd += profile;
+  cmd += " SONICBOOM_PPL_PATH=";
+  cmd += profile_config().ppl_path;
+  if (!extra_env.empty()) {
+    cmd += ' ';
+    cmd += extra_env;
+  }
   cmd += " '";
   cmd += self;
   cmd += "' profile-dump '";
@@ -1251,6 +1489,11 @@ bool run_profile_child(const std::string& self, const char* profile,
   cmd += "' '";
   cmd += model;
   cmd += "'";
+  if (!trace.empty()) {
+    cmd += " '";
+    cmd += trace;
+    cmd += "'";
+  }
   std::printf("  running %s profile for %s...\n", profile, model);
   std::fflush(stdout);
   const int rc = std::system(cmd.c_str());
@@ -1272,8 +1515,16 @@ int profile_gate(const std::string& self_in) {
   const std::string self = std::filesystem::absolute(self_in).string();
   bool ok = true;
   bool any = false;
-  std::printf("profile gate (strict vs standard)\n");
+  const bool arm = profile_config().gate == "arm";
+  std::printf("profile gate (%s)\n",
+              arm ? "standard arm vs standard baseline" : "strict vs standard");
   for (const auto& spec : kProfileModels) {
+    if (!profile_config().models.empty()) {
+      const std::string& m = profile_config().models;
+      const std::string tag = std::string(",") + spec.tag + ",";
+      const std::string list = std::string(",") + m + ",";
+      if (list.find(tag) == std::string::npos) continue;
+    }
     if (find_model(spec.env, spec.rel).empty()) {
       std::printf("  (skipped: %s model not found)\n", spec.tag);
       continue;
@@ -1282,16 +1533,27 @@ int profile_gate(const std::string& self_in) {
         std::string("/tmp/sb-numerics-profile-strict-") + spec.tag + ".dump";
     const std::string t_path =
         std::string("/tmp/sb-numerics-profile-standard-") + spec.tag + ".dump";
-    if (!run_profile_child(self, "strict", s_path, spec.tag)) return 2;
-    if (!run_profile_child(self, "standard", t_path, spec.tag)) return 2;
+    const std::string ks_path =
+        std::string("/tmp/sb-numerics-trace-strict-") + spec.tag + ".bin";
+    const std::string kt_path =
+        std::string("/tmp/sb-numerics-trace-standard-") + spec.tag + ".bin";
+    if (!run_profile_child(self, arm ? "standard" : "strict", s_path, spec.tag,
+                           ks_path, profile_config().strict_env))
+      return 2;
+    if (!run_profile_child(self, "standard", t_path, spec.tag, kt_path,
+                           profile_config().standard_env))
+      return 2;
     ProfileResult a, b;
-    if (!read_profile_dump(s_path, a) || !read_profile_dump(t_path, b)) {
-      std::fprintf(stderr, "sb-numerics: cannot read %s / %s\n",
-                   s_path.c_str(), t_path.c_str());
+    sbmodel::ScoreTrace ta, tb;
+    if (!read_profile_dump(s_path, a) || !read_profile_dump(t_path, b) ||
+        !read_score_trace(ks_path, ta) || !read_score_trace(kt_path, tb)) {
+      std::fprintf(stderr, "sb-numerics: cannot read %s / %s / %s / %s\n",
+                   s_path.c_str(), t_path.c_str(), ks_path.c_str(),
+                   kt_path.c_str());
       return 2;
     }
     any = true;
-    ok = compare_profile_pair(a, b) && ok;
+    ok = compare_profile_pair(a, b, ta, tb, arm) && ok;
   }
   if (!any) std::cout << "  (skipped: no models found)\n";
   std::printf("sb-numerics profile %s\n", ok ? "ACCEPTED" : "REJECTED");
@@ -1316,13 +1578,13 @@ int main(int argc, char** argv) {
     return profile_gate(argv[0]);
   }
   if (argc >= 2 && std::string_view(argv[1]) == "profile-dump") {
-    if (argc != 4) {
+    if (argc != 4 && argc != 5) {
       std::fprintf(stderr, "usage: %s profile-dump <file> "
-                           "<gemma|qwen|deepseek>\n",
+                           "<gemma|qwen|deepseek> [trace-file]\n",
                    argv[0]);
       return 2;
     }
-    return profile_dump_mode(argv[2], argv[3]);
+    return profile_dump_mode(argv[2], argv[3], argc == 5 ? argv[4] : "");
   }
   if (argc >= 2 && std::string_view(argv[1]) == "compare") {
     // compare <f64.dump> <df32.dump> [<f64.dump> <df32.dump> ...]

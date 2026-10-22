@@ -351,6 +351,48 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
                       uint64_t n_ctx, double& sum_nll, uint64_t& n_scored);
 
+// The per-position distribution trace for the standard-profile KL gate
+// (boom-r5 M1). One row per scored position, in corpus order:
+//   target  the teacher-forced next token (what NLL scores)
+//   top     the argmax token of the scored distribution
+//   log_z   logsumexp of the full scored distribution (softcap applied)
+//   logits  the `top_k` largest scored logits, descending; `ids` are their
+//           token ids, so a reader can reconstruct the head exactly and treat
+//           the unlisted tail as bounded by the k-th logit.
+// The rows are written by the same loop and the same kernels as
+// score_spine_cuda, so a trace and a plain score of the same input agree
+// bit-for-bit on sum_nll. Measurement only, same throwaway runtime.
+struct ScoreTrace {
+  size_t top_k = 0;
+  uint64_t vocab = 0;
+  std::vector<uint32_t> target;
+  std::vector<uint32_t> top;
+  std::vector<float> log_z;
+  std::vector<float> logits;  // rows * top_k, descending
+  std::vector<uint32_t> ids;  // rows * top_k, parallel to `logits`
+};
+
+bool score_spine_cuda_trace(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, uint64_t n_ctx,
+                            size_t top_k, ScoreTrace& trace, double& sum_nll,
+                            uint64_t& n_scored);
+
+// The same score/trace through the chunked prefill path instead of the
+// per-token decode graph (gate v2's corpus pass). Every corpus position is
+// computed by the profile's prefill kernels — batched matmul, prefill
+// attention, fused prefill glue — so a kernel change that only affects prefill
+// (e.g. the d128 attention arm) moves the scored distribution. Each segment's
+// hidden columns are projected through the lm-head; the row for position p
+// predicts tokens[p + 1], so the final corpus column is not scored and the row
+// count matches score_spine_cuda_trace. The prefill KV append is the normal
+// one (shared decode-runtime cache, segment boundaries aligned to the ring).
+// Measurement only, same throwaway-runtime contract.
+bool score_spine_cuda_prefill_trace(const Gemma4Model& m,
+                                    std::span<const uint64_t> tokens,
+                                    uint64_t n_ctx, size_t top_k,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored);
+
 // CUDA prefill + decode with prefix-cache reuse: the same token-stream contract
 // as generate_prefill_spine_cuda, but the KV cache persists in `session` across
 // calls. On each call it matches `prompt` against the session's token history

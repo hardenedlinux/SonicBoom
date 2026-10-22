@@ -3363,6 +3363,24 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
               s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
               s->head_fast ? 1 : 0};
   }
+  // d128/gqa6 (DeepSeek-R1-Distill-Qwen-1.5B): boom-r5 M1 re-evaluation arm.
+  // The generated tile is 1.92x the scalar kernel, but its S/P association
+  // order moved DeepSeek's first greedy token on 10 of the r4 gate prompts.
+  // Gate v2 judges the full-corpus distribution rather than 50 first tokens,
+  // so the arm is measured with SONICBOOM_ATTN_D128=codegen; it becomes the
+  // standard-profile default only if the KL/same-top gate admits it. Strict
+  // keeps the scalar kernel either way.
+  if (gqa == 6 && head_dim == 128) {
+    const char *e = std::getenv("SONICBOOM_ATTN_D128");
+    const bool on = e != nullptr && std::string_view(e) == "codegen";
+    if (on) {
+      if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
+        return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+                s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+                s->head_fast ? 1 : 0};
+    }
+    return {AttnImpl::Own, 0, 0, 0};
+  }
   // d512: own wins the prefill leg, and no legal generated tile beats it
   // (best generated 1.717/27.19 ms vs own 1.603/20.25 at q=512/2048; see
   // attn_codegen_default_shape for why the 96 KiB budget rules out packing
