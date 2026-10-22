@@ -40,6 +40,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -111,6 +112,21 @@ struct Vocab {
 // llama.cpp (its prompt always starts with <bos>); other architectures take
 // add_bos from the file.
 std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader);
+
+// Load a Hugging Face `tokenizer.json` (the "tokenizers" library format) as a
+// Gpt2Qwen2 Vocab. The file must use the byte-level BPE model with the qwen2
+// pre-tokenizer regex (the Qwen2/Qwen3 family); any other model type or regex
+// is rejected by name rather than approximated. `added_tokens` carry their ids
+// and are typed Control when flagged special, so tokenize(..., parse_special)
+// emits `<|im_start|>`-style markers as single ids, exactly like a GGUF
+// vocabulary with the same pieces.
+//
+// The serialized normalizer (NFC for the Qwen family) is accepted but not
+// applied: the tokenizer is a byte-level BPE over UTF-8, which for text that is
+// already NFC is identical, and no ICU normalizer is linked. eos/bos/unk ids are
+// read from a sibling `tokenizer_config.json` when present.
+std::expected<Vocab, std::string> load_tokenizer_json(
+    const std::filesystem::path& path);
 
 // tokenize: text -> token ids. When add_bos is set the <bos> token is prepended
 // (matching llama-tokenize's default), so a prompt round-trips through

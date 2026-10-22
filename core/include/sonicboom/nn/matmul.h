@@ -49,4 +49,21 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
 bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols,
                  std::span<const float> x, std::span<float> y);
 
+// bf16 matrix-matrix product: Y = X @ W^T, where W holds raw bf16 halves in
+// GGUF [cols, rows] order (rows = W.size() / cols), X is row-major [n, cols]
+// and Y is row-major [n, rows]. This is the multi-token twin of matvec_bf16:
+// the same widening and accumulator policy, so a single-row call is
+// bit-identical to matvec_bf16.
+//
+// The output-row loop is split across the pool; for each output row every
+// token's dot product is computed before moving to the next row, so the weight
+// row is read from memory once regardless of n. Each output element depends
+// only on its own row and the shared X, so the result is worker-count
+// independent.
+//
+// Returns false (writing nothing) when W.size() < cols * rows, rows == 0,
+// X.size() < n * cols, or Y.size() < n * rows.
+bool matmul_bf16(std::span<const uint16_t> W, uint64_t cols,
+                 std::span<const float> X, uint64_t n, std::span<float> Y);
+
 } // namespace sonicboom::nn
