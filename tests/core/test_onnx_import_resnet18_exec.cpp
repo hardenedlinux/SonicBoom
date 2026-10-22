@@ -17,7 +17,7 @@
 // test_onnx_import_resnet18_exec.cpp — Milestone 2 end-to-end: ONNX → S-Expr.
 //
 // This is NOT the hand-authored fixture. It loads the S-Expr + sidecar emitted
-// by the offline importer (`tools/onnx2sx`) from `<repo>/build/import/`, feeds
+// by the offline importer (`tools/onnx2sx`) from `<build-dir>/import/`, feeds
 // the deterministic input (tests/data/resnet18.input.bin, seed 1234) through the
 // JITted executable, and compares the [1,1000] logits against the independent
 // ONNX reference (tests/data/resnet18.reference.bin, onnx.reference.ReferenceEvaluator).
@@ -25,7 +25,10 @@
 // tolerance — the same comparison as the frozen-fixture test, but over imported
 // artifacts rather than the hand-authored example.
 //
-// Run the importer first (see docs/onnx-to-s-expr-importer.md):
+// The artifacts are produced by the `resnet18_artifacts` CTest setup fixture
+// (tests/core/gen_resnet18_artifacts.sh), so a plain `ctest` generates them on a
+// fresh checkout. To run the importer by hand (see
+// docs/onnx-to-s-expr-importer.md):
 //
 //   PYTHONPATH=tools models/.venv/bin/python -m onnx2sx models/resnet18.onnx \
 //       -o build/import/resnet18.sx --weights-dir build/import
@@ -44,6 +47,9 @@
 
 #ifndef SONICBOOM_SRC_DIR
 #error "SONICBOOM_SRC_DIR must be defined to the repository root"
+#endif
+#ifndef SONICBOOM_IMPORT_DIR
+#error "SONICBOOM_IMPORT_DIR must be defined to the build tree's import dir"
 #endif
 
 namespace sx = sonicboom::sx;
@@ -87,7 +93,7 @@ static constexpr int kSkipReturnCode = 77;
 
 int main() {
   const std::string root = SONICBOOM_SRC_DIR;
-  const std::string import_dir = root + "/build/import";
+  const std::string import_dir = SONICBOOM_IMPORT_DIR;
   const std::string sx_path = import_dir + "/resnet18.sx";
   const std::string data = root + "/tests/data";
 
@@ -100,6 +106,8 @@ int main() {
       std::cout << "SKIP: " << path << " is missing\n"
                 << "      This test runs over imported artifacts, not the "
                    "hand-authored fixture.\n"
+                << "      Normally the resnet18_artifacts CTest fixture "
+                   "generates them.\n"
                 << "      Generate them from models/resnet18.onnx with:\n"
                 << "        PYTHONPATH=tools models/.venv/bin/python -m onnx2sx "
                    "models/resnet18.onnx -o build/import/resnet18.sx "

@@ -108,7 +108,7 @@
       (node add (inputs "getitem_95" "relu_14") (outputs ("add_27" (tensor float32 (shape 1 512 7 7)))))
       (node relu (inputs "add_27") (outputs ("relu_16" (tensor float32 (shape 1 512 7 7)))))
       (node reduce_mean (inputs "relu_16" "val_187") (outputs ("mean" (tensor float32 (shape 1 512 1 1)))) (attrs (keepdims (int 1)) (noop_with_empty_axes (int 0))))
-      (node reshape (inputs "mean" "val_191") (outputs ("view" (tensor float32 (shape 1 512)))) (attrs (allowzero (int 1))))
+      (node reshape (inputs "mean") (outputs ("view" (tensor float32 (shape 1 512)))) (attrs (allowzero (int 1))))
       (node gemm (inputs "view" "fc.weight" "fc.bias") (outputs ("output" (tensor float32 (shape 1 1000)))) (attrs (alpha (float 1.0)) (beta (float 1.0)) (transA (int 0)) (transB (int 1))))
       ))
   )

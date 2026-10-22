@@ -455,18 +455,37 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_o
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
-    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    SONICBOOM_IMPORT_DIR="${CMAKE_BINARY_DIR}/import")
   sb_add_cpp_test(${test_name})
 endforeach()
 
 # The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
 # input / reference sidecars under tests/data/, and the importer's output under
-# build/import/), none of which is committed — see .gitignore. On a fresh
-# checkout they exit 77 with a message naming the file and the generator, so
-# CTest reports them as Skipped rather than Failed.
+# <build>/import/), none of which is committed — see .gitignore. A setup fixture
+# generates them from models/resnet18.onnx before either test starts, so a fresh
+# checkout passes under a plain `ctest`; the tests keep their exit-77 path for
+# the case where the (external) model store is unavailable.
+find_package(Python3 COMPONENTS Interpreter)
+if(NOT Python3_EXECUTABLE)
+  set(Python3_EXECUTABLE python3)
+endif()
+set(SB_RESNET18_PYTHON "${CMAKE_SOURCE_DIR}/models/.venv/bin/python")
+if(NOT EXISTS "${SB_RESNET18_PYTHON}")
+  set(SB_RESNET18_PYTHON "${Python3_EXECUTABLE}")
+endif()
+add_test(NAME resnet18_artifacts
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_resnet18_artifacts.sh
+                 "${CMAKE_SOURCE_DIR}" "${SB_RESNET18_PYTHON}"
+                 "${CMAKE_BINARY_DIR}/import")
+set_tests_properties(resnet18_artifacts PROPERTIES
+  SKIP_RETURN_CODE 77
+  FIXTURES_SETUP resnet18_artifacts)
 set_tests_properties(
   test_s_expr_resnet18_exec test_onnx_import_resnet18_exec
-  PROPERTIES SKIP_RETURN_CODE 77)
+  PROPERTIES
+    SKIP_RETURN_CODE 77
+    FIXTURES_REQUIRED resnet18_artifacts)
 
 # C ABI test, compiled as C to prove <sonicboom/capi.h> is a genuine C header
 # and libsonicboom.so exports its entry points with C linkage. Links libm for
