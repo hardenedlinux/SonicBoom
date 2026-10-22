@@ -18,7 +18,7 @@
 //
 // This is the only rewrite path. The passes were ported from the planner's
 // Graph rewrites, one pass at a time, until the port was complete — the plan
-// goldens in tests/data/plans pinned each one — and the Graph rewrites and the
+// plan goldens pinned each one — and the Graph rewrites and the
 // switch that chose between the two were then removed. A pass is therefore
 // either a registered Boom IR pass or it does not exist; there is no second
 // implementation for a behavior to diverge from.

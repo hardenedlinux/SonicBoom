@@ -2758,7 +2758,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // the hand-written pair (the ablation arm); SONICBOOM_ATTN_DECODE=codegen
   // is still accepted and SONICBOOM_ATTN_IMPL=own forces own.
   //
-  // Measured per shape class (attention_bench, RTX 3050, us/call): windowed
+  // Measured per shape class (attention microbenchmark, RTX 3050, us/call): windowed
   // d256 at a 512-key window 23.2 (codegen, chunk 16) vs 31.3 (own); causal
   // d512 44.8 vs 50.5 at 513 keys but 279+ vs 245.5 at 4097 keys -- own's
   // blocks share one KV group's read across query heads, the generated

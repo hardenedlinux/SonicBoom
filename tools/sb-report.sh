@@ -14,11 +14,10 @@ export LC_ALL=C LANG=C
 # "(build-info)"). Paste it next to a benchmark result or a bug report.
 #
 # The report also *checks* the build it describes. With a model it runs the
-# golden checks through ctest (token goldens, prefix cache, plan cache,
-# elementwise, and the four golden plans) and the canonical benchmark through
-# tools/bench.sh, which is the same measurement a release reports. A model is
-# therefore required: a report that skips the numbers is the one thing this
-# script exists to prevent.
+# public golden checks through ctest (token goldens, prefix cache, plan cache,
+# elementwise) and the canonical benchmark through tools/bench.sh, which is the
+# same measurement a release reports. A model is therefore required: a report
+# that skips the numbers is the one thing this script exists to prevent.
 #
 # Everything else is best-effort: a section whose tool is absent says so, but a
 # failed golden check makes the script exit 1 (a host with no Guile still exits
@@ -208,12 +207,6 @@ if [ "$GOLDEN" = 1 ]; then
   [ -n "$GEMMA" ] && golden_run cuda_elementwise '^test_cuda_elementwise$'
   [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate$'
   [ -n "$DEEPSEEK" ] && golden_run deepseek_tokens '^test_deepseek_generate$'
-  if [ -n "$GEMMA" ] && [ -n "$QWEN" ]; then
-    golden_run golden_plans '^test_boom_conversion$'
-  else
-    [ "$JSON" = 1 ] && emit golden.golden_plans "skipped (needs --gemma and --qwen)"
-    [ "$JSON" = 1 ] || printf '  %-24s %s\n' golden_plans "skipped (needs --gemma and --qwen)"
-  fi
   [ "$JSON" = 1 ] || echo
 fi
 

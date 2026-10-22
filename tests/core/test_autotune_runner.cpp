@@ -69,7 +69,7 @@ uint16_t rand_finite_half(std::mt19937& rng) {
   return h;
 }
 
-// The synthetic q3_K weight of tools/baseline/gemv_bench.cpp: random block
+// The synthetic q3_K weight of the gemv microbenchmark: random block
 // bytes, a finite half scale per block, so the dequant arithmetic is the same
 // work as real GGUF bytes and the result is deterministic for a fixed seed.
 std::vector<std::byte> build_q3k(uint64_t rows, uint64_t cols,

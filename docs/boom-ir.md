@@ -211,8 +211,8 @@ and the folds it feeds together.
 3. Add the pass to the phase's list in `addPasses`, in the position its
    preconditions require, and add a `{"YourPassPass", &DisabledPasses::flag}`
    row to `kPassNames` so ablation can name it.
-4. Add a `TEST` to the conversion/verifier suite, and a plan golden under
-   `tests/data/plans/` if the pass changes the node set.
+4. Add a `TEST` to the conversion/verifier suite, and a plan golden if the
+   pass changes the node set.
 5. Ensure `boomToGraph` still round-trips: a pass may only produce
    `GraphNodeDesc`s the planner can rebuild (same tensor table invariants, same
    attribute kinds).

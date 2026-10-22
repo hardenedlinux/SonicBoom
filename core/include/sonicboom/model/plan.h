@@ -381,7 +381,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 
 // Build the model's plan and record what executing it does, step by step.
 //
-// These are the producers behind tools/plan_dump: given a loaded model and a
+// These are the producers behind the plan dump: given a loaded model and a
 // mode, they return a deterministic, serializable description of the executed
 // plan (see planner/plan_record.h). They deliberately build a *non-captured*
 // runtime: a CUDA-graph-captured decode step replays as a single graph launch
@@ -400,7 +400,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 //
 // The overloads are overloads rather than one function with a defaulted
 // parameter because libsonicboom.so is consumed through its symbol table
-// (tools/plan_dump): a defaulted parameter would silently drop the existing
+// (the plan dump tool): a defaulted parameter would silently drop the existing
 // entry point.
 using GraphTransform = std::function<void(planner::Graph&)>;
 

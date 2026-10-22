@@ -24,13 +24,6 @@ region, so graph/plan build and CUDA-graph capture are never counted. `pp512`
 uses the llama-bench `-p n -n 0` semantics (per-token marginal cost), not the
 wall time of a first cold prefill.
 
-`tools/bench.sh --workload` covers two session traces the per-request set cannot
-express: an eight-turn agent session (shared 1000-token system prompt, prefix
-cache on, reported as per-turn TTFT, per-turn decode rate and wall time beside a
-fresh-session-per-turn variant) and a coding request (2048-token prompt,
-256-token generation). `tools/bench.sh --ablate` runs the canonical set once per
-disabled Boom IR pass group or runtime feature and reports what each is worth.
-
 ## Baselines
 
 llama.cpp is the reference baseline, not an oracle: the same GGUF file, the same
@@ -48,11 +41,6 @@ baseline row is a regression check, not a claim.
   `-rgc`); an unpinned clock drifts by more than the effects being compared.
   When pinning is impossible the run is not clock-homogeneous and the script
   reports the SM clock it actually ran at (min/median/max).
-- A/B mode (`--ab BASE_LIB CUR_LIB`) stages two `libsonicboom.so` builds and
-  runs them in **alternating** order per repetition, so drift lands on both
-  sides. The noise floor is measured, not assumed: the same library is run on
-  both sides for `--control-runs` pairs and a metric's gate is
-  `|median(control deltas)| + k·SD(control deltas)` (default `k=2`).
 - Measurement jobs run alone on an idle GPU under `/tmp/sb-bench.lock`; a run
   that overlapped other load is re-measured rather than reported.
 

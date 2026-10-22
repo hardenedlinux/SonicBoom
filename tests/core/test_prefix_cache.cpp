@@ -166,7 +166,7 @@ int run_case(const sbmodel::Gemma4Model& m, const std::vector<uint64_t>& all,
   // the full prefill computes the same position in a multi-token segment
   // (see the prefix-align note in gemma4_plan.cpp). With
   // SONICBOOM_PREFIX_ALIGN=0 the plan keeps the literal boundary, so this
-  // check must follow the same switch (the l4-repro variants depend on it).
+  // check must follow the same switch (the prefix-alignment repro depends on it).
   const uint64_t chunk =
       m.config.sliding_window > 0 ? m.config.sliding_window : 512;
   const char *align_env = std::getenv("SONICBOOM_PREFIX_ALIGN");

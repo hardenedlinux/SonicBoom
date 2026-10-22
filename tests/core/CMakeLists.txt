@@ -15,7 +15,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_record test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -103,18 +103,9 @@ set_tests_properties(test_prefix_cache_long
 target_compile_definitions(test_vocab PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
-# test_plan_record (execution-plan record determinism + committed goldens) needs
-# the repository root for models/ and tests/data/plans/. It exits 77 (CTest:
-# Skipped) when no CUDA device or no model GGUF is available — the record needs
-# a device, and the goldens are per model.
-target_compile_definitions(test_plan_record PRIVATE
-  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-set_tests_properties(test_plan_record
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-
 # test_plan_cache (prefill segment cache: a hit must be indistinguishable from a
 # fresh build) needs the repository root for models/, and the same CUDA + GGUF
-# skip conditions as test_plan_record.
+# skip conditions as the out-of-tree plan-record suite.
 target_compile_definitions(test_plan_cache PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 set_tests_properties(test_plan_cache
@@ -147,8 +138,7 @@ target_compile_definitions(test_spec_autoprobe PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
 # test_ngram_drafter's coverage case feeds the code-edit trace's source files
-# (the same files workload_bench pastes) through the drafter; it needs the
-# repository root to read them.
+# through the drafter; it needs the repository root to read them.
 target_compile_definitions(test_ngram_drafter PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
 
@@ -156,8 +146,8 @@ target_compile_definitions(test_ngram_drafter PRIVATE
 #
 # The lock covers every test that allocates device memory. Two of them at once
 # do not fit on this device (8192 MiB): the measured peak of a single run is
-# 4210 MiB for test_prefix_cache, 4780 for test_plan_cache, 3784 for
-# test_plan_record and test_boom_conversion, 3370 for test_generate and 924 for
+# 4210 MiB for test_prefix_cache, 4780 for test_plan_cache, 3784 for the
+# out-of-tree plan-golden suites, 3370 for test_generate and 924 for
 # test_qwen2_generate (idle 242). The prefix-cache figure is measured after the
 # test was split into one forked child per case (2026-10-18): nvidia-smi
 # memory.used sampled every 40 ms, maximum over both the short and --long
@@ -200,7 +190,7 @@ set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
 # automatic choice must not be able to let an F64-path regression through
 # unnoticed. test_glue_codegen and test_cuda_elementwise are kernel-level and
 # cover the generated regions and the templated elementwise kernels in F64.
-foreach(test_name IN ITEMS test_generate test_qwen2_generate test_plan_record
+foreach(test_name IN ITEMS test_generate test_qwen2_generate
                             test_glue_codegen test_cuda_elementwise)
   add_test(NAME ${test_name}_reduce_f64
            COMMAND ${CMAKE_COMMAND} -E env
@@ -214,7 +204,7 @@ endforeach()
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
 # measured 0.2-0.5% slower. Run the same greedy-stream checks with it on so the
-# path stays covered; k=4 is the ablation value tools/bench.sh uses.
+# path stays covered; k=4 is the ablation value the internal harness uses.
 add_test(NAME test_generate_decode_chunk
          COMMAND ${CMAKE_COMMAND} -E env
                  LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
@@ -558,19 +548,11 @@ target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
 sb_add_cpp_test(test_blade_to_boom)
 
-# Boom IR conversion test (docs/boom-ir.md): Graph -> Boom IR ->
-# Graph over the real models, and the plan gate — the round-tripped graph, fed
-# back through record_{decode,prefill}_plan's GraphTransform seam, must produce
-# the golden plan (tests/data/plans/) byte for byte. Needs the repository root
-# for those goldens and for models/, and exits 77 (Skipped) without a CUDA
-# device or the model GGUFs, exactly as test_plan_record does.
-add_executable(test_boom_conversion test_boom_conversion.cpp)
-target_link_libraries(test_boom_conversion PRIVATE sonicboom sonicboom_compiler
-                                                  MLIRAsmParser)
-target_compile_definitions(test_boom_conversion PRIVATE
-  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-sb_add_cpp_test(test_boom_conversion)
-# It loads both models onto the GPU for the plan gate, so it takes the same
-# lock as the other model tests (see "The model tests run one at a time").
-set_tests_properties(test_boom_conversion
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+# Out-of-tree suites (optional): plan goldens and the internal measurement
+# harness. The public build references no path outside this repository; when a
+# developer sets SONICBOOM_PRIVATE_TESTS_DIR, that directory's CMakeLists.txt is
+# added here, so its suites build and register into the same build and ctest
+# run. It links the same targets and reuses sb_add_cpp_test above.
+if(SONICBOOM_PRIVATE_TESTS_DIR)
+  add_subdirectory("${SONICBOOM_PRIVATE_TESTS_DIR}" private_tests)
+endif()

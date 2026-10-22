@@ -25,7 +25,7 @@
 // be a pass at all. What was copied exactly is the result: the graph this
 // pipeline produces is the graph the Graph rewrites produced, tensor for tensor
 // and attribute for attribute, which was the whole acceptance criterion for the
-// port (BoomConversion.h) and what tests/data/plans/*.plan pin. The rewrites and
+// port (BoomConversion.h) and what the plan goldens pin. The rewrites and
 // the switch between the two paths were removed once the port was complete; this
 // pipeline is now the only rewrite path.
 

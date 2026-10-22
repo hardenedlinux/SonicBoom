@@ -42,6 +42,13 @@ option(SONICBOOM_USE_CUDA "Enable CUDA support (native-torch CUDA kernels)" OFF)
 # authoring scaffold; the real Vulkan plugin is future community work.
 option(SONICBOOM_USE_VULKAN "Enable the Vulkan backend stub (community scaffold)" OFF)
 
+# Optional out-of-tree test suites. Empty by default: the public build and its
+# tests reference no path outside this repository. When a developer points this
+# at an out-of-tree tests/ directory, that directory's suites are built and
+# registered into the same build and ctest run (see tests/core/CMakeLists.txt).
+set(SONICBOOM_PRIVATE_TESTS_DIR "" CACHE PATH
+    "Out-of-tree private test suites directory (optional)")
+
 if(SONICBOOM_USE_CUDA)
   # Default to the GPU detected at build time (native); override with
   # -DCMAKE_CUDA_ARCHITECTURES=<arch>, required on GPU-less build machines.

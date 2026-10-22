@@ -18,8 +18,8 @@
 //   sb-numerics profile-dump FILE MODEL   run this process's profile once
 //
 // The profile gate measures perplexity (teacher-forced NLL on a fixed >= 20k
-// token local corpus per model, relative delta <= 0.5%), top-1 agreement over
-// 50 prompts (>= 99%), and, within each profile, 3-run greedy determinism,
+// token corpus per model, relative delta <= 0.5%), top-1 agreement over 50
+// prompts (>= 99%), and, within each profile, 3-run greedy determinism,
 // batch-of-4 invariance (a 4-token prefill vs four per-token steps) and prefix
 // reuse vs full prefill — all bit-identical. The cross-profile first divergent
 // greedy step is informational.
@@ -876,21 +876,78 @@ constexpr ProfileModel kProfileModels[] = {
      "deepseek"},
 };
 
-// The fixed local corpus: a committed public-domain text
-// (tests/data/ppl_corpus.txt), so every process and every model scores the same
-// text and the corpus does not depend on the repository's own documentation.
-// Project Gutenberg eBook #1342, "Pride and Prejudice" by Jane Austen
-// (https://www.gutenberg.org/files/1342/1342-0.txt, retrieved 2026-10-22;
-// public domain in the United States). 24k tokens is the scored span (the gate
-// asks for >= 20k); the text is longer so all three tokenizers reach it.
-// SONICBOOM_PPL_TOKENS overrides the span for smoke runs; the recorded gate
-// numbers always use the default.
+// The gate's thresholds and its fixed corpus are internal engineering data, so
+// they live outside this repository. SONICBOOM_PROFILE_CONFIG names a small
+// key=value file (blank lines and '#' comments ignored):
+//
+//   corpus=/path/to/corpus.txt       scored text; no default path, and the ppl
+//                                    row is skipped when it is not set
+//   token_budget=24000               scored token span (gate wants >= 20k)
+//   ppl_max_delta_pct=0.5            strict-vs-standard relative ppl gate
+//   top1_min_prompts=50              prompts compared for top-1
+//   top1_min=0.99                    required top-1 agreement
+//
+// The defaults below are the published gate. SONICBOOM_PPL_CORPUS overrides the
+// corpus for one-off runs and SONICBOOM_PPL_TOKENS the span; the recorded gate
+// numbers always use the defaults.
+struct ProfileGateConfig {
+  std::string corpus;
+  uint64_t token_budget = 24000;
+  double ppl_max_delta_pct = 0.5;
+  size_t top1_min_prompts = 50;
+  double top1_min = 0.99;
+};
+
+ProfileGateConfig load_profile_config() {
+  ProfileGateConfig cfg;
+  const char* path = std::getenv("SONICBOOM_PROFILE_CONFIG");
+  if (path == nullptr || *path == '\0') return cfg;
+  std::ifstream in(path);
+  if (!in) {
+    std::fprintf(stderr, "sb-numerics: cannot read profile config %s\n", path);
+    return cfg;
+  }
+  std::string line;
+  while (std::getline(in, line)) {
+    const size_t hash = line.find('#');
+    if (hash != std::string::npos) line.resize(hash);
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = line.substr(0, eq);
+    const std::string val = line.substr(eq + 1);
+    if (key == "corpus") {
+      cfg.corpus = val;
+    } else if (key == "token_budget") {
+      const long long v = std::atoll(val.c_str());
+      if (v > 0) cfg.token_budget = uint64_t(v);
+    } else if (key == "ppl_max_delta_pct") {
+      const double v = std::atof(val.c_str());
+      if (v > 0.0) cfg.ppl_max_delta_pct = v;
+    } else if (key == "top1_min_prompts") {
+      const long v = std::atol(val.c_str());
+      if (v > 0) cfg.top1_min_prompts = size_t(v);
+    } else if (key == "top1_min") {
+      const double v = std::atof(val.c_str());
+      if (v > 0.0) cfg.top1_min = v;
+    } else {
+      std::fprintf(stderr, "sb-numerics: profile config: unknown key '%s'\n",
+                   key.c_str());
+    }
+  }
+  return cfg;
+}
+
+const ProfileGateConfig& profile_config() {
+  static const ProfileGateConfig cfg = load_profile_config();
+  return cfg;
+}
+
 uint64_t ppl_token_budget() {
   if (const char* e = std::getenv("SONICBOOM_PPL_TOKENS")) {
     const long v = std::atol(e);
     if (v > 0) return uint64_t(v);
   }
-  return 24000;
+  return profile_config().token_budget;
 }
 
 std::string read_text_file(const std::string& path) {
@@ -901,10 +958,13 @@ std::string read_text_file(const std::string& path) {
 }
 
 std::string profile_corpus_text() {
-  std::vector<std::string> roots = {".", ".."};
-  for (const auto& r : roots) {
+  std::vector<std::string> candidates;
+  if (const char* e = std::getenv("SONICBOOM_PPL_CORPUS"))
+    candidates.push_back(e);
+  const std::string& configured = profile_config().corpus;
+  if (!configured.empty()) candidates.push_back(configured);
+  for (const auto& path : candidates) {
     std::error_code ec;
-    const std::string path = r + "/tests/data/ppl_corpus.txt";
     if (std::filesystem::is_regular_file(path, ec))
       return read_text_file(path);
   }
@@ -1014,8 +1074,9 @@ bool run_profile_model(const std::string& path, const char* tag, bool cuda,
     }
   }
 
-  // Top-1 over 50 prompts (first greedy token).
-  for (int i = 0; i < 50; ++i) {
+  // Top-1 over the gate's prompt count (first greedy token).
+  const size_t n_top1_prompts = profile_config().top1_min_prompts;
+  for (size_t i = 0; i < n_top1_prompts; ++i) {
     const std::string text = std::string(kPrompts[i % 3]) + " (" +
                              std::to_string(i) + ")";
     auto prompt = encode(l, text);
@@ -1116,8 +1177,10 @@ bool compare_profile_pair(const ProfileResult& strict,
   const auto ppl = [](const ProfileResult& r) {
     return r.n_scored == 0 ? 0.0 : std::exp(r.sum_nll / double(r.n_scored));
   };
+  const auto& cfg = profile_config();
   const double ps = ppl(strict), pt = ppl(standard);
-  const bool ppl_ok = ps > 0.0 && std::abs(pt - ps) / ps <= 0.005;
+  const bool ppl_ok =
+      ps > 0.0 && std::abs(pt - ps) / ps <= cfg.ppl_max_delta_pct / 100.0;
   size_t agree = 0, total = 0;
   for (const auto& [i, t] : strict.top1) {
     auto it = standard.top1.find(i);
@@ -1126,7 +1189,7 @@ bool compare_profile_pair(const ProfileResult& strict,
     if (it->second == t) ++agree;
   }
   const double top1 = total ? double(agree) / double(total) : 0.0;
-  const bool top1_ok = total >= 50 && top1 >= 0.99;
+  const bool top1_ok = total >= cfg.top1_min_prompts && top1 >= cfg.top1_min;
 
   const bool det_ok = strict.runs[0] == strict.runs[1] &&
                       strict.runs[0] == strict.runs[2] &&
@@ -1286,7 +1349,9 @@ int main(int argc, char** argv) {
   if (argc != 1) {
     std::fprintf(stderr,
                  "usage: %s [dump <file> [model]] | compare <a> <b>... | "
-                 "profile | profile-dump <file> <model>\n",
+                 "profile | profile-dump <file> <model>\n"
+                 "  profile reads thresholds and corpus path from "
+                 "SONICBOOM_PROFILE_CONFIG (key=value file)\n",
                  argv[0]);
     return 2;
   }

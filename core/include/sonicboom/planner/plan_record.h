@@ -22,7 +22,7 @@
 // record describes what it *did* — the executed steps in order, each with the
 // node it came from, its attributes, the tensors and buffers it touched, and the
 // kernels it launched together with their launch configuration. It exists so two
-// plans can be diffed exactly (tools/plan_diff).
+// plans can be diffed exactly (the plan diff tool).
 //
 // Recording is opt-in and costs nothing when off: the hot path checks one
 // thread-local pointer (recorder() below) and takes no other action. The record

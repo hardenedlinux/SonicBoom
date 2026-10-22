@@ -104,7 +104,7 @@ already equated:**
   every tensor, in order. Any change to how a size is computed changes every
   fingerprint.
 - `planner/plan_record.cpp:235` — the plan dump prints each buffer's
-  `size_bytes`; the four committed goldens (`tests/data/plans/*.plan`) pin those
+  `size_bytes`; the four committed plan goldens pin those
   numbers, including the `fingerprint` line.
 - `planner/graph_adapter.cpp:107,165-169` and the Boom IR `#boom.tensor_desc`
   attribute — the round trip carries `size_bytes` and would have to carry the
@@ -144,7 +144,7 @@ struct TensorDesc {
 
 Cost of the change: `model_fingerprint` gains a field → every fingerprint moves →
 all four plan goldens must be re-recorded once, in one commit, with
-`tools/plan_diff` showing only fingerprint/format-affected lines. That is
+the plan diff tool showing only fingerprint/format-affected lines. That is
 expected, not a regression.
 
 ### 4.2 Boom IR side

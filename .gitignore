@@ -70,23 +70,16 @@ tools/baseline/gemma4_dump
 tools/baseline/llama_bench
 tools/baseline/llama_bench_cuda
 tools/baseline/sonicboom_dump
-tools/baseline/attention_bench
-tools/baseline/gemv_bench
 tools/baseline/longctx_bench
-tools/baseline/mmq_minn_bench
 tools/baseline/prefill_bench
 tools/baseline/prefix_cache_bench
 tools/baseline/prefix_cache_isolate
 tools/baseline/qwen_ref
 tools/baseline/tokenize_text
-tools/baseline/workload_bench
 tools/baseline/real_prompt.txt
 *.dump
 
-# plan-record tools (tools/build_plan_*.sh build them)
-tools/plan_dump
 tools/bench_train
-tools/plan_diff
 
 # numeric-acceptance tool (tools/build_sb_numerics.sh builds it)
 tools/sb-numerics
