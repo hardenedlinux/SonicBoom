@@ -231,11 +231,13 @@ planner::Graph lower_graph(mlir::ModuleOp module,
 // graph be planned as if the phase had run.
 planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite,
                            uint64_t dynamic_extent = 0,
-                           bool skip_kv_append_fusion = false) {
+                           bool skip_kv_append_fusion = false,
+                           bool fuse_silu_mul = false) {
   if (!ir.module)
     return {};
   if (rewrite &&
-      !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion))
+      !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
+                               fuse_silu_mul))
     return {};
   return lower_graph(*ir.module, dynamic_extent);
 }
@@ -2890,7 +2892,10 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
   planner::Graph graph = lower_graph(
       ir, planner::IrPassPhase::Prefill,
       quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
-          n >= uint64_t(quant::cuda::mmq_min_n()));
+          n >= uint64_t(quant::cuda::mmq_min_n()),
+      /*dynamic_extent=*/0, /*skip_kv_append_fusion=*/false,
+      /*fuse_silu_mul=*/
+      numerics_profile() == NumericsProfile::Standard);
   // After every graph-level pass (plan.h: GraphTransform).
   if (transform) transform(graph);
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -3253,7 +3258,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
             seg_ir, planner::IrPassPhase::Prefill,
             quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
                 extent >= mmq_min_n,
-            /*dynamic_extent=*/symbolic_plans ? extent : 0);
+            /*dynamic_extent=*/symbolic_plans ? extent : 0,
+            /*skip_kv_append_fusion=*/false,
+            // Standard only: the generated region's exp is covered by the
+            // profile's acceptance gate; strict keeps the two reference kernels.
+            /*fuse_silu_mul=*/
+            numerics_profile() == NumericsProfile::Standard);
       }
       if (seg->graph.nodes.empty()) {
         std::cerr << "[prefill-cuda] n=" << nseg << " graph lowering failed\n";

@@ -1431,6 +1431,41 @@ constexpr const char *kGeluMul = R"MLIR(module attributes {gpu.container_module}
   }
 })MLIR";
 
+// The SwiGLU form of the gated activation. The arithmetic is the reference
+// pair's, in one launch: silu_kernel's y = x / (1 + expf(-x)) on the gate (the
+// f32 division is div.rn, nvcc's default; exp is __nv_expf, which is what nvcc
+// emits for expf), then mul_kernel's y *= up. No reduction, so the ReduceMode
+// variants do not differ.
+constexpr const char *kSiluMul = R"MLIR(module attributes {gpu.container_module} {
+  gpu.module @glue [#nvvm.target<chip = "%CHIP%">] {
+    gpu.func @silu_mul(%gate: !llvm.ptr, %up: !llvm.ptr, %y: !llvm.ptr, %n: i32) kernel {
+      %c256i = arith.constant 256 : i32
+      %bid = gpu.block_id x
+      %tid = gpu.thread_id x
+      %bid_i = arith.index_cast %bid : index to i32
+      %tid_i = arith.index_cast %tid : index to i32
+      %base = arith.muli %bid_i, %c256i : i32
+      %i = arith.addi %base, %tid_i : i32
+      %inb = arith.cmpi slt, %i, %n : i32
+      scf.if %inb {
+        %gp = llvm.getelementptr inbounds %gate[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %v = llvm.load %gp : !llvm.ptr -> f32
+        %c1f = arith.constant 1.0 : f32
+        %neg = arith.negf %v : f32
+        %e = math.exp %neg : f32
+        %d = arith.addf %c1f, %e : f32
+        %s = arith.divf %v, %d : f32
+        %upp = llvm.getelementptr inbounds %up[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        %uv = llvm.load %upp : !llvm.ptr -> f32
+        %yv = arith.mulf %s, %uv : f32
+        %yp = llvm.getelementptr inbounds %y[%i] : (!llvm.ptr, i32) -> !llvm.ptr, f32
+        llvm.store %yv, %yp : f32, !llvm.ptr
+      }
+      gpu.return
+    }
+  }
+})MLIR";
+
 // --- ReduceMode variants of the reduction sections --------------------------
 //
 // The f64 region text above is the reference and is emitted byte-for-byte for
@@ -1960,6 +1995,9 @@ std::string region_text(GlueRegionKind kind, int sm_arch, ReduceMode mode,
     case GlueRegionKind::GeluMul:
       text = kGeluMul;
       break;
+    case GlueRegionKind::SiluMul:
+      text = kSiluMul;
+      break;
   }
   if (text == nullptr) return {};
 
@@ -2061,6 +2099,8 @@ std::optional<GlueRegionKind> glue_region_kind_from_name(
     return GlueRegionKind::SliceScale;
   if (name == "gelu_mul")
     return GlueRegionKind::GeluMul;
+  if (name == "silu_mul")
+    return GlueRegionKind::SiluMul;
   return std::nullopt;
 }
 
@@ -2078,6 +2118,8 @@ const char *glue_region_name(GlueRegionKind kind) noexcept {
       return "slice_scale";
     case GlueRegionKind::GeluMul:
       return "gelu_mul";
+    case GlueRegionKind::SiluMul:
+      return "silu_mul";
   }
   return "?";
 }
@@ -2096,6 +2138,8 @@ const char *glue_kernel_entry(GlueRegionKind kind) noexcept {
       return "slice_scale";
     case GlueRegionKind::GeluMul:
       return "gelu_mul";
+    case GlueRegionKind::SiluMul:
+      return "silu_mul";
   }
   return "?";
 }
@@ -2109,7 +2153,8 @@ std::optional<std::string> generate_glue_ptx(GlueRegionKind kind, int sm_arch,
     return std::nullopt;
   }
   const bool libdevice = kind == GlueRegionKind::HeadsNormRopeCast ||
-                         kind == GlueRegionKind::GeluMul;
+                         kind == GlueRegionKind::GeluMul ||
+                         kind == GlueRegionKind::SiluMul;
   return lower_gpu_module_to_ptx(text, libdevice, glue_region_name(kind));
 }
 

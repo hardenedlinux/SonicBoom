@@ -643,6 +643,10 @@ if [ "$ABLATE" = 1 ]; then
     "kv-append-into-prep|FuseKvAppendIntoPrepPass"
     "slice-scale-fusion|FuseSliceScalePass"
     "gelu-mul-fusion|FuseGeluMulPass"
+    # Silu-GLU FFNs whose down projection has no mmq activation layout (Q6_K):
+    # the fused region is one generated launch instead of silu + mul. Standard
+    # profile only, so under strict this row is a no-op.
+    "silu-mul-fusion|FuseSiluMulPass"
     # The two epilogue folds: the scalar scale after a dense projection / after
     # a generated glue region becomes an attribute of that node. Disabling one
     # restores its standalone scale_kernel launches.

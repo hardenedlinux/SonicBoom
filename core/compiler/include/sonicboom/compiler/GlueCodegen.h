@@ -76,6 +76,14 @@ enum class GlueRegionKind {
   // goes through libdevice, so this region uses the same checked-on-tolerance
   // pathway as the attention prep's trig.
   GeluMul,
+  // SwiGLU activation (silu_mul): the reference silu_kernel's x / (1 + exp(-x))
+  // on the gate, multiplied by the up projection, one thread per element. The
+  // exp goes through libdevice (__nv_expf, the function nvcc calls for expf), so
+  // this region uses the checked-on-tolerance pathway too. It is the fallback
+  // form of the gated activation: the mmq folds take the chains that feed a
+  // quantized matmul, this region takes the ones that feed a dense projection
+  // (a down projection with no mmq activation layout).
+  SiluMul,
 };
 
 // The region kind named `name`, or nullopt if the compiler has no generator for
@@ -123,6 +131,9 @@ constexpr int kSliceScaleBlockThreads = 256;
 // gelu_mul: gelu_fp16_kernel/mul_kernel's geometry — one thread per element,
 // 256 threads per block, no shared memory.
 constexpr int kGeluMulBlockThreads = 256;
+// silu_mul: silu_kernel/mul_kernel's geometry — the same one-thread-per-element,
+// 256-thread block, no shared memory.
+constexpr int kSiluMulBlockThreads = 256;
 
 // Generate the region's PTX for compute capability `sm_arch` (86 = sm_86) and
 // reduction mode `mode`. F64 is the historical text; DF32 and F32 rewrite only

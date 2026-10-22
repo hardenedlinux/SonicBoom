@@ -1503,17 +1503,82 @@ public:
   }
 };
 
-// FuseGeluMulPass — the gated activation (Stage 5f). A gelu_fp16 followed by
-// the gate*up multiply is one region when the product feeds a dense
-// projection (the mmq forms are already fused by GeluMulMmqPass): the prefill
-// FFN's chain and, in decode, Gemma's per-layer gate fed to matvec_f32:
+// The gated activation (Stage 5f): an activation followed by the gate*up
+// multiply is one region when the product feeds a dense projection. Both forms
+// share the match and the rewrite; only the activation op and the region name
+// differ.
 //
 //   gelu_fp16(gate) -> mul(_, up)   =>   fused_region "gelu_mul"
+//   silu(gate)      -> mul(_, up)   =>   fused_region "silu_mul"
 //
-// The generated kernel is the two reference kernels' arithmetic in one launch.
-// The gelu result has no other reader, so the intermediate tensor is dropped.
-// Runs after the mmq activation fold, which takes the chains that feed a
-// quantized matmul; what remains here feeds a dense projection.
+// The generated kernel is the two reference kernels' arithmetic in one launch,
+// and the activation result has no other reader, so the intermediate tensor is
+// dropped. The passes run after the mmq activation folds, which take the chains
+// that feed a quantized matmul; what remains here feeds a dense projection.
+namespace {
+
+void fuseActivationMul(boom::GraphOp graph, planner::OpKind actKind,
+                       llvm::StringRef region) {
+  GraphEditor view(graph);
+  mlir::OpBuilder builder(view.ctx());
+  const mlir::Location loc = graph.getLoc();
+
+  const std::string actName = boomOpName(actKind);
+  const std::string mulName = boomOpName(planner::OpKind::Mul);
+  struct Match {
+    mlir::Operation *act;
+    mlir::Operation *mul;
+  };
+  llvm::SmallVector<Match> matches;
+  for (mlir::Operation &node : view.body()) {
+    if (node.getName().getStringRef() != actName ||
+        node.getNumOperands() != 1 || node.getNumResults() != 1)
+      continue;
+    if (!node.getResult(0).hasOneUse())
+      continue;
+    mlir::Operation *mul = node.getResult(0).use_begin()->getOwner();
+    if (mul->getName().getStringRef() != mulName || mul->getNumOperands() != 2 ||
+        mul->getNumResults() != 1)
+      continue;
+    matches.push_back({&node, mul});
+  }
+
+  for (const Match &m : matches) {
+    // Re-read the operands now, not at match time (see FuseRmsNormAddPass).
+    mlir::Value gate = m.act->getOperand(0);
+    mlir::Value up = m.mul->getOperand(0) == m.act->getResult(0)
+                         ? m.mul->getOperand(1)
+                         : m.mul->getOperand(0);
+    auto attrs =
+        llvm::to_vector(m.mul->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
+    attrs.push_back(boom::NodeAttr::get(
+        view.ctx(), "fused_region", builder.getStringAttr(region)));
+    auto name = m.mul->getAttrOfType<mlir::StringAttr>("node_name");
+    const int64_t mulId = GraphEditor::resultIds(*m.mul)[0];
+    const int64_t actId = GraphEditor::resultIds(*m.act)[0];
+
+    builder.setInsertionPoint(m.mul);
+    mlir::Operation *fused = buildNode(
+        builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
+        GraphEditor::nodeId(*m.mul),
+        name ? name.getValue() : region,
+        builder.getArrayAttr(attrs), GraphEditor::resultIds(*m.mul),
+        {gate, up}, m.mul->getResultTypes(),
+        m.mul->getAttrOfType<mlir::StringAttr>("backend"));
+
+    m.mul->getResult(0).replaceAllUsesWith(fused->getResult(0));
+    view.noteValue(mulId, fused->getResult(0));
+    view.dropTensor(actId);
+    m.mul->erase();
+    m.act->erase();
+  }
+
+  view.commitTable();
+}
+
+}  // namespace
+
+// FuseGeluMulPass — the GELU form (Gemma's FFN and PLE gate).
 class FuseGeluMulPass
     : public mlir::PassWrapper<FuseGeluMulPass,
                                mlir::OperationPass<boom::GraphOp>> {
@@ -1523,63 +1588,27 @@ public:
   void runOnOperation() override {
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
+    fuseActivationMul(getOperation(), planner::OpKind::GeluFp16, "gelu_mul");
+  }
+};
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
-    mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+// FuseSiluMulPass — the SwiGLU form. Same chain and same rewrite as the GELU
+// pass; it is separate because its numerics profile decides whether it runs
+// (the caller adds the pass only under the standard profile, whose acceptance
+// gate covers the generated exp, where the strict profile's plan goldens are
+// the historical contract). What it takes here is the Qwen2-class FFN whose
+// down projection has no mmq activation layout (Q6_K): SiluMulMmqPass has
+// already folded every chain that feeds an mmq matmul.
+class FuseSiluMulPass
+    : public mlir::PassWrapper<FuseSiluMulPass,
+                               mlir::OperationPass<boom::GraphOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSiluMulPass)
 
-    const std::string geluName = boomOpName(planner::OpKind::GeluFp16);
-    const std::string mulName = boomOpName(planner::OpKind::Mul);
-    struct Match {
-      mlir::Operation *gelu;
-      mlir::Operation *mul;
-    };
-    llvm::SmallVector<Match> matches;
-    for (mlir::Operation &node : view.body()) {
-      if (node.getName().getStringRef() != geluName ||
-          node.getNumOperands() != 1 || node.getNumResults() != 1)
-        continue;
-      if (!node.getResult(0).hasOneUse())
-        continue;
-      mlir::Operation *mul = node.getResult(0).use_begin()->getOwner();
-      if (mul->getName().getStringRef() != mulName || mul->getNumOperands() != 2 ||
-          mul->getNumResults() != 1)
-        continue;
-      matches.push_back({&node, mul});
-    }
-
-    for (const Match &m : matches) {
-      // Re-read the operands now, not at match time (see FuseRmsNormAddPass).
-      mlir::Value gate = m.gelu->getOperand(0);
-      mlir::Value up = m.mul->getOperand(0) == m.gelu->getResult(0)
-                           ? m.mul->getOperand(1)
-                           : m.mul->getOperand(0);
-      auto attrs =
-          llvm::to_vector(m.mul->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
-      attrs.push_back(boom::NodeAttr::get(
-          view.ctx(), "fused_region", builder.getStringAttr("gelu_mul")));
-      auto name = m.mul->getAttrOfType<mlir::StringAttr>("node_name");
-      const int64_t mulId = GraphEditor::resultIds(*m.mul)[0];
-      const int64_t geluId = GraphEditor::resultIds(*m.gelu)[0];
-
-      builder.setInsertionPoint(m.mul);
-      mlir::Operation *fused = buildNode(
-          builder, loc, planner::op_kind_name(planner::OpKind::FusedRegion),
-          GraphEditor::nodeId(*m.mul),
-          name ? name.getValue() : llvm::StringRef("gelu_mul"),
-          builder.getArrayAttr(attrs), GraphEditor::resultIds(*m.mul),
-          {gate, up}, m.mul->getResultTypes(),
-          m.mul->getAttrOfType<mlir::StringAttr>("backend"));
-
-      m.mul->getResult(0).replaceAllUsesWith(fused->getResult(0));
-      view.noteValue(mulId, fused->getResult(0));
-      view.dropTensor(geluId);
-      m.mul->erase();
-      m.gelu->erase();
-    }
-
-    view.commitTable();
+  void runOnOperation() override {
+    if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
+      return;
+    fuseActivationMul(getOperation(), planner::OpKind::Silu, "silu_mul");
   }
 };
 
@@ -2884,6 +2913,7 @@ struct DisabledPasses {
   bool fuse_kv_append_into_prep = false;
   bool fuse_slice_scale = false;
   bool fuse_gelu_mul = false;
+  bool fuse_silu_mul = false;
   bool scale_into_dense = false;
   bool fold_scale_into_glue = false;
   bool dense_layout_propagation = false;
@@ -2914,6 +2944,7 @@ constexpr PassName kPassNames[] = {
     {"FuseKvAppendIntoPrepPass", &DisabledPasses::fuse_kv_append_into_prep},
     {"FuseSliceScalePass", &DisabledPasses::fuse_slice_scale},
     {"FuseGeluMulPass", &DisabledPasses::fuse_gelu_mul},
+    {"FuseSiluMulPass", &DisabledPasses::fuse_silu_mul},
     {"ScaleIntoDensePass", &DisabledPasses::scale_into_dense},
     {"FoldScaleIntoGluePass", &DisabledPasses::fold_scale_into_glue},
     {"RmsNormMmqPass", &DisabledPasses::rms_norm_mmq},
@@ -2971,7 +3002,7 @@ bool parseDisabledPasses(DisabledPasses &out) {
 // place in the order and with its preconditions. Both phases run entirely here,
 // and the Graph rewrites are gone, so this is the emitter's only rewrite path.
 void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
-               bool skip_kv_append_fusion) {
+               bool skip_kv_append_fusion, bool fuse_silu_mul) {
   DisabledPasses off;
   // A rejected list disables nothing: running the phase with no passes would
   // leave the graph unfused, and an ablation run would then report that as the
@@ -3049,6 +3080,12 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     // After the mmq activation fold: only the gelu->mul chains that feed a
     // dense projection are left.
     if (!off.fuse_gelu_mul) pm.addPass(std::make_unique<FuseGeluMulPass>());
+    // The SwiGLU counterpart, same place in the order and the same leftover
+    // chains (a silu->mul feeding a dense projection). The caller enables it
+    // under the standard numerics profile only; strict keeps the two-kernel
+    // form its plan goldens record.
+    if (fuse_silu_mul && !off.fuse_silu_mul)
+      pm.addPass(std::make_unique<FuseSiluMulPass>());
     // The scalar scale after a dense projection is the projection's epilogue
     // (attribute-only: the node keeps its place and gets `epilogue_scale`).
     if (!off.scale_into_dense) pm.addPass(std::make_unique<ScaleIntoDensePass>());
@@ -3144,7 +3181,7 @@ int vram_threshold_mb() {
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
-                   bool skip_kv_append_fusion) {
+                   bool skip_kv_append_fusion, bool fuse_silu_mul) {
   // The unit of meaning in this IR is the graph, not the module that holds it
   // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
   // IsolatedFromAbove, which is what makes it a pass anchor at all.
@@ -3160,7 +3197,7 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
   // a state the dialect rejects fails here, naming that pass, rather than three
   // passes later.
   mlir::PassManager pm(module.getContext());
-  addPasses(pm, phase, skip_kv_append_fusion);
+  addPasses(pm, phase, skip_kv_append_fusion, fuse_silu_mul);
   if (mlir::failed(pm.run(graphOp))) {
     std::fprintf(stderr,
                  "runBoomPasses(%s): a Boom IR pass failed (diagnostic "

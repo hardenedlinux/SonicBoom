@@ -3156,6 +3156,23 @@ std::optional<compiler::AttentionShape> attn_codegen_default_shape(int head_dim,
     shape.bc = 16;
     shape.dps = 8;       // dc = 64, 16 warps
     shape.gqa_pack = 2;  // q rows 32 -> 74.5 KiB, the largest legal pack
+  } else if (gqa == 6 && head_dim == 128) {
+    // d128/gqa6 (DeepSeek-R1-Distill-Qwen-1.5B): measurement arm only, not a
+    // class default. The class has no hand-written tiled specialization, so
+    // prefill takes the scalar warp-per-(position, head) kernel (M3 nsys,
+    // pp512 RTX 3050: 48.7% of prefill kernel time at ~1 TFLOP/s). This tile
+    // is 1.92x faster there (pp512 2841 -> 5450 tok/s, attention 562 -> 55 ms
+    // per capture), but its S/P association order moves DeepSeek's first
+    // greedy token on 8 of the 50 standard-profile gate prompts -- the
+    // acceptance gate requires 50/50 -- so auto keeps the scalar kernel in
+    // both profiles. Reachable through SONICBOOM_ATTN_IMPL=codegen. dps 2
+    // keeps dc = 64; packing all six query heads of a KV head per block is 12
+    // warps and 36.6 KiB, staged synchronously (f16 KV rules out cp.async).
+    shape.br = 16;
+    shape.bc = 16;
+    shape.dps = 2;
+    shape.gqa_pack = 6;
+    shape.async_stages = 0;
   } else {
     return std::nullopt;
   }

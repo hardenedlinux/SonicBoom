@@ -48,8 +48,15 @@ namespace sonicboom::compiler {
 // of folding it into the prep regions. The verify step (B3) needs that: its
 // attention appends one row per query position, which a region that stores a
 // single row at the base position cannot express.
+//
+// `fuse_silu_mul` enables FuseSiluMulPass: the silu->mul chain that feeds a
+// dense projection becomes one generated region. It is the caller's numerics
+// decision, not a compiler one — the generated region's exp is covered by the
+// standard profile's acceptance gate, while strict keeps the two reference
+// kernels its plan goldens record.
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
-                   bool skip_kv_append_fusion = false);
+                   bool skip_kv_append_fusion = false,
+                   bool fuse_silu_mul = false);
 
 // The MMQ1 prefill dispatch switch (prefill_dispatch_pass), read from
 // SONICBOOM_MMQ_TC:

@@ -154,6 +154,74 @@ void test_rms_norm_quantize_q8_1(std::mt19937& rng, int n) {
   cudaFree(ygen);
 }
 
+// One silu_mul region launch, compared with the reference pair (silu_kernel
+// then mul_kernel). The exp goes through libdevice (__nv_expf), the same
+// function nvcc calls for expf, so the values are expected to match bit for bit;
+// a mismatch is reported as a ulp distance, because a libdevice difference
+// would be a tolerance question, not a rounding-order one.
+void test_silu_mul(std::mt19937& rng, int n) {
+  const std::string tag = "silu_mul n=" + std::to_string(n);
+
+  std::vector<float> gate(n), up(n);
+  for (auto& v : gate)
+    v = std::uniform_real_distribution<float>(-12.0f, 12.0f)(rng);
+  for (auto& v : up) v = std::uniform_real_distribution<float>(-3.0f, 3.0f)(rng);
+
+  float *gd = nullptr, *ud = nullptr, *yref = nullptr, *ygen = nullptr;
+  check(cudaMalloc(&gd, n * sizeof(float)) == cudaSuccess, "cudaMalloc gate");
+  check(cudaMalloc(&ud, n * sizeof(float)) == cudaSuccess, "cudaMalloc up");
+  check(cudaMalloc(&yref, n * sizeof(float)) == cudaSuccess, "cudaMalloc yref");
+  check(cudaMalloc(&ygen, n * sizeof(float)) == cudaSuccess, "cudaMalloc ygen");
+  if (g_failures) return;
+
+  cudaMemcpy(gd, gate.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(ud, up.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+
+  // The reference: the two kernels the region replaces.
+  check(sonicboom::nn::cuda::silu_dev(gd, yref, n), (tag + ": silu_kernel").c_str());
+  check(sonicboom::nn::cuda::mul_dev(yref, ud, yref, n),
+        (tag + ": mul_kernel").c_str());
+
+  // The generated region: (gate, up, y, n), one element per thread.
+  void *garg = gd, *uarg = ud, *yarg = ygen;
+  int narg = n;
+  void *args[] = {&garg, &uarg, &yarg, &narg};
+  const int grid = (n + sonicboom::compiler::kSiluMulBlockThreads - 1) /
+                   sonicboom::compiler::kSiluMulBlockThreads;
+  check(sonicboom::planner::glue::launch(
+            "silu_mul", args, grid,
+            sonicboom::compiler::kSiluMulBlockThreads, 0),
+        (tag + ": generated kernel launch").c_str());
+
+  check(cudaDeviceSynchronize() == cudaSuccess, "device synchronize");
+
+  std::vector<float> got(n), ref(n);
+  cudaMemcpy(got.data(), ygen, n * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(ref.data(), yref, n * sizeof(float), cudaMemcpyDeviceToHost);
+
+  int64_t differ = 0, max_ulp = 0;
+  for (int i = 0; i < n; ++i) {
+    if (got[i] == ref[i]) continue;
+    ++differ;
+    int32_t a = 0, b = 0;
+    std::memcpy(&a, &got[i], sizeof(a));
+    std::memcpy(&b, &ref[i], sizeof(b));
+    if (a < 0) a = int32_t(0x80000000u - uint32_t(a));
+    if (b < 0) b = int32_t(0x80000000u - uint32_t(b));
+    const int64_t d = std::llabs(int64_t(a) - int64_t(b));
+    max_ulp = std::max(max_ulp, d);
+  }
+  if (differ != 0)
+    std::cerr << "    " << differ << "/" << n << " elements differ, max "
+              << max_ulp << " ulp\n";
+  check(differ == 0, (tag + ": byte-identical to silu+mul").c_str());
+
+  cudaFree(gd);
+  cudaFree(ud);
+  cudaFree(yref);
+  cudaFree(ygen);
+}
+
 // One prefill add+norm+quantize region launch, compared byte for byte with the
 // reference pair. `ds` is the mmq scale layout (0 = D4, 1 = DS4 half2).
 void test_add_rms_norm_quantize_mmq_q8_1(std::mt19937& rng, int tokens, int dim,
@@ -676,6 +744,18 @@ int main() {
           "norm+rope+cast PTX has no unresolved libdevice call");
   }
 
+  auto ptx_silu_mul = sonicboom::compiler::generate_glue_ptx(
+      sonicboom::compiler::GlueRegionKind::SiluMul, arch);
+  check(ptx_silu_mul.has_value(), "generate_glue_ptx returned silu_mul PTX");
+  if (ptx_silu_mul) {
+    check(ptx_silu_mul->find(sonicboom::compiler::glue_kernel_entry(
+              sonicboom::compiler::GlueRegionKind::SiluMul)) !=
+              std::string::npos,
+          "silu_mul PTX contains the kernel entry symbol");
+    check(ptx_silu_mul->find("__nv_expf") == std::string::npos,
+          "silu_mul PTX has no unresolved libdevice call");
+  }
+
   auto ptx_norm_add = sonicboom::compiler::generate_glue_ptx(
       sonicboom::compiler::GlueRegionKind::RmsNormAdd, arch);
   check(ptx_norm_add.has_value(), "generate_glue_ptx returned norm+add PTX");
@@ -703,6 +783,11 @@ int main() {
   test_rms_norm_add(rng, 8, 256);
   test_rms_norm_add(rng, 5, 896);
   test_rms_norm_add(rng, 1, 2560);
+  // The SwiGLU region over a full prefill activation (Qwen2.5-0.5B, 512 rows of
+  // its 4864-wide FFN), a partial last block, and a single block.
+  test_silu_mul(rng, 512 * 4864);
+  test_silu_mul(rng, 20000);
+  test_silu_mul(rng, 256);
   // The attention prep, one chain per shape the model graph emits: V
   // (norm -> cast), Q (norm -> rope), K (norm -> rope -> cast), decode (one
   // position) and prefill (batch 2, two positions). Gemma's local head_dim

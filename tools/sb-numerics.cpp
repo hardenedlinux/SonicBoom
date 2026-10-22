@@ -1061,18 +1061,24 @@ bool run_profile_model(const std::string& path, const char* tag, bool cuda,
     r.batch4_single = std::move(b);
   }
 
-  // Prefix reuse vs full prefill, on the CUDA session path.
+  // Prefix reuse vs full prefill, on the CUDA session path. Both paths run at
+  // the same cache capacity: the decode split-KV chunk is sized from the
+  // graph's fixed window (`lc.sliding_window`, else `n_ctx`), so two different
+  // capacities split the same key range differently and change the reduction
+  // association. This probe is about the cache *contents* surviving reuse, not
+  // about capacity invariance, so it holds the capacity fixed.
   if (cuda) {
     auto ps = encode(l, "Explain in one sentence why the sky is blue.");
     if (ps.size() > 8) ps.resize(8);
     auto full = ps;
     for (int i = 0; i < 6; ++i) full.push_back(ps[size_t(i) % ps.size()]);
+    constexpr uint64_t kReuseCtx = 128;
     std::vector<int64_t> direct(16, -1);
-    const uint64_t nd = sbmodel::generate_prefill_spine_cuda(l.model, full, 0,
-                                                             direct, 0, true);
+    const uint64_t nd = sbmodel::generate_prefill_spine_cuda(
+        l.model, full, 0, direct, kReuseCtx, true);
     direct.resize(nd);
     sonicboom::planner::KvCacheSession session;
-    session.n_ctx = 128;
+    session.n_ctx = kReuseCtx;
     std::vector<int64_t> da(1, -1), reused(16, -1);
     sbmodel::generate_prefill_spine_cuda_prefix(l.model, ps, 0, da, session,
                                                 true);

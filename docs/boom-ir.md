@@ -160,7 +160,7 @@ failure fails the plan — the IR is never lowered as if the phase had run.
 |---|---|
 | **Decode** | `QuantizeOncePass`, `RmsNormQuantizePass`, `GeluMulQuantizePass`, `SiluMulQuantizePass`, `FuseGeluMulPass`, `BiasIntoGemvPass`, `ResidualAddIntoGemvPass`, `FuseResidualEpiloguePass`, `FuseSiblingGemvPass`, `FuseGlueRegionsPass`, `FuseHeadsNormRopeCastPass`, `FuseKvAppendIntoPrepPass`, `BufferReusePass`, `AsyncPrefetchPass` |
 | **Verify** | the decode list with `FuseKvAppendIntoPrepPass` skipped: a verify step appends one row per query position, which a single-row prep region cannot express |
-| **Prefill** | `RmsNormMmqPass`, `FuseAddRmsNormMmqPass`, `FuseRmsNormAddPass`, `FoldScaleIntoGluePass`, `GeluMulMmqPass`, `SiluMulMmqPass`, `FuseSliceScalePass`, `FuseGeluMulPass`, `ScaleIntoDensePass`, `FuseHeadsNormRopeCastPass`, `PrefillDispatchPass`, `DenseLayoutPropagationPass`, `BufferReusePass`, `AsyncPrefetchPass` |
+| **Prefill** | `RmsNormMmqPass`, `FuseAddRmsNormMmqPass`, `FuseRmsNormAddPass`, `FoldScaleIntoGluePass`, `GeluMulMmqPass`, `SiluMulMmqPass`, `FuseSliceScalePass`, `FuseGeluMulPass`, `FuseSiluMulPass` (standard numerics profile only), `ScaleIntoDensePass`, `FuseHeadsNormRopeCastPass`, `PrefillDispatchPass`, `DenseLayoutPropagationPass`, `BufferReusePass`, `AsyncPrefetchPass` |
 | **Training** | `BufferReusePass` only (semantic-neutral for a traced forward+backward graph) |
 
 What each pass does:
@@ -171,6 +171,7 @@ What each pass does:
 | `RmsNormQuantizePass` | `rms_norm` with one reader (`quantize`) becomes `rms_norm_quantize` |
 | `GeluMulQuantizePass` / `SiluMulQuantizePass` | gated `gelu_fp16`/`silu` × up followed by `quantize` becomes one fused op |
 | `FuseGeluMulPass` | the dense-projection form of the same gated multiply |
+| `FuseSiluMulPass` | the SwiGLU counterpart, prefill only and only under the standard numerics profile (a down projection with no mmq activation layout, e.g. Q6_K, leaves the chain for it) |
 | `BiasIntoGemvPass` | `add_bias` over a single-reader gemv becomes the projection's `bias_slot` epilogue |
 | `ResidualAddIntoGemvPass` | `add(proj, residual)` becomes a two-input projection epilogue |
 | `FuseResidualEpiloguePass` | the same treatment where the residual add is produced by a norm (sandwich norm / PLE post-norm) |
