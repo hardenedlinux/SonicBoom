@@ -28,6 +28,7 @@
 
 #include <sonicboom/model/moss_dit.h>
 #include <sonicboom/model/moss_text.h>
+#include <sonicboom/model/moss_vae.h>
 #include <sonicboom/vocab/vocab.h>
 
 #include <chrono>
@@ -61,7 +62,8 @@ void usage() {
          "  --out FILE     hidden-state output (`encode`) / DiT output (`dit`)\n"
          "  --input FILE   a MOSSDIT1 reference file (`dit`): its inputs are run\n"
          "                 and its outputs are replaced by ours\n"
-         "  --skip LIST    block indices to omit, e.g. 22 (`dit`)\n";
+         "  --skip LIST    block indices to omit, e.g. 22 (`dit`)\n"
+         "  --stages FILE  dump per-stage activations (`vae`, MOSVSG01)\n";
 }
 
 // The pipeline's chat rendering for one user turn with enable_thinking=True
@@ -213,6 +215,142 @@ int run_dit(const std::string& model_dir, const std::string& input_path,
   return 0;
 }
 
+// Reads one "MOSVAE1" file: the latent and the arrays the writer produced.
+struct VaeFile {
+  int64_t channels = 0, height = 0, width = 0, out_channels = 0;
+  std::vector<float> latent, out;
+};
+
+std::optional<VaeFile> read_vae(const std::string& path, std::string* error) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    *error = "cannot open " + path;
+    return std::nullopt;
+  }
+  auto read = [&](void* dst, size_t bytes) {
+    in.read(static_cast<char*>(dst), static_cast<std::streamsize>(bytes));
+    return static_cast<bool>(in);
+  };
+  // The Python reference writer emits the 7-character magic "MOSVAE1"
+  // immediately followed by the header, so the header starts at offset 7.
+  char magic[7];
+  VaeFile f;
+  if (!read(magic, 7) || std::memcmp(magic, "MOSVAE1", 7) != 0 ||
+      !read(&f.channels, 8) || !read(&f.height, 8) || !read(&f.width, 8) ||
+      !read(&f.out_channels, 8)) {
+    *error = path + ": not a MOSVAE1 file";
+    return std::nullopt;
+  }
+  auto read_vec = [&](std::vector<float>& v, int64_t n) {
+    v.resize(static_cast<size_t>(n));
+    return read(v.data(), v.size() * sizeof(float));
+  };
+  const int64_t s = f.height * f.width;
+  if (!read_vec(f.latent, f.channels * s) ||
+      !read_vec(f.out, f.out_channels * 64 * s)) {
+    *error = path + ": truncated";
+    return std::nullopt;
+  }
+  return f;
+}
+
+// Writes our stage tensors in the reference writer's MOSVSG01 layout.
+bool write_vae_stages(const std::string& path,
+                      const std::vector<sonicboom::moss::VaeStage>& stages) {
+  std::ofstream out(path, std::ios::binary);
+  if (!out) return false;
+  auto write = [&](const void* p, size_t bytes) {
+    out.write(static_cast<const char*>(p), static_cast<std::streamsize>(bytes));
+  };
+  write("MOSVSG01", 8);
+  const int64_t count = static_cast<int64_t>(stages.size());
+  write(&count, 8);
+  for (const auto& st : stages) {
+    const int32_t name_len = static_cast<int32_t>(st.name.size());
+    write(&name_len, 4);
+    write(st.name.data(), st.name.size());
+    const int32_t ndim = 4;
+    write(&ndim, 4);
+    const int64_t dims[4] = {st.n, st.c, st.h, st.w};
+    write(dims, sizeof(dims));
+    write(st.values.data(), st.values.size() * sizeof(float));
+  }
+  return static_cast<bool>(out);
+}
+
+int run_vae(const std::string& model_dir, const std::string& input_path,
+            const std::string& out_path, const std::string& stages_path) {
+  if (input_path.empty()) {
+    std::cerr << "sb-moss vae: --input is required\n";
+    return 2;
+  }
+  auto model = sonicboom::moss::VaeDecoder::load(model_dir);
+  if (!model) {
+    std::cerr << "sb-moss: " << model.error() << "\n";
+    return 1;
+  }
+  const auto& cfg = (*model)->config();
+  std::cerr << "vae: " << cfg.channels.size() << " up blocks, latent "
+            << cfg.latent_channels << " ch, weights " << (*model)->weight_bytes()
+            << " B\n";
+
+  std::string error;
+  auto ref = read_vae(input_path, &error);
+  if (!ref) {
+    std::cerr << "sb-moss: " << error << "\n";
+    return 1;
+  }
+  if (ref->channels != cfg.latent_channels || ref->out_channels != cfg.out_channels) {
+    std::cerr << "sb-moss: input channel mismatch\n";
+    return 1;
+  }
+
+  std::vector<sonicboom::moss::VaeStage> stages;
+  const auto start = std::chrono::steady_clock::now();
+  auto image = (*model)->decode(ref->latent, ref->height, ref->width,
+                                stages_path.empty() ? nullptr : &stages);
+  if (!image) {
+    std::cerr << "sb-moss: " << image.error() << "\n";
+    return 1;
+  }
+  const auto elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - start);
+
+  double energy = 0.0;
+  for (float v : *image) energy += double(v) * v;
+  const double rms = std::sqrt(energy / double(image->size()));
+  std::cerr << "vae decode: " << ref->height << "x" << ref->width << " -> "
+            << ref->height * 8 << "x" << ref->width * 8 << " in "
+            << elapsed.count() << " s, out rms " << rms << "\n";
+
+  if (!out_path.empty()) {
+    std::ofstream out(out_path, std::ios::binary);
+    if (!out) {
+      std::cerr << "sb-moss: cannot write " << out_path << "\n";
+      return 1;
+    }
+    auto write = [&](const void* p, size_t bytes) {
+      out.write(static_cast<const char*>(p), static_cast<std::streamsize>(bytes));
+    };
+    write("MOSVAE1", 7);
+    write(&ref->channels, 8);
+    write(&ref->height, 8);
+    write(&ref->width, 8);
+    write(&ref->out_channels, 8);
+    write(ref->latent.data(), ref->latent.size() * sizeof(float));
+    write(image->data(), image->size() * sizeof(float));
+    if (!out) {
+      std::cerr << "sb-moss: write failed for " << out_path << "\n";
+      return 1;
+    }
+  }
+  if (!stages_path.empty() && !write_vae_stages(stages_path, stages)) {
+    std::cerr << "sb-moss: cannot write " << stages_path << "\n";
+    return 1;
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -221,7 +359,8 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string_view command = argv[1];
-  if (command != "encode" && command != "tokens" && command != "dit") {
+  if (command != "encode" && command != "tokens" && command != "dit" &&
+      command != "vae") {
     usage();
     return 2;
   }
@@ -232,6 +371,7 @@ int main(int argc, char** argv) {
   std::string out_path;
   std::string input_path;
   std::string skip_arg;
+  std::string stages_path;
   bool have_text = false;
   bool raw = false;
   bool dump_tokens = false;
@@ -257,6 +397,8 @@ int main(int argc, char** argv) {
       input_path = next("--input");
     } else if (a == "--skip") {
       skip_arg = next("--skip");
+    } else if (a == "--stages") {
+      stages_path = next("--stages");
     } else if (a == "--raw") {
       raw = true;
     } else if (a == "--dump-tokens") {
@@ -275,6 +417,7 @@ int main(int argc, char** argv) {
   }
 
   if (command == "dit") return run_dit(model_dir, input_path, out_path, skip_arg);
+  if (command == "vae") return run_vae(model_dir, input_path, out_path, stages_path);
 
   std::vector<int32_t> ids;
   if (!ids_arg.empty()) {
