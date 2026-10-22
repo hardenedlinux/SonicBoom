@@ -179,6 +179,14 @@ for size in ${SIZES//,/ }; do
     per_image=$(awk -v t="$med_gen" -v b="$b" 'BEGIN {printf "%.3f", t/b}')
     per_min=$(awk -v t="$med_gen" -v b="$b" 'BEGIN {printf "%.2f", 60*b/t}')
     say "| $b | $RUNS | $(printf '%.3f' "$med_load") | $(printf '%.3f' "$med_gen") ± $(printf '%.3f' "$sd_gen") | $per_image | $per_min | ${peak:-?} | $(printf '%.3f' "$med_total") (cold $(printf '%.3f' "$cold")) |"
+    # Machine-readable form of the row, for tools/sb-report.sh and scripts.
+    echo "RESULT image_bench size=${h}x${w} batch=$b runs=$RUNS" \
+         "load_s=$(printf '%.3f' "$med_load")" \
+         "gen_s=$(printf '%.3f' "$med_gen")" \
+         "gen_sd=$(printf '%.3f' "$sd_gen")" \
+         "image_s=$per_image images_min=$per_min peak_mib=${peak:-?}" \
+         "total_s=$(printf '%.3f' "$med_total")" \
+         "cold_s=$(printf '%.3f' "$cold")"
   done
 
   if [ "$VERIFY" = 1 ]; then

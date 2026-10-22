@@ -26,6 +26,11 @@ export LC_ALL=C LANG=C
 # Usage: tools/sb-report.sh --gemma PATH [--qwen PATH] [--deepseek PATH]
 #                           [--json] [--lib PATH] [--runs N] [--build]
 #                           [--no-golden] [--no-bench]
+#                           [--moss DIR --moss-embeds FILE --moss-neg-embeds FILE
+#                            [--moss-size 512x512] [--moss-steps 20]]
+#                           (--moss adds the MOSS-Image table through
+#                            tools/bench-image.sh; it is opt-in because each
+#                            image run loads the 9.5 GB checkpoint)
 # Env:   SONICBOOM_LIB=/path/to/libsonicboom.so   (default <repo>/build/core/libsonicboom.so)
 #        LLAMA_BENCH=/path/to/llama-bench        (passed through; adds llama.cpp)
 set -uo pipefail
@@ -40,6 +45,12 @@ RUNS=3
 BUILD=0
 GOLDEN=1
 BENCH=1
+MOSS=""
+MOSS_EMBEDS=""
+MOSS_NEG_EMBEDS=""
+MOSS_SIZE="512x512"
+MOSS_STEPS=20
+MOSS_BATCHES="1,4"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,10 +63,21 @@ while [ $# -gt 0 ]; do
     --build) BUILD=1; shift ;;
     --no-golden) GOLDEN=0; shift ;;
     --no-bench)  BENCH=0; shift ;;
-    -h|--help) sed -n '3,29p' "$0"; exit 0 ;;
+    --moss) MOSS="$2"; shift 2 ;;
+    --moss-embeds) MOSS_EMBEDS="$2"; shift 2 ;;
+    --moss-neg-embeds) MOSS_NEG_EMBEDS="$2"; shift 2 ;;
+    --moss-size) MOSS_SIZE="$2"; shift 2 ;;
+    --moss-steps) MOSS_STEPS="$2"; shift 2 ;;
+    --moss-batches) MOSS_BATCHES="$2"; shift 2 ;;
+    -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ -n "$MOSS" ] && { [ -z "$MOSS_EMBEDS" ] || [ -z "$MOSS_NEG_EMBEDS" ]; }; then
+  echo "sb-report: --moss needs --moss-embeds and --moss-neg-embeds" >&2
+  exit 2
+fi
 
 [ -n "$LIB" ] || LIB="$ROOT/build/core/libsonicboom.so"
 
@@ -238,6 +260,33 @@ if [ "$BENCH" = 1 ]; then
   [ -n "$GEMMA" ] && bench_one gemma "$GEMMA"
   [ -n "$QWEN" ]  && bench_one qwen "$QWEN"
   [ -n "$DEEPSEEK" ] && bench_one deepseek "$DEEPSEEK"
+fi
+
+# --- MOSS-Image (opt-in: each run loads the 9.5 GB checkpoint) --------------
+if [ -n "$MOSS" ]; then
+  [ "$JSON" = 1 ] || echo "[image]"
+  if [ ! -x "$ROOT/tools/bench-image.sh" ]; then
+    [ "$JSON" = 1 ] && emit image.run "unavailable (tools/bench-image.sh missing)" \
+                    || echo "  tools/bench-image.sh not found"
+  else
+    img_out="$("$ROOT/tools/bench-image.sh" --model "$MOSS" \
+      --embeds "$MOSS_EMBEDS" --neg-embeds "$MOSS_NEG_EMBEDS" \
+      --sizes "$MOSS_SIZE" --batches "$MOSS_BATCHES" --steps "$MOSS_STEPS" \
+      --runs "$RUNS" --no-build 2>&1)" || true
+    [ "$JSON" = 1 ] || printf '%s\n' "$img_out"
+    img_lines="$(printf '%s\n' "$img_out" | grep '^RESULT image_bench ' || true)"
+    if [ -z "$img_lines" ]; then
+      [ "$JSON" = 1 ] && emit image.run "failed"
+    else
+      while IFS= read -r img_line; do
+        img_b="$(printf '%s\n' "$img_line" | field batch)"
+        for img_k in gen_s image_s images_min peak_mib total_s cold_s; do
+          img_v="$(printf '%s\n' "$img_line" | field "$img_k")"
+          [ -n "$img_v" ] && { [ "$JSON" = 1 ] && emit "image.b${img_b}.${img_k}" "$img_v"; }
+        done
+      done <<<"$img_lines"
+    fi
+  fi
 fi
 
 # --- render -----------------------------------------------------------------

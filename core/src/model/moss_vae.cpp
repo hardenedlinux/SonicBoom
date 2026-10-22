@@ -376,19 +376,29 @@ std::expected<void, std::string> resnet(const ResNet& rn,
   return check(aten_vae_add(out, t1, x, cout * hw), "residual");
 }
 
+// Query-row band for the [S][S] attention planes. A full score plane is S^2
+// floats, which at the 1024x1024 latent size (S = 16384) is 1 GiB each; a band
+// of query rows produces the same softmax without materializing the full
+// plane. Sizes within the budget use one band, i.e. the unbanded path.
+constexpr int64_t kAttnPlaneBudget = int64_t(16) << 20;  // floats, 64 MiB
+int64_t attn_band(int64_t s) {
+  if (s <= 0) return 1;
+  return std::max<int64_t>(1, std::min<int64_t>(s, kAttnPlaneBudget / s));
+}
+
 template <class Attn>
 std::expected<void, std::string> attention(
     const Attn& a, float* x, float* out, int64_t H, int64_t W,
     int64_t groups, double eps, float* scratch, float* gn_mean,
     float* gn_rstd) {
-  const int64_t C = a.c, S = H * W;
+  const int64_t C = a.c, S = H * W, BQ = attn_band(S);
   float* gn = scratch;              // [C][S]
   float* q = gn + C * S;            // [S][C]
   float* k = q + C * S;             // [S][C]
   float* v = k + C * S;             // [S][C]
   float* u = v + C * S;             // [S][C]
-  float* prod = u + C * S;          // [S][S] or [S][C]
-  float* probs = prod + S * S;      // [S][S]
+  float* prod = u + C * S;          // [BQ][S] or [BQ][C]
+  float* probs = prod + BQ * S;     // [BQ][S]
 
   if (auto e = check(aten_vae_group_norm(gn, gn_mean, gn_rstd, x, a.gw.p,
                                          a.gb.p, 1, C, S, groups, eps),
@@ -407,16 +417,19 @@ std::expected<void, std::string> attention(
     return e;
   if (auto e = check(aten_vae_add_row(v, v, a.vb.p, S, C), "attn v bias"); !e)
     return e;
-  if (auto e = check(aten_vae_bmm_nt(prod, q, k, 1, S, C, S), "attn scores"); !e)
-    return e;
-  if (auto e = check(aten_vae_softmax(probs, prod, S, S), "attn softmax"); !e)
-    return e;
-  if (auto e = check(aten_vae_bmm(prod, probs, v, 1, S, S, C), "attn pv"); !e)
-    return e;
-  if (auto e = check(aten_vae_bmm_nt(u, prod, a.ow.p, 1, S, C, C), "attn out"); !e)
-    return e;
-  if (auto e = check(aten_vae_add_row(u, u, a.ob.p, S, C), "attn out bias"); !e)
-    return e;
+  for (int64_t q0 = 0; q0 < S; q0 += BQ) {
+    const int64_t b = std::min<int64_t>(BQ, S - q0);
+    if (auto e = check(aten_vae_bmm_nt(prod, q + q0 * C, k, 1, b, C, S),
+                       "attn scores"); !e) return e;
+    if (auto e = check(aten_vae_softmax(probs, prod, b, S), "attn softmax"); !e)
+      return e;
+    if (auto e = check(aten_vae_bmm(prod, probs, v, 1, b, S, C), "attn pv"); !e)
+      return e;
+    if (auto e = check(aten_vae_bmm_nt(u + q0 * C, prod, a.ow.p, 1, b, C, C),
+                       "attn out"); !e) return e;
+    if (auto e = check(aten_vae_add_row(u + q0 * C, u + q0 * C, a.ob.p, b, C),
+                       "attn out bias"); !e) return e;
+  }
   if (auto e = check(aten_vae_transpose(gn, u, S, C), "attn transpose back"); !e)
     return e;
   return check(aten_vae_add(out, gn, x, C * S), "attn residual");
@@ -521,8 +534,9 @@ std::expected<std::vector<float>, std::string> VaeDecoder::decode(
     b = arena.alloc(kLevel);
     if (b == nullptr) return std::unexpected("VAE decode: cudaMalloc failed");
   }
-  // gn + q/k/v/u (five [C][S] buffers) plus the [S][S] scores and softmax.
-  const int64_t attn_scratch = 5 * cfg.channels[0] * s + 2 * s * s;
+  // gn + q/k/v/u (five [C][S] buffers) plus the banded scores and softmax.
+  const int64_t attn_scratch =
+      5 * cfg.channels[0] * s + 2 * attn_band(s) * s;
   float* scratch = arena.alloc(attn_scratch);
   float* gn_mean = arena.alloc(cfg.norm_groups);
   float* gn_rstd = arena.alloc(cfg.norm_groups);

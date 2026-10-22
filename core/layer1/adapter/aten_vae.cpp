@@ -32,8 +32,11 @@
 #include <ATen/ops/_upsample_nearest_exact2d_native.h>
 #include <ATen/ops/add_native.h>
 #include <ATen/ops/bmm_native.h>
+#include <ATen/ops/constant_pad_nd.h>
+#include <ATen/ops/empty.h>
 #include <ATen/ops/from_blob.h>
 
+#include <algorithm>
 #include <c10/core/TensorOptions.h>
 #include <c10/cuda/CUDAFunctions.h>
 
@@ -105,8 +108,36 @@ bool aten_vae_conv2d(VaeDevBuf out, VaeDevBuf x, VaeDevBuf w, VaeDevBuf bias,
     at::Tensor to = wrap_f32(out, {N, O, OH, OW});
     std::optional<at::Tensor> tb;
     if (bias != nullptr) tb = wrap_f32(bias, {O});
-    at::native::slow_conv2d_forward_out_cuda(tx, tw, {KH, KW}, tb, {SH, SW},
-                                             {PH, PW}, to);
+    // slow_conv2d materializes a C*KH*KW x OH*OW im2col buffer: 3.6 GiB at the
+    // 1024x1024 image's last upsampler. Band the output rows when it would
+    // exceed the budget. A band carries exactly the input rows the whole-image
+    // convolution would read (padded only where the band meets the image
+    // border), so the result is the same convolution.
+    constexpr std::int64_t kMaxIm2col = std::int64_t(256) << 20;  // floats
+    const std::int64_t im2col = C * KH * KW * OH * OW;
+    if (im2col <= kMaxIm2col || SH != 1 || SW != 1) {
+      at::native::slow_conv2d_forward_out_cuda(tx, tw, {KH, KW}, tb, {SH, SW},
+                                               {PH, PW}, to);
+      return true;
+    }
+    const std::int64_t per_row = C * KH * KW * OW;
+    std::int64_t bh = std::max<std::int64_t>(1, kMaxIm2col / per_row);
+    bh = std::min(bh, OH);
+    for (std::int64_t r0 = 0; r0 < OH; r0 += bh) {
+      const std::int64_t r1 = std::min(OH, r0 + bh);
+      const std::int64_t lo = r0 - PH;            // stride 1
+      const std::int64_t hi = r1 - 1 - PH + KH;   // exclusive
+      const std::int64_t lo_c = std::max<std::int64_t>(0, lo);
+      const std::int64_t hi_c = std::min<std::int64_t>(H, hi);
+      at::Tensor band = tx.narrow(2, lo_c, hi_c - lo_c);
+      band = at::constant_pad_nd(
+          band, {PW, PW, std::max<std::int64_t>(0, -lo),
+                 std::max<std::int64_t>(0, hi - H)}, 0.0);
+      at::Tensor ob = at::empty({N, O, r1 - r0, OW}, to.options());
+      at::native::slow_conv2d_forward_out_cuda(band, tw, {KH, KW}, tb, {SH, SW},
+                                               {0, 0}, ob);
+      to.slice(2, r0, r1).copy_(ob);
+    }
     return true;
   } catch (const std::exception& e) {
     if (std::getenv("SONICBOOM_VAE_ATEN_DEBUG"))
