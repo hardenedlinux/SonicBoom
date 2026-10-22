@@ -9,7 +9,7 @@
 ;;;       bindings/guile/tests/trace/test-trace-validate.scm
 ;;;
 ;;; 1. Every graph the other trace test files execute validates against
-;;;    design/s-expr-v0.2-draft.md (each file runs in a subprocess through
+;;;    docs/s-expr-v0.2-draft.md (each file runs in a subprocess through
 ;;;    validate-graphs.scm).
 ;;; 2. The examples of the draft validate.
 ;;; 3. Deliberately broken documents are rejected with the expected message

@@ -29,6 +29,7 @@
 #include <sonicboom/model/config.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/quant/quantized_matmul.h>
 #include <sonicboom/runtime.h>
@@ -1749,6 +1750,48 @@ sb_status sb_load_params(const char *path, const char *const *names,
             std::memcpy(params[i]->t.data_ptr(), staged[i].data(),
                         staged[i].size());
         }
+        return SB_OK;
+      },
+      err_out);
+}
+
+// --- Numerics profile -------------------------------------------------------
+
+sb_status sb_set_numerics_profile(sb_numerics_profile profile,
+                                  sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        sonicboom::NumericsProfile p;
+        switch (profile) {
+        case SB_NUMERICS_STRICT:
+          p = sonicboom::NumericsProfile::Strict;
+          break;
+        case SB_NUMERICS_STANDARD:
+          p = sonicboom::NumericsProfile::Standard;
+          break;
+        default:
+          return fail_arg(err_out);
+        }
+        std::string error;
+        if (!sonicboom::set_numerics_profile(p, &error)) {
+          set_error(err_out, SB_ERRKIND_BINDING, error.c_str());
+          return SB_ERR_UNSUPPORTED;
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
+                                  sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!profile_out)
+          return fail_arg(err_out);
+        *profile_out =
+            sonicboom::numerics_profile() == sonicboom::NumericsProfile::Strict
+                ? SB_NUMERICS_STRICT
+                : SB_NUMERICS_STANDARD;
         return SB_OK;
       },
       err_out);

@@ -21,7 +21,7 @@
 //   2. the per-device caches: the hand-written tuner's <op>.json choices and
 //      the JIT candidate tuner's sm_<NN>.bin records;
 //   3. the decision registry for the decisions this process resolves
-//      (design/decision-registry.md).
+//      (docs/decision-registry.md).
 //
 // It never tunes: the JIT cache is only read, and the reduce-mode entries come
 // from the same once-per-process functions the runtime uses. Exit 0 on
@@ -31,6 +31,8 @@
 #include "planner/decision_registry.h"
 #include "planner/mlir_autotune.h"
 #include "planner/reduce_mode.h"
+
+#include <sonicboom/numerics.h>
 
 #include <cstdlib>
 #include <iostream>
@@ -48,6 +50,8 @@ struct Knob {
 // The env knobs that select an algorithm, tile, mode or threshold (the
 // diagnostic-only switches are deliberately absent).
 constexpr Knob kKnobs[] = {
+    {"SONICBOOM_NUMERICS", "standard",
+     "numerics profile: strict|standard (latched at first inference)"},
     {"SONICBOOM_REDUCE", "auto (cost ratio + recorded acceptance verdict)",
      "reduction accumulator: f64|df32|f32"},
     {"SONICBOOM_AUTOTUNE", "on", "tuning service: 0 off, force retimes"},
@@ -104,6 +108,9 @@ int main(int argc, char** argv) {
   const std::string identity = sonicboom::planner::device_identity();
   const auto device_mode = sonicboom::planner::device_reduce_mode();
   const auto cpu_mode = sonicboom::planner::cpu_reduce_mode();
+  // Resolving the profile records numerics.profile (and its env/application
+  // origin) in the registry, so both output forms name it.
+  const auto numerics = sonicboom::numerics_profile();
   sonicboom::planner::decisions::seed_static_knobs();
 
   if (json) {
@@ -125,6 +132,12 @@ int main(int argc, char** argv) {
               << "  [default: " << knob.fallback << "]  " << knob.meaning
               << "\n";
   }
+
+  section("numerics profile");
+  std::cout << sonicboom::numerics_profile_name(numerics) << "\n"
+            << (numerics == sonicboom::NumericsProfile::Strict
+                    ? "  f32 KV; f64 reductions; fp64-gated dense\n"
+                    : "  f16 KV; standard acceptance gate (ppl, top-1)\n");
 
   section("reduce mode");
   std::cout << "device: "

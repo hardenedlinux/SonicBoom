@@ -11,8 +11,8 @@
 ;;; Scheme loops. When a model runs, its tensors are marshalled across the
 ;;; SonicBoom C ABI into the native backends (see the execution steps).
 ;;;
-;;; Representation matches the frozen S-Expr v0.1 type system (design/
-;;; s-expr-v0-spec.md): ten dtype names, static non-negative shape dims.
+;;; Representation matches the frozen S-Expr v0.1 type system
+;;; (docs/s-expr-v0-spec.md): ten dtype names, static non-negative shape dims.
 
 (define-module (sonicboom tensor)
   #:use-module (rnrs bytevectors)

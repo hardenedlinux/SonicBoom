@@ -16,6 +16,7 @@
 
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include <sonicboom/numerics.h>
 #include <sonicboom/quant/dequant.h>
 #include <sonicboom/runtime_features.h>
 
@@ -563,6 +564,13 @@ void* g_wf16 = nullptr;
 size_t g_wf16_bytes = 0;
 void* g_xf16 = nullptr;
 size_t g_xf16_bytes = 0;
+// Fixed-width block staging for the standard-profile fp16 matmul (see
+// kCublasF16BlockWidth): the zero-padded [128, cols] fp16 tail activation and
+// its [128, rows] fp32 result. Reused across layers.
+void* g_xf16_tail = nullptr;
+size_t g_xf16_tail_bytes = 0;
+void* g_ytail = nullptr;
+size_t g_ytail_bytes = 0;
 // MMQ int8 tensor-core scratch (C.2): the block_q8_1_mmq quantized activation
 // [K/128][n] (+ J_max tail over-read). Reused across layers.
 void* g_mmq_q8 = nullptr;
@@ -1423,8 +1431,22 @@ bool cublas_enabled() noexcept {
 }
 
 // n (batch) threshold above which the cuBLAS fp16 path is used. Below it the
-// dp4a batched path wins (the fp16 dequant + upload overhead is not amortized
-// over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
+// dp4a batched path wins on wall time (the fp16 dequant + upload overhead is not
+// amortized over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
+//
+// That speed rule is also a numerics boundary, and the threshold is the same in
+// both profiles. The dp4a batched gemv is bit-identical to n calls of the
+// single-column matvec (same q8_1 quantization, same vec_dot, same reduction
+// order), so a position's projection is identical whether it arrives through a
+// batched prefill segment or a one-token decode step. The cuBLAS fp16 GEMM is
+// not: it accumulates tensor-core fragments in a different order. Routing small
+// batches (n in [2, 32)) through it — which is what dropping the threshold to
+// mmq_min_n() under standard did — made the 4-token batch prefill and four
+// per-token decode steps disagree on DeepSeek-R1-Distill-Qwen-1.5B, whose
+// attn_v/ffn_down/output projections are Q6_K (the only quant type that reaches
+// this branch when mmq is enabled): the batch-4, prefix-reuse and top-1 gates
+// all failed. At n >= 32 the fixed-width 128-position blocking in
+// matmul_f16_cublas_dev keeps the GEMM itself segment-invariant.
 constexpr int kCublasMinN = 32;
 int cublas_min_n() {
   static int v = [] {
@@ -2712,6 +2734,57 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // [cols, rows]), the GEMM writes Y [n, rows] directly with A = W^T (op=T,
 // lda=cols), B = X (op=N, ldb=cols), C = Y (m=rows, n=n, ldc=rows):
 //   Y[c, r] = sum_k W[r,k] X[c,k].
+//
+// Fixed column-block width for the standard profile. cuBLAS chooses its kernel
+// (and any split-K schedule) from the problem shape, so one GEMM whose n is the
+// batch makes every output column's rounding depend on the segment length: the
+// same prompt position computed in a 34-token segment and in an 8-token prefix
+// segment comes out differently, and a prefix-reuse continuation stops matching
+// a full prefill (measured on DeepSeek-R1-Distill-Qwen-1.5B Q4_K_M, whose
+// attn_v/ffn_down are Q6_K and take this path: 8 vs 32/64/128/200 columns all
+// diverge; strict's 16-step stream survives only because its margins do). Under
+// standard every call is therefore shaped (m=rows, n=128, k=cols) — full blocks
+// read the position-major activation directly, the tail is zero-padded — exactly
+// like the dense path's kDenseCublasWidth blocking. The strict profile keeps the
+// historical single GEMM byte for byte, because its goldens predate the profile
+// switch. SONICBOOM_CUBLAS_F16_BLOCK=0 restores the single GEMM for A/B.
+constexpr int kCublasF16BlockWidth = 128;
+
+bool cublas_f16_blocking_enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("SONICBOOM_CUBLAS_F16_BLOCK");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  return enabled;
+}
+
+// Zero-padded 128-position tail block for the blocked fp16 matmul, in the
+// position-major layout the full blocks read (dst[p*cols + i] = cast(X[(c0+p)*cols
+// + i]) for p < chunk_n, zero beyond). Same conversion as cast_f32_f16, so a
+// position in a tail block sees the same activation values as in a full block.
+__global__ void pad_f16_tail_kernel(const float* __restrict__ x,
+                                    __half* __restrict__ dst, int cols, int c0,
+                                    int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= cols * kCublasF16BlockWidth) return;
+  const int p = idx / cols;
+  const int i = idx - p * cols;
+  dst[idx] =
+      (p < chunk_n) ? __float2half_rn(x[(size_t)(c0 + p) * cols + i]) : __half(0.0f);
+}
+
+// Drop the padding positions of a [128, rows] result block into the
+// position-major output at position offset c0.
+__global__ void copyback_f16_tail_kernel(const float* __restrict__ src,
+                                         float* __restrict__ dst, int rows,
+                                         int c0, int chunk_n) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= chunk_n * rows) return;
+  const int p = idx / rows;
+  const int r = idx - p * rows;
+  dst[(size_t)(c0 + p) * rows + r] = src[(size_t)p * rows + r];
+}
+
 bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
                            int n) {
   const uint64_t cols = W.dims()[0];
@@ -2754,24 +2827,89 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
       return false;
   }
 
-  // 2. Convert X f32 -> fp16 (position-major [n, cols], flat element count).
-  __half* xf = static_cast<__half*>(
-      grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
-  if (!xf) return false;
-  const int64_t xn = int64_t(cols) * n;
-  SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
-  cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
+  const bool blocked = numerics_profile() == NumericsProfile::Standard &&
+                       cublas_f16_blocking_enabled();
+  if (!blocked) {
+    // 2. Convert X f32 -> fp16 (position-major [n, cols], flat element count).
+    __half* xf = static_cast<__half*>(
+        grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
+    if (!xf) return false;
+    const int64_t xn = int64_t(cols) * n;
+    SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
+    cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
 
-  // 3. cuBLAS tensor-core GEMM on the current stream: C = W^T @ X.
+    // 3. cuBLAS tensor-core GEMM on the current stream: C = W^T @ X.
+    cublasHandle_t h = cublas_handle();
+    if (!h) return false;
+    cublasSetStream(h, cur_stream());
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+        h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), n, int(cols), &alpha, wf,
+        CUDA_R_16F, int(cols), xf, CUDA_R_16F, int(cols), &beta, Y, CUDA_R_32F,
+        int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
+  }
+
+  // Standard profile: every GEMM is (m=rows, n=kCublasF16BlockWidth, k=cols).
+  // Full blocks read the position-major fp16 activation in place; a tail block
+  // is zero-padded into a fixed-width scratch and its real positions copied
+  // back, so a position's per-column numerics never depend on which segment it
+  // landed in. The activation conversion is done per block so a short batch
+  // never pays for the padding columns.
+  __half* xf = nullptr;
+  if (n >= kCublasF16BlockWidth) {
+    xf = static_cast<__half*>(
+        grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
+    if (!xf) return false;
+    const int64_t xn = int64_t(cols) * n;
+    SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
+    cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
+  }
   cublasHandle_t h = cublas_handle();
   if (!h) return false;
   cublasSetStream(h, cur_stream());
   const float alpha = 1.0f, beta = 0.0f;
-  const cublasStatus_t st = cublasGemmEx(
-      h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), n, int(cols), &alpha, wf,
-      CUDA_R_16F, int(cols), xf, CUDA_R_16F, int(cols), &beta, Y, CUDA_R_32F,
-      int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
-  return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
+  __half* xtail = nullptr;
+  float* ytail = nullptr;
+  for (int c0 = 0; c0 < n; c0 += kCublasF16BlockWidth) {
+    const int chunk_n = std::min(kCublasF16BlockWidth, n - c0);
+    const __half* bptr;
+    float* cptr;
+    if (chunk_n == kCublasF16BlockWidth) {
+      bptr = xf + (size_t)c0 * cols;
+      cptr = Y + (size_t)c0 * rows;
+    } else {
+      if (!xtail) {
+        xtail = static_cast<__half*>(grow_scratch(
+            g_xf16_tail, g_xf16_tail_bytes,
+            cols * (size_t)kCublasF16BlockWidth * sizeof(__half)));
+        ytail = static_cast<float*>(grow_scratch(
+            g_ytail, g_ytail_bytes,
+            rows * (size_t)kCublasF16BlockWidth * sizeof(float)));
+        if (!xtail || !ytail) return false;
+      }
+      const int total = int(cols) * kCublasF16BlockWidth;
+      SB_NOTE_LAUNCH(pad_f16_tail_kernel, (total + 255) / 256, 256, 0,
+                     cur_stream());
+      pad_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
+          X, xtail, int(cols), c0, chunk_n);
+      bptr = xtail;
+      cptr = ytail;
+    }
+    const cublasStatus_t st = cublasGemmEx(
+        h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), kCublasF16BlockWidth, int(cols),
+        &alpha, wf, CUDA_R_16F, int(cols), bptr, CUDA_R_16F, int(cols), &beta,
+        cptr, CUDA_R_32F, int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS) return false;
+    if (chunk_n != kCublasF16BlockWidth) {
+      const int total = int(chunk_n) * int(rows);
+      SB_NOTE_LAUNCH(copyback_f16_tail_kernel, (total + 255) / 256, 256, 0,
+                     cur_stream());
+      copyback_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
+          ytail, Y, int(rows), c0, chunk_n);
+    }
+  }
+  return cudaGetLastError() == cudaSuccess;
 }
 
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into

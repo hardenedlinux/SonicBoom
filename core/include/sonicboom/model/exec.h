@@ -26,8 +26,8 @@
 
 // Gemma 4 reference execution (Phase 5C-2): the token / per-layer embedding
 // paths and a single-block forward pass, in float32. The block arithmetic
-// follows the llama.cpp baseline graph recorded in design/gemma4-semantics.md §4
-// (token-embedding sqrt(n_embd) scale, Q/K per-head RMSNorm, V RMSNorm without
+// follows the llama.cpp baseline graph (token-embedding sqrt(n_embd) scale,
+// Q/K per-head RMSNorm, V RMSNorm without
 // weight, NEOX RoPE with global-layer freq_factors, attention scale 1.0,
 // GELU-tanh FFN, post-norms, per-layer gate, whole-block layer_output_scale).
 //

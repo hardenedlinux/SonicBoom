@@ -14,8 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Boom IR verification (design/mlir-migration.md §6, "Verifiers for
-// shape/dtype/quant consistency").
+// Boom IR verification (docs/boom-ir.md): shape/dtype/quant consistency.
 //
 // The dialect's ops already reject a value of a foreign type: every operand and
 // result is constrained by Boom_ValueType, which ODS turns into an

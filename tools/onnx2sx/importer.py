@@ -32,7 +32,7 @@ Supported subset (the 7 ResNet-18 operators, default ONNX domain):
     Conv  Relu  Add  MaxPool  ReduceMean  Reshape  Gemm
 
 Everything else is rejected with an actionable error. See
-`design/onnx-to-s-expr-importer.md` for the full contract.
+`docs/onnx-to-s-expr-importer.md` for the full contract.
 
 Usage:
 

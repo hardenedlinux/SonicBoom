@@ -27,7 +27,42 @@
   #:export (load-model free-model! model-arch model-eos
             make-session free-session!
             prefill! tokenize tokenize-segments detokenize
-            generate generate-tokens generate-stream))
+            generate generate-tokens generate-stream
+            numerics-profile set-numerics-profile!))
+
+;;; --- numerics profile -------------------------------------------------------
+
+;;; The process-wide numeric contract (capi.h sb_set_numerics_profile): 'strict
+;;; keeps every historical reduction, 'standard allows the profile's
+;;; substitutions (today: f16 KV storage). It is latched at the first model or
+;;; session, so call set-numerics-profile! first. Until either is called the
+;;; process uses SONICBOOM_NUMERICS, then 'standard.
+
+(define (numerics-profile)
+  "The effective numerics profile: 'strict or 'standard."
+  (let ((err (make-slot))
+        (out (make-bytevector (sizeof int) 0)))
+    (sb-check! ((proc 'sb_get_numerics_profile) (bytevector->pointer out)
+                (slot-ptr err))
+               err "numerics-profile")
+    (case (bytevector-s32-native-ref out 0)
+      ((0) 'strict)
+      (else 'standard))))
+
+(define (set-numerics-profile! profile)
+  "Request PROFILE ('strict or 'standard) for this process and return the
+effective profile. Signals 'sb-inference if the profile is already latched to
+the other value; setting the effective profile again is a no-op success."
+  (let ((code (case profile
+                ((strict) 0)
+                ((standard) 1)
+                (else (throw 'sb-inference
+                             (string-append "unknown numerics profile: "
+                                            (object->string profile))))))
+        (err (make-slot)))
+    (sb-check! ((proc 'sb_set_numerics_profile) code (slot-ptr err))
+               err "set-numerics-profile!")
+    (numerics-profile)))
 
 ;;; --- helpers ----------------------------------------------------------------
 

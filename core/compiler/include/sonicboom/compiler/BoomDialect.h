@@ -17,7 +17,7 @@
 // The Boom dialect (Boom IR), the node-parameter attributes and the KV-cache
 // effect resource. Compiler-only header: it lives under
 // core/compiler/include/, never under core/include/, so no MLIR type can reach
-// the Layer 2 boundary (design/mlir-migration.md §8.1).
+// the Layer 2 boundary (docs/boom-ir.md).
 
 #pragma once
 

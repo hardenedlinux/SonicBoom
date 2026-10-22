@@ -1,6 +1,6 @@
-# SonicBoom compiler — the MLIR side of the project (design/mlir-migration.md
-# §6-§9): the `boom` dialect, the IR the planner's Graph is lifted into, and the
-# passes that rewrite that IR.
+# SonicBoom compiler — the MLIR side of the project (docs/boom-ir.md): the
+# `boom` dialect, the IR the planner's Graph is lifted into, and the passes that
+# rewrite that IR.
 #
 # Deliberately a SEPARATE library from `sonicboom`, but linked into
 # libsonicboom.so: the runtime's consumers are the plan emitter's IR builder

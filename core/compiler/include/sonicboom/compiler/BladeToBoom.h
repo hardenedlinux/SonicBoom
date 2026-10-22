@@ -22,7 +22,7 @@
 
 #include <sonicboom/sx/ir.h>
 
-// Blade (sx::Document) -> Boom IR (design/mlir-migration.md §6.4, §7d).
+// Blade (sx::Document) -> Boom IR (docs/boom-ir.md).
 //
 // The lowering reads the frozen Blade v0.1 document directly: tensor ids are
 // assigned in the same document order adapt_graph assigns them (inputs,

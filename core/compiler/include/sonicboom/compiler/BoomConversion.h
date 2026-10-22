@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// planner::Graph <-> Boom IR (design/mlir-migration.md §7(a)). The conversion is
+// planner::Graph <-> Boom IR (docs/boom-ir.md). The conversion is
 // a translation, not a transformation: what comes back must be the graph that
 // went in — the same tensors, the same node ids, the same attributes in the same
 // order — because the model fingerprint hashes all of it in that order

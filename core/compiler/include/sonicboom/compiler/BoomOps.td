@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 //===----------------------------------------------------------------------===//
-// Boom IR operations (design/mlir-migration.md §6.1).
+// Boom IR operations (docs/boom-ir.md).
 //
 // One op per planner::OpKind, with the mnemonic equal to op_kind_name(OpKind),
 // so `op_name -> OpKind` is a lookup rather than a table that can drift.

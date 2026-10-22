@@ -50,7 +50,8 @@
 // --- Golden token streams ---------------------------------------------------
 //
 // Beyond the llama.cpp near-tie check above, each prompt's stream is pinned
-// against a committed golden under tests/data/qwen2/pN.golden — SonicBoom's own
+// against a committed golden under tests/data/qwen2/pN.golden (strict) or
+// pN.standard.golden (standard) — SonicBoom's own
 // output, compared byte-for-byte (the same role kGolden plays for Gemma in
 // test_generate.cpp, but committed as data because these are 64-token streams).
 // The CPU line is the CPU spine's stream; the CUDA line is the device spine's,
@@ -61,8 +62,11 @@
 // the one that recorded the golden. Regenerate with:
 //
 //     test_qwen2_generate --write-goldens
+//     SONICBOOM_NUMERICS=standard test_qwen2_generate --write-goldens
 //
 // and commit the result; a CLI-visible token change then shows up as a diff.
+// The profile decides the file name, so each profile's golden is recorded and
+// checked independently.
 //
 // --- Fixture directories ----------------------------------------------------
 //
@@ -80,6 +84,7 @@
 #include <sonicboom/model/exec.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/numerics.h>
 #include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/quant/quantized_matmul.h>
 #include <sonicboom/vocab/vocab.h>
@@ -605,9 +610,22 @@ int main(int argc, char** argv) {
   if (!cpu_streams.empty()) {
     const std::string model_file = std::filesystem::path(path).filename().string();
     const std::string dev = sbmodel::cuda_device_identity();
+    // One golden per numerics profile. Strict keeps the historical pN.golden
+    // names, so its bytes are comparable with every pre-profile run; standard
+    // writes and compares pN.standard.golden. The two profiles are allowed to
+    // differ, so neither file may stand in for the other.
+    const std::string profile_suffix =
+        sonicboom::numerics_profile() == sonicboom::NumericsProfile::Standard
+            ? ".standard"
+            : "";
+    std::cout << "  goldens: numerics profile "
+              << sonicboom::numerics_profile_name(sonicboom::numerics_profile())
+              << (profile_suffix.empty() ? " (pN.golden)"
+                                         : " (pN.standard.golden)")
+              << "\n";
     for (size_t p = 0; p < cpu_streams.size(); ++p) {
       const std::string tag = "p" + std::to_string(p + 1);
-      const std::string gpath = dir + "/" + tag + ".golden";
+      const std::string gpath = dir + "/" + tag + profile_suffix + ".golden";
       const std::vector<int64_t> cuda =
           p < cuda_streams.size() ? cuda_streams[p] : std::vector<int64_t>{};
 
@@ -622,12 +640,13 @@ int main(int argc, char** argv) {
       }
 
       const std::string golden = read_file(gpath);
-      check(!golden.empty(), tag + ".golden present");
+      check(!golden.empty(), tag + profile_suffix + ".golden present");
       if (golden.empty()) continue;
 
       const std::string want_cpu = pick_line(golden, "cpu");
       check(want_cpu == toks(cpu_streams[p]),
-            tag + ": CPU stream == golden " + tag + ".golden (byte-for-byte)");
+            tag + ": CPU stream == golden " + tag + profile_suffix +
+                ".golden (byte-for-byte)");
 
       const std::string want_cuda = pick_line(golden, "cuda");
       if (want_cuda.empty()) {
@@ -639,7 +658,8 @@ int main(int argc, char** argv) {
                   << pick_line(golden, "device") << "', running on '" << dev << "')\n";
       } else {
         check(want_cuda == toks(cuda),
-              tag + ": CUDA stream == golden " + tag + ".golden (byte-for-byte)");
+              tag + ": CUDA stream == golden " + tag + profile_suffix +
+                  ".golden (byte-for-byte)");
       }
     }
   }

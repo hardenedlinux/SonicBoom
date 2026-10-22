@@ -109,6 +109,12 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // ABUF is the number of f32 prefetch buffers: a depth-S pipeline holds the
   // tile being converted/consumed plus S-1 tiles in flight, and the f32
   // buffers are the only per-stage shared-memory cost.
+  // f16 KV pipelines only the batch half of a tile: cp.async copies raw bytes,
+  // so the f32 stage buffer can only be filled from the f32 batch tile. Keys
+  // that live in the f16 cache are read directly by the conversion step, and
+  // the issue step skips their chunks. A fresh prefill has every key in the
+  // batch, so it gets the full pipeline; a reused prefix runs the pipeline for
+  // the suffix and reads the cached prefix the way the synchronous path does.
   const bool ASYNC = sh.async_stages >= 2;
   const int ABUF = ASYNC ? sh.async_stages - 1 : 0;
   // Q fragments held in registers across the key loop (default) or reloaded
@@ -594,22 +600,34 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const std::string bo2 = e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
     const std::string bo3 = e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
     const std::string bo4 = e.val("arith.addi " + bo3 + ", " + d4 + " : i64");
-    const std::string cp =
-        e.val("llvm.getelementptr %kc[" + co4 +
-              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-    const std::string cpv =
-        e.val("llvm.getelementptr %vc[" + co4 +
-              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
     const std::string bp =
         e.val("llvm.getelementptr %kb[" + bo4 +
               "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
     const std::string bpv =
         e.val("llvm.getelementptr %vb[" + bo4 +
               "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-    const std::string rp = e.val("llvm.select " + isc + ", " + cp + ", " + bp +
-                                 " : i1, !llvm.ptr");
-    const std::string rpv = e.val("llvm.select " + isc + ", " + cpv + ", " + bpv +
-                                  " : i1, !llvm.ptr");
+    std::string rp, rpv;
+    if (sh.kv_f16) {
+      // Only the f32 batch tile can be copied into the f32 stage buffer. A
+      // chunk whose key lives in the f16 cache is skipped: the conversion
+      // step reads that key from the cache directly.
+      const std::string inbatch =
+          e.val("arith.cmpi sge, " + j + ", " + start + " : i64");
+      e.op("scf.if " + inbatch + " {");
+      rp = bp;
+      rpv = bpv;
+    } else {
+      const std::string cp =
+          e.val("llvm.getelementptr %kc[" + co4 +
+                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      const std::string cpv =
+          e.val("llvm.getelementptr %vc[" + co4 +
+                "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      rp = e.val("llvm.select " + isc + ", " + cp + ", " + bp +
+                 " : i1, !llvm.ptr");
+      rpv = e.val("llvm.select " + isc + ", " + cpv + ", " + bpv +
+                  " : i1, !llvm.ptr");
+    }
     // Stage-buffer offsets: [slot][K tile][key][4 f32]; V follows at +BC*D.
     const std::string krow =
         e.val("arith.muli " + key + ", " + C["xD"] + " : index");
@@ -639,31 +657,81 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
     e.op("nvvm.cp.async.shared.global " + spv + ", " + gpv +
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
+    if (sh.kv_f16) e.op("}");
     e.op("}");
   };
   // emit_convert turns stage buffer `slot` into the f16 K^T and V tiles with
   // vectorized in-shared loads/stores. The tile contents and the f32 -> f16
-  // truncation are the synchronous path's.
-  const auto emit_convert = [&](const std::string &slot) {
+  // truncation are the synchronous path's. `tstart` is the tile's absolute
+  // first key: with an f16 KV cache the stage buffer only holds batch keys, so
+  // a key at or above `start` comes from the stage buffer and one below it is
+  // loaded from the cache (already f16, stored as-is).
+  const auto emit_convert = [&](const std::string &slot,
+                                const std::string &tstart) {
     const std::string amt =
         "memref<" + s(ABUF) + "x" + s(2 * BC * D / 4) +
         "xvector<4xf32>, #gpu.address_space<workgroup>>";
     const std::string vmt =
         "memref<" + s(BC) + "x" + s(QD / 4) +
         "xvector<4xf16>, #gpu.address_space<workgroup>>";
+    // The absolute key of this chunk's row and whether it is cache-resident.
+    const auto chunk_key = [&]() { return e.val("arith.divui %ci, " + C["xd4"] + " : index"); };
+    const auto cached_of = [&](const std::string &key) {
+      const std::string key64 =
+          e.val("arith.index_cast " + key + " : index to i64");
+      const std::string j =
+          e.val("arith.addi " + tstart + ", " + key64 + " : i64");
+      return std::pair<std::string, std::string>{
+          j, e.val("arith.cmpi slt, " + j + ", " + start + " : i64")};
+    };
+    // One f16 element of the cache row for this chunk's key, element `drow`.
+    const auto cache_elem = [&](const std::string &which,
+                                const std::string &j, const std::string &drow) {
+      const std::string sl = e.val("arith.remui " + j + ", %nslots : i64");
+      const std::string co1 =
+          e.val("arith.muli " + sl + ", " + nhkv64 + " : i64");
+      const std::string co2 =
+          e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
+      const std::string co3 =
+          e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+      const std::string dr64 =
+          e.val("arith.index_cast " + drow + " : index to i64");
+      const std::string co4 =
+          e.val("arith.addi " + co3 + ", " + dr64 + " : i64");
+      const std::string cp =
+          e.val("llvm.getelementptr %" + which + "[" + co4 +
+                "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
+      return e.val("llvm.load " + cp + " : !llvm.ptr -> f16");
+    };
     // K: the stage buffer's [key][D] f32 chunks (chunk %ci of the tile) ->
     // ktmem [D][BC] f16 elements.
     e.op("scf.for %ci = " + tid + " to " + C["xckv4"] + " step " + C["xthr"] +
          " : index {");
     {
-      const std::string key = e.val("arith.divui %ci, " + C["xd4"] + " : index");
+      const std::string key = chunk_key();
       const std::string dq = e.val("arith.remui %ci, " + C["xd4"] + " : index");
+      const std::string dq4 = e.val("arith.muli " + dq + ", " + C["x4i"] +
+                                    " : index");
+      const std::string kstore = " : memref<" + s(D) + "x" + s(KBC) +
+                                 "xf16, #gpu.address_space<workgroup>>";
+      if (sh.kv_f16) {
+        const auto [j, cached] = cached_of(key);
+        e.op("scf.if " + cached + " {");
+        for (int i = 0; i < 4; ++i) {
+          std::string drow = dq4;
+          if (i) {
+            const std::string ii = e.val("arith.constant " + s(i) + " : index");
+            drow = e.val("arith.addi " + dq4 + ", " + ii + " : index");
+          }
+          e.op("memref.store " + cache_elem("kc", j, drow) + ", " + ktmem + "[" +
+               drow + ", " + key + "]" + kstore);
+        }
+        e.op("} else {");
+      }
       const std::string v = e.val("memref.load " + amemv + "[" + slot + ", %ci" +
                                   "] : " + amt);
       const std::string h =
           e.val("arith.truncf " + v + " : vector<4xf32> to vector<4xf16>");
-      const std::string dq4 = e.val("arith.muli " + dq + ", " + C["x4i"] +
-                                    " : index");
       for (int i = 0; i < 4; ++i) {
         std::string drow = dq4;
         if (i) {
@@ -673,9 +741,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         e.op("memref.store " +
              e.val("vector.extract " + h + "[" + s(i) +
                    "] : f16 from vector<4xf16>") +
-             ", " + ktmem + "[" + drow + ", " + key + "] : memref<" + s(D) +
-             "x" + s(KBC) + "xf16, #gpu.address_space<workgroup>>");
+             ", " + ktmem + "[" + drow + ", " + key + "]" + kstore);
       }
+      if (sh.kv_f16) e.op("}");
     }
     e.op("}");
     // V: the V half's [key][D] f32 chunks (chunk %ci + BC*D/4 of the stage
@@ -683,8 +751,27 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     e.op("scf.for %ci = " + tid + " to " + C["xckv4"] + " step " + C["xthr"] +
          " : index {");
     {
-      const std::string key = e.val("arith.divui %ci, " + C["xd4"] + " : index");
+      const std::string key = chunk_key();
       const std::string dq = e.val("arith.remui %ci, " + C["xd4"] + " : index");
+      const std::string dq4 = e.val("arith.muli " + dq + ", " + C["x4i"] +
+                                    " : index");
+      const std::string vstore =
+          " : memref<" + s(BC) + "x" + s(QD) +
+          "xf16, #gpu.address_space<workgroup>>";
+      if (sh.kv_f16) {
+        const auto [j, cached] = cached_of(key);
+        e.op("scf.if " + cached + " {");
+        for (int i = 0; i < 4; ++i) {
+          std::string drow = dq4;
+          if (i) {
+            const std::string ii = e.val("arith.constant " + s(i) + " : index");
+            drow = e.val("arith.addi " + dq4 + ", " + ii + " : index");
+          }
+          e.op("memref.store " + cache_elem("vc", j, drow) + ", " + vmem + "[" +
+               key + ", " + drow + "]" + vstore);
+        }
+        e.op("} else {");
+      }
       const std::string vidx =
           e.val("arith.addi %ci, " + C["xckv4"] + " : index");
       const std::string v = e.val("memref.load " + amemv + "[" + slot + ", " +
@@ -693,6 +780,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
           e.val("arith.truncf " + v + " : vector<4xf32> to vector<4xf16>");
       e.op("memref.store " + h + ", " + vmemv + "[" + key + ", " + dq + "] : " +
            vmt);
+      if (sh.kv_f16) e.op("}");
     }
     e.op("}");
   };
@@ -733,7 +821,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     } else {
       slot = C["x0"];
     }
-    emit_convert(slot);
+    emit_convert(slot, j0v);
     e.op("gpu.barrier");
     const std::string nstart =
         e.val("arith.addi " + j0v + ", " + C["ladv"] + " : i64");
@@ -767,9 +855,8 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
           e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
       const std::string co4 =
           e.val("arith.addi " + co3 + ", " + dd64 + " : i64");
-      const std::string cp =
-          e.val(std::string("llvm.getelementptr %") + (is_k ? "kc" : "vc") +
-                "[" + co4 + "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      const std::string cname = is_k ? "kc" : "vc";
+      const std::string bname = is_k ? "kb" : "vb";
       const std::string bi =
           e.val("arith.subi " + j + ", " + start + " : i64");
       const std::string bo1 =
@@ -780,13 +867,43 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
           e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
       const std::string bo4 =
           e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
-      const std::string bp =
-          e.val(std::string("llvm.getelementptr %") + (is_k ? "kb" : "vb") +
-                "[" + bo4 + "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-      const std::string rp =
-          e.val("llvm.select " + isc + ", " + cp + ", " + bp +
-                " : i1, !llvm.ptr");
-      const std::string vf = e.val("llvm.load " + rp + " : !llvm.ptr -> f32");
+      std::string vf;
+      if (sh.kv_f16) {
+        // f16 cache: the two sources have different element types, so the
+        // load is a typed branch, not a pointer select. Widening the stored
+        // half is exact (the cache holds fp16-rounded values).
+        vf = e.val("scf.if " + isc + " -> f32 {");
+        {
+          const std::string cp =
+              e.val("llvm.getelementptr %" + cname + "[" + co4 +
+                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
+          const std::string lh =
+              e.val("llvm.load " + cp + " : !llvm.ptr -> f16");
+          const std::string xh = e.val("arith.extf " + lh + " : f16 to f32");
+          e.op("scf.yield " + xh + " : f32");
+        }
+        e.op("} else {");
+        {
+          const std::string bp =
+              e.val("llvm.getelementptr %" + bname + "[" + bo4 +
+                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+          const std::string lf =
+              e.val("llvm.load " + bp + " : !llvm.ptr -> f32");
+          e.op("scf.yield " + lf + " : f32");
+        }
+        e.op("}");
+      } else {
+        const std::string cp =
+            e.val("llvm.getelementptr %" + cname + "[" + co4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        const std::string bp =
+            e.val("llvm.getelementptr %" + bname + "[" + bo4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        const std::string rp =
+            e.val("llvm.select " + isc + ", " + cp + ", " + bp +
+                  " : i1, !llvm.ptr");
+        vf = e.val("llvm.load " + rp + " : !llvm.ptr -> f32");
+      }
       e.op("scf.yield " + vf + " : f32");
     }
     e.op("} else {");
@@ -1217,6 +1334,9 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const int GQA = sh.gqa;
   const int K = D / 32;  // output columns per lane
   const bool EXP2 = sh.exp2;
+  // f16 KV cache (standard profile): the decode kernel reads the cache only,
+  // so it loads f16 and widens (exact: the stored values were fp16-rounded).
+  const bool KV16 = sh.kv_f16;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -1348,7 +1468,15 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
                                      : e.val("arith.addi " + base + ", " + oi +
                                              " : i64");
       return e.val("llvm.getelementptr %" + ptr + "[" + off +
-                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+                   "] : (!llvm.ptr, i64) -> !llvm.ptr, " +
+                   (KV16 ? "f16" : "f32"));
+    };
+    // Load cache element i as f32 (widening the f16 storage when KV16).
+    const auto ld = [&](const std::string &ptr, int i) -> std::string {
+      const std::string p = at(ptr, i);
+      if (!KV16) return e.val("llvm.load " + p + " : !llvm.ptr -> f32");
+      const std::string h = e.val("llvm.load " + p + " : !llvm.ptr -> f16");
+      return e.val("arith.extf " + h + " : f16 to f32");
     };
     // The dot product is a chain of fused multiply-adds in ascending i, and
     // the warp reduction is the hand-written kernel's __shfl_down tree
@@ -1358,8 +1486,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     // sums are don't-care.
     std::string acc = C["cf0"];
     for (int i = 0; i < K; ++i) {
-      const std::string k =
-          e.val("llvm.load " + at("kc", i) + " : !llvm.ptr -> f32");
+      const std::string k = ld("kc", i);
       acc = e.val("llvm.intr.fma(" + qv[i] + ", " + k + ", " + acc +
                   ") : (f32, f32, f32) -> f32");
     }
@@ -1450,7 +1577,15 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
                                      : e.val("arith.addi " + base + ", " + oi +
                                              " : i64");
       return e.val("llvm.getelementptr %" + ptr + "[" + off +
-                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+                   "] : (!llvm.ptr, i64) -> !llvm.ptr, " +
+                   (KV16 ? "f16" : "f32"));
+    };
+    // Load cache element i as f32 (widening the f16 storage when KV16).
+    const auto ld = [&](const std::string &ptr, int i) -> std::string {
+      const std::string p = at(ptr, i);
+      if (!KV16) return e.val("llvm.load " + p + " : !llvm.ptr -> f32");
+      const std::string h = e.val("llvm.load " + p + " : !llvm.ptr -> f16");
+      return e.val("arith.extf " + h + " : f16 to f32");
     };
     const std::string psid = e.val("arith.subi %j, " + jlo_i + " : index");
     const std::string psv = e.val("memref.load " + smemf + "[" + psid + "]" +
@@ -1475,8 +1610,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     e.op("}");
     iv["%l"] = nlr;
     for (int i = 0; i < K; ++i) {
-      const std::string v =
-          e.val("llvm.load " + at("vc", i) + " : !llvm.ptr -> f32");
+      const std::string v = ld("vc", i);
       // Fused P*V accumulate: the reference kernel's `acc += p * v` is one
       // FFMA, so a separate mul+add would round differently.
       iv["%o" + s(i)] = e.val("llvm.intr.fma(" + p + ", " + v + ", " +
@@ -1737,7 +1871,9 @@ int attention_shared_bytes(const AttentionShape &shape) {
                      : 0;
   // cp.async prefetch buffers: async_stages-1 buffers of one K|V f32 tile,
   // reusing the Q tile's bytes when they fit (Q is in registers by then). The
-  // partial-S buffer reuses those same bytes when cp.async does not.
+  // partial-S buffer reuses those same bytes when cp.async does not. The stage
+  // buffers are f32 even for an f16 KV cache: only the f32 batch tile can be
+  // copied asynchronously (see attention_region_text).
   const int ab = shape.async_stages >= 2
                      ? (shape.async_stages - 1) * 2 * shape.bc *
                            shape.head_dim * 4
@@ -1777,8 +1913,12 @@ std::string attention_codegen_version() {
   // attn10: GQA packing (gqa_pack query heads per block, bit-identical: each
   // head keeps its own warp roles and arithmetic) and the partial-S buffer
   // aliased into the dead Q staging bytes. attn11: Q-fragment reload arm
-  // (q_in_reg = false) and the head-fast grid order (head_fast).
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn11";
+  // (q_in_reg = false) and the head-fast grid order (head_fast). attn12: the
+  // cp.async pipeline with an f16 KV cache — the batch half of a K/V tile is
+  // copied into the f32 stage buffers asynchronously and the cache half is
+  // read (already f16) by the conversion step, so the tile values are the
+  // synchronous path's.
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn12";
 }
 
 } // namespace sonicboom::compiler

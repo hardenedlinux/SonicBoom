@@ -17,10 +17,9 @@
 //===----------------------------------------------------------------------===//
 // Boom dialect — Boom IR, SonicBoom's compiler IR.
 //
-// This is step (a) of the MLIR migration (design/mlir-migration.md §6–§7):
-// the dialect and its types, with a bidirectional OpKind correspondence added
-// in the next step. Nothing here is on the runtime path — the runtime keeps
-// executing the planner::Graph; the dialect is the compiler's IR.
+// The dialect and its types (docs/boom-ir.md). Nothing here is on the runtime
+// path — the runtime keeps executing the planner::Graph; the dialect is the
+// compiler's IR.
 //
 // Shape of the design (see the doc for the reasoning):
 //
@@ -59,8 +58,7 @@ def Boom_Dialect : Dialect {
   let description = [{
     The compiler IR of SonicBoom. It is the target of the lowering from Blade
     (the user-facing S-expression interchange format) and the IR the planner
-    passes are being ported onto, one pass per commit
-    (design/mlir-migration.md §7).
+    passes rewrite (docs/boom-ir.md).
 
     Text form of a graph:
 

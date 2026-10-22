@@ -30,7 +30,7 @@
 ;;; first send returns #f), so it can always release what it holds.
 ;;;
 ;;; This relies on Artanis internals (register-proto!, the Ragnarok protocol
-;;; record), not on a public API; design/artanis-streaming-notes.md describes
+;;; record), not on a public API; docs/artanis-streaming-notes.md describes
 ;;; what Artanis would need to provide instead.
 
 (define-module (sonicboom serve sse)

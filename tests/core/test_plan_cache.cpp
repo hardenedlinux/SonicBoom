@@ -35,8 +35,8 @@
 //   5. n_ctx is not a plan input — the same segment under a different n_ctx
 //                             has a byte-identical record *body* (only the
 //                             record header names n_ctx).
-//   6. agreement with the fresh-build path — `record_prefill_plan` (the plan_dump
-//                             machinery) plans the same segment independently;
+//   6. agreement with the fresh-build path — `record_prefill_plan` plans the
+//                             same segment independently;
 //                             its record must agree with the cached one, minus
 //                             the final norm + lm_head launches the real path
 //                             appends to its last step.
@@ -111,7 +111,7 @@ std::vector<std::string> body_lines(const std::string& text) {
   return lines;
 }
 
-// Report the first differing line, as tools/plan_diff does.
+// Report the first differing line, as the plan diff tool does.
 void report_diff(const std::vector<std::string>& a,
                  const std::vector<std::string>& b, const std::string& la,
                  const std::string& lb) {
@@ -331,7 +331,7 @@ void check_model(const ModelCase& c, const sbmodel::Gemma4Model& m) {
     std::cout << "  plan body independent of n_ctx (" << body_a.size() << " lines)\n";
   }
 
-  // 6. the same segment planned independently by the plan_dump path.
+  // 6. the same segment planned independently by the fresh-build record path.
   auto fresh = sbmodel::record_prefill_plan(m, N);
   if (!fresh) {
     fail(std::string(c.name) + ": record_prefill_plan produced no plan");

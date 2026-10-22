@@ -17,7 +17,7 @@
 // Phase 5A: Gemma 4 model loader + explicit execution plan + per-layer
 // embedding / single-block reference execution.
 //
-// Two tiers, mirroring the frozen facts in design/gemma4-model-map.md:
+// Two tiers, mirroring the frozen model facts:
 //   1. Pure bf16 conversion checks (always run, no model needed).
 //   2. Real-model checks (skipped cleanly when the target GGUF is absent):
 //      - config + plan structural validation against the frozen facts
@@ -88,7 +88,7 @@ std::string find_model() {
 void test_model(const sbmodel::Gemma4Model& m) {
   const sbmodel::Gemma4Config& c = m.config;
 
-  // --- frozen config facts (design/gemma4-model-map.md) ---------------------
+  // --- frozen config facts --------------------------------------------------
   check(c.block_count == 42, "config: block_count 42");
   check(c.embedding_length == 2560, "config: embedding_length 2560");
   check(c.feed_forward_length == 10240, "config: feed_forward_length 10240");

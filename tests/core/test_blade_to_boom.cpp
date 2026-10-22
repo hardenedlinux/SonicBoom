@@ -14,8 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Blade (sx::Document) -> Boom IR lowering acceptance (design/mlir-migration.md
-// §6.4 / §7d).
+// Blade (sx::Document) -> Boom IR lowering acceptance (docs/boom-ir.md).
 //
 // The direct lowering and the legacy route — `bladeToBoom(doc)` versus
 // `graphToBoom(adapt_graph(doc))` — must produce the same IR, byte for byte:

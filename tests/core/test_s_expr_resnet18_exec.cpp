@@ -17,10 +17,10 @@
 // test_s_expr_resnet18_exec.cpp — Stage C: end-to-end ResNet-18 CPU inference.
 //
 // Parses the frozen ResNet-18 S-Expr v0.1 fixture, loads the flat float32
-// weight sidecar (design/resnet18.weights.bin), feeds the deterministic input
-// (design/resnet18.input.bin, seed 1234) through the JITted executable, and
+// weight sidecar (tests/data/resnet18.weights.bin), feeds the deterministic input
+// (tests/data/resnet18.input.bin, seed 1234) through the JITted executable, and
 // compares the [1,1000] logits against the independent ONNX reference
-// (design/resnet18.reference.bin, onnx.reference.ReferenceEvaluator). Reports
+// (tests/data/resnet18.reference.bin, onnx.reference.ReferenceEvaluator). Reports
 // max absolute and relative error and asserts the argmax and a loose tolerance.
 
 #include <sonicboom/sx/exec.h>
@@ -79,13 +79,13 @@ std::vector<float> as_floats(const sx::Bytes& b) {
 static constexpr int kSkipReturnCode = 77;
 
 int main() {
-  const std::string design = std::string(SONICBOOM_SRC_DIR) + "/design";
-  const std::string fixture = design + "/s-expr-v0-resnet18.example.sx";
+  const std::string data = std::string(SONICBOOM_SRC_DIR) + "/tests/data";
+  const std::string fixture = data + "/s-expr-v0-resnet18.example.sx";
 
   // 0. Fixture gate: skip cleanly when the sidecars are absent.
   for (const char* name :
        {"resnet18.weights.bin", "resnet18.input.bin", "resnet18.reference.bin"}) {
-    const std::string path = design + "/" + name;
+    const std::string path = data + "/" + name;
     std::ifstream probe(path, std::ios::binary);
     if (!probe) {
       std::cout << "SKIP: " << path << " is missing\n"
@@ -93,7 +93,7 @@ int main() {
                 << "      Generate them from models/resnet18.onnx with:\n"
                 << "        models/.venv/bin/python "
                    "tools/reference/gen_resnet18_reference.py\n"
-                << "      (writes design/resnet18.{weights,input,reference}.bin)\n";
+                << "      (writes tests/data/resnet18.{weights,input,reference}.bin)\n";
       return kSkipReturnCode;
     }
   }
@@ -113,7 +113,7 @@ int main() {
   }
 
   // 2. Load the weight sidecar.
-  auto weights = sx::load_external_weights(*doc, design);
+  auto weights = sx::load_external_weights(*doc, data);
   if (!weights) {
     std::cerr << "weight load failed: " << weights.error().message << "\n";
     return 1;
@@ -122,7 +122,7 @@ int main() {
 
   // 3. Load the deterministic input.
   sx::Bytes input;
-  if (!read_file(design + "/resnet18.input.bin", input)) {
+  if (!read_file(data + "/resnet18.input.bin", input)) {
     std::cerr << "cannot read resnet18.input.bin\n";
     return 1;
   }
@@ -153,7 +153,7 @@ int main() {
 
   // 6. Compare against the independent ONNX reference.
   std::vector<std::byte> ref_bytes;
-  if (!read_file(design + "/resnet18.reference.bin", ref_bytes)) {
+  if (!read_file(data + "/resnet18.reference.bin", ref_bytes)) {
     std::cerr << "cannot read resnet18.reference.bin\n";
     return 1;
   }

@@ -334,6 +334,23 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx = 0, bool use_prefill = true);
 
+// Teacher-forced scoring on the CUDA decode spine (test seam for the
+// numerics-profile acceptance gate, tools/sb-numerics). Every token is fed at
+// its own position through the non-greedy decode graph, whose raw [vocab]
+// logits reach the host. The model's logit softcap is then applied to them on
+// the host (models without one, e.g. Qwen2, score the raw logits), so the
+// scored distribution is the model's own — the one HF and llama.cpp also fold
+// into their perplexity — not a sharper uncapped one. `sum_nll` accumulates the
+// negative log-likelihood of
+// each next token under those logits and `n_scored` is the number of scored
+// positions (tokens.size() - 1 on success). `n_ctx` sizes the KV cache and is
+// raised to tokens.size() when smaller. Returns false without CUDA support, on
+// a runtime/execute failure, or for an out-of-vocabulary token id. This is
+// measurement only: it runs a throwaway runtime, not the cached greedy one, so
+// it never disturbs a session.
+bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
+                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored);
+
 // CUDA prefill + decode with prefix-cache reuse: the same token-stream contract
 // as generate_prefill_spine_cuda, but the KV cache persists in `session` across
 // calls. On each call it matches `prompt` against the session's token history
@@ -364,7 +381,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 
 // Build the model's plan and record what executing it does, step by step.
 //
-// These are the producers behind tools/plan_dump: given a loaded model and a
+// These are the producers behind the plan dump: given a loaded model and a
 // mode, they return a deterministic, serializable description of the executed
 // plan (see planner/plan_record.h). They deliberately build a *non-captured*
 // runtime: a CUDA-graph-captured decode step replays as a single graph launch
@@ -378,12 +395,12 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
 // `transform`, when given, is applied to the graph the emitter built — after the
 // graph-level fusion passes, before the execution plan is derived from it. It is
 // the seam for putting the planned graph through another representation and back
-// (the Boom IR round trip, design/mlir-migration.md §7a) and requiring the plan
+// (the Boom IR round trip, docs/boom-ir.md) and requiring the plan
 // that follows to be the same plan; it is not a place to change what runs.
 //
 // The overloads are overloads rather than one function with a defaulted
 // parameter because libsonicboom.so is consumed through its symbol table
-// (tools/plan_dump): a defaulted parameter would silently drop the existing
+// (the plan dump tool): a defaulted parameter would silently drop the existing
 // entry point.
 using GraphTransform = std::function<void(planner::Graph&)>;
 

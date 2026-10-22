@@ -21,7 +21,7 @@
 // This is the *serialized model / graph IR* (the upper layer that feeds MLIR
 // lowering), not the Layer 2 runtime types (nt::). It is pure C++ with no
 // dependency on native-torch, Guile, MLIR, or ONNX. The frozen format this
-// models is documented in design/s-expr-v0-spec.md and must not be redesigned
+// models is documented in docs/s-expr-v0-spec.md and must not be redesigned
 // here.
 
 #include <cstddef>

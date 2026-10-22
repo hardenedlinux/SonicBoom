@@ -1,0 +1,12 @@
+# SonicBoom golden greedy token stream — test_qwen2_generate (batched
+# prefill + decode). SonicBoom's own output, pinned so a token-stream
+# change shows up as a diff. Regenerate with:
+#     test_qwen2_generate --write-goldens
+# The cuda line is device-specific (the device kernels are not
+# device-invariant: the decode-attention split-KV grid is sized from the
+# SM count), so it is only compared on the device that recorded it.
+model DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf
+device NVIDIA GeForce RTX 3050 sm 20 cc 8.6
+steps 64
+cpu 220 17 10 17 28 19 382 4416 11 1207 25 3555 374 220 17 10 17 30 362 25 220 17 10 17 28 19 11 220 19 10 19 28 23 382 4416 11 1207 25 3555 374 220 17 10 17 30 362 25 220 17 10 17 28 19 11 220 19 10 19 28 23 11 220 23 10
+cuda 220 17 10 17 28 19 382 40 1744 358 2776 7402 2494 1588 13 576 3405 374 330 3838 374 220 17 10 17 7521 323 279 4226 374 330 17 10 17 28 19 1189 1988 358 2666 1075 358 2776 537 7225 8660 3170 429 594 279 1142 13 10696 358 1265 1438 432 1495 3019 553 3019 311 1490 421

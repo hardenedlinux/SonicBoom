@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // The incrementally-built Boom IR a plan emitter writes
-// (design/mlir-migration.md §7d). This is the emitter's side of the dialect:
+// (docs/boom-ir.md). This is the emitter's side of the dialect:
 // the model layer names operators, shapes, dtypes and attributes and gets back
 // the SSA values it feeds to the next node. It never names a tensor id, and it
 // never builds a planner::Graph — the graph is what the lowering produces from
@@ -91,7 +91,7 @@ mlir::Operation *createBoomNode(mlir::OpBuilder &builder, mlir::Location loc,
                                 std::optional<planner::BackendTag> backend);
 
 // Lift a module's single boom.graph (a decode graph) into the greedy generation
-// program of design/mlir-migration.md §10: a `boom.program` holding a
+// program (docs/boom-ir.md): a `boom.program` holding a
 // `boom.prefill` call, then an `scf.while` whose body is the decode graph as a
 // `boom.step`, a `boom.sample`, a `boom.emit` and a `boom.stop_check`, and whose
 // continuation advances the position with `boom.pos_inc`.

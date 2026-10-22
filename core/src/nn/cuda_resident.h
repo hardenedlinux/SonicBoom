@@ -116,11 +116,15 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 // `pos_offset` selects a row of a verify step (B3): the position read is
 // pos[pos_offset], so one call per query row executes exactly the n == 1 call
 // of that row with the same split/chunk constants. 0 is the decode call.
+// `kv_f16` selects the standard profile's f16 KV storage: the cache buffers
+// hold __half instead of float. The values in them were fp16-rounded before
+// either storage existed, so reading f16 and widening is numerically exact.
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
-                          float scale, float* out, int pos_offset = 0);
+                          float scale, float* out, int pos_offset = 0,
+                          bool kv_f16 = false);
 
 // Append one token's K and V rows (row_elems floats each) into a device-resident
 // KV cache at slot (pos % n_slots). src/dst are device buffers; `pos` is a DEVICE
@@ -130,7 +134,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 // `pos_offset` is the verify step's row index (pos[pos_offset]; 0 = decode).
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems, int pos_offset = 0);
+                   int row_elems, int pos_offset = 0, bool dst_f16 = false);
 
 // Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
 // tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
@@ -162,7 +166,8 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
                                const float* v_cache, uint64_t start,
                                uint64_t n_slots, int n, int n_heads_q,
                                int n_heads_kv, int head_dim,
-                               uint64_t sliding_window, float scale, float* out);
+                               uint64_t sliding_window, float scale, float* out,
+                               bool kv_f16 = false);
 
 // Device-position variant of flash_attention_chunk_dev: `start` is a DEVICE
 // uint64_t read in-kernel, so the chunk's absolute start position is a graph
@@ -174,7 +179,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t n_slots, int n, int n_heads_q,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
-                                   float* out);
+                                   float* out, bool kv_f16 = false);
 
 // Attention work trace (SONICBOOM_ATTN_TRACE=1). The backend sets the layer
 // before the call; the attention entry points then print one line per call to
@@ -260,12 +265,14 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
 // wrap-free run so the slots are consecutive.
 bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
                            const float* src_v, uint64_t start_pos,
-                           uint64_t n_slots, int row_elems, int n);
+                           uint64_t n_slots, int row_elems, int n,
+                           bool dst_f16 = false);
 
 // Device-position variant of kv_append_batched_dev: `start_pos` is a DEVICE
 // uint64_t read in-kernel (CUDA Graphs for chunked prefill).
 bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
                                const float* src_v, const uint64_t* start_pos,
-                               uint64_t n_slots, int row_elems, int n);
+                               uint64_t n_slots, int row_elems, int n,
+                               bool dst_f16 = false);
 
 } // namespace sonicboom::nn::cuda

@@ -5,7 +5,7 @@
 ;;;
 ;;; A traced segment is a topologically ordered list of nodes plus the inline
 ;;; constant parameters they use. This module defines those records and turns a
-;;; segment into an S-Expr v0.1 document (design/s-expr-v0-spec.md): every value
+;;; segment into an S-Expr v0.1 document (docs/s-expr-v0-spec.md): every value
 ;;; typed at its definition site, nodes in producer-before-consumer order, all
 ;;; user names as strings, constants as `(data :values ...)`.
 
