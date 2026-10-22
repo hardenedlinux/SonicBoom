@@ -92,6 +92,7 @@ struct VaeDecoder::Impl {
     int64_t cin = 0, cout = 0;
   };
 
+  VaeBatchNorm bn;
   D postq_w, postq_b, conv_in_w, conv_in_b;
   ResNet mid0, mid1;
   Attn attn;
@@ -198,6 +199,30 @@ struct VaeDecoder::Impl {
       return {};
     };
     const int64_t L = cfg.latent_channels;
+    // BatchNorm statistics stay on the host: the pipeline applies them as a
+    // per-channel affine transform before the pixel-unshuffle.
+    {
+      // These are indexed by the DiT's latent channel (128), not by the VAE's
+      // 32-channel input: the unnormalization runs before the unshuffle.
+      auto host = [&](const char* name,
+                      std::vector<float>& dst) -> std::expected<void, std::string> {
+        const safetensors::TensorInfo* info = reader.tensor(name);
+        if (info == nullptr) return std::unexpected(std::string("missing tensor ") + name);
+        if (info->dtype != safetensors::DType::F32)
+          return std::unexpected(std::string(name) + ": expected f32");
+        auto span = reader.tensor_data(name);
+        if (!span) return std::unexpected(std::string("cannot read ") + name);
+        const float* src = reinterpret_cast<const float*>(span->data());
+        dst.assign(src, src + info->n_elements);
+        return {};
+      };
+      if (auto e = host("bn.running_mean", bn.running_mean); !e)
+        return std::unexpected(e.error());
+      if (auto e = host("bn.running_var", bn.running_var); !e)
+        return std::unexpected(e.error());
+      if (bn.running_mean.size() != bn.running_var.size())
+        return std::unexpected("VAE BatchNorm statistics size mismatch");
+    }
     const int64_t C0 = cfg.channels[0];
     const int64_t OC = cfg.out_channels;
 
@@ -405,6 +430,7 @@ VaeDecoder::VaeDecoder(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 VaeDecoder::~VaeDecoder() = default;
 
 const VaeConfig& VaeDecoder::config() const noexcept { return impl_->cfg; }
+const VaeBatchNorm& VaeDecoder::batch_norm() const noexcept { return impl_->bn; }
 int64_t VaeDecoder::weight_bytes() const noexcept { return impl_->bytes; }
 
 std::expected<std::unique_ptr<VaeDecoder>, std::string> VaeDecoder::load(
@@ -422,6 +448,10 @@ std::expected<std::unique_ptr<VaeDecoder>, std::string> VaeDecoder::load(
       return std::unexpected(std::string("config.json: ") + key + " missing");
     return v->integer;
   };
+  if (const auto* eps = root->find("batch_norm_eps"); eps && eps->type !=
+          safetensors::detail::JsonValue::Type::Null) {
+    cfg.bn_eps = eps->number;
+  }
   for (auto [key, dest] : {std::pair{"latent_channels", &cfg.latent_channels},
                            std::pair{"out_channels", &cfg.out_channels},
                            std::pair{"layers_per_block", &cfg.layers_per_block},
@@ -453,6 +483,7 @@ std::expected<std::unique_ptr<VaeDecoder>, std::string> VaeDecoder::load(
 
   auto impl = std::make_unique<Impl>(std::move(*reader));
   impl->cfg = cfg;
+  impl->bn.eps = cfg.bn_eps;
 
 #if defined(SONICBOOM_USE_CUDA)
   if (auto ok = impl->load_weights(); !ok)

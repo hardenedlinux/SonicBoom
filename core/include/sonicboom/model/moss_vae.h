@@ -44,8 +44,18 @@ struct VaeConfig {
   int64_t layers_per_block = 2;  // + 1 resnet per up block
   int64_t norm_groups = 32;
   double eps = 1e-6;
+  double bn_eps = 1e-4;  // BatchNorm statistics' epsilon
 
   int64_t spatial_scale() const noexcept { return 4; }  // 2 x 2 unshuffle
+};
+
+// The decoder's BatchNorm statistics, one entry per denoised-latent channel
+// (the DiT's 128, not the VAE's 32). MOSS-Image unnormalizes the latent with
+// these before the 2x2 pixel-unshuffle that feeds decode().
+struct VaeBatchNorm {
+  std::vector<float> running_mean;
+  std::vector<float> running_var;
+  double eps = 0.0;
 };
 
 // One named intermediate, dumped on request for the S4 parity gate.
@@ -65,6 +75,7 @@ class VaeDecoder {
   ~VaeDecoder();
 
   const VaeConfig& config() const noexcept;
+  const VaeBatchNorm& batch_norm() const noexcept;
   int64_t weight_bytes() const noexcept;
 
   // latent: [latent_channels][height][width] f32, the input of
