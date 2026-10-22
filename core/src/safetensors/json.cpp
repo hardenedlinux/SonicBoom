@@ -20,6 +20,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <string>
+#include <unordered_set>
 
 namespace sonicboom::safetensors::detail {
 
@@ -111,6 +113,10 @@ private:
       ++pos_;
       return v;
     }
+    // Duplicate keys are rejected with a hash set rather than a linear scan:
+    // a tokenizer.json vocabulary object has ~250k members, for which the
+    // scan was quadratic.
+    std::unordered_set<std::string> seen;
     while (true) {
       skip_ws();
       if (pos_ >= text_.size() || text_[pos_] != '"')
@@ -124,7 +130,7 @@ private:
       skip_ws();
       auto member = parse_value(depth + 1);
       if (!member) return std::nullopt;
-      if (v.find(key)) return fail("duplicate object key");
+      if (!seen.insert(key).second) return fail("duplicate object key");
       v.object.emplace_back(std::move(key), std::move(*member));
       skip_ws();
       if (pos_ >= text_.size()) return fail("unterminated object");
