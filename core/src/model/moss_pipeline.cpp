@@ -21,6 +21,14 @@
 
 #include <sonicboom/model/moss_pipeline.h>
 
+#include <cstdlib>
+
+#if defined(SONICBOOM_USE_CUDA)
+#include <sonicboom/model/moss_dit_cuda.h>
+#endif
+
+#include "../planner/decision_registry.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -102,7 +110,32 @@ FlowSchedule moss_flow_schedule(int64_t steps, float shift,
 struct MossPipeline::Impl {
   std::unique_ptr<TextEncoder> text;
   std::unique_ptr<DiffusionTransformer> dit;
+#if defined(SONICBOOM_USE_CUDA)
+  // The device-resident Q8_0 DiT (M2). When present it replaces the f32 CPU
+  // executor for every denoising forward; the CPU transformer stays loaded as
+  // the reference/fallback and for the public transformer() accessor.
+  std::unique_ptr<CudaDiffusionTransformer> dit_cuda;
+#endif
   std::unique_ptr<VaeDecoder> vae;
+
+  const DitConfig& dit_config() const noexcept {
+#if defined(SONICBOOM_USE_CUDA)
+    if (dit_cuda) return dit_cuda->config();
+#endif
+    return dit->config();
+  }
+
+  std::expected<DitSample, std::string> forward(
+      std::span<const float> hidden, int64_t height, int64_t width,
+      float timestep, std::span<const float> text, int64_t text_len,
+      const std::vector<int64_t>& skip) const {
+#if defined(SONICBOOM_USE_CUDA)
+    if (dit_cuda)
+      return dit_cuda->forward(hidden, height, width, timestep, text, text_len,
+                               skip);
+#endif
+    return dit->forward(hidden, height, width, timestep, text, text_len, skip);
+  }
 };
 
 MossPipeline::MossPipeline(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -127,6 +160,71 @@ std::expected<std::unique_ptr<MossPipeline>, std::string> MossPipeline::load(
   auto dit = DiffusionTransformer::load(root / "transformer");
   if (!dit) return std::unexpected("transformer: " + dit.error());
   impl->dit = std::move(*dit);
+
+  // R2: the DiT executor is an automatic choice, made once per model/device
+  // and recorded in the decision registry. The device path quantizes the
+  // checkpoint to Q8_0 at load and keeps every activation resident; it is the
+  // only one that meets the image-generation time budget, so it wins when a
+  // device is present and it loads. SONICBOOM_MOSS_DIT=cpu pins the f32 CPU
+  // executor, =cuda makes a device failure fatal instead of falling back.
+  {
+    const char* env = std::getenv("SONICBOOM_MOSS_DIT");
+    const bool want_cpu = env != nullptr && std::string(env) == "cpu";
+    const bool want_cuda = env != nullptr && std::string(env) == "cuda";
+    planner::decisions::Entry entry;
+    entry.name = "moss.dit.executor";
+    entry.scope = "transformer";
+    entry.env = "SONICBOOM_MOSS_DIT";
+    entry.candidates = "cpu-f32-mmap|cuda-q8_0";
+    entry.numerics = "cpu: f32 activations, bf16 weights; cuda: f32 "
+                     "activations, Q8_0 weights";
+#if defined(SONICBOOM_USE_CUDA)
+    std::string cuda_error;
+    if (!want_cpu && moss::dit_cuda_available()) {
+      auto cuda = CudaDiffusionTransformer::load(root / "transformer");
+      if (cuda) {
+        impl->dit_cuda = std::move(*cuda);
+      } else {
+        cuda_error = cuda.error();
+      }
+    } else if (!want_cpu) {
+      cuda_error = "no CUDA device";
+    }
+    if (impl->dit_cuda) {
+      entry.value = "cuda-q8_0";
+      entry.source = want_cuda ? planner::decisions::Source::Env
+                               : planner::decisions::Source::Default;
+      entry.inputs = "weights=" +
+                     std::to_string(impl->dit_cuda->weight_bytes()) +
+                     "B device=8GiB";
+      entry.reason = "Q8_0 fits the device and the per-forward cost is the "
+                     "image-generation budget; the CPU executor is 14 s per "
+                     "forward";
+      entry.vram_bytes = impl->dit_cuda->weight_bytes();
+    } else {
+      if (want_cuda)
+        return std::unexpected("transformer: CUDA DiT requested but " +
+                               cuda_error);
+      entry.value = "cpu-f32-mmap";
+      entry.source = planner::decisions::Source::Default;
+      entry.inputs = "weights=" + std::to_string(impl->dit->weight_bytes()) +
+                     "B device=8GiB";
+      entry.reason = cuda_error.empty()
+                         ? "pinned by SONICBOOM_MOSS_DIT"
+                         : "device path unavailable (" + cuda_error + ")";
+      entry.vram_bytes = 0;
+    }
+#else
+    (void)want_cpu;
+    (void)want_cuda;
+    entry.value = "cpu-f32-mmap";
+    entry.source = planner::decisions::Source::Default;
+    entry.reason = "built without CUDA";
+    entry.vram_bytes = 0;
+#endif
+    planner::decisions::record(entry);
+  }
+
   auto vae = VaeDecoder::load(root / "vae");
   if (!vae) return std::unexpected("vae: " + vae.error());
   impl->vae = std::move(*vae);
@@ -144,7 +242,7 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
     const MossLatent& latent, const MossConditioning& cond,
     const MossPipelineConfig& cfg, std::vector<MossLatent>* trace,
     MossSampleStats* stats) const {
-  const DitConfig& dit_cfg = impl_->dit->config();
+  const DitConfig& dit_cfg = impl_->dit_config();
   if (latent.channels != dit_cfg.latent_channels || latent.height <= 0 ||
       latent.width <= 0)
     return std::unexpected("sample: latent shape does not match the DiT");
@@ -180,9 +278,9 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
     const bool skip_active =
         cfg.slg_start <= fraction && fraction < cfg.slg_stop;
 
-    auto cond_out = impl_->dit->forward(
+    auto cond_out = impl_->forward(
         current.values, current.height, current.width, timestep, cond.text,
-        cond.text_len);
+        cond.text_len, kNoSkip);
     if (!cond_out) return std::unexpected(cond_out.error());
     ++forwards;
     pred = cond_out->values;
@@ -195,7 +293,7 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
           (skip_active && !cfg.uncond_skip_layers.empty())
               ? cfg.uncond_skip_layers
               : kNoSkip;
-      auto uncond_out = impl_->dit->forward(
+      auto uncond_out = impl_->forward(
           current.values, current.height, current.width, timestep, cond.negative,
           cond.negative_len, skip);
       if (!uncond_out) return std::unexpected(uncond_out.error());
@@ -206,7 +304,7 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
     }
 
     if (need_conditional) {
-      auto skipped_out = impl_->dit->forward(
+      auto skipped_out = impl_->forward(
           current.values, current.height, current.width, timestep, cond.text,
           cond.text_len, cfg.slg_layers);
       if (!skipped_out) return std::unexpected(skipped_out.error());
@@ -299,6 +397,12 @@ std::expected<MossImage, std::string> MossPipeline::decode(
     }
   }
 
+  // The Q8_0 DiT holds ~5.4 GiB of the 8 GiB device; the VAE's conv peak does
+  // not fit beside it. Release the DiT first (the host mirror stays, so a later
+  // sample re-uploads without re-quantizing).
+#if defined(SONICBOOM_USE_CUDA)
+  if (impl_->dit_cuda) impl_->dit_cuda->release_device();
+#endif
   auto decoded = impl_->vae->decode(unshuffled, 2 * h, 2 * w);
   if (!decoded) return std::unexpected(decoded.error());
 

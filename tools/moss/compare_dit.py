@@ -5,9 +5,11 @@
 
 usage: compare_dit.py REFERENCE OURS [--latent-channels 128] [--text-dim 4096] [--dim 3072]
 
-The inputs must be identical; the three output arrays are compared by relative
-RMS, max absolute difference, and per-row cosine (rows = tokens for the
-residual dumps, channels for the sample).
+The inputs must be identical; the output arrays present in both files are
+compared by relative RMS, max absolute difference, and per-row cosine (rows =
+tokens for the residual dumps, channels for the sample). The CUDA path has no
+debug taps, so its files carry only the sample and the trailing diagnostics are
+absent rather than zero-filled.
 """
 
 import argparse
@@ -33,6 +35,8 @@ def read(path, channels, text_dim, dim):
     names = ["latent", "text", "out", "block0", "prehead"]
     arrays = {}
     for name, size in zip(names, sizes):
+        if off + size * 4 > len(data):
+            break   # optional trailing arrays (debug taps) may be absent
         arrays[name] = np.frombuffer(data, dtype="<f4", count=size, offset=off).copy()
         off += size * 4
     return height, width, text_len, timestep, arrays
@@ -76,7 +80,10 @@ def main():
         "block0": hw + sa,
         "prehead": hw,
     }
-    worst = min(report(name, ours[name], ref[name], rows[name]) for name in rows)
+    if "out" not in ref or "out" not in ours:
+        sys.exit("both files need the sample array")
+    worst = min(report(name, ours[name], ref[name], rows[name])
+                for name in rows if name in ref and name in ours)
     print(f"worst per-row cos {worst:.6f}")
 
 

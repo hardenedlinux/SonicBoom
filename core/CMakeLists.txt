@@ -216,6 +216,8 @@ if(SONICBOOM_USE_CUDA)
     # dispatches them; the fused adjoints are backward_ops.cu above).
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/device_graph_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
+    # MOSS-Image DiT: Q8_0 weights + a device-resident forward (M2).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
   # ggml-cuda/mmq.cu with -use_fast_math -extended-lambda. The arch already

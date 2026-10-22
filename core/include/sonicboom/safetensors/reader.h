@@ -142,6 +142,11 @@ public:
   std::optional<std::span<const std::byte>> tensor_data(const TensorInfo& t) const;
   std::optional<std::span<const std::byte>> tensor_data(std::string_view name) const;
 
+  // Absolute byte offset of a tensor's data in the file, for pread-based
+  // loaders that read chunk by chunk instead of trusting the mapping. Only
+  // meaningful for a file-backed Reader (load()); from_memory() has no file.
+  uint64_t file_offset(const TensorInfo& t) const noexcept;
+
   // The whole data section (all tensor bytes live within it).
   std::span<const std::byte> data_section() const noexcept { return data_; }
 

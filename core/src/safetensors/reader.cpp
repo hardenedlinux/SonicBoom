@@ -380,6 +380,11 @@ std::optional<std::span<const std::byte>> Reader::tensor_data(std::string_view n
   return tensor_data(*t);
 }
 
+uint64_t Reader::file_offset(const TensorInfo& t) const noexcept {
+  if (map_ == nullptr) return t.begin;
+  return uint64_t(data_.data() - map_) + t.begin;
+}
+
 // ---------------------------------------------------------------------------
 // ShardedReader
 // ---------------------------------------------------------------------------

@@ -27,6 +27,9 @@
 // not run the model.
 
 #include <sonicboom/model/moss_dit.h>
+#if defined(SONICBOOM_TOOL_CUDA)
+#include <sonicboom/model/moss_dit_cuda.h>
+#endif
 #include <sonicboom/model/moss_text.h>
 #include <sonicboom/model/moss_pipeline.h>
 #include <sonicboom/model/moss_vae.h>
@@ -65,6 +68,7 @@ void usage() {
          "  --input FILE   a MOSSDIT1 reference file (`dit`): its inputs are run\n"
          "                 and its outputs are replaced by ours\n"
          "  --skip LIST    block indices to omit, e.g. 22 (`dit`)\n"
+         "  --cuda         run `dit` on the Q8_0 device-resident CUDA path\n"
          "  --stages FILE  dump per-stage activations (`vae`, MOSVSG01)\n"
          "\n"
          "sample: image size is height x width (multiples of 16); the DiT grid is\n"
@@ -153,40 +157,97 @@ std::optional<DitFile> read_dit(const std::string& path, int64_t channels,
 }
 
 int run_dit(const std::string& model_dir, const std::string& input_path,
-            const std::string& out_path, const std::string& skip_arg) {
+            const std::string& out_path, const std::string& skip_arg,
+            bool cuda) {
   if (input_path.empty() || out_path.empty()) {
     std::cerr << "sb-moss dit: --input and --out are required\n";
     return 2;
   }
-  auto model = sonicboom::moss::DiffusionTransformer::load(model_dir);
-  if (!model) {
-    std::cerr << "sb-moss: " << model.error() << "\n";
-    return 1;
+  sonicboom::moss::DitConfig cfg;
+  std::expected<sonicboom::moss::DitSample, std::string> sample =
+      std::unexpected(std::string("not run"));
+  std::vector<float> debug_residual, debug_prehead;
+  double elapsed_seconds = 0.0;
+
+  if (cuda) {
+#if defined(SONICBOOM_TOOL_CUDA)
+    if (!sonicboom::moss::dit_cuda_available()) {
+      std::cerr << "sb-moss dit: CUDA is not available\n";
+      return 1;
+    }
+    auto model = sonicboom::moss::CudaDiffusionTransformer::load(model_dir);
+    if (!model) {
+      std::cerr << "sb-moss: " << model.error() << "\n";
+      return 1;
+    }
+    cfg = (*model)->config();
+    std::cerr << "dit(cuda): " << cfg.num_layers << " layers, dim " << cfg.dim
+              << ", " << cfg.num_heads << " heads, Q8_0 weights "
+              << (*model)->weight_bytes() << " B\n";
+    std::string error;
+    auto ref =
+        read_dit(input_path, cfg.latent_channels, cfg.text_dim, cfg.dim, &error);
+    if (!ref) {
+      std::cerr << "sb-moss: " << error << "\n";
+      return 1;
+    }
+    const std::vector<int64_t> skip = parse_layers(skip_arg);
+    const auto start = std::chrono::steady_clock::now();
+    sample = (*model)->forward(ref->latent, ref->height, ref->width,
+                               ref->timestep, ref->text, ref->text_len, skip);
+    elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    if (!sample) {
+      std::cerr << "sb-moss: " << sample.error() << "\n";
+      return 1;
+    }
+#else
+    std::cerr << "sb-moss dit: this build has no CUDA support\n";
+    return 2;
+#endif
+  } else {
+    auto model = sonicboom::moss::DiffusionTransformer::load(model_dir);
+    if (!model) {
+      std::cerr << "sb-moss: " << model.error() << "\n";
+      return 1;
+    }
+    cfg = (*model)->config();
+    std::cerr << "dit: " << cfg.num_layers << " layers, dim " << cfg.dim << ", "
+              << cfg.num_heads << " heads, weights " << (*model)->weight_bytes()
+              << " B\n";
+
+    std::string error;
+    auto ref =
+        read_dit(input_path, cfg.latent_channels, cfg.text_dim, cfg.dim, &error);
+    if (!ref) {
+      std::cerr << "sb-moss: " << error << "\n";
+      return 1;
+    }
+    const std::vector<int64_t> skip = parse_layers(skip_arg);
+
+    sonicboom::moss::DitDebug debug;
+    const auto start = std::chrono::steady_clock::now();
+    sample = (*model)->forward(ref->latent, ref->height, ref->width,
+                               ref->timestep, ref->text, ref->text_len, skip,
+                               &debug);
+    elapsed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - start).count();
+    if (!sample) {
+      std::cerr << "sb-moss: " << sample.error() << "\n";
+      return 1;
+    }
+    debug_residual = std::move(debug.residual_after_first_block);
+    debug_prehead = std::move(debug.prehead);
   }
-  const auto& cfg = (*model)->config();
-  std::cerr << "dit: " << cfg.num_layers << " layers, dim " << cfg.dim << ", "
-            << cfg.num_heads << " heads, weights " << (*model)->weight_bytes()
-            << " B\n";
 
   std::string error;
-  auto ref = read_dit(input_path, cfg.latent_channels, cfg.text_dim, cfg.dim, &error);
+  auto ref = read_dit(input_path, cfg.latent_channels, cfg.text_dim, cfg.dim,
+                      &error);
   if (!ref) {
     std::cerr << "sb-moss: " << error << "\n";
     return 1;
   }
-  const std::vector<int64_t> skip = parse_layers(skip_arg);
-
-  sonicboom::moss::DitDebug debug;
-  const auto start = std::chrono::steady_clock::now();
-  auto sample = (*model)->forward(ref->latent, ref->height, ref->width,
-                                  ref->timestep, ref->text, ref->text_len, skip,
-                                  &debug);
-  if (!sample) {
-    std::cerr << "sb-moss: " << sample.error() << "\n";
-    return 1;
-  }
-  const auto elapsed = std::chrono::duration<double>(
-      std::chrono::steady_clock::now() - start);
+  const auto elapsed = std::chrono::duration<double>(elapsed_seconds);
 
   std::ofstream out(out_path, std::ios::binary);
   if (!out) {
@@ -207,8 +268,8 @@ int run_dit(const std::string& model_dir, const std::string& input_path,
   write_vec(ref->latent);
   write_vec(ref->text);
   write_vec(sample->values);
-  write_vec(debug.residual_after_first_block);
-  write_vec(debug.prehead);
+  write_vec(debug_residual);
+  write_vec(debug_prehead);
   if (!out) {
     std::cerr << "sb-moss: write failed for " << out_path << "\n";
     return 1;
@@ -217,9 +278,9 @@ int run_dit(const std::string& model_dir, const std::string& input_path,
   double energy = 0.0;
   for (float v : sample->values) energy += double(v) * v;
   const double rms = std::sqrt(energy / double(sample->values.size()));
-  std::cerr << "dit forward: " << ref->text_len << " text + "
-            << ref->height * ref->width << " video tokens in " << elapsed.count()
-            << " s, out rms " << rms << "\n";
+  std::cerr << "dit forward" << (cuda ? " (cuda)" : "") << ": " << ref->text_len
+            << " text + " << ref->height * ref->width << " video tokens in "
+            << elapsed.count() << " s, out rms " << rms << "\n";
   return 0;
 }
 
@@ -466,11 +527,28 @@ int run_sample(const std::string& root, const std::string& text_arg,
     return 2;
   }
 
+  const auto start_all = std::chrono::steady_clock::now();
   auto pipeline = sonicboom::moss::MossPipeline::load(root, /*with_text=*/have_text);
   if (!pipeline) {
     std::cerr << "sb-moss: " << pipeline.error() << "\n";
     return 1;
   }
+  const double load_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - start_all)
+                            .count();
+  // One machine-readable line per run so tools/bench-image.sh never parses
+  // free text. `sample_s` is the denoising loop, `decode_s` the VAE, and
+  // `total_s` the whole process from load to the last byte written.
+  auto emit = [&](int64_t images, int64_t forwards, double sample_s,
+                  double decode_s) {
+    const double total_s = std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - start_all)
+                               .count();
+    std::cout << std::setprecision(6) << "RESULT sample batch=" << images
+              << " steps=" << steps << " forwards=" << forwards
+              << " load_s=" << load_s << " sample_s=" << sample_s
+              << " decode_s=" << decode_s << " total_s=" << total_s << "\n";
+  };
   const auto& dit_cfg = (*pipeline)->transformer()->config();
 
   // Conditioning: the reference runs the encoder once per prompt with no
@@ -617,11 +695,13 @@ int run_sample(const std::string& root, const std::string& text_arg,
       out.write(reinterpret_cast<const char*>(all.data()),
                 static_cast<std::streamsize>(all.size() * sizeof(float)));
     }
+    const double decode_only_s = std::chrono::duration<double>(
+                                     std::chrono::steady_clock::now() -
+                                     decode_start)
+                                     .count();
     std::cerr << "decode only: " << decoded_inputs.size() << " image(s) " << ic
-              << "x" << ih << "x" << iw << " in "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                               decode_start).count()
-              << " s\n";
+              << "x" << ih << "x" << iw << " in " << decode_only_s << " s\n";
+    emit(static_cast<int64_t>(decoded_inputs.size()), 0, 0.0, decode_only_s);
     return 0;
   }
 
@@ -702,7 +782,11 @@ int run_sample(const std::string& root, const std::string& text_arg,
     }
   }
 
-  if (no_decode || image_out.empty()) return 0;
+  if (no_decode || image_out.empty()) {
+    emit(static_cast<int64_t>(refined.size()), stats.forwards, stats.seconds,
+         0.0);
+    return 0;
+  }
 
   std::ofstream out(image_out, std::ios::binary);
   if (!out) {
@@ -739,6 +823,7 @@ int run_sample(const std::string& root, const std::string& text_arg,
   }
   std::cerr << "decode: " << b << " image(s) " << ic << "x" << ih << "x" << iw
             << " in " << decode_seconds << " s\n";
+  emit(b, stats.forwards, stats.seconds, decode_seconds);
   return 0;
 }
 
@@ -783,6 +868,7 @@ int main(int argc, char** argv) {
   bool no_skip = false;
   bool no_decode = false;
   bool decode_only = false;
+  bool cuda = false;
   bool have_text = false;
   bool raw = false;
   bool dump_tokens = false;
@@ -850,6 +936,8 @@ int main(int argc, char** argv) {
       no_decode = true;
     } else if (a == "--decode-only") {
       decode_only = true;
+    } else if (a == "--cuda") {
+      cuda = true;
     } else if (a == "--raw") {
       raw = true;
     } else if (a == "--dump-tokens") {
@@ -867,7 +955,8 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  if (command == "dit") return run_dit(model_dir, input_path, out_path, skip_arg);
+  if (command == "dit")
+    return run_dit(model_dir, input_path, out_path, skip_arg, cuda);
   if (command == "vae") return run_vae(model_dir, input_path, out_path, stages_path);
   if (command == "sample") {
     return run_sample(model_dir, text, embeds_path, negative_arg, neg_embeds_path,

@@ -1222,6 +1222,24 @@ const void* upload_bytes_cached(const void* host, std::size_t bytes) {
   return upload_bytes(host, bytes);
 }
 
+bool register_weight_device(const QuantizedTensor& W, const void* dptr) {
+  if (!W.valid() || W.dims().size() != 2 || dptr == nullptr) return false;
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  CacheKey key{W.data().data(), W.byte_size()};
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) return it->second.ptr == dptr;
+  g_cache.emplace(key, DeviceWeight{const_cast<void*>(dptr), W.byte_size()});
+  return true;
+}
+
+void unregister_weight_device(const QuantizedTensor& W) {
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  auto it = g_cache.find(CacheKey{W.data().data(), W.byte_size()});
+  if (it == g_cache.end()) return;
+  cudaFree(it->second.ptr);
+  g_cache.erase(it);
+}
+
 bool available() noexcept {
   if (!g_available_checked) {
     int n = 0;
@@ -3508,7 +3526,10 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the cuBLAS fp16 or dp4a
   // batched path below — matmul_mmq_dev would reject it anyway, and returning its
   // false here would fail the whole call instead of falling through.
-  const bool mmq_type = W.type() != QuantType::Q6_K;
+  // The MMQ kernel needs K to be a multiple of 256; a short K (e.g. a 128-wide
+  // input projection) takes the dp4a/cuBLAS paths below instead of failing the
+  // whole call on matmul_mmq_dev's precondition.
+  const bool mmq_type = W.type() != QuantType::Q6_K && cols % 256 == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 

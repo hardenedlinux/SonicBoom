@@ -110,6 +110,30 @@ bool matmul_f32(const QuantizedTensor& W, std::span<const float> X,
 // is out of range, or `out` is too short.
 bool gather_f32(const QuantizedTensor& W, int64_t token, std::span<float> out);
 
+// Device-resident activation entry points. The host-span functions above copy
+// the activation in and out on every call, which is the decode/prefill shape
+// (one call per graph node). A device-resident executor (MOSS-Image's DiT)
+// keeps its activations on the device across a whole forward, so it calls the
+// same kernels directly. `X` is [n, cols] position-major, `Y` is [n, rows]
+// position-major (the layout of the CPU matmul). Weight bytes are uploaded on
+// first use and cached by (data pointer, byte size), exactly as the host-span
+// path does — `upload_weight` exposes that step so a loader can pay the upload
+// once at load time. These are internal to the core: no CUDA type appears in
+// the signatures.
+bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
+bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
+
+// Loader hook for the same cache: record that `dptr` already holds W's packed
+// bytes, so later calls skip the upload. The caller owns the allocation, which
+// must stay valid until unregister_weight_device() or clear_cache(), and must
+// carry the kernel's 256-byte zeroed read-ahead tail (allocate byte_size() +
+// 256 and memset the tail). This lets a loader overlap the copy with disk I/O
+// instead of paying a blocking upload per tensor. Returns false when W is
+// invalid, dptr is null, or the key is already registered to another pointer.
+bool register_weight_device(const QuantizedTensor& W, const void* dptr);
+// Remove and free a registered or cached device copy for W. No-op when absent.
+void unregister_weight_device(const QuantizedTensor& W);
+
 // Drop all cached device weight copies (call when a model is reloaded at a new
 // address so stale device buffers are not reused).
 void clear_cache();
