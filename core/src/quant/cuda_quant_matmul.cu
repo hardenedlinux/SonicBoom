@@ -1518,14 +1518,26 @@ int mmq_min_n() {
 // cores fed on this GPU. The tuner times the candidate set (mmq_x x
 // decomposition, both from upstream's Ampere table) and caches the fastest.
 //
-// Cache key: the weight shape class (quant type, M, blocks_per_row), never n.
-// The decomposition changes the floating-point summation order (split-K pieces
-// are combined in a fixed order), so batch invariance requires that the same
-// rows be reduced the same way whether they are prefilled in one segment or
-// many (test_prefix_cache compares 14 cases bitwise). Keying the decomposition
-// by class is what guarantees that; the J that rides along in the same entry is
-// numerics-neutral (it selects the token-tile width only; the fixed split-K
-// pieces and the tiled K-reduction order are independent of J).
+// Two knobs with different numerics standing, so two cache keys:
+//
+//  * The decomposition changes the floating-point summation order (split-K
+//    pieces are combined in a fixed order), so batch invariance requires that
+//    the same rows be reduced the same way whether they are prefilled in one
+//    segment or many (test_prefix_cache compares 14 cases bitwise). It is
+//    keyed by the weight shape class (quant type, M, blocks_per_row) and
+//    never by n.
+//  * J selects the token-tile width only. Under the tiled decomposition the
+//    fixed split-K pieces and the K-reduction order are independent of it, and
+//    every candidate writes the same bytes (test_cuda_quant: "mmq tiled J
+//    candidates write identical output"). A numerics-neutral knob may
+//    therefore be chosen per token-count bucket without weakening batch
+//    invariance -- and it must be, because the tile that wins at prefill
+//    scale (J=128 at the DiT's 4113 tokens) loses to a narrow one at
+//    continuation scale. The bucket is a fixed 2x ladder (mmq_n_bucket), not
+//    the live n, so a class has at most kMmqBucketCount tile entries and
+//    every call resolves to exactly one. Under stream-k J moves the split
+//    geometry and hence the rounding (the test only guarantees closeness, not
+//    identity), so it stays class-wide there.
 //
 // The search runs on the first call for a class outside graph capture (host
 // timing is illegal while capturing) and only at a batch large enough to fill
@@ -1533,19 +1545,18 @@ int mmq_min_n() {
 // its policy decomposition without storing anything, so a decode-first session
 // cannot pin a decode-scale tile onto a later prefill. Inside a capture the
 // cached class entry, or the heuristic + class policy when none exists, is
-// used.
+// used. The class record is written by the first probe; later buckets add
+// only their own tile, so entering a new bucket costs one J sweep, not the
+// decomposition search again.
 //
-// Each class entry carries two tiles, both measured at fixed probe shapes
-// (kMmqDecompProbeN = the call that triggers the search, kMmqSmallProbeN = 64
-// columns of the same launch): a prefill tile and a continuation tile. The
-// split exists because a tile wide enough for n=512 wastes most of its columns
-// at continuation scale (n=64: 1769 tok/s with the class prefill tile vs 2712
+// The class record also carries the continuation tile, measured at a fixed
+// probe shape (kMmqSmallProbeN = 64 columns of the same launch). The split
+// exists because a tile wide enough for n=512 wastes most of its columns at
+// continuation scale (n=64: 1769 tok/s with the class prefill tile vs 2712
 // with upstream's rule; reuse 512+64 78.1 vs 66.1 ms), and a static
 // small-batch rule still left 1.8% on that metric against the step-7
-// per-call tuning. Neither the key nor the stored value depends on the call's
-// n: the probes are fixed constants of the tuner. J never changes the
-// summation order, so this does not weaken batch invariance; the
-// decomposition, which does, is class-wide for every n.
+// per-call tuning. It is measured at a fixed width, so it is class-wide like
+// the decomposition.
 //
 // A tile or decomposition other than the default replaces it only when it
 // wins by more than the switch margin (kMmqTileSwitchMargin /
@@ -1564,6 +1575,21 @@ constexpr int kMmqDecompProbeN = 128;
 // class entry carries a small-batch tile derived from a fixed probe shape
 // rather than from whichever short batch happens to arrive first.
 constexpr int kMmqSmallProbeN = 64;
+// Token-count buckets for the numerics-neutral tile: bucket b covers
+// [kMmqDecompProbeN << b, kMmqDecompProbeN << (b+1)); the last is open-ended.
+// Fixed constants (never derived from a live n), so every n maps to exactly
+// one bucket and a class has a bounded number of entries.
+constexpr int kMmqBucketCount = 8;
+
+int mmq_n_bucket(int n) {
+  int b = 0;
+  long long hi = 2LL * kMmqDecompProbeN;
+  while (n >= hi && b + 1 < kMmqBucketCount) {
+    ++b;
+    hi <<= 1;
+  }
+  return b;
+}
 constexpr double kMmqDecompSwitchMargin = 0.03;
 constexpr double kMmqTileSwitchMargin = 0.03;
 
@@ -1657,16 +1683,46 @@ struct MmqClassKeyHash {
   }
 };
 
-// The tuner's result for a class: the prefill J, the continuation J measured
-// at the fixed small probe width (0 when unknown), and the decomposition.
+// A numerics-neutral tile: the same class plus the token-count bucket it was
+// measured in. bucket == -1 is the class-wide tile used under stream-k, whose
+// J changes the reduction rounding and so must not follow n.
+struct MmqTileKey {
+  int type;
+  int rows;
+  int bpr;
+  int bucket;
+  bool operator==(const MmqTileKey&) const = default;
+};
+
+struct MmqTileKeyHash {
+  std::size_t operator()(const MmqTileKey& k) const noexcept {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    h ^= std::uint64_t(std::uint32_t(k.type)) * 0xC2B2AE3D27D4EB4Full;
+    h ^= std::uint64_t(std::uint32_t(k.rows)) * 0x165667B19E3779F9ull;
+    h ^= std::uint64_t(std::uint32_t(k.bpr)) * 0x9E3779B185EBCA87ull;
+    h ^= std::uint64_t(std::uint32_t(k.bucket)) * 0x27D4EB2F165667C5ull;
+    return std::size_t(h ^ (h >> 29));
+  }
+};
+
+// The tuner's result for a call: the tile J, the decomposition, and the
+// continuation J measured at the fixed small probe width (0 when unknown).
 struct MmqChoice {
   int j;
   MmqDecomp decomp;
   int j_small = 0;
 };
 
+// Class-wide facts: the numerics-bearing decomposition and the fixed-width
+// continuation tile.
+struct MmqClassChoice {
+  MmqDecomp decomp;
+  int j_small = 0;
+};
+
 std::mutex g_mmq_j_mutex;
-std::unordered_map<MmqClassKey, MmqChoice, MmqClassKeyHash> g_mmq_j_choice;
+std::unordered_map<MmqClassKey, MmqClassChoice, MmqClassKeyHash> g_mmq_class;
+std::unordered_map<MmqTileKey, int, MmqTileKeyHash> g_mmq_tile;
 
 // Scratch for the fixed split-K partials (one J*I block per work unit; see
 // split_k_scratch_floats). Grown, never shrunk.
@@ -1718,6 +1774,20 @@ void mmq_launch(int J, MmqDecomp decomp, const char* w, const int* y, float* dst
   }
 }
 
+// Disk keys. c6: the decomposition and the continuation tile moved to the
+// class record and J became a per-bucket tile record, so a c5 entry can serve
+// as neither.
+std::string mmq_class_disk_key(int type, int M, int bpr) {
+  return std::string("c6:t") + std::to_string(type) + "-M" + std::to_string(M) +
+         "-bpr" + std::to_string(bpr);
+}
+
+std::string mmq_tile_disk_key(int type, int M, int bpr, int bucket) {
+  std::string key = mmq_class_disk_key(type, M, bpr);
+  key += bucket < 0 ? "-nk" : "-n" + std::to_string(bucket);
+  return key;
+}
+
 template <int Type>
 MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
                        int bpr, MmqDecomp requested, cudaStream_t stream) {
@@ -1736,83 +1806,121 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   if (forced != 0) return MmqChoice{forced, policy};
   if (runtime::feature_disabled(runtime::Feature::Autotune)) return fallback;
 
-  // The class entry's J is a prefill tile: it is applied only at the probe
-  // scale and above. Below it, upstream's per-call rule (select_J(n)) applies
-  // -- a tile tuned at n=512 computes up to twice the requested columns at
-  // continuation scale (measured: reuse 512+64 78.1 ms with the class tile vs
-  // 66.1 ms with upstream's, n=64 prefill 1769 vs 2712 tok/s). J is
-  // numerics-neutral either way (test_cuda_quant: "mmq J invariant ... tiled
-  // identical"), so this does not weaken batch invariance: the decomposition,
-  // which does change the summation order, stays class-wide for every n.
-  const auto apply_regime = [&](MmqChoice c) -> MmqChoice {
-    if (decomp_pinned) c.decomp = policy;
-    if (n < kMmqDecompProbeN) c.j = c.j_small > 0 ? c.j_small : heuristic;
-    return c;
-  };
-
+  // The probe-scale tile is applied only at the probe scale and above. Below
+  // it, upstream's per-call rule (select_J(n)) applies -- a wide tile computes
+  // up to twice the requested columns at continuation scale (measured: reuse
+  // 512+64 78.1 ms with the class tile vs 66.1 ms with upstream's, n=64
+  // prefill 1769 vs 2712 tok/s). The class keeps its fixed-width continuation
+  // tile for that regime. J is numerics-neutral under tiled (test_cuda_quant:
+  // "mmq tiled J candidates write identical output"), which is what lets the
+  // probe tile follow the token-count bucket; the decomposition stays
+  // class-wide for every n.
+  const bool probe_scale = n >= kMmqDecompProbeN;
   const MmqClassKey key{Type, M, bpr};
+
+  // Class-wide facts: the decomposition and the continuation tile.
+  bool have_class = false;
+  MmqClassChoice cls{policy, 0};
   {
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-    const auto it = g_mmq_j_choice.find(key);
-    if (it != g_mmq_j_choice.end()) return apply_regime(it->second);
-    if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return fallback;
+    if (const auto it = g_mmq_class.find(key); it != g_mmq_class.end()) {
+      cls = it->second;
+      have_class = true;
+    }
   }
-
-  // Step 7 persistence, step 9 keys: one entry per class, holding both
-  // numerics-neutral tiles and the class decomposition. The key is versioned
-  // because changes to what a stored J means or to the cost it was measured
-  // under invalidate the entry: c4 = step-9 candidate set, regime rule and
-  // continuation-tile selection; c5 = the tiled launch's block order (token
-  // tile fastest, for L2 weight reuse), which changes the tiled cost per J.
-  const std::string disk_key =
-      std::string("c5:t") + std::to_string(Type) + "-M" + std::to_string(M) +
-      "-bpr" + std::to_string(bpr);
-  {
+  if (!have_class) {
     const std::map<std::string, int> cached =
-        ::sonicboom::tune::lookup("mmq-j", disk_key);
-    const auto jt = cached.find("j");
+        ::sonicboom::tune::lookup("mmq-j", mmq_class_disk_key(Type, M, bpr));
     const auto dt = cached.find("decomp");
     const auto st = cached.find("j_small");
-    if (jt != cached.end() && dt != cached.end()) {
-      bool valid_j = false;
-      for (int J : kMmqTuneJs) valid_j = valid_j || (J == jt->second);
+    if (dt != cached.end() && dt->second >= int(MmqDecomp::Tiled) &&
+        dt->second <= int(MmqDecomp::StreamK)) {
       const int j_small = st != cached.end() ? st->second : 0;
-      if (valid_j && dt->second >= int(MmqDecomp::Tiled) &&
-          dt->second <= int(MmqDecomp::StreamK)) {
-        const MmqChoice c{jt->second,
-                          static_cast<MmqDecomp>(dt->second), j_small};
-        std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-        g_mmq_j_choice.emplace(key, c);
-        return apply_regime(c);
+      cls = MmqClassChoice{static_cast<MmqDecomp>(dt->second), j_small};
+      have_class = true;
+      std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+      g_mmq_class.emplace(key, cls);
+    }
+  }
+
+  // The decomposition a stored tile belongs to. The env pin wins (ablation);
+  // otherwise the record's class-wide choice stands.
+  const MmqDecomp active = decomp_pinned ? policy : cls.decomp;
+  // A tiled tile is numerics-neutral and may follow the bucket; a stream-k
+  // tile is not, so it keeps one class-wide entry.
+  const int bucket =
+      active == MmqDecomp::StreamK ? -1 : mmq_n_bucket(n);
+
+  int tile_j = heuristic;
+  bool have_tile = false;
+  if (probe_scale) {
+    const MmqTileKey tkey{Type, M, bpr, bucket};
+    {
+      std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+      if (const auto it = g_mmq_tile.find(tkey); it != g_mmq_tile.end()) {
+        tile_j = it->second;
+        have_tile = true;
+      }
+    }
+    if (!have_tile) {
+      const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
+          "mmq-j", mmq_tile_disk_key(Type, M, bpr, bucket));
+      const auto jt = cached.find("j");
+      if (jt != cached.end()) {
+        bool valid_j = false;
+        for (int J : kMmqTuneJs) valid_j = valid_j || (J == jt->second);
+        if (valid_j) {
+          tile_j = jt->second;
+          have_tile = true;
+          std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+          g_mmq_tile.emplace(tkey, tile_j);
+        }
       }
     }
   }
 
+  const auto compose = [&](int j_probe) -> MmqChoice {
+    MmqChoice c{probe_scale ? j_probe
+                            : (cls.j_small > 0 ? cls.j_small : heuristic)};
+    c.decomp = active;
+    c.j_small = cls.j_small;
+    return c;
+  };
+  if (have_class && (!probe_scale || have_tile)) return compose(tile_j);
+  if (!probe_scale) return compose(heuristic);
+
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
-    return fallback;
+    return compose(heuristic);
 
-  // Do not pin a class from a batch too small to fill the device: the entry is
-  // stored for every later n of that class, so a decode-scale first call would
-  // otherwise decide the tile width and the decomposition of the prefill.
-  if (n < kMmqDecompProbeN) return fallback;
+  // Do not pin a class from a batch too small to fill the device (handled
+  // above by the regime); the class record is stored for every later n.
+  if (!have_class) {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    if (g_mmq_class.size() >= kMmqTuneKeyCap) return fallback;
+  }
 
   // Candidate set: upstream's mmq_x values (every multiple of 8, the whole
-  // non-fallback Ampere J set) x the two decompositions. A pinned
-  // decomposition times only itself. Our stream-k is a fixed split over K;
-  // when it degenerates to one part it is the tiled kernel bit for bit, so the
-  // duplicate candidate is skipped.
+  // non-fallback Ampere J set) x the decomposition. The first sweep for a
+  // class also times the alternative decomposition (a pinned decomposition
+  // times only itself; stream-k that degenerates to one part is the tiled
+  // kernel bit for bit, so that duplicate is skipped). A later bucket re-uses
+  // the class decomposition and sweeps only its own tile.
   MmqDecomp candidates[2];
   int ncandidates = 0;
-  candidates[ncandidates++] = policy;
-  if (!decomp_pinned) {
-    const MmqDecomp other =
-        policy == MmqDecomp::StreamK ? MmqDecomp::Tiled : MmqDecomp::StreamK;
-    const bool other_is_kernel =
-        other != MmqDecomp::StreamK ||
-        mmq::split_k_parts(M, bpr, mmq::qk_of<Type>(), mmq_sm_count()) >= 2;
-    if (other_is_kernel) candidates[ncandidates++] = other;
+  if (have_class) {
+    candidates[ncandidates++] = active;
+  } else {
+    candidates[ncandidates++] = policy;
+    if (!decomp_pinned) {
+      const MmqDecomp other =
+          policy == MmqDecomp::StreamK ? MmqDecomp::Tiled : MmqDecomp::StreamK;
+      const bool other_is_kernel =
+          other != MmqDecomp::StreamK ||
+          mmq::split_k_parts(M, bpr, mmq::qk_of<Type>(), mmq_sm_count()) >= 2;
+      if (other_is_kernel) candidates[ncandidates++] = other;
+    }
   }
 
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
@@ -1861,8 +1969,10 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
       // The same tile at the fixed continuation width: dst has at least
       // kMmqDecompProbeN columns at this point, so writing
       // kMmqSmallProbeN columns is in bounds and touches only the columns the
-      // following real launch would rewrite anyway.
-      const float ms_small = time_one(J, decomp, kMmqSmallProbeN);
+      // following real launch would rewrite anyway. It is class-wide, so a
+      // later bucket does not measure it again.
+      const float ms_small =
+          have_class ? -1.0f : time_one(J, decomp, kMmqSmallProbeN);
       if (ms >= 0.0f) {
         if (J == heuristic) {
           heur_ms[c] = ms;
@@ -1928,21 +2038,38 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
       best_ms = chosen_ms[c];
     }
   }
-  const MmqChoice best{chosen_j[best_c], candidates[best_c],
-                       chosen_j_small[best_c]};
-  {
+  const MmqDecomp chosen_decomp = candidates[best_c];
+  const int best_small = have_class
+                             ? cls.j_small
+                             : (cand_have_small[best_c]
+                                    ? chosen_j_small[best_c]
+                                    : 0);
+  const MmqChoice best{chosen_j[best_c], chosen_decomp, best_small};
+
+  // The class record is written once; the tile record of the bucket this call
+  // probed in is written on every sweep.
+  const int record_bucket =
+      chosen_decomp == MmqDecomp::StreamK ? -1 : mmq_n_bucket(n);
+  if (!have_class) {
+    ::sonicboom::tune::store(
+        "mmq-j", mmq_class_disk_key(Type, M, bpr),
+        {{"decomp", int(chosen_decomp)}, {"j_small", best.j_small}});
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-    g_mmq_j_choice.emplace(key, best);
+    g_mmq_class.emplace(key, MmqClassChoice{chosen_decomp, best.j_small});
   }
   ::sonicboom::tune::store(
-      "mmq-j", disk_key,
-      {{"j", best.j}, {"decomp", int(best.decomp)}, {"j_small", best.j_small}});
+      "mmq-j", mmq_tile_disk_key(Type, M, bpr, record_bucket),
+      {{"j", best.j}});
+  {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    g_mmq_tile.emplace(MmqTileKey{Type, M, bpr, record_bucket}, best.j);
+  }
   if (verbose) {
     std::fprintf(stderr,
-                 "[autotune] mmq type=%d M=%d bpr=%d (probe n=%d) "
+                 "[autotune] mmq type=%d M=%d bpr=%d (probe n=%d, bucket %d) "
                  "decomp=%s J=%d %.3f ms, small J=%d (heuristic %d/%d); "
                  "%s J=%d %.3f ms, small J=%d\n",
-                 Type, M, bpr, n,
+                 Type, M, bpr, n, record_bucket,
                  best.decomp == MmqDecomp::StreamK ? "stream_k" : "tiled",
                  best.j, best_ms, best.j_small, heuristic, heuristic_small,
                  ncandidates > 1

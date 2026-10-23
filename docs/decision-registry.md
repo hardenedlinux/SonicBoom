@@ -30,6 +30,18 @@ A decision is `(name, scope)` plus:
 size or a KV position, so a reused prefix and a full prefill resolve the same
 way (R1: no algorithm selected by `n` inside a class).
 
+The one permitted exception is a knob **proven numerics-neutral**: every one of
+its settings writes the same bytes, so a choice that moves with the batch
+cannot make two calls that share rows disagree. MMQ's J tile is the declared
+case — it selects the token-tile width only, the K-reduction order and the
+split-K schedule are independent of it, and `test_cuda_quant` asserts that
+every tiled J candidate writes identical output. Its entry gains a fixed
+token-count bucket (`…-n<b>`, a static 2× ladder from 128 tokens, never the
+live `n`), so a small-batch caller can no longer pin the tile that a
+prefill-scale caller (e.g. the DiT at 4113 tokens) needs. Knobs that change the
+summation order — MMQ's decomposition, stored as a class-wide record — get no
+such bucket; R1 applies to them unchanged.
+
 The first record for a `(name, scope)` pair wins. Repeating the same value is a
 no-op; a different value is a conflict, counted and dropped rather than
 silently replacing an earlier decision. `sb-explain` exits 2 if any conflict

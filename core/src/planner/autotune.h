@@ -27,9 +27,13 @@
 //   /<gpu-name>-sm<arch>-<driver>/<op>.json
 // Each file is a JSON object of shape-class -> object-of-int. A missing or
 // unreadable file is an empty cache; the first tuner run rewrites the whole
-// file. Choices are per (op, shape class, GPU), never per batch size or
-// position: the same shape class must resolve the same way for a reused
-// prefix and a full prefill.
+// file. Choices are per (op, shape class, GPU). A key never carries a live
+// batch size or position: the same shape class must resolve the same way for a
+// reused prefix and a full prefill. The one exception is a knob whose every
+// setting writes identical bytes (MMQ's J tile): the tuner may add a fixed
+// token-count bucket to that key, because the value cannot change the numerics
+// while the optimal tile does move with batch scale. A knob that changes the
+// summation order never gets such a bucket.
 //
 // Switches (ablation groups):
 //   SONICBOOM_AUTOTUNE=0      use the static per-class defaults, never tune
