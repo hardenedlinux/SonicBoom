@@ -161,6 +161,8 @@
      (list 400 "invalid_request_error"
            (format #f "the prompt has ~a tokens, the context length is ~a" n ctx)
            "messages" "context_length_exceeded"))
+    (('invalid-constraint param message)
+     (list 400 "invalid_request_error" message param "invalid_constraint"))
     (_ (list 500 "server_error" (format #f "~a: ~s" key args) 'null 'null))))
 
 (define (error-object-of key args)

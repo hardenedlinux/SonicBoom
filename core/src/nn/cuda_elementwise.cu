@@ -1649,6 +1649,43 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
 }
 
+// Constrained decoding's mask test: bit i of the bitmap at mask[i >> 3], least
+// significant bit first. The host guarantees the mask covers the whole row, so
+// there is no bounds test here.
+__device__ __forceinline__ bool mask_bit(const uint8_t* __restrict__ mask, int i) {
+  return ((mask[i >> 3] >> (i & 7)) & 1u) != 0;
+}
+
+// Masked single-block argmax: the single-block form above restricted to ids the
+// grammar mask allows. Disallowed lanes stay -INFINITY, so an all-disallowed row
+// reduces to the same -1 output as an all-NaN one.
+__global__ void argmax_masked_kernel(const float* __restrict__ x,
+                                     const uint8_t* __restrict__ mask,
+                                     float* __restrict__ out, int n) {
+  __shared__ float s_val[1024];
+  __shared__ int s_idx[1024];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  for (int i = tid; i < n; i += blockDim.x) {
+    if (!mask_bit(mask, i)) continue;
+    if (x[i] > mv) { mv = x[i]; mi = i; }
+  }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
 // Packed argmax candidate: value in the high word as a monotone unsigned key
 // (so an unsigned compare orders floats including +/-inf), index in the low word
 // as 0xFFFFFFFF - i (so the *largest* packed key is the largest value and, on a
@@ -1689,6 +1726,46 @@ __global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
   if (blockIdx.x == 0 && tid == 0)
     for (int i = 4 * n4; i < n; ++i)
       if (x[i] > mv) { mv = x[i]; mi = i; }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
+}
+
+// Masked multi-block argmax: structure and reduction order identical to
+// argmax_partial_kernel, with each lane skipped when the mask disallows it.
+__global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
+                                             const uint8_t* __restrict__ mask,
+                                             int n,
+                                             unsigned long long* __restrict__ keys) {
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  const float4* x4 = reinterpret_cast<const float4*>(x);
+  const int n4 = n >> 2;
+  for (int i = blockIdx.x * blockDim.x + tid; i < n4;
+       i += gridDim.x * blockDim.x) {
+    const float4 v = x4[i];
+    const int b = 4 * i;
+    if (mask_bit(mask, b + 0) && v.x > mv) { mv = v.x; mi = b + 0; }
+    if (mask_bit(mask, b + 1) && v.y > mv) { mv = v.y; mi = b + 1; }
+    if (mask_bit(mask, b + 2) && v.z > mv) { mv = v.z; mi = b + 2; }
+    if (mask_bit(mask, b + 3) && v.w > mv) { mv = v.w; mi = b + 3; }
+  }
+  if (blockIdx.x == 0 && tid == 0)
+    for (int i = 4 * n4; i < n; ++i)
+      if (mask_bit(mask, i) && x[i] > mv) { mv = x[i]; mi = i; }
   s_val[tid] = mv;
   s_idx[tid] = mi;
   __syncthreads();
@@ -5413,6 +5490,29 @@ bool argmax_dev(const float* x, int n, float* out) {
   if (!keys) return false;
   SB_NOTE_LAUNCH(argmax_partial_kernel, grid, kThreads, 0, cur_stream());
   argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
+  SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
+  argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !mask || !out) return false;
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    SB_NOTE_LAUNCH(argmax_masked_kernel, 1, 1024, 0, cur_stream());
+    argmax_masked_kernel<<<1, 1024, 0, cur_stream()>>>(x, mask, out, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * sizeof(unsigned long long)));
+  if (!keys) return false;
+  SB_NOTE_LAUNCH(argmax_partial_masked_kernel, grid, kThreads, 0, cur_stream());
+  argmax_partial_masked_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
   SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;

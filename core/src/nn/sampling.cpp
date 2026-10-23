@@ -37,4 +37,15 @@ int64_t argmax(std::span<const float> x) {
   return best;
 }
 
+int64_t argmax_masked(std::span<const float> x, std::span<const uint8_t> mask) {
+  int64_t best = -1;
+  for (size_t i = 0; i < x.size(); ++i) {
+    const size_t byte = i >> 3;
+    if (byte >= mask.size()) break;
+    if (((mask[byte] >> (i & 7)) & 1u) == 0) continue;
+    if (best < 0 || x[i] > x[size_t(best)]) best = int64_t(i);
+  }
+  return best;
+}
+
 } // namespace sonicboom::nn

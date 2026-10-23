@@ -27,12 +27,19 @@
 ;;; appends it, so the following step continues from it.
 ;;;
 ;;; Sampling parameters and the random state live in a sampler (one per
-;;; request). A constraint is an optional token filter for constrained
-;;; decoding (tool calls, JSON output): a procedure
-;;;   (constraint candidates) -> candidates
-;;; over a list of candidate token ids, returning the allowed ones. A backend
-;;; that samples on the device turns it into a mask; the reference sampler
-;;; below applies it to its candidate list.
+;;; request). A constraint is an optional filter for constrained decoding (tool
+;;; calls, JSON output). Two forms exist:
+;;;   - a procedure (candidates) -> candidates over a list of token ids,
+;;;     returning the allowed ones. That is what a backend with host logits
+;;;     uses, and what sample-from-logits applies; and
+;;;   - a <constraint> record, which names a grammar as its source text (a GBNF
+;;;     document or a JSON Schema). A backend whose decoder supports grammars
+;;;     installs it on the session at prefill; one that does not ignores it.
+;;; A <constraint> has no host-side filter (its filter field is #f), because
+;;; compiling a grammar to a token mask needs the model's vocabulary.
+;;;
+;;; The grammar is applied from prefill on: prefill takes the constraint, so
+;;; the first token sampled at the end of the prompt is already masked.
 
 (define-module (sonicboom serve backend)
   #:use-module (srfi srfi-1)
@@ -52,6 +59,10 @@
             make-sampler sampler? sampler-temperature sampler-top-p
             sampler-top-k sampler-seed sampler-greedy? sampler-random-state
             sample-from-logits
+
+            make-json-schema-constraint make-tool-call-constraint
+            make-gbnf-constraint constraint? constraint-kind constraint-text
+            constraint-filter
 
             common-prefix-length))
 
@@ -98,8 +109,9 @@
 ;;   free-session   (session)                      -> unspecified
 ;;   fork-session   (session n)                    -> session handle, or #f
 ;;                  for a backend that can't copy a KV prefix (optional)
-;;   prefill        (session token-ids)            -> reused count
-;;   step           (session sampler constraint)   -> token id
+;;   prefill        (session token-ids constraint) -> reused count
+;;   step           (session sampler constraint)   -> token id, or #f when the
+;;                  constraint has closed the reply (nothing left to produce)
 ;;   stats          (model)                        -> alist (optional)
 ;; The sampling? capability says whether `step` honors the sampler's
 ;; temperature / top-p / top-k. A greedy-only backend (the libsonicboom one:
@@ -213,9 +225,9 @@
                    ((%backend-fork-session (model-backend model))
                     (session-handle session) n))))
 
-(define (prefill session tokens)
+(define* (prefill session tokens #:optional (constraint #f))
   ((%backend-prefill (model-backend (session-model session)))
-   (session-handle session) tokens))
+   (session-handle session) tokens constraint))
 
 (define* (step session sampler #:optional (constraint #f))
   ((%backend-step (model-backend (session-model session)))
@@ -223,6 +235,37 @@
 
 (define (backend-stats model)
   ((%backend-stats (model-backend model)) (model-handle model)))
+
+;;; ---------------------------------------------------------------------------
+;;; Constraints
+;;;
+;;; kind is one of
+;;;   'json-schema  text is the JSON Schema the whole reply must be a value of;
+;;;   'tool-call    text is the JSON Schema of one call object ({name,
+;;;                 arguments}); the backend adds the <tool_call> envelope;
+;;;   'gbnf         text is the grammar itself.
+;;; filter is #f for every grammar constraint: only the tokenizer's vocabulary
+;;; can turn a grammar into a candidate list.
+
+(define-record-type <constraint>
+  (%make-constraint kind text filter)
+  constraint?
+  (kind constraint-kind)
+  (text constraint-text)
+  (filter constraint-filter))
+
+(define (make-json-schema-constraint schema-json)
+  "The reply must be one JSON value of SCHEMA-JSON."
+  (%make-constraint 'json-schema schema-json #f))
+
+(define (make-tool-call-constraint call-schema-json)
+  "The reply must be one <tool_call> envelope whose object is a value of
+CALL-SCHEMA-JSON."
+  (%make-constraint 'tool-call call-schema-json #f))
+
+(define (make-gbnf-constraint gbnf)
+  "The reply must be text the GBNF grammar accepts."
+  (%make-constraint 'gbnf gbnf #f))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Sampler: the parameters of one request, plus its random state
@@ -251,8 +294,13 @@
 ;; logits: list of (token . logit). constraint: #f or a token filter.
 ;; Order: constraint, then greedy, else temperature, top-k, top-p, draw.
 (define (sample-from-logits sampler logits constraint)
-  (let* ((allowed (if constraint
-                      (let ((ok (constraint (map car logits))))
+  ;; A grammar constraint carries no host filter: a backend that cannot apply
+  ;; grammars samples unconstrained rather than rejecting every token.
+  (let ((keep (if (constraint? constraint)
+                  (constraint-filter constraint)
+                  constraint)))
+    (let* ((allowed (if keep
+                      (let ((ok (keep (map car logits))))
                         (filter (lambda (p) (memv (car p) ok)) logits))
                       logits))
          (sorted (sort allowed (lambda (a b) (> (cdr a) (cdr b))))))
@@ -283,7 +331,7 @@
             (let ((acc (+ acc (cdar ns))))
               (if (or (null? (cdr ns)) (< r acc))
                   (caar ns)
-                  (lp (cdr ns) acc))))))))
+                  (lp (cdr ns) acc)))))))))
 
 ;;; ---------------------------------------------------------------------------
 

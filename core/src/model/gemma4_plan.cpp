@@ -863,9 +863,15 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 // ---------------------------------------------------------------------------
 uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
                         uint64_t start_pos, std::span<int64_t> tokens,
-                        uint64_t n_ctx) {
+                        uint64_t n_ctx, std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
 
@@ -912,11 +918,15 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
     }
     std::span<const float> lf(reinterpret_cast<const float*>(logits.data()), vocab);
 
-    const int64_t next = nn::argmax(lf);
+    const int64_t next =
+        masked ? nn::argmax_masked(lf, sample_mask) : nn::argmax(lf);
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
     ++pos;
+    // A mask constrains the next position only: the caller accepts this token
+    // and recomputes the mask before the next call.
+    if (masked) { ++step; break; }
   }
   return step;
 }
@@ -927,9 +937,16 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 uint64_t generate_prefill_spine(const Gemma4Model& m,
                                 std::span<const uint64_t> prompt,
                                 uint64_t start_pos, std::span<int64_t> tokens,
-                                uint64_t n_ctx, bool use_prefill) {
+                                uint64_t n_ctx, bool use_prefill,
+                                std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[prefill-spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
   auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
@@ -1006,11 +1023,14 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     }
   }
 
-  const int64_t first = nn::argmax(logits);
+  const int64_t first =
+      masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
   if (first < 0) return 0;
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
+  // A mask constrains this one position (see plan.h): one token per call.
+  if (masked) return 1;
 
   // Decode the remaining tokens with the same planner/backend/cache.
   for (step = 1; step < tokens.size(); ++step) {
@@ -1378,6 +1398,14 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  // One-step capture on the same chunked backend, used only by constrained
+  // decoding: the chunk graph replays k steps from device-side feedback, so a
+  // host-computed grammar mask can only be applied between replays, while this
+  // program reads the staged carry token and position slot 0 and writes token
+  // slot 0 — one mask upload, one step. Null when chunking is off (the plain
+  // `prog` already is one step).
+  std::unique_ptr<hal::StepProgram> prog_one;
+  std::shared_ptr<void> prog_one_cache;
   // The cache vector `prog` was recorded against. A capture bakes the KV cache's
   // device pointers in, and a prefill session can adopt a different vector; a
   // caller that replays `prog` must state that the cache it shares is this one
@@ -2153,6 +2181,14 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   auto rt = build_decode_runtime(m, n_ctx);
   if (!rt) return nullptr;
 
+  // The Argmax mask buffer (constrained decoding). It is allocated here, before
+  // any capture, because the captured graphs bake the Argmax kernel choice in:
+  // with the buffer present the masked kernel is recorded for every decode
+  // runtime, and all-ones makes it bit-identical to the unmasked one. A runtime
+  // without it (the build failed) simply cannot be constrained.
+  if (m.config.vocab_size > 0)
+    rt->cuda->argmax_mask_init(size_t((m.config.vocab_size + 7) / 8));
+
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
   if (cuda_graph_decode_enabled()) {
@@ -2179,6 +2215,19 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       rt->cuda->seed_token(0);
       rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
       if (rt->prog) rt->prog_cache = rt->cuda->cache_identity();
+      // Constrained decoding's one-step view of the same chunked backend: step
+      // 0 reads the staged carry token and position 0, writes token 0.
+      if (rt->prog && k > 1) {
+        auto run_one = [&]() {
+          if (!rt->cuda->set_step_index(0)) return false;
+          std::vector<sx::Bytes> in;
+          in.push_back(encode_i64(0));
+          in.push_back(encode_i64(0));
+          return bool(rt->exec->execute(rt->plan, rt->snap, in));
+        };
+        rt->prog_one = rt->cuda->record_step(run_one);
+        if (rt->prog_one) rt->prog_one_cache = rt->cuda->cache_identity();
+      }
     }
     // No re-playable graph (capture failed, e.g. a plan whose decode step has a
     // host task): the executor loop stages the single pos/token slots itself,
@@ -2633,9 +2682,16 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
 
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
-                             uint64_t n_ctx) {
+                             uint64_t n_ctx,
+                             std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const auto t_plan0 = std::chrono::steady_clock::now();
@@ -2657,8 +2713,59 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // warmed with a placeholder token, so every call re-seeds the real start token.
   rt->cuda->seed_token(start_token);
 
+  if (masked) {
+    // Constrained decoding: one masked step, then return (the caller accepts
+    // the token and supplies the next position's mask). The captured graphs bake
+    // in the masked Argmax kernel (get_decode_runtime initializes the mask
+    // buffer before capture), so this only stages the bitmap and the inputs.
+    if (!rt->cuda->set_argmax_mask(sample_mask)) {
+      std::cerr << "[spine] constrained step: mask upload failed\n";
+      return 0;
+    }
+    const std::string name = "decode_step_0";
+    if (nvtx_enabled()) nvtxRangePushA(name.c_str());
+    float next_f = -1.0f;
+    bool ok = true;
+    if (rt->prog_one) {
+      // One captured step on the chunked backend: carry + position slot 0 in,
+      // token slot 0 out. (The chunk graph cannot take a per-step host mask,
+      // which is why this second capture exists.)
+      std::vector<uint64_t> positions(rt->cuda->decode_chunk(), pos);
+      ok = rt->cuda->stage_chunk(*rt->prog_one, float(token), positions) &&
+           rt->prog_one->replay() &&
+           rt->cuda->read_chunk_tokens(&next_f, 1);
+    } else if (rt->prog) {
+      ok = rt->cuda->set_pos(pos) && rt->prog->replay() &&
+           rt->cuda->read_token(&next_f);
+    } else {
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+      rt->cuda->set_pos(pos);
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
+      ok = bool(res) && !res->outputs.empty() &&
+           res->outputs[0].size() >= sizeof(float);
+      if (ok) next_f = *reinterpret_cast<const float*>(res->outputs[0].data());
+    }
+    if (nvtx_enabled()) nvtxRangePop();
+    if (!ok) {
+      std::cerr << "[spine] constrained step failed\n";
+      return 0;
+    }
+    const int64_t next = int64_t(next_f);
+    if (next < 0) return 0;  // the mask allowed nothing (the grammar is stuck)
+    tokens[0] = next;
+    t_first = std::chrono::steady_clock::now();
+    step = 1;
+  } else {
+    // An unconstrained call must not replay a previous call's grammar mask.
+    rt->cuda->clear_argmax_mask();
+  }
+
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
+  if (masked) {
+    // the masked single step above already produced the call's one token
+  } else if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
       rt->prog) {
     // The speculative program drives the loop. There is no captured prefill
     // here, so the drafter starts from an empty history: its proposals are
@@ -3086,9 +3193,16 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                          std::span<int64_t> tokens,
                                          uint64_t n_ctx, bool use_prefill,
                                          planner::KvCacheSession* session,
-                                         std::span<const uint64_t> history) {
+                                         std::span<const uint64_t> history,
+                                         std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[prefill-cuda] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const bool dump_logits = std::getenv("SONICBOOM_DUMP_LOGITS") != nullptr;
@@ -3136,6 +3250,18 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
     if (!dump_rt) return 0;
     rt = dump_rt.get();
+  }
+  // Either stage this call's grammar mask or make sure a previous call's mask
+  // cannot leak into this one. The prefill branch samples on the host (masked
+  // argmax below); the per-token reference branch goes through the backend's
+  // Argmax, which reads the device mask.
+  if (masked && !use_prefill) {
+    if (!rt->cuda->set_argmax_mask(sample_mask)) {
+      std::cerr << "[prefill-cuda] sample mask upload failed\n";
+      return 0;
+    }
+  } else if (!masked) {
+    rt->cuda->clear_argmax_mask();
   }
   const planner::ResourceSnapshot& snap = rt->snap;
   // Cost model for planning a prefill segment graph the first time it is seen
@@ -3445,7 +3571,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
           std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n";
           return 0;
         }
-        first = nn::argmax(logits);
+        first = masked ? nn::argmax_masked(logits, sample_mask)
+                       : nn::argmax(logits);
         if (dump_logits) {
           std::vector<float> capped(vocab);
           const float cap = m.config.final_logit_softcapping;
@@ -3504,6 +3631,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
   step = 1;  // tokens[0] is `first`; the decode loop continues from index 1
+  // Constrained decoding: the mask covers this one position (plan.h), so the
+  // call ends here; the caller accepts the token and supplies the next mask.
+  if (masked) return step;
   // The decode loop below reads the next token id from the device slot, which the
   // reference path already left at `first`; the prefill path never ran an
   // Embedding/Argmax step, so seed it explicitly (Phase 3.2 B4). The cached
@@ -4034,7 +4164,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<int64_t> tokens,
                                             planner::KvCacheSession& session,
                                             bool use_prefill,
-                                            uint64_t* n_reused_out) {
+                                            uint64_t* n_reused_out,
+                                            std::span<const uint8_t> sample_mask) {
   if (n_reused_out) *n_reused_out = 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
 
@@ -4100,7 +4231,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // reuse tail.
   const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
                                                  tokens, n_ctx, use_prefill,
-                                                 &session, prompt);
+                                                 &session, prompt, sample_mask);
   if (done == 0) return 0;
 
   // Record every token whose KV this call actually wrote, for the next

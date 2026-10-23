@@ -15,6 +15,8 @@
 (define-module (sonicboom serve openai)
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
+  #:use-module (json)
+  #:use-module (sonicboom serve backend)
   #:use-module (sonicboom serve engine)
   #:use-module (sonicboom serve chat-template)
   #:export (parse-chat-request
@@ -101,6 +103,57 @@
        name))
     (_ (invalid "tool_choice must be a string or an object" "tool_choice"))))
 
+;; response_format: {"type": "text"} (the default), {"type": "json_object"}, or
+;; {"type": "json_schema", "json_schema": {"name": ..., "schema": <schema>}}.
+;; The schema is passed on as JSON text; the backend compiles it.
+(define (check-response-format v)
+  (match v
+    (#f #f)
+    ((? object? o)
+     (let ((type (ref o "type")))
+       (cond
+        ((equal? type "text") #f)
+        ((equal? type "json_object")
+         (make-json-schema-constraint "{\"type\":\"object\"}"))
+        ((equal? type "json_schema")
+         (let* ((js (ref o "json_schema"))
+                (schema (and (object? js) (ref js "schema"))))
+           (unless (object? schema)
+             (invalid "response_format.json_schema.schema must be an object"
+                      "response_format"))
+           (make-json-schema-constraint (scm->json-string schema))))
+        (else
+         (invalid "response_format.type must be text, json_object or json_schema"
+                  "response_format")))))
+    (_ (invalid "response_format must be an object" "response_format"))))
+
+;; One tool's call object: the name restricted to that tool, the arguments to
+;; its parameters schema.
+(define (tool-call-schema tool)
+  (let* ((fn (ref tool "function"))
+         (name (ref fn "name"))
+         (params (or (ref fn "parameters") '(("type" . "object")))))
+    `(("type" . "object")
+      ("properties" . (("name" . (("const" . ,name)))
+                       ("arguments" . ,params)))
+      ("required" . #("name" "arguments"))
+      ("additionalProperties" . #f))))
+
+;; A tool-call constraint only for a forced call: "required" (any of the tools,
+;; as an anyOf alternation) or a named function. "auto" leaves the model free
+;; to answer in text, so there is no grammar that could apply to the reply.
+(define (tool-choice-constraint tools tool-choice)
+  (cond
+   ((or (null? tools) (member tool-choice '("none" "auto"))) #f)
+   ((string=? tool-choice "required")
+    (make-tool-call-constraint
+     (scm->json-string `(("anyOf" . ,(list->vector (map tool-call-schema tools)))))))
+   (else  ; a function name, already checked against tools
+    (make-tool-call-constraint
+     (scm->json-string
+      (tool-call-schema
+       (find (lambda (t) (equal? (ref (ref t "function") "name") tool-choice)) tools)))))))
+
 (define (check-stop v)
   (match v
     (#f '())
@@ -149,12 +202,16 @@
                       (invalid "seed must be an integer" "seed"))
                     (abs v))))
          (tools (check-tools (ref body "tools")))
-         (tool-choice (check-tool-choice (ref body "tool_choice") tools)))
+         (tool-choice (check-tool-choice (ref body "tool_choice") tools))
+         ;; An explicit response_format is the reply's shape and wins; a forced
+         ;; tool call shapes it only when no response_format is asked for.
+         (constraint (or (check-response-format (ref body "response_format"))
+                         (tool-choice-constraint tools tool-choice))))
     (values (make-chat-request #:model model #:messages messages
                                #:tools tools #:tool-choice tool-choice
                                #:max-tokens max-tokens #:stop (check-stop (ref body "stop"))
                                #:temperature temperature #:top-p top-p #:top-k top-k
-                               #:seed seed)
+                               #:seed seed #:constraint constraint)
             (eq? stream #t)
             include-usage)))
 

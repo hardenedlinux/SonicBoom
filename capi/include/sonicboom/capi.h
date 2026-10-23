@@ -576,6 +576,52 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
                         sb_llm_token_cb cb, void *user, uint32_t *n_out,
                         sb_error **err_out);
 
+/* --- Constrained decoding (session grammar) --------------------------------
+ *
+ * A session may carry a byte-level grammar that every sampled token must keep
+ * acceptable. `gbnf` is a GBNF document (the llama.cpp dialect: rule ::=
+ * alternation, "literals" with the usual escapes, [byte classes], . * + ? and
+ * {m,n}, # comments; the first rule is the start rule). The grammar consumes
+ * the same bytes sb_llm_detokenize would emit for a token, so it constrains the
+ * text the model produces, not token ids. The model's EOS ids (see
+ * sb_llm_model_eos) are the grammar's stop tokens: they are not text, may be
+ * sampled only where the grammar can end, and end the constrained output
+ * without being emitted.
+ *
+ * sb_llm_session_set_json_schema compiles a JSON Schema (one JSON document) to
+ * GBNF first; the supported subset is documented in
+ * core/include/sonicboom/vocab/grammar.h, and an unsupported keyword is
+ * rejected by name rather than silently ignored.
+ *
+ * A grammar starts at every sb_llm_prefill (a new turn) and applies to the
+ * first token sampled by that prefill and to every sb_llm_decode step. Once a
+ * stop token finishes it, sb_llm_decode produces no further tokens.
+ *
+ * sb_llm_session_constraint_state reports whether a grammar is installed
+ * (*active_out) and whether the text accepted so far is already a complete
+ * value of it (*complete_out). */
+/* sb_llm_json_schema_to_gbnf is the compiler alone, as text: it lets a caller
+ * compose a schema into a larger grammar instead of installing the schema as
+ * the whole reply. PREFIX and SUFFIX (may be NULL) are literal UTF-8 text the
+ * value must appear between; the root matches exactly that text, so a complete
+ * value can only be continued by a stop token.
+ * Two-call sizing like sb_llm_model_arch: *len_out always receives the length
+ * (without NUL), and a capacity that cannot hold the text plus its NUL returns
+ * SB_ERR_BINDING with nothing written. */
+sb_status sb_llm_json_schema_to_gbnf(const char *schema_json,
+                                     const char *prefix, const char *suffix,
+                                     char *out, size_t cap, size_t *len_out,
+                                     sb_error **err_out);
+sb_status sb_llm_session_set_grammar(sb_llm_session *session, const char *gbnf,
+                                     sb_error **err_out);
+sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
+                                         const char *schema_json,
+                                         sb_error **err_out);
+void sb_llm_session_clear_grammar(sb_llm_session *session);
+sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
+                                          int *active_out, int *complete_out,
+                                          sb_error **err_out);
+
 /* --- Decision registry (diagnostics) ---------------------------------------
  *
  * The runtime resolves every automatic choice -- reduction mode, spec probe,

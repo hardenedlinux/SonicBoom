@@ -233,6 +233,7 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (pos_ring_) g_alloc.deallocate(pos_ring_);
   if (token_ring_) g_alloc.deallocate(token_ring_);
   if (carry_buf_) g_alloc.deallocate(carry_buf_);
+  if (argmax_mask_) g_alloc.deallocate(argmax_mask_);
 }
 
 uint64_t SonicCudaBackend::pos_slot() const {
@@ -339,6 +340,37 @@ bool SonicCudaBackend::read_verify_tokens(float* host, int rows) const {
 
 bool SonicCudaBackend::synchronize() const {
   return g_alloc.synchronize();
+}
+
+bool SonicCudaBackend::argmax_mask_init(size_t bytes) {
+  if (argmax_mask_) return bytes <= argmax_mask_bytes_;
+  if (bytes == 0) return false;
+  argmax_mask_ = g_alloc.allocate(bytes);
+  if (!argmax_mask_) return false;
+  argmax_mask_bytes_ = bytes;
+  // Start all-allowed: an unconstrained step is then bit-identical to the
+  // unmasked kernel. A fresh allocation is not zeroed, and clear_argmax_mask
+  // only rewrites a dirty buffer, so mark it dirty first: without this the
+  // very first unconstrained decode in a process reads uninitialized mask
+  // bytes and the masked argmax can return -1 (nothing allowed).
+  argmax_mask_dirty_ = true;
+  return clear_argmax_mask();
+}
+
+bool SonicCudaBackend::set_argmax_mask(std::span<const uint8_t> mask) {
+  if (!argmax_mask_ || mask.size() != argmax_mask_bytes_) return false;
+  if (!g_alloc.copy_to_device(argmax_mask_, mask.data(), mask.size())) return false;
+  argmax_mask_dirty_ = true;
+  return true;
+}
+
+bool SonicCudaBackend::clear_argmax_mask() {
+  if (!argmax_mask_) return false;
+  if (argmax_mask_dirty_ &&
+      !g_alloc.fill(argmax_mask_, 0xFF, argmax_mask_bytes_))
+    return false;
+  argmax_mask_dirty_ = false;
+  return true;
 }
 
 std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
@@ -1848,15 +1880,32 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int vocab =
             int(in[0].device.size_bytes / sizeof(float) / uint64_t(vr));
         if (vocab <= 0) { ok = false; break; }
+        const bool masked =
+            argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
+        const auto* mask = reinterpret_cast<const uint8_t*>(
+            masked ? uintptr_t(argmax_mask_.id) : 0);
         for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::argmax_dev(dev(in[0]) + r * vocab, vocab, out + r);
+          ok = masked ? nn::cuda::argmax_masked_dev(dev(in[0]) + r * vocab, vocab,
+                                                    mask, out + r)
+                      : nn::cuda::argmax_dev(dev(in[0]) + r * vocab, vocab, out + r);
         if (ok && token_buf_)
           ok = device::device_copy(out_handle, token_out_slot(),
                                    size_t(vr) * sizeof(float));
         break;
       }
-      ok = nn::cuda::argmax_dev(dev(in[0]),
-                                int(in[0].device.size_bytes / sizeof(float)), out);
+      // The kernel choice is part of a captured decode graph: a backend whose
+      // mask buffer was initialized before capture always runs the masked form
+      // (all-ones = the unmasked result, bit for bit).
+      if (argmax_mask_) {
+        const int n = int(in[0].device.size_bytes / sizeof(float));
+        if (argmax_mask_bytes_ < size_t((n + 7) / 8)) { ok = false; break; }
+        ok = nn::cuda::argmax_masked_dev(
+            dev(in[0]), n,
+            reinterpret_cast<const uint8_t*>(uintptr_t(argmax_mask_.id)), out);
+      } else {
+        ok = nn::cuda::argmax_dev(dev(in[0]),
+                                  int(in[0].device.size_bytes / sizeof(float)), out);
+      }
       if (ok && token_buf_)
         ok = device::device_copy(out_handle, token_out_slot(), sizeof(float));
       break;

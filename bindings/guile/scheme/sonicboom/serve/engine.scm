@@ -246,7 +246,8 @@
       (dynamic-wind
         (lambda () #t)
         (lambda ()
-          (let ((cached (prefill session prompt-tokens)))
+          (let ((cached (prefill session prompt-tokens
+                                 (chat-request-constraint request))))
             ;; State of the text filter.
             (define decoded 0)             ; chars of the decoded text consumed
             (define buffer "")             ; undecided text
@@ -303,12 +304,18 @@
                  ((>= n limit) (feed! "" #t) "length")
                  (else
                   (let ((t (step session sampler (chat-request-constraint request))))
-                    (set! generated (cons t generated))
                     (cond
+                     ;; A grammar constraint closed the reply: the stop token
+                     ;; was consumed by the decoder and is not text.
+                     ((not t)
+                      (feed! "" #t)
+                      (if cancelled? "cancelled" "stop"))
                      ((memv t eos)
+                      (set! generated (cons t generated))
                       (feed! "" #t)
                       (if cancelled? "cancelled" "stop"))
                      (else
+                      (set! generated (cons t generated))
                       ;; Decode everything generated so far (minus the end
                       ;; token) and feed the new part; a trailing U+FFFD may
                       ;; be an incomplete multi-byte character, so wait.

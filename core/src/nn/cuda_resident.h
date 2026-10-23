@@ -239,6 +239,13 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
 
+// Masked argmax: the same selection over the ids whose bit is set in `mask`
+// (a device bitmap of ceil(n / 8) bytes, bit i of byte i / 8, LSB first; the
+// caller owns it). Ids the mask disallows never win, and an all-disallowed row
+// writes -1 like an all-NaN one. Mirrors nn::argmax_masked. Devices that
+// cannot run it return false, and the caller falls back to the host.
+bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out);
+
 // --- batched prefill primitives (the decode *_dev kernels generalized to an
 // n dimension; decode is n == 1). Activations are [n, dim] position-major
 // (dim innermost). Each mirrors the CPU batched prefill op (SonicBackend) and,

@@ -41,6 +41,7 @@
 #include <sonicboom/training/clip_grad_norm.h>
 #include <sonicboom/training/device_graph.h>
 #include <sonicboom/training/param.h>
+#include <sonicboom/vocab/grammar.h>
 #include <sonicboom/vocab/vocab.h>
 
 // core/src is a private include directory for this target (core/CMakeLists):
@@ -157,6 +158,17 @@ struct sb_llm_session {
   uint64_t pos = 0;                   // next decode position (CUDA path)
   int64_t pending = -1;               // first token from prefill, awaiting emit
   bool prefill_done = false;          // a CUDA prefill has run
+
+  // Constrained decoding (optional): the grammar every sampled token must keep
+  // acceptable. `grammar_mask` is the allowed-token bitmap recomputed from the
+  // grammar's state before each step; reset at every prefill (a new turn).
+  // `grammar_text` is the GBNF the installed grammar was built from, so the
+  // same constraint installed again can keep the compiled grammar (and its
+  // per-state masks) instead of rebuilding the vocabulary trie.
+  std::unique_ptr<vocab::Grammar> grammar;
+  std::string grammar_text;
+  std::vector<uint8_t> grammar_mask;
+  bool grammar_done = false;  // a stop token finished the grammar
 };
 
 namespace {
@@ -1877,6 +1889,33 @@ sb_status sb_llm_model_arch(const sb_llm_model *model, char *out, size_t cap,
       err_out);
 }
 
+// The model's EOS ids as its GGUF declares them: `tokenizer.ggml.eos_token_id`
+// is the single id most models declare, `tokenizer.ggml.eos_token_ids` the
+// array form for a model with several. A model that declares neither has none.
+namespace {
+std::vector<int32_t> model_eos_ids(const sb_llm_bundle &b) {
+  std::vector<int32_t> eos;
+  auto push = [&](const gguf::Value &v) {
+    if (v.type == gguf::ValueType::Array) {
+      if (v.elem_type == gguf::ValueType::Int32 ||
+          v.elem_type == gguf::ValueType::UInt32)
+        for (const auto &e : v.elems)
+          eos.push_back(
+              int32_t(e.type == gguf::ValueType::UInt32 ? e.u : uint64_t(e.i)));
+    } else if (v.type == gguf::ValueType::Int32 ||
+               v.type == gguf::ValueType::UInt32) {
+      eos.push_back(
+          int32_t(v.type == gguf::ValueType::UInt32 ? v.u : uint64_t(v.i)));
+    }
+  };
+  if (const gguf::Value *v = b.reader.find("tokenizer.ggml.eos_token_id"))
+    push(*v);
+  if (const gguf::Value *v = b.reader.find("tokenizer.ggml.eos_token_ids"))
+    push(*v);
+  return eos;
+}
+}  // namespace
+
 sb_status sb_llm_model_eos(const sb_llm_model *model, sb_token *out, size_t cap,
                            size_t *n_out, sb_error **err_out) {
   return guard(
@@ -1884,29 +1923,7 @@ sb_status sb_llm_model_eos(const sb_llm_model *model, sb_token *out, size_t cap,
         if (!model || !n_out)
           return fail_arg(err_out);
 
-        // `tokenizer.ggml.eos_token_id` is the single id most models declare;
-        // `tokenizer.ggml.eos_token_ids` is the array form for a model with
-        // several. Both are read; a model that declares neither has none.
-        std::vector<int32_t> eos;
-        auto push = [&](const gguf::Value &v) {
-          if (v.type == gguf::ValueType::Array) {
-            if (v.elem_type == gguf::ValueType::Int32 ||
-                v.elem_type == gguf::ValueType::UInt32)
-              for (const auto &e : v.elems)
-                eos.push_back(int32_t(e.type == gguf::ValueType::UInt32
-                                          ? e.u : uint64_t(e.i)));
-          } else if (v.type == gguf::ValueType::Int32 ||
-                     v.type == gguf::ValueType::UInt32) {
-            eos.push_back(
-                int32_t(v.type == gguf::ValueType::UInt32 ? v.u : uint64_t(v.i)));
-          }
-        };
-        if (const gguf::Value *v =
-                model->bundle->reader.find("tokenizer.ggml.eos_token_id"))
-          push(*v);
-        if (const gguf::Value *v =
-                model->bundle->reader.find("tokenizer.ggml.eos_token_ids"))
-          push(*v);
+        const std::vector<int32_t> eos = model_eos_ids(*model->bundle);
 
         *n_out = eos.size();
         if (cap < eos.size())
@@ -2037,6 +2054,14 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         session->prompt.assign(tokens, tokens + n);
         session->prev_prompt = session->prompt;
 
+        // A prefill starts a new constrained turn: the grammar (when set)
+        // restarts from its first position. The first token sampled at the end
+        // of the prefill is subject to it like any decode step.
+        if (session->grammar) {
+          session->grammar->reset();
+          session->grammar_done = false;
+        }
+
         // CUDA fast path: prefill the prompt device-resident (chunked prefill +
         // prefix reuse via the persistent KvCacheSession), sampling only the
         // first continuation token; sb_llm_decode then continues token-by-token
@@ -2048,12 +2073,30 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
           const model::Gemma4Model &m = session->bundle->model;
           std::vector<uint64_t> prompt(tokens, tokens + n);
           std::vector<int64_t> first(1, -1);
+          if (session->grammar)
+            session->grammar_mask = session->grammar->mask();
           const uint64_t done = model::generate_prefill_spine_cuda_prefix(
               m, prompt, /*start_pos=*/0, first, session->kv,
-              /*use_prefill=*/true, &reused);
+              /*use_prefill=*/true, &reused, session->grammar_mask);
           if (done == 0 || first[0] < 0) {
             set_error(err_out, SB_ERRKIND_INTERNAL, "CUDA prefill failed");
             return SB_ERR_INTERNAL;
+          }
+          if (session->grammar) {
+            if (!session->grammar->accept(int32_t(first[0]))) {
+              set_error(err_out, SB_ERRKIND_INTERNAL,
+                        "grammar rejected the prefill token");
+              return SB_ERR_INTERNAL;
+            }
+            if (session->grammar->finished()) {
+              // The first token was a stop token: the constrained output is
+              // complete and empty, so nothing is pending.
+              session->grammar_done = true;
+              session->token = static_cast<uint64_t>(first[0]);
+              session->pos = n;
+              session->prefill_done = true;
+              return SB_OK;
+            }
           }
           session->token = static_cast<uint64_t>(first[0]);
           session->pos = n;
@@ -2103,6 +2146,12 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
         if (session->prefill_done && quant::cuda_available()) {
           const uint64_t n_ctx = session->n_ctx;
           uint32_t n = 0;
+          // The grammar finished on the prefill token (a stop token): the
+          // constrained output is complete and there is nothing to emit.
+          if (session->grammar && session->grammar_done) {
+            *n_out = 0;
+            return SB_OK;
+          }
           if (session->pending >= 0) {
             if (cb && cb(user, static_cast<sb_token>(session->pending))) {
               *n_out = 0;  // aborted before the first token
@@ -2114,16 +2163,34 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
           while (n < max_tokens) {
             std::vector<int64_t> one(1, -1);
             const uint64_t fed = session->token;  // this step writes fed's KV
+            // Constrained decoding: the allowed-token bitmap for this position,
+            // computed from the text accepted so far. An empty mask means the
+            // grammar has finished; there is nothing more it can accept.
+            if (session->grammar) {
+              session->grammar_mask = session->grammar->mask();
+              if (session->grammar_mask.empty()) break;
+            }
             const uint64_t done = model::generate_spine_cuda(
-                m, session->token, session->pos, one, n_ctx);
+                m, session->token, session->pos, one, n_ctx,
+                session->grammar_mask);
             if (done == 0 || one[0] < 0)
-              break;  // decode step failed
+              break;  // decode step failed, or the mask allowed nothing
             // The step wrote `fed`'s KV at session->pos: the session owns one
             // more history position, so a later prefill on this session reuses
             // the generation instead of re-prefilling it.
             session->kv.filled_tokens.push_back(fed);
             session->token = static_cast<uint64_t>(one[0]);
             ++session->pos;
+            if (session->grammar) {
+              if (!session->grammar->accept(int32_t(one[0])))
+                break;  // the sampler returned a token the grammar forbids
+              if (session->grammar->finished()) {
+                // A stop token ends the constrained output; it is not text, so
+                // it is not emitted.
+                session->grammar_done = true;
+                break;
+              }
+            }
             if (cb && cb(user, static_cast<sb_token>(one[0]))) {
               *n_out = n;  // aborted before one[0]; report n produced
               return SB_OK;
@@ -2138,7 +2205,31 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
         // path): the original full-generation loop over the CPU spine.
         std::vector<int64_t> tokens(max_tokens);
         uint64_t produced = 0;
-        if (session->prompt.size() == 1) {
+        if (session->grammar) {
+          // Constrained decoding recomputes the mask from the accepted text, so
+          // the CPU spine cannot batch the loop: each token is a prefill of the
+          // full history plus one masked sample. O(n^2) work, which is the CPU
+          // reference path's price, not the performance target.
+          std::vector<uint64_t> hist(session->prompt.begin(), session->prompt.end());
+          while (produced < max_tokens) {
+            session->grammar_mask = session->grammar->mask();
+            if (session->grammar_mask.empty()) break;
+            int64_t one[1] = {-1};
+            uint64_t n_ctx = session->n_ctx;
+            if (n_ctx < hist.size() + 1) n_ctx = hist.size() + 1;
+            const uint64_t got = model::generate_prefill_spine(
+                m, hist, 0, std::span<int64_t>(one, 1), n_ctx, true,
+                session->grammar_mask);
+            if (got == 0 || one[0] < 0) break;
+            if (!session->grammar->accept(int32_t(one[0]))) break;
+            if (session->grammar->finished()) {
+              session->grammar_done = true;
+              break;  // a stop token is not text: not emitted
+            }
+            tokens[produced++] = one[0];
+            hist.push_back(uint64_t(one[0]));
+          }
+        } else if (session->prompt.size() == 1) {
           // A single-token prompt is a seed: decode directly (the exact path the
           // golden-token test exercises).
           produced = model::generate_spine(m, uint64_t(session->prompt[0]), 0,
@@ -2162,6 +2253,126 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
           }
         }
         *n_out = n;
+        return SB_OK;
+      },
+      err_out);
+}
+
+// --- Constrained decoding (session grammar) --------------------------------
+
+namespace {
+
+// Install `gbnf` as the session's grammar, replacing any previous one. The
+// model's EOS ids are the grammar's stop tokens: they are not text and may only
+// be sampled where the grammar can end.
+//
+// Installing the grammar that is already installed (a server applying one
+// response_format turn after turn) keeps the compiled one and only resets its
+// position: the vocabulary trie and the mask of every state it has visited
+// stay warm, and the first visit to a permissive state costs a walk over the
+// whole trie (tens of milliseconds on a large vocabulary).
+sb_status install_grammar(sb_llm_session &session, std::string_view gbnf,
+                          sb_error **err_out) {
+  if (session.grammar && session.grammar_text == gbnf) {
+    session.grammar->reset();
+    session.grammar_done = false;
+    session.grammar_mask.clear();
+    return SB_OK;
+  }
+  const std::vector<int32_t> eos = model_eos_ids(*session.bundle);
+  auto parsed =
+      vocab::Grammar::parse(gbnf, session.bundle->vocab, eos);
+  if (!parsed) {
+    const std::string msg = "grammar rejected: " + parsed.error();
+    set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+    return SB_ERR_INTERNAL;
+  }
+  session.grammar = std::move(*parsed);
+  session.grammar_text.assign(gbnf);
+  session.grammar_done = false;
+  session.grammar_mask.clear();
+  return SB_OK;
+}
+
+}  // namespace
+
+sb_status sb_llm_session_set_grammar(sb_llm_session *session, const char *gbnf,
+                                     sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!session || !gbnf)
+          return fail_arg(err_out);
+        return install_grammar(*session, gbnf, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_llm_json_schema_to_gbnf(const char *schema_json,
+                                     const char *prefix, const char *suffix,
+                                     char *out, size_t cap, size_t *len_out,
+                                     sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!schema_json || !len_out)
+          return fail_arg(err_out);
+        auto gbnf = vocab::json_schema_to_gbnf(
+            schema_json, prefix ? std::string_view(prefix) : std::string_view(),
+            suffix ? std::string_view(suffix) : std::string_view());
+        if (!gbnf) {
+          const std::string msg = "JSON schema rejected: " + gbnf.error();
+          set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+          return SB_ERR_INTERNAL;
+        }
+        *len_out = gbnf->size();
+        if (cap <= gbnf->size())
+          return SB_ERR_BINDING;  // two-call sizing: *len_out holds the length
+        std::memcpy(out, gbnf->data(), gbnf->size());
+        out[gbnf->size()] = '\0';
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
+                                         const char *schema_json,
+                                         sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!session || !schema_json)
+          return fail_arg(err_out);
+        auto gbnf = vocab::json_schema_to_gbnf(schema_json);
+        if (!gbnf) {
+          const std::string msg = "JSON schema rejected: " + gbnf.error();
+          set_error(err_out, SB_ERRKIND_INTERNAL, msg.c_str());
+          return SB_ERR_INTERNAL;
+        }
+        return install_grammar(*session, *gbnf, err_out);
+      },
+      err_out);
+}
+
+void sb_llm_session_clear_grammar(sb_llm_session *session) {
+  if (!session)
+    return;
+  session->grammar.reset();
+  session->grammar_text.clear();
+  session->grammar_mask.clear();
+  session->grammar_done = false;
+}
+
+sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
+                                          int *active_out, int *complete_out,
+                                          sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!session || !active_out || !complete_out)
+          return fail_arg(err_out);
+        *active_out = session->grammar ? 1 : 0;
+        *complete_out =
+            (session->grammar &&
+             (session->grammar->finished() || session->grammar->accepting()))
+                ? 1
+                : 0;
         return SB_OK;
       },
       err_out);

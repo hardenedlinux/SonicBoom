@@ -32,4 +32,10 @@ bool softcap(std::span<const float> x, float cap, std::span<float> y);
 // -1 for an empty span. This is the greedy (temperature-0) token selection.
 int64_t argmax(std::span<const float> x);
 
+// Constrained variant: the same argmax, but only ids whose bit is set in
+// `mask` (bit i of mask[i / 8], least-significant bit first) are candidates.
+// Returns -1 when the mask has no set bit among x's indices. A mask shorter
+// than ceil(x.size() / 8) is treated as disallowing anything past its end.
+int64_t argmax_masked(std::span<const float> x, std::span<const uint8_t> mask);
+
 } // namespace sonicboom::nn
