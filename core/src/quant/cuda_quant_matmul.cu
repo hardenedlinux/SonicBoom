@@ -34,6 +34,7 @@
 #include "ggml_derived/mmvq_q8_1.cuh"
 #include "ggml_derived/mmq.cuh"
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -51,6 +52,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -2896,12 +2898,16 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // Width = the prefill segment extent (kDefaultPrefillChunk, and Gemma's SWA
 // ring, both 512). A full segment is then one GEMM at the same n the strict
 // profile's single GEMM runs at, so the two agree on every full segment instead
-// of differing by cuBLAS's n-dependent reduction order. Batch invariance is
-// unchanged: every GEMM is still a fixed-width block, and a short final segment
-// pads to 512 exactly as a short batch padded to 128 before. Measured at 128:
+// of differing by cuBLAS's n-dependent reduction order. Measured at 128:
 // boom-r5's prefill corpus gate put standard at +0.58% (Qwen) / +1.50%
 // (DeepSeek) corpus ppl vs strict, with the difference vanishing at every
 // non-tail position once the block width matched the segment.
+//
+// A short final segment does not pay for the padding: it runs at its real width
+// through cuBLASLt with the algorithm cuBLAS chooses for the 512-column block
+// (matmul_f16_lt_tail below), so it keeps the same per-column numerics without
+// the padded FLOPs. Padding a 64-token prefix-reuse suffix to 512 made that
+// suffix 44% slower than strict on Qwen2.5-0.5B (F2 of boom-r5).
 constexpr int kCublasF16BlockWidth = 512;
 
 bool cublas_f16_blocking_enabled() {
@@ -2912,10 +2918,11 @@ bool cublas_f16_blocking_enabled() {
   return enabled;
 }
 
-// Zero-padded 128-position tail block for the blocked fp16 matmul, in the
-// position-major layout the full blocks read (dst[p*cols + i] = cast(X[(c0+p)*cols
-// + i]) for p < chunk_n, zero beyond). Same conversion as cast_f32_f16, so a
-// position in a tail block sees the same activation values as in a full block.
+// Zero-padded tail block for the blocked fp16 matmul (the fallback when
+// cuBLASLt cannot pin the 512-column algorithm), in the position-major layout
+// the full blocks read (dst[p*cols + i] = cast(X[(c0+p)*cols + i]) for
+// p < chunk_n, zero beyond). Same conversion as cast_f32_f16, so a position in
+// a tail block sees the same activation values as in a full block.
 __global__ void pad_f16_tail_kernel(const float* __restrict__ x,
                                     __half* __restrict__ dst, int cols, int c0,
                                     int chunk_n) {
@@ -2927,7 +2934,7 @@ __global__ void pad_f16_tail_kernel(const float* __restrict__ x,
       (p < chunk_n) ? __float2half_rn(x[(size_t)(c0 + p) * cols + i]) : __half(0.0f);
 }
 
-// Drop the padding positions of a [128, rows] result block into the
+// Drop the padding positions of a [width, rows] result block into the
 // position-major output at position offset c0.
 __global__ void copyback_f16_tail_kernel(const float* __restrict__ src,
                                          float* __restrict__ dst, int rows,
@@ -2937,6 +2944,135 @@ __global__ void copyback_f16_tail_kernel(const float* __restrict__ src,
   const int p = idx / rows;
   const int r = idx - p * rows;
   dst[(size_t)(c0 + p) * rows + r] = src[(size_t)p * rows + r];
+}
+
+// ---------------------------------------------------------------------------
+// cuBLASLt tail block: a short final segment runs at its real width with the
+// algorithm cuBLAS picks for the 512-column block, so its columns keep the full
+// block's numerics (batch invariance) without the padded FLOPs. Verified on
+// every (m, k) class of the three campaign models: the pinned algorithm gives
+// bit-identical columns 0..W-1 against the 512-column GEMM at W = 1, 3, 37, 64,
+// 100, 256, 511, and cuBLASLt's 512-column choice equals cublasGemmEx's.
+// SONICBOOM_CUBLAS_LT_TAIL=0 restores the zero-padded 512-column tail.
+struct TailLtKernel {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+};
+
+bool cublas_lt_tail_enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("SONICBOOM_CUBLAS_LT_TAIL");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  return enabled;
+}
+
+// Workspace for the pinned tail algorithms (sized to the largest one asked
+// for). The algorithms seen so far need none; the buffer exists so a heuristic
+// that does ask for one never forces a malloc inside a graph capture.
+void* g_lt_ws = nullptr;
+size_t g_lt_ws_bytes = 0;
+
+cublasLtHandle_t tail_lt_handle() {
+  static cublasLtHandle_t h = nullptr;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!h && cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
+  return h;
+}
+
+// The algorithm for (rows, cols) under the 512-column shape, chosen once per
+// process. False when cuBLASLt has no candidate or the heuristic would have to
+// run inside a graph capture (host work is not capturable); the caller then
+// uses the padded block.
+bool tail_lt_kernel(cublasLtHandle_t lt, cublasLtMatmulDesc_t op,
+                    cublasLtMatrixLayout_t ad, cublasLtMatrixLayout_t bd,
+                    cublasLtMatrixLayout_t cd, int rows, int cols,
+                    TailLtKernel& out) {
+  static std::mutex mu;
+  static std::map<std::pair<int, int>, std::optional<TailLtKernel>> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = cache.find({rows, cols});
+  if (it != cache.end()) {
+    if (!it->second) return false;
+    out = *it->second;
+    return true;
+  }
+  cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(cur_stream(), &cs) != cudaSuccess ||
+      cs != cudaStreamCaptureStatusNone)
+    return false;
+  std::optional<TailLtKernel> picked;
+  cublasLtMatmulPreference_t pref = nullptr;
+  cublasLtMatmulHeuristicResult_t heur{};
+  int found = 0;
+  if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+    if (cublasLtMatmulAlgoGetHeuristic(lt, op, ad, bd, cd, cd, pref, 1, &heur,
+                                       &found) == CUBLAS_STATUS_SUCCESS &&
+        found > 0) {
+      TailLtKernel k;
+      k.algo = heur.algo;
+      k.workspace = heur.workspaceSize;
+      picked = k;
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+  }
+  cache.insert({{rows, cols}, picked});
+  if (!picked) return false;
+  out = *picked;
+  return true;
+}
+
+// Y[c0 .. c0+chunk_n) = W @ X[c0 .. c0+chunk_n), W fp16 row-major [rows, cols],
+// X fp16 position-major [n, cols], Y fp32 position-major [n, rows]. Same GEMM
+// as the full block (A = W^T column-major, B = the activation positions), run at
+// the tail width with the full block's algorithm.
+bool matmul_f16_lt_tail(const __half* wf, const __half* xf, float* y, int rows,
+                        int cols, int chunk_n) {
+  cublasLtHandle_t lt = tail_lt_handle();
+  if (!lt) return false;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd_full = nullptr, cd_full = nullptr;
+  cublasLtMatrixLayout_t bd = nullptr, cd = nullptr;
+  bool ok = false;
+  TailLtKernel k{};
+  const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
+  if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tr_a,
+                                     sizeof(tr_a)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tr_b,
+                                     sizeof(tr_b)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&ad, CUDA_R_16F, cols, rows, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&bd_full, CUDA_R_16F, cols,
+                                 kCublasF16BlockWidth, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&cd_full, CUDA_R_32F, rows,
+                                 kCublasF16BlockWidth, rows) ==
+          CUBLAS_STATUS_SUCCESS &&
+      tail_lt_kernel(lt, op, ad, bd_full, cd_full, rows, cols, k) &&
+      cublasLtMatrixLayoutCreate(&bd, CUDA_R_16F, cols, chunk_n, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&cd, CUDA_R_32F, rows, chunk_n, rows) ==
+          CUBLAS_STATUS_SUCCESS) {
+    void* ws = nullptr;
+    if (k.workspace) {
+      ws = grow_scratch(g_lt_ws, g_lt_ws_bytes, k.workspace);
+      if (!ws) k.workspace = 0;  // run without workspace if it cannot grow
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    ok = cublasLtMatmul(lt, op, &alpha, wf, ad, xf, bd, &beta, y, cd, y, cd,
+                        &k.algo, ws, k.workspace, cur_stream()) ==
+         CUBLAS_STATUS_SUCCESS;
+  }
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd_full) cublasLtMatrixLayoutDestroy(bd_full);
+  if (cd_full) cublasLtMatrixLayoutDestroy(cd_full);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return ok;
 }
 
 bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
@@ -3004,21 +3140,19 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
     return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
   }
 
-  // Standard profile: every GEMM is (m=rows, n=kCublasF16BlockWidth, k=cols).
-  // Full blocks read the position-major fp16 activation in place; a tail block
-  // is zero-padded into a fixed-width scratch and its real positions copied
-  // back, so a position's per-column numerics never depend on which segment it
-  // landed in. The activation conversion is done per block so a short batch
-  // never pays for the padding columns.
-  __half* xf = nullptr;
-  if (n >= kCublasF16BlockWidth) {
-    xf = static_cast<__half*>(
-        grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
-    if (!xf) return false;
-    const int64_t xn = int64_t(cols) * n;
-    SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
-    cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
-  }
+  // Standard profile: full blocks are (m=rows, n=kCublasF16BlockWidth, k=cols)
+  // GEMMs reading the position-major fp16 activation in place. A short final
+  // block runs at its real width with the full block's cuBLASLt algorithm, so a
+  // position's per-column numerics never depend on which segment it landed in
+  // and the block does not pay for zero padding. When cuBLASLt cannot pin the
+  // algorithm (or SONICBOOM_CUBLAS_LT_TAIL=0) the tail falls back to a
+  // zero-padded fixed-width GEMM and a copyback.
+  __half* xf = static_cast<__half*>(
+      grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
+  if (!xf) return false;
+  const int64_t xn = int64_t(cols) * n;
+  SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
+  cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
   cublasHandle_t h = cublas_handle();
   if (!h) return false;
   cublasSetStream(h, cur_stream());
@@ -3027,41 +3161,45 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   float* ytail = nullptr;
   for (int c0 = 0; c0 < n; c0 += kCublasF16BlockWidth) {
     const int chunk_n = std::min(kCublasF16BlockWidth, n - c0);
-    const __half* bptr;
-    float* cptr;
+    const __half* xblock = xf + (size_t)c0 * cols;
     if (chunk_n == kCublasF16BlockWidth) {
-      bptr = xf + (size_t)c0 * cols;
-      cptr = Y + (size_t)c0 * rows;
-    } else {
-      if (!xtail) {
-        xtail = static_cast<__half*>(grow_scratch(
-            g_xf16_tail, g_xf16_tail_bytes,
-            cols * (size_t)kCublasF16BlockWidth * sizeof(__half)));
-        ytail = static_cast<float*>(grow_scratch(
-            g_ytail, g_ytail_bytes,
-            rows * (size_t)kCublasF16BlockWidth * sizeof(float)));
-        if (!xtail || !ytail) return false;
-      }
-      const int total = int(cols) * kCublasF16BlockWidth;
-      SB_NOTE_LAUNCH(pad_f16_tail_kernel, (total + 255) / 256, 256, 0,
-                     cur_stream());
-      pad_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
-          X, xtail, int(cols), c0, chunk_n);
-      bptr = xtail;
-      cptr = ytail;
+      const cublasStatus_t st = cublasGemmEx(
+          h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), kCublasF16BlockWidth,
+          int(cols), &alpha, wf, CUDA_R_16F, int(cols), xblock, CUDA_R_16F,
+          int(cols), &beta, Y + (size_t)c0 * rows, CUDA_R_32F, int(rows),
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+      if (st != CUBLAS_STATUS_SUCCESS) return false;
+      continue;
     }
+    if (cublas_lt_tail_enabled() &&
+        matmul_f16_lt_tail(wf, xblock, Y + (size_t)c0 * rows, int(rows),
+                           int(cols), chunk_n))
+      continue;
+    if (!xtail) {
+      xtail = static_cast<__half*>(grow_scratch(
+          g_xf16_tail, g_xf16_tail_bytes,
+          cols * (size_t)kCublasF16BlockWidth * sizeof(__half)));
+      ytail = static_cast<float*>(grow_scratch(
+          g_ytail, g_ytail_bytes,
+          rows * (size_t)kCublasF16BlockWidth * sizeof(float)));
+      if (!xtail || !ytail) return false;
+    }
+    const int total = int(cols) * kCublasF16BlockWidth;
+    SB_NOTE_LAUNCH(pad_f16_tail_kernel, (total + 255) / 256, 256, 0,
+                   cur_stream());
+    pad_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
+        X, xtail, int(cols), c0, chunk_n);
     const cublasStatus_t st = cublasGemmEx(
         h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), kCublasF16BlockWidth, int(cols),
-        &alpha, wf, CUDA_R_16F, int(cols), bptr, CUDA_R_16F, int(cols), &beta,
-        cptr, CUDA_R_32F, int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        &alpha, wf, CUDA_R_16F, int(cols), xtail, CUDA_R_16F, int(cols), &beta,
+        ytail, CUDA_R_32F, int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) return false;
-    if (chunk_n != kCublasF16BlockWidth) {
-      const int total = int(chunk_n) * int(rows);
-      SB_NOTE_LAUNCH(copyback_f16_tail_kernel, (total + 255) / 256, 256, 0,
-                     cur_stream());
-      copyback_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
-          ytail, Y, int(rows), c0, chunk_n);
-    }
+    const int total_out = int(chunk_n) * int(rows);
+    SB_NOTE_LAUNCH(copyback_f16_tail_kernel, (total_out + 255) / 256, 256, 0,
+                   cur_stream());
+    copyback_f16_tail_kernel<<<(total_out + 255) / 256, 256, 0,
+                               cur_stream()>>>(ytail, Y, int(rows), c0,
+                                               chunk_n);
   }
   return cudaGetLastError() == cudaSuccess;
 }
