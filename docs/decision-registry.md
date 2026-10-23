@@ -76,26 +76,46 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto`, `SONICBOOM_SPEC_PROBE_MS` |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
-| MOSS-Image DiT full attention | `SONICBOOM_DIT_ATTN=scalar` (force the pre-fattn fallback) |
+| attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |
 
-The DiT attention choice is a static shape-class mapping, not a measured
-per-device pick: `(head_dim 128, one K/V head per query head, non-causal)` takes
-the shared tiled mma kernel `flash_attention_full_dev` (the LLM prefill
-kernel's full-attention mode) above `kSdpaMaxTokens = 2048` sequence positions,
-and the score-matrix cuBLAS f16 GEMM path at or below it, where the scratch a
-per-head `[tokens, tokens]` plane needs still fits. The split is set by that
-scratch capacity, not by timing; within each regime the kernel is fixed for the
-shape class. The env switch exists for A/B runs only.
+Attention class selection is keyed on the **op's attributes**, never on the
+model that issued the call. The op carries `causal`, `kv_cache`
+(present/absent), `prefix_reuse` (possible/not), `gqa`, `head_dim` and
+`window`; the registry key is those attributes plus the device:
 
-This token-count split is a **documented exception to R1**. R1 forbids
+- `causal1` and/or a KV cache present → the LLM prefill/decode classes. R1
+  applies unchanged: one kernel per class, nothing chosen by `n`.
+- non-causal, no KV cache, no prefix reuse → the full-attention classes,
+  keyed `causal0-kvcache0-prefixreuse0-window0-d<head_dim>-g<gqa>`, split by
+  the score-plane capacity boundary:
+  - `full.score-gemm` at or below `kFullScoreMaxTokens = 2048` positions: the
+    per-head `[tokens, tokens]` f16 score planes fit the scratch budget, so
+    S and P are batched cuBLAS f16 GEMMs with a row softmax between them;
+  - `full.tiled` above it: online-softmax tiling with no score planes. The
+    default is the generated FA-2 warp-head kernel (one warp per 16 query
+    rows of one head holding the whole head_dim, P kept in registers as the
+    PV mma's A operand, K/V double-buffered with cp.async, online-softmax
+    rescale per tile); the hand-written tiled kernel is an autotune
+    candidate, kept only if it beats the default by the 3% switch margin on
+    the fixed 2048-token probe (`tune/attention-full`, one entry per device,
+    cached in `attention-full.json`). `full.scalar` is the pre-fattn
+    fallback, reachable only by override.
+
+`full_attn` (the mask kind) is part of the generated kernel's region identity
+and the generator's support rules reject a causal, windowed or cached shape
+for it, so a full-attention cache entry can never serve an LLM class and a
+causal entry can never serve a full-attention op. `sb-explain` prints the
+class each op took and the registry record names its source.
+
+The score-capacity split is a **documented exception to R1**. R1 forbids
 selecting an algorithm by `n` inside a shape class because a reused prefix
 would then execute a different code path than the full prefill. Here the two
 regimes are distinct shape classes separated by a capacity boundary (the score
 matrix fits the scratch budget or it does not), not one class tuned by size;
-the DiT has no prefix reuse and no KV cache, so no two calls must share a
+this op has no prefix reuse and no KV cache, so no two calls must share a
 path, and each resolution deterministically maps to one regime. A resolution
 whose token count crosses the boundary therefore changes path once, at a fixed
-point, reproducibly.
+point, reproducibly. No other class may use `n` this way.
 
 No algorithm-selecting variable has to be set by hand: each has a default or an
 automatic choice, and the registry records which one applied.
@@ -105,7 +125,8 @@ automatic choice, and the registry records which one applied.
 | name | scope | storage |
 |---|---|---|
 | `reduce.mode`, `reduce.df32-acceptance`, `reduce.double-cost-ratio`, `reduce.cpu-measurement` | device / cpu | registry + verdict file |
-| `tune/attention-prefill`, `tune/attention-decode`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
+| `tune/attention-prefill`, `tune/attention-decode`, `tune/attention-full`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
+| `attention.class` | attention attribute key (`causal…-kvcache…-d…-g…`, plus `-cap2048`/`-over2048` for the full classes) | registry |
 | `tune/gemv`, `tune/matmul_q8_tc`, `tune/attn_prefill`, `spec_verify_ratio` | shape class | per-SM JIT file |
 | `mmq.*`, `attention.*`, `dense.*`, `gemv.*`, `spec.*`, `train.*`, feature switches | device | seeded from the T0b table |
 | `numerics.profile` | process | registry (strict/standard, with its env/application origin) |

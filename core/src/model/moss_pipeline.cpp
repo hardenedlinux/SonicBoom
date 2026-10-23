@@ -24,6 +24,8 @@
 #include <cstdlib>
 
 #if defined(SONICBOOM_USE_CUDA)
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
+
 #include <sonicboom/model/moss_dit_cuda.h>
 #endif
 
@@ -37,6 +39,31 @@
 namespace sonicboom::moss {
 
 namespace {
+
+// Stage markers for the nsys runs that produce the per-stage breakdown. Opt-in
+// (SONICBOOM_NVTX), like the planner's per-node ranges: normal runs pay nothing.
+#if defined(SONICBOOM_USE_CUDA)
+bool nvtx_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_NVTX");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+struct NvtxRange {
+  const bool on;
+  explicit NvtxRange(const char* name) : on(nvtx_enabled()) {
+    if (on) nvtxRangePushA(name);
+  }
+  ~NvtxRange() { if (on) nvtxRangePop(); }
+  NvtxRange(const NvtxRange&) = delete;
+  NvtxRange& operator=(const NvtxRange&) = delete;
+};
+#else
+struct NvtxRange {
+  explicit NvtxRange(const char*) {}
+};
+#endif
 
 // grid(count, shift): `count` values from 1 down to lower, warped by shift.
 // The reference evaluates each row in float32 (all grid inputs are f32).
@@ -235,6 +262,7 @@ std::expected<HiddenStates, std::string> MossPipeline::encode(
     std::span<const int32_t> ids) const {
   if (impl_->text == nullptr)
     return std::unexpected("pipeline loaded without the text encoder");
+  NvtxRange text_range("moss.text_encode");
   return impl_->text->forward(ids);
 }
 
@@ -273,14 +301,17 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
   int64_t forwards = 0;
 
   for (int64_t step = 0; step < steps; ++step) {
+    NvtxRange step_range("moss.step");
     const float timestep = schedule.timesteps[static_cast<size_t>(step)];
     const double fraction = static_cast<double>(step) / static_cast<double>(steps);
     const bool skip_active =
         cfg.slg_start <= fraction && fraction < cfg.slg_stop;
 
-    auto cond_out = impl_->forward(
-        current.values, current.height, current.width, timestep, cond.text,
-        cond.text_len, kNoSkip);
+    auto cond_out = [&] {
+      NvtxRange forward_range("moss.dit_forward");
+      return impl_->forward(current.values, current.height, current.width,
+                            timestep, cond.text, cond.text_len, kNoSkip);
+    }();
     if (!cond_out) return std::unexpected(cond_out.error());
     ++forwards;
     pred = cond_out->values;
@@ -293,9 +324,11 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
           (skip_active && !cfg.uncond_skip_layers.empty())
               ? cfg.uncond_skip_layers
               : kNoSkip;
-      auto uncond_out = impl_->forward(
-          current.values, current.height, current.width, timestep, cond.negative,
-          cond.negative_len, skip);
+      auto uncond_out = [&] {
+        NvtxRange forward_range("moss.dit_forward");
+        return impl_->forward(current.values, current.height, current.width,
+                              timestep, cond.negative, cond.negative_len, skip);
+      }();
       if (!uncond_out) return std::unexpected(uncond_out.error());
       ++forwards;
       const float scale = cfg.guidance_scale;
@@ -304,9 +337,12 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
     }
 
     if (need_conditional) {
-      auto skipped_out = impl_->forward(
-          current.values, current.height, current.width, timestep, cond.text,
-          cond.text_len, cfg.slg_layers);
+      auto skipped_out = [&] {
+        NvtxRange forward_range("moss.dit_forward");
+        return impl_->forward(current.values, current.height, current.width,
+                              timestep, cond.text, cond.text_len,
+                              cfg.slg_layers);
+      }();
       if (!skipped_out) return std::unexpected(skipped_out.error());
       ++forwards;
       if (!do_cfg) pred = skipped_out->values;
@@ -403,6 +439,7 @@ std::expected<MossImage, std::string> MossPipeline::decode(
 #if defined(SONICBOOM_USE_CUDA)
   if (impl_->dit_cuda) impl_->dit_cuda->release_device();
 #endif
+  NvtxRange vae_range("moss.vae");
   auto decoded = impl_->vae->decode(unshuffled, 2 * h, 2 * w);
   if (!decoded) return std::unexpected(decoded.error());
 

@@ -151,15 +151,25 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
                          float* out);
 
 // Dense full attention (non-causal, no window, no KV cache): every query
-// attends to every key in [0, n). Same tiled tensor-core kernel as the causal
-// prefill path, with the mask and per-query key range compiled out. Shape
-// class: head_dim 128, one K/V head per query head, n_q == n_kv == n. q/k/v are
-// [n, n_heads, head_dim] f32 (K/V are rounded to f16 in the kernel, matching
-// the causal path); out is [n, n_heads, head_dim] f32. Returns false when the
-// shape class has no instantiation.
+// attends to every key in [0, n). The class is keyed on those attributes
+// (causal 0, kv_cache absent, prefix_reuse impossible, window 0) plus
+// head_dim, the GQA ratio (1 here) and the head count, and resolved through
+// the decision registry (SONICBOOM_ATTN_CLASS / its SONICBOOM_DIT_ATTN alias
+// override). Two regimes: a batched cuBLAS f16 score-GEMM path while the
+// per-head [n, n] planes fit the scratch budget (n <= 2048), and an online-
+// softmax tiled class above it -- the generated FA-2 warp-head kernel, with
+// the hand-written tiled kernel as an autotune candidate. q/k/v are
+// [n, n_heads, head_dim] f32 (K/V are rounded to f16 in both regimes); out is
+// [n, n_heads, head_dim] f32. Returns false when no class of this op can run
+// (e.g. SONICBOOM_ATTN_CLASS=scalar, or an unsupported head width), and the
+// caller keeps its own fallback.
 bool flash_attention_full_dev(const float* q, const float* k, const float* v,
                               int n, int n_heads, int head_dim, float scale,
                               float* out);
+
+// Release the score-GEMM regime's scratch planes (the largest per-call
+// allocation of the full-attention class). Safe to call at any time.
+void flash_attention_full_release_scratch();
 
 // Chunked-prefill flash attention: n queries at absolute positions
 // [start, start+n) each attend over [start_key, p] where start_key = max(0,

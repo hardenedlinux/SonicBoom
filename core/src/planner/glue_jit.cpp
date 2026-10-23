@@ -224,7 +224,12 @@ bool use_disk_cache() {
 }
 
 std::string attention_region_name(const compiler::AttentionShape &shape) {
-  const std::string mask = shape.window_mask ? "-window" : "-causal";
+  // The mask kind is part of the region identity: a full-attention kernel is
+  // never the causal kernel of the same tile geometry (and an LLM class must
+  // never be served from the full-attention cache entry).
+  const std::string mask = shape.full_attn  ? "-full"
+                           : shape.window_mask ? "-window"
+                                               : "-causal";
   // f16 KV storage is a distinct kernel: its cache reads have a different
   // element type, so the entry must not be shared with the f32 cache kernel.
   const std::string kv = shape.kv_f16 ? "-kv16" : "";

@@ -66,6 +66,11 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_ATTN_PREFILL", "auto", "prefill attention: auto|own|codegen"},
     {"SONICBOOM_ATTN_DECODE", "auto", "decode attention: auto|own|codegen"},
     {"SONICBOOM_ATTN_DECODE_CHUNK", "identity rule", "decode split-KV chunk"},
+    {"SONICBOOM_ATTN_CLASS", "auto (full.tiled above 2048 tokens)",
+     "attention class by op attributes: auto|full.score-gemm|full.tiled|"
+     "full.codegen|full.own|full.scalar"},
+    {"SONICBOOM_DIT_ATTN", "(alias of SONICBOOM_ATTN_CLASS)",
+     "legacy spelling, same values"},
     {"SONICBOOM_DENSE_CUBLAS", "on", "dense GEMM uses cuBLAS"},
     {"SONICBOOM_DENSE_CUBLAS_MIN_N", "1", "dense GEMM cuBLAS crossover"},
     {"SONICBOOM_DENSE_LT", "on", "cuBLASLt for the dense GEMM"},
@@ -178,6 +183,23 @@ int main(int argc, char** argv) {
   std::cout << "gemv = " << gemv_default.to_string() << "\n"
             << "matmul_q8_tc = " << mmq_default.to_string() << "\n"
             << "attn_prefill = dispatcher shape\n";
+
+  // The class rules are attributes of the op, so they print the same on every
+  // model: a causal, cached op is an LLM class; a non-causal, cache-less op is
+  // a full-attention class. The live records (with the source each took) are
+  // in the registry section above.
+  section("attention classes (by op attributes, never by model)");
+  std::cout
+      << "causal=1 or kv_cache present   -> LLM classes; R1: one kernel per "
+         "class, nothing by n\n"
+      << "causal=0, no kv_cache, no prefix reuse\n"
+      << "  key: causal0-kvcache0-prefixreuse0-window0-d<head_dim>-g<gqa>\n"
+      << "  tokens <= 2048               -> full.score-gemm (f16 score planes "
+         "fit the scratch budget)\n"
+      << "  tokens >  2048               -> full.tiled (generated FA-2 "
+         "warp-head; tuned per device)\n"
+      << "override: SONICBOOM_ATTN_CLASS=<class> (SONICBOOM_DIT_ATTN is its "
+         "alias)\n";
 
   if (sonicboom::planner::decisions::conflict_count() > 0) {
     std::cerr << "sb-explain: "

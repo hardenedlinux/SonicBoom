@@ -22,7 +22,6 @@
 
 #include "../nn/cuda_resident.h"
 
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -319,155 +318,6 @@ inline unsigned grid_for(long total, int threads = kThreads) {
   return (unsigned)((total + threads - 1) / threads);
 }
 
-// ---------------------------------------------------------------------------
-// Full (non-causal) attention through cuBLAS batched f16 tensor-core GEMMs.
-//
-// The fused fp32 kernel above is shared-memory-issue bound: the QK dot costs
-// one LDS per FMA, which measured 23 ms/call at 1024 tokens and 68% of the
-// DiT's device time. The same math runs on the tensor cores as two batched
-// GEMMs with the scores and probabilities materialized as f16
-// [head][query][key] planes:
-//
-//   S = scale * Q K^T        P = softmax_rows(S)        O = P V
-//
-// Q/K/V are packed once per call into per-head-contiguous f16 (they arrive as
-// [token][head][dim]). The score planes cost 2 * heads * tokens^2 * 2 bytes,
-// so larger token grids keep the fused fp32 kernel, which needs no planes.
-constexpr int kSdpaMaxTokens = 2048;
-
-// [tokens][heads][hd] f32 -> three [heads][tdst][hd] f16 planes. `tdst` is
-// the padded token count that keeps every GEMM leading dimension a multiple
-// of 8 (a tensor-core requirement); only the real rows are written, and only
-// those are ever read (the GEMM tile dims are the real token count).
-__global__ void pack_qkv_f16_kernel(const float* __restrict__ q,
-                                    const float* __restrict__ k,
-                                    const float* __restrict__ v,
-                                    __half* __restrict__ qh,
-                                    __half* __restrict__ kh,
-                                    __half* __restrict__ vh, int tokens,
-                                    int tdst, int heads, int hd) {
-  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  const long total = (long)tokens * heads * hd;
-  if (i >= total) return;
-  const long per_token = (long)heads * hd;
-  const long t = i / per_token;
-  const int rem = int(i - t * per_token);
-  const int h = rem / hd;
-  const int d = rem - h * hd;
-  const long dst = (long(h) * tdst + t) * hd + d;
-  qh[dst] = __float2half_rn(q[i]);
-  kh[dst] = __float2half_rn(k[i]);
-  vh[dst] = __float2half_rn(v[i]);
-}
-
-// The two reductions use separate slots so the value one returns can never be
-// overwritten by the other's first shared-memory store.
-__device__ __forceinline__ float block_reduce_max(float v, float* red) {
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  #pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
-  if (lane == 0) red[warp] = v;
-  __syncthreads();
-  const int nw = (blockDim.x + 31) >> 5;
-  v = (threadIdx.x < nw) ? red[threadIdx.x] : -1e30f;
-  if (warp == 0) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
-    if (lane == 0) red[0] = v;
-  }
-  __syncthreads();
-  return red[0];
-}
-
-__device__ __forceinline__ float block_reduce_sum(float v, float* red) {
-  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  #pragma unroll
-  for (int o = 16; o > 0; o >>= 1)
-    v += __shfl_down_sync(0xffffffffu, v, o);
-  if (lane == 0) red[32 + warp] = v;
-  __syncthreads();
-  const int nw = (blockDim.x + 31) >> 5;
-  v = (threadIdx.x < nw) ? red[32 + threadIdx.x] : 0.0f;
-  if (warp == 0) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-    if (lane == 0) red[32] = v;
-  }
-  __syncthreads();
-  return red[32];
-}
-
-// Per-head attention planes are [head][token][dim]; the caller's buffer is
-// [token][head][dim]. Gather the real rows out of the plane.
-__global__ void attn_interleave_kernel(const float* __restrict__ plane,
-                                       float* __restrict__ out, int tokens,
-                                       int plane_tokens, int heads, int hd) {
-  const long total = (long)tokens * heads * hd;
-  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const int d = int(i % hd);
-  const long r = i / hd;
-  const int h = int(r % heads);
-  const long q = r / heads;
-  out[i] = plane[(h * (long)plane_tokens + q) * hd + d];
-}
-
-// One block of 256 threads per row (<= kSdpaMaxTokens halves). The row is read
-// once into registers, so the scale and both softmax passes touch it only once.
-__global__ void softmax_f16_rows_kernel(const __half* __restrict__ s,
-                                        __half* __restrict__ p, int cols,
-                                        int row_stride, float scale) {
-  __shared__ float red[64];
-  const long row = blockIdx.x;
-  const __half* src = s + row * row_stride;
-  __half* dst = p + row * row_stride;
-  float v[8];
-  float m = -1e30f;
-  #pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    const int i = threadIdx.x + k * 256;
-    v[k] = (i < cols) ? __half2float(src[i]) * scale : -1e30f;
-    m = fmaxf(m, v[k]);
-  }
-  m = block_reduce_max(m, red);
-  float sum = 0.0f;
-  #pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    v[k] = (v[k] > -1e29f) ? __expf(v[k] - m) : 0.0f;
-    sum += v[k];
-  }
-  sum = block_reduce_sum(sum, red);
-  const float inv = 1.0f / sum;
-  #pragma unroll
-  for (int k = 0; k < 8; ++k) {
-    const int i = threadIdx.x + k * 256;
-    if (i < cols) dst[i] = __float2half_rn(v[k] * inv);
-  }
-}
-
-float* g_scratch = nullptr;
-size_t g_scratch_bytes = 0;
-
-bool ensure_scratch(size_t bytes) {
-  if (bytes <= g_scratch_bytes) return true;
-  if (g_scratch != nullptr) cudaFree(g_scratch);
-  g_scratch = nullptr;
-  g_scratch_bytes = 0;
-  void* p = nullptr;
-  if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
-  g_scratch = static_cast<float*>(p);
-  g_scratch_bytes = bytes;
-  return true;
-}
-
-cublasHandle_t sdpa_cublas() {
-  static cublasHandle_t h = nullptr;
-  if (h == nullptr && cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
-  return h;
-}
-
 // The fp32 CUDA-core path, used when the f16 score planes would not fit.
 bool sdpa_full_fused(const float* q, const float* k, const float* v,
                      int tokens, int heads, int head_dim, float scale,
@@ -607,97 +457,22 @@ bool rope_table(float* v, const float* rcos, const float* rsin, int heads,
 }
 
 void sdpa_release_scratch() {
-  if (g_scratch != nullptr) cudaFree(g_scratch);
-  g_scratch = nullptr;
-  g_scratch_bytes = 0;
+  nn::cuda::flash_attention_full_release_scratch();
 }
 
+// Full attention of the DiT block. The op's attributes (non-causal, no KV
+// cache, no prefix reuse, no window) are the class key; nn/cuda resolves the
+// class (full.score-gemm / full.tiled) and its implementation through the
+// decision registry. No model-name check and no token-count branch live here:
+// this function hands the op to the core dispatch and keeps the fused fp32
+// kernel only as the fallback for a shape the core has no class for.
 bool sdpa_full(const float* q, const float* k, const float* v, int tokens,
                int heads, int head_dim, float scale, float* out) {
   if (tokens <= 0) return true;
-  // Above kSdpaMaxTokens the score-matrix GEMM path cannot run (the per-head
-  // [tokens, tokens] plane no longer fits the scratch budget) and this regime
-  // used to fall through to the scalar fused kernel. Route it instead to the
-  // shared tiled tensor-core flash attention in nn/cuda -- the same kernel the
-  // LLM prefill path uses -- for the DiT shape class (head_dim 128, no GQA,
-  // non-causal full attention). At or below the cap, where the score matrix
-  // fits, the materialized GEMM path stays the choice. The paths below remain
-  // the fallback for a shape class the tiled kernel does not cover.
-  // SONICBOOM_DIT_ATTN=scalar forces the fallback for an A/B run without
-  // rebuilding.
-  static const bool force_scalar = [] {
-    const char* v = std::getenv("SONICBOOM_DIT_ATTN");
-    return v != nullptr && std::strcmp(v, "scalar") == 0;
-  }();
-  if (tokens > kSdpaMaxTokens && !force_scalar &&
-      nn::cuda::flash_attention_full_dev(q, k, v, tokens, heads, head_dim,
+  if (nn::cuda::flash_attention_full_dev(q, k, v, tokens, heads, head_dim,
                                          scale, out))
     return true;
-  cublasHandle_t h = sdpa_cublas();
-  if (h == nullptr || tokens > kSdpaMaxTokens || head_dim % 32 != 0 ||
-      head_dim > 32 * 8)
-    return sdpa_full_fused(q, k, v, tokens, heads, head_dim, scale, out);
-
-  // Tensor-core GEMMs require every leading dimension to be a multiple of 8,
-  // so the per-head planes are padded to `tpad` tokens. The tile dimensions
-  // stay at the real token count: the padded rows are never read.
-  const int tpad = (tokens + 7) & ~7;
-  const size_t T = size_t(tokens), H = size_t(heads), D = size_t(head_dim);
-  const size_t TP = size_t(tpad);
-  const size_t kv_elems = TP * H * D;
-  const size_t s_elems = H * TP * TP;
-  const size_t s_pad = (s_elems + 1) & ~size_t(1);  // keep the f32 tail aligned
-  const size_t bytes = 2 * (3 * kv_elems + 2 * s_pad) + 4 * kv_elems;
-  if (!ensure_scratch(bytes))
-    return sdpa_full_fused(q, k, v, tokens, heads, head_dim, scale, out);
-
-  __half* qh = reinterpret_cast<__half*>(g_scratch);
-  __half* kh = qh + kv_elems;
-  __half* vh = kh + kv_elems;
-  __half* sh = vh + kv_elems;
-  __half* ph = sh + s_pad;
-  float* od = reinterpret_cast<float*>(ph + s_pad);  // [head][token][dim]
-
-  pack_qkv_f16_kernel<<<grid_for(long(T * H * D)), kThreads>>>(
-      q, k, v, qh, kh, vh, tokens, tpad, heads, head_dim);
-
-  // S_cm (M=key, N=query) per head is the row-major [query][key] plane the
-  // softmax walks. Both operands are contiguous [token][dim] planes, so the
-  // column-major leading dimensions are just head_dim.
-  const long long stride_kv = (long long)tpad * head_dim;
-  const long long stride_s = (long long)tpad * tpad;
-  const float alpha = 1.0f, beta = 0.0f, one = 1.0f;  // scale is in softmax
-
-  // S = Q K^T: C(m=k, n=q) = sum_d kh(k,d) qh(q,d). A row-major [token][dim]
-  // plane is the *transpose* of its column-major view, so A takes the T flag
-  // and B (also [token][dim]) is already the K-dim-by-N form.
-  if (cublasGemmStridedBatchedEx(
-          h, CUBLAS_OP_T, CUBLAS_OP_N, tokens, tokens, head_dim, &alpha, kh,
-          CUDA_R_16F, head_dim, stride_kv, qh, CUDA_R_16F, head_dim,
-          stride_kv, &beta, sh, CUDA_R_16F, tpad, stride_s, heads,
-          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
-      CUBLAS_STATUS_SUCCESS)
-    return false;
-
-  // One block per padded plane row (the padded query rows are computed too so
-  // the block index maps straight to a plane row; those rows are never read).
-  softmax_f16_rows_kernel<<<unsigned(H * TP), 256>>>(sh, ph, tokens, tpad,
-                                                     scale);
-
-  // O^T = V^T P^T: C(m=d, n=q) = sum_k vh(k,d) ph(q,k). `out` is
-  // [query][head][dim], so its per-head C view is column-major (M=dim, N=query);
-  // vh's column-major view is already V^T (dim by token) and ph's is P^T, so
-  // both operands take the N flag.
-  if (cublasGemmStridedBatchedEx(
-          h, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, tokens, tokens, &one, vh,
-          CUDA_R_16F, head_dim, stride_kv, ph, CUDA_R_16F, tpad, stride_s,
-          &beta, od, CUDA_R_32F, head_dim, stride_kv, heads,
-          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
-      CUBLAS_STATUS_SUCCESS)
-    return false;
-  attn_interleave_kernel<<<grid_for(long(T * H * D)), kThreads>>>(
-      od, out, tokens, tpad, heads, head_dim);
-  return cudaGetLastError() == cudaSuccess;
+  return sdpa_full_fused(q, k, v, tokens, heads, head_dim, scale, out);
 }
 
 bool video_to_tokens(const float* src, float* dst, int channels, int hw) {

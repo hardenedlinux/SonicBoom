@@ -23,6 +23,7 @@
 #include "reduce_sum.cuh"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
+#include "../planner/decision_registry.h"  // attribute-keyed attention classes
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
@@ -49,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -3080,34 +3082,6 @@ bool launch_tiled_flash_attention_kv(const float* q, const float* k_batch,
       n_heads_kv, sliding_window, scale, out);
 }
 
-// Dense full attention (no mask, no window, no KV cache): every query attends
-// to every key. This is the DiT block's shape class — head_dim 128 with one
-// K/V head per query head — reusing the same tiled mma kernel as the causal
-// LLM prefill path. There is no fallback here: false means the shape class has
-// no instantiation, and the caller (core/src/model/moss_dit_cuda.cu) keeps its
-// own scalar/GEMM path.
-bool flash_attention_full_dev(const float* q, const float* k, const float* v,
-                              int n, int n_heads, int head_dim, float scale,
-                              float* out) {
-  if (!available()) return false;
-  if (n <= 0 || n_heads <= 0 || head_dim <= 0) return false;
-  if (!q || !k || !v || !out) return false;
-  if (head_dim % 32 != 0 || head_dim > 512) return false;
-  if (n_heads > 32) return false;  // 16-query m-tiles per block, 1024-thread cap
-  // Tile choice: QB = 128 queries, BK = 64 keys, NW = 2 (each 16-query m-tile
-  // is split across two warps, one per 64-dim half of head_dim). A QB = 256,
-  // NW = 1 block needs 16 accumulator fragments per thread and spills (120 B
-  // stack frame against the 128-register cap of a 512-thread block); NW = 2
-  // halves the accumulator to 4 fragments and keeps the block at 512 threads,
-  // 52 KiB of smem. The tile config is a constant of the shape class, never of
-  // n.
-  if (head_dim == 128)
-    return launch_tiled_flash_attention<float, 128, 64, 2, 128, 1, false>(
-        q, k, v, nullptr, nullptr, nullptr, /*n_slots=*/0, n, n_heads, n_heads,
-        /*sliding_window=*/0, scale, out);
-  return false;
-}
-
 // Host-facing counterpart of flash_attention_full_dev. q/k/v/out are plain
 // [n, n_heads, head_dim] host spans; the inputs are staged into the shared
 // scratch buffers and the result is copied back. This is the entry the
@@ -3345,6 +3319,802 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
   return planner::glue::launch_attention(
       shape, args, shape.head_fast ? heads : tiles,
       shape.head_fast ? tiles : heads);
+}
+
+// --- Full-attention op class (non-causal, no KV cache, no prefix reuse) ----
+//
+// Class selection is keyed on the op's attributes and the device, never on the
+// model that issued the call. The attributes of this class are causal = 0,
+// kv_cache = absent, prefix_reuse = impossible (there is no cache to reuse)
+// and window = 0; head_dim, the GQA ratio and the head count complete the key.
+// A causal or cached op -- every LLM prefill/decode shape, including DeepSeek's
+// d128 GQA 6 -- cannot resolve here: the runtime only reaches this entry from
+// the full-attention op, and the generator's support rules reject a causal,
+// windowed or cached shape for the full mask. full_attn is part of the region
+// identity, so a causal class can never be served from a full-attention JIT
+// cache entry (and a full class can never select the causal kernel).
+//
+// Two regimes, split by score-plane capacity (the documented R1 exception in
+// docs/decision-registry.md):
+//   full.score-gemm  n <= kFullScoreMaxTokens: the per-head [n, n] f16 score
+//                    planes fit the scratch budget; S and P are batched cuBLAS
+//                    f16 GEMMs with a row softmax between them.
+//   full.tiled       above the boundary: online-softmax tiling, no score
+//                    planes. The generated FA-2 warp-head layout is the
+//                    default (one warp per 16 query rows and the whole
+//                    head_dim, P in registers), with the hand-written tiled
+//                    kernel as an autotune candidate.
+// The boundary is a capacity constant of the device, not a live n: a
+// resolution maps to exactly one regime, deterministically and reproducibly.
+constexpr int kFullScoreMaxTokens = 2048;
+
+// Declared here (defined with the causal prefill tuner below): a host-timed
+// probe is illegal while the current stream is capturing.
+bool attn_capturing();
+
+// The tiled regime's decision probe: a fixed synthetic length, never the
+// caller's n, so the class resolves the same way on every call.
+constexpr int kFullTuneTokens = 2048;
+// A tiling candidate must beat the class default by this fraction to replace
+// it (same rule as the causal prefill tuner).
+constexpr double kFullSwitchMargin = 0.03;
+
+// [tokens][heads][hd] f32 -> three [heads][tdst][hd] f16 planes. `tdst` is
+// the padded token count that keeps every GEMM leading dimension a multiple of
+// 8 (a tensor-core requirement); only the real rows are written, and only
+// those are ever read (the GEMM dims are the real token count).
+__global__ void full_pack_qkv_f16_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ k,
+                                         const float* __restrict__ v,
+                                         __half* __restrict__ qh,
+                                         __half* __restrict__ kh,
+                                         __half* __restrict__ vh, int tokens,
+                                         int tdst, int heads, int hd) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long total = (long)tokens * heads * hd;
+  if (i >= total) return;
+  const long per_token = (long)heads * hd;
+  const long t = i / per_token;
+  const int rem = int(i - t * per_token);
+  const int h = rem / hd;
+  const int d = rem - h * hd;
+  const long dst = (long(h) * tdst + t) * hd + d;
+  qh[dst] = __float2half_rn(q[i]);
+  kh[dst] = __float2half_rn(k[i]);
+  vh[dst] = __float2half_rn(v[i]);
+}
+
+// The two reductions use separate slots so the value one returns can never be
+// overwritten by the other's first shared-memory store.
+__device__ __forceinline__ float full_block_reduce_max(float v, float* red) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  const int nw = (blockDim.x + 31) >> 5;
+  v = (threadIdx.x < nw) ? red[threadIdx.x] : -1e30f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
+    if (lane == 0) red[0] = v;
+  }
+  __syncthreads();
+  return red[0];
+}
+
+__device__ __forceinline__ float full_block_reduce_sum(float v, float* red) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, o);
+  if (lane == 0) red[32 + warp] = v;
+  __syncthreads();
+  const int nw = (blockDim.x + 31) >> 5;
+  v = (threadIdx.x < nw) ? red[32 + threadIdx.x] : 0.0f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if (lane == 0) red[32] = v;
+  }
+  __syncthreads();
+  return red[32];
+}
+
+// Per-head attention planes are [head][token][dim]; the caller's buffer is
+// [token][head][dim]. Gather the real rows out of the plane.
+__global__ void full_attn_interleave_kernel(const float* __restrict__ plane,
+                                            float* __restrict__ out,
+                                            int tokens, int plane_tokens,
+                                            int heads, int hd) {
+  const long total = (long)tokens * heads * hd;
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int d = int(i % hd);
+  const long r = i / hd;
+  const int h = int(r % heads);
+  const long q = r / heads;
+  out[i] = plane[(h * (long)plane_tokens + q) * hd + d];
+}
+
+// One block of 256 threads per row. The row is read once into registers, so
+// the scale and both softmax passes touch it only once.
+__global__ void full_softmax_f16_rows_kernel(const __half* __restrict__ s,
+                                             __half* __restrict__ p, int cols,
+                                             int row_stride, float scale) {
+  __shared__ float red[64];
+  const long row = blockIdx.x;
+  const __half* src = s + row * row_stride;
+  __half* dst = p + row * row_stride;
+  float v[8];
+  float m = -1e30f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const int i = threadIdx.x + k * 256;
+    v[k] = (i < cols) ? __half2float(src[i]) * scale : -1e30f;
+    m = fmaxf(m, v[k]);
+  }
+  m = full_block_reduce_max(m, red);
+  float sum = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    v[k] = (v[k] > -1e29f) ? __expf(v[k] - m) : 0.0f;
+    sum += v[k];
+  }
+  sum = full_block_reduce_sum(sum, red);
+  const float inv = 1.0f / sum;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const int i = threadIdx.x + k * 256;
+    if (i < cols) dst[i] = __float2half_rn(v[k] * inv);
+  }
+}
+
+// Score-plane scratch of the full.score-gemm regime. Sized for the largest
+// token count the regime admits; released at the caller's teardown.
+float* g_full_scratch = nullptr;
+size_t g_full_scratch_bytes = 0;
+
+bool ensure_full_scratch(size_t bytes) {
+  if (bytes <= g_full_scratch_bytes) return true;
+  if (g_full_scratch != nullptr) cudaFree(g_full_scratch);
+  g_full_scratch = nullptr;
+  g_full_scratch_bytes = 0;
+  void* p = nullptr;
+  if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
+  g_full_scratch = static_cast<float*>(p);
+  g_full_scratch_bytes = bytes;
+  return true;
+}
+
+void release_full_scratch() {
+  if (g_full_scratch != nullptr) cudaFree(g_full_scratch);
+  g_full_scratch = nullptr;
+  g_full_scratch_bytes = 0;
+}
+
+cublasHandle_t full_attn_cublas() {
+  static cublasHandle_t h = nullptr;
+  if (h == nullptr && cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
+  return h;
+}
+
+size_t full_score_scratch_bytes(int tokens, int heads, int head_dim) {
+  const size_t tpad = (size_t(tokens) + 7) & ~size_t(7);
+  const size_t kv_elems = tpad * size_t(heads) * size_t(head_dim);
+  const size_t s_elems = size_t(heads) * tpad * tpad;
+  const size_t s_pad = (s_elems + 1) & ~size_t(1);  // keep the f32 tail aligned
+  return 2 * (3 * kv_elems + 2 * s_pad) + 4 * kv_elems;
+}
+
+// full.score-gemm: S = scale * Q K^T, P = softmax_rows(S), O = P V, all as
+// batched f16 GEMMs (fp32 accumulate) over the per-head planes. False when the
+// shape or the scratch does not fit the regime; the caller then takes the
+// tiled regime.
+bool full_attention_score_gemm(const float* q, const float* k, const float* v,
+                               int tokens, int heads, int head_dim, float scale,
+                               float* out) {
+  if (tokens <= 0 || heads <= 0 || head_dim <= 0) return false;
+  if (tokens > kFullScoreMaxTokens) return false;
+  if (head_dim % 32 != 0 || head_dim > 32 * 8) return false;
+  cublasHandle_t h = full_attn_cublas();
+  if (h == nullptr) return false;
+
+  // Tensor-core GEMMs require every leading dimension to be a multiple of 8,
+  // so the per-head planes are padded to `tpad` tokens. The tile dimensions
+  // stay at the real token count: the padded rows are never read.
+  const int tpad = (tokens + 7) & ~7;
+  const size_t T = size_t(tokens), H = size_t(heads), D = size_t(head_dim);
+  const size_t TP = size_t(tpad);
+  const size_t kv_elems = TP * H * D;
+  const size_t s_elems = H * TP * TP;
+  const size_t s_pad = (s_elems + 1) & ~size_t(1);  // keep the f32 tail aligned
+  const size_t bytes = 2 * (3 * kv_elems + 2 * s_pad) + 4 * kv_elems;
+  if (!ensure_full_scratch(bytes)) return false;
+
+  __half* qh = reinterpret_cast<__half*>(g_full_scratch);
+  __half* kh = qh + kv_elems;
+  __half* vh = kh + kv_elems;
+  __half* sh = vh + kv_elems;
+  __half* ph = sh + s_pad;
+  float* od = reinterpret_cast<float*>(ph + s_pad);  // [head][token][dim]
+
+  full_pack_qkv_f16_kernel<<<grid_for(int(T * H * D)), 256, 0, cur_stream()>>>(
+      q, k, v, qh, kh, vh, tokens, tpad, heads, head_dim);
+
+  // S_cm (M=key, N=query) per head is the row-major [query][key] plane the
+  // softmax walks. Both operands are contiguous [token][dim] planes, so the
+  // column-major leading dimensions are just head_dim.
+  const long long stride_kv = (long long)tpad * head_dim;
+  const long long stride_s = (long long)tpad * tpad;
+  const float alpha = 1.0f, beta = 0.0f, one = 1.0f;  // scale is in softmax
+  cublasSetStream(h, cur_stream());
+
+  // S = Q K^T: C(m=k, n=q) = sum_d kh(k,d) qh(q,d). A row-major [token][dim]
+  // plane is the *transpose* of its column-major view, so A takes the T flag
+  // and B (also [token][dim]) is already the K-dim-by-N form.
+  if (cublasGemmStridedBatchedEx(
+          h, CUBLAS_OP_T, CUBLAS_OP_N, tokens, tokens, head_dim, &alpha, kh,
+          CUDA_R_16F, head_dim, stride_kv, qh, CUDA_R_16F, head_dim,
+          stride_kv, &beta, sh, CUDA_R_16F, tpad, stride_s, heads,
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+
+  // One block per padded plane row (the padded query rows are computed too so
+  // the block index maps straight to a plane row; those rows are never read).
+  full_softmax_f16_rows_kernel<<<unsigned(H * TP), 256, 0, cur_stream()>>>(
+      sh, ph, tokens, tpad, scale);
+
+  // O^T = V^T P^T: C(m=d, n=q) = sum_k vh(k,d) ph(q,k). `out` is
+  // [query][head][dim], so its per-head C view is column-major (M=dim, N=query);
+  // vh's column-major view is already V^T (dim by token) and ph's is P^T, so
+  // both operands take the N flag.
+  if (cublasGemmStridedBatchedEx(
+          h, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, tokens, tokens, &one, vh,
+          CUDA_R_16F, head_dim, stride_kv, ph, CUDA_R_16F, tpad, stride_s,
+          &beta, od, CUDA_R_32F, head_dim, stride_kv, heads,
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+  full_attn_interleave_kernel<<<grid_for(int(T * H * D)), 256, 0,
+                                cur_stream()>>>(od, out, tokens, tpad, heads,
+                                                head_dim);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// --- full.tiled: resolution, autotune and launch ---------------------------
+
+struct FullTile {
+  int br = 0;
+  int bc = 0;
+  int as = 0;
+};
+
+// The generated full-attention shape: the FA-2 warp-head layout (one warp per
+// 16 query rows of one head, whole head_dim, no dim split), no window, no
+// cache, no exp2 (the exp path keeps the same softmax arithmetic the reference
+// kernel uses, so a re-measurement never changes the numbers).
+compiler::AttentionShape full_attn_shape(int head_dim, int gqa,
+                                         const FullTile& t) {
+  compiler::AttentionShape s;
+  s.head_dim = head_dim;
+  s.gqa = gqa;
+  s.full_attn = true;
+  s.warp_head = true;
+  s.br = t.br;
+  s.bc = t.bc;
+  s.dps = 1;
+  s.async_stages = t.as;
+  return s;
+}
+
+bool full_tile_ok(int head_dim, int gqa, const FullTile& t, int max_smem) {
+  const compiler::AttentionShape s = full_attn_shape(head_dim, gqa, t);
+  if (!compiler::attention_shape_supported(s)) return false;
+  if (compiler::attention_shared_bytes(s) > max_smem) return false;
+  // 16 warps is the largest block the register file holds (see the Q3 apply).
+  if (compiler::attention_block_threads(s) > 512) return false;
+  return true;
+}
+
+// Candidate tilings, in preference order. The first supported entry is the
+// static default: br = 128 (8 warps, 256 threads) holds the whole head_dim
+// accumulator plus the Q fragments without approaching the 128-register cap of
+// a 512-thread block. The wider br = 192/256 tiles halve the K/V traffic per
+// query row but need ~110+ registers per thread; the tuner launches them and
+// keeps one only if it really runs and wins.
+std::vector<FullTile> full_tile_candidates(int head_dim, int gqa) {
+  int dev = 0, max_smem = 96 * 1024;
+  if (cudaGetDevice(&dev) == cudaSuccess) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) == cudaSuccess &&
+        v > 0)
+      max_smem = v;
+  }
+  std::vector<FullTile> out;
+  for (const FullTile t : {FullTile{128, 32, 2}, FullTile{128, 16, 2},
+                           FullTile{192, 16, 2}, FullTile{256, 32, 2},
+                           FullTile{256, 32, 3}, FullTile{192, 32, 0},
+                           FullTile{128, 32, 0}, FullTile{64, 32, 2},
+                           FullTile{256, 16, 2}}) {
+    if (full_tile_ok(head_dim, gqa, t, max_smem)) out.push_back(t);
+  }
+  return out;
+}
+
+enum class FullClass { ScoreGemm, Tiled };
+enum class FullImpl { Own, Codegen };
+
+struct FullResolution {
+  FullClass cls = FullClass::Tiled;
+  FullImpl impl = FullImpl::Codegen;
+  FullTile tile;
+};
+
+std::string full_choice_name(const FullResolution& r) {
+  if (r.cls == FullClass::ScoreGemm) return "full.score-gemm";
+  if (r.impl == FullImpl::Own) return "full.tiled:own";
+  return "full.tiled:codegen-wh:" + std::to_string(r.tile.br) + "," +
+         std::to_string(r.tile.bc) + ",as" + std::to_string(r.tile.as);
+}
+
+// The op's attribute key (device is the registry's own dimension). The mask
+// kind, the cache state and prefix reuse are attributes of the class, not of
+// the model that issued the call.
+std::string full_attn_attrs(int head_dim, int gqa) {
+  return "causal0-kvcache0-prefixreuse0-window0-d" + std::to_string(head_dim) +
+         "-g" + std::to_string(gqa);
+}
+
+// Class scope. The two regimes are two scopes: the capacity boundary is a
+// device constant, so neither scope ever contains a live n.
+std::string full_attn_scope(int head_dim, int gqa, bool score_gemm) {
+  return "full-" + full_attn_attrs(head_dim, gqa) +
+         (score_gemm ? "-cap2048" : "-over2048");
+}
+
+// The tiled regime's tuner entry is regime-independent: the same kernel serves
+// the tiled class whether it was reached at n > 2048 or by a shape at n <=
+// 2048 that the score-GEMM regime cannot serve.
+std::string full_tiled_scope(int head_dim, int gqa) {
+  return "full-" + full_attn_attrs(head_dim, gqa) + "-tiled";
+}
+
+enum class FullClassName { Auto, ScoreGemm, Tiled, Own, Codegen, Scalar };
+
+struct FullOverride {
+  FullClassName cls = FullClassName::Auto;
+  const char* raw = nullptr;
+};
+
+void full_warn_once(const std::string& msg) {
+  static std::mutex mu;
+  static std::unordered_set<std::string> seen;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!seen.insert(msg).second) return;
+  }
+  std::fprintf(stderr, "[attention] %s\n", msg.c_str());
+}
+
+// SONICBOOM_ATTN_CLASS overrides the class for an A/B run; SONICBOOM_DIT_ATTN
+// is kept as its alias (the old spelling). Values that do not describe this
+// op's attributes are refused: an LLM class on a non-causal, cache-less op
+// would silently select a causal kernel, which is exactly what the class key
+// exists to prevent.
+FullOverride full_class_override() {
+  const char* e = std::getenv("SONICBOOM_ATTN_CLASS");
+  if (e == nullptr || *e == '\0') e = std::getenv("SONICBOOM_DIT_ATTN");
+  FullOverride o;
+  if (e == nullptr || *e == '\0') return o;
+  o.raw = e;
+  const std::string_view v(e);
+  if (v == "auto") o.cls = FullClassName::Auto;
+  else if (v == "full.score-gemm") o.cls = FullClassName::ScoreGemm;
+  else if (v == "full.tiled") o.cls = FullClassName::Tiled;
+  else if (v == "full.own") o.cls = FullClassName::Own;
+  else if (v == "full.codegen") o.cls = FullClassName::Codegen;
+  else if (v == "scalar" || v == "full.scalar") o.cls = FullClassName::Scalar;
+  else {
+    full_warn_once("SONICBOOM_ATTN_CLASS=" + std::string(v) +
+                   " is not a class for a non-causal, cache-less attention "
+                   "op; using auto");
+    o.cls = FullClassName::Auto;
+  }
+  return o;
+}
+
+// Process memo: the resolution and the source that produced it, so a repeat
+// call neither retimes nor misreports where the class came from.
+struct FullMemo {
+  FullResolution res;
+  planner::decisions::Source src = planner::decisions::Source::Default;
+};
+
+std::mutex g_full_choice_mutex;
+std::unordered_map<std::string, FullMemo> g_full_choice;
+
+// Class records are written once per (name, scope, value): a second value for
+// the same scope must still reach the registry, where it is counted as a
+// conflict instead of being hidden by a per-scope flag.
+std::mutex g_full_rec_mutex;
+std::unordered_set<std::string> g_full_rec_seen;
+
+bool full_record_once(planner::decisions::Entry e) {
+  const std::string k = e.name + "\x1f" + e.scope + "\x1f" + e.value;
+  {
+    std::lock_guard<std::mutex> lk(g_full_rec_mutex);
+    if (!g_full_rec_seen.insert(k).second) return false;
+  }
+  planner::decisions::record(std::move(e));
+  return true;
+}
+
+void full_record_class(const FullResolution& r, int head_dim, int gqa,
+                       int n_heads, int score_gemm_vram, bool fallback,
+                       planner::decisions::Source src) {
+  planner::decisions::Entry e;
+  e.name = "attention.class";
+  e.scope = full_attn_scope(head_dim, gqa, r.cls == FullClass::ScoreGemm);
+  e.value = full_choice_name(r);
+  e.source = src;
+  e.env = "SONICBOOM_ATTN_CLASS";
+  e.inputs = full_attn_attrs(head_dim, gqa) + " heads=" +
+             std::to_string(n_heads) + " device=sm_86";
+  e.candidates = "full.score-gemm|full.tiled";
+  if (r.cls == FullClass::ScoreGemm)
+    e.reason = "n <= 2048: the per-head score planes fit the scratch budget "
+               "(R1 capacity exception; no prefix reuse, deterministic)";
+  else if (fallback)
+    e.reason = "score-GEMM regime unavailable for this shape; tiled regime "
+               "(R1 capacity exception; no prefix reuse, deterministic)";
+  else
+    e.reason = "n > 2048: score planes exceed the scratch budget; online "
+               "tiling (R1 capacity exception; no prefix reuse, deterministic)";
+  e.numerics = r.cls == FullClass::ScoreGemm
+                   ? "f16 GEMM operands, fp32 accumulate, row softmax in f32"
+                   : "f16 K/V, fp32 accumulate, deterministic per resolution";
+  e.vram_bytes = r.cls == FullClass::ScoreGemm ? score_gemm_vram : 0;
+  full_record_once(std::move(e));
+}
+
+bool full_attn_launch_own(int head_dim, const float* q, const float* k,
+                          const float* v, int n, int n_heads, float scale,
+                          float* out) {
+  if (head_dim != 128) return false;
+  // The hand-written tiled kernel in dense full-attention mode: identical
+  // geometry to the causal prefill specialization, with the mask compile-time
+  // off (no cache, no start position, no window).
+  return launch_tiled_flash_attention<float, 128, 64, 2, 128, 1, false>(
+      q, k, v, nullptr, nullptr, nullptr, /*n_slots=*/0, n, n_heads, n_heads,
+      /*sliding_window=*/0, scale, out);
+}
+
+// Launch the generated full-attention kernel. Falls back to the hand-written
+// kernel only when the generator cannot launch (JIT failure); the production
+// resolution always names the implementation that ran.
+bool full_attn_launch(const FullResolution& r, int head_dim, int gqa,
+                      const float* q, const float* k, const float* v, int n,
+                      int n_heads, float scale, float* out,
+                      FullImpl& ran) {
+  if (r.impl == FullImpl::Codegen) {
+    const compiler::AttentionShape s = full_attn_shape(head_dim, gqa, r.tile);
+    if (attn_launch_codegen(s, q, k, v, nullptr, nullptr, nullptr, 0, n,
+                            n_heads, n_heads, 0, scale, out)) {
+      ran = FullImpl::Codegen;
+      return true;
+    }
+    full_warn_once("full-attention kernel launch failed for " +
+                   full_choice_name(r) + "; using the hand-written kernel");
+  }
+  ran = FullImpl::Own;
+  return full_attn_launch_own(head_dim, q, k, v, n, n_heads, scale, out);
+}
+
+// Static tiled default: the first supported generated tiling, else the
+// hand-written kernel.
+FullResolution full_tiled_default(int head_dim, int gqa) {
+  FullResolution r;
+  r.cls = FullClass::Tiled;
+  const std::vector<FullTile> cands = full_tile_candidates(head_dim, gqa);
+  if (!cands.empty()) {
+    r.impl = FullImpl::Codegen;
+    r.tile = cands.front();
+  } else {
+    r.impl = FullImpl::Own;
+  }
+  return r;
+}
+
+std::string full_tune_key(int head_dim, int gqa, int n_heads) {
+  // The generated-code version and the default the pick was measured against
+  // are decision inputs: changing either retimes the class. The probe length,
+  // head dimension, GQA ratio and head count are the class; the caller's n is
+  // never part of the key.
+  std::string k = compiler::attention_codegen_version();
+  k += "|" + full_tiled_scope(head_dim, gqa) + "|h" + std::to_string(n_heads) +
+       "|wl" + std::to_string(kFullTuneTokens) + "|dflt-" +
+       full_choice_name(full_tiled_default(head_dim, gqa));
+  return k;
+}
+
+std::optional<FullResolution>
+full_choice_from_values(const std::map<std::string, int>& v, int head_dim,
+                        int gqa) {
+  const auto get = [&v](const char* name, int& dst) {
+    const auto it = v.find(name);
+    if (it == v.end()) return false;
+    dst = it->second;
+    return true;
+  };
+  int impl = 0;
+  if (!get("impl", impl)) return std::nullopt;
+  FullResolution r;
+  r.cls = FullClass::Tiled;
+  if (impl == 0) {
+    if (head_dim != 128) return std::nullopt;  // no hand-written instantiation
+    r.impl = FullImpl::Own;
+    return r;
+  }
+  int br = 0, bc = 0, as = 0;
+  if (!get("br", br) || !get("bc", bc)) return std::nullopt;
+  (void)get("as", as);
+  // A cached tile must still be a supported, launchable tile on this device.
+  for (const FullTile& c : full_tile_candidates(head_dim, gqa))
+    if (c.br == br && c.bc == bc && c.as == as) {
+      r.impl = FullImpl::Codegen;
+      r.tile = c;
+      return r;
+    }
+  return std::nullopt;
+}
+
+// Time every supported tiling plus the hand-written kernel on one fixed
+// synthetic full-attention call. The probe length is a constant of the class,
+// so the ranking never depends on the caller's n.
+FullResolution full_tune_tiled(int head_dim, int gqa, int n_heads,
+                               const FullResolution& def, double& tune_s,
+                               int& candidate_count) {
+  const auto t0 = std::chrono::steady_clock::now();
+  candidate_count = 0;
+  std::vector<FullResolution> cands{def};
+  auto add = [&](const FullResolution& c) {
+    for (const FullResolution& x : cands)
+      if (x.cls == c.cls && x.impl == c.impl && x.tile.br == c.tile.br &&
+          x.tile.bc == c.tile.bc && x.tile.as == c.tile.as)
+        return;
+    cands.push_back(c);
+  };
+  {
+    FullResolution own;
+    own.cls = FullClass::Tiled;
+    own.impl = FullImpl::Own;
+    if (head_dim == 128) add(own);
+  }
+  for (const FullTile& t : full_tile_candidates(head_dim, gqa)) {
+    FullResolution c;
+    c.cls = FullClass::Tiled;
+    c.impl = FullImpl::Codegen;
+    c.tile = t;
+    add(c);
+  }
+
+  const int n = kFullTuneTokens;
+  const size_t elems = size_t(n) * size_t(n_heads) * size_t(head_dim);
+  float *q = nullptr, *k = nullptr, *v = nullptr, *out = nullptr;
+  bool ok = cudaMalloc(reinterpret_cast<void**>(&q), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&k), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&v), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&out), elems * 4) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    for (float* p : {q, k, v, out})
+      if (p) cudaFree(p);
+    tune_s = 0.0;
+    return def;
+  }
+  // Zeroed inputs: the kernel's work is data-independent (no early exits).
+  for (float* p : {q, k, v, out}) cudaMemsetAsync(p, 0, elems * 4, cur_stream());
+
+  const float scale = 1.0f / std::sqrt(float(head_dim));
+  auto run = [&](const FullResolution& r) {
+    if (r.impl == FullImpl::Own)
+      return full_attn_launch_own(head_dim, q, k, v, n, n_heads, scale, out);
+    return attn_launch_codegen(full_attn_shape(head_dim, gqa, r.tile), q, k, v,
+                               nullptr, nullptr, nullptr, 0, n, n_heads,
+                               n_heads, 0, scale, out);
+  };
+
+  // The timing launches are not part of any run (same rule as the causal
+  // prefill tuner: a recorded plan must name the real kernel's grid).
+  planner::PlanRecorder* saved_rec = planner::recorder();
+  planner::set_thread_recorder(nullptr);
+  candidate_count = int(cands.size());
+  auto time_one = [&](const FullResolution& c) {
+    if (!run(c)) {  // a tile that cannot launch cannot be chosen
+      (void)cudaGetLastError();
+      return -1.0;
+    }
+    const double ms = ::sonicboom::tune::median_launch_ms(
+        [&] { return run(c); }, cur_stream(), 2, 5);
+    if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+      std::fprintf(stderr, "[autotune]   full-attn cand %s %.4f ms\n",
+                   full_choice_name(c).c_str(), ms);
+    return ms;
+  };
+  // The default is timed first; it is the reference the winner must beat by
+  // the switch margin.
+  const double def_ms = time_one(def);
+  FullResolution best = def;
+  double best_ms = def_ms;
+  for (size_t i = 1; i < cands.size(); ++i) {
+    const double ms = time_one(cands[i]);
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
+      best = cands[i];
+      best_ms = ms;
+    }
+  }
+  planner::set_thread_recorder(saved_rec);
+  for (float* p : {q, k, v, out}) cudaFree(p);
+
+  if (best_ms <= 0.0)
+    best = def;
+  else if (def_ms > 0.0 &&
+           !(best_ms < def_ms * (1.0 - kFullSwitchMargin)))
+    best = def;  // within the noise margin: keep the measured default
+  tune_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count();
+  return best;
+}
+
+// Resolve the tiled regime for the class: the env pin, else the process memo,
+// else the per-device cached pick, else a tuning run, else the static default.
+// `src` reports where the value came from, for the registry.
+FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
+                                  const FullOverride& ov,
+                                  planner::decisions::Source& src,
+                                  double& tune_s, int& candidate_count) {
+  const FullResolution def = full_tiled_default(head_dim, gqa);
+  src = planner::decisions::Source::Default;
+  tune_s = 0.0;
+  candidate_count = 0;
+
+  if (ov.cls == FullClassName::Own || ov.cls == FullClassName::Codegen) {
+    FullResolution r;
+    r.cls = FullClass::Tiled;
+    if (ov.cls == FullClassName::Own) {
+      if (head_dim != 128) {
+        full_warn_once("SONICBOOM_ATTN_CLASS=full.own has no instantiation for "
+                       "this head width; using the default class");
+        return def;
+      }
+      r.impl = FullImpl::Own;
+    } else {
+      if (def.impl != FullImpl::Codegen) {
+        full_warn_once("SONICBOOM_ATTN_CLASS=full.codegen has no supported "
+                       "tiling for this shape; using the default class");
+        return def;
+      }
+      r.impl = FullImpl::Codegen;
+      r.tile = def.tile;
+    }
+    src = planner::decisions::Source::Env;
+    return r;
+  }
+
+  const std::string key = full_tune_key(head_dim, gqa, n_heads);
+  {
+    std::lock_guard<std::mutex> lk(g_full_choice_mutex);
+    const auto it = g_full_choice.find(key);
+    if (it != g_full_choice.end()) {
+      src = it->second.src;
+      tune_s = 0.0;
+      return it->second.res;
+    }
+  }
+
+  FullResolution choice = def;
+  bool have = false;
+  if (::sonicboom::tune::enabled()) {
+    // Host timing is illegal inside a graph capture, so a capture that misses
+    // the cache takes the static default (the class is still recorded).
+    if (!attn_capturing()) {
+      const std::map<std::string, int> cached =
+          ::sonicboom::tune::lookup("attention-full", key);
+      if (!cached.empty()) {
+        if (const auto c = full_choice_from_values(cached, head_dim, gqa)) {
+          choice = *c;
+          have = true;
+        }
+      }
+      if (!have) {
+        choice = full_tune_tiled(head_dim, gqa, n_heads, def, tune_s,
+                                 candidate_count);
+        const std::map<std::string, int> values{
+            {"impl", choice.impl == FullImpl::Codegen ? 1 : 0},
+            {"br", choice.tile.br},
+            {"bc", choice.tile.bc},
+            {"as", choice.tile.as}};
+        ::sonicboom::tune::store("attention-full", key, values);
+      }
+    }
+  }
+  src = have ? planner::decisions::Source::Cached
+             : (candidate_count > 0 ? planner::decisions::Source::Measured
+                                    : planner::decisions::Source::Default);
+
+  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+    std::fprintf(stderr,
+                 "[autotune] attention-full %s %s default=%s candidates=%d "
+                 "tune=%.2f s\n",
+                 key.c_str(),
+                 std::string(planner::decisions::source_name(src)).c_str(),
+                 full_choice_name(def).c_str(), candidate_count, tune_s);
+
+  {
+    std::lock_guard<std::mutex> lk(g_full_choice_mutex);
+    g_full_choice[key] = FullMemo{choice, src};
+  }
+  return choice;
+}
+
+// The tiled regime's tuner decision: one entry per attribute key, with the
+// candidates considered, the measured probe and where the value came from.
+void full_record_tune(const FullResolution& r, int head_dim, int gqa,
+                      int n_heads, planner::decisions::Source src,
+                      int candidate_count, double tune_s) {
+  planner::decisions::Entry e;
+  e.name = "tune/attention-full";
+  e.scope = full_tiled_scope(head_dim, gqa);
+  e.value = full_choice_name(r);
+  e.source = src;
+  e.env = "SONICBOOM_ATTN_CLASS";
+  e.inputs = full_attn_attrs(head_dim, gqa) + " heads=" +
+             std::to_string(n_heads) + " probe=" +
+             std::to_string(kFullTuneTokens) + "-tokens dev=sm_86";
+  std::string cands = "full.tiled:own|";
+  for (const FullTile& t : full_tile_candidates(head_dim, gqa))
+    cands += "full.tiled:codegen-wh:" + std::to_string(t.br) + "," +
+             std::to_string(t.bc) + ",as" + std::to_string(t.as) + "|";
+  e.candidates = std::move(cands);
+  e.reason = "FA-2 warp-head kernel timed once per device on a fixed synthetic "
+             "full-attention call; the default is kept unless a candidate wins "
+             "by the switch margin";
+  e.numerics =
+      "f16 K/V, fp32 accumulate; deterministic per resolution, not "
+      "token-identical to the hand-written kernel's S/P association";
+  e.tuning_ms = int64_t(std::llround(tune_s * 1000.0));
+  full_record_once(std::move(e));
+}
+
+// Resolve the whole class for one call: regime first (capacity boundary), then
+// the tiled regime's implementation. `src` is the origin of the value.
+FullResolution full_resolve(int n, int n_heads, int head_dim, int gqa,
+                            const FullOverride& ov,
+                            planner::decisions::Source& src, double& tune_s,
+                            int& candidate_count) {
+  bool score_gemm = n <= kFullScoreMaxTokens;
+  if (ov.cls == FullClassName::ScoreGemm) score_gemm = true;
+  if (ov.cls == FullClassName::Tiled || ov.cls == FullClassName::Own ||
+      ov.cls == FullClassName::Codegen)
+    score_gemm = false;
+  if (score_gemm) {
+    FullResolution r;
+    r.cls = FullClass::ScoreGemm;
+    r.impl = FullImpl::Own;
+    src = ov.cls == FullClassName::ScoreGemm
+              ? planner::decisions::Source::Env
+              : planner::decisions::Source::Default;
+    tune_s = 0.0;
+    candidate_count = 0;
+    return r;
+  }
+  return full_resolve_tiled(head_dim, gqa, n_heads, ov, src, tune_s,
+                            candidate_count);
 }
 
 // Prefill implementation choice for a shape class: the hand-written kernel
@@ -4331,6 +5101,77 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
 }
 
 } // namespace
+
+// Dense full attention (no mask, no window, no KV cache): every query attends
+// to every key in [0, n). The op's attributes (causal 0, kv_cache absent,
+// prefix_reuse impossible, window 0) are the class key; the class and its
+// implementation are resolved through the decision registry (full_resolve) and
+// recorded as `attention.class` / `tune/attention-full`. No model name and no
+// caller identity participates in the choice.
+//
+// The score-GEMM regime returns false when the shape or the scratch does not
+// fit (the caller then falls back to its own scalar kernel); every other
+// regime falls back to the hand-written tiled kernel instead. false means no
+// class of this op can run, never "this caller is the DiT".
+bool flash_attention_full_dev(const float* q, const float* k, const float* v,
+                              int n, int n_heads, int head_dim, float scale,
+                              float* out) {
+  if (!available()) return false;
+  if (n <= 0 || n_heads <= 0 || head_dim <= 0) return false;
+  if (!q || !k || !v || !out) return false;
+  if (n_heads > 32) return false;  // one warp per 16-row chunk, 16-warps cap
+
+  // This op has one K/V head per query head: GQA 1 is an attribute of the
+  // class, not an assumption about the caller.
+  const int gqa = 1;
+  const FullOverride ov = full_class_override();
+  if (ov.cls == FullClassName::Scalar) return false;
+
+  planner::decisions::Source src = planner::decisions::Source::Default;
+  double tune_s = 0.0;
+  int candidate_count = 0;
+  FullResolution r = full_resolve(n, n_heads, head_dim, gqa, ov, src, tune_s,
+                                  candidate_count);
+  bool fell_back = false;
+
+  if (r.cls == FullClass::ScoreGemm) {
+    const int vram = int(full_score_scratch_bytes(n, n_heads, head_dim));
+    if (full_attention_score_gemm(q, k, v, n, n_heads, head_dim, scale, out)) {
+      full_record_class(r, head_dim, gqa, n_heads, vram, /*fallback=*/false,
+                        src);
+      return true;
+    }
+    // Pinned to the score-GEMM regime: do not silently take another class.
+    if (ov.cls == FullClassName::ScoreGemm) return false;
+    // The shape/scratch cannot serve this regime; the tiled regime is the
+    // class's remaining implementation.
+    full_warn_once(
+        "score-GEMM regime unavailable at this shape; using the tiled "
+        "full-attention class");
+    src = planner::decisions::Source::Default;
+    tune_s = 0.0;
+    candidate_count = 0;
+    r = full_resolve_tiled(head_dim, gqa, n_heads, ov, src, tune_s,
+                           candidate_count);
+    fell_back = true;
+  }
+
+  full_record_tune(r, head_dim, gqa, n_heads, src, candidate_count, tune_s);
+  FullImpl ran = FullImpl::Own;
+  if (!full_attn_launch(r, head_dim, gqa, q, k, v, n, n_heads, scale, out,
+                        ran))
+    return false;
+  if (ran != r.impl) {
+    // The generated kernel did not launch: record what actually ran, under the
+    // same scope, so the registry counts the deviation as a conflict.
+    r.impl = ran;
+    r.tile = FullTile{0, 0, 0};
+  }
+  full_record_class(r, head_dim, gqa, n_heads, 0, fell_back, src);
+  return true;
+}
+
+void flash_attention_full_release_scratch() { release_full_scratch(); }
 
 bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    const float* v_batch, const float* k_cache,

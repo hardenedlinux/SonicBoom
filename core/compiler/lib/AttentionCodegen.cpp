@@ -95,9 +95,15 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const int DC = D / DPS;     // output columns per warp
   const int WROW = BR / 16;   // 16-row query chunks per block
   // Query heads per block (GQA packing). The warp-head variant packs one warp
-  // per query head already, so its pack factor is implicit.
+  // per (query head, 16-row chunk) already, so its pack factor is implicit.
   const int PACK = WH ? 1 : sh.gqa_pack;
-  const int NW = WH ? GQA : WROW * DPS * PACK;  // warps per block
+  // Warp-head blocks hold gqa * WROW warps: head-major, warp = headloc*WROW +
+  // rowchunk, so the block's warps share one K/V tile per KV head and each
+  // owns distinct query rows and the whole head_dim.
+  const int NW = WH ? GQA * WROW : WROW * DPS * PACK;  // warps per block
+  // Full attention (non-causal, no cache, no window): keys [0, n), batch
+  // K/V only.
+  const bool FULL = sh.full_attn;
   const int THREADS = NW * 32;
   const int SUBS = BC / 16;
   const int NT = DC / 8;   // output n-tiles of 8 columns per warp
@@ -296,18 +302,24 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // [dchunk*DC, dchunk*DC+DC). With dps = 1 the row chunk is the whole warp
   // role and the D split is trivial.
   if (DPS != 1) c32("cdps", DPS);
-  // Warp-head: every warp covers the block's one 16-row chunk and the whole
-  // head_dim; the warp index selects its query head instead.
+  // Warp-head: every warp covers one 16-row chunk and the whole head_dim.
+  // Warp roles are head-major: warp = headloc * WROW + rowchunk, so the first
+  // WROW warps serve the first query head's chunks and all warps of one KV
+  // head share the staged K/V tile.
   // With GQA packing the warp index also selects which packed query head the
   // warp serves: warp = headloc * (WROW * DPS) + rowchunk * DPS + dchunk.
   std::string headloc = C["c0"];
   std::string wrem = warp;
-  if (!WH && PACK > 1) {
+  if (WH && WROW > 1) {
+    const std::string wd = e.val("arith.constant " + s(WROW) + " : i32");
+    headloc = e.val("arith.divui " + warp + ", " + wd + " : i32");
+    wrem = e.val("arith.remui " + warp + ", " + wd + " : i32");
+  } else if (!WH && PACK > 1) {
     const std::string wd = e.val("arith.constant " + s(WROW * DPS) + " : i32");
     headloc = e.val("arith.divui " + warp + ", " + wd + " : i32");
     wrem = e.val("arith.remui " + warp + ", " + wd + " : i32");
   }
-  const std::string rowchunk = WH ? C["c0"]
+  const std::string rowchunk = WH ? (WROW > 1 ? wrem : C["c0"])
       : DPS == 1
       ? wrem
       : e.val("arith.divui " + wrem + ", " + C["cdps"] + " : i32");
@@ -334,7 +346,11 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   const std::string n64 = e.val("arith.extsi %n : i32 to i64");
   const std::string nhq64 = e.val("arith.extui %nhq : i32 to i64");
   const std::string nhkv64 = e.val("arith.extui %nhkv : i32 to i64");
-  const std::string start = e.val("llvm.load %startp : !llvm.ptr -> i64");
+  // Full attention has no cache and no reused prefix: every key is in the
+  // batch plane, so the start position is the constant 0 and %startp is never
+  // dereferenced (the launch passes no start buffer).
+  const std::string start =
+      FULL ? C["l0"] : e.val("llvm.load %startp : !llvm.ptr -> i64");
   const std::string divc =
       GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
   // Grid y is the KV head in the warp-head variant (each warp takes one of its
@@ -344,7 +360,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   if (WH) {
     const std::string gqac = GQA == 4 ? C["c4"] : GQA == 7 ? C["c7"] : C["gqa"];
     hq = e.val("arith.muli " + by_i + ", " + gqac + " : i32");
-    hq = e.val("arith.addi " + hq + ", " + warp + " : i32");
+    // one 16-row chunk per head (WROW == 1): the warp index is the head
+    hq = e.val("arith.addi " + hq + ", " +
+               (WROW > 1 ? headloc : warp) + " : i32");
   } else if (PACK > 1) {
     const std::string packc = e.val("arith.constant " + s(PACK) + " : i32");
     hq = e.val("arith.muli " + by_i + ", " + packc + " : i32");
@@ -361,8 +379,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       e.val("arith.muli " + bx64 + ", " + C["lbr"] + " : i64");
 
   // ---- Q tile: [QROWS][D] f16 ---------------------------------------------
-  // Warp-head: QROWS = gqa 16-row tiles, one per query head of this KV head;
-  // the staged row's head is by*gqa + row/16.
+  // Warp-head: QROWS = gqa * BR rows, one br-row tile per query head of this
+  // KV head; the staged row's head is by*gqa + row/BR and its position within
+  // the head is row%BR.
   e.op("scf.for %qi = " + tid + " to " + C["xq"] + " step " + C["xthr"] +
        " : index {");
   {
@@ -373,9 +392,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     if (WH) {
       const std::string kk32 =
           e.val("arith.index_cast " + kk + " : index to i32");
-      const std::string hloc = e.val("arith.divui " + kk32 + ", " + C["c16"] +
+      const std::string hloc = e.val("arith.divui " + kk32 + ", " + C["cbr"] +
                                      " : i32");
-      const std::string rloc = e.val("arith.remui " + kk32 + ", " + C["c16"] +
+      const std::string rloc = e.val("arith.remui " + kk32 + ", " + C["cbr"] +
                                      " : i32");
       const std::string rloc64 =
           e.val("arith.extsi " + rloc + " : i32 to i64");
@@ -437,6 +456,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // ---- Q fragments (invariant across key tiles) ---------------------------
   // Each warp loads its 16 query rows over its DC-column slice of head_dim
   // and holds them in registers for the whole key-tile loop.
+  // Warp-head: warp = headloc*WROW + rowchunk, and the staged Q tile is
+  // head-major with WROW chunks per head, so the warp index is its 16-row
+  // chunk index directly.
   std::string qbase = WH ? warp : rowchunk;
   if (!WH && PACK > 1) {
     // 16-row chunk index within the packed Q tile: one tile of WROW chunks
@@ -492,8 +514,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       e.val("arith.minsi " + nrem + ", " + C["lbr"] + " : i64");
   const std::string keyend0 =
       e.val("arith.addi " + start + ", " + bxbr + " : i64");
-  const std::string keyend1 =
-      e.val("arith.addi " + keyend0 + ", " + nblk + " : i64");
+  // Full attention: the key range is [0, n) for every block, independent of
+  // the block's query rows (non-causal). The last key tile is partial
+  // whenever n is not a multiple of bc; the mask keeps its tail out of the
+  // softmax, and the staging clamps those keys to n-1.
+  const std::string keyend1 = FULL
+      ? n64
+      : e.val("arith.addi " + keyend0 + ", " + nblk + " : i64");
   const std::string keyend =
       e.val("arith.subi " + keyend1 + ", " + C["l1"] + " : i64");
   const std::string abs_pb = keyend0;
@@ -538,6 +565,13 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   };
   const std::string low0 = low_of(p0);
   const std::string low1 = low_of(p1);
+  // Full attention: mask only the keys past the key range's end. The bound is
+  // the same for every query row (no causal or window term), and keys before
+  // 0 do not exist.
+  const std::string maskhi0 = FULL ? keyend : p0;
+  const std::string maskhi1 = FULL ? keyend : p1;
+  const std::string masklo0 = FULL ? C["l0"] : low0;
+  const std::string masklo1 = FULL ? C["l0"] : low1;
 
   // ---- online-softmax loop ------------------------------------------------
   // iter_args: O[0..NT-1] (2x2 f32 each), then m0, m1, l0, l1.
@@ -587,46 +621,72 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
     const std::string jr =
         e.val("arith.addi " + tstart + ", " + key64 + " : i64");
     const std::string j = e.val("arith.minsi " + jr + ", " + keyend + " : i64");
-    const std::string isc =
-        e.val("arith.cmpi slt, " + j + ", " + start + " : i64");
-    const std::string sl = e.val("arith.remui " + j + ", %nslots : i64");
-    const std::string co1 = e.val("arith.muli " + sl + ", " + nhkv64 + " : i64");
-    const std::string co2 = e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
-    const std::string co3 = e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
-    const std::string d4 = e.val("arith.muli " + dq64 + ", " + C["l4"] + " : i64");
-    const std::string co4 = e.val("arith.addi " + co3 + ", " + d4 + " : i64");
-    const std::string bi = e.val("arith.subi " + j + ", " + start + " : i64");
-    const std::string bo1 = e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
-    const std::string bo2 = e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
-    const std::string bo3 = e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
-    const std::string bo4 = e.val("arith.addi " + bo3 + ", " + d4 + " : i64");
-    const std::string bp =
-        e.val("llvm.getelementptr %kb[" + bo4 +
-              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-    const std::string bpv =
-        e.val("llvm.getelementptr %vb[" + bo4 +
-              "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
     std::string rp, rpv;
-    if (sh.kv_f16) {
-      // Only the f32 batch tile can be copied into the f32 stage buffer. A
-      // chunk whose key lives in the f16 cache is skipped: the conversion
-      // step reads that key from the cache directly.
-      const std::string inbatch =
-          e.val("arith.cmpi sge, " + j + ", " + start + " : i64");
-      e.op("scf.if " + inbatch + " {");
-      rp = bp;
-      rpv = bpv;
+    if (FULL) {
+      // Full attention reads the batch planes only: no cache pointer, no
+      // %nslots modulo (the launch passes no cache and no start buffer).
+      const std::string bi =
+          e.val("arith.subi " + j + ", " + start + " : i64");
+      const std::string bo1 =
+          e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
+      const std::string bo2 =
+          e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
+      const std::string bo3 =
+          e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
+      const std::string d4 =
+          e.val("arith.muli " + dq64 + ", " + C["l4"] + " : i64");
+      const std::string bo4 =
+          e.val("arith.addi " + bo3 + ", " + d4 + " : i64");
+      rp = e.val("llvm.getelementptr %kb[" + bo4 +
+                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      rpv = e.val("llvm.getelementptr %vb[" + bo4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
     } else {
-      const std::string cp =
-          e.val("llvm.getelementptr %kc[" + co4 +
+      const std::string isc =
+          e.val("arith.cmpi slt, " + j + ", " + start + " : i64");
+      const std::string sl = e.val("arith.remui " + j + ", %nslots : i64");
+      const std::string co1 = e.val("arith.muli " + sl + ", " + nhkv64 + " : i64");
+      const std::string co2 = e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
+      const std::string co3 = e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+      const std::string d4 = e.val("arith.muli " + dq64 + ", " + C["l4"] + " : i64");
+      const std::string co4 = e.val("arith.addi " + co3 + ", " + d4 + " : i64");
+      const std::string bi =
+          e.val("arith.subi " + j + ", " + start + " : i64");
+      const std::string bo1 =
+          e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
+      const std::string bo2 =
+          e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
+      const std::string bo3 =
+          e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
+      const std::string bo4 =
+          e.val("arith.addi " + bo3 + ", " + d4 + " : i64");
+      const std::string bp =
+          e.val("llvm.getelementptr %kb[" + bo4 +
                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-      const std::string cpv =
-          e.val("llvm.getelementptr %vc[" + co4 +
+      const std::string bpv =
+          e.val("llvm.getelementptr %vb[" + bo4 +
                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-      rp = e.val("llvm.select " + isc + ", " + cp + ", " + bp +
-                 " : i1, !llvm.ptr");
-      rpv = e.val("llvm.select " + isc + ", " + cpv + ", " + bpv +
-                  " : i1, !llvm.ptr");
+      if (sh.kv_f16) {
+        // Only the f32 batch tile can be copied into the f32 stage buffer. A
+        // chunk whose key lives in the f16 cache is skipped: the conversion
+        // step reads that key from the cache directly.
+        const std::string inbatch =
+            e.val("arith.cmpi sge, " + j + ", " + start + " : i64");
+        e.op("scf.if " + inbatch + " {");
+        rp = bp;
+        rpv = bpv;
+      } else {
+        const std::string cp =
+            e.val("llvm.getelementptr %kc[" + co4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        const std::string cpv =
+            e.val("llvm.getelementptr %vc[" + co4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+        rp = e.val("llvm.select " + isc + ", " + cp + ", " + bp +
+                   " : i1, !llvm.ptr");
+        rpv = e.val("llvm.select " + isc + ", " + cpv + ", " + bpv +
+                    " : i1, !llvm.ptr");
+      }
     }
     // Stage-buffer offsets: [slot][K tile][key][4 f32]; V follows at +BC*D.
     const std::string krow =
@@ -657,7 +717,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
     e.op("nvvm.cp.async.shared.global " + spv + ", " + gpv +
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
-    if (sh.kv_f16) e.op("}");
+    if (sh.kv_f16 && !FULL) e.op("}");
     e.op("}");
   };
   // emit_convert turns stage buffer `slot` into the f16 K^T and V tiles with
@@ -844,65 +904,84 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         e.val("arith.cmpi sle, " + j + ", " + keyend + " : i64");
     const std::string vv = e.val("scf.if " + okj + " -> f32 {");
     {
-      const std::string isc =
-          e.val("arith.cmpi slt, " + j + ", " + start + " : i64");
-      const std::string slot = e.val("arith.remui " + j + ", %nslots : i64");
-      const std::string co1 =
-          e.val("arith.muli " + slot + ", " + nhkv64 + " : i64");
-      const std::string co2 =
-          e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
-      const std::string co3 =
-          e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
-      const std::string co4 =
-          e.val("arith.addi " + co3 + ", " + dd64 + " : i64");
-      const std::string cname = is_k ? "kc" : "vc";
-      const std::string bname = is_k ? "kb" : "vb";
-      const std::string bi =
-          e.val("arith.subi " + j + ", " + start + " : i64");
-      const std::string bo1 =
-          e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
-      const std::string bo2 =
-          e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
-      const std::string bo3 =
-          e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
-      const std::string bo4 =
-          e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
       std::string vf;
-      if (sh.kv_f16) {
-        // f16 cache: the two sources have different element types, so the
-        // load is a typed branch, not a pointer select. Widening the stored
-        // half is exact (the cache holds fp16-rounded values).
-        vf = e.val("scf.if " + isc + " -> f32 {");
-        {
-          const std::string cp =
-              e.val("llvm.getelementptr %" + cname + "[" + co4 +
-                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
-          const std::string lh =
-              e.val("llvm.load " + cp + " : !llvm.ptr -> f16");
-          const std::string xh = e.val("arith.extf " + lh + " : f16 to f32");
-          e.op("scf.yield " + xh + " : f32");
-        }
-        e.op("} else {");
-        {
-          const std::string bp =
-              e.val("llvm.getelementptr %" + bname + "[" + bo4 +
-                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-          const std::string lf =
-              e.val("llvm.load " + bp + " : !llvm.ptr -> f32");
-          e.op("scf.yield " + lf + " : f32");
-        }
-        e.op("}");
-      } else {
-        const std::string cp =
-            e.val("llvm.getelementptr %" + cname + "[" + co4 +
-                  "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+      if (FULL) {
+        // Batch planes only: no cache slot, no %nslots modulo.
+        const std::string bname = is_k ? "kb" : "vb";
+        const std::string bi =
+            e.val("arith.subi " + j + ", " + start + " : i64");
+        const std::string bo1 =
+            e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
+        const std::string bo2 =
+            e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
+        const std::string bo3 =
+            e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
+        const std::string bo4 =
+            e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
         const std::string bp =
             e.val("llvm.getelementptr %" + bname + "[" + bo4 +
                   "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-        const std::string rp =
-            e.val("llvm.select " + isc + ", " + cp + ", " + bp +
-                  " : i1, !llvm.ptr");
-        vf = e.val("llvm.load " + rp + " : !llvm.ptr -> f32");
+        vf = e.val("llvm.load " + bp + " : !llvm.ptr -> f32");
+      } else {
+        const std::string isc =
+            e.val("arith.cmpi slt, " + j + ", " + start + " : i64");
+        const std::string slot = e.val("arith.remui " + j + ", %nslots : i64");
+        const std::string co1 =
+            e.val("arith.muli " + slot + ", " + nhkv64 + " : i64");
+        const std::string co2 =
+            e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
+        const std::string co3 =
+            e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+        const std::string co4 =
+            e.val("arith.addi " + co3 + ", " + dd64 + " : i64");
+        const std::string cname = is_k ? "kc" : "vc";
+        const std::string bname = is_k ? "kb" : "vb";
+        const std::string bi =
+            e.val("arith.subi " + j + ", " + start + " : i64");
+        const std::string bo1 =
+            e.val("arith.muli " + bi + ", " + nhkv64 + " : i64");
+        const std::string bo2 =
+            e.val("arith.addi " + bo1 + ", " + hkv64 + " : i64");
+        const std::string bo3 =
+            e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
+        const std::string bo4 =
+            e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
+        if (sh.kv_f16) {
+          // f16 cache: the two sources have different element types, so the
+          // load is a typed branch, not a pointer select. Widening the stored
+          // half is exact (the cache holds fp16-rounded values).
+          vf = e.val("scf.if " + isc + " -> f32 {");
+          {
+            const std::string cp =
+                e.val("llvm.getelementptr %" + cname + "[" + co4 +
+                      "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
+            const std::string lh =
+                e.val("llvm.load " + cp + " : !llvm.ptr -> f16");
+            const std::string xh = e.val("arith.extf " + lh + " : f16 to f32");
+            e.op("scf.yield " + xh + " : f32");
+          }
+          e.op("} else {");
+          {
+            const std::string bp =
+                e.val("llvm.getelementptr %" + bname + "[" + bo4 +
+                      "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+            const std::string lf =
+                e.val("llvm.load " + bp + " : !llvm.ptr -> f32");
+            e.op("scf.yield " + lf + " : f32");
+          }
+          e.op("}");
+        } else {
+          const std::string cp =
+              e.val("llvm.getelementptr %" + cname + "[" + co4 +
+                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+          const std::string bp =
+              e.val("llvm.getelementptr %" + bname + "[" + bo4 +
+                    "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
+          const std::string rp =
+              e.val("llvm.select " + isc + ", " + cp + ", " + bp +
+                    " : i1, !llvm.ptr");
+          vf = e.val("llvm.load " + rp + " : !llvm.ptr -> f32");
+        }
       }
       e.op("scf.yield " + vf + " : f32");
     }
@@ -1100,14 +1179,14 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       return e.val("arith.select " + ok + ", " + sc + ", " + C["cneg"] +
                    " : f32");
     };
-    const std::string m0a = masked(se00, k0a, p0, low0);
-    const std::string m0b = masked(se01, k0b, p0, low0);
-    const std::string m0c = masked(sf00, k1a, p0, low0);
-    const std::string m0d = masked(sf01, k1b, p0, low0);
-    const std::string m1a = masked(se10, k0a, p1, low1);
-    const std::string m1b = masked(se11, k0b, p1, low1);
-    const std::string m1c = masked(sf10, k1a, p1, low1);
-    const std::string m1d = masked(sf11, k1b, p1, low1);
+    const std::string m0a = masked(se00, k0a, maskhi0, masklo0);
+    const std::string m0b = masked(se01, k0b, maskhi0, masklo0);
+    const std::string m0c = masked(sf00, k1a, maskhi0, masklo0);
+    const std::string m0d = masked(sf01, k1b, maskhi0, masklo0);
+    const std::string m1a = masked(se10, k0a, maskhi1, masklo1);
+    const std::string m1b = masked(se11, k0b, maskhi1, masklo1);
+    const std::string m1c = masked(sf10, k1a, maskhi1, masklo1);
+    const std::string m1d = masked(sf11, k1b, maskhi1, masklo1);
 
     // Row reductions over the four lanes that share a row. Width 32 with XOR
     // 1/2 keeps the shuffle closed over each 4-lane group (width 4 lowers to
@@ -1815,15 +1894,23 @@ bool attention_shape_supported(const AttentionShape &shape) {
     return shape.head_dim % 32 == 0 && shape.head_dim / 32 <= 16 &&
            shape.head_dim <= 1024;
   }
+  // Full attention is a mask kind, not a different warp layout: it requires
+  // the warp-head variant (S and P stay in registers) and there is no cache to
+  // read, so an f16 cache and a window are both ruled out. A causal or
+  // windowed shape never reaches this kernel.
+  if (shape.full_attn &&
+      (shape.decode || !shape.warp_head || shape.window_mask || shape.kv_f16))
+    return false;
   if (shape.warp_head) {
     // One warp per (query head, 16-row chunk), whole head_dim per warp: the
     // lane's f32 output accumulator is head_dim/2 registers (at most 128), the
-    // Q fragments head_dim/2 f16 pairs. A block is gqa warps (one per query
-    // head of the KV head), so gqa <= 8 keeps the block within 256 threads;
-    // br is fixed at one 16-row chunk and there is no d split.
-    if (shape.br != 16 || shape.dps != 1) return false;
+    // Q fragments head_dim/2 f16 pairs. A block is gqa*(br/16) warps (the
+    // head's br/16 chunks per query head of the KV head), so at most 16 warps;
+    // br is a multiple of 16 and there is no d split.
+    if (shape.br < 16 || shape.br % 16 != 0 || shape.dps != 1) return false;
     if (shape.bc < 16 || shape.bc > 64 || shape.bc % 16 != 0) return false;
     if (shape.gqa > 8) return false;
+    if (shape.gqa * (shape.br / 16) > 16) return false;
     if (shape.head_dim % 16 != 0 || shape.head_dim / 8 > 32) return false;
     return attention_shared_bytes(shape) <= 96 * 1024;
   }
@@ -1850,7 +1937,8 @@ bool attention_shape_supported(const AttentionShape &shape) {
 
 int attention_block_threads(const AttentionShape &shape) {
   if (shape.decode) return 32;  // one warp for the partial kernel
-  if (shape.warp_head) return shape.gqa * 32;  // one warp per query head
+  if (shape.warp_head)
+    return shape.gqa * (shape.br / 16) * 32;  // one warp per row chunk
   return (shape.br / 16) * shape.dps * shape.gqa_pack * 32;
 }
 
@@ -1918,7 +2006,12 @@ std::string attention_codegen_version() {
   // copied into the f32 stage buffers asynchronously and the cache half is
   // read (already f16) by the conversion step, so the tile values are the
   // synchronous path's.
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn12";
+  // attn13: full-attention mask kind (non-causal, no window, no cache) and
+  // the warp-head layout generalized to br = 16*w (w warps of one query head
+  // per block, each owning distinct query rows and the whole head_dim). A
+  // causal or windowed shape is unaffected: its generated text and region
+  // identity are the ones attn12 produced.
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn13";
 }
 
 } // namespace sonicboom::compiler

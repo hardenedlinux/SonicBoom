@@ -20,6 +20,9 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <cstdint>
 #include <iostream>
 #include <random>
@@ -334,12 +337,46 @@ void test_flash_attention(std::mt19937& rng) {
   }
 
   // Full (non-causal) attention over a dense batch: the DiT shape class,
-  // head_dim 128 with one K/V head per query head. n=300 exercises a partial
-  // third 128-query tile and a partial final 64-key tile; n=65 is the edge
-  // where the key loop is one full and one partial tile and the query tile is
-  // partial as well.
-  for (const uint64_t n : {uint64_t(65), uint64_t(300)}) {
-    const uint64_t heads = 24, hd = 128;
+  // head_dim 128 with one K/V head per query head. Each class arm is pinned
+  // through SONICBOOM_ATTN_CLASS (the A/B override) and must match the same
+  // CPU reference: "auto" at n <= 2048 is the score-GEMM regime, "full.tiled"
+  // the generated FA-2 full-attention kernel, "full.own" the hand-written
+  // tiled kernel. n=300 exercises a partial final 128-query tile and a partial
+  // final key tile; n=65 is the edge where the key loop is one full and one
+  // partial tile and the query tile is partial as well.
+  const auto set_class = [](const char* v) {
+    if (v == nullptr)
+      unsetenv("SONICBOOM_ATTN_CLASS");
+    else
+      setenv("SONICBOOM_ATTN_CLASS", v, 1);
+  };
+  for (const char* arm : {"auto", "full.tiled", "full.own"}) {
+    set_class(arm);
+    for (const uint64_t n : {uint64_t(65), uint64_t(300)}) {
+      const uint64_t heads = 24, hd = 128;
+      const size_t total = n * heads * hd;
+      std::vector<float> q(total), k(total), v(total), y(total), yr(total);
+      for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+      for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+      for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+      const float scale = 1.0f / std::sqrt(float(hd));
+      check(sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y),
+            "cuda::flash_attention_full (head_dim=128) returns true");
+      check(sbnn::scaled_dot_product_attention(q, n, k, v, n, heads, heads, hd,
+                                               false, 0, 0.0f, scale, yr),
+            "CPU sdpa (full, non-causal) returns true");
+      const std::string nm = std::string("cuda::flash_attention_full matches "
+                                         "CPU (") + arm + " n=" +
+                             std::to_string(n) + ")";
+      check_cmp(nm.c_str(), y, yr);
+    }
+  }
+  // Above the capacity boundary every arm must take the tiled regime (or the
+  // pinned hand-written kernel) and still match the reference. Fewer heads
+  // keep the O(n^2) CPU reference affordable.
+  for (const char* arm : {"auto", "full.tiled", "full.own"}) {
+    set_class(arm);
+    const uint64_t n = 2057, heads = 3, hd = 128;
     const size_t total = n * heads * hd;
     std::vector<float> q(total), k(total), v(total), y(total), yr(total);
     for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
@@ -347,11 +384,50 @@ void test_flash_attention(std::mt19937& rng) {
     for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
     const float scale = 1.0f / std::sqrt(float(hd));
     check(sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y),
-          "cuda::flash_attention_full (head_dim=128) returns true");
+          "cuda::flash_attention_full (n > capacity) returns true");
     check(sbnn::scaled_dot_product_attention(q, n, k, v, n, heads, heads, hd,
                                              false, 0, 0.0f, scale, yr),
           "CPU sdpa (full, non-causal) returns true");
-    check_cmp("cuda::flash_attention_full matches CPU", y, yr);
+    const std::string nm = std::string("cuda::flash_attention_full matches "
+                                       "CPU (") + arm + " n=2057)";
+    check_cmp(nm.c_str(), y, yr);
+  }
+  // Determinism: the same resolution called twice on the same inputs must
+  // produce bitwise-identical output. The full class has no atomics and its
+  // tile is fixed per device, so a repeated forward reproduces the decode
+  // stream exactly; a mismatch here would be a nondeterministic reduction.
+  {
+    set_class("auto");
+    const uint64_t n = 2057, heads = 3, hd = 128;
+    const size_t total = n * heads * hd;
+    std::vector<float> q(total), k(total), v(total), y1(total), y2(total);
+    for (auto& x : q) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : k) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    for (auto& x : v) x = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
+    const float scale = 1.0f / std::sqrt(float(hd));
+    const bool first =
+        sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y1);
+    const bool second =
+        sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y2);
+    check(first && second, "cuda::flash_attention_full (determinism) returns true");
+    check(std::memcmp(y1.data(), y2.data(), total * sizeof(float)) == 0,
+          "cuda::flash_attention_full is bitwise deterministic on repeat");
+  }
+  // The scalar pin (and its legacy SONICBOOM_DIT_ATTN spelling) refuses the
+  // class, which is how an A/B run reaches the caller's own fallback.
+  {
+    const uint64_t n = 64, heads = 2, hd = 128;
+    const size_t total = n * heads * hd;
+    std::vector<float> q(total, 0.1f), k(total, 0.1f), v(total, 0.1f), y(total);
+    const float scale = 1.0f / std::sqrt(float(hd));
+    set_class("scalar");
+    check(!sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y),
+          "SONICBOOM_ATTN_CLASS=scalar refuses the full-attention class");
+    set_class(nullptr);
+    setenv("SONICBOOM_DIT_ATTN", "scalar", 1);
+    check(!sbnn::cuda::flash_attention_full(q, k, v, n, heads, hd, scale, y),
+          "SONICBOOM_DIT_ATTN=scalar is an alias of SONICBOOM_ATTN_CLASS");
+    unsetenv("SONICBOOM_DIT_ATTN");
   }
 }
 
