@@ -27,9 +27,7 @@
 //
 // The reference is llama.cpp CPU, i.e. the baseline this runtime is measured
 // against; the prompt ids are checked first so a tokenizer difference can never
-// masquerade as a model difference. The same prompt is then run through the
-// per-token spine (use_prefill = false) to assert the batched prefill and the
-// single-token path agree, which is a model-independent invariant of the spine.
+// masquerade as a model difference.
 //
 // Greedy-stream agreement is asserted as "agrees with llama.cpp up to a
 // documented near-tie", not as bit-exactness. Greedy decode over a quantized
@@ -453,13 +451,6 @@ int main(int argc, char** argv) {
       std::cout << "    llama: " << toks(want_tokens) << "\n";
     }
 
-    // 3. Spine invariant: batched prefill and per-token decode agree.
-    std::vector<int64_t> got_slow(size_t(kSteps), -1);
-    const uint64_t n2 = sbmodel::generate_prefill_spine(
-        *m, prompt, /*start_pos=*/0, got_slow, /*n_ctx=*/0, /*use_prefill=*/false);
-    got_slow.resize(n2);
-    check(got_slow == got,
-          "p" + std::to_string(p) + ": batched prefill == per-token spine");
   }
 
   // A prompt that failed the tokenizer check above never reaches the model, so

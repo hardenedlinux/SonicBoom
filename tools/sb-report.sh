@@ -223,12 +223,12 @@ golden_run() { # LABEL CTEST_REGEX
 
 if [ "$GOLDEN" = 1 ]; then
   [ "$JSON" = 1 ] || echo "[golden]"
-  [ -n "$GEMMA" ] && golden_run gemma_tokens '^test_generate$'
+  [ -n "$GEMMA" ] && golden_run gemma_tokens '^test_generate_numerics_standard$'
   [ -n "$GEMMA" ] && golden_run gemma_prefix_cache '^test_prefix_cache$'
   [ -n "$GEMMA" ] && golden_run gemma_plan_cache '^test_plan_cache$'
   [ -n "$GEMMA" ] && golden_run cuda_elementwise '^test_cuda_elementwise$'
-  [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate$'
-  [ -n "$DEEPSEEK" ] && golden_run deepseek_tokens '^test_deepseek_generate$'
+  [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate_numerics_standard$'
+  [ -n "$DEEPSEEK" ] && golden_run deepseek_tokens '^test_deepseek_generate_numerics_standard$'
   [ "$JSON" = 1 ] || echo
 fi
 
