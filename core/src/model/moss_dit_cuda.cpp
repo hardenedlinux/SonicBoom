@@ -31,6 +31,7 @@
 #include "../quant/ggml_derived/legacy_quants_q5_0_q8_0.h"
 #include "../safetensors/json.h"
 #include "moss_dit_kernels.h"
+#include "weight_cache.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -43,11 +44,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
+
+// The cache lives in its own internal namespace; this TU reaches it by the
+// bare name everywhere.
+namespace weight_cache = sonicboom::model::weight_cache;
 
 namespace sonicboom::moss {
 namespace {
@@ -77,6 +83,30 @@ std::expected<std::string, std::string> read_text(const std::filesystem::path& p
 bool env_is(const char* name, const char* value) {
   const char* got = std::getenv(name);
   return got != nullptr && std::strcmp(got, value) == 0;
+}
+
+// Convert a row range of a BF16 matrix to Q8_0. Row ranges are disjoint, so
+// conversion fans out across cores with no synchronization: this is the 15 s
+// single-threaded phase of the load.
+void convert_q8_rows(const uint16_t* src, uint64_t cols,
+                     quant::ggml_derived::block_q8_0* dst, uint64_t bpr,
+                     uint64_t begin, uint64_t end) {
+  std::vector<float> rowf(cols);
+  for (uint64_t r = begin; r < end; ++r) {
+    const uint16_t* in = src + r * cols;
+    for (uint64_t i = 0; i < cols; ++i) rowf[i] = bf16_to_f32(in[i]);
+    quant::ggml_derived::quantize_q8_0(rowf.data(), cols, dst + r * bpr);
+  }
+}
+
+unsigned convert_threads() {
+  const char* env = std::getenv("SONICBOOM_DIT_CONVERT_THREADS");
+  if (env != nullptr && *env != '\0') {
+    const long v = std::strtol(env, nullptr, 10);
+    if (v >= 1 && v <= 64) return unsigned(v);
+  }
+  const unsigned hw = std::thread::hardware_concurrency();
+  return std::clamp(hw == 0 ? 1u : hw, 1u, 8u);
 }
 
 }  // namespace
@@ -431,11 +461,22 @@ struct CudaDiffusionTransformer::Impl {
     if (stage == nullptr)
       return std::unexpected("pinned staging allocation for " + task.name);
     auto* dst = static_cast<quant::ggml_derived::block_q8_0*>(stage);
-    std::vector<float> rowf(task.cols);
-    for (uint64_t r = 0; r < task.rows; ++r) {
-      const uint16_t* in = src + r * task.cols;
-      for (uint64_t i = 0; i < task.cols; ++i) rowf[i] = bf16_to_f32(in[i]);
-      quant::ggml_derived::quantize_q8_0(rowf.data(), task.cols, dst + r * bpr);
+    const unsigned threads = convert_threads();
+    std::vector<std::thread> workers;
+    if (threads > 1 && task.rows > 1) {
+      const uint64_t chunk = (task.rows + threads - 1) / threads;
+      for (unsigned t = 1; t < threads; ++t) {
+        const uint64_t begin = std::min(task.rows, uint64_t(t) * chunk);
+        if (begin >= task.rows) break;
+        const uint64_t end = std::min(task.rows, begin + chunk);
+        workers.emplace_back(convert_q8_rows, src, task.cols, dst, bpr, begin,
+                             end);
+      }
+      convert_q8_rows(src, task.cols, dst, bpr, 0,
+                      std::min(task.rows, chunk));
+      for (auto& w : workers) w.join();
+    } else {
+      convert_q8_rows(src, task.cols, dst, bpr, 0, task.rows);
     }
     // Permanent Q8 storage mirrors the staged bytes; the device copy is taken
     // from the pinned stage so it can proceed asynchronously.
@@ -471,6 +512,26 @@ struct CudaDiffusionTransformer::Impl {
   }
 
   std::expected<void, std::string> load_weights_pread(void* up) {
+    // The converted bytes are device-independent: a cache hit replaces the
+    // read-and-convert phases with a read of the cache file.
+    if (auto cached = load_weights_cache(up)) {
+      if (*cached) {
+        if (!cdit::stream_sync(up))
+          return std::unexpected("weight upload stream failed");
+        return {};
+      }
+    } else {
+      return std::unexpected(cached.error());
+    }
+    // A miss converts and then writes the cache. Hashing the checkpoint is a
+    // full read of the same files the producer is reading; run it across the
+    // conversion instead of adding it to the critical path.
+    std::future<std::string> checkpoint_sha;
+    if (weight_cache::directory())
+      checkpoint_sha = std::async(std::launch::async, [this] {
+        return weight_cache::checkpoint_sha256(shard_paths());
+      });
+
     struct Entry {
       const safetensors::ShardedTensor* t;
       uint64_t offset;
@@ -611,6 +672,7 @@ struct CudaDiffusionTransformer::Impl {
     }
     for (void* p : stage.buf) cdit::pinned_free(p);
     if (!cdit::stream_sync(up)) return std::unexpected("weight upload stream failed");
+    if (checkpoint_sha.valid()) write_weight_cache(checkpoint_sha.get());
     return {};
   }
 
@@ -642,6 +704,105 @@ struct CudaDiffusionTransformer::Impl {
     }
     if (!cdit::stream_sync(up)) return std::unexpected("weight upload stream failed");
     return {};
+  }
+
+  // --- converted-weight cache ----------------------------------------------
+
+  std::vector<std::filesystem::path> shard_paths() const {
+    std::vector<std::filesystem::path> out;
+    out.reserve(reader->shards().size());
+    for (const auto& s : reader->shards()) out.push_back(s.path());
+    return out;
+  }
+
+  std::expected<void, std::string> ingest_cached(
+      const weight_cache::CacheFile& file,
+      const weight_cache::TensorRecord& rec, Task& task, void* up) {
+    QMat& m = *task.dst;
+    const size_t bytes = size_t(rec.q8_bytes);
+    void* stage = q8_stage.get(up, bytes);
+    if (stage == nullptr)
+      return std::unexpected("pinned staging allocation for " + task.name);
+    std::span<std::byte> staged(static_cast<std::byte*>(stage), bytes);
+    m.bias.clear();
+    if (!weight_cache::read_tensor(file, rec, staged,
+                                   task.has_bias ? &m.bias : nullptr))
+      return std::unexpected(task.name +
+                             ": cache payload failed verification (remove " +
+                             file.path.string() + " to rebuild)");
+    m.bytes.assign(staged.begin(), staged.end());
+    m.rows = task.rows;
+    m.cols = task.cols;
+    m.tensor = quant::QuantizedTensor(quant::QuantType::Q8_0,
+                                      {task.cols, task.rows}, m.bytes);
+    if (!m.tensor.valid()) return std::unexpected(task.name + ": invalid Q8_0");
+    void* d = cdit::device_alloc(bytes + 256);
+    if (d == nullptr)
+      return std::unexpected("device alloc failed for " + task.name);
+    static const std::vector<std::byte> zeros(256, std::byte{0});
+    if (!cdit::upload_async(static_cast<std::byte*>(d) + bytes, zeros.data(),
+                            zeros.size(), up) ||
+        !cdit::upload_async(d, stage, bytes, up)) {
+      cdit::device_free(d);
+      return std::unexpected("upload failed for " + task.name);
+    }
+    q8_stage.note_issued();
+    if (!quant::cuda::register_weight_device(m.tensor, d)) {
+      cdit::device_free(d);
+      return std::unexpected("could not register " + task.name);
+    }
+    m.loaded = true;
+    if (task.has_bias) {
+      m.d_bias = upload_f32(m.bias);
+      if (m.d_bias == nullptr)
+        return std::unexpected("bias upload failed for " + task.name);
+    }
+    return {};
+  }
+
+  // Try the converted-weight cache. Returns true when every matrix was loaded,
+  // false when there is no usable cache (the conversion path then runs). A
+  // non-empty error means a cache entry failed verification; that is reported
+  // rather than silently re-converted.
+  std::expected<bool, std::string> load_weights_cache(void* up) {
+    if (!weight_cache::directory()) return false;
+    const auto shards = shard_paths();
+    auto file = weight_cache::open_existing(shards);
+    if (!file) return false;
+    for (const Task& task : tasks) {
+      const auto* rec = file->find(task.name);
+      if (rec == nullptr || rec->rows != task.rows || rec->cols != task.cols ||
+          (task.has_bias && rec->bias_count != task.rows))
+        return false;  // format or geometry mismatch: rebuild
+    }
+    for (Task& task : tasks) {
+      const auto* rec = file->find(task.name);
+      if (auto r = ingest_cached(*file, *rec, task, up); !r)
+        return std::unexpected(r.error());
+    }
+    return true;
+  }
+
+  void write_weight_cache(const std::string& sha) {
+    if (sha.size() != 64) return;
+    const auto shards = shard_paths();
+    std::vector<weight_cache::WriteTensor> tensors;
+    tensors.reserve(tasks.size());
+    for (const Task& task : tasks) {
+      weight_cache::WriteTensor w;
+      w.name = task.name;
+      w.rows = task.rows;
+      w.cols = task.cols;
+      w.q8 = std::span<const std::byte>(task.dst->bytes);
+      if (task.has_bias) w.bias = std::span<const float>(task.dst->bias);
+      tensors.push_back(std::move(w));
+    }
+    auto r = weight_cache::store(shards, tensors, sha);
+    if (r)
+      std::fprintf(stderr, "sonicboom: weight cache: %s\n", r->c_str());
+    else
+      std::fprintf(stderr, "sonicboom: weight cache not written: %s\n",
+                   r.error().c_str());
   }
 
   // --- forward -------------------------------------------------------------
