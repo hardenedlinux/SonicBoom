@@ -41,8 +41,18 @@ export LC_ALL=C LANG=C
 # reported beside it: the median alone cannot say whether a later comparison's
 # difference is bigger than this harness's own repeatability.
 #
+# --long adds the extended-context tiers (M3): decode at depth 4K/16K/32K and
+# prefill of 4K/16K/32K tokens, each against llama-bench at the same depth
+# (`-d` / `-p`). It is opt-in because the deep tiers cost minutes per run. The
+# decode tiers reach the depth with the chunked prefill path (longctx_bench
+# --prefill) rather than decoding to it; the subtraction cancels the prefill,
+# so the number is the steady decode rate with a depth-deep KV cache, the same
+# thing llama-bench `-d` measures. Tiers whose n_ctx exceeds a model's declared
+# context are reported as rejected by the runtime rather than as a number.
+#
 # Usage: tools/bench.sh <model.gguf> [--label NAME] [--runs N] [--no-build]
 #                                       [--gpu-clock MHZ] [--no-lock-clocks]
+#                                       [--long]
 # Env:   LLAMA_BENCH=/path/to/llama-bench   (optional; enables the llama.cpp column)
 set -euo pipefail
 
@@ -54,6 +64,9 @@ LABEL=""
 GGUF=""
 CLOCKS=1
 CLOCK_MHZ=""
+LONG=0
+LONG_DEPTHS="4096 16384 32768"
+LONG_STEPS=64
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,6 +75,7 @@ while [ $# -gt 0 ]; do
     --no-build) BUILD=0; shift ;;
     --gpu-clock) CLOCK_MHZ="$2"; shift 2 ;;
     --no-lock-clocks) CLOCKS=0; shift ;;
+    --long) LONG=1; shift ;;
     -h|--help) awk '/^# SPDX/{f=1;next} /^set -euo pipefail/{f=0} f' "$0"; exit 0 ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *)  GGUF="$1"; shift ;;
@@ -349,3 +363,54 @@ row "pp512"          "$sb_pp512" "$sb_pp512_sd" "$ll_pp512" "$(ratio "$sb_pp512"
 row "reuse 512+64"   "$sb_reuse" "$sb_reuse_sd" "n/a" "n/a" "ms"
 echo
 echo "RESULT bench model=$LABEL tg64=$sb_tg64 d512=$sb_d512 pp512=$sb_pp512 reuse_ms=$sb_reuse"
+
+# --- extended-context tiers (--long) ---------------------------------------
+# One llama-bench invocation per run with -r 1: the deep tiers are long enough
+# that llama-bench's internal repeats would put a single cell at tens of
+# minutes. The median over RUNS process runs is the reported value, as in the
+# canonical table.
+if [ "$LONG" = 1 ]; then
+  lb_long_ts() { # PROMPT GEN DEPTH -> median avg_ts, or "" when llama-bench absent
+    local p=$1 g=$2 d=$3
+    [ -n "${LLAMA_BENCH:-}" ] && [ -x "${LLAMA_BENCH:-}" ] || return 0
+    local vals="" i f
+    for ((i=1;i<=RUNS;i++)); do
+      f=$(mktemp)
+      "$LLAMA_BENCH" -m "$GGUF" -p "$p" -n "$g" -d "$d" -ngl 99 -r 1 -o csv \
+        >"$f" 2>/dev/null || true
+      local v
+      v=$(awk -F, -v P="$p" -v G="$g" -v D="$d" '
+            {gsub(/"/,"")}
+            NR==1 {for(i=1;i<=NF;i++) h[$i]=i; next}
+            h["avg_ts"] && $(h["n_prompt"])==P && $(h["n_gen"])==G && $(h["n_depth"])==D \
+              {print $(h["avg_ts"])}
+          ' "$f" | sed -n '1p')
+      rm -f "$f"
+      [ -n "$v" ] && vals="$vals$v\n"
+    done
+    printf '%b' "$vals" | median
+  }
+
+  echo
+  echo "==== $LABEL (long context) ===="
+  echo "median ± sd of $RUNS runs; decode = $LONG_STEPS tokens at depth"
+  echo
+  echo "| tier          | SonicBoom          | llama.cpp      |  ratio |"
+  echo "|---------------|--------------------|----------------|--------|"
+  for d in $LONG_DEPTHS; do
+    st=$(bench_stats tok_s "$BASELINE/longctx_bench" --prefill --depth "$d" \
+           --steps "$LONG_STEPS")
+    sb=${st%% *}; sbsd=${st##* }
+    ll=$(lb_long_ts 0 "$LONG_STEPS" "$d")
+    row "d${d}" "$sb" "$sbsd" "${ll:-nan}" "$(ratio "$sb" "${ll:-nan}")" "tok/s"
+    echo "RESULT bench_long model=$LABEL tier=d$d tok_s=$sb llama_tok_s=${ll:-nan}"
+  done
+  for n in $LONG_DEPTHS; do
+    st=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt "$n" \
+           --reps 1)
+    sb=${st%% *}; sbsd=${st##* }
+    ll=$(lb_long_ts "$n" 0 0)
+    row "pp${n}" "$sb" "$sbsd" "${ll:-nan}" "$(ratio "$sb" "${ll:-nan}")" "tok/s"
+    echo "RESULT bench_long model=$LABEL tier=pp$n tok_s=$sb llama_tok_s=${ll:-nan}"
+  done
+fi

@@ -20,12 +20,21 @@
 // and read the `steady … tok/s` line (the `depth`-step decode averaged, first
 // step excluded). That is what benchmark.md §1.2 uses.
 //
+// --prefill reaches the depth with the chunked prefill path instead of decoding
+// to it, which is what makes the 4K/16K/32K tiers affordable: two prefix-session
+// calls (prompt = depth tokens, one with 1 decode token and one with `steps`)
+// are subtracted, so the chunked prefill and the per-call graph/plan rebuild
+// cancel and only `steps-1` decode steps at depth remain. This matches
+// llama-bench `-d <depth>`, which also prefills the depth.
+//
 // Usage: longctx_bench [--depth N] [--steps N] [--token id] [--n-ctx N]
+//                      [--prefill]
 // Build: tools/baseline/build_longctx_bench.sh
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
+#include <sonicboom/planner/kv_cache.h>
 
 #include <chrono>
 #include <cstdint>
@@ -38,17 +47,20 @@
 
 namespace sbgguf = sonicboom::gguf;
 namespace sbmodel = sonicboom::model;
+namespace sbplanner = sonicboom::planner;
 
 int main(int argc, char** argv) {
   uint64_t depth = 512;
   uint64_t steps = 64;
   uint64_t seed = 2;
   uint64_t n_ctx = 0;  // 0 = default (depth + steps)
+  bool prefill_mode = false;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--depth")) depth = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--steps")) steps = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--token")) seed = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--n-ctx")) n_ctx = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--prefill")) prefill_mode = true;
   }
 
   std::string path;
@@ -75,6 +87,52 @@ int main(int argc, char** argv) {
   // over/under-counts the tail. --n-ctx overrides to probe the chunk-size
   // dependence at a fixed depth (the n_ctx sensitivity sweep).
   const uint64_t ctx = n_ctx ? n_ctx : (depth + steps);
+
+  if (prefill_mode) {
+    // Chunked prefill to `depth`, then subtraction against a 1-decode-token
+    // call. Fresh session per call: both calls perform the identical chunked
+    // prefill of `depth` tokens, so their difference is exactly `steps-1`
+    // steady decode steps at depth (the first sampled token comes from the
+    // prefill itself).
+    std::vector<uint64_t> prompt(depth);
+    for (uint64_t i = 0; i < depth; ++i) prompt[i] = seed + (i % 500);
+    // The warm call must be the exact timed call. A short prompt at the same
+    // n_ctx does not absorb the one-time decode CUDA-graph capture: the capture
+    // lands in the first call that reaches this depth, leaving it inside the
+    // 1-token timing and making the subtraction negative (observed: -309 ms at
+    // depth 512). Warm with `prompt` itself and discard the result.
+    const std::vector<uint64_t>& warm_prompt = prompt;
+    auto run = [&](const std::vector<uint64_t>& p, uint64_t ntok,
+                   double* secs) -> uint64_t {
+      std::vector<int64_t> toks(ntok, -1);
+      sbplanner::KvCacheSession s;
+      s.n_ctx = ctx;
+      const auto t0 = std::chrono::steady_clock::now();
+      const uint64_t done =
+          sbmodel::generate_prefill_spine_cuda_prefix(*m, p, 0, toks, s,
+                                                      true);
+      const auto t1 = std::chrono::steady_clock::now();
+      *secs = std::chrono::duration<double>(t1 - t0).count();
+      return done;
+    };
+    double t_warm = 0.0, t_one = 0.0, t_all = 0.0;
+    if (run(warm_prompt, 1, &t_warm) == 0 || run(prompt, 1, &t_one) == 0) {
+      fprintf(stderr, "prefill-to-depth failed at depth %llu\n",
+              (unsigned long long)depth);
+      return 1;
+    }
+    const uint64_t done = run(prompt, steps, &t_all);
+    const double tail = t_all - t_one;
+    const uint64_t tail_toks = done > 1 ? done - 1 : 0;
+    const double tok_per_sec = tail > 0.0 ? double(tail_toks) / tail : 0.0;
+    printf("longctx depth=%llu: prefill-to-depth, %llu decode tokens in %.3f ms "
+           "= %.3f tok/s (CUDA, seed %llu, prefill %.3f ms)\n",
+           (unsigned long long)depth, (unsigned long long)tail_toks,
+           tail * 1000.0, tok_per_sec, (unsigned long long)seed, t_one * 1000.0);
+    printf("RESULT longctx depth=%llu steps=%llu tok_s=%.3f mode=prefill\n",
+           (unsigned long long)depth, (unsigned long long)steps, tok_per_sec);
+    return 0;
+  }
 
   // Warm up at the EXACT n_ctx the timed runs use. The decode runtime (greedy
   // graph + plan + CUDA-graph capture) is cached per (model, n_ctx); the

@@ -307,6 +307,24 @@ int main(int argc, char** argv) {
     }
   }
 
+  // The golden below is byte-identical, so the reduction order has to be fixed.
+  // The tuner's decomposition is a per-device, class-wide choice and stream-k
+  // rounds differently by design (test_cuda_quant accepts that within fp32
+  // tolerance), so a machine whose long-context runs picked stream-k would see
+  // this golden move with no code change. Pin the tiled decomposition the
+  // goldens were recorded under; an explicit override still wins.
+  setenv("SONICBOOM_MMQ_DECOMP", "tiled", 0);
+
+  // The decode-attention chunk is also a per-device tuned, numerics-bearing
+  // choice: the split-KV merge adds the chunk partials in a fixed order, so a
+  // stream deeper than the chunk depends on the pick. A machine with a cold
+  // cache would tune it (timing-dependent) and one with autotune disabled would
+  // use the class default (16), either of which moves the golden with no code
+  // change. The streams here never exceed 95 positions, so every pick >= 128 is
+  // one chunk and reproduces the recorded bytes; pin 256 for both profiles. An
+  // explicit override still wins.
+  setenv("SONICBOOM_ATTN_DECODE_CHUNK", "256", 0);
+
   const std::string dir = data_dir();
   const std::string path = find_model(dir);
   if (path.empty()) {
@@ -350,6 +368,7 @@ int main(int argc, char** argv) {
   // Kept for the Stage-5 CUDA section below: each prompt's CPU spine stream, the
   // same prompts' token ids, and llama.cpp's per-step ranking.
   std::vector<std::vector<int64_t>> cpu_streams;
+  std::vector<std::vector<int64_t>> llama_streams;
   std::vector<std::vector<uint64_t>> prompts;
   std::vector<std::vector<std::vector<std::pair<int64_t, double>>>> topk_all;
 
@@ -398,6 +417,7 @@ int main(int argc, char** argv) {
     const int64_t d = first_diff(got, want_tokens);
     const bool first16 = d < 0 || d >= 16;
     cpu_streams.push_back(got);
+    llama_streams.push_back(want_tokens);
     prompts.push_back(prompt);
     topk_all.push_back(topk);
     std::cout << "  p" << p << ": " << got.size() << " tokens, first diff at "
@@ -483,10 +503,23 @@ int main(int argc, char** argv) {
       std::cout << "  " << tag << ": CUDA vs CPU diverge at " << d << " (cuda="
                 << gpu[size_t(d)] << " cpu=" << cpu[size_t(d)] << ", llama rank "
                 << rank << " gap " << gap << ")\n";
-      check(gap >= 0.0 && gap < kNearTieGap,
-            tag + ": CUDA-vs-CPU divergence at step " + std::to_string(d) +
-                " is a near-tie (gap " + std::to_string(gap) + " < " +
-                std::to_string(kNearTieGap) + ")");
+      // llama.cpp's ranking at step d ranks tokens for the same context only
+      // while the CPU reference still matches llama.cpp there. Once the CPU
+      // stream has itself left llama.cpp (at a documented near-tie), llama's
+      // top-8 at a later step describes a different context and the gate would
+      // be measuring noise; beyond that point the CPU stream is the reference
+      // and the divergence is reported instead of asserted.
+      const int64_t cpu_leaves_llama = first_diff(cpu, llama_streams[p]);
+      if (cpu_leaves_llama < 0 || d <= cpu_leaves_llama) {
+        check(gap >= 0.0 && gap < kNearTieGap,
+              tag + ": CUDA-vs-CPU divergence at step " + std::to_string(d) +
+                  " is a near-tie (gap " + std::to_string(gap) + " < " +
+                  std::to_string(kNearTieGap) + ")");
+      } else {
+        std::cout << "    (CPU reference left llama.cpp at step "
+                  << cpu_leaves_llama << "; llama's ranking at step " << d
+                  << " is not for this context)\n";
+      }
     }
 
     // Determinism: the same prompt must give the same stream on every run. The

@@ -82,6 +82,21 @@ struct Gemma4Weights {
   std::span<const uint16_t> per_layer_model_proj;  // bf16 [embedding_length, block_count*per_layer_input]
   std::span<const float> output_norm;           // [embedding_length]
   std::span<const float> rope_freqs;            // [256] (precomputed RoPE table)
+  // Owned storage behind `rope_freqs` when the table is synthesized from
+  // `{arch}.rope.scaling.*` metadata (generic linear/YaRN scaling) instead of
+  // read from a `rope_freqs.weight` tensor. Metadata keys cannot borrow the
+  // reader's tensor buffer the way `rope_freqs.weight` can, so the model owns
+  // these floats; `rope_freqs` points into this vector and stays valid across
+  // moves (a vector move transfers its heap buffer).
+  std::vector<float> rope_freqs_table;
+  // YaRN magnitude scaling, expressed as a multiplier on the ATTENTION SCORES.
+  // YaRN rotates q and k by cos/sin multiplied by m = 0.1*ln(factor)+1 (times
+  // the GGUF attn_factor), so the q·k dot product is m^2 times the unscaled
+  // one. With full rope every component of q/k is rotated, which makes scaling
+  // the scores by m^2 exactly equivalent; folding it into the emitter's
+  // attention temperature avoids a per-pair magnitude argument in every rope
+  // kernel. 1.0 = no magnitude scaling (linear scaling, or no scaling at all).
+  float rope_attn_scale = 1.0f;
 
   // The lm head. Empty when the model ties its output to the token embedding
   // (Gemma 4), in which case the emitter falls back to token_embd.

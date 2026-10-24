@@ -43,6 +43,7 @@
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
+#include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #endif
 
 #include <algorithm>
@@ -306,10 +307,32 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   };
   // The attention temperature is emitted only when it is not the identity, so a
   // model whose Q/K are unit-normed (Gemma 4) gets a byte-identical graph to the
-  // one before the generalization.
+  // one before the generalization. `rope_attn_scale` carries YaRN's magnitude
+  // term (q and k are each m-scaled, so the scores are m^2), 1.0 for every model
+  // without YaRN metadata.
   auto attn_attrs = [&](uint32_t l) {
     std::vector<sx::Attribute> a = {layer_a(l), kv_src(l)};
-    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
+    if (scale != 1.0) a.push_back(attr_f("scale", scale));
+#ifdef SONICBOOM_USE_CUDA
+    // Split-KV decode schedule, carried by the op: the chunk size (keys per
+    // split) and the partial-combine order. Chunk boundaries are absolute
+    // (chunk index = key position / C) and partials merge in ascending chunk
+    // index, so a query's reduction tree depends only on the key positions —
+    // never on n_ctx/capacity, the current depth or prefix reuse. The value is
+    // the class default or the per-device tuned pick (both capacity-free);
+    // `context_length` only bounds the depths the tuner measures at.
+    const LayerConfig& lc = cfg.layer_config(l);
+    const int n_kv = int(lc.n_heads_kv);
+    const int n_q = int(lc.n_heads_q);
+    a.push_back(attr_i("decode_chunk",
+                       int64_t(nn::cuda::attn_decode_plan_chunk(
+                           int(lc.head_dim), n_q / std::max(1, n_kv), n_q, n_kv,
+                           lc.sliding_window, cfg.context_length,
+                           numerics_kv_storage() == KvStorage::F16,
+                           numerics_kv_storage() == KvStorage::Q8))));
+    a.push_back(attr_s("decode_combine", "chunk_index_asc"));
+#endif
     return a;
   };
 
@@ -645,7 +668,8 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   // build_gemma4_graph).
   auto attn_attrs = [&](uint32_t l) {
     std::vector<sx::Attribute> a = {layer_a(l), batch_a(n), kv_src(l)};
-    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
+    if (scale != 1.0) a.push_back(attr_f("scale", scale));
     return a;
   };
 
@@ -1605,13 +1629,19 @@ static uint64_t run_program_steps(
     }
   } else if (rt.prog) {
     for (; step < limit; ++step) {
+      // Same NVTX step marker as decode_steps_spine_cuda: opt-in via
+      // SONICBOOM_NVTX so nsys can isolate one steady-state decode window.
+      const std::string name = "decode_step_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(name.c_str());
       rt.cuda->set_pos(pos);
       if (!rt.prog->replay()) {
+        if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
       }
       float next_f = -1.0f;
       rt.cuda->read_token(&next_f);
+      if (nvtx_enabled()) nvtxRangePop();
       const int64_t next = int64_t(next_f);
       if (next < 0) break;
       tokens[step] = next;
@@ -3754,7 +3784,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx, bool use_prefill) {
   return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
-                                  use_prefill, /*session=*/nullptr, prompt);
+                                  use_prefill, /*session=*/nullptr, prompt, {});
 }
 
 namespace {
@@ -4260,7 +4290,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
                                             std::span<const uint64_t>, uint64_t,
                                             std::span<int64_t>,
                                             planner::KvCacheSession&, bool,
-                                            uint64_t* n_reused_out) {
+                                            uint64_t* n_reused_out,
+                                            std::span<const uint8_t>) {
   if (n_reused_out) *n_reused_out = 0;
   return 0;  // built without CUDA: no device prefill is available
 }

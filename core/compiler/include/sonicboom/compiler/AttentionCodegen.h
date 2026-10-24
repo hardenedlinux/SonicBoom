@@ -158,6 +158,14 @@ struct AttentionShape {
   // region identity (the JIT cache key).
   bool kv_f16 = false;
 
+  // The KV cache is q8 instead of f32: each row is head_dim int8 values then
+  // one f32 scale (max|x| / 127), so a row is addressed in bytes and every
+  // load dequantizes (int8 -> f32 -> scale). Like kv_f16, the batch K/V of the
+  // current chunk stay f32 (rounding to f16 on read where the cache would have
+  // rounded), and the generated kernel stages synchronously. Mutually
+  // exclusive with kv_f16. Part of the region identity (the JIT cache key).
+  bool kv_q8 = false;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
@@ -165,7 +173,8 @@ struct AttentionShape {
            gqa_pack == o.gqa_pack && q_in_reg == o.q_in_reg &&
            head_fast == o.head_fast &&
            async_stages == o.async_stages && exp2 == o.exp2 &&
-           full_attn == o.full_attn && kv_f16 == o.kv_f16;
+           full_attn == o.full_attn && kv_f16 == o.kv_f16 &&
+           kv_q8 == o.kv_q8;
   }
 };
 

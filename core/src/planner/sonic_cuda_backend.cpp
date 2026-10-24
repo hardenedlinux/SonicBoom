@@ -410,12 +410,16 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
     // kernels address it as pos % n_slots and every window read spans at most
     // `window` resident slots.
     c.n_slots = (sl.window > 0) ? sl.window + kMaxVerifyRows : n_ctx;
-    // f16 KV under the standard numerics profile halves the cache's device
-    // bytes; the attention kernels read f16 and widen, and the append stores
-    // the same fp16-rounded values the f32 cache already held.
-    c.f16 = sonicboom::numerics_profile_f16_kv();
-    c.bytes = c.n_slots * c.n_heads_kv * c.head_dim *
-              (c.f16 ? sizeof(uint16_t) : sizeof(float));
+    // The standard numerics profile stores f16 or q8 instead of f32: f16
+    // halves the cache and is exact for the fp16-rounded values; q8 halves it
+    // again (int8 per head_dim value plus an f32 row scale) at the cost of a
+    // per-row quantization error. The attention kernels and the append know
+    // the row layout from `dtype`.
+    const KvStorage storage = sonicboom::numerics_kv_storage();
+    c.dtype = storage == KvStorage::F32   ? KvDtype::F32
+              : storage == KvStorage::Q8 ? KvDtype::Q8
+                                         : KvDtype::F16;
+    c.bytes = c.n_slots * c.n_heads_kv * kv_row_bytes(c.dtype, c.head_dim);
     c.k_buf = g_alloc.allocate(c.bytes);
     c.v_buf = g_alloc.allocate(c.bytes);
   }
@@ -429,14 +433,23 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
     planner::decisions::Entry e;
     e.name = "kv.cache";
     e.scope = "n_ctx=" + std::to_string(n_ctx);
+    const KvCacheDev& first = raw->front();
     e.value = raw->empty() ? "empty"
-                           : (raw->front().f16 ? "f16" : "f32");
+                           : first.q8()    ? "q8"
+                           : first.f16()   ? "f16"
+                                           : "f32";
     e.source = planner::decisions::Source::Default;
     e.inputs = "n_ctx=" + std::to_string(n_ctx) +
                " layers=" + std::to_string(n_kv);
-    e.candidates = "f32|f16";
-    e.reason = "the numerics profile: standard stores f16, strict f32";
-    e.numerics = "f16 storage is exact for the fp16-rounded K/V values";
+    e.candidates = "f32|f16|q8";
+    e.reason = "the resolved KV storage (numerics profile; SONICBOOM_KV "
+               "may override)";
+    e.numerics =
+        first.q8()
+            ? "q8 re-quantizes the fp16-rounded K/V (per-row scale = amax/127)"
+            : first.f16() ? "f16 storage is exact for the fp16-rounded K/V "
+                            "values"
+                          : "f32 storage (the pre-rounding values)";
     e.vram_bytes = total;
     planner::decisions::record(e);
   }
@@ -476,7 +489,25 @@ bool SonicCudaBackend::read_cache_row(const KvCacheDev& cache, bool is_k,
   const uint64_t row = cache.n_heads_kv * cache.head_dim;
   const hal::Buffer& buf = is_k ? cache.k_buf : cache.v_buf;
   if (!buf || cache.n_slots == 0 || row == 0 || out.size() < row) return false;
-  if (!cache.f16) {
+  if (cache.q8()) {
+    // q8: each (slot, KV head) row is head_dim int8 values then its f32
+    // scale. Download the slot's packed rows and dequantize.
+    const uint64_t row_bytes = kv_q8_row_bytes(cache.head_dim);
+    std::vector<uint8_t> packed(static_cast<size_t>(row_bytes * cache.n_heads_kv));
+    const uint64_t byte_off = (pos % cache.n_slots) * packed.size();
+    if (!device::download(buf.id + byte_off, packed.data(), packed.size()))
+      return false;
+    for (uint64_t h = 0; h < cache.n_heads_kv; ++h) {
+      const uint8_t* base = packed.data() + h * row_bytes;
+      float scale = 0.0f;
+      std::memcpy(&scale, base + cache.head_dim, sizeof(scale));
+      const int8_t* q = reinterpret_cast<const int8_t*>(base);
+      for (uint64_t i = 0; i < cache.head_dim; ++i)
+        out[size_t(h * cache.head_dim + i)] = float(q[i]) * scale;
+    }
+    return true;
+  }
+  if (!cache.f16()) {
     const uint64_t byte_off = (pos % cache.n_slots) * row * sizeof(float);
     return device::download(buf.id + byte_off, out.data(), row * sizeof(float));
   }
@@ -793,6 +824,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_i(*node, "kv_source_layer", ksrc);
       int64_t kv_appended = 0;
       attr_i(*node, "kv_appended", kv_appended);
+      // Split-KV schedule written by the plan: chunk size in keys (0 = class
+      // default). The merge order is fixed (ascending chunk index) and chunk
+      // boundaries are absolute, so the attribute alone fully describes the
+      // reduction tree.
+      int64_t decode_chunk = 0;
+      attr_i(*node, "decode_chunk", decode_chunk);
       const uint32_t cache_layer = ksrc >= 0 ? uint32_t(ksrc) : uint32_t(layer);
       KvCacheDev& cache = (*caches_)[cache_layer];
       const int row_elems = int(cache.n_heads_kv * cache.head_dim);
@@ -819,7 +856,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                   dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                   dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
                   reinterpret_cast<const uint64_t*>(pos_slot()), cache.n_slots,
-                  row_elems, int(r), cache.f16)) {
+                  row_elems, int(r), cache.f16(), cache.q8(),
+                  int(cache.head_dim))) {
             ok = false;
             break;
           }
@@ -829,7 +867,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
               reinterpret_cast<const uint64_t*>(pos_slot()), window,
               cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
               int(cache.head_dim), lc.sliding_window, float(attn_scale),
-              out + r * q_row, int(r), cache.f16);
+              out + r * q_row, int(r), cache.f16(), uint64_t(decode_chunk),
+              cache.q8());
         }
         break;
       }
@@ -838,7 +877,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                      dev(in[1]), dev(in[2]),
                                      reinterpret_cast<const uint64_t*>(pos_slot()),
-                                     cache.n_slots, row_elems, 0, cache.f16)) {
+                                     cache.n_slots, row_elems, 0, cache.f16(),
+                                     cache.q8(), int(cache.head_dim))) {
           ok = false;
           break;
         }
@@ -850,7 +890,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_slot()), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
-          lc.sliding_window, float(attn_scale), out, 0, cache.f16);
+          lc.sliding_window, float(attn_scale), out, 0, cache.f16(),
+          uint64_t(decode_chunk), cache.q8());
       break;
     }
     case OpKind::GqaBroadcast: {
@@ -1500,13 +1541,21 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             ok = nn::cuda::kv_append_dev(
                 kv_dst, kv_dst, out, out,
                 reinterpret_cast<const uint64_t*>(pos_slot()), kv->n_slots,
-                kv_row, 0, kv->f16);
+                kv_row, 0, kv->f16(), kv->q8(), int(kv->head_dim));
           }
         };
         // The region is an optimization: a head wider than its shared stage
         // falls back to the reference chain (Gemma's global layers are 512,
         // its local layers 256; the region covers both).
         if (dim > compiler::kHeadsNormRopeCastMaxHeadDim) {
+          reference();
+          break;
+        }
+        // A q8 cache has no generated store variant (the store is per element,
+        // the scale needs the whole row): the reference chain writes y and
+        // appends the q8 row. (Stage 6d emits kv_store nowhere today; this
+        // keeps the arm correct if a plan starts setting it.)
+        if (kv_store != 0 && kv->q8()) {
           reference();
           break;
         }
@@ -1552,8 +1601,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // The standard profile's cache holds f16: launch the store variant
         // (distinct kernel and PTX cache entry) rather than writing f32.
         const std::string launch_region =
-            kv_store != 0 && kv->f16 ? std::string(region) + "-kv16"
-                                     : std::string(region);
+            kv_store != 0 && kv->f16() ? std::string(region) + "-kv16"
+                                       : std::string(region);
         ok = glue::launch(launch_region, args, heads,
                           compiler::kHeadsNormRopeCastBlockThreads,
                           compiler::kHeadsNormRopeCastSharedBytes);
@@ -1940,7 +1989,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           dev_mut(cache.v_buf.id), reinterpret_cast<const uint64_t*>(pos_slot()),
           cache.n_slots, int(nb), int(lc.n_heads_q), int(cache.n_heads_kv),
           int(cache.head_dim), lc.sliding_window, float(attn_scale), out,
-          cache.f16);
+          cache.f16(), cache.q8());
       break;
     }
     case OpKind::KvAppend: {
@@ -1954,7 +2003,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           !nn::cuda::kv_append_batched_dev_pos(
               dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[0]),
               dev(in[1]), reinterpret_cast<const uint64_t*>(pos_slot()),
-              cache.n_slots, row_elems, int(nb), cache.f16)) {
+              cache.n_slots, row_elems, int(nb), cache.f16(), cache.q8(),
+              int(cache.head_dim))) {
         ok = false;
         break;
       }

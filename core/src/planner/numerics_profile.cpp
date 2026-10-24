@@ -33,6 +33,8 @@ struct State {
   bool latched = false;
   NumericsProfile profile = kDefaultNumericsProfile;
   std::optional<NumericsProfile> application;
+  bool kv_latched = false;
+  KvStorage kv = KvStorage::F16;
 };
 
 State &state() {
@@ -138,6 +140,83 @@ NumericsProfile numerics_profile() {
 
 bool numerics_profile_f16_kv() {
   return numerics_profile() == NumericsProfile::Standard;
+}
+
+const char *numerics_kv_storage_name(KvStorage storage) noexcept {
+  switch (storage) {
+    case KvStorage::F32: return "f32";
+    case KvStorage::F16: return "f16";
+    case KvStorage::Q8: return "q8";
+  }
+  return "f16";
+}
+
+KvStorage numerics_kv_storage() {
+  // Resolve the profile first: numerics_profile() takes the same lock.
+  const NumericsProfile profile = numerics_profile();
+  State &s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  if (s.kv_latched) return s.kv;
+
+  // The profile decides what the default means: strict pins f32 (its contract
+  // is the pre-rounding values); standard stores f16, or q8 once selected.
+  KvStorage chosen = profile == NumericsProfile::Strict ? KvStorage::F32
+                                                        : KvStorage::F16;
+  planner::decisions::Source source = planner::decisions::Source::Default;
+  std::string inputs = "none";
+  const char *reason = "the numerics profile";
+
+  // SONICBOOM_KV is the test/CI switch, same rules as SONICBOOM_NUMERICS: the
+  // environment overrides the default, an unknown value warns and keeps it.
+  if (const char *env = std::getenv("SONICBOOM_KV"); env != nullptr && *env != '\0') {
+    if (std::string_view(env) == "f32") {
+      chosen = KvStorage::F32;
+    } else if (std::string_view(env) == "f16") {
+      chosen = KvStorage::F16;
+    } else if (std::string_view(env) == "q8") {
+      chosen = KvStorage::Q8;
+    } else if (std::string_view(env) != "auto") {
+      std::fprintf(stderr,
+                   "SONICBOOM_KV: unknown storage '%s' (auto|f32|f16|q8); "
+                   "using %s\n",
+                   env, numerics_kv_storage_name(chosen));
+      inputs = std::string("SONICBOOM_KV invalid: ") + env;
+    }
+    if (inputs == "none" && std::string_view(env) != "auto") {
+      source = planner::decisions::Source::Env;
+      reason = "SONICBOOM_KV set explicitly";
+      inputs = std::string("SONICBOOM_KV=") + env;
+    }
+  }
+
+  planner::decisions::Entry entry;
+  entry.name = "kv.storage";
+  entry.scope = "process";
+  entry.value = numerics_kv_storage_name(chosen);
+  entry.source = source;
+  entry.env = "SONICBOOM_KV";
+  entry.inputs = std::move(inputs);
+  entry.candidates = "f32|f16|q8";
+  entry.reason = reason;
+  entry.numerics =
+      chosen == KvStorage::Q8
+          ? "q8 re-quantizes the fp16-rounded K/V (per-row scale = amax/127)"
+          : chosen == KvStorage::F16
+                ? "f16 storage is exact for the fp16-rounded K/V values"
+                : "f32 storage (the pre-rounding values)";
+  planner::decisions::record(entry);
+
+  s.kv = chosen;
+  s.kv_latched = true;
+  return s.kv;
+}
+
+void reset_numerics_kv_storage_for_test() {
+  State &s = state();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  s.kv_latched = false;
+  s.kv = KvStorage::F16;
+  planner::decisions::forget_for_test("kv.storage", "process");
 }
 
 void reset_numerics_profile_for_test() {

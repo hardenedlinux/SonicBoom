@@ -122,6 +122,10 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   // batch, so it gets the full pipeline; a reused prefix runs the pipeline for
   // the suffix and reads the cached prefix the way the synchronous path does.
   const bool ASYNC = sh.async_stages >= 2;
+  // A narrower-than-f32 KV cache (f16 or q8) means the cache and the batch
+  // rows have different element types, so the staging reads the cache in the
+  // convert step (typed loads) and only batch keys go through cp.async.
+  const bool KVCACHE = !FULL && (sh.kv_f16 || sh.kv_q8);
   const int ABUF = ASYNC ? sh.async_stages - 1 : 0;
   // Q fragments held in registers across the key loop (default) or reloaded
   // from the staged Q tile per key tile.
@@ -154,6 +158,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   c64("lbc", BC);
   c64("lbr", BR);
   c64("ld", D);
+  c64("lq", D + 4);  // q8 row stride: D int8 values then the f32 scale
   if (ASYNC) {
     c64("lbcd", BC * D);         // one f32 K (or V) tile
     c64("ladv", ABUF * BC);      // key-tile lead of the prefetch
@@ -666,10 +671,10 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string bpv =
           e.val("llvm.getelementptr %vb[" + bo4 +
                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f32");
-      if (sh.kv_f16) {
+      if (KVCACHE) {
         // Only the f32 batch tile can be copied into the f32 stage buffer. A
-        // chunk whose key lives in the f16 cache is skipped: the conversion
-        // step reads that key from the cache directly.
+        // chunk whose key lives in the cache is skipped: the conversion step
+        // reads that key from the cache directly.
         const std::string inbatch =
             e.val("arith.cmpi sge, " + j + ", " + start + " : i64");
         e.op("scf.if " + inbatch + " {");
@@ -717,7 +722,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
     e.op("nvvm.cp.async.shared.global " + spv + ", " + gpv +
          ", 16, cache = ca : !llvm.ptr<3>, !llvm.ptr<1>");
-    if (sh.kv_f16 && !FULL) e.op("}");
+    if (KVCACHE) e.op("}");
     e.op("}");
   };
   // emit_convert turns stage buffer `slot` into the f16 K^T and V tiles with
@@ -745,6 +750,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
           j, e.val("arith.cmpi slt, " + j + ", " + start + " : i64")};
     };
     // One f16 element of the cache row for this chunk's key, element `drow`.
+    // A q8 row is D int8 values then the row's f32 scale at byte offset D, so
+    // it is addressed in bytes and dequantized (the shared tile is f16 either
+    // way).
     const auto cache_elem = [&](const std::string &which,
                                 const std::string &j, const std::string &drow) {
       const std::string sl = e.val("arith.remui " + j + ", %nslots : i64");
@@ -753,11 +761,28 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string co2 =
           e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
       const std::string co3 =
-          e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+          e.val("arith.muli " + co2 + ", " + (sh.kv_q8 ? C["lq"] : C["ld"]) +
+                " : i64");
       const std::string dr64 =
           e.val("arith.index_cast " + drow + " : index to i64");
       const std::string co4 =
           e.val("arith.addi " + co3 + ", " + dr64 + " : i64");
+      if (sh.kv_q8) {
+        const std::string cp =
+            e.val("llvm.getelementptr %" + which + "[" + co4 +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+        const std::string soff =
+            e.val("arith.addi " + co3 + ", " + C["ld"] + " : i64");
+        const std::string sp =
+            e.val("llvm.getelementptr %" + which + "[" + soff +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+        const std::string sv = e.val("llvm.load " + sp + " : !llvm.ptr -> f32");
+        const std::string q = e.val("llvm.load " + cp + " : !llvm.ptr -> i8");
+        const std::string q32 = e.val("arith.extsi " + q + " : i8 to i32");
+        const std::string qf = e.val("arith.sitofp " + q32 + " : i32 to f32");
+        const std::string dv = e.val("arith.mulf " + qf + ", " + sv + " : f32");
+        return e.val("arith.truncf " + dv + " : f32 to f16");
+      }
       const std::string cp =
           e.val("llvm.getelementptr %" + which + "[" + co4 +
                 "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
@@ -774,7 +799,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                                     " : index");
       const std::string kstore = " : memref<" + s(D) + "x" + s(KBC) +
                                  "xf16, #gpu.address_space<workgroup>>";
-      if (sh.kv_f16) {
+      if (KVCACHE) {
         const auto [j, cached] = cached_of(key);
         e.op("scf.if " + cached + " {");
         for (int i = 0; i < 4; ++i) {
@@ -803,7 +828,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
                    "] : f16 from vector<4xf16>") +
              ", " + ktmem + "[" + drow + ", " + key + "]" + kstore);
       }
-      if (sh.kv_f16) e.op("}");
+      if (KVCACHE) e.op("}");
     }
     e.op("}");
     // V: the V half's [key][D] f32 chunks (chunk %ci + BC*D/4 of the stage
@@ -818,7 +843,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       const std::string vstore =
           " : memref<" + s(BC) + "x" + s(QD) +
           "xf16, #gpu.address_space<workgroup>>";
-      if (sh.kv_f16) {
+      if (KVCACHE) {
         const auto [j, cached] = cached_of(key);
         e.op("scf.if " + cached + " {");
         for (int i = 0; i < 4; ++i) {
@@ -840,7 +865,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
           e.val("arith.truncf " + v + " : vector<4xf32> to vector<4xf16>");
       e.op("memref.store " + h + ", " + vmemv + "[" + key + ", " + dq + "] : " +
            vmt);
-      if (sh.kv_f16) e.op("}");
+      if (KVCACHE) e.op("}");
     }
     e.op("}");
   };
@@ -931,7 +956,8 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
         const std::string co2 =
             e.val("arith.addi " + co1 + ", " + hkv64 + " : i64");
         const std::string co3 =
-            e.val("arith.muli " + co2 + ", " + C["ld"] + " : i64");
+            e.val("arith.muli " + co2 + ", " + (sh.kv_q8 ? C["lq"] : C["ld"]) +
+                  " : i64");
         const std::string co4 =
             e.val("arith.addi " + co3 + ", " + dd64 + " : i64");
         const std::string cname = is_k ? "kc" : "vc";
@@ -946,20 +972,39 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
             e.val("arith.muli " + bo2 + ", " + C["ld"] + " : i64");
         const std::string bo4 =
             e.val("arith.addi " + bo3 + ", " + dd64 + " : i64");
-        if (sh.kv_f16) {
-          // f16 cache: the two sources have different element types, so the
+        if (KVCACHE) {
+          // Narrow cache: the two sources have different element types, so the
           // load is a typed branch, not a pointer select. Widening the stored
-          // half is exact (the cache holds fp16-rounded values).
-          vf = e.val("scf.if " + isc + " -> f32 {");
-          {
+          // f16 is exact (the cache holds fp16-rounded values); a q8 element
+          // is dequantized with its row's f32 scale.
+          std::string cv;
+          if (sh.kv_q8) {
+            const std::string cp =
+                e.val("llvm.getelementptr %" + cname + "[" + co4 +
+                      "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+            const std::string soff =
+                e.val("arith.addi " + co3 + ", " + C["ld"] + " : i64");
+            const std::string sp =
+                e.val("llvm.getelementptr %" + cname + "[" + soff +
+                      "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+            const std::string sv =
+                e.val("llvm.load " + sp + " : !llvm.ptr -> f32");
+            const std::string q =
+                e.val("llvm.load " + cp + " : !llvm.ptr -> i8");
+            const std::string q32 = e.val("arith.extsi " + q + " : i8 to i32");
+            const std::string qf =
+                e.val("arith.sitofp " + q32 + " : i32 to f32");
+            cv = e.val("arith.mulf " + qf + ", " + sv + " : f32");
+          } else {
             const std::string cp =
                 e.val("llvm.getelementptr %" + cname + "[" + co4 +
                       "] : (!llvm.ptr, i64) -> !llvm.ptr, f16");
             const std::string lh =
                 e.val("llvm.load " + cp + " : !llvm.ptr -> f16");
-            const std::string xh = e.val("arith.extf " + lh + " : f16 to f32");
-            e.op("scf.yield " + xh + " : f32");
+            cv = e.val("arith.extf " + lh + " : f16 to f32");
           }
+          vf = e.val("scf.if " + isc + " -> f32 {");
+          { e.op("scf.yield " + cv + " : f32"); }
           e.op("} else {");
           {
             const std::string bp =
@@ -1398,8 +1443,9 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
   return text;
 }
 
-// Flash-decoding text: `fa_decode` (one warp per (head, chunk) partial) and
-// `fa_combine` (one block per head, ascending-chunk reduction). The split is
+// Flash-decoding text: `fa_decode` (one warp per (query head, chunk) partial,
+// gqa warps per block sharing one KV head's chunk) and `fa_combine` (one block
+// per query head, ascending-chunk reduction). The split is
 // over key chunks of a runtime length, aligned to absolute positions: chunk s
 // covers keys [s*C, (s+1)*C), clamped to the window's valid lower bound and to
 // the current position. Each lane owns head_dim/32 output columns and keeps
@@ -1408,14 +1454,30 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
 // trees at o = 16, 8, 4, 2, 1; a final division), so for the same chunk length
 // the two paths are bit-identical. The combine reads chunks in ascending
 // order, so the output does not depend on scheduling.
+//
+// Block (bx, by) covers chunk bx of KV head by, with one warp per query head of
+// that group (warp w handles query head by*gqa + w). All gqa warps read the
+// same chunk of K and V, so the cache lines a warp pulls in are reused by the
+// rest of the block through L1 instead of being re-read from DRAM once per
+// query head. Nothing about the per-warp arithmetic changes: each warp keeps
+// its own scores and its own partial, so the generated output (and the token
+// stream) is bit-identical to the one-warp-per-(head, chunk) grid.
 std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) {
   const int D = sh.head_dim;
   const int GQA = sh.gqa;
   const int K = D / 32;  // output columns per lane
+  // Keys processed per decode-loop iteration (main step-N loop + one-key tail).
+  // Four keys per iteration pays off while each key is a short load/FMA chain
+  // (D <= 256, eight loads per key at most); at D = 512 a key is 16 loads and
+  // holding four keys in flight thrashes instead (measured at depth 16K/32K:
+  // gemma d512 2.90/5.14 ms with no unroll vs 3.56/7.01 ms unrolled, while
+  // gemma d256 improves 0.68 -> 0.59 ms and DS d128 6.00 -> 4.87 ms).
+  const int kKeyUnroll = D <= 256 ? 4 : 1;
   const bool EXP2 = sh.exp2;
   // f16 KV cache (standard profile): the decode kernel reads the cache only,
   // so it loads f16 and widens (exact: the stored values were fp16-rounded).
   const bool KV16 = sh.kv_f16;
+  const bool KV8 = sh.kv_q8;
 
   Emitter e;
   std::map<std::string, std::string> C;
@@ -1436,10 +1498,11 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   e.op("gpu.func @fa_decode(%q: !llvm.ptr, %kc: !llvm.ptr, %vc: !llvm.ptr, "
        "%startp: !llvm.ptr, %nslots: i64, %nhq: i32, %nhkv: i32, "
        "%window: i64, %scale: f32, %part: !llvm.ptr, %chunk: i64) kernel {");
-  c32("c0", 0); c32("c1", 1); c32("c4", 4); c32("c7", 7); c32("c16", 16);
-  c32("c31", 31); c32("c32", 32);
+  c32("c0", 0); c32("c1", 1); c32("c4", 4); c32("c5", 5); c32("c7", 7);
+  c32("c16", 16); c32("c31", 31); c32("c32", 32);
+  c32("cmax", kAttentionDecodeMaxChunk);
   c64("l0", 0); c64("l1", 1); c64("l2", 2); c64("ldp", D + 2);
-  c64("lD", D);
+  c64("lD", D); c64("lDQ", D + 4);  // q8 row stride: D int8 values + f32 scale
   cf("cf0", "0.0"); cf("cneg", "-1.0e+30"); cf("cone", "1.0");
   // exp2 arm: scores and the partial m are in log2 units (see the prefill
   // generator); the combine kernel's exp2 then matches them.
@@ -1453,22 +1516,29 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
 
   const std::string tid = e.val("gpu.thread_id x");
   const std::string bx = e.val("gpu.block_id x");
-  const std::string by = e.val("gpu.block_id y");
+  const std::string by = e.val("gpu.block_id y");  // KV head of the block
   const std::string tid_i = e.val("arith.index_cast " + tid + " : index to i32");
   const std::string bx_i = e.val("arith.index_cast " + bx + " : index to i32");
   const std::string by_i = e.val("arith.index_cast " + by + " : index to i32");
+  // Warp index = query head inside the KV group, lane = column strip. The block
+  // is gqa warps (one per query head of the group), so all warps read the same
+  // K/V chunk and share it through L1.
+  const std::string warp =
+      e.val("arith.shrui " + tid_i + ", " + C["c5"] + " : i32");
   const std::string lane =
       e.val("arith.andi " + tid_i + ", " + C["c31"] + " : i32");
   const std::string lane64 = e.val("arith.extsi " + lane + " : i32 to i64");
   const std::string bx64 = e.val("arith.extsi " + bx_i + " : i32 to i64");
-  const std::string by64 = e.val("arith.extsi " + by_i + " : i32 to i64");
   const std::string nhq64 = e.val("arith.extui %nhq : i32 to i64");
   const std::string nhkv64 = e.val("arith.extui %nhkv : i32 to i64");
   const std::string start = e.val("llvm.load %startp : !llvm.ptr -> i64");
-  const std::string div =
-      GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
-  const std::string hkv = e.val("arith.divui " + by_i + ", " + div + " : i32");
+  const std::string gqa_c = GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
+  const std::string hkv = by_i;
   const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
+  // Query head this warp owns: hq = kv head * gqa + warp.
+  const std::string hqw0 = e.val("arith.muli " + hkv + ", " + gqa_c + " : i32");
+  const std::string hq = e.val("arith.addi " + hqw0 + ", " + warp + " : i32");
+  const std::string hq64 = e.val("arith.extsi " + hq + " : i32 to i64");
 
   // Valid key window: [low, start] intersect the block's chunk.
   std::string low = C["l0"];
@@ -1481,11 +1551,19 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     const std::string cond = e.val("arith.andi " + hasw + ", " + big + " : i1");
     low = e.val("arith.select " + cond + ", " + ws1 + ", " + C["l0"] + " : i64");
   }
-  // Chunks are aligned to the window's first key (`low`), not to absolute
-  // position 0: the grid is sized for ceil(window / chunk) chunks, and they
-  // must cover any window of that size ending at the current position.
+  // Chunks are aligned to ABSOLUTE key positions (0, C, 2C, ...): block bx
+  // covers the absolute chunk that holds `low`, plus bx chunks. Every key
+  // therefore always belongs to the same chunk index, so the reduction tree
+  // (the combine's ascending chunk order) depends only on key positions --
+  // never on the window length, the cache capacity or how much of the prompt
+  // came from a reused prefix. The grid is sized for floor(window / C) + 1
+  // chunks, the most a window of that length can overlap. Blocks whose chunk
+  // holds no valid key write a neutral partial (m = -1e30, l = 0, O = 0),
+  // which the combine treats as absent.
+  const std::string first = e.val("arith.divsi " + low + ", %chunk : i64");
   const std::string cbo = e.val("arith.muli " + bx64 + ", %chunk : i64");
-  const std::string clo = e.val("arith.addi " + low + ", " + cbo + " : i64");
+  const std::string cbase = e.val("arith.muli " + first + ", %chunk : i64");
+  const std::string clo = e.val("arith.addi " + cbase + ", " + cbo + " : i64");
   const std::string chi = e.val("arith.addi " + clo + ", %chunk : i64");
   const std::string endp1 = e.val("arith.addi " + start + ", " + C["l1"] +
                                   " : i64");
@@ -1495,7 +1573,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const std::string jhi_i = e.val("arith.index_cast " + jhi + " : i64 to index");
 
   // q: [n_heads_q][head_dim] f32, one token.
-  const std::string qbase = e.val("arith.muli " + by64 + ", " + C["lD"] +
+  const std::string qbase = e.val("arith.muli " + hq64 + ", " + C["lD"] +
                                   " : i64");
   std::vector<std::string> qv(K);
   for (int i = 0; i < K; ++i) {
@@ -1508,21 +1586,29 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     qv[i] = e.val("llvm.load " + p + " : !llvm.ptr -> f32");
   }
 
-  // The chunk's scores go through a fixed shared-memory view: the block is one
-  // warp, and the P·V pass needs every key's score in every lane. Two passes
-  // (scores + max, then exp + accumulate) keep the computation identical to
-  // the hand-written kernel's chunking — no online rescaling of O — and cost
-  // a store plus a broadcast load per key.
+  // The chunk's scores go through a fixed shared-memory view with one chunk
+  // slot per warp (each warp's scores are its own query head's): the P·V pass
+  // needs every key's score in every lane of the warp. Two passes (scores +
+  // max, then exp + accumulate) keep the computation identical to the
+  // hand-written kernel's chunking — no online rescaling of O — and cost a
+  // store plus a broadcast load per key.
   const std::string smem =
       e.val("gpu.dynamic_shared_memory : memref<?xi8, "
             "#gpu.address_space<workgroup>>");
   const std::string smemf = e.val(
       "memref.view " + smem + "[" + C["x0"] +
       "][] : memref<?xi8, #gpu.address_space<workgroup>> to memref<" +
-      s(kAttentionDecodeMaxChunk) + "xf32, #gpu.address_space<workgroup>>");
-  const std::string smtype = " : memref<" + s(kAttentionDecodeMaxChunk) +
+      s(kAttentionDecodeMaxChunk * GQA) +
+      "xf32, #gpu.address_space<workgroup>>");
+  const std::string smtype = " : memref<" + s(kAttentionDecodeMaxChunk * GQA) +
                              "xf32, #gpu.address_space<workgroup>>";
-  const std::string is0 = e.val("arith.cmpi eq, " + tid_i + ", " + C["c0"] +
+  // Per-warp shared slot base: warp * kAttentionDecodeMaxChunk.
+  const std::string smwarp =
+      e.val("arith.muli " + warp + ", " + C["cmax"] + " : i32");
+  const std::string smwarp_idx =
+      e.val("arith.index_cast " + smwarp + " : i32 to index");
+  // Lane 0 of each warp stores that head's m/l partial.
+  const std::string is0 = e.val("arith.cmpi eq, " + lane + ", " + C["c0"] +
                                 " : i32");
 
   // The first key's cache slot costs one 64-bit modulo; every later key's is
@@ -1530,15 +1616,40 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   // software routine and dominated this loop before).
   const std::string slot0 = e.val("arith.remui " + jlo + ", %nslots : i64");
 
-  // Pass 1: one q·k per key, stored by lane 0.
-  e.op("scf.for %j = " + jlo_i + " to " + jhi_i + " step " + C["x1"] +
-       " iter_args(%slot = " + slot0 + ") -> (i64) {");
-  {
+  // The key's cache slot is a pure function of its position:
+  // slot(j) = (slot0 + (j - jlo)) mod nslots, and a chunk spans at most
+  // kAttentionDecodeMaxChunk keys, so the sum wraps at most once. Computing
+  // it per key (rather than carrying `%slot` through the loop) removes the
+  // only loop-carried value from the score loop, so its iterations are
+  // independent and the key loads can be unrolled and overlapped instead of
+  // serialized on the predecessor's slot arithmetic.
+  const auto slot_of = [&](const std::string &j) {
+    const std::string off =
+        e.val("arith.subi " + j + ", " + jlo_i + " : index");
+    const std::string off64 =
+        e.val("arith.index_cast " + off + " : index to i64");
+    const std::string sj =
+        e.val("arith.addi " + slot0 + ", " + off64 + " : i64");
+    const std::string wrap =
+        e.val("arith.cmpi sge, " + sj + ", %nslots : i64");
+    const std::string sjm = e.val("arith.subi " + sj + ", %nslots : i64");
+    return e.val("arith.select " + wrap + ", " + sjm + ", " + sj + " : i64");
+  };
+
+  // Pass 1: one q·k per key, stored by lane 0. Four keys per iteration (the
+  // per-key work — the load stream and the shuffle-reduce chain — is latency
+  // bound, and independent keys overlap; a remainder loop handles the tail).
+  // Keys are processed in ascending order and each key's arithmetic is
+  // unchanged, so the result is bit-identical to the one-key loop.
+  const auto p1_body = [&](const std::string &jv) {
+    const std::string slot = slot_of(jv);
     const std::string so1 =
-        e.val("arith.muli %slot, " + nhkv64 + " : i64");
+        e.val("arith.muli " + slot + ", " + nhkv64 + " : i64");
     const std::string so2 = e.val("arith.addi " + so1 + ", " + hkv64 + " : i64");
-    const std::string so3 = e.val("arith.muli " + so2 + ", " + C["lD"] +
-                                  " : i64");
+    // Row stride: D elements for f32/f16, D + 4 bytes for q8 (D int8 values
+    // then the row's f32 scale).
+    const std::string so3 = e.val("arith.muli " + so2 + ", " +
+                                  (KV8 ? C["lDQ"] : C["lD"]) + " : i64");
     const std::string base =
         e.val("arith.addi " + so3 + ", " + lane64 + " : i64");
     const auto at = [&](const std::string &ptr, int i) {
@@ -1548,11 +1659,28 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
                                              " : i64");
       return e.val("llvm.getelementptr %" + ptr + "[" + off +
                    "] : (!llvm.ptr, i64) -> !llvm.ptr, " +
-                   (KV16 ? "f16" : "f32"));
+                   (KV8 ? "i8" : KV16 ? "f16" : "f32"));
     };
-    // Load cache element i as f32 (widening the f16 storage when KV16).
+    // Load cache element i as f32: widen f16, or dequantize q8 (int8 times
+    // the row's f32 scale, which sits at byte offset D of the row and is the
+    // same for every element of it).
     const auto ld = [&](const std::string &ptr, int i) -> std::string {
       const std::string p = at(ptr, i);
+      if (KV8) {
+        const std::string soff =
+            e.val("arith.addi " + so3 + ", " + C["lD"] + " : i64");
+        const std::string spp =
+            e.val("llvm.getelementptr %" + ptr + "[" + soff +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+        const std::string sv =
+            e.val("llvm.load " + spp + " : !llvm.ptr -> f32");
+        const std::string q8v =
+            e.val("llvm.load " + p + " : !llvm.ptr -> i8");
+        const std::string q32 = e.val("arith.extsi " + q8v + " : i8 to i32");
+        const std::string qf =
+            e.val("arith.sitofp " + q32 + " : i32 to f32");
+        return e.val("arith.mulf " + qf + ", " + sv + " : f32");
+      }
       if (!KV16) return e.val("llvm.load " + p + " : !llvm.ptr -> f32");
       const std::string h = e.val("llvm.load " + p + " : !llvm.ptr -> f16");
       return e.val("arith.extf " + h + " : f16 to f32");
@@ -1577,18 +1705,51 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
       acc = e.val("arith.addf " + acc + ", " + sh + " : f32");
     }
     const std::string sc = e.val("arith.mulf " + acc + ", " + scl + " : f32");
-    const std::string sid = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string sid0 = e.val("arith.subi " + jv + ", " + jlo_i +
+                                   " : index");
+    const std::string sid =
+        e.val("arith.addi " + sid0 + ", " + smwarp_idx + " : index");
     e.op("scf.if " + is0 + " {");
     e.op("memref.store " + sc + ", " + smemf + "[" + sid + "]" + smtype);
     e.op("}");
-    const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] + " : i64");
-    const std::string full =
-        e.val("arith.cmpi eq, " + sp1 + ", %nslots : i64");
-    const std::string next =
-        e.val("arith.select " + full + ", " + C["l0"] + ", " + sp1 + " : i64");
-    e.op("scf.yield " + next + " : i64");
+  };
+  {
+    const std::string one_i = e.val("arith.constant 1 : index");
+    const std::string un_i = e.val("arith.constant " + s(kKeyUnroll) +
+                                   " : index");
+    // An inactive block (this chunk holds no valid key) has jlo > jhi, which
+    // the one-key loop handled by scf.for's unsigned IV test (zero-trip). The
+    // step-N prologue divides the span, so clamp it: an unsigned underflow
+    // would wrap the trip count and run the loop over invalid keys.
+    const std::string raw_span =
+        e.val("arith.subi " + jhi_i + ", " + jlo_i + " : index");
+    const std::string span_pos =
+        e.val("arith.cmpi sgt, " + jhi_i + ", " + jlo_i + " : index");
+    const std::string span =
+        e.val("arith.select " + span_pos + ", " + raw_span + ", " + C["x0"] +
+              " : index");
+    const std::string q4 = e.val("arith.divui " + span + ", " + un_i +
+                                 " : index");
+    const std::string m4 = e.val("arith.muli " + q4 + ", " + un_i + " : index");
+    const std::string main_end =
+        e.val("arith.addi " + jlo_i + ", " + m4 + " : index");
+    e.op("scf.for %j = " + jlo_i + " to " + main_end + " step " + un_i +
+         " {");
+    {
+      p1_body("%j");
+      for (int u = 1; u < kKeyUnroll; ++u) {
+        const std::string ju =
+            e.val("arith.addi %j, " + e.val("arith.constant " + s(u) +
+                                             " : index") + " : index");
+        p1_body(ju);
+      }
+    }
+    e.op("}");
+    e.op("scf.for %j = " + main_end + " to " + jhi_i + " step " + one_i +
+         " {");
+    { p1_body("%j"); }
+    e.op("}");
   }
-  e.op("}");
   e.op("gpu.barrier");
 
   // Pass 2: chunk maximum, lane-strided local max then an exact warp reduce.
@@ -1602,7 +1763,9 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     const std::string mr = e.val(
         "scf.for %j = " + jstart + " to " + jhi_i + " step " + m0 +
         " iter_args(%mm = " + C["cneg"] + ") -> (f32) {");
-    const std::string sid = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string sid0 = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string sid =
+        e.val("arith.addi " + sid0 + ", " + smwarp_idx + " : index");
     const std::string sv = e.val("memref.load " + smemf + "[" + sid + "]" +
                                  smtype);
     const std::string nm = e.val("arith.maximumf %mm, " + sv + " : f32");
@@ -1619,35 +1782,26 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     // Pass 3: exp + accumulate. Every lane iterates the whole chunk, so each
     // lane's l is the full sum (identical across lanes; lane 0 stores it).
     std::vector<std::string> names;
-    std::vector<std::string> init;
     std::vector<std::string> types;
     for (int i = 0; i < K; ++i) {
       names.push_back("%o" + s(i));
-      init.push_back(C["cf0"]);
       types.push_back("f32");
     }
-    names.push_back("%l"); init.push_back(C["cf0"]); types.push_back("f32");
-    names.push_back("%slot"); init.push_back(slot0); types.push_back("i64");
-    std::string ia = "iter_args(";
-    std::string ty = " -> (";
-    std::string loopres;
-    for (size_t i = 0; i < names.size(); ++i) {
-      ia += (i ? ", " : "") + names[i] + " = " + init[i];
-      ty += (i ? ", " : "") + types[i];
-      loopres += (i ? ", " : "") + std::string("%r") + s(int(i));
-    }
-    ia += ")";
-    ty += ")";
-    e.op(loopres + " = scf.for %j = " + jlo_i + " to " + jhi_i + " step " +
-         C["x1"] + " " + ia + ty + " {");
-    std::map<std::string, std::string> iv;
-    for (size_t i = 0; i < names.size(); ++i) iv[names[i]] = names[i];
+    names.push_back("%l"); types.push_back("f32");
 
+    // One key j: P = exp(S - mx), O += P*V, l += P in the lane holding j's
+    // slot. Up to four keys are emitted per iteration (same order, same f32
+    // ops per key) to give the scheduler independent loads to overlap.
+    const auto p3_body = [&](const std::string &jv,
+                             std::map<std::string, std::string> &iv) {
+    const std::string slot = slot_of(jv);
     const std::string so1 =
-        e.val("arith.muli %slot, " + nhkv64 + " : i64");
+        e.val("arith.muli " + slot + ", " + nhkv64 + " : i64");
     const std::string so2 = e.val("arith.addi " + so1 + ", " + hkv64 + " : i64");
-    const std::string so3 = e.val("arith.muli " + so2 + ", " + C["lD"] +
-                                  " : i64");
+    // Row stride: D elements for f32/f16, D + 4 bytes for q8 (D int8 values
+    // then the row's f32 scale).
+    const std::string so3 = e.val("arith.muli " + so2 + ", " +
+                                  (KV8 ? C["lDQ"] : C["lD"]) + " : i64");
     const std::string base =
         e.val("arith.addi " + so3 + ", " + lane64 + " : i64");
     const auto at = [&](const std::string &ptr, int i) {
@@ -1657,16 +1811,36 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
                                              " : i64");
       return e.val("llvm.getelementptr %" + ptr + "[" + off +
                    "] : (!llvm.ptr, i64) -> !llvm.ptr, " +
-                   (KV16 ? "f16" : "f32"));
+                   (KV8 ? "i8" : KV16 ? "f16" : "f32"));
     };
-    // Load cache element i as f32 (widening the f16 storage when KV16).
+    // Load cache element i as f32: widen f16, or dequantize q8 (int8 times
+    // the row's f32 scale, which sits at byte offset D of the row and is the
+    // same for every element of it).
     const auto ld = [&](const std::string &ptr, int i) -> std::string {
       const std::string p = at(ptr, i);
+      if (KV8) {
+        const std::string soff =
+            e.val("arith.addi " + so3 + ", " + C["lD"] + " : i64");
+        const std::string spp =
+            e.val("llvm.getelementptr %" + ptr + "[" + soff +
+                  "] : (!llvm.ptr, i64) -> !llvm.ptr, i8");
+        const std::string sv =
+            e.val("llvm.load " + spp + " : !llvm.ptr -> f32");
+        const std::string q8v =
+            e.val("llvm.load " + p + " : !llvm.ptr -> i8");
+        const std::string q32 = e.val("arith.extsi " + q8v + " : i8 to i32");
+        const std::string qf =
+            e.val("arith.sitofp " + q32 + " : i32 to f32");
+        return e.val("arith.mulf " + qf + ", " + sv + " : f32");
+      }
       if (!KV16) return e.val("llvm.load " + p + " : !llvm.ptr -> f32");
       const std::string h = e.val("llvm.load " + p + " : !llvm.ptr -> f16");
       return e.val("arith.extf " + h + " : f16 to f32");
     };
-    const std::string psid = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string psid0 = e.val("arith.subi " + jv + ", " + jlo_i +
+                                    " : index");
+    const std::string psid =
+        e.val("arith.addi " + psid0 + ", " + smwarp_idx + " : index");
     const std::string psv = e.val("memref.load " + smemf + "[" + psid + "]" +
                                   smtype);
     const std::string p =
@@ -1675,7 +1849,8 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
     // l: each lane sums its own keys and the warp tree-reduces (same reduction
     // shape as the hand-written kernel), rather than every lane serially
     // summing the whole chunk.
-    const std::string jj = e.val("arith.subi %j, " + jlo_i + " : index");
+    const std::string jj = e.val("arith.subi " + jv + ", " + jlo_i +
+                                 " : index");
     const std::string idx31 = e.val("arith.constant 31 : index");
     const std::string jj32 = e.val("arith.andi " + jj + ", " + idx31 +
                                    " : index");
@@ -1695,26 +1870,80 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
       iv["%o" + s(i)] = e.val("llvm.intr.fma(" + p + ", " + v + ", " +
                               iv["%o" + s(i)] + ") : (f32, f32, f32) -> f32");
     }
-    {
-      const std::string sp1 = e.val("arith.addi %slot, " + C["l1"] + " : i64");
-      const std::string full =
-          e.val("arith.cmpi eq, " + sp1 + ", %nslots : i64");
-      iv["%slot"] =
-          e.val("arith.select " + full + ", " + C["l0"] + ", " + sp1 + " : i64");
-    }
-    {
-      std::string y = "scf.yield ";
-      std::string t;
+    };
+    // Emit a pass-3 loop over [start, end), `unroll` keys per iteration. The
+    // one-key remainder loop carries the main loop's results, so each
+    // accumulator still sees ascending-j f32 operations in the same order as
+    // the pre-unroll kernel (bit-identical).
+    int loop_tag = 0;
+    const auto emit_p3_loop = [&](const std::string &start,
+                                  const std::string &end,
+                                  const std::string &step,
+                                  const std::map<std::string, std::string> &in,
+                                  int unroll)
+        -> std::map<std::string, std::string> {
+      const std::string tag = loop_tag++ ? "t" : "m";
+      std::string ia = "iter_args(";
+      std::string ty = " -> (";
+      std::string loopres;
       for (size_t i = 0; i < names.size(); ++i) {
-        y += (i ? ", " : "") + iv[names[i]];
-        t += (i ? ", " : "") + types[i];
+        ia += (i ? ", " : "") + names[i] + " = " + in.at(names[i]);
+        ty += (i ? ", " : "") + types[i];
+        loopres += (i ? ", " : "") + std::string("%r") + tag + s(int(i));
       }
-      e.op(y + " : " + t);
-    }
-    e.op("}");
-    std::map<std::string, std::string> out;
-    for (size_t i = 0; i < names.size(); ++i)
-      out[names[i]] = "%r" + s(int(i));
+      ia += ")";
+      ty += ")";
+      e.op(loopres + " = scf.for %j = " + start + " to " + end + " step " +
+           step + " " + ia + ty + " {");
+      std::map<std::string, std::string> iv;
+      for (size_t i = 0; i < names.size(); ++i) iv[names[i]] = names[i];
+      p3_body("%j", iv);
+      for (int u = 1; u < unroll; ++u) {
+        const std::string ju =
+            e.val("arith.addi %j, " + e.val("arith.constant " + s(u) +
+                                             " : index") + " : index");
+        p3_body(ju, iv);
+      }
+      {
+        std::string y = "scf.yield ";
+        std::string t;
+        for (size_t i = 0; i < names.size(); ++i) {
+          y += (i ? ", " : "") + iv[names[i]];
+          t += (i ? ", " : "") + types[i];
+        }
+        e.op(y + " : " + t);
+      }
+      e.op("}");
+      std::map<std::string, std::string> res;
+      for (size_t i = 0; i < names.size(); ++i)
+        res[names[i]] = "%r" + tag + s(int(i));
+      return res;
+    };
+    std::map<std::string, std::string> zero;
+    for (size_t i = 0; i < names.size(); ++i) zero[names[i]] = C["cf0"];
+    const std::string one_i = e.val("arith.constant 1 : index");
+    const std::string un_i = e.val("arith.constant " + s(kKeyUnroll) +
+                                   " : index");
+    // An inactive block (this chunk holds no valid key) has jlo > jhi, which
+    // the one-key loop handled by scf.for's unsigned IV test (zero-trip). The
+    // step-N prologue divides the span, so clamp it: an unsigned underflow
+    // would wrap the trip count and run the loop over invalid keys.
+    const std::string raw_span =
+        e.val("arith.subi " + jhi_i + ", " + jlo_i + " : index");
+    const std::string span_pos =
+        e.val("arith.cmpi sgt, " + jhi_i + ", " + jlo_i + " : index");
+    const std::string span =
+        e.val("arith.select " + span_pos + ", " + raw_span + ", " + C["x0"] +
+              " : index");
+    const std::string q4 =
+        e.val("arith.divui " + span + ", " + un_i + " : index");
+    const std::string m4 =
+        e.val("arith.muli " + q4 + ", " + un_i + " : index");
+    const std::string main_end =
+        e.val("arith.addi " + jlo_i + ", " + m4 + " : index");
+    std::map<std::string, std::string> out =
+        emit_p3_loop(jlo_i, main_end, un_i, zero, kKeyUnroll);
+    out = emit_p3_loop(main_end, jhi_i, one_i, out, 1);
     out["%m"] = mx;
     // Warp tree sum of the per-lane l partials; lane 0 ends with the total,
     // which is the only copy stored (same reduction as the own kernel).
@@ -1733,7 +1962,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
 
   // Partial slot: (chunk, head) -> [head_dim + 2] f32; O stays unnormalized.
   const std::string pid1 = e.val("arith.muli " + bx64 + ", " + nhq64 + " : i64");
-  const std::string pid2 = e.val("arith.addi " + pid1 + ", " + by64 + " : i64");
+  const std::string pid2 = e.val("arith.addi " + pid1 + ", " + hq64 + " : i64");
   const std::string pid = e.val("arith.muli " + pid2 + ", " + C["ldp"] + " : i64");
   for (int i = 0; i < K; ++i) {
     const std::string oi = e.val("arith.constant " + s(i * 32) + " : i64");
@@ -1899,7 +2128,8 @@ bool attention_shape_supported(const AttentionShape &shape) {
   // read, so an f16 cache and a window are both ruled out. A causal or
   // windowed shape never reaches this kernel.
   if (shape.full_attn &&
-      (shape.decode || !shape.warp_head || shape.window_mask || shape.kv_f16))
+      (shape.decode || !shape.warp_head || shape.window_mask || shape.kv_f16 ||
+       shape.kv_q8))
     return false;
   if (shape.warp_head) {
     // One warp per (query head, 16-row chunk), whole head_dim per warp: the
@@ -1936,15 +2166,17 @@ bool attention_shape_supported(const AttentionShape &shape) {
 }
 
 int attention_block_threads(const AttentionShape &shape) {
-  if (shape.decode) return 32;  // one warp for the partial kernel
+  // One warp per query head of the KV group: the block's warps read the same
+  // K/V chunk and share the cache lines through L1.
+  if (shape.decode) return shape.gqa * 32;
   if (shape.warp_head)
     return shape.gqa * (shape.br / 16) * 32;  // one warp per row chunk
   return (shape.br / 16) * shape.dps * shape.gqa_pack * 32;
 }
 
 int attention_shared_bytes(const AttentionShape &shape) {
-  // Decode: the fixed score view the partial kernel stages the chunk in.
-  if (shape.decode) return 4 * kAttentionDecodeMaxChunk;
+  // Decode: one fixed score slot per warp (one per query head of the group).
+  if (shape.decode) return 4 * kAttentionDecodeMaxChunk * shape.gqa;
   const int qrows = shape.warp_head ? shape.gqa * shape.br
                                     : shape.gqa_pack * shape.br;
   // Every f16 tile row carries the 8-element bank-conflict pad (see
@@ -2011,7 +2243,28 @@ std::string attention_codegen_version() {
   // per block, each owning distinct query rows and the whole head_dim). A
   // causal or windowed shape is unaffected: its generated text and region
   // identity are the ones attn12 produced.
-  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn13";
+  // attn14: the decode partial kernel's block covers one (chunk, KV head) with
+  // one warp per query head, so the gqa warps share the chunk's K/V reads
+  // instead of each (head, chunk) block re-reading them (long-context decode is
+  // DRAM-bound on that gqa-fold duplication). Per-warp arithmetic is unchanged,
+  // so the output stays bit-identical.
+  // attn16: q8 KV cache variant (the cache row is int8 + an f32 scale).
+  // attn17: the decode score/accumulate loops compute each key's cache slot
+  // from its position instead of carrying it as a loop-carried value, so the
+  // iterations no longer serialize on the predecessor's slot arithmetic (the
+  // per-key arithmetic and its order are unchanged, so output is identical).
+  // attn18: both decode key loops are unrolled four keys per iteration (main
+  // step-4 loop + one-key remainder carrying the accumulators), so the
+  // scheduler can overlap independent key loads; keys still execute in
+  // ascending j with the same per-key f32 ops, so output is unchanged.
+  // attn19: the unroll prologue clamps (jhi - jlo) at zero. An inactive block
+  // (jlo > jhi) used to be zero-trip through scf.for's unsigned IV test, but
+  // the step-4 trip count divides the span and wrapped on underflow. attn18
+  // never shipped; its cache entries are invalid.
+  // attn20 (never shipped): unroll factor eight, measured 0.7% slower than
+  // four at depth 16K; attn21 restores four. attn22 is the experiment arm with
+  // no unroll (kKeyUnroll = 1).
+  return std::string("llvm-") + LLVM_VERSION_STRING + "-attn22";
 }
 
 } // namespace sonicboom::compiler

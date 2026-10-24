@@ -230,9 +230,11 @@ std::string attention_region_name(const compiler::AttentionShape &shape) {
   const std::string mask = shape.full_attn  ? "-full"
                            : shape.window_mask ? "-window"
                                                : "-causal";
-  // f16 KV storage is a distinct kernel: its cache reads have a different
-  // element type, so the entry must not be shared with the f32 cache kernel.
-  const std::string kv = shape.kv_f16 ? "-kv16" : "";
+  // A narrower KV storage is a distinct kernel: its cache reads have a
+  // different element type/layout, so the entry must not be shared with the
+  // f32 cache kernel (and f16 must not share with q8).
+  const std::string kv =
+      shape.kv_f16 ? "-kv16" : shape.kv_q8 ? "-kv8" : "";
   if (shape.decode)
     return "attn-dec-d" + std::to_string(shape.head_dim) + "-g" +
            std::to_string(shape.gqa) + mask + kv;
@@ -599,8 +601,14 @@ bool launch_attention(const compiler::AttentionShape &shape,
 bool launch_attention_decode(const compiler::AttentionShape &shape,
                              void *const *args, int n_chunks, int n_heads_q) {
 #if SONICBOOM_USE_CUDA
-  if (n_chunks <= 0 || n_heads_q <= 0) return false;
+  if (n_chunks <= 0 || n_heads_q <= 0 || shape.gqa <= 0 ||
+      n_heads_q % shape.gqa != 0)
+    return false;
   const int shared_bytes = compiler::attention_shared_bytes(shape);
+  // fa_decode: one block per (chunk, KV head), gqa warps of one query head
+  // each. fa_combine stays one block per query head.
+  const int threads = compiler::attention_block_threads(shape);
+  const int n_heads_kv = n_heads_q / shape.gqa;
   const std::string key = attention_region_name(shape);
   CUfunction partial_fn = nullptr;
   CUfunction combine_fn = nullptr;
@@ -626,7 +634,7 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
 
   if (auto *rec = sonicboom::planner::recorder()) {
     rec->add_launch(key + ":decode", "", unsigned(n_chunks),
-                    unsigned(n_heads_q), 1, 32, 1, 1,
+                    unsigned(n_heads_kv), 1, unsigned(threads), 1, 1,
                     static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
                         sonicboom::cuda::sb_current_stream()));
@@ -636,9 +644,9 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
                         sonicboom::cuda::sb_current_stream()));
   }
   CUresult r = cuLaunchKernel(
-      partial_fn, unsigned(n_chunks), unsigned(n_heads_q), 1, 32, 1, 1,
-      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
-      part_args, nullptr);
+      partial_fn, unsigned(n_chunks), unsigned(n_heads_kv), 1,
+      unsigned(threads), 1, 1, unsigned(shared_bytes),
+      CUstream(sonicboom::cuda::sb_current_stream()), part_args, nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
                  key.c_str(), cu_error(r));

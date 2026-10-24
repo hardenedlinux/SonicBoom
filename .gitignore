@@ -94,3 +94,7 @@ tools/sb-moss
 
 # range-analysis driver (tools/build_sb_range.sh builds it)
 tools/sb-range
+
+# dev-time benchmark binaries built by tools/baseline/build_*.sh
+/tools/baseline/gen_from_tokens
+/tools/baseline/llama_gen_tokens

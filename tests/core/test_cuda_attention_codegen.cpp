@@ -254,7 +254,12 @@ void check_prefill_bit_identity(DeviceBufs &b, const std::vector<float> &qabs,
 // the file proves the codegen path ran rather than silently falling back to
 // the hand-written kernel (the fallback is by design and would otherwise let
 // every differential check above pass on the wrong kernel).
-bool codegen_cache_hit(const char *region) {
+//
+// The check is on the class (`attn-d64-g7-causal-*`), not one exact tile:
+// which tile the class runs is a per-device decision (the static default, or
+// the tuner's cached pick), so pinning a tile name here would make the check
+// depend on this machine's tuning state.
+bool codegen_cache_hit_class(const char *region_prefix) {
   const char *home = std::getenv("HOME");
   if (!home) return false;
   int major = 0, minor = 0;
@@ -263,15 +268,25 @@ bool codegen_cache_hit(const char *region) {
       cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, 0) !=
           cudaSuccess)
     return false;
-  const std::filesystem::path p =
-      std::filesystem::path(home) / ".cache" / "sonicboom" / "kernels" /
-      (std::string(region) + "-sm" + std::to_string(major * 10 + minor) +
-       ".ptx");
-  std::ifstream in(p, std::ios::binary);
-  if (!in) return false;
-  const std::string body((std::istreambuf_iterator<char>(in)),
-                         std::istreambuf_iterator<char>());
-  return body.find("mma.sync") != std::string::npos;
+  const std::string prefix = std::string(region_prefix) + "-";
+  const std::string suffix =
+      "-sm" + std::to_string(major * 10 + minor) + ".ptx";
+  const std::filesystem::path dir =
+      std::filesystem::path(home) / ".cache" / "sonicboom" / "kernels";
+  std::error_code ec;
+  for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+    const std::string name = entry.path().filename().string();
+    if (name.size() <= prefix.size() + suffix.size()) continue;
+    if (name.compare(0, prefix.size(), prefix) != 0) continue;
+    if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0)
+      continue;
+    std::ifstream in(entry.path(), std::ios::binary);
+    if (!in) continue;
+    const std::string body((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    if (body.find("mma.sync") != std::string::npos) return true;
+  }
+  return false;
 }
 
 } // namespace
@@ -358,9 +373,9 @@ int main() {
   // (SONICBOOM_GLUE_CACHE=0) writes no file, so it skips just this check.
   const char *cache_env = std::getenv("SONICBOOM_GLUE_CACHE");
   if (cache_env == nullptr || std::string_view(cache_env) != "0") {
-    check(codegen_cache_hit("attn-d64-g7-causal-b64x64-dps1"),
+    check(codegen_cache_hit_class("attn-d64-g7-causal"),
           "the causal generated kernel was compiled and cached by the runtime");
-    check(codegen_cache_hit("attn-d64-g7-window-b64x64-dps1"),
+    check(codegen_cache_hit_class("attn-d64-g7-window"),
           "the window generated kernel was compiled and cached by the runtime");
   }
 
