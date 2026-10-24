@@ -21,6 +21,7 @@
 ;;; Endpoints
 ;;;   GET  /v1/models, /v1/models/:id
 ;;;   POST /v1/chat/completions       stream=false: JSON; stream=true: SSE
+;;;   POST /v1/images/generations     MOSS-Image, PNG as base64 (b64_json)
 ;;;   GET  /v1/ws/chat                WebSocket: a request per text message,
 ;;;                                   answered by chunk JSON messages, "[DONE]"
 ;;;   GET  /sonicboom/stats           queue, sessions and backend counters
@@ -30,6 +31,8 @@
 ;;;   --host ADDR --port N            listen address (127.0.0.1:8000)
 ;;;   --backend real|mock             libsonicboom C ABI (real) or the
 ;;;                                   deterministic in-process mock (real)
+;;;   --image-model DIR               MOSS-Image root, loaded on the first
+;;;                                   image request (models/MOSS-Image-SFT)
 ;;;   --queue N                       requests allowed to wait (8)
 ;;;   --max-sessions N --token-budget N   session pool, per model (4, 32768)
 ;;;   --context-length N              of the mock models (8192)
@@ -44,7 +47,10 @@
              (srfi srfi-1)
              (ice-9 getopt-long)
              (ice-9 threads)
+             (ice-9 binary-ports)
              (ice-9 match)
+             (sonicboom error)
+             (sonicboom image)
              (sonicboom serve backend)
              (sonicboom serve real-backend)
              (sonicboom serve mock-backend)
@@ -63,7 +69,8 @@
                  (model (value #t)) (model-id (value #t)) (queue (value #t))
                  (max-sessions (value #t)) (token-budget (value #t))
                  (context-length (value #t)) (step-delay (value #t))
-                 (prefill-delay (value #t)) (runtime-dir (value #t)))))
+                 (prefill-delay (value #t)) (image-model (value #t))
+                 (runtime-dir (value #t)))))
 
 (define (option key default)
   (match (option-ref options key #f)
@@ -128,6 +135,66 @@
 (define (now) (car (gettimeofday)))
 
 ;;; ---------------------------------------------------------------------------
+;;; The image model: loaded on the first image request, so a chat-only server
+;;; never pays for the MOSS-Image weights or their device memory. There is no
+;;; session pool for it: one generation at a time, serialized on this mutex.
+
+(define image-model-path (option 'image-model "models/MOSS-Image-SFT"))
+(define image-model-lock (make-mutex))
+(define image-model #f)
+
+(define (image-pipeline)
+  (lock-mutex image-model-lock)
+  (dynamic-wind
+    (lambda () #t)
+    (lambda ()
+      (unless image-model
+        (set! image-model (load-image-model image-model-path)))
+      image-model)
+    (lambda () (unlock-mutex image-model-lock))))
+
+;; The C ABI's PNG writer takes a path, so encode through a temporary file and
+;; read the bytes back. Each request has its own file name; it is removed even
+;; when the write fails.
+(define (png-bytes width height rgb)
+  (let ((path (format #f "~a/image-~a-~a.png" runtime-dir (getpid)
+                      (random 1000000000))))
+    (dynamic-wind
+      (lambda () #t)
+      (lambda ()
+        (write-png path rgb width height)
+        (call-with-input-file path get-bytevector-all))
+      (lambda ()
+        (catch #t (lambda () (delete-file path)) (lambda _ #f))))))
+
+;; One generation at a time: the pipeline's device buffers are reused in place
+;; from request to request, so concurrent generations on it are not safe.
+(define image-run-lock (make-mutex))
+
+;; REQUEST is the alist parse-image-request returns; the result is the list of
+;; base64 PNGs for the response's data array.
+(define (render-images request)
+  (lock-mutex image-run-lock)
+  (dynamic-wind
+    (lambda () #t)
+    (lambda ()
+      (let ((images (generate-images
+                     (image-pipeline)
+                     #:prompt (assoc-ref request "prompt")
+                     #:negative (assoc-ref request "negative_prompt")
+                     #:width (assoc-ref request "width")
+                     #:height (assoc-ref request "height")
+                     #:steps (assoc-ref request "steps")
+                     #:guidance (assoc-ref request "guidance_scale")
+                     #:seed (assoc-ref request "seed")
+                     #:batch (assoc-ref request "n"))))
+        (map (lambda (image)
+               (base64-encode-bytevector
+                (png-bytes (car image) (cadr image) (caddr image))))
+             images)))
+    (lambda () (unlock-mutex image-run-lock))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Helpers
 
 (define (json-emit status obj)
@@ -163,6 +230,18 @@
            "messages" "context_length_exceeded"))
     (('invalid-constraint param message)
      (list 400 "invalid_request_error" message param "invalid_constraint"))
+    ;; A Guile 3 condition raised by a binding module. `catch #t` reports the
+    ;; condition itself with the key `%exception`. A &sonicboom-error carries
+    ;; the C ABI's message (a failed model load, a generation failure, a
+    ;; cancelled generation; the server never cancels one).
+    (('%exception c)
+     (if (sonicboom-error? c)
+         (let ((message (sonicboom-error-message c)))
+           (list 500 "server_error"
+                 (if (string-null? message) "SonicBoom error" message)
+                 'null 'null))
+         (list 500 "server_error" (format #f "internal error: ~a" c)
+               'null 'null)))
     (_ (list 500 "server_error" (format #f "~a: ~s" key args) 'null 'null))))
 
 (define (error-object-of key args)
@@ -258,6 +337,22 @@
                   (json-emit 200 (completion-object (new-completion-id) (now)
                                                     (chat-request-model request)
                                                     result)))))))
+      (lambda (key . args)
+        (apply error-emit (classify key args))))))
+
+;; Image generation is blocking and long, so it runs in a runner thread like a
+;; chat completion (same NOTE as above: no dynamic-wind). It does not use the
+;; engine's queue or session pool; render-images serializes the generations.
+(post "/v1/images/generations"
+  (lambda (rc)
+    (catch #t
+      (lambda ()
+        (let ((request (parse-image-request (read-json-body rc))))
+          (json-emit 200
+                     (images-object (now)
+                                    (call-with-runner
+                                     (lambda () (render-images request))
+                                     #:timeout 0)))))
       (lambda (key . args)
         (apply error-emit (classify key args))))))
 

@@ -52,6 +52,7 @@ typedef enum sb_status {
   SB_ERR_RUNTIME = 5,  /* the JITted function failed or was unavailable       */
   SB_ERR_INTERNAL = 6, /* invalid argument to the C API, or unexpected error  */
   SB_ERR_UNSUPPORTED = 7, /* a requested feature this build/backend lacks     */
+  SB_ERR_CANCELLED = 8, /* the caller's progress callback asked to stop      */
 } sb_status;
 
 /* Error categories (the `message` carries the human-readable detail). */
@@ -66,6 +67,7 @@ typedef enum sb_error_kind {
   SB_ERRKIND_BINDING = 7,
   SB_ERRKIND_RUNTIME = 8,
   SB_ERRKIND_INTERNAL = 9,
+  SB_ERRKIND_CANCELLED = 10,
 } sb_error_kind;
 
 /* The frozen v0 dtype set. */
@@ -471,8 +473,8 @@ sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
  *  - decode runs one whole greedy generation per call (the CPU planner spine
  *    has no step-wise persistent session yet); a single-token prompt is a seed
  *    and decodes directly, a longer prompt prefills then decodes;
- *  - sampling is greedy-only (temperature 0); non-greedy returns
- *    SB_ERR_UNSUPPORTED;
+ *  - temperature 0 is greedy (the historical path); temperature > 0 samples
+ *    deterministically from sb_llm_sampling's seed;
  *  - tokenize/detokenize use the model's GGUF built-in vocabulary (SPM-style
  *    BPE for Gemma 4, byte-level BPE for Qwen2), matching llama-tokenize;
  *  - the architectures SonicBoom models load (Gemma 4, Qwen2); anything else
@@ -486,9 +488,38 @@ typedef struct sb_llm_model sb_llm_model;
 typedef struct sb_llm_session sb_llm_session;
 typedef int32_t sb_token;   /* a vocabulary index */
 
-/* Sampling parameters for one decode call. temperature 0 == greedy argmax (the
- * only mode implemented today; temperature > 0, 0 < top_p < 1, or top_k > 0
- * return SB_ERR_UNSUPPORTED). max_tokens caps the output length. */
+/* Sampling parameters for one decode call.
+ *
+ * temperature 0 is the greedy argmax path, bit-identical to the historical
+ * decode. temperature > 0 enables seeded sampling: the application order is
+ *   1. repetition / presence / frequency penalties over the last
+ *      repeat_last_n tokens of the history (prompt + tokens generated so far);
+ *   2. the grammar mask (constrained decoding);
+ *   3. temperature scaling and a 30-logit candidate window;
+ *   4. top_k truncation (top_k 0 disables it);
+ *   5. min_p truncation (min_p 0 disables it);
+ *   6. nucleus truncation when 0 < top_p < 1 (top_p 1 disables it);
+ *   7. a seeded Gumbel-max draw keyed by (seed, absolute token position).
+ * The same seed, position and history therefore always produce the same token,
+ * independently of KV-cache capacity or prefix reuse.
+ *
+ * max_tokens caps the output length.
+ *
+ * Fields appended after max_tokens are read only when struct_size covers them;
+ * a caller built against an older struct_size gets the neutral defaults below.
+ *   min_p              neutral 0    (keep every candidate above the window)
+ *   repeat_penalty     neutral 1    (no repetition penalty; 0 = off, < 0 is
+ *                                    SB_ERR_BINDING)
+ *   repeat_last_n      neutral 64   (penalty window, tokens; 0 disables every
+ *                                    penalty)
+ *   presence_penalty   neutral 0    (subtracted once per repeated token)
+ *   frequency_penalty  neutral 0    (subtracted per occurrence)
+ * Zero means "off" throughout: a zero-initialized sb_llm_sampling whose only
+ * fields are struct_size = sizeof(sb_llm_sampling) and max_tokens is plain
+ * greedy (temperature 0, no truncation, no penalties).
+ * For a token t appearing c times in the window: if repeat_penalty != 1,
+ * l[t] = l[t] / repeat_penalty when l[t] > 0 else l[t] * repeat_penalty; then
+ * l[t] -= frequency_penalty * c + presence_penalty. */
 typedef struct sb_llm_sampling {
   size_t struct_size;
   float temperature;
@@ -496,6 +527,11 @@ typedef struct sb_llm_sampling {
   uint32_t top_k;
   uint64_t seed;
   uint32_t max_tokens;
+  float min_p;
+  float repeat_penalty;
+  uint32_t repeat_last_n;
+  float presence_penalty;
+  float frequency_penalty;
 } sb_llm_sampling;
 
 /* Per-token callback: called synchronously on the calling thread, once per
@@ -621,6 +657,74 @@ void sb_llm_session_clear_grammar(sb_llm_session *session);
 sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
                                           int *active_out, int *complete_out,
                                           sb_error **err_out);
+
+/* --- Image generation ------------------------------------------------------
+ *
+ * MOSS-Image text-to-image through the same stable ABI: an opaque model (the
+ * pipeline with its text encoder), one request struct, a batch of RGB images
+ * and a minimal PNG writer. The model directory is the MOSS-Image root
+ * (text_encoder/, transformer/, vae/, tokenizer/); a directory the pipeline
+ * rejects is SB_ERR_UNSUPPORTED.
+ *
+ * Determinism: image i starts from the same seeded noise sb-moss's `sample
+ * --seed` draws (seed + i), and images in a batch are denoised one at a time,
+ * so image i of a batch is bit-identical to generating it alone.
+ */
+
+typedef struct sb_image_model sb_image_model;
+
+/* One generation request. Fields beyond `struct_size` take their defaults, so
+ * a caller built against an older header keeps working. prompt is required
+ * (NUL-terminated UTF-8, wrapped in the pipeline's chat template);
+ * negative_prompt NULL is the empty prompt (used when guidance_scale != 1).
+ * width and height are multiples of 16 (and >= 16); batch >= 1; steps >= 1;
+ * guidance_scale is used as given (0 is unconditional-only; the reference
+ * pipeline's default is 3.0), so a caller sets the guidance it wants. */
+typedef struct sb_image_request {
+  size_t struct_size;
+  const char *prompt;
+  const char *negative_prompt;
+  uint32_t width;
+  uint32_t height;
+  uint32_t steps;
+  float guidance_scale;
+  uint64_t seed;
+  uint32_t batch;
+} sb_image_request;
+
+/* Called after each denoising step with the image's index in the batch, the
+ * steps completed (1-based) and the total. A non-zero return cancels: the
+ * generation stops after the current step and sb_image_generate returns
+ * SB_ERR_CANCELLED. */
+typedef int (*sb_image_progress_cb)(void *user, uint32_t image_index,
+                                    uint32_t step, uint32_t total_steps);
+
+/* Load the MOSS-Image pipeline and its text encoder from `dir`. */
+sb_status sb_image_model_load(const char *dir, sb_image_model **out,
+                              sb_error **err_out);
+void sb_image_model_free(sb_image_model *model);
+
+/* The architecture name ("moss-image"), two-call sizing like the other string
+ * outputs: a short cap returns SB_ERR_BINDING and the needed byte count. */
+sb_status sb_image_model_arch(const sb_image_model *model, char *out,
+                              size_t cap, size_t *len_out,
+                              sb_error **err_out);
+
+/* Generate `req->batch` images. rgb_out receives batch x height x width x 3
+ * bytes, uint8 HWC, row-major, top row first, converted from the pipeline's
+ * [-1, 1] CHW floats with clamp and lrintf. Two-call sizing: pass rgb_out NULL
+ * (or a cap too small) to get the needed byte count in *bytes_out and
+ * SB_ERR_BINDING. cb may be NULL. */
+sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
+                            sb_image_progress_cb cb, void *user,
+                            uint8_t *rgb_out, size_t cap, size_t *bytes_out,
+                            sb_error **err_out);
+
+/* Write `rgb` (height rows of width*3 bytes, RGB) as a PNG: 8-bit RGB, one
+ * IDAT of stored (uncompressed) deflate blocks, no external dependency. */
+sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
+                             uint32_t width, uint32_t height,
+                             sb_error **err_out);
 
 /* --- Decision registry (diagnostics) ---------------------------------------
  *

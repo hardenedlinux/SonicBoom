@@ -38,6 +38,37 @@
 
 namespace sonicboom::moss {
 
+std::vector<float> seeded_noise(int64_t n, uint64_t seed) {
+  // splitmix64 + Box-Muller: deterministic, but not torch's generator (parity
+  // runs pass an explicit latent).
+  std::vector<float> out(static_cast<size_t>(n));
+  auto next = [&]() {
+    seed += 0x9e3779b97f4a7c15ull;
+    uint64_t z = seed;
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+    return z ^ (z >> 31);
+  };
+  auto uniform = [&]() {
+    return (static_cast<double>(next() >> 11) + 0.5) *
+           (1.0 / 9007199254740992.0);
+  };
+  constexpr double kTau = 6.28318530717958647692;
+  for (int64_t i = 0; i + 1 < n; i += 2) {
+    const double u1 = uniform(), u2 = uniform();
+    const double r = std::sqrt(-2.0 * std::log(u1));
+    out[static_cast<size_t>(i)] =
+        static_cast<float>(r * std::cos(kTau * u2));
+    out[static_cast<size_t>(i + 1)] =
+        static_cast<float>(r * std::sin(kTau * u2));
+  }
+  if (n % 2 == 1)
+    out[static_cast<size_t>(n - 1)] =
+        static_cast<float>(std::sqrt(-2.0 * std::log(uniform())) *
+                           std::cos(kTau * uniform()));
+  return out;
+}
+
 namespace {
 
 // Stage markers for the nsys runs that produce the per-stage breakdown. Opt-in
@@ -269,7 +300,8 @@ std::expected<HiddenStates, std::string> MossPipeline::encode(
 std::expected<MossLatent, std::string> MossPipeline::sample(
     const MossLatent& latent, const MossConditioning& cond,
     const MossPipelineConfig& cfg, std::vector<MossLatent>* trace,
-    MossSampleStats* stats) const {
+    MossSampleStats* stats, const MossProgress& progress,
+    int64_t image_index) const {
   const DitConfig& dit_cfg = impl_->dit_config();
   if (latent.channels != dit_cfg.latent_channels || latent.height <= 0 ||
       latent.width <= 0)
@@ -357,6 +389,8 @@ std::expected<MossLatent, std::string> MossPipeline::sample(
       current.values[i] += dt * pred[i];
 
     if (trace != nullptr) trace->push_back(current);
+    if (progress && !progress(image_index, step + 1, steps))
+      return std::unexpected("cancelled");
   }
 
   if (stats != nullptr) {
@@ -372,7 +406,7 @@ std::expected<std::vector<MossLatent>, std::string> MossPipeline::sample_batch(
     std::span<const MossLatent> latents, std::span<const MossConditioning> conds,
     const MossPipelineConfig& cfg,
     std::vector<std::vector<MossLatent>>* trace,
-    MossSampleStats* stats) const {
+    MossSampleStats* stats, const MossProgress& progress) const {
   if (latents.size() != conds.size())
     return std::unexpected("sample_batch: latents and conditionings differ in count");
   std::vector<MossLatent> out;
@@ -382,7 +416,8 @@ std::expected<std::vector<MossLatent>, std::string> MossPipeline::sample_batch(
   for (size_t i = 0; i < latents.size(); ++i) {
     MossSampleStats one;
     auto got = sample(latents[i], conds[i], cfg,
-                      trace != nullptr ? &(*trace)[i] : nullptr, &one);
+                      trace != nullptr ? &(*trace)[i] : nullptr, &one, progress,
+                      static_cast<int64_t>(i));
     if (!got) return std::unexpected(got.error());
     out.push_back(std::move(*got));
     seconds += one.seconds;
@@ -441,6 +476,11 @@ std::expected<MossImage, std::string> MossPipeline::decode(
 #endif
   NvtxRange vae_range("moss.vae");
   auto decoded = impl_->vae->decode(unshuffled, 2 * h, 2 * w);
+  // The VAE runs through ATen kernels, whose caching allocator keeps ~2 GiB of
+  // decode temporaries as free cached blocks. Hand them back to the driver so
+  // the DiT's next upload (raw cudaMalloc, ~5.4 GiB) fits beside them; without
+  // this a second generation on the same pipeline runs out of memory.
+  impl_->vae->release_cached_memory();
   if (!decoded) return std::unexpected(decoded.error());
 
   MossImage image;

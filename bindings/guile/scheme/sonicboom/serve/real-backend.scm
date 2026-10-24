@@ -6,6 +6,8 @@
 (define-module (sonicboom serve real-backend)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-34)
+  #:use-module (sonicboom error)
   #:use-module ((sonicboom inference) #:prefix inference:)
   #:use-module (sonicboom serve backend)
   #:use-module (sonicboom serve chat-template)
@@ -89,9 +91,9 @@
 ;; the grammar text came from the client — so it is rethrown as a typed error
 ;; and the route answers 400 on the offending parameter, not a 500.
 (define (compile-constraint param thunk)
-  (catch 'sb-inference
-    thunk
-    (lambda (_key msg) (throw 'invalid-constraint param msg))))
+  (guard (c ((sonicboom-error? c)
+             (throw 'invalid-constraint param (sonicboom-error-message c))))
+    (thunk)))
 
 ;; Install (or clear) the session's grammar before a prefill: the core restarts
 ;; it there, and the first token sampled at the end of the prompt is masked like

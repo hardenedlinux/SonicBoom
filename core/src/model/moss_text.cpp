@@ -91,6 +91,15 @@ std::string shape_string(std::span<const uint64_t> shape) {
 
 }  // namespace
 
+std::string moss_chat_prompt(std::string_view text) {
+  std::string out;
+  out.reserve(text.size() + 64);
+  out += "<|im_start|>user\n";
+  out += text;
+  out += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+  return out;
+}
+
 struct TextEncoder::Impl {
   TextEncoderConfig cfg;
   std::unique_ptr<safetensors::ShardedReader> reader;

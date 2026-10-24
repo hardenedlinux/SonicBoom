@@ -94,6 +94,9 @@ add_library(sonicboom_compiler STATIC
 # already read from the tests next to it, so PIC now rather than as a later fix.
 set_target_properties(sonicboom_compiler PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# SONICBOOM_SANITIZE: the dialect and its passes are SonicBoom code.
+sonicboom_sanitize(sonicboom_compiler)
+
 # The installed MLIR is built without RTTI, so `typeinfo for mlir::Dialect` does
 # not exist anywhere. Defining BoomDialect (a subclass of mlir::Dialect) with
 # RTTI on emits a vtable whose RTTI slot names that typeinfo, and the link

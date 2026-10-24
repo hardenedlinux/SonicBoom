@@ -1,6 +1,9 @@
 # build outputs
 /build/
 /build-nocuda/
+# SONICBOOM_SANITIZE builds (root CMakeLists.txt)
+/build-asan/
+/build-tsan/
 /cmake-build-*/
 /Testing/
 

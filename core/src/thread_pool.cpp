@@ -17,6 +17,7 @@
 #include <sonicboom/thread_pool.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 
@@ -28,16 +29,22 @@ namespace {
 constexpr uint64_t k_min_parallel_elements = 64;
 
 // --- temporary profiling (remove after measuring) ---------------------------
+// Atomics: every worker accumulates work_ms and the callers accumulate the
+// other fields concurrently. The values are diagnostics only, so relaxed
+// ordering is enough (no other memory is published through them).
 struct PoolProf {
-  long inline_calls = 0;
-  long dispatch_calls = 0;
-  double handshake_ms = 0.0;
-  double work_ms = 0.0;  // sum of per-worker slice durations (≈ n_workers x wall)
+  std::atomic<long> inline_calls{0};
+  std::atomic<long> dispatch_calls{0};
+  std::atomic<double> handshake_ms{0.0};
+  std::atomic<double> work_ms{0.0};  // sum of per-worker slice durations
   ~PoolProf() {
     std::fprintf(stderr,
                  "[threadpool-prof] %ld inline, %ld dispatch, handshake %.2f ms, "
                  "work %.2f ms\n",
-                 inline_calls, dispatch_calls, handshake_ms, work_ms);
+                 inline_calls.load(std::memory_order_relaxed),
+                 dispatch_calls.load(std::memory_order_relaxed),
+                 handshake_ms.load(std::memory_order_relaxed),
+                 work_ms.load(std::memory_order_relaxed));
   }
 } g_pool_prof;
 } // namespace
@@ -70,12 +77,12 @@ void ThreadPool::parallel_for(
   if (end <= begin) return;
 
   if (n_workers_ <= 1 || (end - begin) < k_min_parallel_elements) {
-    ++g_pool_prof.inline_calls;
+    g_pool_prof.inline_calls.fetch_add(1, std::memory_order_relaxed);
     fn(begin, end);
     return;
   }
 
-  ++g_pool_prof.dispatch_calls;
+  g_pool_prof.dispatch_calls.fetch_add(1, std::memory_order_relaxed);
   const auto t0 = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lk(mu_);
@@ -89,10 +96,11 @@ void ThreadPool::parallel_for(
 
   std::unique_lock<std::mutex> lk(mu_);
   done_cv_.wait(lk, [this] { return remaining_ == 0; });
-  g_pool_prof.handshake_ms +=
+  g_pool_prof.handshake_ms.fetch_add(
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t0)
-          .count();
+          .count(),
+      std::memory_order_relaxed);
 }
 
 void ThreadPool::worker_loop(int id) {
@@ -118,10 +126,11 @@ void ThreadPool::worker_loop(int id) {
     if (f != nullptr && s < e) {
       const auto w0 = std::chrono::steady_clock::now();
       (*f)(s, e);
-      g_pool_prof.work_ms +=
+      g_pool_prof.work_ms.fetch_add(
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - w0)
-              .count();
+              .count(),
+          std::memory_order_relaxed);
     }
     {
       std::lock_guard<std::mutex> lk(mu_);

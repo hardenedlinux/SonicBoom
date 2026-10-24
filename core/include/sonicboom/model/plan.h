@@ -32,6 +32,7 @@
 #include <string>
 
 #include <sonicboom/model/loader.h>
+#include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/graph.h>
 #include <sonicboom/planner/kv_cache.h>
 #include <sonicboom/planner/plan_record.h>
@@ -142,7 +143,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
 uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
                         uint64_t start_pos, std::span<int64_t> tokens,
                         uint64_t n_ctx = 0,
-                        std::span<const uint8_t> sample_mask = {});
+                        std::span<const uint8_t> sample_mask = {},
+                        const nn::SamplingParams* sampling = nullptr);
 
 // CUDA spine: the same greedy decode as generate_spine, but planned against a
 // CUDA-aware snapshot so Sonic nodes with *_dev kernels run on the GPU and only
@@ -157,6 +159,20 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx = 0,
                              std::span<const uint8_t> sample_mask = {});
+
+// Sampled CUDA generation (temperature > 0). Runs the non-greedy decode graph —
+// the one score_spine_cuda uses, whose full softcapped [vocab] logits reach the
+// host each step — over `prompt` (teacher-forced to fill its own KV cache), then
+// chooses each produced token on the host with nn::sample_token. The greedy
+// runtime and its captured graph are not used: temperature 0 keeps the device
+// argmax path untouched. Returns the number of tokens written; 0 without CUDA
+// support, on a build/step failure, or when temperature <= 0.
+uint64_t generate_spine_cuda_sampled(const Gemma4Model& m,
+                                     std::span<const uint64_t> prompt,
+                                     uint64_t start_pos,
+                                     std::span<int64_t> tokens, uint64_t n_ctx,
+                                     const nn::SamplingParams& sampling,
+                                     std::span<const uint8_t> sample_mask = {});
 
 // Pay the one-time decode-runtime construction for (model, n_ctx) up front.
 //
@@ -334,7 +350,8 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
                                 std::span<const uint64_t> prompt,
                                 uint64_t start_pos, std::span<int64_t> tokens,
                                 uint64_t n_ctx = 0, bool use_prefill = true,
-                                std::span<const uint8_t> sample_mask = {});
+                                std::span<const uint8_t> sample_mask = {},
+                                const nn::SamplingParams* sampling = nullptr);
 
 // CUDA prefill + decode: the same prompt-prefill contract as
 // generate_prefill_spine, but on the device — SonicCudaBackend::prefill (batched

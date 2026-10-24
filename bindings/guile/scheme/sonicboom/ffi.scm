@@ -15,8 +15,10 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-34)
   #:use-module (json)
   #:use-module (ice-9 threads)
+  #:use-module (sonicboom error)
   #:export (libsonicboom-available?
             library-load-error
             exception-text
@@ -24,7 +26,9 @@
             build-info
             sb-status-ok?
             sb-status->message
+            sb-check!
             SB_ERR_BINDING
+            SB_ERR_CANCELLED
             ;; low-level FFI plumbing exposed for the training module
             proc make-slot slot-ptr slot-ref capture-error))
 
@@ -38,6 +42,7 @@
 (define SB_ERR_RUNTIME 5)
 (define SB_ERR_INTERNAL 6)
 (define SB_ERR_UNSUPPORTED 7)
+(define SB_ERR_CANCELLED 8)
 
 (define (sb-status-ok? status) (= status SB_OK))
 
@@ -45,7 +50,7 @@
   `((,SB_OK . "ok") (,SB_ERR_PARSE . "parse") (,SB_ERR_WEIGHT . "weight")
     (,SB_ERR_COMPILE . "compile") (,SB_ERR_BINDING . "binding")
     (,SB_ERR_RUNTIME . "runtime") (,SB_ERR_INTERNAL . "internal")
-    (,SB_ERR_UNSUPPORTED . "unsupported")))
+    (,SB_ERR_UNSUPPORTED . "unsupported") (,SB_ERR_CANCELLED . "cancelled")))
 
 (define (sb-status->message status)
   (or (assq-ref *status-names* status) "unknown"))
@@ -156,6 +161,8 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                     (list '* '* size_t '* '*)))
                (sb_error_message . ,(foreign-proc "sb_error_message" '*
                                                   (list '*)))
+               (sb_error_get_kind . ,(foreign-proc "sb_error_get_kind" int
+                                                   (list '*)))
                (sb_error_free . ,(foreign-proc "sb_error_free" void (list '*)))
                (sb_document_free . ,(foreign-proc "sb_document_free" void
                                                   (list '*)))
@@ -189,6 +196,33 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                 (list '* '* '* size_t '*)))
                (sb_load_params . ,(foreign-proc "sb_load_params" int
                                                 (list '* '* '* size_t '*)))
+               ;; planner decision registry (see (sonicboom explain))
+               (sb_explain_table . ,(foreign-proc "sb_explain_table" int
+                                                  (list '* size_t '* '*)))
+               (sb_explain_json . ,(foreign-proc "sb_explain_json" int
+                                                 (list '* size_t '* '*)))
+               ;; training parameters (fused AdamW) — see (sonicboom param)
+               (sb_param_create . ,(foreign-proc "sb_param_create" int
+                                                 (list '* int64 '* size_t '* '*)))
+               (sb_param_numel . ,(foreign-proc "sb_param_numel" int
+                                                (list '* '*)))
+               (sb_param_on_device . ,(foreign-proc "sb_param_on_device" int
+                                                    (list '*)))
+               (sb_param_step_count . ,(foreign-proc "sb_param_step_count" uint64
+                                                     (list '*)))
+               (sb_param_zero_grad . ,(foreign-proc "sb_param_zero_grad" int
+                                                    (list '* '*)))
+               (sb_param_set_grad . ,(foreign-proc "sb_param_set_grad" int
+                                                   (list '* '* size_t '*)))
+               (sb_param_step . ,(foreign-proc "sb_param_step" int
+                                               (list '* float float float float
+                                                     float '*)))
+               (sb_param_step_lr . ,(foreign-proc "sb_param_step_lr" int
+                                                  (list '* '* float float float
+                                                        float '*)))
+               (sb_param_read . ,(foreign-proc "sb_param_read" int
+                                               (list '* '* size_t '* '*)))
+               (sb_param_free . ,(foreign-proc "sb_param_free" void (list '*)))
                ;; numerics profile (process-wide, latched; see capi.h)
                (sb_set_numerics_profile . ,(foreign-proc "sb_set_numerics_profile" int
                                                          (list int '*)))
@@ -226,7 +260,20 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_llm_session_clear_grammar . ,(foreign-proc "sb_llm_session_clear_grammar"
                                                               void (list '*)))
                (sb_llm_session_constraint_state . ,(foreign-proc "sb_llm_session_constraint_state"
-                                                                 int (list '* '* '* '*))))))
+                                                                 int (list '* '* '* '*)))
+               ;; image generation (MOSS-Image) — see capi.h sb_image_*
+               (sb_image_model_load . ,(foreign-proc "sb_image_model_load" int
+                                                     (list '* '* '*)))
+               (sb_image_model_free . ,(foreign-proc "sb_image_model_free" void
+                                                     (list '*)))
+               (sb_image_model_arch . ,(foreign-proc "sb_image_model_arch" int
+                                                     (list '* '* size_t '* '*)))
+               (sb_image_generate . ,(foreign-proc "sb_image_generate" int
+                                                   (list '* '* '* '* '* size_t
+                                                         '* '*)))
+               (sb_image_write_png . ,(foreign-proc "sb_image_write_png" int
+                                                    (list '* '* uint32 uint32
+                                                          '*))))))
         (%procs table)
         table)))
 
@@ -256,6 +303,42 @@ NULL the slot."
       ((proc 'sb_error_free) p)
       (slot-null! err-slot))
     msg))
+
+;;; --- status/error raising ----------------------------------------------------
+
+;; The kind the sb_error in ERR-SLOT reports, read before capture-error frees it.
+;; 0 (SB_ERRKIND_NONE) when the call left no error object.
+(define (error-kind-code err-slot)
+  (let ((p (slot-ref err-slot)))
+    (if (null-pointer? p) 0 ((proc 'sb_error_get_kind) p))))
+
+;; When the C side left no error object, the status code still says roughly
+;; what kind of failure it was.
+(define (status-kind status)
+  (case status
+    ((SB_ERR_PARSE) 'parse-syntax)
+    ((SB_ERR_WEIGHT) 'weight)
+    ((SB_ERR_COMPILE) 'compile)
+    ((SB_ERR_BINDING) 'binding)
+    ((SB_ERR_RUNTIME) 'runtime)
+    ((SB_ERR_INTERNAL) 'internal)
+    ((SB_ERR_CANCELLED) 'cancelled)
+    (else 'none)))
+
+(define (sb-check! status err-slot what)
+  "If STATUS is not SB_OK, raise a &sonicboom-error built from STATUS and the
+sb_error in ERR-SLOT (which is freed either way), with WHAT prefixed to the
+message. This is the one place a C ABI failure becomes a Guile exception."
+  (unless (sb-status-ok? status)
+    (let* ((code (error-kind-code err-slot))
+           (msg (capture-error err-slot))
+           (text (if (string-null? msg)
+                     (string-append "C ABI error: " (sb-status->message status))
+                     msg)))
+      (raise-sonicboom-error
+       status
+       (if (zero? code) (status-kind status) (sb-error-kind->symbol code))
+       (if what (string-append what ": " text) text)))))
 
 ;;; --- build info -------------------------------------------------------------
 
@@ -307,16 +390,10 @@ document/executable/error handles is always released."
       (unless (null-pointer? (slot-ref exe-slot))
         ((proc 'sb_executable_free) (slot-ref exe-slot))))
     (define (fail status)
-      (let ((msg (capture-error err-slot)))
-        (cleanup!)
-        (throw 'sb-ffi
-               (if (string-null? msg)
-                   (string-append "C ABI error: "
-                                  (sb-status->message status))
-                   msg))))
+      (cleanup!)
+      (sb-check! status err-slot "run-s-expr"))
 
-    (catch 'sb-ffi
-      (lambda ()
+    (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
         (let ((st ((proc 'sb_parse) txt-ptr len (slot-ptr doc-slot)
                    (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
@@ -347,5 +424,4 @@ document/executable/error handles is always released."
                            (slot-ptr err-slot))))
                 (unless (sb-status-ok? st) (fail st))
                 (cleanup!)
-                (values out-bv #f))))))
-      (lambda (key msg) (values #f msg)))))
+                (values out-bv #f))))))))

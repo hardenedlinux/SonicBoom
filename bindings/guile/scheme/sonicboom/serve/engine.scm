@@ -38,7 +38,8 @@
             chat-request-model chat-request-messages chat-request-tools
             chat-request-tool-choice chat-request-max-tokens chat-request-stop
             chat-request-temperature chat-request-top-p chat-request-top-k
-            chat-request-seed chat-request-constraint
+            chat-request-seed chat-request-presence-penalty
+            chat-request-frequency-penalty chat-request-constraint
 
             engine-admit! engine-run engine-drop! engine-generate
             engine-stats
@@ -51,7 +52,8 @@
 
 (define-record-type <chat-request>
   (%make-chat-request model messages tools tool-choice max-tokens stop
-                      temperature top-p top-k seed constraint)
+                      temperature top-p top-k seed presence-penalty
+                      frequency-penalty constraint)
   chat-request?
   (model chat-request-model)                ; model id
   (messages chat-request-messages)          ; list of message alists
@@ -59,17 +61,25 @@
   (tool-choice chat-request-tool-choice)    ; "none" "auto" "required" or a name
   (max-tokens chat-request-max-tokens)      ; #f: up to the context length
   (stop chat-request-stop)                  ; list of strings
-  (temperature chat-request-temperature)
+  (temperature chat-request-temperature)    ; 0: greedy (the default)
   (top-p chat-request-top-p)
   (top-k chat-request-top-k)
-  (seed chat-request-seed)
+  (seed chat-request-seed)                  ; 0 when the request omits it
+  (presence-penalty chat-request-presence-penalty)
+  (frequency-penalty chat-request-frequency-penalty)
   (constraint chat-request-constraint))     ; #f or a token filter
 
+;; Omitted sampling parameters are neutral: temperature 0 (greedy), top-p 1,
+;; no top-k, seed 0, no penalties. A request is thus greedy unless it asks for
+;; sampling, and reproducible when it does.
 (define* (make-chat-request #:key model messages (tools '()) (tool-choice "auto")
-                            (max-tokens #f) (stop '()) (temperature 1.0)
-                            (top-p 1.0) (top-k 0) (seed #f) (constraint #f))
+                            (max-tokens #f) (stop '()) (temperature 0.0)
+                            (top-p 1.0) (top-k 0) (seed 0)
+                            (presence-penalty 0.0) (frequency-penalty 0.0)
+                            (constraint #f))
   (%make-chat-request model messages tools tool-choice max-tokens stop
-                      temperature top-p top-k seed constraint))
+                      temperature top-p top-k seed presence-penalty
+                      frequency-penalty constraint))
 
 (define-record-type <result>
   (make-result finish-reason content tool-calls prompt-tokens

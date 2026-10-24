@@ -212,8 +212,11 @@ std::optional<TileConfig> TileConfig::from_string(std::string_view s) {
     if (i == 4) end = s.size();
     const std::string_view field = s.substr(pos, end - pos);
     if (field.empty()) return std::nullopt;
+    // Bind the text to a named string that outlives the call: `tail` points
+    // into it and is dereferenced on the next line.
+    const std::string field_str(field);
     char* tail = nullptr;
-    const long x = std::strtol(std::string(field).c_str(), &tail, 10);
+    const long x = std::strtol(field_str.c_str(), &tail, 10);
     if (!tail || *tail != '\0' || x <= 0 || x > 1 << 20) return std::nullopt;
     v[i] = int(x);
     pos = end + 1;

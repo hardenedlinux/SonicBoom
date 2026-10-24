@@ -86,6 +86,13 @@ class VaeDecoder {
       std::span<const float> latent, int64_t height, int64_t width,
       std::vector<VaeStage>* stages = nullptr) const;
 
+  // Returns the ATen caching allocator's unused device blocks to the driver.
+  // The decode temporaries are ATen allocations, and the Q8_0 DiT's next
+  // upload (raw cudaMalloc) cannot reuse the cached blocks; on an 8 GiB device
+  // the DiT and the cached decode peak do not fit together. No-op without
+  // CUDA.
+  void release_cached_memory() const;
+
  private:
   struct Impl;
   explicit VaeDecoder(std::unique_ptr<Impl> impl);

@@ -83,4 +83,11 @@ bool aten_vae_bmm_nt(VaeDevBuf out, VaeDevBuf a, VaeDevBuf b, std::int64_t B,
 bool aten_vae_softmax(VaeDevBuf out, VaeDevBuf x, std::int64_t rows,
                       std::int64_t cols);
 
+// Returns the caching allocator's unused device blocks to the driver. The
+// pipeline alternates between the ATen-based VAE and the raw-cudaMalloc Q8_0
+// DiT, and a decode leaves ~2 GiB of temporaries cached that the DiT's next
+// upload cannot use; on an 8 GiB device a second generation therefore needs
+// this after each decode. No-op without CUDA.
+void aten_vae_release_cached_memory();
+
 } // namespace sonicboom::vae::detail

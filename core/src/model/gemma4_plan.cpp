@@ -887,7 +887,8 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 // ---------------------------------------------------------------------------
 uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
                         uint64_t start_pos, std::span<int64_t> tokens,
-                        uint64_t n_ctx, std::span<const uint8_t> sample_mask) {
+                        uint64_t n_ctx, std::span<const uint8_t> sample_mask,
+                        const nn::SamplingParams* sampling) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
   const bool masked = !sample_mask.empty();
@@ -917,6 +918,11 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
           {planner::BackendTag::Sonic, &backend}});
 
   const uint64_t vocab = m.config.vocab_size;
+  const bool do_sample = sampling && sampling->temperature > 0.0f;
+  // Sampling history (prompt + produced) for the repetition penalties. The
+  // seed token is the single-token prompt.
+  std::vector<int64_t> history;
+  if (do_sample) history.push_back(int64_t(start_token));
   uint64_t token = start_token;
   uint64_t pos = start_pos;
   uint64_t step = 0;
@@ -943,10 +949,13 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
     std::span<const float> lf(reinterpret_cast<const float*>(logits.data()), vocab);
 
     const int64_t next =
-        masked ? nn::argmax_masked(lf, sample_mask) : nn::argmax(lf);
+        do_sample
+            ? nn::sample_token(lf, *sampling, pos + 1, history, sample_mask)
+            : (masked ? nn::argmax_masked(lf, sample_mask) : nn::argmax(lf));
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
+    if (do_sample) history.push_back(next);
     ++pos;
     // A mask constrains the next position only: the caller accepts this token
     // and recomputes the mask before the next call.
@@ -962,7 +971,8 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
                                 std::span<const uint64_t> prompt,
                                 uint64_t start_pos, std::span<int64_t> tokens,
                                 uint64_t n_ctx, bool use_prefill,
-                                std::span<const uint8_t> sample_mask) {
+                                std::span<const uint8_t> sample_mask,
+                                const nn::SamplingParams* sampling) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
   const bool masked = !sample_mask.empty();
@@ -987,6 +997,11 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
   const uint64_t vocab = m.config.vocab_size;
   const uint32_t d = m.config.embedding_length;
   std::vector<float> logits(vocab);
+
+  const bool do_sample = sampling && sampling->temperature > 0.0f;
+  // Sampling history: the prompt, then each produced token, in order.
+  std::vector<int64_t> history;
+  if (do_sample) history.assign(prompt.begin(), prompt.end());
 
   uint64_t token = 0;
   uint64_t pos = start_pos;
@@ -1047,12 +1062,27 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     }
   }
 
-  const int64_t first =
-      masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
+  const uint64_t first_pos = start_pos + prompt.size();
+  int64_t first;
+  if (do_sample) {
+    // The CPU lm-head emits raw logits; the model's distribution is the
+    // softcapped one (the same distribution the CUDA non-greedy graph emits).
+    const float cap = m.config.final_logit_softcapping;
+    std::vector<float> capped;
+    std::span<const float> z(logits);
+    if (cap > 0.0f) {
+      capped.resize(vocab);
+      if (nn::softcap(logits, cap, capped)) z = capped;
+    }
+    first = nn::sample_token(z, *sampling, first_pos, history, sample_mask);
+  } else {
+    first = masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
+  }
   if (first < 0) return 0;
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
-  pos = start_pos + prompt.size();
+  if (do_sample) history.push_back(first);
+  pos = first_pos;
   // A mask constrains this one position (see plan.h): one token per call.
   if (masked) return 1;
 
@@ -1073,10 +1103,23 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     const sx::Bytes& lo = res->outputs[0];
     if (lo.size() < vocab * sizeof(float)) break;
     std::span<const float> lf(reinterpret_cast<const float*>(lo.data()), vocab);
-    const int64_t next = nn::argmax(lf);
+    int64_t next;
+    if (do_sample) {
+      const float cap = m.config.final_logit_softcapping;
+      std::vector<float> capped;
+      std::span<const float> z = lf;
+      if (cap > 0.0f) {
+        capped.resize(vocab);
+        if (nn::softcap(lf, cap, capped)) z = capped;
+      }
+      next = nn::sample_token(z, *sampling, pos, history, sample_mask);
+    } else {
+      next = nn::argmax(lf);
+    }
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
+    if (do_sample) history.push_back(next);
     ++pos;
   }
   return step;
@@ -3771,6 +3814,70 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                   use_prefill, /*session=*/nullptr, prompt, {});
 }
 
+uint64_t generate_spine_cuda_sampled(const Gemma4Model& m,
+                                     std::span<const uint64_t> prompt,
+                                     uint64_t start_pos,
+                                     std::span<int64_t> tokens, uint64_t n_ctx,
+                                     const nn::SamplingParams& sampling,
+                                     std::span<const uint8_t> sample_mask) {
+  if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
+  if (!(sampling.temperature > 0.0f)) return 0;
+  if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
+  const uint64_t vocab = m.config.vocab_size;
+  for (uint64_t t : prompt)
+    if (t >= vocab) return 0;
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (vocab + 7) / 8) return 0;
+  if (start_pos + prompt.size() + tokens.size() > n_ctx) return 0;
+
+  // The non-greedy decode graph: the [vocab] softcapped logits reach the host
+  // each step (the same graph score_spine_cuda runs), and the token is chosen
+  // here with sample_token. A throwaway runtime: sampled decoding is not the
+  // hot path, and the caller's greedy runtime and its KV cache stay untouched.
+  std::unique_ptr<DecodeRuntime> rt =
+      build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
+  if (!rt) return 0;
+
+  std::vector<int64_t> history(prompt.begin(), prompt.end());
+  std::vector<float> lf(vocab);
+  auto run = [&](uint64_t token, uint64_t pos) -> bool {
+    rt->cuda->seed_token(token);
+    rt->cuda->set_pos(pos);
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_i64(token));
+    in.push_back(encode_i64(pos));
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (!res || res->outputs.empty()) return false;
+    const sx::Bytes& lo = res->outputs[0];
+    if (lo.size() < vocab * sizeof(float)) return false;
+    std::memcpy(lf.data(), lo.data(), vocab * sizeof(float));
+    return true;
+  };
+
+  // Teacher-force the prompt: the last prompt token's logits predict the first
+  // produced token. Then each produced token is fed at its own position for the
+  // next step's logits.
+  for (size_t i = 0; i < prompt.size(); ++i)
+    if (!run(prompt[i], start_pos + i)) return 0;
+
+  uint64_t pos = start_pos + prompt.size();  // position of the next token
+  uint64_t step = 0;
+  for (; step < tokens.size(); ++step) {
+    if (step > 0) {
+      // Feed the token produced last step at its own position.
+      if (!run(uint64_t(tokens[step - 1]), pos - 1)) break;
+    }
+    const int64_t next =
+        nn::sample_token(lf, sampling, pos, history, sample_mask);
+    if (next < 0) break;
+    tokens[step] = next;
+    history.push_back(next);
+    ++pos;
+    if (masked) { ++step; break; }  // one constrained position per call
+  }
+  return step;
+}
+
 namespace {
 
 // Shared teacher-forced scoring loop. Fills `trace` when non-null (top_k > 0):
@@ -4265,6 +4372,13 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   return done;
 }
 #else
+uint64_t generate_spine_cuda_sampled(const Gemma4Model&,
+                                     std::span<const uint64_t>, uint64_t,
+                                     std::span<int64_t>, uint64_t,
+                                     const nn::SamplingParams&,
+                                     std::span<const uint8_t>) {
+  return 0;  // built without CUDA: no device decode is available
+}
 uint64_t generate_prefill_spine_cuda(const Gemma4Model&,
                                      std::span<const uint64_t>, uint64_t,
                                      std::span<int64_t>, uint64_t, bool) {

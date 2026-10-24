@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <c10/core/TensorOptions.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
 
 #endif
@@ -331,6 +332,13 @@ bool aten_vae_softmax(VaeDevBuf out, VaeDevBuf x, std::int64_t rows,
   }
 }
 
+void aten_vae_release_cached_memory() {
+  // The decode temporaries are ATen allocations, so freeing them only returns
+  // their blocks to the caching allocator; emptyCache hands the unused blocks
+  // back to the driver (a no-op for blocks still owned by live tensors).
+  c10::cuda::CUDACachingAllocator::emptyCache();
+}
+
 #else // !SONICBOOM_USE_CUDA
 
 bool aten_vae_conv2d(VaeDevBuf, VaeDevBuf, VaeDevBuf, VaeDevBuf, std::int64_t,
@@ -370,6 +378,8 @@ bool aten_vae_bmm_nt(VaeDevBuf, VaeDevBuf, VaeDevBuf, std::int64_t,
 bool aten_vae_softmax(VaeDevBuf, VaeDevBuf, std::int64_t, std::int64_t) {
   return false;
 }
+
+void aten_vae_release_cached_memory() {}
 
 #endif
 

@@ -21,6 +21,7 @@
 
 (define-module (sonicboom inference)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom error)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
@@ -29,7 +30,7 @@
             set-grammar! set-json-schema! clear-grammar! constraint-state
             json-schema->gbnf
             prefill! tokenize tokenize-segments detokenize
-            generate generate-tokens generate-stream
+            generate generate-tokens generate-stream make-sampling-bv
             numerics-profile set-numerics-profile!))
 
 ;;; --- numerics profile -------------------------------------------------------
@@ -53,14 +54,15 @@
 
 (define (set-numerics-profile! profile)
   "Request PROFILE ('strict or 'standard) for this process and return the
-effective profile. Signals 'sb-inference if the profile is already latched to
+effective profile. Signals a &sonicboom-error if the profile is already latched to
 the other value; setting the effective profile again is a no-op success."
   (let ((code (case profile
                 ((strict) 0)
                 ((standard) 1)
-                (else (throw 'sb-inference
-                             (string-append "unknown numerics profile: "
-                                            (object->string profile))))))
+                (else (raise-sonicboom-error
+                       SB_ERR_BINDING 'binding
+                       (string-append "unknown numerics profile: "
+                                      (object->string profile))))))
         (err (make-slot)))
     (sb-check! ((proc 'sb_set_numerics_profile) code (slot-ptr err))
                err "set-numerics-profile!")
@@ -68,11 +70,8 @@ the other value; setting the effective profile again is a no-op success."
 
 ;;; --- helpers ----------------------------------------------------------------
 
-(define (sb-check! st err-slot what)
-  (unless (sb-status-ok? st)
-    (let ((msg (capture-error err-slot)))
-      (throw 'sb-inference
-             (string-append what ": " msg)))))
+;; sb-check! comes from (sonicboom ffi): it raises a &sonicboom-error carrying
+;; the C status, the sb_error_kind and the message.
 
 ;; A list of token ids → a native-endian int32 bytevector (sb_token[]).
 (define (tokens->bv tokens)
@@ -104,16 +103,35 @@ the other value; setting the effective profile again is a no-op success."
 
 ;; sb_llm_sampling as a native-layout bytevector (x86-64; see capi.h):
 ;;   struct_size u64@0, temperature f32@8, top_p f32@12, top_k u32@16,
-;;   seed u64@24, max_tokens u32@32  → 40 bytes.
-;; Greedy only: temperature 0, top_p 1 (off), top_k 0 (off), seed 0.
-(define (make-sampling-bv max-tokens)
-  (let ((bv (make-bytevector 40 0)))
-    (bytevector-u64-native-set! bv 0 40)
-    (bytevector-ieee-single-native-set! bv 8 0.0)
-    (bytevector-ieee-single-native-set! bv 12 1.0)
-    (bytevector-u32-native-set! bv 16 0)
-    (bytevector-u64-native-set! bv 24 0)
+;;   seed u64@24, max_tokens u32@32, min_p f32@36, repeat_penalty f32@40,
+;;   repeat_last_n u32@44, presence_penalty f32@48,
+;;   frequency_penalty f32@52  → 56 bytes.
+;; The defaults are greedy/neutral: temperature 0, top_p 1 (off), top_k 0 (off),
+;; min_p 0 (off), seed 0, repeat_penalty 1 (off), repeat_last_n 64, and the two
+;; penalties 0. temperature 0 keeps the historical greedy path bit-identical.
+(define* (make-sampling-bv max-tokens
+                           #:key
+                           (temperature 0.0)
+                           (top-k 0)
+                           (top-p 1.0)
+                           (min-p 0.0)
+                           (seed 0)
+                           (repeat-penalty 1.0)
+                           (repeat-last-n 64)
+                           (presence-penalty 0.0)
+                           (frequency-penalty 0.0))
+  (let ((bv (make-bytevector 56 0)))
+    (bytevector-u64-native-set! bv 0 56)
+    (bytevector-ieee-single-native-set! bv 8 (exact->inexact temperature))
+    (bytevector-ieee-single-native-set! bv 12 (exact->inexact top-p))
+    (bytevector-u32-native-set! bv 16 top-k)
+    (bytevector-u64-native-set! bv 24 seed)
     (bytevector-u32-native-set! bv 32 max-tokens)
+    (bytevector-ieee-single-native-set! bv 36 (exact->inexact min-p))
+    (bytevector-ieee-single-native-set! bv 40 (exact->inexact repeat-penalty))
+    (bytevector-u32-native-set! bv 44 repeat-last-n)
+    (bytevector-ieee-single-native-set! bv 48 (exact->inexact presence-penalty))
+    (bytevector-ieee-single-native-set! bv 52 (exact->inexact frequency-penalty))
     bv))
 
 ;;; --- model ------------------------------------------------------------------
@@ -353,17 +371,40 @@ tokens reused from the previous prompt (informational)."
     (sb-check! st err-slot "prefill")
     (bytevector-u64-native-ref reused-slot 0)))
 
-(define* (generate-tokens session prompt max-tokens #:optional (prefill? #t))
-  "Prefill PROMPT (a list of token ids) and greedily decode up to MAX-TOKENS
-tokens. Returns the list of produced token ids. When PREFILL? is false, decode
-from the prompt already held by SESSION."
+(define* (generate-tokens session prompt max-tokens #:optional (prefill? #t)
+                          #:key
+                          (temperature 0.0)
+                          (top-k 0)
+                          (top-p 1.0)
+                          (min-p 0.0)
+                          (seed 0)
+                          (repeat-penalty 1.0)
+                          (repeat-last-n 64)
+                          (presence-penalty 0.0)
+                          (frequency-penalty 0.0))
+  "Prefill PROMPT (a list of token ids) and decode up to MAX-TOKENS tokens.
+Returns the list of produced token ids. When PREFILL? is false, decode from the
+prompt already held by SESSION.
+
+The sampling keywords are those of make-sampling-bv: temperature 0 (the
+default) is greedy and bit-identical to the historical path; temperature > 0
+samples deterministically from SEED (see sb_llm_sampling in capi.h)."
   (when prefill? (prefill! session prompt))
   (let* ((tokens '())
          (cb (lambda (user token)
                (set! tokens (cons token tokens))
                0))                 ; 0 = continue
          (cb-ptr (procedure->pointer int cb (list '* int32)))
-         (smp-bv (make-sampling-bv max-tokens))
+         (smp-bv (make-sampling-bv max-tokens
+                                   #:temperature temperature
+                                   #:top-k top-k
+                                   #:top-p top-p
+                                   #:min-p min-p
+                                   #:seed seed
+                                   #:repeat-penalty repeat-penalty
+                                   #:repeat-last-n repeat-last-n
+                                   #:presence-penalty presence-penalty
+                                   #:frequency-penalty frequency-penalty))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
          (st ((proc 'sb_llm_decode) session (bytevector->pointer smp-bv)
@@ -372,11 +413,30 @@ from the prompt already held by SESSION."
     (sb-check! st err-slot "decode")
     (reverse tokens)))
 
-(define (generate model session prompt max-tokens)
-  "Tokenize PROMPT (a UTF-8 string), prefill, greedily decode up to MAX-TOKENS
-tokens, and detokenize. Returns the generated text."
+(define* (generate model session prompt max-tokens #:key
+                   (temperature 0.0)
+                   (top-k 0)
+                   (top-p 1.0)
+                   (min-p 0.0)
+                   (seed 0)
+                   (repeat-penalty 1.0)
+                   (repeat-last-n 64)
+                   (presence-penalty 0.0)
+                   (frequency-penalty 0.0))
+  "Tokenize PROMPT (a UTF-8 string), prefill, decode up to MAX-TOKENS tokens,
+and detokenize. Returns the generated text. The sampling keywords are passed
+through to generate-tokens; the default temperature 0 is greedy."
   (detokenize model
-              (generate-tokens session (tokenize model prompt) max-tokens)))
+              (generate-tokens session (tokenize model prompt) max-tokens #t
+                               #:temperature temperature
+                               #:top-k top-k
+                               #:top-p top-p
+                               #:min-p min-p
+                               #:seed seed
+                               #:repeat-penalty repeat-penalty
+                               #:repeat-last-n repeat-last-n
+                               #:presence-penalty presence-penalty
+                               #:frequency-penalty frequency-penalty)))
 
 ;;; --- streaming --------------------------------------------------------------
 ;;; The C ABI hands each produced token to a callback as it is decoded

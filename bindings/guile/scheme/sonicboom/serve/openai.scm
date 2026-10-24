@@ -16,11 +16,13 @@
   #:use-module (srfi srfi-1)
   #:use-module (ice-9 match)
   #:use-module (json)
+  #:use-module (rnrs bytevectors)
   #:use-module (sonicboom serve backend)
   #:use-module (sonicboom serve engine)
   #:use-module (sonicboom serve chat-template)
   #:export (parse-chat-request
             check-greedy-body
+            parse-image-request images-object base64-encode-bytevector
             openai-error-object raise-openai-error
             completion-object chunk-object usage-chunk-object
             role-delta content-delta tool-call-deltas finish-delta
@@ -185,8 +187,10 @@
                            ((ref body "max_tokens")
                             => (lambda (v) (positive-integer "max_tokens" v)))
                            (else #f)))
+         ;; An omitted temperature is 0: greedy. That is not the OpenAI
+         ;; service's 1.0 default — a client that wants sampling asks for it.
          (temperature (match (ref body "temperature")
-                        (#f 1.0)
+                        (#f 0.0)
                         (v (number-in "temperature" v 0 2))))
          (top-p (match (ref body "top_p")
                   (#f 1.0)
@@ -196,11 +200,18 @@
                   (v (unless (and (integer? v) (exact? v) (>= v 0))
                        (invalid "top_k must be a non-negative integer" "top_k"))
                      v)))
+         ;; An omitted seed is 0, so a request is reproducible by default.
          (seed (match (ref body "seed")
-                 (#f #f)
+                 (#f 0)
                  (v (unless (and (integer? v) (exact? v))
                       (invalid "seed must be an integer" "seed"))
                     (abs v))))
+         (presence-penalty (match (ref body "presence_penalty")
+                             (#f 0.0)
+                             (v (number-in "presence_penalty" v -2 2))))
+         (frequency-penalty (match (ref body "frequency_penalty")
+                              (#f 0.0)
+                              (v (number-in "frequency_penalty" v -2 2))))
          (tools (check-tools (ref body "tools")))
          (tool-choice (check-tool-choice (ref body "tool_choice") tools))
          ;; An explicit response_format is the reply's shape and wins; a forced
@@ -211,13 +222,17 @@
                                #:tools tools #:tool-choice tool-choice
                                #:max-tokens max-tokens #:stop (check-stop (ref body "stop"))
                                #:temperature temperature #:top-p top-p #:top-k top-k
-                               #:seed seed #:constraint constraint)
+                               #:seed seed
+                               #:presence-penalty presence-penalty
+                               #:frequency-penalty frequency-penalty
+                               #:constraint constraint)
             (eq? stream #t)
             include-usage)))
 
 ;; A greedy-only backend cannot honor a sampling request, so an explicit one is
-;; rejected instead of silently decoding greedily (the core's decode wants
-;; temperature 0, top-p 1, top-k 0 and returns SB_ERR_UNSUPPORTED otherwise).
+;; rejected instead of silently decoding greedily (the libsonicboom backend's
+;; per-step decode ignores the sampler, so it wants temperature 0, top-p 1,
+;; top-k 0).
 ;; A parameter that is absent means "the backend's default", which for a
 ;; greedy-only backend is greedy — so the common OpenAI client that leaves
 ;; temperature at its default still works, while one that asks for sampling is
@@ -234,6 +249,108 @@
       (invalid "this backend decodes greedily; top_p must be 1" "top_p"))
     (when (and (number? k) (not (zero? k)))
       (invalid "this backend decodes greedily; top_k must be 0" "top_k"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Images
+
+;; "WIDTHxHEIGHT", both multiples of 16 (the C ABI's limit), -> (w . h).
+(define (check-image-size v)
+  (unless (string? v)
+    (invalid "size must be a string \"WIDTHxHEIGHT\"" "size"))
+  (let ((parts (string-split v #\x)))
+    (unless (= 2 (length parts))
+      (invalid "size must be a string \"WIDTHxHEIGHT\"" "size"))
+    (let ((w (string->number (car parts)))
+          (h (string->number (cadr parts))))
+      (unless (and (integer? w) (exact? w) (> w 0)
+                   (integer? h) (exact? h) (> h 0))
+        (invalid "size must be \"WIDTHxHEIGHT\" with positive integers" "size"))
+      (unless (and (zero? (remainder w 16)) (zero? (remainder h 16)))
+        (invalid "size must name multiples of 16" "size"))
+      (cons w h))))
+
+;; A /v1/images/generations body -> an alist with string keys:
+;;   prompt, negative_prompt, n, width, height, steps, guidance_scale, seed
+;; prompt is required; the rest default like the Guile binding's keywords.
+;; steps, guidance_scale and seed are extensions (the OpenAI image schema has
+;; no such fields, but a reproducible request needs them). response_format is
+;; b64_json only: the reference server has no storage to hand out URLs from.
+(define (parse-image-request body)
+  (unless (object? body)
+    (invalid "the request body must be a JSON object" 'null))
+  (let ((prompt (ref body "prompt")))
+    (unless (and (string? prompt) (not (string-null? prompt)))
+      (invalid "prompt is required" "prompt"))
+    (let* ((negative (ref body "negative_prompt"))
+           (n (match (ref body "n")
+                (#f 1)
+                (v (let ((n (positive-integer "n" v)))
+                     (when (> n 10)
+                       (invalid "n must be at most 10" "n"))
+                     n))))
+           (wh (check-image-size (or (ref body "size") "512x512")))
+           (steps (match (ref body "steps")
+                    (#f 50)
+                    (v (positive-integer "steps" v))))
+           (guidance (match (ref body "guidance_scale")
+                       (#f 3.0)
+                       (v (number-in "guidance_scale" v 0 20))))
+           (seed (match (ref body "seed")
+                   (#f 0)
+                   (v (unless (and (integer? v) (exact? v))
+                        (invalid "seed must be an integer" "seed"))
+                      (abs v))))
+           (format (ref body "response_format")))
+      (unless (or (not format) (equal? format "b64_json"))
+        (invalid "response_format must be b64_json (the only supported format)"
+                 "response_format"))
+      ;; negative_prompt is an extension too: the string reaches the model's
+      ;; classifier-free guidance pass.
+      (unless (or (not negative) (string? negative))
+        (invalid "negative_prompt must be a string" "negative_prompt"))
+      `(("prompt" . ,prompt)
+        ("negative_prompt" . ,negative)
+        ("n" . ,n)
+        ("width" . ,(car wh))
+        ("height" . ,(cdr wh))
+        ("steps" . ,steps)
+        ("guidance_scale" . ,guidance)
+        ("seed" . ,seed)))))
+
+;; {"created": ..., "data": [{"b64_json": ...}, ...]}
+(define (images-object created b64s)
+  `(("created" . ,created)
+    ("data" . ,(list->vector
+                (map (lambda (b64) `(("b64_json" . ,b64))) b64s)))))
+
+;; Base64 (RFC 4648, padded) of a bytevector. Guile 3.0.9 ships no (ice-9
+;; base64), and the response body needs the standard alphabet.
+(define %base64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(define (base64-encode-bytevector bv)
+  (let* ((n (bytevector-length bv))
+         (out (make-string (* 4 (quotient (+ n 2) 3)) #\=)))
+    (let loop ((i 0) (o 0))
+      (if (>= i n)
+          out
+          (let* ((b0 (bytevector-u8-ref bv i))
+                 (b1 (if (< (+ i 1) n) (bytevector-u8-ref bv (+ i 1)) 0))
+                 (b2 (if (< (+ i 2) n) (bytevector-u8-ref bv (+ i 2)) 0))
+                 (v (+ (* b0 65536) (* b1 256) b2)))
+            (string-set! out o
+                         (string-ref %base64-alphabet (quotient v 262144)))
+            (string-set! out (+ o 1)
+                         (string-ref %base64-alphabet
+                                     (quotient (remainder v 262144) 4096)))
+            (when (< (+ i 1) n)
+              (string-set! out (+ o 2)
+                           (string-ref %base64-alphabet
+                                       (quotient (remainder v 4096) 64))))
+            (when (< (+ i 2) n)
+              (string-set! out (+ o 3)
+                           (string-ref %base64-alphabet (remainder v 64))))
+            (loop (+ i 3) (+ o 4)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Responses

@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -100,6 +101,16 @@ struct MossSampleStats {
   double seconds = 0.0;
 };
 
+// After each denoising step: (image index in the batch, steps done, total
+// steps). Returning false cancels the run; sample()/sample_batch() then return
+// the error "cancelled".
+using MossProgress =
+    std::function<bool(int64_t image_index, int64_t step, int64_t total_steps)>;
+
+// Deterministic initial noise for one latent: splitmix64 uniforms through
+// Box-Muller (not torch's generator; parity runs pass an explicit latent).
+std::vector<float> seeded_noise(int64_t count, uint64_t seed);
+
 class MossPipeline {
  public:
   // Opens the components under `root` (text_encoder/, transformer/, vae/).
@@ -125,7 +136,8 @@ class MossPipeline {
   std::expected<MossLatent, std::string> sample(
       const MossLatent& latent, const MossConditioning& cond,
       const MossPipelineConfig& cfg, std::vector<MossLatent>* trace = nullptr,
-      MossSampleStats* stats = nullptr) const;
+      MossSampleStats* stats = nullptr, const MossProgress& progress = {},
+      int64_t image_index = 0) const;
 
   // Images are denoised one at a time, exactly as the reference loops over its
   // batch, so each result is bit-identical to sampling it alone.
@@ -133,7 +145,7 @@ class MossPipeline {
       std::span<const MossLatent> latents,
       std::span<const MossConditioning> conds, const MossPipelineConfig& cfg,
       std::vector<std::vector<MossLatent>>* trace = nullptr,
-      MossSampleStats* stats = nullptr) const;
+      MossSampleStats* stats = nullptr, const MossProgress& progress = {}) const;
 
   // BatchNorm unnormalization, 2x2 pixel-unshuffle, VAE decode, clamp(-1, 1).
   std::expected<MossImage, std::string> decode(const MossLatent& latent) const;

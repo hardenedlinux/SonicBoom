@@ -133,6 +133,11 @@ add_library(sonicboom SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/src/mlir/smoke.cpp
   $<TARGET_OBJECTS:sonicboom_capi>)
 
+# SONICBOOM_SANITIZE: instrument SonicBoom's own runtime code. The native-torch
+# and MLIR static libraries linked below stay uninstrumented (root
+# CMakeLists.txt explains why).
+sonicboom_sanitize(sonicboom)
+
 # Drop the static symbol table (and its string table) from the published
 # library in Release builds. Dynamic linking reads .dynsym, which is kept, and
 # the C ABI is exported there; the static table is a quarter of the file and
