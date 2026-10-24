@@ -18,7 +18,6 @@
 
 #include <sonicboom/planner/cost_model.h>
 #include <sonicboom/planner/graph.h>
-#include <sonicboom/planner/cpu_kernel_backend.h>
 #include <sonicboom/planner/partition.h>
 #include <sonicboom/planner/pipeline.h>
 #include <sonicboom/sx/parser.h>
@@ -28,56 +27,13 @@
 #include <fstream>
 #include <iterator>
 #include <map>
-#include <optional>
 #include <utility>
 #include <vector>
 
 namespace sonicboom {
 
-namespace {
-
-// Extract the region a compute task covers into a standalone document: the
-// kept nodes are selected by their outputs, and the task's outputs become the
-// region's graph outputs. This mirrors the slice used by the co-execution
-// integration tests, so a model run through `Model` executes the same regions.
-std::expected<sx::Document, ModelError> region_slice(const sx::Document& doc,
-                                                     const planner::Graph& g,
-                                                     const planner::TaskDesc& t) {
-  const planner::ComputeTaskDesc* c = t.as_compute();
-  if (!c)
-    return std::unexpected(ModelError{"plan", "task has no compute payload"});
-
-  std::vector<std::string> kept;
-  for (planner::GraphNodeId nid : c->graph_nodes) {
-    const planner::GraphNodeDesc* nd = g.find_node(nid);
-    if (!nd)
-      return std::unexpected(ModelError{"plan", "region node not found"});
-    for (planner::TensorId o : nd->outputs) {
-      const planner::TensorDesc* td = g.find_tensor(o);
-      if (!td)
-        return std::unexpected(ModelError{"plan", "region tensor not found"});
-      kept.push_back(td->name);
-    }
-  }
-
-  std::vector<std::string> outs;
-  for (planner::TensorId o : t.outputs) {
-    const planner::TensorDesc* td = g.find_tensor(o);
-    if (!td)
-      return std::unexpected(ModelError{"plan", "region output not found"});
-    outs.push_back(td->name);
-  }
-
-  auto sliced = planner::slice_region(doc, kept, outs);
-  if (!sliced)
-    return std::unexpected(ModelError{"plan", sliced.error().message});
-  return std::move(*sliced);
-}
-
-} // namespace
-
-std::expected<Model, ModelError> Model::compile(const sx::Document& doc,
-                                                std::string base_dir) {
+std::expected<Model, ModelError> Model::compile_document(const sx::Document& doc,
+                                                         std::string base_dir) {
   auto graph = planner::adapt_graph(doc);
   if (!graph)
     return std::unexpected(ModelError{"plan", graph.error().message});
@@ -120,67 +76,34 @@ std::expected<Model, ModelError> Model::compile(const sx::Document& doc,
     model.output_types_.push_back(*tt);
   }
 
-  // One CpuKernelBackend serves every per-node CPU kernel task (it resolves the
-  // node per task); every MLIR region gets its own CpuBackend compiled from a
-  // slice_region sub-document (or the whole document for the homogeneous path,
-  // which emits a single WholeGraph task).
-  bool has_native = false;
-  for (const auto& t : model.plan_.tasks)
-    if (t.kind == planner::TaskKind::Compute && t.as_compute() &&
-        t.as_compute()->backend == planner::BackendTag::NativeTorch)
-      has_native = true;
-
-  std::map<planner::BackendTag, planner::Backend*> tag_map;
-  if (has_native) {
-    auto nt = planner::CpuKernelBackend::compile(*graph);
-    if (!nt)
-      return std::unexpected(ModelError{"compile", nt.error().message});
-    tag_map[planner::BackendTag::NativeTorch] = nt->get();
-    model.backends_.push_back(std::move(*nt));
-  }
-
+  // The artifact loader compiles the document's one homogeneous MLIR region:
+  // the planner emits a single WholeGraph task for it. The mixed CPU
+  // co-execution path (per-node NativeTorch tasks plus sliced MLIR regions)
+  // was retired, so any other plan is not an artifact this loader can run.
   std::vector<std::pair<planner::TaskId, planner::Backend*>> mlir_task_backends;
   for (const auto& t : model.plan_.tasks) {
     if (t.kind != planner::TaskKind::Compute)
       continue;
     const planner::ComputeTaskDesc* c = t.as_compute();
-    if (!c || c->backend != planner::BackendTag::Mlir)
-      continue;
+    if (!c || c->backend != planner::BackendTag::Mlir ||
+        c->op != planner::OpKind::WholeGraph)
+      return std::unexpected(ModelError{
+          "compile", "artifact graph is not a single homogeneous MLIR region"});
 
-    const sx::Document* target = &doc;
-    std::optional<sx::Document> sliced;
-    if (c->op != planner::OpKind::WholeGraph) {
-      auto s = region_slice(doc, *graph, t);
-      if (!s)
-        return std::unexpected(s.error());
-      sliced = std::move(*s);
-      target = &*sliced;
-    }
-
-    auto cpu = planner::CpuBackend::compile(*target, *weights);
+    auto cpu = planner::CpuBackend::compile(doc, *weights);
     if (!cpu)
       return std::unexpected(ModelError{"compile", cpu.error().message});
     mlir_task_backends.emplace_back(t.id, cpu->get());
     model.backends_.push_back(std::move(*cpu));
   }
 
-  // Wire the executor: the per-node CPU kernel backend via the tag map, each
-  // MLIR region via a per-task backend (the Mlir tag alone is ambiguous across
-  // multiple regions).
-  auto executor = std::make_unique<planner::RuntimeExecutor>(std::move(tag_map));
+  auto executor = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{});
   for (auto [tid, be] : mlir_task_backends)
     executor->set_task_backend(tid, be);
   model.executor_ = std::move(executor);
 
   return model;
-}
-
-std::expected<Model, ModelError> Model::compile(std::string_view text,
-                                                std::string base_dir) {
-  auto doc = sx::parse_document(text);
-  if (!doc)
-    return std::unexpected(ModelError{"parse", doc.error().message});
-  return compile(*doc, std::move(base_dir));
 }
 
 std::expected<Model, ModelError> Model::load(const std::string& dir,
@@ -195,7 +118,10 @@ std::expected<Model, ModelError> Model::load(const std::string& dir,
   if (f.bad())
     return std::unexpected(
         ModelError{"load", "failed reading model file '" + p.string() + "'"});
-  return compile(text, dir);
+  auto doc = sx::parse_document(text);
+  if (!doc)
+    return std::unexpected(ModelError{"parse", doc.error().message});
+  return compile_document(*doc, dir);
 }
 
 std::expected<std::vector<sx::Bytes>, ModelError> Model::run(

@@ -16,15 +16,13 @@
 
 #pragma once
 
-// Unified C++ execution entry: submit an S-Expr v0.1 graph, get results.
+// Unified C++ artifact loader: load an exported S-Expr model, run it.
 //
-// `Model` composes the stages a caller previously had to wire by hand —
-// adapt_graph → resource snapshot → static planning → region partitioning →
-// backend compilation → RuntimeExecutor — behind one facade. It does not
-// redesign the IR, the lowering, or the routing seam: it reuses the existing
-// pipeline verbatim (see the planner algorithm and co-execution audit design
-// documents), so a model that runs through `Model` runs through exactly the
-// same path as the manual integration tests.
+// `Model` compiles the single homogeneous MLIR region of an exported artifact
+// (adapt_graph → resource snapshot → static planning → CpuBackend) and then
+// executes the resulting plan through RuntimeExecutor. The public S-Expr
+// document/text compile facade was removed with the per-node CPU co-execution
+// path; the only consumer of this interface is the artifact loader below.
 //
 // This is a Layer 2 C++ (source-level) interface. It exposes no native-torch,
 // MLIR, or ATen/c10 type; the C ABI and the Guile binding sit above it.
@@ -39,7 +37,6 @@
 #include <expected>
 #include <memory>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -53,20 +50,11 @@ struct ModelError {
   std::string message;
 };
 
-// A compiled, runnable S-Expr model. `compile` runs the full planning pipeline
-// and compiles every backend region; `run` executes the plan over raw buffers.
+// A compiled, runnable exported model. `load` runs the planning pipeline and
+// compiles the artifact's whole-graph region; `run` executes the plan over raw
+// buffers.
 class Model {
 public:
-  // Compile a parsed document. `base_dir` resolves relative external-weight
-  // sidecars ("" = the process working directory). Uses the v0 CPU resource
-  // snapshot (auto host budget) and the analytical CPU cost model.
-  static std::expected<Model, ModelError> compile(const sx::Document& doc,
-                                                  std::string base_dir = "");
-
-  // Convenience overload: parse `text` (S-Expr v0.1 source), then compile.
-  static std::expected<Model, ModelError> compile(std::string_view text,
-                                                  std::string base_dir = "");
-
   // Load a previously exported model from `dir` (reads `<dir>/<graph_file>`
   // plus its external weight sidecars, resolved relative to `dir`) and compile
   // it. The inverse of `export_model`.
@@ -97,6 +85,12 @@ public:
 
 private:
   Model() = default;
+
+  // Compile an already-parsed artifact document: plan it, compile its
+  // whole-graph MLIR region, and wire the executor. `base_dir` resolves
+  // relative external-weight sidecars. Used by `load`.
+  static std::expected<Model, ModelError> compile_document(
+      const sx::Document& doc, std::string base_dir);
 
   planner::ResourceSnapshot snapshot_;
   planner::ExecutionPlan plan_;

@@ -56,9 +56,12 @@ tag. The concrete backends today are:
 | Backend | Tag | Device | Notes |
 |---|---|---|---|
 | `CpuBackend` | `Mlir` | CPU | whole-region Boom IR executor (`core/src/exec/cpu_executor.cpp`) |
-| `CpuKernelBackend` | `NativeTorch` | CPU | one graph node per task, through the same executor (the tag name is kept for plan/IR spelling) |
 | `SonicBackend` | `Sonic` | CPU | transformer ops (`nn::*`/`quant::*` CPU kernels) |
 | `SonicCudaBackend` | `Sonic` (device) | GPU | transformer ops (`nn::cuda::*`/`quant::cuda::*` kernels) |
+
+`NativeTorch` is a legacy tag retained for plan/IR spelling; the per-node CPU
+kernel backend that served it was removed with the co-execution path, so
+nothing registers for it.
 
 A task whose tag has no registered backend fails with a `RuntimeError`; the
 "fall back to CPU" behavior is realized by *not routing* an op to a backend that
