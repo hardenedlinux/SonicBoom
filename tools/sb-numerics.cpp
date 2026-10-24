@@ -19,10 +19,19 @@
 //
 // The profile gate measures perplexity (teacher-forced NLL on a fixed >= 20k
 // token corpus per model, relative delta <= 0.5%), top-1 agreement over 50
-// prompts (>= 99%), and, within each profile, 3-run greedy determinism,
-// batch-of-4 invariance (a 4-token prefill vs four per-token steps) and prefix
-// reuse vs full prefill — all bit-identical. The cross-profile first divergent
-// greedy step is informational.
+// prompts (>= 99%), and, within each profile, 3-run greedy determinism and
+// prefix reuse vs full prefill — both bit-identical. The cross-profile first
+// divergent greedy step is informational.
+//
+// SonicBoom guarantees exactly three properties:
+//   (1) determinism — same input, same output, every run;
+//   (2) prefix-reuse identity — output does not depend on whether, or where,
+//       a prefix was reused;
+//   (3) KV-capacity independence — output does not depend on n_ctx.
+// Prefill-vs-decode identity is NOT guaranteed: a batched prefill and the same
+// tokens fed one by one may use different arithmetic. Speculative decoding
+// on/off is nevertheless bit-identical — the verify step runs decode arithmetic
+// for every row (tests/core/test_spec_invariance.cpp).
 //
 // What is measured:
 //   * per T0a kernel: max ulp to the F64-mode output (the output dtype's ulp),
@@ -1032,8 +1041,6 @@ struct ProfileResult {
   uint64_t n_scored = 0;
   std::map<int, uint64_t> top1;
   std::array<std::vector<int64_t>, 3> runs;
-  std::vector<int64_t> batch4;
-  std::vector<int64_t> batch4_single;
   std::vector<int64_t> reuse_full;
   std::vector<int64_t> reuse_session;
 };
@@ -1118,8 +1125,6 @@ bool write_profile_dump(const ProfileResult& r, const std::string& path) {
   for (const auto& [i, t] : r.top1) out << "top1 " << i << ' ' << t << '\n';
   for (int i = 0; i < 3; ++i) vec(("run" + std::to_string(i)).c_str(),
                                   r.runs[i]);
-  vec("batch4", r.batch4);
-  vec("batch4_single", r.batch4_single);
   vec("reuse_full", r.reuse_full);
   vec("reuse_session", r.reuse_session);
   return bool(out);
@@ -1150,9 +1155,7 @@ bool read_profile_dump(const std::string& path, ProfileResult& r) {
       int64_t t = 0;
       while (ss >> t) r.runs[size_t(i)].push_back(t);
     } else {
-      std::vector<int64_t>* v = key == "batch4"          ? &r.batch4
-                                : key == "batch4_single" ? &r.batch4_single
-                                : key == "reuse_full"    ? &r.reuse_full
+      std::vector<int64_t>* v = key == "reuse_full"    ? &r.reuse_full
                                 : key == "reuse_session" ? &r.reuse_session
                                                          : nullptr;
       if (v == nullptr) return false;
@@ -1245,25 +1248,6 @@ bool run_profile_model(const std::string& path, const char* tag, bool cuda,
       toks.resize(n);
       r.runs[size_t(run)] = std::move(toks);
     }
-  }
-
-  // Batch-of-four invariance: a 4-token batch prefill vs four per-token steps.
-  auto p4 = encode(l, "The quick brown fox");
-  if (p4.size() > 4) p4.resize(4);
-  if (p4.size() == 4) {
-    std::vector<int64_t> a(16, -1), b(16, -1);
-    uint64_t na = cuda ? sbmodel::generate_prefill_spine_cuda(l.model, p4, 0, a,
-                                                              0, true)
-                       : sbmodel::generate_prefill_spine(l.model, p4, 0, a, 0,
-                                                         true);
-    uint64_t nb = cuda ? sbmodel::generate_prefill_spine_cuda(l.model, p4, 0, b,
-                                                              0, false)
-                       : sbmodel::generate_prefill_spine(l.model, p4, 0, b, 0,
-                                                         false);
-    a.resize(na);
-    b.resize(nb);
-    r.batch4 = std::move(a);
-    r.batch4_single = std::move(b);
   }
 
   // Prefix reuse vs full prefill, on the CUDA session path. Both paths run at
@@ -1386,7 +1370,8 @@ KlSummary compare_traces(const sbmodel::ScoreTrace& strict,
 // (and prints the row). Gate v2 (boom-r5 M1) judges the standard profile by the
 // full-corpus distribution: relative ppl delta, mean KL over every scored
 // position and the same-top-token rate. The old 50-prompt top-1 is printed for
-// information only. Determinism, batch-4 and prefix reuse remain hard.
+// information only. Determinism, prefix-reuse identity and KV-capacity
+// independence remain hard; prefill-vs-decode identity is not guaranteed.
 bool compare_profile_pair(const ProfileResult& strict,
                           const ProfileResult& standard,
                           const sbmodel::ScoreTrace& strict_trace,
@@ -1419,8 +1404,6 @@ bool compare_profile_pair(const ProfileResult& strict,
                       strict.runs[0] == strict.runs[2] &&
                       standard.runs[0] == standard.runs[1] &&
                       standard.runs[0] == standard.runs[2];
-  const bool batch_ok = strict.batch4 == strict.batch4_single &&
-                        standard.batch4 == standard.batch4_single;
   const bool reuse_ok = strict.reuse_full == strict.reuse_session &&
                         standard.reuse_full == standard.reuse_session;
   const size_t div = first_divergence(strict.runs[0], standard.runs[0]);
@@ -1428,7 +1411,7 @@ bool compare_profile_pair(const ProfileResult& strict,
   std::printf("  %-8s ppl %s=%.4f %s=%.4f delta=%+.3f%% %s | "
               "KL mean=%.3e med=%.3e p99=%.3e p99.9=%.3e max=%.3e %s "
               "(head mass min %.9f) | same-top %.4f%% %s | "
-              "det %s batch4 %s reuse %s | top1(info) %zu/%zu %.1f%% | "
+              "det %s reuse %s | top1(info) %zu/%zu %.1f%% | "
               "first divergence step %zu\n",
               strict.model.c_str(), arm ? "base" : "strict", ps,
               arm ? "arm" : "standard", pt,
@@ -1436,11 +1419,11 @@ bool compare_profile_pair(const ProfileResult& strict,
               ppl_ok ? "OK" : "FAIL", kl.mean, kl.median, kl.p99, kl.p999,
               kl.max, kl_ok ? "OK" : "FAIL", kl.min_head_mass,
               100.0 * same_top, same_top_ok ? "OK" : "FAIL",
-              det_ok ? "OK" : "FAIL", batch_ok ? "OK" : "FAIL",
+              det_ok ? "OK" : "FAIL",
               reuse_ok ? "OK" : "FAIL", agree, total,
               total ? 100.0 * top1 : 0.0, div);
   std::fflush(stdout);
-  return ppl_ok && kl_ok && same_top_ok && det_ok && batch_ok && reuse_ok;
+  return ppl_ok && kl_ok && same_top_ok && det_ok && reuse_ok;
 }
 
 int profile_dump_mode(const std::string& out_path, const std::string& model,

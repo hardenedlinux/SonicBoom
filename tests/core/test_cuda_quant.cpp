@@ -910,11 +910,12 @@ void test_mmq_q6_type(std::mt19937& rng) {
 }
 
 void test_dense_q6_all_n(std::mt19937& rng) {
-  // Q6_K takes one arithmetic for every n (R1): the q8_1 dp4a batched gemv.
-  // This used to cover the cuBLAS fp16 route at n = kCublasMinN; that route is
-  // gone for Q6_K (see matmul_f32_dev), so the contract is now the exact
-  // integer q8_1 arithmetic and, across batch sizes, segment invariance —
-  // which is what prefix reuse needs.
+  // Q6_K prefill (n >= 2): the blocked fp16 cuBLAS GEMM. The n == 1 contract
+  // is the exact integer q8_1 matvec, covered by test_q6_single_q8_1 above.
+  // The GEMM rounds the dequantized weight and the activation to fp16, so it
+  // matches the f32 dequant CPU reference to an fp16 tolerance; segment
+  // invariance (the split check below) is what prefix reuse needs, and it must
+  // hold in strict and standard alike — the binary is run under both profiles.
   constexpr uint64_t rows = 64;
   constexpr uint64_t cols = 256 * 4;
   constexpr uint64_t n = 32;
@@ -924,23 +925,23 @@ void test_dense_q6_all_n(std::mt19937& rng) {
   for (size_t off = 0; off < bytes.size(); off += 210)
     for (int i = 0; i < 16; ++i) bytes[off + 192 + i] = std::byte{1};
   sbquant::QuantizedTensor W(sbquant::QuantType::Q6_K, {cols, rows}, bytes);
-  std::vector<float> X(cols * n), Y(rows * n);
+  std::vector<float> X(cols * n), Y(rows * n), ref(rows * n);
   for (float& v : X) v = std::uniform_real_distribution<float>(-1.0f, 1.0f)(rng);
   unsetenv("SONICBOOM_GEMV_F32");
   setenv("SONICBOOM_MMQ", "0", 1);
   unsetenv("SONICBOOM_CUBLAS");
   const bool ok = sbquant::cuda::matmul_f32(W, X, Y, n);
-  check(ok, "Q6_K dense (n=32) returns true");
+  check(ok, "Q6_K cuBLAS fp16 matmul returns true");
   if (!ok) return;
-  const std::vector<float> qref = q6_q8_1_reference(W, X, n);
+  check(sbquant::matmul_f32(W, X, ref, n), "Q6_K cuBLAS CPU reference returns true");
   bool cmp = false;
-  const double worst = compare(Y, qref, 1e-4, &cmp);
-  check(cmp, "Q6_K dense (n=32) matches the integer q8_1 reference");
-  if (!cmp) std::cerr << "    worst rel err (Q6_K dense, n=32) = " << worst << "\n";
+  const double worst = compare(Y, ref, 1e-1, &cmp);
+  check(cmp, "Q6_K cuBLAS fp16 dequant matches CPU reference tolerance");
+  if (!cmp) std::cerr << "    worst rel err (Q6_K cuBLAS) = " << worst << "\n";
 
   // Segment invariance: the same positions computed as one 32-wide batch and
   // as a 5-wide + 27-wide pair must be bit-identical. 5 is below mmq_min_n()
-  // and 27 is below the old cuBLAS threshold, so both sides of every old
+  // and 27 is below the generic cuBLAS threshold, so both sides of every old
   // boundary are covered; this is the prefix-reuse contract.
   std::vector<float> Ysplit(rows * n);
   const std::span<const float> xs(X);

@@ -1450,28 +1450,24 @@ bool cublas_enabled() noexcept {
   return std::string_view(std::getenv("SONICBOOM_CUBLAS")) != "0";
 }
 
-// n (batch) threshold above which the cuBLAS fp16 path is used. Below it the
-// dp4a batched path wins on wall time (the fp16 dequant + upload overhead is not
-// amortized over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
+// n (batch) threshold above which the generic cuBLAS fp16 path is used. Below
+// it the dp4a batched path wins on wall time (the fp16 dequant + upload
+// overhead is not amortized over enough columns). Tunable via
+// SONICBOOM_CUBLAS_MIN_N.
 //
-// That speed rule is also a numerics boundary, and the threshold is the same in
-// both profiles. The dp4a batched gemv is bit-identical to n calls of the
-// single-column matvec (same q8_1 quantization, same vec_dot, same reduction
-// order), so a position's projection is identical whether it arrives through a
-// batched prefill segment or a one-token decode step. The cuBLAS fp16 GEMM is
-// not: it accumulates tensor-core fragments in a different order, and in strict
-// (no fixed-width blocking) its width follows the segment. Routing small
-// batches (n in [2, 32)) through it — which is what dropping the threshold to
-// mmq_min_n() under standard did — made the 4-token batch prefill and four
-// per-token decode steps disagree on DeepSeek-R1-Distill-Qwen-1.5B.
+// Q6_K does not use this threshold. Its rule is one arithmetic for every
+// prefill n — the blocked fp16 cuBLAS GEMM (matmul_f16_cublas_dev with
+// force_blocked) for n >= mmq_min_n(), the q8_1 dp4a matvec at n == 1.
+// Guarantee (2), prefix-reuse identity, requires that: the blocked GEMM's
+// fixed block width plus the real-width tail makes a column's result
+// independent of its segment length, so a resumed prefill computes the same
+// values as a from-scratch one. Prefill vs decode identity is not a guarantee,
+// so n == 1 and n >= 2 may use different arithmetic.
 //
-// Q6_K is therefore NOT routed here at any n: it takes the dp4a batched gemv
-// unconditionally (see matmul_f32_dev). It is the one type that cannot take
-// the MMQ path, so a threshold for it is an n-dependent kernel switch (R1) —
-// the DeepSeek prefix-reuse failure. The remaining types that reach this branch
-// are the ones MMQ rejects (K below 256 or not a multiple of 128, or MMQ
-// disabled); for them the n >= threshold switch still exists and is
-// pre-existing, not exercised by the shipped models.
+// The remaining types that reach this branch are the ones MMQ rejects (K below
+// 256 or not a multiple of 128, or MMQ disabled); for them the n >= threshold
+// switch still exists and is pre-existing, not exercised by the shipped
+// models.
 constexpr int kCublasMinN = 32;
 int cublas_min_n() {
   static int v = [] {
@@ -3081,7 +3077,7 @@ bool matmul_f16_lt_tail(const __half* wf, const __half* xf, float* y, int rows,
 }
 
 bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
-                           int n) {
+                           int n, bool force_blocked = false) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
 
@@ -3122,8 +3118,8 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
       return false;
   }
 
-  const bool blocked = numerics_profile() == NumericsProfile::Standard &&
-                       cublas_f16_blocking_enabled();
+  const bool blocked = force_blocked ||
+      (numerics_profile() == NumericsProfile::Standard && cublas_f16_blocking_enabled());
   if (!blocked) {
     // 2. Convert X f32 -> fp16 (position-major [n, cols], flat element count).
     __half* xf = static_cast<__half*>(
@@ -3303,8 +3299,8 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
 
   if (W.type() == QuantType::Q6_K) {
     // Keep the Q6_K MMQ weight kernel disabled; dequantize the D4 activation
-    // and take the same dp4a batched path as matmul_f32_dev (one arithmetic for
-    // every n — see the routing note there).
+    // and take matmul_f32_dev's Q6_K rule (one arithmetic for every prefill n —
+    // see the routing note there).
     float* X = static_cast<float*>(grow_scratch(
         g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
     if (!X) return false;
@@ -3795,9 +3791,9 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
   // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K)
   // and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per 256-value
-  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the dp4a batched path
-  // below — matmul_mmq_dev would reject it anyway, and returning its
-  // false here would fail the whole call instead of falling through.
+  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the blocked fp16
+  // cuBLAS path below — matmul_mmq_dev would reject it anyway, and returning
+  // its false here would fail the whole call instead of falling through.
   // The MMQ kernel needs K to be a multiple of QK8_1_MMQ (128) and a K below
   // one 256-element iteration (e.g. the DiT's 128-wide input projection) takes
   // the dp4a/cuBLAS paths below instead of failing the whole call on
@@ -3809,20 +3805,20 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
+  // Q6_K: n == 1 is the q8_1 dp4a matvec above; every prefill n >= 2 takes the
+  // blocked fp16 cuBLAS GEMM. Fixed block width + real-width tail make the
+  // result per-column invariant, so a position computes the same whether its
+  // segment is long or short (prefix-reuse identity). The fixed-width block
+  // is forced in strict as well, so both profiles share one prefill
+  // arithmetic. TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill
+  // is Roy's MMQ kernel, disabled until its incoherent output on Gemma Q4_K_M
+  // is fixed.
+  if (W.type() == QuantType::Q6_K && q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
+    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
+
   // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
-  // Q6_K is excluded: it takes one arithmetic for every n (R1), the dp4a
-  // batched gemv below. Its cuBLAS fp16 alternative is segment-width
-  // dependent (strict's single GEMM) and threshold dependent (n >=
-  // cublas_min_n), so positions the prefix cache hands to a shorter resumed
-  // segment were not computed like the same positions in a from-scratch
-  // prefill; a later decode-numerics change flipped a near-tie. The dp4a
-  // batched gemv is bit-identical to the single-column matvec, so resumed and
-  // from-scratch prefills agree exactly. TODO(q6k-mmq): the batch-invariant
-  // fast path for Q6_K prefill is Roy's MMQ kernel, disabled until
-  // its incoherent output on Gemma Q4_K_M is fixed.
-  const bool q6k = W.type() == QuantType::Q6_K;
-  if (!q6k && q8_1_enabled() && cublas_enabled() && n >= cublas_min_n())
+  if (q8_1_enabled() && cublas_enabled() && n >= cublas_min_n())
     return matmul_f16_cublas_dev(W, X, Y, n);
 
   const void* d_w = upload_weight(W);

@@ -45,6 +45,16 @@
 // checked where it is achieved (p1, p3); p2's first divergence is at step 5 and
 // is a rank-2 near-tie.
 //
+// Near-tie margin. One named constant, kNearTieGap, is the single margin for
+// both gates: CPU-vs-llama and CUDA-vs-CPU. The CUDA-vs-CPU gate is relaxed in
+// one specific way (approved): it runs only while the CPU reference still
+// agrees with llama.cpp; once the CPU stream has itself left llama.cpp, a
+// divergence is reported instead of asserted, because llama.cpp's ranking
+// there describes a different context. A divergence inside the valid region
+// passes only when the token is within kNearTieGap (0.25 raw logit) of
+// llama.cpp's top-1. The value is fixed and must not be changed without
+// re-running the gate.
+//
 // Skips cleanly (exit 0) when the GGUF is absent.
 //
 // --- Golden token streams ---------------------------------------------------

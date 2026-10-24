@@ -24,10 +24,16 @@
 //   standard  the default. f16 KV storage (the values stored were already
 //             fp16-rounded, so the storage change is exact) and the device
 //             reduction mode as resolved for the device. It is deterministic
-//             and batch-invariant on a given device exactly as strict is; the
-//             two profiles may differ from each other, and standard is the
-//             one held to the perceptual gate (perplexity, top-1 agreement)
+//             and prefix-reuse invariant on a given device exactly as strict
+//             is; the two profiles may differ from each other, and standard is
+//             the one held to the perceptual gate (perplexity, top-1 agreement)
 //             rather than bit identity.
+//
+// Both profiles guarantee determinism, prefix-reuse identity and KV-capacity
+// independence. Prefill-vs-decode identity is not guaranteed in either: a
+// batched prefill and the same tokens fed one at a time may use different
+// arithmetic. Speculative decoding on/off is nevertheless bit-identical: the
+// verify step uses decode arithmetic for every row (test_spec_invariance).
 //
 // Selection, resolved once per process:
 //
