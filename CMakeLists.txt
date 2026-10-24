@@ -49,6 +49,62 @@ option(SONICBOOM_USE_VULKAN "Enable the Vulkan backend stub (community scaffold)
 set(SONICBOOM_PRIVATE_TESTS_DIR "" CACHE PATH
     "Out-of-tree private test suites directory (optional)")
 
+# Sanitizer instrumentation for SonicBoom-owned code. Empty = a normal build.
+# Accepted values are "address;undefined" (ASan + UBSan) and "thread" (TSan);
+# both want a separate build directory because the sanitizer runtime must be
+# linked into every executable that loads libsonicboom.so.
+#
+# Scope: only SonicBoom's own targets are instrumented (core, compiler, C ABI,
+# tests). third_party/native-torch and the installed MLIR/LLVM are NOT: they are
+# implementation dependencies with their own upstream build constraints, and a
+# report inside them is not SonicBoom's to triage. Instrumented code still
+# calls into them, and ASan/TSan interceptors see the process-wide heap, so the
+# runtime boundary is still observed.
+set(SONICBOOM_SANITIZE "" CACHE STRING
+    "Sanitizers for SonicBoom-owned targets (empty, 'address;undefined', or 'thread')")
+set_property(CACHE SONICBOOM_SANITIZE PROPERTY STRINGS
+             "" "address;undefined" "thread")
+if(SONICBOOM_SANITIZE)
+  if(NOT SONICBOOM_SANITIZE STREQUAL "address;undefined"
+     AND NOT SONICBOOM_SANITIZE STREQUAL "thread")
+    message(FATAL_ERROR
+      "SONICBOOM_SANITIZE='${SONICBOOM_SANITIZE}' is not supported; use "
+      "'address;undefined' or 'thread' (empty for a normal build).")
+  endif()
+  string(REPLACE ";" "," _sb_sanitize_list "${SONICBOOM_SANITIZE}")
+  set(SONICBOOM_SANITIZE_FLAGS "-fsanitize=${_sb_sanitize_list}")
+
+  # UBSan's vptr check has to be off. `-fsanitize=undefined` instruments every
+  # virtual call and refers to `typeinfo` for the static type of the object,
+  # but the installed MLIR/LLVM is built without RTTI, so there is no
+  # `typeinfo for mlir::BuiltinDialect`, `llvm::raw_ostream`, ... The Boom
+  # dialect and the plan emitter call into MLIR virtually throughout, and with
+  # the check on libsonicboom.so leaves those references undefined and every
+  # test that links it fails. None of the other UBSan checks depend on RTTI.
+  set(SONICBOOM_SANITIZE_COMPILE_EXTRA "")
+  if("undefined" IN_LIST SONICBOOM_SANITIZE)
+    set(SONICBOOM_SANITIZE_COMPILE_EXTRA "-fno-sanitize=vptr")
+  endif()
+endif()
+
+# Apply the sanitizer flags to one SonicBoom-owned target. Called from the
+# subdirectory CMakeLists for every target whose code is ours.
+#
+# Host languages only: nvcc accepts neither -fsanitize=host-sanitizer form, and
+# device code is not instrumented by the host toolchain anyway. The host TUs of
+# a CUDA-enabled target are still instrumented, including the MOSS Q8_0 loader's
+# std::thread workers.
+function(sonicboom_sanitize target)
+  if(NOT SONICBOOM_SANITIZE)
+    return()
+  endif()
+  target_compile_options(${target} PRIVATE
+    "$<$<COMPILE_LANGUAGE:C,CXX>:${SONICBOOM_SANITIZE_FLAGS}>"
+    "$<$<COMPILE_LANGUAGE:C,CXX>:${SONICBOOM_SANITIZE_COMPILE_EXTRA}>"
+    "$<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>")
+  target_link_options(${target} PRIVATE ${SONICBOOM_SANITIZE_FLAGS})
+endfunction()
+
 if(SONICBOOM_USE_CUDA)
   # Default to the GPU detected at build time (native); override with
   # -DCMAKE_CUDA_ARCHITECTURES=<arch>, required on GPU-less build machines.

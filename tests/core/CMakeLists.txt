@@ -4,6 +4,19 @@
 # Every suite is both built (add_executable) and registered with CTest so a
 # single `ctest` run exercises the whole C++ suite next to the Guile suites.
 
+# SONICBOOM_SANITIZE: every target in this directory (including the optional
+# private suites added at the bottom) is SonicBoom-owned test code, so the whole
+# directory takes the flags. Each executable must carry the sanitizer runtime:
+# it loads the instrumented libsonicboom.so.
+if(SONICBOOM_SANITIZE)
+  # SONICBOOM_SANITIZE_COMPILE_EXTRA carries -fno-sanitize=vptr for the
+  # address;undefined build (no RTTI in MLIR; root CMakeLists.txt explains).
+  add_compile_options(${SONICBOOM_SANITIZE_FLAGS}
+                      ${SONICBOOM_SANITIZE_COMPILE_EXTRA}
+                      -fno-omit-frame-pointer)
+  add_link_options(${SONICBOOM_SANITIZE_FLAGS})
+endif()
+
 # Register a C++ suite with CTest. The suites load libsonicboom.so at runtime,
 # so the loader path must include its directory; the executable path is resolved
 # through a generator expression so it stays valid across build configurations.

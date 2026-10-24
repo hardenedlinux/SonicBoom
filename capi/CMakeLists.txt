@@ -9,6 +9,10 @@
 
 add_library(sonicboom_capi OBJECT src/capi.cpp src/capi_image.cpp)
 
+# SONICBOOM_SANITIZE: this is SonicBoom-owned code (the object library is
+# folded into libsonicboom.so, whose link carries the same flags).
+sonicboom_sanitize(sonicboom_capi)
+
 # capi.h is the public header for C consumers; the sx:: core headers are a
 # private implementation dependency (never re-exposed).
 target_include_directories(sonicboom_capi
