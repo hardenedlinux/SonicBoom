@@ -43,6 +43,7 @@
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
+#include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #endif
 
 #include <algorithm>
@@ -306,10 +307,32 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   };
   // The attention temperature is emitted only when it is not the identity, so a
   // model whose Q/K are unit-normed (Gemma 4) gets a byte-identical graph to the
-  // one before the generalization.
+  // one before the generalization. `rope_attn_scale` carries YaRN's magnitude
+  // term (q and k are each m-scaled, so the scores are m^2), 1.0 for every model
+  // without YaRN metadata.
   auto attn_attrs = [&](uint32_t l) {
     std::vector<sx::Attribute> a = {layer_a(l), kv_src(l)};
-    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
+    if (scale != 1.0) a.push_back(attr_f("scale", scale));
+#ifdef SONICBOOM_USE_CUDA
+    // Split-KV decode schedule, carried by the op: the chunk size (keys per
+    // split) and the partial-combine order. Chunk boundaries are absolute
+    // (chunk index = key position / C) and partials merge in ascending chunk
+    // index, so a query's reduction tree depends only on the key positions —
+    // never on n_ctx/capacity, the current depth or prefix reuse. The value is
+    // the class default or the per-device tuned pick (both capacity-free);
+    // `context_length` only bounds the depths the tuner measures at.
+    const LayerConfig& lc = cfg.layer_config(l);
+    const int n_kv = int(lc.n_heads_kv);
+    const int n_q = int(lc.n_heads_q);
+    a.push_back(attr_i("decode_chunk",
+                       int64_t(nn::cuda::attn_decode_plan_chunk(
+                           int(lc.head_dim), n_q / std::max(1, n_kv), n_q, n_kv,
+                           lc.sliding_window, cfg.context_length,
+                           numerics_kv_storage() == KvStorage::F16,
+                           numerics_kv_storage() == KvStorage::Q8))));
+    a.push_back(attr_s("decode_combine", "chunk_index_asc"));
+#endif
     return a;
   };
 
@@ -645,7 +668,8 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   // build_gemma4_graph).
   auto attn_attrs = [&](uint32_t l) {
     std::vector<sx::Attribute> a = {layer_a(l), batch_a(n), kv_src(l)};
-    if (prof.attn_scale != 1.0f) a.push_back(attr_f("scale", double(prof.attn_scale)));
+    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
+    if (scale != 1.0) a.push_back(attr_f("scale", scale));
     return a;
   };
 
@@ -863,9 +887,15 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
 // ---------------------------------------------------------------------------
 uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
                         uint64_t start_pos, std::span<int64_t> tokens,
-                        uint64_t n_ctx) {
+                        uint64_t n_ctx, std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
 
@@ -912,11 +942,15 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
     }
     std::span<const float> lf(reinterpret_cast<const float*>(logits.data()), vocab);
 
-    const int64_t next = nn::argmax(lf);
+    const int64_t next =
+        masked ? nn::argmax_masked(lf, sample_mask) : nn::argmax(lf);
     if (next < 0) break;
     tokens[step] = next;
     token = static_cast<uint64_t>(next);
     ++pos;
+    // A mask constrains the next position only: the caller accepts this token
+    // and recomputes the mask before the next call.
+    if (masked) { ++step; break; }
   }
   return step;
 }
@@ -927,9 +961,16 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 uint64_t generate_prefill_spine(const Gemma4Model& m,
                                 std::span<const uint64_t> prompt,
                                 uint64_t start_pos, std::span<int64_t> tokens,
-                                uint64_t n_ctx, bool use_prefill) {
+                                uint64_t n_ctx, bool use_prefill,
+                                std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[prefill-spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   planner::Graph graph = build_gemma4_graph(m, /*greedy=*/false);
   auto snap = planner::CpuResourceProvider::snapshot({.enumerate_cuda = false});
@@ -1006,11 +1047,14 @@ uint64_t generate_prefill_spine(const Gemma4Model& m,
     }
   }
 
-  const int64_t first = nn::argmax(logits);
+  const int64_t first =
+      masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
   if (first < 0) return 0;
   tokens[0] = first;
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
+  // A mask constrains this one position (see plan.h): one token per call.
+  if (masked) return 1;
 
   // Decode the remaining tokens with the same planner/backend/cache.
   for (step = 1; step < tokens.size(); ++step) {
@@ -1378,6 +1422,14 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  // One-step capture on the same chunked backend, used only by constrained
+  // decoding: the chunk graph replays k steps from device-side feedback, so a
+  // host-computed grammar mask can only be applied between replays, while this
+  // program reads the staged carry token and position slot 0 and writes token
+  // slot 0 — one mask upload, one step. Null when chunking is off (the plain
+  // `prog` already is one step).
+  std::unique_ptr<hal::StepProgram> prog_one;
+  std::shared_ptr<void> prog_one_cache;
   // The cache vector `prog` was recorded against. A capture bakes the KV cache's
   // device pointers in, and a prefill session can adopt a different vector; a
   // caller that replays `prog` must state that the cache it shares is this one
@@ -1577,13 +1629,19 @@ static uint64_t run_program_steps(
     }
   } else if (rt.prog) {
     for (; step < limit; ++step) {
+      // Same NVTX step marker as decode_steps_spine_cuda: opt-in via
+      // SONICBOOM_NVTX so nsys can isolate one steady-state decode window.
+      const std::string name = "decode_step_" + std::to_string(step);
+      if (nvtx_enabled()) nvtxRangePushA(name.c_str());
       rt.cuda->set_pos(pos);
       if (!rt.prog->replay()) {
+        if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
       }
       float next_f = -1.0f;
       rt.cuda->read_token(&next_f);
+      if (nvtx_enabled()) nvtxRangePop();
       const int64_t next = int64_t(next_f);
       if (next < 0) break;
       tokens[step] = next;
@@ -2153,6 +2211,14 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   auto rt = build_decode_runtime(m, n_ctx);
   if (!rt) return nullptr;
 
+  // The Argmax mask buffer (constrained decoding). It is allocated here, before
+  // any capture, because the captured graphs bake the Argmax kernel choice in:
+  // with the buffer present the masked kernel is recorded for every decode
+  // runtime, and all-ones makes it bit-identical to the unmasked one. A runtime
+  // without it (the build failed) simply cannot be constrained.
+  if (m.config.vocab_size > 0)
+    rt->cuda->argmax_mask_init(size_t((m.config.vocab_size + 7) / 8));
+
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
   if (cuda_graph_decode_enabled()) {
@@ -2179,6 +2245,19 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       rt->cuda->seed_token(0);
       rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
       if (rt->prog) rt->prog_cache = rt->cuda->cache_identity();
+      // Constrained decoding's one-step view of the same chunked backend: step
+      // 0 reads the staged carry token and position 0, writes token 0.
+      if (rt->prog && k > 1) {
+        auto run_one = [&]() {
+          if (!rt->cuda->set_step_index(0)) return false;
+          std::vector<sx::Bytes> in;
+          in.push_back(encode_i64(0));
+          in.push_back(encode_i64(0));
+          return bool(rt->exec->execute(rt->plan, rt->snap, in));
+        };
+        rt->prog_one = rt->cuda->record_step(run_one);
+        if (rt->prog_one) rt->prog_one_cache = rt->cuda->cache_identity();
+      }
     }
     // No re-playable graph (capture failed, e.g. a plan whose decode step has a
     // host task): the executor loop stages the single pos/token slots itself,
@@ -2633,9 +2712,16 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
 
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
-                             uint64_t n_ctx) {
+                             uint64_t n_ctx,
+                             std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[spine] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const auto t_plan0 = std::chrono::steady_clock::now();
@@ -2657,8 +2743,59 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   // warmed with a placeholder token, so every call re-seeds the real start token.
   rt->cuda->seed_token(start_token);
 
+  if (masked) {
+    // Constrained decoding: one masked step, then return (the caller accepts
+    // the token and supplies the next position's mask). The captured graphs bake
+    // in the masked Argmax kernel (get_decode_runtime initializes the mask
+    // buffer before capture), so this only stages the bitmap and the inputs.
+    if (!rt->cuda->set_argmax_mask(sample_mask)) {
+      std::cerr << "[spine] constrained step: mask upload failed\n";
+      return 0;
+    }
+    const std::string name = "decode_step_0";
+    if (nvtx_enabled()) nvtxRangePushA(name.c_str());
+    float next_f = -1.0f;
+    bool ok = true;
+    if (rt->prog_one) {
+      // One captured step on the chunked backend: carry + position slot 0 in,
+      // token slot 0 out. (The chunk graph cannot take a per-step host mask,
+      // which is why this second capture exists.)
+      std::vector<uint64_t> positions(rt->cuda->decode_chunk(), pos);
+      ok = rt->cuda->stage_chunk(*rt->prog_one, float(token), positions) &&
+           rt->prog_one->replay() &&
+           rt->cuda->read_chunk_tokens(&next_f, 1);
+    } else if (rt->prog) {
+      ok = rt->cuda->set_pos(pos) && rt->prog->replay() &&
+           rt->cuda->read_token(&next_f);
+    } else {
+      std::vector<sx::Bytes> in;
+      in.push_back(encode_i64(token));
+      in.push_back(encode_i64(pos));
+      rt->cuda->set_pos(pos);
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
+      ok = bool(res) && !res->outputs.empty() &&
+           res->outputs[0].size() >= sizeof(float);
+      if (ok) next_f = *reinterpret_cast<const float*>(res->outputs[0].data());
+    }
+    if (nvtx_enabled()) nvtxRangePop();
+    if (!ok) {
+      std::cerr << "[spine] constrained step failed\n";
+      return 0;
+    }
+    const int64_t next = int64_t(next_f);
+    if (next < 0) return 0;  // the mask allowed nothing (the grammar is stuck)
+    tokens[0] = next;
+    t_first = std::chrono::steady_clock::now();
+    step = 1;
+  } else {
+    // An unconstrained call must not replay a previous call's grammar mask.
+    rt->cuda->clear_argmax_mask();
+  }
+
   const uint32_t chunk = rt->cuda->decode_chunk();
-  if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
+  if (masked) {
+    // the masked single step above already produced the call's one token
+  } else if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
       rt->prog) {
     // The speculative program drives the loop. There is no captured prefill
     // here, so the drafter starts from an empty history: its proposals are
@@ -3086,9 +3223,16 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                          std::span<int64_t> tokens,
                                          uint64_t n_ctx, bool use_prefill,
                                          planner::KvCacheSession* session,
-                                         std::span<const uint64_t> history) {
+                                         std::span<const uint64_t> history,
+                                         std::span<const uint8_t> sample_mask) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
+  const bool masked = !sample_mask.empty();
+  if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
+    std::cerr << "[prefill-cuda] sample mask too small: " << sample_mask.size()
+              << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const bool dump_logits = std::getenv("SONICBOOM_DUMP_LOGITS") != nullptr;
@@ -3136,6 +3280,18 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
     if (!dump_rt) return 0;
     rt = dump_rt.get();
+  }
+  // Either stage this call's grammar mask or make sure a previous call's mask
+  // cannot leak into this one. The prefill branch samples on the host (masked
+  // argmax below); the per-token reference branch goes through the backend's
+  // Argmax, which reads the device mask.
+  if (masked && !use_prefill) {
+    if (!rt->cuda->set_argmax_mask(sample_mask)) {
+      std::cerr << "[prefill-cuda] sample mask upload failed\n";
+      return 0;
+    }
+  } else if (!masked) {
+    rt->cuda->clear_argmax_mask();
   }
   const planner::ResourceSnapshot& snap = rt->snap;
   // Cost model for planning a prefill segment graph the first time it is seen
@@ -3445,7 +3601,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
           std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n";
           return 0;
         }
-        first = nn::argmax(logits);
+        first = masked ? nn::argmax_masked(logits, sample_mask)
+                       : nn::argmax(logits);
         if (dump_logits) {
           std::vector<float> capped(vocab);
           const float cap = m.config.final_logit_softcapping;
@@ -3504,6 +3661,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   token = static_cast<uint64_t>(first);
   pos = start_pos + prompt.size();
   step = 1;  // tokens[0] is `first`; the decode loop continues from index 1
+  // Constrained decoding: the mask covers this one position (plan.h), so the
+  // call ends here; the caller accepts the token and supplies the next mask.
+  if (masked) return step;
   // The decode loop below reads the next token id from the device slot, which the
   // reference path already left at `first`; the prefill path never ran an
   // Embedding/Argmax step, so seed it explicitly (Phase 3.2 B4). The cached
@@ -3624,13 +3784,30 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx, bool use_prefill) {
   return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
-                                  use_prefill, /*session=*/nullptr, prompt);
+                                  use_prefill, /*session=*/nullptr, prompt, {});
 }
 
-bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
-                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored) {
+namespace {
+
+// Shared teacher-forced scoring loop. Fills `trace` when non-null (top_k > 0):
+// one row per scored position with the full-distribution logsumexp, the argmax
+// and the k largest scored logits. A min-heap keeps the head without sorting
+// the vocabulary; the rows are then emitted descending.
+bool score_spine_cuda_impl(const Gemma4Model& m,
+                           std::span<const uint64_t> tokens, uint64_t n_ctx,
+                           ScoreTrace* trace, size_t top_k, double& sum_nll,
+                           uint64_t& n_scored) {
   sum_nll = 0;
   n_scored = 0;
+  if (trace) {
+    trace->top_k = 0;
+    trace->vocab = 0;
+    trace->target.clear();
+    trace->top.clear();
+    trace->log_z.clear();
+    trace->logits.clear();
+    trace->ids.clear();
+  }
   if (m.weights.blocks.empty() || tokens.size() < 2) {
     std::cerr << "[score] empty model (" << m.weights.blocks.size()
               << " blocks) or short input (" << tokens.size() << ")\n";
@@ -3642,6 +3819,16 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
       std::cerr << "[score] token " << t << " outside vocab " << vocab << "\n";
       return false;
     }
+  if (trace && top_k > 0) {
+    trace->top_k = std::min(top_k, size_t(vocab));
+    trace->vocab = vocab;
+    const size_t rows = size_t(tokens.size() - 1);
+    trace->target.reserve(rows);
+    trace->top.reserve(rows);
+    trace->log_z.reserve(rows);
+    trace->logits.reserve(rows * trace->top_k);
+    trace->ids.reserve(rows * trace->top_k);
+  }
   if (n_ctx < tokens.size()) n_ctx = tokens.size();
   // Teacher forcing on the non-greedy decode graph: token p is seeded and fed
   // at position p, and the graph's full logits predict token p+1. This is the
@@ -3664,6 +3851,17 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
   // extra device op, and the raw distribution stays available for diagnostics.
   const float cap = m.config.final_logit_softcapping;
   std::vector<float> capped(vocab);
+  struct HeadItem {
+    float logit;
+    uint32_t id;
+  };
+  struct HeadWorse {
+    bool operator()(const HeadItem& a, const HeadItem& b) const {
+      return a.logit > b.logit;  // min-heap on logit
+    }
+  };
+  std::vector<HeadItem> head;
+  if (trace && trace->top_k > 0) head.reserve(trace->top_k);
   double sum = 0;
   uint64_t scored = 0;
   for (uint64_t p = 0; p + 1 < tokens.size(); ++p) {
@@ -3696,12 +3894,283 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
     double se = 0.0;
     for (uint64_t v = 0; v < vocab; ++v)
       se += std::exp(double(z[v]) - double(mx));
-    sum += (double(mx) + std::log(se)) - double(z[tokens[p + 1]]);
+    const double log_z = double(mx) + std::log(se);
+    sum += log_z - double(z[tokens[p + 1]]);
+    if (trace && trace->top_k > 0) {
+      const size_t k = trace->top_k;
+      head.clear();
+      for (uint64_t v = 0; v < vocab; ++v) {
+        const HeadItem item{z[v], uint32_t(v)};
+        if (head.size() < k) {
+          head.push_back(item);
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        } else if (item.logit > head.front().logit) {
+          std::pop_heap(head.begin(), head.end(), HeadWorse{});
+          head.back() = item;
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        }
+      }
+      std::sort(head.begin(), head.end(),
+                [](const HeadItem& a, const HeadItem& b) {
+                  return a.logit > b.logit;
+                });
+      trace->target.push_back(uint32_t(tokens[p + 1]));
+      trace->top.push_back(head.empty() ? 0u : head.front().id);
+      trace->log_z.push_back(float(log_z));
+      for (const HeadItem& h : head) {
+        trace->logits.push_back(h.logit);
+        trace->ids.push_back(h.id);
+      }
+    }
     ++scored;
   }
   sum_nll = sum;
   n_scored = scored;
+  if (trace)
+    trace->top_k = (trace->top_k && scored) ? trace->top_k : 0;
   return scored > 0;
+}
+
+}  // namespace
+
+bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
+                      uint64_t n_ctx, double& sum_nll, uint64_t& n_scored) {
+  return score_spine_cuda_impl(m, tokens, n_ctx, /*trace=*/nullptr, 0, sum_nll,
+                               n_scored);
+}
+
+bool score_spine_cuda_trace(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, uint64_t n_ctx,
+                            size_t top_k, ScoreTrace& trace, double& sum_nll,
+                            uint64_t& n_scored) {
+  return score_spine_cuda_impl(m, tokens, n_ctx, &trace, top_k, sum_nll,
+                               n_scored);
+}
+
+namespace {
+
+// Prefill-path corpus scoring (gate v2). The corpus is run through the same
+// chunked prefill segments generation uses — same IR, same lowering phase, same
+// planner and kernels — and every segment's hidden columns are projected
+// through the lm-head, so prefill-only kernel choices are visible in the scored
+// distribution. Segment boundaries follow prefill_decode_cuda_impl exactly
+// (absolute multiples of the ring/chunk), and the deferred KV append of each
+// segment is what the next segment attends over. No CUDA-graph replay: this
+// path needs each segment's hidden output on the host, and a replay does not
+// surface it.
+bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
+                                   std::span<const uint64_t> tokens,
+                                   uint64_t n_ctx, size_t top_k,
+                                   ScoreTrace* trace, double& sum_nll,
+                                   uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  if (trace) {
+    trace->top_k = 0;
+    trace->vocab = 0;
+    trace->target.clear();
+    trace->top.clear();
+    trace->log_z.clear();
+    trace->logits.clear();
+    trace->ids.clear();
+  }
+  if (m.weights.blocks.empty() || tokens.size() < 2) {
+    std::cerr << "[score-prefill] empty model (" << m.weights.blocks.size()
+              << " blocks) or short input (" << tokens.size() << ")\n";
+    return false;
+  }
+  const uint64_t vocab = m.config.vocab_size;
+  for (uint64_t t : tokens)
+    if (t >= vocab) {
+      std::cerr << "[score-prefill] token " << t << " outside vocab " << vocab
+                << "\n";
+      return false;
+    }
+  if (trace && top_k > 0) {
+    trace->top_k = std::min(top_k, size_t(vocab));
+    trace->vocab = vocab;
+    const size_t rows = size_t(tokens.size() - 1);
+    trace->target.reserve(rows);
+    trace->top.reserve(rows);
+    trace->log_z.reserve(rows);
+    trace->logits.reserve(rows * trace->top_k);
+    trace->ids.reserve(rows * trace->top_k);
+  }
+  if (n_ctx < tokens.size()) n_ctx = tokens.size();
+
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt) {
+    std::cerr << "[score-prefill] decode runtime build failed\n";
+    return false;
+  }
+  const planner::ResourceSnapshot& snap = rt->snap;
+  planner::AnalyticalCpuCostModel cost(snap);
+
+  const uint64_t d = m.config.embedding_length;
+  const uint64_t n = tokens.size();
+  const uint64_t chunk = (m.config.sliding_window > 0)
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  const bool symbolic_plans =
+      runtime::feature_enabled(runtime::Feature::SymbolicPrefill);
+  const uint64_t mmq_min_n =
+      std::max<uint64_t>(uint64_t(quant::cuda::mmq_min_n()), 1);
+  auto plan_extent_for = [&](uint64_t nseg) -> uint64_t {
+    if (!symbolic_plans) return nseg;
+    return nseg >= mmq_min_n ? chunk : mmq_min_n - 1;
+  };
+  // One segment per shape class, owned by this call.
+  std::map<uint64_t, std::unique_ptr<PrefillSegment>> segs;
+  auto segment_for = [&](uint64_t nseg) -> PrefillSegment* {
+    const uint64_t extent = plan_extent_for(nseg);
+    auto it = segs.find(extent);
+    if (it != segs.end()) return it->second.get();
+    auto seg = std::make_unique<PrefillSegment>();
+    GraphIr seg_ir = emit_prefill_ir(m, extent, symbolic_plans);
+    seg->graph = lower_graph(
+        seg_ir, planner::IrPassPhase::Prefill,
+        quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+            extent >= mmq_min_n,
+        symbolic_plans ? extent : 0,
+        /*skip_kv_append_fusion=*/false,
+        /*fuse_silu_mul=*/numerics_profile() == NumericsProfile::Standard);
+    if (seg->graph.nodes.empty()) {
+      std::cerr << "[score-prefill] n=" << nseg << " graph lowering failed\n";
+      return nullptr;
+    }
+    auto pplan = planner::plan_execution(seg->graph, snap, cost);
+    if (!pplan) {
+      std::cerr << "[score-prefill] n=" << nseg << " plan failed\n";
+      return nullptr;
+    }
+    seg->plan = std::move(*pplan);
+    seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
+    seg->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), seg->graph, n_ctx);
+    seg->cuda->bind_model(m);
+    seg->cuda->share_caches(*rt->cuda);
+    seg->exec = std::make_unique<planner::RuntimeExecutor>(
+        std::map<planner::BackendTag, planner::Backend*>{
+            {planner::BackendTag::Sonic, seg->cuda.get()}});
+    route_host_tasks(*seg->exec, seg->plan, *seg->cpu);
+    PrefillSegment* raw = seg.get();
+    segs.emplace(extent, std::move(seg));
+    return raw;
+  };
+
+  struct HeadItem {
+    float logit;
+    uint32_t id;
+  };
+  struct HeadWorse {
+    bool operator()(const HeadItem& a, const HeadItem& b) const {
+      return a.logit > b.logit;  // min-heap on logit
+    }
+  };
+  std::vector<HeadItem> head;
+  if (trace && trace->top_k > 0) head.reserve(trace->top_k);
+  std::vector<float> logits(vocab);
+  double sum = 0;
+  uint64_t scored = 0;
+  for (uint64_t off = 0; off < n;) {
+    const uint64_t pos = off;
+    uint64_t nseg = std::min(chunk, n - off);
+    const uint64_t rem = pos % chunk;
+    if (rem != 0 && chunk - rem < nseg) nseg = chunk - rem;
+    PrefillSegment* seg = segment_for(nseg);
+    if (!seg) return false;
+    seg->cuda->set_prefill_tokens(tokens.subspan(off, nseg));
+    seg->cuda->set_pos(pos);
+    std::vector<sx::Bytes> in;
+    in.push_back(encode_tokens(tokens.subspan(off, nseg)));
+    in.push_back(encode_i64(pos));
+    auto res = seg->exec->execute(seg->plan, snap, in,
+                                  /*segment_extent=*/nseg);
+    if (!res) {
+      std::cerr << "[score-prefill] segment off=" << off
+                << " execute failed: " << res.error().message << "\n";
+      return false;
+    }
+    if (res->outputs.empty()) {
+      std::cerr << "[score-prefill] segment off=" << off << " no outputs\n";
+      return false;
+    }
+    const sx::Bytes& hidden_b = res->outputs[0];
+    if (hidden_b.size() < uint64_t(d) * nseg * sizeof(float)) {
+      std::cerr << "[score-prefill] hidden too small: " << hidden_b.size()
+                << " < " << uint64_t(d) * nseg * sizeof(float) << "\n";
+      return false;
+    }
+    const float* hf = reinterpret_cast<const float*>(hidden_b.data());
+    for (uint64_t i = 0; i < nseg; ++i) {
+      const uint64_t p = off + i;
+      if (p + 1 >= n) continue;  // the final corpus column has no target
+      // lm_head applies the model's own logit softcap; the result is the
+      // scored distribution (no second cap).
+      if (!lm_head(m, std::span<const float>(hf + i * d, d), logits,
+                   quant::MatmulBackend::Cuda)) {
+        std::cerr << "[score-prefill] lm_head failed at position " << p << "\n";
+        return false;
+      }
+      const float* z = logits.data();
+      float mx = -INFINITY;
+      for (uint64_t v = 0; v < vocab; ++v) mx = std::max(mx, z[v]);
+      // One pass over the vocabulary does the softmax sum and, when tracing,
+      // the top-k heap. expf (not exp(double)) matters at corpus scale: the
+      // gate scores 24k positions over a 100k-260k vocabulary, where the double
+      // transcendental would dominate the run; the sum is still accumulated in
+      // double, so log_z keeps its precision.
+      double se = 0.0;
+      const size_t k = (trace && trace->top_k > 0) ? trace->top_k : 0;
+      if (k) head.clear();
+      for (uint64_t v = 0; v < vocab; ++v) {
+        const float zz = z[v];
+        se += double(std::exp(zz - mx));
+        if (k == 0) continue;
+        const HeadItem item{zz, uint32_t(v)};
+        if (head.size() < k) {
+          head.push_back(item);
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        } else if (item.logit > head.front().logit) {
+          std::pop_heap(head.begin(), head.end(), HeadWorse{});
+          head.back() = item;
+          std::push_heap(head.begin(), head.end(), HeadWorse{});
+        }
+      }
+      const double log_z = double(mx) + std::log(se);
+      sum += log_z - double(z[tokens[p + 1]]);
+      if (k) {
+        std::sort(head.begin(), head.end(),
+                  [](const HeadItem& a, const HeadItem& b) {
+                    return a.logit > b.logit;
+                  });
+        trace->target.push_back(uint32_t(tokens[p + 1]));
+        trace->top.push_back(head.empty() ? 0u : head.front().id);
+        trace->log_z.push_back(float(log_z));
+        for (const HeadItem& h : head) {
+          trace->logits.push_back(h.logit);
+          trace->ids.push_back(h.id);
+        }
+      }
+      ++scored;
+    }
+    off += nseg;
+  }
+  sum_nll = sum;
+  n_scored = scored;
+  if (trace) trace->top_k = (trace->top_k && scored) ? trace->top_k : 0;
+  return scored > 0 && scored == tokens.size() - 1;
+}
+
+}  // namespace
+
+bool score_spine_cuda_prefill_trace(const Gemma4Model& m,
+                                    std::span<const uint64_t> tokens,
+                                    uint64_t n_ctx, size_t top_k,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored) {
+  return score_spine_cuda_prefill_impl(m, tokens, n_ctx, top_k, &trace,
+                                       sum_nll, n_scored);
 }
 
 namespace {
@@ -3725,7 +4194,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<int64_t> tokens,
                                             planner::KvCacheSession& session,
                                             bool use_prefill,
-                                            uint64_t* n_reused_out) {
+                                            uint64_t* n_reused_out,
+                                            std::span<const uint8_t> sample_mask) {
   if (n_reused_out) *n_reused_out = 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
 
@@ -3791,7 +4261,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // reuse tail.
   const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
                                                  tokens, n_ctx, use_prefill,
-                                                 &session, prompt);
+                                                 &session, prompt, sample_mask);
   if (done == 0) return 0;
 
   // Record every token whose KV this call actually wrote, for the next
@@ -3820,12 +4290,30 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
                                             std::span<const uint64_t>, uint64_t,
                                             std::span<int64_t>,
                                             planner::KvCacheSession&, bool,
-                                            uint64_t* n_reused_out) {
+                                            uint64_t* n_reused_out,
+                                            std::span<const uint8_t>) {
   if (n_reused_out) *n_reused_out = 0;
   return 0;  // built without CUDA: no device prefill is available
 }
 bool score_spine_cuda(const Gemma4Model&, std::span<const uint64_t>, uint64_t,
                       double& sum_nll, uint64_t& n_scored) {
+  sum_nll = 0;
+  n_scored = 0;
+  return false;  // built without CUDA: no device scoring
+}
+bool score_spine_cuda_trace(const Gemma4Model&, std::span<const uint64_t>,
+                            uint64_t, size_t, ScoreTrace& trace,
+                            double& sum_nll, uint64_t& n_scored) {
+  trace = ScoreTrace{};
+  sum_nll = 0;
+  n_scored = 0;
+  return false;  // built without CUDA: no device scoring
+}
+bool score_spine_cuda_prefill_trace(const Gemma4Model&,
+                                    std::span<const uint64_t>, uint64_t, size_t,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored) {
+  trace = ScoreTrace{};
   sum_nll = 0;
   n_scored = 0;
   return false;  // built without CUDA: no device scoring

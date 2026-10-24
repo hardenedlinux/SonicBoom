@@ -23,6 +23,7 @@
 #include "reduce_sum.cuh"
 
 #include "../planner/autotune.h"  // per-GPU tuning cache (Step 7)
+#include "../planner/decision_registry.h"  // attribute-keyed attention classes
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
@@ -49,6 +50,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -115,6 +117,30 @@ __device__ inline float kv_load_batch(const float* p) {
 __device__ inline void kv_store(float* p, float v) { *p = v; }
 __device__ inline void kv_store(__half* p, float v) {
   *p = __float2half_rn(v);
+}
+
+// q8 storage: a row is `head_dim` int8 values followed by one f32 scale (the
+// magnitude the int8 values were divided by, i.e. max|x| / 127), so a row is
+// addressed in bytes and the stride is head_dim + 4. kv_row returns row
+// `index` of a cache laid out [n_slots, n_heads_kv, head_dim]; kv_load_at reads
+// element i of a row through the cache's element type, dequantizing q8.
+// The scale is the same for every element of the row, so a loop reading a
+// whole row hoists the load; `head_dim` is a kernel argument or a compile-time
+// constant at every call site.
+template <typename KV>
+__device__ inline const KV *kv_row(const KV *cache, uint64_t index,
+                                   int head_dim) {
+  if constexpr (std::is_same_v<KV, int8_t>)
+    return cache + index * (uint64_t)(head_dim + 4);
+  return cache + index * (uint64_t)head_dim;
+}
+template <typename KV>
+__device__ inline float kv_load_at(const KV *row, int i, int head_dim) {
+  if constexpr (std::is_same_v<KV, int8_t>) {
+    return float(row[i]) * *reinterpret_cast<const float *>(row + head_dim);
+  } else {
+    return kv_load(row + i);
+  }
 }
 
 // ggml's ggml_gelu_f32, reproduced verbatim (constants + operation order) so the
@@ -607,17 +633,24 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   const uint64_t p = *pos;
   const uint64_t start =
       (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
-  const uint64_t n_keys = p - start + 1;
-
-  const uint64_t c0 = chunk_idx * chunk;
-  if (c0 >= n_keys) return;  // neutral chunk: the merge only reads chunks < n_active
-  const uint64_t cn = (c0 + chunk < n_keys) ? chunk : (n_keys - c0);
+  // Chunk indices are absolute: chunk k covers key positions [k*C, (k+1)*C),
+  // so a key always lands in the same chunk whatever the window length, the
+  // cache capacity or how the context was built. Blocks are launched from the
+  // window's first chunk (block 0) in ascending absolute index; a block whose
+  // chunk holds no valid key exits without writing, and the merge stops at the
+  // last active block.
+  const uint64_t first = start / chunk;
+  const uint64_t c0 = (first + chunk_idx) * chunk;
+  if (c0 > p || c0 + chunk <= start) return;
+  const uint64_t jlo = c0 > start ? c0 : start;
+  const uint64_t jhi = (c0 + chunk < p + 1) ? (c0 + chunk) : (p + 1);
+  const uint64_t cn = jhi - jlo;
 
   // Slot of the chunk's first key: one 64-bit modulo per block (device division
   // is a software routine, and doing it per key was a large part of this loop's
   // cost), then a compare-and-reset step so every later key's slot is a single
   // increment. Identical values to (start + c0 + j) % n_slots.
-  uint64_t slot = (start + c0) % n_slots;
+  uint64_t slot = jlo % n_slots;
 
   // Phase 1: one q·k dot per key, warp-cooperative. Unrolled by 4 so several
   // keys' K loads are in flight at once — the per-key warp reduction is a
@@ -625,9 +658,11 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   // per key.
   #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const KV* krow = k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    const KV* krow =
+        kv_row(k_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
     float d = 0.0f;
-    for (int i = lane; i < head_dim; i += 32) d += qrow[i] * kv_load(krow + i);
+    for (int i = lane; i < head_dim; i += 32)
+      d += qrow[i] * kv_load_at(krow, i, head_dim);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
       d += __shfl_down_sync(0xffffffffu, d, o);
@@ -665,14 +700,16 @@ __global__ void decode_attention_split_kernel(const float* __restrict__ q,
   float acc[16];
 #pragma unroll
   for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
-  slot = (start + c0) % n_slots;
+  slot = jlo % n_slots;
   #pragma unroll 4
   for (uint64_t j = 0; j < cn; ++j) {
-    const KV* vrow = v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+    const KV* vrow =
+        kv_row(v_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
     const float p = srow[j];  // exp(score - local max)
 #pragma unroll
     for (int i = 0; i < 16; ++i)
-      if (i < dims_per_lane) acc[i] += p * kv_load(vrow + lane + i * 32);
+      if (i < dims_per_lane)
+        acc[i] += p * kv_load_at(vrow, lane + i * 32, head_dim);
     if (++slot == n_slots) slot = 0;
   }
 
@@ -700,14 +737,14 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
   const int t = threadIdx.x;   // one thread per output dim
   if (t >= head_dim) return;
 
-  // Active chunk count from the device-resident position: the split kernel only
-  // wrote chunks with c0 < n_keys, so merging only those needs no neutral-value
-  // sentinel / partial memset. n_keys >= 1 always, so n_active >= 1.
+  // Active chunk count from the device-resident position. Block bx covers the
+  // absolute chunk start/chunk + bx, so the last block holding a valid key is
+  // p/chunk - start/chunk; blocks after it exited unwritten and must not be
+  // read. n_keys >= 1 always, so n_active >= 1.
   const uint64_t p = *pos;
   const uint64_t start =
       (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
-  const uint64_t n_keys = p - start + 1;
-  const uint64_t n_active = (n_keys + chunk - 1) / chunk;
+  const uint64_t n_active = p / chunk - start / chunk + 1;
   const int nc = n_active < (uint64_t)n_chunks ? (int)n_active : n_chunks;
 
   // Global max over the active chunks. Every thread redundantly scans the same
@@ -909,8 +946,9 @@ __global__ void flash_attention_chunk_kernel(
       } else if (j < start) {
         const uint64_t slot = j % n_slots;
         const KV* krow =
-            k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * kv_load(krow + d);
+            kv_row(k_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
+        for (int d = lane; d < head_dim; d += 32)
+          dot += qrow[d] * kv_load_at(krow, d, head_dim);
       } else {
         const uint64_t bi = j - start;
         const float* krow =
@@ -971,12 +1009,12 @@ __global__ void flash_attention_chunk_kernel(
         } else if (j < start) {
           const uint64_t slot = j % n_slots;
           const KV* vrow =
-              v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+              kv_row(v_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
           // Explicit FMA: nvcc contracts the f32 instantiation's `a += t*v`
           // into FFMA but not the f16 one, which then rounds the V
           // accumulation 1 ulp differently from strict even though the values
           // are identical. __fmaf_rn pins both to the same FFMA.
-          a = __fmaf_rn(tile[jj], kv_load(vrow + d), a);
+          a = __fmaf_rn(tile[jj], kv_load_at(vrow, d, head_dim), a);
         } else {
           const uint64_t bi = j - start;
           const float* vrow =
@@ -1051,8 +1089,9 @@ __global__ void flash_attention_chunk_pos_kernel(
       } else if (j < start) {
         const uint64_t slot = j % n_slots;
         const KV* krow =
-            k_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
-        for (int d = lane; d < head_dim; d += 32) dot += qrow[d] * kv_load(krow + d);
+            kv_row(k_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
+        for (int d = lane; d < head_dim; d += 32)
+          dot += qrow[d] * kv_load_at(krow, d, head_dim);
       } else {
         const uint64_t bi = j - start;
         const float* krow =
@@ -1109,12 +1148,12 @@ __global__ void flash_attention_chunk_pos_kernel(
         } else if (j < start) {
           const uint64_t slot = j % n_slots;
           const KV* vrow =
-              v_cache + (slot * (uint64_t)n_heads_kv + kv_h) * head_dim;
+              kv_row(v_cache, slot * (uint64_t)n_heads_kv + kv_h, head_dim);
           // Explicit FMA: nvcc contracts the f32 instantiation's `a += t*v`
           // into FFMA but not the f16 one, which then rounds the V
           // accumulation 1 ulp differently from strict even though the values
           // are identical. __fmaf_rn pins both to the same FFMA.
-          a = __fmaf_rn(tile[jj], kv_load(vrow + d), a);
+          a = __fmaf_rn(tile[jj], kv_load_at(vrow, d, head_dim), a);
         } else {
           const uint64_t bi = j - start;
           const float* vrow =
@@ -1238,7 +1277,13 @@ __device__ __forceinline__ float fa_rsum4(float x) {
   return x;
 }
 
-template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
+// CAUSAL = true is the LLM prefill contract: a query at absolute position p
+// attends to keys in [max(0, p - window + 1), p]. CAUSAL = false is dense full
+// attention (no mask, no window): every query attends to all keys in
+// [start, start + n), which is the image-token block of a DiT. The key range
+// and the mask are compile-time, so the full path carries no mask arithmetic.
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA,
+          bool CAUSAL = true>
 __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
     flash_attention_tiled_kernel(
         const float* __restrict__ q, const float* __restrict__ k_batch,
@@ -1271,7 +1316,9 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
   const int g = lane >> 2;  // fragment group 0..7
   const int t = lane & 3;   // thread in group 0..3
 
-  const uint64_t start = *start_ptr;
+  // The full-attention entry has no KV cache and no absolute position: start
+  // is 0 and start_ptr is null, so it must never be dereferenced.
+  const uint64_t start = CAUSAL ? *start_ptr : 0;
 
   // online-softmax state for the two rows this thread owns (g, g+8), used only
   // by the dim_slice==0 warps (phase 1).
@@ -1290,10 +1337,13 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
 
   const uint64_t abs_pb = start + (uint64_t)blockIdx.x * QB;
   const int n_blk = (n - blockIdx.x * QB < QB) ? (n - blockIdx.x * QB) : QB;
-  const uint64_t key_end = abs_pb + (uint64_t)n_blk - 1;  // last query (absolute)
+  // Causal: the last key any query in this segment attends is its last query.
+  // Full: every query attends to the whole key range [start, start + n).
+  const uint64_t key_end = CAUSAL ? abs_pb + (uint64_t)n_blk - 1
+                                  : start + (uint64_t)n - 1;
   // key_start: earliest key any query in this segment attends.
   const uint64_t key_start =
-      (sliding_window > 0 && abs_pb >= sliding_window)
+      (CAUSAL && sliding_window > 0 && abs_pb >= sliding_window)
           ? (abs_pb - sliding_window + 1)
           : 0;
   // Align the key-tile start down to a BK multiple so tile boundaries are global
@@ -1325,9 +1375,10 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
       if (j <= key_end) {
         if (j < start) {
           const uint64_t slot = j % n_slots;
-          kv = __float2half_rn(
-              kv_load(k_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) *
-                                    HEAD_DIM + d));
+          kv = __float2half_rn(kv_load_at(
+              kv_row(k_cache, slot * (uint64_t)n_heads_kv + blockIdx.y,
+                     HEAD_DIM),
+              d, HEAD_DIM));
         } else {
           const uint64_t bi = j - start;
           kv = __float2half_rn(
@@ -1344,9 +1395,10 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
       if (j <= key_end) {
         if (j < start) {
           const uint64_t slot = j % n_slots;
-          vv = __float2half_rn(
-              kv_load(v_cache + (slot * (uint64_t)n_heads_kv + blockIdx.y) *
-                                    HEAD_DIM + d));
+          vv = __float2half_rn(kv_load_at(
+              kv_row(v_cache, slot * (uint64_t)n_heads_kv + blockIdx.y,
+                     HEAD_DIM),
+              d, HEAD_DIM));
         } else {
           const uint64_t bi = j - start;
           vv = __float2half_rn(
@@ -1375,15 +1427,34 @@ __global__ void __launch_bounds__(NW * GQA * (QB / 16) * 32)
         }
 
         // 2. scale + causal/window mask. Keys jb, jb+1 (s0) and jb+8, jb+9 (s1).
-        const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
-        s0[0] = (jb > p0 || jb < low0) ? -1e30f : s0[0] * scale;
-        s0[1] = (jb + 1 > p0 || jb + 1 < low0) ? -1e30f : s0[1] * scale;
-        s1[0] = (jb + 8 > p0 || jb + 8 < low0) ? -1e30f : s1[0] * scale;
-        s1[1] = (jb + 9 > p0 || jb + 9 < low0) ? -1e30f : s1[1] * scale;
-        s0[2] = (jb > p1 || jb < low1) ? -1e30f : s0[2] * scale;
-        s0[3] = (jb + 1 > p1 || jb + 1 < low1) ? -1e30f : s0[3] * scale;
-        s1[2] = (jb + 8 > p1 || jb + 8 < low1) ? -1e30f : s1[2] * scale;
-        s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
+        if constexpr (CAUSAL) {
+          const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
+          s0[0] = (jb > p0 || jb < low0) ? -1e30f : s0[0] * scale;
+          s0[1] = (jb + 1 > p0 || jb + 1 < low0) ? -1e30f : s0[1] * scale;
+          s1[0] = (jb + 8 > p0 || jb + 8 < low0) ? -1e30f : s1[0] * scale;
+          s1[1] = (jb + 9 > p0 || jb + 9 < low0) ? -1e30f : s1[1] * scale;
+          s0[2] = (jb > p1 || jb < low1) ? -1e30f : s0[2] * scale;
+          s0[3] = (jb + 1 > p1 || jb + 1 < low1) ? -1e30f : s0[3] * scale;
+          s1[2] = (jb + 8 > p1 || jb + 8 < low1) ? -1e30f : s1[2] * scale;
+          s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
+        } else {
+          // Full attention: every key in [start, start + n) is attended, so the
+          // only mask is the end of the key range. The loop steps the keys in
+          // BK tiles, so the final tile may be partial: keys past key_end load a
+          // zero-filled K row, and their score of 0 would otherwise enter the
+          // softmax denominator (inflating l and shrinking the output). In the
+          // causal path j <= key_end already implies j <= p, so no such tail
+          // exists there.
+          const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
+          s0[0] = (jb > key_end) ? -1e30f : s0[0] * scale;
+          s0[1] = (jb + 1 > key_end) ? -1e30f : s0[1] * scale;
+          s1[0] = (jb + 8 > key_end) ? -1e30f : s1[0] * scale;
+          s1[1] = (jb + 9 > key_end) ? -1e30f : s1[1] * scale;
+          s0[2] = (jb > key_end) ? -1e30f : s0[2] * scale;
+          s0[3] = (jb + 1 > key_end) ? -1e30f : s0[3] * scale;
+          s1[2] = (jb + 8 > key_end) ? -1e30f : s1[2] * scale;
+          s1[3] = (jb + 9 > key_end) ? -1e30f : s1[3] * scale;
+        }
 
         // 3. online-softmax: row max over the 16 keys (reduce over the group).
         const float mx0 = fa_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
@@ -1617,6 +1688,43 @@ __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ o
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
 }
 
+// Constrained decoding's mask test: bit i of the bitmap at mask[i >> 3], least
+// significant bit first. The host guarantees the mask covers the whole row, so
+// there is no bounds test here.
+__device__ __forceinline__ bool mask_bit(const uint8_t* __restrict__ mask, int i) {
+  return ((mask[i >> 3] >> (i & 7)) & 1u) != 0;
+}
+
+// Masked single-block argmax: the single-block form above restricted to ids the
+// grammar mask allows. Disallowed lanes stay -INFINITY, so an all-disallowed row
+// reduces to the same -1 output as an all-NaN one.
+__global__ void argmax_masked_kernel(const float* __restrict__ x,
+                                     const uint8_t* __restrict__ mask,
+                                     float* __restrict__ out, int n) {
+  __shared__ float s_val[1024];
+  __shared__ int s_idx[1024];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  for (int i = tid; i < n; i += blockDim.x) {
+    if (!mask_bit(mask, i)) continue;
+    if (x[i] > mv) { mv = x[i]; mi = i; }
+  }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
 // Packed argmax candidate: value in the high word as a monotone unsigned key
 // (so an unsigned compare orders floats including +/-inf), index in the low word
 // as 0xFFFFFFFF - i (so the *largest* packed key is the largest value and, on a
@@ -1657,6 +1765,46 @@ __global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
   if (blockIdx.x == 0 && tid == 0)
     for (int i = 4 * n4; i < n; ++i)
       if (x[i] > mv) { mv = x[i]; mi = i; }
+  s_val[tid] = mv;
+  s_idx[tid] = mi;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s) {
+      if (s_val[tid + s] > s_val[tid]) {
+        s_val[tid] = s_val[tid + s];
+        s_idx[tid] = s_idx[tid + s];
+      }
+    }
+    __syncthreads();
+  }
+  if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
+}
+
+// Masked multi-block argmax: structure and reduction order identical to
+// argmax_partial_kernel, with each lane skipped when the mask disallows it.
+__global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
+                                             const uint8_t* __restrict__ mask,
+                                             int n,
+                                             unsigned long long* __restrict__ keys) {
+  __shared__ float s_val[256];
+  __shared__ int s_idx[256];
+  const int tid = threadIdx.x;
+  float mv = -INFINITY;
+  int mi = -1;
+  const float4* x4 = reinterpret_cast<const float4*>(x);
+  const int n4 = n >> 2;
+  for (int i = blockIdx.x * blockDim.x + tid; i < n4;
+       i += gridDim.x * blockDim.x) {
+    const float4 v = x4[i];
+    const int b = 4 * i;
+    if (mask_bit(mask, b + 0) && v.x > mv) { mv = v.x; mi = b + 0; }
+    if (mask_bit(mask, b + 1) && v.y > mv) { mv = v.y; mi = b + 1; }
+    if (mask_bit(mask, b + 2) && v.z > mv) { mv = v.z; mi = b + 2; }
+    if (mask_bit(mask, b + 3) && v.w > mv) { mv = v.w; mi = b + 3; }
+  }
+  if (blockIdx.x == 0 && tid == 0)
+    for (int i = 4 * n4; i < n; ++i)
+      if (mask_bit(mask, i) && x[i] > mv) { mv = x[i]; mi = i; }
   s_val[tid] = mv;
   s_idx[tid] = mi;
   __syncthreads();
@@ -1932,6 +2080,92 @@ __global__ void kv_append_batched_pos_kernel(KV* __restrict__ dst,
   const int e = idx - row * row_elems;
   const uint64_t slot = (*start_pos + (uint64_t)row) % n_slots;
   kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[idx]);
+}
+
+// --- q8 KV cache append -----------------------------------------------------
+//
+// A q8 cache row is head_dim int8 values then that row's f32 scale at byte
+// offset head_dim, i.e. head_dim + 4 bytes; the row index is
+// slot * n_heads_kv + head. One block quantizes one (position, KV head) row:
+// the scale is the row's amax / 127, so the whole row must be seen at once
+// (an element-wise append cannot compute it). Quantization is symmetric and
+// rounds to nearest; the source rows are the fp16-rounded f32 values the
+// f16/f32 appends store, so only the int8 rounding is new.
+__device__ __forceinline__ void kv_q8_store_row(int8_t *__restrict__ dst,
+                                                const float *__restrict__ srow,
+                                                uint64_t pos, uint64_t n_slots,
+                                                int head, int n_heads_kv,
+                                                int head_dim) {
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const uint64_t slot = pos % n_slots;
+  int8_t *drow = dst + (slot * (uint64_t)n_heads_kv + (uint64_t)head) *
+                          (uint64_t)(head_dim + 4);
+  float amax = 0.0f;
+  for (int i = tid; i < head_dim; i += (int)blockDim.x)
+    amax = fmaxf(amax, fabsf(srow[i]));
+  for (int o = 16; o > 0; o >>= 1)
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, o));
+  __shared__ float swarp[32];
+  __shared__ float sscale;
+  if (lane == 0) swarp[warp] = amax;
+  __syncthreads();
+  if (tid == 0) {
+    float m = swarp[0];
+    const int nw = ((int)blockDim.x + 31) >> 5;
+    for (int w = 1; w < nw; ++w) m = fmaxf(m, swarp[w]);
+    sscale = m / 127.0f;
+  }
+  __syncthreads();
+  const float scale = sscale;
+  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+  for (int i = tid; i < head_dim; i += (int)blockDim.x) {
+    int q = __float2int_rn(srow[i] * inv);
+    q = q < -127 ? -127 : (q > 127 ? 127 : q);
+    drow[i] = (int8_t)q;
+  }
+  if (tid == 0) *reinterpret_cast<float *>(drow + head_dim) = scale;
+}
+
+// One position; the slot's position is a DEVICE value (graph-capturable).
+__global__ void kv_append_q8_kernel(int8_t *__restrict__ dst,
+                                    const float *__restrict__ src,
+                                    const uint64_t *__restrict__ pos,
+                                    uint64_t n_slots, int n_heads_kv,
+                                    int head_dim) {
+  const int head = blockIdx.x;
+  kv_q8_store_row(dst, src + (uint64_t)head * head_dim, *pos, n_slots, head,
+                  n_heads_kv, head_dim);
+}
+
+// n positions from a host start position; grid = n * n_heads_kv.
+__global__ void kv_append_batched_q8_kernel(int8_t *__restrict__ dst,
+                                            const float *__restrict__ src,
+                                            uint64_t start_pos,
+                                            uint64_t n_slots, int n_heads_kv,
+                                            int head_dim, int n) {
+  const int head = blockIdx.x % n_heads_kv;
+  const int row = blockIdx.x / n_heads_kv;
+  if (row >= n) return;
+  const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
+  kv_q8_store_row(
+      dst, src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
+      start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
+}
+
+// Device-position variant of kv_append_batched_q8_kernel.
+__global__ void kv_append_batched_pos_q8_kernel(
+    int8_t *__restrict__ dst, const float *__restrict__ src,
+    const uint64_t *__restrict__ start_pos, uint64_t n_slots, int n_heads_kv,
+    int head_dim, int n) {
+  const int head = blockIdx.x % n_heads_kv;
+  const int row = blockIdx.x / n_heads_kv;
+  if (row >= n) return;
+  const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
+  kv_q8_store_row(
+      dst, src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
+      *start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
 }
 
 } // namespace
@@ -2723,19 +2957,26 @@ void attn_trace_decode(uint64_t pos, uint64_t window, uint64_t chunk,
 void attention_trace_set_layer(int layer) { attn_trace_layer_slot() = layer; }
 
 namespace {
-// Defined with the Step 7 tuners below; declared here because the decode path
-// is emitted before them.
-uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
-                                   int n_heads_kv, uint64_t max_window,
-                                   uint64_t sliding_window,
-                                   uint64_t default_chunk);
+// Defined with the decode-schedule tuner below; declared here because the
+// decode path is emitted before it.
+uint64_t attn_decode_class_chunk(int n_heads_kv, uint64_t sliding_window);
+// The chunk a call runs with: the plan's attribute, else the env override (for
+// A/B and for callers that drive the kernel directly), else the class default.
+uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
+                                     uint64_t sliding_window);
 } // namespace
+
+// The identity split's chunk cap, shared by both decode paths. A tuned chunk
+// size may exceed it (up to kAttentionDecodeMaxChunk); when the plan carries
+// no `decode_chunk` attribute, the class default is capped by it.
+constexpr uint64_t kMaxChunk = 16;
 
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
-                          float scale, float* out, int pos_offset, bool kv_f16) {
+                          float scale, float* out, int pos_offset, bool kv_f16,
+                          uint64_t chunk_attr, bool kv_q8) {
   if (!available()) return false;
   if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || head_dim > 512 ||
       !q || !k_cache || !v_cache || !out || !pos || n_slots == 0 || window == 0 ||
@@ -2746,10 +2987,6 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   pos += pos_offset;
 
   const int group_q = n_heads_q / n_heads_kv;
-
-  // Chunk cap shared by both decode paths (see the own split-KV launch below):
-  // it bounds how far a single block's key slice can grow with n_ctx.
-  constexpr uint64_t kMaxChunk = 16;
 
   // Generated flash-decoding (codegen) or the hand-written split-KV (own).
   // Codegen is the default: since attn8 its rounding and reduction order match
@@ -2777,43 +3014,34 @@ bool decode_attention_dev(const float* q, const float* k_cache,
     dsh.window_mask = sliding_window != 0;
     dsh.decode = true;
     dsh.kv_f16 = kv_f16;
+    dsh.kv_q8 = kv_q8;
     dsh.exp2 = std::getenv("SONICBOOM_ATTN_EXP2") != nullptr;
     if (want_codegen && compiler::attention_shape_supported(dsh) &&
         n_heads_q % n_heads_kv == 0) {
-      // Fixed chunk length per shape class: the chunk count scales with the
-      // max valid KV extent (`window`), not with this launch's key count. The
-      // absolute alignment makes a chunk's keys independent of the step.
-      //
-      // Token identity with the hand-written pair requires the same split, so
-      // the default reproduces its chunk rule; the Step 7 chunk tuner changes
-      // the split and is therefore part of the non-token-identical arm.
-      // SONICBOOM_ATTN_DECODE_CHUNK overrides either way (ablation).
-      const uint64_t gen_target_chunks =
-          std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
+      // The chunk size is the plan's `decode_chunk` attribute: a per-class
+      // constant resolved (and tuned) when the graph was built. It never
+      // depends on `window`/capacity -- chunk boundaries are absolute key
+      // positions -- so the split is the same for any n_ctx and any depth.
+      // A graph without the attribute (built before the schedule existed, or
+      // by a caller that does not resolve it) uses the class default, which
+      // both decode paths share (token identity with the hand-written pair).
       const uint64_t gen_no_split_chunk =
           std::max<uint64_t>(1, (48 * 1024 / sizeof(float)) / (uint64_t)group_q);
       uint64_t kDecodeChunk =
           runtime::feature_enabled(runtime::Feature::SplitKv)
-              ? std::max<uint64_t>(
-                    1, std::min((window + gen_target_chunks - 1) /
-                                    gen_target_chunks,
-                                kMaxChunk))
+              ? attn_decode_requested_chunk(chunk_attr, n_heads_kv,
+                                            sliding_window)
               : std::min(window, gen_no_split_chunk);
-      if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
-        const long v = std::atol(e);
-        if (v > 0) kDecodeChunk = (uint64_t)v;
-      } else if (std::getenv("SONICBOOM_ATTN_TUNE_NONIDENTICAL") != nullptr) {
-        // Step 7 runtime tuner (cached per GPU + shape class; the identity
-        // chunk is the fallback when tuning is off or inside a capture).
-        kDecodeChunk = attn_decode_chunk_resolve(
-            head_dim, group_q, n_heads_q, n_heads_kv, window, sliding_window,
-            kDecodeChunk);
-      }
       // The generated decoder stages one chunk's scores in a fixed shared
       // view; a larger chunk is outside what the generated text supports.
       if (kDecodeChunk > (uint64_t)compiler::kAttentionDecodeMaxChunk)
         kDecodeChunk = compiler::kAttentionDecodeMaxChunk;
-      const uint64_t n_chunks = (window + kDecodeChunk - 1) / kDecodeChunk;
+      // Absolute chunk alignment: a window of `window` keys starts and ends
+      // mid-chunk when C does not divide it, so it can straddle one more
+      // absolute chunk than window / C + 1 (a 512-key SWA window at C == 13
+      // touches 41 chunks, not 40). Missing the last block would drop the
+      // newest keys -- including the query's own -- from the merge.
+      const uint64_t n_chunks = (window - 1) / kDecodeChunk + 2;
       const size_t partial_floats =
           (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
       float *partial = static_cast<float *>(
@@ -2855,22 +3083,12 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // count this graph replays for: sliding_window for SWA, n_ctx for global), so
   // grid/smem/chunk are stable for CUDA Graph capture; the split kernel computes
   // the real start/n_keys from *pos and early-exits chunks beyond n_keys.
-  const uint64_t target_chunks =
-      std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
-  // chunk = ceil(window / target_chunks), but capped so a large n_ctx does not
-  // serialize the whole KV sequence onto one block. Without the cap chunk grows
-  // linearly with n_ctx (820 at n_ctx=32768), so at a short depth only one block
-  // per KV head stays active and the split kernel becomes latency-bound
-  // (measured split 1.95 -> 9.32 -> 20.36 ms at n_ctx 2048/8192/32768). Capping
-  // lets the grid scale with window instead — ceil(window/chunk)*n_heads_kv —
-  // with blocks beyond the current n_keys early-exiting (see the split kernel).
-  // The cap is sized for the SWA window (512): chunk 16 keeps depth-512
-  // attention at 32 active chunks (64 blocks, ~3.2/SM) for any n_ctx, matching
-  // the SWA layers' parallelism (chunk 13 -> 80 blocks). A cap of 32 is a
-  // wave-fill local minimum (16 chunks -> 32 blocks, 1.6/SM) and measured
-  // ~2.4x slower split (3.20 vs 1.29 ms at depth 512). The trade-off of the
-  // smaller chunk is a larger partial buffer (n_chunks*8*322 floats) and a
-  // longer merge loop at full depth, both negligible at the SWA depth.
+  //
+  // The chunk size is NOT derived from the window: it is the plan's
+  // decode_chunk attribute, or the shared class default. Chunk boundaries are
+  // absolute (key position / chunk), and the merge order is ascending chunk
+  // index, so a query's reduction tree depends only on absolute key positions —
+  // not on total length, n_ctx/capacity or prefix reuse.
   // Feature split_kv: off collapses to one chunk per KV head (no split-KV
   // partials; the split kernel still runs its n_chunks == 1 path and the merge
   // is a single-chunk copy). The reduction order differs from the split
@@ -2882,13 +3100,19 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // kMaxChunk-capped split above), which is the "less split-KV" comparison.
   const uint64_t no_split_chunk =
       std::max<uint64_t>(1, (48 * 1024 / sizeof(float)) / (uint64_t)group_q);
+  // Same schedule as the generated pair: the plan's chunk attribute when it
+  // has one, else the shared class default. Only the no-split ablation arm
+  // (feature off) derives anything from the window.
   const uint64_t chunk =
       runtime::feature_enabled(runtime::Feature::SplitKv)
-          ? std::max<uint64_t>(1, std::min((window + target_chunks - 1) /
-                                               target_chunks,
-                                           kMaxChunk))
+          ? attn_decode_requested_chunk(chunk_attr, n_heads_kv,
+                                        sliding_window)
           : std::min(window, no_split_chunk);
-  const uint64_t n_chunks = (window + chunk - 1) / chunk;
+  // Absolute chunk alignment (same rule as the generated pair): the chunk
+  // index is a function of the key's absolute position, so the merge order
+  // never depends on the window length or the cache capacity. A window that
+  // C does not divide straddles floor((window - 1) / C) + 2 absolute chunks.
+  const uint64_t n_chunks = (window - 1) / chunk + 2;
 
   const size_t partial_floats =
       (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
@@ -2905,6 +3129,12 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                                     cur_stream()>>>(
         q, reinterpret_cast<const __half*>(k_cache),
         reinterpret_cast<const __half*>(v_cache), pos, n_slots, chunk,
+        sliding_window, n_heads_q, n_heads_kv, head_dim, scale, partial);
+  else if (kv_q8)
+    decode_attention_split_kernel<<<split_grid, group_q * 32, smem,
+                                    cur_stream()>>>(
+        q, reinterpret_cast<const int8_t*>(k_cache),
+        reinterpret_cast<const int8_t*>(v_cache), pos, n_slots, chunk,
         sliding_window, n_heads_q, n_heads_kv, head_dim, scale, partial);
   else
     decode_attention_split_kernel<<<split_grid, group_q * 32, smem,
@@ -2924,12 +3154,24 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems, int pos_offset, bool dst_f16) {
+                   int row_elems, int pos_offset, bool dst_f16, bool dst_q8,
+                   int head_dim) {
   if (!available()) return false;
   if (row_elems <= 0 || !dst_k || !dst_v || !src_k || !src_v || !pos ||
       n_slots == 0 || pos_offset < 0)
     return false;
   pos += pos_offset;  // B3 verify: append row `pos_offset` at its position
+  if (dst_q8) {
+    if (head_dim <= 0 || row_elems % head_dim != 0) return false;
+    const int nhkv = row_elems / head_dim;
+    SB_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
+    kv_append_q8_kernel<<<nhkv, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_k), src_k, pos, n_slots, nhkv, head_dim);
+    SB_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
+    kv_append_q8_kernel<<<nhkv, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_v), src_v, pos, n_slots, nhkv, head_dim);
+    return cudaGetLastError() == cudaSuccess;
+  }
   const int grid = grid_for(row_elems);
   SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
@@ -2973,7 +3215,7 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
                                uint64_t n_slots, int n, int n_heads_q,
                                int n_heads_kv, int head_dim,
                                uint64_t sliding_window, float scale,
-                               float* out, bool kv_f16) {
+                               float* out, bool kv_f16, bool kv_q8) {
   if (!available()) return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
     return false;
@@ -2988,6 +3230,11 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
         q, k_batch, v_batch, reinterpret_cast<const __half*>(k_cache),
         reinterpret_cast<const __half*>(v_cache), start, n_slots, n_heads_q,
         n_heads_kv, head_dim, sliding_window, scale, out);
+  else if (kv_q8)
+    flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, reinterpret_cast<const int8_t*>(k_cache),
+        reinterpret_cast<const int8_t*>(v_cache), start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
   else
     flash_attention_chunk_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
@@ -2995,7 +3242,8 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
   return cudaGetLastError() == cudaSuccess;
 }
 
-template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA>
+template <typename KV, int HEAD_DIM, int BK, int NW, int QB, int GQA,
+          bool CAUSAL = true>
 bool launch_tiled_flash_attention(const float* q, const float* k_batch,
                                   const float* v_batch, const void* k_cache,
                                   const void* v_cache, const uint64_t* start,
@@ -3009,7 +3257,8 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
   constexpr int smem_bytes = HEAD_DIM * (2 * BK + 2) * (int)sizeof(__half) +
                              P_ELEMS * (int)sizeof(__half) +
                              (RS_ELEMS + L_ELEMS) * (int)sizeof(float);
-  auto kfn = flash_attention_tiled_kernel<KV, HEAD_DIM, BK, NW, QB, GQA>;
+  auto kfn =
+      flash_attention_tiled_kernel<KV, HEAD_DIM, BK, NW, QB, GQA, CAUSAL>;
   static bool configured = false;
   if (!configured) {
     cudaFuncSetAttribute((const void*)kfn,
@@ -3038,14 +3287,53 @@ bool launch_tiled_flash_attention_kv(const float* q, const float* k_batch,
                                      const uint64_t* start, uint64_t n_slots,
                                      int n, int n_heads_q, int n_heads_kv,
                                      uint64_t sliding_window, float scale,
-                                     float* out, bool kv_f16) {
+                                     float* out, bool kv_f16, bool kv_q8) {
   if (kv_f16)
     return launch_tiled_flash_attention<__half, HEAD_DIM, BK, NW, QB, GQA>(
+        q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+        n_heads_kv, sliding_window, scale, out);
+  if (kv_q8)
+    return launch_tiled_flash_attention<int8_t, HEAD_DIM, BK, NW, QB, GQA>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out);
   return launch_tiled_flash_attention<float, HEAD_DIM, BK, NW, QB, GQA>(
       q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
       n_heads_kv, sliding_window, scale, out);
+}
+
+// Host-facing counterpart of flash_attention_full_dev. q/k/v/out are plain
+// [n, n_heads, head_dim] host spans; the inputs are staged into the shared
+// scratch buffers and the result is copied back. This is the entry the
+// differential test uses, so the tiled full-attention kernel is exercised
+// through the same device pointers the DiT path hands it.
+bool flash_attention_full(std::span<const float> q, std::span<const float> k,
+                          std::span<const float> v, uint64_t n,
+                          uint64_t n_heads, uint64_t head_dim, float scale,
+                          std::span<float> out) {
+  if (!available()) return false;
+  if (n == 0 || n_heads == 0 || head_dim == 0) return false;
+  const size_t total = (size_t)n * n_heads * head_dim;
+  if (q.size() < total || k.size() < total || v.size() < total ||
+      out.size() < total)
+    return false;
+  const size_t bytes = total * sizeof(float);
+  void* d_q = grow_scratch(g_dx, g_dx_bytes, bytes);
+  void* d_k = grow_scratch(g_db, g_db_bytes, bytes);
+  void* d_v = grow_scratch(g_dy, g_dy_bytes, bytes);
+  void* d_o = grow_scratch(g_dff, g_dff_bytes, bytes);
+  if (!d_q || !d_k || !d_v || !d_o) return false;
+  if (cudaMemcpy(d_q, q.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_k, k.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_v, v.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  if (!flash_attention_full_dev(static_cast<const float*>(d_q),
+                                static_cast<const float*>(d_k),
+                                static_cast<const float*>(d_v), (int)n,
+                                (int)n_heads, (int)head_dim, scale,
+                                static_cast<float*>(d_o)))
+    return false;
+  return cudaMemcpy(out.data(), d_o, bytes, cudaMemcpyDeviceToHost) ==
+         cudaSuccess;
 }
 
 namespace {
@@ -3252,6 +3540,802 @@ bool attn_launch_codegen(const compiler::AttentionShape &shape,
       shape.head_fast ? tiles : heads);
 }
 
+// --- Full-attention op class (non-causal, no KV cache, no prefix reuse) ----
+//
+// Class selection is keyed on the op's attributes and the device, never on the
+// model that issued the call. The attributes of this class are causal = 0,
+// kv_cache = absent, prefix_reuse = impossible (there is no cache to reuse)
+// and window = 0; head_dim, the GQA ratio and the head count complete the key.
+// A causal or cached op -- every LLM prefill/decode shape, including DeepSeek's
+// d128 GQA 6 -- cannot resolve here: the runtime only reaches this entry from
+// the full-attention op, and the generator's support rules reject a causal,
+// windowed or cached shape for the full mask. full_attn is part of the region
+// identity, so a causal class can never be served from a full-attention JIT
+// cache entry (and a full class can never select the causal kernel).
+//
+// Two regimes, split by score-plane capacity (the documented R1 exception in
+// docs/decision-registry.md):
+//   full.score-gemm  n <= kFullScoreMaxTokens: the per-head [n, n] f16 score
+//                    planes fit the scratch budget; S and P are batched cuBLAS
+//                    f16 GEMMs with a row softmax between them.
+//   full.tiled       above the boundary: online-softmax tiling, no score
+//                    planes. The generated FA-2 warp-head layout is the
+//                    default (one warp per 16 query rows and the whole
+//                    head_dim, P in registers), with the hand-written tiled
+//                    kernel as an autotune candidate.
+// The boundary is a capacity constant of the device, not a live n: a
+// resolution maps to exactly one regime, deterministically and reproducibly.
+constexpr int kFullScoreMaxTokens = 2048;
+
+// Declared here (defined with the causal prefill tuner below): a host-timed
+// probe is illegal while the current stream is capturing.
+bool attn_capturing();
+
+// The tiled regime's decision probe: a fixed synthetic length, never the
+// caller's n, so the class resolves the same way on every call.
+constexpr int kFullTuneTokens = 2048;
+// A tiling candidate must beat the class default by this fraction to replace
+// it (same rule as the causal prefill tuner).
+constexpr double kFullSwitchMargin = 0.03;
+
+// [tokens][heads][hd] f32 -> three [heads][tdst][hd] f16 planes. `tdst` is
+// the padded token count that keeps every GEMM leading dimension a multiple of
+// 8 (a tensor-core requirement); only the real rows are written, and only
+// those are ever read (the GEMM dims are the real token count).
+__global__ void full_pack_qkv_f16_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ k,
+                                         const float* __restrict__ v,
+                                         __half* __restrict__ qh,
+                                         __half* __restrict__ kh,
+                                         __half* __restrict__ vh, int tokens,
+                                         int tdst, int heads, int hd) {
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  const long total = (long)tokens * heads * hd;
+  if (i >= total) return;
+  const long per_token = (long)heads * hd;
+  const long t = i / per_token;
+  const int rem = int(i - t * per_token);
+  const int h = rem / hd;
+  const int d = rem - h * hd;
+  const long dst = (long(h) * tdst + t) * hd + d;
+  qh[dst] = __float2half_rn(q[i]);
+  kh[dst] = __float2half_rn(k[i]);
+  vh[dst] = __float2half_rn(v[i]);
+}
+
+// The two reductions use separate slots so the value one returns can never be
+// overwritten by the other's first shared-memory store.
+__device__ __forceinline__ float full_block_reduce_max(float v, float* red) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
+  if (lane == 0) red[warp] = v;
+  __syncthreads();
+  const int nw = (blockDim.x + 31) >> 5;
+  v = (threadIdx.x < nw) ? red[threadIdx.x] : -1e30f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, o));
+    if (lane == 0) red[0] = v;
+  }
+  __syncthreads();
+  return red[0];
+}
+
+__device__ __forceinline__ float full_block_reduce_sum(float v, float* red) {
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1)
+    v += __shfl_down_sync(0xffffffffu, v, o);
+  if (lane == 0) red[32 + warp] = v;
+  __syncthreads();
+  const int nw = (blockDim.x + 31) >> 5;
+  v = (threadIdx.x < nw) ? red[32 + threadIdx.x] : 0.0f;
+  if (warp == 0) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    if (lane == 0) red[32] = v;
+  }
+  __syncthreads();
+  return red[32];
+}
+
+// Per-head attention planes are [head][token][dim]; the caller's buffer is
+// [token][head][dim]. Gather the real rows out of the plane.
+__global__ void full_attn_interleave_kernel(const float* __restrict__ plane,
+                                            float* __restrict__ out,
+                                            int tokens, int plane_tokens,
+                                            int heads, int hd) {
+  const long total = (long)tokens * heads * hd;
+  const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total) return;
+  const int d = int(i % hd);
+  const long r = i / hd;
+  const int h = int(r % heads);
+  const long q = r / heads;
+  out[i] = plane[(h * (long)plane_tokens + q) * hd + d];
+}
+
+// One block of 256 threads per row. The row is read once into registers, so
+// the scale and both softmax passes touch it only once.
+__global__ void full_softmax_f16_rows_kernel(const __half* __restrict__ s,
+                                             __half* __restrict__ p, int cols,
+                                             int row_stride, float scale) {
+  __shared__ float red[64];
+  const long row = blockIdx.x;
+  const __half* src = s + row * row_stride;
+  __half* dst = p + row * row_stride;
+  float v[8];
+  float m = -1e30f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const int i = threadIdx.x + k * 256;
+    v[k] = (i < cols) ? __half2float(src[i]) * scale : -1e30f;
+    m = fmaxf(m, v[k]);
+  }
+  m = full_block_reduce_max(m, red);
+  float sum = 0.0f;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    v[k] = (v[k] > -1e29f) ? __expf(v[k] - m) : 0.0f;
+    sum += v[k];
+  }
+  sum = full_block_reduce_sum(sum, red);
+  const float inv = 1.0f / sum;
+  #pragma unroll
+  for (int k = 0; k < 8; ++k) {
+    const int i = threadIdx.x + k * 256;
+    if (i < cols) dst[i] = __float2half_rn(v[k] * inv);
+  }
+}
+
+// Score-plane scratch of the full.score-gemm regime. Sized for the largest
+// token count the regime admits; released at the caller's teardown.
+float* g_full_scratch = nullptr;
+size_t g_full_scratch_bytes = 0;
+
+bool ensure_full_scratch(size_t bytes) {
+  if (bytes <= g_full_scratch_bytes) return true;
+  if (g_full_scratch != nullptr) cudaFree(g_full_scratch);
+  g_full_scratch = nullptr;
+  g_full_scratch_bytes = 0;
+  void* p = nullptr;
+  if (cudaMalloc(&p, bytes) != cudaSuccess) return false;
+  g_full_scratch = static_cast<float*>(p);
+  g_full_scratch_bytes = bytes;
+  return true;
+}
+
+void release_full_scratch() {
+  if (g_full_scratch != nullptr) cudaFree(g_full_scratch);
+  g_full_scratch = nullptr;
+  g_full_scratch_bytes = 0;
+}
+
+cublasHandle_t full_attn_cublas() {
+  static cublasHandle_t h = nullptr;
+  if (h == nullptr && cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
+  return h;
+}
+
+size_t full_score_scratch_bytes(int tokens, int heads, int head_dim) {
+  const size_t tpad = (size_t(tokens) + 7) & ~size_t(7);
+  const size_t kv_elems = tpad * size_t(heads) * size_t(head_dim);
+  const size_t s_elems = size_t(heads) * tpad * tpad;
+  const size_t s_pad = (s_elems + 1) & ~size_t(1);  // keep the f32 tail aligned
+  return 2 * (3 * kv_elems + 2 * s_pad) + 4 * kv_elems;
+}
+
+// full.score-gemm: S = scale * Q K^T, P = softmax_rows(S), O = P V, all as
+// batched f16 GEMMs (fp32 accumulate) over the per-head planes. False when the
+// shape or the scratch does not fit the regime; the caller then takes the
+// tiled regime.
+bool full_attention_score_gemm(const float* q, const float* k, const float* v,
+                               int tokens, int heads, int head_dim, float scale,
+                               float* out) {
+  if (tokens <= 0 || heads <= 0 || head_dim <= 0) return false;
+  if (tokens > kFullScoreMaxTokens) return false;
+  if (head_dim % 32 != 0 || head_dim > 32 * 8) return false;
+  cublasHandle_t h = full_attn_cublas();
+  if (h == nullptr) return false;
+
+  // Tensor-core GEMMs require every leading dimension to be a multiple of 8,
+  // so the per-head planes are padded to `tpad` tokens. The tile dimensions
+  // stay at the real token count: the padded rows are never read.
+  const int tpad = (tokens + 7) & ~7;
+  const size_t T = size_t(tokens), H = size_t(heads), D = size_t(head_dim);
+  const size_t TP = size_t(tpad);
+  const size_t kv_elems = TP * H * D;
+  const size_t s_elems = H * TP * TP;
+  const size_t s_pad = (s_elems + 1) & ~size_t(1);  // keep the f32 tail aligned
+  const size_t bytes = 2 * (3 * kv_elems + 2 * s_pad) + 4 * kv_elems;
+  if (!ensure_full_scratch(bytes)) return false;
+
+  __half* qh = reinterpret_cast<__half*>(g_full_scratch);
+  __half* kh = qh + kv_elems;
+  __half* vh = kh + kv_elems;
+  __half* sh = vh + kv_elems;
+  __half* ph = sh + s_pad;
+  float* od = reinterpret_cast<float*>(ph + s_pad);  // [head][token][dim]
+
+  full_pack_qkv_f16_kernel<<<grid_for(int(T * H * D)), 256, 0, cur_stream()>>>(
+      q, k, v, qh, kh, vh, tokens, tpad, heads, head_dim);
+
+  // S_cm (M=key, N=query) per head is the row-major [query][key] plane the
+  // softmax walks. Both operands are contiguous [token][dim] planes, so the
+  // column-major leading dimensions are just head_dim.
+  const long long stride_kv = (long long)tpad * head_dim;
+  const long long stride_s = (long long)tpad * tpad;
+  const float alpha = 1.0f, beta = 0.0f, one = 1.0f;  // scale is in softmax
+  cublasSetStream(h, cur_stream());
+
+  // S = Q K^T: C(m=k, n=q) = sum_d kh(k,d) qh(q,d). A row-major [token][dim]
+  // plane is the *transpose* of its column-major view, so A takes the T flag
+  // and B (also [token][dim]) is already the K-dim-by-N form.
+  if (cublasGemmStridedBatchedEx(
+          h, CUBLAS_OP_T, CUBLAS_OP_N, tokens, tokens, head_dim, &alpha, kh,
+          CUDA_R_16F, head_dim, stride_kv, qh, CUDA_R_16F, head_dim,
+          stride_kv, &beta, sh, CUDA_R_16F, tpad, stride_s, heads,
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+
+  // One block per padded plane row (the padded query rows are computed too so
+  // the block index maps straight to a plane row; those rows are never read).
+  full_softmax_f16_rows_kernel<<<unsigned(H * TP), 256, 0, cur_stream()>>>(
+      sh, ph, tokens, tpad, scale);
+
+  // O^T = V^T P^T: C(m=d, n=q) = sum_k vh(k,d) ph(q,k). `out` is
+  // [query][head][dim], so its per-head C view is column-major (M=dim, N=query);
+  // vh's column-major view is already V^T (dim by token) and ph's is P^T, so
+  // both operands take the N flag.
+  if (cublasGemmStridedBatchedEx(
+          h, CUBLAS_OP_N, CUBLAS_OP_N, head_dim, tokens, tokens, &one, vh,
+          CUDA_R_16F, head_dim, stride_kv, ph, CUDA_R_16F, tpad, stride_s,
+          &beta, od, CUDA_R_32F, head_dim, stride_kv, heads,
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) !=
+      CUBLAS_STATUS_SUCCESS)
+    return false;
+  full_attn_interleave_kernel<<<grid_for(int(T * H * D)), 256, 0,
+                                cur_stream()>>>(od, out, tokens, tpad, heads,
+                                                head_dim);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// --- full.tiled: resolution, autotune and launch ---------------------------
+
+struct FullTile {
+  int br = 0;
+  int bc = 0;
+  int as = 0;
+};
+
+// The generated full-attention shape: the FA-2 warp-head layout (one warp per
+// 16 query rows of one head, whole head_dim, no dim split), no window, no
+// cache, no exp2 (the exp path keeps the same softmax arithmetic the reference
+// kernel uses, so a re-measurement never changes the numbers).
+compiler::AttentionShape full_attn_shape(int head_dim, int gqa,
+                                         const FullTile& t) {
+  compiler::AttentionShape s;
+  s.head_dim = head_dim;
+  s.gqa = gqa;
+  s.full_attn = true;
+  s.warp_head = true;
+  s.br = t.br;
+  s.bc = t.bc;
+  s.dps = 1;
+  s.async_stages = t.as;
+  return s;
+}
+
+bool full_tile_ok(int head_dim, int gqa, const FullTile& t, int max_smem) {
+  const compiler::AttentionShape s = full_attn_shape(head_dim, gqa, t);
+  if (!compiler::attention_shape_supported(s)) return false;
+  if (compiler::attention_shared_bytes(s) > max_smem) return false;
+  // 16 warps is the largest block the register file holds (see the Q3 apply).
+  if (compiler::attention_block_threads(s) > 512) return false;
+  return true;
+}
+
+// Candidate tilings, in preference order. The first supported entry is the
+// static default: br = 128 (8 warps, 256 threads) holds the whole head_dim
+// accumulator plus the Q fragments without approaching the 128-register cap of
+// a 512-thread block. The wider br = 192/256 tiles halve the K/V traffic per
+// query row but need ~110+ registers per thread; the tuner launches them and
+// keeps one only if it really runs and wins.
+std::vector<FullTile> full_tile_candidates(int head_dim, int gqa) {
+  int dev = 0, max_smem = 96 * 1024;
+  if (cudaGetDevice(&dev) == cudaSuccess) {
+    int v = 0;
+    if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) == cudaSuccess &&
+        v > 0)
+      max_smem = v;
+  }
+  std::vector<FullTile> out;
+  for (const FullTile t : {FullTile{128, 32, 2}, FullTile{128, 16, 2},
+                           FullTile{192, 16, 2}, FullTile{256, 32, 2},
+                           FullTile{256, 32, 3}, FullTile{192, 32, 0},
+                           FullTile{128, 32, 0}, FullTile{64, 32, 2},
+                           FullTile{256, 16, 2}}) {
+    if (full_tile_ok(head_dim, gqa, t, max_smem)) out.push_back(t);
+  }
+  return out;
+}
+
+enum class FullClass { ScoreGemm, Tiled };
+enum class FullImpl { Own, Codegen };
+
+struct FullResolution {
+  FullClass cls = FullClass::Tiled;
+  FullImpl impl = FullImpl::Codegen;
+  FullTile tile;
+};
+
+std::string full_choice_name(const FullResolution& r) {
+  if (r.cls == FullClass::ScoreGemm) return "full.score-gemm";
+  if (r.impl == FullImpl::Own) return "full.tiled:own";
+  return "full.tiled:codegen-wh:" + std::to_string(r.tile.br) + "," +
+         std::to_string(r.tile.bc) + ",as" + std::to_string(r.tile.as);
+}
+
+// The op's attribute key (device is the registry's own dimension). The mask
+// kind, the cache state and prefix reuse are attributes of the class, not of
+// the model that issued the call.
+std::string full_attn_attrs(int head_dim, int gqa) {
+  return "causal0-kvcache0-prefixreuse0-window0-d" + std::to_string(head_dim) +
+         "-g" + std::to_string(gqa);
+}
+
+// Class scope. The two regimes are two scopes: the capacity boundary is a
+// device constant, so neither scope ever contains a live n.
+std::string full_attn_scope(int head_dim, int gqa, bool score_gemm) {
+  return "full-" + full_attn_attrs(head_dim, gqa) +
+         (score_gemm ? "-cap2048" : "-over2048");
+}
+
+// The tiled regime's tuner entry is regime-independent: the same kernel serves
+// the tiled class whether it was reached at n > 2048 or by a shape at n <=
+// 2048 that the score-GEMM regime cannot serve.
+std::string full_tiled_scope(int head_dim, int gqa) {
+  return "full-" + full_attn_attrs(head_dim, gqa) + "-tiled";
+}
+
+enum class FullClassName { Auto, ScoreGemm, Tiled, Own, Codegen, Scalar };
+
+struct FullOverride {
+  FullClassName cls = FullClassName::Auto;
+  const char* raw = nullptr;
+};
+
+void full_warn_once(const std::string& msg) {
+  static std::mutex mu;
+  static std::unordered_set<std::string> seen;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!seen.insert(msg).second) return;
+  }
+  std::fprintf(stderr, "[attention] %s\n", msg.c_str());
+}
+
+// SONICBOOM_ATTN_CLASS overrides the class for an A/B run; SONICBOOM_DIT_ATTN
+// is kept as its alias (the old spelling). Values that do not describe this
+// op's attributes are refused: an LLM class on a non-causal, cache-less op
+// would silently select a causal kernel, which is exactly what the class key
+// exists to prevent.
+FullOverride full_class_override() {
+  const char* e = std::getenv("SONICBOOM_ATTN_CLASS");
+  if (e == nullptr || *e == '\0') e = std::getenv("SONICBOOM_DIT_ATTN");
+  FullOverride o;
+  if (e == nullptr || *e == '\0') return o;
+  o.raw = e;
+  const std::string_view v(e);
+  if (v == "auto") o.cls = FullClassName::Auto;
+  else if (v == "full.score-gemm") o.cls = FullClassName::ScoreGemm;
+  else if (v == "full.tiled") o.cls = FullClassName::Tiled;
+  else if (v == "full.own") o.cls = FullClassName::Own;
+  else if (v == "full.codegen") o.cls = FullClassName::Codegen;
+  else if (v == "scalar" || v == "full.scalar") o.cls = FullClassName::Scalar;
+  else {
+    full_warn_once("SONICBOOM_ATTN_CLASS=" + std::string(v) +
+                   " is not a class for a non-causal, cache-less attention "
+                   "op; using auto");
+    o.cls = FullClassName::Auto;
+  }
+  return o;
+}
+
+// Process memo: the resolution and the source that produced it, so a repeat
+// call neither retimes nor misreports where the class came from.
+struct FullMemo {
+  FullResolution res;
+  planner::decisions::Source src = planner::decisions::Source::Default;
+};
+
+std::mutex g_full_choice_mutex;
+std::unordered_map<std::string, FullMemo> g_full_choice;
+
+// Class records are written once per (name, scope, value): a second value for
+// the same scope must still reach the registry, where it is counted as a
+// conflict instead of being hidden by a per-scope flag.
+std::mutex g_full_rec_mutex;
+std::unordered_set<std::string> g_full_rec_seen;
+
+bool full_record_once(planner::decisions::Entry e) {
+  const std::string k = e.name + "\x1f" + e.scope + "\x1f" + e.value;
+  {
+    std::lock_guard<std::mutex> lk(g_full_rec_mutex);
+    if (!g_full_rec_seen.insert(k).second) return false;
+  }
+  planner::decisions::record(std::move(e));
+  return true;
+}
+
+void full_record_class(const FullResolution& r, int head_dim, int gqa,
+                       int n_heads, int score_gemm_vram, bool fallback,
+                       planner::decisions::Source src) {
+  planner::decisions::Entry e;
+  e.name = "attention.class";
+  e.scope = full_attn_scope(head_dim, gqa, r.cls == FullClass::ScoreGemm);
+  e.value = full_choice_name(r);
+  e.source = src;
+  e.env = "SONICBOOM_ATTN_CLASS";
+  e.inputs = full_attn_attrs(head_dim, gqa) + " heads=" +
+             std::to_string(n_heads) + " device=sm_86";
+  e.candidates = "full.score-gemm|full.tiled";
+  if (r.cls == FullClass::ScoreGemm)
+    e.reason = "n <= 2048: the per-head score planes fit the scratch budget "
+               "(R1 capacity exception; no prefix reuse, deterministic)";
+  else if (fallback)
+    e.reason = "score-GEMM regime unavailable for this shape; tiled regime "
+               "(R1 capacity exception; no prefix reuse, deterministic)";
+  else
+    e.reason = "n > 2048: score planes exceed the scratch budget; online "
+               "tiling (R1 capacity exception; no prefix reuse, deterministic)";
+  e.numerics = r.cls == FullClass::ScoreGemm
+                   ? "f16 GEMM operands, fp32 accumulate, row softmax in f32"
+                   : "f16 K/V, fp32 accumulate, deterministic per resolution";
+  e.vram_bytes = r.cls == FullClass::ScoreGemm ? score_gemm_vram : 0;
+  full_record_once(std::move(e));
+}
+
+bool full_attn_launch_own(int head_dim, const float* q, const float* k,
+                          const float* v, int n, int n_heads, float scale,
+                          float* out) {
+  if (head_dim != 128) return false;
+  // The hand-written tiled kernel in dense full-attention mode: identical
+  // geometry to the causal prefill specialization, with the mask compile-time
+  // off (no cache, no start position, no window).
+  return launch_tiled_flash_attention<float, 128, 64, 2, 128, 1, false>(
+      q, k, v, nullptr, nullptr, nullptr, /*n_slots=*/0, n, n_heads, n_heads,
+      /*sliding_window=*/0, scale, out);
+}
+
+// Launch the generated full-attention kernel. Falls back to the hand-written
+// kernel only when the generator cannot launch (JIT failure); the production
+// resolution always names the implementation that ran.
+bool full_attn_launch(const FullResolution& r, int head_dim, int gqa,
+                      const float* q, const float* k, const float* v, int n,
+                      int n_heads, float scale, float* out,
+                      FullImpl& ran) {
+  if (r.impl == FullImpl::Codegen) {
+    const compiler::AttentionShape s = full_attn_shape(head_dim, gqa, r.tile);
+    if (attn_launch_codegen(s, q, k, v, nullptr, nullptr, nullptr, 0, n,
+                            n_heads, n_heads, 0, scale, out)) {
+      ran = FullImpl::Codegen;
+      return true;
+    }
+    full_warn_once("full-attention kernel launch failed for " +
+                   full_choice_name(r) + "; using the hand-written kernel");
+  }
+  ran = FullImpl::Own;
+  return full_attn_launch_own(head_dim, q, k, v, n, n_heads, scale, out);
+}
+
+// Static tiled default: the first supported generated tiling, else the
+// hand-written kernel.
+FullResolution full_tiled_default(int head_dim, int gqa) {
+  FullResolution r;
+  r.cls = FullClass::Tiled;
+  const std::vector<FullTile> cands = full_tile_candidates(head_dim, gqa);
+  if (!cands.empty()) {
+    r.impl = FullImpl::Codegen;
+    r.tile = cands.front();
+  } else {
+    r.impl = FullImpl::Own;
+  }
+  return r;
+}
+
+std::string full_tune_key(int head_dim, int gqa, int n_heads) {
+  // The generated-code version and the default the pick was measured against
+  // are decision inputs: changing either retimes the class. The probe length,
+  // head dimension, GQA ratio and head count are the class; the caller's n is
+  // never part of the key.
+  std::string k = compiler::attention_codegen_version();
+  k += "|" + full_tiled_scope(head_dim, gqa) + "|h" + std::to_string(n_heads) +
+       "|wl" + std::to_string(kFullTuneTokens) + "|dflt-" +
+       full_choice_name(full_tiled_default(head_dim, gqa));
+  return k;
+}
+
+std::optional<FullResolution>
+full_choice_from_values(const std::map<std::string, int>& v, int head_dim,
+                        int gqa) {
+  const auto get = [&v](const char* name, int& dst) {
+    const auto it = v.find(name);
+    if (it == v.end()) return false;
+    dst = it->second;
+    return true;
+  };
+  int impl = 0;
+  if (!get("impl", impl)) return std::nullopt;
+  FullResolution r;
+  r.cls = FullClass::Tiled;
+  if (impl == 0) {
+    if (head_dim != 128) return std::nullopt;  // no hand-written instantiation
+    r.impl = FullImpl::Own;
+    return r;
+  }
+  int br = 0, bc = 0, as = 0;
+  if (!get("br", br) || !get("bc", bc)) return std::nullopt;
+  (void)get("as", as);
+  // A cached tile must still be a supported, launchable tile on this device.
+  for (const FullTile& c : full_tile_candidates(head_dim, gqa))
+    if (c.br == br && c.bc == bc && c.as == as) {
+      r.impl = FullImpl::Codegen;
+      r.tile = c;
+      return r;
+    }
+  return std::nullopt;
+}
+
+// Time every supported tiling plus the hand-written kernel on one fixed
+// synthetic full-attention call. The probe length is a constant of the class,
+// so the ranking never depends on the caller's n.
+FullResolution full_tune_tiled(int head_dim, int gqa, int n_heads,
+                               const FullResolution& def, double& tune_s,
+                               int& candidate_count) {
+  const auto t0 = std::chrono::steady_clock::now();
+  candidate_count = 0;
+  std::vector<FullResolution> cands{def};
+  auto add = [&](const FullResolution& c) {
+    for (const FullResolution& x : cands)
+      if (x.cls == c.cls && x.impl == c.impl && x.tile.br == c.tile.br &&
+          x.tile.bc == c.tile.bc && x.tile.as == c.tile.as)
+        return;
+    cands.push_back(c);
+  };
+  {
+    FullResolution own;
+    own.cls = FullClass::Tiled;
+    own.impl = FullImpl::Own;
+    if (head_dim == 128) add(own);
+  }
+  for (const FullTile& t : full_tile_candidates(head_dim, gqa)) {
+    FullResolution c;
+    c.cls = FullClass::Tiled;
+    c.impl = FullImpl::Codegen;
+    c.tile = t;
+    add(c);
+  }
+
+  const int n = kFullTuneTokens;
+  const size_t elems = size_t(n) * size_t(n_heads) * size_t(head_dim);
+  float *q = nullptr, *k = nullptr, *v = nullptr, *out = nullptr;
+  bool ok = cudaMalloc(reinterpret_cast<void**>(&q), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&k), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&v), elems * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&out), elems * 4) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    for (float* p : {q, k, v, out})
+      if (p) cudaFree(p);
+    tune_s = 0.0;
+    return def;
+  }
+  // Zeroed inputs: the kernel's work is data-independent (no early exits).
+  for (float* p : {q, k, v, out}) cudaMemsetAsync(p, 0, elems * 4, cur_stream());
+
+  const float scale = 1.0f / std::sqrt(float(head_dim));
+  auto run = [&](const FullResolution& r) {
+    if (r.impl == FullImpl::Own)
+      return full_attn_launch_own(head_dim, q, k, v, n, n_heads, scale, out);
+    return attn_launch_codegen(full_attn_shape(head_dim, gqa, r.tile), q, k, v,
+                               nullptr, nullptr, nullptr, 0, n, n_heads,
+                               n_heads, 0, scale, out);
+  };
+
+  // The timing launches are not part of any run (same rule as the causal
+  // prefill tuner: a recorded plan must name the real kernel's grid).
+  planner::PlanRecorder* saved_rec = planner::recorder();
+  planner::set_thread_recorder(nullptr);
+  candidate_count = int(cands.size());
+  auto time_one = [&](const FullResolution& c) {
+    if (!run(c)) {  // a tile that cannot launch cannot be chosen
+      (void)cudaGetLastError();
+      return -1.0;
+    }
+    const double ms = ::sonicboom::tune::median_launch_ms(
+        [&] { return run(c); }, cur_stream(), 2, 5);
+    if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+      std::fprintf(stderr, "[autotune]   full-attn cand %s %.4f ms\n",
+                   full_choice_name(c).c_str(), ms);
+    return ms;
+  };
+  // The default is timed first; it is the reference the winner must beat by
+  // the switch margin.
+  const double def_ms = time_one(def);
+  FullResolution best = def;
+  double best_ms = def_ms;
+  for (size_t i = 1; i < cands.size(); ++i) {
+    const double ms = time_one(cands[i]);
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
+      best = cands[i];
+      best_ms = ms;
+    }
+  }
+  planner::set_thread_recorder(saved_rec);
+  for (float* p : {q, k, v, out}) cudaFree(p);
+
+  if (best_ms <= 0.0)
+    best = def;
+  else if (def_ms > 0.0 &&
+           !(best_ms < def_ms * (1.0 - kFullSwitchMargin)))
+    best = def;  // within the noise margin: keep the measured default
+  tune_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+               .count();
+  return best;
+}
+
+// Resolve the tiled regime for the class: the env pin, else the process memo,
+// else the per-device cached pick, else a tuning run, else the static default.
+// `src` reports where the value came from, for the registry.
+FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
+                                  const FullOverride& ov,
+                                  planner::decisions::Source& src,
+                                  double& tune_s, int& candidate_count) {
+  const FullResolution def = full_tiled_default(head_dim, gqa);
+  src = planner::decisions::Source::Default;
+  tune_s = 0.0;
+  candidate_count = 0;
+
+  if (ov.cls == FullClassName::Own || ov.cls == FullClassName::Codegen) {
+    FullResolution r;
+    r.cls = FullClass::Tiled;
+    if (ov.cls == FullClassName::Own) {
+      if (head_dim != 128) {
+        full_warn_once("SONICBOOM_ATTN_CLASS=full.own has no instantiation for "
+                       "this head width; using the default class");
+        return def;
+      }
+      r.impl = FullImpl::Own;
+    } else {
+      if (def.impl != FullImpl::Codegen) {
+        full_warn_once("SONICBOOM_ATTN_CLASS=full.codegen has no supported "
+                       "tiling for this shape; using the default class");
+        return def;
+      }
+      r.impl = FullImpl::Codegen;
+      r.tile = def.tile;
+    }
+    src = planner::decisions::Source::Env;
+    return r;
+  }
+
+  const std::string key = full_tune_key(head_dim, gqa, n_heads);
+  {
+    std::lock_guard<std::mutex> lk(g_full_choice_mutex);
+    const auto it = g_full_choice.find(key);
+    if (it != g_full_choice.end()) {
+      src = it->second.src;
+      tune_s = 0.0;
+      return it->second.res;
+    }
+  }
+
+  FullResolution choice = def;
+  bool have = false;
+  if (::sonicboom::tune::enabled()) {
+    // Host timing is illegal inside a graph capture, so a capture that misses
+    // the cache takes the static default (the class is still recorded).
+    if (!attn_capturing()) {
+      const std::map<std::string, int> cached =
+          ::sonicboom::tune::lookup("attention-full", key);
+      if (!cached.empty()) {
+        if (const auto c = full_choice_from_values(cached, head_dim, gqa)) {
+          choice = *c;
+          have = true;
+        }
+      }
+      if (!have) {
+        choice = full_tune_tiled(head_dim, gqa, n_heads, def, tune_s,
+                                 candidate_count);
+        const std::map<std::string, int> values{
+            {"impl", choice.impl == FullImpl::Codegen ? 1 : 0},
+            {"br", choice.tile.br},
+            {"bc", choice.tile.bc},
+            {"as", choice.tile.as}};
+        ::sonicboom::tune::store("attention-full", key, values);
+      }
+    }
+  }
+  src = have ? planner::decisions::Source::Cached
+             : (candidate_count > 0 ? planner::decisions::Source::Measured
+                                    : planner::decisions::Source::Default);
+
+  if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr)
+    std::fprintf(stderr,
+                 "[autotune] attention-full %s %s default=%s candidates=%d "
+                 "tune=%.2f s\n",
+                 key.c_str(),
+                 std::string(planner::decisions::source_name(src)).c_str(),
+                 full_choice_name(def).c_str(), candidate_count, tune_s);
+
+  {
+    std::lock_guard<std::mutex> lk(g_full_choice_mutex);
+    g_full_choice[key] = FullMemo{choice, src};
+  }
+  return choice;
+}
+
+// The tiled regime's tuner decision: one entry per attribute key, with the
+// candidates considered, the measured probe and where the value came from.
+void full_record_tune(const FullResolution& r, int head_dim, int gqa,
+                      int n_heads, planner::decisions::Source src,
+                      int candidate_count, double tune_s) {
+  planner::decisions::Entry e;
+  e.name = "tune/attention-full";
+  e.scope = full_tiled_scope(head_dim, gqa);
+  e.value = full_choice_name(r);
+  e.source = src;
+  e.env = "SONICBOOM_ATTN_CLASS";
+  e.inputs = full_attn_attrs(head_dim, gqa) + " heads=" +
+             std::to_string(n_heads) + " probe=" +
+             std::to_string(kFullTuneTokens) + "-tokens dev=sm_86";
+  std::string cands = "full.tiled:own|";
+  for (const FullTile& t : full_tile_candidates(head_dim, gqa))
+    cands += "full.tiled:codegen-wh:" + std::to_string(t.br) + "," +
+             std::to_string(t.bc) + ",as" + std::to_string(t.as) + "|";
+  e.candidates = std::move(cands);
+  e.reason = "FA-2 warp-head kernel timed once per device on a fixed synthetic "
+             "full-attention call; the default is kept unless a candidate wins "
+             "by the switch margin";
+  e.numerics =
+      "f16 K/V, fp32 accumulate; deterministic per resolution, not "
+      "token-identical to the hand-written kernel's S/P association";
+  e.tuning_ms = int64_t(std::llround(tune_s * 1000.0));
+  full_record_once(std::move(e));
+}
+
+// Resolve the whole class for one call: regime first (capacity boundary), then
+// the tiled regime's implementation. `src` is the origin of the value.
+FullResolution full_resolve(int n, int n_heads, int head_dim, int gqa,
+                            const FullOverride& ov,
+                            planner::decisions::Source& src, double& tune_s,
+                            int& candidate_count) {
+  bool score_gemm = n <= kFullScoreMaxTokens;
+  if (ov.cls == FullClassName::ScoreGemm) score_gemm = true;
+  if (ov.cls == FullClassName::Tiled || ov.cls == FullClassName::Own ||
+      ov.cls == FullClassName::Codegen)
+    score_gemm = false;
+  if (score_gemm) {
+    FullResolution r;
+    r.cls = FullClass::ScoreGemm;
+    r.impl = FullImpl::Own;
+    src = ov.cls == FullClassName::ScoreGemm
+              ? planner::decisions::Source::Env
+              : planner::decisions::Source::Default;
+    tune_s = 0.0;
+    candidate_count = 0;
+    return r;
+  }
+  return full_resolve_tiled(head_dim, gqa, n_heads, ov, src, tune_s,
+                            candidate_count);
+}
+
 // Prefill implementation choice for a shape class: the hand-written kernel
 // ("own") or the generated FA-2 kernel at a (br, bc, dps) tile config.
 struct AttnChoice {
@@ -3363,6 +4447,24 @@ AttnChoice attn_default_choice(int head_dim, int gqa, bool window) {
               s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
               s->head_fast ? 1 : 0};
   }
+  // d128/gqa6 (DeepSeek-R1-Distill-Qwen-1.5B): boom-r5 M1 re-evaluation arm.
+  // The generated tile is 1.92x the scalar kernel, but its S/P association
+  // order moved DeepSeek's first greedy token on 10 of the r4 gate prompts.
+  // Gate v2 judges the full-corpus distribution rather than 50 first tokens,
+  // so the arm is measured with SONICBOOM_ATTN_D128=codegen; it becomes the
+  // standard-profile default only if the KL/same-top gate admits it. Strict
+  // keeps the scalar kernel either way.
+  if (gqa == 6 && head_dim == 128) {
+    const char *e = std::getenv("SONICBOOM_ATTN_D128");
+    const bool on = e != nullptr && std::string_view(e) == "codegen";
+    if (on) {
+      if (const auto s = attn_codegen_default_shape(head_dim, gqa, window))
+        return {AttnImpl::Codegen, s->br,          s->bc,      s->dps, false,
+                s->async_stages, s->gqa_pack, s->q_in_reg ? 0 : 1,
+                s->head_fast ? 1 : 0};
+    }
+    return {AttnImpl::Own, 0, 0, 0};
+  }
   // d512: own wins the prefill leg, and no legal generated tile beats it
   // (best generated 1.717/27.19 ms vs own 1.603/20.25 at q=512/2048; see
   // attn_codegen_default_shape for why the 96 KiB budget rules out packing
@@ -3383,19 +4485,20 @@ bool attn_launch_own(int head_dim, int gqa, const float *q,
                      const float *k_cache, const float *v_cache,
                      const uint64_t *start, uint64_t n_slots, int n,
                      int n_heads_q, int n_heads_kv, uint64_t sliding_window,
-                     float scale, float *out, bool kv_f16 = false) {
+                     float scale, float *out, bool kv_f16 = false,
+                     bool kv_q8 = false) {
   if (gqa == 4 && head_dim == 256)
     return launch_tiled_flash_attention_kv<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
   if (gqa == 4 && head_dim == 512)
     return launch_tiled_flash_attention_kv<512, 32, 4, 16, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
   if (gqa == 7 && head_dim == 64)
     return launch_tiled_flash_attention_kv<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
   return false;
 }
 
@@ -3443,7 +4546,7 @@ struct AttnTuneBufs {
 AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
                              int n_heads_kv, uint64_t window_len, bool window,
                              const AttnChoice &def, bool kv_f16, double &tune_s,
-                             int &candidate_count) {
+                             int &candidate_count, bool kv_q8 = false) {
   const auto t0 = std::chrono::steady_clock::now();
   candidate_count = 0;
 
@@ -3482,7 +4585,7 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   };
   // f16 KV forces synchronous staging (the generated kernel cannot cp.async a
   // mixed f16-cache / f32-batch tile), so only the as = 0 candidates exist.
-  const std::vector<int> stages = kv_f16 ? std::vector<int>{0}
+  const std::vector<int> stages = (kv_f16 || kv_q8) ? std::vector<int>{0}
                                          : std::vector<int>{0, 2, 3};
   for (int as : stages)
     for (int dps : {1, 2, 4, 8})
@@ -3509,11 +4612,15 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   const size_t q_n = size_t(kAttnTuneMaxQueries) * n_heads_q * head_dim;
   const size_t kv_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
   const size_t c_n = size_t(kAttnTuneMaxQueries) * n_heads_kv * head_dim;
+  // A q8 row is head_dim + 4 bytes instead of head_dim elements.
+  const size_t c_bytes = kv_q8 ? size_t(kAttnTuneMaxQueries) * n_heads_kv *
+                                     size_t(head_dim + 4)
+                               : c_n * 4;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
-  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_n * 4) == cudaSuccess;
-  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_bytes) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
   ok = ok &&
        cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
@@ -3528,8 +4635,8 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
   cudaMemsetAsync(b.q, 0, q_n * 4, cur_stream());
   cudaMemsetAsync(b.kb, 0, kv_n * 4, cur_stream());
   cudaMemsetAsync(b.vb, 0, kv_n * 4, cur_stream());
-  cudaMemsetAsync(b.kc, 0, c_n * 4, cur_stream());
-  cudaMemsetAsync(b.vc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.kc, 0, c_bytes, cur_stream());
+  cudaMemsetAsync(b.vc, 0, c_bytes, cur_stream());
   cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
   const uint64_t zero = 0;
   ok = cudaMemcpyAsync(b.start, &zero, sizeof(zero), cudaMemcpyHostToDevice,
@@ -3546,11 +4653,12 @@ AttnChoice attn_tune_prefill(int head_dim, int gqa, int n_heads_q,
     if (c.impl == AttnImpl::Own)
       return attn_launch_own(head_dim, gqa, b.q, b.kb, b.vb, b.kc, b.vc,
                              b.start, slots, queries, n_heads_q, n_heads_kv, w,
-                             scale, b.out, kv_f16);
+                             scale, b.out, kv_f16, kv_q8);
     compiler::AttentionShape s = attn_prefill_shape(
         head_dim, gqa, window, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
         c.qs == 0, c.hf);
     s.kv_f16 = kv_f16;
+    s.kv_q8 = kv_q8;
     return attn_launch_codegen(s, b.q, b.kb, b.vb, b.kc, b.vc, b.start, slots,
                                queries, n_heads_q, n_heads_kv, w, scale, b.out);
   };
@@ -3690,12 +4798,17 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   const size_t kv_n = size_t(probe_n) * size_t(n_heads_kv) * size_t(head_dim);
   const size_t c_n = size_t(kQ3ProbeSlots) * size_t(n_heads_kv) *
                      size_t(head_dim);
+  // A q8 row is head_dim + 4 bytes instead of head_dim elements.
+  const size_t c_bytes = base.kv_q8
+                             ? size_t(kQ3ProbeSlots) * size_t(n_heads_kv) *
+                                   size_t(head_dim + 4)
+                             : c_n * 4;
   AttnTuneBufs b;
   bool ok = cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kb), kv_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vb), kv_n * 4) == cudaSuccess;
-  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_n * 4) == cudaSuccess;
-  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.kc), c_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.vc), c_bytes) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
   ok = ok &&
        cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
@@ -3729,8 +4842,8 @@ static std::optional<compiler::AttentionShape> attn_prefill_tile_autotune(
   ok = ok && cudaMemcpyAsync(b.vb, hkv.data(), kv_n * 4,
                              cudaMemcpyHostToDevice, cur_stream()) ==
                  cudaSuccess;
-  cudaMemsetAsync(b.kc, 0, c_n * 4, cur_stream());
-  cudaMemsetAsync(b.vc, 0, c_n * 4, cur_stream());
+  cudaMemsetAsync(b.kc, 0, c_bytes, cur_stream());
+  cudaMemsetAsync(b.vc, 0, c_bytes, cur_stream());
   cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
   if (!ok) {
     (void)cudaGetLastError();
@@ -3899,7 +5012,7 @@ std::unordered_map<std::string, AttnChoice> g_attn_choice;
 
 std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
                           bool window, uint64_t window_len, bool kv_f16,
-                          const AttnChoice &def) {
+                          bool kv_q8, const AttnChoice &def) {
   std::string k = compiler::attention_codegen_version();
   k += "|prefill-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
        "-h" + std::to_string(n_heads_q) + "-kv" + std::to_string(n_heads_kv) +
@@ -3910,6 +5023,7 @@ std::string attn_tune_key(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   // under the standard profile, which keeps every strict key byte-identical to
   // the pre-profile ones.
   if (kv_f16) k += "-kv16";
+  if (kv_q8) k += "-kv8";
   if (attn_exp2_enabled()) k += "-x2";
   // The default the choice was measured against is a decision input: a new
   // default (a different tile, packing or grid order) must retune the class
@@ -3961,7 +5075,8 @@ bool attn_choice_from_values(const std::map<std::string, int> &v, int head_dim,
 // shape class (head count included) and the generated-code version; it never
 // includes the batch size or position.
 AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
-                        bool window, uint64_t window_len, bool kv_f16) {
+                        bool window, uint64_t window_len, bool kv_f16,
+                        bool kv_q8 = false) {
   const AttnChoice def = attn_default_choice(head_dim, gqa, window);
   if (!::sonicboom::tune::enabled()) return def;
   // Only the classes the generator covers can be tuned; the rest keep own.
@@ -3976,7 +5091,8 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     return def;
 
   const std::string key = attn_tune_key(head_dim, gqa, n_heads_q, n_heads_kv,
-                                        window, window_len, kv_f16, def);
+                                        window, window_len, kv_f16, kv_q8,
+                                        def);
   {
     std::lock_guard<std::mutex> lk(g_attn_choice_mutex);
     const auto it = g_attn_choice.find(key);
@@ -4003,7 +5119,8 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     double tune_s = 0.0;
     int candidate_count = 0;
     choice = attn_tune_prefill(head_dim, gqa, n_heads_q, n_heads_kv, window_len,
-                               window, def, kv_f16, tune_s, candidate_count);
+                               window, def, kv_f16, tune_s, candidate_count,
+                               kv_q8);
     std::map<std::string, int> values{
         {"impl", choice.impl == AttnImpl::Codegen ? 1 : 0},
         {"br", choice.br},
@@ -4033,45 +5150,116 @@ AttnChoice attn_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   return choice;
 }
 
-// --- Step 7: decode chunk length for the generated split-KV pair ----------
+// --- Decode split-KV schedule: the chunk size C ---------------------------
 //
-// The generated flash-decoding pair is the default decode path. Its default
-// chunk rule reproduces the hand-written kernel's split, which is what makes
-// the two bit-identical; the tuner below trades grid width against per-block
-// work and therefore changes the split, so it belongs to the
-// non-token-identical arm (SONICBOOM_ATTN_TUNE_NONIDENTICAL). The chunk
-// length is a pure runtime argument (generated text unchanged).
-// The choice is keyed by shape class + window extent, never by position.
-constexpr uint64_t kAttnDecodeTuneChunks[] = {8, 16, 32, 64};
-// The synthetic extent: the full window when it is small, capped so the
-// partial buffer stays bounded (a 32k-key extent would need hundreds of MB of
-// tuning scratch). The choice is made once per class; the kernel itself still
-// runs the real extent.
-constexpr uint64_t kAttnDecodeTuneMaxExtent = 4096;
+// The schedule is (C, combine order). C is a per-(device, shape class)
+// constant and is NOT derived from the window length or the cache capacity:
+// chunk k covers the ABSOLUTE key positions [k*C, (k+1)*C), and the combine
+// walks the grid in ascending absolute chunk index. A key therefore always
+// belongs to the same chunk, so every query's reduction tree is a function of
+// key positions alone -- independent of depth, n_ctx capacity, and how much of
+// the context came from a reused prefix. That is what makes a decode at depth
+// N bit-identical whether it followed a full prefill or a prefix reuse at any
+// capacity, and it keeps R1 (one fixed split per class) honest.
+//
+// The number of splits still adapts: the grid is sized from the capacity
+// (floor(window/C) + 1 chunks) so it covers any position, and chunks beyond
+// the current key count write a neutral partial. Larger C => fewer, longer
+// splits; smaller C => more parallelism.
+//
+// C is timed once per class on synthetic KV of the class's shape (same
+// head_dim/GQA/mask/kv type, zeroed data) at the depths the workload covers,
+// and the pick minimizes the workload-weighted expected step time. The default
+// weights favour long context: short depths are dominated by the weight
+// stream and barely see C, while at long depth attention is a large share of
+// the step. SONICBOOM_ATTN_DECODE_WEIGHTS overrides the weights.
+constexpr uint64_t kAttnDecodeTuneChunks[] = {8, 16, 32, 64, 128, 256};
+// Depths the pick is measured at. The last tier is the model's context
+// capacity, capped so a cold tune stays inside the cold budget (the ring is
+// only 512 slots, so a longer extent costs DRAM replay, not memory).
+constexpr uint64_t kAttnDecodeTuneDepths[] = {1024, 4096, 16384};
+constexpr uint64_t kAttnDecodeTuneCapacityCap = 32768;
+constexpr double kAttnDecodeTuneWeights[] = {0.10, 0.20, 0.30, 0.40};
 
 std::mutex g_attn_decode_key_mutex;
 std::unordered_map<std::string, uint64_t> g_attn_decode_chunk;
 
-uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
-                                   int n_heads_kv, uint64_t max_window,
-                                   uint64_t sliding_window,
-                                   uint64_t default_chunk) {
-  if (!::sonicboom::tune::enabled()) return default_chunk;
+// The class default: the generated and hand-written decoders share it, which
+// keeps them token-identical. For a windowed class the window is a model
+// property (the SWA ring), so deriving the split from it is class-fixed; a
+// causal class uses kMaxChunk whatever its capacity.
+uint64_t attn_decode_class_chunk(int n_heads_kv, uint64_t sliding_window) {
+  if (sliding_window == 0) return kMaxChunk;
+  const uint64_t target_chunks =
+      std::max<uint64_t>(1, (uint64_t)sm_count() * 4 / (uint64_t)n_heads_kv);
+  return std::max<uint64_t>(
+      1, std::min((sliding_window + target_chunks - 1) / target_chunks,
+                  kMaxChunk));
+}
+
+uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
+                                     uint64_t sliding_window) {
+  if (chunk_attr != 0) return chunk_attr;
+  if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
+    const long v = std::atol(e);
+    if (v > 0 && (uint64_t)v <= (uint64_t)compiler::kAttentionDecodeMaxChunk)
+      return (uint64_t)v;
+  }
+  return attn_decode_class_chunk(n_heads_kv, sliding_window);
+}
+
+} // namespace
+
+// Public so the model plans can write the schedule into the Boom IR attention
+// op (the chunk size and merge order are plan-visible attributes, not a
+// dispatch-time surprise).
+uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
+                                int n_heads_kv, uint64_t sliding_window,
+                                uint64_t capacity, bool kv_f16, bool kv_q8) {
+  const uint64_t default_chunk = attn_decode_class_chunk(n_heads_kv, sliding_window);
   compiler::AttentionShape dsh;
   dsh.head_dim = head_dim;
   dsh.gqa = gqa;
   dsh.window_mask = sliding_window != 0;
   dsh.decode = true;
+  dsh.kv_f16 = kv_f16;
+  dsh.kv_q8 = kv_q8;
   dsh.exp2 = attn_exp2_enabled();
   if (!compiler::attention_shape_supported(dsh)) return default_chunk;
 
+  // Class key: no capacity and no position. A pick is valid for every n_ctx.
   std::string key = compiler::attention_codegen_version();
   key += "|decode-d" + std::to_string(head_dim) + "-g" + std::to_string(gqa) +
          "-h" + std::to_string(n_heads_q) + "-kv" +
          std::to_string(n_heads_kv) + "-m" +
-         (sliding_window != 0 ? "window" : "causal");
-  key += "-w" + std::to_string(max_window);
+         (sliding_window != 0 ? "window" : "causal") +
+         (kv_f16 ? "-kv16" : kv_q8 ? "-kv8" : "-kv32");
   if (attn_exp2_enabled()) key += "-x2";
+
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  const auto remember = [&](uint64_t c) {
+    std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
+    g_attn_decode_chunk[key] = c;
+    return c;
+  };
+  const auto record = [&](uint64_t c, planner::decisions::Source src,
+                          const std::string &inputs, const std::string &reason,
+                          int64_t tuning_ms) {
+    planner::decisions::Entry e;
+    e.name = "attention.decode-chunk";
+    e.scope = key;
+    e.value = std::to_string(c);
+    e.source = src;
+    e.env = "SONICBOOM_ATTN_DECODE_CHUNK";
+    e.inputs = inputs;
+    e.candidates = "8|16|32|64|128|256";
+    e.reason = reason;
+    e.numerics =
+        "chunk boundaries at absolute key positions; fixed per class, "
+        "independent of depth/capacity/prefix reuse";
+    e.tuning_ms = tuning_ms;
+    planner::decisions::record(std::move(e));
+  };
 
   {
     std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
@@ -4079,7 +5267,16 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
     if (it != g_attn_decode_chunk.end()) return it->second;
   }
 
-  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_CHUNK")) {
+    const long v = std::atol(e);
+    if (v > 0 && (uint64_t)v <= (uint64_t)compiler::kAttentionDecodeMaxChunk) {
+      const uint64_t c = (uint64_t)v;
+      record(c, planner::decisions::Source::Env, "env override",
+             "SONICBOOM_ATTN_DECODE_CHUNK set", 0);
+      return remember(c);
+    }
+  }
+
   if (const std::map<std::string, int> cached =
           ::sonicboom::tune::lookup("attention-decode", key);
       !cached.empty()) {
@@ -4087,40 +5284,70 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
     if (it != cached.end() && it->second > 0 &&
         (uint64_t)it->second <= (uint64_t)compiler::kAttentionDecodeMaxChunk) {
       const uint64_t c = (uint64_t)it->second;
-      std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
-      g_attn_decode_chunk[key] = c;
+      record(c, planner::decisions::Source::Cached,
+             "chunk=" + std::to_string(c) + " (per-device cache)",
+             "cached pick", 0);
       if (verbose)
         std::fprintf(stderr, "[autotune] attention-decode %s cached=chunk %llu\n",
                      key.c_str(), (unsigned long long)c);
-      return c;
+      return remember(c);
     }
   }
-  if (attn_capturing()) return default_chunk;
+  if (attn_capturing() || !::sonicboom::tune::enabled()) {
+    record(default_chunk, planner::decisions::Source::Default,
+           "no measurement", "class default", 0);
+    return remember(default_chunk);
+  }
+  // A plan being recorded (the plan golden / plan dump path) must be a
+  // function of the plan, not of a measurement taken on whatever device is
+  // recording it: the goldens pin the static class default. Normal runs still
+  // tune; the default is not remembered for this process, so a plan built
+  // after recording in the same process still tunes.
+  if (planner::recorder() != nullptr) {
+    record(default_chunk, planner::decisions::Source::Default, "plan recording",
+           "static class default while a plan record is installed", 0);
+    return default_chunk;
+  }
 
-  const uint64_t extent =
-      std::min<uint64_t>(std::max<uint64_t>(max_window, 1),
-                         kAttnDecodeTuneMaxExtent);
-  const uint64_t slots = std::min<uint64_t>(extent, 512);
-  AttnTuneBufs b;
+  // Measurement tiers: 1K, 4K, 16K, and the model capacity (capped). A tier at
+  // or below the previous one is dropped so short-capacity models are not
+  // measured twice at the same extent.
+  std::vector<uint64_t> depths;
+  const uint64_t cap =
+      std::max<uint64_t>(1, std::min<uint64_t>(capacity, kAttnDecodeTuneCapacityCap));
+  for (uint64_t d : kAttnDecodeTuneDepths)
+    if (depths.empty() || d > depths.back()) depths.push_back(d);
+  if (depths.empty() || cap > depths.back()) depths.push_back(cap);
+
+  // The synthetic KV is sized to the deepest tier, not to a small ring: a
+  // 512-slot ring times every depth with the cache resident in L2, so the pick
+  // would be blind to the DRAM traffic that dominates a real long context. One
+  // buffer per class; the worst case (Gemma's global class: 2 KV heads x 512
+  // dims x 32K keys at f16) is ~67 MiB per side. A sliding-window class touches
+  // at most window+1 distinct keys at any depth, so its buffer stops there —
+  // that ring is the real working set, not a cache-residency shortcut.
+  const uint64_t slots = std::max<uint64_t>(
+      1, sliding_window ? std::min<uint64_t>(depths.back(), sliding_window + 1)
+                        : depths.back());
   const size_t q_n = size_t(n_heads_q) * head_dim;
+  const size_t kv_elems = size_t(slots) * n_heads_kv * head_dim;
+  const size_t kv_bytes =
+      kv_q8 ? size_t(slots) * n_heads_kv * (head_dim + 4)
+            : kv_elems * (kv_f16 ? 2 : 4);
+  AttnTuneBufs b;
+  void *kc_raw = nullptr, *vc_raw = nullptr;
   bool ok =
       cudaMalloc(reinterpret_cast<void **>(&b.q), q_n * 4) == cudaSuccess;
-  ok = ok &&
-       cudaMalloc(reinterpret_cast<void **>(&b.kc), slots * n_heads_kv * head_dim * 4) ==
-           cudaSuccess;
-  ok = ok &&
-       cudaMalloc(reinterpret_cast<void **>(&b.vc), slots * n_heads_kv * head_dim * 4) ==
-           cudaSuccess;
-  ok = ok &&
-       cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
+  ok = ok && cudaMalloc(&kc_raw, kv_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(&vc_raw, kv_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.out), q_n * 4) == cudaSuccess;
   ok = ok && cudaMalloc(reinterpret_cast<void **>(&b.start), sizeof(uint64_t)) ==
                  cudaSuccess;
-  // Partial scratch sized for the smallest chunk (the most chunks).
+  // Partial scratch: the largest grid any candidate produces at the deepest
+  // tier (the smallest candidate).
   uint64_t max_chunks = 0;
   for (uint64_t c : kAttnDecodeTuneChunks)
-    max_chunks = std::max<uint64_t>(max_chunks, (extent + c - 1) / c);
-  max_chunks = std::max<uint64_t>(max_chunks, (extent + default_chunk - 1) /
-                                                  default_chunk);
+    max_chunks = std::max<uint64_t>(max_chunks, depths.back() / c + 1);
   float *partial = nullptr;
   const size_t partial_floats =
       size_t(max_chunks) * size_t(n_heads_q) * size_t(head_dim + 2);
@@ -4129,95 +5356,253 @@ uint64_t attn_decode_chunk_resolve(int head_dim, int gqa, int n_heads_q,
   if (!ok) {
     (void)cudaGetLastError();
     if (partial) cudaFree(partial);
-    return default_chunk;
+    if (kc_raw) cudaFree(kc_raw);
+    if (vc_raw) cudaFree(vc_raw);
+    record(default_chunk, planner::decisions::Source::Default,
+           "scratch allocation failed", "class default", 0);
+    return remember(default_chunk);
   }
   // Zeroed inputs: data-independent work, no denormals in the timing.
   cudaMemsetAsync(b.q, 0, q_n * 4, cur_stream());
-  cudaMemsetAsync(b.kc, 0, slots * n_heads_kv * head_dim * 4, cur_stream());
-  cudaMemsetAsync(b.vc, 0, slots * n_heads_kv * head_dim * 4, cur_stream());
+  cudaMemsetAsync(kc_raw, 0, kv_bytes, cur_stream());
+  cudaMemsetAsync(vc_raw, 0, kv_bytes, cur_stream());
   cudaMemsetAsync(b.out, 0, q_n * 4, cur_stream());
   cudaMemsetAsync(partial, 0, partial_floats * 4, cur_stream());
-  // One full window of keys is valid: start = 0 when the extent does not
-  // exceed the window, so the whole synthetic ring is exercised.
-  const uint64_t pos_host = extent - 1;
-  ok = cudaMemcpyAsync(b.start, &pos_host, sizeof(pos_host),
-                       cudaMemcpyHostToDevice, cur_stream()) == cudaSuccess;
-  if (!ok) {
-    (void)cudaGetLastError();
-    cudaFree(partial);
-    return default_chunk;
-  }
 
-  const auto t0 = std::chrono::steady_clock::now();
-  auto launch = [&](uint64_t c) {
-    const uint64_t n_chunks = (extent + c - 1) / c;
-    const float *qa = b.q;
-    const float *kca = b.kc;
-    const float *vca = b.vc;
-    const uint64_t *startp = b.start;
+  const float *kca = reinterpret_cast<const float *>(kc_raw);
+  const float *vca = reinterpret_cast<const float *>(vc_raw);
+  float *out_d = b.out;
+  uint64_t *start_d = b.start;
+
+  auto launch = [&](uint64_t c, uint64_t extent) {
+    // The grid a real decode launch would use at this depth: the window is the
+    // sliding window when there is one, else the cache extent (n_ctx). Sizing
+    // an SWA class from the extent would launch thousands of blocks that exit
+    // on their first compare, which is not what the model pays.
+    const uint64_t win = sliding_window ? sliding_window : extent;
+    const uint64_t n_chunks = (win - 1) / c + 2;
+    const uint64_t *startp = start_d;
     uint64_t nslots_arg = slots;
     int nhq_arg = n_heads_q;
     int nhkv_arg = n_heads_kv;
     uint64_t win_arg = sliding_window;
     float scale_arg = 1.0f / std::sqrt(float(head_dim));
     uint64_t chunk_arg = c;
-    float *out_arg = b.out;
+    float *out_arg = out_d;
     int nch_arg = int(n_chunks);
-    void *args[13] = {&qa,        &kca,       &vca,        &startp,
-                      &nslots_arg, &nhq_arg,  &nhkv_arg,   &win_arg,
-                      &scale_arg, &partial,   &chunk_arg,  &out_arg,
+    const float *q_arg = b.q;
+    void *args[13] = {&q_arg,      &kca,      &vca,       &startp,
+                      &nslots_arg, &nhq_arg, &nhkv_arg,  &win_arg,
+                      &scale_arg,  &partial, &chunk_arg, &out_arg,
                       &nch_arg};
     return planner::glue::launch_attention_decode(dsh, args, int(n_chunks),
                                                   n_heads_q);
   };
+  const auto time_at = [&](uint64_t c, uint64_t extent) {
+    const uint64_t pos_host = extent - 1;  // one full extent of valid keys
+    if (cudaMemcpyAsync(start_d, &pos_host, sizeof(pos_host),
+                        cudaMemcpyHostToDevice, cur_stream()) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return -1.0;
+    }
+    return ::sonicboom::tune::median_launch_ms(
+        [&] { return launch(c, extent); }, cur_stream(), 2, 5);
+  };
 
-  // Same recorder rule as the prefill tuner: a decode being recorded must not
+  // Weights: default favour long context; an env override is comma separated.
+  std::vector<double> weights;
+  if (const char *e = std::getenv("SONICBOOM_ATTN_DECODE_WEIGHTS")) {
+    std::string s(e), item;
+    for (char ch : s + ",") {
+      if (ch == ',') {
+        if (!item.empty()) weights.push_back(std::atof(item.c_str()));
+        item.clear();
+      } else {
+        item.push_back(ch);
+      }
+    }
+  }
+  if (weights.size() != depths.size()) {
+    weights.assign(depths.size(), 0.0);
+    for (size_t i = 0; i < depths.size(); ++i)
+      weights[i] = kAttnDecodeTuneWeights[std::min<size_t>(
+          i, sizeof(kAttnDecodeTuneWeights) / sizeof(double) - 1)];
+  }
+
+  // Analytic prune: a candidate whose smallest tier cannot fill the device
+  // with blocks is not measured (it cannot beat a wider grid).
+  const uint64_t sms = (uint64_t)sm_count();
+  std::vector<uint64_t> cands;
+  for (uint64_t c : kAttnDecodeTuneChunks) {
+    if (c > (uint64_t)compiler::kAttentionDecodeMaxChunk) continue;
+    const uint64_t blocks = (depths.front() / c + 1) * (uint64_t)n_heads_q;
+    if (c == default_chunk || blocks >= sms) cands.push_back(c);
+  }
+  if (std::find(cands.begin(), cands.end(), default_chunk) == cands.end())
+    cands.insert(cands.begin(), default_chunk);
+
+  // Same recorder rule as the prefill tuner: a decode being planned must not
   // carry the chunk candidates' launches.
   planner::PlanRecorder *saved_rec = planner::recorder();
   planner::set_thread_recorder(nullptr);
-  const double def_ms =
-      ::sonicboom::tune::median_launch_ms([&] { return launch(default_chunk); },
-                                          cur_stream(), 2, 5);
+  const auto t0 = std::chrono::steady_clock::now();
+  double best_score = -1.0;
   uint64_t best = default_chunk;
-  double best_ms = def_ms;
-  for (uint64_t c : kAttnDecodeTuneChunks) {
-    if (c == default_chunk || c > (uint64_t)compiler::kAttentionDecodeMaxChunk)
-      continue;
-    const double ms =
-        ::sonicboom::tune::median_launch_ms([&] { return launch(c); },
-                                            cur_stream(), 2, 5);
-    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms)) {
+  std::vector<std::pair<uint64_t, std::string>> timings;  // "C:ms,ms,..."
+  double total_w = 0.0;
+  for (double w : weights) total_w += w;
+  for (uint64_t c : cands) {
+    double score = 0.0;
+    bool valid = true;
+    std::string row = std::to_string(c) + ":";
+    for (size_t i = 0; i < depths.size(); ++i) {
+      const double ms = time_at(c, depths[i]);
+      if (ms < 0.0) {
+        valid = false;
+        break;
+      }
+      score += (weights[i] / (total_w > 0.0 ? total_w : 1.0)) * ms;
+      row += (i ? "," : "") + std::to_string(ms);
+    }
+    if (!valid) continue;
+    timings.emplace_back(c, row);
+    if (best_score < 0.0 || score < best_score) {
+      best_score = score;
       best = c;
-      best_ms = ms;
     }
   }
-  if (best_ms <= 0.0)
-    best = default_chunk;
-  else if (best != default_chunk && def_ms > 0.0 &&
-           !(best_ms < def_ms * (1.0 - kAttnSwitchMargin)))
+  const double def_score = [&] {
+    for (const auto &t : timings)
+      if (t.first == default_chunk) {
+        // Recompute is cheaper than storing a parallel score: the row holds
+        // the per-tier times.
+        std::string s = t.second.substr(t.second.find(':') + 1);
+        double sc = 0.0, wsum = 0.0;
+        size_t i = 0;
+        std::string item;
+        for (char ch : s + ",") {
+          if (ch == ',') {
+            if (i < depths.size() && i < weights.size()) {
+              sc += weights[i] * std::atof(item.c_str());
+              wsum += weights[i];
+            }
+            ++i;
+            item.clear();
+          } else {
+            item.push_back(ch);
+          }
+        }
+        return wsum > 0.0 ? sc / wsum : -1.0;
+      }
+    return -1.0;
+  }();
+  // Keep the default unless a candidate wins by the switch margin. A different
+  // C is a different (still position-only) reduction tree, so the margin also
+  // keeps a noisy measurement from moving the blessed split.
+  if (best_score < 0.0 || def_score < 0.0 ||
+      !(best_score < def_score * (1.0 - kAttnSwitchMargin)))
     best = default_chunk;
   planner::set_thread_recorder(saved_rec);
+  const double tune_s =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
   cudaFree(partial);
+  cudaFree(kc_raw);
+  cudaFree(vc_raw);
 
   ::sonicboom::tune::store("attention-decode", key, {{"chunk", int(best)}});
+  std::string inputs = "depths=";
+  for (size_t i = 0; i < depths.size(); ++i)
+    inputs += (i ? "|" : "") + std::to_string(depths[i]);
+  inputs += " weights=";
+  for (size_t i = 0; i < weights.size(); ++i)
+    inputs += (i ? "|" : "") + std::to_string(weights[i]);
+  inputs += " device=" + std::to_string(int(sms)) + "SMs";
+  std::string cand_times;
+  for (const auto &t : timings) cand_times += t.second + "|";
+  record(best, planner::decisions::Source::Measured, inputs,
+         "min weighted mean decode-attention ms at synthetic depths; " +
+             cand_times + " default kept unless beaten by the switch margin",
+         int64_t(std::llround(tune_s * 1000.0)));
   if (verbose)
     std::fprintf(stderr,
                  "[autotune] attention-decode %s default_chunk=%llu "
-                 "chosen_chunk=%llu default=%.4f ms chosen=%.4f ms tune=%.2f s\n",
+                 "chosen_chunk=%llu score=%.4f default_score=%.4f tune=%.2f s\n",
                  key.c_str(), (unsigned long long)default_chunk,
-                 (unsigned long long)best, def_ms, best_ms,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                               t0)
-                     .count());
-
-  {
-    std::lock_guard<std::mutex> lk(g_attn_decode_key_mutex);
-    g_attn_decode_chunk[key] = best;
-  }
-  return best;
+                 (unsigned long long)best, best_score, def_score, tune_s);
+  return remember(best);
 }
 
-} // namespace
+// Dense full attention (no mask, no window, no KV cache): every query attends
+// to every key in [0, n). The op's attributes (causal 0, kv_cache absent,
+// prefix_reuse impossible, window 0) are the class key; the class and its
+// implementation are resolved through the decision registry (full_resolve) and
+// recorded as `attention.class` / `tune/attention-full`. No model name and no
+// caller identity participates in the choice.
+//
+// The score-GEMM regime returns false when the shape or the scratch does not
+// fit (the caller then falls back to its own scalar kernel); every other
+// regime falls back to the hand-written tiled kernel instead. false means no
+// class of this op can run, never "this caller is the DiT".
+bool flash_attention_full_dev(const float* q, const float* k, const float* v,
+                              int n, int n_heads, int head_dim, float scale,
+                              float* out) {
+  if (!available()) return false;
+  if (n <= 0 || n_heads <= 0 || head_dim <= 0) return false;
+  if (!q || !k || !v || !out) return false;
+  if (n_heads > 32) return false;  // one warp per 16-row chunk, 16-warps cap
+
+  // This op has one K/V head per query head: GQA 1 is an attribute of the
+  // class, not an assumption about the caller.
+  const int gqa = 1;
+  const FullOverride ov = full_class_override();
+  if (ov.cls == FullClassName::Scalar) return false;
+
+  planner::decisions::Source src = planner::decisions::Source::Default;
+  double tune_s = 0.0;
+  int candidate_count = 0;
+  FullResolution r = full_resolve(n, n_heads, head_dim, gqa, ov, src, tune_s,
+                                  candidate_count);
+  bool fell_back = false;
+
+  if (r.cls == FullClass::ScoreGemm) {
+    const int vram = int(full_score_scratch_bytes(n, n_heads, head_dim));
+    if (full_attention_score_gemm(q, k, v, n, n_heads, head_dim, scale, out)) {
+      full_record_class(r, head_dim, gqa, n_heads, vram, /*fallback=*/false,
+                        src);
+      return true;
+    }
+    // Pinned to the score-GEMM regime: do not silently take another class.
+    if (ov.cls == FullClassName::ScoreGemm) return false;
+    // The shape/scratch cannot serve this regime; the tiled regime is the
+    // class's remaining implementation.
+    full_warn_once(
+        "score-GEMM regime unavailable at this shape; using the tiled "
+        "full-attention class");
+    src = planner::decisions::Source::Default;
+    tune_s = 0.0;
+    candidate_count = 0;
+    r = full_resolve_tiled(head_dim, gqa, n_heads, ov, src, tune_s,
+                           candidate_count);
+    fell_back = true;
+  }
+
+  full_record_tune(r, head_dim, gqa, n_heads, src, candidate_count, tune_s);
+  FullImpl ran = FullImpl::Own;
+  if (!full_attn_launch(r, head_dim, gqa, q, k, v, n, n_heads, scale, out,
+                        ran))
+    return false;
+  if (ran != r.impl) {
+    // The generated kernel did not launch: record what actually ran, under the
+    // same scope, so the registry counts the deviation as a conflict.
+    r.impl = ran;
+    r.tile = FullTile{0, 0, 0};
+  }
+  full_record_class(r, head_dim, gqa, n_heads, 0, fell_back, src);
+  return true;
+}
+
+void flash_attention_full_release_scratch() { release_full_scratch(); }
 
 bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    const float* v_batch, const float* k_cache,
@@ -4225,7 +5610,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t n_slots, int n, int n_heads_q,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
-                                   float* out, bool kv_f16) {
+                                   float* out, bool kv_f16, bool kv_q8) {
   if (!available()) return false;
   if (n <= 0 || n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || n_slots == 0)
     return false;
@@ -4278,7 +5663,10 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     attn_impl = e;
   std::optional<compiler::AttentionShape> shape;
   auto with_kv = [&](std::optional<compiler::AttentionShape> s) {
-    if (s) s->kv_f16 = kv_f16;
+    if (s) {
+      s->kv_f16 = kv_f16;
+      s->kv_q8 = kv_q8;
+    }
     return s;
   };
   if (attn_impl == "codegen") {
@@ -4291,13 +5679,15 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
       // pin does not move a class whose measured default is own.
       shape = with_kv(attn_codegen_shape(head_dim, gqa, windowed));
     } else {
-      const AttnChoice c = attn_resolve(head_dim, gqa, n_heads_q, n_heads_kv,
-                                        windowed, sliding_window, kv_f16);
+      const AttnChoice c =
+          attn_resolve(head_dim, gqa, n_heads_q, n_heads_kv, windowed,
+                       sliding_window, kv_f16, kv_q8);
       if (c.impl == AttnImpl::Codegen) {
         compiler::AttentionShape s = attn_prefill_shape(
             head_dim, gqa, windowed, c.br, c.bc, c.dps, c.wh, c.as, c.pack,
             c.qs == 0, c.hf);
         s.kv_f16 = kv_f16;
+        s.kv_q8 = kv_q8;
         if (compiler::attention_shape_supported(s)) shape = s;
       }
     }
@@ -4357,7 +5747,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (gqa == 4 && head_dim == 256) {
     const bool ok = launch_tiled_flash_attention_kv<256, 64, 2, 32, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
     if (ok)
       attn_trace_own<256, 64, 2, 32, 4>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
@@ -4366,7 +5756,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (gqa == 4 && head_dim == 512) {
     const bool ok = launch_tiled_flash_attention_kv<512, 32, 4, 16, 4>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
     if (ok)
       attn_trace_own<512, 32, 4, 16, 4>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
@@ -4375,7 +5765,7 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   if (gqa == 7 && head_dim == 64) {
     const bool ok = launch_tiled_flash_attention_kv<64, 64, 2, 32, 7>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
-        n_heads_kv, sliding_window, scale, out, kv_f16);
+        n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
     if (ok)
       attn_trace_own<64, 64, 2, 32, 7>(start, n, n_heads_kv, head_dim, gqa,
                            sliding_window);
@@ -4389,6 +5779,11 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
         q, k_batch, v_batch, reinterpret_cast<const __half*>(k_cache),
         reinterpret_cast<const __half*>(v_cache), start, n_slots, n_heads_q,
         n_heads_kv, head_dim, sliding_window, scale, out);
+  else if (kv_q8)
+    flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
+        q, k_batch, v_batch, reinterpret_cast<const int8_t*>(k_cache),
+        reinterpret_cast<const int8_t*>(v_cache), start, n_slots, n_heads_q,
+        n_heads_kv, head_dim, sliding_window, scale, out);
   else
     flash_attention_chunk_pos_kernel<<<n, n_heads_q * 32, smem, cur_stream()>>>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n_heads_q,
@@ -4396,7 +5791,9 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   const bool ok_scalar = cudaGetLastError() == cudaSuccess;
   if (ok_scalar)
     attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
-                       sliding_window, kv_f16 ? "own-scalar-kv16" : "own-scalar",
+                       sliding_window,
+                       kv_f16 ? "own-scalar-kv16"
+                              : kv_q8 ? "own-scalar-kv8" : "own-scalar",
                        "warp/head", 1, FA_BK, n, n_heads_q, n_heads_q * 32,
                        smem);
   return ok_scalar;
@@ -4459,6 +5856,29 @@ bool argmax_dev(const float* x, int n, float* out) {
   if (!keys) return false;
   SB_NOTE_LAUNCH(argmax_partial_kernel, grid, kThreads, 0, cur_stream());
   argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
+  SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
+  argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !mask || !out) return false;
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    SB_NOTE_LAUNCH(argmax_masked_kernel, 1, 1024, 0, cur_stream());
+    argmax_masked_kernel<<<1, 1024, 0, cur_stream()>>>(x, mask, out, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * sizeof(unsigned long long)));
+  if (!keys) return false;
+  SB_NOTE_LAUNCH(argmax_partial_masked_kernel, grid, kThreads, 0, cur_stream());
+  argmax_partial_masked_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
   SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
@@ -5690,11 +7110,25 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
 bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
                            const float* src_v, uint64_t start_pos,
                            uint64_t n_slots, int row_elems, int n,
-                           bool dst_f16) {
+                           bool dst_f16, bool dst_q8, int head_dim) {
   if (!available()) return false;
   if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
       n_slots == 0)
     return false;
+  if (dst_q8) {
+    if (head_dim <= 0 || row_elems % head_dim != 0) return false;
+    const int nhkv = row_elems / head_dim;
+    const int grid = n * nhkv;
+    SB_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
+    kv_append_batched_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_k), src_k, start_pos, n_slots, nhkv,
+        head_dim, n);
+    SB_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
+    kv_append_batched_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_v), src_v, start_pos, n_slots, nhkv,
+        head_dim, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
   const int grid = grid_for(row_elems * n);
   SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
@@ -5718,11 +7152,27 @@ bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
 bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
                                const float* src_v, const uint64_t* start_pos,
                                uint64_t n_slots, int row_elems, int n,
-                               bool dst_f16) {
+                               bool dst_f16, bool dst_q8, int head_dim) {
   if (!available()) return false;
   if (row_elems <= 0 || n <= 0 || !dst_k || !dst_v || !src_k || !src_v ||
       !start_pos || n_slots == 0)
     return false;
+  if (dst_q8) {
+    if (head_dim <= 0 || row_elems % head_dim != 0) return false;
+    const int nhkv = row_elems / head_dim;
+    const int grid = n * nhkv;
+    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
+                   cur_stream());
+    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_k), src_k, start_pos, n_slots, nhkv,
+        head_dim, n);
+    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
+                   cur_stream());
+    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_v), src_v, start_pos, n_slots, nhkv,
+        head_dim, n);
+    return cudaGetLastError() == cudaSuccess;
+  }
   const int grid = grid_for(row_elems * n);
   SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {

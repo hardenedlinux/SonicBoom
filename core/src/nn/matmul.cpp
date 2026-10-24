@@ -55,4 +55,25 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols,
   return true;
 }
 
+bool matmul_bf16(std::span<const uint16_t> W, uint64_t cols,
+                 std::span<const float> X, uint64_t n, std::span<float> Y) {
+  if (cols == 0) return W.empty() && n == 0;
+  const uint64_t rows = W.size() / cols;
+  if (rows == 0 || W.size() < cols * rows || X.size() < n * cols ||
+      Y.size() < n * rows) {
+    return false;
+  }
+  // Row-outer, token-inner: the weight row is loaded once and reused for all n
+  // tokens, and each output element is the same dot cpu_dot_bf16 computes.
+  ThreadPool::instance().parallel_for(0, rows, [&](uint64_t jb, uint64_t je) {
+    for (uint64_t j = jb; j < je; ++j) {
+      const std::span<const uint16_t> w = W.subspan(j * cols, cols);
+      for (uint64_t t = 0; t < n; ++t) {
+        Y[t * rows + j] = cpu_dot_bf16(w, X.subspan(t * cols, cols));
+      }
+    }
+  });
+  return true;
+}
+
 } // namespace sonicboom::nn

@@ -288,7 +288,9 @@ a small model answers in a predictable way so that the tests can check it.")
                        (vector-copy (ms-tokens s) 0 (min n (vector-length (ms-tokens s))))
                        #f)))
 
-(define (mock-prefill s tokens)
+;; The mock has no vocabulary and so no grammar support; it ignores the
+;; constraint. sample-from-logits still applies a procedure constraint in step.
+(define (mock-prefill s tokens _constraint)
   (let* ((model (ms-model s))
          (new (list->vector tokens))
          (reused (common-prefix-length (ms-tokens s) new))

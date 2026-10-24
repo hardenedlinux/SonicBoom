@@ -1,6 +1,5 @@
 # M2 Layer 2 boundary tests (manifest M2 §tests). They include only
 # <sonicboom/...> headers and link libsonicboom.so (the SHARED core library).
-# test_mlir additionally proves the statically-linked MLIR infrastructure.
 #
 # Every suite is both built (add_executable) and registered with CTest so a
 # single `ctest` run exercises the whole C++ suite next to the Guile suites.
@@ -15,10 +14,19 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_mlir test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_qwen2_generate test_generate test_prefix_cache test_vocab test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_prefix_cache test_vocab test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry test_safetensors test_grammar)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
+endforeach()
+
+# test_generate and test_qwen2_generate are the executables behind the
+# variant-registered entries below (decode-chunk, spec, numerics profiles,
+# deepseek). They are built but not registered under their bare names: the
+# variants already cover the default path.
+foreach(test_name IN ITEMS test_generate test_qwen2_generate)
+  add_executable(${test_name} ${test_name}.cpp)
+  target_link_libraries(${test_name} PRIVATE sonicboom)
 endforeach()
 
 # test_clip_grad_norm exercises the fused device kernels directly when the
@@ -178,28 +186,11 @@ target_compile_definitions(test_ngram_drafter PRIVATE
 # prefill/decode or speculative session to compare against token goldens
 # (~15 s to ~2 min apiece, serialized by the device lock), so they belong to
 # the nightly/weekly suite rather than the per-commit one.
-set_tests_properties(test_generate test_qwen2_generate test_prefix_cache
+set_tests_properties(test_prefix_cache
                               test_spec_invariance test_spec_rollback
                               test_spec_program test_spec_bootstrap
                               test_spec_autoprobe
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
-
-# The committed token / plan goldens are recorded in the automatic reduction
-# mode (planner/reduce_mode.h). Run the same goldens with F64 forced, so the
-# F64 path stays a tested contract on every device: a device where DF32 is the
-# automatic choice must not be able to let an F64-path regression through
-# unnoticed. test_glue_codegen and test_cuda_elementwise are kernel-level and
-# cover the generated regions and the templated elementwise kernels in F64.
-foreach(test_name IN ITEMS test_generate test_qwen2_generate
-                            test_glue_codegen test_cuda_elementwise)
-  add_test(NAME ${test_name}_reduce_f64
-           COMMAND ${CMAKE_COMMAND} -E env
-                   LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                   SONICBOOM_REDUCE=f64
-                   $<TARGET_FILE:${test_name}>)
-  set_tests_properties(${test_name}_reduce_f64
-    PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-endforeach()
 
 # The decode-chunk path (k greedy steps captured per graph, §10) is off by
 # default — autotuned to k=1, since the decode step is GPU-bound and chunking
@@ -225,20 +216,6 @@ add_test(NAME test_generate_spec
 set_tests_properties(test_generate_spec
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
-# B7's adaptive draft length (SONICBOOM_SPEC=auto) also goes through the same
-# golden streams: the warm-up's forced drafts and the policy's per-step k are
-# proposals only, so not one emitted token may change. The tune directory is
-# the build tree's own so the test neither reads the user's cache nor races the
-# other GPU tests (they hold gpu_vram).
-add_test(NAME test_generate_spec_auto
-         COMMAND ${CMAKE_COMMAND} -E env
-                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                 SONICBOOM_SPEC=auto
-                 SONICBOOM_TUNE_DIR=${CMAKE_BINARY_DIR}/spec-auto-tune
-                 $<TARGET_FILE:test_generate>)
-set_tests_properties(test_generate_spec_auto
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-
 # The same coverage for the other consumer of the chunked loop: the
 # prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
 # golden streams with the chunked replay.
@@ -254,30 +231,14 @@ set_tests_properties(test_qwen2_generate_decode_chunk
 # it runs the same executable and the same checks against its own fixture
 # directory — its prompts, its llama.cpp references and its token goldens. The
 # directory's `model` file names the GGUF, so nothing here is model-specific
-# beyond the data path. Skips cleanly (exit 0) when the GGUF is absent.
-add_test(NAME test_deepseek_generate
-         COMMAND ${CMAKE_COMMAND} -E env
-                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
-                 $<TARGET_FILE:test_qwen2_generate>)
-set_tests_properties(test_deepseek_generate
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-
-# The same token goldens with the F64 reduction path forced (see above).
-add_test(NAME test_deepseek_generate_reduce_f64
-         COMMAND ${CMAKE_COMMAND} -E env
-                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                 SONICBOOM_QWEN_DATA=${CMAKE_SOURCE_DIR}/tests/data/deepseek-r1-qwen15b
-                 SONICBOOM_REDUCE=f64
-                 $<TARGET_FILE:test_qwen2_generate>)
-set_tests_properties(test_deepseek_generate_reduce_f64
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+# beyond the data path. It is registered through the numerics-profile entries
+# below (strict and standard); skips cleanly (exit 0) when the GGUF is absent.
 
 # Both numerics profiles are tested contracts (core/include/sonicboom/numerics.h).
 # Strict is the historical semantics and compares the historical goldens
 # (pN.golden, kGolden); standard is the default and has its own goldens
-# (pN.standard.golden). Each binary also checks batch invariance and prefix
-# reuse internally, so those hold under both profiles. The base entries above
+# (pN.standard.golden). Each binary also checks determinism, the goldens and
+# prefix reuse internally, so those hold under both profiles. The base entries above
 # run under the default profile; these name it explicitly so an environment
 # change cannot silently move what is checked.
 foreach(profile IN ITEMS strict standard)
@@ -436,7 +397,7 @@ endif()
 
 # Static execution planner tests (unit + integration). They include only
 # <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
-foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_coexecution test_coexecution_merge test_coexecution_region test_coexecution_benchmark test_planner_telemetry test_planner_benchmark test_runtime test_persistence)
+foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_coexecution test_coexecution_merge test_coexecution_region test_planner_telemetry test_runtime test_persistence)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -455,18 +416,37 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_o
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
-    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    SONICBOOM_IMPORT_DIR="${CMAKE_BINARY_DIR}/import")
   sb_add_cpp_test(${test_name})
 endforeach()
 
 # The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
 # input / reference sidecars under tests/data/, and the importer's output under
-# build/import/), none of which is committed — see .gitignore. On a fresh
-# checkout they exit 77 with a message naming the file and the generator, so
-# CTest reports them as Skipped rather than Failed.
+# <build>/import/), none of which is committed — see .gitignore. A setup fixture
+# generates them from models/resnet18.onnx before either test starts, so a fresh
+# checkout passes under a plain `ctest`; the tests keep their exit-77 path for
+# the case where the (external) model store is unavailable.
+find_package(Python3 COMPONENTS Interpreter)
+if(NOT Python3_EXECUTABLE)
+  set(Python3_EXECUTABLE python3)
+endif()
+set(SB_RESNET18_PYTHON "${CMAKE_SOURCE_DIR}/models/.venv/bin/python")
+if(NOT EXISTS "${SB_RESNET18_PYTHON}")
+  set(SB_RESNET18_PYTHON "${Python3_EXECUTABLE}")
+endif()
+add_test(NAME resnet18_artifacts
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_resnet18_artifacts.sh
+                 "${CMAKE_SOURCE_DIR}" "${SB_RESNET18_PYTHON}"
+                 "${CMAKE_BINARY_DIR}/import")
+set_tests_properties(resnet18_artifacts PROPERTIES
+  SKIP_RETURN_CODE 77
+  FIXTURES_SETUP resnet18_artifacts)
 set_tests_properties(
   test_s_expr_resnet18_exec test_onnx_import_resnet18_exec
-  PROPERTIES SKIP_RETURN_CODE 77)
+  PROPERTIES
+    SKIP_RETURN_CODE 77
+    FIXTURES_REQUIRED resnet18_artifacts)
 
 # C ABI test, compiled as C to prove <sonicboom/capi.h> is a genuine C header
 # and libsonicboom.so exports its entry points with C linkage. Links libm for

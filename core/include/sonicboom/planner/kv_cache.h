@@ -32,13 +32,38 @@
 
 namespace sonicboom::planner {
 
+// Element type of the KV cache. The strict numerics profile stores f32 (the
+// pre-rounding values); the standard profile stores f16, or q8 once the
+// quantization arm is enabled. q8 is not a drop-in narrower dtype: a row is
+// `head_dim` int8 values followed by one f32 scale (symmetric, per (slot, KV
+// head), scale = max|x| / 127), so the row stride is head_dim + 4 bytes and
+// every reader dequantizes on load.
+enum class KvDtype { F32, F16, Q8 };
+
+// Bytes of one q8 KV row: head_dim int8 values then the f32 scale. head_dim is
+// a multiple of 32, so the scale lands 4-byte aligned.
+constexpr uint64_t kv_q8_row_bytes(uint64_t head_dim) noexcept {
+  return head_dim + 4;
+}
+
+// Bytes of one (slot, KV head) row in `dtype`.
+constexpr uint64_t kv_row_bytes(KvDtype dtype, uint64_t head_dim) noexcept {
+  switch (dtype) {
+    case KvDtype::F32: return head_dim * sizeof(float);
+    case KvDtype::F16: return head_dim * sizeof(uint16_t);
+    case KvDtype::Q8: return kv_q8_row_bytes(head_dim);
+  }
+  return head_dim * sizeof(float);
+}
+
 // One KV layer's persistent device-resident cache (moved here from
 // SonicCudaBackend so a session can own it). K is RoPE'd + per-head-normed then
 // fp16-rounded; V per-head-normed then fp16-rounded. Flat
-// [n_slots, n_heads_kv, head_dim]; slot for absolute position j is
-// `j % n_slots`. Element type: f32 under the strict numerics profile, f16
-// under standard (`f16`). Reading an f16 row and widening is exact, since the
-// values were fp16-rounded before either storage existed.
+// [n_slots, n_heads_kv, row]; slot for absolute position j is `j % n_slots`.
+// Element type: f32 under the strict numerics profile, f16 or q8 under
+// standard. Reading an f16 row and widening is exact, since the values were
+// fp16-rounded before either storage existed; q8 re-quantizes those same
+// fp16-rounded values (see KvDtype).
 struct KvCacheDev {
   hal::Buffer k_buf;
   hal::Buffer v_buf;
@@ -46,7 +71,10 @@ struct KvCacheDev {
   uint64_t n_slots = 0;
   uint64_t n_heads_kv = 0;
   uint64_t head_dim = 0;
-  bool f16 = false;    // element type of k_buf/v_buf (standard profile)
+  KvDtype dtype = KvDtype::F32;  // element type of k_buf/v_buf
+
+  bool f16() const noexcept { return dtype == KvDtype::F16; }
+  bool q8() const noexcept { return dtype == KvDtype::Q8; }
 };
 
 // Static KV-cache geometry the CUDA backend needs to allocate and index the

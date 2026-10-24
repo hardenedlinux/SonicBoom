@@ -1,9 +1,13 @@
 # Route 2 C ABI draft: the inference backend behind `(sonicboom serve backend)`
 
-Status: **draft**, nothing implemented. This document maps the backend protocol
-of the Guile inference service (`bindings/guile/scheme/sonicboom/serve/backend.scm`)
-to the C ABI that `libsonicboom.so` would need to export, so the mock backend
-can be replaced by a libsonicboom one without changing the service.
+Status: the serving path is implemented — `(sonicboom serve real-backend)`
+drives `libsonicboom.so` through these functions. §2 keeps the design's fuller
+declaration list; what the path does not use yet is listed in §6.
+
+This document maps the backend protocol of the Guile inference service
+(`bindings/guile/scheme/sonicboom/serve/backend.scm`) to the C ABI that
+`libsonicboom.so` exports, so the mock backend can be replaced by a
+libsonicboom one without changing the service.
 
 "Route 2" is Path 2 of the execution-path plan: GGUF → model loader →
 planner spine → native-torch / hand-written CUDA / MLIR kernels (Gemma 4 E4B
@@ -36,7 +40,7 @@ The prefix `sb_llm_` keeps these functions apart from the S-Expr graph API
 | `prefill` | `sb_llm_prefill` | returns the number of reused tokens |
 | sampler (`make-sampler`) | `sb_llm_sampler_new`, `sb_llm_sampler_free` | parameters + random state |
 | `step` | `sb_llm_step` | sample, append, return the token |
-| constraint hook | `sb_llm_constraint` (struct of a callback) | optional argument of `sb_llm_step` |
+| constraint hook | `sb_llm_session_set_grammar`, `sb_llm_session_set_json_schema`, `sb_llm_session_clear_grammar` | installed on the session, restarted by each prefill |
 | `backend-stats` | `sb_llm_model_get_stats` | prefill / reuse / step counters |
 
 Chat templates stay out of the ABI on purpose: GGUF carries the template as
@@ -173,11 +177,29 @@ sb_status sb_llm_step(sb_llm_session *session, sb_llm_sampler *sampler,
   seed reproduces a request on the same build and device. The GPU sampler may
   use a counter-based generator (Philox); its stream need not match the CPU
   one, in line with the v1 rule that GPU numerics need not be bit-identical.
-- **Constraint.** The callback runs on the calling thread, synchronously,
-  before sampling; the mask is applied to the logits on the device. It must not
-  call into the same session, nor unwind (no `longjmp`, no exceptions). A
-  native grammar handle (JSON schema / GBNF compiled once, evaluated in C) can
-  be added later as a second constraint kind without changing `sb_llm_step`.
+- **Constraint (constrained decoding).** A session may carry a grammar
+  (`sb_llm_session_set_grammar`, `sb_llm_session_set_json_schema`). The
+  grammar consumes the text a token spells — the same bytes
+  `sb_llm_detokenize` emits — and the allowed-token bitmap is applied to the
+  logits on the device by the argmax kernel. The model's EOS ids are the
+  grammar's stop tokens: they are allowed only where the grammar can end, and
+  a stop that finishes it ends the output and is not emitted. The grammar
+  restarts at every `sb_llm_prefill`, so installing it before the prefill also
+  masks the turn's first token. `sb_llm_json_schema_to_gbnf` is the schema
+  compiler alone, with optional literal PREFIX/SUFFIX (how the server composes
+  the `<tool_call>` envelope); unsupported schema keywords are rejected by
+  name, never silently ignored. A bare schema compiles to JSON text (RFC 8259),
+  so up to 16 bytes of whitespace may precede the value and none may follow it
+  (a finished value leaves only the stop tokens); an envelope is matched
+  exactly. `sb_llm_session_clear_grammar` returns to plain
+  greedy decoding. Installing the grammar a session already holds resets it in
+  place instead of recompiling, so a server that applies one constraint turn
+  after turn keeps its vocabulary trie and the masks of the states it has
+  visited warm (the first visit to a permissive state walks the whole trie).
+  An unconstrained decode uses the same captured (masked) argmax kernel with an
+  all-ones buffer, so it is bit-identical to the unmasked path. Without a CUDA device the CPU fallback recomputes the mask per token
+  and re-prefills the history (O(n^2)) — the CPU reference path's price, not
+  the performance target.
 - **Context.** `prefill` or `step` past `n_ctx` returns `SB_ERR_CONTEXT`
   and leaves the session unchanged.
 
@@ -201,30 +223,32 @@ sb_status sb_llm_step(sb_llm_session *session, sb_llm_sampler *sampler,
 
 ## 5. Guile side
 
-A future `(sonicboom serve libsonicboom-backend)` module builds a `make-backend`
-record from these functions through `(system foreign)`, in the style of
-`bindings/guile/scheme/sonicboom/ffi.scm`:
+`(sonicboom serve real-backend)` builds a `make-backend` record from these
+functions through `(system foreign)` (`bindings/guile/scheme/sonicboom/ffi.scm`
+plus the `(sonicboom inference)` wrappers):
 
 - handles become pointers wrapped with finalizers (safe thanks to §4's
   reference counting);
 - `tokenize` / `detokenize` use the two-call sizing;
 - `detokenize` returns bytes; the binding decodes UTF-8 with replacement, and
   the engine already holds back a trailing U+FFFD until the next token;
-- a constraint procedure `(candidates) -> candidates` becomes an
-  `allow` callback via `procedure->pointer` filling the mask.
+- constrained decoding is `set-grammar!` / `set-json-schema!` /
+  `json-schema->gbnf` on the session; the serve layer passes its grammar
+  record to the prefill of each turn, and a `#f` from `step` (the grammar's
+  stop token ended the reply) becomes `finish_reason: stop`.
+- a procedure constraint `(candidates) -> candidates` is applied by the mock
+  backend's sampler on the host.
 
-The service above the backend (sessions, engine, OpenAI format, HTTP) stays as
-is.
+## 6. What the core provides
 
-## 6. What the core needs for this
-
-| needed | today |
+| the serving path uses | today |
 |---|---|
-| step-wise prefill / decode on a persistent session | `generate_prefill_spine_cuda_prefix` runs a whole greedy generation per call |
-| sampler (temperature, top-k, top-p, seed) | greedy argmax only |
-| logit mask before sampling | none |
-| tokenizer from GGUF (`tokenizer.ggml.*`) | the GGUF reader reads string arrays; no tokenizer yet |
-| family / EOS ids from GGUF metadata | config parsing exists for Gemma 4; EOS not exported |
-| session fork (KV prefix copy) | none |
-| context-full detection as a status | the prefix function returns 0 tokens |
-| stats counters | none |
+| persistent sessions | `sb_llm_session_new` over `planner::KvCacheSession`; `sb_llm_prefill` keeps the longest common prefix |
+| sampling (temperature, top-k, top-p, seed) | `sb_llm_decode` |
+| logit mask before sampling | the session's compiled grammar; the argmax kernel applies its bitmap |
+| tokenizer and EOS ids from GGUF metadata | `sb_llm_tokenize(_ex)`, `sb_llm_detokenize`, `sb_llm_model_eos` |
+
+Not in the ABI yet: session fork (`sb_llm_session_fork`), a per-step sampler
+(`sb_llm_sampler_new` / `sb_llm_step` — `sb_llm_decode` runs a request's steps
+through a token callback instead), and stats counters. The service above the
+backend supplies its own request statistics.

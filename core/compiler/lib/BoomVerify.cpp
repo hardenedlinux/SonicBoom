@@ -565,7 +565,62 @@ mlir::LogicalResult GraphOp::verify() {
                   "activation is";
     }
 
-    // 5e. Elementwise shapes.
+    // 5e. Split-KV decode schedule. A decode attention op may state its split
+    //     schedule explicitly: `decode_chunk` (keys per split) and
+    //     `decode_combine` (how the per-split partials are merged). The only
+    //     schedule whose reduction tree is a function of absolute key
+    //     positions is a fixed chunk size over absolute boundaries
+    //     (chunk index = key position / chunk) merged in ascending chunk index;
+    //     the split count then follows the depth. Anything that would make the
+    //     tree depend on the total length or the cache capacity — which change
+    //     with n_ctx and prefix reuse, and would break batch invariance — is
+    //     rejected here rather than left to the backend's discretion.
+    auto recordedValue = [&](llvm::StringRef name) -> mlir::Attribute {
+      for (const NamedAttribute &attr : recorded)
+        if (attr.getName().getValue() == name)
+          return attr.getValue();
+      return {};
+    };
+    auto chunkAttr = llvm::dyn_cast_or_null<mlir::IntegerAttr>(
+        recordedValue("decode_chunk"));
+    auto combineAttr = llvm::dyn_cast_or_null<mlir::StringAttr>(
+        recordedValue("decode_combine"));
+    if (chunkAttr || combineAttr) {
+      if (opName != "attention")
+        return op.emitOpError()
+               << "carries a split-KV decode schedule, but is not a "
+                  "boom.attention";
+      if (!chunkAttr || !combineAttr)
+        return op.emitOpError()
+               << "carries a split-KV decode schedule without both "
+                  "`decode_chunk` and `decode_combine`";
+      if (chunkAttr.getInt() < 1 || chunkAttr.getInt() > 256)
+        return op.emitOpError()
+               << "has decode_chunk = " << chunkAttr.getInt()
+               << ", which is outside 1..256 keys per split";
+      if (combineAttr.getValue() != "chunk_index_asc")
+        return op.emitOpError()
+               << "has decode_combine = '" << combineAttr.getValue()
+               << "', but the only schedule whose reduction tree depends on "
+                  "absolute key positions alone is 'chunk_index_asc'";
+      for (const NamedAttribute &attr : recorded) {
+        const llvm::StringRef name = attr.getName().getValue();
+        if (name.starts_with("decode_") && name != "decode_chunk" &&
+            name != "decode_combine")
+          return op.emitOpError()
+                 << "carries the schedule attribute '" << name
+                 << "', which the verifier cannot prove position-only";
+        if (name == "n_ctx" || name == "capacity" || name == "n_keys" ||
+            name == "seq_len" || name == "total_length" ||
+            name == "n_chunks" || name == "prefix_length")
+          return op.emitOpError()
+                 << "carries '" << name
+                 << "', which would make the split-KV reduction tree depend "
+                    "on the total length or the cache capacity";
+      }
+    }
+
+    // 5f. Elementwise shapes.
     const llvm::StringRef shapeOpName = op.getName().getStringRef();
     if (isShapePreserving(shapeOpName) && op.getNumOperands() &&
         op.getNumResults() && boomValueShape(op.getOperand(0).getType()) !=
@@ -595,7 +650,7 @@ mlir::LogicalResult GraphOp::verify() {
                << boomValueShape(op.getResult(0).getType());
     }
 
-    // 5f. Register this op's results, so the next op's operands resolve.
+    // 5g. Register this op's results, so the next op's operands resolve.
     auto resultIds = op.getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");
     for (auto [index, id] : llvm::enumerate(resultIds.asArrayRef()))
       tensorOf[op.getResult(index)] = id;

@@ -416,7 +416,14 @@ def convert(model, sidecar_name="weights.bin"):
         defined.add(out_name)
 
         attr_forms = node_attrs(node)
-        nodes.append((op, list(node.input), out_name, out_dtype, out_shape, attr_forms))
+        # Reshape's second ONNX operand is the target-shape tensor, already
+        # resolved into out_shape above. The executor's reshape takes one
+        # operand (the shape lives in its result type), so emitting the shape
+        # constant as a second input failed the compiler's arity check.
+        emit_inputs = [node.input[0]] if op == "reshape" else list(node.input)
+        nodes.append(
+            (op, emit_inputs, out_name, out_dtype, out_shape, attr_forms)
+        )
 
     # --- graph outputs -------------------------------------------------------
     outputs = []

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+
+# Locale-independent output: numbers must parse/print identically everywhere.
+export LC_ALL=C LANG=C
+# Build the llama.cpp greedy-continuation reference tool (M3 rope scaling
+# comparison). Dev-time only: links llama.cpp, not SonicBoom.
+set -euo pipefail
+
+LLAMA_ROOT="${LLAMA_ROOT:?set LLAMA_ROOT to the llama.cpp checkout}"
+LLAMA_BIN="${LLAMA_BIN:-$LLAMA_ROOT/build/bin}"
+
+CXX="${CXX:-g++}"
+CXXFLAGS="-std=c++17 -O2 -I$LLAMA_ROOT/include -I$LLAMA_ROOT/ggml/include"
+
+LDFLAGS="-L$LLAMA_BIN -Wl,-rpath,$LLAMA_BIN \
+  -lllama -lggml-cpu -lggml -lggml-base"
+
+"$CXX" $CXXFLAGS "$(dirname "$0")/llama_gen_tokens.cpp" \
+  -o "$(dirname "$0")/llama_gen_tokens" $LDFLAGS
+
+echo "built $(dirname "$0")/llama_gen_tokens"

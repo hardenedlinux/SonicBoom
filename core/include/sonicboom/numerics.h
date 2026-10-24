@@ -24,10 +24,16 @@
 //   standard  the default. f16 KV storage (the values stored were already
 //             fp16-rounded, so the storage change is exact) and the device
 //             reduction mode as resolved for the device. It is deterministic
-//             and batch-invariant on a given device exactly as strict is; the
-//             two profiles may differ from each other, and standard is the
-//             one held to the perceptual gate (perplexity, top-1 agreement)
+//             and prefix-reuse invariant on a given device exactly as strict
+//             is; the two profiles may differ from each other, and standard is
+//             the one held to the perceptual gate (perplexity, top-1 agreement)
 //             rather than bit identity.
+//
+// Both profiles guarantee determinism, prefix-reuse identity and KV-capacity
+// independence. Prefill-vs-decode identity is not guaranteed in either: a
+// batched prefill and the same tokens fed one at a time may use different
+// arithmetic. Speculative decoding on/off is nevertheless bit-identical: the
+// verify step uses decode arithmetic for every row (test_spec_invariance).
 //
 // Selection, resolved once per process:
 //
@@ -86,6 +92,22 @@ bool set_numerics_profile(NumericsProfile profile, std::string *error);
 //   profile default -- it is gate-blocked, reachable only through
 //   SONICBOOM_DENSE_F32=tf32).
 bool numerics_profile_f16_kv();
+
+// KV-cache element type. Under the standard profile the cache may be f16 or
+// q8; the q8 row is `head_dim` int8 values plus that row's f32 scale, so it
+// halves the bytes again at the cost of a per-row quantization error. The
+// strict profile is f32 (its contract pins the pre-rounding values).
+enum class KvStorage { F32, F16, Q8 };
+
+const char *numerics_kv_storage_name(KvStorage storage) noexcept;
+
+// The resolved cache storage. Resolves and records the decision on first call;
+// SONICBOOM_KV (auto|f32|f16|q8) overrides it. Resolved independently of the
+// profile latch so a test can select the arm in standard numerics.
+KvStorage numerics_kv_storage();
+
+// Tests only: forget the resolution (the registry record is dropped with it).
+void reset_numerics_kv_storage_for_test();
 
 // Tests only: forget the resolution, so the next call re-reads the
 // environment. The registry record is dropped with it.

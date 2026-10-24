@@ -19,9 +19,12 @@
 #include "../quant/foreign_dequant.h"
 #include "../quant/ggml_derived/quantize_q5_k.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <numbers>
 #include <string>
 #include <string_view>
 
@@ -99,6 +102,127 @@ std::optional<std::string_view> read_string(const gguf::Reader& r,
   const gguf::Value* v = r.find(key);
   if (!v || v->type != gguf::ValueType::String) return std::nullopt;
   return std::string_view(v->s);
+}
+
+// --- generic RoPE frequency scaling -----------------------------------------
+//
+// `{arch}.rope.scaling.*` is the GGUF form of the long-context RoPE schemes
+// (linear and YaRN; llama.cpp's parser lives in llama-model.cpp, the per-pair
+// arithmetic in ggml's rope_yarn). The kernels here express a per-pair
+// frequency multiplier as a DIVISOR in the same `freq_factors` slot Gemma's
+// precomputed `rope_freqs.weight` uses:
+//
+//   theta(i) = pos * base^(-2i/d) / ff[i]
+//
+// llama.cpp computes theta = theta_extrap * alpha(i), where
+//   alpha(i) = freq_scale*(1 - ramp(i)*ext) + ramp(i)*ext
+// with freq_scale = 1/factor, ext = 0 for linear and 1 for YaRN (a YaRN file
+// without a factor is the identity, because freq_scale = 1). So ff[i] =
+// 1/alpha(i) reproduces every scheme in the existing kernels, on CPU and GPU,
+// with no model-specific code and no new kernel entry point.
+//
+// The ramp and its correction dims are ggml's verbatim formulas:
+//   corr(beta) = n_rot*ln(orig_ctx/(beta*2*pi)) / (2*ln(base))
+//   lo = max(0, floor(corr(beta_fast)))   hi = min(n_rot-1, ceil(corr(beta_slow)))
+//   ramp(i) = 1 - clamp((i - lo)/max(0.001, hi - lo), 0, 1)
+// YaRN also has a magnitude term: llama.cpp multiplies cos and sin by
+// m = (1 + 0.1*ln factor) (times `attn_factor`), i.e. q and k each by m and the
+// scores by m^2. It is not a frequency, so it does not belong in ff; it is
+// returned in `rope_attn_scale`, which the emitter folds into the attention
+// temperature (see the weights field). That is exact only with full rope, which
+// is the only YaRN configuration accepted here.
+//
+// A precomputed `rope_freqs.weight` table, when present, is multiplied in: the
+// kernels divide by ff, and two chained divisors compose by multiplication.
+//
+// Returns an error string on unsupported metadata; sets nothing when the file
+// requests no scaling. `head_dim` is the largest per-layer head dim (the table
+// covers head_dim/2 pairs; pairs past `rope.dimension_count` keep ff = 1).
+std::optional<std::string> apply_rope_scaling(const gguf::Reader& r,
+                                              std::string_view arch,
+                                              uint32_t head_dim, float base,
+                                              uint64_t ctx_train,
+                                              Gemma4Weights& w) {
+  const std::string p(arch);
+  auto key = [&](std::string_view suffix) { return p + std::string(suffix); };
+
+  const auto type = read_string(r, key(".rope.scaling.type"));
+  if (!type || *type == "none") return std::nullopt;
+  if (*type != "linear" && *type != "yarn")
+    return "unsupported rope scaling type: " + std::string(*type);
+
+  const auto factor = read_f64(r, key(".rope.scaling.factor"));
+  if (!factor || *factor <= 0.0) return std::nullopt;  // unset == identity
+  // `attn_factor` is YaRN's magnitude scale (llama.cpp multiplies it into the
+  // net mscale, see below); anything else in the file is frequency scaling.
+  const double attn_factor =
+      read_f64(r, key(".rope.scaling.attn_factor")).value_or(1.0);
+  if (const auto lm = read_f64(r, key(".rope.scaling.yarn_log_multiplier"));
+      lm && std::abs(*lm - 1.0) > 1e-6)
+    return "unsupported yarn_log_multiplier (magnitude scaling)";
+
+  const bool yarn = (*type == "yarn");
+  const double fs = 1.0 / *factor;
+  uint32_t n_rot = head_dim;
+  if (const auto v = read_u64(r, key(".rope.dimension_count"));
+      v && *v > 0 && *v <= head_dim)
+    n_rot = uint32_t(*v);
+  const uint64_t orig =
+      read_u64(r, key(".rope.scaling.original_context_length")).value_or(ctx_train);
+  const double beta_fast =
+      read_f64(r, key(".rope.scaling.yarn_beta_fast")).value_or(32.0);
+  const double beta_slow =
+      read_f64(r, key(".rope.scaling.yarn_beta_slow")).value_or(1.0);
+
+  double lo = 0.0, hi = 0.0;
+  if (yarn) {
+    const auto corr = [&](double beta) {
+      return double(n_rot) *
+             std::log(double(orig) / (beta * 2.0 * std::numbers::pi)) /
+             (2.0 * std::log(double(base)));
+    };
+    lo = std::max(0.0, std::floor(corr(beta_fast)));
+    hi = std::min(double(n_rot) - 1.0, std::ceil(corr(beta_slow)));
+  }
+
+  std::vector<float> table(head_dim / 2, 1.0f);
+  for (size_t i = 0; i < n_rot / 2; ++i) {
+    double alpha = fs;
+    if (yarn) {
+      const double y = (double(i) - lo) / std::max(0.001, hi - lo);
+      const double ramp = 1.0 - std::min(1.0, std::max(0.0, y));
+      alpha = fs * (1.0 - ramp) + ramp;  // ext = 1 for YaRN
+    }
+    table[i] = alpha > 0.0 ? float(1.0 / alpha) : 1.0f;
+  }
+
+  if (!w.rope_freqs.empty()) {
+    if (w.rope_freqs.size() != table.size())
+      return "rope scaling covers " + std::to_string(table.size()) +
+             " pairs but rope_freqs.weight has " +
+             std::to_string(w.rope_freqs.size());
+    for (size_t i = 0; i < table.size(); ++i) table[i] *= w.rope_freqs[i];
+  }
+  w.rope_freqs_table = std::move(table);
+  w.rope_freqs = w.rope_freqs_table;
+
+  // YaRN's magnitude scale. llama.cpp computes m = (factor>1 ? 1 + 0.1*ln
+  // factor : 1) and applies it to cos and sin (the `attn_factor` key scales it
+  // once more), so q and k are each multiplied by m and the attention scores by
+  // m^2. Folding m^2 into the emitted attention temperature is exact only when
+  // EVERY rope pair is rotated: with partial rope the unrotated tail is also
+  // m-scaled by that formulation, which a score scale cannot reproduce. Refuse
+  // that combination instead of computing a different model.
+  if (yarn) {
+    if (n_rot != head_dim)
+      return "YaRN scaling with partial rope (rope.dimension_count " +
+             std::to_string(n_rot) + " of " + std::to_string(head_dim) +
+             ") is not supported";
+    const double m =
+        (*factor <= 1.0 ? 1.0 : 1.0 + 0.1 * std::log(*factor)) * attn_factor;
+    w.rope_attn_scale = float(m * m);
+  }
+  return std::nullopt;
 }
 
 // Tensor binding with exact type + shape validation. All errors accumulate into
@@ -475,6 +599,14 @@ std::expected<Gemma4Model, std::string> load_qwen2(const gguf::Reader& r) {
 
   if (!errs.empty()) return std::unexpected(std::move(errs));
 
+  // Generic long-context RoPE scaling (qwen2.rope.scaling.*). Every Qwen2 layer
+  // applies the same table; the kind==Global gate at the rope call sites is the
+  // Gemma partial-RoPE rule, which is satisfied here because all layers are
+  // global.
+  if (auto err = apply_rope_scaling(r, "qwen2", c.head_dim_global, c.rope_base,
+                                    c.context_length, w))
+    return std::unexpected(std::move(*err));
+
   m.plan.clear();
   m.plan.reserve(c.block_count);
   for (uint32_t l = 0; l < c.block_count; ++l) m.plan.push_back(c.layer_config(l));
@@ -579,6 +711,14 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   }
 
   if (!errs.empty()) return std::unexpected(std::move(errs));
+
+  // Generic RoPE scaling, composed with the precomputed partial-RoPE divisors
+  // bound above. The table covers the global layers' head dim (the widest one);
+  // sliding-window layers take the empty divisor span at the call sites.
+  if (auto err = apply_rope_scaling(r, "gemma4",
+                                    std::max(c.head_dim_global, c.head_dim_swa),
+                                    c.rope_base, c.context_length, w))
+    return std::unexpected(std::move(*err));
 
   if (!converted.empty()) {
     uint64_t total=0; for (const auto& [id,count] : converted) total+=count;

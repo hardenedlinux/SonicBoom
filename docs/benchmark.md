@@ -90,8 +90,16 @@ A performance number is only reported for a build that passes:
   top-1/top-2 margin recorded);
 - the numerics gate for the active profile (`tools/sb-numerics`): strict is the
   historical f32-KV path; standard (f16 KV) must stay inside its acceptance
-  gate — perplexity delta, top-1 agreement, determinism, batch invariance and
+  gate — perplexity delta, KL, same-top, top-1 agreement, determinism and
   prefix-reuse identity.
+
+SonicBoom guarantees exactly three properties: (1) determinism — same input,
+same output, every run; (2) prefix-reuse identity — output does not depend on
+whether, or where, a prefix was reused; (3) KV-capacity independence — output
+does not depend on `n_ctx`. Prefill-vs-decode identity is **not** guaranteed:
+a batched prefill and the same tokens fed one at a time may use different
+arithmetic. Speculative decoding on/off is nevertheless **bit-identical**: the
+verify step uses decode arithmetic for every row (`test_spec_invariance`).
 
 ## Conditions
 

@@ -214,7 +214,19 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_llm_prefill . ,(foreign-proc "sb_llm_prefill" int
                                                 (list '* '* size_t '* '*)))
                (sb_llm_decode . ,(foreign-proc "sb_llm_decode" int
-                                               (list '* '* '* '* '* '*))))))
+                                               (list '* '* '* '* '* '*)))
+               ;; constrained decoding (session grammar) — see capi.h
+               (sb_llm_json_schema_to_gbnf
+                . ,(foreign-proc "sb_llm_json_schema_to_gbnf" int
+                                 (list '* '* '* '* size_t '* '*)))
+               (sb_llm_session_set_grammar . ,(foreign-proc "sb_llm_session_set_grammar" int
+                                                            (list '* '* '*)))
+               (sb_llm_session_set_json_schema . ,(foreign-proc "sb_llm_session_set_json_schema"
+                                                                int (list '* '* '*)))
+               (sb_llm_session_clear_grammar . ,(foreign-proc "sb_llm_session_clear_grammar"
+                                                              void (list '*)))
+               (sb_llm_session_constraint_state . ,(foreign-proc "sb_llm_session_constraint_state"
+                                                                 int (list '* '* '* '*))))))
         (%procs table)
         table)))
 

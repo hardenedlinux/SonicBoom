@@ -136,6 +136,18 @@ struct AttentionShape {
   // is an opt-in arm (SONICBOOM_ATTN_EXP2).
   bool exp2 = false;
 
+  // Full attention: non-causal, no window, no KV cache. Every query attends
+  // to every key in [0, n); the kernel reads the batch K/V planes only (no
+  // cache arithmetic, no %startp load) and masks only the keys past n in the
+  // final partial tile. This is a distinct mask kind, not a causal shape with
+  // a large window: a causal class must never resolve to it (and vice versa),
+  // so it is part of the region identity. Only the warp-head layout is
+  // generated for it: br = 16*w gives one 16-row chunk per warp while the
+  // block's warps share one K/V tile staged in shared memory, which is the
+  // FA-2 layout (each warp owns distinct query rows and the whole head_dim;
+  // S and P stay in registers).
+  bool full_attn = false;
+
   // The KV cache is f16 instead of f32 (the standard numerics profile). The
   // batch K/V of the current chunk stay f32, so the staging reads the two
   // sources with different element types; the generated kernel then stages
@@ -146,6 +158,14 @@ struct AttentionShape {
   // region identity (the JIT cache key).
   bool kv_f16 = false;
 
+  // The KV cache is q8 instead of f32: each row is head_dim int8 values then
+  // one f32 scale (max|x| / 127), so a row is addressed in bytes and every
+  // load dequantizes (int8 -> f32 -> scale). Like kv_f16, the batch K/V of the
+  // current chunk stay f32 (rounding to f16 on read where the cache would have
+  // rounded), and the generated kernel stages synchronously. Mutually
+  // exclusive with kv_f16. Part of the region identity (the JIT cache key).
+  bool kv_q8 = false;
+
   bool operator==(const AttentionShape &o) const {
     return head_dim == o.head_dim && gqa == o.gqa &&
            window_mask == o.window_mask && br == o.br && bc == o.bc &&
@@ -153,7 +173,8 @@ struct AttentionShape {
            gqa_pack == o.gqa_pack && q_in_reg == o.q_in_reg &&
            head_fast == o.head_fast &&
            async_stages == o.async_stages && exp2 == o.exp2 &&
-           kv_f16 == o.kv_f16;
+           full_attn == o.full_attn && kv_f16 == o.kv_f16 &&
+           kv_q8 == o.kv_q8;
   }
 };
 
@@ -162,10 +183,12 @@ struct AttentionShape {
 // budget bounds the per-warp column slice, not head_dim; the staging is
 // 2*(br*(head_dim+8) + head_dim*(bc+8) + bc*(head_dim+8)) bytes (the +8 is
 // the bank-conflict row pad) plus the partial-S buffer when dps > 1.
-// Warp-head shapes (warp_head) additionally require br == 16, dps == 1,
-// gqa <= 8, head_dim % 16 == 0 and head_dim <= 256 (the whole head_dim is
-// accumulated in one warp), and their staging is
+// Warp-head shapes (warp_head) additionally require br % 16 == 0, dps == 1,
+// gqa*(br/16) <= 16 warps, head_dim % 16 == 0 and head_dim <= 256 (the whole
+// head_dim is accumulated in one warp), and their staging is
 // 2*(gqa*br*(head_dim+8) + head_dim*(bc+8) + bc*(head_dim+8)).
+// Full-attention shapes (full_attn) require the warp-head layout and no
+// window; a causal or windowed class never resolves to them.
 // Decode shapes need head_dim % 32 == 0 and head_dim / 32 <= 16 accumulator
 // registers per lane (a single warp owns one head), and head_dim <= 1024 so the
 // combine block fits the thread limit.

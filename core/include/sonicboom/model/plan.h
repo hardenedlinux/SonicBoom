@@ -131,9 +131,18 @@ planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
 // `n_ctx` sizes the KV cache (global layers allocate `n_ctx` slots; sliding-window
 // layers a fixed `sliding_window` ring). 0 defaults to `start_pos + tokens.size()`
 // (the exact decode length). The cache is cleared at session start.
+//
+// `sample_mask` (constrained decoding, optional): a token bitmap of
+// ceil(vocab_size / 8) bytes, bit i of byte i / 8 (LSB first), where a set bit
+// means "token i may be sampled". When non-empty, every sample in the call is
+// the argmax over the allowed ids only, and the call produces at most ONE
+// token — the mask is the allowed set for the next position, which the caller
+// recomputes after accepting the token it gets back. An empty mask is the
+// plain greedy path, byte for byte.
 uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
                         uint64_t start_pos, std::span<int64_t> tokens,
-                        uint64_t n_ctx = 0);
+                        uint64_t n_ctx = 0,
+                        std::span<const uint8_t> sample_mask = {});
 
 // CUDA spine: the same greedy decode as generate_spine, but planned against a
 // CUDA-aware snapshot so Sonic nodes with *_dev kernels run on the GPU and only
@@ -142,9 +151,12 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 // CPU SonicBackend (host boundary) with explicit H2D/D2H transfer tasks between
 // them. Returns the number of steps actually run; 0 when the build has no CUDA
 // support (SONICBOOM_USE_CUDA off), so callers gate on quant::cuda_available().
+// `sample_mask` is generate_spine's constrained-decoding bitmap (one token per
+// call when set).
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
-                             uint64_t n_ctx = 0);
+                             uint64_t n_ctx = 0,
+                             std::span<const uint8_t> sample_mask = {});
 
 // Pay the one-time decode-runtime construction for (model, n_ctx) up front.
 //
@@ -315,10 +327,14 @@ uint64_t spec_generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
 // `start_pos + prompt.size() + tokens.size()`); the prompt must fit each KV
 // layer without ring wrap (n <= sliding_window for SWA layers, start_pos + n <=
 // n_ctx for global layers). Returns the number of tokens written.
+// `sample_mask` is generate_spine's constrained-decoding bitmap (one token per
+// call when set), applied to the token sampled from the prompt's final column
+// and to any decode step.
 uint64_t generate_prefill_spine(const Gemma4Model& m,
                                 std::span<const uint64_t> prompt,
                                 uint64_t start_pos, std::span<int64_t> tokens,
-                                uint64_t n_ctx = 0, bool use_prefill = true);
+                                uint64_t n_ctx = 0, bool use_prefill = true,
+                                std::span<const uint8_t> sample_mask = {});
 
 // CUDA prefill + decode: the same prompt-prefill contract as
 // generate_prefill_spine, but on the device — SonicCudaBackend::prefill (batched
@@ -351,6 +367,48 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
 bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
                       uint64_t n_ctx, double& sum_nll, uint64_t& n_scored);
 
+// The per-position distribution trace for the standard-profile KL gate
+// (boom-r5 M1). One row per scored position, in corpus order:
+//   target  the teacher-forced next token (what NLL scores)
+//   top     the argmax token of the scored distribution
+//   log_z   logsumexp of the full scored distribution (softcap applied)
+//   logits  the `top_k` largest scored logits, descending; `ids` are their
+//           token ids, so a reader can reconstruct the head exactly and treat
+//           the unlisted tail as bounded by the k-th logit.
+// The rows are written by the same loop and the same kernels as
+// score_spine_cuda, so a trace and a plain score of the same input agree
+// bit-for-bit on sum_nll. Measurement only, same throwaway runtime.
+struct ScoreTrace {
+  size_t top_k = 0;
+  uint64_t vocab = 0;
+  std::vector<uint32_t> target;
+  std::vector<uint32_t> top;
+  std::vector<float> log_z;
+  std::vector<float> logits;  // rows * top_k, descending
+  std::vector<uint32_t> ids;  // rows * top_k, parallel to `logits`
+};
+
+bool score_spine_cuda_trace(const Gemma4Model& m,
+                            std::span<const uint64_t> tokens, uint64_t n_ctx,
+                            size_t top_k, ScoreTrace& trace, double& sum_nll,
+                            uint64_t& n_scored);
+
+// The same score/trace through the chunked prefill path instead of the
+// per-token decode graph (gate v2's corpus pass). Every corpus position is
+// computed by the profile's prefill kernels — batched matmul, prefill
+// attention, fused prefill glue — so a kernel change that only affects prefill
+// (e.g. the d128 attention arm) moves the scored distribution. Each segment's
+// hidden columns are projected through the lm-head; the row for position p
+// predicts tokens[p + 1], so the final corpus column is not scored and the row
+// count matches score_spine_cuda_trace. The prefill KV append is the normal
+// one (shared decode-runtime cache, segment boundaries aligned to the ring).
+// Measurement only, same throwaway-runtime contract.
+bool score_spine_cuda_prefill_trace(const Gemma4Model& m,
+                                    std::span<const uint64_t> tokens,
+                                    uint64_t n_ctx, size_t top_k,
+                                    ScoreTrace& trace, double& sum_nll,
+                                    uint64_t& n_scored);
+
 // CUDA prefill + decode with prefix-cache reuse: the same token-stream contract
 // as generate_prefill_spine_cuda, but the KV cache persists in `session` across
 // calls. On each call it matches `prompt` against the session's token history
@@ -371,13 +429,16 @@ bool score_spine_cuda(const Gemma4Model& m, std::span<const uint64_t> tokens,
 // as a one-token suffix, which produces exactly the logits a full prefill would.
 // `n_reused_out` (optional) reports the prefix actually reused, so the count is
 // prompt.size()-1 in that case and the matched prefix length otherwise.
+// `sample_mask` is generate_spine's constrained-decoding bitmap (one token per
+// call when set).
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint64_t> prompt,
                                             uint64_t start_pos,
                                             std::span<int64_t> tokens,
                                             planner::KvCacheSession& session,
                                             bool use_prefill = true,
-                                            uint64_t* n_reused_out = nullptr);
+                                            uint64_t* n_reused_out = nullptr,
+                                            std::span<const uint8_t> sample_mask = {});
 
 // Build the model's plan and record what executing it does, step by step.
 //

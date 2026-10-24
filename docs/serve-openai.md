@@ -47,15 +47,30 @@ it never touches the core or native-torch directly.
 | `render-chat model messages tools tool-choice` | → prompt text (both backends use `chat-template.scm`) |
 | `create-session model` / `free-session session` | a session is a KV cache holding one token sequence |
 | `fork-session session n` (optional) | a new session holding the first n tokens, without recomputing them |
-| `prefill session tokens` | the session holds exactly `tokens` afterwards; the longest common prefix with what it held is kept; → number of reused tokens |
-| `step session sampler constraint` | sample the next token, append it, return it |
+| `prefill session tokens [constraint]` | the session holds exactly `tokens` afterwards; the longest common prefix with what it held is kept; a grammar constraint starts at this turn's first token; → number of reused tokens |
+| `step session sampler constraint` | sample the next token, append it, return it; `#f` when the constraint has closed the reply |
 | `stats model` | counters (optional) |
 
 A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed`) carries one
-request's parameters and random state; temperature 0 is greedy. A
-**constraint** is a token filter `(candidates) → candidates` applied before
-sampling, the hook for constrained decoding (tool-call or JSON grammars). The
-mock applies it; nothing in the service installs one yet.
+request's parameters and random state; temperature 0 is greedy.
+
+A **constraint** shapes the reply. There are two forms:
+
+- a record (`make-json-schema-constraint`, `make-tool-call-constraint`,
+  `make-gbnf-constraint`) naming a grammar. The real backend compiles and
+  installs it as the session's grammar before the prefill, so the turn's first
+  token is masked too; every token must keep the reply's text inside the
+  grammar's language, and a stop token ends the reply where the grammar can
+  end. `step` then returns `#f` and the engine reports `finish_reason: stop`.
+  The mock ignores grammar records — it has no decoder — and answers
+  unconstrained.
+- a procedure `(candidates) → candidates`, a token filter applied by the
+  sampler before sampling. Both backends' samplers apply it; it is the form
+  the mock's tests use.
+
+`prefill` resets the grammar, so a constraint is per turn: the engine passes it
+to both `prefill` and every `step` of that turn.
+
 `sample-from-logits` is a reference sampler for backends that produce logits
 on the host (the mock uses it; the real backend's C ABI returns the sampled
 token).
@@ -179,7 +194,37 @@ Request fields: `model`, `messages` (string or text-part content; roles
 `system`, `developer`, `user`, `assistant` with `tool_calls`, `tool`), `stream`,
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`,
 `stop` (string or up to 4), `temperature`, `top_p`, `top_k` (extension),
-`seed`, `n` (1 only), `tools`, `tool_choice`. Unknown fields are ignored.
+`seed`, `n` (1 only), `tools`, `tool_choice`, `response_format`. Unknown
+fields are ignored.
+
+### Constrained replies
+
+Two request fields compile to a grammar constraint on the real backend:
+
+- `response_format: {"type": "json_schema", "json_schema": {"schema": …}}`
+  constrains the reply to one JSON value of that schema. `{"type":
+  "json_object"}` constrains it to any JSON object; `{"type": "text"}` and an
+  absent field are unconstrained. The supported schema subset is the one in
+  `core/include/sonicboom/vocab/grammar.h`; an unsupported keyword (pattern,
+  format, not, …) is a 400 naming the keyword, not a silently ignored
+  constraint.
+- A forced tool choice (`tool_choice: "required"`, or the named form
+  `{"type": "function", "function": {"name": …}}`) constrains the reply to the
+  tool-call envelope the chat template already understands:
+  `<tool_call>` newline `{"name": …, "arguments": …}` newline `</tool_call>`.
+  The arguments object is the tool's `parameters` schema; `required` allows
+  any of the offered tools (`anyOf`). The tool-call parser then goes through
+  the same path as an unconstrained call, so the result is an ordinary
+  `tool_calls` reply.
+
+`response_format` wins when both are given; `tool_choice: "auto"` and
+`"none"` do not constrain. A bare JSON reply is JSON text (RFC 8259): up to 16
+bytes of whitespace may precede the value, so a model that opens its answer
+with a newline keeps that choice; nothing may follow the value, so the reply
+ends as soon as it is complete instead of padding whitespace up to the bound.
+A tool-call envelope is exact on both sides. Greedy decoding is unchanged
+wherever the unconstrained token is allowed, so a model that answers with
+valid JSON produces the same tokens it would have produced anyway.
 
 Streaming: the first chunk carries `delta.role`, then content deltas (one per
 token here), the tool-call deltas (a header with `index`, `id`, `type`, `name`
@@ -234,8 +279,10 @@ Results: units 47/47, HTTP 86/86, openai SDK (3.29.0) 24/24.
 
 ## 8. Limits of the prototype
 
-- `n` must be 1; no `logprobs`; `response_format` is ignored (a JSON-mode
-  constraint is the intended implementation).
+- `n` must be 1; no `logprobs`.
+- `response_format` supports `json_schema` and `json_object` (and `text`); the
+  schema subset is the compiler's — `pattern`, `format`, `not` and the other
+  keywords listed in [`capi.md`](capi.md) are 400s, not silently ignored.
 - One sequence per session; fork copies (no paged KV sharing).
 - The queue does not notice a client that leaves while waiting; it is
   cancelled at its first token.

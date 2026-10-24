@@ -85,19 +85,64 @@
 (define (real-free-session session)
   (inference:free-session! (real-session-handle session)))
 
-(define (real-prefill session tokens)
+;; A constraint that does not compile is the request's fault — the schema or
+;; the grammar text came from the client — so it is rethrown as a typed error
+;; and the route answers 400 on the offending parameter, not a 500.
+(define (compile-constraint param thunk)
+  (catch 'sb-inference
+    thunk
+    (lambda (_key msg) (throw 'invalid-constraint param msg))))
+
+;; Install (or clear) the session's grammar before a prefill: the core restarts
+;; it there, and the first token sampled at the end of the prompt is masked like
+;; every decode step. A tool-call constraint is the call object's schema wrapped
+;; in the envelope the engine parses back out of the text.
+(define (real-apply-constraint session constraint)
+  (let ((handle (real-session-handle session)))
+    (cond
+     ((not constraint) (inference:clear-grammar! handle))
+     ((constraint? constraint)
+      (case (constraint-kind constraint)
+        ((json-schema)
+         (compile-constraint "response_format"
+          (lambda ()
+            (inference:set-json-schema! handle (constraint-text constraint)))))
+        ((tool-call)
+         (compile-constraint "tool_choice"
+          (lambda ()
+            (inference:set-grammar!
+             handle
+             (inference:json-schema->gbnf
+              (constraint-text constraint)
+              #:prefix (string-append tool-call-open "\n")
+              #:suffix (string-append "\n" tool-call-close))))))
+        ((gbnf) (inference:set-grammar! handle (constraint-text constraint)))
+        (else (error "unknown constraint kind" (constraint-kind constraint)))))
+     (else
+      ;; A host token filter: this backend samples on the device, so there is
+      ;; no candidate list to filter.
+      (error "the libsonicboom backend cannot apply a procedure constraint")))))
+
+(define (real-prefill session tokens constraint)
+  (real-apply-constraint session constraint)
   (let ((reused (inference:prefill! (real-session-handle session) tokens)))
     (set-real-session-history! session tokens)
     reused))
 
 (define (real-step session sampler constraint)
+  ;; With a grammar the core masks every step and finishes the reply itself
+  ;; (the stop token is not emitted), so an empty result means the constrained
+  ;; output is complete: #f tells the engine there is nothing left to produce.
   (let* ((tokens (inference:generate-tokens (real-session-handle session)
                                             (real-session-history session) 1 #f))
          (token (and (pair? tokens) (car tokens))))
-    (unless token (error "SonicBoom backend produced no token"))
-    (set-real-session-history! session
-                               (append (real-session-history session) (list token)))
-    token))
+    (cond
+     (token
+      (set-real-session-history! session
+                                 (append (real-session-history session) (list token)))
+      token)
+     ((constraint? constraint) #f)
+     (else (error "SonicBoom backend produced no token")))))
 
 (define (make-real-backend)
   (make-backend

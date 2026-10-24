@@ -34,6 +34,7 @@
 #include "ggml_derived/mmvq_q8_1.cuh"
 #include "ggml_derived/mmq.cuh"
 
+#include <cublasLt.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -51,6 +52,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -1222,6 +1224,24 @@ const void* upload_bytes_cached(const void* host, std::size_t bytes) {
   return upload_bytes(host, bytes);
 }
 
+bool register_weight_device(const QuantizedTensor& W, const void* dptr) {
+  if (!W.valid() || W.dims().size() != 2 || dptr == nullptr) return false;
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  CacheKey key{W.data().data(), W.byte_size()};
+  auto it = g_cache.find(key);
+  if (it != g_cache.end()) return it->second.ptr == dptr;
+  g_cache.emplace(key, DeviceWeight{const_cast<void*>(dptr), W.byte_size()});
+  return true;
+}
+
+void unregister_weight_device(const QuantizedTensor& W) {
+  std::lock_guard<std::mutex> lk(g_cache_mutex);
+  auto it = g_cache.find(CacheKey{W.data().data(), W.byte_size()});
+  if (it == g_cache.end()) return;
+  cudaFree(it->second.ptr);
+  g_cache.erase(it);
+}
+
 bool available() noexcept {
   if (!g_available_checked) {
     int n = 0;
@@ -1430,23 +1450,24 @@ bool cublas_enabled() noexcept {
   return std::string_view(std::getenv("SONICBOOM_CUBLAS")) != "0";
 }
 
-// n (batch) threshold above which the cuBLAS fp16 path is used. Below it the
-// dp4a batched path wins on wall time (the fp16 dequant + upload overhead is not
-// amortized over enough columns). Tunable via SONICBOOM_CUBLAS_MIN_N.
+// n (batch) threshold above which the generic cuBLAS fp16 path is used. Below
+// it the dp4a batched path wins on wall time (the fp16 dequant + upload
+// overhead is not amortized over enough columns). Tunable via
+// SONICBOOM_CUBLAS_MIN_N.
 //
-// That speed rule is also a numerics boundary, and the threshold is the same in
-// both profiles. The dp4a batched gemv is bit-identical to n calls of the
-// single-column matvec (same q8_1 quantization, same vec_dot, same reduction
-// order), so a position's projection is identical whether it arrives through a
-// batched prefill segment or a one-token decode step. The cuBLAS fp16 GEMM is
-// not: it accumulates tensor-core fragments in a different order. Routing small
-// batches (n in [2, 32)) through it — which is what dropping the threshold to
-// mmq_min_n() under standard did — made the 4-token batch prefill and four
-// per-token decode steps disagree on DeepSeek-R1-Distill-Qwen-1.5B, whose
-// attn_v/ffn_down/output projections are Q6_K (the only quant type that reaches
-// this branch when mmq is enabled): the batch-4, prefix-reuse and top-1 gates
-// all failed. At n >= 32 the fixed-width 128-position blocking in
-// matmul_f16_cublas_dev keeps the GEMM itself segment-invariant.
+// Q6_K does not use this threshold. Its rule is one arithmetic for every
+// prefill n — the blocked fp16 cuBLAS GEMM (matmul_f16_cublas_dev with
+// force_blocked) for n >= mmq_min_n(), the q8_1 dp4a matvec at n == 1.
+// Guarantee (2), prefix-reuse identity, requires that: the blocked GEMM's
+// fixed block width plus the real-width tail makes a column's result
+// independent of its segment length, so a resumed prefill computes the same
+// values as a from-scratch one. Prefill vs decode identity is not a guarantee,
+// so n == 1 and n >= 2 may use different arithmetic.
+//
+// The remaining types that reach this branch are the ones MMQ rejects (K below
+// 256 or not a multiple of 128, or MMQ disabled); for them the n >= threshold
+// switch still exists and is pre-existing, not exercised by the shipped
+// models.
 constexpr int kCublasMinN = 32;
 int cublas_min_n() {
   static int v = [] {
@@ -1500,14 +1521,26 @@ int mmq_min_n() {
 // cores fed on this GPU. The tuner times the candidate set (mmq_x x
 // decomposition, both from upstream's Ampere table) and caches the fastest.
 //
-// Cache key: the weight shape class (quant type, M, blocks_per_row), never n.
-// The decomposition changes the floating-point summation order (split-K pieces
-// are combined in a fixed order), so batch invariance requires that the same
-// rows be reduced the same way whether they are prefilled in one segment or
-// many (test_prefix_cache compares 14 cases bitwise). Keying the decomposition
-// by class is what guarantees that; the J that rides along in the same entry is
-// numerics-neutral (it selects the token-tile width only; the fixed split-K
-// pieces and the tiled K-reduction order are independent of J).
+// Two knobs with different numerics standing, so two cache keys:
+//
+//  * The decomposition changes the floating-point summation order (split-K
+//    pieces are combined in a fixed order), so batch invariance requires that
+//    the same rows be reduced the same way whether they are prefilled in one
+//    segment or many (test_prefix_cache compares 14 cases bitwise). It is
+//    keyed by the weight shape class (quant type, M, blocks_per_row) and
+//    never by n.
+//  * J selects the token-tile width only. Under the tiled decomposition the
+//    fixed split-K pieces and the K-reduction order are independent of it, and
+//    every candidate writes the same bytes (test_cuda_quant: "mmq tiled J
+//    candidates write identical output"). A numerics-neutral knob may
+//    therefore be chosen per token-count bucket without weakening batch
+//    invariance -- and it must be, because the tile that wins at prefill
+//    scale (J=128 at the DiT's 4113 tokens) loses to a narrow one at
+//    continuation scale. The bucket is a fixed 2x ladder (mmq_n_bucket), not
+//    the live n, so a class has at most kMmqBucketCount tile entries and
+//    every call resolves to exactly one. Under stream-k J moves the split
+//    geometry and hence the rounding (the test only guarantees closeness, not
+//    identity), so it stays class-wide there.
 //
 // The search runs on the first call for a class outside graph capture (host
 // timing is illegal while capturing) and only at a batch large enough to fill
@@ -1515,19 +1548,18 @@ int mmq_min_n() {
 // its policy decomposition without storing anything, so a decode-first session
 // cannot pin a decode-scale tile onto a later prefill. Inside a capture the
 // cached class entry, or the heuristic + class policy when none exists, is
-// used.
+// used. The class record is written by the first probe; later buckets add
+// only their own tile, so entering a new bucket costs one J sweep, not the
+// decomposition search again.
 //
-// Each class entry carries two tiles, both measured at fixed probe shapes
-// (kMmqDecompProbeN = the call that triggers the search, kMmqSmallProbeN = 64
-// columns of the same launch): a prefill tile and a continuation tile. The
-// split exists because a tile wide enough for n=512 wastes most of its columns
-// at continuation scale (n=64: 1769 tok/s with the class prefill tile vs 2712
+// The class record also carries the continuation tile, measured at a fixed
+// probe shape (kMmqSmallProbeN = 64 columns of the same launch). The split
+// exists because a tile wide enough for n=512 wastes most of its columns at
+// continuation scale (n=64: 1769 tok/s with the class prefill tile vs 2712
 // with upstream's rule; reuse 512+64 78.1 vs 66.1 ms), and a static
 // small-batch rule still left 1.8% on that metric against the step-7
-// per-call tuning. Neither the key nor the stored value depends on the call's
-// n: the probes are fixed constants of the tuner. J never changes the
-// summation order, so this does not weaken batch invariance; the
-// decomposition, which does, is class-wide for every n.
+// per-call tuning. It is measured at a fixed width, so it is class-wide like
+// the decomposition.
 //
 // A tile or decomposition other than the default replaces it only when it
 // wins by more than the switch margin (kMmqTileSwitchMargin /
@@ -1546,6 +1578,21 @@ constexpr int kMmqDecompProbeN = 128;
 // class entry carries a small-batch tile derived from a fixed probe shape
 // rather than from whichever short batch happens to arrive first.
 constexpr int kMmqSmallProbeN = 64;
+// Token-count buckets for the numerics-neutral tile: bucket b covers
+// [kMmqDecompProbeN << b, kMmqDecompProbeN << (b+1)); the last is open-ended.
+// Fixed constants (never derived from a live n), so every n maps to exactly
+// one bucket and a class has a bounded number of entries.
+constexpr int kMmqBucketCount = 8;
+
+int mmq_n_bucket(int n) {
+  int b = 0;
+  long long hi = 2LL * kMmqDecompProbeN;
+  while (n >= hi && b + 1 < kMmqBucketCount) {
+    ++b;
+    hi <<= 1;
+  }
+  return b;
+}
 constexpr double kMmqDecompSwitchMargin = 0.03;
 constexpr double kMmqTileSwitchMargin = 0.03;
 
@@ -1639,16 +1686,46 @@ struct MmqClassKeyHash {
   }
 };
 
-// The tuner's result for a class: the prefill J, the continuation J measured
-// at the fixed small probe width (0 when unknown), and the decomposition.
+// A numerics-neutral tile: the same class plus the token-count bucket it was
+// measured in. bucket == -1 is the class-wide tile used under stream-k, whose
+// J changes the reduction rounding and so must not follow n.
+struct MmqTileKey {
+  int type;
+  int rows;
+  int bpr;
+  int bucket;
+  bool operator==(const MmqTileKey&) const = default;
+};
+
+struct MmqTileKeyHash {
+  std::size_t operator()(const MmqTileKey& k) const noexcept {
+    std::uint64_t h = 0x9E3779B97F4A7C15ull;
+    h ^= std::uint64_t(std::uint32_t(k.type)) * 0xC2B2AE3D27D4EB4Full;
+    h ^= std::uint64_t(std::uint32_t(k.rows)) * 0x165667B19E3779F9ull;
+    h ^= std::uint64_t(std::uint32_t(k.bpr)) * 0x9E3779B185EBCA87ull;
+    h ^= std::uint64_t(std::uint32_t(k.bucket)) * 0x27D4EB2F165667C5ull;
+    return std::size_t(h ^ (h >> 29));
+  }
+};
+
+// The tuner's result for a call: the tile J, the decomposition, and the
+// continuation J measured at the fixed small probe width (0 when unknown).
 struct MmqChoice {
   int j;
   MmqDecomp decomp;
   int j_small = 0;
 };
 
+// Class-wide facts: the numerics-bearing decomposition and the fixed-width
+// continuation tile.
+struct MmqClassChoice {
+  MmqDecomp decomp;
+  int j_small = 0;
+};
+
 std::mutex g_mmq_j_mutex;
-std::unordered_map<MmqClassKey, MmqChoice, MmqClassKeyHash> g_mmq_j_choice;
+std::unordered_map<MmqClassKey, MmqClassChoice, MmqClassKeyHash> g_mmq_class;
+std::unordered_map<MmqTileKey, int, MmqTileKeyHash> g_mmq_tile;
 
 // Scratch for the fixed split-K partials (one J*I block per work unit; see
 // split_k_scratch_floats). Grown, never shrunk.
@@ -1700,6 +1777,20 @@ void mmq_launch(int J, MmqDecomp decomp, const char* w, const int* y, float* dst
   }
 }
 
+// Disk keys. c6: the decomposition and the continuation tile moved to the
+// class record and J became a per-bucket tile record, so a c5 entry can serve
+// as neither.
+std::string mmq_class_disk_key(int type, int M, int bpr) {
+  return std::string("c6:t") + std::to_string(type) + "-M" + std::to_string(M) +
+         "-bpr" + std::to_string(bpr);
+}
+
+std::string mmq_tile_disk_key(int type, int M, int bpr, int bucket) {
+  std::string key = mmq_class_disk_key(type, M, bpr);
+  key += bucket < 0 ? "-nk" : "-n" + std::to_string(bucket);
+  return key;
+}
+
 template <int Type>
 MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
                        int bpr, MmqDecomp requested, cudaStream_t stream) {
@@ -1718,83 +1809,121 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   if (forced != 0) return MmqChoice{forced, policy};
   if (runtime::feature_disabled(runtime::Feature::Autotune)) return fallback;
 
-  // The class entry's J is a prefill tile: it is applied only at the probe
-  // scale and above. Below it, upstream's per-call rule (select_J(n)) applies
-  // -- a tile tuned at n=512 computes up to twice the requested columns at
-  // continuation scale (measured: reuse 512+64 78.1 ms with the class tile vs
-  // 66.1 ms with upstream's, n=64 prefill 1769 vs 2712 tok/s). J is
-  // numerics-neutral either way (test_cuda_quant: "mmq J invariant ... tiled
-  // identical"), so this does not weaken batch invariance: the decomposition,
-  // which does change the summation order, stays class-wide for every n.
-  const auto apply_regime = [&](MmqChoice c) -> MmqChoice {
-    if (decomp_pinned) c.decomp = policy;
-    if (n < kMmqDecompProbeN) c.j = c.j_small > 0 ? c.j_small : heuristic;
-    return c;
-  };
-
+  // The probe-scale tile is applied only at the probe scale and above. Below
+  // it, upstream's per-call rule (select_J(n)) applies -- a wide tile computes
+  // up to twice the requested columns at continuation scale (measured: reuse
+  // 512+64 78.1 ms with the class tile vs 66.1 ms with upstream's, n=64
+  // prefill 1769 vs 2712 tok/s). The class keeps its fixed-width continuation
+  // tile for that regime. J is numerics-neutral under tiled (test_cuda_quant:
+  // "mmq tiled J candidates write identical output"), which is what lets the
+  // probe tile follow the token-count bucket; the decomposition stays
+  // class-wide for every n.
+  const bool probe_scale = n >= kMmqDecompProbeN;
   const MmqClassKey key{Type, M, bpr};
+
+  // Class-wide facts: the decomposition and the continuation tile.
+  bool have_class = false;
+  MmqClassChoice cls{policy, 0};
   {
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-    const auto it = g_mmq_j_choice.find(key);
-    if (it != g_mmq_j_choice.end()) return apply_regime(it->second);
-    if (g_mmq_j_choice.size() >= kMmqTuneKeyCap) return fallback;
+    if (const auto it = g_mmq_class.find(key); it != g_mmq_class.end()) {
+      cls = it->second;
+      have_class = true;
+    }
   }
-
-  // Step 7 persistence, step 9 keys: one entry per class, holding both
-  // numerics-neutral tiles and the class decomposition. The key is versioned
-  // because changes to what a stored J means or to the cost it was measured
-  // under invalidate the entry: c4 = step-9 candidate set, regime rule and
-  // continuation-tile selection; c5 = the tiled launch's block order (token
-  // tile fastest, for L2 weight reuse), which changes the tiled cost per J.
-  const std::string disk_key =
-      std::string("c5:t") + std::to_string(Type) + "-M" + std::to_string(M) +
-      "-bpr" + std::to_string(bpr);
-  {
+  if (!have_class) {
     const std::map<std::string, int> cached =
-        ::sonicboom::tune::lookup("mmq-j", disk_key);
-    const auto jt = cached.find("j");
+        ::sonicboom::tune::lookup("mmq-j", mmq_class_disk_key(Type, M, bpr));
     const auto dt = cached.find("decomp");
     const auto st = cached.find("j_small");
-    if (jt != cached.end() && dt != cached.end()) {
-      bool valid_j = false;
-      for (int J : kMmqTuneJs) valid_j = valid_j || (J == jt->second);
+    if (dt != cached.end() && dt->second >= int(MmqDecomp::Tiled) &&
+        dt->second <= int(MmqDecomp::StreamK)) {
       const int j_small = st != cached.end() ? st->second : 0;
-      if (valid_j && dt->second >= int(MmqDecomp::Tiled) &&
-          dt->second <= int(MmqDecomp::StreamK)) {
-        const MmqChoice c{jt->second,
-                          static_cast<MmqDecomp>(dt->second), j_small};
-        std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-        g_mmq_j_choice.emplace(key, c);
-        return apply_regime(c);
+      cls = MmqClassChoice{static_cast<MmqDecomp>(dt->second), j_small};
+      have_class = true;
+      std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+      g_mmq_class.emplace(key, cls);
+    }
+  }
+
+  // The decomposition a stored tile belongs to. The env pin wins (ablation);
+  // otherwise the record's class-wide choice stands.
+  const MmqDecomp active = decomp_pinned ? policy : cls.decomp;
+  // A tiled tile is numerics-neutral and may follow the bucket; a stream-k
+  // tile is not, so it keeps one class-wide entry.
+  const int bucket =
+      active == MmqDecomp::StreamK ? -1 : mmq_n_bucket(n);
+
+  int tile_j = heuristic;
+  bool have_tile = false;
+  if (probe_scale) {
+    const MmqTileKey tkey{Type, M, bpr, bucket};
+    {
+      std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+      if (const auto it = g_mmq_tile.find(tkey); it != g_mmq_tile.end()) {
+        tile_j = it->second;
+        have_tile = true;
+      }
+    }
+    if (!have_tile) {
+      const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
+          "mmq-j", mmq_tile_disk_key(Type, M, bpr, bucket));
+      const auto jt = cached.find("j");
+      if (jt != cached.end()) {
+        bool valid_j = false;
+        for (int J : kMmqTuneJs) valid_j = valid_j || (J == jt->second);
+        if (valid_j) {
+          tile_j = jt->second;
+          have_tile = true;
+          std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+          g_mmq_tile.emplace(tkey, tile_j);
+        }
       }
     }
   }
 
+  const auto compose = [&](int j_probe) -> MmqChoice {
+    MmqChoice c{probe_scale ? j_probe
+                            : (cls.j_small > 0 ? cls.j_small : heuristic)};
+    c.decomp = active;
+    c.j_small = cls.j_small;
+    return c;
+  };
+  if (have_class && (!probe_scale || have_tile)) return compose(tile_j);
+  if (!probe_scale) return compose(heuristic);
+
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   if (cudaStreamIsCapturing(stream, &capture) != cudaSuccess ||
       capture != cudaStreamCaptureStatusNone)
-    return fallback;
+    return compose(heuristic);
 
-  // Do not pin a class from a batch too small to fill the device: the entry is
-  // stored for every later n of that class, so a decode-scale first call would
-  // otherwise decide the tile width and the decomposition of the prefill.
-  if (n < kMmqDecompProbeN) return fallback;
+  // Do not pin a class from a batch too small to fill the device (handled
+  // above by the regime); the class record is stored for every later n.
+  if (!have_class) {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    if (g_mmq_class.size() >= kMmqTuneKeyCap) return fallback;
+  }
 
   // Candidate set: upstream's mmq_x values (every multiple of 8, the whole
-  // non-fallback Ampere J set) x the two decompositions. A pinned
-  // decomposition times only itself. Our stream-k is a fixed split over K;
-  // when it degenerates to one part it is the tiled kernel bit for bit, so the
-  // duplicate candidate is skipped.
+  // non-fallback Ampere J set) x the decomposition. The first sweep for a
+  // class also times the alternative decomposition (a pinned decomposition
+  // times only itself; stream-k that degenerates to one part is the tiled
+  // kernel bit for bit, so that duplicate is skipped). A later bucket re-uses
+  // the class decomposition and sweeps only its own tile.
   MmqDecomp candidates[2];
   int ncandidates = 0;
-  candidates[ncandidates++] = policy;
-  if (!decomp_pinned) {
-    const MmqDecomp other =
-        policy == MmqDecomp::StreamK ? MmqDecomp::Tiled : MmqDecomp::StreamK;
-    const bool other_is_kernel =
-        other != MmqDecomp::StreamK ||
-        mmq::split_k_parts(M, bpr, mmq::qk_of<Type>(), mmq_sm_count()) >= 2;
-    if (other_is_kernel) candidates[ncandidates++] = other;
+  if (have_class) {
+    candidates[ncandidates++] = active;
+  } else {
+    candidates[ncandidates++] = policy;
+    if (!decomp_pinned) {
+      const MmqDecomp other =
+          policy == MmqDecomp::StreamK ? MmqDecomp::Tiled : MmqDecomp::StreamK;
+      const bool other_is_kernel =
+          other != MmqDecomp::StreamK ||
+          mmq::split_k_parts(M, bpr, mmq::qk_of<Type>(), mmq_sm_count()) >= 2;
+      if (other_is_kernel) candidates[ncandidates++] = other;
+    }
   }
 
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
@@ -1843,8 +1972,10 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
       // The same tile at the fixed continuation width: dst has at least
       // kMmqDecompProbeN columns at this point, so writing
       // kMmqSmallProbeN columns is in bounds and touches only the columns the
-      // following real launch would rewrite anyway.
-      const float ms_small = time_one(J, decomp, kMmqSmallProbeN);
+      // following real launch would rewrite anyway. It is class-wide, so a
+      // later bucket does not measure it again.
+      const float ms_small =
+          have_class ? -1.0f : time_one(J, decomp, kMmqSmallProbeN);
       if (ms >= 0.0f) {
         if (J == heuristic) {
           heur_ms[c] = ms;
@@ -1910,21 +2041,38 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
       best_ms = chosen_ms[c];
     }
   }
-  const MmqChoice best{chosen_j[best_c], candidates[best_c],
-                       chosen_j_small[best_c]};
-  {
+  const MmqDecomp chosen_decomp = candidates[best_c];
+  const int best_small = have_class
+                             ? cls.j_small
+                             : (cand_have_small[best_c]
+                                    ? chosen_j_small[best_c]
+                                    : 0);
+  const MmqChoice best{chosen_j[best_c], chosen_decomp, best_small};
+
+  // The class record is written once; the tile record of the bucket this call
+  // probed in is written on every sweep.
+  const int record_bucket =
+      chosen_decomp == MmqDecomp::StreamK ? -1 : mmq_n_bucket(n);
+  if (!have_class) {
+    ::sonicboom::tune::store(
+        "mmq-j", mmq_class_disk_key(Type, M, bpr),
+        {{"decomp", int(chosen_decomp)}, {"j_small", best.j_small}});
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
-    g_mmq_j_choice.emplace(key, best);
+    g_mmq_class.emplace(key, MmqClassChoice{chosen_decomp, best.j_small});
   }
   ::sonicboom::tune::store(
-      "mmq-j", disk_key,
-      {{"j", best.j}, {"decomp", int(best.decomp)}, {"j_small", best.j_small}});
+      "mmq-j", mmq_tile_disk_key(Type, M, bpr, record_bucket),
+      {{"j", best.j}});
+  {
+    std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
+    g_mmq_tile.emplace(MmqTileKey{Type, M, bpr, record_bucket}, best.j);
+  }
   if (verbose) {
     std::fprintf(stderr,
-                 "[autotune] mmq type=%d M=%d bpr=%d (probe n=%d) "
+                 "[autotune] mmq type=%d M=%d bpr=%d (probe n=%d, bucket %d) "
                  "decomp=%s J=%d %.3f ms, small J=%d (heuristic %d/%d); "
                  "%s J=%d %.3f ms, small J=%d\n",
-                 Type, M, bpr, n,
+                 Type, M, bpr, n, record_bucket,
                  best.decomp == MmqDecomp::StreamK ? "stream_k" : "tiled",
                  best.j, best_ms, best.j_small, heuristic, heuristic_small,
                  ncandidates > 1
@@ -2748,7 +2896,20 @@ bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
 // like the dense path's kDenseCublasWidth blocking. The strict profile keeps the
 // historical single GEMM byte for byte, because its goldens predate the profile
 // switch. SONICBOOM_CUBLAS_F16_BLOCK=0 restores the single GEMM for A/B.
-constexpr int kCublasF16BlockWidth = 128;
+// Width = the prefill segment extent (kDefaultPrefillChunk, and Gemma's SWA
+// ring, both 512). A full segment is then one GEMM at the same n the strict
+// profile's single GEMM runs at, so the two agree on every full segment instead
+// of differing by cuBLAS's n-dependent reduction order. Measured at 128:
+// boom-r5's prefill corpus gate put standard at +0.58% (Qwen) / +1.50%
+// (DeepSeek) corpus ppl vs strict, with the difference vanishing at every
+// non-tail position once the block width matched the segment.
+//
+// A short final segment does not pay for the padding: it runs at its real width
+// through cuBLASLt with the algorithm cuBLAS chooses for the 512-column block
+// (matmul_f16_lt_tail below), so it keeps the same per-column numerics without
+// the padded FLOPs. Padding a 64-token prefix-reuse suffix to 512 made that
+// suffix 44% slower than strict on Qwen2.5-0.5B (F2 of boom-r5).
+constexpr int kCublasF16BlockWidth = 512;
 
 bool cublas_f16_blocking_enabled() {
   static const bool enabled = [] {
@@ -2758,10 +2919,11 @@ bool cublas_f16_blocking_enabled() {
   return enabled;
 }
 
-// Zero-padded 128-position tail block for the blocked fp16 matmul, in the
-// position-major layout the full blocks read (dst[p*cols + i] = cast(X[(c0+p)*cols
-// + i]) for p < chunk_n, zero beyond). Same conversion as cast_f32_f16, so a
-// position in a tail block sees the same activation values as in a full block.
+// Zero-padded tail block for the blocked fp16 matmul (the fallback when
+// cuBLASLt cannot pin the 512-column algorithm), in the position-major layout
+// the full blocks read (dst[p*cols + i] = cast(X[(c0+p)*cols + i]) for
+// p < chunk_n, zero beyond). Same conversion as cast_f32_f16, so a position in
+// a tail block sees the same activation values as in a full block.
 __global__ void pad_f16_tail_kernel(const float* __restrict__ x,
                                     __half* __restrict__ dst, int cols, int c0,
                                     int chunk_n) {
@@ -2773,7 +2935,7 @@ __global__ void pad_f16_tail_kernel(const float* __restrict__ x,
       (p < chunk_n) ? __float2half_rn(x[(size_t)(c0 + p) * cols + i]) : __half(0.0f);
 }
 
-// Drop the padding positions of a [128, rows] result block into the
+// Drop the padding positions of a [width, rows] result block into the
 // position-major output at position offset c0.
 __global__ void copyback_f16_tail_kernel(const float* __restrict__ src,
                                          float* __restrict__ dst, int rows,
@@ -2785,8 +2947,137 @@ __global__ void copyback_f16_tail_kernel(const float* __restrict__ src,
   dst[(size_t)(c0 + p) * rows + r] = src[(size_t)p * rows + r];
 }
 
+// ---------------------------------------------------------------------------
+// cuBLASLt tail block: a short final segment runs at its real width with the
+// algorithm cuBLAS picks for the 512-column block, so its columns keep the full
+// block's numerics (batch invariance) without the padded FLOPs. Verified on
+// every (m, k) class of the three campaign models: the pinned algorithm gives
+// bit-identical columns 0..W-1 against the 512-column GEMM at W = 1, 3, 37, 64,
+// 100, 256, 511, and cuBLASLt's 512-column choice equals cublasGemmEx's.
+// SONICBOOM_CUBLAS_LT_TAIL=0 restores the zero-padded 512-column tail.
+struct TailLtKernel {
+  cublasLtMatmulAlgo_t algo{};
+  size_t workspace = 0;
+};
+
+bool cublas_lt_tail_enabled() {
+  static const bool enabled = [] {
+    const char* e = std::getenv("SONICBOOM_CUBLAS_LT_TAIL");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  return enabled;
+}
+
+// Workspace for the pinned tail algorithms (sized to the largest one asked
+// for). The algorithms seen so far need none; the buffer exists so a heuristic
+// that does ask for one never forces a malloc inside a graph capture.
+void* g_lt_ws = nullptr;
+size_t g_lt_ws_bytes = 0;
+
+cublasLtHandle_t tail_lt_handle() {
+  static cublasLtHandle_t h = nullptr;
+  static std::mutex mu;
+  std::lock_guard<std::mutex> lk(mu);
+  if (!h && cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) h = nullptr;
+  return h;
+}
+
+// The algorithm for (rows, cols) under the 512-column shape, chosen once per
+// process. False when cuBLASLt has no candidate or the heuristic would have to
+// run inside a graph capture (host work is not capturable); the caller then
+// uses the padded block.
+bool tail_lt_kernel(cublasLtHandle_t lt, cublasLtMatmulDesc_t op,
+                    cublasLtMatrixLayout_t ad, cublasLtMatrixLayout_t bd,
+                    cublasLtMatrixLayout_t cd, int rows, int cols,
+                    TailLtKernel& out) {
+  static std::mutex mu;
+  static std::map<std::pair<int, int>, std::optional<TailLtKernel>> cache;
+  std::lock_guard<std::mutex> lk(mu);
+  auto it = cache.find({rows, cols});
+  if (it != cache.end()) {
+    if (!it->second) return false;
+    out = *it->second;
+    return true;
+  }
+  cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+  if (cudaStreamIsCapturing(cur_stream(), &cs) != cudaSuccess ||
+      cs != cudaStreamCaptureStatusNone)
+    return false;
+  std::optional<TailLtKernel> picked;
+  cublasLtMatmulPreference_t pref = nullptr;
+  cublasLtMatmulHeuristicResult_t heur{};
+  int found = 0;
+  if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
+    if (cublasLtMatmulAlgoGetHeuristic(lt, op, ad, bd, cd, cd, pref, 1, &heur,
+                                       &found) == CUBLAS_STATUS_SUCCESS &&
+        found > 0) {
+      TailLtKernel k;
+      k.algo = heur.algo;
+      k.workspace = heur.workspaceSize;
+      picked = k;
+    }
+    cublasLtMatmulPreferenceDestroy(pref);
+  }
+  cache.insert({{rows, cols}, picked});
+  if (!picked) return false;
+  out = *picked;
+  return true;
+}
+
+// Y[c0 .. c0+chunk_n) = W @ X[c0 .. c0+chunk_n), W fp16 row-major [rows, cols],
+// X fp16 position-major [n, cols], Y fp32 position-major [n, rows]. Same GEMM
+// as the full block (A = W^T column-major, B = the activation positions), run at
+// the tail width with the full block's algorithm.
+bool matmul_f16_lt_tail(const __half* wf, const __half* xf, float* y, int rows,
+                        int cols, int chunk_n) {
+  cublasLtHandle_t lt = tail_lt_handle();
+  if (!lt) return false;
+  cublasLtMatmulDesc_t op = nullptr;
+  cublasLtMatrixLayout_t ad = nullptr, bd_full = nullptr, cd_full = nullptr;
+  cublasLtMatrixLayout_t bd = nullptr, cd = nullptr;
+  bool ok = false;
+  TailLtKernel k{};
+  const cublasOperation_t tr_a = CUBLAS_OP_T, tr_b = CUBLAS_OP_N;
+  if (cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &tr_a,
+                                     sizeof(tr_a)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tr_b,
+                                     sizeof(tr_b)) == CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&ad, CUDA_R_16F, cols, rows, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&bd_full, CUDA_R_16F, cols,
+                                 kCublasF16BlockWidth, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&cd_full, CUDA_R_32F, rows,
+                                 kCublasF16BlockWidth, rows) ==
+          CUBLAS_STATUS_SUCCESS &&
+      tail_lt_kernel(lt, op, ad, bd_full, cd_full, rows, cols, k) &&
+      cublasLtMatrixLayoutCreate(&bd, CUDA_R_16F, cols, chunk_n, cols) ==
+          CUBLAS_STATUS_SUCCESS &&
+      cublasLtMatrixLayoutCreate(&cd, CUDA_R_32F, rows, chunk_n, rows) ==
+          CUBLAS_STATUS_SUCCESS) {
+    void* ws = nullptr;
+    if (k.workspace) {
+      ws = grow_scratch(g_lt_ws, g_lt_ws_bytes, k.workspace);
+      if (!ws) k.workspace = 0;  // run without workspace if it cannot grow
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    ok = cublasLtMatmul(lt, op, &alpha, wf, ad, xf, bd, &beta, y, cd, y, cd,
+                        &k.algo, ws, k.workspace, cur_stream()) ==
+         CUBLAS_STATUS_SUCCESS;
+  }
+  if (bd) cublasLtMatrixLayoutDestroy(bd);
+  if (cd) cublasLtMatrixLayoutDestroy(cd);
+  if (ad) cublasLtMatrixLayoutDestroy(ad);
+  if (bd_full) cublasLtMatrixLayoutDestroy(bd_full);
+  if (cd_full) cublasLtMatrixLayoutDestroy(cd_full);
+  if (op) cublasLtMatmulDescDestroy(op);
+  return ok;
+}
+
 bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
-                           int n) {
+                           int n, bool force_blocked = false) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
 
@@ -2827,8 +3118,8 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
       return false;
   }
 
-  const bool blocked = numerics_profile() == NumericsProfile::Standard &&
-                       cublas_f16_blocking_enabled();
+  const bool blocked = force_blocked ||
+      (numerics_profile() == NumericsProfile::Standard && cublas_f16_blocking_enabled());
   if (!blocked) {
     // 2. Convert X f32 -> fp16 (position-major [n, cols], flat element count).
     __half* xf = static_cast<__half*>(
@@ -2850,21 +3141,19 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
     return st == CUBLAS_STATUS_SUCCESS && cudaGetLastError() == cudaSuccess;
   }
 
-  // Standard profile: every GEMM is (m=rows, n=kCublasF16BlockWidth, k=cols).
-  // Full blocks read the position-major fp16 activation in place; a tail block
-  // is zero-padded into a fixed-width scratch and its real positions copied
-  // back, so a position's per-column numerics never depend on which segment it
-  // landed in. The activation conversion is done per block so a short batch
-  // never pays for the padding columns.
-  __half* xf = nullptr;
-  if (n >= kCublasF16BlockWidth) {
-    xf = static_cast<__half*>(
-        grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
-    if (!xf) return false;
-    const int64_t xn = int64_t(cols) * n;
-    SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
-    cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
-  }
+  // Standard profile: full blocks are (m=rows, n=kCublasF16BlockWidth, k=cols)
+  // GEMMs reading the position-major fp16 activation in place. A short final
+  // block runs at its real width with the full block's cuBLASLt algorithm, so a
+  // position's per-column numerics never depend on which segment it landed in
+  // and the block does not pay for zero padding. When cuBLASLt cannot pin the
+  // algorithm (or SONICBOOM_CUBLAS_LT_TAIL=0) the tail falls back to a
+  // zero-padded fixed-width GEMM and a copyback.
+  __half* xf = static_cast<__half*>(
+      grow_scratch(g_xf16, g_xf16_bytes, cols * (size_t)n * sizeof(__half)));
+  if (!xf) return false;
+  const int64_t xn = int64_t(cols) * n;
+  SB_NOTE_LAUNCH(cast_f32_f16, (xn + 255) / 256, 256, 0, cur_stream());
+  cast_f32_f16<<<(xn + 255) / 256, 256, 0, cur_stream()>>>(X, xf, xn);
   cublasHandle_t h = cublas_handle();
   if (!h) return false;
   cublasSetStream(h, cur_stream());
@@ -2873,41 +3162,45 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   float* ytail = nullptr;
   for (int c0 = 0; c0 < n; c0 += kCublasF16BlockWidth) {
     const int chunk_n = std::min(kCublasF16BlockWidth, n - c0);
-    const __half* bptr;
-    float* cptr;
+    const __half* xblock = xf + (size_t)c0 * cols;
     if (chunk_n == kCublasF16BlockWidth) {
-      bptr = xf + (size_t)c0 * cols;
-      cptr = Y + (size_t)c0 * rows;
-    } else {
-      if (!xtail) {
-        xtail = static_cast<__half*>(grow_scratch(
-            g_xf16_tail, g_xf16_tail_bytes,
-            cols * (size_t)kCublasF16BlockWidth * sizeof(__half)));
-        ytail = static_cast<float*>(grow_scratch(
-            g_ytail, g_ytail_bytes,
-            rows * (size_t)kCublasF16BlockWidth * sizeof(float)));
-        if (!xtail || !ytail) return false;
-      }
-      const int total = int(cols) * kCublasF16BlockWidth;
-      SB_NOTE_LAUNCH(pad_f16_tail_kernel, (total + 255) / 256, 256, 0,
-                     cur_stream());
-      pad_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
-          X, xtail, int(cols), c0, chunk_n);
-      bptr = xtail;
-      cptr = ytail;
+      const cublasStatus_t st = cublasGemmEx(
+          h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), kCublasF16BlockWidth,
+          int(cols), &alpha, wf, CUDA_R_16F, int(cols), xblock, CUDA_R_16F,
+          int(cols), &beta, Y + (size_t)c0 * rows, CUDA_R_32F, int(rows),
+          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+      if (st != CUBLAS_STATUS_SUCCESS) return false;
+      continue;
     }
+    if (cublas_lt_tail_enabled() &&
+        matmul_f16_lt_tail(wf, xblock, Y + (size_t)c0 * rows, int(rows),
+                           int(cols), chunk_n))
+      continue;
+    if (!xtail) {
+      xtail = static_cast<__half*>(grow_scratch(
+          g_xf16_tail, g_xf16_tail_bytes,
+          cols * (size_t)kCublasF16BlockWidth * sizeof(__half)));
+      ytail = static_cast<float*>(grow_scratch(
+          g_ytail, g_ytail_bytes,
+          rows * (size_t)kCublasF16BlockWidth * sizeof(float)));
+      if (!xtail || !ytail) return false;
+    }
+    const int total = int(cols) * kCublasF16BlockWidth;
+    SB_NOTE_LAUNCH(pad_f16_tail_kernel, (total + 255) / 256, 256, 0,
+                   cur_stream());
+    pad_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
+        X, xtail, int(cols), c0, chunk_n);
     const cublasStatus_t st = cublasGemmEx(
         h, CUBLAS_OP_T, CUBLAS_OP_N, int(rows), kCublasF16BlockWidth, int(cols),
-        &alpha, wf, CUDA_R_16F, int(cols), bptr, CUDA_R_16F, int(cols), &beta,
-        cptr, CUDA_R_32F, int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+        &alpha, wf, CUDA_R_16F, int(cols), xtail, CUDA_R_16F, int(cols), &beta,
+        ytail, CUDA_R_32F, int(rows), CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st != CUBLAS_STATUS_SUCCESS) return false;
-    if (chunk_n != kCublasF16BlockWidth) {
-      const int total = int(chunk_n) * int(rows);
-      SB_NOTE_LAUNCH(copyback_f16_tail_kernel, (total + 255) / 256, 256, 0,
-                     cur_stream());
-      copyback_f16_tail_kernel<<<(total + 255) / 256, 256, 0, cur_stream()>>>(
-          ytail, Y, int(rows), c0, chunk_n);
-    }
+    const int total_out = int(chunk_n) * int(rows);
+    SB_NOTE_LAUNCH(copyback_f16_tail_kernel, (total_out + 255) / 256, 256, 0,
+                   cur_stream());
+    copyback_f16_tail_kernel<<<(total_out + 255) / 256, 256, 0,
+                               cur_stream()>>>(ytail, Y, int(rows), c0,
+                                               chunk_n);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3005,7 +3298,9 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   if (blocks_per_row == 0) return false;
 
   if (W.type() == QuantType::Q6_K) {
-    // Keep the Q6_K MMQ weight kernel disabled; use D4 activation + fp16 cuBLAS.
+    // Keep the Q6_K MMQ weight kernel disabled; dequantize the D4 activation
+    // and take matmul_f32_dev's Q6_K rule (one arithmetic for every prefill n —
+    // see the routing note there).
     float* X = static_cast<float*>(grow_scratch(
         g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
     if (!X) return false;
@@ -3014,7 +3309,7 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
     dequant_mmq_q8_1_d4<<<(nx + 255) / 256, 256, 0, cur_stream()>>>(
         reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), X, int(cols), n);
     if (cudaGetLastError() != cudaSuccess) return false;
-    return matmul_f16_cublas_dev(W, X, Y, n);
+    return matmul_f32_dev(W, X, Y, n);
   }
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
@@ -3496,17 +3791,30 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
   // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K)
   // and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per 256-value
-  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the cuBLAS fp16 or dp4a
-  // batched path below — matmul_mmq_dev would reject it anyway, and returning its
-  // false here would fail the whole call instead of falling through.
-  const bool mmq_type = W.type() != QuantType::Q6_K;
+  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the blocked fp16
+  // cuBLAS path below — matmul_mmq_dev would reject it anyway, and returning
+  // its false here would fail the whole call instead of falling through.
+  // The MMQ kernel needs K to be a multiple of QK8_1_MMQ (128) and a K below
+  // one 256-element iteration (e.g. the DiT's 128-wide input projection) takes
+  // the dp4a/cuBLAS paths below instead of failing the whole call on
+  // matmul_mmq_dev's precondition. A longer K that is not a multiple of 256
+  // (Qwen 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane, and
+  // the LLM goldens pin that numerics.
+  const bool mmq_type = W.type() != QuantType::Q6_K && cols >= 256 &&
+                        cols % mmq::QK8_1_MMQ == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
-  // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
-  if (W.type() == QuantType::Q6_K && q8_1_enabled() && mmq_enabled() &&
-      n >= mmq_min_n() && cublas_enabled() && n >= cublas_min_n())
-    return matmul_f16_cublas_dev(W, X, Y, n);
+  // Q6_K: n == 1 is the q8_1 dp4a matvec above; every prefill n >= 2 takes the
+  // blocked fp16 cuBLAS GEMM. Fixed block width + real-width tail make the
+  // result per-column invariant, so a position computes the same whether its
+  // segment is long or short (prefix-reuse identity). The fixed-width block
+  // is forced in strict as well, so both profiles share one prefill
+  // arithmetic. TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill
+  // is Roy's MMQ kernel, disabled until its incoherent output on Gemma Q4_K_M
+  // is fixed.
+  if (W.type() == QuantType::Q6_K && q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
+    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
 
   // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.

@@ -26,6 +26,8 @@
   #:use-module (ice-9 optargs)
   #:export (load-model free-model! model-arch model-eos
             make-session free-session!
+            set-grammar! set-json-schema! clear-grammar! constraint-state
+            json-schema->gbnf
             prefill! tokenize tokenize-segments detokenize
             generate generate-tokens generate-stream
             numerics-profile set-numerics-profile!))
@@ -178,6 +180,71 @@ handle."
 
 (define (free-session! session)
   ((proc 'sb_llm_session_free) session))
+
+;;; --- constrained decoding ---------------------------------------------------
+
+;;; A session may carry a grammar (capi.h "Constrained decoding"): every sampled
+;;; token must keep its text acceptable, and the model's EOS ids end the output
+;;; where the grammar can end. The grammar restarts at every prefill, so install
+;;; it before prefill! — that is what masks the turn's first token too.
+
+(define (set-grammar! session gbnf)
+  "Constrain SESSION's next turn to GBNF (a llama.cpp-dialect grammar)."
+  (let ((err-slot (make-slot)))
+    (sb-check! ((proc 'sb_llm_session_set_grammar) session
+                (string->pointer gbnf) (slot-ptr err-slot))
+               err-slot "set-grammar!")))
+
+(define (set-json-schema! session schema-json)
+  "Constrain SESSION's next turn to the JSON Schema SCHEMA-JSON. An unsupported
+keyword is rejected here by name, not silently ignored."
+  (let ((err-slot (make-slot)))
+    (sb-check! ((proc 'sb_llm_session_set_json_schema) session
+                (string->pointer schema-json) (slot-ptr err-slot))
+               err-slot "set-json-schema!")))
+
+(define (clear-grammar! session)
+  "Remove SESSION's grammar: the next turn decodes unconstrained."
+  ((proc 'sb_llm_session_clear_grammar) session))
+
+(define (constraint-state session)
+  "Two values: whether SESSION has a grammar installed, and whether the text
+sampled so far is already a complete value of it."
+  (let* ((active (make-bytevector (sizeof int) 0))
+         (complete (make-bytevector (sizeof int) 0))
+         (err-slot (make-slot)))
+    (sb-check! ((proc 'sb_llm_session_constraint_state) session
+                (bytevector->pointer active) (bytevector->pointer complete)
+                (slot-ptr err-slot))
+               err-slot "constraint-state")
+    (values (not (zero? (bytevector-s32-native-ref active 0)))
+            (not (zero? (bytevector-s32-native-ref complete 0))))))
+
+(define* (json-schema->gbnf schema-json #:key (prefix "") (suffix ""))
+  "Compile SCHEMA-JSON to GBNF text. With PREFIX/SUFFIX, the schema value must
+appear between those literal texts — how the server builds a tool-call envelope
+around a function's arguments schema."
+  (let* ((len-slot (make-bytevector 8 0))       ; size_t
+         (err-slot (make-slot))
+         (head (list (string->pointer schema-json)
+                     (string->pointer prefix) (string->pointer suffix))))
+    ;; Sizing call (cap 0): fills *len_out (the length, no NUL).
+    (let ((st (apply (proc 'sb_llm_json_schema_to_gbnf)
+                     (append head
+                             (list %null-pointer 0
+                                   (bytevector->pointer len-slot)
+                                   (slot-ptr err-slot))))))
+      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+        (sb-check! st err-slot "json-schema->gbnf")))
+    (let* ((m (bytevector-u64-native-ref len-slot 0))
+           (out (make-bytevector (+ m 1) 0))    ; +1 for the NUL terminator
+           (st (apply (proc 'sb_llm_json_schema_to_gbnf)
+                      (append head
+                              (list (bytevector->pointer out) (+ m 1)
+                                    (bytevector->pointer len-slot)
+                                    (slot-ptr err-slot))))))
+      (sb-check! st err-slot "json-schema->gbnf")
+      (utf8->string (bytevector-range out 0 m)))))
 
 ;;; --- tokenize / detokenize --------------------------------------------------
 

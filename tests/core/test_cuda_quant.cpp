@@ -909,7 +909,13 @@ void test_mmq_q6_type(std::mt19937& rng) {
   if (!cmp) std::cerr << "    worst rel err (Q6_K MMQ) = " << worst << "\n";
 }
 
-void test_cublas_q6_type(std::mt19937& rng) {
+void test_dense_q6_all_n(std::mt19937& rng) {
+  // Q6_K prefill (n >= 2): the blocked fp16 cuBLAS GEMM. The n == 1 contract
+  // is the exact integer q8_1 matvec, covered by test_q6_single_q8_1 above.
+  // The GEMM rounds the dequantized weight and the activation to fp16, so it
+  // matches the f32 dequant CPU reference to an fp16 tolerance; segment
+  // invariance (the split check below) is what prefix reuse needs, and it must
+  // hold in strict and standard alike — the binary is run under both profiles.
   constexpr uint64_t rows = 64;
   constexpr uint64_t cols = 256 * 4;
   constexpr uint64_t n = 32;
@@ -932,6 +938,22 @@ void test_cublas_q6_type(std::mt19937& rng) {
   const double worst = compare(Y, ref, 1e-1, &cmp);
   check(cmp, "Q6_K cuBLAS fp16 dequant matches CPU reference tolerance");
   if (!cmp) std::cerr << "    worst rel err (Q6_K cuBLAS) = " << worst << "\n";
+
+  // Segment invariance: the same positions computed as one 32-wide batch and
+  // as a 5-wide + 27-wide pair must be bit-identical. 5 is below mmq_min_n()
+  // and 27 is below the generic cuBLAS threshold, so both sides of every old
+  // boundary are covered; this is the prefix-reuse contract.
+  std::vector<float> Ysplit(rows * n);
+  const std::span<const float> xs(X);
+  const std::span<float> ys(Ysplit);
+  bool ok_split =
+      sbquant::cuda::matmul_f32(W, xs.first(5 * cols), ys.first(5 * rows), 5) &&
+      sbquant::cuda::matmul_f32(W, xs.subspan(5 * cols, 27 * cols),
+                                ys.subspan(5 * rows, 27 * rows), 27);
+  check(ok_split, "Q6_K dense split (5 + 27) returns true");
+  bool same = ok_split;
+  for (size_t i = 0; same && i < Y.size(); ++i) same = Y[i] == Ysplit[i];
+  check(same, "Q6_K dense (n=32) equals the 5 + 27 split bit for bit");
 }
 
 } // namespace
@@ -1007,7 +1029,7 @@ int main() {
   // choice matches them (K-quant and legacy tile layouts).
   test_mmq_j_invariant(sbquant::QuantType::Q4_K, "q4_K", 256, 1024, 128);
   test_mmq_j_invariant(sbquant::QuantType::Q8_0, "q8_0", 256, 1024, 128);
-  test_cublas_q6_type(rng);
+  test_dense_q6_all_n(rng);
   test_legacy_cublas_type(sbquant::QuantType::Q5_0, "q5_0", rng);
   test_legacy_cublas_type(sbquant::QuantType::Q8_0, "q8_0", rng);
   // Last: the epilogue checks draw from the shared rng, so they must not shift

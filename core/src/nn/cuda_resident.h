@@ -119,12 +119,32 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 // `kv_f16` selects the standard profile's f16 KV storage: the cache buffers
 // hold __half instead of float. The values in them were fp16-rounded before
 // either storage existed, so reading f16 and widening is numerically exact.
+// `kv_q8` selects q8 KV storage instead: each cache row is head_dim int8
+// values followed by that row's f32 scale (max|x| / 127) at byte offset
+// head_dim, so a row is head_dim + 4 bytes. Loads dequantize (int8 * scale).
+// `chunk_attr` is the plan's split-KV chunk size (the Boom IR `decode_chunk`
+// attribute). 0 means "use the shared class default". Chunk boundaries are
+// absolute (key position / chunk) and partials merge in ascending chunk order,
+// so the reduction tree depends only on key positions, never on the window
+// capacity or the current depth.
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
                           float scale, float* out, int pos_offset = 0,
-                          bool kv_f16 = false);
+                          bool kv_f16 = false, uint64_t chunk_attr = 0,
+                          bool kv_q8 = false);
+
+// Resolve the split-KV chunk size for one decode attention class (head_dim,
+// GQA ratio, head counts, causal vs windowed, KV element type). Returns the
+// class default or a per-device tuned pick; the pick is recorded in the
+// decision registry and is a pure function of the class (never of n_ctx, the
+// current position or the prefix). `capacity` only bounds the depths the tuner
+// measures at; it is not part of the class key.
+uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
+                                int n_heads_kv, uint64_t sliding_window,
+                                uint64_t capacity, bool kv_f16,
+                                bool kv_q8 = false);
 
 // Append one token's K and V rows (row_elems floats each) into a device-resident
 // KV cache at slot (pos % n_slots). src/dst are device buffers; `pos` is a DEVICE
@@ -134,7 +154,8 @@ bool decode_attention_dev(const float* q, const float* k_cache,
 // `pos_offset` is the verify step's row index (pos[pos_offset]; 0 = decode).
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
                    const float* src_v, const uint64_t* pos, uint64_t n_slots,
-                   int row_elems, int pos_offset = 0, bool dst_f16 = false);
+                   int row_elems, int pos_offset = 0, bool dst_f16 = false,
+                   bool dst_q8 = false, int head_dim = 0);
 
 // Prefill flash attention (mirrors nn::scaled_dot_product_attention for n_q > 1):
 // tiled online-softmax over the KV sequence so the [n_q, n_kv] scores matrix is
@@ -149,6 +170,27 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
                          int n_q, int n_kv, int n_heads_q, int n_heads_kv,
                          int head_dim, uint64_t sliding_window, float scale,
                          float* out);
+
+// Dense full attention (non-causal, no window, no KV cache): every query
+// attends to every key in [0, n). The class is keyed on those attributes
+// (causal 0, kv_cache absent, prefix_reuse impossible, window 0) plus
+// head_dim, the GQA ratio (1 here) and the head count, and resolved through
+// the decision registry (SONICBOOM_ATTN_CLASS / its SONICBOOM_DIT_ATTN alias
+// override). Two regimes: a batched cuBLAS f16 score-GEMM path while the
+// per-head [n, n] planes fit the scratch budget (n <= 2048), and an online-
+// softmax tiled class above it -- the generated FA-2 warp-head kernel, with
+// the hand-written tiled kernel as an autotune candidate. q/k/v are
+// [n, n_heads, head_dim] f32 (K/V are rounded to f16 in both regimes); out is
+// [n, n_heads, head_dim] f32. Returns false when no class of this op can run
+// (e.g. SONICBOOM_ATTN_CLASS=scalar, or an unsupported head width), and the
+// caller keeps its own fallback.
+bool flash_attention_full_dev(const float* q, const float* k, const float* v,
+                              int n, int n_heads, int head_dim, float scale,
+                              float* out);
+
+// Release the score-GEMM regime's scratch planes (the largest per-call
+// allocation of the full-attention class). Safe to call at any time.
+void flash_attention_full_release_scratch();
 
 // Chunked-prefill flash attention: n queries at absolute positions
 // [start, start+n) each attend over [start_key, p] where start_key = max(0,
@@ -167,7 +209,7 @@ bool flash_attention_chunk_dev(const float* q, const float* k_batch,
                                uint64_t n_slots, int n, int n_heads_q,
                                int n_heads_kv, int head_dim,
                                uint64_t sliding_window, float scale, float* out,
-                               bool kv_f16 = false);
+                               bool kv_f16 = false, bool kv_q8 = false);
 
 // Device-position variant of flash_attention_chunk_dev: `start` is a DEVICE
 // uint64_t read in-kernel, so the chunk's absolute start position is a graph
@@ -179,7 +221,8 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    uint64_t n_slots, int n, int n_heads_q,
                                    int n_heads_kv, int head_dim,
                                    uint64_t sliding_window, float scale,
-                                   float* out, bool kv_f16 = false);
+                                   float* out, bool kv_f16 = false,
+                                   bool kv_q8 = false);
 
 // Attention work trace (SONICBOOM_ATTN_TRACE=1). The backend sets the layer
 // before the call; the attention entry points then print one line per call to
@@ -217,6 +260,13 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
 // out[0]. Ties are broken toward the lowest index, exactly mirroring
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
+
+// Masked argmax: the same selection over the ids whose bit is set in `mask`
+// (a device bitmap of ceil(n / 8) bytes, bit i of byte i / 8, LSB first; the
+// caller owns it). Ids the mask disallows never win, and an all-disallowed row
+// writes -1 like an all-NaN one. Mirrors nn::argmax_masked. Devices that
+// cannot run it return false, and the caller falls back to the host.
+bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out);
 
 // --- batched prefill primitives (the decode *_dev kernels generalized to an
 // n dimension; decode is n == 1). Activations are [n, dim] position-major
@@ -266,13 +316,15 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
 bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
                            const float* src_v, uint64_t start_pos,
                            uint64_t n_slots, int row_elems, int n,
-                           bool dst_f16 = false);
+                           bool dst_f16 = false, bool dst_q8 = false,
+                           int head_dim = 0);
 
 // Device-position variant of kv_append_batched_dev: `start_pos` is a DEVICE
 // uint64_t read in-kernel (CUDA Graphs for chunked prefill).
 bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
                                const float* src_v, const uint64_t* start_pos,
                                uint64_t n_slots, int row_elems, int n,
-                               bool dst_f16 = false);
+                               bool dst_f16 = false, bool dst_q8 = false,
+                               int head_dim = 0);
 
 } // namespace sonicboom::nn::cuda

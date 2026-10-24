@@ -69,6 +69,16 @@ text_one() { grep -o '"content":"[^"]*"' "$1" | head -1 \
                | sed 's/^"content":"//; s/"$//'; }
 text_all() { grep -o '"content":"[^"]*"' "$1" \
                | sed 's/^"content":"//; s/"$//' | tr -d '\n'; }
+# The text of a completion as it stands inside the response JSON: the string
+# value with its escapes intact, so a reply that is itself JSON (\", \\n) is
+# read whole instead of stopping at its first quote.
+json_content() { sed -n 's/.*"content":"\(\(\\.\|[^"\\]\)*\)".*/\1/p' "$1" | head -1; }
+# The leading-whitespace-free form of a value read by json_content.
+trim_lead() { local s=$1; printf '%s' "${s#"${s%%[![:space:]]*}"}"; }
+# The compact form of a reply read by json_content: its escaped newlines and its
+# spaces removed, so a pretty-printed value matches a compact pattern. Only for
+# values whose strings hold no spaces of their own.
+compact_reply() { local s=$1; s=${s//\\n/}; s=${s//[[:space:]]/}; printf '%s' "$s"; }
 
 ok()   { printf '  ok    %s\n' "$1"; }
 bad()  { printf '  FAIL  %s\n' "$1"; fail=1; }
@@ -383,6 +393,78 @@ run_model() {
     else
       bad "the prompt-injection check failed (HTTP $code: $(msg "$body"))"
     fi
+  fi
+
+  # --- constrained decoding --------------------------------------------------
+  # response_format {type: json_schema}: the reply is one JSON value of the
+  # schema — whitespace may precede it and nothing may follow. The content is a
+  # JSON string inside the response, so it is read escaped: the key city is
+  # \"city\" in it, and the value of units is \"c\" or \"f\".
+
+  local obj_schema='{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer","minimum":1,"maximum":14},"units":{"enum":["c","f"]}},"required":["city","days","units"],"additionalProperties":false}'
+  jpost "$base/v1/chat/completions" "$(printf \
+    '{"model":"%s","messages":[{"role":"user","content":"What is the weather in Paris for the next three days? Answer as JSON."}],"max_tokens":96,"response_format":{"type":"json_schema","json_schema":{"name":"weather","schema":%s}}}' \
+    "$mid" "$obj_schema")"
+  local obj_reply obj_compact
+  obj_reply=$(trim_lead "$(json_content "$body")")
+  obj_compact=$(compact_reply "$obj_reply")
+  if [ "$code" = 200 ] && grep -q '"finish_reason":"stop"' "$body" \
+     && [ "${obj_compact:0:1}" = "{" ] && [ "${obj_compact: -1}" = "}" ] \
+     && grep -q '\\"city\\":' <<<"$obj_compact" \
+     && grep -q '\\"days\\":' <<<"$obj_compact" \
+     && grep -Eq '\\"units\\":\\"[cf]\\"' <<<"$obj_compact"; then
+    ok "response_format json_schema: the reply is one object of the schema"
+  else
+    bad "response_format json_schema: the reply is not the requested object (HTTP $code: $obj_reply)"
+  fi
+
+  # The item type and both item bounds are the grammar's, so the array must be
+  # made of 4..8 booleans and of nothing else.
+  local arr_schema='{"type":"array","items":{"type":"boolean"},"minItems":4,"maxItems":8}'
+  jpost "$base/v1/chat/completions" "$(printf \
+    '{"model":"%s","messages":[{"role":"user","content":"Answer with a JSON array of four to eight booleans."}],"max_tokens":96,"response_format":{"type":"json_schema","json_schema":{"name":"flags","schema":%s}}}' \
+    "$mid" "$arr_schema")"
+  local arr_reply arr_compact
+  arr_reply=$(trim_lead "$(json_content "$body")")
+  arr_compact=$(compact_reply "$arr_reply")
+  if [ "$code" = 200 ] && [ "${arr_compact: -1}" = "]" ] \
+     && grep -Eq '^\[(true|false)(,(true|false)){3,7}\]$' <<<"$arr_compact"; then
+    ok "response_format json_schema: the array holds 4..8 booleans and nothing else ($arr_compact)"
+  else
+    bad "response_format json_schema: the array is not 4..8 booleans (HTTP $code: $arr_reply)"
+  fi
+
+  # A schema that cannot be compiled is the request's error: a 400 on
+  # response_format naming the parameter, not a 500.
+  local bad_schema='{"type":"string","pattern":"^a+$"}'
+  jpost "$base/v1/chat/completions" "$(printf \
+    '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"response_format":{"type":"json_schema","json_schema":{"name":"s","schema":%s}}}' \
+    "$mid" "$bad_schema")"
+  [ "$code" = 400 ] && grep -q '"param":"response_format"' "$body" \
+    && ok "an unsupported schema keyword -> 400 on response_format" \
+    || bad "an unsupported keyword should be a 400 on response_format ($code)"
+
+  # tools + tool_choice required: one call of the named function, its arguments
+  # an object of that function's parameters schema.
+  local tools_json='[{"type":"function","function":{"name":"get_weather","description":"Report the weather for a city.","parameters":{"type":"object","properties":{"city":{"type":"string"},"units":{"enum":["c","f"]}},"required":["city","units"],"additionalProperties":false}}}]'
+  jpost "$base/v1/chat/completions" "$(printf \
+    '{"model":"%s","messages":[{"role":"user","content":"What is the weather in Paris?"}],"max_tokens":96,"tools":%s,"tool_choice":"required"}' \
+    "$mid" "$tools_json")"
+  if [ "$code" = 200 ] && grep -q '"finish_reason":"tool_calls"' "$body" \
+     && grep -q '"type":"function"' "$body" \
+     && grep -q '"name":"get_weather"' "$body"; then
+    local call_args
+    call_args=$(sed -n 's/.*"arguments":"\(\(\\.\|[^"\\]\)*\)".*/\1/p' "$body" | head -1)
+    call_args=$(trim_lead "$call_args")
+    if [ "${call_args:0:1}" = "{" ] && [ "${call_args: -1}" = "}" ] \
+       && grep -q '\\"city\\":' <<<"$call_args" \
+       && grep -Eq '\\"units\\":\\"[cf]\\"' <<<"$call_args"; then
+      ok "tools + tool_choice required: one call of get_weather, arguments of its schema"
+    else
+      bad "tool_choice required: the arguments are not the function's object ($call_args)"
+    fi
+  else
+    bad "tool_choice required should force one call of get_weather (HTTP $code)"
   fi
 
   echo

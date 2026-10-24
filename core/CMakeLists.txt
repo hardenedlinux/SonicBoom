@@ -63,6 +63,13 @@ file(GLOB_RECURSE SONICBOOM_AUTOGRAD_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE SONICBOOM_GGUF_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/gguf/*.cpp)
 
+# safetensors reader (core/src/safetensors/). Pure file-format reader: parses
+# the 8-byte header length and the JSON tensor directory, validates every byte
+# range, and exposes tensor bytes as spans over a read-only mmap. No dtype
+# conversion, no device backend, no dependency on the torch safetensors library.
+file(GLOB_RECURSE SONICBOOM_SAFETENSORS_SOURCES CONFIGURE_DEPENDS
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors/*.cpp)
+
 # Tokenizer vocabulary (core/src/vocab/). Layer 2 data layout + GGUF loading
 # glue; the BPE/detokenize algorithms are header-only, MIT-derived from ggml
 # (core/src/vocab/ggml_derived/bpe_tokenizer.h). No ggml runtime dependency.
@@ -116,6 +123,7 @@ add_library(sonicboom SHARED
   ${SONICBOOM_PLANNER_SOURCES}
   ${SONICBOOM_AUTOGRAD_SOURCES}
   ${SONICBOOM_GGUF_SOURCES}
+  ${SONICBOOM_SAFETENSORS_SOURCES}
   ${SONICBOOM_VOCAB_SOURCES}
   ${SONICBOOM_QUANT_SOURCES}
   ${SONICBOOM_NN_SOURCES}
@@ -208,6 +216,8 @@ if(SONICBOOM_USE_CUDA)
     # dispatches them; the fused adjoints are backward_ops.cu above).
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/device_graph_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
+    # MOSS-Image DiT: Q8_0 weights + a device-resident forward (M2).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
   # ggml-cuda/mmq.cu with -use_fast_math -extended-lambda. The arch already

@@ -466,6 +466,30 @@ void test_sampling() {
     std::vector<float> empty;
     check(sbnn::argmax(empty) == -1, "argmax(empty) == -1");
   }
+
+  // Masked argmax (constrained decoding): the plain result whenever its id is
+  // allowed, the best allowed id otherwise, and -1 when nothing is allowed.
+  {
+    std::vector<float> x = {1.0f, 3.0f, 2.0f, 4.0f, 0.5f};
+    const std::vector<uint8_t> all{0xFF};
+    check(sbnn::argmax_masked(x, all) == 3,
+          "masked argmax: all-ones equals argmax");
+    const std::vector<uint8_t> without{uint8_t(~(1u << 3))};
+    check(sbnn::argmax_masked(x, without) == 1,
+          "masked argmax: skips a disallowed max");
+    const std::vector<uint8_t> only{uint8_t(1u << 4)};
+    check(sbnn::argmax_masked(x, only) == 4,
+          "masked argmax: a single allowed id");
+    const std::vector<uint8_t> none{0x00};
+    check(sbnn::argmax_masked(x, none) == -1,
+          "masked argmax: nothing allowed -> -1");
+    const std::vector<uint8_t> short_mask{};
+    check(sbnn::argmax_masked(x, short_mask) == -1,
+          "masked argmax: an empty mask allows nothing");
+    const std::vector<uint8_t> first_two{0x03};
+    check(sbnn::argmax_masked(x, first_two) == 1,
+          "masked argmax: ids past the allowed bits lose");
+  }
 }
 
 void test_embedding() {

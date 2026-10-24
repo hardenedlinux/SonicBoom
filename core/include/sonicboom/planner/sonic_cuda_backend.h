@@ -123,6 +123,26 @@ public:
   // from the persistent token slot. The synchronous D2H is the replay barrier.
   bool read_verify_tokens(float* host, int rows) const;
 
+  // --- constrained decoding ------------------------------------------------
+  //
+  // The mask the Argmax node applies before selecting its token (constrained
+  // decoding). The bitmap is `mask.size()` bytes, bit i of byte i / 8 (LSB
+  // first), covering ceil(vocab / 8) bytes. Once this buffer exists the Argmax
+  // node always runs the masked kernel — the captured decode graph bakes the
+  // kernel choice in — so a decode runtime that may ever be constrained must
+  // allocate it before capture with argmax_mask_init(); all-ones is then
+  // bit-identical to the unmasked kernel, and an unconstrained replay must
+  // argmax_mask_clear() first so a previous constrained replay's mask cannot
+  // leak. A backend whose mask was never initialized keeps the unmasked
+  // kernel.
+  bool argmax_mask_init(size_t bytes);
+  bool argmax_mask_ready() const { return static_cast<bool>(argmax_mask_); }
+  // Upload the current allowed-token bitmap (bit i of byte i / 8). Size must
+  // equal the size the mask was initialized with.
+  bool set_argmax_mask(std::span<const uint8_t> mask);
+  // Fill the mask with all-ones = every token allowed.
+  bool clear_argmax_mask();
+
   // --- decode chunking (§10) ------------------------------------------------
   //
   // k greedy decode steps are captured into one graph: step j reads the token
@@ -222,6 +242,9 @@ private:
   hal::Buffer pos_ring_;            // chunk mode: k positions ([k] uint64_t)
   hal::Buffer token_ring_;          // chunk mode: k emitted tokens ([k] float)
   hal::Buffer carry_buf_;           // chunk mode: the token the chunk's first step reads
+  hal::Buffer argmax_mask_;         // allowed-token bitmap for the Argmax node
+  size_t argmax_mask_bytes_ = 0;    // its size (ceil(vocab / 8)), 0 = never initialized
+  bool argmax_mask_dirty_ = false;  // a constrained mask has been uploaded and not cleared
   uint32_t chunk_ = 1;              // decode steps captured per graph
   uint32_t step_index_ = 0;         // which step the next execute() is
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)

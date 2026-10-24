@@ -108,6 +108,17 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
                      uint64_t head_dim, uint64_t sliding_window, float scale,
                      std::span<float> out);
 
+// Dense full attention (non-causal, no window, no KV cache), the DiT shape
+// class: q/k/v/out are [n, n_heads, head_dim] with one K/V head per query head.
+// Host-facing counterpart of the device-resident flash_attention_full_dev: it
+// stages q/k/v through the shared scratch buffers and copies the result back,
+// so it exercises the same tiled tensor-core kernel. Returns false when the
+// shape class has no instantiation or a buffer is too small.
+bool flash_attention_full(std::span<const float> q, std::span<const float> k,
+                          std::span<const float> v, uint64_t n,
+                          uint64_t n_heads, uint64_t head_dim, float scale,
+                          std::span<float> out);
+
 // Drop all cached device weight copies (call when a model is reloaded at a new
 // address so stale device buffers are not reused).
 void clear_cache();
