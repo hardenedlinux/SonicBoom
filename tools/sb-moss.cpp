@@ -78,19 +78,6 @@ void usage() {
          "file (int64 B,C,H,W then f32), --seed draws the initial noise instead.\n";
 }
 
-// The pipeline's chat rendering for one user turn with enable_thinking=True
-// (MOSS-Image's encode_prompt): the Qwen3.5 template emits no system block for
-// a single-user conversation, so the text is the user turn plus the assistant
-// generation prompt and its empty thinking block.
-std::string chat_prompt(std::string_view text) {
-  std::string out;
-  out.reserve(text.size() + 64);
-  out += "<|im_start|>user\n";
-  out += text;
-  out += "<|im_end|>\n<|im_start|>assistant\n<think>\n";
-  return out;
-}
-
 std::vector<int32_t> parse_ids(const std::string& list) {
   std::vector<int32_t> ids;
   std::stringstream ss(list);
@@ -477,36 +464,6 @@ std::optional<LatentBatch> read_latents(const std::string& path,
   return b;
 }
 
-std::vector<float> seeded_noise(int64_t n, uint64_t seed) {
-  // splitmix64 + Box-Muller: deterministic, but not torch's generator (parity
-  // runs pass an explicit --latent-in).
-  std::vector<float> out(static_cast<size_t>(n));
-  auto next = [&]() {
-    seed += 0x9e3779b97f4a7c15ull;
-    uint64_t z = seed;
-    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-    z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-    return z ^ (z >> 31);
-  };
-  auto uniform = [&]() {
-    return (static_cast<double>(next() >> 11) + 0.5) *
-           (1.0 / 9007199254740992.0);
-  };
-  for (int64_t i = 0; i + 1 < n; i += 2) {
-    const double u1 = uniform(), u2 = uniform();
-    const double r = std::sqrt(-2.0 * std::log(u1));
-    out[static_cast<size_t>(i)] =
-        static_cast<float>(r * std::cos(2.0 * 3.14159265358979323846 * u2));
-    out[static_cast<size_t>(i + 1)] =
-        static_cast<float>(r * std::sin(2.0 * 3.14159265358979323846 * u2));
-  }
-  if (n % 2 == 1)
-    out[static_cast<size_t>(n - 1)] =
-        static_cast<float>(std::sqrt(-2.0 * std::log(uniform())) *
-                           std::cos(2.0 * 3.14159265358979323846 * uniform()));
-  return out;
-}
-
 int run_sample(const std::string& root, const std::string& text_arg,
                const std::string& embeds_path, const std::string& negative_arg,
                const std::string& neg_embeds_path, int64_t height,
@@ -580,7 +537,7 @@ int run_sample(const std::string& root, const std::string& text_arg,
       std::cerr << "sb-moss: " << vocab.error() << "\n";
       return false;
     }
-    const std::string rendered = raw ? prompt : chat_prompt(prompt);
+    const std::string rendered = raw ? prompt : sonicboom::moss::moss_chat_prompt(prompt);
     const auto ids = sonicboom::vocab::tokenize(*vocab, rendered, true, false);
     auto hidden = (*pipeline)->encode(ids);
     if (!hidden) {
@@ -654,7 +611,7 @@ int run_sample(const std::string& root, const std::string& text_arg,
       l.channels = dit_cfg.latent_channels;
       l.height = grid_h;
       l.width = grid_w;
-      l.values = seeded_noise(l.count(), seed + static_cast<uint64_t>(i));
+      l.values = sonicboom::moss::seeded_noise(l.count(), seed + static_cast<uint64_t>(i));
       latents.push_back(std::move(l));
     }
   }
@@ -987,7 +944,7 @@ int main(int argc, char** argv) {
       std::cerr << "sb-moss: " << vocab.error() << "\n";
       return 1;
     }
-    const std::string prompt = raw ? text : chat_prompt(text);
+    const std::string prompt = raw ? text : sonicboom::moss::moss_chat_prompt(text);
     ids = sonicboom::vocab::tokenize(*vocab, prompt, /*parse_special=*/true,
                                      /*add_special=*/false);
   }

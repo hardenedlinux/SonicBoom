@@ -45,9 +45,16 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sonicboom::moss {
+
+// The pipeline's chat rendering for one user turn with enable_thinking=True
+// (MOSS-Image's encode_prompt): the Qwen3.5 template emits no system block for
+// a single-user conversation, so the text is the user turn plus the assistant
+// generation prompt and its empty thinking block.
+std::string moss_chat_prompt(std::string_view text);
 
 // The fields of config.json's "text_config" the forward needs.
 struct TextEncoderConfig {

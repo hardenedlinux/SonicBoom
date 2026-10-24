@@ -25,6 +25,7 @@
             sb-status-ok?
             sb-status->message
             SB_ERR_BINDING
+            SB_ERR_CANCELLED
             ;; low-level FFI plumbing exposed for the training module
             proc make-slot slot-ptr slot-ref capture-error))
 
@@ -38,6 +39,7 @@
 (define SB_ERR_RUNTIME 5)
 (define SB_ERR_INTERNAL 6)
 (define SB_ERR_UNSUPPORTED 7)
+(define SB_ERR_CANCELLED 8)
 
 (define (sb-status-ok? status) (= status SB_OK))
 
@@ -45,7 +47,7 @@
   `((,SB_OK . "ok") (,SB_ERR_PARSE . "parse") (,SB_ERR_WEIGHT . "weight")
     (,SB_ERR_COMPILE . "compile") (,SB_ERR_BINDING . "binding")
     (,SB_ERR_RUNTIME . "runtime") (,SB_ERR_INTERNAL . "internal")
-    (,SB_ERR_UNSUPPORTED . "unsupported")))
+    (,SB_ERR_UNSUPPORTED . "unsupported") (,SB_ERR_CANCELLED . "cancelled")))
 
 (define (sb-status->message status)
   (or (assq-ref *status-names* status) "unknown"))
@@ -226,7 +228,20 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_llm_session_clear_grammar . ,(foreign-proc "sb_llm_session_clear_grammar"
                                                               void (list '*)))
                (sb_llm_session_constraint_state . ,(foreign-proc "sb_llm_session_constraint_state"
-                                                                 int (list '* '* '* '*))))))
+                                                                 int (list '* '* '* '*)))
+               ;; image generation (MOSS-Image) — see capi.h sb_image_*
+               (sb_image_model_load . ,(foreign-proc "sb_image_model_load" int
+                                                     (list '* '* '*)))
+               (sb_image_model_free . ,(foreign-proc "sb_image_model_free" void
+                                                     (list '*)))
+               (sb_image_model_arch . ,(foreign-proc "sb_image_model_arch" int
+                                                     (list '* '* size_t '* '*)))
+               (sb_image_generate . ,(foreign-proc "sb_image_generate" int
+                                                   (list '* '* '* '* '* size_t
+                                                         '* '*)))
+               (sb_image_write_png . ,(foreign-proc "sb_image_write_png" int
+                                                    (list '* '* uint32 uint32
+                                                          '*))))))
         (%procs table)
         table)))
 

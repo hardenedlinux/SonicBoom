@@ -14,7 +14,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_prefix_cache test_vocab test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry test_safetensors test_grammar test_sampling)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_dispatch test_native_ops test_autograd test_gguf test_dequant test_quantized_matmul test_nn test_gemma4 test_qwen2_config test_prefix_cache test_vocab test_plan_cache test_spec_invariance test_spec_rollback test_spec_program test_spec_bootstrap test_spec_autoprobe test_ngram_drafter test_clip_grad_norm test_runtime_features test_autotune_cache test_autotune_runner test_decision_registry test_safetensors test_grammar test_sampling test_png)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
@@ -448,6 +448,23 @@ if(SONICBOOM_USE_CUDA)
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
   sb_add_cpp_test(test_capi_sampling)
   set_tests_properties(test_capi_sampling PROPERTIES
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+endif()
+
+# Image generation through the C ABI (MOSS-Image, CUDA, 512x512, 4 steps): the
+# pixels match `sb-moss sample` under the same settings, the same request is
+# deterministic, image 0 of a batch equals the single image, and a cancelling
+# progress callback returns SB_ERR_CANCELLED. The sb-moss reference is the
+# out-of-tree tool built by tools/build_sb_moss.sh; the test skips (77) when it
+# or the model is absent.
+if(SONICBOOM_USE_CUDA)
+  add_executable(test_capi_image test_capi_image.c)
+  target_link_libraries(test_capi_image PRIVATE sonicboom m CUDA::cudart)
+  target_compile_definitions(test_capi_image PRIVATE
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    SB_MOSS_BIN="${CMAKE_SOURCE_DIR}/tools/sb-moss")
+  sb_add_cpp_test(test_capi_image)
+  set_tests_properties(test_capi_image PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 endif()
 

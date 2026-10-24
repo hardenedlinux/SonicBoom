@@ -52,6 +52,7 @@ typedef enum sb_status {
   SB_ERR_RUNTIME = 5,  /* the JITted function failed or was unavailable       */
   SB_ERR_INTERNAL = 6, /* invalid argument to the C API, or unexpected error  */
   SB_ERR_UNSUPPORTED = 7, /* a requested feature this build/backend lacks     */
+  SB_ERR_CANCELLED = 8, /* the caller's progress callback asked to stop      */
 } sb_status;
 
 /* Error categories (the `message` carries the human-readable detail). */
@@ -66,6 +67,7 @@ typedef enum sb_error_kind {
   SB_ERRKIND_BINDING = 7,
   SB_ERRKIND_RUNTIME = 8,
   SB_ERRKIND_INTERNAL = 9,
+  SB_ERRKIND_CANCELLED = 10,
 } sb_error_kind;
 
 /* The frozen v0 dtype set. */
@@ -650,6 +652,74 @@ void sb_llm_session_clear_grammar(sb_llm_session *session);
 sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
                                           int *active_out, int *complete_out,
                                           sb_error **err_out);
+
+/* --- Image generation ------------------------------------------------------
+ *
+ * MOSS-Image text-to-image through the same stable ABI: an opaque model (the
+ * pipeline with its text encoder), one request struct, a batch of RGB images
+ * and a minimal PNG writer. The model directory is the MOSS-Image root
+ * (text_encoder/, transformer/, vae/, tokenizer/); a directory the pipeline
+ * rejects is SB_ERR_UNSUPPORTED.
+ *
+ * Determinism: image i starts from the same seeded noise sb-moss's `sample
+ * --seed` draws (seed + i), and images in a batch are denoised one at a time,
+ * so image i of a batch is bit-identical to generating it alone.
+ */
+
+typedef struct sb_image_model sb_image_model;
+
+/* One generation request. Fields beyond `struct_size` take their defaults, so
+ * a caller built against an older header keeps working. prompt is required
+ * (NUL-terminated UTF-8, wrapped in the pipeline's chat template);
+ * negative_prompt NULL is the empty prompt (used when guidance_scale != 1).
+ * width and height are multiples of 16 (and >= 16); batch >= 1; steps >= 1;
+ * guidance_scale is used as given (0 is unconditional-only; the reference
+ * pipeline's default is 3.0), so a caller sets the guidance it wants. */
+typedef struct sb_image_request {
+  size_t struct_size;
+  const char *prompt;
+  const char *negative_prompt;
+  uint32_t width;
+  uint32_t height;
+  uint32_t steps;
+  float guidance_scale;
+  uint64_t seed;
+  uint32_t batch;
+} sb_image_request;
+
+/* Called after each denoising step with the image's index in the batch, the
+ * steps completed (1-based) and the total. A non-zero return cancels: the
+ * generation stops after the current step and sb_image_generate returns
+ * SB_ERR_CANCELLED. */
+typedef int (*sb_image_progress_cb)(void *user, uint32_t image_index,
+                                    uint32_t step, uint32_t total_steps);
+
+/* Load the MOSS-Image pipeline and its text encoder from `dir`. */
+sb_status sb_image_model_load(const char *dir, sb_image_model **out,
+                              sb_error **err_out);
+void sb_image_model_free(sb_image_model *model);
+
+/* The architecture name ("moss-image"), two-call sizing like the other string
+ * outputs: a short cap returns SB_ERR_BINDING and the needed byte count. */
+sb_status sb_image_model_arch(const sb_image_model *model, char *out,
+                              size_t cap, size_t *len_out,
+                              sb_error **err_out);
+
+/* Generate `req->batch` images. rgb_out receives batch x height x width x 3
+ * bytes, uint8 HWC, row-major, top row first, converted from the pipeline's
+ * [-1, 1] CHW floats with clamp and lrintf. Two-call sizing: pass rgb_out NULL
+ * (or a cap too small) to get the needed byte count in *bytes_out and
+ * SB_ERR_BINDING. cb may be NULL. */
+sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
+                            sb_image_progress_cb cb, void *user,
+                            uint8_t *rgb_out, size_t cap, size_t *bytes_out,
+                            sb_error **err_out);
+
+/* Write `rgb` (height rows of width*3 bytes, RGB) as a PNG: 8-bit RGB, one
+ * IDAT of stored (uncompressed) deflate blocks, no external dependency. */
+sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
+                             uint32_t width, uint32_t height,
+                             sb_error **err_out);
 
 /* --- Decision registry (diagnostics) ---------------------------------------
  *

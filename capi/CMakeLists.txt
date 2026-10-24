@@ -7,7 +7,7 @@
 # library that FFI consumers load. This header/source pair exposes no C++,
 # MLIR, LLVM, ATen, or c10 types across the boundary.
 
-add_library(sonicboom_capi OBJECT src/capi.cpp)
+add_library(sonicboom_capi OBJECT src/capi.cpp src/capi_image.cpp)
 
 # capi.h is the public header for C consumers; the sx:: core headers are a
 # private implementation dependency (never re-exposed).

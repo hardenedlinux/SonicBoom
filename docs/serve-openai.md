@@ -24,9 +24,10 @@ bindings/guile/scheme/sonicboom/serve/
 └── app.scm            the single-file Artanis app: the HTTP layer only
 
 bindings/guile/tests/serve/
-├── test-serve-units.scm   below HTTP (templates, mock, sampler, pool, engine)
-├── test-serve-http.scm    end to end with Guile's HTTP client, raw SSE, WebSocket
-└── test-openai-sdk.py     the official openai Python SDK against the app
+├── test-serve-units.scm    below HTTP (templates, mock, sampler, pool, engine)
+├── test-serve-http.scm     end to end with Guile's HTTP client, raw SSE, WebSocket
+├── test-serve-images.scm   POST /v1/images/generations against the real model
+└── test-openai-sdk.py      the official openai Python SDK against the app
 ```
 
 Dependencies point down: `app.scm` → `openai`, `engine`, `sse` → `sessions` →
@@ -189,6 +190,7 @@ Endpoints:
 |---|---|
 | `GET /v1/models`, `GET /v1/models/:id` | the served models: one real model (default `gemma-4-E4B-it-Q3_K_M`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE of `chat.completion.chunk`, then `data: [DONE]` |
+| `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
 | `GET /sonicboom/stats` | engine, pool and backend counters (not OpenAI) |
 | `GET /health` | `ok` |
@@ -235,6 +237,32 @@ A tool-call envelope is exact on both sides. Greedy decoding is unchanged
 wherever the unconstrained token is allowed, so a model that answers with
 valid JSON produces the same tokens it would have produced anyway.
 
+### Image generation
+
+`POST /v1/images/generations` runs the MOSS-Image pipeline through
+`(sonicboom image)` (C ABI `sb_image_*`). The model directory is
+`--image-model` (default `models/MOSS-Image-SFT`) and is loaded on the first
+image request, so a chat-only server never claims the DiT's device memory.
+Generations run in a runner thread, one at a time (the pipeline's device
+buffers are reused in place); they do not use the chat engine's queue or
+session pool.
+
+| field | |
+|---|---|
+| `prompt` | required, non-empty |
+| `n` | 1..10 (default 1); image *i* starts from seed + *i* |
+| `size` | `"WIDTHxHEIGHT"`, both multiples of 16 (default `512x512`) |
+| `response_format` | `"b64_json"` only (the default); anything else is a 400 |
+| `seed`, `steps`, `guidance_scale`, `negative_prompt` | extensions (defaults 0, 50, 3.0, none) |
+
+The response is `{"created": <unix time>, "data": [{"b64_json": <PNG>}, …]}`.
+Each PNG is written by the C ABI's own writer (8-bit RGB, stored deflate
+blocks) and base64-encoded in Scheme — Guile 3.0.9 has no `(ice-9 base64)`.
+The same request twice returns the same pixels, because both the noise and
+the sampler are seeded. A model that cannot be loaded, and a generation
+failure, are 500s (`server_error`); a cancelled generation would be
+`SB_ERR_CANCELLED`, but the server never cancels one.
+
 Streaming: the first chunk carries `delta.role`, then content deltas (one per
 token here), the tool-call deltas (a header with `index`, `id`, `type`, `name`
 and empty `arguments`, then the arguments in pieces), a chunk with
@@ -258,9 +286,9 @@ the WebSocket replies are generated in a thread so the connection task can
 write each chunk. Details, and the Artanis changes that would replace both
 workarounds: [`artanis-streaming-notes.md`](artanis-streaming-notes.md).
 
-Options: `--backend real|mock`, `--model`, `--model-id`, `--host`, `--port`,
-`--queue`, `--max-sessions`, `--token-budget`, `--context-length`,
-`--step-delay`, `--prefill-delay`, `--runtime-dir`. The
+Options: `--backend real|mock`, `--model`, `--model-id`, `--image-model`,
+`--host`, `--port`, `--queue`, `--max-sessions`, `--token-budget`,
+`--context-length`, `--step-delay`, `--prefill-delay`, `--runtime-dir`. The
 app sets `server.websocket = true` and `server.runners = queue + 2` (each
 running or waiting stream holds a runner).
 
@@ -296,3 +324,6 @@ Results: units 47/47, HTTP 86/86, openai SDK (3.29.0) 24/24.
 - The queue does not notice a client that leaves while waiting; it is
   cancelled at its first token.
 - No authentication; the `Authorization` header is ignored.
+- `/v1/images/generations` is not queued and not cancellable: it holds the
+  image model for the whole generation, and a client that goes away waits for
+  it to finish. `response_format` `url` is not implemented (no storage).

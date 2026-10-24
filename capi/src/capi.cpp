@@ -47,6 +47,9 @@
 // core/src is a private include directory for this target (core/CMakeLists):
 // the decision registry is internal runtime state, not a Layer 2 header.
 #include "planner/decision_registry.h"
+// Private to this directory: sb_error's definition + the guard/set_error
+// helpers shared with capi_image.cpp.
+#include "capi_private.h"
 // Generated at build time (cmake/WriteBuildTag.cmake, a private include
 // directory of this target): the revision the library was built from. It is
 // rewritten only when the revision changes.
@@ -101,11 +104,6 @@ struct sb_executable {
   // executable does not retain value names.
   const char *input_name(std::size_t index) const;
   const char *output_name(std::size_t index) const;
-};
-
-struct sb_error {
-  sb_error_kind kind;
-  std::string message;
 };
 
 struct sb_tensor {
@@ -174,56 +172,12 @@ struct sb_llm_session {
 
 namespace {
 
-void set_error(sb_error **err_out, sb_error_kind kind, const char *message) noexcept {
-  if (!err_out)
-    return;
-  // Reusing an error slot that already holds an error must not leak the
-  // previous handle: free it first. The slot holds a handle we allocated via
-  // sb_error_free, never a caller-owned pointer, so this is always safe and
-  // never frees uninitialized memory (sb_error_free is null-safe).
-  if (*err_out) {
-    delete *err_out;
-    *err_out = nullptr;
-  }
-  auto *err = new (std::nothrow) sb_error();
-  if (!err)
-    return;  // slot left NULL; the failure is still visible via the status code
-  err->kind = kind;
-  try {
-    err->message = message ? message : "";
-  } catch (...) {
-    // Constructing the diagnostic can in principle throw under allocation
-    // pressure; release the handle rather than hand back a broken one.
-    delete err;
-    return;
-  }
-  *err_out = err;
-}
+using sonicboom::capi_private::guard;
+using sonicboom::capi_private::set_error;
 
 sb_status fail_arg(sb_error **err_out) {
   set_error(err_out, SB_ERRKIND_INTERNAL, "invalid argument");
   return SB_ERR_INTERNAL;
-}
-
-// Contain every C++ exception so none escapes an exported `sb_*` function.
-// Each status-returning function runs its body through this: an expected
-// exception (std::exception, including bad_alloc) or an unexpected one becomes
-// SB_ERR_INTERNAL with a best-effort diagnostic. The function is noexcept so a
-// throw during set_error's own (nothrow) allocation path cannot escape.
-template <typename Fn>
-sb_status guard(Fn &&fn, sb_error **err_out) noexcept {
-  try {
-    return fn();
-  } catch (const std::bad_alloc &) {
-    set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
-    return SB_ERR_INTERNAL;
-  } catch (const std::exception &e) {
-    set_error(err_out, SB_ERRKIND_INTERNAL, e.what());
-    return SB_ERR_INTERNAL;
-  } catch (...) {
-    set_error(err_out, SB_ERRKIND_INTERNAL, "unknown exception");
-    return SB_ERR_INTERNAL;
-  }
 }
 
 sb_dtype map_dtype(sx::DType d) {

@@ -446,6 +446,10 @@ const VaeConfig& VaeDecoder::config() const noexcept { return impl_->cfg; }
 const VaeBatchNorm& VaeDecoder::batch_norm() const noexcept { return impl_->bn; }
 int64_t VaeDecoder::weight_bytes() const noexcept { return impl_->bytes; }
 
+void VaeDecoder::release_cached_memory() const {
+  vae::detail::aten_vae_release_cached_memory();
+}
+
 std::expected<std::unique_ptr<VaeDecoder>, std::string> VaeDecoder::load(
     const std::filesystem::path& dir) {
   auto text = read_text(dir / "config.json");
