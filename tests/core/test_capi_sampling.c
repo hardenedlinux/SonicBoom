@@ -5,7 +5,9 @@
 //  3. prefix reuse: a prefill of prompt + the first 16 sampled tokens followed
 //     by 16 more tokens reproduces tokens 17..32 of the first run;
 //  4. temperature 0 is still the historical greedy stream (the p1 golden);
-//  5. constrained decoding + sampling produces text the grammar accepts.
+//  5. constrained decoding + sampling produces text the grammar accepts;
+//  6. a zero-initialized struct (struct_size + max_tokens only) is greedy:
+//     repeat_penalty 0 means off and repeat_last_n 0 disables penalties.
 //
 // Skips (exit 77) when the model, the golden or a CUDA device is absent.
 
@@ -258,6 +260,22 @@ int main(void) {
     check(strcmp(out, "yes") == 0 || strcmp(out, "no") == 0,
           "(5) grammar-constrained sampled text is accepted");
     sb_llm_session_free(session);
+  }
+
+  // (6) zero-initialized fields mean "off": only struct_size and max_tokens
+  // are set, so repeat_penalty 0 and repeat_last_n 0 must behave as plain
+  // greedy (and must not be rejected).
+  {
+    sb_llm_sampling z;
+    memset(&z, 0, sizeof z);
+    z.struct_size = sizeof z;
+    z.max_tokens = 32;
+    run_result g = run_plain(model, prompt, n_prompt, z);
+    check(g.n == 32, "(6) zero-initialized struct produced 32 tokens");
+    int same = g.n == 32;
+    for (int i = 0; same && i < 32; ++i)
+      same = (int64_t)g.tokens[i] == golden[i];
+    check(same, "(6) zero-initialized struct == the p1 greedy golden");
   }
 
   sb_llm_model_free(model);

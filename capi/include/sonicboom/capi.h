@@ -508,10 +508,15 @@ typedef int32_t sb_token;   /* a vocabulary index */
  * Fields appended after max_tokens are read only when struct_size covers them;
  * a caller built against an older struct_size gets the neutral defaults below.
  *   min_p              neutral 0    (keep every candidate above the window)
- *   repeat_penalty     neutral 1    (no repetition penalty; must be > 0)
- *   repeat_last_n      neutral 64   (penalty window, tokens)
+ *   repeat_penalty     neutral 1    (no repetition penalty; 0 = off, < 0 is
+ *                                    SB_ERR_BINDING)
+ *   repeat_last_n      neutral 64   (penalty window, tokens; 0 disables every
+ *                                    penalty)
  *   presence_penalty   neutral 0    (subtracted once per repeated token)
  *   frequency_penalty  neutral 0    (subtracted per occurrence)
+ * Zero means "off" throughout: a zero-initialized sb_llm_sampling whose only
+ * fields are struct_size = sizeof(sb_llm_sampling) and max_tokens is plain
+ * greedy (temperature 0, no truncation, no penalties).
  * For a token t appearing c times in the window: if repeat_penalty != 1,
  * l[t] = l[t] / repeat_penalty when l[t] > 0 else l[t] * repeat_penalty; then
  * l[t] -= frequency_penalty * c + presence_penalty. */

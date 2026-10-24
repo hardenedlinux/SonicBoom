@@ -2087,7 +2087,7 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             has_field(offsetof(sb_llm_sampling, min_p), sizeof(float))
                 ? sampling->min_p
                 : 0.0f;
-        const float repeat_penalty =
+        const float repeat_penalty_field =
             has_field(offsetof(sb_llm_sampling, repeat_penalty), sizeof(float))
                 ? sampling->repeat_penalty
                 : 1.0f;
@@ -2120,11 +2120,17 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
                     "min_p must be in [0, 1]");
           return SB_ERR_BINDING;
         }
-        if (!(repeat_penalty > 0.0f)) {
+        // Zero means "off" for the appended fields, so a zero-initialized
+        // sb_llm_sampling is plain greedy: repeat_penalty 0 is read as 1 (no
+        // penalty) and repeat_last_n 0 leaves an empty penalty window. Only a
+        // negative penalty is a caller error.
+        if (!(repeat_penalty_field >= 0.0f)) {
           set_error(err_out, SB_ERRKIND_BINDING,
-                    "repeat_penalty must be > 0");
+                    "repeat_penalty must be >= 0");
           return SB_ERR_BINDING;
         }
+        const float repeat_penalty =
+            repeat_penalty_field == 0.0f ? 1.0f : repeat_penalty_field;
 
         nn::SamplingParams sp;
         sp.temperature = sampling->temperature;
