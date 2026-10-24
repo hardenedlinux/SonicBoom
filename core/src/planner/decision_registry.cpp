@@ -437,8 +437,6 @@ constexpr KnobRow kKnobRows[] = {
      "drafter selection", "accept rule is drafter-agnostic", 0, 0},
     {"spec.verify-batch", "SONICBOOM_SPEC_VERIFY_BATCH", "batched", "batched|single",
      "one batched mmvq per projection", "bit-identical launch shapes", 0, 0},
-    {"decode.chunk", "SONICBOOM_DECODE_CHUNK", "1", "1..16",
-     "plain decode rows per step", "chunk replay is exact", 0, 0},
     {"prefix.align", "SONICBOOM_PREFIX_ALIGN", "on", "on|off",
      "hold the reuse boundary on a prefill chunk", "restores identical reuse", 0, 0},
     {"train.graph", "SONICBOOM_TRAIN_GRAPH", "on", "on|off",

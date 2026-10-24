@@ -2088,27 +2088,11 @@ static bool capture_reuse_enabled() {
   return runtime::feature_enabled(runtime::Feature::CaptureReuse);
 }
 
-// The number of greedy decode steps one captured graph runs (§10). Autotuned
-// over {1,4,8,16} on the target GPU: 1 is the fastest by 0.2-0.5% (d0/d512,
-// 3-run medians), because the decode step is GPU-bound at ~94% busy — the host
-// round-trips chunking removes were already hidden — so the measured default
-// is 1 (the per-step replay loop). k > 1 is the ablation switch (tools/
-// bench.sh --ablate, group "decode-chunk"): one graph launch + one host
-// round-trip per k tokens.
-static uint32_t decode_chunk_size() {
-  // Speculation and chunking are alternative launch-overhead reducers: a
-  // speculative step needs the captured graph to mean exactly one decode step
-  // (the k == 0 fallback replays it once), so the chunk capture is off.
-  if (spec_enabled()) return 1;
-  static const uint32_t k = [] {
-    const char* e = std::getenv("SONICBOOM_DECODE_CHUNK");
-    if (!e || !*e) return uint32_t(1);
-    const int requested = std::atoi(e);
-    if (requested <= 1) return uint32_t(1);
-    return uint32_t(std::min(requested, 16));
-  }();
-  return k;
-}
+// The number of greedy decode steps one captured graph runs (§10): one. The
+// k > 1 chunk switch was never selected by a default or autotune path (1 was
+// the fastest in the {1,4,8,16} autotune), so it was removed; the decode step
+// is captured one step per graph.
+static uint32_t decode_chunk_size() { return 1; }
 
 // Route host-memory-space compute tasks (Embedding / Softcap) to the CPU backend
 // and leave device-memory-space tasks on the CUDA backend. Shared by the decode

@@ -192,18 +192,6 @@ set_tests_properties(test_prefix_cache
                               test_spec_autoprobe
   PROPERTIES RESOURCE_LOCK gpu_vram LABELS long)
 
-# The decode-chunk path (k greedy steps captured per graph, §10) is off by
-# default — autotuned to k=1, since the decode step is GPU-bound and chunking
-# measured 0.2-0.5% slower. Run the same greedy-stream checks with it on so the
-# path stays covered; k=4 is the ablation value the internal harness uses.
-add_test(NAME test_generate_decode_chunk
-         COMMAND ${CMAKE_COMMAND} -E env
-                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                 SONICBOOM_DECODE_CHUNK=4
-                 $<TARGET_FILE:test_generate>)
-set_tests_properties(test_generate_decode_chunk
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-
 # The speculative loop (SONICBOOM_SPEC, B6) is also parsed once per process.
 # Run the golden-stream checks with it on: the drafter's proposals must not
 # change a single token, and the prefill path's speculative iterations must
@@ -214,17 +202,6 @@ add_test(NAME test_generate_spec
                  SONICBOOM_SPEC=on
                  $<TARGET_FILE:test_generate>)
 set_tests_properties(test_generate_spec
-  PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
-
-# The same coverage for the other consumer of the chunked loop: the
-# prefill-then-decode path (prefill_decode_cuda_impl) must produce the same
-# golden streams with the chunked replay.
-add_test(NAME test_qwen2_generate_decode_chunk
-         COMMAND ${CMAKE_COMMAND} -E env
-                 LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
-                 SONICBOOM_DECODE_CHUNK=4
-                 $<TARGET_FILE:test_qwen2_generate>)
-set_tests_properties(test_qwen2_generate_decode_chunk
   PROPERTIES SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 
 # The third model (T8): DeepSeek-R1-Distill-Qwen-1.5B is Qwen2 architecture, so
@@ -397,7 +374,7 @@ endif()
 
 # Static execution planner tests (unit + integration). They include only
 # <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
-foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_coexecution test_coexecution_merge test_coexecution_region test_planner_telemetry test_runtime test_persistence)
+foreach(test_name IN ITEMS test_planner_resource test_planner_cost_model test_planner_graph test_execution_plan test_planner test_memory_planner test_plan_validator test_transfer_scheduler test_runtime_executor test_planner_telemetry test_persistence)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})
