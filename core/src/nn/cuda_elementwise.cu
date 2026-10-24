@@ -3036,9 +3036,12 @@ bool decode_attention_dev(const float* q, const float* k_cache,
       // view; a larger chunk is outside what the generated text supports.
       if (kDecodeChunk > (uint64_t)compiler::kAttentionDecodeMaxChunk)
         kDecodeChunk = compiler::kAttentionDecodeMaxChunk;
-      // Absolute chunk alignment: a window of `window` keys can overlap at
-      // most floor(window / C) + 1 chunks, whatever its start position.
-      const uint64_t n_chunks = window / kDecodeChunk + 1;
+      // Absolute chunk alignment: a window of `window` keys starts and ends
+      // mid-chunk when C does not divide it, so it can straddle one more
+      // absolute chunk than window / C + 1 (a 512-key SWA window at C == 13
+      // touches 41 chunks, not 40). Missing the last block would drop the
+      // newest keys -- including the query's own -- from the merge.
+      const uint64_t n_chunks = (window - 1) / kDecodeChunk + 2;
       const size_t partial_floats =
           (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
       float *partial = static_cast<float *>(
@@ -3107,8 +3110,9 @@ bool decode_attention_dev(const float* q, const float* k_cache,
           : std::min(window, no_split_chunk);
   // Absolute chunk alignment (same rule as the generated pair): the chunk
   // index is a function of the key's absolute position, so the merge order
-  // never depends on the window length or the cache capacity.
-  const uint64_t n_chunks = window / chunk + 1;
+  // never depends on the window length or the cache capacity. A window that
+  // C does not divide straddles floor((window - 1) / C) + 2 absolute chunks.
+  const uint64_t n_chunks = (window - 1) / chunk + 2;
 
   const size_t partial_floats =
       (size_t)n_chunks * (size_t)n_heads_q * (size_t)(head_dim + 2);
@@ -5376,7 +5380,7 @@ uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
     // an SWA class from the extent would launch thousands of blocks that exit
     // on their first compare, which is not what the model pays.
     const uint64_t win = sliding_window ? sliding_window : extent;
-    const uint64_t n_chunks = win / c + 1;
+    const uint64_t n_chunks = (win - 1) / c + 2;
     const uint64_t *startp = start_d;
     uint64_t nslots_arg = slots;
     int nhq_arg = n_heads_q;
