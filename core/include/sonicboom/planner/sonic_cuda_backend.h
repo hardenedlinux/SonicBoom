@@ -149,8 +149,10 @@ public:
   // step j-1's Argmax wrote (device-side feedback, no host round-trip), reads
   // position `pos_slots_[j]`, and writes its own token to `token_slots_[j]`. The
   // host stages one carry token and k positions, replays once, then reads the k
-  // tokens in one D2H. k = SONICBOOM_DECODE_CHUNK (default 4; 1 keeps the
-  // single-step loop and is the ablation switch).
+  // tokens in one D2H. The decode runtime captures one step per graph
+  // (decode_chunk() == 1); the k > 1 machinery is reachable only through an
+  // explicit enable_decode_chunking(k) call, which no default or autotune path
+  // makes.
   uint32_t decode_chunk() const { return chunk_; }
 
   // Turn chunking on for a decode backend: allocate the k-position and
