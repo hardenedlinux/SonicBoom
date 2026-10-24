@@ -21,6 +21,7 @@
 
 (define-module (sonicboom inference)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom error)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
@@ -53,14 +54,15 @@
 
 (define (set-numerics-profile! profile)
   "Request PROFILE ('strict or 'standard) for this process and return the
-effective profile. Signals 'sb-inference if the profile is already latched to
+effective profile. Signals a &sonicboom-error if the profile is already latched to
 the other value; setting the effective profile again is a no-op success."
   (let ((code (case profile
                 ((strict) 0)
                 ((standard) 1)
-                (else (throw 'sb-inference
-                             (string-append "unknown numerics profile: "
-                                            (object->string profile))))))
+                (else (raise-sonicboom-error
+                       SB_ERR_BINDING 'binding
+                       (string-append "unknown numerics profile: "
+                                      (object->string profile))))))
         (err (make-slot)))
     (sb-check! ((proc 'sb_set_numerics_profile) code (slot-ptr err))
                err "set-numerics-profile!")
@@ -68,11 +70,8 @@ the other value; setting the effective profile again is a no-op success."
 
 ;;; --- helpers ----------------------------------------------------------------
 
-(define (sb-check! st err-slot what)
-  (unless (sb-status-ok? st)
-    (let ((msg (capture-error err-slot)))
-      (throw 'sb-inference
-             (string-append what ": " msg)))))
+;; sb-check! comes from (sonicboom ffi): it raises a &sonicboom-error carrying
+;; the C status, the sb_error_kind and the message.
 
 ;; A list of token ids → a native-endian int32 bytevector (sb_token[]).
 (define (tokens->bv tokens)

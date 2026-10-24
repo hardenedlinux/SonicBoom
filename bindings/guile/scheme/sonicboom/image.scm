@@ -16,6 +16,7 @@
 
 (define-module (sonicboom image)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom error)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (ice-9 optargs)
@@ -24,14 +25,9 @@
 
 ;;; --- errors -----------------------------------------------------------------
 
-(define (sb-check! st err what)
-  (unless (sb-status-ok? st)
-    (let ((msg (capture-error err)))
-      (throw 'sb-image
-             (string-append what ": "
-                            (if (string-null? msg)
-                                (sb-status->message st)
-                                msg))))))
+;; sb-check! comes from (sonicboom ffi): a C ABI failure is a &sonicboom-error
+;; with the status, the sb_error_kind and the message. A cancelled generation
+;; arrives here with kind 'cancelled.
 
 ;; Free (and NULL) whatever error an expected non-OK status left in ERR.
 (define (discard-error! err) (capture-error err))
@@ -45,7 +41,8 @@
 
 (define (load-image-model dir)
   "Load a MOSS-Image model directory and return an opaque image-model handle.
-Signals 'sb-image if the directory is not a model the pipeline accepts."
+Signals a &sonicboom-error if the directory is not a model the pipeline
+accepts."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
          (st ((proc 'sb_image_model_load) (string->pointer dir)
@@ -124,8 +121,8 @@ Signals 'sb-image if the directory is not a model the pipeline accepts."
 WIDTH and HEIGHT are multiples of 16. NEGATIVE is the negative prompt used by
 classifier-free guidance (#f is the empty prompt). PROGRESS, when a procedure,
 is called as (image-index step total-steps) after each denoising step; returning
-#f cancels the generation, which then signals 'sb-image (the C status is
-SB_ERR_CANCELLED). Image i starts from the same seeded noise as sb-moss's
+#f cancels the generation, which signals a &sonicboom-error of kind 'cancelled
+(the C status is SB_ERR_CANCELLED). Image i starts from the same seeded noise as sb-moss's
 `sample --seed`, so the same request is reproducible."
   (let* ((prompt-ptr (string->pointer prompt))
          (negative-ptr (and negative (string->pointer negative)))
@@ -147,15 +144,7 @@ SB_ERR_CANCELLED). Image i starts from the same seeded noise as sb-moss's
                 (if cb cb %null-pointer) %null-pointer
                 (bytevector->pointer rgb) n
                 (bytevector->pointer bytes-slot) (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (let ((msg (capture-error err-slot)))
-          (throw 'sb-image
-                 (if (= st SB_ERR_CANCELLED)
-                     "generate-images: cancelled"
-                     (string-append "generate-images: "
-                                    (if (string-null? msg)
-                                        (sb-status->message st)
-                                        msg))))))
+      (sb-check! st err-slot "generate-images")
       (let* ((stride (* width height 3))
              (images
               (let loop ((i (- batch 1)) (acc '()))
@@ -174,7 +163,8 @@ SB_ERR_CANCELLED). Image i starts from the same seeded noise as sb-moss's
   "Write RGB (a width*height*3 bytevector, RGB HWC) to PATH as a PNG
 (8-bit RGB, stored deflate blocks) and return #t."
   (unless (and (bytevector? rgb) (>= (bytevector-length rgb) (* width height 3)))
-    (throw 'sb-image "write-png: rgb is shorter than width*height*3"))
+    (raise-sonicboom-error SB_ERR_BINDING 'binding
+                           "write-png: rgb is shorter than width*height*3"))
   (let ((err-slot (make-slot)))
     (sb-check! ((proc 'sb_image_write_png) (string->pointer path)
                 (bytevector->pointer rgb) width height (slot-ptr err-slot))

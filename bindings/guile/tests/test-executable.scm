@@ -13,8 +13,10 @@
 ;;; executable without changing the numerics.
 
 (use-modules (srfi srfi-1)
+             (srfi srfi-34)
              (srfi srfi-64)
              (rnrs bytevectors)
+             (sonicboom error)
              (sonicboom ffi)
              (sonicboom executable))
 
@@ -132,7 +134,12 @@
 (test-equal "reaping again finds nothing new" 0 (reap-executables!))
 
 ;; 9. a malformed graph raises at compile time, not at run time
-(test-error "a malformed graph raises at compile time"
-  'misc-error (compile-s-expr "(this is not an s-expr document)"))
+(test-assert "a malformed graph raises a typed parse error at compile time"
+  (guard (c ((sonicboom-error? c)
+             (memq (sonicboom-error-kind c)
+                   '(parse-lexical parse-syntax parse-semantic
+                     parse-unsupported))))
+    (compile-s-expr "(this is not an s-expr document)")
+    #f))
 
 (test-end "sonicboom-executable")

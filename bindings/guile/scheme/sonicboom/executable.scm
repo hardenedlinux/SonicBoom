@@ -26,9 +26,11 @@
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-34)
   #:use-module (ice-9 hash-table)
   #:use-module (ice-9 threads)
   #:use-module (sonicboom ffi)
+  #:use-module (sonicboom error)
   #:export (compile-s-expr
             executable? executable-run free-executable!
             executable-freed? executable-graph-text
@@ -94,16 +96,12 @@ for repeated `executable-run`. Raises on a parse or compile failure."
         ((proc 'sb_document_free) (slot-ref doc-slot))
         (bytevector-fill! doc-slot 0)))
     (define (fail status)
-      (let ((msg (capture-error err-slot)))
-        (free-doc!)
-        (unless (null-pointer? (slot-ref exe-slot))
-          ((proc 'sb_executable_free) (slot-ref exe-slot))
-          (bytevector-fill! exe-slot 0))
-        (throw 'sb-ffi (if (string-null? msg)
-                           (string-append "C ABI error: " (sb-status->message status))
-                           msg))))
-    (catch 'sb-ffi
-      (lambda ()
+      ;; Release the half-built handles before sb-check! raises.
+      (free-doc!)
+      (unless (null-pointer? (slot-ref exe-slot))
+        ((proc 'sb_executable_free) (slot-ref exe-slot))
+        (bytevector-fill! exe-slot 0))
+      (sb-check! status err-slot "compile-s-expr"))
         (let ((st ((proc 'sb_parse) txt-ptr len (slot-ptr doc-slot) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
         (let ((st ((proc 'sb_compile) (slot-ref doc-slot) (string->pointer "")
@@ -128,8 +126,7 @@ for repeated `executable-run`. Raises on a parse or compile failure."
                                        #f)))
             ;; Register with the guardian; see reap-executables!.
             (%exe-guardian exe)
-            exe)))
-      (lambda (key msg) (error "compile-s-expr:" msg)))))
+            exe))))
 
 ;;; --- running -----------------------------------------------------------------
 
@@ -141,15 +138,12 @@ INPUT-BV may be reused or freed immediately."
   (if (executable-freed? exe)
       (values #f "executable-run: executable has already been freed")
       (let ((err-slot (make-slot)))
-        (define (fail status)
-          (let ((msg (capture-error err-slot)))
-            (throw 'sb-ffi (if (string-null? msg)
-                               (string-append "C ABI error: " (sb-status->message status))
-                               msg))))
-        (catch 'sb-ffi
-          (lambda ()
+        (define (fail status) (sb-check! status err-slot "executable-run"))
+        (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
             (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
-              (throw 'sb-ffi "executable-run: input size does not match the graph"))
+              (raise-sonicboom-error
+               SB_ERR_BINDING 'binding
+               "executable-run: input size does not match the graph"))
             (let ((st ((proc 'sb_bind_input) (executable-ptr exe)
                        (bytevector->pointer input-bv) (bytevector-length input-bv)
                        (slot-ptr err-slot))))
@@ -163,8 +157,7 @@ INPUT-BV may be reused or freed immediately."
                         (bytevector->pointer out-bv) cap
                         (bytevector->pointer written) (slot-ptr err-slot))))
               (unless (sb-status-ok? st) (fail st))
-              (values out-bv #f)))
-          (lambda (key msg) (values #f msg))))))
+              (values out-bv #f))))))
 
 ;;; --- the text-keyed cache ----------------------------------------------------
 

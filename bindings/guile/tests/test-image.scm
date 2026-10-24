@@ -10,15 +10,17 @@
 ;;;      size, and the same request twice is byte-identical;
 ;;;   3. image 0 of a batch of 2 equals the single-image result;
 ;;;   4. #:progress sees (image step total) after each step, and returning #f
-;;;      cancels with an 'sb-image exception;
+;;;      cancels with a &sonicboom-error of kind 'cancelled;
 ;;;   5. write-png writes the 2x2 known-answer PNG byte-for-byte.
 ;;;
 ;;; Skips cleanly without the model or a CUDA device (the f32 CPU DiT is far
 ;;; too slow for a unit test).
 
-(use-modules (srfi srfi-64)
+(use-modules (srfi srfi-34)
+             (srfi srfi-64)
              (rnrs bytevectors)
              (ice-9 binary-ports)
+             (sonicboom error)
              (sonicboom ffi)
              (sonicboom image))
 
@@ -90,15 +92,14 @@
             (test-equal "progress saw both steps, 1-based"
               '((0 2 2) (0 1 2)) seen))
 
-          ;; Cancelling from the callback surfaces as an 'sb-image exception.
+          ;; Cancelling from the callback surfaces as a typed cancellation.
           (test-assert "a #f from progress cancels"
-            (catch 'sb-image
-              (lambda ()
-                (generate-images model #:prompt "a red fox" #:width w
-                                 #:height h #:steps 2 #:seed 5
-                                 #:progress (lambda (i step total) #f))
-                #f)
-              (lambda args #t))))
+            (guard (c ((sonicboom-error? c)
+                       (eq? 'cancelled (sonicboom-error-kind c))))
+              (generate-images model #:prompt "a red fox" #:width w
+                               #:height h #:steps 2 #:seed 5
+                               #:progress (lambda (i step total) #f))
+              #f)))
 
         (free-image-model! model))))
 

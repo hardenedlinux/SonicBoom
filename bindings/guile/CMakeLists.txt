@@ -102,6 +102,31 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-checkpoint.scm)
 
+  # guile-explain reads the planner's decision registry through
+  # sb_explain_table/sb_explain_json and checks both views; same shared-library
+  # dependency as guile-nn. It tunes nothing, so it needs no device.
+  add_test(
+    NAME guile-explain
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-explain.scm)
+
+  # guile-param replays tests/core/test_adamw.cpp's 10-step AdamW sequence
+  # through the sb_param_* surface. When a CUDA device is present the parameter
+  # buffers are device-resident, so it holds the device lock.
+  add_test(
+    NAME guile-param
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-param.scm)
+  set_tests_properties(guile-param PROPERTIES RESOURCE_LOCK gpu_vram)
+
   # guile-executable compiles a graph once and runs it repeatedly through
   # libsonicboom.so, checking numerics, reuse and handle lifetime; same
   # shared-library dependency as guile-nn.

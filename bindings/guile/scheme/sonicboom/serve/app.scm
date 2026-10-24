@@ -49,6 +49,7 @@
              (ice-9 threads)
              (ice-9 binary-ports)
              (ice-9 match)
+             (sonicboom error)
              (sonicboom image)
              (sonicboom serve backend)
              (sonicboom serve real-backend)
@@ -229,10 +230,18 @@
            "messages" "context_length_exceeded"))
     (('invalid-constraint param message)
      (list 400 "invalid_request_error" message param "invalid_constraint"))
-    ;; (sonicboom image) signals 'sb-image for load and generation failures
-    ;; (including a cancelled generation; the server never cancels one).
-    (('sb-image message)
-     (list 500 "server_error" message 'null 'null))
+    ;; A Guile 3 condition raised by a binding module. `catch #t` reports the
+    ;; condition itself with the key `%exception`. A &sonicboom-error carries
+    ;; the C ABI's message (a failed model load, a generation failure, a
+    ;; cancelled generation; the server never cancels one).
+    (('%exception c)
+     (if (sonicboom-error? c)
+         (let ((message (sonicboom-error-message c)))
+           (list 500 "server_error"
+                 (if (string-null? message) "SonicBoom error" message)
+                 'null 'null))
+         (list 500 "server_error" (format #f "internal error: ~a" c)
+               'null 'null)))
     (_ (list 500 "server_error" (format #f "~a: ~s" key args) 'null 'null))))
 
 (define (error-object-of key args)

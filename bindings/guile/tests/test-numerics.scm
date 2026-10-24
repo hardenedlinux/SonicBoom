@@ -15,7 +15,9 @@
 ;;; Needs no model and no GPU: the profile resolves without one.
 
 (use-modules (srfi srfi-1)
+             (srfi srfi-34)
              (srfi srfi-64)
+             (sonicboom error)
              (sonicboom inference))
 
 (test-begin "sonicboom-numerics")
@@ -37,11 +39,9 @@
   effective (set-numerics-profile! effective))
 
 (test-assert "switching after the latch signals"
-  (catch 'sb-inference
-    (lambda ()
-      (set-numerics-profile! (if (eq? effective 'strict) 'standard 'strict))
-      #f)
-    (lambda (key . args) #t)))
+  (guard (c ((sonicboom-error? c) (eq? 'binding (sonicboom-error-kind c))))
+    (set-numerics-profile! (if (eq? effective 'strict) 'standard 'strict))
+    #f))
 
 (test-equal "the profile did not move"
   effective (numerics-profile))
