@@ -3791,10 +3791,14 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the cuBLAS fp16 or dp4a
   // batched path below — matmul_mmq_dev would reject it anyway, and returning its
   // false here would fail the whole call instead of falling through.
-  // The MMQ kernel needs K to be a multiple of 256; a short K (e.g. a 128-wide
-  // input projection) takes the dp4a/cuBLAS paths below instead of failing the
-  // whole call on matmul_mmq_dev's precondition.
-  const bool mmq_type = W.type() != QuantType::Q6_K && cols % 256 == 0;
+  // The MMQ kernel needs K to be a multiple of QK8_1_MMQ (128) and a K below
+  // one 256-element iteration (e.g. the DiT's 128-wide input projection) takes
+  // the dp4a/cuBLAS paths below instead of failing the whole call on
+  // matmul_mmq_dev's precondition. A longer K that is not a multiple of 256
+  // (Qwen 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane, and
+  // the LLM goldens pin that numerics.
+  const bool mmq_type = W.type() != QuantType::Q6_K && cols >= 256 &&
+                        cols % mmq::QK8_1_MMQ == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
