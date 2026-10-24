@@ -22,6 +22,7 @@
 ;;;      subword pieces by default and is one control token when asked for;
 ;;;      tokenize-segments parses the template's own markers but never a marker
 ;;;      that came from a message.
+;;;   7. seeded sampling: the same prompt, temperature and seed repeat exactly.
 ;;;
 ;;; Skips cleanly when the GGUF is absent, so the suite is green on machines
 ;;; without the model. The generate-stream chunk-boundary checks need no model
@@ -49,7 +50,7 @@
 
 (let ((path (find-model)))
   (if (not path)
-      (test-skip 15)
+      (test-skip 16)
       (let* ((model (load-model path))
              (sess1 (make-session model 512)))
         (test-equal "generate-tokens reproduces the golden decode stream"
@@ -62,6 +63,17 @@
             (let ((s (generate model sess2 "Hello" 4)))
               (and (string? s) (> (string-length s) 0))))
           (free-session! sess2))
+
+        ;; Sampling is seeded and deterministic: two fresh sessions with the
+        ;; same prompt, temperature and seed produce the same tokens.
+        (let* ((prompt (tokenize model "Hello"))
+               (a (make-session model 512))
+               (b (make-session model 512)))
+          (test-equal "sampling: the same seed and temperature repeat exactly"
+            (generate-tokens a prompt 8 #:temperature 0.8 #:seed 7)
+            (generate-tokens b prompt 8 #:temperature 0.8 #:seed 7))
+          (free-session! a)
+          (free-session! b))
 
         ;; Streaming. One decode per session: generate-stream's own run, and a
         ;; separate generate / generate-tokens run of the same prompt for the

@@ -121,6 +121,7 @@ struct sb_param {
 };
 
 namespace model = sonicboom::model;
+namespace nn = sonicboom::nn;
 namespace gguf = sonicboom::gguf;
 namespace planner = sonicboom::planner;
 namespace quant = sonicboom::quant;
@@ -2123,14 +2124,79 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
           return SB_ERR_BINDING;
         }
 
-        // Only greedy argmax is implemented; a requested sampling mode returns
-        // unsupported rather than silently decoding greedily.
-        if (sampling->temperature > 0.0f ||
-            (sampling->top_p > 0.0f && sampling->top_p < 1.0f) ||
-            sampling->top_k != 0) {
-          set_error(err_out, SB_ERRKIND_INTERNAL,
-                    "sampling not supported (greedy temperature 0 only)");
-          return SB_ERR_UNSUPPORTED;
+        // Fields appended after max_tokens are read only when struct_size
+        // covers them; otherwise their neutral defaults apply.
+        auto has_field = [&](size_t offset, size_t size) {
+          return sampling->struct_size >= offset + size;
+        };
+        const float min_p =
+            has_field(offsetof(sb_llm_sampling, min_p), sizeof(float))
+                ? sampling->min_p
+                : 0.0f;
+        const float repeat_penalty =
+            has_field(offsetof(sb_llm_sampling, repeat_penalty), sizeof(float))
+                ? sampling->repeat_penalty
+                : 1.0f;
+        const uint32_t repeat_last_n =
+            has_field(offsetof(sb_llm_sampling, repeat_last_n), sizeof(uint32_t))
+                ? sampling->repeat_last_n
+                : 64u;
+        const float presence_penalty =
+            has_field(offsetof(sb_llm_sampling, presence_penalty), sizeof(float))
+                ? sampling->presence_penalty
+                : 0.0f;
+        const float frequency_penalty =
+            has_field(offsetof(sb_llm_sampling, frequency_penalty), sizeof(float))
+                ? sampling->frequency_penalty
+                : 0.0f;
+
+        // Range validation names the offending field.
+        if (!(sampling->temperature >= 0.0f)) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "temperature must be >= 0");
+          return SB_ERR_BINDING;
+        }
+        if (!(sampling->top_p >= 0.0f && sampling->top_p <= 1.0f)) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "top_p must be in [0, 1]");
+          return SB_ERR_BINDING;
+        }
+        if (!(min_p >= 0.0f && min_p <= 1.0f)) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "min_p must be in [0, 1]");
+          return SB_ERR_BINDING;
+        }
+        if (!(repeat_penalty > 0.0f)) {
+          set_error(err_out, SB_ERRKIND_BINDING,
+                    "repeat_penalty must be > 0");
+          return SB_ERR_BINDING;
+        }
+
+        nn::SamplingParams sp;
+        sp.temperature = sampling->temperature;
+        sp.top_k = sampling->top_k;
+        sp.top_p = sampling->top_p;
+        sp.min_p = min_p;
+        sp.seed = sampling->seed;
+        sp.repeat_penalty = repeat_penalty;
+        sp.repeat_last_n = repeat_last_n;
+        sp.presence_penalty = presence_penalty;
+        sp.frequency_penalty = frequency_penalty;
+        const bool sampling_mode = sp.temperature > 0.0f;
+
+        // Speculative decoding verifies a draft greedily; a sampled stream
+        // cannot use it. The sampled path below is the plain per-token loop.
+        if (sampling_mode)
+          planner::decisions::record("spec.disabled_by_sampling", "decode",
+                                     "plain", planner::decisions::Source::Application);
+
+        // A sampled decode recomputes every token from the prompt, including
+        // the prefill's first token (which the greedy prefill may already have
+        // consumed into the grammar). Restart the grammar at the prompt's end.
+        if (sampling_mode && session->grammar) {
+          session->grammar->reset();
+          session->grammar_done = false;
+          session->grammar_mask.clear();
         }
 
         const uint32_t max_tokens = sampling->max_tokens;
@@ -2139,11 +2205,36 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
 
         const model::Gemma4Model &m = session->bundle->model;
 
+        // Sampled CUDA decode: the non-greedy decode graph puts the full
+        // [vocab] logits on the host each step and sample_token chooses the
+        // token there. The prefill's greedy pending token is not used, so a
+        // shifted prompt (prefix reuse) samples position-correctly: the draw is
+        // keyed by the token's absolute position and the history is the whole
+        // prompt, so a re-prefilled prefix reproduces the same stream.
+        if (sampling_mode && quant::cuda_available() && !session->grammar) {
+          std::vector<int64_t> out(max_tokens);
+          std::vector<uint64_t> prompt(session->prompt.begin(),
+                                       session->prompt.end());
+          const uint64_t got = model::generate_spine_cuda_sampled(
+              m, prompt, /*start_pos=*/0, out, session->n_ctx, sp);
+          uint32_t n = got > max_tokens ? max_tokens : uint32_t(got);
+          if (cb) {
+            for (uint32_t i = 0; i < n; ++i) {
+              if (cb(user, static_cast<sb_token>(out[i]))) {
+                n = i;
+                break;
+              }
+            }
+          }
+          *n_out = n;
+          return SB_OK;
+        }
+
         // CUDA fast path: the prefill already filled the persistent KV cache and
         // sampled the first token. Emit it, then decode the rest one step at a
         // time — each step advances the same persistent cache, so this never
         // re-runs the prefill or the whole generation.
-        if (session->prefill_done && quant::cuda_available()) {
+        if (!sampling_mode && session->prefill_done && quant::cuda_available()) {
           const uint64_t n_ctx = session->n_ctx;
           uint32_t n = 0;
           // The grammar finished on the prefill token (a stop token): the
@@ -2219,7 +2310,7 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             if (n_ctx < hist.size() + 1) n_ctx = hist.size() + 1;
             const uint64_t got = model::generate_prefill_spine(
                 m, hist, 0, std::span<int64_t>(one, 1), n_ctx, true,
-                session->grammar_mask);
+                session->grammar_mask, sampling_mode ? &sp : nullptr);
             if (got == 0 || one[0] < 0) break;
             if (!session->grammar->accept(int32_t(one[0]))) break;
             if (session->grammar->finished()) {
@@ -2232,13 +2323,15 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
         } else if (session->prompt.size() == 1) {
           // A single-token prompt is a seed: decode directly (the exact path the
           // golden-token test exercises).
-          produced = model::generate_spine(m, uint64_t(session->prompt[0]), 0,
-                                           tokens, session->n_ctx);
+          produced = model::generate_spine(
+              m, uint64_t(session->prompt[0]), 0, tokens, session->n_ctx, {},
+              sampling_mode ? &sp : nullptr);
         } else {
           std::vector<uint64_t> prompt(session->prompt.begin(),
                                        session->prompt.end());
-          produced = model::generate_prefill_spine(m, prompt, 0, tokens,
-                                                   session->n_ctx, true);
+          produced = model::generate_prefill_spine(
+              m, prompt, 0, tokens, session->n_ctx, true, {},
+              sampling_mode ? &sp : nullptr);
         }
 
         uint32_t n = static_cast<uint32_t>(produced);

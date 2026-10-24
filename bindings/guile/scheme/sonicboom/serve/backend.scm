@@ -114,10 +114,12 @@
 ;;                  constraint has closed the reply (nothing left to produce)
 ;;   stats          (model)                        -> alist (optional)
 ;; The sampling? capability says whether `step` honors the sampler's
-;; temperature / top-p / top-k. A greedy-only backend (the libsonicboom one:
-;; the core's decode accepts temperature 0, top-p 1, top-k 0 only) reports #f,
+;; temperature / top-p / top-k. The libsonicboom backend decodes one token at a
+;; time through its session and returns #f here: its step ignores the sampler,
 ;; and the HTTP layer then rejects an explicit sampling request instead of
-;; silently decoding greedily. It defaults to #f, so a backend has to claim it.
+;; silently decoding greedily. (The core's sb_llm_decode can sample when the
+;; whole reply is decoded in one call; that path is not what this per-step
+;; backend uses.) It defaults to #f, so a backend has to claim it.
 (define* (make-backend #:key (name "backend")
                        (load-model (required 'load-model))
                        (model-info (required 'model-info))

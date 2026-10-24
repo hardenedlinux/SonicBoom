@@ -52,7 +52,10 @@ it never touches the core or native-torch directly.
 | `stats model` | counters (optional) |
 
 A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed`) carries one
-request's parameters and random state; temperature 0 is greedy.
+request's parameters and random state; temperature 0 is greedy. The request's
+`presence_penalty` and `frequency_penalty` are validated and carried on the
+request; the reference logits sampler (`sample-from-logits`) applies
+temperature, top-k and top-p, and the libsonicboom backend decodes greedily.
 
 A **constraint** shapes the reply. There are two forms:
 
@@ -194,8 +197,14 @@ Request fields: `model`, `messages` (string or text-part content; roles
 `system`, `developer`, `user`, `assistant` with `tool_calls`, `tool`), `stream`,
 `stream_options.include_usage`, `max_tokens` / `max_completion_tokens`,
 `stop` (string or up to 4), `temperature`, `top_p`, `top_k` (extension),
-`seed`, `n` (1 only), `tools`, `tool_choice`, `response_format`. Unknown
-fields are ignored.
+`seed`, `presence_penalty`, `frequency_penalty`, `n` (1 only), `tools`,
+`tool_choice`, `response_format`. Unknown fields are ignored.
+
+Omitted sampling defaults differ from the OpenAI service: **an omitted
+`temperature` is 0 (greedy, not 1.0)** and **an omitted `seed` is 0 (not a
+clock seed)**, so a request that says nothing samples nothing and repeats
+exactly. `top_p` defaults to 1 and `top_k` to 0; `presence_penalty` and
+`frequency_penalty` default to 0 and are validated to [-2, 2].
 
 ### Constrained replies
 

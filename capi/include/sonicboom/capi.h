@@ -471,8 +471,8 @@ sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
  *  - decode runs one whole greedy generation per call (the CPU planner spine
  *    has no step-wise persistent session yet); a single-token prompt is a seed
  *    and decodes directly, a longer prompt prefills then decodes;
- *  - sampling is greedy-only (temperature 0); non-greedy returns
- *    SB_ERR_UNSUPPORTED;
+ *  - temperature 0 is greedy (the historical path); temperature > 0 samples
+ *    deterministically from sb_llm_sampling's seed;
  *  - tokenize/detokenize use the model's GGUF built-in vocabulary (SPM-style
  *    BPE for Gemma 4, byte-level BPE for Qwen2), matching llama-tokenize;
  *  - the architectures SonicBoom models load (Gemma 4, Qwen2); anything else
@@ -486,9 +486,33 @@ typedef struct sb_llm_model sb_llm_model;
 typedef struct sb_llm_session sb_llm_session;
 typedef int32_t sb_token;   /* a vocabulary index */
 
-/* Sampling parameters for one decode call. temperature 0 == greedy argmax (the
- * only mode implemented today; temperature > 0, 0 < top_p < 1, or top_k > 0
- * return SB_ERR_UNSUPPORTED). max_tokens caps the output length. */
+/* Sampling parameters for one decode call.
+ *
+ * temperature 0 is the greedy argmax path, bit-identical to the historical
+ * decode. temperature > 0 enables seeded sampling: the application order is
+ *   1. repetition / presence / frequency penalties over the last
+ *      repeat_last_n tokens of the history (prompt + tokens generated so far);
+ *   2. the grammar mask (constrained decoding);
+ *   3. temperature scaling and a 30-logit candidate window;
+ *   4. top_k truncation (top_k 0 disables it);
+ *   5. min_p truncation (min_p 0 disables it);
+ *   6. nucleus truncation when 0 < top_p < 1 (top_p 1 disables it);
+ *   7. a seeded Gumbel-max draw keyed by (seed, absolute token position).
+ * The same seed, position and history therefore always produce the same token,
+ * independently of KV-cache capacity or prefix reuse.
+ *
+ * max_tokens caps the output length.
+ *
+ * Fields appended after max_tokens are read only when struct_size covers them;
+ * a caller built against an older struct_size gets the neutral defaults below.
+ *   min_p              neutral 0    (keep every candidate above the window)
+ *   repeat_penalty     neutral 1    (no repetition penalty; must be > 0)
+ *   repeat_last_n      neutral 64   (penalty window, tokens)
+ *   presence_penalty   neutral 0    (subtracted once per repeated token)
+ *   frequency_penalty  neutral 0    (subtracted per occurrence)
+ * For a token t appearing c times in the window: if repeat_penalty != 1,
+ * l[t] = l[t] / repeat_penalty when l[t] > 0 else l[t] * repeat_penalty; then
+ * l[t] -= frequency_penalty * c + presence_penalty. */
 typedef struct sb_llm_sampling {
   size_t struct_size;
   float temperature;
@@ -496,6 +520,11 @@ typedef struct sb_llm_sampling {
   uint32_t top_k;
   uint64_t seed;
   uint32_t max_tokens;
+  float min_p;
+  float repeat_penalty;
+  uint32_t repeat_last_n;
+  float presence_penalty;
+  float frequency_penalty;
 } sb_llm_sampling;
 
 /* Per-token callback: called synchronously on the calling thread, once per

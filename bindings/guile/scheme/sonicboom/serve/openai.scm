@@ -185,8 +185,10 @@
                            ((ref body "max_tokens")
                             => (lambda (v) (positive-integer "max_tokens" v)))
                            (else #f)))
+         ;; An omitted temperature is 0: greedy. That is not the OpenAI
+         ;; service's 1.0 default — a client that wants sampling asks for it.
          (temperature (match (ref body "temperature")
-                        (#f 1.0)
+                        (#f 0.0)
                         (v (number-in "temperature" v 0 2))))
          (top-p (match (ref body "top_p")
                   (#f 1.0)
@@ -196,11 +198,18 @@
                   (v (unless (and (integer? v) (exact? v) (>= v 0))
                        (invalid "top_k must be a non-negative integer" "top_k"))
                      v)))
+         ;; An omitted seed is 0, so a request is reproducible by default.
          (seed (match (ref body "seed")
-                 (#f #f)
+                 (#f 0)
                  (v (unless (and (integer? v) (exact? v))
                       (invalid "seed must be an integer" "seed"))
                     (abs v))))
+         (presence-penalty (match (ref body "presence_penalty")
+                             (#f 0.0)
+                             (v (number-in "presence_penalty" v -2 2))))
+         (frequency-penalty (match (ref body "frequency_penalty")
+                              (#f 0.0)
+                              (v (number-in "frequency_penalty" v -2 2))))
          (tools (check-tools (ref body "tools")))
          (tool-choice (check-tool-choice (ref body "tool_choice") tools))
          ;; An explicit response_format is the reply's shape and wins; a forced
@@ -211,13 +220,17 @@
                                #:tools tools #:tool-choice tool-choice
                                #:max-tokens max-tokens #:stop (check-stop (ref body "stop"))
                                #:temperature temperature #:top-p top-p #:top-k top-k
-                               #:seed seed #:constraint constraint)
+                               #:seed seed
+                               #:presence-penalty presence-penalty
+                               #:frequency-penalty frequency-penalty
+                               #:constraint constraint)
             (eq? stream #t)
             include-usage)))
 
 ;; A greedy-only backend cannot honor a sampling request, so an explicit one is
-;; rejected instead of silently decoding greedily (the core's decode wants
-;; temperature 0, top-p 1, top-k 0 and returns SB_ERR_UNSUPPORTED otherwise).
+;; rejected instead of silently decoding greedily (the libsonicboom backend's
+;; per-step decode ignores the sampler, so it wants temperature 0, top-p 1,
+;; top-k 0).
 ;; A parameter that is absent means "the backend's default", which for a
 ;; greedy-only backend is greedy — so the common OpenAI client that leaves
 ;; temperature at its default still works, while one that asks for sampling is
