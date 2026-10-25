@@ -160,19 +160,54 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t n_ctx = 0,
                              std::span<const uint8_t> sample_mask = {});
 
-// Sampled CUDA generation (temperature > 0). Runs the non-greedy decode graph —
-// the one score_spine_cuda uses, whose full softcapped [vocab] logits reach the
-// host each step — over `prompt` (teacher-forced to fill its own KV cache), then
-// chooses each produced token on the host with nn::sample_token. The greedy
-// runtime and its captured graph are not used: temperature 0 keeps the device
-// argmax path untouched. Returns the number of tokens written; 0 without CUDA
-// support, on a build/step failure, or when temperature <= 0.
-uint64_t generate_spine_cuda_sampled(const Gemma4Model& m,
-                                     std::span<const uint64_t> prompt,
-                                     uint64_t start_pos,
-                                     std::span<int64_t> tokens, uint64_t n_ctx,
-                                     const nn::SamplingParams& sampling,
-                                     std::span<const uint8_t> sample_mask = {});
+// --- sampled decode on the session path (r7) -------------------------------
+//
+// A sampled turn runs on the same persistent session path as greedy decoding:
+// the prefill fills the session's KV cache, the first token is drawn from the
+// prefill's own final logits, and every later token is one replay of a sampled
+// decode graph on the session's cache. That graph is the greedy decode graph
+// with a terminal SampleSelect node instead of Argmax: the [vocab] pass and the
+// candidate selection stay on the device, the host reads only the
+// nn::kSampleCandidates candidate pairs, and draws with
+// nn::sample_from_candidates at the token's absolute position. Prefix reuse is
+// therefore identical to the greedy path's.
+//
+// SampledState is the per-session device copy of the last prefill's final
+// logits ([vocab] f32, the values the greedy argmax reads). It is created by
+// the caller and has no constructor arguments; it is opaque so the C API never
+// sees a device handle.
+struct SampledState;
+SampledState* sampled_state_new();
+void sampled_state_free(SampledState*);
+
+// Copy the prefill's final host logits into the state's device buffer,
+// allocating it on the first call (the width is fixed by that call).
+bool sampled_state_store_logits(SampledState& state,
+                                std::span<const float> logits);
+
+// The first token of a sampled turn: select candidates from the stored prefill
+// logits with nn::cuda::sample_select_dev, then draw at `position` (the prompt
+// length). Requires the session's cache to be populated by a prefill.
+// Temperature must be > 0. Returns -1 on failure (including no stored logits).
+int64_t sampled_first_token_cuda(const Gemma4Model& m, SampledState& state,
+                                 planner::KvCacheSession& session,
+                                 uint64_t position,
+                                 const nn::SamplingParams& sampling,
+                                 std::span<const int64_t> history,
+                                 std::span<const uint8_t> sample_mask = {});
+
+// One sampled decode step on the session's persistent KV cache: feed `token`
+// at `position` through the sampled decode graph, then draw the token at
+// `position + 1` from its candidates. `history` is the accepted sequence
+// (prompt + generated so far, `token` included) and feeds the penalty window.
+// Returns the token, or -1 on failure. The first call for a (model, n_ctx,
+// session cache) builds, plans and captures the sampled step; later calls
+// replay it.
+int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
+                          uint64_t position, planner::KvCacheSession& session,
+                          const nn::SamplingParams& sampling,
+                          std::span<const int64_t> history,
+                          std::span<const uint8_t> sample_mask = {});
 
 // Pay the one-time decode-runtime construction for (model, n_ctx) up front.
 //
@@ -447,7 +482,11 @@ bool score_spine_cuda_prefill_trace(const Gemma4Model& m,
 // `n_reused_out` (optional) reports the prefix actually reused, so the count is
 // prompt.size()-1 in that case and the matched prefix length otherwise.
 // `sample_mask` is generate_spine's constrained-decoding bitmap (one token per
-// call when set).
+// call when set). `logits_out`, when non-empty, receives the final prompt
+// position's full logits (the values the first token's argmax is taken over;
+// vocab_size floats), which is what a sampled turn draws its first token from.
+// The prefill path fills it; the one-token-at-a-time reference path has no
+// logits to report and rejects the request.
 uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint64_t> prompt,
                                             uint64_t start_pos,
@@ -455,7 +494,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             planner::KvCacheSession& session,
                                             bool use_prefill = true,
                                             uint64_t* n_reused_out = nullptr,
-                                            std::span<const uint8_t> sample_mask = {});
+                                            std::span<const uint8_t> sample_mask = {},
+                                            std::span<float> logits_out = {});
 
 // Build the model's plan and record what executing it does, step by step.
 //

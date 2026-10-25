@@ -37,6 +37,129 @@ inline void mulhilo(uint32_t a, uint32_t b, uint32_t& hi, uint32_t& lo) {
   lo = uint32_t(p);
 }
 
+// Repetition / presence / frequency penalties over the trailing window, in the
+// historic float expression. Used by the greedy path only, whose output must
+// stay bit-identical to the pre-sampling implementation.
+void apply_penalties_legacy(std::span<const float> logits,
+                            const SamplingParams& p,
+                            std::span<const int64_t> history,
+                            std::vector<float>& adv) {
+  const int64_t vocab = int64_t(logits.size());
+  if (history.empty() || (p.repeat_penalty == 1.0f &&
+                          p.presence_penalty == 0.0f &&
+                          p.frequency_penalty == 0.0f))
+    return;
+  const size_t window =
+      std::min<size_t>(history.size(), size_t(p.repeat_last_n));
+  std::unordered_map<int64_t, uint32_t> count;
+  count.reserve(window);
+  for (size_t i = history.size() - window; i < history.size(); ++i) {
+    const int64_t t = history[i];
+    if (t >= 0 && t < vocab) ++count[t];
+  }
+  for (const auto& [t, c] : count) {
+    if (p.repeat_penalty != 1.0f) {
+      float& v = adv[size_t(t)];
+      v = v > 0.0f ? v / p.repeat_penalty : v * p.repeat_penalty;
+    }
+    adv[size_t(t)] -=
+        p.frequency_penalty * float(c) + p.presence_penalty;
+  }
+}
+
+// The same penalties with explicit single-rounding operations only
+// (temperature-corrected paths, including the CUDA select kernel):
+//   repeat:  v > 0 ? v / rp : v * rp
+//   adjust:  v - (freq * count + presence)
+// Each arithmetic result is one correctly-rounded IEEE operation; no
+// multiply-add contraction is possible across the explicit fma calls, so host
+// and device agree bitwise.
+void apply_penalties_exact(std::span<const float> logits,
+                           const SamplingParams& p,
+                           std::span<const int64_t> history,
+                           std::vector<float>& adv) {
+  const int64_t vocab = int64_t(logits.size());
+  if (history.empty() || (p.repeat_penalty == 1.0f &&
+                          p.presence_penalty == 0.0f &&
+                          p.frequency_penalty == 0.0f))
+    return;
+  const size_t window =
+      std::min<size_t>(history.size(), size_t(p.repeat_last_n));
+  std::unordered_map<int64_t, uint32_t> count;
+  count.reserve(window);
+  for (size_t i = history.size() - window; i < history.size(); ++i) {
+    const int64_t t = history[i];
+    if (t >= 0 && t < vocab) ++count[t];
+  }
+  for (const auto& [t, c] : count) {
+    float v = adv[size_t(t)];
+    if (p.repeat_penalty != 1.0f) {
+      // fma(v, rp, 0) rounds exactly like a plain multiply but cannot be
+      // fused with the subtraction below.
+      v = v > 0.0f ? v / p.repeat_penalty : std::fma(v, p.repeat_penalty, 0.0f);
+    }
+    const float adjust =
+        std::fma(p.frequency_penalty, float(c), p.presence_penalty);
+    adv[size_t(t)] = std::fma(-1.0f, adjust, v);
+  }
+}
+
+auto by_z_desc_id_asc = [](const Candidate& a, const Candidate& b) {
+  if (a.z != b.z) return a.z > b.z;
+  return a.id < b.id;
+};
+
+// Stages (e)-(h) of the sampler: the logit window, top-k, min-p and the
+// nucleus. `in` is ordered by (z descending, id ascending) and every filter
+// preserves that order.
+std::vector<Candidate> filter_candidates(std::span<const Candidate> in,
+                                         const SamplingParams& p) {
+  std::vector<Candidate> out;
+  if (in.empty()) return out;
+  const float m = in.front().z;
+
+  // (e) Logit window.
+  const float floor_z = m - kSampleLogitWindow;
+  out.reserve(in.size());
+  for (const Candidate& c : in)
+    if (c.z >= floor_z) out.push_back(c);
+
+  // (f) Top-k (the input order is already (z descending, id ascending)).
+  if (p.top_k > 0 && out.size() > p.top_k) out.resize(p.top_k);
+
+  // (g) Min-p.
+  if (p.min_p > 0.0f) {
+    const float cutoff = m + std::log(p.min_p);
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [cutoff](const Candidate& c) {
+                               return c.z < cutoff;
+                             }),
+              out.end());
+  }
+
+  // (h) Nucleus: the shortest descending prefix whose normalized probability
+  // reaches top_p.
+  if (p.top_p > 0.0f && p.top_p < 1.0f && !out.empty()) {
+    double total = 0.0;
+    for (const Candidate& c : out)
+      total += std::exp(double(c.z) - double(m));
+    if (total > 0.0) {
+      double acc = 0.0;
+      size_t keep = 0;
+      for (; keep < out.size(); ++keep) {
+        acc += std::exp(double(out[keep].z) - double(m));
+        if (acc / total >= double(p.top_p)) {
+          ++keep;
+          break;
+        }
+      }
+      if (keep == 0) keep = 1;
+      out.resize(std::min(keep, out.size()));
+    }
+  }
+  return out;
+}
+
 } // namespace
 
 std::array<uint32_t, 4> philox4x32_10(std::array<uint32_t, 4> counter,
@@ -89,148 +212,41 @@ int64_t argmax_masked(std::span<const float> x, std::span<const uint8_t> mask) {
   return best;
 }
 
-namespace {
-
-struct Cand {
-  int64_t id;
-  float z;
-};
-
-// The shared front half of sample_token: penalties, mask, and (for
-// temperature > 0) the temperature window, top-k, min-p and top-p filters.
-// `adv` holds the penalized logits; `m` the pre-window maximum (0 when greedy).
-struct CandidateSet {
-  std::vector<float> adv;
-  std::vector<Cand> cands;
-  float m = 0.0f;
-};
-
-CandidateSet build_candidates(std::span<const float> logits,
-                              const SamplingParams& p,
-                              std::span<const int64_t> history,
-                              std::span<const uint8_t> mask) {
+std::vector<Candidate> select_candidates_host(std::span<const float> logits,
+                                              const SamplingParams& p,
+                                              std::span<const int64_t> history,
+                                              std::span<const uint8_t> mask) {
   const int64_t vocab = int64_t(logits.size());
-  CandidateSet out;
-  out.adv.assign(logits.begin(), logits.end());
+  std::vector<Candidate> out;
+  if (!(p.temperature > 0.0f) || vocab <= 0) return out;
 
-  // (b) Repetition / presence / frequency penalties over the trailing window.
-  // Only in-vocabulary ids are touched; an id is penalized once for its count
-  // in the window.
-  if (!history.empty() && (p.repeat_penalty != 1.0f ||
-                           p.presence_penalty != 0.0f ||
-                           p.frequency_penalty != 0.0f)) {
-    const size_t window =
-        std::min<size_t>(history.size(), size_t(p.repeat_last_n));
-    std::unordered_map<int64_t, uint32_t> count;
-    count.reserve(window);
-    for (size_t i = history.size() - window; i < history.size(); ++i) {
-      const int64_t t = history[i];
-      if (t >= 0 && t < vocab) ++count[t];
-    }
-    for (const auto& [t, c] : count) {
-      if (p.repeat_penalty != 1.0f) {
-        float& v = out.adv[size_t(t)];
-        v = v > 0.0f ? v / p.repeat_penalty : v * p.repeat_penalty;
-      }
-      out.adv[size_t(t)] -=
-          p.frequency_penalty * float(c) + p.presence_penalty;
-    }
-  }
+  std::vector<float> adv(logits.begin(), logits.end());
+  apply_penalties_exact(logits, p, history, adv);
 
-  // (c) Grammar mask: disallowed tokens leave the candidate set. Candidates are
-  // built in ascending id order, so every later tie-break toward the lowest id
-  // is the stable order.
-  out.cands.reserve(size_t(std::max<int64_t>(vocab, 0)));
+  out.reserve(size_t(vocab));
   for (int64_t i = 0; i < vocab; ++i) {
     if (!mask.empty()) {
       const size_t byte = size_t(i) >> 3;
       if (byte >= mask.size()) break;  // past the bitmap: disallowed
       if (((mask[byte] >> (i & 7)) & 1u) == 0) continue;
     }
-    out.cands.push_back({i, 0.0f});
+    // z = l_adj / T as one float division (the CUDA kernel's __fdiv_rn).
+    out.push_back({int32_t(i), adv[size_t(i)] / p.temperature});
   }
-  if (out.cands.empty() || !(p.temperature > 0.0f)) return out;
-
-  // (e) Temperature scaling and the logit window.
-  const float inv_t = 1.0f / p.temperature;
-  out.m = -std::numeric_limits<float>::infinity();
-  for (Cand& c : out.cands) {
-    c.z = out.adv[size_t(c.id)] * inv_t;
-    out.m = std::max(out.m, c.z);
+  if (int(out.size()) > kSampleCandidates) {
+    std::nth_element(out.begin(), out.begin() + kSampleCandidates, out.end(),
+                     by_z_desc_id_asc);
+    out.resize(size_t(kSampleCandidates));
   }
-  const float floor_z = out.m - kSampleLogitWindow;
-  out.cands.erase(std::remove_if(out.cands.begin(), out.cands.end(),
-                                 [floor_z](const Cand& c) {
-                                   return c.z < floor_z;
-                                 }),
-                  out.cands.end());
-
-  auto by_z = [](const Cand& a, const Cand& b) {
-    if (a.z != b.z) return a.z > b.z;
-    return a.id < b.id;
-  };
-
-  // (f) Top-k under (z descending, id ascending).
-  if (p.top_k > 0 && out.cands.size() > p.top_k) {
-    std::sort(out.cands.begin(), out.cands.end(), by_z);
-    out.cands.resize(p.top_k);
-  }
-
-  // (g) Min-p.
-  if (p.min_p > 0.0f) {
-    const float cutoff = out.m + std::log(p.min_p);
-    out.cands.erase(std::remove_if(out.cands.begin(), out.cands.end(),
-                                   [cutoff](const Cand& c) {
-                                     return c.z < cutoff;
-                                   }),
-                    out.cands.end());
-  }
-
-  // (h) Nucleus: the shortest descending prefix whose normalized probability
-  // reaches top_p.
-  if (p.top_p > 0.0f && p.top_p < 1.0f) {
-    std::sort(out.cands.begin(), out.cands.end(), by_z);
-    double total = 0.0;
-    for (const Cand& c : out.cands)
-      total += std::exp(double(c.z) - double(out.m));
-    if (total > 0.0) {
-      double acc = 0.0;
-      size_t keep = 0;
-      for (; keep < out.cands.size(); ++keep) {
-        acc += std::exp(double(out.cands[keep].z) - double(out.m));
-        if (acc / total >= double(p.top_p)) {
-          ++keep;
-          break;
-        }
-      }
-      if (keep == 0) keep = 1;
-      out.cands.resize(std::min(keep, out.cands.size()));
-    }
-  }
+  std::sort(out.begin(), out.end(), by_z_desc_id_asc);
   return out;
 }
 
-} // namespace
-
-int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
-                     uint64_t position, std::span<const int64_t> history,
-                     std::span<const uint8_t> mask) {
-  CandidateSet set = build_candidates(logits, p, history, mask);
-  if (set.cands.empty()) return -1;
-
-  // (d) Greedy: argmax of the penalized logits (ties -> lowest id).
-  if (!(p.temperature > 0.0f)) {
-    int64_t best = set.cands.front().id;
-    float best_v = set.adv[size_t(best)];
-    for (size_t k = 1; k < set.cands.size(); ++k) {
-      const float v = set.adv[size_t(set.cands[k].id)];
-      if (v > best_v) {
-        best = set.cands[k].id;
-        best_v = v;
-      }
-    }
-    return best;
-  }
+int64_t sample_from_candidates(std::span<const Candidate> cands,
+                               const SamplingParams& p, uint64_t position) {
+  if (cands.empty()) return -1;
+  const std::vector<Candidate> kept = filter_candidates(cands, p);
+  if (kept.empty()) return -1;
 
   // (i) Gumbel-max: per-candidate deterministic draw keyed by
   // (seed, position, token id).
@@ -238,7 +254,7 @@ int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
   const uint32_t pos_hi = uint32_t(position >> 32);
   int64_t best = -1;
   double best_score = -std::numeric_limits<double>::infinity();
-  for (const Cand& c : set.cands) {
+  for (const Candidate& c : kept) {
     const auto bits =
         philox4x32_10({pos_lo, pos_hi, uint32_t(c.id), 0u}, p.seed);
     const double u = (double(bits[0]) + 0.5) / 4294967296.0;
@@ -253,14 +269,58 @@ int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
   return best;
 }
 
+int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
+                     uint64_t position, std::span<const int64_t> history,
+                     std::span<const uint8_t> mask) {
+  if (logits.empty()) return -1;
+
+  // Greedy: the argmax of the penalized logits (ties -> lowest id), with the
+  // historic arithmetic so temperature-0 streams stay bit-identical.
+  if (!(p.temperature > 0.0f)) {
+    std::vector<float> adv(logits.begin(), logits.end());
+    apply_penalties_legacy(logits, p, history, adv);
+    int64_t best = -1;
+    float best_v = 0.0f;
+    for (size_t i = 0; i < logits.size(); ++i) {
+      if (!mask.empty()) {
+        const size_t byte = i >> 3;
+        if (byte >= mask.size()) break;
+        if (((mask[byte] >> (i & 7)) & 1u) == 0) continue;
+      }
+      const float v = adv[i];
+      if (best < 0 || v > best_v) {
+        best = int64_t(i);
+        best_v = v;
+      }
+    }
+    return best;
+  }
+
+  const std::vector<Candidate> cands =
+      select_candidates_host(logits, p, history, mask);
+  return sample_from_candidates(cands, p, position);
+}
+
 std::vector<int64_t> sample_candidates(std::span<const float> logits,
                                        const SamplingParams& p,
                                        std::span<const int64_t> history,
                                        std::span<const uint8_t> mask) {
-  CandidateSet set = build_candidates(logits, p, history, mask);
   std::vector<int64_t> ids;
-  ids.reserve(set.cands.size());
-  for (const Cand& c : set.cands) ids.push_back(c.id);
+  if (logits.empty()) return ids;
+  if (!(p.temperature > 0.0f)) {
+    for (size_t i = 0; i < logits.size(); ++i) {
+      const size_t byte = i >> 3;
+      if (byte >= mask.size()) break;
+      if (((mask[byte] >> (i & 7)) & 1u) == 0) continue;
+      ids.push_back(int64_t(i));
+    }
+    return ids;
+  }
+  const std::vector<Candidate> cands =
+      select_candidates_host(logits, p, history, mask);
+  const std::vector<Candidate> kept = filter_candidates(cands, p);
+  ids.reserve(kept.size());
+  for (const Candidate& c : kept) ids.push_back(c.id);
   std::sort(ids.begin(), ids.end());
   return ids;
 }

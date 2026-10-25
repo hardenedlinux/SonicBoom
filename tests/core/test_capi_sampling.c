@@ -7,7 +7,13 @@
 //  4. temperature 0 is still the historical greedy stream (the p1 golden);
 //  5. constrained decoding + sampling produces text the grammar accepts;
 //  6. a zero-initialized struct (struct_size + max_tokens only) is greedy:
-//     repeat_penalty 0 means off and repeat_last_n 0 disables penalties.
+//     repeat_penalty 0 means off and repeat_last_n 0 disables penalties;
+//  7. sampled decode runs on the session path: on a 2048-token prompt its
+//     time-to-first-token (prefill + the first callback) stays within 2x the
+//     greedy path's, i.e. the prompt is never re-run token by token;
+//  8. a second turn on the same session reuses the prefix and the same
+//     (seed, position, history) reproduces the same stream;
+//  9. grammar + sampling on CUDA: the output is accepted by the grammar.
 //
 // Skips (exit 77) when the model, the golden or a CUDA device is absent.
 
@@ -19,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int g_failures = 0;
 
@@ -69,6 +76,51 @@ static int token_cb(void *user, sb_token token) {
   run_result *r = (run_result *)user;
   if (r->n < MAX_TOK) r->tokens[r->n++] = token;
   return 0;
+}
+
+// Wall clock for the time-to-first-token comparison.
+static double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
+typedef struct {
+  double first_ms;  // when the first token arrived
+  int n;
+} first_token_state;
+
+static int first_token_cb(void *user, sb_token token) {
+  (void)token;
+  first_token_state *f = (first_token_state *)user;
+  if (f->n++ == 0) f->first_ms = now_ms();
+  return 0;
+}
+
+// Time from the start of the prefill to the first decode callback on a fresh
+// session: the whole time-to-first-token of one turn, so the comparison covers
+// the same work on both the greedy and the sampled path.
+static double ttft_ms(sb_llm_model *model, const sb_token *prompt,
+                      size_t n_prompt, uint64_t n_ctx, sb_llm_sampling s,
+                      double *prefill_ms, double *decode_ms) {
+  sb_error *err = NULL;
+  sb_llm_session *session = NULL;
+  check_status(sb_llm_session_new(model, n_ctx, &session, &err), err,
+               "session_new (ttft)");
+  const double t0 = now_ms();
+  uint64_t reused = 0;
+  check_status(sb_llm_prefill(session, prompt, n_prompt, &reused, &err), err,
+               "prefill (ttft)");
+  const double t1 = now_ms();
+  first_token_state f = {0.0, 0};
+  uint32_t n = 0;
+  check_status(sb_llm_decode(session, &s, first_token_cb, &f, &n, &err), err,
+               "decode (ttft)");
+  check(f.n >= 1, "(7) decode produced a first token");
+  sb_llm_session_free(session);
+  if (prefill_ms) *prefill_ms = t1 - t0;
+  if (decode_ms) *decode_ms = (f.n ? f.first_ms - t1 : 0.0);
+  return f.n ? f.first_ms - t0 : 1e12;
 }
 
 // Run one generation: a fresh session, prefill `prompt`, decode `max_tokens`.
@@ -276,6 +328,111 @@ int main(void) {
     for (int i = 0; same && i < 32; ++i)
       same = (int64_t)g.tokens[i] == golden[i];
     check(same, "(6) zero-initialized struct == the p1 greedy golden");
+  }
+
+  // (7) sampled decode reuses the session path: on a 2048-token prompt the
+  // sampled turn's time-to-first-token (prefill + first callback) stays within
+  // 2x the greedy turn's. The old sampled path re-ran the whole prompt token by
+  // token through the decode graph inside sb_llm_decode, so it could not pass.
+  {
+    const size_t n_big = 2048;
+    sb_token *big = (sb_token *)malloc(n_big * sizeof(sb_token));
+    check(big != NULL, "(7) prompt allocation");
+    if (big) {
+      for (size_t i = 0; i < n_big; ++i)
+        big[i] = prompt[i % n_prompt];
+      double g_pf = 0.0, g_dec = 0.0, s_pf = 0.0, s_dec = 0.0;
+      sb_llm_sampling greedy;
+      memset(&greedy, 0, sizeof greedy);
+      greedy.struct_size = sizeof greedy;
+      greedy.max_tokens = 1;
+      const double g_ms = ttft_ms(model, big, n_big, 2304, greedy, &g_pf, &g_dec);
+      const double s_ms = ttft_ms(model, big, n_big, 2304,
+                                  sampling(0.8f, 0.9f, 0, 7, 1), &s_pf, &s_dec);
+      fprintf(stderr,
+              "    ttft 2048: greedy %.1f ms (prefill %.1f, decode %.1f), "
+              "sampled %.1f ms (prefill %.1f, decode %.1f)\n",
+              g_ms, g_pf, g_dec, s_ms, s_pf, s_dec);
+      check(s_ms < 2.0 * g_ms,
+            "(7) sampled TTFT on a 2048-token prompt is within 2x greedy");
+      free(big);
+    }
+  }
+
+  // (8) a second turn on the same session reuses the prefix (the cache holds
+  // the first prompt) and the same (seed, position, history) reproduces the
+  // same stream when the turn is run twice.
+  {
+    sb_llm_session *session = NULL;
+    check_status(sb_llm_session_new(model, 512, &session, &err), err,
+                 "session_new (turn 2)");
+    uint64_t reused = 0;
+    check_status(sb_llm_prefill(session, prompt, n_prompt, &reused, &err), err,
+                 "prefill (turn 1)");
+    run_result r1;
+    memset(&r1, 0, sizeof r1);
+    uint32_t n = 0;
+    check_status(sb_llm_decode(session, &s7, token_cb, &r1, &n, &err), err,
+                 "decode (turn 1)");
+    check(r1.n >= 32, "(8) turn 1 produced 32 tokens");
+
+    sb_token ext[512];
+    memcpy(ext, prompt, n_prompt * sizeof(sb_token));
+    memcpy(ext + n_prompt, r1.tokens, 16 * sizeof(sb_token));
+    const size_t n_ext = n_prompt + 16;
+    run_result r2a, r2b;
+    uint64_t reused_a = 0, reused_b = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+      uint64_t *reused_p = pass == 0 ? &reused_a : &reused_b;
+      run_result *out = pass == 0 ? &r2a : &r2b;
+      memset(out, 0, sizeof *out);
+      check_status(sb_llm_prefill(session, ext, n_ext, reused_p, &err), err,
+                   pass == 0 ? "prefill (turn 2a)" : "prefill (turn 2b)");
+      check_status(sb_llm_decode(session, &s7, token_cb, out, &n, &err), err,
+                   pass == 0 ? "decode (turn 2a)" : "decode (turn 2b)");
+    }
+    fprintf(stderr, "    turn 2: reused %llu and %llu of a %zu-token prompt\n",
+            (unsigned long long)reused_a, (unsigned long long)reused_b, n_ext);
+    check(reused_a >= n_prompt,
+          "(8) turn 2 reuses at least the previous prompt's prefix");
+    check(reused_b >= n_prompt,
+          "(8) a re-run of turn 2 still reuses the previous prompt's prefix");
+    check(r2a.n >= 16 && r2b.n == r2a.n &&
+              memcmp(r2a.tokens, r2b.tokens, r2a.n * sizeof(sb_token)) == 0,
+          "(8) running turn 2 twice reproduces the same tokens");
+    sb_llm_session_free(session);
+  }
+
+  // (9) grammar + sampling on CUDA: the constrained stream stays inside the
+  // grammar (the device SampleSelect applies the same allowed-token bitmap the
+  // greedy Argmax node applies).
+  {
+    const char *gbnf = "root ::= \"yes\" | \"no\" | \"maybe\"";
+    sb_llm_session *session = NULL;
+    check_status(sb_llm_session_new(model, 256, &session, &err), err,
+                 "session_new (grammar 9)");
+    check_status(sb_llm_session_set_grammar(session, gbnf, &err), err,
+                 "set_grammar (9)");
+    uint64_t reused = 0;
+    check_status(sb_llm_prefill(session, prompt, n_prompt, &reused, &err), err,
+                 "prefill (grammar 9)");
+    run_result g;
+    memset(&g, 0, sizeof g);
+    uint32_t n = 0;
+    check_status(sb_llm_decode(session, &s7, token_cb, &g, &n, &err), err,
+                 "decode (grammar 9)");
+    char out[128] = {0};
+    sb_error *de = NULL;
+    size_t len = 0;
+    sb_status dst = sb_llm_detokenize(model, g.tokens, g.n, out, sizeof out,
+                                      &len, &de);
+    if (de) sb_error_free(de);
+    check(dst == SB_OK && g.n >= 1,
+          "(9) grammar-constrained sampled CUDA output detokenizes");
+    check(strcmp(out, "yes") == 0 || strcmp(out, "no") == 0 ||
+              strcmp(out, "maybe") == 0,
+          "(9) grammar-constrained sampled CUDA text is in the grammar");
+    sb_llm_session_free(session);
   }
 
   sb_llm_model_free(model);

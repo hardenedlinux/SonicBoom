@@ -60,6 +60,20 @@ struct SamplingParams {
 // before top-k/min-p/top-p: the probability ratio there is below 1e-13.
 inline constexpr float kSampleLogitWindow = 30.0f;
 
+// Sampling draws only from the kSampleCandidates highest-z candidates
+// (z = penalized logit / temperature, ties toward the lower id). This is exact
+// whenever top_k <= kSampleCandidates or the nucleus lies inside the top
+// kSampleCandidates; otherwise the tail below the 256th candidate is never
+// selected.
+inline constexpr int kSampleCandidates = 256;
+
+// One sampling candidate: the token id and its temperature-scaled, penalized
+// logit z = l_adj / T (float, computed as a single division).
+struct Candidate {
+  int32_t id;
+  float z;
+};
+
 // Philox4x32-10 with the standard Random123 constants and a 64-bit key
 // (key0 = low 32 bits, key1 = high 32 bits). Known answer:
 // philox4x32_10({0,0,0,0}, 0) == {0x6627e8d5, 0xe169c58d, 0xbc57ac4c,
@@ -77,12 +91,31 @@ std::array<uint32_t, 4> philox4x32_10(std::array<uint32_t, 4> counter,
 //   mask    constrained-decoding bitmap, may be empty (see argmax_masked).
 //
 // Order: penalties over the last repeat_last_n history tokens -> mask ->
-// temperature <= 0 argmax -> temperature scaling / kSampleLogitWindow -> top_k
-// -> min_p -> top_p -> Gumbel-max with a Philox4x32-10 draw keyed by
-// (seed, position, candidate id). Returns -1 when no candidate remains.
+// temperature <= 0 argmax -> select_candidates_host -> sample_from_candidates.
+// For temperature <= 0 the result is the argmax of the penalized logits (ties
+// toward the lowest id), unchanged from the historic greedy path. For
+// temperature > 0 sampling draws from the top kSampleCandidates candidates.
+// Returns -1 when no candidate remains.
 int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
                      uint64_t position, std::span<const int64_t> history,
                      std::span<const uint8_t> mask);
+
+// Stage (1) of sampling: penalties over the last repeat_last_n history tokens,
+// the grammar mask, and z = l_adj / temperature in float. The
+// kSampleCandidates highest z survive (ties toward the lower id) and are
+// returned in (z descending, id ascending) order. The penalties use explicit
+// single-rounding operations so the CUDA select kernel produces bitwise
+// identical z values. Requires p.temperature > 0.
+std::vector<Candidate> select_candidates_host(std::span<const float> logits,
+                                              const SamplingParams& p,
+                                              std::span<const int64_t> history,
+                                              std::span<const uint8_t> mask);
+
+// Stage (2) of sampling: kSampleLogitWindow, top_k, min_p and top_p over the
+// given candidate order, then a Gumbel-max draw with a Philox4x32-10 keyed by
+// (seed, position, candidate id). Returns -1 for an empty candidate list.
+int64_t sample_from_candidates(std::span<const Candidate> cands,
+                               const SamplingParams& p, uint64_t position);
 
 // Test seam for sample_token's filter stages (penalties, mask, the temperature
 // window, top_k, min_p, top_p): the surviving candidate ids in ascending order.

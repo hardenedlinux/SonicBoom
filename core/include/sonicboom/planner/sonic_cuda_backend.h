@@ -26,18 +26,22 @@
 // H2D/D2H Transfer tasks only at the host/device boundary.
 //
 // Like SonicBackend it reads weights straight from the bound model via the
-// (layer, slot) attributes; weights are never graph tensors. Embedding and
-// Softcap are placed on the CPU SonicBackend (there is no *_dev kernel for
-// them), so this backend never sees them and returns a hard error if it does.
+// (layer, slot) attributes; weights are never graph tensors. Softcap is placed
+// on the CPU SonicBackend for the prefill graph; the sampled decode graph (r7)
+// runs it here (softcap_dev) ahead of its terminal SampleSelect node, so a
+// sampled step never moves the [vocab] logits to the host.
 
 #include <sonicboom/hal/buffer.h>
 #include <sonicboom/model/loader.h>
+#include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/graph.h>
 #include <sonicboom/planner/kv_cache.h>
 
+#include <cstdint>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace sonicboom::planner {
 
@@ -122,6 +126,43 @@ public:
   // Download the verify step's per-row argmax results (rows <= kMaxVerifyRows)
   // from the persistent token slot. The synchronous D2H is the replay barrier.
   bool read_verify_tokens(float* host, int rows) const;
+
+  // --- sampled decode (r7) --------------------------------------------------
+  //
+  // A sampled decode graph ends in OpKind::SampleSelect instead of Argmax: that
+  // node runs nn::cuda::sample_select_dev_dyn over its [vocab] f32 input and
+  // writes the top nn::kSampleCandidates (id, z) pairs into a persistent device
+  // candidate buffer (its graph output is only the 4-byte candidate count). The
+  // sampler parameters and the penalty window are persistent device buffers
+  // too, staged per step before replay, so a captured step neither moves the
+  // [vocab] vector to the host nor bakes a sampling setting into the launch.
+  // The host then draws from the downloaded candidates with
+  // nn::sample_from_candidates.
+  //
+  // Allocate with sample_select_init() before capture (it also initializes the
+  // argmax_mask_ bitmap with ceil(vocab / 8) bytes, so the sampled node can
+  // apply a grammar mask exactly like the greedy Argmax node). `vocab` fixes
+  // the candidate geometry; the SampleSelect node rejects a different width.
+  bool sample_select_init(int vocab);
+  bool sample_select_ready() const { return static_cast<bool>(sample_cands_); }
+  int sample_vocab() const { return sample_vocab_; }
+
+  // Stage this step's sampler parameters and the trailing penalty window onto
+  // `prog` (async H2D ordered before its next replay). `history` is the full
+  // accepted sequence (prompt + generated); only its last repeat_last_n
+  // tokens are staged. A window longer than kSampleSelectMaxWindow is rejected.
+  bool stage_sample(hal::StepProgram& prog, const nn::SamplingParams& p,
+                    std::span<const int64_t> history);
+
+  // The synchronous form of stage_sample, for the uncaptured fallback (CUDA
+  // graphs disabled): the executor then runs the sampled graph per step.
+  bool upload_sample(const nn::SamplingParams& p,
+                     std::span<const int64_t> history);
+
+  // Download the last step's candidate list and count (synchronous D2H; also
+  // the replay's completion barrier, like read_token). `out` receives at most
+  // nn::kSampleCandidates entries.
+  bool read_sample_candidates(nn::Candidate* out, int* out_count) const;
 
   // --- constrained decoding ------------------------------------------------
   //
@@ -247,6 +288,17 @@ private:
   hal::Buffer argmax_mask_;         // allowed-token bitmap for the Argmax node
   size_t argmax_mask_bytes_ = 0;    // its size (ceil(vocab / 8)), 0 = never initialized
   bool argmax_mask_dirty_ = false;  // a constrained mask has been uploaded and not cleared
+
+  // Sampled decode (r7): the persistent device buffers the captured
+  // SampleSelect node reads. They are allocated by sample_select_init() before
+  // capture and filled per step by stage_sample()/upload_sample().
+  hal::Buffer sample_params_;       // nn::cuda::SampleSelectParams (scalars)
+  hal::Buffer sample_window_;       // int32[kSampleSelectMaxWindow] penalty window
+  hal::Buffer sample_cands_;        // kSampleCandidates Candidates, then the int count
+  std::vector<uint8_t> sample_params_stage_;  // host staging for sample_params_
+  std::vector<int32_t> sample_window_stage_;  // host staging for sample_window_
+  nn::Candidate* sample_host_ = nullptr;      // pinned candidate readback
+  int sample_vocab_ = 0;            // the width the candidate buffers were sized for
   uint32_t chunk_ = 1;              // decode steps captured per graph
   uint32_t step_index_ = 0;         // which step the next execute() is
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
