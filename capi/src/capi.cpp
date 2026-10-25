@@ -168,6 +168,20 @@ struct sb_llm_session {
   std::string grammar_text;
   std::vector<uint8_t> grammar_mask;
   bool grammar_done = false;  // a stop token finished the grammar
+
+  // Sampled decode (temperature > 0) reuses the same session path: the prefill
+  // above fills the persistent KV cache and hands its final-position logits to
+  // `sampled` (device-resident), so the first sampled token is a device select
+  // over those logits and each further step replays the captured sampled decode
+  // graph on the same cache. `sampled_started` distinguishes the first draw
+  // (from the stored prefill logits, at position = prompt length) from the
+  // decode steps that follow it.
+  model::SampledState *sampled = nullptr;
+  bool sampled_started = false;
+  // The history a sampled decode penalizes: the prompt plus every token this
+  // session has emitted since the last prefill. Kept across decode calls so a
+  // second call without a new prefill continues the same penalty history.
+  std::vector<int64_t> sampled_history;
 };
 
 namespace {
@@ -1973,7 +1987,11 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
       err_out);
 }
 
-void sb_llm_session_free(sb_llm_session *session) { delete session; }
+void sb_llm_session_free(sb_llm_session *session) {
+  if (!session) return;
+  model::sampled_state_free(session->sampled);
+  delete session;
+}
 
 sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
                          size_t n, uint64_t *n_reused_out, sb_error **err_out) {
@@ -2024,17 +2042,32 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         // (no device) defers all compute to sb_llm_decode as before.
         session->prefill_done = false;
         session->pending = -1;
+        session->sampled_started = false;
+        session->sampled_history.assign(session->prompt.begin(),
+                                        session->prompt.end());
         if (quant::cuda_available() && n > 0) {
           const model::Gemma4Model &m = session->bundle->model;
           std::vector<uint64_t> prompt(tokens, tokens + n);
           std::vector<int64_t> first(1, -1);
+          // The last prompt position's (softcapped) logits: the greedy path
+          // argmaxes them now, and a later sampled decode draws its first token
+          // from them, so the sampled turn never re-runs the prompt.
+          std::vector<float> logits(static_cast<size_t>(m.config.vocab_size));
           if (session->grammar)
             session->grammar_mask = session->grammar->mask();
           const uint64_t done = model::generate_prefill_spine_cuda_prefix(
               m, prompt, /*start_pos=*/0, first, session->kv,
-              /*use_prefill=*/true, &reused, session->grammar_mask);
+              /*use_prefill=*/true, &reused, session->grammar_mask, logits);
           if (done == 0 || first[0] < 0) {
             set_error(err_out, SB_ERRKIND_INTERNAL, "CUDA prefill failed");
+            return SB_ERR_INTERNAL;
+          }
+          if (!session->sampled)
+            session->sampled = model::sampled_state_new();
+          if (!session->sampled ||
+              !model::sampled_state_store_logits(*session->sampled, logits)) {
+            set_error(err_out, SB_ERRKIND_INTERNAL,
+                      "CUDA prefill: cannot retain the final logits");
             return SB_ERR_INTERNAL;
           }
           if (session->grammar) {
@@ -2152,8 +2185,10 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
 
         // A sampled decode recomputes every token from the prompt, including
         // the prefill's first token (which the greedy prefill may already have
-        // consumed into the grammar). Restart the grammar at the prompt's end.
-        if (sampling_mode && session->grammar) {
+        // consumed into the grammar). Restart the grammar at the prompt's end —
+        // but only for the turn's first decode call: a continuing call must
+        // keep the grammar state it has already advanced.
+        if (sampling_mode && !session->sampled_started && session->grammar) {
           session->grammar->reset();
           session->grammar_done = false;
           session->grammar_mask.clear();
@@ -2165,26 +2200,108 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
 
         const model::Gemma4Model &m = session->bundle->model;
 
-        // Sampled CUDA decode: the non-greedy decode graph puts the full
-        // [vocab] logits on the host each step and sample_token chooses the
-        // token there. The prefill's greedy pending token is not used, so a
-        // shifted prompt (prefix reuse) samples position-correctly: the draw is
-        // keyed by the token's absolute position and the history is the whole
-        // prompt, so a re-prefilled prefix reproduces the same stream.
-        if (sampling_mode && quant::cuda_available() && !session->grammar) {
-          std::vector<int64_t> out(max_tokens);
-          std::vector<uint64_t> prompt(session->prompt.begin(),
-                                       session->prompt.end());
-          const uint64_t got = model::generate_spine_cuda_sampled(
-              m, prompt, /*start_pos=*/0, out, session->n_ctx, sp);
-          uint32_t n = got > max_tokens ? max_tokens : uint32_t(got);
-          if (cb) {
-            for (uint32_t i = 0; i < n; ++i) {
-              if (cb(user, static_cast<sb_token>(out[i]))) {
-                n = i;
-                break;
+        // Sampled CUDA decode on the session path. The prefill above ran once
+        // and filled the persistent KV cache (prefix reuse included); its final
+        // prompt-position logits live on the device. The first token is a device
+        // select over those logits at position = prompt length; each further
+        // step replays the captured sampled decode graph (reduction + softcap +
+        // SampleSelect on the device) on the same cache, so the prompt is never
+        // re-run and the [vocab] vector never reaches the host. The host draws
+        // from the 256 downloaded candidates with the token's absolute
+        // position, so a given (seed, position, history) always yields the same
+        // token, independently of KV capacity or prefix reuse.
+        if (sampling_mode && quant::cuda_available() && session->prefill_done) {
+          // The device penalty window is int32[1024]
+          // (nn::cuda::kSampleSelectMaxWindow), the most a sampled step can
+          // apply; a larger window is a caller error on this path.
+          if (repeat_last_n > 1024) {
+            set_error(err_out, SB_ERRKIND_BINDING,
+                      "repeat_last_n must be <= 1024 on the CUDA sampled path");
+            return SB_ERR_BINDING;
+          }
+          const size_t prompt_len = session->prompt.size();
+          // The session's penalty history: the prompt as of the last prefill
+          // plus every token emitted since, including earlier decode calls.
+          std::vector<int64_t> &history = session->sampled_history;
+          uint32_t n = 0;
+          if (session->grammar && session->grammar_done) {
+            *n_out = 0;  // the constrained output already ended
+            return SB_OK;
+          }
+          if (!session->sampled_started) {
+            if (!session->sampled) {
+              set_error(err_out, SB_ERRKIND_INTERNAL,
+                        "sampled decode state is not allocated");
+              return SB_ERR_INTERNAL;
+            }
+            std::span<const uint8_t> mask;
+            if (session->grammar) {
+              session->grammar_mask = session->grammar->mask();
+              if (session->grammar_mask.empty()) {
+                *n_out = 0;
+                return SB_OK;
+              }
+              mask = session->grammar_mask;
+            }
+            const int64_t first = model::sampled_first_token_cuda(
+                m, *session->sampled, session->kv, prompt_len, sp, history, mask);
+            if (first < 0 || uint64_t(first) >= m.config.vocab_size) {
+              set_error(err_out, SB_ERRKIND_INTERNAL,
+                        "CUDA sampled first token failed");
+              return SB_ERR_INTERNAL;
+            }
+            session->token = static_cast<uint64_t>(first);
+            session->pos = prompt_len;
+            session->pending = -1;
+            session->sampled_started = true;
+            if (session->grammar) {
+              if (!session->grammar->accept(int32_t(first))) {
+                set_error(err_out, SB_ERRKIND_INTERNAL,
+                          "grammar rejected the sampled token");
+                return SB_ERR_INTERNAL;
+              }
+              if (session->grammar->finished()) {
+                session->grammar_done = true;  // a stop token is not emitted
+                *n_out = 0;
+                return SB_OK;
               }
             }
+            if (cb && cb(user, static_cast<sb_token>(first))) {
+              *n_out = 0;  // aborted before the first token
+              return SB_OK;
+            }
+            history.push_back(first);
+            n = 1;
+          }
+          while (n < max_tokens) {
+            std::span<const uint8_t> mask;
+            if (session->grammar) {
+              session->grammar_mask = session->grammar->mask();
+              if (session->grammar_mask.empty()) break;
+              mask = session->grammar_mask;
+            }
+            const uint64_t fed = session->token;  // this step writes fed's KV
+            const int64_t next = model::sampled_step_cuda(
+                m, fed, session->pos, session->kv, sp, history, mask);
+            if (next < 0 || uint64_t(next) >= m.config.vocab_size) break;
+            // The step wrote `fed`'s KV at session->pos, so a later prefill can
+            // reuse this generation like any greedy one.
+            session->kv.filled_tokens.push_back(fed);
+            session->token = static_cast<uint64_t>(next);
+            ++session->pos;
+            if (session->grammar) {
+              if (!session->grammar->accept(int32_t(next))) break;
+              if (session->grammar->finished()) {
+                session->grammar_done = true;
+                break;  // a stop token ends the constrained output; not emitted
+              }
+            }
+            if (cb && cb(user, static_cast<sb_token>(next))) {
+              *n_out = n;  // aborted before next; report n produced
+              return SB_OK;
+            }
+            history.push_back(next);
+            ++n;
           }
           *n_out = n;
           return SB_OK;

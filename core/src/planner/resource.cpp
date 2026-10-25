@@ -275,11 +275,11 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   // M3: enumerate a CUDA device + device-local memory space when one is present
   // and the caller has not requested a host-only snapshot (a CPU-only spine sets
   // cfg.enumerate_cuda = false). The GPU device declares exactly the transformer
-  // ops the SonicCudaBackend can execute (everything except Softcap, which has
-  // no *_dev kernel and stays on the CPU SonicBackend for the sampling path;
-  // the greedy decode path never emits Softcap). Embedding and Argmax have *_dev
-  // kernels (Phase 3.2), so they run on the GPU and drop the per-token embedding
-  // H2D uploads and the 1 MiB logits D2H.
+  // ops the SonicCudaBackend can execute (including Softcap via softcap_dev,
+  // which sampled decode (r7) needs on the device so its logits never reach the
+  // host; the greedy decode path never emits Softcap). Embedding and Argmax have
+  // *_dev kernels (Phase 3.2), so they run on the GPU and drop the per-token
+  // embedding H2D uploads and the 1 MiB logits D2H.
   if (cfg.enumerate_cuda && quant::cuda_available()) {
     Device gpu;
     gpu.id = DeviceId{1};
@@ -307,6 +307,12 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         OpKind::AddBias,
         OpKind::Slice,          OpKind::Embedding,
         OpKind::Argmax,
+        // Sampled decode (r7): the terminal candidate selection runs on the
+        // device, and the logit softcap that feeds it (Gemma 4's
+        // final_logit_softcapping) is softcap_dev, so a sampled decode graph
+        // never moves the [vocab] vector through the host.
+        OpKind::SampleSelect,
+        OpKind::Softcap,
         // Phase 7 chunked prefill operators (device-resident): FlashAttention
         // (chunked SDPA) and KvAppend (deferred cache append) have no per-token
         // decode twin. The rest of the prefill graph reuses the per-token

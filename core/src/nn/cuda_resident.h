@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <span>
 
+#include <sonicboom/nn/sampling.h>
+
 // Internal device-resident elementwise / norm / RoPE / dense-matvec primitives
 // (Phase 6a Option A). These mirror the public <sonicboom/nn/cuda_elementwise.h>
 // entry points but take/return DEVICE pointers for the activation operands and
@@ -64,6 +66,11 @@ bool add_dev(const float* a, const float* b, float* y, int n);
 // bound model weight, uploaded once and cached.
 bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n);
 bool scale_dev(const float* x, float s, float* y, int n);
+
+// y[i] = cap * tanh(x[i] / cap), the final-logit softcap (mirrors nn::softcap's
+// expression cap * tanh(x * (1 / cap))). Keeps the sampled decode graph's
+// logits on the device ahead of sample_select_dev; x and y may alias.
+bool softcap_dev(const float* x, float cap, float* y, int n);
 
 // In-place f32 -> fp16 -> f32 round-trip.
 bool cast_fp16_dev(float* v, int n);
@@ -267,6 +274,53 @@ bool argmax_dev(const float* x, int n, float* out);
 // writes -1 like an all-NaN one. Mirrors nn::argmax_masked. Devices that
 // cannot run it return false, and the caller falls back to the host.
 bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out);
+
+// Deterministic sampling's candidate selection on the device:
+//   z[i] = (penalized logit i) / temperature        (float division)
+// for the unmasked ids (mask may be null = everything allowed; a bitmap of
+// ceil(vocab / 8) bytes, LSB first), then the kSampleCandidates highest z
+// (ties toward the lower id) are written to out[0..*out_count) in that order
+// (z descending, id ascending). *out_count = min(256, unmasked count).
+//
+// Penalties mirror nn::select_candidates_host exactly: `window` holds the last
+// window_len history tokens (device int32, at most kSampleSelectMaxWindow
+// entries; window may be null when window_len is 0); a token occurring c times
+// there has its logit adjusted once, with the same single-rounding operations
+// as the host: repeat penalty by division (positive) or multiplication
+// (non-positive), then - (frequency * c + presence). The logits buffer is not
+// modified. `out` and `out_count` are device buffers (kSampleCandidates
+// entries and one int).
+//
+// The result is bitwise identical to nn::select_candidates_host for the same
+// inputs. One block, deterministic; the device key scratch is retained and
+// never freed because a captured decode graph may embed it.
+inline constexpr int kSampleSelectMaxWindow = 1024;
+
+// The per-launch parameters that a captured decode graph stages on the device
+// before replay (the values that change between decode calls). Mirrors the
+// scalar arguments of sample_select_dev.
+struct SampleSelectParams {
+  int32_t window_len;
+  float temperature;
+  float repeat_penalty;
+  float presence_penalty;
+  float frequency_penalty;
+};
+
+bool sample_select_dev(const float* logits, int vocab, const uint8_t* mask,
+                       const int32_t* window, int window_len,
+                       float temperature, float repeat_penalty, float presence,
+                       float frequency, Candidate* out, int* out_count);
+
+// The captured-graph form: the scalars (and window length) come from
+// `params_dev` (device memory) instead of the launch arguments, so one
+// recorded launch can be replayed with new sampling parameters. `window` must
+// be non-null whenever params_dev->window_len > 0. Returns false if the device
+// is unavailable; the caller validates the staged values.
+bool sample_select_dev_dyn(const float* logits, int vocab, const uint8_t* mask,
+                           const int32_t* window,
+                           const SampleSelectParams* params_dev,
+                           Candidate* out, int* out_count);
 
 // --- batched prefill primitives (the decode *_dev kernels generalized to an
 // n dimension; decode is n == 1). Activations are [n, dim] position-major

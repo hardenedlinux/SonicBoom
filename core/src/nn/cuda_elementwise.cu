@@ -231,6 +231,14 @@ __global__ void scale_kernel(const float* __restrict__ x, float s,
   if (i < n) y[i] = x[i] * s;
 }
 
+// Final-logit softcap, y = cap * tanh(x / cap), the device form of nn::softcap.
+// One multiply by the reciprocal, as on the host.
+__global__ void softcap_kernel(const float* __restrict__ x, float cap,
+                               float* __restrict__ y, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = cap * tanhf(x[i] * (1.0f / cap));
+}
+
 __global__ void cast_fp16_kernel(float* __restrict__ v, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) v[i] = half_roundtrip(v[i]);
@@ -1601,6 +1609,8 @@ void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*
 size_t g_attn_partial_bytes = 0;
 void* g_argmax_keys = nullptr;  // per-block packed argmax candidates (grid unsigned long long)
 size_t g_argmax_keys_bytes = 0;
+void* g_select_keys = nullptr;  // per-token packed sampling keys (vocab unsigned long long, r7)
+size_t g_select_keys_bytes = 0;
 void* g_xpack = nullptr;        // repacked activation column-block for the cuBLAS dense matvec ([cols, 128])
 size_t g_xpack_bytes = 0;
 void* g_outpack = nullptr;      // padded output column-block ([rows, 128])
@@ -1620,6 +1630,19 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
   buf = nullptr;
   have = 0;
   if (cudaMalloc(&buf, need) != cudaSuccess) return nullptr;
+  have = need;
+  return buf;
+}
+
+// Grow a scratch that a captured CUDA graph may embed (the sampling select
+// kernel's key buffer): the old allocation is retained instead of freed, so a
+// graph captured against it keeps a valid pointer. Growth happens before the
+// capture that uses the new buffer.
+void* grow_scratch_keep(void*& buf, size_t& have, size_t need) {
+  if (have >= need) return buf;
+  void* nb = nullptr;
+  if (cudaMalloc(&nb, need) != cudaSuccess) return nullptr;
+  buf = nb;
   have = need;
   return buf;
 }
@@ -1723,6 +1746,256 @@ __global__ void argmax_masked_kernel(const float* __restrict__ x,
     __syncthreads();
   }
   if (tid == 0) out[0] = (s_idx[0] < 0) ? -1.0f : float(s_idx[0]);
+}
+
+// --- deterministic sampling candidate selection (r7) ------------------------
+// One block: penalties -> mask -> z = l/T -> top kSampleCandidates by the
+// packed key (z descending, id ascending) -> write (id, z). The arithmetic is
+// the same single-rounding sequence as nn::select_candidates_host, so the
+// output is bitwise identical to the host selector.
+//
+// The window is small (<= kSampleSelectMaxWindow), so its per-token counts are
+// built once in a shared lock-free linear-probe hash table; the logits buffer
+// stays read-only. Keys are materialized in a global scratch buffer (8 B per
+// token) so the eight radix passes only scan keys.
+
+__device__ __forceinline__ float select_adjust_logit(float v, unsigned count,
+                                                     float rp, float pres,
+                                                     float freq) {
+  if (rp != 1.0f) v = v > 0.0f ? __fdiv_rn(v, rp) : fmaf(v, rp, 0.0f);
+  const float adjust = fmaf(freq, float(count), pres);
+  return fmaf(-1.0f, adjust, v);
+}
+
+// Order-preserving float -> uint32 (monotone unsigned), with -0.0 folded onto
+// +0.0 so sign-zero ties order by id like the host comparator. The low word is
+// 0xFFFFFFFF - id, so a larger key is the better candidate.
+__device__ __forceinline__ unsigned long long select_key(float z, int id) {
+  unsigned bits = __float_as_uint(z);
+  if ((bits << 1) == 0u) bits = 0u;
+  const unsigned ord = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  return (static_cast<unsigned long long>(ord) << 32) |
+         (0xFFFFFFFFu - static_cast<unsigned>(id));
+}
+
+constexpr int kSelectThreads = 1024;
+constexpr int kSelectHashSize = 2048;  // power of two, >= 2 * window cap
+constexpr unsigned long long kSelectEmpty = ~0ull;
+
+__device__ __forceinline__ unsigned select_hash(uint32_t token) {
+  return (token * 2654435761u) >> 21;  // 11 bits -> [0, 2048)
+}
+
+// Insert token into the window hash; the low word becomes its occurrence count.
+__device__ __forceinline__ void select_hash_insert(unsigned long long* ht,
+                                                   uint32_t token) {
+  unsigned h = select_hash(token);
+  unsigned long long old = ht[h];
+  while (true) {
+    const unsigned key = unsigned(old >> 32);
+    if (key == 0xFFFFFFFFu) {
+      const unsigned long long want =
+          (static_cast<unsigned long long>(token) << 32) | 1ull;
+      const unsigned long long prev = atomicCAS(&ht[h], old, want);
+      if (prev == old) return;
+      old = prev;
+    } else if (key == token) {
+      const unsigned long long prev = atomicCAS(&ht[h], old, old + 1ull);
+      if (prev == old) return;
+      old = prev;
+    } else {
+      h = (h + 1u) & (kSelectHashSize - 1);
+      old = ht[h];
+    }
+  }
+}
+
+__device__ __forceinline__ int select_hash_count(const unsigned long long* ht,
+                                                 uint32_t token) {
+  unsigned h = select_hash(token);
+  while (true) {
+    const unsigned long long e = ht[h];
+    const unsigned key = unsigned(e >> 32);
+    if (key == 0xFFFFFFFFu) return 0;
+    if (key == token) return int(e & 0xFFFFFFFFu);
+    h = (h + 1u) & (kSelectHashSize - 1);
+  }
+}
+
+// z for token i. The window lookup is skipped when the window is empty; neutral
+// penalties reproduce v exactly (fmaf(0, c, 0) == 0, fmaf(-1, 0, v) == v).
+__device__ __forceinline__ float select_z(const float* __restrict__ logits, int i,
+                                          const unsigned long long* ht,
+                                          int window_len, float temperature,
+                                          float rp, float pres, float freq) {
+  float v = logits[i];
+  if (window_len > 0) {
+    const int c = select_hash_count(ht, uint32_t(i));
+    if (c > 0 && (rp != 1.0f || pres != 0.0f || freq != 0.0f))
+      v = select_adjust_logit(v, unsigned(c), rp, pres, freq);
+  }
+  return __fdiv_rn(v, temperature);
+}
+
+__global__ void sample_select_kernel(
+    const float* __restrict__ logits, int vocab,
+    const uint8_t* __restrict__ mask, const int32_t* __restrict__ window,
+    const SampleSelectParams* __restrict__ dyn, int window_len,
+    float temperature, float repeat_penalty, float presence, float frequency,
+    unsigned long long* __restrict__ keys, Candidate* __restrict__ out,
+    int* __restrict__ out_count) {
+  if (dyn) {
+    window_len = dyn->window_len;
+    temperature = dyn->temperature;
+    repeat_penalty = dyn->repeat_penalty;
+    presence = dyn->presence_penalty;
+    frequency = dyn->frequency_penalty;
+  }
+  const int tid = threadIdx.x;
+
+  __shared__ int32_t s_window[kSampleSelectMaxWindow];
+  __shared__ unsigned long long s_hash[kSelectHashSize];
+  __shared__ unsigned s_hist[256];
+  __shared__ unsigned long long s_keys[kSampleCandidates];
+  __shared__ float s_z[kSampleCandidates];
+  __shared__ int s_id[kSampleCandidates];
+  __shared__ unsigned s_total;
+  __shared__ int s_fill;
+  __shared__ unsigned long long s_prefix;
+  __shared__ int s_rank;
+
+  // Window + its (token -> count) hash. Slots outside the vocabulary never
+  // adjust a logit, matching the host's in-vocabulary filter.
+  for (int i = tid; i < window_len; i += blockDim.x) s_window[i] = window[i];
+  for (int i = tid; i < kSelectHashSize; i += blockDim.x) s_hash[i] = kSelectEmpty;
+  if (tid == 0) s_total = 0u;
+  __syncthreads();
+  for (int i = tid; i < window_len; i += blockDim.x) {
+    const int t = s_window[i];
+    if (t >= 0 && t < vocab) select_hash_insert(s_hash, uint32_t(t));
+  }
+  __syncthreads();
+
+  // z per token, packed into a key; masked ids carry the sentinel key 0 (a real
+  // key always has a non-zero low word or ordinal, and the sentinel is checked
+  // explicitly in the passes below).
+  for (int i = tid; i < vocab; i += blockDim.x) {
+    if (mask && !mask_bit(mask, i)) {
+      keys[i] = 0ull;
+      continue;
+    }
+    const float z =
+        select_z(logits, i, s_hash, window_len, temperature, repeat_penalty,
+                 presence, frequency);
+    keys[i] = select_key(z, i);
+    atomicAdd(&s_total, 1u);
+  }
+  __syncthreads();
+
+  const int total = int(s_total);
+  if (total == 0) {
+    if (tid == 0) *out_count = 0;
+    return;
+  }
+
+  // Deterministic radix select of the kSampleCandidates-th largest key: 8-bit
+  // digits from the top, largest bucket first. Integer counts make each pass
+  // order-independent under any thread schedule.
+  unsigned long long threshold = 0ull;
+  if (total >= kSampleCandidates) {
+    unsigned rank = unsigned(kSampleCandidates);
+    unsigned long long prefix = 0ull;
+    for (int pass = 0; pass < 8; ++pass) {
+      const int shift = 56 - 8 * pass;
+      for (int d = tid; d < 256; d += blockDim.x) s_hist[d] = 0u;
+      __syncthreads();
+      for (int i = tid; i < vocab; i += blockDim.x) {
+        const unsigned long long k = keys[i];
+        if (k == 0ull) continue;
+        if (pass > 0 && (k >> (shift + 8)) != (prefix >> (shift + 8)))
+          continue;
+        atomicAdd(&s_hist[unsigned((k >> shift) & 0xFFull)], 1u);
+      }
+      __syncthreads();
+      if (tid == 0) {
+        unsigned acc = 0u;
+        int bucket = 0;
+        for (int d = 255; d >= 0; --d) {
+          const unsigned c = s_hist[d];
+          if (acc + c >= rank) {
+            bucket = d;
+            break;
+          }
+          acc += c;
+        }
+        s_prefix = prefix | (static_cast<unsigned long long>(unsigned(bucket))
+                             << shift);
+        s_rank = int(rank - acc);
+      }
+      __syncthreads();
+      prefix = s_prefix;
+      rank = unsigned(s_rank);
+    }
+    threshold = prefix;
+  }
+
+  // Gather keys >= threshold. With at least 256 candidates there are exactly
+  // 256 of them (keys are unique: one per token id); otherwise every key.
+  // The gather order is nondeterministic; the sort below makes the output
+  // deterministic.
+  if (tid == 0) s_fill = 0;
+  __syncthreads();
+  for (int i = tid; i < vocab; i += blockDim.x) {
+    const unsigned long long k = keys[i];
+    if (k == 0ull) continue;
+    if (total >= kSampleCandidates && k < threshold) continue;
+    const int slot = atomicAdd(&s_fill, 1);
+    if (slot < kSampleCandidates) {
+      s_keys[slot] = k;
+      s_z[slot] = select_z(logits, i, s_hash, window_len, temperature,
+                           repeat_penalty, presence, frequency);
+      s_id[slot] = i;
+    }
+  }
+  __syncthreads();
+
+  const int count = total < kSampleCandidates ? total : kSampleCandidates;
+  for (int i = tid; i < kSampleCandidates; i += blockDim.x) {
+    if (i >= count) {
+      s_keys[i] = 0ull;
+      s_z[i] = 0.0f;
+      s_id[i] = -1;
+    }
+  }
+  __syncthreads();
+
+  // Bitonic sort, descending key (ids are unique, so the order is total).
+  for (int size = 2; size <= kSampleCandidates; size <<= 1) {
+    for (int stride = size >> 1; stride > 0; stride >>= 1) {
+      for (int i = tid; i < kSampleCandidates; i += blockDim.x) {
+        const int j = i ^ stride;
+        if (j <= i) continue;
+        const bool descending = ((i & size) == 0);
+        const bool swap =
+            descending ? (s_keys[i] < s_keys[j]) : (s_keys[i] > s_keys[j]);
+        if (swap) {
+          const unsigned long long tk = s_keys[i];
+          s_keys[i] = s_keys[j];
+          s_keys[j] = tk;
+          const float tz = s_z[i];
+          s_z[i] = s_z[j];
+          s_z[j] = tz;
+          const int ti = s_id[i];
+          s_id[i] = s_id[j];
+          s_id[j] = ti;
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  if (tid < count) out[tid] = Candidate{s_id[tid], s_z[tid]};
+  if (tid == 0) *out_count = count;
 }
 
 // Packed argmax candidate: value in the high word as a monotone unsigned key
@@ -2683,6 +2956,14 @@ bool scale_dev(const float* x, float s, float* y, int n) {
   if (n <= 0 || !x || !y) return false;
   SB_NOTE_LAUNCH(scale_kernel, grid_for(n), 256, 0, cur_stream());
   scale_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, s, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool softcap_dev(const float* x, float cap, float* y, int n) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !y || !(cap > 0.0f)) return false;
+  SB_NOTE_LAUNCH(softcap_kernel, grid_for(n), 256, 0, cur_stream());
+  softcap_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, cap, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -5882,6 +6163,52 @@ bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
   SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
+}
+
+namespace {
+
+// Shared launcher for the direct and captured-graph forms. The key scratch is
+// allocated (never freed) before the launch, so a capture always sees a buffer
+// that is large enough.
+bool sample_select_launch(const float* logits, int vocab, const uint8_t* mask,
+                          const int32_t* window, const SampleSelectParams* dyn,
+                          int window_len, float temperature,
+                          float repeat_penalty, float presence, float frequency,
+                          Candidate* out, int* out_count) {
+  if (!available()) return false;
+  if (vocab <= 0 || !logits || !out || !out_count) return false;
+  unsigned long long* keys = static_cast<unsigned long long*>(
+      grow_scratch_keep(g_select_keys, g_select_keys_bytes,
+                        size_t(vocab) * sizeof(unsigned long long)));
+  if (!keys) return false;
+  SB_NOTE_LAUNCH(sample_select_kernel, 1, kSelectThreads, 0, cur_stream());
+  sample_select_kernel<<<1, kSelectThreads, 0, cur_stream()>>>(
+      logits, vocab, mask, window, dyn, window_len, temperature, repeat_penalty,
+      presence, frequency, keys, out, out_count);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool sample_select_dev(const float* logits, int vocab, const uint8_t* mask,
+                       const int32_t* window, int window_len,
+                       float temperature, float repeat_penalty, float presence,
+                       float frequency, Candidate* out, int* out_count) {
+  if (window_len < 0 || window_len > kSampleSelectMaxWindow) return false;
+  if (window_len > 0 && !window) return false;
+  if (!(temperature > 0.0f)) return false;
+  return sample_select_launch(logits, vocab, mask, window, nullptr, window_len,
+                              temperature, repeat_penalty, presence, frequency,
+                              out, out_count);
+}
+
+bool sample_select_dev_dyn(const float* logits, int vocab, const uint8_t* mask,
+                           const int32_t* window,
+                           const SampleSelectParams* params_dev,
+                           Candidate* out, int* out_count) {
+  if (!params_dev || !window) return false;
+  return sample_select_launch(logits, vocab, mask, window, params_dev, 0, 0.0f,
+                              0.0f, 0.0f, 0.0f, out, out_count);
 }
 
 // Strided row slice (Section C.5): copies `rows` contiguous `length`-element

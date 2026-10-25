@@ -181,6 +181,14 @@ enum class OpKind : uint8_t {
   // ClipGradNorm.
   AsyncWeightPrefetch,
   SyncPrefetch,
+
+  // Sampled decode's terminal step (r7): the top-kSampleCandidates adjusted
+  // logits (nn::cuda::sample_select_dev) instead of an argmax index. It is the
+  // sampled decode graph's replacement for Argmax; the host then draws from the
+  // candidates (nn::sample_from_candidates), so the [vocab] pass and its
+  // transfer stay on the device while the nucleus and the random draw stay on
+  // the host. Appended last for the same reason as ClipGradNorm.
+  SampleSelect,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

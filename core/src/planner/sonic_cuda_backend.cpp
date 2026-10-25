@@ -234,6 +234,10 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (token_ring_) g_alloc.deallocate(token_ring_);
   if (carry_buf_) g_alloc.deallocate(carry_buf_);
   if (argmax_mask_) g_alloc.deallocate(argmax_mask_);
+  if (sample_params_) g_alloc.deallocate(sample_params_);
+  if (sample_window_) g_alloc.deallocate(sample_window_);
+  if (sample_cands_) g_alloc.deallocate(sample_cands_);
+  if (sample_host_) cudaFreeHost(sample_host_);
 }
 
 uint64_t SonicCudaBackend::pos_slot() const {
@@ -370,6 +374,152 @@ bool SonicCudaBackend::clear_argmax_mask() {
       !g_alloc.fill(argmax_mask_, 0xFF, argmax_mask_bytes_))
     return false;
   argmax_mask_dirty_ = false;
+  return true;
+}
+
+namespace {
+
+// The device penalty window's contents: the last min(repeat_last_n, |history|)
+// token ids as int32. Returns the length, or -1 when repeat_last_n exceeds the
+// device limit (kSampleSelectMaxWindow) or a id does not fit.
+int fill_sample_window(const nn::SamplingParams& p,
+                       std::span<const int64_t> history,
+                       std::span<int32_t> window) {
+  if (p.repeat_last_n > uint32_t(nn::cuda::kSampleSelectMaxWindow)) return -1;
+  const size_t n = std::min<size_t>(p.repeat_last_n, history.size());
+  if (n > window.size()) return -1;
+  const size_t start = history.size() - n;
+  for (size_t i = 0; i < n; ++i) {
+    const int64_t t = history[start + i];
+    if (t < 0 || t > INT32_MAX) return -1;
+    window[i] = int32_t(t);
+  }
+  return int(n);
+}
+
+// The device parameters of one sampling step (mirrors the scalars
+// sample_select_dev would otherwise take as launch arguments).
+nn::cuda::SampleSelectParams sample_params_of(const nn::SamplingParams& p,
+                                              int window_len) {
+  return nn::cuda::SampleSelectParams{int32_t(window_len), p.temperature,
+                                      p.repeat_penalty, p.presence_penalty,
+                                      p.frequency_penalty};
+}
+
+}  // namespace
+
+bool SonicCudaBackend::sample_select_init(int vocab) {
+  if (vocab <= 0) return false;
+  if (sample_cands_) return sample_vocab_ == vocab;
+  const uint64_t cand_bytes = uint64_t(nn::kSampleCandidates) *
+                                  sizeof(nn::Candidate) +
+                              sizeof(int32_t);
+  hal::Buffer params = g_alloc.allocate(sizeof(nn::cuda::SampleSelectParams));
+  hal::Buffer window =
+      g_alloc.allocate(uint64_t(nn::cuda::kSampleSelectMaxWindow) * sizeof(int32_t));
+  hal::Buffer cands = g_alloc.allocate(cand_bytes);
+  if (!params || !window || !cands ||
+      cudaHostAlloc(reinterpret_cast<void**>(&sample_host_), cand_bytes,
+                    cudaHostAllocDefault) != cudaSuccess) {
+    sample_host_ = nullptr;
+    if (params) g_alloc.deallocate(params);
+    if (window) g_alloc.deallocate(window);
+    if (cands) g_alloc.deallocate(cands);
+    return false;
+  }
+  sample_params_ = params;
+  sample_window_ = window;
+  sample_cands_ = cands;
+  sample_vocab_ = vocab;
+  sample_params_stage_.assign(sizeof(nn::cuda::SampleSelectParams), 0);
+  sample_window_stage_.assign(nn::cuda::kSampleSelectMaxWindow, 0);
+  // A benign initial state (temperature 1, no window, neutral penalties, empty
+  // candidate list): the capture's warm-up step and any read before the first
+  // stage_sample see a valid configuration instead of a division by a zeroed
+  // temperature.
+  const auto init_params = sample_params_of(nn::SamplingParams{}, 0);
+  if (!g_alloc.copy_to_device(sample_params_, &init_params, sizeof(init_params)) ||
+      !g_alloc.copy_to_device(sample_window_, sample_window_stage_.data(),
+                              sample_window_stage_.size() * sizeof(int32_t)) ||
+      !g_alloc.fill(cands, 0, cand_bytes)) {
+    g_alloc.deallocate(params);
+    g_alloc.deallocate(window);
+    g_alloc.deallocate(cands);
+    cudaFreeHost(sample_host_);
+    sample_host_ = nullptr;
+    sample_params_ = {};
+    sample_window_ = {};
+    sample_cands_ = {};
+    sample_vocab_ = 0;
+    return false;
+  }
+  // The grammar mask is the same bitmap the greedy Argmax node reads, so a
+  // constrained sampled step filters exactly like a constrained greedy one.
+  if (!argmax_mask_init(size_t((vocab + 7) / 8))) {
+    g_alloc.deallocate(params);
+    g_alloc.deallocate(window);
+    g_alloc.deallocate(cands);
+    cudaFreeHost(sample_host_);
+    sample_host_ = nullptr;
+    sample_params_ = {};
+    sample_window_ = {};
+    sample_cands_ = {};
+    sample_vocab_ = 0;
+    return false;
+  }
+  return true;
+}
+
+bool SonicCudaBackend::stage_sample(hal::StepProgram& prog,
+                                    const nn::SamplingParams& p,
+                                    std::span<const int64_t> history) {
+  if (!sample_cands_ || sample_vocab_ <= 0) return false;
+  if (!(p.temperature > 0.0f)) return false;  // the greedy graph never selects
+  const int len =
+      fill_sample_window(p, history, sample_window_stage_);
+  if (len < 0) return false;
+  const auto params = sample_params_of(p, len);
+  std::memcpy(sample_params_stage_.data(), &params, sizeof(params));
+  if (!prog.stage_upload(sample_params_, sample_params_stage_.data(),
+                         sizeof(params)))
+    return false;
+  if (len > 0 &&
+      !prog.stage_upload(sample_window_, sample_window_stage_.data(),
+                         size_t(len) * sizeof(int32_t)))
+    return false;
+  return true;
+}
+
+bool SonicCudaBackend::upload_sample(const nn::SamplingParams& p,
+                                     std::span<const int64_t> history) {
+  if (!sample_cands_ || sample_vocab_ <= 0) return false;
+  if (!(p.temperature > 0.0f)) return false;
+  const int len = fill_sample_window(p, history, sample_window_stage_);
+  if (len < 0) return false;
+  const auto params = sample_params_of(p, len);
+  std::memcpy(sample_params_stage_.data(), &params, sizeof(params));
+  if (!g_alloc.copy_to_device(sample_params_, sample_params_stage_.data(),
+                              sizeof(params)))
+    return false;
+  return len == 0 ||
+         g_alloc.copy_to_device(sample_window_, sample_window_stage_.data(),
+                                size_t(len) * sizeof(int32_t));
+}
+
+bool SonicCudaBackend::read_sample_candidates(nn::Candidate* out,
+                                              int* out_count) const {
+  if (!sample_cands_ || !sample_host_ || !out || !out_count) return false;
+  constexpr uint64_t cand_bytes =
+      uint64_t(nn::kSampleCandidates) * sizeof(nn::Candidate);
+  if (!g_alloc.copy_from_device(sample_host_, sample_cands_,
+                                cand_bytes + sizeof(int32_t)))
+    return false;
+  int n = 0;
+  std::memcpy(&n, reinterpret_cast<const uint8_t*>(sample_host_) + cand_bytes,
+              sizeof(n));
+  if (n < 0 || n > nn::kSampleCandidates) return false;
+  std::memcpy(out, sample_host_, size_t(n) * sizeof(nn::Candidate));
+  *out_count = n;
   return true;
 }
 
@@ -712,6 +862,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   switch (node->op) {
     case OpKind::Scale: {
       ok = nn::cuda::scale_dev(dev(in[0]), float(scale_d), out, out_n);
+      break;
+    }
+    case OpKind::Softcap: {
+      // Final-logit softcap on the device (sampled decode, r7): the [vocab]
+      // distribution feeds the SampleSelect node without a host round-trip.
+      // `scale` is the cap. The prefill graph keeps Softcap on the CPU through
+      // lm_head, so this branch is only ever reached by a sampled decode graph.
+      ok = nn::cuda::softcap_dev(dev(in[0]), float(scale_d), out, out_n);
       break;
     }
     case OpKind::RmsNorm: {
@@ -1959,6 +2117,38 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = device::device_copy(out_handle, token_out_slot(), sizeof(float));
       break;
     }
+    case OpKind::SampleSelect: {
+      // Sampled decode (r7): the terminal candidate selection. The [vocab]
+      // logits stay on the device; the kernel writes the kSampleCandidates
+      // best (id, z) pairs into the backend's persistent candidate buffer and
+      // this node's output receives only the 4-byte count, which is all the
+      // host reads before drawing the token itself (nn::sample_from_candidates).
+      // The penalty window and the parameter block are persistent device
+      // buffers staged by stage_sample() before replay; the grammar mask is
+      // the same argmax_mask_ bitmap the greedy Argmax node applies.
+      const int vocab = int(in[0].device.size_bytes / sizeof(float));
+      if (vocab <= 0 || !sample_cands_ || sample_vocab_ != vocab ||
+          out_bytes < sizeof(int32_t)) {
+        ok = false;
+        break;
+      }
+      const bool masked =
+          argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
+      const uint64_t cands = sample_cands_.id;
+      const uint64_t count = cands + uint64_t(nn::kSampleCandidates) *
+                                          sizeof(nn::Candidate);
+      ok = nn::cuda::sample_select_dev_dyn(
+          dev(in[0]), vocab,
+          masked ? reinterpret_cast<const uint8_t*>(uintptr_t(argmax_mask_.id))
+                 : nullptr,
+          reinterpret_cast<const int32_t*>(uintptr_t(sample_window_.id)),
+          reinterpret_cast<const nn::cuda::SampleSelectParams*>(
+              uintptr_t(sample_params_.id)),
+          reinterpret_cast<nn::Candidate*>(uintptr_t(cands)),
+          reinterpret_cast<int*>(uintptr_t(count)));
+      if (ok) ok = device::device_copy(count, out_handle, sizeof(int32_t));
+      break;
+    }
     // --- inherently-batched prefill ops (Phase 7 / Section C.3) ---------------
     // FlashAttention/KvAppend have no per-token decode twin;
     // they always carry the `batch` attribute and run the chunked *_dev kernels.
@@ -2013,8 +2203,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     default:
-      // Softcap is placed on the CPU SonicBackend (no *_dev kernel); hitting it
-      // here means the placement pass routed a host-only op to the device.
+      // An op this backend has no device kernel for: the placement pass routed
+      // a host-only op to the device.
       ok = false;
       break;
   }

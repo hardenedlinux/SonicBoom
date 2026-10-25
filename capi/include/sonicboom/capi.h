@@ -495,13 +495,17 @@ typedef int32_t sb_token;   /* a vocabulary index */
  *   1. repetition / presence / frequency penalties over the last
  *      repeat_last_n tokens of the history (prompt + tokens generated so far);
  *   2. the grammar mask (constrained decoding);
- *   3. temperature scaling and a 30-logit candidate window;
- *   4. top_k truncation (top_k 0 disables it);
- *   5. min_p truncation (min_p 0 disables it);
- *   6. nucleus truncation when 0 < top_p < 1 (top_p 1 disables it);
- *   7. a seeded Gumbel-max draw keyed by (seed, absolute token position).
- * The same seed, position and history therefore always produce the same token,
- * independently of KV-cache capacity or prefix reuse.
+ *   3. the top 256 adjusted logits (ties toward the lower id) are kept:
+ *      sampling draws only from those 256 candidates;
+ *   4. a 30-logit candidate window;
+ *   5. top_k truncation (top_k 0 disables it);
+ *   6. min_p truncation (min_p 0 disables it);
+ *   7. nucleus truncation when 0 < top_p < 1 (top_p 1 disables it);
+ *   8. a seeded Gumbel-max draw keyed by (seed, absolute token position).
+ * The 256-candidate limit is exact whenever top_k <= 256 or the nucleus lies
+ * inside the top 256; the remaining tail is never selected. The same seed,
+ * position and history therefore always produce the same token, independently
+ * of KV-cache capacity or prefix reuse.
  *
  * max_tokens caps the output length.
  *
@@ -511,7 +515,9 @@ typedef int32_t sb_token;   /* a vocabulary index */
  *   repeat_penalty     neutral 1    (no repetition penalty; 0 = off, < 0 is
  *                                    SB_ERR_BINDING)
  *   repeat_last_n      neutral 64   (penalty window, tokens; 0 disables every
- *                                    penalty)
+ *                                    penalty; on the CUDA path a value above
+ *                                    1024 is SB_ERR_BINDING, the device
+ *                                    penalty window's cap)
  *   presence_penalty   neutral 0    (subtracted once per repeated token)
  *   frequency_penalty  neutral 0    (subtracted per occurrence)
  * Zero means "off" throughout: a zero-initialized sb_llm_sampling whose only

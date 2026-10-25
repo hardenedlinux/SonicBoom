@@ -35,6 +35,7 @@
 
 #include "../planner/autotune.h"        // B7 draft-length cost cache
 #include "../planner/decision_registry.h"  // the plan-cache decision fingerprint
+#include "../planner/device_pool.h"      // the sampled state's device logits buffer
 #include "../planner/mlir_autotune.h"    // V2 spec probe ratio cache (Q1 file)
 #include "../planner/reduce_mode.h"      // the per-device reduction mode
 #include "mlir/IR/BuiltinTypes.h"
@@ -2298,6 +2299,318 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// r7: sampled decode on the session path.
+//
+// The sampled decode graph is the non-greedy decode graph (Softcap kept, so the
+// distribution is the model's own) with a terminal SampleSelect node appended
+// after lowering. The optimized body is therefore exactly the greedy graph's;
+// only the tail differs. The terminal node selects the kSampleCandidates best
+// (id, z) pairs on the device, so the [vocab] logits never reach the host —
+// only 256 candidate pairs do, once per step.
+// ---------------------------------------------------------------------------
+
+// Turn the lowered graph's output (the [vocab] logits) into the input of a
+// SampleSelect node, and make the node's 4-byte candidate count the graph
+// output. The logits stay device-resident; the planner sees the count as a
+// scalar float tensor (the same shape the greedy graph's Argmax output has).
+static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab) {
+  if (g.outputs.size() != 1 || vocab == 0) return false;
+  const planner::TensorId logits_id = g.outputs[0];
+  const planner::TensorDesc* logits = g.find_tensor(logits_id);
+  if (!logits || logits->size_bytes != vocab * sizeof(float)) return false;
+  uint32_t max_tensor = 0;
+  uint32_t max_node = 0;
+  for (const auto& t : g.tensors) max_tensor = std::max(max_tensor, t.id.value);
+  for (const auto& n : g.nodes) max_node = std::max(max_node, n.id.value);
+  if (max_tensor == UINT32_MAX || max_node == UINT32_MAX) return false;
+  const planner::TensorId count_id{max_tensor + 1};
+  planner::TensorDesc count;
+  count.id = count_id;
+  count.shape = {1};
+  count.dtype = sx::DType::Float32;
+  count.size_bytes = sizeof(int32_t);  // the device-resident candidate count
+  count.name = "sample_count";
+  g.tensors.push_back(std::move(count));
+  planner::GraphNodeDesc node;
+  node.id = planner::GraphNodeId{max_node + 1};
+  node.op = planner::OpKind::SampleSelect;
+  node.inputs = {logits_id};
+  node.outputs = {count_id};
+  node.name = "sample_select";
+  node.backend = planner::BackendTag::Sonic;
+  g.nodes.push_back(std::move(node));
+  for (auto& t : g.tensors) t.is_graph_output = (t.id == count_id);
+  g.outputs = {count_id};
+  return true;
+}
+
+struct SampledRuntime {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  planner::ResourceSnapshot snap;
+  std::unique_ptr<planner::SonicBackend> cpu;
+  std::unique_ptr<planner::SonicCudaBackend> cuda;
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+  std::unique_ptr<hal::StepProgram> prog;  // captured sampled decode step
+  // The session cache the capture is bound to (same contract as VerifyRuntime).
+  std::shared_ptr<void> cache;
+};
+
+static std::map<std::pair<const Gemma4Model*, uint64_t>,
+                std::unique_ptr<SampledRuntime>>
+    g_sampled_runtimes;
+
+static std::unique_ptr<SampledRuntime> build_sampled_runtime(
+    const Gemma4Model& m, uint64_t n_ctx) {
+  auto rt = std::make_unique<SampledRuntime>();
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
+  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
+                          quant::cuda::q8_1_enabled());
+  if (rt->graph.nodes.empty()) return nullptr;
+  if (!append_sample_select_tail(rt->graph, m.config.vocab_size)) return nullptr;
+  auto s = planner::CpuResourceProvider::snapshot();
+  if (!s) return nullptr;
+  rt->snap = std::move(*s);
+  {
+    planner::AnalyticalCpuCostModel cost(rt->snap);
+    auto p = planner::plan_execution(rt->graph, rt->snap, cost);
+    if (!p) return nullptr;
+    rt->plan = std::move(*p);
+  }
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx);
+  rt->cuda->bind_model(m);
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
+// Build (or fetch) the sampled decode runtime bound to `session`'s cache. The
+// capture bakes that cache's device pointers in, so a runtime recorded against
+// a different vector is rebuilt (a session with its own kv_session_allocate
+// cache). The first call also pays the capture, which is why the session
+// warm-up builds it ahead of the first request.
+static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
+                                           const planner::KvCacheSession& session) {
+  if (!session.caches || m.config.vocab_size == 0) return nullptr;
+  auto key = std::make_pair(&m, n_ctx);
+  auto it = g_sampled_runtimes.find(key);
+  if (it != g_sampled_runtimes.end()) {
+    if (it->second->cache.get() == session.caches.get())
+      return it->second.get();
+    g_sampled_runtimes.erase(it);
+  }
+
+  auto rt = build_sampled_runtime(m, n_ctx);
+  if (!rt) return nullptr;
+  // The candidate/parameter/window buffers (and the grammar mask bitmap) exist
+  // before any capture: a captured launch bakes their device pointers in.
+  if (!rt->cuda->sample_select_init(int(m.config.vocab_size))) return nullptr;
+
+  // Warm-up on the runtime's own fresh (identically sized) cache: it writes a
+  // KV row at position 0, which must not touch the session's prompt rows. The
+  // session cache is adopted after the warm-up and before the capture, so the
+  // recorded kernels carry its pointers while no kernel writes a row of it.
+  const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+  auto run = [&]() -> bool {
+    return bool(rt->exec->execute(rt->plan, rt->snap, in));
+  };
+  if (cuda_graph_decode_enabled()) {
+    if (rt->cuda->seed_token(0) && rt->cuda->set_pos(0) && run()) {
+      rt->cuda->synchronize();
+      rt->cuda->share_caches(session);
+      if (rt->cuda->seed_token(0) && rt->cuda->set_pos(0)) {
+        rt->prog = rt->cuda->record_step(run);
+        if (rt->prog) rt->cache = rt->cuda->cache_identity();
+      }
+    }
+  }
+  // Graphs off (or capture failed): run the executor per step on the session
+  // cache. The cache must be adopted outside the capture either way.
+  if (!rt->prog) rt->cuda->share_caches(session);
+
+  SampledRuntime* raw = rt.get();
+  g_sampled_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+// Apply the per-position grammar mask to the sampled runtime's device bitmap
+// (the SampleSelect node reads the same argmax_mask_ the greedy Argmax node
+// does). An empty mask means unconstrained: clear to all-ones so a previous
+// constrained step cannot leak, exactly like the greedy path.
+static bool set_sample_mask(planner::SonicCudaBackend& cuda,
+                            std::span<const uint8_t> mask) {
+  return mask.empty() ? cuda.clear_argmax_mask() : cuda.set_argmax_mask(mask);
+}
+
+struct SampledState {
+  uint64_t logits = 0;   // device [vocab] f32: the last prefill's final logits
+  uint64_t bytes = 0;
+  int vocab = 0;
+  uint64_t window = 0;   // device int32[kSampleSelectMaxWindow] penalty window
+  uint64_t mask = 0;     // device ceil(vocab / 8) grammar bitmap
+  uint64_t mask_bytes = 0;
+  uint64_t cands = 0;    // device kSampleCandidates Candidates, then the int count
+  uint64_t cand_bytes = 0;
+  std::vector<int32_t> window_host;
+  std::vector<nn::Candidate> cand_host;
+};
+
+// Draw a token from a step's candidate list at its absolute position.
+static int64_t draw_from_candidates(const nn::SamplingParams& sampling,
+                                    std::span<const nn::Candidate> cands,
+                                    uint64_t position) {
+  if (cands.empty()) return -1;
+  return nn::sample_from_candidates(cands, sampling, position);
+}
+
+SampledState* sampled_state_new() {
+  return new (std::nothrow) SampledState();
+}
+
+void sampled_state_free(SampledState* state) {
+  if (!state) return;
+  if (state->logits) planner::device::release(state->logits, state->bytes);
+  if (state->window)
+    planner::device::release(state->window,
+                             uint64_t(nn::cuda::kSampleSelectMaxWindow) *
+                                 sizeof(int32_t));
+  if (state->mask) planner::device::release(state->mask, state->mask_bytes);
+  if (state->cands) planner::device::release(state->cands, state->cand_bytes);
+  delete state;
+}
+
+bool sampled_state_store_logits(SampledState& state,
+                                std::span<const float> logits) {
+  if (logits.empty()) return false;
+  const uint64_t bytes = logits.size() * sizeof(float);
+  if (state.logits && state.bytes != bytes) {
+    planner::device::release(state.logits, state.bytes);
+    state.logits = 0;
+  }
+  if (!state.logits) {
+    const uint64_t window_bytes =
+        uint64_t(nn::cuda::kSampleSelectMaxWindow) * sizeof(int32_t);
+    const uint64_t mask_bytes = (bytes / sizeof(float) + 7) / 8;
+    const uint64_t cand_bytes =
+        uint64_t(nn::kSampleCandidates) * sizeof(nn::Candidate) + sizeof(int32_t);
+    state.logits = planner::device::acquire(bytes);
+    state.window = planner::device::acquire(window_bytes);
+    state.mask = planner::device::acquire(mask_bytes);
+    state.cands = planner::device::acquire(cand_bytes);
+    if (!state.logits || !state.window || !state.mask || !state.cands) {
+      if (state.logits) planner::device::release(state.logits, bytes);
+      if (state.window) planner::device::release(state.window, window_bytes);
+      if (state.mask) planner::device::release(state.mask, mask_bytes);
+      if (state.cands) planner::device::release(state.cands, cand_bytes);
+      state.logits = state.window = state.mask = state.cands = 0;
+      return false;
+    }
+    state.bytes = bytes;
+    state.vocab = int(bytes / sizeof(float));
+    state.mask_bytes = mask_bytes;
+    state.cand_bytes = cand_bytes;
+    state.window_host.assign(nn::cuda::kSampleSelectMaxWindow, 0);
+    state.cand_host.assign(nn::kSampleCandidates, nn::Candidate{});
+  }
+  return planner::device::upload(logits.data(), state.logits, bytes);
+}
+
+int64_t sampled_first_token_cuda(const Gemma4Model& m, SampledState& state,
+                                 planner::KvCacheSession& session,
+                                 uint64_t position,
+                                 const nn::SamplingParams& sampling,
+                                 std::span<const int64_t> history,
+                                 std::span<const uint8_t> sample_mask) {
+  (void)session;  // the first token reads the stored logits, not the cache
+  if (state.logits == 0 || state.vocab != int(m.config.vocab_size))
+    return -1;
+  if (!(sampling.temperature > 0.0f)) return -1;
+  if (sampling.repeat_last_n > uint32_t(nn::cuda::kSampleSelectMaxWindow))
+    return -1;
+  const size_t n = std::min<size_t>(sampling.repeat_last_n, history.size());
+  const size_t start = history.size() - n;
+  for (size_t i = 0; i < n; ++i) {
+    const int64_t t = history[start + i];
+    if (t < 0 || t > INT32_MAX) return -1;
+    state.window_host[i] = int32_t(t);
+  }
+  if (n > 0 &&
+      !planner::device::upload(state.window_host.data(), state.window,
+                               uint64_t(n) * sizeof(int32_t)))
+    return -1;
+  const uint8_t* mask_dev = nullptr;
+  if (!sample_mask.empty()) {
+    if (sample_mask.size() != state.mask_bytes ||
+        !planner::device::upload(sample_mask.data(), state.mask,
+                                 state.mask_bytes))
+      return -1;
+    mask_dev = reinterpret_cast<const uint8_t*>(uintptr_t(state.mask));
+  }
+  const uint64_t count_dev =
+      state.cands + uint64_t(nn::kSampleCandidates) * sizeof(nn::Candidate);
+  if (!nn::cuda::sample_select_dev(
+          reinterpret_cast<const float*>(uintptr_t(state.logits)), state.vocab,
+          mask_dev,
+          reinterpret_cast<const int32_t*>(uintptr_t(state.window)), int(n),
+          sampling.temperature, sampling.repeat_penalty,
+          sampling.presence_penalty, sampling.frequency_penalty,
+          reinterpret_cast<nn::Candidate*>(uintptr_t(state.cands)),
+          reinterpret_cast<int*>(uintptr_t(count_dev))))
+    return -1;
+  int count = 0;
+  if (!planner::device::download(count_dev, &count, sizeof(count))) return -1;
+  if (count < 0 || count > nn::kSampleCandidates) return -1;
+  if (count > 0 &&
+      !planner::device::download(state.cands, state.cand_host.data(),
+                                 uint64_t(count) * sizeof(nn::Candidate)))
+    return -1;
+  return draw_from_candidates(
+      sampling, std::span<const nn::Candidate>(state.cand_host.data(),
+                                               size_t(count)),
+      position);
+}
+
+int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
+                          uint64_t position, planner::KvCacheSession& session,
+                          const nn::SamplingParams& sampling,
+                          std::span<const int64_t> history,
+                          std::span<const uint8_t> sample_mask) {
+  if (m.config.vocab_size == 0 || token >= m.config.vocab_size) return -1;
+  if (!(sampling.temperature > 0.0f) || session.n_ctx == 0) return -1;
+  SampledRuntime* rt = get_sampled_runtime(m, session.n_ctx, session);
+  if (!rt) return -1;
+  if (sample_mask.empty()) {
+    if (!rt->cuda->clear_argmax_mask()) return -1;
+  } else if (!rt->cuda->set_argmax_mask(sample_mask)) {
+    return -1;
+  }
+  if (!rt->cuda->set_pos(position) || !rt->cuda->seed_token(token)) return -1;
+  if (rt->prog) {
+    if (!rt->cuda->stage_sample(*rt->prog, sampling, history) ||
+        !rt->prog->replay())
+      return -1;
+  } else {
+    // CUDA graphs disabled (or capture failed): run the same graph through the
+    // executor. The parameters are staged synchronously; the node arithmetic is
+    // identical.
+    if (!rt->cuda->upload_sample(sampling, history)) return -1;
+    std::vector<sx::Bytes> in{encode_i64(token), encode_i64(position)};
+    if (!rt->exec->execute(rt->plan, rt->snap, in)) return -1;
+  }
+  std::vector<nn::Candidate> cands(nn::kSampleCandidates);
+  int count = 0;
+  // The blocking D2H is this step's completion barrier (like read_token).
+  if (!rt->cuda->read_sample_candidates(cands.data(), &count)) return -1;
+  return draw_from_candidates(
+      sampling, std::span<const nn::Candidate>(cands.data(), size_t(count)),
+      position + 1);
+}
+
+// ---------------------------------------------------------------------------
 // B3: the row-invariant verify step. One runtime per (model, n_ctx, rows):
 // the decode graph emitted with `rows` query positions, run through the verify
 // phase's passes (decode fusions, KV append left on attention), planned and
@@ -2734,7 +3047,18 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
   // first generate call pays the plan/capture cost inside its own timed
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
-  return get_decode_runtime(m, n_ctx) != nullptr;
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  if (!rt) return false;
+  // r7: build and capture the sampled decode runtime here too, bound to the
+  // cache the greedy runtime publishes into a session's first prefill. Without
+  // this the first sampled step of a fresh session would pay the plan/capture
+  // (~1 s) before its first callback, inside TTFT. A session that brings its
+  // own cache adapts (get_sampled_runtime rebuilds on the identity mismatch).
+  planner::KvCacheSession warm;
+  warm.n_ctx = n_ctx;
+  rt->cuda->publish_cache(warm);
+  (void)get_sampled_runtime(m, n_ctx, warm);
+  return true;
 }
 
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
@@ -3251,13 +3575,22 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                          uint64_t n_ctx, bool use_prefill,
                                          planner::KvCacheSession* session,
                                          std::span<const uint64_t> history,
-                                         std::span<const uint8_t> sample_mask) {
+                                         std::span<const uint8_t> sample_mask,
+                                         std::span<float> logits_out) {
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
   const bool masked = !sample_mask.empty();
   if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
     std::cerr << "[prefill-cuda] sample mask too small: " << sample_mask.size()
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
+  // The final logits exist only on the attention prefill path (lm_head over the
+  // last hidden column); the per-token reference graph emits an argmax only.
+  if (!logits_out.empty() &&
+      (logits_out.size() < m.config.vocab_size || !use_prefill)) {
+    std::cerr << "[prefill-cuda] prefill logits requested on a path that "
+                 "cannot produce them\n";
     return 0;
   }
 
@@ -3628,6 +3961,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
           std::cerr << "[prefill-cuda] n=" << n << " lm_head failed\n";
           return 0;
         }
+        // The first token of a sampled turn is drawn from exactly these values
+        // (softcap already applied by lm_head), so hand them back before they
+        // die with this frame.
+        if (!logits_out.empty())
+          std::copy(logits.begin(), logits.end(), logits_out.begin());
         first = masked ? nn::argmax_masked(logits, sample_mask)
                        : nn::argmax(logits);
         if (dump_logits) {
@@ -3811,71 +4149,8 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx, bool use_prefill) {
   return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
-                                  use_prefill, /*session=*/nullptr, prompt, {});
-}
-
-uint64_t generate_spine_cuda_sampled(const Gemma4Model& m,
-                                     std::span<const uint64_t> prompt,
-                                     uint64_t start_pos,
-                                     std::span<int64_t> tokens, uint64_t n_ctx,
-                                     const nn::SamplingParams& sampling,
-                                     std::span<const uint8_t> sample_mask) {
-  if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
-  if (!(sampling.temperature > 0.0f)) return 0;
-  if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
-  const uint64_t vocab = m.config.vocab_size;
-  for (uint64_t t : prompt)
-    if (t >= vocab) return 0;
-  const bool masked = !sample_mask.empty();
-  if (masked && sample_mask.size() < (vocab + 7) / 8) return 0;
-  if (start_pos + prompt.size() + tokens.size() > n_ctx) return 0;
-
-  // The non-greedy decode graph: the [vocab] softcapped logits reach the host
-  // each step (the same graph score_spine_cuda runs), and the token is chosen
-  // here with sample_token. A throwaway runtime: sampled decoding is not the
-  // hot path, and the caller's greedy runtime and its KV cache stay untouched.
-  std::unique_ptr<DecodeRuntime> rt =
-      build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
-  if (!rt) return 0;
-
-  std::vector<int64_t> history(prompt.begin(), prompt.end());
-  std::vector<float> lf(vocab);
-  auto run = [&](uint64_t token, uint64_t pos) -> bool {
-    rt->cuda->seed_token(token);
-    rt->cuda->set_pos(pos);
-    std::vector<sx::Bytes> in;
-    in.push_back(encode_i64(token));
-    in.push_back(encode_i64(pos));
-    auto res = rt->exec->execute(rt->plan, rt->snap, in);
-    if (!res || res->outputs.empty()) return false;
-    const sx::Bytes& lo = res->outputs[0];
-    if (lo.size() < vocab * sizeof(float)) return false;
-    std::memcpy(lf.data(), lo.data(), vocab * sizeof(float));
-    return true;
-  };
-
-  // Teacher-force the prompt: the last prompt token's logits predict the first
-  // produced token. Then each produced token is fed at its own position for the
-  // next step's logits.
-  for (size_t i = 0; i < prompt.size(); ++i)
-    if (!run(prompt[i], start_pos + i)) return 0;
-
-  uint64_t pos = start_pos + prompt.size();  // position of the next token
-  uint64_t step = 0;
-  for (; step < tokens.size(); ++step) {
-    if (step > 0) {
-      // Feed the token produced last step at its own position.
-      if (!run(uint64_t(tokens[step - 1]), pos - 1)) break;
-    }
-    const int64_t next =
-        nn::sample_token(lf, sampling, pos, history, sample_mask);
-    if (next < 0) break;
-    tokens[step] = next;
-    history.push_back(next);
-    ++pos;
-    if (masked) { ++step; break; }  // one constrained position per call
-  }
-  return step;
+                                  use_prefill, /*session=*/nullptr, prompt, {},
+                                  {});
 }
 
 namespace {
@@ -4286,7 +4561,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             planner::KvCacheSession& session,
                                             bool use_prefill,
                                             uint64_t* n_reused_out,
-                                            std::span<const uint8_t> sample_mask) {
+                                            std::span<const uint8_t> sample_mask,
+                                            std::span<float> logits_out) {
   if (n_reused_out) *n_reused_out = 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
 
@@ -4352,7 +4628,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // reuse tail.
   const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
                                                  tokens, n_ctx, use_prefill,
-                                                 &session, prompt, sample_mask);
+                                                 &session, prompt, sample_mask,
+                                                 logits_out);
   if (done == 0) return 0;
 
   // Record every token whose KV this call actually wrote, for the next
@@ -4372,13 +4649,6 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   return done;
 }
 #else
-uint64_t generate_spine_cuda_sampled(const Gemma4Model&,
-                                     std::span<const uint64_t>, uint64_t,
-                                     std::span<int64_t>, uint64_t,
-                                     const nn::SamplingParams&,
-                                     std::span<const uint8_t>) {
-  return 0;  // built without CUDA: no device decode is available
-}
 uint64_t generate_prefill_spine_cuda(const Gemma4Model&,
                                      std::span<const uint64_t>, uint64_t,
                                      std::span<int64_t>, uint64_t, bool) {
@@ -4389,9 +4659,29 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model&,
                                             std::span<int64_t>,
                                             planner::KvCacheSession&, bool,
                                             uint64_t* n_reused_out,
-                                            std::span<const uint8_t>) {
+                                            std::span<const uint8_t>,
+                                            std::span<float>) {
   if (n_reused_out) *n_reused_out = 0;
   return 0;  // built without CUDA: no device prefill is available
+}
+SampledState* sampled_state_new() { return nullptr; }
+void sampled_state_free(SampledState*) {}
+bool sampled_state_store_logits(SampledState&, std::span<const float>) {
+  return false;
+}
+int64_t sampled_first_token_cuda(const Gemma4Model&, SampledState&,
+                                 planner::KvCacheSession&, uint64_t,
+                                 const nn::SamplingParams&,
+                                 std::span<const int64_t>,
+                                 std::span<const uint8_t>) {
+  return -1;
+}
+int64_t sampled_step_cuda(const Gemma4Model&, uint64_t, uint64_t,
+                          planner::KvCacheSession&,
+                          const nn::SamplingParams&,
+                          std::span<const int64_t>,
+                          std::span<const uint8_t>) {
+  return -1;  // built without CUDA: no device decode is available
 }
 bool score_spine_cuda(const Gemma4Model&, std::span<const uint64_t>, uint64_t,
                       double& sum_nll, uint64_t& n_scored) {

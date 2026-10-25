@@ -168,6 +168,95 @@ void test_penalties() {
   }
 }
 
+void test_candidate_limit() {
+  // With more than kSampleCandidates survivors and no other truncation, only
+  // the 256 highest z (ties toward the lowest id) are kept.
+  std::vector<float> logits(1000, 0.0f);
+  sbnn::SamplingParams p;
+  p.temperature = 1.0f;
+  const std::vector<sbnn::Candidate> c =
+      sbnn::select_candidates_host(logits, p, {}, {});
+  check(sbnn::kSampleCandidates == 256, "candidate limit is 256");
+  check(c.size() == size_t(sbnn::kSampleCandidates),
+        "1000 equal logits leave exactly 256 candidates");
+  bool ids = c.size() == size_t(sbnn::kSampleCandidates);
+  for (size_t i = 0; ids && i < c.size(); ++i) ids = c[i].id == int32_t(i);
+  check(ids, "the 256 equal-logit candidates are ids 0..255 in order");
+  // top_k above the limit is still capped by it, and the tie-break toward the
+  // lower id decides which 256.
+  p.top_k = 300;
+  const std::vector<int64_t> set = sbnn::sample_candidates(logits, p, {}, {});
+  std::vector<int64_t> want(256);
+  for (size_t i = 0; i < want.size(); ++i) want[i] = int64_t(i);
+  check(same_set(set, want), "top_k 300 is capped at the 256 lowest ids");
+}
+
+void test_select_candidates() {
+  // (z descending, id ascending): z = {0.5, 1.5, 1.0, 1.5} at T 2.
+  {
+    const std::vector<float> logits = {1.0f, 3.0f, 2.0f, 3.0f};
+    sbnn::SamplingParams p;
+    p.temperature = 2.0f;
+    const std::vector<sbnn::Candidate> c =
+        sbnn::select_candidates_host(logits, p, {}, {});
+    const std::vector<int32_t> want = {1, 3, 2, 0};
+    bool ok = c.size() == want.size();
+    for (size_t i = 0; ok && i < c.size(); ++i) ok = c[i].id == want[i];
+    check(ok, "select orders by z descending, ties by id ascending");
+    check(!c.empty() && c[0].z == 3.0f / 2.0f,
+          "select z is the single float division l/T");
+  }
+  // Equal logits order purely by id.
+  {
+    const std::vector<float> logits = {0.0f, 0.0f, 0.0f};
+    sbnn::SamplingParams p;
+    p.temperature = 1.0f;
+    const std::vector<sbnn::Candidate> c =
+        sbnn::select_candidates_host(logits, p, {}, {});
+    bool ok = c.size() == 3;
+    for (size_t i = 0; ok && i < 3; ++i) ok = c[i].id == int32_t(i);
+    check(ok, "select tie order is id ascending");
+  }
+  // The mask removes candidates before the top-256 selection.
+  {
+    const std::vector<float> logits = {3.0f, 2.0f, 1.0f, 0.0f};
+    sbnn::SamplingParams p;
+    p.temperature = 1.0f;
+    const std::vector<uint8_t> mask = {0x0A};  // ids 1 and 3
+    const std::vector<sbnn::Candidate> c =
+        sbnn::select_candidates_host(logits, p, {}, mask);
+    bool ok = c.size() == 2 && c[0].id == 1 && c[1].id == 3;
+    check(ok, "select applies the mask first");
+  }
+  // Penalties are applied to the logit before the temperature division.
+  {
+    const std::vector<float> logits = {2.0f, 2.0f, 1.0f};
+    sbnn::SamplingParams p;
+    p.temperature = 1.0f;
+    p.repeat_penalty = 2.0f;
+    const std::vector<int64_t> hist = {0};  // id 0: 2/2 = 1
+    const std::vector<sbnn::Candidate> c =
+        sbnn::select_candidates_host(logits, p, hist, {});
+    bool ok = c.size() == 3 && c[0].id == 1 && c[1].id == 0 && c[2].id == 2;
+    check(ok, "select applies repeat_penalty before ordering");
+    check(c.size() == 3 && c[1].z == 1.0f && c[2].z == 1.0f,
+          "select penalized z values");
+  }
+  {
+    // id 0 occurs twice in the window but is penalized once: 2 - 0.5 = 1.5
+    // still beats id 1's 1.4. (Per occurrence it would be 1.0 and lose.)
+    const std::vector<float> logits = {2.0f, 1.4f};
+    sbnn::SamplingParams p;
+    p.temperature = 1.0f;
+    p.presence_penalty = 0.5f;
+    const std::vector<int64_t> hist = {0, 0};
+    const std::vector<sbnn::Candidate> c =
+        sbnn::select_candidates_host(logits, p, hist, {});
+    bool ok = c.size() == 2 && c[0].id == 0 && c[0].z == 1.5f;
+    check(ok, "select applies presence_penalty once per distinct token");
+  }
+}
+
 void test_determinism() {
   const std::vector<float> logits = {0.3f, 1.1f, 0.7f, 0.2f, 0.9f};
   sbnn::SamplingParams p;
@@ -233,6 +322,8 @@ int main() {
   test_min_p_set();
   test_top_p_set();
   test_penalties();
+  test_candidate_limit();
+  test_select_candidates();
   test_determinism();
   test_distribution();
   if (g_failures) {

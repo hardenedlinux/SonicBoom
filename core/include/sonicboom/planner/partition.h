@@ -76,6 +76,9 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::CastFp16:
     case OpKind::Softcap:
     case OpKind::Argmax:
+    // The sampled decode's terminal candidate selection is a device kernel like
+    // argmax; the host-side draw follows the step.
+    case OpKind::SampleSelect:
     case OpKind::Slice:
     // A compiler-generated glue region has no MLIR-S-Expr lowering; it is a
     // device kernel like the quant::* ops around it.

@@ -283,6 +283,13 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_cuda_elementwise PRIVATE sonicboom)
   sb_add_cpp_test(test_cuda_elementwise)
 
+  # r7 sampling select kernel: sample_select_dev must reproduce
+  # nn::select_candidates_host (ids and z bitwise) over real vocabularies, with
+  # and without a grammar mask / penalty window, at several temperatures.
+  add_executable(test_sample_select test_sample_select.cpp)
+  target_link_libraries(test_sample_select PRIVATE sonicboom CUDA::cudart)
+  sb_add_cpp_test(test_sample_select)
+
   # R3: backward ops (matmul, softmax, cross-entropy) — device kernels vs an
   # independent fp64 reference, plus finite-difference gradient checks.
   add_executable(test_backward_ops test_backward_ops.cpp)
