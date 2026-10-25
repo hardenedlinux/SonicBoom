@@ -48,7 +48,7 @@ bool available() noexcept;
 bool q8_1_enabled() noexcept;
 
 // MMQ int8-tensor-core batched prefill matmul selection (C.2). SONICBOOM_MMQ=0
-// disables it and restores the cuBLAS fp16 path at n >= cublas_min_n();
+// disables it and restores the blocked cuBLAS fp16 GEMM at n >= mmq_min_n();
 // SONICBOOM_MMQ_MIN_N sets the batch threshold (default 2, so the per-position
 // numerics stay batch-independent — see mmq_min_n). The prefill fusion pass
 // (C.4) gates on the same conditions the matmul uses, so the fused

@@ -652,7 +652,7 @@ void compare_fp16_bound(std::span<const float> got, std::span<const float> ref,
               << " elements over the fp16 bound, worst ratio " << worst << "\n";
 }
 
-// n >= cublas_min_n() routes a legacy weight down the f16 cuBLAS path
+// n >= mmq_min_n() routes a legacy weight down the blocked f16 cuBLAS path
 // (matmul_f16_cublas_dev's Q5_0/Q8_0 dequant cases), since mmq covers the
 // K-quants only.
 void test_legacy_cublas_type(sbquant::QuantType type, const char* name,
