@@ -139,7 +139,8 @@ int main(int argc, char** argv) {
   // subtraction below cancels the shared `depth` decode steps but NOT a one-time
   // plan/capture triggered inside the timed region. Warming at n_ctx = 1 (a
   // different cache key) used to leave that ~130 ms cost in the tail, which is
-  // exactly the depth-0 gap 52.6 -> 47.5 tok/s measured against test_generate.
+  // exactly the depth-0 gap 52.6 -> 47.5 tok/s measured against the out-of-tree
+  // test_generate.
   {
     std::vector<int64_t> warm(1, -1);
     sbmodel::generate_spine_cuda(*m, seed, 0, warm, ctx);

@@ -36,7 +36,7 @@
 // Prefill-vs-decode identity is NOT guaranteed: a batched prefill and the same
 // tokens fed one by one may use different arithmetic. Speculative decoding
 // on/off is nevertheless bit-identical — the verify step runs decode arithmetic
-// for every row (tests/core/test_spec_invariance.cpp).
+// for every row (the out-of-tree test_spec_invariance).
 //
 // What is measured:
 //   * per T0a kernel: max ulp to the F64-mode output (the output dtype's ulp),

@@ -1508,12 +1508,14 @@ int mmq_min_n() {
 //  * The decomposition changes the floating-point summation order (split-K
 //    pieces are combined in a fixed order), so batch invariance requires that
 //    the same rows be reduced the same way whether they are prefilled in one
-//    segment or many (test_prefix_cache compares 14 cases bitwise). It is
+//    segment or many (the out-of-tree test_prefix_cache compares 14 cases
+//    bitwise). It is
 //    keyed by the weight shape class (quant type, M, blocks_per_row) and
 //    never by n.
 //  * J selects the token-tile width only. Under the tiled decomposition the
 //    fixed split-K pieces and the K-reduction order are independent of it, and
-//    every candidate writes the same bytes (test_cuda_quant: "mmq tiled J
+//    every candidate writes the same bytes (out-of-tree test_cuda_quant:
+//    "mmq tiled J
 //    candidates write identical output"). A numerics-neutral knob may
 //    therefore be chosen per token-count bucket without weakening batch
 //    invariance -- and it must be, because the tile that wins at prefill
@@ -1624,7 +1626,7 @@ int mmq_sm_count() noexcept {
 // (mmq_j_select) times stream-k as the alternative candidate for each class
 // and may replace this default only on a > 3% win, so on this GPU it keeps
 // tiled. Stream-k stays reachable through SONICBOOM_MMQ_DECOMP=stream_k for A/B
-// and is exercised by test_cuda_quant.
+// and is exercised by the out-of-tree test_cuda_quant.
 MmqDecomp mmq_class_decomp(uint64_t rows, uint64_t cols,
                            QuantType type) noexcept {
   (void)rows;
@@ -1796,7 +1798,8 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   // up to twice the requested columns at continuation scale (measured: reuse
   // 512+64 78.1 ms with the class tile vs 66.1 ms with upstream's, n=64
   // prefill 1769 vs 2712 tok/s). The class keeps its fixed-width continuation
-  // tile for that regime. J is numerics-neutral under tiled (test_cuda_quant:
+  // tile for that regime. J is numerics-neutral under tiled (the out-of-tree
+  // test_cuda_quant:
   // "mmq tiled J candidates write identical output"), which is what lets the
   // probe tile follow the token-count bucket; the decomposition stays
   // class-wide for every n.

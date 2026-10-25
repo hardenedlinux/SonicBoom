@@ -74,7 +74,8 @@ why Qwen2 is level at depth 512. Prefill is at parity on Gemma and ahead on
 Qwen. Prefix reuse has no llama.cpp counterpart (`llama-bench` cannot measure
 it), so it is reported as first-token latency only; the exactness claim beside
 it is a test, not a benchmark — a reuse continuation is token-identical to a
-full prefill at every tested prefix length (`test_prefix_cache`).
+full prefill (`test_guarantees` covers the public contract; the exhaustive
+prefix-length sweep is an engine regression suite maintained separately).
 
 SM clock medians over the published runs: 1912 MHz (Gemma) and 1927 MHz
 (Qwen); the script prints its own clock readings per run.
@@ -84,10 +85,13 @@ SM clock medians over the published runs: 1912 MHz (Gemma) and 1927 MHz
 A performance number is only reported for a build that passes:
 
 - the full test suite (`ctest --test-dir build`), CUDA on and off;
-- the decode golden: `test_generate` reproduces the committed llama.cpp
-  multi-token stream on the CPU path, and the CUDA path is compared per token
-  (GPU lanes may diverge only at near-ties, with the first divergent step and
-  top-1/top-2 margin recorded);
+- the public guarantee check (`test_guarantees`): determinism, prefix-reuse
+  identity, KV-capacity independence and speculative-decoding identity on the
+  published models;
+- the decode golden (engine regression suite): the committed llama.cpp
+  multi-token stream is reproduced on the CPU path, and the CUDA path is
+  compared per token (GPU lanes may diverge only at near-ties, with the first
+  divergent step and top-1/top-2 margin recorded);
 - the numerics gate for the active profile (`tools/sb-numerics`): strict is the
   historical f32-KV path; standard (f16 KV) must stay inside its acceptance
   gate — perplexity delta, KL, same-top, top-1 agreement, determinism and
@@ -99,7 +103,8 @@ whether, or where, a prefix was reused; (3) KV-capacity independence — output
 does not depend on `n_ctx`. Prefill-vs-decode identity is **not** guaranteed:
 a batched prefill and the same tokens fed one at a time may use different
 arithmetic. Speculative decoding on/off is nevertheless **bit-identical**: the
-verify step uses decode arithmetic for every row (`test_spec_invariance`).
+verify step uses decode arithmetic for every row (`test_guarantees` compares
+on/off on the public models).
 
 ## Conditions
 

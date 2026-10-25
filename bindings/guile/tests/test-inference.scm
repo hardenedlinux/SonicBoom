@@ -8,7 +8,7 @@
 ;;;
 ;;;   1. generate-tokens (the token-ID entry point) seeds token 2 and greedily
 ;;;      decodes 4 tokens, matching the C++ spine golden decode stream
-;;;      {236761 107 236769 236776} (the same tokens test_generate checks).
+;;;      {236761 107 236769 236776} (the same tokens the decode golden checks).
 ;;;   2. generate (string -> string) tokenizes, decodes, and detokenizes back to
 ;;;      a non-empty string.
 ;;;   3. tokenize / detokenize round-trip through the two-call C ABI sizing path.

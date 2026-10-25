@@ -2,7 +2,7 @@
 //
 // Dev-time reference only. This tool links against the llama.cpp CPU-only build
 // (NOT SonicBoom) and reports greedy-decode tokens/sec for direct comparison
-// against SonicBoom's model::generate() (tests/core/test_generate.cpp). It is
+// against SonicBoom's model::generate() (the out-of-tree test_generate). It is
 // NOT part of libsonicboom.so and adds no llama.cpp dependency to the runtime.
 //
 // Greedy decode loop: for each step, decode the current token at position pos

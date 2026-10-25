@@ -67,7 +67,8 @@ enum class MmqDecomp { Auto = 0, Tiled = 1, StreamK = 2 };
 // columns, type = quant format. It is deliberately a function of the weight
 // shape only, never of the activation batch size n: split-K changes the
 // floating-point summation order, so a choice that moved with n would make
-// prefix-cache reuse diverge from a full prefill (test_prefix_cache). The plan
+// prefix-cache reuse diverge from a full prefill (the out-of-tree
+// test_prefix_cache). The plan
 // emitter records the answer as the node's `decomp` attribute; the runtime
 // resolves Auto with the same function.
 //
