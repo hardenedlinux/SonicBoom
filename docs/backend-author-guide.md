@@ -125,15 +125,18 @@ interpreter. The op-level differential tests are the consistency suite:
 
 | Test | Device surface vs CPU reference | Tolerance |
 |---|---|---|
-| `tests/core/test_cuda_elementwise.cpp` | `nn::cuda::*` (rms_norm, gelu, mul/add/scale, cast_fp16, rope, matvec, flash attention) vs `nn::*` / `scaled_dot_product_attention` | 1e-3 relative |
-| `tests/core/test_cuda_quant.cpp` | `quant::cuda::matvec_f32`/`matmul_f32` vs `quant::matvec_f32` | 1e-3 (1e-1 for large-shape gemv: fp32 non-deterministic reduction order) |
-| `tests/core/test_cuda_gather.cpp` | `quant::cuda::gather_f32` vs `quant::dequantize_row_f32` | bit-exact |
+| `test_cuda_elementwise` (engine suite) | `nn::cuda::*` (rms_norm, gelu, mul/add/scale, cast_fp16, rope, matvec, flash attention) vs `nn::*` / `scaled_dot_product_attention` | 1e-3 relative |
+| `test_cuda_quant` (engine suite) | `quant::cuda::matvec_f32`/`matmul_f32` vs `quant::matvec_f32` | 1e-3 (1e-1 for large-shape gemv: fp32 non-deterministic reduction order) |
+| `test_cuda_gather` (engine suite) | `quant::cuda::gather_f32` vs `quant::dequantize_row_f32` | bit-exact |
 | `tests/core/test_nn.cpp` | CPU reference self-consistency (no device) | exact |
 
-These are the "CUDA must pass" gates: they run only in a `SONICBOOM_USE_CUDA=ON`
-build and skip cleanly when no device is present. A new backend adds its own
-differential test in the same shape — build synthetic inputs, run the device
-kernel and the CPU reference, compare within a stated tolerance.
+The device differentials are engine-internal suites, maintained out of tree
+(the private tests directory: configure with `SONICBOOM_PRIVATE_TESTS_DIR`).
+These are the "CUDA must pass" gates: they run only in a
+`SONICBOOM_USE_CUDA=ON` build and skip cleanly when no device is present. A new
+backend adds its own differential test in the same shape — build synthetic
+inputs, run the device kernel and the CPU reference, compare within a stated
+tolerance.
 
 **Tolerance policy** (per the v1 rules): GPU numerics need not be bit-identical
 to the CPU path. Device kernels that accumulate in fp32 against a CPU
@@ -142,7 +145,7 @@ architecturally bit-exact (gather dequantize, the single-pass rms_norm which
 reproduces the CPU reduction order) are checked bit-exactly. The fused internal
 q8_1 kernels (`quantize_q8_1`, `rms_norm_quantize_q8_1`, `gelu_mul_quantize_q8_1`
 — T1/T3/T5) have **no public CPU q8_1 reference**, so they are validated
-end-to-end by `test_generate`'s golden token stream (bit-identical to the
+end-to-end by the engine suite's golden decode streams (bit-identical to the
 pre-fusion baseline) rather than differentially.
 
 ## 5. Where this is going (Step 4)

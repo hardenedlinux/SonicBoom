@@ -111,9 +111,10 @@ the build that produced it.
 - **Prefix reuse** has no llama.cpp counterpart (`llama-bench` cannot measure
   it), so it is reported as first-token latency in milliseconds and nothing
   else. The exactness claim beside it is a test, not a benchmark: a
-  prefix-reuse continuation is token-identical to a full prefill at every
-  tested prefix length (`test_prefix_cache`, 14/14; three more 8K-context cases
-  under `--long`).
+  prefix-reuse continuation is token-identical to a full prefill
+  (`test_guarantees` checks the public contract; the exhaustive prefix-length
+  sweep, 14 cases plus three 8K-context cases, is an engine regression suite
+  maintained separately).
 - SM clock medians over the published runs: 1912 MHz (Gemma) and 1927 MHz
   (Qwen); `tools/bench.sh` prints its own clock readings, because the GPU is
   not power-capped on this host. Decode moves by about 1% between runs at
@@ -159,7 +160,7 @@ the reporter credited, and marked as not reproduced by us.
 | RTX 4060 Ti 16 GB (sm_89) | 550.163.01 / 12.4 | `1462b04` (sm_86 code, before tuning) | Gemma 4 E4B-it Q3_K_M | 73.6 tok/s | 78 tok/s | 0.94 | identical (64/64) | [@svenha](https://github.com/hardenedlinux/SonicBoom/issues/1) |
 
 The 4060 Ti row predates `tools/bench.sh` and the build-for-the-detected-GPU
-default: it measures sm_86 code running on Ada with `test_generate`, against
+default: it measures sm_86 code running on Ada with the decode golden, against
 llama.cpp `43fe9c64281` built for the card. Both numbers come from the
 reporter's machine.
 
@@ -371,7 +372,9 @@ Its limits:
   rows with the same per-row kernels and reductions as plain decode, and KV
   entries computed from rejected drafts are rolled back by valid length. The
   emitted stream is bit-identical to greedy by construction
-  (`test_spec_invariance`, `test_spec_rollback`). `SONICBOOM_SPEC=off|on|auto`;
+  (`test_guarantees` compares spec on/off on the public models; the exhaustive
+  invariance and rollback sweeps are engine regression suites maintained
+  separately). `SONICBOOM_SPEC=off|on|auto`;
   unset runs a per-SM startup probe (verify/plain ratio; auto below 1.5, off
   otherwise) and an explicit value bypasses it. `auto` chooses k from a
   measured verify-cost curve c(k) and an acceptance-rate EMA. On sm_86 the
