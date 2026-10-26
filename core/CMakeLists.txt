@@ -234,8 +234,9 @@ if(SONICBOOM_USE_CUDA)
   #
   # -use_fast_math is NOT applied: step 8 measured it as codegen-neutral for
   # every Type/J here, and with it this TU's q8_1 scale/quantization math
-  # changes low bits -- test_cuda_quant's "q8_1 batched matches integer CPU
-  # reference" (Q6_K, rel err 9.4e-4 / 2.9e-2), test_glue_codegen's
+  # changes low bits -- the out-of-tree test_cuda_quant's "q8_1 batched matches
+  # integer CPU reference" (Q6_K, rel err 9.4e-4 / 2.9e-2), the out-of-tree
+  # test_glue_codegen's
   # byte-identical rms_norm_quantize_q8_1 check against this TU's reference,
   # and the Qwen greedy streams versus their goldens all fail. The numerics
   # rule (tokens bit-identical) outranks flag parity. -extended-lambda has no

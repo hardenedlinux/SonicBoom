@@ -2,9 +2,10 @@
 //
 // Dev-time reference only. This tool links against the llama.cpp CPU-only build
 // (NOT SonicBoom) and emits, for one prompt, the tokenized prompt ids and the
-// first `-n` greedy (argmax) continuation ids. tests/core/test_qwen2_generate.cpp
-// replays the same prompts through SonicBoom's CPU spine and diffs the streams;
-// the goldens it reads are this tool's output, checked into tests/data/qwen2/.
+// first `-n` greedy (argmax) continuation ids. The out-of-tree test_qwen2_generate
+// (private engine suite) replays the same prompts through SonicBoom's CPU spine
+// and diffs the streams; the goldens it reads are this tool's output, kept with
+// that suite (private tests/data/qwen2/).
 //
 // The prompt is read from a file so the shell never touches it, and tokenized
 // with the vocabulary's own BOS rule (add_special; Qwen2.5 sets add_bos_token =

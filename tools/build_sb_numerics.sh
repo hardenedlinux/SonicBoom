@@ -3,7 +3,7 @@
 # Locale-independent output: numbers must parse/print identically everywhere.
 export LC_ALL=C LANG=C
 # Build tools/sb-numerics against libsonicboom.so. The per-kernel probes go
-# through the same internal entry points tests/core/test_glue_codegen uses
+# through the same internal entry points the out-of-tree test_glue_codegen uses
 # (core/src/... headers); everything else is the public Layer 2 surface.
 set -euo pipefail
 

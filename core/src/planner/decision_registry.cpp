@@ -369,8 +369,6 @@ constexpr KnobRow kKnobRows[] = {
      "generated glue regions", "bit-identical gate per region", 0, 0},
     {"quant.cublas", "SONICBOOM_CUBLAS", "on", "on|off",
      "cuBLAS fp16 path for the quant GEMMs", "same operands, different kernel", 0, 0},
-    {"quant.cublas-min-n", "SONICBOOM_CUBLAS_MIN_N", "32", "1|...",
-     "cuBLAS crossover token count", "algorithm choice only", 0, 0},
     {"gemv.q6k-epilogue", "SONICBOOM_GEMV_Q6K_EPILOGUE", "on", "on|off",
      "Q6_K gemv epilogue form", "same arithmetic per element", 0, 0},
     {"gemv.sibling-kquant", "SONICBOOM_GEMV_SIBLING_KQUANT", "on", "on|off",

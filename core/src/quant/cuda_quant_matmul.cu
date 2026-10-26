@@ -1440,48 +1440,30 @@ bool q8_1_enabled() noexcept {
   return runtime::feature_enabled(runtime::Feature::Q8_1Dispatch);
 }
 
-// cuBLAS fp16 path for the batched prefill matmul (C.1). On by default; the
-// threshold is n >= kCublasMinN. SONICBOOM_CUBLAS=0 disables it and restores the
-// dp4a batched path for A/B measurement. Also requires q8_1_enabled() (the fp32
-// fallback is the CPU-matching differential path and must not be routed through
-// fp16 tensor cores).
+// cuBLAS fp16 path for the batched prefill matmul (C.1). On by default; every
+// prefill n >= mmq_min_n() that does not take MMQ uses it. SONICBOOM_CUBLAS=0
+// disables it and restores the dp4a batched path for A/B measurement. Also
+// requires q8_1_enabled() (the fp32 fallback is the CPU-matching differential
+// path and must not be routed through fp16 tensor cores).
 bool cublas_enabled() noexcept {
   if (std::getenv("SONICBOOM_CUBLAS") == nullptr) return true;
   return std::string_view(std::getenv("SONICBOOM_CUBLAS")) != "0";
 }
 
-// n (batch) threshold above which the generic cuBLAS fp16 path is used. Below
-// it the dp4a batched path wins on wall time (the fp16 dequant + upload
-// overhead is not amortized over enough columns). Tunable via
-// SONICBOOM_CUBLAS_MIN_N.
+// One arithmetic per prefill shape class (R1): every prefill n >= mmq_min_n()
+// that does not take MMQ takes the blocked fp16 cuBLAS GEMM
+// (matmul_f16_cublas_dev with force_blocked), in both numerics profiles; n == 1
+// is the q8_1 dp4a matvec. Guarantee (2), prefix-reuse identity, requires that:
+// the blocked GEMM's fixed block width plus the real-width tail makes a
+// column's result independent of its segment length, so a resumed prefill
+// computes the same values as a from-scratch one. Prefill vs decode identity is
+// not a guarantee, so n == 1 and n >= 2 may use different arithmetic.
 //
-// Q6_K does not use this threshold. Its rule is one arithmetic for every
-// prefill n — the blocked fp16 cuBLAS GEMM (matmul_f16_cublas_dev with
-// force_blocked) for n >= mmq_min_n(), the q8_1 dp4a matvec at n == 1.
-// Guarantee (2), prefix-reuse identity, requires that: the blocked GEMM's
-// fixed block width plus the real-width tail makes a column's result
-// independent of its segment length, so a resumed prefill computes the same
-// values as a from-scratch one. Prefill vs decode identity is not a guarantee,
-// so n == 1 and n >= 2 may use different arithmetic.
-//
-// The remaining types that reach this branch are the ones MMQ rejects (K below
-// 256 or not a multiple of 128, or MMQ disabled); for them the n >= threshold
-// switch still exists and is pre-existing, not exercised by the shipped
-// models.
-constexpr int kCublasMinN = 32;
-int cublas_min_n() {
-  static int v = [] {
-    if (const char* e = std::getenv("SONICBOOM_CUBLAS_MIN_N")) {
-      const int x = std::atoi(e);
-      if (x > 0) return x;
-    }
-    return kCublasMinN;
-  }();
-  return v;
-}
+// The remaining types that reach the GEMM branch are the ones MMQ rejects (K
+// below 256 or not a multiple of 128, or MMQ disabled).
 
 // MMQ int8 tensor-core path (C.2). On by default; SONICBOOM_MMQ=0 disables it
-// and restores the cuBLAS fp16 path at n >= cublas_min_n(). Requires
+// and restores the cuBLAS fp16 path at n >= mmq_min_n(). Requires
 // q8_1_enabled() (the fp32 fallback is the CPU-matching differential path and
 // must not be routed through int8 tensor cores).
 bool mmq_enabled() noexcept {
@@ -1526,12 +1508,14 @@ int mmq_min_n() {
 //  * The decomposition changes the floating-point summation order (split-K
 //    pieces are combined in a fixed order), so batch invariance requires that
 //    the same rows be reduced the same way whether they are prefilled in one
-//    segment or many (test_prefix_cache compares 14 cases bitwise). It is
+//    segment or many (the out-of-tree test_prefix_cache compares 14 cases
+//    bitwise). It is
 //    keyed by the weight shape class (quant type, M, blocks_per_row) and
 //    never by n.
 //  * J selects the token-tile width only. Under the tiled decomposition the
 //    fixed split-K pieces and the K-reduction order are independent of it, and
-//    every candidate writes the same bytes (test_cuda_quant: "mmq tiled J
+//    every candidate writes the same bytes (out-of-tree test_cuda_quant:
+//    "mmq tiled J
 //    candidates write identical output"). A numerics-neutral knob may
 //    therefore be chosen per token-count bucket without weakening batch
 //    invariance -- and it must be, because the tile that wins at prefill
@@ -1642,7 +1626,7 @@ int mmq_sm_count() noexcept {
 // (mmq_j_select) times stream-k as the alternative candidate for each class
 // and may replace this default only on a > 3% win, so on this GPU it keeps
 // tiled. Stream-k stays reachable through SONICBOOM_MMQ_DECOMP=stream_k for A/B
-// and is exercised by test_cuda_quant.
+// and is exercised by the out-of-tree test_cuda_quant.
 MmqDecomp mmq_class_decomp(uint64_t rows, uint64_t cols,
                            QuantType type) noexcept {
   (void)rows;
@@ -1814,7 +1798,8 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   // up to twice the requested columns at continuation scale (measured: reuse
   // 512+64 78.1 ms with the class tile vs 66.1 ms with upstream's, n=64
   // prefill 1769 vs 2712 tok/s). The class keeps its fixed-width continuation
-  // tile for that regime. J is numerics-neutral under tiled (test_cuda_quant:
+  // tile for that regime. J is numerics-neutral under tiled (the out-of-tree
+  // test_cuda_quant:
   // "mmq tiled J candidates write identical output"), which is what lets the
   // probe tile follow the token-count bucket; the decomposition stays
   // class-wide for every n.
@@ -3224,8 +3209,9 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
 
   // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
+  // Until then Q6_K takes the one prefill arithmetic: the blocked fp16 GEMM.
   if (W.type() == QuantType::Q6_K)
-    return matmul_f16_cublas_dev(W, X, Y, n);
+    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -3805,21 +3791,16 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
-  // Q6_K: n == 1 is the q8_1 dp4a matvec above; every prefill n >= 2 takes the
-  // blocked fp16 cuBLAS GEMM. Fixed block width + real-width tail make the
-  // result per-column invariant, so a position computes the same whether its
-  // segment is long or short (prefix-reuse identity). The fixed-width block
-  // is forced in strict as well, so both profiles share one prefill
-  // arithmetic. TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill
-  // is Roy's MMQ kernel, disabled until its incoherent output on Gemma Q4_K_M
-  // is fixed.
-  if (W.type() == QuantType::Q6_K && q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
-    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
-
-  // cuBLAS fp16 path for large batches (C.1). Only when q8_1 is active — the
+  // Every prefill n >= mmq_min_n() that does not take MMQ takes the blocked
+  // fp16 cuBLAS GEMM, in both numerics profiles; n == 1 is the q8_1 dp4a
+  // matvec above. Fixed block width + real-width tail make the result
+  // per-column invariant, so a position computes the same whether its segment
+  // is long or short (prefix-reuse identity). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
-  if (q8_1_enabled() && cublas_enabled() && n >= cublas_min_n())
-    return matmul_f16_cublas_dev(W, X, Y, n);
+  // TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill is Roy's MMQ
+  // kernel, disabled until its incoherent output on Gemma Q4_K_M is fixed.
+  if (q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
+    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
 
   const void* d_w = upload_weight(W);
   if (!d_w) return false;

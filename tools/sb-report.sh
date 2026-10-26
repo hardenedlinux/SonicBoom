@@ -14,10 +14,14 @@ export LC_ALL=C LANG=C
 # "(build-info)"). Paste it next to a benchmark result or a bug report.
 #
 # The report also *checks* the build it describes. With a model it runs the
-# public golden checks through ctest (token goldens, prefix cache, plan cache,
-# elementwise) and the canonical benchmark through tools/bench.sh, which is the
-# same measurement a release reports. A model is therefore required: a report
-# that skips the numbers is the one thing this script exists to prevent.
+# public guarantee check (inference_guarantees: determinism, prefix reuse,
+# KV-capacity independence, speculative-decoding identity) through ctest, the
+# engine-internal golden suites when the private tests are configured (token
+# streams, prefix cache, plan cache, kernel differentials; absent ones are
+# skipped, not failed), and the canonical benchmark through tools/bench.sh,
+# which is the same measurement a release reports. A model is therefore
+# required: a report that skips the numbers is the one thing this script exists
+# to prevent.
 #
 # Everything else is best-effort: a section whose tool is absent says so, but a
 # failed golden check makes the script exit 1 (a host with no Guile still exits
@@ -210,6 +214,18 @@ done
 GOLDEN_FAIL=0
 golden_run() { # LABEL CTEST_REGEX
   local out rc
+  # The exhaustive engine goldens (token streams, prefix/plan cache, kernel
+  # differentials) are out-of-tree suites: a build configured without
+  # SONICBOOM_PRIVATE_TESTS_DIR legitimately has no such test. That is not a
+  # failed check — report the suite as absent and keep going.
+  if ! ctest --test-dir "$ROOT/build" -N -R "$2" 2>/dev/null | grep -q '^  Test #'; then
+    if [ "$JSON" = 1 ]; then
+      emit "golden.$1" "skipped (suite not in this build)"
+    else
+      printf '  %-24s %s\n' "$1" "skipped (suite not in this build)"
+    fi
+    return
+  fi
   out=$(ctest --test-dir "$ROOT/build" -R "$2" --output-on-failure 2>&1); rc=$?
   [ "$rc" = 0 ] || GOLDEN_FAIL=1
   if [ "$JSON" = 1 ]; then
@@ -223,6 +239,10 @@ golden_run() { # LABEL CTEST_REGEX
 
 if [ "$GOLDEN" = 1 ]; then
   [ "$JSON" = 1 ] || echo "[golden]"
+  # The public guarantee check needs both models (it skips without them).
+  [ -n "$GEMMA" ] && [ -n "$QWEN" ] && golden_run inference_guarantees '^test_guarantees$'
+  # Engine-internal goldens: present only when the private suites are
+  # configured; skipped cleanly otherwise.
   [ -n "$GEMMA" ] && golden_run gemma_tokens '^test_generate_numerics_standard$'
   [ -n "$GEMMA" ] && golden_run gemma_prefix_cache '^test_prefix_cache$'
   [ -n "$GEMMA" ] && golden_run gemma_plan_cache '^test_plan_cache$'

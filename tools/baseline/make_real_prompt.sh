@@ -2,14 +2,16 @@
 
 # Locale-independent output: numbers must parse/print identically everywhere.
 export LC_ALL=C LANG=C
-# Tokenize the frozen real-text prompt used by the C.4 prefix-cache tests, with
-# the llama.cpp tokenizer for the GGUF under test, and emit a space-separated
-# token-id file. The text is a committed fixture (tests/data/real_prompt.txt):
-# it was once a concatenation of SonicBoom's own docs and source, and freezing
-# it keeps the workload comparable now that the docs it used have moved.
+# Tokenize the frozen real-text prompt used by the prefix-cache tests and the
+# canonical bench, with the llama.cpp tokenizer for the GGUF under test, and
+# emit a space-separated token-id file. The text is a frozen fixture kept with
+# the private engine suites (private tests/data/real_prompt.txt): it was once a
+# concatenation of SonicBoom's own docs and source, and freezing it keeps the
+# workload comparable now that the docs it used have moved. An older checkout
+# keeps the text under tests/data/; both are accepted and the private copy wins.
 #
-#   tests/data/real_prompt.txt  committed fixture (the raw concatenated text)
-#   real_prompt.tokens          committed fixture (space-separated token ids)
+#   <private>/tests/data/real_prompt.txt  frozen fixture (raw concatenated text)
+#   real_prompt.tokens                    this tool's output (space-separated ids)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,10 +23,16 @@ if [ ! -f "$MODEL" ]; then
   exit 1
 fi
 
-TEXT="$ROOT/tests/data/real_prompt.txt"
+PRIVATE_ROOT="${SONICBOOM_PRIVATE_ROOT:-$ROOT/../sonicboom-private}"
+TEXT="$PRIVATE_ROOT/tests/data/real_prompt.txt"
+[ -f "$TEXT" ] || TEXT="$ROOT/tests/data/real_prompt.txt"
 if [ ! -f "$TEXT" ]; then
-  echo "frozen prompt not found: $TEXT" >&2
-  exit 1
+  # The private suites are optional: without them there is no frozen prompt to
+  # tokenize, and no private consumer to serve. Say so and leave the existing
+  # tokens file untouched rather than failing a bench setup.
+  echo "SKIP: frozen prompt not found (looked in $PRIVATE_ROOT/tests/data and" \
+       "$ROOT/tests/data; set SONICBOOM_PRIVATE_ROOT)" >&2
+  exit 0
 fi
 TOKENS="$DIR/real_prompt.tokens"
 
