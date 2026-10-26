@@ -1230,6 +1230,13 @@ __device__ __forceinline__ void fa_exact_stage_kv(
   constexpr int RPI = NTHREADS / 32;        // rows in flight per iteration
   constexpr int ITERS = (ROWS + RPI - 1) / RPI;
   const int lane = threadIdx.x & 31;
+  // Ring slot of the tile's first key, so a row's slot is base + jj with at
+  // most one wrap instead of a 64-bit modulo per row: device division is a
+  // reciprocal sequence (inline for a 32-bit dividend, a 65-instruction call
+  // above it) and it stood in the per-row staging path. A tile that ends
+  // before the ring (start == 0 during a first prefill) has no ring row at
+  // all, so the division is skipped there.
+  const uint64_t base_slot = (start > j0) ? j0 % n_slots : 0;
   #pragma unroll
   for (int it = 0; it < ITERS; ++it) {
     const int r = (threadIdx.x >> 5) + it * RPI;
@@ -1242,7 +1249,8 @@ __device__ __forceinline__ void fa_exact_stage_kv(
     const KV* crow = nullptr;
     const float* brow = nullptr;
     if (ring) {
-      const uint64_t slot = j % n_slots;
+      uint64_t slot = base_slot + (uint64_t)jj;
+      while (slot >= n_slots) slot -= n_slots;  // jj < FA_BK: one step
       crow = kv_row(cache, slot * (uint64_t)NHKV + (uint64_t)kv, HEAD_DIM);
     } else {
       const uint64_t bi = j - start;
@@ -3429,13 +3437,16 @@ bool attn_trace_on() {
   return on;
 }
 
-// R10 Stage B: opt in to the strict-order shared-memory tiled kernel for the
-// d128/gqa6 class. Default off: the class keeps the scalar kernel until the
-// tiled path clears the numerical and performance gates.
+// R10 Stage B: the strict-order shared-memory tiled kernel is the default for
+// the d128/gqa6 class. It cleared the bitwise differential suite, the 50/50
+// arm gate and the performance gates, so the switch now only exists to roll
+// back a regression: =0 (or =off) forces the scalar kernel, and any other
+// value keeps the default.
 bool attn_own_d128_exact() {
   const char* e = std::getenv("SONICBOOM_ATTN_D128_EXACT");
-  return e != nullptr &&
-         (std::string_view(e) == "1" || std::string_view(e) == "smem");
+  if (e == nullptr) return true;
+  const std::string_view v(e);
+  return !(v == "0" || v == "off");
 }
 
 int &attn_trace_layer_slot() {
@@ -6271,9 +6282,9 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   // class (window-less causal KV-cache prefill). It reproduces the scalar
   // kernel's FP associations — the differential test compares it bit-for-bit
   // at every required length, both KV dtypes and with/without a cached
-  // prefix — so it is a pure performance route, not a numerical one. Opt-in
-  // until the benchmark gates pass; any other shape, or a launch failure,
-  // falls through to the scalar kernel.
+  // prefix — so it is a pure performance route, not a numerical one. It is
+  // the default for this class (SONICBOOM_ATTN_D128_EXACT=0 rolls back); any
+  // other shape, or a launch failure, falls through to the scalar kernel.
   if (head_dim == 128 && gqa == 6 && n_heads_q == 12 && n_heads_kv == 2 &&
       sliding_window == 0 && !kv_q8 && attn_own_d128_exact()) {
     const bool ok =
