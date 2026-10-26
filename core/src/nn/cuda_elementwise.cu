@@ -1182,6 +1182,326 @@ __global__ void flash_attention_chunk_pos_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Strict-order shared-memory tiled flash attention (chunked prefill).
+//
+// The same per-query arithmetic as flash_attention_chunk_pos_kernel — the
+// lane-strided QK partial sums reduced by the fixed 32-lane butterfly, 32-key
+// online-softmax tiles, ascending fp32 PV FMA chains, final fp32
+// normalization — but K/V are staged once per 32-key tile into shared memory
+// and shared by all n_heads_q warps of the block instead of being re-read from
+// global memory by every (position, head) warp. The block is one query
+// position with one warp per query head, exactly the scalar launch shape, so
+// every warp walks the same j0 tiles (window 0 only) and the block-wide
+// staging barriers are uniform.
+//
+// The staged tile is lane-major: element ((kv*BK + jj)*32 + lane)*NP + i holds
+// dim lane + 32*i, so the NP terms of one lane's dot are contiguous and become
+// a single vector load. K and V reuse one buffer — K is dead once the tile's
+// scores are in `tile`, and V is staged after the whole block finishes its QK
+// pass — which keeps the footprint at BK*NHKV*HEAD_DIM floats.
+//
+// This is the strict-profile counterpart of the tensor-core tiled kernel
+// below: it buys the K/V reuse and Q/accumulator register residency while
+// keeping every FP association of the scalar kernel.
+// ---------------------------------------------------------------------------
+
+// One K or V tile for every KV head: [NHKV][BK][HEAD_DIM] fp32, read either
+// from the f16/f32 ring cache (j < start) or from the f32 chunk batch (j >=
+// start, rounded through the cache's element type exactly as kv_load_batch).
+// One warp stages one row, which is one [16-byte] store per warp either way:
+//   LANE_MAJOR=false (K): each lane takes four consecutive dims, a single
+//     16-byte load.
+//   LANE_MAJOR=true (V): each lane takes dim lane+32i, i.e. the four values
+//     the PV loop consumes for that lane, so PV becomes one 16-byte shared
+//     load per key instead of four. The four global loads are still fully
+//     coalesced (one 128-byte transaction per i).
+// The row loop is fully unrolled so several independent loads are in flight
+// (the scalar kernel's staging cost was one exposed global-load latency per
+// element).
+template <typename KV, int HEAD_DIM, int NHKV, int NTHREADS,
+          bool LANE_MAJOR = false>
+__device__ __forceinline__ void fa_exact_stage_kv(
+    float* __restrict__ dst, const float* __restrict__ batch,
+    const KV* __restrict__ cache, uint64_t start, uint64_t n_slots, uint64_t j0,
+    int jj_count) {
+  constexpr int NP = HEAD_DIM / 32;         // dims per lane
+  static_assert(NP == 4, "staging assumes four dims per lane");
+  constexpr int ROWS = NHKV * FA_BK;        // rows per tile
+  constexpr int RPI = NTHREADS / 32;        // rows in flight per iteration
+  constexpr int ITERS = (ROWS + RPI - 1) / RPI;
+  const int lane = threadIdx.x & 31;
+  #pragma unroll
+  for (int it = 0; it < ITERS; ++it) {
+    const int r = (threadIdx.x >> 5) + it * RPI;
+    if (r >= ROWS) continue;
+    const int kv = r / FA_BK;
+    const int jj = r - kv * FA_BK;
+    if (jj >= jj_count) continue;  // tail rows are never read
+    const uint64_t j = j0 + (uint64_t)jj;
+    const bool ring = j < start;
+    const KV* crow = nullptr;
+    const float* brow = nullptr;
+    if (ring) {
+      const uint64_t slot = j % n_slots;
+      crow = kv_row(cache, slot * (uint64_t)NHKV + (uint64_t)kv, HEAD_DIM);
+    } else {
+      const uint64_t bi = j - start;
+      brow = batch + (bi * (uint64_t)NHKV + (uint64_t)kv) * HEAD_DIM;
+    }
+    float v[NP];
+    if constexpr (LANE_MAJOR) {
+      if (ring) {
+        #pragma unroll
+        for (int i = 0; i < NP; ++i)
+          v[i] = kv_load_at(crow, lane + i * 32, HEAD_DIM);
+      } else {
+        #pragma unroll
+        for (int i = 0; i < NP; ++i)
+          v[i] = kv_load_batch<KV>(brow + lane + i * 32);
+      }
+    } else if (ring) {
+      // Four consecutive dims: one width-4 load, then widen.
+      if constexpr (std::is_same_v<KV, float>) {
+        const float4 x = *reinterpret_cast<const float4*>(crow + lane * NP);
+        v[0] = x.x; v[1] = x.y; v[2] = x.z; v[3] = x.w;
+      } else {
+        const uint2 h = *reinterpret_cast<const uint2*>(crow + lane * NP);
+        const __half* hp = reinterpret_cast<const __half*>(&h);
+        #pragma unroll
+        for (int i = 0; i < NP; ++i) v[i] = __half2float(hp[i]);
+      }
+    } else {
+      const float* src = brow + lane * NP;
+      if constexpr (std::is_same_v<KV, float>) {
+        const float4 x = *reinterpret_cast<const float4*>(src);
+        v[0] = x.x; v[1] = x.y; v[2] = x.z; v[3] = x.w;
+      } else {
+        #pragma unroll
+        for (int i = 0; i < NP; ++i) v[i] = kv_load_batch<KV>(src + i);
+      }
+    }
+    *reinterpret_cast<float4*>(dst + (size_t)r * HEAD_DIM + lane * NP) =
+        make_float4(v[0], v[1], v[2], v[3]);
+  }
+}
+
+// Block = NQ consecutive query positions x NHQ heads, one warp per head; each
+// warp carries the NQ positions of its head through the tile loop together, so
+// every staged K/V value feeds NQ dots before it is discarded. That halves the
+// shared-memory read traffic per (position, head, key) visit, which is what the
+// kernel is bound by: a visit needs the whole 128-dim K and V row (1 KiB) for
+// only eight FMAs. The four per-tile barriers are shared by all positions too.
+// One warp per head means 12 warps per block and 24 warps per SM with two
+// resident blocks; four keys x NQ positions in flight per warp cover the
+// dependent shuffle latency. HEAD_DIM is a multiple of 32 and NHQ/NHKV is the
+// GQA ratio.
+template <typename KV, int HEAD_DIM, int NHQ, int NHKV, int NQ>
+__global__ void __launch_bounds__(NHQ * 32, 2)
+    flash_attention_chunk_exact_kernel(
+        const float* __restrict__ q, const float* __restrict__ k_batch,
+        const float* __restrict__ v_batch, const KV* __restrict__ k_cache,
+        const KV* __restrict__ v_cache, const uint64_t* __restrict__ start_ptr,
+        uint64_t n_slots, int n_heads_kv, uint64_t sliding_window, int n,
+        float scale, float* __restrict__ out) {
+  constexpr int NP = HEAD_DIM / 32;  // dims per lane
+  static_assert(NP == 4, "lane-major staging assumes four dims per lane");
+  constexpr int KV_TILE = NHKV * FA_BK * HEAD_DIM;
+  extern __shared__ float s_sh[];
+  float* kv_sm = s_sh;                  // [NHKV][FA_BK][HEAD_DIM], lane-major
+  float* tile_all = s_sh + KV_TILE;     // [NHQ][NQ][FA_BK]
+
+  const int lane = threadIdx.x & 31;
+  const int h = threadIdx.x >> 5;
+  const int kv_h = h * NHKV / NHQ;
+  const int iq = blockIdx.x;
+  const uint64_t start = *start_ptr;
+  const int pos0 = iq * NQ;
+  const int npos = (n - pos0 < NQ) ? (n - pos0) : NQ;
+
+  // Q and the output accumulators live in registers for every position: the
+  // scalar kernel re-reads Q through L1 for each key and spills acc[] once the
+  // loop index becomes dynamic. The values here are the same ones.
+  float qreg[NQ][NP], acc[NQ][NP];
+  float m[NQ], l[NQ];
+  uint64_t p[NQ];
+  float* tile = tile_all + h * (NQ * FA_BK);
+  #pragma unroll
+  for (int t = 0; t < NQ; ++t) {
+    const bool ok = t < npos;
+    const int posi = pos0 + (ok ? t : 0);
+    const float* qrow = q + ((uint64_t)posi * NHQ + h) * HEAD_DIM;
+    p[t] = start + (uint64_t)posi;
+    m[t] = -1e30f;
+    l[t] = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < NP; ++i) {
+      qreg[t][i] = ok ? qrow[lane + i * 32] : 0.0f;
+      acc[t][i] = 0.0f;
+    }
+  }
+  const uint64_t p_blk = p[npos - 1];
+
+  // The loop runs to the block's last position; a position that is already
+  // finished still reaches every barrier but skips its softmax and PV.
+  for (uint64_t j0 = 0; j0 < p_blk + 1; j0 += FA_BK) {
+    const uint64_t jstage_end =
+        (p_blk + 1 < j0 + FA_BK) ? (p_blk + 1) : (j0 + FA_BK);
+    const int jstage_cnt = int(jstage_end - j0);
+    bool act[NQ];
+    int jc[NQ];
+    int jqk = 0;
+    #pragma unroll
+    for (int t = 0; t < NQ; ++t) {
+      act[t] = (t < npos) && (j0 <= p[t]);
+      const uint64_t jend =
+          (p[t] + 1 < j0 + FA_BK) ? (p[t] + 1) : (j0 + FA_BK);
+      jc[t] = act[t] ? int(jend - j0) : 0;
+      jqk = (jc[t] > jqk) ? jc[t] : jqk;
+    }
+
+    // ---- stage K for every KV head, then compute this tile's scores --------
+    fa_exact_stage_kv<KV, HEAD_DIM, NHKV, NHQ * 32, true>(
+        kv_sm, k_batch, k_cache, start, n_slots, j0, jstage_cnt);
+    __syncthreads();
+
+    // Four keys in flight for every position: the five-step butterfly is a
+    // long dependent shfl chain and one staged K row feeds all NQ dots. Each
+    // key's dot order and reduction tree are exactly the scalar kernel's.
+    int jj = 0;
+    for (; jj + 3 < jqk; jj += 4) {
+      const float* kp = kv_sm + (kv_h * FA_BK + jj) * HEAD_DIM + lane * NP;
+      float k0[NP], k1[NP], k2[NP], k3[NP];
+      *reinterpret_cast<float4*>(k0) = *reinterpret_cast<const float4*>(kp);
+      *reinterpret_cast<float4*>(k1) =
+          *reinterpret_cast<const float4*>(kp + HEAD_DIM);
+      *reinterpret_cast<float4*>(k2) =
+          *reinterpret_cast<const float4*>(kp + 2 * HEAD_DIM);
+      *reinterpret_cast<float4*>(k3) =
+          *reinterpret_cast<const float4*>(kp + 3 * HEAD_DIM);
+      float d[NQ][4];
+      #pragma unroll
+      for (int t = 0; t < NQ; ++t) {
+        d[t][0] = 0.0f; d[t][1] = 0.0f; d[t][2] = 0.0f; d[t][3] = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NP; ++i) {
+          d[t][0] += qreg[t][i] * k0[i];
+          d[t][1] += qreg[t][i] * k1[i];
+          d[t][2] += qreg[t][i] * k2[i];
+          d[t][3] += qreg[t][i] * k3[i];
+        }
+      }
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) {
+        #pragma unroll
+        for (int t = 0; t < NQ; ++t) {
+          d[t][0] += __shfl_down_sync(0xffffffffu, d[t][0], o);
+          d[t][1] += __shfl_down_sync(0xffffffffu, d[t][1], o);
+          d[t][2] += __shfl_down_sync(0xffffffffu, d[t][2], o);
+          d[t][3] += __shfl_down_sync(0xffffffffu, d[t][3], o);
+        }
+      }
+      if (lane == 0) {
+        #pragma unroll
+        for (int t = 0; t < NQ; ++t) {
+          tile[t * FA_BK + jj + 0] = d[t][0] * scale;
+          tile[t * FA_BK + jj + 1] = d[t][1] * scale;
+          tile[t * FA_BK + jj + 2] = d[t][2] * scale;
+          tile[t * FA_BK + jj + 3] = d[t][3] * scale;
+        }
+      }
+    }
+    for (; jj < jqk; ++jj) {
+      const float* kp = kv_sm + (kv_h * FA_BK + jj) * HEAD_DIM + lane * NP;
+      float k[NP];
+      *reinterpret_cast<float4*>(k) = *reinterpret_cast<const float4*>(kp);
+      #pragma unroll
+      for (int t = 0; t < NQ; ++t) {
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < NP; ++i) dot += qreg[t][i] * k[i];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+          dot += __shfl_down_sync(0xffffffffu, dot, o);
+        if (lane == 0) tile[t * FA_BK + jj] = dot * scale;
+      }
+    }
+    __syncwarp();
+
+    // ---- online softmax, identical to the scalar kernel -------------------
+    float m_new[NQ], rescale[NQ];
+    #pragma unroll
+    for (int t = 0; t < NQ; ++t) {
+      m_new[t] = m[t];
+      rescale[t] = 1.0f;
+      if (act[t]) {
+        const int n_j = jc[t];
+        float* tl = tile + t * FA_BK;
+        float tile_max = -1e30f;
+        for (int j = lane; j < n_j; j += 32) tile_max = fmaxf(tile_max, tl[j]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+          tile_max =
+              fmaxf(tile_max, __shfl_down_sync(0xffffffffu, tile_max, o));
+        tile_max = __shfl_sync(0xffffffffu, tile_max, 0);
+        m_new[t] = fmaxf(m[t], tile_max);
+        rescale[t] = expf(m[t] - m_new[t]);
+        float tile_sum = 0.0f;
+        for (int j = lane; j < n_j; j += 32) {
+          const float pv = expf(tl[j] - m_new[t]);
+          tl[j] = pv;
+          tile_sum += pv;
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+          tile_sum += __shfl_down_sync(0xffffffffu, tile_sum, o);
+        tile_sum = __shfl_sync(0xffffffffu, tile_sum, 0);
+        l[t] = l[t] * rescale[t] + tile_sum;
+      }
+    }
+
+    // ---- stage V into the same buffer, then accumulate --------------------
+    __syncthreads();  // every warp is done reading K
+    fa_exact_stage_kv<KV, HEAD_DIM, NHKV, NHQ * 32, true>(
+        kv_sm, v_batch, v_cache, start, n_slots, j0, jstage_cnt);
+    __syncthreads();
+    __syncwarp();
+
+    #pragma unroll
+    for (int t = 0; t < NQ; ++t) {
+      if (!act[t]) continue;
+      const float* tl = tile + t * FA_BK;
+      // Loop order is interchanged (key outer, dim inner): each accumulator
+      // sees exactly the scalar kernel's ascending sequence of FMAs, while the
+      // key weight and the V row are loaded once for all four accumulators.
+      #pragma unroll
+      for (int i = 0; i < NP; ++i) acc[t][i] *= rescale[t];
+      for (int j = 0; j < jc[t]; ++j) {
+        const float tv = tl[j];
+        const float4 v = *reinterpret_cast<const float4*>(
+            kv_sm + (kv_h * FA_BK + j) * HEAD_DIM + lane * NP);
+        acc[t][0] = __fmaf_rn(tv, v.x, acc[t][0]);
+        acc[t][1] = __fmaf_rn(tv, v.y, acc[t][1]);
+        acc[t][2] = __fmaf_rn(tv, v.z, acc[t][2]);
+        acc[t][3] = __fmaf_rn(tv, v.w, acc[t][3]);
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < NQ; ++t) m[t] = m_new[t];
+    __syncwarp();
+    __syncthreads();  // every warp is done reading V before the next K stage
+  }
+
+  #pragma unroll
+  for (int t = 0; t < NQ; ++t) {
+    if (t >= npos) continue;
+    const float inv = 1.0f / l[t];
+    float* orow = out + ((uint64_t)(pos0 + t) * NHQ + h) * HEAD_DIM;
+    #pragma unroll
+    for (int i = 0; i < NP; ++i) orow[lane + i * 32] = acc[t][i] * inv;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tiled tensor-core flash attention (fp16 mma.m16n8k16) for chunked prefill.
 //
 // Replaces flash_attention_chunk_pos_kernel's one-warp-per-(position, head)
@@ -3109,6 +3429,15 @@ bool attn_trace_on() {
   return on;
 }
 
+// R10 Stage B: opt in to the strict-order shared-memory tiled kernel for the
+// d128/gqa6 class. Default off: the class keeps the scalar kernel until the
+// tiled path clears the numerical and performance gates.
+bool attn_own_d128_exact() {
+  const char* e = std::getenv("SONICBOOM_ATTN_D128_EXACT");
+  return e != nullptr &&
+         (std::string_view(e) == "1" || std::string_view(e) == "smem");
+}
+
 int &attn_trace_layer_slot() {
   static thread_local int layer = -1;
   return layer;
@@ -3580,6 +3909,32 @@ bool launch_tiled_flash_attention_kv(const float* q, const float* k_batch,
   return launch_tiled_flash_attention<float, HEAD_DIM, BK, NW, QB, GQA>(
       q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
       n_heads_kv, sliding_window, scale, out);
+}
+
+// Strict-order shared-memory tiled kernel. Fixed block shape (NQ query
+// positions x NHQ warps) and BK == FA_BK so its softmax tiles and reduction
+// points are the scalar kernel's.
+constexpr int kExactNQ = 2;
+
+template <typename KV, int HEAD_DIM, int NHQ, int NHKV>
+bool launch_exact_flash_attention(const float* q, const float* k_batch,
+                                  const float* v_batch, const void* k_cache,
+                                  const void* v_cache, const uint64_t* start,
+                                  uint64_t n_slots, int n, uint64_t sliding_window,
+                                  float scale, float* out) {
+  constexpr int NQ = kExactNQ;
+  constexpr int smem_bytes =
+      (NHKV * FA_BK * HEAD_DIM + NQ * NHQ * FA_BK) * (int)sizeof(float);
+  auto kfn = flash_attention_chunk_exact_kernel<KV, HEAD_DIM, NHQ, NHKV, NQ>;
+  SB_NOTE_LAUNCH_TP("flash_attention_chunk_exact_kernel",
+                    ::sonicboom::planner::plan_detail::tp_label(
+                        {{"HEAD_DIM", HEAD_DIM}, {"NHQ", NHQ}, {"NHKV", NHKV}}),
+                    (n + NQ - 1) / NQ, NHQ * 32, smem_bytes, cur_stream());
+  kfn<<<(n + NQ - 1) / NQ, NHQ * 32, smem_bytes, cur_stream()>>>(
+      q, k_batch, v_batch, static_cast<const KV*>(k_cache),
+      static_cast<const KV*>(v_cache), start, n_slots, NHKV, sliding_window, n,
+      scale, out);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 // Host-facing counterpart of flash_attention_full_dev. q/k/v/out are plain
@@ -5911,6 +6266,33 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   //   - SwiGLU families (Qwen2.5-0.5B, and the same 7:1 group ratio at the
   //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
+
+  // R10 Stage B: strict-order shared-memory tiled kernel for the d128/gqa6
+  // class (window-less causal KV-cache prefill). It reproduces the scalar
+  // kernel's FP associations — the differential test compares it bit-for-bit
+  // at every required length, both KV dtypes and with/without a cached
+  // prefix — so it is a pure performance route, not a numerical one. Opt-in
+  // until the benchmark gates pass; any other shape, or a launch failure,
+  // falls through to the scalar kernel.
+  if (head_dim == 128 && gqa == 6 && n_heads_q == 12 && n_heads_kv == 2 &&
+      sliding_window == 0 && !kv_q8 && attn_own_d128_exact()) {
+    const bool ok =
+        kv_f16 ? launch_exact_flash_attention<__half, 128, 12, 2>(
+                     q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+                     sliding_window, scale, out)
+               : launch_exact_flash_attention<float, 128, 12, 2>(
+                     q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+                     sliding_window, scale, out);
+    if (ok) {
+      const size_t smem =
+          (2 * FA_BK * 128 + kExactNQ * 12 * FA_BK) * sizeof(float);
+      attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                         sliding_window,
+                         kv_f16 ? "own-tiled-exact-kv16" : "own-tiled-exact",
+                         "smem/head", 1, FA_BK, n, n_heads_q, 12 * 32, smem);
+      return true;
+    }
+  }
 
   // Attention implementation switch (v1 Stages 2-3). "auto" (default)
   // resolves the shape class through the runtime tuner (attn_resolve, Step 7)
