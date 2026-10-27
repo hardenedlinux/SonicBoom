@@ -215,6 +215,14 @@ if(SONICBOOM_USE_CUDA)
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
+    # Imported ggml flash-attention adapter (removable measurement backend;
+    # SONICBOOM_ATTN_IMPL=ggml). Same nvcc invocation and static link as the
+    # other core TUs -- no separate build path.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
+    # SonicBoom-owned GGML-inspired prefill attention (boom_fattn; removable
+    # measurement backend, SONICBOOM_ATTN_IMPL=boom_fattn). Plain device code,
+    # no device lambdas, so it needs no per-source flags.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_boom_fattn.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/adamw.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/backward_ops.cu
     # The training graph executor's forward + AdamW kernels (device_graph.cpp
@@ -250,6 +258,13 @@ if(SONICBOOM_USE_CUDA)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     PROPERTIES COMPILE_OPTIONS "-extended-lambda")
+  # The imported ggml flash-attention kernel (src/nn/fattn_ggml.cu) uses
+  # device lambdas in its cp.async pipelines and needs nvcc's
+  # --extended-lambda, as upstream compiles it. Scoped to that TU so the
+  # flag cannot change any SonicBoom-owned kernel's code generation.
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
+    PROPERTIES COMPILE_OPTIONS "--extended-lambda")
 endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;
