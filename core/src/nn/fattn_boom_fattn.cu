@@ -58,7 +58,11 @@
 //      its phase 1 is the serial part of the block and is why the imported
 //      ggml kernel wins at long context. The d512 default instead uses the
 //      query-resident variant below (mode 1), which splits phase 1 over the
-//      unit's dim slices; d256 still uses this kernel unchanged.
+//      unit's dim slices. The d256 default (the Gemma sliding-window head)
+//      uses that variant too (SONICBOOM_BOOM_FATTN_D256=1): 16-key tiles
+//      re-read Q twice as often as 32-key tiles, and phase 1 on 8 of 32 warps
+//      was the prefill bottleneck. The variant is window-agnostic; the window
+//      itself comes only from the per-layer metadata and may be 0 here.
 //   4. K and V staging is cp.async double-buffered per key tile; the V tile is
 //      padded to a 16-byte-aligned stride (BK+8 halves) so every cp.async is a
 //      16-byte transfer.
@@ -634,8 +638,10 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Query-resident variant: the d512 f16 default (SONICBOOM_BOOM_FATTN_QREG=1).
-// SONICBOOM_BOOM_FATTN_QREG=0 selects the previous kernel above as the fallback.
+// Query-resident variant: the d512 f16 default (SONICBOOM_BOOM_FATTN_QREG=1)
+// and the d256 f16 default (SONICBOOM_BOOM_FATTN_D256=1; NW and the tile
+// geometry differ per head width). The 0 modes select the previous kernel
+// above as the explicit fallback.
 //
 // The baseline kernel re-reads each unit's Q slice from global memory once per
 // key tile: 16 KB per unit per 16-key tile, 128 KB per block per tile, which
@@ -1015,8 +1021,9 @@ void debug_check(const char* stage, cudaStream_t stream) {
 //               (control: isolates the split from the smaller query tile and
 //               block, which modes 1 and 2 also change)
 // Modes 0-3 apply to head_dim 512 with the default f16 accumulator only; the
-// d256 and f32-accumulator configurations have no QREG variant and keep their
-// previous kernels regardless of this setting.
+// d256 configuration has its own variant and switch below, and the
+// f32-accumulator configuration keeps its previous kernel regardless of this
+// setting.
 // Read per call so the variants can be benchmarked in one process.
 int qreg_mode() {
   const char* e = std::getenv("SONICBOOM_BOOM_FATTN_QREG");
@@ -1025,6 +1032,28 @@ int qreg_mode() {
   if (std::string_view(e) == "1") return 1;
   if (std::string_view(e) == "2") return 2;
   if (std::string_view(e) == "3") return 3;
+  return 1;
+}
+
+// SONICBOOM_BOOM_FATTN_D256 selects the d256 head-width kernel (window-agnostic;
+// the windowed traversal is driven by the per-layer window argument):
+//   1 (default) query-resident, QK^T split over 4 dim slices, BR16/BK16,
+//               512-thread block (the d512 mode-1 schedule at this head width)
+//   0           the previous kernel: BR32/BK32, phase 1 on the slice-0 warps,
+//               Q re-read from global per key tile (explicit fallback)
+//   2           split QK^T only, Q still re-read per key tile (control)
+//   3           BR16/BK16 without the split (control: isolates the geometry)
+//   4           as 1 but split over 8 dim slices (1024-thread block; control)
+// The d256 f32-accumulator configuration keeps its previous kernel regardless
+// of this setting.
+int d256_mode() {
+  const char* e = std::getenv("SONICBOOM_BOOM_FATTN_D256");
+  if (e == nullptr) return 1;
+  if (std::string_view(e) == "0") return 0;
+  if (std::string_view(e) == "1") return 1;
+  if (std::string_view(e) == "2") return 2;
+  if (std::string_view(e) == "3") return 3;
+  if (std::string_view(e) == "4") return 4;
   return 1;
 }
 
@@ -1191,10 +1220,28 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
         n_heads_kv, sliding_window, scale, out, kv_f16);
   }
   if (head_dim == 256) {
-    if (acc_f16())
-      return run_chunk<256, 4, 32, 32, 4, true>(
+    if (acc_f16()) {
+      const int mode = d256_mode();
+      if (mode == 0)
+        return run_chunk<256, 4, 32, 32, 4, true>(
+            q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+            n_heads_q, n_heads_kv, sliding_window, scale, out, kv_f16);
+      if (mode == 2)
+        return run_chunk<256, 4, 16, 16, 4, true, true, false>(
+            q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+            n_heads_q, n_heads_kv, sliding_window, scale, out, kv_f16);
+      if (mode == 3)
+        return run_chunk<256, 4, 16, 16, 4, true>(
+            q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+            n_heads_q, n_heads_kv, sliding_window, scale, out, kv_f16);
+      if (mode == 4)
+        return run_chunk<256, 4, 16, 16, 8, true, true, true>(
+            q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n,
+            n_heads_q, n_heads_kv, sliding_window, scale, out, kv_f16);
+      return run_chunk<256, 4, 16, 16, 4, true, true, true>(
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
           n_heads_kv, sliding_window, scale, out, kv_f16);
+    }
     return run_chunk<256, 4, 32, 32, 4, false>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out, kv_f16);
@@ -1222,10 +1269,21 @@ bool flash_attention_boom_fattn_config(int head_dim, int gqa, int* br, int* bk,
     return true;
   }
   if (head_dim == 256) {
-    if (acc_f16())
-      describe<256, 4, 32, 32, 4, true>(br, bk, block, smem);
-    else
+    if (acc_f16()) {
+      const int mode = d256_mode();
+      if (mode == 0)
+        describe<256, 4, 32, 32, 4, true>(br, bk, block, smem);
+      else if (mode == 2)
+        describe<256, 4, 16, 16, 4, true, true, false>(br, bk, block, smem);
+      else if (mode == 3)
+        describe<256, 4, 16, 16, 4, true>(br, bk, block, smem);
+      else if (mode == 4)
+        describe<256, 4, 16, 16, 8, true, true, true>(br, bk, block, smem);
+      else
+        describe<256, 4, 16, 16, 4, true, true, true>(br, bk, block, smem);
+    } else {
       describe<256, 4, 32, 32, 4, false>(br, bk, block, smem);
+    }
     return true;
   }
   return false;
