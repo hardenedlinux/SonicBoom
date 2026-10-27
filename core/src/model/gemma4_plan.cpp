@@ -1466,6 +1466,23 @@ struct DecodeRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;    // device-resident compute
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;             // captured greedy decode step
+  // Multi-tier capture (SONICBOOM_DECODE_MULTIGRAPH): one captured graph per
+  // depth tier, so the per-node launch geometry follows the tier. `prog` is
+  // tier 0; prog_tier[1..tier_count-1] are the later tiers. tier_cap is
+  // ascending and the last entry is n_ctx, so a position selects exactly one
+  // graph and no replay can use a grid sized below its key count.
+  std::unique_ptr<hal::StepProgram> prog_tier[nn::cuda::kDecodeTierCount];
+  uint64_t tier_cap[nn::cuda::kDecodeTierCount] = {};
+  int tier_count = 0;  // <= 1: the single `prog`
+  hal::StepProgram* step_at(uint64_t pos) {
+    if (tier_count <= 1) return prog.get();
+    const uint64_t n_keys = pos + 1;
+    // The smallest tier whose capacity covers the key count; tier 0 is `prog`.
+    if (n_keys <= tier_cap[0]) return prog.get();
+    for (int t = 1; t < tier_count; ++t)
+      if (n_keys <= tier_cap[t]) return prog_tier[t].get();
+    return prog_tier[tier_count - 1].get();
+  }
   // One-step capture on the same chunked backend, used only by constrained
   // decoding: the chunk graph replays k steps from device-side feedback, so a
   // host-computed grammar mask can only be applied between replays, while this
@@ -1678,7 +1695,8 @@ static uint64_t run_program_steps(
       const std::string name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(name.c_str());
       rt.cuda->set_pos(pos);
-      if (!rt.prog->replay()) {
+      hal::StepProgram* step_prog = rt.step_at(pos);
+      if (!step_prog || !step_prog->replay()) {
         if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
@@ -1998,7 +2016,8 @@ static uint64_t run_spec_program_steps(
         break;
       }
       rt.cuda->set_pos(L);
-      if (!rt.cuda->seed_token(token) || !rt.prog->replay()) {
+      hal::StepProgram* step_prog = rt.step_at(L);
+      if (!rt.cuda->seed_token(token) || !step_prog || !step_prog->replay()) {
         std::cerr << "[spec] the k == 0 decode step failed at position " << L
                   << "\n";
         break;
@@ -2255,8 +2274,6 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
     // pooled buffer the capture records is already allocated.
     rt->cuda->enable_decode_chunking(decode_chunk_size());
     const uint32_t k = rt->cuda->decode_chunk();
-    rt->cuda->seed_token(0);
-    rt->cuda->set_pos(0);
     auto run_steps = [&]() {
       for (uint32_t j = 0; j < k; ++j) {
         if (!rt->cuda->set_step_index(j)) return false;
@@ -2268,23 +2285,80 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       }
       return true;
     };
-    if (run_steps()) {
-      rt->cuda->synchronize();
+
+    // Multi-tier capture: one graph per depth tier, each with that tier's
+    // launch geometry baked in. Every tier is warmed before the first capture:
+    // the warm-up allocates the pooled buffers and the split-KV partial scratch
+    // for that tier's grid (grow_scratch frees the old buffer, which a graph
+    // captured earlier would still point at) and loads the JIT'd module.
+    bool captured = false;
+    if (k == 1 && nn::cuda::decode_multigraph_enabled()) {
+      const auto t0 = std::chrono::steady_clock::now();
+      uint64_t caps[nn::cuda::kDecodeTierCount];
+      const int nt = nn::cuda::decode_tier_caps(n_ctx, caps);
+      bool ok = true;
+      for (int t = 0; t < nt && ok; ++t) {
+        rt->cuda->set_capture_tier(t);
+        ok = rt->cuda->seed_token(0) && rt->cuda->set_pos(0) && run_steps();
+        rt->cuda->synchronize();
+      }
+      std::unique_ptr<hal::StepProgram> progs[nn::cuda::kDecodeTierCount];
+      if (ok) {
+        for (int t = 0; t < nt; ++t) {
+          rt->cuda->set_capture_tier(t);
+          if (!rt->cuda->seed_token(0) || !rt->cuda->set_pos(0)) {
+            ok = false;
+            break;
+          }
+          progs[t] = rt->cuda->record_step([&]() { return run_steps(); });
+          if (!progs[t]) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      rt->cuda->set_capture_tier(-1);
+      if (ok) {
+        rt->prog = std::move(progs[0]);
+        for (int t = 1; t < nt; ++t) rt->prog_tier[t] = std::move(progs[t]);
+        rt->tier_count = nt;
+        for (int t = 0; t < nt; ++t) rt->tier_cap[t] = caps[t];
+        rt->prog_cache = rt->cuda->cache_identity();
+        captured = true;
+        using ms = std::chrono::duration<double, std::milli>;
+        std::cerr << "[decode-tiers] " << nt << " decode graphs in "
+                  << ms(std::chrono::steady_clock::now() - t0).count()
+                  << " ms (warm-up + capture); caps=";
+        for (int t = 0; t < nt; ++t)
+          std::cerr << (t ? "," : "") << caps[t];
+        std::cerr << "\n";
+      }
+    }
+
+    if (!captured) {
+      // The single-graph path (unchanged default): one capture covering every
+      // position, with the class schedule. Also the fallback when a tier
+      // capture failed.
       rt->cuda->seed_token(0);
-      rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
-      if (rt->prog) rt->prog_cache = rt->cuda->cache_identity();
-      // Constrained decoding's one-step view of the same chunked backend: step
-      // 0 reads the staged carry token and position 0, writes token 0.
-      if (rt->prog && k > 1) {
-        auto run_one = [&]() {
-          if (!rt->cuda->set_step_index(0)) return false;
-          std::vector<sx::Bytes> in;
-          in.push_back(encode_i64(0));
-          in.push_back(encode_i64(0));
-          return bool(rt->exec->execute(rt->plan, rt->snap, in));
-        };
-        rt->prog_one = rt->cuda->record_step(run_one);
-        if (rt->prog_one) rt->prog_one_cache = rt->cuda->cache_identity();
+      rt->cuda->set_pos(0);
+      if (run_steps()) {
+        rt->cuda->synchronize();
+        rt->cuda->seed_token(0);
+        rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
+        if (rt->prog) rt->prog_cache = rt->cuda->cache_identity();
+        // Constrained decoding's one-step view of the same chunked backend: step
+        // 0 reads the staged carry token and position 0, writes token 0.
+        if (rt->prog && k > 1) {
+          auto run_one = [&]() {
+            if (!rt->cuda->set_step_index(0)) return false;
+            std::vector<sx::Bytes> in;
+            in.push_back(encode_i64(0));
+            in.push_back(encode_i64(0));
+            return bool(rt->exec->execute(rt->plan, rt->snap, in));
+          };
+          rt->prog_one = rt->cuda->record_step(run_one);
+          if (rt->prog_one) rt->prog_one_cache = rt->cuda->cache_identity();
+        }
       }
     }
     // No re-playable graph (capture failed, e.g. a plan whose decode step has a
@@ -2761,7 +2835,8 @@ static bool spec_probe_measure(const Gemma4Model& m, DecodeRuntime* rt,
   auto plain = [&](uint64_t p) -> double {
     const auto t0 = std::chrono::steady_clock::now();
     float tok = -1.0f;
-    if (!rt->cuda->set_pos(p) || !rt->prog->replay() ||
+    hal::StepProgram* step_prog = rt->step_at(p);
+    if (!step_prog || !rt->cuda->set_pos(p) || !step_prog->replay() ||
         !rt->cuda->read_token(&tok))
       return -1.0;
     return ms_since(t0);
@@ -3115,8 +3190,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       ok = rt->cuda->stage_chunk(*rt->prog_one, float(token), positions) &&
            rt->prog_one->replay() &&
            rt->cuda->read_chunk_tokens(&next_f, 1);
-    } else if (rt->prog) {
-      ok = rt->cuda->set_pos(pos) && rt->prog->replay() &&
+    } else if (hal::StepProgram* step_prog = rt->step_at(pos)) {
+      ok = rt->cuda->set_pos(pos) && step_prog->replay() &&
            rt->cuda->read_token(&next_f);
     } else {
       std::vector<sx::Bytes> in;
@@ -3200,7 +3275,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       const std::string step_name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(step_name.c_str());
       rt->cuda->set_pos(pos);
-      if (!rt->prog->replay()) {
+      hal::StepProgram* step_prog = rt->step_at(pos);
+      if (!step_prog || !step_prog->replay()) {
         if (nvtx_enabled()) nvtxRangePop();
         std::cerr << "[spine] step " << step << " graph replay failed\n";
         break;
@@ -4095,7 +4171,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   } else if (!dump_logits && rt->prog) {
     for (; step < tokens.size(); ++step) {
       rt->cuda->set_pos(pos);
-      if (!rt->prog->replay()) {
+      hal::StepProgram* step_prog = rt->step_at(pos);
+      if (!step_prog || !step_prog->replay()) {
         std::cerr << "[prefill-spine-cuda] step " << step
                   << " graph replay failed\n";
         break;

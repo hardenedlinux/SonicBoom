@@ -1044,12 +1044,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       double attn_scale = 1.0;
       attr_f(*node, "scale", attn_scale);
       nn::cuda::attention_trace_set_layer(int(layer));  // no-op when tracing off
+      // Multi-tier capture: `capture_tier_` is -1 outside a tier capture, so
+      // the ordinary dispatch keeps the single class schedule.
       ok = nn::cuda::decode_attention_dev(
           dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
           reinterpret_cast<const uint64_t*>(pos_slot()), window, cache.n_slots,
           int(lc.n_heads_q), int(cache.n_heads_kv), int(cache.head_dim),
           lc.sliding_window, float(attn_scale), out, 0, cache.f16(),
-          uint64_t(decode_chunk), cache.q8());
+          uint64_t(decode_chunk), cache.q8(), capture_tier_);
       break;
     }
     case OpKind::GqaBroadcast: {

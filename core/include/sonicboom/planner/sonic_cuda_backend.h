@@ -207,6 +207,16 @@ public:
   // pointers are already the per-step ones, so it is not consulted.
   bool set_step_index(uint32_t index);
 
+  // --- multi-tier decode graphs --------------------------------------------
+  //
+  // The depth tier a step is being warmed/captured for (-1 = none). The decode
+  // attention dispatch passes it through so each captured graph bakes in the
+  // tier's launch geometry; at replay the tier is already in the graph and the
+  // host only selects which program to launch. Set around the warm-up and the
+  // capture of each tier by the decode runtime; never consulted at replay.
+  void set_capture_tier(int tier) { capture_tier_ = tier; }
+  int capture_tier() const { return capture_tier_; }
+
   // Stage a chunk's carry token and k positions onto the program's stream,
   // ordered before its next replay. `positions.size()` must be the chunk size.
   bool stage_chunk(hal::StepProgram& prog, float carry,
@@ -301,6 +311,7 @@ private:
   int sample_vocab_ = 0;            // the width the candidate buffers were sized for
   uint32_t chunk_ = 1;              // decode steps captured per graph
   uint32_t step_index_ = 0;         // which step the next execute() is
+  int capture_tier_ = -1;           // depth tier being warmed/captured (-1 off)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
 

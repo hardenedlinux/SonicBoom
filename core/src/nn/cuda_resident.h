@@ -134,13 +134,40 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
 // absolute (key position / chunk) and partials merge in ascending chunk order,
 // so the reduction tree depends only on key positions, never on the window
 // capacity or the current depth.
+// `tier` is the capture-time decode depth tier (-1 = off, the default): when
+// multi-tier decode graphs are active the host captures one graph per tier and
+// passes that tier here, so the launch geometry (split-KV chunk, query heads per
+// block, grid window) is baked into the graph for that tier. The tier's grid
+// window is the tier capacity, not the full cache capacity, so a captured graph
+// covers exactly the key counts it is selected for; replay selection stays a
+// host-side choice of graph, never a kernel-node parameter update.
 bool decode_attention_dev(const float* q, const float* k_cache,
                           const float* v_cache, const uint64_t* pos,
                           uint64_t window, uint64_t n_slots, int n_heads_q,
                           int n_heads_kv, int head_dim, uint64_t sliding_window,
                           float scale, float* out, int pos_offset = 0,
                           bool kv_f16 = false, uint64_t chunk_attr = 0,
-                          bool kv_q8 = false);
+                          bool kv_q8 = false, int tier = -1);
+
+// --- multi-tier decode graphs ----------------------------------------------
+//
+// Depth tiers: fixed key-count boundaries, the last the runtime capacity. A
+// greedy decode runtime captures one graph per tier so the per-node launch
+// geometry can follow the tier (W: split-KV chunk; P3: query heads per block)
+// while a replay stays one graph launch.
+constexpr int kDecodeTierCount = 4;
+
+// Capture one decode graph per depth tier. Opt-in (SONICBOOM_DECODE_MULTIGRAPH=1)
+// because it changes the number of captured graphs; with it off the runtime
+// captures the single graph it always has.
+bool decode_multigraph_enabled();
+
+// The tier capacities for a cache whose maximum key count is `keys_capacity`
+// (n_ctx for a causal layer, the sliding window for a windowed one). Writes an
+// ascending list, last == keys_capacity, at most kDecodeTierCount entries, and
+// returns its length (>= 1).
+int decode_tier_caps(uint64_t keys_capacity,
+                     uint64_t caps[kDecodeTierCount]);
 
 // Resolve the split-KV chunk size for one decode attention class (head_dim,
 // GQA ratio, head counts, causal vs windowed, KV element type). Returns the
