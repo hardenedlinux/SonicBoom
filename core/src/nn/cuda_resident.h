@@ -231,6 +231,41 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    float* out, bool kv_f16 = false,
                                    bool kv_q8 = false);
 
+// Same contract as flash_attention_chunk_dev_pos, computed by the imported
+// ggml mma flash-attention kernel (the pinned llama.cpp commit's prefill
+// kernel). Selected explicitly by SONICBOOM_ATTN_IMPL=ggml; "auto" never
+// chooses it. Returns false without launching anything when the shape or the
+// KV storage is not covered (q8 cache, unknown head_dim/GQA); the caller then
+// takes the native path. kv_f16/kv_q8 describe the cache storage exactly as
+// in flash_attention_chunk_dev_pos.
+bool flash_attention_ggml_chunk_dev_pos(
+    const float* q, const float* k_batch, const float* v_batch,
+    const float* k_cache, const float* v_cache, const uint64_t* start,
+    uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
+    uint64_t sliding_window, float scale, float* out, bool kv_f16 = false,
+    bool kv_q8 = false);
+
+// Same contract, computed by SonicBoom's own "GGML-inspired" kernel
+// (core/src/nn/fattn_boom_fattn.cu): f16 KV span materialization, tiled MMA
+// with an online softmax, GQA query grouping and cp.async staging, with the
+// causal/window mask derived in registers. This is SonicBoom's own
+// `boom_fattn` backend, selected explicitly by
+// SONICBOOM_ATTN_IMPL=boom_fattn; "auto" never chooses it. Returns false
+// without launching anything for q8 caches or shapes it has no instantiation
+// for.
+bool flash_attention_boom_fattn_chunk_dev_pos(
+    const float* q, const float* k_batch, const float* v_batch,
+    const float* k_cache, const float* v_cache, const uint64_t* start,
+    uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
+    uint64_t sliding_window, float scale, float* out, bool kv_f16 = false,
+    bool kv_q8 = false);
+
+// Launch geometry the boom_fattn backend would use for this shape class
+// (query tile, key tile, block threads, dynamic smem), for the attention trace
+// and the planner's cost model. False when the backend has no instantiation.
+bool flash_attention_boom_fattn_config(int head_dim, int gqa, int* br, int* bk,
+                                       int* block, size_t* smem);
+
 // Attention work trace (SONICBOOM_ATTN_TRACE=1). The backend sets the layer
 // before the call; the attention entry points then print one line per call to
 // stderr with the shape, the implementation/config chosen, the KV extent the

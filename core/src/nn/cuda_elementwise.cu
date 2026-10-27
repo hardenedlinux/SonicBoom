@@ -6278,6 +6278,57 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
   //     wider head): gqa 7, head_dim 64.
   const int gqa = n_heads_q / n_heads_kv;
 
+  // Attention implementation switch (v1). "auto" (the default) resolves the
+  // shape class through the runtime tuner or its static defaults below; "own"
+  // pins the native kernel; "codegen" pins the compiler-generated FA-2 kernel;
+  // "ggml" pins the imported ggml mma kernel (a removable measurement backend
+  // that "auto" never selects) and falls through to the native path for shapes
+  // or KV storage it does not cover. "boom_fattn" pins SonicBoom's own
+  // GGML-inspired kernel. SONICBOOM_ATTN_PREFILL overrides the choice for this
+  // prefill leg only, for every shape class.
+  const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
+  std::string_view attn_impl =
+      attn_impl_env ? std::string_view(attn_impl_env) : std::string_view("auto");
+  if (const char *e = std::getenv("SONICBOOM_ATTN_PREFILL"); e != nullptr &&
+      (std::string_view(e) == "own" || std::string_view(e) == "codegen" ||
+       std::string_view(e) == "ggml" || std::string_view(e) == "boom_fattn"))
+    attn_impl = e;
+
+  // boom_fattn (SonicBoom's own GGML-inspired kernel): explicit opt-in only,
+  // and it falls through to the native path for shapes/KV storage it does not
+  // cover.
+  if (attn_impl == "boom_fattn" &&
+      flash_attention_boom_fattn_chunk_dev_pos(
+          q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+          n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8)) {
+    int sbr = 0, sbk = 0, sblock = 0;
+    size_t ssmem = 0;
+    flash_attention_boom_fattn_config(head_dim, gqa, &sbr, &sbk, &sblock,
+                                      &ssmem);
+    const char* acc_env = std::getenv("SONICBOOM_BOOM_FATTN_ACC");
+    char scfg[80];
+    std::snprintf(scfg, sizeof(scfg), "BR%d,BK%d,acc=%s", sbr, sbk,
+                  acc_env != nullptr && std::string_view(acc_env) == "f32"
+                      ? "f32"
+                      : "f16");
+    attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                       sliding_window,
+                       kv_f16 ? "boom_fattn-mma-kv16" : "boom_fattn-mma", scfg,
+                       sbr, sbk, (n + sbr - 1) / sbr, n_heads_kv, sblock,
+                       ssmem);
+    return true;
+  }
+
+  if (attn_impl == "ggml" &&
+      flash_attention_ggml_chunk_dev_pos(
+          q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+          n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8)) {
+    attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                       sliding_window, kv_f16 ? "ggml-mma-kv16" : "ggml-mma",
+                       "llama.cpp-pinned", 1, n, n, n_heads_q, 0, 0);
+    return true;
+  }
+
   // R10 Stage B: strict-order shared-memory tiled kernel for the d128/gqa6
   // class (window-less causal KV-cache prefill). It reproduces the scalar
   // kernel's FP associations — the differential test compares it bit-for-bit
@@ -6305,36 +6356,13 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
     }
   }
 
-  // Attention implementation switch (v1 Stages 2-3). "auto" (default)
-  // resolves the shape class through the runtime tuner (attn_resolve, Step 7)
-  // or its static defaults when tuning is off; its key is the shape class and
-  // not the batch size, so a reused prefix takes the same path as a full
-  // prefill. "own" pins the native tiled kernel below, "codegen" the
-  // compiler-generated FA-2 kernel; the pinned implementations fall back to
-  // the native kernel for shapes they do not cover. "ggml" was the imported
-  // mma kernel, now retired: it maps to "auto" (once, with a warning) rather
-  // than failing, so an old script still runs the measured choice instead of
-  // silently changing behavior.
-  const char* attn_impl_env = std::getenv("SONICBOOM_ATTN_IMPL");
-  std::string_view attn_impl =
-      attn_impl_env ? std::string_view(attn_impl_env) : std::string_view("auto");
-  if (attn_impl == "ggml") {
-    static const bool warned = [] {
-      std::fprintf(stderr,
-                   "[attention] SONICBOOM_ATTN_IMPL=ggml is retired; using "
-                   "auto\n");
-      return true;
-    }();
-    (void)warned;
-    attn_impl = "auto";
-  }
-  // Prefill-only ablation switch (D0): SONICBOOM_ATTN_PREFILL=own reverts this
-  // leg to the hand-written tiled kernel for every shape class, leaving the
-  // decode leg's implementation untouched. "codegen" pins the generated
-  // default shape, "auto" (or unset) keeps the normal resolution.
-  if (const char *e = std::getenv("SONICBOOM_ATTN_PREFILL"); e != nullptr &&
-      (std::string_view(e) == "own" || std::string_view(e) == "codegen"))
-    attn_impl = e;
+  // The implementation choice was resolved at the top of this function (it
+  // must be known before the d128 exact-kernel default, which is the "own"
+  // arm). "auto" resolves the shape class through the runtime tuner
+  // (attn_resolve, Step 7) or its static defaults when tuning is off; its key
+  // is the shape class and not the batch size, so a reused prefix takes the
+  // same path as a full prefill. Every other value falls through to the native
+  // kernels for shapes it does not cover.
   std::optional<compiler::AttentionShape> shape;
   auto with_kv = [&](std::optional<compiler::AttentionShape> s) {
     if (s) {
