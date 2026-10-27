@@ -421,7 +421,13 @@ float loss_value(const Result &r) {
 }
 
 int main(int argc, char **argv) {
-  const char *fixture = "tests/data/train/tiny-train.sx";
+#ifdef SONICBOOM_PRIVATE_DATA_DIR
+  const std::string default_fixture =
+      std::string(SONICBOOM_PRIVATE_DATA_DIR) + "/train/tiny-train.sx";
+  const char *fixture = default_fixture.c_str();
+#else
+  const char *fixture = nullptr;
+#endif
   int gate_steps = 50;
   int timed_steps = 20;
   int repeats = 3;
@@ -435,6 +441,9 @@ int main(int argc, char **argv) {
     else if (!std::strcmp(argv[i], "--loss-trace")) g_loss_trace = true;
     else die(std::string("unknown argument ") + argv[i]);
   }
+  if (fixture == nullptr)
+    die("no --fixture and SONICBOOM_PRIVATE_DATA_DIR is not set; the bench "
+        "input lives in the private suite's tests/data");
   const std::string text = read_file(fixture);
 
   const char *g = std::getenv("SONICBOOM_TRAIN_GRAPH");

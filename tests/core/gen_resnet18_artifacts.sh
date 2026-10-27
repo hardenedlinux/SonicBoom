@@ -3,13 +3,14 @@
 # Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 #
 # CTest setup fixture for the two end-to-end ResNet-18 tests. It regenerates
-# every artifact they read, none of which is committed:
+# every artifact they read into the build tree, none of which is committed:
 #
 #   <build>/import/resnet18.sx            importer output (S-Expr)
-#   <build>/import/resnet18.weights.bin   importer weight sidecar
-#   tests/data/resnet18.weights.bin       frozen-fixture weight sidecar
-#   tests/data/resnet18.input.bin         deterministic input (seed 1234)
-#   tests/data/resnet18.reference.bin     ONNX reference logits
+#   <build>/import/resnet18.weights.bin   weight sidecar (both tests)
+#   <build>/import/resnet18.input.bin     deterministic input (seed 1234)
+#   <build>/import/resnet18.reference.bin ONNX reference logits
+#
+# The model-derived sidecars are never written into the source tree.
 #
 # Usage: gen_resnet18_artifacts.sh <source-root> <python> <import-dir>
 #
@@ -32,12 +33,12 @@ fi
 mkdir -p "$import_dir"
 
 # A fixture setup runs on every ctest invocation; skip the ~46 MB of sidecars
-# when they are already newer than the model they derive from.
+# when they are already newer than the model they derive from. Only build-tree
+# outputs are checked: the source tree holds no generated sidecars.
 fresh=1
 for out in "$import_dir/resnet18.sx" "$import_dir/resnet18.weights.bin" \
-           "$root/tests/data/resnet18.weights.bin" \
-           "$root/tests/data/resnet18.input.bin" \
-           "$root/tests/data/resnet18.reference.bin"; do
+           "$import_dir/resnet18.input.bin" \
+           "$import_dir/resnet18.reference.bin"; do
     if [ ! -f "$out" ] || [ "$onnx" -nt "$out" ]; then
         fresh=0
     fi
@@ -48,6 +49,11 @@ if [ "$fresh" -eq 1 ]; then
 fi
 
 cd "$root"
+# The reference generator writes the frozen-fixture weight sidecar (plus the
+# input and reference logits); the importer then writes its own sidecar, which
+# the two tests consume. The importer runs last so that the end-to-end ONNX
+# test still exercises the importer's weight emission rather than the
+# generator's — the two layouts are byte-identical.
+"$python" "$root/tools/reference/gen_resnet18_reference.py" "$import_dir"
 PYTHONPATH="$root/tools" "$python" -m onnx2sx "$onnx" \
     -o "$import_dir/resnet18.sx" --weights-dir "$import_dir"
-"$python" "$root/tools/reference/gen_resnet18_reference.py"
