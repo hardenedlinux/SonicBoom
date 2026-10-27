@@ -15,8 +15,9 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // test_s_expr_resnet18.cpp — integration test: parse the frozen ResNet-18
-// S-Expr v0.1 example document (tests/data/s-expr-v0-resnet18.example.sx) end to
-// end and verify it validates. No <cassert>: Release build disables it.
+// S-Expr v0.1 example document end to end and verify it validates. The fixture
+// is test data and lives with the private suites; without it the test skips.
+// No <cassert>: Release build disables it.
 
 #include <sonicboom/sx/parser.h>
 
@@ -25,17 +26,22 @@
 #include <sstream>
 #include <string>
 
-#ifndef SONICBOOM_SRC_DIR
-#error "SONICBOOM_SRC_DIR must be defined to the repository root"
+#ifndef SONICBOOM_PRIVATE_DATA_DIR
+#define SONICBOOM_PRIVATE_DATA_DIR ""
 #endif
 
 int main() {
-  const std::string path =
-      std::string(SONICBOOM_SRC_DIR) + "/tests/data/s-expr-v0-resnet18.example.sx";
+  if (SONICBOOM_PRIVATE_DATA_DIR[0] == '\0') {
+    std::cout << "SKIP: private test data not configured "
+                 "(SONICBOOM_PRIVATE_TESTS_DIR)\n";
+    return 77;
+  }
+  const std::string path = std::string(SONICBOOM_PRIVATE_DATA_DIR) +
+                           "/resnet18/s-expr-v0-resnet18.example.sx";
   std::ifstream in(path);
   if (!in) {
-    std::cerr << "cannot open " << path << "\n";
-    return 1;
+    std::cout << "SKIP: " << path << " is missing\n";
+    return 77;
   }
   std::ostringstream ss;
   ss << in.rdbuf();

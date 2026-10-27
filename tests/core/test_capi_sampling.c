@@ -144,11 +144,18 @@ static run_result run_plain(sb_llm_model *model, const sb_token *prompt,
   return r;
 }
 
-// Read the greedy golden's `cuda` token line from p1.standard.golden.
-static int read_golden(const char *root, int64_t *out, size_t cap,
-                       size_t *n_out) {
+#ifndef SONICBOOM_PRIVATE_DATA_DIR
+#define SONICBOOM_PRIVATE_DATA_DIR ""
+#endif
+
+// Read the greedy golden's `cuda` token line from p1.standard.golden. The
+// golden is test data and lives with the private suites; a public-only build
+// has none and the caller skips.
+static int read_golden(int64_t *out, size_t cap, size_t *n_out) {
+  if (SONICBOOM_PRIVATE_DATA_DIR[0] == '\0') return 0;
   char path[4096];
-  snprintf(path, sizeof path, "%s/tests/data/qwen2/p1.standard.golden", root);
+  snprintf(path, sizeof path, "%s/qwen2/p1.standard.golden",
+           SONICBOOM_PRIVATE_DATA_DIR);
   FILE *f = fopen(path, "r");
   if (!f) return 0;
   char line[8192];
@@ -177,7 +184,7 @@ static int read_golden(const char *root, int64_t *out, size_t cap,
 #endif
 
 int main(void) {
-  // Pin the numerics-bearing choices tests/data/qwen2's goldens were recorded
+  // Pin the numerics-bearing choices the private qwen2 goldens were recorded
   // under (the same pins test_qwen2_generate sets).
   setenv("SONICBOOM_MMQ_DECOMP", "tiled", 0);
   setenv("SONICBOOM_ATTN_DECODE_CHUNK", "256", 0);
@@ -201,7 +208,7 @@ int main(void) {
 
   int64_t golden[256];
   size_t n_golden = 0;
-  if (!read_golden(root, golden, 256, &n_golden) || n_golden < 32) {
+  if (!read_golden(golden, 256, &n_golden) || n_golden < 32) {
     fprintf(stderr, "SKIP: golden absent\n");
     return 77;
   }

@@ -22,7 +22,8 @@ S-Expr v0.1 remains the canonical interchange format. The importer is a
 - Its output is ordinary S-Expr v0.1 text — it does **not** bypass the parser or
   the validator, and it introduces **no new syntax**.
 - The generated document is parsed/validated/lowered by exactly the same code
-  that consumes the hand-authored fixture (`tests/data/s-expr-v0-resnet18.example.sx`).
+  that consumes the hand-authored ResNet-18 fixture (kept with the private test
+  suites, not in this repository).
 - Nothing in this tool is linked into `libsonicboom.so`; the C ABI and Layer 2
   interfaces are unchanged, and no ONNX/protobuf/MLIR/LLVM/ATen/c10 type appears
   in them.
@@ -107,7 +108,7 @@ The sidecar's byte ordering is `np.ascontiguousarray(arr).tobytes()`
 (little-endian on all supported hosts); offsets/lengths are recomputed from the
 accumulated blob so they are always self-consistent. The importer's ResNet-18
 sidecar is byte-identical to the reference generator's
-`tests/data/resnet18.weights.bin`, confirming exact ordering.
+`<build-dir>/import/resnet18.weights.bin`, confirming exact ordering.
 
 ## Shape inference
 
@@ -170,9 +171,12 @@ Nonzero exit on any load/convert/write failure, with a single actionable line.
 
 `tests/core/test_onnx_import_resnet18_exec.cpp` re-runs the full ResNet-18
 pipeline over **generated** artifacts (not the hand-authored fixture): it parses
-`build/import/resnet18.sx`, loads `build/import/resnet18.weights.bin`, feeds the
-deterministic seed-1234 input, and compares the `[1,1000]` logits against the
-independent `onnx.reference.ReferenceEvaluator` oracle.
+`<build-dir>/import/resnet18.sx`, loads `<build-dir>/import/resnet18.weights.bin`,
+feeds the deterministic seed-1234 input from
+`<build-dir>/import/resnet18.input.bin`, and compares the `[1,1000]` logits
+against the independent `onnx.reference.ReferenceEvaluator` oracle in
+`<build-dir>/import/resnet18.reference.bin`. The sidecars are generated into the
+build tree; none is stored in the source tree.
 
 | Metric | Value |
 |---|---|

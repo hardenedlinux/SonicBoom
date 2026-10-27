@@ -4,25 +4,32 @@
 #
 # Development-time test oracle for the SonicBoom ResNet-18 CPU execution path.
 # This is NOT a SonicBoom runtime dependency and never runs as part of the
-# build. It generates three byte-level artifacts from models/resnet18.onnx:
+# build. It generates three byte-level artifacts under the output directory
+# given on the command line (normally <build-dir>/import/, outside the source
+# tree) from models/resnet18.onnx:
 #
-#   1. tests/data/resnet18.weights.bin — the flat float32 weight sidecar that
-#      the frozen fixture tests/data/s-expr-v0-resnet18.example.sx references by
+#   1. <output-dir>/resnet18.weights.bin — the flat float32 weight sidecar that
+#      the frozen private fixture tests/data/resnet18/
+#      s-expr-v0-resnet18.example.sx references by
 #      (:external file offset length). It is the concatenation, in the exact
 #      order and byte offsets declared by the fixture, of the 42 float32 ONNX
 #      initializers (20 conv weights, fc.weight, fc.bias, 20 conv biases). The
 #      two int64 constants (val_187 / val_191) are inlined with :values in the
 #      fixture and are therefore absent from the sidecar.
 #
-#   2. tests/data/resnet18.input.bin  — one deterministic float32 input
+#   2. <output-dir>/resnet18.input.bin  — one deterministic float32 input
 #      [1,3,224,224] (NCHW, row-major), drawn from a fixed seed.
 #
-#   3. tests/data/resnet18.reference.bin — the [1,1000] float32 output produced by
-#      ONNX's own reference evaluator (onnx.reference.ReferenceEvaluator) for
+#   3. <output-dir>/resnet18.reference.bin — the [1,1000] float32 output produced
+#      by ONNX's own reference evaluator (onnx.reference.ReferenceEvaluator) for
 #      that input. This is the independent ground truth the C++ test compares
 #      against.
 #
-# Usage:  models/.venv/bin/python tools/reference/gen_resnet18_reference.py
+# The sidecars are model-derived test data and are never written into the
+# source tree.
+#
+# Usage:  models/.venv/bin/python tools/reference/gen_resnet18_reference.py \
+#             <output-dir>
 #
 # The script is self-checking: it parses the frozen fixture for the exact
 # (:external file offset length) layout and asserts the concatenated weights
@@ -38,8 +45,12 @@ from onnx.reference import ReferenceEvaluator
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODELS = os.path.join(REPO, "models")
-DATA = os.path.join(REPO, "tests", "data")
-FIXTURE = os.path.join(DATA, "s-expr-v0-resnet18.example.sx")
+# The fixture is test data and lives with the private suites. The public build
+# passes SONICBOOM_PRIVATE_DATA_DIR (from SONICBOOM_PRIVATE_TESTS_DIR/data);
+# without it there is nothing to generate from and the CTest fixture skips.
+DATA = os.environ.get("SONICBOOM_PRIVATE_DATA_DIR", "")
+FIXTURE = (os.path.join(DATA, "resnet18", "s-expr-v0-resnet18.example.sx")
+           if DATA else "")
 ONNX_PATH = os.path.join(MODELS, "resnet18.onnx")
 
 # Deterministic input seed (documented in the lowering/execution docs).
@@ -115,7 +126,21 @@ def parse_parameters(tree):
     return result
 
 
-def main():
+def main(argv):
+    if len(argv) != 2:
+        sys.stderr.write(
+            "usage: gen_resnet18_reference.py <output-dir>\n"
+            "  <output-dir> receives resnet18.{weights,input,reference}.bin;\n"
+            "  use the build tree's import directory, never the source tree.\n")
+        return 2
+    out_dir = argv[1]
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not FIXTURE or not os.path.isfile(FIXTURE):
+        sys.stderr.write(
+            "SKIP: private ResNet-18 fixture not found; set "
+            "SONICBOOM_PRIVATE_DATA_DIR to the private tests/data directory\n")
+        return 77
     assert os.path.exists(ONNX_PATH), f"missing {ONNX_PATH} (run models/resnet18.py first)"
     with open(FIXTURE) as f:
         tree = parse_sx(f.read())
@@ -135,7 +160,7 @@ def main():
         assert len(blob) == offset, (name, len(blob), offset)
         blob.extend(arr.tobytes(order="C"))
 
-    weights_path = os.path.join(DATA, "resnet18.weights.bin")
+    weights_path = os.path.join(out_dir, "resnet18.weights.bin")
     with open(weights_path, "wb") as f:
         f.write(blob)
     print(f"wrote {weights_path} ({len(blob)} bytes, {len(params)} tensors)")
@@ -143,7 +168,7 @@ def main():
     # Deterministic input and independent reference output.
     rng = np.random.RandomState(SEED)
     x = rng.randn(1, 3, 224, 224).astype(np.float32)
-    input_path = os.path.join(DATA, "resnet18.input.bin")
+    input_path = os.path.join(out_dir, "resnet18.input.bin")
     x.tofile(input_path)
     print(f"wrote {input_path} ({x.nbytes} bytes, seed={SEED})")
 
@@ -151,10 +176,10 @@ def main():
     y = evaluator.run(None, {"input": x})[0]
     assert y.shape == (1, 1000) and y.dtype == np.float32, (y.shape, y.dtype)
     assert np.isfinite(y).all()
-    ref_path = os.path.join(DATA, "resnet18.reference.bin")
+    ref_path = os.path.join(out_dir, "resnet18.reference.bin")
     np.ascontiguousarray(y).tofile(ref_path)
     print(f"wrote {ref_path} ({y.nbytes} bytes, argmax={int(y.argmax())})")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))

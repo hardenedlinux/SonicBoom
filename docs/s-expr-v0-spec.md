@@ -361,8 +361,9 @@ makes v0 files forward-stable.
 
 ## 13. Complete ResNet18 Example
 
-See `s-expr-v0-resnet18.example.sx` (full 49-node, 44-parameter serialization,
-every value explicitly typed, topologically ordered). A schematic head:
+The complete 49-node, 44-parameter serialization (every value explicitly typed,
+topologically ordered) is the ResNet-18 fixture kept with the private test
+suites; it is not distributed in this repository. A schematic head:
 
 ```lisp
 (sonicboom-s-expr

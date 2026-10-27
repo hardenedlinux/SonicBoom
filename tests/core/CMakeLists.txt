@@ -21,6 +21,15 @@ if(SONICBOOM_SANITIZE)
   add_link_options(${SONICBOOM_SANITIZE_FLAGS})
 endif()
 
+# Test data (fixtures, goldens, bench inputs) lives with the private suites:
+# SONICBOOM_PRIVATE_TESTS_DIR/data. The public tree carries none. Tests that
+# read it take this definition and skip (exit 77) when it is unset or the file
+# is absent, so a public-only checkout still configures and passes.
+set(SB_PRIVATE_DATA_DIR "")
+if(SONICBOOM_PRIVATE_TESTS_DIR)
+  set(SB_PRIVATE_DATA_DIR "${SONICBOOM_PRIVATE_TESTS_DIR}/data")
+endif()
+
 # Register a C++ suite with CTest. The suites load libsonicboom.so at runtime,
 # so the loader path must include its directory; the executable path is resolved
 # through a generator expression so it stays valid across build configurations.
@@ -88,16 +97,17 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_o
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    SONICBOOM_PRIVATE_DATA_DIR="${SB_PRIVATE_DATA_DIR}"
     SONICBOOM_IMPORT_DIR="${CMAKE_BINARY_DIR}/import")
   sb_add_cpp_test(${test_name})
 endforeach()
 
 # The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
-# input / reference sidecars under tests/data/, and the importer's output under
-# <build>/import/), none of which is committed — see .gitignore. A setup fixture
-# generates them from models/resnet18.onnx before either test starts, so a fresh
-# checkout passes under a plain `ctest`; the tests keep their exit-77 path for
-# the case where the (external) model store is unavailable.
+# input / reference sidecars and the importer's output, all under
+# <build>/import/), none of which is committed or written into the source tree.
+# A setup fixture generates them from models/resnet18.onnx before either test
+# starts, so a fresh checkout passes under a plain `ctest`; the tests keep their
+# exit-77 path for the case where the (external) model store is unavailable.
 find_package(Python3 COMPONENTS Interpreter)
 if(NOT Python3_EXECUTABLE)
   set(Python3_EXECUTABLE python3)
@@ -107,7 +117,9 @@ if(NOT EXISTS "${SB_RESNET18_PYTHON}")
   set(SB_RESNET18_PYTHON "${Python3_EXECUTABLE}")
 endif()
 add_test(NAME resnet18_artifacts
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/gen_resnet18_artifacts.sh
+         COMMAND ${CMAKE_COMMAND} -E env
+                 "SONICBOOM_PRIVATE_DATA_DIR=${SB_PRIVATE_DATA_DIR}"
+                 ${CMAKE_CURRENT_SOURCE_DIR}/gen_resnet18_artifacts.sh
                  "${CMAKE_SOURCE_DIR}" "${SB_RESNET18_PYTHON}"
                  "${CMAKE_BINARY_DIR}/import")
 set_tests_properties(resnet18_artifacts PROPERTIES
@@ -118,6 +130,8 @@ set_tests_properties(
   PROPERTIES
     SKIP_RETURN_CODE 77
     FIXTURES_REQUIRED resnet18_artifacts)
+# The parse-only test needs the private fixture but no generated sidecars.
+set_tests_properties(test_s_expr_resnet18 PROPERTIES SKIP_RETURN_CODE 77)
 
 # C ABI test, compiled as C to prove <sonicboom/capi.h> is a genuine C header
 # and libsonicboom.so exports its entry points with C linkage. Links libm for
@@ -139,7 +153,8 @@ if(SONICBOOM_USE_CUDA)
   add_executable(test_capi_sampling test_capi_sampling.c)
   target_link_libraries(test_capi_sampling PRIVATE sonicboom m CUDA::cudart)
   target_compile_definitions(test_capi_sampling PRIVATE
-    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    SONICBOOM_PRIVATE_DATA_DIR="${SB_PRIVATE_DATA_DIR}")
   sb_add_cpp_test(test_capi_sampling)
   set_tests_properties(test_capi_sampling PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
