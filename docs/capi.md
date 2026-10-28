@@ -38,8 +38,8 @@ The prefix `sb_llm_` keeps these functions apart from the S-Expr graph API
 | `create-session`, `free-session` | `sb_llm_session_new`, `sb_llm_session_free` | a KV cache + its token history |
 | `fork-session` (optional) | `sb_llm_session_fork` | copies the first n positions; may return `SB_ERR_UNSUPPORTED` |
 | `prefill` | `sb_llm_prefill` | returns the number of reused tokens |
-| sampler (`make-sampler`) | `sb_llm_sampler_new`, `sb_llm_sampler_free` | parameters + random state |
-| `step` | `sb_llm_step` | sample, append, return the token |
+| sampler (`make-sampler`) | `sb_llm_sampling` + `sb_llm_decode` | parameters per call; draw state lives in the session |
+| `step` | `sb_llm_decode` (`max_tokens` 1) | sample, append, return the token; repeated calls continue the same stream |
 | constraint hook | `sb_llm_session_set_grammar`, `sb_llm_session_set_json_schema`, `sb_llm_session_clear_grammar` | installed on the session, restarted by each prefill |
 | `backend-stats` | `sb_llm_model_get_stats` | prefill / reuse / step counters |
 
@@ -172,11 +172,15 @@ sb_status sb_llm_step(sb_llm_session *session, sb_llm_sampler *sampler,
   session, on the device. With a paged KV cache it becomes block sharing with
   copy-on-write; the ABI does not change. Backends without it return
   `SB_ERR_UNSUPPORTED`; the session pool then takes a session over instead.
-- **Sampler state.** Temperature 0 is greedy (`argmax`, today's only mode in
-  the spine). The random state lives in the sampler, one per request, so a
-  seed reproduces a request on the same build and device. The GPU sampler may
-  use a counter-based generator (Philox); its stream need not match the CPU
-  one, in line with the v1 rule that GPU numerics need not be bit-identical.
+- **Sampler state.** Temperature 0 is greedy (`argmax`, bit-identical to the
+  historical path). Temperature > 0 samples from the device's candidate window
+  with a counter-based generator (Philox) keyed by `(seed, absolute token
+  position, history)`, so a seed reproduces a request on the same build and
+  device and the result does not depend on KV capacity or prefix reuse. The
+  parameters travel in `sb_llm_sampling` on every `sb_llm_decode` call; the
+  sampled path keeps its draw state in the session, so repeated calls (for
+  example `max_tokens` 1 per step) continue one stream. GPU numerics need not
+  be bit-identical to the CPU path, in line with the v1 rule.
 - **Constraint (constrained decoding).** A session may carry a grammar
   (`sb_llm_session_set_grammar`, `sb_llm_session_set_json_schema`). The
   grammar consumes the text a token spells — the same bytes
@@ -244,11 +248,11 @@ plus the `(sonicboom inference)` wrappers):
 | the serving path uses | today |
 |---|---|
 | persistent sessions | `sb_llm_session_new` over `planner::KvCacheSession`; `sb_llm_prefill` keeps the longest common prefix |
-| sampling (temperature, top-k, top-p, seed) | `sb_llm_decode` |
-| logit mask before sampling | the session's compiled grammar; the argmax kernel applies its bitmap |
+| sampling (temperature, top-k, top-p, min-p, seed, penalties) | `sb_llm_decode` over `sb_llm_sampling`; its sampled path keeps draw state in the session, so repeated `max_tokens` 1 calls are the serving path's per-token `step` |
+| logit mask before sampling | the session's compiled grammar; the argmax / sampled-select kernel applies its bitmap |
 | tokenizer and EOS ids from GGUF metadata | `sb_llm_tokenize(_ex)`, `sb_llm_detokenize`, `sb_llm_model_eos` |
 
-Not in the ABI yet: session fork (`sb_llm_session_fork`), a per-step sampler
-(`sb_llm_sampler_new` / `sb_llm_step` — `sb_llm_decode` runs a request's steps
-through a token callback instead), and stats counters. The service above the
-backend supplies its own request statistics.
+Not in the ABI yet: session fork (`sb_llm_session_fork`), a sampler handle
+(`sb_llm_sampler_new` — parameters are passed to each `sb_llm_decode` call
+instead), and stats counters. The service above the backend supplies its own
+request statistics.

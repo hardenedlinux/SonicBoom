@@ -277,8 +277,9 @@ matmul's output has exactly one consumer; nothing else is fused.
 ## (sonicboom inference)
 
 A GGUF language model through the minimal LLM C ABI: the built-in tokenizer,
-a session, prefill with prefix reuse, and greedy decode. Handles are foreign
-pointers and are freed explicitly.
+a session, prefill with prefix reuse, and decode (greedy by default, seeded
+sampling with `#:temperature` > 0). Handles are foreign pointers and are freed
+explicitly.
 
 Nothing here is tied to one model family. The GGUF's architecture string
 selects the plan, the vocabulary decides which pieces are control tokens, and
@@ -293,9 +294,18 @@ tokens — so a Gemma 4 and a Qwen2 GGUF both run through this same interface.
 - `tokenize model text #:special?` — UTF-8 text to token ids (the vocabulary's BOS is prepended when it asks for one); `#:special? #t` also matches the vocabulary's control pieces (`<|turn>`, `<turn|>` for Gemma; `<|im_start|>`, `<|im_end|>` for Qwen2) verbatim, one token each
 - `tokenize-segments model segments` — a rendered chat prompt as `(kind . text)` segments: `'special` segments are tokenized with `#:special? #t`, `'text` segments never are; BOS is added once, by the first segment
 - `detokenize model tokens` — token ids back to text
-- `generate model session prompt max-tokens` — tokenize, prefill, decode greedily, detokenize
+- `generate model session prompt max-tokens` — tokenize, prefill, decode, detokenize
 - `generate-tokens session prompt max-tokens #:prefill?` — the same, returning token ids; `#:prefill? #f` continues from what the session holds
 - `generate-stream model session prompt max-tokens proc #:prefill?` — call `(proc token chunk)` once per produced token; chunks never split a UTF-8 character and concatenate to exactly what `generate` returns; returns the token ids
+
+All three take the sampling keywords (`#:temperature`, `#:top-k`, `#:top-p`,
+`#:min-p`, `#:seed`, `#:repeat-penalty`, `#:repeat-last-n`,
+`#:presence-penalty`, `#:frequency-penalty`). Temperature 0 (the default) is
+greedy and bit-identical to the historical argmax path; temperature > 0 samples
+deterministically from `#:seed`, keyed by the token's absolute position, and is
+unaffected by KV capacity or prefix reuse. `#:prefill? #f` with the same
+parameters continues the session's sampled stream exactly as one longer call
+would (the server's per-token decode relies on this).
 
 ```scheme
 (use-modules (sonicboom inference))
@@ -358,8 +368,13 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
 - **The tracer names closed-over constants itself** (`c0`, `c2`, ...), so a
   traced graph does not carry the model's `"l1.weight"` names. Parameters are
   matched by shape and value, not by name.
-- **Inference is greedy only** — temperature 0, top-p 1, top-k 0. A sampling
-  request is rejected (HTTP 400) rather than silently ignored.
+- **Sampling is per token and seeded.** Temperature 0 is greedy; temperature
+  > 0 samples from the C ABI's device-side candidate window (top-256, then the
+  30-logit window, top-k, min-p, top-p in the order `capi.h` documents), keyed
+  by `(seed, absolute position, history)`. The server's per-step decode gets the
+  same stream as a one-shot decode. A backend that cannot sample (the
+  `#:sampling? #f` default) still rejects an explicit sampling request with
+  HTTP 400 rather than silently decoding greedily; both shipped backends sample.
 - **Detokenization is not additive**: the tokenizer's space cleanup runs over
   the whole text and looks across token boundaries, so streaming must
   re-detokenize the prefix (which `generate-stream` does; that is O(tokens²)

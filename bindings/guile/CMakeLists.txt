@@ -281,6 +281,29 @@ if(GUILE_EXECUTABLE)
     message(STATUS "GNU Artanis not found; skipping the guile-serve-http test")
   endif()
 
+  # guile-serve-units drives the serving layer below HTTP — chat templates, the
+  # mock backend and its sampler, the session pool, the engine — with no GGUF
+  # and no HTTP server. It needs guile-json but not Artanis, so it is registered
+  # on its own (before this block it was only runnable by hand).
+  execute_process(COMMAND ${GUILE_EXECUTABLE} --no-auto-compile -c
+                          "(use-modules (json))"
+                  RESULT_VARIABLE GUILE_JSON_RESULT
+                  OUTPUT_QUIET ERROR_QUIET)
+  if(GUILE_JSON_RESULT EQUAL 0)
+    add_test(
+      NAME guile-serve-units
+      COMMAND ${CMAKE_COMMAND} -E env
+              GUILE_AUTO_COMPILE=0
+              LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+              ${GUILE_EXECUTABLE} --no-auto-compile
+              -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/serve/test-serve-units.scm)
+    set_tests_properties(guile-serve-units PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  else()
+    message(STATUS "guile-json not found; skipping the guile-serve-units test")
+  endif()
+
   # guile-cpp-e2e: the full training → export → independent C++ load loop. The
   # Guile exporter (train + sb_export_model) writes an artifact, then the C++
   # loader (test_e2e_load, built in tests/core) reloads it and checks its

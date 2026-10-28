@@ -42,25 +42,33 @@
   (let* ((path (assq-ref config 'path))
          (id (or (assq-ref config 'id) path))
          (context-length (or (assq-ref config 'context-length) 8192))
-         (handle (inference:load-model path))
-         (arch (inference:model-arch handle))
-         (family (family-for-arch arch))
-         ;; Stop tokens, two sources, unioned:
-         ;;  - the model's own eos ids, read from its metadata (Gemma 4: <turn|>,
-         ;;    Qwen2: <|im_end|>), which is what generation must stop on;
-         ;;  - the family template's end-of-turn markers. They are the same
-         ;;    control token for these two families, and the union keeps the
-         ;;    turn-end guarantee if a model's metadata ever names something
-         ;;    else.
-         ;; Either way the markers go through the tokenizer's special parsing,
-         ;; so each becomes the vocabulary's own control token; as plain text
-         ;; they would be subword pieces and never match a sampled token.
-         (eos (append
-               (inference:model-eos handle)
-               (append-map (lambda (s)
-                             (cdr (inference:tokenize handle s #:special? #t)))
-                           (template-eos-strings family)))))
-    (make-real-model id handle context-length family (delete-duplicates eos))))
+         (handle (inference:load-model path)))
+    ;; Everything after the load can throw (an architecture with no chat
+    ;; template, a failed tokenizer call). The handle is not owned by a record
+    ;; yet, so it has to be freed on the way out or the weights leak for the
+    ;; lifetime of the process.
+    (guard (c (else (inference:free-model! handle) (raise c)))
+      (let* ((arch (inference:model-arch handle))
+             (family (family-for-arch arch))
+             ;; Stop tokens, two sources, unioned:
+             ;;  - the model's own eos ids, read from its metadata (Gemma 4:
+             ;;    <turn|>, Qwen2: <|im_end|>), which is what generation must
+             ;;    stop on;
+             ;;  - the family template's end-of-turn markers. They are the same
+             ;;    control token for these two families, and the union keeps the
+             ;;    turn-end guarantee if a model's metadata ever names something
+             ;;    else.
+             ;; Either way the markers go through the tokenizer's special
+             ;; parsing, so each becomes the vocabulary's own control token; as
+             ;; plain text they would be subword pieces and never match a
+             ;; sampled token.
+             (eos (append
+                   (inference:model-eos handle)
+                   (append-map (lambda (s)
+                                 (cdr (inference:tokenize handle s #:special? #t)))
+                               (template-eos-strings family)))))
+        (make-real-model id handle context-length family
+                         (delete-duplicates eos))))))
 
 (define (real-model-info model)
   `((id . ,(real-model-id model))
@@ -132,11 +140,26 @@
     reused))
 
 (define (real-step session sampler constraint)
+  ;; One sb_llm_decode call per token on the persistent session (prefill already
+  ;; ran). The sampler's parameters go through on every call: the core keys its
+  ;; draws by (seed, absolute position, history) and keeps that state in the
+  ;; session, so a per-step decode follows the same stream as one decode call of
+  ;; the whole reply. temperature 0 is the historical greedy path, unchanged.
+  ;;
   ;; With a grammar the core masks every step and finishes the reply itself
   ;; (the stop token is not emitted), so an empty result means the constrained
   ;; output is complete: #f tells the engine there is nothing left to produce.
-  (let* ((tokens (inference:generate-tokens (real-session-handle session)
-                                            (real-session-history session) 1 #f))
+  (let* ((tokens (inference:generate-tokens
+                  (real-session-handle session)
+                  (real-session-history session) 1 #f
+                  #:temperature (if (sampler-greedy? sampler)
+                                    0.0
+                                    (sampler-temperature sampler))
+                  #:top-k (sampler-top-k sampler)
+                  #:top-p (sampler-top-p sampler)
+                  #:seed (or (sampler-seed sampler) 0)
+                  #:presence-penalty (sampler-presence-penalty sampler)
+                  #:frequency-penalty (sampler-frequency-penalty sampler)))
          (token (and (pair? tokens) (car tokens))))
     (cond
      (token
@@ -160,4 +183,6 @@
    #:create-session real-create-session
    #:free-session real-free-session
    #:prefill real-prefill
-   #:step real-step))
+   #:step real-step
+   ;; real-step passes the sampler to sb_llm_decode's sampled session path.
+   #:sampling? #t))

@@ -229,12 +229,11 @@
             (eq? stream #t)
             include-usage)))
 
-;; A greedy-only backend cannot honor a sampling request, so an explicit one is
-;; rejected instead of silently decoding greedily (the libsonicboom backend's
-;; per-step decode ignores the sampler, so it wants temperature 0, top-p 1,
-;; top-k 0).
+;; A backend that cannot sample (model-sampling? #f) cannot honor a sampling
+;; request, so an explicit one is rejected instead of silently decoding
+;; greedily. The app calls this only for such a backend.
 ;; A parameter that is absent means "the backend's default", which for a
-;; greedy-only backend is greedy — so the common OpenAI client that leaves
+;; non-sampling backend is greedy — so the common OpenAI client that leaves
 ;; temperature at its default still works, while one that asks for sampling is
 ;; told so. BODY is the raw request object, before parse-chat-request's
 ;; defaults, so "absent" is still visible here. Call it after

@@ -6,7 +6,8 @@
 ;;; The (sonicboom inference) module binds the minimal LLM C ABI (capi.h
 ;;; sb_llm_*) through (sonicboom ffi), which is the only path Guile uses to
 ;;; reach libsonicboom.so. It exposes load-model / make-session / generate —
-;;; a greedy-decode inference loop over the GGUF built-in tokenizer.
+;;; a decode inference loop over the GGUF built-in tokenizer (greedy by
+;;; default, seeded sampling when temperature > 0).
 ;;;
 ;;;   Guile → (sonicboom inference) → (sonicboom ffi) → libsonicboom.so
 ;;;
@@ -485,9 +486,20 @@ boundary. Returns the new emitted length."
           boundary)
         emitted)))
 
-(define* (generate-stream model session prompt max-tokens proc #:optional (prefill? #t))
-  "Prefill PROMPT (a list of token ids) and greedily decode up to MAX-TOKENS
-tokens, calling (PROC TOKEN CHUNK) once per produced token, in order. CHUNK is
+(define* (generate-stream model session prompt max-tokens proc #:optional (prefill? #t)
+                          #:key
+                          (temperature 0.0)
+                          (top-k 0)
+                          (top-p 1.0)
+                          (min-p 0.0)
+                          (seed 0)
+                          (repeat-penalty 1.0)
+                          (repeat-last-n 64)
+                          (presence-penalty 0.0)
+                          (frequency-penalty 0.0))
+  "Prefill PROMPT (a list of token ids) and decode up to MAX-TOKENS tokens
+(greedy by default; the sampling keywords are those of generate-tokens),
+calling (PROC TOKEN CHUNK) once per produced token, in order. CHUNK is
 the text that became available with that token; it is empty when the token only
 completed a character started earlier. Chunks never split a UTF-8 sequence, and
 concatenated in order they are exactly the string `generate` returns for the same
@@ -512,7 +524,16 @@ unwinding through the decoder's stack frame."
                    (set! failure (cons key args))
                    1))))              ; non-zero = stop the decode
          (cb-ptr (procedure->pointer int cb (list '* int32)))
-         (smp-bv (make-sampling-bv max-tokens))
+         (smp-bv (make-sampling-bv max-tokens
+                                   #:temperature temperature
+                                   #:top-k top-k
+                                   #:top-p top-p
+                                   #:min-p min-p
+                                   #:seed seed
+                                   #:repeat-penalty repeat-penalty
+                                   #:repeat-last-n repeat-last-n
+                                   #:presence-penalty presence-penalty
+                                   #:frequency-penalty frequency-penalty))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
          (st ((sb-fn 'sb_llm_decode) session (bytevector->pointer smp-bv)

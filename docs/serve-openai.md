@@ -52,11 +52,16 @@ it never touches the core or native-torch directly.
 | `step session sampler constraint` | sample the next token, append it, return it; `#f` when the constraint has closed the reply |
 | `stats model` | counters (optional) |
 
-A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed`) carries one
-request's parameters and random state; temperature 0 is greedy. The request's
-`presence_penalty` and `frequency_penalty` are validated and carried on the
-request; the reference logits sampler (`sample-from-logits`) applies
-temperature, top-k and top-p, and the libsonicboom backend decodes greedily.
+A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed
+#:presence-penalty #:frequency-penalty`) carries one request's parameters and
+random state; temperature 0 is greedy. The reference logits sampler
+(`sample-from-logits`) applies temperature, top-k and top-p. The libsonicboom
+backend passes the whole sampler through on every step: each `step` is one
+`sb_llm_decode` call (`max_tokens` 1) on the persistent session, and the core's
+sampled path keeps its draw state across calls, so the per-step stream matches
+a one-shot decode with the same parameters. `presence_penalty` and
+`frequency_penalty` reach the C ABI's sampled path; the mock sampler has no
+penalty model.
 
 A **constraint** shapes the reply. There are two forms:
 
@@ -69,8 +74,9 @@ A **constraint** shapes the reply. There are two forms:
   The mock ignores grammar records — it has no decoder — and answers
   unconstrained.
 - a procedure `(candidates) → candidates`, a token filter applied by the
-  sampler before sampling. Both backends' samplers apply it; it is the form
-  the mock's tests use.
+  mock's host sampler before sampling; it is the form the mock's tests use.
+  The real backend samples on the device (there is no host candidate list), so
+  it rejects a procedure constraint instead of silently ignoring it.
 
 `prefill` resets the grammar, so a constraint is per turn: the engine passes it
 to both `prefill` and every `step` of that turn.
