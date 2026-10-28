@@ -62,9 +62,8 @@ constexpr Knob kKnobs[] = {
     {"SONICBOOM_MMQ_J", "tuner", "MMQ J split when not tuned"},
     {"SONICBOOM_MMQ_TC", "off", "generated tensor-core matmul"},
     {"SONICBOOM_MMQ_MIN_N", "2", "MMQ crossover token count"},
-    {"SONICBOOM_ATTENTION_IMPL", "auto", "prefill/decode attention implementation"},
-    {"SONICBOOM_ATTN_PREFILL", "auto",
-     "prefill attention: auto|own|codegen|ggml|boom_fattn"},
+    {"SONICBOOM_ATTN_IMPL", "auto",
+     "decode attention pair: auto|own (prefill is always boom_fattn)"},
     {"SONICBOOM_ATTN_DECODE", "auto", "decode attention: auto|own|codegen"},
     {"SONICBOOM_ATTN_DECODE_CHUNK", "identity rule", "decode split-KV chunk"},
     {"SONICBOOM_ATTN_CLASS", "auto (full.tiled above 2048 tokens)",
@@ -182,8 +181,7 @@ int main(int argc, char** argv) {
   const auto gemv_default = sonicboom::mlir_tune::default_config("gemv");
   const auto mmq_default = sonicboom::mlir_tune::mmq_tc_default_config();
   std::cout << "gemv = " << gemv_default.to_string() << "\n"
-            << "matmul_q8_tc = " << mmq_default.to_string() << "\n"
-            << "attn_prefill = dispatcher shape\n";
+            << "matmul_q8_tc = " << mmq_default.to_string() << "\n";
 
   // The class rules are attributes of the op, so they print the same on every
   // model: a causal, cached op is an LLM class; a non-causal, cache-less op is

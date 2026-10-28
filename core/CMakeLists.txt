@@ -215,14 +215,13 @@ if(SONICBOOM_USE_CUDA)
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
-    # Imported ggml flash-attention adapter (removable measurement backend;
-    # SONICBOOM_ATTN_IMPL=ggml). Same nvcc invocation and static link as the
-    # other core TUs -- no separate build path.
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
-    # SonicBoom-owned GGML-inspired prefill attention (boom_fattn; removable
-    # measurement backend, SONICBOOM_ATTN_IMPL=boom_fattn). Plain device code,
-    # no device lambdas, so it needs no per-source flags.
+    # SonicBoom-owned prefill attention (boom_fattn), the prefill attention
+    # implementation. Plain device code, no device lambdas, so it needs no
+    # per-source flags.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/boom_fattn.cu
+    # boom_fattn's strict-order path (d128/GQA 6): the scalar reference kernel
+    # and the byte-identical strict-order tiled kernel it is gated against.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/boom_fattn_strict.cu
     # boom_fattn candidate selection and its runtime JIT (see src/nn/
     # fattn_tune.h). fattn_tune.cu is the autotuner, the per-device selection
     # cache and the startup report; fattn_jit.cpp compiles a candidate the AOT
@@ -265,13 +264,6 @@ if(SONICBOOM_USE_CUDA)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
     PROPERTIES COMPILE_OPTIONS "-extended-lambda")
-  # The imported ggml flash-attention kernel (src/nn/fattn_ggml.cu) uses
-  # device lambdas in its cp.async pipelines and needs nvcc's
-  # --extended-lambda, as upstream compiles it. Scoped to that TU so the
-  # flag cannot change any SonicBoom-owned kernel's code generation.
-  set_source_files_properties(
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
-    PROPERTIES COMPILE_OPTIONS "--extended-lambda")
 
   # boom_fattn's runtime JIT compiles the same device code the AOT translation
   # unit includes, so src/nn/boom_fattn_device.cuh is embedded verbatim as a

@@ -1,11 +1,10 @@
 # boom_fattn: candidate registry, JIT and startup autotuning
 
-`boom_fattn` is the hand-written prefill flash-attention kernel used when the
-prefill attention implementation is `boom_fattn`
-(`SONICBOOM_ATTN_PREFILL=boom_fattn`). Its layout and schedule parameters are
-not fixed at build time: the kernel exists as a small set of candidates, and a
-startup autotuner picks one per device and shape class, then reuses that pick
-from a persistent cache.
+`boom_fattn` is the prefill flash-attention implementation: every prefill
+attention call is served by it (the d128/GQA-6 strict-order class included).
+Its layout and schedule parameters are not fixed at build time: the kernel
+exists as a small set of candidates, and a startup autotuner picks one per
+device and shape class, then reuses that pick from a persistent cache.
 
 This document describes the external contract: the candidates, the selection
 flow, the cache, the environment switches and the report a run prints. The
@@ -342,7 +341,9 @@ layout/schedule candidates *of* the selected variant.
 |---|---|---|
 | `SONICBOOM_BOOM_FATTN_QREG` | `1` (default), `0`, `2`, `3` | d512, f16 accumulator: `1` query-resident, QK^T split over the four dim slices, BR16/BK16, 512-thread block. `0` the previous kernel (BR32/BK16, 1024 threads, phase 1 on the slice-0 warps, Q re-read per key tile) — the explicit fallback. `2` split without Q residency and `3` BR16/BK16 without the split are diagnostic controls, not alternatives to prefer. |
 | `SONICBOOM_BOOM_FATTN_D256` | `1` (default), `0`, `2`, `3`, `4` | d256 (the sliding-window head): `1` the d512 mode-1 schedule at this width (BR16/BK16, 512 threads). `0` the previous kernel (BR32/BK32, 1024 threads) — the explicit fallback. `2`, `3`, `4` are controls (split only, geometry only, 8-slice split). |
-| `SONICBOOM_BOOM_FATTN_ACC` | unset (f16), `f32` | `f32` keeps the earlier fp32-accumulator kernel for either width, regardless of the QREG/D256 setting; the per-width mode switches do not apply to it. |
+| `SONICBOOM_BOOM_FATTN_D64` | `1` (default), `2`, `3`, `4`, `5`, `6`, `7` | d64/GQA-7 geometry diagnostics: `1` the class family the tuner selects within (BR16/BK16, NW 1, phase 1b unsplit). `2` BR32/NW2, `3` BR16/NW2, `4` BR16/NW1, `5` BR32/NW1, `6` BR64/NW1, `7` BR32/BK32/NW1 — fixed-geometry control arms, not alternatives to prefer. |
+| `SONICBOOM_BOOM_FATTN_ACC` | unset (f16), `f32` | `f32` keeps the earlier fp32-accumulator kernel for either width, regardless of the QREG/D256/D64 setting; the per-width mode switches do not apply to it. |
+| `SONICBOOM_ATTN_D128_EXACT` | unset (exact), `0` | d128/GQA-6 (DeepSeek) strict-order class: unset runs the strict-order tiled kernel; `0` rolls back to the scalar reference kernel it is gated against. The two are byte-identical, and the class is never routed to another prefill implementation. |
 
 Rules that hold for this table:
 
@@ -360,11 +361,16 @@ Rules that hold for this table:
   are required to be bit-identical to the reference, which the correctness
   gates check with a byte comparison. The QREG/D256 switches change no
   tolerance or numerical rule.
-- **Backend selection is separate.** `boom_fattn` is opt-in
-  (`SONICBOOM_ATTN_IMPL=boom_fattn` or `SONICBOOM_ATTN_PREFILL=boom_fattn`;
-  `auto` never selects it) and falls through to the native path for shapes
-  without an instantiation. The switches above only choose the kernel once
-  `boom_fattn` has been selected; they do not make it the default backend.
+- **There is no backend switch.** `boom_fattn` is the prefill attention
+  implementation; `SONICBOOM_ATTN_IMPL` only selects the decode attention pair.
+  A shape class without an instantiation fails its launch rather than falling
+  through to another prefill kernel. The switches above choose the kernel
+  geometry within `boom_fattn`.
+- **Geometry is per shape class.** The d64/GQA-7 class (Qwen2.5) runs the same
+  family at BR16/BK16 with one warp per query-head unit (NW 1, phase 1b
+  unsplit); the wider classes run BR16/BK16/NW 4 with the row-half split. The
+  tuner still selects among the layout/schedule candidates of the class's
+  family, and the query count is never part of the selection key (R1).
 
 ## Community diagnostics
 

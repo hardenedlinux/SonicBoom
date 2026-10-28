@@ -146,9 +146,9 @@ automatic choice, and the registry records which one applied.
 | name | scope | storage |
 |---|---|---|
 | `reduce.mode`, `reduce.df32-acceptance`, `reduce.double-cost-ratio`, `reduce.cpu-measurement` | device / cpu | registry + verdict file |
-| `tune/attention-prefill`, `tune/attention-decode`, `tune/attention-full`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
+| `tune/attention-decode`, `tune/attention-full`, `tune/dense-gemm`, `tune/mmq-j`, `tune/spec-length` | shape class | hand-written JSON |
 | `attention.class` | attention attribute key (`causal…-kvcache…-d…-g…`, plus `-cap2048`/`-over2048` for the full classes) | registry |
-| `tune/gemv`, `tune/matmul_q8_tc`, `tune/attn_prefill`, `spec_verify_ratio` | shape class | per-SM JIT file |
+| `tune/gemv`, `tune/matmul_q8_tc`, `spec_verify_ratio` | shape class | per-SM JIT file |
 | `mmq.*`, `attention.*`, `dense.*`, `gemv.*`, `spec.*`, `train.*`, feature switches | device | seeded from the T0b table |
 | `numerics.profile` | process | registry (strict/standard, with its env/application origin) |
 | `kv.cache` | `n_ctx=<n>` | registry (storage dtype + the VRAM bytes it allocated) |

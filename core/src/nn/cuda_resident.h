@@ -233,22 +233,15 @@ void flash_attention_full_release_scratch();
 // K/V read from the batch buffer (batch index j - start). One online-softmax
 // pass covers both sources; the caller defers the chunk's cache append until
 // after every layer (including shared donors) has read it, so the cache still
-// holds the prior context here. For start == 0 the prior range is empty and the
-// result is bit-identical to flash_attention_dev. q is [n, n_heads_q, head_dim];
+// holds the prior context here. For start == 0 the prior range is empty, so the
+// kernel reads the current chunk only. q is [n, n_heads_q, head_dim];
 // k_batch/v_batch are [n, n_heads_kv, head_dim] (fp16-rounded f32); k_cache/
 // v_cache are [n_slots, n_heads_kv, head_dim]. out is [n, n_heads_q, head_dim].
-bool flash_attention_chunk_dev(const float* q, const float* k_batch,
-                               const float* v_batch, const float* k_cache,
-                               const float* v_cache, uint64_t start,
-                               uint64_t n_slots, int n, int n_heads_q,
-                               int n_heads_kv, int head_dim,
-                               uint64_t sliding_window, float scale, float* out,
-                               bool kv_f16 = false, bool kv_q8 = false);
-
-// Device-position variant of flash_attention_chunk_dev: `start` is a DEVICE
-// uint64_t read in-kernel, so the chunk's absolute start position is a graph
-// input rather than a value baked into the node at capture time (CUDA Graphs for
-// chunked prefill). The launch config is fixed by n/head shapes, never by start.
+// Device-position variant: `start` is a DEVICE uint64_t read in-kernel, so the
+// chunk's absolute start position is a graph input rather than a value baked
+// into the node at capture time (CUDA Graphs for chunked prefill). The launch
+// config is fixed by n/head shapes, never by start. boom_fattn is the prefill
+// attention implementation for every supported shape class.
 bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    const float* v_batch, const float* k_cache,
                                    const float* v_cache, const uint64_t* start,
@@ -258,29 +251,23 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                                    float* out, bool kv_f16 = false,
                                    bool kv_q8 = false);
 
-// Same contract as flash_attention_chunk_dev_pos, computed by the imported
-// ggml mma flash-attention kernel (the pinned llama.cpp commit's prefill
-// kernel). Selected explicitly by SONICBOOM_ATTN_IMPL=ggml; "auto" never
-// chooses it. Returns false without launching anything when the shape or the
-// KV storage is not covered (q8 cache, unknown head_dim/GQA); the caller then
-// takes the native path. kv_f16/kv_q8 describe the cache storage exactly as
-// in flash_attention_chunk_dev_pos.
-bool flash_attention_ggml_chunk_dev_pos(
+// The prefill attention implementation (core/src/nn/boom_fattn.cu): f16 KV
+// span materialization (f32/f16/q8 cache rows are dequantized into the f16
+// workspace), tiled MMA with an online softmax, GQA query grouping and
+// cp.async staging, with the causal/window mask derived in registers. Returns
+// false without launching anything for shapes it has no instantiation for.
+bool flash_attention_boom_fattn_chunk_dev_pos(
     const float* q, const float* k_batch, const float* v_batch,
     const float* k_cache, const float* v_cache, const uint64_t* start,
     uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,
     uint64_t sliding_window, float scale, float* out, bool kv_f16 = false,
     bool kv_q8 = false);
 
-// Same contract, computed by SonicBoom's own "GGML-inspired" kernel
-// (core/src/nn/boom_fattn.cu): f16 KV span materialization, tiled MMA
-// with an online softmax, GQA query grouping and cp.async staging, with the
-// causal/window mask derived in registers. This is SonicBoom's own
-// `boom_fattn` backend, selected explicitly by
-// SONICBOOM_ATTN_IMPL=boom_fattn; "auto" never chooses it. Returns false
-// without launching anything for q8 caches or shapes it has no instantiation
-// for.
-bool flash_attention_boom_fattn_chunk_dev_pos(
+// boom_fattn's strict-order path for the d128/GQA-6 class
+// (core/src/nn/boom_fattn_strict.cu). Same contract; false for any other
+// shape. The exact kernel is the default and SONICBOOM_ATTN_D128_EXACT=0
+// selects the scalar arm it is byte-identical to.
+bool flash_attention_boom_fattn_strict_chunk_dev_pos(
     const float* q, const float* k_batch, const float* v_batch,
     const float* k_cache, const float* v_cache, const uint64_t* start,
     uint64_t n_slots, int n, int n_heads_q, int n_heads_kv, int head_dim,

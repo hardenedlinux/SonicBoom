@@ -112,23 +112,6 @@ tests/core/ggml_baseline.h
     reference for the native legacy types).
     (Already carries its own attribution header.)
 
-core/src/quant/ggml_derived/fattn/fattn-mma-f16.cuh
-core/src/quant/ggml_derived/fattn/mma.cuh
-core/src/quant/ggml_derived/fattn/cp-async.cuh
-    Flash-attention (fattn) MMA kernel for Ampere+ (CUDA). Ported from:
-      - flash_attn_ext_f16 (kernel + process_tile/iters, config
-        tables, host config queries)           ← ggml/src/ggml-cuda/fattn-mma-f16.cuh
-      - tile<>, load_ldmatrix, mma wrappers    ← ggml/src/ggml-cuda/mma.cuh
-      - cp_async_cg_16 / cp.async pipeline     ← ggml/src/ggml-cuda/cp-async.cuh
-    (Adaptation: the kernel-only cut of fattn-mma-f16.cuh — ggml's host
-     launcher, ggml_tensor plumbing and instantiation list are not imported;
-     SonicBoom's adapter core/src/nn/fattn_ggml.cu materializes the f16 K/V,
-     additive mask and KV_max inputs and launches the kernel directly.
-     ggml_cuda_compat.cuh supplies the subset of ggml's common.cuh the
-     imported headers use; its adapted parts are described in its header.
-     The adapter is an explicit, removable measurement backend selected only
-     by SONICBOOM_ATTN_IMPL=ggml; the default dispatch never selects it.)
-
 ----------------------------------------------------------------------------
 Same algorithm, independent expression (SonicBoom's own; no ggml code copied)
 ----------------------------------------------------------------------------

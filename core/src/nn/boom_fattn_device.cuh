@@ -224,6 +224,40 @@ __device__ __forceinline__ void boom_fattn_copy8(__half dst[8], const CACHE* src
   }
 }
 
+// q8 cache tag: a row is head_dim int8 values followed by that row's f32
+// scale, so the row stride is head_dim + 4 bytes (cuda_elementwise.cu's
+// kv_row/kv_load_at layout). The gather dequantizes into the same f16 K/V
+// workspace every other cache type writes: the workspace is the backend's one
+// value precision, exactly as the f16 cache path is. The batch rows are f32
+// and take the same f16 rounding as the f16 cache path, which is the scalar
+// kernel's kv_load_batch rounding for every non-f32 instantiation.
+struct sb_q8_cache {};
+
+// Cache row at `row` (element 0 of the row), elements d..d+7. Four-byte loads:
+// a q8 row starts at a multiple of head_dim+4 bytes, which is only 4-byte
+// aligned, so a uint2 would fault for an odd row index.
+template <typename CACHE>
+__device__ __forceinline__ void boom_fattn_copy8_row(__half dst[8],
+                                                     const CACHE* row, int d,
+                                                     int head_dim) {
+  if constexpr (std::is_same_v<CACHE, sb_q8_cache>) {
+    const int8_t* p = reinterpret_cast<const int8_t*>(row);
+    const float scale = *reinterpret_cast<const float*>(p + head_dim);
+    const int8_t* q = p + d;
+    uint32_t lo = *reinterpret_cast<const uint32_t*>(q);
+    uint32_t hi = *reinterpret_cast<const uint32_t*>(q + 4);
+    const int8_t* lo_b = reinterpret_cast<const int8_t*>(&lo);
+    const int8_t* hi_b = reinterpret_cast<const int8_t*>(&hi);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dst[i] = __float2half_rn(float(lo_b[i]) * scale);
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+      dst[4 + i] = __float2half_rn(float(hi_b[i]) * scale);
+  } else {
+    boom_fattn_copy8(dst, row + d);
+  }
+}
+
 union sb_half8 {
   __half h[8];
   uint4 u;
@@ -261,7 +295,6 @@ __global__ void __launch_bounds__(256) boom_fattn_gather_kernel(
   const uint64_t key_end = start + (uint64_t)n;  // exclusive
   const uint64_t base = sb_span_base(start, window);
   const int h = blockIdx.z;
-  const int key0 = blockIdx.y * 32;
   const int d0 = blockIdx.x * 64;
 
   __shared__ __half tile[32][72];  // 64 dims padded to a 16-byte row stride
@@ -270,47 +303,70 @@ __global__ void __launch_bounds__(256) boom_fattn_gather_kernel(
   const int key = tid >> 3;
   const int lane_d = tid & 7;
   const int d = d0 + lane_d * 8;
-  const uint64_t abs = base + (uint64_t)(key0 + key);
+  // The grid's key dimension is a fixed lane count, not the span: the launch
+  // geometry is part of the recorded prefill plan, and the plan body must not
+  // depend on the KV capacity (n_ctx). Each lane walks its key tiles, so the
+  // same launch covers any span.
+  for (int key0 = blockIdx.y * 32; key0 < ne_pad;
+       key0 += gridDim.y * 32) {
+    __syncthreads();  // previous iteration's V read of `tile` is done
+    const uint64_t abs = base + (uint64_t)(key0 + key);
 
-  sb_half8 kv, vv;
-  if (abs < key_end) {
-    if (abs < start) {
-      const uint64_t slot = abs % n_slots;
-      const size_t cache_off =
-          (slot * (uint64_t)n_heads_kv + (uint64_t)h) * (uint64_t)head_dim + d;
-      boom_fattn_copy8(kv.h, k_cache + cache_off);
-      boom_fattn_copy8(vv.h, v_cache + cache_off);
+    sb_half8 kv, vv;
+    if (abs < key_end) {
+      if (abs < start) {
+        const uint64_t slot = abs % n_slots;
+        const uint64_t row_index =
+            slot * (uint64_t)n_heads_kv + (uint64_t)h;
+        if constexpr (std::is_same_v<CACHE, sb_q8_cache>) {
+          const size_t row_bytes = (size_t)row_index * (size_t)(head_dim + 4);
+          boom_fattn_copy8_row(
+              kv.h,
+              reinterpret_cast<const sb_q8_cache*>(
+                  reinterpret_cast<const int8_t*>(k_cache) + row_bytes),
+              d, head_dim);
+          boom_fattn_copy8_row(
+              vv.h,
+              reinterpret_cast<const sb_q8_cache*>(
+                  reinterpret_cast<const int8_t*>(v_cache) + row_bytes),
+              d, head_dim);
+        } else {
+          const size_t cache_off = row_index * (uint64_t)head_dim;
+          boom_fattn_copy8_row(kv.h, k_cache + cache_off, d, head_dim);
+          boom_fattn_copy8_row(vv.h, v_cache + cache_off, d, head_dim);
+        }
+      } else {
+        const uint64_t bi = abs - start;
+        const size_t batch_off =
+            (bi * (uint64_t)n_heads_kv + (uint64_t)h) * (uint64_t)head_dim + d;
+        boom_fattn_copy8(kv.h, k_batch + batch_off);
+        boom_fattn_copy8(vv.h, v_batch + batch_off);
+      }
     } else {
-      const uint64_t bi = abs - start;
-      const size_t batch_off =
-          (bi * (uint64_t)n_heads_kv + (uint64_t)h) * (uint64_t)head_dim + d;
-      boom_fattn_copy8(kv.h, k_batch + batch_off);
-      boom_fattn_copy8(vv.h, v_batch + batch_off);
+    #pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        kv.h[i] = __float2half_rn(0.0f);
+        vv.h[i] = __float2half_rn(0.0f);
+      }
     }
-  } else {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-      kv.h[i] = __float2half_rn(0.0f);
-      vv.h[i] = __float2half_rn(0.0f);
-    }
+
+    *reinterpret_cast<uint4*>(
+        k_ws + ((size_t)h * (size_t)ne_pad + (size_t)(key0 + key)) *
+                   (size_t)head_dim +
+               d) = kv.u;
+    *reinterpret_cast<uint4*>(&tile[key][lane_d * 8]) = vv.u;
+    __syncthreads();
+
+    const int dim = tid & 63;
+    const int kc = tid >> 6;  // 4 groups of 8 keys
+    sb_half8 tv;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) tv.h[i] = tile[kc * 8 + i][dim];
+    *reinterpret_cast<uint4*>(v_ws + ((size_t)h * (size_t)head_dim +
+                                      (size_t)(d0 + dim)) *
+                                         (size_t)ne_pad +
+                                     (size_t)(key0 + kc * 8)) = tv.u;
   }
-
-  *reinterpret_cast<uint4*>(
-      k_ws + ((size_t)h * (size_t)ne_pad + (size_t)(key0 + key)) *
-                 (size_t)head_dim +
-             d) = kv.u;
-  *reinterpret_cast<uint4*>(&tile[key][lane_d * 8]) = vv.u;
-  __syncthreads();
-
-  const int dim = tid & 63;
-  const int kc = tid >> 6;  // 4 groups of 8 keys
-  sb_half8 tv;
-#pragma unroll
-  for (int i = 0; i < 8; ++i) tv.h[i] = tile[kc * 8 + i][dim];
-  *reinterpret_cast<uint4*>(v_ws + ((size_t)h * (size_t)head_dim +
-                                    (size_t)(d0 + dim)) *
-                                       (size_t)ne_pad +
-                                   (size_t)(key0 + kc * 8)) = tv.u;
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +710,10 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
   static_assert(VPAD == 0 || VPAD == 4 || VPAD == 8,
                 "V row padding is 0, 4 or 8 halves");
   static_assert(SPW == 1 || SPW == 2, "phase 1b runs on 4 or 8 warps");
+  // SPW 2 splits the 16 query rows of a unit by row half across the first two
+  // dim slices, so it needs a slice-1 warp to exist.
+  static_assert(SPW == 1 || NW >= 2,
+                "phase 1b row-half split needs two dim slices");
   // V row bytes must fill the cp.async width: 16 B for VPAD 0/8, 8 B for 4.
   static_assert(((2 * (BK + VPAD)) % (VPAD == 4 ? 8 : 16)) == 0,
                 "V row must be a whole number of cp.async transfers");
