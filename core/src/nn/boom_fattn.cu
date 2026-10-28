@@ -101,7 +101,7 @@
 #include <string>
 #include <string_view>
 
-#include "fattn_boom_device.cuh"
+#include "boom_fattn_device.cuh"
 
 namespace sonicboom::nn::cuda {
 namespace {

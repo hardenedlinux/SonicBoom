@@ -364,7 +364,7 @@ bool aot_image_exists(int candidate, int head_dim) {
 // code object from the AOT one.
 //
 // The reference is representative for the whole registry: every candidate is
-// instantiated in the same translation unit (fattn_boom_fattn.cu) with the same
+// instantiated in the same translation unit (boom_fattn.cu) with the same
 // architecture list, so either the cubin has an image every candidate can use
 // or it has none of them. If a candidate ever gains its own instantiation
 // condition, this must become "jit when any in-set candidate would JIT", so the

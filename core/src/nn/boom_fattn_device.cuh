@@ -15,7 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Device half of the boom_fattn backend. This header is the single source of
-// truth for the kernels: the AOT translation unit (fattn_boom_fattn.cu)
+// truth for the kernels: the AOT translation unit (boom_fattn.cu)
 // includes it, and the runtime JIT (fattn_jit.cpp) compiles this same text
 // with NVRTC, so a JIT-compiled candidate is the same code as the AOT one.
 // Keep it device-only: no host headers, no project includes, no <type_traits>

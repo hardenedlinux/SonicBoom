@@ -18,7 +18,7 @@
 
 #include "fattn_jit.h"
 
-// Generated at build time from fattn_boom_device.cuh (the same text the AOT
+// Generated at build time from boom_fattn_device.cuh (the same text the AOT
 // translation unit includes): `kFattnDeviceSource` is the whole device header.
 #include "fattn_device_src.inc"
 

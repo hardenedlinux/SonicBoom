@@ -93,7 +93,7 @@ constexpr int kFingerprintVersion = 1;
 bool supported(int head_dim, int gqa);
 
 // Registration hook, implemented by the AOT translation unit
-// (fattn_boom_fattn.cu): the kernel for a candidate this build instantiates, or
+// (boom_fattn.cu): the kernel for a candidate this build instantiates, or
 // nullptr when the cubin has no instantiation for it. A non-null pointer does
 // not mean it can run on every device: the caller checks
 // cudaFuncGetAttributes() and falls back to the JIT when there is no image for

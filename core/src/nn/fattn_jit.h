@@ -23,7 +23,7 @@
 // candidate cannot run on another architecture, so the tuner compiles the
 // candidate for the device it actually finds:
 //
-//   fattn_boom_device.cuh (embedded at build time, same file the AOT TU uses)
+//   boom_fattn_device.cuh (embedded at build time, same file the AOT TU uses)
 //        + a generated extern "C" wrapper per candidate
 //        -> NVRTC -> PTX (computed for the device's compute capability)
 //        -> $XDG_CACHE_HOME/sonicboom/kernels/fattn-<hash>-sm<NN>.ptx

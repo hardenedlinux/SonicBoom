@@ -273,7 +273,7 @@ bool flash_attention_ggml_chunk_dev_pos(
     bool kv_q8 = false);
 
 // Same contract, computed by SonicBoom's own "GGML-inspired" kernel
-// (core/src/nn/fattn_boom_fattn.cu): f16 KV span materialization, tiled MMA
+// (core/src/nn/boom_fattn.cu): f16 KV span materialization, tiled MMA
 // with an online softmax, GQA query grouping and cp.async staging, with the
 // causal/window mask derived in registers. This is SonicBoom's own
 // `boom_fattn` backend, selected explicitly by
