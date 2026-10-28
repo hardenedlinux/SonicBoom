@@ -305,7 +305,9 @@ greedy and bit-identical to the historical argmax path; temperature > 0 samples
 deterministically from `#:seed`, keyed by the token's absolute position, and is
 unaffected by KV capacity or prefix reuse. `#:prefill? #f` with the same
 parameters continues the session's sampled stream exactly as one longer call
-would (the server's per-token decode relies on this).
+would (the server's per-token decode relies on this). At temperature 0 the
+other keywords are unused: the greedy path is a plain argmax, so `#:min-p`,
+`#:top-p`, `#:top-k` and the penalties do not apply.
 
 ```scheme
 (use-modules (sonicboom inference))
@@ -338,6 +340,23 @@ The chat format comes from the loaded model's architecture, not from a flag:
 `gemma4` renders Gemma's `<|turn>…` turns, `qwen2` renders ChatML, and a reply
 ends on the model's own end-of-turn tokens. An architecture with no template is
 refused at load time. `/v1/models` reports the family each model selected.
+
+A request chooses how the reply is decoded; the same body with the same seed
+repeats the reply exactly:
+
+```sh
+curl -s http://127.0.0.1:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"gemma-4-E4B-it-Q3_K_M",
+       "messages":[{"role":"user","content":"hi"}],
+       "max_tokens":32,"temperature":0.8,"top_p":0.95,"seed":7}'
+```
+
+An omitted `temperature` is 0 (greedy, not OpenAI's 1.0) and an omitted `seed`
+is 0, so a request that says nothing repeats exactly. `top_k` is an extension;
+`presence_penalty`/`frequency_penalty` apply only when `temperature` > 0 (the
+greedy path is a plain argmax). See `docs/serve-openai.md` §6 for the full
+request-field list.
 
 `tools/test-api-server.sh` takes the GGUFs to test — defaulting to the Gemma and
 Qwen files under `models/` when both are present — and runs the whole suite

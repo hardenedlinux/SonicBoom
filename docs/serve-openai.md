@@ -214,6 +214,14 @@ clock seed)**, so a request that says nothing samples nothing and repeats
 exactly. `top_p` defaults to 1 and `top_k` to 0; `presence_penalty` and
 `frequency_penalty` default to 0 and are validated to [-2, 2].
 
+With the real backend, `temperature`, `top_p`, `top_k`, `seed` and the two
+penalties are passed to `sb_llm_decode` on every step. A request with
+`temperature` > 0 therefore samples, and repeating the same body repeats the
+reply exactly; the penalties are part of the C ABI's sampled path, so they take
+effect only when `temperature` > 0 — the greedy default is a plain argmax and
+ignores them. The mock backend ignores the penalties (it has no penalty
+model).
+
 ### Constrained replies
 
 Two request fields compile to a grammar constraint on the real backend:
