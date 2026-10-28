@@ -211,28 +211,52 @@ int64_t budget_ms() {
 
 // ---------------------------------------------------------------------------
 // Geometry (mirrors boom_fattn_qreg_body's shared-memory layout).
+//
+// The query tile and the QK^T dim split are a per-shape-class choice, not a
+// candidate axis: the class's block must stay inside the 1024-thread limit,
+// and the d64/GQA-7 class (7 units per 16 queries) only fits a larger query
+// tile with one warp per unit. Measured on the RTX 3050: d64 at BR64/NW1 is
+// +4..6% over BR16/NW4 at pp4096..8192 (half the query tiles, each warp over
+// the whole 64-dim QK^T), parity at pp1024 and ~3% behind at pp512, where the
+// larger tile leaves the 20-SM part underfilled. The span bucket is already
+// part of the selection key, so the layout candidates still resolve per
+// bucket; geometry is fixed per class (run rule R1).
+//
+// Phase 1b splits the key tile by row half across the first two dim slices,
+// so a class with NW == 1 can only run it unsplit (SPW 1). The candidate's spw
+// is capped by the family.
 // ---------------------------------------------------------------------------
+struct Family {
+  int br;
+  int bk;
+  int nw;
+  int spw;  // phase-1b warps per unit the geometry can support
+};
+
+Family family(int head_dim, int gqa) {
+  if (head_dim == 64 && gqa == 7) return {16, 16, 1, 1};
+  return {16, 16, 4, 2};
+}
+
 Geometry geometry(const Cand& c, int head_dim, int gqa) {
-  constexpr int BR = 16;
-  constexpr int BK = 16;
-  constexpr int NW = 4;
-  const int units = (BR / 16) * gqa;
-  const int subs = BK / 16;
+  const Family f = family(head_dim, gqa);
+  const int units = (f.br / 16) * gqa;
+  const int subs = f.bk / 16;
   const int vbuf = c.pipe ? 3 : 2;
-  const int k_elems = 2 * BK * (head_dim + c.kpad);
-  const int v_elems = vbuf * head_dim * (BK + c.vpad);
-  const int p_elems = units * 16 * BK;
+  const int k_elems = 2 * f.bk * (head_dim + c.kpad);
+  const int v_elems = vbuf * head_dim * (f.bk + c.vpad);
+  const int p_elems = units * 16 * f.bk;
   const int rs_elems = units * subs * 16;
   Geometry g;
-  g.br = BR;
-  g.bk = BK;
-  g.block = units * NW * 32;
+  g.br = f.br;
+  g.bk = f.bk;
+  g.block = units * f.nw * 32;
   g.kstride = head_dim + c.kpad;
-  g.bkp = BK + c.vpad;
-  g.softmax_warps = c.spw * units;
+  g.bkp = f.bk + c.vpad;
+  g.softmax_warps = std::min(c.spw, f.spw) * units;
   g.pipeline = c.pipe != 0;
   g.smem = (size_t)(k_elems + v_elems + p_elems) * sizeof(__half) +
-           (size_t)(rs_elems + units * 16 + units * NW * subs * 256) *
+           (size_t)(rs_elems + units * 16 + units * f.nw * subs * 256) *
                sizeof(float);
   return g;
 }
@@ -345,10 +369,10 @@ std::string capability_fingerprint(const Dev& d) {
   return buf;
 }
 
-// True when this build's cubin has an image for (candidate, head_dim) that the
-// driver accepts on the current device.
-bool aot_image_exists(int candidate, int head_dim) {
-  void* fn = aot_kernel(candidate, head_dim);
+// True when this build's cubin has an image for (candidate, head_dim, gqa)
+// that the driver accepts on the current device.
+bool aot_image_exists(int candidate, int head_dim, int gqa) {
+  void* fn = aot_kernel(candidate, head_dim, gqa);
   if (fn == nullptr) return false;
   cudaFuncAttributes attr{};
   const cudaError_t e = cudaFuncGetAttributes(&attr, fn);
@@ -372,7 +396,7 @@ bool aot_image_exists(int candidate, int head_dim) {
 const char* expected_compile_path(const Call& c) {
   const Jit m = jit_mode();
   if (m == Jit::Force) return "jit";
-  if (aot_image_exists(kCands[0].num, c.head_dim)) return "aot";
+  if (aot_image_exists(kCands[0].num, c.head_dim, c.gqa)) return "aot";
   return "jit";
 }
 
@@ -999,19 +1023,20 @@ double* cmp_sums() {
 bool resolve_target(const Call& c, const Cand& cand, int jit, Target* t,
                     std::string* why) {
   const Dev& d = device();
+  const Family f = family(c.head_dim, c.gqa);
   t->spec.id = cand.num;
   t->spec.head_dim = c.head_dim;
   t->spec.gqa = c.gqa;
-  t->spec.br = 16;
-  t->spec.bk = 16;
-  t->spec.nw = 4;
+  t->spec.br = f.br;
+  t->spec.bk = f.bk;
+  t->spec.nw = f.nw;
   t->spec.kpad = cand.kpad;
   t->spec.vpad = cand.vpad;
-  t->spec.spw = cand.spw;
+  t->spec.spw = std::min(cand.spw, f.spw);
   t->spec.pipe = cand.pipe;
 
   if (jit != int(Jit::Force)) {
-    void* fn = aot_kernel(cand.num, c.head_dim);
+    void* fn = aot_kernel(cand.num, c.head_dim, c.gqa);
     if (fn != nullptr) {
       cudaFuncAttributes attr{};
       const cudaError_t e = cudaFuncGetAttributes(&attr, fn);
@@ -1991,8 +2016,13 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
 
 }  // namespace
 
+// Shape classes with a boom_fattn tensor-core instantiation. Every production
+// prefill geometry has one; a shape outside this table is served by the
+// strict-order SIMT path in boom_fattn.cu, which does not go through this
+// tuner (its arithmetic is fixed, so there is nothing to choose).
 bool supported(int head_dim, int gqa) {
-  return (head_dim == 256 || head_dim == 512) && gqa == 4;
+  return (head_dim == 64 && gqa == 7) || (head_dim == 128 && gqa == 7) ||
+         (head_dim == 256 && gqa == 4) || (head_dim == 512 && gqa == 4);
 }
 
 bool run(const Call& call) {

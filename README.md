@@ -346,8 +346,8 @@ Its limits:
   `ffn_down` makes prefill slower than the same shape in Q4_K.
 - **Compiler tier:** Boom IR is the only rewrite path, and it now generates
   CUDA kernels through MLIR/NVVM for fused glue regions (norm, quantize,
-  activation, residual, RoPE), prefill flash attention, split-KV decode
-  attention and a bf16 dense GEMM. Generated kernels are checked against the
+  activation, residual, RoPE), split-KV decode attention and a bf16 dense
+  GEMM. Generated kernels are checked against the
   hand-written ones they replace and are selected per shape class by a runtime
   tuner; the first tune of a shape class runs during warm-up (never inside
   CUDA-graph capture) and is cached under `~/.cache/sonicboom/`, keyed by GPU,
@@ -362,11 +362,12 @@ Its limits:
   split-KV pair's chunk rule, fused-multiply-add rounding and reduction order,
   so it reproduces the token stream bit-for-bit (`SONICBOOM_ATTN_DECODE=own`
   selects the hand-written pair, which remains the numerical reference).
-  Generated prefill attention stages K/V through a 2–3-stage cp.async pipeline
-  (autotuned), pads the shared tiles, and skips the online-softmax rescale when
-  no row maximum grew — the factor is exactly `exp(0)`, so that skip is
-  bit-identical. An exp2 arm exists but is opt-in: it changes the token stream
-  and does not meet the d64 fp64-error bound.
+  Prefill attention is the hand-written `boom_fattn` kernel: a f16 KV span
+  materialized by a gather (f32, f16 and q8 cache rows alike), tiled MMA with
+  an online softmax, GQA query grouping, cp.async staging and a per-shape-class
+  autotuned layout (`docs/fattn-autotune.md`). The generated prefill route
+  (and its exp2 arm) is no longer reachable: that exp2 arm changed the token
+  stream and did not meet the d64 fp64-error bound.
 - **Speculative decoding (`boom-next`):** a CPU n-gram/prompt-lookup drafter
   proposes up to 7 tokens, a verify pass runs the decode graph over k+1 query
   rows with the same per-row kernels and reductions as plain decode, and KV
@@ -445,7 +446,7 @@ this order of preference:
 |---|---|---|
 | **1. MLIR compiler** | Model graphs become Boom IR, which is rewritten and lowered to MLIR. GPU kernels are generated through `linalg → gpu → nvvm` and JIT-compiled by shape signature; S-Expr graphs still run on the CPU JIT, and ONNX-imported ResNet-18 matches the ONNX reference. | **Shipped**: fused glue, attention and a bf16 dense GEMM are generated on CUDA. |
 | **2. Graph planner** | Rewrites the whole model before it runs: quantize-once, norm→quantize and activation→quantize fusion, dead-computation elimination, layout selection and CUDA Graph capture of the full decode step. | **Shipped**: this tier produces the decode lead measured above. |
-| **3. Hand-written kernels** | Used where the other tiers are not yet faster, for example the ported ggml MMQ/MMVQ kernels and the tiled prefill attention. | **Shipped** |
+| **3. Hand-written kernels** | Used where the other tiers are not yet faster, for example the ported ggml MMQ/MMVQ kernels and the `boom_fattn` prefill attention kernel. | **Shipped** |
 
 What follows from this design:
 
@@ -481,7 +482,7 @@ always be checked against the hand-written one it replaces.
 | **0. Lowering** | S-Expr → `arith`/`func`/`linalg`, executed on CPU through the LLVM JIT; ONNX ResNet-18 matches the ONNX reference | **shipped** |
 | **1. One GPU glue kernel** | A single fused region — norm + quantize — lowered `linalg → gpu → nvvm → cubin`, JIT-compiled at load and cached by shape signature | **shipped** |
 | **2. The glue set** | The rest of the between-kernel glue: activation→quantize, residual add, RoPE | **shipped** |
-| **2b. Attention and dense GEMM** | Generated FA-2 prefill attention (cp.async pipeline, padded tiles, conditional rescale), split-KV decode attention and a bf16 dense GEMM with an mma m16n8k16 core, selected per shape class by the runtime tuner | **shipped**; generated decode attention is token-identical to the hand-written pair and is the default |
+| **2b. Attention and dense GEMM** | Generated split-KV decode attention and a bf16 dense GEMM with an mma m16n8k16 core, selected per shape class by the runtime tuner; prefill attention is served by the hand-written `boom_fattn` kernel | **shipped**; generated decode attention is token-identical to the hand-written pair and is the default |
 | **3. GPU-independent targeting** | The same lowering for a GPU the binary was not built for (compute capability discovered at run time), and for a second vendor through SPIR-V | not started |
 | **4. Beyond LLM glue** | Whole-model lowering for the research route's traced graphs | not started |
 

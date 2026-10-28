@@ -63,7 +63,7 @@ namespace sonicboom::nn::cuda::fattn_tune {
 // Candidate registry version. Part of the persistent cache key: bump it when a
 // candidate is added, removed or its code changes, and every stored selection
 // for this backend is invalidated.
-constexpr int kRegistryVersion = 1;
+constexpr int kRegistryVersion = 2;
 
 // Fingerprint schema version. A selection key is
 //   f<version>/<capability>/<software>/<workload>
@@ -98,7 +98,7 @@ bool supported(int head_dim, int gqa);
 // not mean it can run on every device: the caller checks
 // cudaFuncGetAttributes() and falls back to the JIT when there is no image for
 // the current architecture.
-void* aot_kernel(int candidate, int head_dim);
+void* aot_kernel(int candidate, int head_dim, int gqa);
 
 // The launch geometry a candidate resolves to, for the plan trace and for
 // flash_attention_boom_fattn_config().
