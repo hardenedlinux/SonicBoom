@@ -256,8 +256,9 @@
       (let ((model (engine-model engine (chat-request-model request))))
         (unless model
           (throw 'model-not-found (chat-request-model request)))
-        ;; The libsonicboom backend decodes greedily only; an explicit
-        ;; sampling request is a 400, not a silent fallback.
+        ;; A backend that cannot sample gets an explicit sampling request
+        ;; rejected as a 400, not silently decoded greedily. Both shipped
+        ;; backends sample; this guards a future one that does not.
         (unless (model-sampling? model)
           (check-greedy-body body))
         (values request stream? include-usage? (engine-admit! engine))))))

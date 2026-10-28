@@ -22,7 +22,10 @@
 ;;;      subword pieces by default and is one control token when asked for;
 ;;;      tokenize-segments parses the template's own markers but never a marker
 ;;;      that came from a message.
-;;;   7. seeded sampling: the same prompt, temperature and seed repeat exactly.
+;;;   7. seeded sampling: the same prompt, temperature and seed repeat exactly;
+;;;      per-step decode (max_tokens 1, #:prefill? #f, as the server runs it)
+;;;      produces the same stream as one 8-token call, and generate-stream
+;;;      passes the sampler through the same way.
 ;;;
 ;;; Skips cleanly when the GGUF is absent, so the suite is green on machines
 ;;; without the model. The generate-stream chunk-boundary checks need no model
@@ -50,7 +53,7 @@
 
 (let ((path (find-model)))
   (if (not path)
-      (test-skip 16)
+      (test-skip 18)
       (let* ((model (load-model path))
              (sess1 (make-session model 512)))
         (test-equal "generate-tokens reproduces the golden decode stream"
@@ -74,6 +77,29 @@
             (generate-tokens b prompt 8 #:temperature 0.8 #:seed 7))
           (free-session! a)
           (free-session! b))
+
+        ;; The server decodes one token per call on a persistent session
+        ;; (max_tokens 1, #:prefill? #f). The core's sampled path keeps its draw
+        ;; state in the session, so stepping eight times must produce exactly
+        ;; the tokens one 8-token call produces.
+        (let* ((prompt (tokenize model "Hello"))
+               (one (make-session model 512))
+               (stepwise (make-session model 512))
+               (ref (generate-tokens one prompt 8 #:temperature 0.8 #:seed 7))
+               (per-step '()))
+          (prefill! stepwise prompt)
+          (let loop ((n 0))
+            (when (< n 8)
+              (set! per-step
+                    (append per-step
+                            (generate-tokens stepwise prompt 1 #f
+                                             #:temperature 0.8 #:seed 7)))
+              (loop (+ n 1))))
+          (test-equal
+            "per-step sampled decode matches one 8-token call"
+            ref per-step)
+          (free-session! one)
+          (free-session! stepwise))
 
         ;; Streaming. One decode per session: generate-stream's own run, and a
         ;; separate generate / generate-tokens run of the same prompt for the
@@ -116,6 +142,18 @@
                 (lambda (key . args) #t)))
             (test-equal "the decode stopped at the failing token" 3 seen)
             (free-session! sess2)))
+
+        ;; Sampling through the streaming entry point: the same parameters and
+        ;; seed as generate-tokens must select the same ids.
+        (let* ((prompt (tokenize model "Hello"))
+               (stream (make-session model 512))
+               (ref (make-session model 512)))
+          (test-equal "generate-stream passes the sampler through"
+            (generate-tokens ref prompt 8 #:temperature 0.8 #:seed 7)
+            (generate-stream model stream prompt 8 (lambda (tok chunk) #t)
+                             #:temperature 0.8 #:seed 7))
+          (free-session! stream)
+          (free-session! ref))
 
         (test-equal "tokenize / detokenize round-trip"
           "Hello, world!"

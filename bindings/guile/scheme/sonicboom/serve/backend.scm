@@ -58,6 +58,7 @@
 
             make-sampler sampler? sampler-temperature sampler-top-p
             sampler-top-k sampler-seed sampler-greedy? sampler-random-state
+            sampler-presence-penalty sampler-frequency-penalty
             sample-from-logits
 
             make-json-schema-constraint make-tool-call-constraint
@@ -114,12 +115,13 @@
 ;;                  constraint has closed the reply (nothing left to produce)
 ;;   stats          (model)                        -> alist (optional)
 ;; The sampling? capability says whether `step` honors the sampler's
-;; temperature / top-p / top-k. The libsonicboom backend decodes one token at a
-;; time through its session and returns #f here: its step ignores the sampler,
-;; and the HTTP layer then rejects an explicit sampling request instead of
-;; silently decoding greedily. (The core's sb_llm_decode can sample when the
-;; whole reply is decoded in one call; that path is not what this per-step
-;; backend uses.) It defaults to #f, so a backend has to claim it.
+;; temperature / top-p / top-k / seed and penalties. The libsonicboom backend
+;; claims it: each `step` is one sb_llm_decode call on the persistent session,
+;; and the core's sampled path (temperature > 0) keeps its draw state across
+;; those calls, so a per-step decode samples exactly like a one-shot decode.
+;; A backend that cannot sample returns #f (the default), and the HTTP layer
+;; then rejects an explicit sampling request instead of silently decoding
+;; greedily.
 (define* (make-backend #:key (name "backend")
                        (load-model (required 'load-model))
                        (model-info (required 'model-info))
@@ -273,24 +275,29 @@ CALL-SCHEMA-JSON."
 ;;; Sampler: the parameters of one request, plus its random state
 
 (define-record-type <sampler>
-  (%make-sampler temperature top-p top-k seed greedy? random-state)
+  (%make-sampler temperature top-p top-k seed greedy? random-state
+                 presence-penalty frequency-penalty)
   sampler?
   (temperature sampler-temperature)
   (top-p sampler-top-p)
   (top-k sampler-top-k)
   (seed sampler-seed)
   (greedy? sampler-greedy?)
-  (random-state sampler-random-state))
+  (random-state sampler-random-state)
+  (presence-penalty sampler-presence-penalty)
+  (frequency-penalty sampler-frequency-penalty))
 
 ;; temperature 0 means greedy, like the OpenAI API. top-k 0 means no top-k.
 ;; Without a seed the random state is seeded from the clock.
 (define* (make-sampler #:key (temperature 1.0) (top-p 1.0) (top-k 0)
-                       (seed #f) (greedy? #f))
+                       (seed #f) (greedy? #f)
+                       (presence-penalty 0.0) (frequency-penalty 0.0))
   (%make-sampler temperature top-p top-k seed
                  (or greedy? (<= temperature 0))
                  (seed->random-state
                   (or seed (+ (* 1000000 (car (gettimeofday)))
-                              (cdr (gettimeofday)))))))
+                              (cdr (gettimeofday)))))
+                 presence-penalty frequency-penalty))
 
 ;; The reference sampler for backends that produce logits on the host.
 ;; logits: list of (token . logit). constraint: #f or a token filter.

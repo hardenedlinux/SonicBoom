@@ -11,10 +11,11 @@ export LC_ALL=C LANG=C
 # Runs bindings/guile/scheme/sonicboom/serve/app.scm — the libsonicboom backend,
 # a real GGUF through the C ABI — on a free port and drives it with curl:
 # /health, /v1/models, /v1/chat/completions (JSON and SSE), the usage fields
-# (prompt_tokens_details.cached_tokens is the prefill's reused-token count), the
-# greedy-only rejection, the context-length rejection, prefix reuse across a
-# multi-turn conversation, and that a turn marker typed in a message stays text
-# (never a control token). Exits non-zero if a check fails.
+# (prompt_tokens_details.cached_tokens is the prefill's reused-token count),
+# seeded sampling (the per-step decode is deterministic per seed), the
+# context-length rejection, prefix reuse across a multi-turn conversation, and
+# that a turn marker typed in a message stays text (never a control token).
+# Exits non-zero if a check fails.
 #
 #   tools/test-api-server.sh [MODEL.gguf ...]
 #
@@ -217,19 +218,33 @@ run_model() {
     bad "SSE stream ($code)"
   fi
 
-  # --- greedy only -----------------------------------------------------------
+  # --- sampling --------------------------------------------------------------
+  # The real backend passes the sampler through sb_llm_decode's sampled session
+  # path, one call per step. A request is reproducible per seed: the same body
+  # twice must give the same reply. Whether a different seed gives a different
+  # reply is model-dependent, so it is not asserted.
 
-  jpost "$base/v1/chat/completions" \
-        "$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"temperature":1}' "$mid")"
-  [ "$code" = 400 ] && grep -q '"param":"temperature"' "$body" \
-    && ok "temperature 1 -> 400 (param temperature)" \
-    || bad "temperature 1 should be a 400 on temperature ($code)"
+  local samp_body samp1 samp2 samp_c1 samp_c2
+  samp_body=$(printf \
+    '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":8,"temperature":1,"seed":7}' \
+    "$mid")
+  jpost "$base/v1/chat/completions" "$samp_body"
+  local samp_code=$code
+  samp1=$(json_content "$body"); samp_c1=$(num "$body" completion_tokens)
+  jpost "$base/v1/chat/completions" "$samp_body"
+  samp2=$(json_content "$body"); samp_c2=$(num "$body" completion_tokens)
+  if [ "$samp_code" = 200 ] && [ "$code" = 200 ] \
+     && [ -n "$samp_c1" ] && [ "$samp_c1" -gt 0 ] \
+     && [ "$samp_c1" = "$samp_c2" ] && [ "$samp1" = "$samp2" ]; then
+    ok "seeded sampling: temperature 1, seed 7 repeats its $samp_c1-token reply"
+  else
+    bad "seeded sampling is not deterministic (HTTP $samp_code/$code, $samp_c1/$samp_c2 tokens)"
+  fi
 
   jpost "$base/v1/chat/completions" \
         "$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"top_p":0.5}' "$mid")"
-  [ "$code" = 400 ] && grep -q '"param":"top_p"' "$body" \
-    && ok "top_p 0.5 -> 400 (param top_p)" \
-    || bad "top_p 0.5 should be a 400 on top_p ($code)"
+  [ "$code" = 200 ] && ok "a nucleus request (top_p 0.5) is accepted" \
+    || bad "top_p 0.5 should be accepted ($code)"
 
   jpost "$base/v1/chat/completions" \
         "$(printf '{"model":"%s","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"temperature":0,"top_p":1}' "$mid")"

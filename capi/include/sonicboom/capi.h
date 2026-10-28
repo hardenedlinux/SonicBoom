@@ -468,13 +468,17 @@ sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
 /* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
 /* A thin facade over the Layer 2 model loader + planner spine, exposing the
  * smallest inference set the first binding (Guile) needs: model load/free,
- * session new/free, tokenize/detokenize, prefill, and greedy decode with a
- * per-token callback. The scope is intentionally minimal (v1 wrap-up):
- *  - decode runs one whole greedy generation per call (the CPU planner spine
- *    has no step-wise persistent session yet); a single-token prompt is a seed
- *    and decodes directly, a longer prompt prefills then decodes;
+ * session new/free, tokenize/detokenize, prefill, and decode with a per-token
+ * callback. The scope is intentionally minimal (v1 wrap-up):
+ *  - on the device path, after sb_llm_prefill decode continues from the
+ *    session's persistent KV cache: each call emits up to max_tokens from where
+ *    the previous one stopped, so a max_tokens=1 call is a per-token step. (The
+ *    CPU fallback re-runs from the prompt on every call and does not carry
+ *    generated tokens across calls.) A single-token prompt is a seed and
+ *    decodes directly;
  *  - temperature 0 is greedy (the historical path); temperature > 0 samples
- *    deterministically from sb_llm_sampling's seed;
+ *    deterministically from sb_llm_sampling's seed, and the sampled draw state
+ *    persists across calls on the same session;
  *  - tokenize/detokenize use the model's GGUF built-in vocabulary (SPM-style
  *    BPE for Gemma 4, byte-level BPE for Qwen2), matching llama-tokenize;
  *  - the architectures SonicBoom models load (Gemma 4, Qwen2); anything else
