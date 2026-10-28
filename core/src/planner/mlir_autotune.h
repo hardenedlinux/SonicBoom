@@ -113,9 +113,32 @@ void reset_budget_for_test();
 // or no device is visible. Cached after the first call.
 int sm_version();
 
+// On-disk record version. Part of the file header: a bump resets every record,
+// so anything that reproduces a selection can report which store it came from.
+int cache_version();
+
 // Candidate grid for the decode gemv: tile_m {128, 256, 512} × tile_k {32, 64},
 // tile_n = 1 (one row of output per tile), unroll = 1, vectorize = 1.
 std::span<const TileConfig> gemv_candidates();
+
+// Why a lookup did or did not return a record. Callers that report their
+// decision need to say *why* a cached selection was not used; a plain
+// nullopt cannot tell "no record for this key" from "the file is an older
+// schema and was ignored".
+enum class CacheStatus {
+  Hit,              // a record for (op, shape_class) was found
+  NotFound,         // the file is readable and current, no record for this key
+  VersionMismatch,  // the file was written by another schema version
+  Unreadable,       // no file, no lock, or a corrupt header
+};
+
+struct CacheLookup {
+  CacheStatus status = CacheStatus::NotFound;
+  TileConfig cfg{};
+  // Schema version found on disk (0 when no header could be read). Set on
+  // VersionMismatch so a report can name the store that was ignored.
+  int file_version = 0;
+};
 
 class AutotuneCache {
  public:
@@ -124,6 +147,15 @@ class AutotuneCache {
   // The record for (op, shape_class, sm_version()), or nullopt on a miss.
   std::optional<TileConfig> lookup(std::string_view op,
                                    std::string_view shape_class);
+
+  // Same lookup, with the outcome made explicit (see CacheStatus). lookup()
+  // is lookup_ex() without the status.
+  CacheLookup lookup_ex(std::string_view op, std::string_view shape_class);
+
+  // Longest key the record layout can hold. A class string at or above this
+  // length can never match a record: field_matches() rejects it rather than
+  // comparing a truncated key.
+  static size_t max_shape_class_bytes();
   // Insert or update the record. False when the file cannot be created or
   // locked; the caller keeps its default then.
   bool store(std::string_view op, std::string_view shape_class,

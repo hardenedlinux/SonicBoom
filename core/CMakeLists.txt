@@ -223,6 +223,13 @@ if(SONICBOOM_USE_CUDA)
     # measurement backend, SONICBOOM_ATTN_IMPL=boom_fattn). Plain device code,
     # no device lambdas, so it needs no per-source flags.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_boom_fattn.cu
+    # boom_fattn candidate selection and its runtime JIT (see src/nn/
+    # fattn_tune.h). fattn_tune.cu is the autotuner, the per-device selection
+    # cache and the startup report; fattn_jit.cpp compiles a candidate the AOT
+    # cubin has no image for (other architectures) with NVRTC and caches the
+    # PTX. Both are host-side: no device lambdas, no extra flags.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_tune.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_jit.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/adamw.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/backward_ops.cu
     # The training graph executor's forward + AdamW kernels (device_graph.cpp
@@ -265,6 +272,44 @@ if(SONICBOOM_USE_CUDA)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_ggml.cu
     PROPERTIES COMPILE_OPTIONS "--extended-lambda")
+
+  # boom_fattn's runtime JIT compiles the same device code the AOT translation
+  # unit includes, so src/nn/fattn_boom_device.cuh is embedded verbatim as a
+  # string here and handed to NVRTC. Reading it at configure time and listing it
+  # as a configure dependency is what keeps the two from drifting: editing the
+  # header regenerates the string on the next build.
+  set(_sb_fattn_device
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_boom_device.cuh")
+  set(_sb_fattn_src_inc
+      "${CMAKE_CURRENT_BINARY_DIR}/fattn_device_src.inc")
+  file(READ "${_sb_fattn_device}" _sb_fattn_device_text)
+  file(WRITE "${_sb_fattn_src_inc}"
+       "// Generated from src/nn/fattn_boom_device.cuh by CMake. Do not edit.\n"
+       "static const char kFattnDeviceSource[] = R\"SB_FATTN_DEVICE(\n")
+  file(APPEND "${_sb_fattn_src_inc}" "${_sb_fattn_device_text}")
+  file(APPEND "${_sb_fattn_src_inc}" ")SB_FATTN_DEVICE\";\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+               "${_sb_fattn_device}")
+  target_include_directories(sonicboom PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+
+  # NVRTC searches no system path: the CUDA headers (<cuda_fp16.h>) have to be
+  # passed explicitly, and the directory is a property of the toolkit this
+  # library was built against. The JIT also probes the usual locations at
+  # runtime, so a program run against a differently installed toolkit still
+  # finds them.
+  set(_sb_fattn_cuda_includes "")
+  foreach(_sb_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(_sb_inc)
+      if(_sb_fattn_cuda_includes)
+        string(APPEND _sb_fattn_cuda_includes ":${_sb_inc}")
+      else()
+        set(_sb_fattn_cuda_includes "${_sb_inc}")
+      endif()
+    endif()
+  endforeach()
+  target_compile_definitions(sonicboom PRIVATE
+    SONICBOOM_VERSION_STRING="${PROJECT_VERSION}"
+    FATTN_JIT_CUDA_INCLUDE="${_sb_fattn_cuda_includes}")
 endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;

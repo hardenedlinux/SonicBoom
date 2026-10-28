@@ -68,6 +68,14 @@ the class is retimed; `=0` skips measurement and keeps the defaults.
 - **JIT candidate tuner** (`core/src/planner/mlir_autotune.{h,cpp}`):
   `<cache>/sonicboom/autotune/sm_<NN>.bin`, one versioned fixed-record file per
   compute capability, flock-protected, keyed by `(op, shape class)`.
+  `boom_fattn` uses a three-component shape class,
+  `f<version>/<capability>/<software>/<workload>`, built from probed device
+  limits, the driver/runtime/NVRTC versions, the kernel source hash and the
+  bucketed workload — never the product name. Version 6 widened the record so
+  that key fits; older files are reported as `version-mismatch` and not read.
+  See `fattn-autotune.md`. The workload's KV span is bucketed to a power of two
+  because every selectable candidate is measured bit-identical to the
+  reference; a non-bit-identical candidate must not join that set.
 - **Spec ratio**: the `spec_verify_ratio` record in the per-SM JIT file.
 - **Plan cache**: `PlannerEnv` carries `decisions::fingerprint()`, an FNV-1a
   hash of the sorted `(name, scope, value)` triples. A new decision changes the
@@ -86,6 +94,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
+| `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE` (see `fattn-autotune.md`) |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto`, `SONICBOOM_SPEC_PROBE_MS` |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 | attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |

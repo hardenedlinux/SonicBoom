@@ -57,12 +57,18 @@ constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // would be applied to a class it was not measured for. Version 5 drops the
 // query-length bucket from the "attn_prefill" class key (one kernel per shape
 // class; run rule R1), so a version-4 record names a class that no longer
-// exists. An older file misses on lookup and is rewritten by the first store,
-// which is the cache's own reset path.
-constexpr uint32_t kVersion = 5;
+// exists. Version 6 widens the shape field from 48 to 192 bytes and the record
+// from 112 to 256 bytes: "boom_fattn" keys carry a capability, a software and
+// a workload fingerprint, and a 47-byte class could not hold them (a longer
+// key could never match, so the class would silently retune on every launch).
+// The wider record changes the file layout, so a version-5 file must not be
+// read as version 6 even though both are fixed-record arrays. An older file
+// misses on lookup and is rewritten by the first store, which is the cache's
+// own reset path.
+constexpr uint32_t kVersion = 6;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
-constexpr size_t kShapeBytes = 48;
+constexpr size_t kShapeBytes = 192;
 
 struct Header {
   uint32_t magic;
@@ -81,7 +87,7 @@ struct Record {
 
 static_assert(sizeof(TileConfig) == 20, "TileConfig is five int32 fields");
 static_assert(sizeof(Header) == 16, "cache header layout");
-static_assert(sizeof(Record) == 112, "cache record layout");
+static_assert(sizeof(Record) == 256, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
 
@@ -322,6 +328,8 @@ int sm_version() {
   return v;
 }
 
+int cache_version() { return int(kVersion); }
+
 TileConfig default_config(std::string_view op) {
   (void)op;
   // The pre-Q1 launch shape: tile_m 256 is the one-thread-per-super-block gemv
@@ -349,38 +357,63 @@ std::string AutotuneCache::path() const {
 
 void AutotuneCache::reset_for_test() { path_.clear(); }
 
-std::optional<TileConfig> AutotuneCache::lookup(std::string_view op,
-                                                std::string_view shape_class) {
+size_t AutotuneCache::max_shape_class_bytes() { return kShapeBytes - 1; }
+
+CacheLookup AutotuneCache::lookup_ex(std::string_view op,
+                                     std::string_view shape_class) {
+  CacheLookup out;
   const int fd = open_cache_file();
-  if (fd < 0) return std::nullopt;
-  std::optional<TileConfig> found;
+  if (fd < 0) {
+    out.status = CacheStatus::Unreadable;
+    return out;
+  }
+  out.status = CacheStatus::Unreadable;  // until the file proves readable
   if (::flock(fd, LOCK_SH) == 0) {
     struct stat st {};
-    if (::fstat(fd, &st) == 0 && st.st_size >= off_t(sizeof(Header))) {
-      const size_t bytes =
-          std::min<size_t>(size_t(st.st_size), kFileBytes);
-      void* m = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
-      if (m != MAP_FAILED) {
-        const Header* h = static_cast<const Header*>(m);
-        const size_t avail = (bytes - sizeof(Header)) / sizeof(Record);
-        const size_t count =
-            std::min<size_t>(h->count, std::min<size_t>(h->capacity, avail));
-        if (h->magic == kMagic && h->version == kVersion) {
-          const Record* recs = reinterpret_cast<const Record*>(h + 1);
-          for (size_t i = 0; i < count; ++i) {
-            if (op_matches(recs[i], op, shape_class)) {
-              found = recs[i].cfg;
-              break;
+    if (::fstat(fd, &st) == 0) {
+      if (st.st_size < off_t(sizeof(Header))) {
+        // A file created but not yet written is a normal first-launch state.
+        out.status = CacheStatus::NotFound;
+      } else {
+        const size_t bytes =
+            std::min<size_t>(size_t(st.st_size), kFileBytes);
+        void* m = ::mmap(nullptr, bytes, PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) {
+          const Header* h = static_cast<const Header*>(m);
+          const size_t avail = (bytes - sizeof(Header)) / sizeof(Record);
+          const size_t count =
+              std::min<size_t>(h->count, std::min<size_t>(h->capacity, avail));
+          if (h->magic != kMagic) {
+            out.status = CacheStatus::Unreadable;
+          } else if (h->version != kVersion) {
+            out.status = CacheStatus::VersionMismatch;
+            out.file_version = int(h->version);
+          } else {
+            out.status = CacheStatus::NotFound;
+            const Record* recs = reinterpret_cast<const Record*>(h + 1);
+            for (size_t i = 0; i < count; ++i) {
+              if (op_matches(recs[i], op, shape_class)) {
+                out.cfg = recs[i].cfg;
+                out.status = CacheStatus::Hit;
+                break;
+              }
             }
           }
+          ::munmap(m, bytes);
         }
-        ::munmap(m, bytes);
       }
     }
     ::flock(fd, LOCK_UN);
   }
   ::close(fd);
-  return found;
+  return out;
+}
+
+std::optional<TileConfig> AutotuneCache::lookup(std::string_view op,
+                                                std::string_view shape_class) {
+  const CacheLookup r = lookup_ex(op, shape_class);
+  if (r.status != CacheStatus::Hit) return std::nullopt;
+  return r.cfg;
 }
 
 bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
