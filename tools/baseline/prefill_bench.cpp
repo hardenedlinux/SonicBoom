@@ -25,6 +25,9 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/kv_cache.h>
 
+#include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
+
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -79,18 +82,44 @@ int main(int argc, char** argv) {
         *m, prompt, 0, toks, session, true);
   };
 
-  auto best = [&](const std::vector<uint64_t>& prompt, bool* ok) -> double {
-    double b = 1e18;
+  // NVTX call markers (opt-in via SONICBOOM_NVTX, the runtime's own switch):
+  // nsys can then isolate exactly one measured prefill call. The range wraps
+  // the timed region, so the host duration of the range is the call latency.
+  const bool nvtx_on = std::getenv("SONICBOOM_NVTX") != nullptr;
+  struct Stats {
+    std::vector<double> reps;  // seconds, in execution order
+    double best = 1e18;
+    double median = 0.0;
+  };
+  auto best = [&](const std::vector<uint64_t>& prompt, const char* label,
+                  bool* ok) -> Stats {
+    Stats s;
+    s.reps.reserve(reps);
     for (uint64_t rep = 0; rep < reps; ++rep) {
+      if (nvtx_on) nvtxRangePushA(label);
       const auto t0 = std::chrono::steady_clock::now();
       const uint64_t done = run(prompt);
       const auto t1 = std::chrono::steady_clock::now();
-      if (done == 0) { *ok = false; return 0.0; }
+      if (nvtx_on) nvtxRangePop();
+      if (done == 0) { *ok = false; return s; }
       const double secs = std::chrono::duration<double>(t1 - t0).count();
-      if (secs < b) b = secs;
+      s.reps.push_back(secs);
+      if (secs < s.best) s.best = secs;
     }
+    std::vector<double> sorted = s.reps;
+    std::sort(sorted.begin(), sorted.end());
+    const size_t m = sorted.size();
+    s.median = (m % 2) ? sorted[m / 2]
+                       : 0.5 * (sorted[m / 2 - 1] + sorted[m / 2]);
     *ok = true;
-    return b;
+    return s;
+  };
+  auto print_reps = [](const char* what, const Stats& s) {
+    fprintf(stderr, "[reps] %s ms=", what);
+    for (size_t i = 0; i < s.reps.size(); ++i)
+      fprintf(stderr, "%s%.3f", i ? "," : "", s.reps[i] * 1000.0);
+    fprintf(stderr, " best=%.3f median=%.3f\n", s.best * 1000.0,
+            s.median * 1000.0);
   };
 
   const std::vector<uint64_t> prompt = make_prompt(n);
@@ -98,21 +127,28 @@ int main(int argc, char** argv) {
 
   // Warm up (builds graph/plan caches, allocates buffers, warms the device).
   bool ok = true;
-  best(prompt, &ok);
+  best(prompt, "bench:warmup_N", &ok);
   if (!ok) {
     fprintf(stderr, "prefill rejected at --prompt %llu\n",
             (unsigned long long)n);
     return 1;
   }
-  best(one, &ok);
+  best(one, "bench:warmup_1", &ok);
 
-  const double t_n = best(prompt, &ok);
+  const Stats sn = best(prompt, "bench:measure_N", &ok);
   if (!ok) return 1;
-  const double t_1 = best(one, &ok);
+  const Stats s1 = best(one, "bench:measure_1", &ok);
+  const double t_n = sn.best;
+  const double t_1 = s1.best;
+  print_reps("N", sn);
+  print_reps("1", s1);
 
   const double pp_wall = t_n > 0.0 ? double(n) / t_n : 0.0;
   const double dt = t_n - t_1;
   const double pp_marginal = dt > 0.0 ? double(n - 1) / dt : 0.0;
+  // Median-of-reps view (the same marginal definition on median latencies).
+  const double dt_med = sn.median - s1.median;
+  const double pp_marginal_med = dt_med > 0.0 ? double(n - 1) / dt_med : 0.0;
 
   printf("prefill --prompt %llu: %.3f ms (N=%llu) vs %.3f ms (N=1) | "
          "pp_marginal %.1f tok/s (CANONICAL) | pp_wall %.1f tok/s "
@@ -125,5 +161,11 @@ int main(int argc, char** argv) {
   // timed region). pp_wall is reported for reference only.
   printf("RESULT prefill prompt=%llu pp_marginal_tok_s=%.1f pp_wall_tok_s=%.1f\n",
          (unsigned long long)n, pp_marginal, pp_wall);
+  // Median-of-reps view, alongside the canonical best-of line above.
+  printf("RESULT_MEDIAN prefill prompt=%llu t_n_ms=%.3f t_1_ms=%.3f "
+         "pp_marginal_tok_s=%.1f pp_wall_tok_s=%.1f\n",
+         (unsigned long long)n, sn.median * 1000.0, s1.median * 1000.0,
+         pp_marginal_med,
+         sn.median > 0.0 ? double(n) / sn.median : 0.0);
   return 0;
 }
