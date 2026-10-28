@@ -186,6 +186,42 @@ Gemma (1.20× / 1.21× / 1.04×) and 306.9 / 302.8 / 14027 tok/s on Qwen2.5-0.5B
 - DeepSeek and Qwen2.5-7B are benchmark-only in this README: their token
   streams are not part of the public golden set.
 
+### Long context
+
+Same protocol as the canonical table — medians of 3 process runs, both
+runtimes on the same GGUF in the same session — run through
+`tools/bench.sh --long`. Decode is 64 tokens at the given KV depth; prefill is
+the marginal per-token cost of a prompt of that length (one repeat per process
+run). A tier the card cannot hold is shown as rejected. SM clock medians over
+these runs: 1875 MHz (Gemma), 1920 MHz (Qwen2.5-0.5B), 1890 MHz (DeepSeek) and
+1852 MHz (Qwen2.5-7B).
+
+**Decode at depth** (tok/s; ratio to llama.cpp in parentheses)
+
+| depth | Gemma 4 E4B | Qwen2.5-0.5B | DeepSeek-1.5B | Qwen2.5-7B |
+|---|---:|---:|---:|---:|
+| d4096 | 50.5 (1.18×) | 242.1 (0.87×) | 121.7 (0.90×) | 35.6 (0.86×) |
+| d16384 | 45.1 (1.13×) | 144.8 (0.63×) | 82.3 (0.75×) | 27.2 (0.75×) |
+| d32768 | 38.5 (1.05×) | 92.0 (0.49×) | 57.6 (0.65×) | rejected (8 GB) |
+
+**Prefill** (tok/s; ratio to llama.cpp in parentheses)
+
+| prompt | Gemma 4 E4B | Qwen2.5-0.5B | DeepSeek-1.5B | Qwen2.5-7B |
+|---|---:|---:|---:|---:|
+| pp4096 | 1942.2 (1.00×) | 12305.5 (0.92×) | 1627.8 (0.30×) | 1237.1 (0.82×) |
+| pp8192 | 1842.0 (0.98×) | 9475.6 (0.81×) | 935.4 (0.20×) | 1088.1 (0.77×) |
+| pp16384 | 1696.3 (0.98×) | 6569.3 (0.71×) | 506.7 (0.13×) | 884.7 (0.70×) |
+| pp32768 | 1463.5 (0.96×) | 4045.4 (0.61×) | 264.4 (0.09×) | rejected (8 GB) |
+
+Gemma 4 keeps its decode lead as the KV cache grows (1.18× at 4K, 1.13× at
+16K, 1.05× at 32K) and its prefill stays within 4% of llama.cpp across the
+range (1.00× → 0.96×). The d128 families lose ground as the attended span
+grows. DeepSeek's prefill is the largest gap in this release: 0.30× at 4K,
+falling to 0.09× at 32K as its cost grows superlinearly with prompt length.
+Qwen2.5-7B's 32K decode and prefill tiers do not fit in 8 GB. The decode
+sweep here is 4K/16K/32K; pp8192 is included, d8192 was not measured for this
+release.
+
 ### Benchmark conditions
 
 | | |
@@ -211,9 +247,9 @@ carry no token-stream claim in this README.
 
 ### Community results
 
-Numbers from other people's hardware belong here, next to the command that
-produced them. Results are published as reported, with the reporter credited,
-and marked as not reproduced by us.
+Numbers from other people's hardware are collected in the release issues; the
+standard run below is what a report should follow. Results are credited with
+the reporter's GitHub handle and marked as not reproduced by us.
 
 #### Standard run
 
@@ -268,25 +304,13 @@ rejected, not as a failure; that is a valid result.
 
 Repeat steps 3–4 for each GGUF you have; one model per run.
 
-**What to send.** Open an issue or PR with:
+Results are collected in GitHub issues, one per release:
 
-- the full output of step 3, which carries the GPU, driver, toolchain and
-  SonicBoom build hash (or its `--json` form);
-- the canonical table and its `RESULT bench ...` line;
-- the step 4 table and its `RESULT bench_long ...` lines, if you ran it;
-- GPU model, driver/CUDA version, llama.cpp commit (and whether it was built
-  with CUDA, e.g. `-DGGML_CUDA=ON`), and whether the clock was pinned.
+- **v0.0.3:** [issue #1](https://github.com/hardenedlinux/SonicBoom/issues/1)
+  and [issue #2](https://github.com/hardenedlinux/SonicBoom/issues/2)
+- **v0.0.4:** [issue #3](https://github.com/hardenedlinux/SonicBoom/issues/3)
 
-A number without those conditions cannot be added to the table.
-
-| GPU | Driver / CUDA | SonicBoom build | Model | SonicBoom decode | llama.cpp tg64 | Ratio | Decode tokens vs sm_86 golden | Reporter |
-|---|---|---|---|---:|---:|---:|---|---|
-| RTX 4060 Ti 16 GB (sm_89) | 550.163.01 / 12.4 | `1462b04` (sm_86 code, before tuning) | Gemma 4 E4B-it Q3_K_M | 73.6 tok/s | 78 tok/s | 0.94 | identical (64/64) | [@svenha](https://github.com/hardenedlinux/SonicBoom/issues/1) |
-
-The 4060 Ti row predates `tools/bench.sh` and the build-for-the-detected-GPU
-default: it measures sm_86 code running on Ada with the decode golden, against
-llama.cpp `43fe9c64281` built for the card. Both numbers come from the
-reporter's machine.
+Post your run in the open issue for your version.
 
 ### Thanks
 
