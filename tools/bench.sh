@@ -22,10 +22,11 @@ export LC_ALL=C LANG=C
 #
 # The decode tools warm the exact (model, n_ctx) runtime before the timed region,
 # so the one-time graph/plan build + CUDA-graph capture is never counted. That is
-# why tg64 reads ~51.6 tok/s through this harness and not the ~47.5 tok/s a
-# warm-up keyed on a different n_ctx used to report (the capture cost leaked into
-# the depth-0 tail). pp512 reports pp_marginal (the per-token prefill cost, the
-# llama-bench `-p n -n 0` semantics); pp_wall is a labelled legacy metric.
+# why tg64 reads the steady-state rate through this harness and not the lower
+# number a warm-up keyed on a different n_ctx used to report (the capture cost
+# leaked into the depth-0 tail). pp512 reports pp_marginal (the per-token prefill
+# cost, the llama-bench `-p n -n 0` semantics); pp_wall is a labelled legacy
+# metric.
 #
 # Measurement conditions: the GPU clock is pinned for the duration of the run
 # (`nvidia-smi -lgc`, released on exit with `-rgc`) — an unpinned clock drifts by
@@ -41,8 +42,8 @@ export LC_ALL=C LANG=C
 # reported beside it: the median alone cannot say whether a later comparison's
 # difference is bigger than this harness's own repeatability.
 #
-# --long adds the extended-context tiers (M3): decode at depth 4K/16K/32K and
-# prefill of 4K/16K/32K tokens, each against llama-bench at the same depth
+# --long adds the extended-context tiers (M3): decode at depth 4K/8K/16K/32K and
+# prefill of 4K/8K/16K/32K tokens, each against llama-bench at the same depth
 # (`-d` / `-p`). It is opt-in because the deep tiers cost minutes per run. The
 # decode tiers reach the depth with the chunked prefill path (longctx_bench
 # --prefill) rather than decoding to it; the subtraction cancels the prefill,
@@ -65,7 +66,7 @@ GGUF=""
 CLOCKS=1
 CLOCK_MHZ=""
 LONG=0
-LONG_DEPTHS="4096 16384 32768"
+LONG_DEPTHS="4096 8192 16384 32768"
 LONG_STEPS=64
 
 while [ $# -gt 0 ]; do

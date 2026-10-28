@@ -28,13 +28,16 @@ export LC_ALL=C LANG=C
 # 0). --no-golden / --no-bench skip the two sections when they are not wanted.
 #
 # Usage: tools/sb-report.sh --gemma PATH [--qwen PATH] [--deepseek PATH]
-#                           [--json] [--lib PATH] [--runs N] [--build]
-#                           [--no-golden] [--no-bench]
+#                           [--model PATH] [--json] [--lib PATH] [--runs N]
+#                           [--build] [--no-golden] [--no-bench]
 #                           [--moss DIR --moss-embeds FILE --moss-neg-embeds FILE
 #                            [--moss-size 512x512] [--moss-steps 20]]
 #                           (--moss adds the MOSS-Image table through
 #                            tools/bench-image.sh; it is opt-in because each
 #                            image run loads the 9.5 GB checkpoint)
+# --model PATH benchmarks any GGUF the runtime loads, for a model with no golden
+# tag (for example Qwen2.5-7B). It reports host, build and the canonical bench;
+# the golden suites need --gemma / --qwen / --deepseek.
 # Env:   SONICBOOM_LIB=/path/to/libsonicboom.so   (default <repo>/build/core/libsonicboom.so)
 #        LLAMA_BENCH=/path/to/llama-bench        (passed through; adds llama.cpp)
 set -uo pipefail
@@ -45,6 +48,7 @@ LIB="${SONICBOOM_LIB:-}"
 GEMMA=""
 QWEN=""
 DEEPSEEK=""
+MODEL=""
 RUNS=3
 BUILD=0
 GOLDEN=1
@@ -63,6 +67,7 @@ while [ $# -gt 0 ]; do
     --gemma) GEMMA="$2"; shift 2 ;;
     --qwen)  QWEN="$2"; shift 2 ;;
     --deepseek) DEEPSEEK="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
     --runs)  RUNS="$2"; shift 2 ;;
     --build) BUILD=1; shift ;;
     --no-golden) GOLDEN=0; shift ;;
@@ -73,7 +78,7 @@ while [ $# -gt 0 ]; do
     --moss-size) MOSS_SIZE="$2"; shift 2 ;;
     --moss-steps) MOSS_STEPS="$2"; shift 2 ;;
     --moss-batches) MOSS_BATCHES="$2"; shift 2 ;;
-    -h|--help) sed -n '3,36p' "$0"; exit 0 ;;
+    -h|--help) awk '/^# SPDX/{f=1;next} /^set -uo pipefail/{f=0} f' "$0"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -199,12 +204,13 @@ fi
 # A model is required: the report exists to bind a number to the machine and
 # binary that produced it, so "no model, no numbers" is an error, not an empty
 # section. --no-golden / --no-bench still require a model; they only skip work.
-if [ -z "$GEMMA" ] && [ -z "$QWEN" ] && [ -z "$DEEPSEEK" ]; then
-  echo "sb-report: no model given — pass --gemma PATH, --qwen PATH and/or --deepseek PATH" >&2
+if [ -z "$GEMMA" ] && [ -z "$QWEN" ] && [ -z "$DEEPSEEK" ] && [ -z "$MODEL" ]; then
+  echo "sb-report: no model given — pass --gemma PATH, --qwen PATH, --deepseek PATH" >&2
+  echo "           or --model PATH for a benchmark-only model" >&2
   echo "           the report runs the golden checks and the canonical bench against it" >&2
   exit 2
 fi
-for m in "$GEMMA" "$QWEN" "$DEEPSEEK"; do
+for m in "$GEMMA" "$QWEN" "$DEEPSEEK" "$MODEL"; do
   [ -z "$m" ] || [ -f "$m" ] || { echo "sb-report: model not found: $m" >&2; exit 2; }
 done
 [ -z "$GEMMA" ] || export SONICBOOM_GEMMA_GGUF="$GEMMA"
@@ -249,6 +255,9 @@ if [ "$GOLDEN" = 1 ]; then
   [ -n "$GEMMA" ] && golden_run cuda_elementwise '^test_cuda_elementwise$'
   [ -n "$QWEN" ]  && golden_run qwen_tokens '^test_qwen2_generate_numerics_standard$'
   [ -n "$DEEPSEEK" ] && golden_run deepseek_tokens '^test_deepseek_generate_numerics_standard$'
+  if [ -n "$MODEL" ] && [ -z "$GEMMA" ] && [ -z "$QWEN" ] && [ -z "$DEEPSEEK" ]; then
+    [ "$JSON" = 1 ] || echo "  --model has no golden tag; bench only"
+  fi
   [ "$JSON" = 1 ] || echo
 fi
 
@@ -280,6 +289,7 @@ if [ "$BENCH" = 1 ]; then
   [ -n "$GEMMA" ] && bench_one gemma "$GEMMA"
   [ -n "$QWEN" ]  && bench_one qwen "$QWEN"
   [ -n "$DEEPSEEK" ] && bench_one deepseek "$DEEPSEEK"
+  [ -n "$MODEL" ] && bench_one model "$MODEL"
 fi
 
 # --- MOSS-Image (opt-in: each run loads the 9.5 GB checkpoint) --------------

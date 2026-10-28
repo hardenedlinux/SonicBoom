@@ -50,35 +50,66 @@ Medians of 3 process runs, both runtimes on the same GGUF in the same session,
 on the machine in [Conditions](#conditions). Every claim is bounded by that: one
 GPU, one quant file.
 
+Four language-model families are benchmarked: d64 dense (Gemma 4, Qwen2.5-0.5B)
+and d128 grouped-query attention (DeepSeek-R1-Distill-1.5B GQA-6, Qwen2.5-7B
+GQA-7). DeepSeek and Qwen2.5-7B are benchmark-only: they carry no public
+token-stream golden.
+
 **Gemma 4 E4B-it Q3_K_M** (RTX 3050 8 GB, sm_86)
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **53.6 tok/s** | 44.8 tok/s | **1.20×** |
-| Decode at KV depth 512 | **53.5 tok/s** | 44.1 tok/s | **1.21×** |
-| Prefill, 512-token prompt (marginal) | 2084 tok/s | 1995 tok/s | 1.04× |
-| Prefix reuse, 512-token prefix + 64 new | 57.4 ms to first token | — | — |
+| **Decode**, 64-step steady state | **53.3 tok/s** | 44.9 tok/s | **1.19×** |
+| Decode at KV depth 512 | **52.7 tok/s** | 44.3 tok/s | **1.19×** |
+| Prefill, 512-token prompt (marginal) | 2261.7 tok/s | 1998.7 tok/s | 1.13× |
+| Prefix reuse, 512-token prefix + 64 new | 51.1 ms to first token | — | — |
 
 **Qwen2.5-0.5B-Instruct Q4_K_M** (same machine, same session)
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | **345.9 tok/s** | 306.9 tok/s | **1.13×** |
-| Decode at KV depth 512 | **307.0 tok/s** | 302.8 tok/s | **1.01×** |
-| Prefill, 512-token prompt (marginal) | 15301 tok/s | 14027 tok/s | 1.09× |
-| Prefix reuse, 512-token prefix + 64 new | 13.7 ms to first token | — | — |
+| **Decode**, 64-step steady state | **350.7 tok/s** | 306.9 tok/s | **1.14×** |
+| Decode at KV depth 512 | 297.9 tok/s | 303.2 tok/s | 0.98× |
+| Prefill, 512-token prompt (marginal) | 17932 tok/s | 14017.3 tok/s | 1.28× |
+| Prefix reuse, 512-token prefix + 64 new | 11.7 ms to first token | — | — |
 
-Decode leads on both families at depth 0 and depth 512. Qwen2 has no sliding
-window, so it attends all 512 keys while Gemma's ring buffer wraps — that is
-why Qwen2 is level at depth 512. Prefill is at parity on Gemma and ahead on
-Qwen. Prefix reuse has no llama.cpp counterpart (`llama-bench` cannot measure
-it), so it is reported as first-token latency only; the exactness claim beside
-it is a test, not a benchmark — a reuse continuation is token-identical to a
-full prefill (`test_guarantees` covers the public contract; the exhaustive
-prefix-length sweep is an engine regression suite maintained separately).
+**DeepSeek-R1-Distill-Qwen-1.5B Q4_K_M** (d128/GQA-6, same machine)
 
-SM clock medians over the published runs: 1912 MHz (Gemma) and 1927 MHz
-(Qwen); the script prints its own clock readings per run.
+| metric | SonicBoom | llama.cpp | ratio |
+|---|---:|---:|---:|
+| **Decode**, 64-step steady state | **154.0 tok/s** | 149.0 tok/s | **1.03×** |
+| Decode at KV depth 512 | 138.4 tok/s | 147.1 tok/s | 0.94× |
+| Prefill, 512-token prompt (marginal) | 4795.7 tok/s | 5815.0 tok/s | 0.82× |
+| Prefix reuse, 512-token prefix + 64 new | 33.1 ms to first token | — | — |
+
+**Qwen2.5-7B-Instruct-1M Q4_K_M** (d128/GQA-7, same machine)
+
+| metric | SonicBoom | llama.cpp | ratio |
+|---|---:|---:|---:|
+| **Decode**, 64-step steady state | 41.1 tok/s | 43.5 tok/s | 0.94× |
+| Decode at KV depth 512 | 39.7 tok/s | 43.2 tok/s | 0.92× |
+| Prefill, 512-token prompt (marginal) | 1475.4 tok/s | 1587.9 tok/s | 0.93× |
+| Prefix reuse, 512-token prefix + 64 new | 101.7 ms to first token | — | — |
+
+Decode leads on the two d64 families at depth 0 (1.19× Gemma, 1.14× Qwen2.5-0.5B).
+Qwen2.5-0.5B has no sliding window, so it attends all 512 keys while Gemma's
+ring buffer wraps — that is why it is level at depth 512. DeepSeek is at decode
+parity (1.03×) and Qwen2.5-7B is 6–8% behind. Prefill is ahead on both d64
+families (1.13× / 1.28×, the converged `boom_fattn` path) and behind on the d128
+families (0.82× / 0.93×). Prefix reuse has no llama.cpp counterpart
+(`llama-bench` cannot measure it), so it is reported as first-token latency
+only; the exactness claim beside it is a test, not a benchmark — a reuse
+continuation is token-identical to a full prefill (`test_guarantees` covers the
+public contract; the exhaustive prefix-length sweep is an engine regression
+suite maintained separately).
+
+The v0.0.3 values for the two original families are kept in the
+[README numbers table](../README.md#numbers) so the release-over-release change
+stays visible; the doc here reports the current release only.
+
+SM clock medians over the published runs: 1927 MHz (Gemma), 1942 MHz
+(Qwen2.5-0.5B), 1935 MHz (DeepSeek) and 1852 MHz (Qwen2.5-7B); the script
+prints its own clock readings per run.
 
 ## Correctness gates
 
@@ -116,15 +147,18 @@ on/off on the public models).
 | RAM | 32 GB DDR4-2400, single channel |
 | Host | Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
 | Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
-| Qwen model | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes, sha256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`) |
+| Qwen2.5-0.5B model | `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes, sha256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`) |
+| DeepSeek model | `DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` (1,117,321,312 bytes, sha256 `f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840`) |
+| Qwen2.5-7B model | `qwen2.5-7b-instruct-1m-q4_k_m.gguf` (4,683,073,888 bytes, sha256 `6dba997502a27b5f0c840346f45d9d62c0a04e6eb3cf72adc6c7ceb18804f380`) |
 | llama.cpp | commit `43fe9c64281`, CUDA build, `llama-bench -ngl 99` |
 | SonicBoom build | `tools/sb-report.sh`: git commit, CUDA archs actually compiled, LLVM version |
 
 The comparison is against llama.cpp at the commit above; newer versions may be
-faster or slower. The Qwen2 greedy token stream agrees with llama.cpp except at
-llama.cpp's own near-ties, where a different prefill batch geometry flips the
-last-place logits (first divergent step and top-1/top-2 margin recorded by the
-tests).
+faster or slower. The Qwen2.5-0.5B greedy token stream agrees with llama.cpp
+except at llama.cpp's own near-ties, where a different prefill batch geometry
+flips the last-place logits (first divergent step and top-1/top-2 margin
+recorded by the tests). DeepSeek and Qwen2.5-7B are benchmark-only and carry no
+token-stream claim.
 
 ## Reproduce
 
@@ -142,13 +176,30 @@ SONICBOOM_GEMMA_GGUF=models/gemma-4-E4B-it-Q3_K_M.gguf \
 $LLAMA_ROOT/build-cuda/bin/llama-bench \
   -m models/gemma-4-E4B-it-Q3_K_M.gguf -p 512 -n 64 -ngl 99 -r 1
 
-# two builds of libsonicboom.so against each other, with the measured noise floor
-tools/bench.sh models/gemma-4-E4B-it-Q3_K_M.gguf \
-  --ab build-base/libsonicboom.so build/libsonicboom.so
+# extended-context tiers: decode at depth 4K/8K/16K/32K and prefill 4K–32K
+LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
+  tools/bench.sh models/gemma-4-E4B-it-Q3_K_M.gguf --long
 
 # correctness
 ctest --test-dir build
 ```
 
+## Community runs
+
 Numbers from other people's hardware are collected in the README's *Community
-results* section, as reported and marked not reproduced by us.
+results* section, as reported and marked not reproduced by us. The copy-paste
+standard run — hardware/build record, canonical bench, extended-context tiers,
+clock pinning and what to send — is
+[README: Standard run](../README.md#standard-run).
+
+A community submission follows the same protocol as the published numbers:
+
+- both runtimes on the same GGUF, on the same machine, in the same session;
+- medians of 3 independent process runs (`--runs 3`);
+- one GPU at a time, idle, with no other measurement running;
+- the SM clock either pinned or reported as min/median/max;
+- the hardware, driver, SonicBoom build and llama.cpp commit included with the
+  numbers.
+
+A submission that omits the conditions is reported as a regression check, not
+as a published ratio.
