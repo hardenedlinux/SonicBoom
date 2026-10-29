@@ -426,6 +426,7 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
 | `tests/test-executable.scm` | compile-once, reuse, lifetime, the cache |
 | `tests/test-trace-lower.scm` | lowering coverage, and the runtime matching the reference interpreter |
 | `tests/trace/test-trace-forms.scm` | the tracer's forms and graph breaks |
+| `tests/trace/test-trace-optim.scm` | DCE, constant folding and static-branch guarantees; results, cache and gradients unchanged |
 | `tests/test-inference.scm` | the LLM C ABI: golden decode, round-trips, prefix reuse, streaming, opt-in control-token parsing |
 | `tests/test-e2e-export.scm` + `tests/run-e2e.sh` | train → export → an independent C++ loader |
 | `tests/serve/*` | the HTTP server, over HTTP/SSE/WebSocket and as units |

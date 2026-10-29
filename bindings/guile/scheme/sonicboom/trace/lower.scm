@@ -101,7 +101,10 @@ dtype and cadr is the shape list; `(length (cadr t))` is the rank."
 ;; Find the matmuls that complete a `linear`: a matmul whose sole consumer is
 ;; an `add` with a rank-1 bias. Returns a table MATMUL-OUTPUT -> MATMUL-NODE for
 ;; every such matmul; the matmul is dropped and the add becomes a `gemm`.
-(define (find-linear-fusions nodes types)
+;; OUTPUTS are the graph's output names: a matmul whose value is also a graph
+;; output is not fused, because dropping it would leave that output with no
+;; producer (the un-fused nodes are the correct fallback).
+(define (find-linear-fusions nodes types outputs)
   (let ((refs (make-hash-table)) (mms (make-hash-table)) (fuse (make-hash-table)))
     (for-each (lambda (n)
                 (for-each (lambda (i) (hash-set! refs i (+ 1 (hash-ref refs i 0))))
@@ -123,6 +126,7 @@ dtype and cadr is the shape list; `(length (cadr t))` is the rank."
                 (ty (and bias (hash-ref types bias #f))))
            (when (and acc
                       (= 1 (hash-ref refs acc 0))       ; consumed only here
+                      (not (member acc outputs))        ; not a graph output
                       ty
                       (= 1 (length (cadr ty))))          ; rank-1 bias
              (hash-set! fuse acc (hash-ref mms acc))))))
@@ -255,7 +259,7 @@ node with no lowering."
   (let* ((g (graph-of graph))
          (types (value-types g))
          (nodes (field g 'nodes))
-         (fuse (find-linear-fusions nodes types))
+         (fuse (find-linear-fusions nodes types (map cadr (field g 'outputs))))
          (extra (reduce-axes-params nodes types))
          (lowered (append-map (lambda (n) (lower-node n fuse types)) nodes)))
     (sexpr->text

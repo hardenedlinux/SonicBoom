@@ -69,9 +69,11 @@
     (('sonicboom-s-expr _ ('graph . fields)) fields)
     (_ (error "not an S-Expr document" doc))))
 
+(define (doc-ops doc)
+  (map cadr (cdr (assq 'nodes (doc-fields doc)))))
+
 (define (lowered-ops graph)
-  (map cadr (cdr (assq 'nodes (doc-fields (call-with-input-string
-                                           (traced->s-expr graph) read))))))
+  (doc-ops (call-with-input-string (traced->s-expr graph) read)))
 
 ;; Run PROC on X through both paths and check shapes and numerics.
 (define (check-lowering name proc x)
@@ -102,6 +104,110 @@
   (test-assert "run-traced matches the pure-Guile reference (rel err <= 1e-4)"
     (<= (rel-max-err actual expected) 1e-4))
   (test-equal "dtype is float32" 'float32 (ctensor-dtype actual)))
+
+;;; --- linear fusion: conditions and the conservative fallback -------------------
+
+;; The matmul may be either operand of the commutative add.
+(check-lowering "linear with the bias as the first add operand"
+  (lambda (x) (add b1 (matmul x w1))) x)
+(test-equal "bias first still lowers to a single gemm"
+  '(gemm) (lowered-ops (trace-graph (lambda (x) (add b1 (matmul x w1))) x)))
+
+;; A matmul read twice is not fused; both nodes stay, and the graph still runs
+;; (the core add broadcasts the rank-1 bias).
+(check-lowering "matmul with two consumers is not fused and still computes"
+  (lambda (x)
+    (let ((y (matmul x w1)))
+      (add (relu y) (add y b1))))
+  x)
+(test-equal "a matmul with two consumers keeps both of its uses"
+  '(gemm relu add add)
+  (lowered-ops (trace-graph (lambda (x)
+                              (let ((y (matmul x w1)))
+                                (add (relu y) (add y b1))))
+                            x)))
+
+;; A matmul output that is also a graph output is observed outside the
+;; graph: fusing would delete its only producer. The lowering must fall back
+;; to the un-fused nodes, in a multi-output graph just as in a single-output
+;; one.
+(define (two-outputs x)
+  (let ((y (matmul x w1)))
+    (list y (add y b1))))
+
+(define two-graph (trace-graph two-outputs x))
+
+(define (doc-output-names doc)
+  (map cadr (cdr (assq 'outputs (doc-fields doc)))))
+
+;; A node is (node <op> (inputs ...) (outputs (<name> <type>) ...) (attrs ...)),
+;; so CDDR is the three field forms and the outputs form lists (name type)
+;; pairs. Same shape in the traced datum and in the text read back from
+;; `traced->s-expr`.
+(define (doc-node-output-names n)
+  (map car (cdr (assq 'outputs (cddr n)))))
+
+;; Every value the document defines, in order, as (kind . name): INPUT and
+;; PARAMETER for the graph sections, the node's op for a node output.
+(define (doc-definitions doc)
+  (let ((fields (doc-fields doc)))
+    (append (map (lambda (i) (cons 'input (cadr i)))
+                 (cdr (assq 'inputs fields)))
+            (map (lambda (p) (cons 'parameter (cadr p)))
+                 (cdr (assq 'parameters fields)))
+            (append-map (lambda (n)
+                          (map (lambda (o) (cons (cadr n) o))
+                               (doc-node-output-names n)))
+                        (cdr (assq 'nodes fields))))))
+
+(define (definitions-of defs name)
+  (filter (lambda (d) (equal? (cdr d) name)) defs))
+
+(define (duplicates xs)
+  (let loop ((xs xs) (seen '()) (dups '()))
+    (cond ((null? xs) dups)
+          ((member (car xs) seen) (loop (cdr xs) seen (cons (car xs) dups)))
+          (else (loop (cdr xs) (cons (car xs) seen) dups)))))
+
+;; The traced graph still names the nodes matmul/add; `lowered-ops` below
+;; reads the text `traced->s-expr` emits, so it must see gemm/add.
+(test-equal "the traced graph uses matmul; only the lowered graph uses gemm"
+  '(matmul add) (doc-ops two-graph))
+(test-equal "a matmul output that is also a graph output is not fused"
+  '(gemm add) (lowered-ops two-graph))
+
+(define lowered-two (call-with-input-string (traced->s-expr two-graph) read))
+(define two-out-names (doc-output-names lowered-two))
+(define two-defs (doc-definitions lowered-two))
+
+(test-equal "lowering preserves the graph's outputs in order"
+  (doc-output-names two-graph) two-out-names)
+
+(test-equal "every output of the lowered graph is defined exactly once"
+  '() (filter (lambda (o) (not (= 1 (length (definitions-of two-defs o)))))
+              two-out-names))
+(test-equal "no value name in the lowered graph is defined twice"
+  '() (duplicates (map cdr two-defs)))
+(test-equal "the first output's producer is the gemm (the matmul)"
+  '(gemm) (map car (definitions-of two-defs (car two-out-names))))
+(test-equal "the second output's producer is the add (the bias add)"
+  '(add) (map car (definitions-of two-defs (cadr two-out-names))))
+
+;; The reference interpreter runs the traced graph (matmul + add), not the
+;; lowered text: it checks the graph semantics that lowering must preserve.
+;; No native execution is claimed for this pair: the S-Expr C ABI binds one
+;; input and returns one output, so `run-traced` cannot run a two-output
+;; graph (single-output fusion is executed natively above).
+(let* ((in-name (doc-input-name two-graph))
+       (outs (interpret-sexpr two-graph (list (cons in-name x))))
+       (mm (matmul x w1))
+       (sum (add mm b1)))
+  (test-equal "the reference interpreter returns the traced graph's outputs in order"
+    (doc-output-names two-graph) (map car outs))
+  (test-assert "the first output is the matmul value"
+    (<= (rel-max-err (cdar outs) mm) 1e-5))
+  (test-assert "the second output is the bias-added value"
+    (<= (rel-max-err (cdadr outs) sum) 1e-5)))
 
 ;;; --- reshape -------------------------------------------------------------------
 ;;; A reshape that produces the graph output directly from the graph input
