@@ -10,7 +10,7 @@ stable C ABI, and GNU Guile is its first-class language. You load
 `libsonicboom.so` from whatever language you use. There is no Python
 interpreter, no pip, and no wheel tree on the inference path.
 
-SonicBoom targets local LLM inference on consumer GPUs. On a laptop
+SonicBoom targets local LLM inference on consumer GPUs. On a desktop
 RTX 3050 it **decodes 14–19% faster than llama.cpp, using the same quantized
 kernels** — 1.19× on Gemma 4 E4B-it Q3_K_M, 1.14× on Qwen2.5-0.5B-Instruct
 Q4_K_M ([numbers](#numbers), same machine, medians of 3) — and its prefill is
@@ -230,7 +230,7 @@ release.
 | Driver / CUDA | 595.84 (CUDA 13.2 driver API); nvcc 12.0.140 |
 | CPU | AMD Ryzen 5 5500 (6C/12T, Zen 3), PCIe 3.0 |
 | RAM | 32 GB DDR4-2400, single channel |
-| Host | Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
+| Host | Desktop, Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
 | Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
 | Qwen2.5-0.5B model | [`Qwen/Qwen2.5-0.5B-Instruct-GGUF`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) → `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes, sha256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`) |
 | DeepSeek model | [`unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF`](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF) → `DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` (1,117,321,312 bytes, sha256 `f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840`) |
