@@ -59,6 +59,7 @@
         (instance (list 'loop))
         (nodes (recorder-nodes rec))
         (params (recorder-params rec))
+        (index (recorder-param-index rec))
         (n (recorder-count rec)))
     (%catch-signal 'sonicboom-trace-unroll-limit
       (lambda ()
@@ -76,6 +77,7 @@
                ;; drop the unrolled iterations, run it as a host loop
                (set-recorder-nodes! rec nodes)
                (set-recorder-params! rec params)
+               (set-recorder-param-index! rec index)
                (set-recorder-count! rec n)
                (host-loop site rec body inits))
               (else (%raise-signal 'sonicboom-trace-unroll-limit which)))))))
@@ -95,7 +97,7 @@
 ;; data = (text externals next-static next-types) or 'exit.
 (define (trace-iteration site rec body args)
   (let* ((ctx (recorder-context rec))
-         (scratch (make-recorder ctx '() '() 0 (recorder-assumptions rec) 0 #f))
+         (scratch (make-recorder ctx '() '() '() 0 (recorder-assumptions rec) 0 #f))
          (holders (map (lambda (a)
                          (and (tensor? a)
                               (let ((name (fresh-name! ctx "v")))

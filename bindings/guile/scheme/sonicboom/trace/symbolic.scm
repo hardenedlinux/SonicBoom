@@ -39,9 +39,11 @@
             set-trace-context-leaves! register-leaf!
             fresh-name! register-type!
             make-recorder recorder? recorder-context recorder-nodes
-            recorder-params recorder-count recorder-assumptions
+            recorder-params recorder-param-index
+            recorder-count recorder-assumptions
             recorder-depth recorder-spec-base
-            set-recorder-nodes! set-recorder-params! set-recorder-count!
+            set-recorder-nodes! set-recorder-params! set-recorder-param-index!
+            set-recorder-count!
             as-value record-node! apply-op-multi unwrap-leaf ref-dtype
             ;; ops
             add sub mul matmul relu neg sum gt lt where bool trace-print
@@ -161,15 +163,24 @@ has no `if` on tensor values): strict mode stops reporting it. Returns PROC."
 
 ;; A recorder is the state of one segment being traced. NODES and PARAMS are
 ;; kept in reverse order as shared-tail lists, so copying a recorder for a
-;; speculative resumption is O(1). ASSUMPTIONS maps condition value names to
-;; the boolean the current path took. SPEC-BASE is #f outside speculation,
-;; otherwise the node count when the speculative side started.
+;; speculative resumption is O(1). PARAM-INDEX is a persistent alist
+;; concrete-object -> parameter name: a constant captured again by identity in
+;; the same segment reuses its parameter instead of emitting the value list a
+;; second time. It is an alist rather than a hash table so the key is compared
+;; with eq? only (never by hashing or comparing a tensor's contents), and so a
+;; rollback that restores PARAMS can restore the index by restoring this value
+;; (updates cons onto it, leaving earlier values intact). It is per recorder,
+;; i.e. per traced segment; it never outlives the graph. ASSUMPTIONS maps
+;; condition value names to the boolean the current path took. SPEC-BASE is #f
+;; outside speculation, otherwise the node count when the speculative side
+;; started.
 (define-record-type <recorder>
-  (make-recorder context nodes params count assumptions depth spec-base)
+  (make-recorder context nodes params param-index count assumptions depth spec-base)
   recorder?
   (context     recorder-context)
   (nodes       recorder-nodes set-recorder-nodes!)
   (params      recorder-params set-recorder-params!)
+  (param-index recorder-param-index set-recorder-param-index!)
   (count       recorder-count set-recorder-count!)
   (assumptions recorder-assumptions)
   (depth       recorder-depth)
@@ -192,15 +203,26 @@ concrete operands become an inline parameter of the current segment."
         (as-value-1 rec x dtype))))
 
 (define (as-value-1 rec x dtype)
-  (let* ((t (lift x dtype))
-         (ctx (recorder-context rec))
-         (name (fresh-name! ctx "c")))
-    (register-type! ctx name (ctensor-dtype t) (ctensor-shape t))
-    (set-recorder-params!
-     rec (cons (make-gparam name (ctensor-dtype t) (ctensor-shape t)
-                            (ctensor->list t))
-               (recorder-params rec)))
-    (make-sym name (ctensor-dtype t) (ctensor-shape t))))
+  "Concrete operand X captured by REC: a parameter of the current segment.
+A ctensor captured again by identity in the same segment reuses the parameter
+already emitted for it, so its value list is not materialised twice. Bare
+numbers and booleans are lifted to a fresh scalar ctensor on every capture and
+are therefore not deduplicated (identity, not value, is the key)."
+  (let ((hit (and (ctensor? x) (assq x (recorder-param-index rec)))))
+    (if hit
+        (make-sym (cdr hit) (ctensor-dtype x) (ctensor-shape x))
+        (let* ((t (lift x dtype))
+               (ctx (recorder-context rec))
+               (name (fresh-name! ctx "c")))
+          (register-type! ctx name (ctensor-dtype t) (ctensor-shape t))
+          (set-recorder-params!
+           rec (cons (make-gparam name (ctensor-dtype t) (ctensor-shape t)
+                                  (ctensor->list t))
+                     (recorder-params rec)))
+          (when (ctensor? x)
+            (set-recorder-param-index!
+             rec (cons (cons x name) (recorder-param-index rec))))
+          (make-sym name (ctensor-dtype t) (ctensor-shape t))))))
 
 (define (record-node! rec op ins attrs)
   "Append node OP(INS) to REC and return its symbolic output."

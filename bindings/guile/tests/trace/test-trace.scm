@@ -101,7 +101,7 @@
 
 (test-equal "symbolic tensor records shape and dtype only"
   '(float32 (2 3) "v0")
-  (let ((r (make-recorder (make-trace-context 16) '() '() 0 '() 0 #f)))
+  (let ((r (make-recorder (make-trace-context 16) '() '() '() 0 '() 0 #f)))
     (parameterize ((current-tracer r))
       (let ((s (matmul (make-sym "a" 'float32 '(2 4))
                        (make-sym "b" 'float32 '(4 3)))))

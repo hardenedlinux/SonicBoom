@@ -117,6 +117,7 @@ FALLBACK, which resolves the condition with `bool` (a graph break)."
       (%raise-signal 'sonicboom-trace-site-reentry site)
       (let ((nodes (recorder-nodes rec))
             (params (recorder-params rec))
+            (index (recorder-param-index rec))
             (count (recorder-count rec)))
         (%catch-signal 'sonicboom-trace-site-reentry
           (lambda ()
@@ -127,6 +128,7 @@ FALLBACK, which resolves the condition with `bool` (a graph break)."
                    (when (eq? (current-tracer) rec)
                      (set-recorder-nodes! rec nodes)
                      (set-recorder-params! rec params)
+                     (set-recorder-param-index! rec index)
                      (set-recorder-count! rec count))
                    (context-count! (recorder-context (current-tracer)) 'loop-breaks)
                    (fallback))

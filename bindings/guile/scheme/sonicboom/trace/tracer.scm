@@ -199,12 +199,15 @@ outputs there."
 ;;; --- recorders and prompts ----------------------------------------------------------
 
 (define (segment-recorder st assumptions)
-  (make-recorder (tstate-ctx st) '() '() 0 assumptions 0 #f))
+  (make-recorder (tstate-ctx st) '() '() '() 0 assumptions 0 #f))
 
 (define (side-recorder rec cond-name value)
-  "Speculative copy of REC continuing on the path where COND-NAME = VALUE."
+  "Speculative copy of REC continuing on the path where COND-NAME = VALUE. The
+parameter index is inherited as a persistent alist: each side conses onto it,
+so neither side sees the other's constants."
   (make-recorder (recorder-context rec) (recorder-nodes rec)
-                 (recorder-params rec) (recorder-count rec)
+                 (recorder-params rec) (recorder-param-index rec)
+                 (recorder-count rec)
                  (acons cond-name value (recorder-assumptions rec))
                  (+ 1 (recorder-depth rec)) (recorder-count rec)))
 
@@ -305,6 +308,13 @@ Returns (recorder . output) or #f."
                            m))
                        (lambda _ #f))))))))
 
+(define (extend-param-index base extra)
+  "BASE with the entries of EXTRA whose object is not already in BASE; identity
+only (eq? through assq), no content comparison."
+  (fold (lambda (p acc)
+          (if (assq (car p) acc) acc (cons p acc)))
+        base extra))
+
 (define (join-sides rec rt rf c ot of)
   ;; Both side recorders extend REC's lists, so their new entries are the
   ;; leading (count difference) elements. Order: prefix, #t side, #f side.
@@ -314,9 +324,17 @@ Returns (recorder . output) or #f."
          (p0 (length (recorder-params rec)))
          (par-t (take (recorder-params rt) (- (length (recorder-params rt)) p0)))
          (par-f (take (recorder-params rf) (- (length (recorder-params rf)) p0)))
+         ;; Both sides kept every parameter the other one emitted (par-t and
+         ;; par-f both survive); the index only chooses a name for a later
+         ;; capture, so the #t side's name wins when both captured one object.
+         (index (extend-param-index
+                 (extend-param-index (recorder-param-index rec)
+                                     (recorder-param-index rt))
+                 (recorder-param-index rf)))
          (m (make-recorder (recorder-context rec)
                            (append new-f new-t (recorder-nodes rec))
                            (append par-f par-t (recorder-params rec))
+                           index
                            (+ n0 (length new-t) (length new-f))
                            (recorder-assumptions rec) (recorder-depth rec)
                            (recorder-spec-base rec))))
