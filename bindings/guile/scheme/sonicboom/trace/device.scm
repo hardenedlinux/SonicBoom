@@ -181,39 +181,14 @@ its first run uploads the whole leaf state (see run-device-executable)."
     (error "sonicboom-device: input dtype mismatch" dtype (ctensor-dtype t)))
   (unless (equal? (ctensor-shape t) shape)
     (error "sonicboom-device: input shape mismatch" shape (ctensor-shape t)))
-  (let* ((n (ctensor-numel t))
-         (sz (dtype-size dtype))
-         (bv (make-bytevector (* n sz) 0)))
-    (do ((i 0 (+ i 1))) ((= i n))
-      (let ((x (ctensor-ref t i)))
-        (case dtype
-          ((float32) (bytevector-ieee-single-native-set! bv (* i 4) (exact->inexact x)))
-          ((float64) (bytevector-ieee-double-native-set! bv (* i 8) (exact->inexact x)))
-          ((int64) (bytevector-s64-native-set! bv (* i 8) (inexact->exact x)))
-          ((int32) (bytevector-s32-native-set! bv (* i 4) (inexact->exact x)))
-          ((int16) (bytevector-s16-native-set! bv (* i 2) (inexact->exact x)))
-          ((int8) (bytevector-s8-set! bv i (inexact->exact x)))
-          ((uint8) (bytevector-u8-set! bv i (inexact->exact x)))
-          (else (error "sonicboom-device: unsupported input dtype" dtype)))))
-    bv))
+  ;; The dtype and shape match, so the ctensor already stores exactly the bytes
+  ;; the device boundary takes.
+  (bytevector-copy (ctensor-data t)))
 
 (define (decode-ctensor dtype shape bv)
-  (let* ((n (shape-numel shape))
-         (v (make-vector n)))
-    (do ((i 0 (+ i 1))) ((= i n))
-      (vector-set! v i
-                   (case dtype
-                     ((float32) (bytevector-ieee-single-native-ref bv (* i 4)))
-                     ((float64) (bytevector-ieee-double-native-ref bv (* i 8)))
-                     ((int64) (bytevector-s64-native-ref bv (* i 8)))
-                     ((int32) (bytevector-s32-native-ref bv (* i 4)))
-                     ((int16) (bytevector-s16-native-ref bv (* i 2)))
-                     ((int8) (bytevector-s8-ref bv i))
-                     ((uint8) (bytevector-u8-ref bv i))
-                     ((bool) (not (zero? (bytevector-u8-ref bv i))))
-                     (else (error "sonicboom-device: unsupported output dtype"
-                                  dtype)))))
-    (make-ctensor dtype shape v)))
+  ;; Copy: the output buffer is also kept as resident state and reused by later
+  ;; runs, so the returned ctensor must not alias it.
+  (bytevector->ctensor dtype shape (bytevector-copy bv)))
 
 ;; A flat array of pointers as the C ABI takes `const void* const*`. The
 ;; bytevectors themselves are kept alive by the caller for the duration of the

@@ -44,7 +44,10 @@
 
 (define (close-list? a b)
   (and (= (length a) (length b))
-       (every (lambda (x y) (<= (abs (- x y)) 1e-6)) a b)))
+       (every (lambda (x y)
+                ;; float32 storage: relative tolerance at its precision
+                (<= (abs (- x y)) (* 1e-5 (max 1.0 (abs x) (abs y)))))
+              a b)))
 
 (define (flat t) (ctensor->list t))
 
@@ -134,8 +137,8 @@
     (let loop ((i 0) (a x))
       (if (< i 20) (loop (+ i 1) (add (mul a c) c)) a))))
 (let ((out (looped x)))
-  (test-equal "host-loop rollback keeps the result"
-    (l-iter '(1.0 2.0) 20) (map (lambda (v) (+ v 0.0)) (flat out)))
+  (test-assert "host-loop rollback keeps the result"
+    (close-list? (l-iter '(1.0 2.0) 20) (flat out)))
   (test-assert "the loop really took the host-loop path"
     (positive? (stat looped 'host-loops))))
 

@@ -35,7 +35,10 @@
 (define (close? a b)
   (let ((xs (deep-flatten a)) (ys (deep-flatten b)))
     (and (= (length xs) (length ys))
-         (every (lambda (x y) (< (abs (- x y)) 1e-9)) xs ys))))
+         (every (lambda (x y)
+             ;; float32 storage: compare at its precision, not double's
+             (<= (abs (- x y)) (* 1e-5 (max 1.0 (abs x) (abs y)))))
+           xs ys))))
 
 (define (t x) (list->ctensor x))
 (define (stat f key) (assq-ref (trace-stats f) key))

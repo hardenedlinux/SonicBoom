@@ -69,24 +69,10 @@ the file."
     (error who "checkpoints only store float32 tensors" (ctensor-dtype t))))
 
 (define (ctensor->bytevector t)
-  (let* ((n (ctensor-numel t))
-         (bv (make-bytevector (* 4 n))))
-    (let loop ((i 0) (xs (ctensor->list t)))
-      (unless (null? xs)
-        (bytevector-ieee-single-native-set! bv (* i 4)
-                                            (exact->inexact (car xs)))
-        (loop (+ i 1) (cdr xs))))
-    bv))
+  (bytevector-copy (ctensor-data t)))
 
-(define (bytevector->ctensor bv shape)
-  (let ((n (/ (bytevector-length bv) 4)))
-    (make-ctensor 'float32 shape
-                  (let loop ((i 0) (acc '()))
-                    (if (= i n)
-                        (reverse acc)
-                        (loop (+ i 1)
-                              (cons (bytevector-ieee-single-native-ref bv (* i 4))
-                                    acc)))))))
+(define (f32-bytes->ctensor bv shape)
+  (bytevector->ctensor 'float32 shape (bytevector-copy bv)))
 
 (define (ctensor->handle who t)
   (check-float32 who t)
@@ -113,7 +99,7 @@ the file."
                     (slot-ptr err))))
           (unless (sb-status-ok? st)
             (error who (capture-error err)))
-          (bytevector->ctensor bv shape)))))
+          (f32-bytes->ctensor bv shape)))))
 
 ;;; --- save / load -------------------------------------------------------------
 

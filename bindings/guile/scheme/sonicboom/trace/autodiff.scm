@@ -117,7 +117,7 @@ Returns one gradient, or a list in WRT's order."
                       (out (sym-of ctx out-name))
                       (elementwise? (op-elementwise? (gnode-op g)))
                       (masks (if elementwise? (cdr entry) (filter scalar-mask? (cdr entry))))
-                      (locals (rule emit shape-of ins out (car entry) (gnode-attrs g))))
+                      (locals (rule emit shape-of ins out (car entry) (gnode-attrs g) dtype-of)))
                  (for-each
                   (lambda (in local i)
                     (when (and local (needs-grad? (sym-name in)))

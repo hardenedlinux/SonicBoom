@@ -71,7 +71,7 @@
   (define (generic)
     (let ((rule (op-gradient op)))
       (unless rule (error "backward!: no adjoint rule for op" op))
-      (rule emit shape ins out g attrs)))
+      (rule emit shape ins out g attrs dtype-of)))
   (case op
     ((matmul)
      (let ((a (car ins)) (b (cadr ins)))

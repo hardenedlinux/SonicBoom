@@ -275,21 +275,19 @@ node with no lowering."
 ;;; --- execution ----------------------------------------------------------------
 
 (define (ctensor->f32-bytes t)
-  (let* ((n (ctensor-numel t))
-         (bv (make-bytevector (* n 4) 0)))
-    (let loop ((i 0))
-      (when (< i n)
-        (bytevector-ieee-single-native-set! bv (* i 4) (* 1.0 (ctensor-ref t i)))
-        (loop (+ i 1))))
-    bv))
+  (if (eq? 'float32 (ctensor-dtype t))
+      (bytevector-copy (ctensor-data t))
+      (let* ((n (ctensor-numel t))
+             (bv (make-bytevector (* n 4) 0)))
+        (let loop ((i 0))
+          (when (< i n)
+            (bytevector-ieee-single-native-set! bv (* i 4) (* 1.0 (ctensor-ref t i)))
+            (loop (+ i 1))))
+        bv)))
 
 (define (f32-bytes->ctensor bv shape)
-  (make-ctensor 'float32 shape
-                (let loop ((i 0) (acc '()))
-                  (if (< i (shape-numel shape))
-                      (loop (+ i 1)
-                            (cons (bytevector-ieee-single-native-ref bv (* i 4)) acc))
-                      (reverse acc)))))
+  ;; The C side hands us a fresh buffer; take it as storage.
+  (bytevector->ctensor 'float32 shape bv))
 
 (define (graph-output-type g name)
   (let loop ((ns (field g 'nodes)))

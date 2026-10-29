@@ -110,7 +110,9 @@
     (and hit (tensor->ctensor hit))))
 
 (define (tensor->ctensor t)
-  (ct:make-ctensor (tensor-dtype t) (tensor-shape t) (tensor->list t)))
+  ;; make-ctensor copies the packed bytes, so the ctensor does not alias the
+  ;; parameter tensor.
+  (ct:make-ctensor (tensor-dtype t) (tensor-shape t) (tensor->bytevector t)))
 
 (define (transpose-2d ct)
   "Transpose a rank-2 ctensor. Used once, when a linear's [out, in] weight is

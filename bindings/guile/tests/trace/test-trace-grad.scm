@@ -39,12 +39,13 @@
 (define %in-new-section #f)
 
 (define (perturb tensor i delta)
-  (let ((v (vector-copy (ctensor-data tensor))))
-    (vector-set! v i (+ (vector-ref v i) delta))
-    (make-ctensor (ctensor-dtype tensor) (ctensor-shape tensor) v)))
+  (let ((v (ctensor-copy tensor)))
+    (ctensor-set! v i (+ (ctensor-ref v i) delta))
+    v))
 
-(define (numeric-grad loss-fn args k)
-  "Central differences of LOSS-FN (args -> rank-0 ctensor) w.r.t. argument K."
+(define* (numeric-grad loss-fn args k #:optional (h %h))
+  "Central differences of LOSS-FN (args -> rank-0 ctensor) w.r.t. argument K.
+H is the step; a caller whose loss is quantised to float32 needs a larger one."
   (let ((x (list-ref args k)))
     (map (lambda (i)
            (let ((at (lambda (d)
@@ -52,37 +53,59 @@
                         (apply loss-fn (append (take args k)
                                                (list (perturb x i d))
                                                (drop args (+ k 1))))))))
-             (/ (- (at %h) (at (- %h))) (* 2 %h))))
+             (/ (- (at h) (at (- h))) (* 2 h))))
          (iota (ctensor-numel x)))))
 
 (define (rel-error a n) (/ (abs (- a n)) (max (abs a) (abs n) 1e-3)))
 (define (close-list? a b)
-  (and (= (length a) (length b)) (every (lambda (x y) (< (abs (- x y)) 1e-9)) a b)))
+  (and (= (length a) (length b))
+       (every (lambda (x y)
+                ;; float32 storage: relative tolerance at its precision
+                (<= (abs (- x y)) (* 1e-5 (max 1.0 (abs x) (abs y)))))
+              a b)))
+
+(define (float64-copy t)
+  "Widen a float ctensor to float64. Finite differences need double precision:
+  an f32 store quantises a 1e-5 perturbation to the storage epsilon, which
+  swamps the difference quotient."
+  (if (and (ctensor? t) (float-dtype? (ctensor-dtype t))
+           (not (eq? (ctensor-dtype t) 'float64)))
+      (make-ctensor 'float64 (ctensor-shape t) (ctensor->list t))
+      t))
 
 (define (grad-ok? loss-fn args which)
   "Analytic gradients (value-and-grad of LOSS-FN) agree with finite
-differences for the argument positions WHICH."
-  (let* ((vg (value-and-grad loss-fn))
-         (r (apply vg args))
+differences for the argument positions WHICH. The check runs in float64,
+whatever the caller's float dtype, so the finite-difference reference is
+limited by H, not by the storage precision."
+  (let* ((args* (map float64-copy args))
+         (vg (value-and-grad loss-fn))
+         (r (apply vg args*))
          (grads (cdr r))
-         (tensor-positions (filter (lambda (i) (ctensor? (list-ref args i)))
-                                   (iota (length args)))))
+         ;; A loss whose declared output is float32 (cross_entropy) is quantised
+         ;; at the scalar return; finite differences then need a step well above
+         ;; the quantisation floor, and a correspondingly looser tolerance.
+         (f32-loss? (eq? 'float32 (ctensor-dtype (car r))))
+         (h (if f32-loss? 1e-1 %h))
+         (tol (if f32-loss? 1e-2 1e-4))
+         (tensor-positions (filter (lambda (i) (ctensor? (list-ref args* i)))
+                                   (iota (length args*)))))
     (every (lambda (k)
              (let* ((analytic (ctensor->list (list-ref grads (list-index (lambda (p) (= p k))
                                                                           tensor-positions))))
-                    (numeric (numeric-grad loss-fn args k))
+                    (numeric (numeric-grad loss-fn args* k h))
                     (errs (map rel-error analytic numeric)))
                (set! %max-rel (apply max %max-rel errs))
                (when %in-new-section
                  (set! %max-rel-new (apply max %max-rel-new errs)))
-               (every (lambda (e) (< e 1e-4)) errs)))
+               (every (lambda (e) (< e tol)) errs)))
            which)))
 
 ;; A fixed weighting so that each output element gets a different gradient.
-(define (probe shape)
-  (make-ctensor 'float32 shape
+(define (probe shape dtype)
+  (make-ctensor dtype shape
                 (map (lambda (i) (+ 0.3 (* 0.17 (modulo (* 7 i) 11)))) (iota (shape-numel shape)))))
-(define (weighted y) (sum (mul y (probe (shape-of y)))))
+(define (weighted y) (sum (mul y (probe (shape-of y) (dtype-of y)))))
 
 (define a23 (t '((0.5 -1.2 2.0) (1.5 0.7 -0.3))))
 (define b23 (t '((1.1 0.4 -0.9) (-2.0 0.8 1.3))))
@@ -272,12 +295,12 @@ differences for the argument positions WHICH."
 (test-assert "log-softmax subtracts the max: huge logits stay finite and exact"
   (let ((r (ctensor->list ((trace-function (lambda (x) (log-softmax x 0)))
                            (t '(1000.0 1001.0 1002.0))))))
-    (every (lambda (a b) (< (abs (- a b)) 1e-9))
+    (every (lambda (a b) (<= (abs (- a b)) (* 1e-5 (max 1.0 (abs a) (abs b)))))
            r (let ((lse (+ 1002.0 (log (+ (exp -2.0) (exp -1.0) 1.0)))))
                (map (lambda (v) (- v lse)) '(1000.0 1001.0 1002.0))))))
 
 (test-assert "softmax rows sum to 1"
-  (every (lambda (row) (< (abs (- 1.0 (apply + row))) 1e-12))
+  (every (lambda (row) (< (abs (- 1.0 (apply + row))) 1e-5))
          (ctensor->nested ((trace-function (lambda (x) (softmax x 1))) x34))))
 
 (set! %in-new-section #f)
