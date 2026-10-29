@@ -61,6 +61,15 @@ in the same order. Attribute *order* is part of the model identity
 (`model_fingerprint` hashes it), so `node_attrs` is an ordered array, never a
 name-keyed dictionary.
 
+The lowering accepts a document only where the operator identities it declares
+are the ones this runtime implements: every node's domain must be `default`,
+and a node's explicit version — if it has one — must equal the version the
+graph declares for `default`. A node in another domain (the draft's `aten`
+vocabulary, a custom op) may share a name with a `default` operator and mean
+something else, so it is refused rather than lowered by name. The
+Blade→planner and Blade→Boom routes apply the same check (`sx::ir.h`), so they
+accept and refuse the same documents.
+
 ## Types
 
 | type | meaning |
@@ -80,6 +89,13 @@ shape, dtype or tensor-table entry.
 
 Attribute definitions: `#boom.attr<name, value>` is one `sx::Attribute`, and
 `#boom.tensor_desc<...>` is one tensor-table entry.
+
+The `value` slot is the attribute's MLIR encoding: a non-empty `ints`/`floats`/
+`strings`/`bools` value is an `ArrayAttr` whose elements carry the kind, and an
+empty one is the kind's zero-length typed container (`array<i64>`,
+`array<f64>`, `array<i1>`, and a zero-element `dense` string tensor), because an
+empty `ArrayAttr` carries no element to infer the kind from. The kind is part
+of the model identity, so an empty array keeps it.
 
 ## Operations
 

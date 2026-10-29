@@ -147,6 +147,11 @@ uint64_t model_fingerprint(const Graph& g) noexcept {
 
 std::expected<Graph, PlannerError> adapt_graph(const sx::Document& doc) {
   const sx::Graph& sg = doc.graph;
+  // The operator identities must be ones this runtime implements before any
+  // node is mapped onto an OpKind by name alone (sx/ir.h).
+  if (auto error = sx::operator_identity_error(sg))
+    return std::unexpected(PlannerError(PlannerErrorCode::UnsupportedOperator,
+                                        *error, Phase::GraphAnalysis));
   Graph g;
   g.name = sg.name;
 

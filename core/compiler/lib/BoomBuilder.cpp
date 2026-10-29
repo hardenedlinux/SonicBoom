@@ -149,6 +149,14 @@ mlir::Attribute toMlirAttribute(mlir::MLIRContext *context,
                                 const sx::Attribute &attr) {
   using K = sx::AttrValueKind;
   const auto &v = attr.value;
+
+  // A non-empty array is an ArrayAttr whose element attributes name its kind.
+  // An *empty* array has no element to carry that: an empty ArrayAttr reads
+  // back as whichever kind the decoder guesses, so the encoder gives it the
+  // element kind's typed zero-length container instead (DenseI64ArrayAttr …
+  // DenseStringElementsAttr). The value slot of #boom.attr is any MLIR
+  // attribute, so this is an encoding of the value, not a change to the
+  // attribute's format.
   switch (attr.kind()) {
   case K::Int:
     return mlir::IntegerAttr::get(
@@ -161,28 +169,51 @@ mlir::Attribute toMlirAttribute(mlir::MLIRContext *context,
   case K::Bool:
     return mlir::BoolAttr::get(context, std::get<bool>(v));
   case K::Ints: {
+    const auto &values = std::get<std::vector<int64_t>>(v);
+    if (values.empty())
+      return mlir::DenseI64ArrayAttr::get(context, {});
     llvm::SmallVector<mlir::Attribute> items;
-    for (int64_t x : std::get<std::vector<int64_t>>(v))
+    for (int64_t x : values)
       items.push_back(mlir::IntegerAttr::get(
           mlir::IntegerType::get(context, 64), x));
     return mlir::ArrayAttr::get(context, items);
   }
   case K::Floats: {
+    const auto &values = std::get<std::vector<double>>(v);
+    if (values.empty())
+      return mlir::DenseF64ArrayAttr::get(context, {});
     llvm::SmallVector<mlir::Attribute> items;
-    for (double x : std::get<std::vector<double>>(v))
+    for (double x : values)
       items.push_back(
           mlir::FloatAttr::get(mlir::Float64Type::get(context), x));
     return mlir::ArrayAttr::get(context, items);
   }
   case K::Strings: {
+    const auto &values = std::get<std::vector<std::string>>(v);
+    if (values.empty()) {
+      // MLIR has no string element type, and a dense string attribute needs a
+      // shaped type. With no elements the type is never inspected; it must
+      // only be a non-integer, non-float type, because the parser turns
+      // `dense<…> : tensor<Nxi8>` into a dense integer attribute — the very
+      // ambiguity this encoding avoids. A [1]xi8 vector element is that
+      // placeholder.
+      auto element =
+          mlir::VectorType::get({1}, mlir::IntegerType::get(context, 8));
+      auto type = mlir::RankedTensorType::get({0}, element);
+      return mlir::DenseStringElementsAttr::get(
+          type, llvm::ArrayRef<llvm::StringRef>());
+    }
     llvm::SmallVector<mlir::Attribute> items;
-    for (const std::string &x : std::get<std::vector<std::string>>(v))
+    for (const std::string &x : values)
       items.push_back(mlir::StringAttr::get(context, x));
     return mlir::ArrayAttr::get(context, items);
   }
   case K::Bools: {
+    const auto &values = std::get<std::vector<bool>>(v);
+    if (values.empty())
+      return mlir::DenseBoolArrayAttr::get(context, {});
     llvm::SmallVector<mlir::Attribute> items;
-    for (bool x : std::get<std::vector<bool>>(v))
+    for (bool x : values)
       items.push_back(mlir::BoolAttr::get(context, x));
     return mlir::ArrayAttr::get(context, items);
   }
@@ -214,9 +245,36 @@ std::optional<sx::Attribute> fromMlirAttribute(llvm::StringRef name,
     out.value = s.getValue().str();
     return out;
   }
+  // The zero-length containers toMlirAttribute gives an empty array. Each
+  // names its element kind, so the kind survives the round trip; they are read
+  // before any generic attribute test because they carry no elements to infer
+  // from.
+  if (auto a = llvm::dyn_cast<mlir::DenseBoolArrayAttr>(value)) {
+    llvm::ArrayRef<bool> items = a.asArrayRef();
+    out.value = std::vector<bool>(items.begin(), items.end());
+    return out;
+  }
+  if (auto a = llvm::dyn_cast<mlir::DenseI64ArrayAttr>(value)) {
+    llvm::ArrayRef<int64_t> items = a.asArrayRef();
+    out.value = std::vector<int64_t>(items.begin(), items.end());
+    return out;
+  }
+  if (auto a = llvm::dyn_cast<mlir::DenseF64ArrayAttr>(value)) {
+    llvm::ArrayRef<double> items = a.asArrayRef();
+    out.value = std::vector<double>(items.begin(), items.end());
+    return out;
+  }
+  if (auto a = llvm::dyn_cast<mlir::DenseStringElementsAttr>(value)) {
+    std::vector<std::string> items;
+    for (llvm::StringRef x : a.getValues<llvm::StringRef>())
+      items.push_back(x.str());
+    out.value = std::move(items);
+    return out;
+  }
   if (auto a = llvm::dyn_cast<mlir::ArrayAttr>(value)) {
-    // The element type is the first element's. An empty array is the one
-    // ambiguous case (see toMlirAttribute) and reads back as int64.
+    // The element type is the first element's. A zero-length ArrayAttr has
+    // none; the encoder never produces one (see toMlirAttribute), so this
+    // reads it as the pre-encoding behaviour did — an int64 array.
     if (a.empty()) {
       out.value = std::vector<int64_t>{};
       return out;

@@ -65,8 +65,8 @@ struct Entry {
 
 // The SSA type of a tensor. This is the same rule graphToBoom applies: a
 // q8_1 activation layout where the graph says one is (the first operand of a
-// quantized-matmul node), a Boom tensor otherwise; a dtype no Boom type names
-// is refused rather than guessed.
+// node `op_consumes_q8_1` names), a Boom tensor otherwise; a dtype no Boom
+// type names is refused rather than guessed.
 mlir::Type valueType(mlir::MLIRContext *context, mlir::Location loc,
                      int64_t id, llvm::StringRef name,
                      const sx::TensorType &type, bool is_q8_1) {
@@ -98,6 +98,12 @@ mlir::OwningOpRef<mlir::ModuleOp> bladeToBoom(const sx::Document &doc,
                                               mlir::MLIRContext *context) {
   const sx::Graph &sg = doc.graph;
   const mlir::Location loc = mlir::UnknownLoc::get(context);
+  // The same operator-identity check adapt_graph applies, so the two routes
+  // accept and refuse the same documents (sx/ir.h).
+  if (auto error = sx::operator_identity_error(sg)) {
+    mlir::emitError(loc) << *error;
+    return {};
+  }
   // An op cannot be created by name until its dialect is loaded. Loading here
   // (idempotently) keeps the lowering independent of what the caller did.
   context->getOrLoadDialect<boom::BoomDialect>();
@@ -232,11 +238,13 @@ mlir::OwningOpRef<mlir::ModuleOp> bladeToBoom(const sx::Document &doc,
     for (int64_t id : n.outputs)
       produced.insert(id);
 
-  // The q8_1 activations the graph declares: the first operand of a quantized
-  // matmul. This is graphToBoom's rule, read from the document's nodes.
+  // The q8_1 activations the graph declares: the first operand of a node the
+  // shared predicate names (a quantized matmul, or the tensor-core form the
+  // prefill dispatch pass turns it into). graphToBoom's q8_1Ids uses the same
+  // predicate, which is what keeps the two routes' typing identical.
   llvm::DenseSet<int64_t> q8_1;
   for (const LoweredNode &n : nodes)
-    if (n.op == planner::OpKind::QuantizedMatmulQ8 && !n.inputs.empty())
+    if (planner::op_consumes_q8_1(n.op) && !n.inputs.empty())
       q8_1.insert(n.inputs.front());
 
   llvm::SmallVector<int64_t> free_ids;

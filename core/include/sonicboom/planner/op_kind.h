@@ -197,4 +197,15 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept;
 
 const char* op_kind_name(OpKind k) noexcept;
 
+// The ops whose *first* operand is the mmq activation layout (Boom's
+// `!boom.q8_1`): the K-quant matmuls. This is the whole q8_1-typing rule, and
+// both lowerings derive it from it — `bladeToBoom` from the document's nodes
+// and `graphToBoom` from the planner graph (`q8_1Ids` in BoomConversion.cpp).
+// They must cover the same ops or the two routes disagree on which tensors are
+// q8_1-typed; `matmul_q8_tc` is included even though the prefill dispatch pass
+// is what normally introduces it, because a graph may carry it on input.
+inline constexpr bool op_consumes_q8_1(OpKind k) noexcept {
+  return k == OpKind::QuantizedMatmulQ8 || k == OpKind::MatmulQ8Tc;
+}
+
 } // namespace sonicboom::planner

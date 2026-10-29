@@ -170,6 +170,56 @@ struct Graph {
   std::vector<Node> nodes;
 };
 
+// The operator identities a graph declares, checked by every lowering path
+// before it applies SonicBoom semantics. An operator's identity is the triple
+// (domain, op-name, version) (spec §8); the lowerings implement exactly one
+// semantics, the unversioned `default` domain, so anything else must be
+// refused rather than lowered under a name that happens to match.
+//
+//   * A node in another domain — the v0.2 draft's `aten` vocabulary, a custom
+//     op — may share an op_name with a SonicBoom operator and mean something
+//     else. There is no semantic-compatibility basis for mapping `aten::add`
+//     (or any other domain) onto the `default` operator, so it is refused.
+//   * The lowerings do not dispatch on an operator version. A node that
+//     declares its own version is accepted only when the graph declares the
+//     same version for `default`; with no declared version there is no
+//     baseline to compare against, so an explicit node version is refused.
+//     A graph that declares no opset is unversioned and accepted (the model
+//     emitters and the tracer emit none).
+//   * An opset for a domain no node uses states nothing about the operators
+//     that are lowered, so it is accepted; only `default` opsets are compared
+//     against node versions, and two `default` opsets must agree.
+//
+// Returns the first problem found, or nullopt when the document's operator
+// identities are lowerable. Both `adapt_graph` and `bladeToBoom` call this, so
+// the Blade→Planner and Blade→Boom routes accept and refuse the same documents.
+inline std::optional<std::string> operator_identity_error(const Graph &g) {
+  const std::string kDomain = "default";
+
+  const Graph::Opset *default_opset = nullptr;
+  for (const Graph::Opset &opset : g.opsets) {
+    if (opset.domain != kDomain)
+      continue;
+    if (default_opset && default_opset->version != opset.version)
+      return "graph declares conflicting versions for the '" + kDomain +
+             "' operator domain";
+    default_opset = &opset;
+  }
+  const std::optional<int64_t> graph_version =
+      default_opset ? std::optional<int64_t>(default_opset->version)
+                    : std::nullopt;
+
+  for (const Node &n : g.nodes) {
+    if (n.domain != kDomain)
+      return "node '" + n.op_name + "' is in the operator domain '" +
+             n.domain + "', which SonicBoom does not implement";
+    if (n.version && (!graph_version || *n.version != *graph_version))
+      return "node '" + n.op_name + "' declares the operator version " +
+             std::to_string(*n.version) + ", which the graph does not declare";
+  }
+  return std::nullopt;
+}
+
 // --- Document --------------------------------------------------------------
 
 struct Document {
