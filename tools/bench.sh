@@ -303,7 +303,10 @@ row() { # LABEL SB_MEDIAN SB_SD LL RATIO UNIT
 # harness's own repeatability.
 sb_tg64_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
 sb_d512_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 512 --steps 64)
-sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt 512 --reps 3)
+# pp is the steady-state (reused-session) number; the fresh-session lifecycle
+# cost is a separate scenario and is measured by the tool itself, not folded in.
+sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
+                   --prompt 512 --reps 3 --session reused)
 # prefix_cache_bench needs prompt token ids that are valid for the model under
 # test: real_prompt.tokens is a Gemma-vocab fixture, and feeding it to Qwen
 # (vocab 151936) indexes past the embedding table (CUDA kernel failure). Token
@@ -408,7 +411,7 @@ if [ "$LONG" = 1 ]; then
   done
   for n in $LONG_DEPTHS; do
     st=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" --prompt "$n" \
-           --reps 1)
+           --reps 1 --session reused)
     sb=${st%% *}; sbsd=${st##* }
     ll=$(lb_long_ts "$n" 0 0)
     row "pp${n}" "$sb" "$sbsd" "${ll:-nan}" "$(ratio "$sb" "${ll:-nan}")" "tok/s"

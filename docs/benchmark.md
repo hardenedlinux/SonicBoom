@@ -24,6 +24,47 @@ region, so graph/plan build and CUDA-graph capture are never counted. `pp512`
 uses the llama-bench `-p n -n 0` semantics (per-token marginal cost), not the
 wall time of a first cold prefill.
 
+### Prefill session lifecycle
+
+A session owns its KV cache, and every execution runtime is bound to that cache
+and keyed by its identity. What a prefill number means therefore depends on how
+many sessions the run creates and where the one-time build is charged.
+[`prefill_bench`](../tools/baseline/prefill_bench.cpp) separates the two
+scenarios and never mixes them; both use the same code on every revision of the
+library, so old and new measurements stay comparable.
+
+- **reused** (`RESULT prefill ... session=reused`) is the canonical throughput.
+  One session is created before measurement; its KV cache, decode runtime,
+  prefill segment plans and captured full-chunk graph are built once
+  (`first_prefill_ms`), then every repetition runs the same full prefill with
+  only the logical prefill state reset (`filled_tokens` cleared — no KV
+  reallocation and no runtime rebuild). The timed region contains prefill
+  execution only.
+  - `pp_wall_tok_s` = `N / t_warm`, the steady-state throughput.
+  - `pp_marginal_tok_s` = `(N - n0) / (t_N - t_n0)`, all times from that
+    session. The cancellation baseline `n0` takes the *same execution path*:
+    `n0 = n/2` for `n <= chunk` (both one uncaptured batched segment) and
+    `n0 = n - chunk` for `n > chunk` (the delta is exactly one full chunk,
+    with the final partial segment identical in both runs). A one-token call
+    is never used: it takes the single-column kernels and skips the prefill
+    segment/capture path, so it cancels costs that were never added.
+- **fresh** (`RESULT prefill_fresh*`) reports session lifecycle cost, not
+  throughput. Every repetition creates and destroys a session exactly as
+  `sb_llm_session_new`/`sb_llm_session_free` do. `session_create_ms` is the KV
+  allocation plus the session-bound runtime warm-up; `first_prefill_ms` is that
+  session's first prefill (segment plan build, capture when `N > chunk`,
+  execution); `e2e_ms` is their sum — what a server creating one session per
+  request pays. Runtimes are released between repetitions, so the measurement
+  does not accumulate sessions or device memory.
+- An untimed warm-up session/prefill precedes both sections, so
+  `first_prefill_ms` means the session's own build (segment plan, capture), not
+  one process's first kernel load.
+
+Compare numbers produced by the same mode. Reading a per-request measurement
+(session creation inside the timed region) against a steady-state one is what
+makes a session-ownership change look like a kernel regression; `tools/bench.sh`
+uses the reused mode.
+
 ## Baselines
 
 llama.cpp is the reference baseline, not an oracle: the same GGUF file, the same
