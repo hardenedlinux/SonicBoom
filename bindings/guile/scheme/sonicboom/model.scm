@@ -20,7 +20,8 @@
   #:use-module (ice-9 optargs)
   #:use-module (system foreign)
   #:use-module ((sonicboom tensor)
-                #:select (tensor-shape tensor-numel tensor->list))
+                #:select (tensor-shape tensor-numel tensor-dtype
+                          tensor->list tensor->bytevector))
   #:use-module ((sonicboom nn)
                 #:select (model-layers model-parameters model-graph-text
                           layer-kind layer-name layer-parameters))
@@ -59,11 +60,24 @@ training."
                        (name (symbol->string sym))
                        (gt   (cdr pair))               ; Guile <tensor>
                        (dims (tensor-shape gt))
-                       (override (and init-values (assoc-ref init-values name)))
-                       (lst  (or override (tensor->list gt))))
-                  (unless (= (length lst) (tensor-numel gt))
-                    (error "make-model: init-values length mismatch for" name))
-                  (cons name (train:tensor-from-list dims lst))))
+                       (override (and init-values (assoc-ref init-values name))))
+                  (cons name
+                        (if override
+                            (begin
+                              (unless (= (length override) (tensor-numel gt))
+                                (error "make-model: init-values length mismatch for"
+                                       name))
+                              (train:tensor-from-list dims override))
+                            ;; sb_tensor_from_f32 takes float32 bytes, so a
+                            ;; float32 parameter crosses as its own bytes — no
+                            ;; per-element Scheme list. Other dtypes keep the
+                            ;; numeric path, which converts their values to
+                            ;; float32 exactly as before.
+                            (if (eq? (tensor-dtype gt) 'float32)
+                                (train:tensor-from-bytes
+                                 dims (tensor->bytevector gt))
+                                (train:tensor-from-list
+                                 dims (tensor->list gt)))))))
               (model-parameters structure))))
     (%make-nn-model structure params input-dims)))
 

@@ -14,6 +14,7 @@
   #:use-module (rnrs bytevectors)
   #:use-module (system foreign)
   #:export (tensor-from-list
+            tensor-from-bytes
             tensor->list
             list->f32-bv
             f32-bv->list
@@ -59,18 +60,24 @@
         (loop (+ i 1) (cdr ls))))
     (bytevector->pointer bv)))
 
-(define (tensor-from-list dims lst)
-  "Create a native float32 tensor of shape DIMS from the Scheme number list Lst.
-Returns an opaque handle (pointer)."
-  (let* ((bv (list->f32-bv lst))
-         (out-slot (make-slot))
+(define (tensor-from-bytes dims bv)
+  "Create a native float32 tensor of shape DIMS from little-endian IEEE-754
+float32 bytes BV (the C ABI copies them). Returns an opaque handle (pointer).
+Use this instead of tensor-from-list when the source already holds float32
+bytes: no per-element Scheme conversion happens."
+  (let* ((out-slot (make-slot))
          (err-slot (make-slot)))
     (let ((st ((proc 'sb_tensor_from_f32) (dims->pointer dims) (length dims)
                (bytevector->pointer bv) (bytevector-length bv)
                (slot-ptr out-slot) (slot-ptr err-slot))))
       (unless (sb-status-ok? st)
-        (error "tensor-from-list:" (capture-error err-slot)))
+        (error "tensor-from-bytes:" (capture-error err-slot)))
       (slot-ref out-slot))))
+
+(define (tensor-from-list dims lst)
+  "Create a native float32 tensor of shape DIMS from the Scheme number list Lst.
+Returns an opaque handle (pointer)."
+  (tensor-from-bytes dims (list->f32-bv lst)))
 
 (define (tensor->list handle numel)
   "Read a native float32 tensor's elements back as a Scheme list."

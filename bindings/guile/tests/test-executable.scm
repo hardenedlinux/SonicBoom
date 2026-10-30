@@ -133,7 +133,29 @@
   (>= (reap-executables!) 1))
 (test-equal "reaping again finds nothing new" 0 (reap-executables!))
 
-;; 9. a malformed graph raises at compile time, not at run time
+;; 9. executable-run is the 1-in/1-out wrapper. A multi-output graph keeps the
+;;    historical wrapper diagnostic; it is not silently reduced to output 0.
+(define two-output-text
+  "(sonicboom-s-expr
+     (version 0 1)
+     (graph
+       (name \"two-outputs\")
+       (inputs (input \"x\" (tensor float32 (shape 2))))
+       (outputs (output \"y\") (output \"z\"))
+       (parameters)
+       (nodes
+         (node add (inputs \"x\" \"x\")
+               (outputs (\"y\" (tensor float32 (shape 2)))) (attrs))
+         (node add (inputs \"x\" \"x\")
+               (outputs (\"z\" (tensor float32 (shape 2)))) (attrs)))))")
+
+(test-assert "a multi-output graph is refused by the 1-in/1-out wrapper"
+  (let* ((e (compile-s-expr two-output-text))
+         (r (call-run e (f32-bv 1.0 2.0))))
+    (free-executable! e)
+    (and (not (car r)) (string? (cdr r)))))
+
+;; 10. a malformed graph raises at compile time, not at run time
 (test-assert "a malformed graph raises a typed parse error at compile time"
   (guard (c ((sonicboom-error? c)
              (memq (sonicboom-error-kind c)

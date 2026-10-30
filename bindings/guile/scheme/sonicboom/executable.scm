@@ -44,15 +44,27 @@
 ;;; --- the executable record ---------------------------------------------------
 
 (define-record-type <executable>
-  (%make-executable text ptr in-nbytes out-nbytes freed)
+  (%make-executable text ptr in-nbytes out-nbytes in-count out-count freed)
   executable?
   (text executable-graph-text)
   (ptr executable-ptr)
   (in-nbytes executable-input-nbytes)
   (out-nbytes executable-output-nbytes)
+  ;; Graph arity, captured at compile time. executable-run is the 1-in/1-out
+  ;; wrapper; any other arity keeps the historical bind/execute/retrieve path
+  ;; so its diagnostics are unchanged.
+  (in-count executable-input-count)
+  (out-count executable-output-count)
   ;; Flipped to #t by whoever releases the handle first (explicit free or the
   ;; finalizer), so the other one becomes a no-op instead of a double free.
   (freed executable-freed? set-executable-freed!))
+
+;; A one-element size_t out-param (8 bytes on every 64-bit target; Guile's
+;; `sizeof` accepts only pointer types, so the scalar size is hardcoded).
+(define (u64-native-bv n)
+  (let ((bv (make-bytevector 8 0)))
+    (bytevector-u64-native-set! bv 0 n)
+    bv))
 
 (define (free-executable! exe)
   "Release EXE's native handle. Idempotent: freeing an already-freed (or
@@ -113,16 +125,26 @@ for repeated `executable-run`. Raises on a parse or compile failure."
         ;; (uint64 is 8 bytes on every 64-bit target; Guile's `sizeof` accepts
         ;; only pointer types, so the scalar sizes are hardcoded.)
         (let ((in-bytes (make-bytevector 8 0))
-              (out-bytes (make-bytevector 8 0)))
+              (out-bytes (make-bytevector 8 0))
+              (in-count (make-bytevector 8 0))
+              (out-count (make-bytevector 8 0)))
           (let ((st ((proc 'sb_input_info) (slot-ref exe-slot) %null %null %null
                      (bytevector->pointer in-bytes))))
             (unless (sb-status-ok? st) (fail st)))
           (let ((st ((proc 'sb_output_info) (slot-ref exe-slot) %null %null %null
                      (bytevector->pointer out-bytes))))
             (unless (sb-status-ok? st) (fail st)))
+          (let ((st ((proc 'sb_input_count) (slot-ref exe-slot)
+                     (bytevector->pointer in-count))))
+            (unless (sb-status-ok? st) (fail st)))
+          (let ((st ((proc 'sb_output_count) (slot-ref exe-slot)
+                     (bytevector->pointer out-count))))
+            (unless (sb-status-ok? st) (fail st)))
           (let ((exe (%make-executable text (slot-ref exe-slot)
                                        (bytevector-u64-native-ref in-bytes 0)
                                        (bytevector-u64-native-ref out-bytes 0)
+                                       (bytevector-u64-native-ref in-count 0)
+                                       (bytevector-u64-native-ref out-count 0)
                                        #f)))
             ;; Register with the guardian; see reap-executables!.
             (%exe-guardian exe)
@@ -135,29 +157,69 @@ for repeated `executable-run`. Raises on a parse or compile failure."
 and #f on success, or #f and an error-message string on failure. The native
 handle is retained, so EXE may be run again; the C ABI copies the input, so
 INPUT-BV may be reused or freed immediately."
-  (if (executable-freed? exe)
-      (values #f "executable-run: executable has already been freed")
-      (let ((err-slot (make-slot)))
-        (define (fail status) (sb-check! status err-slot "executable-run"))
-        (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
-            (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
-              (raise-sonicboom-error
-               SB_ERR_BINDING 'binding
-               "executable-run: input size does not match the graph"))
-            (let ((st ((proc 'sb_bind_input) (executable-ptr exe)
-                       (bytevector->pointer input-bv) (bytevector-length input-bv)
-                       (slot-ptr err-slot))))
-              (unless (sb-status-ok? st) (fail st)))
-            (let ((st ((proc 'sb_execute) (executable-ptr exe) (slot-ptr err-slot))))
-              (unless (sb-status-ok? st) (fail st)))
-            (let* ((cap (executable-output-nbytes exe))
-                   (out-bv (make-bytevector cap 0))
-                   (written (make-bytevector 8 0))
-                   (st ((proc 'sb_retrieve_output) (executable-ptr exe)
-                        (bytevector->pointer out-bv) cap
-                        (bytevector->pointer written) (slot-ptr err-slot))))
-              (unless (sb-status-ok? st) (fail st))
-              (values out-bv #f))))))
+  (cond
+    ((executable-freed? exe)
+     (values #f "executable-run: executable has already been freed"))
+    ((and (= (executable-input-count exe) 1)
+          (= (executable-output-count exe) 1))
+     (executable-run-1x1 exe input-bv))
+    (else
+     ;; sb_run_multi requires the exact arity; executable-run's contract is one
+     ;; input and one output. Keep the historical wrapper for any other graph
+     ;; so its failure mode (a binding error naming the arity) is unchanged.
+     (executable-run-legacy exe input-bv))))
+
+;; The one-in/one-out fast path. sb_run_multi takes the caller's input bytes
+;; and writes the result directly into the bytevector it returns, so neither
+;; the bind-time copy into the executable nor the retrieve-time copy out of it
+;; happens. The executor still copies the input into its own slot and the C ABI
+;; still copies the result out of the backend — those copies are below the
+;; stable ABI, not here.
+(define (executable-run-1x1 exe input-bv)
+  (let ((err-slot (make-slot)))
+    (define (fail status) (sb-check! status err-slot "executable-run"))
+    (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
+      (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
+        (raise-sonicboom-error
+         SB_ERR_BINDING 'binding
+         "executable-run: input size does not match the graph"))
+      (let* ((cap (executable-output-nbytes exe))
+             (out-bv (make-bytevector cap 0))
+             (in-lens (u64-native-bv (bytevector-length input-bv)))
+             (out-caps (u64-native-bv cap))
+             (in-array (make-c-struct '(*) (list (bytevector->pointer input-bv))))
+             (out-array (make-c-struct '(*) (list (bytevector->pointer out-bv))))
+             (st ((proc 'sb_run_multi) (executable-ptr exe)
+                  in-array (bytevector->pointer in-lens) 1
+                  out-array (bytevector->pointer out-caps) 1
+                  %null (slot-ptr err-slot))))
+        (unless (sb-status-ok? st) (fail st))
+        (values out-bv #f)))))
+
+;; The historical bind / execute / retrieve path (as before Stage 0). Only
+;; reachable for a graph that is not one-in/one-out.
+(define (executable-run-legacy exe input-bv)
+  (let ((err-slot (make-slot)))
+    (define (fail status) (sb-check! status err-slot "executable-run"))
+    (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
+        (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
+          (raise-sonicboom-error
+           SB_ERR_BINDING 'binding
+           "executable-run: input size does not match the graph"))
+        (let ((st ((proc 'sb_bind_input) (executable-ptr exe)
+                   (bytevector->pointer input-bv) (bytevector-length input-bv)
+                   (slot-ptr err-slot))))
+          (unless (sb-status-ok? st) (fail st)))
+        (let ((st ((proc 'sb_execute) (executable-ptr exe) (slot-ptr err-slot))))
+          (unless (sb-status-ok? st) (fail st)))
+        (let* ((cap (executable-output-nbytes exe))
+               (out-bv (make-bytevector cap 0))
+               (written (make-bytevector 8 0))
+               (st ((proc 'sb_retrieve_output) (executable-ptr exe)
+                    (bytevector->pointer out-bv) cap
+                    (bytevector->pointer written) (slot-ptr err-slot))))
+          (unless (sb-status-ok? st) (fail st))
+          (values out-bv #f)))))
 
 ;;; --- the text-keyed cache ----------------------------------------------------
 
