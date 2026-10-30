@@ -56,12 +56,14 @@
 #include "sb_build_tag.h"
 
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <span>
 #include <string>
@@ -178,6 +180,13 @@ struct sb_llm_session {
   // decode steps that follow it.
   model::SampledState *sampled = nullptr;
   bool sampled_started = false;
+
+  // Handle lifetime guard. Every API call that touches a session takes a
+  // SessionRef; session_free removes the handle from the live set and waits for
+  // the outstanding references to drain before tearing anything down. A call
+  // that arrives after the removal is refused instead of touching freed memory,
+  // so a concurrent decode/free cannot become a use-after-free.
+  uint32_t refs = 0;
   // The history a sampled decode penalizes: the prompt plus every token this
   // session has emitted since the last prefill. Kept across decode calls so a
   // second call without a new prefill continues the same penalty history.
@@ -188,6 +197,37 @@ namespace {
 
 using sonicboom::capi_private::guard;
 using sonicboom::capi_private::set_error;
+
+// Live-session registry for the handle lifetime guard (see sb_llm_session). The
+// mutex orders "is this handle still live" against session_free's removal, so a
+// reference is only ever taken on a handle that free has not started tearing
+// down. It protects the handle itself, not session execution: the core's
+// execution lock serializes the device work.
+std::mutex g_sessions_mu;
+std::condition_variable g_sessions_cv;
+std::unordered_set<sb_llm_session *> g_sessions;
+
+class SessionRef {
+ public:
+  explicit SessionRef(sb_llm_session *h) {
+    if (!h) return;
+    std::lock_guard<std::mutex> lk(g_sessions_mu);
+    if (g_sessions.count(h) == 0) return;
+    ++h->refs;
+    h_ = h;
+  }
+  ~SessionRef() {
+    if (!h_) return;
+    std::lock_guard<std::mutex> lk(g_sessions_mu);
+    if (--h_->refs == 0) g_sessions_cv.notify_all();
+  }
+  SessionRef(const SessionRef &) = delete;
+  SessionRef &operator=(const SessionRef &) = delete;
+  explicit operator bool() const { return h_ != nullptr; }
+
+ private:
+  sb_llm_session *h_ = nullptr;
+};
 
 sb_status fail_arg(sb_error **err_out) {
   set_error(err_out, SB_ERRKIND_INTERNAL, "invalid argument");
@@ -1974,13 +2014,30 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
         }
         h->bundle = model->bundle;  // keep the model (and its buffer) alive
         h->n_ctx = n_ctx;
-        h->kv.n_ctx = n_ctx;  // size the persistent KV cache to this session's window
-        // Pay the one-time decode-runtime construction (graph + plan +
-        // decode-step capture, ~1 s) here rather than inside the session's first
-        // prefill, so first-request TTFT matches steady state. The runtime is
-        // cached under (model, n_ctx) and is the exact one the prefill builds.
-        if (quant::cuda_available() && n_ctx != 0)
-          (void)model::warmup_spine_cuda(model->bundle->model, n_ctx);
+        // The session owns its KV cache exclusively, allocated at construction
+        // so every runtime built for it can bind the cache from the start. A
+        // failure leaves no half-initialized session: the handle is discarded
+        // and the error returned. n_ctx == 0 keeps its meaning (the cache is
+        // sized by the first prefill); the CPU path never allocates one.
+        if (quant::cuda_available() && n_ctx != 0) {
+          const model::Gemma4Model &m = model->bundle->model;
+          if (!model::kv_session_allocate(m, h->kv, n_ctx)) {
+            set_error(err_out, SB_ERRKIND_INTERNAL,
+                      "cannot allocate the session KV cache");
+            delete h;
+            return SB_ERR_INTERNAL;
+          }
+          // Pay the one-time decode/sampled runtime construction (graph + plan
+          // + capture, ~1 s) here rather than inside the first request. Both
+          // runtimes are bound to this session's cache from construction and
+          // cached under (model, n_ctx, cache_id); they are the exact ones the
+          // first prefill and decode use.
+          (void)model::warmup_spine_cuda(m, n_ctx, &h->kv);
+        }
+        {
+          std::lock_guard<std::mutex> lk(g_sessions_mu);
+          g_sessions.insert(h);
+        }
         *session_out = h;
         return SB_OK;
       },
@@ -1989,7 +2046,28 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
 
 void sb_llm_session_free(sb_llm_session *session) {
   if (!session) return;
+  {
+    // Block new operations: removing the handle first makes every later
+    // SessionRef refuse it. Then wait for the in-flight ones to drop their
+    // references, so nothing is still reading the session's state below.
+    std::unique_lock<std::mutex> lk(g_sessions_mu);
+    auto it = g_sessions.find(session);
+    if (it == g_sessions.end()) return;  // already freed
+    g_sessions.erase(it);
+    g_sessions_cv.wait(lk, [&] { return session->refs == 0; });
+  }
+  // The runtimes hold captures bound to this session's KV and a reference to
+  // its cache set; release them (taking the execution lock, which waits out any
+  // operation still inside the core) before dropping the cache. Then the
+  // session's own state goes, and only then the handle.
+  const auto &m = session->bundle->model;
+  model::release_session_runtimes(m, session->n_ctx, session->kv.cache_id);
   model::sampled_state_free(session->sampled);
+  session->sampled = nullptr;
+  session->kv.filled_tokens.clear();
+  session->kv.caches.reset();
+  session->kv.cache_id = 0;
+  session->kv.n_ctx = 0;
   delete session;
 }
 
@@ -1999,6 +2077,8 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
       [&]() -> sb_status {
         if (!session)
           return fail_arg(err_out);
+        SessionRef ref(session);
+        if (!ref) return fail_arg(err_out);
         if (n > 0 && !tokens)
           return fail_arg(err_out);
 
@@ -2103,6 +2183,8 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
       [&]() -> sb_status {
         if (!session || !sampling || !n_out)
           return fail_arg(err_out);
+        SessionRef ref(session);
+        if (!ref) return fail_arg(err_out);
         *n_out = 0;
 
         if (session->prompt.empty()) {
@@ -2340,7 +2422,7 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             }
             const uint64_t done = model::generate_spine_cuda(
                 m, session->token, session->pos, one, n_ctx,
-                session->grammar_mask);
+                session->grammar_mask, &session->kv);
             if (done == 0 || one[0] < 0)
               break;  // decode step failed, or the mask allowed nothing
             // The step wrote `fed`'s KV at session->pos: the session owns one
@@ -2472,6 +2554,8 @@ sb_status sb_llm_session_set_grammar(sb_llm_session *session, const char *gbnf,
       [&]() -> sb_status {
         if (!session || !gbnf)
           return fail_arg(err_out);
+        SessionRef ref(session);
+        if (!ref) return fail_arg(err_out);
         return install_grammar(*session, gbnf, err_out);
       },
       err_out);
@@ -2510,6 +2594,8 @@ sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
       [&]() -> sb_status {
         if (!session || !schema_json)
           return fail_arg(err_out);
+        SessionRef ref(session);
+        if (!ref) return fail_arg(err_out);
         auto gbnf = vocab::json_schema_to_gbnf(schema_json);
         if (!gbnf) {
           const std::string msg = "JSON schema rejected: " + gbnf.error();
@@ -2524,6 +2610,8 @@ sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
 void sb_llm_session_clear_grammar(sb_llm_session *session) {
   if (!session)
     return;
+  SessionRef ref(session);
+  if (!ref) return;
   session->grammar.reset();
   session->grammar_text.clear();
   session->grammar_mask.clear();
@@ -2537,6 +2625,8 @@ sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
       [&]() -> sb_status {
         if (!session || !active_out || !complete_out)
           return fail_arg(err_out);
+        SessionRef ref(const_cast<sb_llm_session *>(session));
+        if (!ref) return fail_arg(err_out);
         *active_out = session->grammar ? 1 : 0;
         *complete_out =
             (session->grammar &&

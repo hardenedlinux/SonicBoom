@@ -44,6 +44,11 @@ bool g_checked = false;
 bool g_available = false;
 // Free buffers keyed by aligned size.
 std::unordered_map<uint64_t, std::vector<uint64_t>> g_free;
+// The aligned size each live handle was acquired at, so release() accounts it
+// exactly even when the caller passes a size that does not match the acquire
+// (the executor has one release path that passes 0).
+std::unordered_map<uint64_t, uint64_t> g_sizes;
+Stats g_stats;
 
 #endif
 
@@ -72,11 +77,20 @@ uint64_t acquire(uint64_t bytes) {
   if (it != g_free.end() && !it->second.empty()) {
     const uint64_t h = it->second.back();
     it->second.pop_back();
+    g_stats.retained_blocks--;
+    g_stats.retained_bytes -= size;
+    g_stats.live_blocks++;
+    g_stats.live_bytes += size;
+    g_sizes[h] = size;
     return h;
   }
   void* p = nullptr;
   if (cudaMalloc(&p, size) != cudaSuccess) return 0;
-  return reinterpret_cast<uint64_t>(p);
+  const uint64_t h = reinterpret_cast<uint64_t>(p);
+  g_sizes[h] = size;
+  g_stats.live_blocks++;
+  g_stats.live_bytes += size;
+  return h;
 #else
   (void)bytes;
   return 0;
@@ -86,9 +100,18 @@ uint64_t acquire(uint64_t bytes) {
 void release(uint64_t handle, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (handle == 0) return;
-  const uint64_t size = align_up(bytes);
   std::lock_guard<std::mutex> lk(g_mutex);
+  // The acquire-time size is authoritative: one executor path releases with 0.
+  auto sit = g_sizes.find(handle);
+  if (sit == g_sizes.end()) return;  // unknown or already released
+  const uint64_t size = sit->second;
+  (void)bytes;
+  g_sizes.erase(sit);
   g_free[size].push_back(handle);
+  g_stats.live_blocks--;
+  g_stats.live_bytes -= size;
+  g_stats.retained_blocks++;
+  g_stats.retained_bytes += size;
 #else
   (void)handle;
   (void)bytes;
@@ -154,13 +177,26 @@ bool synchronize() {
 #endif
 }
 
+Stats stats() noexcept {
+#ifdef SONICBOOM_USE_CUDA
+  std::lock_guard<std::mutex> lk(g_mutex);
+  return g_stats;
+#else
+  return Stats{};
+#endif
+}
+
 void clear_all() {
 #ifdef SONICBOOM_USE_CUDA
   std::lock_guard<std::mutex> lk(g_mutex);
   for (auto& kv : g_free)
-    for (uint64_t h : kv.second)
+    for (uint64_t h : kv.second) {
       cudaFree(reinterpret_cast<void*>(h));
+      g_sizes.erase(h);
+    }
   g_free.clear();
+  g_stats.retained_blocks = 0;
+  g_stats.retained_bytes = 0;
 #endif
 }
 

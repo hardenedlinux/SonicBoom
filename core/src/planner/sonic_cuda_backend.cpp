@@ -31,6 +31,7 @@
 
 #include "../nn/cuda_graph.h"
 #include "../nn/cuda_resident.h"
+#include "../nn/cuda_scratch_epoch.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
 #include "async_prefetch.h"
@@ -138,6 +139,11 @@ hal::DeviceAllocator g_alloc;
 // a backend-private detail and never crosses into Layer 2 or the planner.
 class CudaStepProgram final : public hal::StepProgram {
  public:
+  // Register the capture for its whole lifetime: while any exists, the global
+  // kernel scratch is retained rather than freed on regrowth (see
+  // cuda_scratch_epoch.h).
+  CudaStepProgram() { sonicboom::cuda::capture_register(); }
+  ~CudaStepProgram() override { sonicboom::cuda::capture_unregister(); }
   bool replay() override { return graph_.replay(); }
   bool sync() override { return graph_.sync(); }
   bool valid() const override { return graph_.valid(); }
@@ -165,17 +171,26 @@ class CudaStepProgram final : public hal::StepProgram {
 SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
                                    uint64_t n_ctx)
     : spec_(spec), graph_(graph), n_ctx_(n_ctx) {
+  // A backend that allocates its own set is that set's owner and identity.
+  // Session-bound runtimes use the bind-existing constructor instead.
   ensure_caches(n_ctx);
+  if (caches_) cache_id_ = next_kv_cache_id();
   init_staging();
 }
 
 SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
                                    uint64_t n_ctx,
-                                   std::shared_ptr<std::vector<KvCacheDev>> caches)
-    : spec_(spec), graph_(graph), n_ctx_(n_ctx), caches_(std::move(caches)) {
+                                   std::shared_ptr<std::vector<KvCacheDev>> caches,
+                                   uint64_t cache_id)
+    : spec_(spec), graph_(graph), n_ctx_(n_ctx), caches_(std::move(caches)),
+      cache_id_(cache_id) {
   // The bound set must have this model's layer count: a mismatch would make
   // every attention task index past the end of the vector.
-  if (caches_ && caches_->size() != spec_.n_layers) caches_.reset();
+  if (caches_ && caches_->size() != spec_.n_layers) {
+    caches_.reset();
+    cache_id_ = 0;
+  }
+  if (caches_ && cache_id_ == 0) cache_id_ = next_kv_cache_id();
   init_staging();
 }
 
@@ -548,7 +563,45 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
     captured = step_fn();
   }
   if (!captured || !gs.end()) return nullptr;
+  // Snapshot every device resource the recorded launches reference, so a
+  // replay can prove the graph still points at this session's buffers.
+  capture_res_.valid = true;
+  capture_res_.cache_id = cache_id_;
+  capture_res_.token = token_buf_.id;
+  capture_res_.pos = pos_buf_.id;
+  capture_res_.tokens = tokens_buf_.id;
+  capture_res_.pos_ring = pos_ring_.id;
+  capture_res_.token_ring = token_ring_.id;
+  capture_res_.carry = carry_buf_.id;
+  capture_res_.mask = argmax_mask_.id;
+  capture_res_.sample_params = sample_params_.id;
+  capture_res_.sample_window = sample_window_.id;
+  capture_res_.sample_cands = sample_cands_.id;
+  capture_res_.scratch_epoch = sonicboom::cuda::scratch_epoch();
   return prog;
+}
+
+bool SonicCudaBackend::capture_resources_ok(
+    uint64_t expected_cache_id) const noexcept {
+  const CaptureResources& c = capture_res_;
+  if (!c.valid || !caches_ || cache_id_ == 0) return false;
+  if (c.cache_id != cache_id_ || cache_id_ != expected_cache_id) return false;
+  // Every persistent buffer the capture recorded still owns its documented
+  // handle. A changed handle means a reallocation the graph did not record.
+  if (c.token != token_buf_.id || c.pos != pos_buf_.id ||
+      c.tokens != tokens_buf_.id || c.pos_ring != pos_ring_.id ||
+      c.token_ring != token_ring_.id || c.carry != carry_buf_.id ||
+      c.mask != argmax_mask_.id || c.sample_params != sample_params_.id ||
+      c.sample_window != sample_window_.id ||
+      c.sample_cands != sample_cands_.id)
+    return false;
+  // The two .cu files' file-static scratch: unchanged epoch is confirmed
+  // identity; a change is acceptable only when the old allocation was retained
+  // for the capture (the default with a live program).
+  if (c.scratch_epoch != sonicboom::cuda::scratch_epoch() &&
+      !sonicboom::cuda::scratch_retention_enabled())
+    return false;
+  return true;
 }
 
 std::shared_ptr<std::vector<KvCacheDev>>
@@ -647,15 +700,20 @@ void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
 
 void SonicCudaBackend::share_caches(const SonicCudaBackend& other) {
   caches_ = other.caches_;
+  cache_id_ = other.cache_id_;
 }
 
 void SonicCudaBackend::share_caches(const KvCacheSession& session) {
-  if (session.caches)
+  if (session.caches) {
     caches_ = session.caches;  // adopt the session's cache (prefix reuse)
+    cache_id_ = session.cache_id;
+  }
 }
 
 void SonicCudaBackend::publish_cache(KvCacheSession& session) const {
+  if (!caches_) return;
   session.caches = caches_;
+  if (session.cache_id == 0) session.cache_id = cache_id_;
   session.n_ctx = n_ctx_;
 }
 
@@ -1034,7 +1092,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         attr_f(*node, "scale", attn_scale);
         nn::cuda::attention_trace_set_layer(int(layer));
         for (int64_t r = 0; r < vr && ok; ++r) {
-          if (in.size() >= 4 &&
+          // A warm-up run must not write the session's rows (see
+          // set_kv_write_suppressed); the attention still runs so the split
+          // scratch and every launch the capture records are exercised.
+          if (in.size() >= 4 && !kv_write_suppressed_ &&
               !nn::cuda::kv_append_dev(
                   dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                   dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
@@ -1055,7 +1116,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         }
         break;
       }
-      if (in.size() >= 4 && kv_appended == 0) {
+      if (in.size() >= 4 && kv_appended == 0 && !kv_write_suppressed_) {
         if (!cache.k_buf || !cache.v_buf ||
             !nn::cuda::kv_append_dev(dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                                      dev(in[1]), dev(in[2]),
@@ -1722,7 +1783,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           // cache exactly as the generated kernel would have. kv_append writes
           // both destinations; passing the one buffer for both is how a
           // single-buffer append runs through the existing kernel.
-          if (ok && kv_store != 0) {
+          if (ok && kv_store != 0 && !kv_write_suppressed_) {
             ok = nn::cuda::kv_append_dev(
                 kv_dst, kv_dst, out, out,
                 reinterpret_cast<const uint64_t*>(pos_slot()), kv->n_slots,
@@ -1779,7 +1840,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         void* carg = kv_dst;
         int slotsarg = kv_slots;
         int rowarg = kv_row;
-        int storearg = int(kv_store);
+        // The store is skipped during a warm-up run (see the setter): the
+        // capture is recorded with it enabled, so the replayed graph writes.
+        int storearg = kv_write_suppressed_ ? 0 : int(kv_store);
         void* args[] = {&xarg,   &warg,    &haswarg, &yarg,   &posarg, &dimarg,
                         &earg,   &fsarg,   &lbarg,   &ffarg,  &hpparg, &ropearg,
                         &castarg, &carg,   &slotsarg, &rowarg, &storearg};

@@ -22,6 +22,7 @@
 
 #include "cuda_resident.h"
 
+#include "../nn/cuda_scratch_epoch.h"
 #include "../nn/cuda_stream.h"
 #include "../nn/reduce_sum.cuh"
 #include "../planner/reduce_mode.h"
@@ -613,10 +614,23 @@ bool g_available = false;
 // (or nullptr on allocation failure). Reuses the existing buffer when big enough.
 void* grow_scratch(void*& buf, size_t& have, size_t need) {
   if (have >= need) return buf;
-  if (buf) cudaFree(buf);
+  const size_t old_have = have;
+  void* old = buf;
+  sonicboom::cuda::scratch_epoch_bump();
+  // A live CUDA graph may have baked this pointer in: retain it rather than
+  // freeing memory the graph still launches against (see cuda_scratch_epoch.h).
+  if (old && sonicboom::cuda::scratch_may_free()) {
+    cudaFree(old);
+    old = nullptr;
+  }
   buf = nullptr;
   have = 0;
-  if (cudaMalloc(&buf, need) != cudaSuccess) return nullptr;
+  if (cudaMalloc(&buf, need) != cudaSuccess) {
+    // Keep the retained buffer usable when the growth failed.
+    buf = old;
+    have = old ? old_have : 0;
+    return nullptr;
+  }
   have = need;
   return buf;
 }

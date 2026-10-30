@@ -59,14 +59,16 @@ public:
                    uint64_t n_ctx = 0);
 
   // Construct bound to an existing KV cache set instead of allocating one.
-  // Prefill segment backends run against the decode runtime's cache anyway
-  // (share_caches after construction), so allocating a second full set only to
-  // replace it retains a full KV set in the device pool for the process
-  // lifetime. `caches` must describe the same geometry as `spec`; the backend
-  // takes a reference and never allocates KV storage. A null set leaves the
-  // backend unusable (has_caches() == false); callers must check.
+  // Every execution backend is constructed this way in the session path: a
+  // runtime must never allocate its own full KV set and then have it replaced.
+  // `caches` must describe the same geometry as `spec`; the backend takes a
+  // reference and never allocates KV storage. `cache_id` is the set's identity
+  // (KvCacheSession::cache_id); 0 asks for a fresh one (a set whose owner has no
+  // identity yet). A null set leaves the backend unusable (has_caches() ==
+  // false); callers must check.
   SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph, uint64_t n_ctx,
-                   std::shared_ptr<std::vector<KvCacheDev>> caches);
+                   std::shared_ptr<std::vector<KvCacheDev>> caches,
+                   uint64_t cache_id = 0);
 
   // Bind the compute model the backend reads weights / per-layer config from.
   // Required before execute(); the pointer is stored (the model must outlive the
@@ -292,6 +294,44 @@ public:
   }
   bool has_caches() const noexcept { return bool(caches_); }
 
+  // The identity of the cache set this backend is bound to (see
+  // KvCacheSession::cache_id). Runtime registries and capture checks compare
+  // this value, never the caches pointer.
+  uint64_t cache_id() const noexcept { return cache_id_; }
+
+  // Every device resource a recorded step baked in beyond the graph's own
+  // command stream, snapshotted by record_step() on a successful capture. The
+  // runtime compares it before each replay: a mismatch (another session's KV,
+  // a staging buffer that was reallocated, or scratch that could have moved
+  // without capture retention) forbids the replay and the caller falls back to
+  // the uncaptured executor. The KV cache id alone is not sufficient: the
+  // capture also embeds token/position/ring/carry/mask/sample buffers.
+  struct CaptureResources {
+    bool valid = false;
+    uint64_t cache_id = 0;
+    uint64_t token = 0;
+    uint64_t pos = 0;
+    uint64_t tokens = 0;
+    uint64_t pos_ring = 0;
+    uint64_t token_ring = 0;
+    uint64_t carry = 0;
+    uint64_t mask = 0;
+    uint64_t sample_params = 0;
+    uint64_t sample_window = 0;
+    uint64_t sample_cands = 0;
+    uint64_t scratch_epoch = 0;
+  };
+  const CaptureResources& capture_resources() const noexcept {
+    return capture_res_;
+  }
+
+  // True when a replay of the recorded step against `expected_cache_id` is
+  // safe: the capture resource snapshot is valid, the backend is still bound to
+  // exactly that cache set, every persistent buffer still has the handle the
+  // capture recorded, and the process-global kernel scratch either did not
+  // change or is retained (scratch retention keeps the baked pointers valid).
+  bool capture_resources_ok(uint64_t expected_cache_id) const noexcept;
+
   // Test seam (B4): copy one KV layer's K or V row for absolute position `pos`
   // into `out` (n_heads_kv * head_dim floats). The row's slot is `pos %
   // n_slots`, exactly what the kernels address. Used only by the speculative
@@ -300,6 +340,17 @@ public:
   static bool read_cache_row(const KvCacheDev& cache, bool is_k, uint64_t pos,
                              std::span<float> out);
 
+  // Warm-up seam: while set, execute() runs every kernel of the plan except the
+  // KV cache stores. A runtime's warm-up run exists to allocate pooled buffers
+  // and load the kernels its capture records; on a session cache that already
+  // holds history, the row it would append lands on a live prompt row (a
+  // sliding-window ring maps a tail position onto an in-window slot), so the
+  // warm-up must not write. The capture is recorded with the flag cleared, so
+  // the replayed graph stores normally. Warm-up only; never held across a
+  // replay or a capture.
+  void set_kv_write_suppressed(bool on) noexcept { kv_write_suppressed_ = on; }
+  bool kv_write_suppressed() const noexcept { return kv_write_suppressed_; }
+
 private:
   const model::Gemma4Model* model_ = nullptr;  // compute model (weights/config), bound via bind_model()
   KvCacheSpec spec_;                           // KV-cache geometry (owned copy)
@@ -307,6 +358,8 @@ private:
   // index == KV layer (0 .. n_layer_kv-1). Shared across the decode backend and
   // a prefill backend bound to a different graph (see share_caches).
   std::shared_ptr<std::vector<KvCacheDev>> caches_;
+  uint64_t cache_id_ = 0;           // identity of caches_ (KvCacheSession::cache_id)
+  CaptureResources capture_res_;    // set by record_step() on a successful capture
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
   hal::Buffer pos_buf_;             // persistent device buffer: current position (uint64_t)
   hal::Buffer tokens_buf_;          // persistent device buffer: prefill chunk token ids ([chunk] uint64)
@@ -332,6 +385,7 @@ private:
   int capture_tier_ = -1;           // depth tier being warmed/captured (-1 off)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
+  bool kv_write_suppressed_ = false;  // warm-up: skip KV stores (see setter)
 
   // The device address of the position / token a kernel reads or writes for the
   // current step: the single-step slots outside chunk mode, the step's own ring

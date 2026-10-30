@@ -155,10 +155,14 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 // support (SONICBOOM_USE_CUDA off), so callers gate on quant::cuda_available().
 // `sample_mask` is generate_spine's constrained-decoding bitmap (one token per
 // call when set).
+// `session`, when non-null, is the KV cache the decode runtime is bound to from
+// construction; a null session keeps the non-session tooling behavior (one
+// anonymous runtime owning its own cache per (model, n_ctx)).
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx = 0,
-                             std::span<const uint8_t> sample_mask = {});
+                             std::span<const uint8_t> sample_mask = {},
+                             planner::KvCacheSession* session = nullptr);
 
 // --- sampled decode on the session path (r7) -------------------------------
 //
@@ -221,7 +225,12 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 // same (model, n_ctx) key, so a later call is a map hit. Returns false when the
 // build has no CUDA support or no weights; the caller may ignore the result and
 // fall back to the lazy path.
-bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx);
+// `session`, when non-null, supplies the cache every warmed runtime is bound to
+// from construction (decode and sampled; the verify step has no pre-warm and is
+// built on first use, still bound to the session). Null is the non-session
+// tooling path: the anonymous runtime-owned cache, as before.
+bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
+                       planner::KvCacheSession* session = nullptr);
 
 // ---------------------------------------------------------------------------
 // Speculative verification (Part B). A draft of k tokens is checked by running
@@ -236,11 +245,34 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx);
 // ---------------------------------------------------------------------------
 
 // Allocate `session` a device KV cache of the model's geometry at decode length
-// `n_ctx`, so two sessions on the same model/runtime have independent caches
-// (a session left empty adopts the decode runtime's cache on its first prefill).
-// Clears the session's filled-token history. Returns false without CUDA.
+// `n_ctx`, so two sessions on the same model/runtime have independent caches.
+// The set gets a fresh, never-reused identity (KvCacheSession::cache_id) and
+// every runtime bound to it is keyed by that id. On failure the session is left
+// unchanged (no cache, no id): no half-initialized session. Clears the session's
+// filled-token history. Returns false without CUDA.
 bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
                          uint64_t n_ctx);
+
+// Release every runtime bound to `cache_id` (decode, sampled, verify, fed) for
+// `m`, including the prefill segments and captures those runtimes own. Blocks
+// until an in-flight operation on any session finishes (the global execution
+// lock spans a complete operation, not a token). `n_ctx == 0` releases the key
+// for every context size of that cache. Call with the cache still alive; the
+// runtimes' references drop, then the caller releases the set itself.
+void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
+                              uint64_t cache_id);
+
+// Device-pool accounting for the B0.2 memory measurements. Live bytes are
+// currently held (a session's KV, captures' staging, activations); retained
+// bytes were released back to the pool and are reusable by a new session
+// without another cudaMalloc. Zero without CUDA.
+struct DevicePoolStats {
+  uint64_t live_bytes = 0;
+  uint64_t live_blocks = 0;
+  uint64_t retained_bytes = 0;
+  uint64_t retained_blocks = 0;
+};
+DevicePoolStats device_pool_stats();
 
 // The verify step: feed `tokens` at positions `start_pos .. start_pos+rows-1`
 // through the row-invariant verify graph on `session`'s cache and write each
@@ -363,7 +395,8 @@ double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted);
 // must still be the plain greedy stream. Returns the number of tokens written.
 uint64_t spec_generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                                   uint64_t start_pos, std::span<int64_t> tokens,
-                                  uint64_t n_ctx, const char* draft_strategy);
+                                  uint64_t n_ctx, const char* draft_strategy,
+                                  planner::KvCacheSession* session = nullptr);
 
 // Prefill + decode through the CPU spine. Processes the whole `prompt` in one
 // batched graph pass (build_gemma4_prefill_graph → plan_execution →

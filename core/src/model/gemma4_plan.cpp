@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -59,6 +60,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1345,13 +1347,13 @@ static void spec_diag_dump(const char* strategy) {
 // planner environment) — is cached, and the capture stays per call.
 // ---------------------------------------------------------------------------
 
-// A prefill segment's build product. `cuda` holds the shared KV cache (adopted
-// via share_caches, re-adopted on every cache hit) plus three small persistent
-// slots (token 4 B, pos 8 B, segment token ids chunk*8 = 4096 B at the SWA
-// chunk); the plan itself owns no device memory — its buffers are logical and
-// the device pool allocates them per execute. The segment-build path also
-// allocates a full KV cache in the backend constructor, which share_caches then
-// discards, so the retained device cost of a cache entry is those 4 KiB.
+// A prefill segment's build product. `cuda` is bound to the decode runtime's
+// KV cache set at construction (same shared_ptr and cache identity; B0.2: no
+// allocate-then-share_caches) plus three small persistent slots (token 4 B,
+// pos 8 B, segment token ids chunk*8 = 4096 B at the SWA chunk); the plan
+// itself owns no device memory — its buffers are logical and the device pool
+// allocates them per execute. So the retained device cost of a cache entry is
+// those 4 KiB.
 struct PrefillSegment {
   planner::Graph graph;
   planner::ExecutionPlan plan;
@@ -1505,6 +1507,23 @@ struct DecodeRuntime {
   bool prefill_env_set = false;
 };
 
+// The runtime registry key: every execution runtime is bound to exactly one KV
+// cache set, identified by the session's monotonic cache_id (0 = the anonymous
+// runtime-owned cache of the non-session tooling paths).
+using DecodeKey = std::tuple<const Gemma4Model*, uint64_t, uint64_t>;
+
+// A fed decode runtime: the uncaptured decode graph `decode_steps_spine_cuda`
+// drives with caller-supplied tokens. Bound to the session cache from
+// construction, like every other runtime.
+struct FedRuntime {
+  std::unique_ptr<DecodeRuntime> rt;
+  std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
+};
+
+static void log_capture_refusal(const char* where, const Gemma4Model& m,
+                                uint64_t n_ctx, uint64_t cache_id);
+
 // SONICBOOM_IR_PROGRAM=0 runs the hand-written decode loop instead of the
 // program-driven one (ablation group "ir-program"). Default: the program.
 static bool ir_program_enabled() {
@@ -1648,7 +1667,8 @@ static bool program_stop(const GreedyProgramDesc& p, int64_t token,
 // tests the program's stop set and pos_inc advances the position. Returns the
 // number of tokens written.
 static uint64_t run_program_steps(
-    DecodeRuntime& rt, const GreedyProgramDesc& p, uint64_t token, uint64_t pos,
+    const Gemma4Model& m, uint64_t n_ctx, DecodeRuntime& rt,
+    const GreedyProgramDesc& p, uint64_t token, uint64_t pos,
     std::span<int64_t> tokens, uint64_t step,
     std::chrono::steady_clock::time_point* first_out = nullptr) {
   const uint64_t limit = p.max_tokens > 0
@@ -1656,7 +1676,15 @@ static uint64_t run_program_steps(
                                                   tokens.size())
                              : tokens.size();
   const uint32_t chunk = rt.cuda->decode_chunk();
-  if (rt.prog && chunk > 1) {
+  // A capture replays only while every resource it recorded still has its
+  // recorded identity (KV set, staging buffers, global scratch). Otherwise the
+  // same step runs as an executor dispatch: the same graph and kernels, only
+  // without the graph launch.
+  const uint64_t cache_id = rt.cuda->cache_id();
+  const bool replay_ok = rt.prog && rt.cuda->capture_resources_ok(cache_id);
+  if (rt.prog && !replay_ok)
+    log_capture_refusal("program", m, n_ctx, cache_id);
+  if (replay_ok && chunk > 1) {
     // One replay per k loop iterations: the step node is executed k times, and
     // sample/emit/stop_check/pos_inc run on each of its k results in order.
     float carry = float(token);
@@ -1688,7 +1716,7 @@ static uint64_t run_program_steps(
       }
       if (stopped) break;
     }
-  } else if (rt.prog) {
+  } else if (replay_ok) {
     for (; step < limit; ++step) {
       // Same NVTX step marker as decode_steps_spine_cuda: opt-in via
       // SONICBOOM_NVTX so nsys can isolate one steady-state decode window.
@@ -1880,6 +1908,14 @@ static uint64_t run_spec_program_steps(
                  "session cache\n";
     return step;
   }
+  // The k == 0 path replays the captured single decode step. That capture is
+  // usable only while the resources it recorded still have their identities;
+  // otherwise the same step runs as an executor dispatch (same graph, same
+  // kernels).
+  const uint64_t cache_id = session.cache_id;
+  const bool replay_ok = rt.prog && rt.cuda->capture_resources_ok(cache_id);
+  if (rt.prog && !replay_ok)
+    log_capture_refusal("spec", m, session.n_ctx, cache_id);
   // "ngram" is the program's prompt-lookup drafter; "repeat" is the test seam's
   // always-proposing drafter (the last token, cap times). Either way the
   // verifier decides, so the accepted stream is the plain greedy stream.
@@ -2010,21 +2046,33 @@ static uint64_t run_spec_program_steps(
     }
 
     if (k == 0) {
-      // (k == 0 ? step : verify): the captured single decode step at L.
-      if (!rt.prog) {
-        std::cerr << "[spec] no captured decode step for the k == 0 path\n";
-        break;
+      // (k == 0 ? step : verify): the captured single decode step at L, or the
+      // same step through the executor when no capture is replayable.
+      int64_t next = -1;
+      if (replay_ok) {
+        rt.cuda->set_pos(L);
+        hal::StepProgram* step_prog = rt.step_at(L);
+        if (!rt.cuda->seed_token(token) || !step_prog || !step_prog->replay()) {
+          std::cerr << "[spec] the k == 0 decode step failed at position " << L
+                    << "\n";
+          break;
+        }
+        float next_f = -1.0f;
+        rt.cuda->read_token(&next_f);
+        next = int64_t(next_f);
+      } else {
+        rt.cuda->set_pos(L);
+        const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(L)};
+        auto res = rt.exec->execute(rt.plan, rt.snap, in);
+        if (!res || res->outputs.empty() ||
+            res->outputs[0].size() < sizeof(float)) {
+          std::cerr << "[spec] the k == 0 decode step failed at position " << L
+                    << "\n";
+          break;
+        }
+        next = int64_t(*reinterpret_cast<const float*>(
+            res->outputs[0].data()));
       }
-      rt.cuda->set_pos(L);
-      hal::StepProgram* step_prog = rt.step_at(L);
-      if (!rt.cuda->seed_token(token) || !step_prog || !step_prog->replay()) {
-        std::cerr << "[spec] the k == 0 decode step failed at position " << L
-                  << "\n";
-        break;
-      }
-      float next_f = -1.0f;
-      rt.cuda->read_token(&next_f);
-      const int64_t next = int64_t(next_f);
       if (next < 0) break;
       // S4: a plain step is a proposal of length 0 (the drafter missed or the
       // policy chose k = 0) that emits the verifier's own token.
@@ -2134,8 +2182,45 @@ static uint64_t run_spec_program_steps(
   return step;
 }
 
-static std::map<std::pair<const Gemma4Model*, uint64_t>,
-                std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
+// B0.2 runtime lifecycle.
+//
+// Every execution runtime is bound to exactly one KV cache set from
+// construction and keyed by that set's identity (KvCacheSession::cache_id):
+//
+//   decode   (model, n_ctx, cache_id)
+//   sampled  (model, n_ctx, cache_id)
+//   verify   (model, n_ctx, rows, cache_id)
+//   fed      (model, n_ctx, cache_id)
+//
+// cache_id 0 is the anonymous key: a non-session caller (tooling, plan records)
+// uses one runtime per (model, n_ctx) owning its own cache, exactly as before.
+// Ids are monotonic and never reused, so a released set cannot alias a later
+// one; every entry also retains the cache's shared_ptr, which keeps the id's
+// set alive for as long as a capture bound to it can replay.
+//
+// Lock order: g_exec_mutex (outer) -> g_registry_mutex (inner). No path waits
+// for the execution mutex while holding the registry mutex: a build runs
+// outside the registry, and the insert re-checks for a racing builder. The
+// execution mutex serializes a complete session operation (prefill, decode,
+// sampled/verify/spec step, session free), not one token.
+static std::mutex g_registry_mutex;
+static std::recursive_mutex g_exec_mutex;
+
+static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
+static std::map<DecodeKey, std::unique_ptr<FedRuntime>> g_fed_runtimes;
+
+// A captured step was refused because a resource it recorded no longer has its
+// recorded identity. The runtime falls back to the uncaptured executor (the same
+// graph, the same kernels, only without the graph launch); the reason is
+// reported here once per site so a per-token stream cannot spam.
+static void log_capture_refusal(const char* where, const Gemma4Model& m,
+                                uint64_t n_ctx, uint64_t cache_id) {
+  static std::atomic<unsigned> logged{0};
+  if (logged.fetch_add(1, std::memory_order_relaxed) >= 8) return;
+  std::cerr << "[capture] " << where << ": replay refused (model=" << &m
+            << " n_ctx=" << n_ctx << " cache_id=" << cache_id
+            << "); using the uncaptured executor\n";
+}
 
 // Decode and prefill captures are separate features so an ablation can turn
 // off either one; SONICBOOM_CUDA_GRAPHS=0 still disables both.
@@ -2180,9 +2265,14 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 // capture: a captured step replays as one graph launch and bypasses the
 // executor, so no per-step launches would be visible to record. Returns nullptr
 // on a build/plan failure (the caller falls back to 0).
+// `session`, when non-null, is the cache this runtime must be bound to from
+// construction. Every execution backend takes the bind-existing constructor:
+// allocating a full KV set and replacing it later is what B0.2 removes. A null
+// session builds the anonymous runtime-owned cache the non-session APIs need.
 static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
-    const GraphTransform* transform = nullptr) {
+    const GraphTransform* transform = nullptr,
+    const planner::KvCacheSession* session = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
@@ -2233,8 +2323,16 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     rt->plan = std::move(*plan);
   }
   rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
-  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
-      kv_cache_spec(m.config), rt->graph, n_ctx);
+  if (session) {
+    if (!session->caches) return nullptr;
+    rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), rt->graph, n_ctx, session->caches,
+        session->cache_id);
+    if (!rt->cuda->has_caches()) return nullptr;
+  } else {
+    rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), rt->graph, n_ctx);
+  }
   rt->cuda->bind_model(m);
   rt->exec = std::make_unique<planner::RuntimeExecutor>(
       std::map<planner::BackendTag, planner::Backend*>{
@@ -2243,19 +2341,26 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   return rt;
 }
 
-// Build (or fetch) the cached greedy decode runtime for (m, n_ctx). The first
-// call builds the graph + quantize passes + plan + backends and captures one
-// decode step (HAL record_step); later calls return the same runtime. The
+// Build (or fetch) the cached greedy decode runtime for (m, n_ctx, cache). The
+// first call builds the graph + quantize passes + plan + backends and captures
+// one decode step (HAL record_step); later calls return the same runtime. The
 // capture reads token/pos from the device slots, so it is replay-agnostic to the
 // real start token/position (the caller re-seeds/re-stages before each replay).
-// Returns nullptr on a build/plan failure (the caller falls back to 0).
-static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
-  auto key = std::make_pair(&m, n_ctx);
-  auto it = g_decode_runtimes.find(key);
-  if (it != g_decode_runtimes.end())
-    return it->second.get();
+// A non-null `session` binds the runtime to that session's cache from
+// construction; null builds the anonymous runtime-owned runtime (non-session
+// callers, keyed by cache_id 0). Returns nullptr on a build/plan failure.
+static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
+                                         const planner::KvCacheSession* session) {
+  const uint64_t cache_id = session ? session->cache_id : 0;
+  if (session && (!session->caches || cache_id == 0)) return nullptr;
+  const DecodeKey key{&m, n_ctx, cache_id};
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_decode_runtimes.find(key);
+    if (it != g_decode_runtimes.end()) return it->second.get();
+  }
 
-  auto rt = build_decode_runtime(m, n_ctx);
+  auto rt = build_decode_runtime(m, n_ctx, /*transform=*/nullptr, session);
   if (!rt) return nullptr;
 
   // The Argmax mask buffer (constrained decoding). It is allocated here, before
@@ -2269,6 +2374,13 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
   if (cuda_graph_decode_enabled()) {
+    // The warm-up run executes the step but has its KV stores suppressed (see
+    // set_kv_write_suppressed): a session that already holds history must not
+    // have any live row overwritten, and on a sliding-window ring the tail
+    // position aliases an in-window slot. The position still selects the
+    // attention extent the warm-up exercises.
+    const uint64_t warm_pos =
+        (session && !session->filled_tokens.empty()) ? n_ctx - 1 : 0;
     // The k-step capture (§10): step j reads the token step j-1's argmax wrote
     // and its own staged position. The warm-up runs the same k steps so every
     // pooled buffer the capture records is already allocated.
@@ -2297,16 +2409,22 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       uint64_t caps[nn::cuda::kDecodeTierCount];
       const int nt = nn::cuda::decode_tier_caps(n_ctx, caps);
       bool ok = true;
+      // The warm-up must not write a row of the session cache: the runtime may
+      // be built after the session already holds history, and a sliding-window
+      // ring maps the tail position onto a live slot. The capture below is
+      // recorded with the flag cleared, so the replayed graph stores normally.
+      rt->cuda->set_kv_write_suppressed(true);
       for (int t = 0; t < nt && ok; ++t) {
         rt->cuda->set_capture_tier(t);
-        ok = rt->cuda->seed_token(0) && rt->cuda->set_pos(0) && run_steps();
+        ok = rt->cuda->seed_token(0) && rt->cuda->set_pos(warm_pos) && run_steps();
         rt->cuda->synchronize();
       }
+      rt->cuda->set_kv_write_suppressed(false);
       std::unique_ptr<hal::StepProgram> progs[nn::cuda::kDecodeTierCount];
       if (ok) {
         for (int t = 0; t < nt; ++t) {
           rt->cuda->set_capture_tier(t);
-          if (!rt->cuda->seed_token(0) || !rt->cuda->set_pos(0)) {
+          if (!rt->cuda->seed_token(0) || !rt->cuda->set_pos(warm_pos)) {
             ok = false;
             break;
           }
@@ -2339,9 +2457,12 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
       // The single-graph path (unchanged default): one capture covering every
       // position, with the class schedule. Also the fallback when a tier
       // capture failed.
+      rt->cuda->set_kv_write_suppressed(true);
       rt->cuda->seed_token(0);
-      rt->cuda->set_pos(0);
-      if (run_steps()) {
+      rt->cuda->set_pos(warm_pos);
+      const bool warmed = run_steps();
+      rt->cuda->set_kv_write_suppressed(false);
+      if (warmed) {
         rt->cuda->synchronize();
         rt->cuda->seed_token(0);
         rt->prog = rt->cuda->record_step([&]() { return run_steps(); });
@@ -2367,6 +2488,11 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx) {
     if (!rt->prog) rt->cuda->enable_decode_chunking(1);
   }
 
+  // Another thread may have built the same key while we did: keep the one in
+  // the map (a capture bound to this cache is equivalent) and drop ours.
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_decode_runtimes.find(key);
+  if (it != g_decode_runtimes.end()) return it->second.get();
   DecodeRuntime* raw = rt.get();
   g_decode_runtimes.emplace(key, std::move(rt));
   return raw;
@@ -2426,16 +2552,16 @@ struct SampledRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;  // captured sampled decode step
-  // The session cache the capture is bound to (same contract as VerifyRuntime).
+  // The session cache this runtime (and its capture) is bound to.
   std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
 };
 
-static std::map<std::pair<const Gemma4Model*, uint64_t>,
-                std::unique_ptr<SampledRuntime>>
-    g_sampled_runtimes;
+static std::map<DecodeKey, std::unique_ptr<SampledRuntime>> g_sampled_runtimes;
 
 static std::unique_ptr<SampledRuntime> build_sampled_runtime(
-    const Gemma4Model& m, uint64_t n_ctx) {
+    const Gemma4Model& m, uint64_t n_ctx,
+    const planner::KvCacheSession& session) {
   auto rt = std::make_unique<SampledRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
@@ -2453,7 +2579,9 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
   }
   rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
   rt->cuda = std::make_unique<planner::SonicCudaBackend>(
-      kv_cache_spec(m.config), rt->graph, n_ctx);
+      kv_cache_spec(m.config), rt->graph, n_ctx, session.caches,
+      session.cache_id);
+  if (!rt->cuda->has_caches()) return nullptr;
   rt->cuda->bind_model(m);
   rt->exec = std::make_unique<planner::RuntimeExecutor>(
       std::map<planner::BackendTag, planner::Backend*>{
@@ -2462,50 +2590,61 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
   return rt;
 }
 
-// Build (or fetch) the sampled decode runtime bound to `session`'s cache. The
-// capture bakes that cache's device pointers in, so a runtime recorded against
-// a different vector is rebuilt (a session with its own kv_session_allocate
-// cache). The first call also pays the capture, which is why the session
-// warm-up builds it ahead of the first request.
+// Build (or fetch) the sampled decode runtime bound to `session`'s cache from
+// construction. The capture bakes that cache's device pointers in, so the
+// runtime is keyed by the cache's identity: a second session gets its own
+// runtime rather than evicting the first session's capture. The first call also
+// pays the capture, which is why the session warm-up builds it ahead of the
+// first request.
 static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                            const planner::KvCacheSession& session) {
-  if (!session.caches || m.config.vocab_size == 0) return nullptr;
-  auto key = std::make_pair(&m, n_ctx);
-  auto it = g_sampled_runtimes.find(key);
-  if (it != g_sampled_runtimes.end()) {
-    if (it->second->cache.get() == session.caches.get())
-      return it->second.get();
-    g_sampled_runtimes.erase(it);
+  if (!session.caches || session.cache_id == 0 ||
+      m.config.vocab_size == 0)
+    return nullptr;
+  const DecodeKey key{&m, n_ctx, session.cache_id};
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_sampled_runtimes.find(key);
+    if (it != g_sampled_runtimes.end()) return it->second.get();
   }
 
-  auto rt = build_sampled_runtime(m, n_ctx);
+  auto rt = build_sampled_runtime(m, n_ctx, session);
   if (!rt) return nullptr;
+  rt->cache = session.caches;
+  rt->cache_id = session.cache_id;
   // The candidate/parameter/window buffers (and the grammar mask bitmap) exist
   // before any capture: a captured launch bakes their device pointers in.
   if (!rt->cuda->sample_select_init(int(m.config.vocab_size))) return nullptr;
 
-  // Warm-up on the runtime's own fresh (identically sized) cache: it writes a
-  // KV row at position 0, which must not touch the session's prompt rows. The
-  // session cache is adopted after the warm-up and before the capture, so the
-  // recorded kernels carry its pointers while no kernel writes a row of it.
-  const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
-  auto run = [&]() -> bool {
-    return bool(rt->exec->execute(rt->plan, rt->snap, in));
-  };
+  // Warm-up on the session cache with KV stores suppressed: the step would
+  // otherwise append a row at a tail position, which a sliding-window ring maps
+  // onto a live prompt slot. The captured graph (recorded with the flag
+  // cleared) carries the session cache's pointers and stores normally on
+  // replay; the warm-up only allocates and loads what the capture records.
   if (cuda_graph_decode_enabled()) {
-    if (rt->cuda->seed_token(0) && rt->cuda->set_pos(0) && run()) {
+    const uint64_t warm_pos = n_ctx > 0 ? n_ctx - 1 : 0;
+    const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+    auto warm_run = [&]() -> bool {
+      return bool(rt->exec->execute(rt->plan, rt->snap, warm_in));
+    };
+    rt->cuda->set_kv_write_suppressed(true);
+    const bool warmed =
+        rt->cuda->seed_token(0) && rt->cuda->set_pos(warm_pos) && warm_run();
+    rt->cuda->set_kv_write_suppressed(false);
+    if (warmed) {
       rt->cuda->synchronize();
-      rt->cuda->share_caches(session);
-      if (rt->cuda->seed_token(0) && rt->cuda->set_pos(0)) {
+      const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+      auto run = [&]() -> bool {
+        return bool(rt->exec->execute(rt->plan, rt->snap, in));
+      };
+      if (rt->cuda->seed_token(0) && rt->cuda->set_pos(0))
         rt->prog = rt->cuda->record_step(run);
-        if (rt->prog) rt->cache = rt->cuda->cache_identity();
-      }
     }
   }
-  // Graphs off (or capture failed): run the executor per step on the session
-  // cache. The cache must be adopted outside the capture either way.
-  if (!rt->prog) rt->cuda->share_caches(session);
 
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_sampled_runtimes.find(key);
+  if (it != g_sampled_runtimes.end()) return it->second.get();
   SampledRuntime* raw = rt.get();
   g_sampled_runtimes.emplace(key, std::move(rt));
   return raw;
@@ -2600,6 +2739,8 @@ int64_t sampled_first_token_cuda(const Gemma4Model& m, SampledState& state,
                                  std::span<const int64_t> history,
                                  std::span<const uint8_t> sample_mask) {
   (void)session;  // the first token reads the stored logits, not the cache
+  // Serialize against session free, which frees `state` under the same lock.
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   if (state.logits == 0 || state.vocab != int(m.config.vocab_size))
     return -1;
   if (!(sampling.temperature > 0.0f)) return -1;
@@ -2655,6 +2796,7 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
                           std::span<const uint8_t> sample_mask) {
   if (m.config.vocab_size == 0 || token >= m.config.vocab_size) return -1;
   if (!(sampling.temperature > 0.0f) || session.n_ctx == 0) return -1;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   SampledRuntime* rt = get_sampled_runtime(m, session.n_ctx, session);
   if (!rt) return -1;
   if (sample_mask.empty()) {
@@ -2663,14 +2805,22 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
     return -1;
   }
   if (!rt->cuda->set_pos(position) || !rt->cuda->seed_token(token)) return -1;
-  if (rt->prog) {
+  // A capture may be replayed only while every resource it recorded still has
+  // its recorded identity: this session's KV set, the backend's staging/candidate
+  // buffers, and the process-global kernel scratch. Otherwise run the same graph
+  // through the uncaptured executor (identical arithmetic).
+  const bool replay_ok =
+      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("sampled", m, session.n_ctx, session.cache_id);
+  if (replay_ok) {
     if (!rt->cuda->stage_sample(*rt->prog, sampling, history) ||
         !rt->prog->replay())
       return -1;
   } else {
-    // CUDA graphs disabled (or capture failed): run the same graph through the
-    // executor. The parameters are staged synchronously; the node arithmetic is
-    // identical.
+    // CUDA graphs disabled (or the capture resource check failed): run the same
+    // graph through the executor. The parameters are staged synchronously; the
+    // node arithmetic is identical.
     if (!rt->cuda->upload_sample(sampling, history)) return -1;
     std::vector<sx::Bytes> in{encode_i64(token), encode_i64(position)};
     if (!rt->exec->execute(rt->plan, rt->snap, in)) return -1;
@@ -2701,16 +2851,14 @@ struct VerifyRuntime {
   std::unique_ptr<planner::SonicCudaBackend> cuda;
   std::unique_ptr<planner::RuntimeExecutor> exec;
   std::unique_ptr<hal::StepProgram> prog;  // captured verify step
-  // The session cache the runtime (and therefore the capture) is bound to. The
-  // backend adopts it after the warm-up (which must not write the session) and
-  // before the capture, so the captured kernels carry its device pointers; the
-  // shared_ptr keeps those buffers alive for as long as
-  // the capture can be replayed, and a different session cannot alias it while
-  // this entry exists (same reason as cache_identity()).
+  // The session cache the runtime (and therefore the capture) is bound to from
+  // construction. The shared_ptr keeps those buffers alive for as long as the
+  // capture can be replayed; the id is the registry and capture-check identity.
   std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
 };
 
-static std::map<std::tuple<const Gemma4Model*, uint64_t, int>,
+static std::map<std::tuple<const Gemma4Model*, uint64_t, int, uint64_t>,
                 std::unique_ptr<VerifyRuntime>>
     g_verify_runtimes;
 
@@ -2734,15 +2882,15 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   }
   rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
   rt->cuda = std::make_unique<planner::SonicCudaBackend>(
-      kv_cache_spec(m.config), rt->graph, n_ctx);
+      kv_cache_spec(m.config), rt->graph, n_ctx, session.caches,
+      session.cache_id);
+  if (!rt->cuda->has_caches()) return nullptr;
   rt->cuda->bind_model(m);
-  // The capture records the session cache's device pointers, but the warm-up
-  // that precedes it *writes* the cache: it runs one verify step at positions
-  // 0..rows-1, which would overwrite the prompt's KV rows 0..rows-1 in the
-  // session before the real verify replays at start_pos. So the warm-up runs on
-  // the backend's own (freshly allocated, identically sized) cache and
-  // get_verify_runtime adopts the session cache after it, before the capture.
+  // Bound to the session cache from construction. The capture records its
+  // device pointers; the warm-up (in get_verify_runtime) runs with KV stores
+  // suppressed, so no session row is touched.
   rt->cache = session.caches;
+  rt->cache_id = session.cache_id;
   rt->exec = std::make_unique<planner::RuntimeExecutor>(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
@@ -2750,23 +2898,22 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   return rt;
 }
 
-// Build (or fetch) the cached verify runtime. The capture reads the token ids
-// from `tokens_buf_` and the base position from `pos_buf_`, both restaged before
-// every replay, so one capture serves every call at any depth. Keyed by the
-// session cache as well as the shape: a capture is only replayable against the
-// vector it was recorded with. Returns nullptr on a build/plan failure.
+// Build (or fetch) the cached verify runtime bound to `session`'s cache. The
+// capture reads the token ids from `tokens_buf_` and the base position from
+// `pos_buf_`, both restaged before every replay, so one capture serves every
+// call at any depth. Keyed by the cache identity as well as the shape: a capture
+// is only replayable against the set it was recorded with, and a second session
+// must not evict the first session's capture. Returns nullptr on a build/plan
+// failure.
 static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                          int rows,
                                          const planner::KvCacheSession& session) {
-  if (!session.caches) return nullptr;
-  auto key = std::make_tuple(&m, n_ctx, rows);
-  auto it = g_verify_runtimes.find(key);
-  if (it != g_verify_runtimes.end()) {
-    if (it->second->cache.get() == session.caches.get())
-      return it->second.get();
-    // A different session on the same shape: the old capture cannot be replayed
-    // against the new cache, and holding both would be two full verify graphs.
-    g_verify_runtimes.erase(it);
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, rows, session.cache_id);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_verify_runtimes.find(key);
+    if (it != g_verify_runtimes.end()) return it->second.get();
   }
 
   auto rt = build_verify_runtime(m, n_ctx, rows, session);
@@ -2774,27 +2921,37 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
 
   if (cuda_graph_decode_enabled()) {
     // Warm-up run: allocates every pooled buffer and uploads the weights the
-    // capture pass then only records. The ids and position are placeholders;
-    // every real call stages its own before replay.
+    // capture pass then only records. Its KV stores are suppressed: the rows it
+    // would append land on the cache's ring at positions past the session's
+    // live length, which a sliding-window ring maps onto live slots. The ids and
+    // position are placeholders, every real call stages its own before replay.
+    const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
     const std::vector<uint64_t> warm(size_t(rows), 0);
+    const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+    auto warm_run = [&]() {
+      return bool(rt->exec->execute(rt->plan, rt->snap, warm_in));
+    };
     const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
     auto run = [&]() {
-      auto res = rt->exec->execute(rt->plan, rt->snap, in);
-      return bool(res);
+      return bool(rt->exec->execute(rt->plan, rt->snap, in));
     };
-    if (rt->cuda->set_prefill_tokens(warm) &&
-        rt->cuda->set_verify_pos(0, rows) && run()) {
+    rt->cuda->set_kv_write_suppressed(true);
+    const bool warmed = rt->cuda->set_prefill_tokens(warm) &&
+                        rt->cuda->set_verify_pos(warm_pos, rows) && warm_run();
+    rt->cuda->set_kv_write_suppressed(false);
+    if (warmed) {
       rt->cuda->synchronize();
-      // Adopt the session cache only after the warm-up and before the capture.
       // Capture records the launches without executing them, so the graph bakes
       // the session's pointers while no kernel writes a row of it.
-      rt->cuda->share_caches(session);
       if (rt->cuda->set_prefill_tokens(warm) &&
           rt->cuda->set_verify_pos(0, rows))
         rt->prog = rt->cuda->record_step(run);
     }
   }
 
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_verify_runtimes.find(key);
+  if (it != g_verify_runtimes.end()) return it->second.get();
   VerifyRuntime* raw = rt.get();
   g_verify_runtimes.emplace(key, std::move(rt));
   return raw;
@@ -2819,14 +2976,28 @@ constexpr double kSpecProbeAutoRatio = 1.5;
 // + position staging, replay, sync). Both include the same host round-trip, so
 // the ratio compares the device work, not the launch overhead.
 static bool spec_probe_measure(const Gemma4Model& m, DecodeRuntime* rt,
-                               uint64_t n_ctx, uint64_t pos, double& plain_ms,
+                               uint64_t n_ctx, uint64_t pos,
+                               const planner::KvCacheSession* session,
+                               uint64_t& verify_cache_id, double& plain_ms,
                                double& verify_ms) {
   if (!cuda_graph_decode_enabled() || !rt || !rt->prog) return false;
   if (pos + 2 > n_ctx) return false;  // the k=1 verify appends 2 rows
-  planner::KvCacheSession session;
-  rt->cuda->publish_cache(session);
-  VerifyRuntime* vrt = get_verify_runtime(m, n_ctx, 2, session);
+  // The probe's verify runtime is bound to the same cache as the decode runtime
+  // it measures: the caller's session cache when there is one, otherwise the
+  // anonymous runtime's own (published into a local identity).
+  planner::KvCacheSession local;
+  const planner::KvCacheSession* kv = session;
+  if (!kv || !kv->caches || kv->cache_id == 0) {
+    rt->cuda->publish_cache(local);
+    kv = &local;
+  }
+  if (!kv->caches || kv->cache_id == 0) return false;
+  verify_cache_id = kv->cache_id;
+  VerifyRuntime* vrt = get_verify_runtime(m, n_ctx, 2, *kv);
   if (!vrt || !vrt->prog) return false;
+  // Built after the verify runtime: its construction may have grown the global
+  // scratch, and the plain step's capture must still be replayable.
+  if (!rt->cuda->capture_resources_ok(kv->cache_id)) return false;
 
   auto ms_since = [](std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(
@@ -2885,13 +3056,15 @@ static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
 // was still undecided) with the greedy program, in which case it is rebuilt.
 // The rebuild is safe at both call sites: the probe runs before the runtime's
 // KV cache is published into a session, so no capture is bound to it yet.
-static DecodeRuntime* spec_resolve_probe(const Gemma4Model& m, DecodeRuntime* rt,
-                                         uint64_t n_ctx, uint64_t pos) {
+static DecodeRuntime* spec_resolve_probe(
+    const Gemma4Model& m, DecodeRuntime* rt, uint64_t n_ctx, uint64_t pos,
+    const planner::KvCacheSession* session) {
   if (!rt || env_spec_mode() != SpecMode::Undecided ||
       g_spec_mode != SpecMode::Undecided)
     return rt;
   double ratio = 0.0;
   bool measured = false;
+  uint64_t verify_cache_id = 0;
   if (const auto cached =
           mlir_tune::lookup_ratio("spec_verify_ratio", "decode")) {
     ratio = *cached;
@@ -2900,7 +3073,8 @@ static DecodeRuntime* spec_resolve_probe(const Gemma4Model& m, DecodeRuntime* rt
     if (spec_probe_injected(plain_ms, verify_ms)) {
       ratio = verify_ms / plain_ms;
     } else {
-      if (!spec_probe_measure(m, rt, n_ctx, pos, plain_ms, verify_ms))
+      if (!spec_probe_measure(m, rt, n_ctx, pos, session, verify_cache_id,
+                              plain_ms, verify_ms))
         return rt;  // no captured step (or no room): stay greedy, retry later
       ratio = verify_ms / plain_ms;
       measured = true;
@@ -2917,11 +3091,30 @@ static DecodeRuntime* spec_resolve_probe(const Gemma4Model& m, DecodeRuntime* rt
   if (measured) {
     // The probe's rows=2 verify runtime is only a measurement; drop it so a
     // decision for off does not keep a second set of device weights alive.
-    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, 2));
+    g_verify_runtimes.erase(
+        std::make_tuple(&m, n_ctx, 2, verify_cache_id));
   }
-  if (mode == SpecMode::Auto && !rt->program.speculative) {
-    g_decode_runtimes.erase(std::make_pair(&m, n_ctx));
-    return get_decode_runtime(m, n_ctx);
+  if (mode == SpecMode::Auto) {
+    // Every greedy runtime built before the decision (one per live cache
+    // identity) carries the plain program. The loop shape is a per-runtime
+    // property, so each must be rebuilt with the speculative program; doing it
+    // here keeps a second session from silently decoding greedily after the
+    // probe selected auto. Read the flag before erasing: `rt` is one of the
+    // erased entries.
+    const bool was_greedy = !rt->program.speculative;
+    {
+      std::lock_guard<std::mutex> lk(g_registry_mutex);
+      for (auto it = g_decode_runtimes.begin();
+           it != g_decode_runtimes.end();) {
+        const DecodeKey& k = it->first;
+        if (std::get<0>(k) == &m && std::get<1>(k) == n_ctx &&
+            !it->second->program.speculative)
+          it = g_decode_runtimes.erase(it);
+        else
+          ++it;
+      }
+    }
+    if (was_greedy) return get_decode_runtime(m, n_ctx, session);
   }
   return rt;
 }
@@ -2929,9 +3122,13 @@ static DecodeRuntime* spec_resolve_probe(const Gemma4Model& m, DecodeRuntime* rt
 bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
                          uint64_t n_ctx) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
-  session.caches =
-      planner::SonicCudaBackend::allocate_cache_set(kv_cache_spec(m.config), n_ctx);
-  if (!session.caches) return false;
+  // Allocate first, assign only on success: a failure must not leave the
+  // session with a cleared cache (or a new id pointing at nothing).
+  auto caches = planner::SonicCudaBackend::allocate_cache_set(
+      kv_cache_spec(m.config), n_ctx);
+  if (!caches) return false;
+  session.caches = std::move(caches);
+  session.cache_id = planner::next_kv_cache_id();
   session.n_ctx = n_ctx;
   session.filled_tokens.clear();
   return true;
@@ -2948,36 +3145,37 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
   };
   if (tokens.empty() || out.size() < tokens.size())
     return fail("empty input");
+  // One complete operation holds the execution mutex; the lock is recursive so
+  // the verify/spec helpers it calls re-enter. Session free takes the same lock,
+  // which is how it waits out an in-flight operation.
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
   if (start_pos + uint64_t(tokens.size()) > session.n_ctx)
     return fail("positions exceed the session cache");
 
   // Deliberately not the captured runtime: a capture bakes the cache it was
-  // recorded against, and this seam is fed a session cache it did not choose.
-  // The uncaptured runtime runs the very same decode graph through the very same
-  // executor dispatch; only the graph launch is absent, and it has no numerical
-  // effect. It is built once per (model, n_ctx) and bound to the session's cache
-  // before its first execution.
-  struct FedRuntime {
-    std::unique_ptr<DecodeRuntime> rt;
-    std::shared_ptr<void> cache;
-  };
-  static std::map<std::pair<const Gemma4Model*, uint64_t>,
-                  std::unique_ptr<FedRuntime>>
-      fed;
-  auto key = std::make_pair(&m, session.n_ctx);
-  auto it = fed.find(key);
+  // recorded against, and this seam is fed arbitrary tokens. The uncaptured
+  // runtime runs the very same decode graph through the very same executor
+  // dispatch; only the graph launch is absent, and it has no numerical effect.
+  // It is built once per cache identity and bound to the session's cache from
+  // construction (B0.2: no allocate-then-replace).
+  if (session.cache_id == 0) return fail("session cache has no identity");
+  const DecodeKey key{&m, session.n_ctx, session.cache_id};
   FedRuntime* fr = nullptr;
-  if (it != fed.end() && it->second->cache.get() == session.caches.get()) {
-    fr = it->second.get();
-  } else {
-    auto rt = build_decode_runtime(m, session.n_ctx);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_fed_runtimes.find(key);
+    if (it != g_fed_runtimes.end()) fr = it->second.get();
+  }
+  if (!fr) {
+    auto rt = build_decode_runtime(m, session.n_ctx, nullptr, &session);
     if (!rt) return fail("decode runtime build failed");
-    rt->cuda->share_caches(session);
-    it = fed.insert_or_assign(
-        key, std::make_unique<FedRuntime>(FedRuntime{
-                 std::move(rt), std::shared_ptr<void>(session.caches)})).first;
-    fr = it->second.get();
+    auto entry = std::make_unique<FedRuntime>(
+        FedRuntime{std::move(rt), std::shared_ptr<void>(session.caches),
+                   session.cache_id});
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto ins = g_fed_runtimes.emplace(key, std::move(entry));
+    fr = ins.first->second.get();
   }
 
   for (size_t i = 0; i < tokens.size(); ++i) {
@@ -3014,14 +3212,20 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   const int rows = int(tokens.size());
   if (rows <= 0 || rows > planner::kMaxVerifyRows || out.size() < tokens.size())
     return fail("bad row count");
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
   if (start_pos + uint64_t(rows) > session.n_ctx)
     return fail("positions exceed the session cache");
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
-  rt->cuda->share_caches(session);  // identity: the capture is bound to it
 
-  if (rt->prog) {
+  // Replay only while the capture's recorded resources are still this
+  // session's; otherwise run the same graph through the uncaptured executor.
+  const bool replay_ok =
+      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
+  if (replay_ok) {
     // Stage the row token ids and the base position on the captured graph's
     // stream, then one replay: the whole verify step is one graph launch.
     if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
@@ -3061,6 +3265,7 @@ bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
   if (drafts.empty() || drafts.size() + 1 > size_t(planner::kMaxVerifyRows))
     return fail("bad draft length");
   if (out.size() < drafts.size() + 1) return fail("output too small");
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
   // The valid length: the history is exactly the tokens whose KV is resident,
   // so the token the previous step sampled (last_token) goes at start_pos and
@@ -3099,6 +3304,51 @@ bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
   return true;
 }
 
+// Release every runtime bound to one session cache. Called by session_free
+// after no new operation can start on the session: taking the execution mutex
+// waits out an in-flight operation (a complete decode/prefill/verify, not one
+// token), then the registry mutex orders the erasure against a concurrent
+// get_* build (which re-checks the map on insert). Destruction drops the
+// runtimes' captures and their shared_ptr to the cache set; the session then
+// releases the last reference. n_ctx == 0 releases the key for every context
+// size of that cache (the id alone identifies the set).
+void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
+                              uint64_t cache_id) {
+  if (cache_id == 0) return;
+  std::lock_guard<std::recursive_mutex> ex(g_exec_mutex);
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto matches = [&](const DecodeKey& k) {
+    return std::get<0>(k) == &m && std::get<2>(k) == cache_id &&
+           (n_ctx == 0 || std::get<1>(k) == n_ctx);
+  };
+  for (auto it = g_decode_runtimes.begin(); it != g_decode_runtimes.end();) {
+    if (matches(it->first)) it = g_decode_runtimes.erase(it);
+    else ++it;
+  }
+  for (auto it = g_sampled_runtimes.begin(); it != g_sampled_runtimes.end();) {
+    if (matches(it->first)) it = g_sampled_runtimes.erase(it);
+    else ++it;
+  }
+  for (auto it = g_fed_runtimes.begin(); it != g_fed_runtimes.end();) {
+    if (matches(it->first)) it = g_fed_runtimes.erase(it);
+    else ++it;
+  }
+  for (auto it = g_verify_runtimes.begin(); it != g_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<3>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+}
+
+DevicePoolStats device_pool_stats() {
+  const planner::device::Stats s = planner::device::stats();
+  return DevicePoolStats{s.live_bytes, s.live_blocks, s.retained_bytes,
+                         s.retained_blocks};
+}
+
 bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
                        bool is_k, uint64_t first, uint64_t count,
                        std::span<float> out) {
@@ -3116,30 +3366,38 @@ bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
   return true;
 }
 
-bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx) {
+bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
+                       planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
   // Ablatable warm-up: with the feature off nothing is built here, so the
   // first generate call pays the plan/capture cost inside its own timed
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
-  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  // The warm-up builds the same runtimes the first request would, bound to the
+  // caller's session cache from construction. The sampled capture bakes that
+  // cache's device pointers in, so it cannot be warmed on a temporary set and
+  // adopted later; a null session (non-session tooling) uses the anonymous
+  // runtime-owned cache as before.
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx, session);
   if (!rt) return false;
-  // r7: build and capture the sampled decode runtime here too, bound to the
-  // cache the greedy runtime publishes into a session's first prefill. Without
-  // this the first sampled step of a fresh session would pay the plan/capture
-  // (~1 s) before its first callback, inside TTFT. A session that brings its
-  // own cache adapts (get_sampled_runtime rebuilds on the identity mismatch).
-  planner::KvCacheSession warm;
-  warm.n_ctx = n_ctx;
-  rt->cuda->publish_cache(warm);
-  (void)get_sampled_runtime(m, n_ctx, warm);
+  if (session) {
+    if (!session->caches || session->cache_id == 0) return false;
+    (void)get_sampled_runtime(m, n_ctx, *session);
+  } else {
+    planner::KvCacheSession warm;
+    warm.n_ctx = n_ctx;
+    rt->cuda->publish_cache(warm);
+    (void)get_sampled_runtime(m, n_ctx, warm);
+  }
   return true;
 }
 
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx,
-                             std::span<const uint8_t> sample_mask) {
+                             std::span<const uint8_t> sample_mask,
+                             planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
   const bool masked = !sample_mask.empty();
@@ -3148,16 +3406,25 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
     return 0;
   }
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
   const auto t_plan0 = std::chrono::steady_clock::now();
   // C.2: the greedy decode graph/plan/backends and the captured decode step are
-  // cached per (model, n_ctx); the first call builds + captures, later calls
-  // only re-seed/re-stage the device params and replay.
-  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  // cached per (model, n_ctx, cache identity); the first call builds + captures,
+  // later calls only re-seed/re-stage the device params and replay. A session
+  // caller gets the runtime bound to its own cache from construction.
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx, session);
   if (!rt) return 0;
-  rt = spec_resolve_probe(m, rt, n_ctx, start_pos);
+  rt = spec_resolve_probe(m, rt, n_ctx, start_pos, session);
   if (!rt) return 0;
+  // Every replay below is gated on the capture's recorded resources still
+  // having their identities. A refused capture falls back to the uncaptured
+  // executor for the same step (same graph, same kernels).
+  const bool replay_ok = rt->prog && rt->cuda->capture_resources_ok(
+                                            rt->cuda->cache_id());
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("decode", m, n_ctx, rt->cuda->cache_id());
 
   const auto t_loop0 = std::chrono::steady_clock::now();
   auto t_first = t_loop0;
@@ -3182,7 +3449,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     if (nvtx_enabled()) nvtxRangePushA(name.c_str());
     float next_f = -1.0f;
     bool ok = true;
-    if (rt->prog_one) {
+    if (rt->prog_one && replay_ok) {
       // One captured step on the chunked backend: carry + position slot 0 in,
       // token slot 0 out. (The chunk graph cannot take a per-step host mask,
       // which is why this second capture exists.)
@@ -3190,7 +3457,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       ok = rt->cuda->stage_chunk(*rt->prog_one, float(token), positions) &&
            rt->prog_one->replay() &&
            rt->cuda->read_chunk_tokens(&next_f, 1);
-    } else if (hal::StepProgram* step_prog = rt->step_at(pos)) {
+    } else if (replay_ok && rt->step_at(pos)) {
+      hal::StepProgram* step_prog = rt->step_at(pos);
       ok = rt->cuda->set_pos(pos) && step_prog->replay() &&
            rt->cuda->read_token(&next_f);
     } else {
@@ -3221,21 +3489,27 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   const uint32_t chunk = rt->cuda->decode_chunk();
   if (masked) {
     // the masked single step above already produced the call's one token
-  } else if (ir_program_enabled() && rt->program.valid && rt->program.speculative &&
-      rt->prog) {
+  } else if (ir_program_enabled() && rt->program.valid &&
+             rt->program.speculative) {
     // The speculative program drives the loop. There is no captured prefill
     // here, so the drafter starts from an empty history: its proposals are
-    // verified, never trusted, so the token stream is the plain loop's.
-    planner::KvCacheSession session;
-    rt->cuda->publish_cache(session);
+    // verified, never trusted, so the token stream is the plain loop's. A
+    // non-session caller uses the runtime's own cache, published into a local
+    // identity (no implicit fallback: a session caller always passes its own).
+    planner::KvCacheSession local;
+    planner::KvCacheSession* kv = session;
+    if (!kv) {
+      rt->cuda->publish_cache(local);
+      kv = &local;
+    }
     step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
-                                  session, {}, &t_first);
+                                  *kv, {}, &t_first);
   } else if (ir_program_enabled() && rt->program.valid) {
     // The lowered boom.program drives the loop; each step node is the captured
     // StepProgram replay (or the executor dispatch when nothing was captured).
-    step = run_program_steps(*rt, rt->program, token, pos, tokens, step,
-                             &t_first);
-  } else if (rt->prog && chunk > 1) {
+    step = run_program_steps(m, n_ctx, *rt, rt->program, token, pos, tokens,
+                             step, &t_first);
+  } else if (replay_ok && chunk > 1) {
     // Replay one captured k-step chunk: stage the carry token and the k
     // positions on the graph's stream, launch once, then read the k tokens in
     // one D2H. The device feeds each step's token to the next, so the host
@@ -3267,7 +3541,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       }
       if (stopped) break;
     }
-  } else if (rt->prog) {
+  } else if (replay_ok) {
     // Replay the cached captured step: stage the position, launch the graph, read
     // the winning token back from the persistent device slot. The synchronous D2H
     // read also drains the graph stream before the next step.
@@ -3350,17 +3624,22 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
 
 uint64_t spec_generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                                   uint64_t start_pos, std::span<int64_t> tokens,
-                                  uint64_t n_ctx, const char* draft_strategy) {
+                                  uint64_t n_ctx, const char* draft_strategy,
+                                  planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
-  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
-  if (!rt || !rt->prog || !rt->program.valid || !rt->program.speculative)
-    return 0;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx, session);
+  if (!rt || !rt->program.valid || !rt->program.speculative) return 0;
   rt->cuda->seed_token(start_token);
-  planner::KvCacheSession session;
-  rt->cuda->publish_cache(session);
+  planner::KvCacheSession local;
+  planner::KvCacheSession* kv = session;
+  if (!kv) {
+    rt->cuda->publish_cache(local);
+    kv = &local;
+  }
   return run_spec_program_steps(m, *rt, rt->program, start_token, start_pos,
-                                tokens, 0, session, {}, nullptr,
+                                tokens, 0, *kv, {}, nullptr,
                                 draft_strategy);
 }
 
@@ -3424,6 +3703,7 @@ std::optional<planner::PlanRunRecord> record_decode_plan(
   // Deliberately not get_decode_runtime: that runtime is captured, and a
   // captured step replays as a single graph launch with no executor walk, so
   // there would be no per-step kernels to record.
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   auto rt = build_decode_runtime(m, n_ctx, &transform);
   if (!rt) return std::nullopt;
 
@@ -3450,6 +3730,7 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
 std::optional<planner::PlanRunRecord> record_prefill_plan(
     const Gemma4Model& m, uint64_t n, const GraphTransform& transform) {
   if (n == 0) return std::nullopt;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   GraphIr ir = emit_prefill_ir(m, n);
   // The same mmq fusion the prefill segments use, under the same conditions, so
   // the recorded steps are the ones a real prefill segment would run.
@@ -3502,16 +3783,20 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
 }
 #else
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
-                             std::span<int64_t>, uint64_t) {
+                             std::span<int64_t>, uint64_t,
+                             std::span<const uint8_t>,
+                             planner::KvCacheSession*) {
   return 0;  // built without CUDA: no device spine is available
 }
 
 uint64_t spec_generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
-                                  std::span<int64_t>, uint64_t, const char*) {
+                                  std::span<int64_t>, uint64_t, const char*,
+                                  planner::KvCacheSession*) {
   return 0;  // built without CUDA: no speculative loop to run
 }
 
-bool warmup_spine_cuda(const Gemma4Model&, uint64_t) {
+bool warmup_spine_cuda(const Gemma4Model&, uint64_t,
+                       planner::KvCacheSession*) {
   return false;  // built without CUDA: there is no runtime to build
 }
 
@@ -3542,6 +3827,9 @@ bool kv_read_rows_cuda(const planner::KvCacheSession&, uint32_t, bool,
                        uint64_t, uint64_t, std::span<float>) {
   return false;  // built without CUDA: there is no device cache to read
 }
+
+void release_session_runtimes(const Gemma4Model&, uint64_t, uint64_t) {}
+DevicePoolStats device_pool_stats() { return DevicePoolStats{}; }
 
 std::optional<planner::PlanRunRecord> record_decode_plan(const Gemma4Model&,
                                                          uint64_t, uint64_t) {
@@ -3613,9 +3901,9 @@ static void dump_logits_top2(const char* file, uint64_t step, uint64_t pos,
 // the model's logit softcap off the output path: the logit dump wants the
 // softcapped distribution from the graph, the perplexity scorer wants the raw
 // one so it can apply the cap itself (f32, host) before the softmax.
-static std::unique_ptr<DecodeRuntime> build_eval_runtime(const Gemma4Model& m,
-                                                         uint64_t n_ctx,
-                                                         bool raw_logits) {
+static std::unique_ptr<DecodeRuntime> build_eval_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, bool raw_logits,
+    const planner::KvCacheSession* session = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
                               /*softcap_output=*/!raw_logits);
@@ -3629,8 +3917,16 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(const Gemma4Model& m,
   if (!p) return nullptr;
   rt->plan = std::move(*p);
   rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
-  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
-      kv_cache_spec(m.config), rt->graph, n_ctx);
+  if (session) {
+    if (!session->caches) return nullptr;
+    rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), rt->graph, n_ctx, session->caches,
+        session->cache_id);
+    if (!rt->cuda->has_caches()) return nullptr;
+  } else {
+    rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+        kv_cache_spec(m.config), rt->graph, n_ctx);
+  }
   rt->cuda->bind_model(m);
   rt->exec = std::make_unique<planner::RuntimeExecutor>(
       std::map<planner::BackendTag, planner::Backend*>{
@@ -3704,16 +4000,16 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   std::unique_ptr<DecodeRuntime> dump_rt;
   if (!dump_logits) {
     Phase _p("prefill:get_decode_runtime", phase_timing);
-    rt = get_decode_runtime(m, n_ctx);
+    rt = get_decode_runtime(m, n_ctx, session);
     if (!rt) return 0;
     // V2: with SONICBOOM_SPEC unset, settle the loop shape (probe or cached
     // ratio) before the prefill/loop below reads rt->program.
     Phase _pp("prefill:spec_probe", phase_timing);
-    rt = spec_resolve_probe(m, rt, n_ctx, start_pos);
+    rt = spec_resolve_probe(m, rt, n_ctx, start_pos, session);
     if (!rt) return 0;
   } else {
     Phase _p("prefill:build_decode_graph", phase_timing);
-    dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false);
+    dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false, session);
     if (!dump_rt) return 0;
     rt = dump_rt.get();
   }
@@ -3735,15 +4031,21 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   // reused from rt->prefills — see segment_for below).
   planner::AnalyticalCpuCostModel cost(snap);
 
-  // Prefix reuse: adopt the session's persistent cache if it has one, otherwise
-  // publish this backend's fresh cache into the session (first call) so it
-  // survives this run. The prefill segment backends then share it transitively
-  // via share_caches(*rt->cuda).
+  // Every backend here was constructed against the session's cache; there is no
+  // adoption step. A mismatch means the registry handed back a runtime bound to
+  // a different set, which must be reported rather than papered over with a
+  // post-hoc share_caches (B0.2 forbids that replacement).
   if (session) {
-    if (session->caches)
-      rt->cuda->share_caches(*session);
-    else
-      rt->cuda->publish_cache(*session);
+    if (!session->caches || session->cache_id == 0) {
+      std::cerr << "[prefill-cuda] session has no KV cache\n";
+      return 0;
+    }
+    if (rt->cuda->cache_id() != session->cache_id) {
+      std::cerr << "[prefill-cuda] decode runtime is bound to cache "
+                << rt->cuda->cache_id() << ", session owns "
+                << session->cache_id << "\n";
+      return 0;
+    }
   }
 
   const uint64_t vocab = m.config.vocab_size;
@@ -3828,12 +4130,16 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         if (it != rt->prefills.end()) {
           Phase _h("prefill:segment_cache_hit", phase_timing);
           PrefillSegment* hit = it->second.get();
-          rt->prefills.splice(rt->prefills.begin(), rt->prefills, it);  // LRU
-          // Re-adopt the runtime's KV cache: the entry may have been built (or
-          // last used) against a different session's cache, and a segment must
-          // never keep an old session's cache alive.
-          hit->cuda->share_caches(*rt->cuda);
-          return hit;
+          // The segment is bound to the decode runtime's cache at construction
+          // and its capture bakes those pointers in. The runtime itself is
+          // keyed by cache identity, so a hit can only be for this cache; a
+          // stale entry (different identity) is dropped and rebuilt rather than
+          // re-adopted via share_caches.
+          if (hit->cuda->cache_id() == rt->cuda->cache_id()) {
+            rt->prefills.splice(rt->prefills.begin(), rt->prefills, it);  // LRU
+            return hit;
+          }
+          rt->prefills.erase(it);
         }
       }
       auto seg = std::make_unique<PrefillSegment>();
@@ -3883,7 +4189,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
         return nullptr;
       }
       seg->cuda = std::make_unique<planner::SonicCudaBackend>(
-          kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches));
+          kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches),
+          rt->cuda->cache_id());
       seg->cuda->bind_model(m);
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{
@@ -3928,7 +4235,8 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       if (full) {
         const std::shared_ptr<void> cache_id = full->cuda->cache_identity();
         if (capture_reuse_enabled() && full->chunk_prog &&
-            full->chunk_prog_cache.get() == cache_id.get()) {
+            full->chunk_prog_cache.get() == cache_id.get() &&
+            full->cuda->capture_resources_ok(rt->cuda->cache_id())) {
           Phase _reuse("prefill:capture_reuse", phase_timing);
           progs[chunk] = full->chunk_prog.get();
         } else {
@@ -4129,8 +4437,15 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   // back from the persistent device slot (the synchronous D2H also drains the
   // graph stream). Otherwise fall back to per-step executor dispatch.
   const uint32_t chunk = rt->cuda->decode_chunk();
+  // The prefill run may have built segments and captured their graphs since the
+  // decode step was captured; the recorded resources must still match before a
+  // replay, otherwise the step runs through the executor.
+  const bool replay_ok = rt->prog && rt->cuda->capture_resources_ok(
+                                            rt->cuda->cache_id());
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("prefill-decode", m, n_ctx, rt->cuda->cache_id());
   if (!dump_logits && ir_program_enabled() && rt->program.valid &&
-      rt->program.speculative && rt->prog) {
+      rt->program.speculative) {
     // The speculative program drives the loop over the same cache the prefill
     // filled: the session's when the caller passed one, otherwise a session
     // published from this runtime's own cache (the one the step capture was
@@ -4148,8 +4463,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
                                   *kv, history.empty() ? prompt : history);
   } else if (!dump_logits && ir_program_enabled() && rt->program.valid) {
-    step = run_program_steps(*rt, rt->program, token, pos, tokens, step);
-  } else if (!dump_logits && rt->prog && chunk > 1) {
+    step = run_program_steps(m, n_ctx, *rt, rt->program, token, pos, tokens,
+                             step);
+  } else if (!dump_logits && replay_ok && chunk > 1) {
     float carry = float(token);
     std::vector<uint64_t> positions(chunk);
     std::vector<float> out(chunk);
@@ -4177,7 +4493,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       }
       if (stopped) break;
     }
-  } else if (!dump_logits && rt->prog) {
+  } else if (!dump_logits && replay_ok) {
     for (; step < tokens.size(); ++step) {
       rt->cuda->set_pos(pos);
       hal::StepProgram* step_prog = rt->step_at(pos);
@@ -4234,6 +4550,7 @@ uint64_t generate_prefill_spine_cuda(const Gemma4Model& m,
                                      std::span<const uint64_t> prompt,
                                      uint64_t start_pos, std::span<int64_t> tokens,
                                      uint64_t n_ctx, bool use_prefill) {
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   return prefill_decode_cuda_impl(m, prompt, start_pos, tokens, n_ctx,
                                   use_prefill, /*session=*/nullptr, prompt, {},
                                   {});
@@ -4265,6 +4582,7 @@ bool score_spine_cuda_impl(const Gemma4Model& m,
               << " blocks) or short input (" << tokens.size() << ")\n";
     return false;
   }
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   const uint64_t vocab = m.config.vocab_size;
   for (uint64_t t : tokens)
     if (t >= vocab) {
@@ -4431,6 +4749,7 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
               << " blocks) or short input (" << tokens.size() << ")\n";
     return false;
   }
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   const uint64_t vocab = m.config.vocab_size;
   for (uint64_t t : tokens)
     if (t >= vocab) {
@@ -4450,7 +4769,8 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
   }
   if (n_ctx < tokens.size()) n_ctx = tokens.size();
 
-  DecodeRuntime* rt = get_decode_runtime(m, n_ctx);
+  // Scoring is non-session tooling: the anonymous runtime owns its own cache.
+  DecodeRuntime* rt = get_decode_runtime(m, n_ctx, /*session=*/nullptr);
   if (!rt) {
     std::cerr << "[score-prefill] decode runtime build failed\n";
     return false;
@@ -4504,7 +4824,8 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
       return nullptr;
     }
     seg->cuda = std::make_unique<planner::SonicCudaBackend>(
-        kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches));
+        kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches),
+        rt->cuda->cache_id());
     seg->cuda->bind_model(m);
     seg->exec = std::make_unique<planner::RuntimeExecutor>(
         std::map<planner::BackendTag, planner::Backend*>{
@@ -4656,6 +4977,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<float> logits_out) {
   if (n_reused_out) *n_reused_out = 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
 
   // Prefix reuse only anchors at position 0 (the session's token history is a
   // contiguous run from 0); a non-zero start_pos disables reuse.
@@ -4707,7 +5029,19 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // zero. A request larger than the session's cache is rejected outright rather
   // than silently wrapping the global layers' ring.
   const uint64_t required = start_pos + prompt.size() + tokens.size();
-  const uint64_t n_ctx = (session.n_ctx != 0) ? session.n_ctx : required;
+  // The session always owns a cache of its own, allocated here on first use if
+  // it has none (n_ctx == 0 keeps its old meaning: size it from this request).
+  // The cache is a real, identity-bearing session set, so every runtime bound
+  // to it is keyed by its id and can be released with it; nothing is adopted
+  // from a runtime-owned set.
+  if (!session.caches || session.cache_id == 0) {
+    const uint64_t alloc_ctx = session.n_ctx != 0 ? session.n_ctx : required;
+    if (!kv_session_allocate(m, session, alloc_ctx)) {
+      std::cerr << "[prefill-cuda] cannot allocate the session KV cache\n";
+      return 0;
+    }
+  }
+  const uint64_t n_ctx = session.n_ctx;
   if (n_ctx < required) return 0;
 
   const uint64_t prefill_start = start_pos + prefix_len;

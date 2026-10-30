@@ -55,6 +55,19 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes);
 // Block until all device work is complete.
 bool synchronize();
 
+// Pool accounting. "live" is what callers currently hold (KV caches, staging,
+// activations); "retained" is what was released back to the pool and can be
+// handed to a new session without a cudaMalloc. The two are reported
+// separately: a session's live bytes must fall to zero after release even while
+// its buffers remain retained for reuse.
+struct Stats {
+  uint64_t live_bytes = 0;
+  uint64_t live_blocks = 0;
+  uint64_t retained_bytes = 0;
+  uint64_t retained_blocks = 0;
+};
+Stats stats() noexcept;
+
 // Free every pooled buffer (used at teardown / model reload).
 void clear_all();
 

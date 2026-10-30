@@ -25,12 +25,22 @@
 
 #include <sonicboom/hal/buffer.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
 #include <vector>
 
 namespace sonicboom::planner {
+
+// A process-unique identity for one device cache set. Runtime registries use it
+// (instead of the caches pointer) so the address of a released set can never
+// alias the key of a later one: ids are monotonic and never reused. 0 means
+// "no set".
+inline uint64_t next_kv_cache_id() {
+  static std::atomic<uint64_t> next{1};
+  return next.fetch_add(1, std::memory_order_relaxed);
+}
 
 // Element type of the KV cache. The strict numerics profile stores f32 (the
 // pre-rounding values); the standard profile stores f16, or q8 once the
@@ -113,6 +123,10 @@ struct KvCacheSpec {
 // allocates the cache and records the tokens.
 struct KvCacheSession {
   std::shared_ptr<std::vector<KvCacheDev>> caches;
+  // Identity of `caches` (see next_kv_cache_id). Set when the set is allocated
+  // or published; 0 when the session holds no set or was given one whose id is
+  // unknown. Registries and capture checks compare this, never the pointer.
+  uint64_t cache_id = 0;
   std::vector<uint64_t> filled_tokens;  // token at each prefilled position
   uint64_t n_ctx = 0;
 

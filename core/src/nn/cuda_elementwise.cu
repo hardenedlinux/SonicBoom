@@ -19,6 +19,7 @@
 #include <sonicboom/runtime_features.h>
 
 #include "cuda_resident.h"
+#include "cuda_scratch_epoch.h"
 #include "cuda_stream.h"
 #include "reduce_sum.cuh"
 
@@ -1348,10 +1349,23 @@ bool g_available = false;
 // enough (nullptr on allocation failure).
 void* grow_scratch(void*& buf, size_t& have, size_t need) {
   if (have >= need) return buf;
-  if (buf) cudaFree(buf);
+  const size_t old_have = have;
+  void* old = buf;
+  sonicboom::cuda::scratch_epoch_bump();
+  // A live CUDA graph may have baked this pointer in: retain it rather than
+  // freeing memory the graph still launches against (see cuda_scratch_epoch.h).
+  if (old && sonicboom::cuda::scratch_may_free()) {
+    cudaFree(old);
+    old = nullptr;
+  }
   buf = nullptr;
   have = 0;
-  if (cudaMalloc(&buf, need) != cudaSuccess) return nullptr;
+  if (cudaMalloc(&buf, need) != cudaSuccess) {
+    // Keep the retained buffer usable when the growth failed.
+    buf = old;
+    have = old ? old_have : 0;
+    return nullptr;
+  }
   have = need;
   return buf;
 }
@@ -1362,6 +1376,7 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
 // capture that uses the new buffer.
 void* grow_scratch_keep(void*& buf, size_t& have, size_t need) {
   if (have >= need) return buf;
+  sonicboom::cuda::scratch_epoch_bump();
   void* nb = nullptr;
   if (cudaMalloc(&nb, need) != cudaSuccess) return nullptr;
   buf = nb;
@@ -4233,7 +4248,10 @@ bool ensure_full_scratch(size_t bytes) {
 }
 
 void release_full_scratch() {
-  if (g_full_scratch != nullptr) cudaFree(g_full_scratch);
+  if (g_full_scratch == nullptr) return;
+  sonicboom::cuda::scratch_epoch_bump();
+  // A live capture may still launch against this buffer: retain it then.
+  if (sonicboom::cuda::scratch_may_free()) cudaFree(g_full_scratch);
   g_full_scratch = nullptr;
   g_full_scratch_bytes = 0;
 }
