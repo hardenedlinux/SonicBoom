@@ -58,6 +58,16 @@ public:
   SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
                    uint64_t n_ctx = 0);
 
+  // Construct bound to an existing KV cache set instead of allocating one.
+  // Prefill segment backends run against the decode runtime's cache anyway
+  // (share_caches after construction), so allocating a second full set only to
+  // replace it retains a full KV set in the device pool for the process
+  // lifetime. `caches` must describe the same geometry as `spec`; the backend
+  // takes a reference and never allocates KV storage. A null set leaves the
+  // backend unusable (has_caches() == false); callers must check.
+  SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph, uint64_t n_ctx,
+                   std::shared_ptr<std::vector<KvCacheDev>> caches);
+
   // Bind the compute model the backend reads weights / per-layer config from.
   // Required before execute(); the pointer is stored (the model must outlive the
   // backend). Decoupled from the constructor so cache geometry (KvCacheSpec) and
@@ -274,6 +284,14 @@ public:
   // alias a different, later vector.
   std::shared_ptr<void> cache_identity() const { return caches_; }
 
+  // The cache set this backend currently shares. A prefill segment backend is
+  // constructed with this set directly (see the bind-existing constructor)
+  // rather than allocating and replacing its own.
+  const std::shared_ptr<std::vector<KvCacheDev>>& caches() const noexcept {
+    return caches_;
+  }
+  bool has_caches() const noexcept { return bool(caches_); }
+
   // Test seam (B4): copy one KV layer's K or V row for absolute position `pos`
   // into `out` (n_heads_kv * head_dim floats). The row's slot is `pos %
   // n_slots`, exactly what the kernels address. Used only by the speculative
@@ -323,6 +341,7 @@ private:
   uint64_t token_out_slot() const;
 
   void ensure_caches(uint64_t n_ctx);
+  void init_staging();
 };
 
 } // namespace sonicboom::planner

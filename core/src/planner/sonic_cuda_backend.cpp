@@ -166,6 +166,20 @@ SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
                                    uint64_t n_ctx)
     : spec_(spec), graph_(graph), n_ctx_(n_ctx) {
   ensure_caches(n_ctx);
+  init_staging();
+}
+
+SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
+                                   uint64_t n_ctx,
+                                   std::shared_ptr<std::vector<KvCacheDev>> caches)
+    : spec_(spec), graph_(graph), n_ctx_(n_ctx), caches_(std::move(caches)) {
+  // The bound set must have this model's layer count: a mismatch would make
+  // every attention task index past the end of the vector.
+  if (caches_ && caches_->size() != spec_.n_layers) caches_.reset();
+  init_staging();
+}
+
+void SonicCudaBackend::init_staging() {
   // Persistent current-token slot; sized for the verify step's widest row set
   // (k+1 <= kMaxVerifyRows) so one Argmax node's row indices land contiguously
   // for a single D2H read. Decode reads element 0 only.
@@ -182,7 +196,6 @@ SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
     tokens_buf_ = g_alloc.allocate(chunk * sizeof(uint64_t));
   if (pos_buf_)
     g_alloc.fill(pos_buf_, 0, kMaxVerifyRows * sizeof(uint64_t));  // defensive: pos starts at 0
-
 }
 
 bool SonicCudaBackend::enable_decode_chunking(uint32_t k) {
@@ -571,7 +584,19 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
                                          : KvDtype::F16;
     c.bytes = c.n_slots * c.n_heads_kv * kv_row_bytes(c.dtype, c.head_dim);
     c.k_buf = g_alloc.allocate(c.bytes);
-    c.v_buf = g_alloc.allocate(c.bytes);
+    if (c.k_buf) c.v_buf = g_alloc.allocate(c.bytes);
+    if (!c.k_buf || !c.v_buf) {
+      // A partial KV set is worse than none: the caller would treat the session
+      // as initialized while some layers' attention reads a null buffer. Free
+      // every buffer allocated so far (they return to the device pool) and
+      // report failure.
+      for (auto& done : *raw) {
+        if (done.k_buf) g_alloc.deallocate(done.k_buf);
+        if (done.v_buf) g_alloc.deallocate(done.v_buf);
+      }
+      delete raw;
+      return nullptr;
+    }
   }
   {
     // Record the storage decision and its VRAM cost. The dtype is the

@@ -3872,10 +3872,19 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       }
       seg->plan = std::move(*pplan);
       seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
+      // Bind the decode runtime's cache directly. The segment used to allocate
+      // a full KV set in its constructor and replace it via share_caches; the
+      // discarded set stayed in the device pool for the process lifetime, so a
+      // second full KV set was resident at every context length (0a).
+      auto seg_caches = rt->cuda->caches();
+      if (!seg_caches) {
+        std::cerr << "[prefill-cuda] n=" << nseg
+                  << " decode runtime has no KV cache\n";
+        return nullptr;
+      }
       seg->cuda = std::make_unique<planner::SonicCudaBackend>(
-          kv_cache_spec(m.config), seg->graph, n_ctx);
+          kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches));
       seg->cuda->bind_model(m);
-      seg->cuda->share_caches(*rt->cuda);
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{
               {planner::BackendTag::Sonic, seg->cuda.get()}});
@@ -4488,10 +4497,15 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
     }
     seg->plan = std::move(*pplan);
     seg->cpu = std::make_unique<planner::SonicBackend>(m, seg->graph);
+    auto seg_caches = rt->cuda->caches();
+    if (!seg_caches) {
+      std::cerr << "[score-prefill] n=" << nseg
+                << " decode runtime has no KV cache\n";
+      return nullptr;
+    }
     seg->cuda = std::make_unique<planner::SonicCudaBackend>(
-        kv_cache_spec(m.config), seg->graph, n_ctx);
+        kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches));
     seg->cuda->bind_model(m);
-    seg->cuda->share_caches(*rt->cuda);
     seg->exec = std::make_unique<planner::RuntimeExecutor>(
         std::map<planner::BackendTag, planner::Backend*>{
             {planner::BackendTag::Sonic, seg->cuda.get()}});
