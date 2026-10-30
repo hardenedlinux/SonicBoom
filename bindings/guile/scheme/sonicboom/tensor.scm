@@ -4,12 +4,12 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
 ;;; The Guile-side foundation of the SonicBoom AI framework: a <tensor> is a
-;;; frozen dtype + a static shape + a raw little-endian bytevector; a
-;;; <parameter> is a tensor with `requires-grad` set (and an optional `.grad`
-;;; slot) — mirroring the PyTorch mental model. Tensors are pure Guile data
-;;; here: no native C++ object backs them, and no arithmetic is performed in
-;;; Scheme loops. When a model runs, its tensors are marshalled across the
-;;; SonicBoom C ABI into the native backends (see the execution steps).
+;;; frozen dtype + a static shape + owned storage over a raw little-endian
+;;; bytevector; a <parameter> is a tensor with `requires-grad` set (and an
+;;; optional `.grad` slot) — mirroring the PyTorch mental model. Tensors are pure
+;;; Guile data here: no native C++ object backs them, and no arithmetic is
+;;; performed in Scheme loops. When a model runs, its tensors are marshalled
+;;; across the SonicBoom C ABI into the native backends (see the execution steps).
 ;;;
 ;;; Representation matches the frozen S-Expr v0.1 type system
 ;;; (docs/s-expr-v0-spec.md): ten dtype names, static non-negative shape dims.
@@ -21,6 +21,7 @@
   #:use-module (srfi srfi-27)
   #:use-module (ice-9 optargs)
   #:use-module (ice-9 match)
+  #:use-module (sonicboom storage)
   #:export (<tensor> tensor?
             make-tensor %make-tensor bytevector->tensor tensor->bytevector
             tensor-dtype tensor-shape tensor-data tensor-numel
@@ -58,13 +59,26 @@
 ;;; --- record -----------------------------------------------------------------
 
 (define-record-type <tensor>
-  (%make-tensor dtype shape data requires-grad grad)
+  (%make-tensor-record dtype shape storage requires-grad grad)
   tensor?
   (dtype        tensor-dtype)
   (shape        tensor-shape)
-  (data         tensor-data)
+  (storage      tensor-storage)
   (requires-grad tensor-requires-grad? set-tensor-requires-grad!)
   (grad         tensor-grad set-tensor-grad!))
+
+;; %make-tensor is exported, and took a bytevector before storage existed. Keep
+;; that contract: a bytevector argument is wrapped as owned storage (not copied);
+;; a <storage> argument is used as given.
+(define (%make-tensor dtype shape data requires-grad grad)
+  (%make-tensor-record dtype shape
+                       (if (storage? data) data (owned-storage data))
+                       requires-grad grad))
+
+(define (tensor-data t)
+  "The bytevector backing T. Only owned storage exists, so every tensor has one;
+this is a field read, never a copy."
+  (storage-data (tensor-storage t)))
 
 ;;; --- element access ---------------------------------------------------------
 
@@ -72,8 +86,10 @@
   (* i (dtype-size (tensor-dtype t))))
 
 (define (tensor-ref t i)
+  ;; The element accessors read the field directly: tensor-data is an exported
+  ;; procedure, and calling it per element measurably slows tensor->list.
   (let ((d (tensor-dtype t))
-        (bv (tensor-data t)))
+        (bv (storage-data (tensor-storage t))))
     (case d
       ((float32) (bytevector-ieee-single-native-ref bv (* i 4)))
       ((float64) (bytevector-ieee-double-native-ref bv (* i 8)))
@@ -89,7 +105,7 @@
 
 (define (tensor-set! t i v)
   (let ((d (tensor-dtype t))
-        (bv (tensor-data t)))
+        (bv (storage-data (tensor-storage t))))
     (case d
       ((float32) (bytevector-ieee-single-native-set! bv (* i 4) v))
       ((float64) (bytevector-ieee-double-native-set! bv (* i 8) v))
@@ -120,7 +136,7 @@ elements; they are packed into a little-endian bytevector of the given dtype."
       (unless (null? xs)
         (tensor-set!-raw bv dtype i (car xs))
         (loop (+ i 1) (cdr xs))))
-    (%make-tensor dtype shape bv requires-grad #f)))
+    (%make-tensor dtype shape (owned-storage bv) requires-grad #f)))
 
 ;;; Raw element write into an owned bytevector (no <tensor> allocation), used by
 ;;; the constructor before the record exists.
@@ -145,7 +161,7 @@ must equal (apply * shape) * (dtype-size dtype)."
     (error "bytevector->tensor: invalid shape" shape))
   (unless (= (bytevector-length bv) (* (numel shape) (dtype-size dtype)))
     (error "bytevector->tensor: bytevector length mismatch"))
-  (%make-tensor dtype shape bv requires-grad #f))
+  (%make-tensor dtype shape (owned-storage bv) requires-grad #f))
 
 (define (tensor->bytevector t)
   (tensor-data t))
@@ -156,7 +172,8 @@ must equal (apply * shape) * (dtype-size dtype)."
   (unless (valid-shape? shape)
     (error "zeros: invalid shape" shape))
   (%make-tensor dtype shape
-                (make-bytevector (* (numel shape) (dtype-size dtype)) 0)
+                (owned-storage
+                 (make-bytevector (* (numel shape) (dtype-size dtype)) 0))
                 #f #f))
 
 (define* (ones shape #:key (dtype 'float32))
@@ -205,7 +222,7 @@ must equal (apply * shape) * (dtype-size dtype)."
 
 (define (tensor-copy t)
   (%make-tensor (tensor-dtype t) (tensor-shape t)
-                (bytevector-copy (tensor-data t))
+                (owned-storage (bytevector-copy (tensor-data t)))
                 (tensor-requires-grad? t) (tensor-grad t)))
 
 ;;; --- parameters -------------------------------------------------------------

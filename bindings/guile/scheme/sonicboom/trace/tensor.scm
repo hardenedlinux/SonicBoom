@@ -4,15 +4,15 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
 ;;; Research prototype. Pure Scheme; no
-;;; libsonicboom. A concrete tensor ("ctensor") is a dtype, a static shape and a
-;;; flat row-major bytevector holding the elements in the dtype's native
-;;; representation (native-endian, like libsonicboom's tensors): IEEE binary32
-;;; for float32, IEEE binary16 for float16, bfloat16 for bfloat16, IEEE binary64
-;;; for float64, two's-complement native integers, and one byte 0/1 for bool.
-;;; Element access converts to and from Scheme numbers (inexact reals for float
-;;; dtypes, exact integers for integer dtypes, booleans for bool).
+;;; libsonicboom. A concrete tensor ("ctensor") is a dtype, a static shape and an
+;;; owned <storage> over a flat row-major bytevector holding the elements in the
+;;; dtype's native representation (native-endian, like libsonicboom's tensors):
+;;; IEEE binary32 for float32, IEEE binary16 for float16, bfloat16 for bfloat16,
+;;; IEEE binary64 for float64, two's-complement native integers, and one byte 0/1
+;;; for bool. Element access converts to and from Scheme numbers (inexact reals
+;;; for float dtypes, exact integers for integer dtypes, booleans for bool).
 ;;;
-;;; A bytevector is the storage, not a serialised view: `ctensor-ref` and
+;;; The bytevector is the storage, not a serialised view: `ctensor-ref` and
 ;;; `ctensor-set!` read and write it in place, and `bytevector->ctensor` shares
 ;;; it (reshape/view aliasing). Materialising a whole tensor into Scheme values
 ;;; is explicit: `ctensor->list` / `ctensor->nested` / `ctensor-write` are the
@@ -25,6 +25,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (rnrs bytevectors)
+  #:use-module (sonicboom storage)
   #:export (make-ctensor ctensor? ctensor-dtype ctensor-shape ctensor-data
             bytevector->ctensor ctensor-copy ctensor-nbytes dtype-size
             ctensor-numel ctensor-ref ctensor-set! ctensor->list ctensor->nested
@@ -144,11 +145,16 @@
 ;;; --- storage ---------------------------------------------------------------------
 
 (define-record-type <ctensor>
-  (%make-ctensor dtype shape data)
+  (%make-ctensor dtype shape storage)
   ctensor?
-  (dtype ctensor-dtype)
-  (shape ctensor-shape)
-  (data  ctensor-data))     ; bytevector, row-major, native-endian
+  (dtype   ctensor-dtype)
+  (shape   ctensor-shape)
+  (storage ctensor-storage))   ; owned storage: row-major, native-endian bytes
+
+(define (ctensor-data t)
+  "The bytevector backing T. Only owned storage exists, so every ctensor has one;
+this is a field read, never a copy."
+  (storage-data (ctensor-storage t)))
 
 (define (check-shape shape)
   (unless (every (lambda (d) (and (integer? d) (exact? d) (>= d 0))) shape)
@@ -227,7 +233,7 @@ argument is copied, not wrapped (use `bytevector->ctensor` to share storage)."
                             (pack-value! bv dtype i (car xs))
                             (loop (+ i 1) (cdr xs))))
                         bv))))))
-    (%make-ctensor dtype shape bv)))
+    (%make-ctensor dtype shape (owned-storage bv))))
 
 (define (bytevector->ctensor dtype shape bv)
   "Wrap BV, a bytevector of packed DTYPE values (no copy), as a ctensor. The
@@ -241,12 +247,12 @@ and vice versa, which is what reshape/view aliasing relies on."
   (unless (= (bytevector-length bv) (* (shape-numel shape) (dtype-size dtype)))
     (error "bytevector->ctensor: bytevector length does not match shape"
            shape (bytevector-length bv)))
-  (%make-ctensor dtype shape bv))
+  (%make-ctensor dtype shape (owned-storage bv)))
 
 (define (ctensor-copy t)
   "An independent ctensor with the same dtype, shape and bytes."
   (%make-ctensor (ctensor-dtype t) (ctensor-shape t)
-                 (bytevector-copy (ctensor-data t))))
+                 (owned-storage (bytevector-copy (ctensor-data t)))))
 
 (define (ctensor-nbytes t) (bytevector-length (ctensor-data t)))
 
@@ -255,13 +261,15 @@ and vice versa, which is what reshape/view aliasing relies on."
 (define (ctensor-ref t i)
   "Element I of T as a Scheme value (inexact real, exact integer or boolean)."
   (check-index "ctensor-ref" t i)
-  (unpack-value (ctensor-data t) (ctensor-dtype t) i))
+  ;; Direct field read: ctensor-data is an exported procedure, and calling it
+  ;; per element measurably slows ctensor->list and the interpreter's kernels.
+  (unpack-value (storage-data (ctensor-storage t)) (ctensor-dtype t) i))
 
 (define (ctensor-set! t i v)
   "Store V as element I of T, converting to T's dtype. Floats round to the
 dtype's precision (nearest, ties to even); integers must be in range."
   (check-index "ctensor-set!" t i)
-  (pack-value! (ctensor-data t) (ctensor-dtype t) i v))
+  (pack-value! (storage-data (ctensor-storage t)) (ctensor-dtype t) i v))
 
 (define (ctensor->list t)
   "All elements of T as a flat Scheme list. This materialises the whole tensor;

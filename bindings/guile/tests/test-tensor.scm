@@ -8,6 +8,7 @@
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
+             (rnrs bytevectors)
              (sonicboom tensor))
 
 (define (approx= a b eps)
@@ -75,6 +76,18 @@
          (t2 (bytevector->tensor (tensor->bytevector t) '(3))))
     (tensor->list t2)))
 
+;; --- accessors return the storage bytevector itself, never a copy ------------
+
+(test-assert "bytevector->tensor wraps the caller's bytevector without copying"
+  (let* ((bv (make-bytevector 12 0))
+         (t (bytevector->tensor bv '(3))))
+    (and (eq? (tensor->bytevector t) bv)
+         (eq? (tensor-data t) (tensor-data t)))))
+
+(test-assert "make-tensor hands out one stable bytevector"
+  (let ((t (make-tensor '(1 2 3) '(3))))
+    (eq? (tensor-data t) (tensor->bytevector t))))
+
 ;; --- copy independence -------------------------------------------------------
 
 (test-assert "tensor-copy is independent of the source"
@@ -82,7 +95,8 @@
          (b (tensor-copy a)))
     (tensor-set! b 0 100)
     (and (= (tensor-ref a 0) 1)
-         (= (tensor-ref b 0) 100))))
+         (= (tensor-ref b 0) 100)
+         (not (eq? (tensor-data a) (tensor-data b))))))
 
 ;; --- parameters --------------------------------------------------------------
 

@@ -168,20 +168,23 @@
   (let* ((bv (make-bytevector 4 0))
          (t (make-ctensor 'uint8 '(4) bv)))
     (bytevector-u8-set! bv 0 9)
-    (= 0 (ctensor-ref t 0))))
+    (and (= 0 (ctensor-ref t 0))
+         (not (eq? (ctensor-data t) bv)))))
 
 (test-assert "bytevector->ctensor wraps and shares storage"
   (let* ((bv (make-bytevector 4 0))
          (t (bytevector->ctensor 'uint8 '(4) bv)))
     (ctensor-set! t 1 7)
     (and (= 7 (bytevector-u8-ref bv 1))
+         (eq? (ctensor-data t) bv)
          (ctensor-copy t))))
 
 (test-assert "ctensor-copy is independent"
   (let* ((a (make-ctensor 'float32 '(2) '(1.0 2.0)))
          (b (ctensor-copy a)))
     (ctensor-set! b 0 9.0)
-    (and (= 1.0 (ctensor-ref a 0)) (= 9.0 (ctensor-ref b 0)))))
+    (and (= 1.0 (ctensor-ref a 0)) (= 9.0 (ctensor-ref b 0))
+         (not (eq? (ctensor-data a) (ctensor-data b))))))
 
 (test-error "bytevector->ctensor rejects a short buffer" #t
   (bytevector->ctensor 'float32 '(2) (make-bytevector 4 0)))
