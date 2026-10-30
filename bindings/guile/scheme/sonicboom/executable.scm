@@ -39,6 +39,7 @@
             executable-input-nbytes executable-output-nbytes
             executable-parameter-count executable-parameter-name
             executable-parameter-ref
+            executable-bind-parameter! executable-bindings-complete?
             cached-executable run-s-expr/cached
             clear-executable-cache! executable-cache-enabled
             reap-executables!))
@@ -370,6 +371,46 @@ by tensor-data aliases the native bytes and must not be written directly."
                            (pointer->bytevector data nbytes) exe view)
                           #f #f)))))))
 
+;;; --- deferred (:bound) parameters --------------------------------------------
+;;;
+;;; A graph may declare a parameter as (data :bound "name"), leaving its bytes
+;;; to be supplied after compile. Compile allocates the slot; executable-run
+;;; fails until every bound parameter has been filled (executable-bindings-
+;;; complete? reports whether it is). Binding copies the bytes once, so later
+;;; edits to DATA-BV are not reflected. Rebinding is rejected after the first
+;;; successful run.
+
+(define (executable-bind-parameter! exe name data-bv)
+  "Copy DATA-BV into EXE's (:bound NAME) parameter. NAME is the binding name
+from the graph. Raises on an unknown name, a byte-count mismatch, or when the
+executable has already run successfully."
+  (check-parameter-query exe "executable-bind-parameter!")
+  (unless (string? name)
+    (error "executable-bind-parameter!: parameter name must be a string" name))
+  (unless (bytevector? data-bv)
+    (error "executable-bind-parameter!: data must be a bytevector" data-bv))
+  (let ((err-slot (make-slot)))
+    (let ((st ((proc 'sb_bind_parameter) (executable-ptr exe)
+               (string->pointer name)
+               (bytevector->pointer data-bv)
+               (bytevector-length data-bv)
+               (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (sb-check! st err-slot "executable-bind-parameter!"))))
+  *unspecified*)
+
+(define (executable-bindings-complete? exe)
+  "True when EXE has no :bound parameters or every one has been filled.
+executable-run raises until this is true."
+  (check-parameter-query exe "executable-bindings-complete?")
+  (let ((complete (make-bytevector 4 0))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_bindings_complete) (executable-ptr exe)
+               (bytevector->pointer complete) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (sb-check! st err-slot "executable-bindings-complete?")))
+    (not (zero? (bytevector-s32-native-ref complete 0)))))
+
 ;;; --- the text-keyed cache ----------------------------------------------------
 
 (define executable-cache-enabled
@@ -385,7 +426,12 @@ by tensor-data aliases the native bytes and must not be written directly."
 (define (cached-executable text)
   "Return a compiled executable for TEXT, compiling it on first use. The
 executable is owned by the cache; do not free it. A cache hit returns the same
-object on every call for the same text."
+object on every call for the same text.
+
+TEXT must be self-contained: :values and :external graphs qualify, but a graph
+with (data :bound ...) parameters does not, because the cached executable holds
+the bytes one caller bound. Give each such graph its own executable (as
+model-forward does) instead of going through this cache."
   (let ((hit (hash-ref %cache text #f)))
     (if (and hit (not (executable-freed? hit)))
         hit

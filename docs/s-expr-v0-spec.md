@@ -111,6 +111,7 @@ dim         ::= <int>                              ; v0: static, non-negative
 
 data        ::= (data :external <string> <int> <int>)   ; file, byte-offset, byte-length
               | (data :values <atom>*)                  ; inline literal list (dtype implied)
+              | (data :bound <string>)                  ; deferred binding by name (extension, §7.4)
 ```
 
 ### 3.3 Notes
@@ -123,9 +124,11 @@ data        ::= (data :external <string> <int> <int>)   ; file, byte-offset, byt
   a type**. There is no separate type-annotation section.
 - `(opset "default" 20)` states the operator semantic version (§11). A node may
   override with `(domain …)` / `(version …)` for custom operators.
-- `data` supports exactly two layouts in v0: a flat external binary sidecar
+- `data` supports two layouts in frozen v0: a flat external binary sidecar
   (`:external`) and inline typed literals (`:values`). No container format
-  (safetensors, etc.) is introduced.
+  (safetensors, etc.) is introduced. The additive `:bound` tag (§7.4) defers
+  the bytes to a post-compile binding step; a reader without it must reject the
+  document as an unsupported feature (§12 fail-safe rule), never mis-parse it.
 
 ---
 
@@ -254,17 +257,44 @@ By name, in the same flat value namespace, in a node's `(inputs …)`. Example:
 
 ### 7.3 Data storage
 
-`data` supports exactly two layouts in v0:
+Frozen v0 has two layouts; §7.4 adds a third as an additive extension:
 
 | Form | Use |
 |---|---|
 | `(data :external <file> <offset> <len>)` | large weights in a flat binary sidecar (46.7 MB for ResNet18). Keeps the text file small and diff-friendly. |
 | `(data :values <atom>*)` | small inline constants (`val_187` = `-1 -2`). |
+| `(data :bound <name>)` | deferred binding: the text carries the parameter's name, type and byte count; the bytes are supplied to the compiled executable before its first run (§7.4). |
 
 `offset`/`length` are byte offsets/lengths into the sidecar file. The sidecar is
 a flat concatenation; no container metadata lives inside the S-Expr. (The blob's
 own byte layout is agreed between writer and reader; the S-Expr records only
 file, offset, length.)
+
+### 7.4 Deferred binding (additive extension)
+
+`(data :bound <name>)` declares a parameter whose bytes are supplied after
+compilation, keyed by the string `<name>`. The parameter's `(tensor <dtype>
+<shape>)` fixes the expected byte count (`numel × dtype size`); no bytes are
+read from the document or from any sidecar. This is an additive extension: the
+frozen `:external` and `:values` layouts are unchanged, and a reader that does
+not implement `:bound` rejects the document as unsupported (§12).
+
+Runtime contract (S-Expr executable path):
+
+- Compile allocates the parameter's slot and records its binding name and byte
+  count. The slot reads as zero until bound.
+- The caller fills each bound parameter by name before the first run; the run
+  fails with a binding error while any bound parameter is unset.
+- A binding copies the supplied bytes. Supplying a byte count different from
+  the declared type is a binding error; an unknown name is a binding error.
+- A parameter may be rebound before the first successful run. Binding after a
+  successful run is rejected (binding is a compile-time initialization step,
+  not a per-run weight-update mechanism).
+
+Serialization keeps the declaration as written: `:bound` parameters are
+parameters in every other respect (name, type, graph position). Export tooling
+may replace them with `:external`/`:values` data; a graph that still contains
+`:bound` parameters is not self-contained.
 
 ---
 
@@ -407,8 +437,9 @@ A valid v0 document satisfies:
    node output must have its producing node at index < i. (Inputs that are graph
    inputs or parameters have no producer and are always valid.) A validator MUST
    reject a document that violates this order.
-7. `data` layout is `:external` (with `file`/`offset`/`length`, all present) or
-   `:values`. No other layout.
+7. `data` layout is `:external` (with `file`/`offset`/`length`, all present),
+   `:values`, or the additive `:bound` (with a string name, §7.4). No other
+   layout.
 8. `dtype` ∈ the ten-name enum; every `dim` is a non-negative integer.
 9. `(opset …)` domains referenced by nodes are declared (or `"default"`).
 10. Attribute `typed-value` tags are only the eight forms in §9.
@@ -445,7 +476,8 @@ No open issues remain that affect v0 semantics.
 - **Every value explicitly typed at its definition site** (input / parameter /
   node output); no `(types …)` section.
 - `input` (typed) / `output` (name-only reference).
-- `parameter` (unified weight+constant) with `:external` / `:values` data only.
+- `parameter` (unified weight+constant) with `:external` / `:values` data only
+  (the additive `:bound` tag is specified separately in §7.4).
 - `node` with `(inputs …)` `(outputs (<name> <type>)…)` `(attrs …)`, optional
   `domain`/`version`.
 - Attribute typed-value forms: `int/float/string/bool` + `ints/floats/strings/bools`.
@@ -469,7 +501,8 @@ No open issues remain that affect v0 semantics.
 ### FUTURE EXTENSION (reserved, not implemented)
 
 - Dynamic/symbolic dims; control flow; subgraph; custom domain/op; quantization;
-  metadata `(meta …)`; new data layouts; non-tensor types; a weight `role` tag.
+  metadata `(meta …)`; further new data layouts (`:bound`, §7.4, is implemented
+  as an additive extension); non-tensor types; a weight `role` tag.
 
 ### OPEN QUESTIONS
 

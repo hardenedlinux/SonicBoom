@@ -143,13 +143,13 @@ ExpectedData parse_data(const SExpr& e) {
   if (!is_list(e) || e.items.size() < 2 || !e.items[0].is_symbol("data")) {
     return std::unexpected(
         sx_error(ErrorCategory::Syntax, e.loc,
-                 "expected (data :external <file> <offset> <length>) or "
-                 "(data :values <atom>*)"));
+                 "expected (data :external <file> <offset> <length>), "
+                 "(data :values <atom>*) or (data :bound <name>)"));
   }
   const SExpr& tag = e.items[1];
   if (tag.kind != SExpr::Kind::Symbol) {
     return std::unexpected(sx_error(ErrorCategory::Syntax, tag.loc,
-                                    "expected :external or :values data tag, got " +
+                                    "expected :external, :values or :bound data tag, got " +
                                         describe(tag)));
   }
 
@@ -174,6 +174,20 @@ ExpectedData parse_data(const SExpr& e) {
     d.file = e.items[2].text;
     d.offset = e.items[3].i;
     d.length = e.items[4].i;
+    return d;
+  }
+
+  if (tag.is_symbol(":bound")) {
+    if (e.items.size() != 3) {
+      return std::unexpected(sx_error(ErrorCategory::Syntax, e.loc,
+                                      ":bound data requires <name>"));
+    }
+    if (e.items[2].kind != SExpr::Kind::String) {
+      return std::unexpected(sx_error(ErrorCategory::Syntax, e.items[2].loc,
+                                      ":bound name must be a string"));
+    }
+    BoundData d;
+    d.name = e.items[2].text;
     return d;
   }
 

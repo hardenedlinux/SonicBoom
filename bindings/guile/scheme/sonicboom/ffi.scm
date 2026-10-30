@@ -170,6 +170,12 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                                                  (list '* '* '*)))
                (sb_storage_release . ,(foreign-proc "sb_storage_release" void
                                                     (list '*)))
+               ;; deferred (:bound) parameters (see capi.h)
+               (sb_bind_parameter . ,(foreign-proc "sb_bind_parameter" int
+                                                   (list '* '* '* size_t '*)))
+               (sb_bindings_complete
+                . ,(foreign-proc "sb_bindings_complete" int
+                                 (list '* '* '*)))
                (sb_run_resident . ,(foreign-proc "sb_run_resident" int
                                                  (list '* '* '* size_t '* size_t
                                                        '* '* '* '*)))

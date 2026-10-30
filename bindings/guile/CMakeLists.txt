@@ -164,6 +164,18 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-executable-parameters.scm)
 
+  # guile-model-binding checks deferred (:bound) parameters and the per-model
+  # executable identity: compile without bytes, bind by name, bind-once
+  # semantics, and two same-structure models never sharing bound state.
+  add_test(
+    NAME guile-model-binding
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-model-binding.scm)
+
   # guile-trace-lower lowers a traced forward graph onto the S-Expr v0.1
   # vocabulary and executes it through libsonicboom.so (`run-s-expr`); same
   # shared-library dependency as guile-nn.

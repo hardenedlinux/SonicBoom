@@ -94,6 +94,9 @@ std::string fmt_data(const ParameterData& d) {
     return "(data :external " + fmt_string(ext->file) + " " + fmt_int(ext->offset) +
            " " + fmt_int(ext->length) + ")";
   }
+  if (const auto* bound = std::get_if<BoundData>(&d)) {
+    return "(data :bound " + fmt_string(bound->name) + ")";
+  }
   return "(data :values" + fmt_values(std::get<ValuesData>(d)) + ")";
 }
 

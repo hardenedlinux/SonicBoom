@@ -22,6 +22,7 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-13)
   #:use-module (ice-9 optargs)
+  #:use-module (ice-9 threads)
   #:use-module (rnrs bytevectors)
   #:use-module (sonicboom tensor)
   #:use-module (sonicboom ffi)
@@ -51,21 +52,11 @@
         (else (list c))))
     (string->list s))))
 
-(define (float->sx x)
-  ;; Guarantee a decimal point / exponent so the lexer reads a Float, never an Int.
-  (let ((s (number->string x)))
-    (if (or (string-index s #\.) (string-index s #\e) (string-index s #\E))
-        s
-        (string-append s ".0"))))
-
 (define (shape->sx dims)
   (string-append "(shape " (string-join (map number->string dims) " ") ")"))
 
 (define (type->sx dtype dims)
   (string-append "(tensor " (symbol->string dtype) " " (shape->sx dims) ")"))
-
-(define (values->sx t)
-  (string-join (map float->sx (tensor->list t)) " "))
 
 (define (quoted name) (string-append "\"" (string->sx name) "\""))
 
@@ -181,10 +172,15 @@ native relu."
 ;;; --- model ------------------------------------------------------------------
 
 (define-record-type <model>
-  (%make-model layers parameters)
+  (%make-model layers parameters executables lock)
   model?
-  (layers     model-layers)
-  (parameters model-parameters))   ; merged alist of (key . tensor)
+  (layers      model-layers)
+  (parameters  model-parameters)   ; merged alist of (key . tensor)
+  ;; Per-model compiled executables: alist of (input-dims . <executable>).
+  ;; Bound graphs are model state (their parameter bytes belong to this
+  ;; instance), so they must never come from the process-wide text cache.
+  (executables model-executables set-model-executables!)
+  (lock        model-lock))
 
 (define (sequential . layers)
   "Compose LAYERS into a model. Parameter names are made unique per layer."
@@ -197,13 +193,17 @@ native relu."
                                 (cdr pair)))
                         (layer-parameters layer)))
                  layers)))
-    (%make-model layers params)))
+    (%make-model layers params '() (make-mutex))))
 
 (define (model-parameter-ref model key)
   (assq-ref (model-parameters model) key))
 
 ;;; Build the S-Expr v0.1 text for a forward pass, threading the input value
-;;; through each layer in order. Returns (values text out-dims).
+;;; through each layer in order. Parameters are emitted as (data :bound
+;;; "<name>") — the text carries names and shapes, never weight values — so it
+;;; is a pure function of the layer structure and the input shape. Returns
+;;; (values text out-dims params), where each param is
+;;; (ssa-name dtype dims tensor); the caller binds those tensors by name.
 (define (build-graph input-name input-dtype input-dims layers)
   (let ((params '())    ; reversed: (ssa-name dtype dims tensor)
         (nodes '())     ; in-order: formatted node strings
@@ -218,7 +218,7 @@ native relu."
                         (string-append
                          "(parameter " (quoted (car p)) " "
                          (type->sx (cadr p) (caddr p))
-                         " (data :values " (values->sx (cadddr p)) "))"))
+                         " (data :bound " (quoted (car p)) "))"))
                       (reverse params))))
             (values
              (string-append
@@ -228,7 +228,8 @@ native relu."
               " (outputs (output " (quoted x-name) "))"
               " (parameters " (string-join param-strs " ") ")"
               " (nodes " (string-join nodes " ") ")))")
-             x-dims))
+             x-dims
+             (reverse params)))
           (let* ((layer (car ls))
                  ;; Parameter SSA names match sequential's model-parameters keys
                  ;; ("<layer-name>.<key>") so export_model can match trained
@@ -253,12 +254,14 @@ native relu."
 
 (define (model-graph-text model input-dims)
   "Return the S-Expr v0.1 graph text for MODEL's forward pass (input named
-\"x\", float32, shape INPUT-DIMS). The parameter names in the text match
-model-parameters (\"<layer-name>.<key>\"), so the trained tensors can be
-matched to graph parameters by name at export time."
+\"x\", float32, shape INPUT-DIMS). Parameters are declared (data :bound
+\"<name>\") with names matching model-parameters (\"<layer-name>.<key>\"):
+the text carries no weight bytes, and the same text for two models with the
+same structure is identical. Model-forward binds each model's own tensors by
+name; sb_export_model replaces them with the trained weights at export time."
   (call-with-values
       (lambda () (build-graph "x" 'float32 input-dims (model-layers model)))
-    (lambda (text out-dims) text)))
+    (lambda (text out-dims params) text)))
 
 ;;; --- the traced route --------------------------------------------------------
 ;;; model-forward emits S-Expr text from the layer structure; model-trace runs
@@ -307,21 +310,72 @@ computes, reached through the tracer instead of emitted text."
     (ctensor->tensor
      (run-traced graph (list (cons (doc-input-name graph) (tensor->ctensor x)))))))
 
+(define (compile-and-bind text params)
+  "Compile TEXT and copy every parameter tensor in PARAMS into its :bound
+slot. On a binding failure the half-bound executable is freed and the error
+re-raised."
+  (let ((exe (compile-s-expr text)))
+    (catch #t
+      (lambda ()
+        (for-each (lambda (p)
+                    (executable-bind-parameter!
+                     exe (car p) (tensor->bytevector (cadddr p))))
+                  params)
+        exe)
+      (lambda (key . args)
+        (free-executable! exe)
+        (apply throw key args)))))
+
+;; MODEL's compiled forward graph for INPUT-DIMS, compiled and bound on first
+;; use. Bound parameters make the executable model state: two models with the
+;; same structure but different weights must not share one, so this cache is
+;; per <model> and not the process-wide text cache in (sonicboom executable).
+(define (model-executable model input-dims text params)
+  (let ((hit (assoc input-dims (model-executables model))))
+    (if (and hit (not (executable-freed? (cdr hit))))
+        (cdr hit)
+        (let ((exe (compile-and-bind text params))
+              (lock (model-lock model)))
+          (dynamic-wind
+            (lambda () (lock-mutex lock))
+            (lambda ()
+              (let ((race (assoc input-dims (model-executables model))))
+                (if (and race (not (executable-freed? (cdr race))))
+                    (begin (free-executable! exe) (cdr race))
+                    (begin
+                      (set-model-executables!
+                       model (cons (cons input-dims exe)
+                                   (model-executables model)))
+                      exe))))
+            (lambda () (unlock-mutex lock)))))))
+
 (define (model-forward model x)
   "Run a forward pass of MODEL on input tensor X through the native backend.
-Returns the output tensor. Only float32 is supported in v0."
+Returns the output tensor. Only float32 is supported in v0. The parameters are
+bound from MODEL's tensors by name on the first forward; later edits to those
+tensors are not re-bound (bind once, then run)."
   (unless (eq? (tensor-dtype x) 'float32)
     (error "model-forward: only float32 inputs are supported in v0"
            (tensor-dtype x)))
   (call-with-values
       (lambda () (build-graph "x" 'float32 (tensor-shape x) (model-layers model)))
-    (lambda (text out-dims)
-      ;; The graph text is a pure function of the model's layer structure and
-      ;; the input shape, so the compiled executable is reused across forward
-      ;; passes (see (sonicboom executable)); disable with
-      ;; `executable-cache-enabled` to compile per call.
+    (lambda (text out-dims params)
+      ;; The text is a pure function of the layer structure and the input
+      ;; shape, so one executable per (model, input shape) is reused across
+      ;; forward passes; `executable-cache-enabled` off compiles per call.
       (call-with-values
-          (lambda () (run-s-expr/cached text (tensor->bytevector x)))
+          (lambda ()
+            (let ((input-bv (tensor->bytevector x)))
+              (if (executable-cache-enabled)
+                  (executable-run
+                   (model-executable model (tensor-shape x) text params)
+                   input-bv)
+                  (let ((exe (compile-and-bind text params)))
+                    (call-with-values
+                        (lambda () (executable-run exe input-bv))
+                      (lambda (out-bv err)
+                        (free-executable! exe)
+                        (values out-bv err)))))))
         (lambda (out-bv err)
           (if err
               (error "model-forward:" err)

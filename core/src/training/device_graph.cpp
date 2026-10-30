@@ -163,7 +163,7 @@ bool parameter_bytes(const sx::Parameter& p, std::vector<std::byte>* out,
   const auto* values = std::get_if<sx::ValuesData>(&p.data);
   if (values == nullptr) {
     *error = "parameter '" + p.name +
-             "' is external data; the device training graph takes inline "
+             "' is not inline data; the device training graph takes inline "
              "parameters only";
     return false;
   }

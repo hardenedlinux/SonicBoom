@@ -73,8 +73,10 @@ class Executable {
 public:
   // Compile `doc` for CPU execution. `weights` must provide a buffer for every
   // `:external` parameter (see load_external_weights); `:values` parameters are
-  // taken from `doc` itself. Requires one or more float32 graph inputs and one
-  // or more float32 graph outputs (v0 execution scope).
+  // taken from `doc` itself; `:bound` parameters allocate an empty slot that
+  // must be filled with bind_parameter before the first run. Requires one or
+  // more float32 graph inputs and one or more float32 graph outputs (v0
+  // execution scope).
   static std::expected<std::unique_ptr<Executable>, ExecError> compile(
       const Document& doc, const std::unordered_map<std::string, Bytes>& weights);
 
@@ -92,10 +94,11 @@ public:
   const std::vector<TensorType>& input_types() const;
   const std::vector<TensorType>& output_types() const;
 
-  // A graph constant resolved at compile time (inline `:values` data or an
-  // `:external` sidecar). Its bytes are materialized once into the
-  // executable's own buffers and are never written by run(), so they may be
-  // borrowed read-only for as long as this Executable is alive.
+  // A graph constant resolved at compile time (inline `:values` data, an
+  // `:external` sidecar, or a `:bound` slot filled by bind_parameter). Its
+  // bytes live in the executable's own buffer and are never written by run(),
+  // so they may be borrowed read-only for as long as this Executable is alive.
+  // A bound slot reads as zero until its first successful bind.
   struct ParameterInfo {
     std::string name;                 // graph tensor name (the parameter name)
     TensorType type;
@@ -108,6 +111,19 @@ public:
   std::size_t parameter_count() const;
   // The parameter at INDEX, or nullptr if INDEX is out of range.
   const ParameterInfo* parameter(std::size_t index) const;
+
+  // Fill the `:bound` parameter declared with binding name NAME by copying
+  // LEN bytes from DATA into its slot. LEN must equal the parameter's
+  // size_bytes. Binding is allowed until the first successful run(); after
+  // that it fails with ExecErrorKind::Binding. An unknown NAME, a wrong LEN or
+  // a null DATA fails with ExecErrorKind::Binding.
+  std::expected<void, ExecError> bind_parameter(const std::string &name,
+                                                const std::byte *data,
+                                                std::size_t len);
+
+  // True when the graph has no `:bound` parameters or every one has been
+  // filled. run() fails with ExecErrorKind::Binding while this is false.
+  bool bindings_complete() const;
 
   // Run the graph over one raw little-endian buffer per graph input (in graph
   // input order). Each buffer's byte count must equal numel(its type) *

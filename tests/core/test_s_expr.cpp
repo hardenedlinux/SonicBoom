@@ -25,6 +25,7 @@
 // a non-zero exit code keep the test meaningful in Release.
 
 #include <sonicboom/sx/parser.h>
+#include <sonicboom/sx/serialize.h>
 
 #include <cstdint>
 #include <iostream>
@@ -145,6 +146,52 @@ void test_parameter_external() {
   const auto& e = std::get<sx::ExternalData>(p.data);
   check(e.file == "w.bin" && e.offset == 0 && e.length == 37632,
         "ext-param: file/offset/length");
+}
+
+// 4b. valid parameter (deferred :bound), and its serialized round-trip
+void test_parameter_bound() {
+  sx::Document doc;
+  if (!must_parse(
+          "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+          " (inputs) (outputs)"
+          " (parameters (parameter \"w\" (tensor float32 (shape 2))"
+          "   (data :bound \"l1.weight\")))"
+          " (nodes)))",
+          doc, "bound parameter")) {
+    return;
+  }
+  const auto& p = doc.graph.parameters[0];
+  check(std::holds_alternative<sx::BoundData>(p.data), "bound-param: bound data");
+  check(std::get<sx::BoundData>(p.data).name == "l1.weight",
+        "bound-param: binding name");
+
+  auto text = sx::serialize_document(doc);
+  check(text.has_value(), "bound-param: serializes");
+  if (!text) return;
+  check(text->find("(data :bound \"l1.weight\")") != std::string::npos,
+        "bound-param: serialized form keeps the tag and name");
+
+  sx::Document again;
+  if (!must_parse(*text, again, "bound-param round-trip")) return;
+  check(std::holds_alternative<sx::BoundData>(again.graph.parameters[0].data) &&
+            std::get<sx::BoundData>(again.graph.parameters[0].data).name ==
+                "l1.weight",
+        "bound-param: round-trip preserves the binding name");
+
+  must_reject(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs) (outputs)"
+      " (parameters (parameter \"w\" (tensor float32 (shape 2))"
+      "   (data :bound)))"
+      " (nodes)))",
+      ":bound without a name", sx::ErrorCategory::Syntax);
+  must_reject(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs) (outputs)"
+      " (parameters (parameter \"w\" (tensor float32 (shape 2))"
+      "   (data :bound 7)))"
+      " (nodes)))",
+      ":bound with a non-string name", sx::ErrorCategory::Syntax);
 }
 
 // 5. valid node
@@ -306,6 +353,7 @@ int main() {
   test_tensor_type();
   test_parameter_values();
   test_parameter_external();
+  test_parameter_bound();
   test_node();
   test_attributes();
   test_graph_io();

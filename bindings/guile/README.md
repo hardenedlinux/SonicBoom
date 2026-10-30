@@ -90,7 +90,7 @@ executes.
 - `sequential layer ...` — a model from layers, applied in order
 - `layer?`, `layer-kind`, `layer-name`, `layer-parameters`, `layer-parameter-ref` — layer introspection
 - `model?`, `model-layers`, `model-parameters`, `model-parameter-ref` — model introspection; a parameter name is `"<layer>.<key>"`, e.g. `"l1.weight"`
-- `model-graph-text model input-dims` — the model's graph as S-Expr v0.1 text, ready for `compile-s-expr`
+- `model-graph-text model input-dims` — the model's graph as S-Expr v0.1 text; parameters are declared `(data :bound "<name>")`, so compile the text and bind the model's parameters (see below) before running it
 - `model-forward model x` — run the emitted text through the runtime; returns a Guile tensor
 - `model-trace model input-dims` — trace the same layers to an S-Expr document datum
 - `model-trace-forward model x` — run that traced graph through the runtime
@@ -111,7 +111,10 @@ executes.
 `model-forward` and `model-trace-forward` are two routes over the same
 parameters: the first runs the text `apply` emits, the second traces the
 layers and lowers the result. Both are checked to agree in
-`tests/test-nn-trace.scm`.
+`tests/test-nn-trace.scm`. `model-forward` emits `(data :bound "<name>")`
+parameters and keeps one compiled, bound executable per model and input shape,
+so the weight values are captured at the first forward and two models never
+share parameter state; see `tests/test-model-binding.scm`.
 
 ## (sonicboom model)
 
@@ -175,7 +178,9 @@ An S-Expr graph parsed and compiled once, then run many times.
 - `executable-run exe input-bv` — one run; returns `(values output-bv #f)`, or `(values #f message)` on failure
 - `executable-graph-text`, `executable-input-nbytes`, `executable-output-nbytes` — what it was compiled from
 - `executable?`, `executable-freed?`, `free-executable!` — lifetime; freeing is idempotent
-- `run-s-expr/cached text input` — compile-once wrapper over `(sonicboom ffi)`'s `run-s-expr`
+- `executable-bind-parameter! exe name data-bv` — fill a `(data :bound "<name>")` parameter (one-time, before the first run)
+- `executable-bindings-complete? exe` — whether every `:bound` parameter has been filled
+- `run-s-expr/cached text input` — compile-once wrapper over `(sonicboom ffi)`'s `run-s-expr`; only for self-contained text (`:values` / `:external`), never a graph with `:bound` parameters
 - `cached-executable text` — the cache entry for a graph text
 - `executable-cache-enabled` — a parameter (default `#t`) turning the cache off
 - `clear-executable-cache!` — free and drop every cached entry
@@ -186,6 +191,11 @@ An S-Expr graph parsed and compiled once, then run many times.
 
 (define text (model-graph-text m '(1 4)))
 (define exe  (compile-s-expr text))            ; parsed and compiled once
+;; The text carries parameter names, not values: bind this model's tensors.
+(for-each (lambda (pair)
+            (executable-bind-parameter!
+             exe (symbol->string (car pair)) (tensor->bytevector (cdr pair))))
+          (model-parameters m))
 (call-with-values (lambda () (executable-run exe input-bytes))
   (lambda (out msg) (if out (use out) (display msg))))
 (free-executable! exe)

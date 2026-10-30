@@ -34,6 +34,19 @@ namespace sonicboom {
 
 std::expected<Model, ModelError> Model::compile_document(const sx::Document& doc,
                                                          std::string base_dir) {
+  // (data :bound ...) parameters are a deferred-binding extension of the
+  // S-Expr executable path. The plan path resolves constants at compile time
+  // and has no binding contract, so reject them instead of compiling a graph
+  // whose bound slots would read as zeros.
+  for (const sx::Parameter& p : doc.graph.parameters) {
+    if (const auto* bound = std::get_if<sx::BoundData>(&p.data)) {
+      return std::unexpected(ModelError{
+          "compile", "parameter '" + p.name + "' is declared :bound (\"" +
+                         bound->name +
+                         "\"); the plan path cannot execute bound parameters"});
+    }
+  }
+
   auto graph = planner::adapt_graph(doc);
   if (!graph)
     return std::unexpected(ModelError{"plan", graph.error().message});

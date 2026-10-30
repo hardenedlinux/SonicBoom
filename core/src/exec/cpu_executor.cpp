@@ -1166,8 +1166,19 @@ struct Executable::Impl {
   std::vector<TensorType> input_types;
   std::vector<TensorType> output_types;
   // Graph constants, in graph tensor order; `data` points into slot_bytes and
-  // is never written after compile.
+  // is never written by run().
   std::vector<ParameterInfo> parameters;
+  // (data :bound ...) slots, in document parameter order. Each targets its
+  // constant's buffer; bind_parameter copies into it.
+  struct BoundSlot {
+    std::string name;   // binding name from the document
+    std::byte* target;  // the constant's buffer (zero until bound)
+    std::uint64_t size_bytes = 0;
+    bool bound = false;
+  };
+  std::vector<BoundSlot> bound;
+  // Set by the first successful run; binding afterwards is rejected.
+  mutable bool has_run = false;
 
   // Compile-time scratch: padded NCHW input (conv/max_pool), pooling indices,
   // transposed gemm operands. Sized from the graph so a run allocates nothing.
@@ -1180,6 +1191,14 @@ struct Executable::Impl {
 
   bool run(const std::vector<Bytes>& inputs, std::vector<Bytes>& outputs,
            ExecError* error) const {
+    for (const BoundSlot& b : bound) {
+      if (!b.bound) {
+        *error = {ExecErrorKind::Binding,
+                  "parameter '" + b.name +
+                      "' is declared :bound but no bytes were bound"};
+        return false;
+      }
+    }
     if (inputs.size() != input_ids.size()) {
       *error = {ExecErrorKind::Binding,
                 "expected " + std::to_string(input_ids.size()) +
@@ -1231,6 +1250,7 @@ struct Executable::Impl {
       std::memcpy(outputs[i].data(), buffers[output_ids[i].value],
                   t.size_bytes);
     }
+    has_run = true;
     return true;
   }
 };
@@ -1345,20 +1365,36 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
                     "constant tensor '" + t.name +
                         "' has no parameter in the document"});
     }
-    std::vector<std::byte> bytes;
-    std::string error;
-    if (!parameter_bytes(*it->second, weights, &bytes, &error)) {
-      return std::unexpected(
-          ExecError{ExecErrorKind::Weight, std::move(error)});
+    if (const auto* bound = std::get_if<BoundData>(&it->second->data)) {
+      // Deferred binding: no bytes are loaded here. The slot is already
+      // allocated and zero-initialized; bind_parameter fills it before the
+      // first run.
+      for (const Impl::BoundSlot& b : s.bound) {
+        if (b.name == bound->name) {
+          return std::unexpected(
+              ExecError{ExecErrorKind::Compile,
+                        "binding name '" + bound->name +
+                            "' is used by more than one :bound parameter"});
+        }
+      }
+      s.bound.push_back(Impl::BoundSlot{bound->name, s.buffers[t.id.value],
+                                        t.size_bytes, false});
+    } else {
+      std::vector<std::byte> bytes;
+      std::string error;
+      if (!parameter_bytes(*it->second, weights, &bytes, &error)) {
+        return std::unexpected(
+            ExecError{ExecErrorKind::Weight, std::move(error)});
+      }
+      if (bytes.size() != t.size_bytes) {
+        return std::unexpected(
+            ExecError{ExecErrorKind::Weight,
+                      "constant tensor '" + t.name + "' is " +
+                          std::to_string(t.size_bytes) + " bytes but its "
+                          "parameter holds " + std::to_string(bytes.size())});
+      }
+      std::memcpy(s.buffers[t.id.value], bytes.data(), bytes.size());
     }
-    if (bytes.size() != t.size_bytes) {
-      return std::unexpected(
-          ExecError{ExecErrorKind::Weight,
-                    "constant tensor '" + t.name + "' is " +
-                        std::to_string(t.size_bytes) + " bytes but its "
-                        "parameter holds " + std::to_string(bytes.size())});
-    }
-    std::memcpy(s.buffers[t.id.value], bytes.data(), bytes.size());
     // The constant now lives in its own slot (assigned above), which no node
     // writes; the pointer is stable for the executable's lifetime.
     s.parameters.push_back(ParameterInfo{
@@ -1463,6 +1499,39 @@ const Executable::ParameterInfo* Executable::parameter(
     std::size_t index) const {
   return index < impl_->parameters.size() ? &impl_->parameters[index]
                                           : nullptr;
+}
+
+std::expected<void, ExecError> Executable::bind_parameter(
+    const std::string& name, const std::byte* data, std::size_t len) {
+  if (impl_->has_run) {
+    return std::unexpected(
+        ExecError{ExecErrorKind::Binding,
+                  "parameter '" + name +
+                      "' cannot be bound after the first successful run"});
+  }
+  for (Impl::BoundSlot& b : impl_->bound) {
+    if (b.name != name) continue;
+    if (data == nullptr || len != b.size_bytes) {
+      return std::unexpected(
+          ExecError{ExecErrorKind::Binding,
+                    "parameter '" + name + "' takes " +
+                        std::to_string(b.size_bytes) + " bytes, got " +
+                        std::to_string(len)});
+    }
+    std::memcpy(b.target, data, len);
+    b.bound = true;
+    return {};
+  }
+  return std::unexpected(
+      ExecError{ExecErrorKind::Binding,
+                "no parameter is declared (:bound \"" + name + "\")"});
+}
+
+bool Executable::bindings_complete() const {
+  for (const Impl::BoundSlot& b : impl_->bound) {
+    if (!b.bound) return false;
+  }
+  return true;
 }
 
 std::expected<void, ExecError> Executable::run(

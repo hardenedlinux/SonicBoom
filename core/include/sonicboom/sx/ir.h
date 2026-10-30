@@ -124,7 +124,15 @@ struct ValuesData {
   std::vector<std::variant<int64_t, double>> values;
 };
 
-using ParameterData = std::variant<ExternalData, ValuesData>;
+// Deferred binding (additive extension, spec §7.4): the document declares the
+// parameter's name, type and byte count only. Compile allocates the constant
+// slot; the caller fills it by NAME before the first run. Unlike :external,
+// no sidecar is read and nothing is resolved from the compile-time weights.
+struct BoundData {
+  std::string name;
+};
+
+using ParameterData = std::variant<ExternalData, ValuesData, BoundData>;
 
 // A parameter unifies weights and constants (spec §7). There is no separate
 // `constant` form and no `role` tag.

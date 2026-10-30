@@ -1168,6 +1168,46 @@ sb_status sb_storage_desc(const sb_storage *view, sb_tensor_desc *desc_out,
 
 void sb_storage_release(sb_storage *view) { delete view; }
 
+sb_status sb_bind_parameter(sb_executable *exe, const char *name,
+                            const void *data, size_t len, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name || !data)
+          return fail_arg(err_out);
+        if (exe->is_device()) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "device training graphs have no host parameter block");
+          return SB_ERR_UNSUPPORTED;
+        }
+        if (!exe->exe) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "executable is not compiled");
+          return SB_ERR_INTERNAL;
+        }
+        auto result = exe->exe->bind_parameter(
+            name, static_cast<const std::byte *>(data), len);
+        if (!result) {
+          set_error(err_out, exec_errkind(result.error().kind),
+                    result.error().message.c_str());
+          return exec_status(result.error().kind);
+        }
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_bindings_complete(const sb_executable *exe, int *complete_out,
+                               sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !complete_out)
+          return fail_arg(err_out);
+        *complete_out =
+            (!exe->exe || exe->exe->bindings_complete()) ? 1 : 0;
+        return SB_OK;
+      },
+      err_out);
+}
+
 // --- Release ----------------------------------------------------------------
 
 void sb_document_free(sb_document *doc) { delete doc; }

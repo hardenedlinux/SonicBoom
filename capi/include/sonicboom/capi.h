@@ -374,6 +374,28 @@ sb_status sb_storage_desc(const sb_storage *view, sb_tensor_desc *desc_out,
 /* Drop a view's ownership reference. NULL is safe. */
 void sb_storage_release(sb_storage *view);
 
+/* --- Bound parameters ------------------------------------------------------ */
+
+/* A graph parameter may be declared `(data :bound "<name>")` instead of
+ * carrying inline `:values` bytes or an `:external` sidecar. Compile allocates
+ * the constant's slot and records its byte count, but loads nothing: the caller
+ * must fill every bound parameter with sb_bind_parameter before the first run.
+ * Until then sb_execute, sb_run_multi and sb_run_resident fail with
+ * SB_ERR_BINDING. Binding copies `len` bytes (the caller may free `data` on
+ * return); `len` must equal the parameter's num_bytes. A parameter may be
+ * rebound before the first successful run; afterwards binding fails with
+ * SB_ERR_BINDING. An unknown name or wrong size is SB_ERR_BINDING; a NULL
+ * argument is SB_ERR_INTERNAL. Device training graphs (sb_compile_device)
+ * have no bound parameters and fail with SB_ERR_UNSUPPORTED. */
+sb_status sb_bind_parameter(sb_executable *exe, const char *name,
+                            const void *data, size_t len, sb_error **err_out);
+
+/* 1 when every `(data :bound ...)` parameter of `exe` has been filled, 0
+ * otherwise. A graph without bound parameters (and a device training graph,
+ * which has no host parameter block) is complete. */
+sb_status sb_bindings_complete(const sb_executable *exe, int *complete_out,
+                               sb_error **err_out);
+
 /* --- Release --------------------------------------------------------------- */
 
 void sb_document_free(sb_document *doc);
