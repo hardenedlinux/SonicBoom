@@ -28,6 +28,7 @@
             sb-status->message
             sb-check!
             SB_ERR_BINDING
+            SB_ERR_INTERNAL
             SB_ERR_CANCELLED
             ;; low-level FFI plumbing exposed for the training module
             proc make-slot slot-ptr slot-ref capture-error))
@@ -149,6 +150,26 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
                (sb_run_multi . ,(foreign-proc "sb_run_multi" int
                                               (list '* '* '* size_t '* '* size_t
                                                     '* '*)))
+               ;; read-only parameter views (see capi.h)
+               (sb_api_version . ,(foreign-proc "sb_api_version" uint32 (list)))
+               (sb_executable_parameter_count
+                . ,(foreign-proc "sb_executable_parameter_count" int
+                                 (list '* '* '*)))
+               (sb_executable_parameter_name_at
+                . ,(foreign-proc "sb_executable_parameter_name_at" int
+                                 (list '* size_t '* '*)))
+               (sb_executable_parameter_desc
+                . ,(foreign-proc "sb_executable_parameter_desc" int
+                                 (list '* size_t '* '*)))
+               (sb_executable_parameter_view
+                . ,(foreign-proc "sb_executable_parameter_view" int
+                                 (list '* size_t '* '*)))
+               (sb_storage_data . ,(foreign-proc "sb_storage_data" int
+                                                 (list '* '* '* '*)))
+               (sb_storage_desc . ,(foreign-proc "sb_storage_desc" int
+                                                 (list '* '* '*)))
+               (sb_storage_release . ,(foreign-proc "sb_storage_release" void
+                                                    (list '*)))
                (sb_run_resident . ,(foreign-proc "sb_run_resident" int
                                                  (list '* '* '* size_t '* size_t
                                                        '* '* '* '*)))

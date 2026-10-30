@@ -31,10 +31,14 @@
   #:use-module (ice-9 threads)
   #:use-module (sonicboom ffi)
   #:use-module (sonicboom error)
+  #:use-module (sonicboom storage)
+  #:use-module (sonicboom tensor)
   #:export (compile-s-expr
             executable? executable-run free-executable!
             executable-freed? executable-graph-text
             executable-input-nbytes executable-output-nbytes
+            executable-parameter-count executable-parameter-name
+            executable-parameter-ref
             cached-executable run-s-expr/cached
             clear-executable-cache! executable-cache-enabled
             reap-executables!))
@@ -86,11 +90,12 @@ guardian-reaped) executable is a no-op, never an error."
 
 (define (reap-executables!)
   "Release every executable whose record has been collected without an explicit
-`free-executable!`. Returns the number of handles released."
+`free-executable!`, and every parameter view whose tensor was collected. Returns
+the number of executable handles released."
   (let loop ((n 0))
     (let ((dead (%exe-guardian)))
       (if (or (not dead) (null? dead))
-          n
+          (begin (reap-storage-views!) n)
           (begin (free-executable! dead) (loop (+ 1 n)))))))
 
 ;;; --- compiling ---------------------------------------------------------------
@@ -220,6 +225,150 @@ INPUT-BV may be reused or freed immediately."
                     (bytevector->pointer written) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st))
           (values out-bv #f)))))
+
+;;; --- parameters (read-only native views) --------------------------------------
+;;;
+;;; A compiled graph materializes every parameter (a graph constant) into its
+;;; own buffers at compile time and never writes them, so a parameter can be
+;;; exposed as a zero-copy, read-only <tensor>. The view is an sb_storage handle
+;;; owned by the tensor's storage; it pins the native implementation, so the
+;;; tensor stays valid even after free-executable! or a cache eviction. Views
+;;; are released by tensor-release! or, when the tensor is collected, by the
+;;; storage guardian that reap-executables! drains.
+
+;; sb_tensor_desc layout: struct_size size_t, dtype enum (int), rank int64,
+;; dims pointer, num_bytes uint64, flags uint32, quant enum (int),
+;; quant_block uint32, name pointer. The type values (uint64, int, ...) are the
+;; (system foreign) descriptors; '*' is the pointer type symbol.
+(define %desc-types
+  (list uint64 int int64 '* uint64 unsigned-int int unsigned-int '*))
+
+(define (align-up n alignment)
+  (* alignment (quotient (+ n alignment -1) alignment)))
+
+(define %desc-offsets
+  (let loop ((types %desc-types) (offset 0) (acc '()))
+    (if (null? types)
+        (reverse acc)
+        (let* ((t (car types))
+               (o (align-up offset (alignof t))))
+          (loop (cdr types) (+ o (sizeof t)) (cons o acc))))))
+
+(define %desc-size
+  (let loop ((types %desc-types) (offset 0))
+    (if (null? types)
+        offset
+        (let* ((t (car types))
+               (o (align-up offset (alignof t))))
+          (loop (cdr types) (+ o (sizeof t)))))))
+
+(define %desc-off-struct-size (list-ref %desc-offsets 0))
+(define %desc-off-dtype (list-ref %desc-offsets 1))
+(define %desc-off-rank (list-ref %desc-offsets 2))
+(define %desc-off-dims (list-ref %desc-offsets 3))
+(define %desc-off-num-bytes (list-ref %desc-offsets 4))
+
+;; sb_dtype value → Scheme dtype symbol (capi.h sb_dtype, same order).
+(define %sb-dtypes
+  (vector 'float32 'float16 'bfloat16 'float64 'int8 'uint8
+          'int16 'int32 'int64 'bool))
+
+(define (make-desc-bv)
+  (let ((bv (make-bytevector %desc-size 0)))
+    (bytevector-u64-native-set! bv %desc-off-struct-size %desc-size)
+    bv))
+
+(define (check-parameter-query exe who)
+  (unless (executable? exe)
+    (error who "not an executable" exe))
+  (when (executable-freed? exe)
+    (error who "executable has already been freed")))
+
+(define (executable-parameter-count exe)
+  "Number of parameters (graph constants) materialized by EXE. A device
+training graph has no host parameter block and raises."
+  (check-parameter-query exe "executable-parameter-count")
+  (let ((count (u64-native-bv 0))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_executable_parameter_count) (executable-ptr exe)
+               (bytevector->pointer count) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (sb-check! st err-slot "executable-parameter-count")))
+    (bytevector-u64-native-ref count 0)))
+
+(define (executable-parameter-name exe index)
+  "The name of parameter INDEX in EXE (a borrowed string, copied here)."
+  (check-parameter-query exe "executable-parameter-name")
+  (let ((name-slot (make-slot))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_executable_parameter_name_at) (executable-ptr exe)
+               index (slot-ptr name-slot) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (sb-check! st err-slot "executable-parameter-name")))
+    (let ((p (slot-ref name-slot)))
+      (if (null-pointer? p) "" (pointer->string p)))))
+
+(define (executable-parameter-ref exe index)
+  "A read-only <tensor> viewing parameter INDEX of EXE without copying. The
+tensor's storage owns an independent native view, so it stays valid after
+free-executable!; release it with tensor-release! when done (or let the guardian
+release it). tensor-set! on the result raises; tensor-copy gives a writable,
+independent copy. Read-only is enforced by tensor-set!: the bytevector returned
+by tensor-data aliases the native bytes and must not be written directly."
+  (check-parameter-query exe "executable-parameter-ref")
+  (let ((view-slot (make-slot))
+        (err-slot (make-slot)))
+    (let ((st ((proc 'sb_executable_parameter_view) (executable-ptr exe) index
+               (slot-ptr view-slot) (slot-ptr err-slot))))
+      (unless (sb-status-ok? st)
+        (sb-check! st err-slot "executable-parameter-ref")))
+    (let ((view (slot-ref view-slot)))
+      (define (release!) ((proc 'sb_storage_release) view))
+      (define (fail! st)
+        (let ((msg (capture-error err-slot)))
+          (release!)
+          (raise-sonicboom-error
+           st 'internal
+           (string-append "executable-parameter-ref: "
+                          (if (string-null? msg) "invalid descriptor" msg)))))
+      (let ((desc (make-desc-bv)))
+        (let ((st ((proc 'sb_storage_desc) view (bytevector->pointer desc)
+                   (slot-ptr err-slot))))
+          (unless (sb-status-ok? st) (fail! st)))
+        (let ((data-slot (make-slot)))
+          (let ((st ((proc 'sb_storage_data) view (slot-ptr data-slot) %null
+                     (slot-ptr err-slot))))
+            (unless (sb-status-ok? st) (fail! st)))
+          (let* ((dtype-code (bytevector-s32-native-ref desc %desc-off-dtype))
+                 (rank (bytevector-s64-native-ref desc %desc-off-rank))
+                 (nbytes (bytevector-u64-native-ref desc %desc-off-num-bytes))
+                 (data (slot-ref data-slot))
+                 (dtype (and (>= dtype-code 0)
+                             (< dtype-code (vector-length %sb-dtypes))
+                             (vector-ref %sb-dtypes dtype-code)))
+                 (shape (if (<= rank 0)
+                            '()
+                            (let ((dims (pointer->bytevector
+                                         (make-pointer
+                                          (bytevector-u64-native-ref
+                                           desc %desc-off-dims))
+                                         (* rank 8))))
+                              (let loop ((i (- rank 1)) (acc '()))
+                                (if (< i 0)
+                                    acc
+                                    (loop (- i 1)
+                                          (cons (bytevector-s64-native-ref
+                                                 dims (* i 8))
+                                                acc)))))))
+                 (elements (if (null? shape) 1 (apply * shape))))
+            (when (or (not dtype)
+                      (null-pointer? data)
+                      (not (= nbytes (* elements (dtype-size dtype)))))
+              (fail! SB_ERR_INTERNAL))
+            (%make-tensor dtype shape
+                          (borrowed-host-storage
+                           (pointer->bytevector data nbytes) exe view)
+                          #f #f)))))))
 
 ;;; --- the text-keyed cache ----------------------------------------------------
 

@@ -86,7 +86,10 @@ struct sb_executable {
   // (sb_compile) or a compiled device training graph (sb_compile_device). The
   // introspection, bind, execute and retrieve entry points below are shared,
   // and so are the sb_run_multi semantics.
-  std::unique_ptr<sx::Executable> exe;
+  //
+  // The CPU executable is shared with parameter views, which must outlive
+  // this handle; freeing it here only drops this reference.
+  std::shared_ptr<sx::Executable> exe;
   std::unique_ptr<sonicboom::training::DeviceTrainingGraph> device;
   bool input_bound = false;
   sx::Bytes input;    // copied at bind time
@@ -110,6 +113,14 @@ struct sb_executable {
 
 struct sb_tensor {
   nt::Tensor t;
+};
+
+// A read-only host view of one executable parameter. The shared owner keeps
+// the executable implementation — and therefore the parameter's bytes — alive
+// independently of the public sb_executable handle.
+struct sb_storage {
+  std::shared_ptr<sx::Executable> owner;
+  std::size_t index = 0;
 };
 
 struct sb_tape {
@@ -490,7 +501,9 @@ sb_status sb_compile(const sb_document *doc, const char *base_dir,
         }
 
         auto *out = new sb_executable();
-        out->exe = std::move(*exe);
+        // shared, not unique: a parameter view keeps the implementation alive
+        // after sb_executable_free drops this handle.
+        out->exe = std::shared_ptr<sx::Executable>(std::move(*exe));
         *exe_out = out;
         return SB_OK;
       },
@@ -975,6 +988,185 @@ sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
       },
       err_out);
 }
+
+// --- Parameters and read-only storage views ---------------------------------
+
+namespace {
+
+// Resolve parameter INDEX or report why it cannot be described. Returns
+// nullptr with *err_out set and the failure status in *status_out.
+const sx::Executable::ParameterInfo *parameter_at(const sb_executable *exe,
+                                                  std::size_t index,
+                                                  sb_status *status_out,
+                                                  sb_error **err_out) {
+  if (exe->is_device()) {
+    set_error(err_out, SB_ERRKIND_INTERNAL,
+              "device training graphs have no host parameter block");
+    *status_out = SB_ERR_UNSUPPORTED;
+    return nullptr;
+  }
+  const sx::Executable::ParameterInfo *p =
+      exe->exe ? exe->exe->parameter(index) : nullptr;
+  if (!p) {
+    set_error(err_out, SB_ERRKIND_INTERNAL,
+              ("parameter index " + std::to_string(index) +
+               " is out of range")
+                  .c_str());
+    *status_out = SB_ERR_INTERNAL;
+    return nullptr;
+  }
+  return p;
+}
+
+// Fill a caller-provided descriptor. The caller sets struct_size to its own
+// struct size; it must cover this library's struct. On success struct_size is
+// set to sizeof(sb_tensor_desc) so a caller built against a later header knows
+// which fields are meaningful.
+sb_status write_desc(const sx::Executable::ParameterInfo &p,
+                     sb_tensor_desc *desc, sb_error **err_out) {
+  if (!desc)
+    return fail_arg(err_out);
+  if (desc->struct_size < sizeof(sb_tensor_desc)) {
+    set_error(err_out, SB_ERRKIND_INTERNAL,
+              "sb_tensor_desc.struct_size is smaller than sb_tensor_desc");
+    return SB_ERR_INTERNAL;
+  }
+  desc->dtype = map_dtype(p.type.dtype);
+  desc->rank = static_cast<int64_t>(p.type.shape.dims.size());
+  desc->dims = p.type.shape.dims.empty() ? nullptr : p.type.shape.dims.data();
+  desc->num_bytes = p.size_bytes;
+  desc->flags = SB_TF_READ_ONLY;
+  desc->quant = SB_QUANT_NONE;
+  desc->quant_block = 0;
+  desc->name = p.name.c_str();
+  desc->struct_size = sizeof(sb_tensor_desc);
+  return SB_OK;
+}
+
+} // namespace
+
+uint32_t sb_api_version(void) { return SB_API_VERSION; }
+
+sb_status sb_executable_parameter_count(const sb_executable *exe,
+                                        size_t *count_out,
+                                        sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !count_out)
+          return fail_arg(err_out);
+        if (exe->is_device()) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "device training graphs have no host parameter block");
+          return SB_ERR_UNSUPPORTED;
+        }
+        *count_out = exe->exe ? exe->exe->parameter_count() : 0;
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_executable_parameter_name_at(const sb_executable *exe,
+                                          size_t index,
+                                          const char **name_out,
+                                          sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !name_out)
+          return fail_arg(err_out);
+        *name_out = nullptr;
+        sb_status status = SB_OK;
+        const sx::Executable::ParameterInfo *p =
+            parameter_at(exe, index, &status, err_out);
+        if (!p)
+          return status;
+        *name_out = p->name.c_str();
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_executable_parameter_desc(const sb_executable *exe, size_t index,
+                                       sb_tensor_desc *desc_out,
+                                       sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !desc_out)
+          return fail_arg(err_out);
+        sb_status status = SB_OK;
+        const sx::Executable::ParameterInfo *p =
+            parameter_at(exe, index, &status, err_out);
+        if (!p)
+          return status;
+        return write_desc(*p, desc_out, err_out);
+      },
+      err_out);
+}
+
+sb_status sb_executable_parameter_view(const sb_executable *exe, size_t index,
+                                       sb_storage **view_out,
+                                       sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!exe || !view_out)
+          return fail_arg(err_out);
+        *view_out = nullptr;
+        sb_status status = SB_OK;
+        const sx::Executable::ParameterInfo *p =
+            parameter_at(exe, index, &status, err_out);
+        if (!p)
+          return status;
+        auto *view = new (std::nothrow) sb_storage();
+        if (!view) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "out of memory");
+          return SB_ERR_INTERNAL;
+        }
+        view->owner = exe->exe;  // pins the implementation past the handle
+        view->index = index;
+        *view_out = view;
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_storage_data(const sb_storage *view, const void **data_out,
+                          uint64_t *bytes_out, sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!view)
+          return fail_arg(err_out);
+        const sx::Executable::ParameterInfo *p =
+            view->owner ? view->owner->parameter(view->index) : nullptr;
+        if (!p) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "storage view is stale");
+          return SB_ERR_INTERNAL;
+        }
+        if (data_out)
+          *data_out = p->data;
+        if (bytes_out)
+          *bytes_out = p->size_bytes;
+        return SB_OK;
+      },
+      err_out);
+}
+
+sb_status sb_storage_desc(const sb_storage *view, sb_tensor_desc *desc_out,
+                          sb_error **err_out) {
+  return guard(
+      [&]() -> sb_status {
+        if (!view || !desc_out)
+          return fail_arg(err_out);
+        const sx::Executable::ParameterInfo *p =
+            view->owner ? view->owner->parameter(view->index) : nullptr;
+        if (!p) {
+          set_error(err_out, SB_ERRKIND_INTERNAL, "storage view is stale");
+          return SB_ERR_INTERNAL;
+        }
+        return write_desc(*p, desc_out, err_out);
+      },
+      err_out);
+}
+
+void sb_storage_release(sb_storage *view) { delete view; }
 
 // --- Release ----------------------------------------------------------------
 

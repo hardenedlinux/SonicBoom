@@ -30,6 +30,11 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Version of this ABI surface, reported by sb_api_version(). It changes only
+ * when an existing declaration changes meaning; additive symbols (new
+ * functions, new structs) do not bump it. */
+#define SB_API_VERSION 1u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -41,6 +46,7 @@ typedef struct sb_error sb_error;            /* a failure detail               *
 typedef struct sb_tensor sb_tensor;          /* a float32 tensor (autograd)     */
 typedef struct sb_tape sb_tape;              /* a differentiable-op tape        */
 typedef struct sb_param sb_param;            /* a trainable param + AdamW state */
+typedef struct sb_storage sb_storage;        /* a borrowed, read-only view     */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
 typedef enum sb_status {
@@ -83,6 +89,47 @@ typedef enum sb_dtype {
   SB_DTYPE_INT64 = 8,
   SB_DTYPE_BOOL = 9,
 } sb_dtype;
+
+/* Physical element layout of a tensor. Only SB_QUANT_NONE is produced today;
+ * the values are reserved so a later quantized view keeps this enum stable. */
+typedef enum sb_quant_format {
+  SB_QUANT_NONE = 0,
+  SB_QUANT_Q8_1 = 1,
+  SB_QUANT_Q5_0 = 2,
+  SB_QUANT_Q8_0 = 3,
+  SB_QUANT_Q3_K = 4,
+  SB_QUANT_Q4_K = 5,
+  SB_QUANT_Q5_K = 6,
+  SB_QUANT_Q6_K = 7,
+} sb_quant_format;
+
+typedef enum sb_tensor_flags {
+  SB_TF_NONE = 0,
+  SB_TF_READ_ONLY = 1u << 0,
+  SB_TF_DEVICE = 1u << 1,
+  SB_TF_QUANTIZED = 1u << 2,
+  SB_TF_EXTERNAL = 1u << 3,
+} sb_tensor_flags;
+
+/* A plain-C tensor description, versioned by struct_size (set it to
+ * sizeof(sb_tensor_desc) before the call). `dims` and `name` are borrowed from
+ * the owner and are valid only while the owner is alive: the executable handle
+ * for sb_executable_parameter_desc, the view for sb_storage_desc. A library
+ * writes the fields it knows and then stores sizeof(sb_tensor_desc) back into
+ * struct_size, so a caller compiled against a later, larger header can tell
+ * which fields it may read. dtype is the logical dtype; num_bytes is the
+ * physical byte count (equal to numel * element size for dense tensors). */
+typedef struct sb_tensor_desc {
+  size_t struct_size;
+  sb_dtype dtype;
+  int64_t rank;
+  const int64_t *dims;
+  uint64_t num_bytes;
+  uint32_t flags;        /* sb_tensor_flags */
+  sb_quant_format quant;
+  uint32_t quant_block;  /* elements per block; 0 when dense */
+  const char *name;      /* may be NULL */
+} sb_tensor_desc;
 
 /* --- Error inspection ------------------------------------------------------ */
 
@@ -264,6 +311,68 @@ sb_status sb_run_resident(sb_executable *exe, const void *const *input_data,
  * SB_ERR_BINDING for a non-device executable or an index out of range. */
 sb_status sb_input_is_resident(const sb_executable *exe, size_t index,
                                int *resident_out, sb_error **err_out);
+
+/* --- Parameters and read-only storage views -------------------------------- */
+/* A compiled CPU graph materializes every parameter (a graph constant: inline
+ * `:values` data or an `:external` sidecar) into its own buffers at compile
+ * time. A run never writes those buffers, so they may be borrowed read-only.
+ * A view is an opaque sb_storage handle that pins the executable
+ * implementation independently of the public sb_executable handle:
+ *
+ *   - the view stays valid after sb_executable_free (and after a cache
+ *     eviction that frees the handle);
+ *   - several views may pin the same executable independently;
+ *   - sb_storage_release drops this view's reference; the memory is freed when
+ *     the last handle (executable or view) is gone. Releasing NULL is safe;
+ *     release each non-NULL view exactly once.
+ *
+ * Device training graphs (sb_compile_device) have no host parameter block:
+ * their parameter queries fail with SB_ERR_UNSUPPORTED, and no raw device
+ * pointer ever crosses this ABI. */
+
+/* The ABI version implemented by this library (SB_API_VERSION of the header it
+ * was built from). */
+uint32_t sb_api_version(void);
+
+/* Number of parameters (graph constants) in `exe`, in graph tensor order. The
+ * same parameter name used by several constants appears once per constant. */
+sb_status sb_executable_parameter_count(const sb_executable *exe,
+                                        size_t *count_out,
+                                        sb_error **err_out);
+
+/* Parameter `index` in [0, count): its name (a borrowed NUL-terminated string)
+ * or its descriptor. Both are borrowed from the executable and valid until
+ * sb_executable_free. An index out of range is SB_ERR_INTERNAL. */
+sb_status sb_executable_parameter_name_at(const sb_executable *exe,
+                                          size_t index,
+                                          const char **name_out,
+                                          sb_error **err_out);
+sb_status sb_executable_parameter_desc(const sb_executable *exe, size_t index,
+                                       sb_tensor_desc *desc_out,
+                                       sb_error **err_out);
+
+/* Acquire a read-only host view of parameter `index`. On success *view_out
+ * receives a new handle (release with sb_storage_release). The view keeps the
+ * executable implementation alive: the memory stays valid after
+ * sb_executable_free. View flags include SB_TF_READ_ONLY, and the byte count
+ * is the parameter's num_bytes. */
+sb_status sb_executable_parameter_view(const sb_executable *exe, size_t index,
+                                       sb_storage **view_out,
+                                       sb_error **err_out);
+
+/* Host address and byte count of a view. `data_out` and `bytes_out` may each be
+ * NULL. The address is borrowed: the view pins it, so it stays valid until the
+ * view is released, and must not be written. */
+sb_status sb_storage_data(const sb_storage *view, const void **data_out,
+                          uint64_t *bytes_out, sb_error **err_out);
+
+/* Descriptor of a view's tensor, as sb_executable_parameter_desc. dims/name
+ * stay valid while the view is alive. */
+sb_status sb_storage_desc(const sb_storage *view, sb_tensor_desc *desc_out,
+                          sb_error **err_out);
+
+/* Drop a view's ownership reference. NULL is safe. */
+void sb_storage_release(sb_storage *view);
 
 /* --- Release --------------------------------------------------------------- */
 

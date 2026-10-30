@@ -146,6 +146,10 @@ add_executable(test_capi_multi test_capi_multi.c)
 target_link_libraries(test_capi_multi PRIVATE sonicboom m)
 sb_add_cpp_test(test_capi_multi)
 
+add_executable(test_capi_parameter_view test_capi_parameter_view.c)
+target_link_libraries(test_capi_parameter_view PRIVATE sonicboom)
+sb_add_cpp_test(test_capi_parameter_view)
+
 # Seeded sampling through the C ABI (qwen2.5-0.5b, CUDA): determinism, seed
 # sensitivity, prefix-reuse identity, the greedy golden and grammar+sampling.
 # Skips cleanly (exit 77) without the model, the golden or a CUDA device.

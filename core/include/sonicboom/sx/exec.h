@@ -92,6 +92,23 @@ public:
   const std::vector<TensorType>& input_types() const;
   const std::vector<TensorType>& output_types() const;
 
+  // A graph constant resolved at compile time (inline `:values` data or an
+  // `:external` sidecar). Its bytes are materialized once into the
+  // executable's own buffers and are never written by run(), so they may be
+  // borrowed read-only for as long as this Executable is alive.
+  struct ParameterInfo {
+    std::string name;                 // graph tensor name (the parameter name)
+    TensorType type;
+    std::uint64_t size_bytes = 0;
+    const std::byte* data = nullptr;  // borrowed; never written by run()
+  };
+
+  // Parameters in graph tensor order. A parameter is a constant tensor, so a
+  // name used by several constants appears once per constant.
+  std::size_t parameter_count() const;
+  // The parameter at INDEX, or nullptr if INDEX is out of range.
+  const ParameterInfo* parameter(std::size_t index) const;
+
   // Run the graph over one raw little-endian buffer per graph input (in graph
   // input order). Each buffer's byte count must equal numel(its type) *
   // dtype_size; `outputs` is resized to one buffer per graph output and filled.

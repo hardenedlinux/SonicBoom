@@ -1165,6 +1165,9 @@ struct Executable::Impl {
   std::vector<TensorId> output_ids;
   std::vector<TensorType> input_types;
   std::vector<TensorType> output_types;
+  // Graph constants, in graph tensor order; `data` points into slot_bytes and
+  // is never written after compile.
+  std::vector<ParameterInfo> parameters;
 
   // Compile-time scratch: padded NCHW input (conv/max_pool), pooling indices,
   // transposed gemm operands. Sized from the graph so a run allocates nothing.
@@ -1356,6 +1359,11 @@ std::expected<std::unique_ptr<Executable>, ExecError> Executable::compile(
                         "parameter holds " + std::to_string(bytes.size())});
     }
     std::memcpy(s.buffers[t.id.value], bytes.data(), bytes.size());
+    // The constant now lives in its own slot (assigned above), which no node
+    // writes; the pointer is stable for the executable's lifetime.
+    s.parameters.push_back(ParameterInfo{
+        t.name, TensorType{t.dtype, Shape{t.shape}}, t.size_bytes,
+        s.buffers[t.id.value]});
   }
 
   // Compile-time scratch.
@@ -1445,6 +1453,16 @@ const std::vector<TensorType>& Executable::input_types() const {
 
 const std::vector<TensorType>& Executable::output_types() const {
   return impl_->output_types;
+}
+
+std::size_t Executable::parameter_count() const {
+  return impl_->parameters.size();
+}
+
+const Executable::ParameterInfo* Executable::parameter(
+    std::size_t index) const {
+  return index < impl_->parameters.size() ? &impl_->parameters[index]
+                                          : nullptr;
 }
 
 std::expected<void, ExecError> Executable::run(

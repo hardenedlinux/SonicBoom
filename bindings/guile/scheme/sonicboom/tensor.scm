@@ -26,6 +26,7 @@
             make-tensor %make-tensor bytevector->tensor tensor->bytevector
             tensor-dtype tensor-shape tensor-data tensor-numel
             tensor-ref tensor-set! tensor->list list->tensor tensor-copy
+            tensor-release!
             zeros ones rand randn
             parameter parameter? tensor-requires-grad?
             tensor-grad set-tensor-grad! parameter-grad parameter-grad-set!
@@ -76,8 +77,11 @@
                        requires-grad grad))
 
 (define (tensor-data t)
-  "The bytevector backing T. Only owned storage exists, so every tensor has one;
-this is a field read, never a copy."
+  "The bytevector backing T: a field read, never a copy. For an owned tensor it
+is T's storage; for a read-only borrowed view (an executable parameter) it
+aliases native memory. Read-only is enforced by tensor-set!, not by the
+bytevector: Guile bytevectors are always mutable, so writing through this
+bytevector would modify the parameter bytes and must not be done."
   (storage-data (tensor-storage t)))
 
 ;;; --- element access ---------------------------------------------------------
@@ -104,6 +108,10 @@ this is a field read, never a copy."
       (else (error "tensor-ref: unknown dtype" d)))))
 
 (define (tensor-set! t i v)
+  ;; A borrowed view may be native read-only memory (an executable parameter);
+  ;; reject the write before touching it.
+  (unless (storage-writable? (tensor-storage t))
+    (error "tensor-set!: storage is read-only" (tensor-shape t)))
   (let ((d (tensor-dtype t))
         (bv (storage-data (tensor-storage t))))
     (case d
@@ -221,9 +229,18 @@ must equal (apply * shape) * (dtype-size dtype)."
   (make-tensor data shape #:dtype dtype))
 
 (define (tensor-copy t)
+  "An independent tensor with the same dtype, shape and bytes. Always owned and
+writable, even when T is a read-only borrowed view."
   (%make-tensor (tensor-dtype t) (tensor-shape t)
                 (owned-storage (bytevector-copy (tensor-data t)))
                 (tensor-requires-grad? t) (tensor-grad t)))
+
+(define (tensor-release! t)
+  "Release T's borrowed native view, if any. Idempotent; a no-op for owned
+storage. T's bytes stay valid until its last view and executable are gone, but
+the view handle itself is dropped: do not read T after releasing it."
+  (storage-release! (tensor-storage t))
+  *unspecified*)
 
 ;;; --- parameters -------------------------------------------------------------
 
