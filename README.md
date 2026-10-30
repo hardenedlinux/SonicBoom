@@ -62,13 +62,34 @@ not have, and they are where SonicBoom keeps improving.
   retired.
 - **Research route:** reverse-mode ops, a fused AdamW, checkpoint save/load,
   LR schedules, BPE training and dataset utilities behind the C ABI and Guile.
-- **ggml-derived code is down to 7.3% of the core** (from 13.7%), after the
+- **ggml-derived code is down to 7.2% of the core** (from 13.1%), after the
   imported prefill attention was removed.
 
 ## The architecture
 
 ![SonicBoom architecture](assets/sonicboom-architecture-light.svg#gh-light-mode-only)
 ![SonicBoom architecture](assets/sonicboom-architecture-dark.svg#gh-dark-mode-only)
+
+## Reproducible
+
+SonicBoom is designed to provide reproducible inference under a controlled execution environment.
+
+Our reproducibility guarantees cover three areas:
+
+1. **Deterministic execution** — identical inputs produce identical outputs under the same supported hardware and execution configuration.
+2. **Speculative decoding consistency** — enabling or disabling speculative decoding produces bit-for-bit identical output token sequences.
+3. **Seeded sampling** — sampling with the same seed and identical configuration produces deterministic results.
+
+### Reproducibility Scope
+
+These guarantees are currently scoped to:
+- The same GPU model.
+- The same warmed-up execution/dispatch table.
+- The same model, inputs, configuration, and random seed where applicable.
+
+Reproducibility across different GPU models, different warmed-up dispatch tables, or different execution environments is not claimed unless separately validated.
+
+Batch execution reproducibility is not currently claimed.
 
 ## How this is built
 
@@ -80,8 +101,9 @@ not have, and they are where SonicBoom keeps improving.
 
 ## Why another runtime?
 
-**For people who need to know what they are running.** The core is
-43k lines of hand-written C++/CUDA. It is GPL-3.0-or-later, and the boundary is
+**For people who need to know what they are running.** The core contains
+43,669 lines of SonicBoom's own C++/CUDA (47,062 including the documented
+ggml ports). It is GPL-3.0-or-later, and the boundary is
 a plain C ABI that you can audit, pin and link against. It has no Python
 dependency chain to vet, and nothing is downloaded at run time. Python is not
 needed to build it either: PyTorch's Python code generator, torchgen, is
@@ -598,12 +620,14 @@ license. They live in `ggml_derived/` directories, with the details in
 | | Lines of code |
 |---|---:|
 | ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 3,393 |
-| SonicBoom core total (`core/src`, `core/include`) | 46,579 |
-| **Derived share** | **~7.3%** |
+| SonicBoom's own code (`core/src`, `core/include`, minus derived) | 43,669 |
+| SonicBoom core total (`core/src`, `core/include`) | 47,062 |
+| **Derived share** | **7.2%** |
 
-*Counted with `cloc` 1.98. These are code lines only, excluding blanks and
-comments. The C ABI, the Guile bindings and the dependencies are not
-counted.*
+*Counted with `cloc` 1.98: `cloc core/src core/include`, and
+`cloc core/src/quant/ggml_derived core/src/vocab/ggml_derived` for the derived
+subset. These are code lines only, excluding blanks and comments. The C ABI,
+the Guile bindings and the dependencies are not counted.*
 
 The imported ggml flash attention and its four-file subtree were removed in
 v0.0.4; prefill attention is SonicBoom's own `boom_fattn` kernel.
@@ -788,8 +812,11 @@ Two routes share this core:
 - **Usability:** sampling and constrained decoding shipped in v0.0.4; next are
   the remaining JSON-Schema keywords and chat templates for further families
 - **Scale:** larger MoE models with expert offload
-- **Beyond LLMs:** diffusion models, with a converter for existing ComfyUI
-  workflows
+- **Image and Video Generation:**
+  - Expand image generation capabilities with optimized batching and execution
+    scheduling.
+  - Extend support for video generation workloads.
+  - Investigate and integrate MiniMax H3 for video generation.
 - **Distribution:** Guix packaging, CPU first. A Vulkan backend is planned so
   that a fully free-software stack also gets GPU acceleration. The backend
   scaffold is already in the tree (`-DSONICBOOM_USE_VULKAN=ON`).
