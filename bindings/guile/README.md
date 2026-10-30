@@ -188,10 +188,10 @@ An S-Expr graph parsed and compiled once, then run many times.
 - `executable?`, `executable-freed?`, `free-executable!` — lifetime; freeing is idempotent
 - `executable-bind-parameter! exe name data-bv` — fill a `(data :bound "<name>")` parameter; the bytes are copied, and the parameter may be rebound until the first successful run (after that, binding raises)
 - `executable-bindings-complete? exe` — whether every `:bound` parameter has been filled
-- `run-s-expr/cached text input` — compile-once wrapper over `(sonicboom ffi)`'s `run-s-expr`; only for self-contained text (`:values` / `:external`), never a graph with `:bound` parameters
+- `run-s-expr/cached text input` — compile-once wrapper over `(sonicboom ffi)`'s `run-s-expr`; only for self-contained text (`:values` / `:external`), never a graph with `:bound` parameters. The cache is ownerless by contract; `<model>` never uses it, because a model owns one executable per input shape
 - `cached-executable text` — the cache entry for a graph text
 - `executable-cache-enabled` — a parameter (default `#t`) turning the cache off
-- `clear-executable-cache!` — free and drop every cached entry
+- `clear-executable-cache!` — drop every cached entry; a handle a caller still holds stays valid and runnable until the caller releases it (the guardian then frees it)
 - `reap-executables!` — release the handles the guardian has collected
 
 ```scheme

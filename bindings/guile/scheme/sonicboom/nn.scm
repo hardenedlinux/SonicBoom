@@ -212,8 +212,11 @@ native relu."
 (define (model-parameter-ref model key)
   (assq-ref (model-parameters model) key))
 
-;; Internal (not exported): the single-flight counter, for tests.
+;; Internal (not exported): the single-flight counter and the executable
+;; alist, for tests. A plain procedure is used because a record accessor is a
+;; syntax binding and cannot be applied through `module-ref`.
 (define (model-compilation-count model) (model-compilations model))
+(define (model-executable-entries model) (model-executables model))
 
 ;;; Build the S-Expr v0.1 text for a forward pass, threading the input value
 ;;; through each layer in order. Parameters are emitted as (data :bound

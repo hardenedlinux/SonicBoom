@@ -113,8 +113,8 @@
                (lambda (out err) (cons out err)))))
       (and (car r) (equal? (car r) (f32-bv 2.0 -5.0 6.5 0.0))))))
 
-;; 7. clearing the cache releases the handles and leaves it usable
-(test-assert "clear-executable-cache! drops freed handles and leaves a usable cache"
+;; 7. clearing the cache drops its entries and leaves it usable
+(test-assert "clear-executable-cache! drops the entries and leaves a usable cache"
   (begin
     (clear-executable-cache!)
     (let ((r (call-with-values (lambda () (run-s-expr/cached add-graph-text input))

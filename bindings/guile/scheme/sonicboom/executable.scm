@@ -19,8 +19,13 @@
 ;;;
 ;;; `run-s-expr/cached` is a drop-in replacement for `run-s-expr` that keys a
 ;;; process-wide cache by graph text (enable/disable with the
-;;; `executable-cache-enabled` parameter). The cache is never invalidated
-;;; automatically — `clear-executable-cache!` drops every entry.
+;;; `executable-cache-enabled` parameter). It is only for self-contained text:
+;;; a graph with (data :bound ...) parameters carries state supplied after the
+;;; cache key is computed, so an owner of that state (a <model>, which owns one
+;;; executable per input shape) must hold its own executable instead. The cache
+;;; is never invalidated automatically; `clear-executable-cache!` drops every
+;;; entry, but an entry a caller still holds stays alive until the caller
+;;; drops it (the guardian then releases it).
 
 (define-module (sonicboom executable)
   #:use-module (system foreign)
@@ -77,12 +82,19 @@
 
 (define (free-executable! exe)
   "Release EXE's native handle. Idempotent: freeing an already-freed (or
-guardian-reaped) executable is a no-op, never an error."
-  (unless (executable-freed? exe)
-    (set-executable-freed! exe #t)      ; claim it before touching the pointer
-    (let ((p (executable-ptr exe)))
-      (unless (null-pointer? p)
-        ((proc 'sb_executable_free) p))))
+guardian-reaped) executable is a no-op, never an error.
+
+The run lock is taken first, so an explicit free waits for an in-flight
+`executable-run` instead of releasing the native handle underneath it. A run
+that starts after the free sees the freed flag and fails instead."
+  (call-with-executable-lock
+   exe
+   (lambda ()
+     (unless (executable-freed? exe)
+       (set-executable-freed! exe #t)   ; claim it before touching the pointer
+       (let ((p (executable-ptr exe)))
+         (unless (null-pointer? p)
+           ((proc 'sb_executable_free) p))))))
   *unspecified*)
 
 ;;; --- GC fallback -------------------------------------------------------------
@@ -459,7 +471,10 @@ TEXT must be self-contained: :values and :external graphs qualify, but a graph
 with (data :bound ...) parameters does not, because the cached executable holds
 the bytes one caller bound. Give each such graph its own executable (as
 model-forward does) instead of going through this cache."
-  (let ((hit (hash-ref %cache text #f)))
+  (let* ((hit (begin (lock-mutex %cache-lock)
+                     (let ((h (hash-ref %cache text #f)))
+                       (unlock-mutex %cache-lock)
+                       h))))
     (if (and hit (not (executable-freed? hit)))
         hit
         (let ((exe (compile-s-expr text)))
@@ -480,10 +495,14 @@ executable is cached by graph TEXT and reused across calls."
       (run-s-expr text input-bv)))
 
 (define (clear-executable-cache!)
-  "Release every cached executable, drop the cache, and reap any other
-collected executables."
+  "Drop every cached entry and reap any other collected executables.
+
+Eviction does not free an executable a caller still holds: the entry stops
+being shared, but the held handle stays valid and runnable until the caller
+drops it, when the executable guardian releases its native handle. This keeps
+eviction from invalidating an executable (or a parameter view it pins)
+underneath an active user."
   (lock-mutex %cache-lock)
-  (hash-for-each (lambda (k v) (free-executable! v)) %cache)
   (set! %cache (make-hash-table))
   (unlock-mutex %cache-lock)
   (reap-executables!)

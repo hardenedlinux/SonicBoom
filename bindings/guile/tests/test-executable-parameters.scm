@@ -124,13 +124,25 @@
   (tensor-release! view)
   (test-assert "tensor-release! is idempotent" #t))
 
-;; 8. a cache eviction does not invalidate a live view
+;; 8. a cache eviction drops the entry but does not invalidate a handle or a
+;;    view the caller still holds: the held executable stays runnable, and its
+;;    bytes are unchanged.
 (let* ((exe (cached-executable add-relu-text))
        (view (executable-parameter-ref exe 0)))
   (clear-executable-cache!)
-  (test-assert "cache eviction freed the cached handle"
-               (executable-freed? exe))
+  (test-assert "cache eviction leaves a held handle valid"
+               (not (executable-freed? exe)))
+  (let-values (((out err) (executable-run exe x-input)))
+    (test-assert "a held executable still runs after cache eviction"
+                 (and out (not err)))
+    (test-assert "the post-eviction run sees the same parameter bytes"
+                 (and out (bytevector=? out
+                                       (f32-bv 1.5 1.0 0.0 1.0
+                                               0.0 1.0 0.0 1.0)))))
   (test-assert "the view survives cache eviction" (view-bytes-equal? view))
+  (free-executable! exe)
+  (test-assert "an explicit free still releases the evicted handle"
+               (executable-freed? exe))
   (tensor-release! view))
 
 ;; 9. multiple views of one parameter are independent

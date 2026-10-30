@@ -256,6 +256,31 @@
               '(-4.0) (tensor->list (model-forward m x)))
   (executable-cache-enabled #t))
 
+;; 12. Cache ownership is per model: two models whose bound-parameter graph
+;;     text is byte-identical still own distinct executables, and each holds
+;;     its own bound parameter bytes.
+(let* ((m1 (sequential (linear-with '(1.0 0.0) '(0.0) 2 1)))
+       (m2 (sequential (linear-with '(0.0 1.0) '(0.0) 2 1)))
+       (x (make-tensor '(3.0 -4.0) '(1 2)))
+       (model-executables
+        (module-ref (resolve-module '(sonicboom nn)) 'model-executable-entries)))
+  (test-assert "two models with different weights emit identical text"
+               (string=? (model-graph-text m1 '(1 2))
+                         (model-graph-text m2 '(1 2))))
+  ;; Compile both models' entries.
+  (model-forward m1 x)
+  (model-forward m2 x)
+  (let* ((e1 (cdr (assoc '(1 2) (model-executables m1))))
+         (e2 (cdr (assoc '(1 2) (model-executables m2)))))
+    (test-assert "each model owns a compiled executable"
+                 (and (executable? e1) (executable? e2)))
+    (test-assert "identical text does not share one executable"
+                 (not (eq? e1 e2)))
+    (test-equal "model 1's executable holds model 1's weight"
+                (f32-bv 1.0 0.0) (bound-bytes e1))
+    (test-equal "model 2's executable holds model 2's weight"
+                (f32-bv 0.0 1.0) (bound-bytes e2))))
+
 ;; srfi-64 reports counts but does not set the process exit status; CTest has
 ;; to see a failure, so capture the runner before test-end clears it and turn
 ;; its failure count into our exit code.
