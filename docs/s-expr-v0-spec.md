@@ -285,8 +285,9 @@ Runtime contract (S-Expr executable path):
   count. The slot reads as zero until bound.
 - The caller fills each bound parameter by name before the first run; the run
   fails with a binding error while any bound parameter is unset.
-- A binding copies the supplied bytes. Supplying a byte count different from
-  the declared type is a binding error; an unknown name is a binding error.
+- A binding copies the supplied bytes into the executable; later writes to the
+  caller's buffer are not observed. Supplying a byte count different from the
+  declared type is a binding error; an unknown name is a binding error.
 - A parameter may be rebound before the first successful run. Binding after a
   successful run is rejected (binding is a compile-time initialization step,
   not a per-run weight-update mechanism).

@@ -171,16 +171,30 @@ native relu."
 
 ;;; --- model ------------------------------------------------------------------
 
+;; Marks an executable slot another thread is compiling. A waiting thread
+;; leaves the model lock on the condition variable until the result lands.
+(define-record-type <compilation-pending>
+  (%make-compilation-pending)
+  compilation-pending?)
+
 (define-record-type <model>
-  (%make-model layers parameters executables lock)
+  (%make-model layers parameters executables lock compile-cond compilations)
   model?
-  (layers      model-layers)
-  (parameters  model-parameters)   ; merged alist of (key . tensor)
-  ;; Per-model compiled executables: alist of (input-dims . <executable>).
-  ;; Bound graphs are model state (their parameter bytes belong to this
+  (layers       model-layers)
+  (parameters   model-parameters)   ; merged alist of (key . tensor)
+  ;; Per-model compiled executables: alist of (input-dims . <executable>), or
+  ;; (input-dims . <compilation-pending>) while another thread compiles the
+  ;; entry. Bound graphs are model state (their parameter bytes belong to this
   ;; instance), so they must never come from the process-wide text cache.
-  (executables model-executables set-model-executables!)
-  (lock        model-lock))
+  (executables  model-executables set-model-executables!)
+  ;; Guards `executables`; compile-cond wakes threads waiting on an entry.
+  (lock         model-lock)
+  (compile-cond model-compile-cond)
+  ;; Internal instrumentation: compilations started for this model's
+  ;; executables, bumped under LOCK. Single-flight means one per (model, input
+  ;; shape) however many threads ask. Read by tests through module-ref; not
+  ;; exported.
+  (compilations model-compilations set-model-compilations!))
 
 (define (sequential . layers)
   "Compose LAYERS into a model. Parameter names are made unique per layer."
@@ -193,10 +207,13 @@ native relu."
                                 (cdr pair)))
                         (layer-parameters layer)))
                  layers)))
-    (%make-model layers params '() (make-mutex))))
+    (%make-model layers params '() (make-mutex) (make-condition-variable) 0)))
 
 (define (model-parameter-ref model key)
   (assq-ref (model-parameters model) key))
+
+;; Internal (not exported): the single-flight counter, for tests.
+(define (model-compilation-count model) (model-compilations model))
 
 ;;; Build the S-Expr v0.1 text for a forward pass, threading the input value
 ;;; through each layer in order. Parameters are emitted as (data :bound
@@ -330,30 +347,66 @@ re-raised."
 ;; use. Bound parameters make the executable model state: two models with the
 ;; same structure but different weights must not share one, so this cache is
 ;; per <model> and not the process-wide text cache in (sonicboom executable).
+;;
+;; Compilation is single-flight per (model, input shape): the first thread to
+;; ask marks the entry pending and compiles without the model lock; threads
+;; asking for the same entry wait on the model's condition variable and reuse
+;; the result. Different models, and different input shapes of one model, hold
+;; separate entries and compile independently. A failed compilation publishes
+;; no entry, wakes the waiters (one of them retries) and re-raises here.
 (define (model-executable model input-dims text params)
-  (let ((hit (assoc input-dims (model-executables model))))
-    (if (and hit (not (executable-freed? (cdr hit))))
-        (cdr hit)
-        (let ((exe (compile-and-bind text params))
-              (lock (model-lock model)))
-          (dynamic-wind
-            (lambda () (lock-mutex lock))
-            (lambda ()
-              (let ((race (assoc input-dims (model-executables model))))
-                (if (and race (not (executable-freed? (cdr race))))
-                    (begin (free-executable! exe) (cdr race))
-                    (begin
+  (let ((lock (model-lock model))
+        (condv (model-compile-cond model)))
+    (define (replace-entry! entry)
+      (set-model-executables!
+       model (cons (cons input-dims entry)
+                   (alist-delete input-dims (model-executables model) equal?))))
+    (let loop ()
+      (lock-mutex lock)
+      (let ((hit (assoc input-dims (model-executables model))))
+        (cond
+          ((and hit (executable? (cdr hit)) (not (executable-freed? (cdr hit))))
+           (unlock-mutex lock)
+           (cdr hit))
+          ((and hit (compilation-pending? (cdr hit)))
+           ;; Another thread is compiling this entry; wait for its result.
+           (wait-condition-variable condv lock)  ; returns holding LOCK
+           (unlock-mutex lock)
+           (loop))
+          (else
+           (replace-entry! (%make-compilation-pending))
+           (set-model-compilations! model (+ (model-compilations model) 1))
+           (unlock-mutex lock)
+           (let ((exe
+                  (catch #t
+                    (lambda () (compile-and-bind text params))
+                    (lambda (key . args)
+                      ;; Leave no result behind and wake the waiters, one of
+                      ;; which retries; the caller still sees the error.
+                      (lock-mutex lock)
                       (set-model-executables!
-                       model (cons (cons input-dims exe)
-                                   (model-executables model)))
-                      exe))))
-            (lambda () (unlock-mutex lock)))))))
+                       model (alist-delete input-dims
+                                           (model-executables model) equal?))
+                      (broadcast-condition-variable condv)
+                      (unlock-mutex lock)
+                      (apply throw key args)))))
+             (lock-mutex lock)
+             (replace-entry! exe)
+             (broadcast-condition-variable condv)
+             (unlock-mutex lock)
+             exe)))))))
 
 (define (model-forward model x)
   "Run a forward pass of MODEL on input tensor X through the native backend.
-Returns the output tensor. Only float32 is supported in v0. The parameters are
-bound from MODEL's tensors by name on the first forward; later edits to those
-tensors are not re-bound (bind once, then run)."
+Returns the output tensor. Only float32 is supported in v0.
+
+The first forward for a given input shape compiles and binds one executable for
+that (model, shape) and reuses it afterwards. The parameters are bound from
+MODEL's tensors at that first forward, so later edits to those tensors are not
+observed (bind once, then run); with `executable-cache-enabled` off, every call
+recompiles and rebinds from the current tensors instead. Concurrent calls are
+safe: the first call for a shape compiles it once and the other callers wait for
+and share that executable, whose runs are serialized."
   (unless (eq? (tensor-dtype x) 'float32)
     (error "model-forward: only float32 inputs are supported in v0"
            (tensor-dtype x)))

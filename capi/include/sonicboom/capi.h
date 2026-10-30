@@ -382,8 +382,9 @@ void sb_storage_release(sb_storage *view);
  * must fill every bound parameter with sb_bind_parameter before the first run.
  * Until then sb_execute, sb_run_multi and sb_run_resident fail with
  * SB_ERR_BINDING. Binding copies `len` bytes (the caller may free `data` on
- * return); `len` must equal the parameter's num_bytes. A parameter may be
- * rebound before the first successful run; afterwards binding fails with
+ * return, and later writes through it are not observed); `len` must equal the
+ * parameter's num_bytes. A parameter may be rebound before the first
+ * successful run, replacing the copied bytes; afterwards binding fails with
  * SB_ERR_BINDING. An unknown name or wrong size is SB_ERR_BINDING; a NULL
  * argument is SB_ERR_INTERNAL. Device training graphs (sb_compile_device)
  * have no bound parameters and fail with SB_ERR_UNSUPPORTED. */

@@ -49,7 +49,7 @@
 ;;; --- the executable record ---------------------------------------------------
 
 (define-record-type <executable>
-  (%make-executable text ptr in-nbytes out-nbytes in-count out-count freed)
+  (%make-executable text ptr in-nbytes out-nbytes in-count out-count freed lock)
   executable?
   (text executable-graph-text)
   (ptr executable-ptr)
@@ -62,7 +62,11 @@
   (out-count executable-output-count)
   ;; Flipped to #t by whoever releases the handle first (explicit free or the
   ;; finalizer), so the other one becomes a no-op instead of a double free.
-  (freed executable-freed? set-executable-freed!))
+  (freed executable-freed? set-executable-freed!)
+  ;; A native executable owns one set of input, output and scratch buffers, so
+  ;; two concurrent runs would overwrite each other's data. executable-run
+  ;; serializes runs of one executable; different executables stay parallel.
+  (lock executable-lock))
 
 ;; A one-element size_t out-param (8 bytes on every 64-bit target; Guile's
 ;; `sizeof` accepts only pointer types, so the scalar size is hardcoded).
@@ -151,29 +155,44 @@ for repeated `executable-run`. Raises on a parse or compile failure."
                                        (bytevector-u64-native-ref out-bytes 0)
                                        (bytevector-u64-native-ref in-count 0)
                                        (bytevector-u64-native-ref out-count 0)
-                                       #f)))
+                                       #f (make-mutex))))
             ;; Register with the guardian; see reap-executables!.
             (%exe-guardian exe)
             exe))))
 
 ;;; --- running -----------------------------------------------------------------
 
+(define (call-with-executable-lock exe thunk)
+  (let ((lock (executable-lock exe)))
+    (dynamic-wind
+      (lambda () (lock-mutex lock))
+      thunk
+      (lambda () (unlock-mutex lock)))))
+
 (define (executable-run exe input-bv)
   "Bind INPUT-BV to EXE, run it and return two values: the output bytevector
 and #f on success, or #f and an error-message string on failure. The native
 handle is retained, so EXE may be run again; the C ABI copies the input, so
-INPUT-BV may be reused or freed immediately."
-  (cond
-    ((executable-freed? exe)
-     (values #f "executable-run: executable has already been freed"))
-    ((and (= (executable-input-count exe) 1)
-          (= (executable-output-count exe) 1))
-     (executable-run-1x1 exe input-bv))
-    (else
-     ;; sb_run_multi requires the exact arity; executable-run's contract is one
-     ;; input and one output. Keep the historical wrapper for any other graph
-     ;; so its failure mode (a binding error naming the arity) is unchanged.
-     (executable-run-legacy exe input-bv))))
+INPUT-BV may be reused or freed immediately.
+
+Runs of one executable are serialized, because the compiled graph owns a single
+set of input, output and scratch buffers. Different executables, including two
+entries of one model's per-shape cache, run in parallel."
+  (call-with-executable-lock
+   exe
+   (lambda ()
+     (cond
+       ((executable-freed? exe)
+        (values #f "executable-run: executable has already been freed"))
+       ((and (= (executable-input-count exe) 1)
+             (= (executable-output-count exe) 1))
+        (executable-run-1x1 exe input-bv))
+       (else
+        ;; sb_run_multi requires the exact arity; executable-run's contract is
+        ;; one input and one output. Keep the historical wrapper for any other
+        ;; graph so its failure mode (a binding error naming the arity) is
+        ;; unchanged.
+        (executable-run-legacy exe input-bv))))))
 
 ;; The one-in/one-out fast path. sb_run_multi takes the caller's input bytes
 ;; and writes the result directly into the bytevector it returns, so neither
@@ -377,31 +396,39 @@ by tensor-data aliases the native bytes and must not be written directly."
 ;;; to be supplied after compile. Compile allocates the slot; executable-run
 ;;; fails until every bound parameter has been filled (executable-bindings-
 ;;; complete? reports whether it is). Binding copies the bytes once, so later
-;;; edits to DATA-BV are not reflected. Rebinding is rejected after the first
-;;; successful run.
+;;; edits to DATA-BV are not reflected. A parameter may be rebound (replacing
+;;; the bytes) any number of times before the first successful run; after that
+;;; binding raises, because the executable is bound once and then run.
 
 (define (executable-bind-parameter! exe name data-bv)
   "Copy DATA-BV into EXE's (:bound NAME) parameter. NAME is the binding name
 from the graph. Raises on an unknown name, a byte-count mismatch, or when the
-executable has already run successfully."
+executable has already run successfully.
+
+The bytes are copied: subsequent writes to DATA-BV are not observed. A
+parameter may be bound again until the first successful run replaces the
+previous bytes; afterwards binding it raises."
   (check-parameter-query exe "executable-bind-parameter!")
   (unless (string? name)
     (error "executable-bind-parameter!: parameter name must be a string" name))
   (unless (bytevector? data-bv)
     (error "executable-bind-parameter!: data must be a bytevector" data-bv))
-  (let ((err-slot (make-slot)))
-    (let ((st ((proc 'sb_bind_parameter) (executable-ptr exe)
-               (string->pointer name)
-               (bytevector->pointer data-bv)
-               (bytevector-length data-bv)
-               (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (sb-check! st err-slot "executable-bind-parameter!"))))
-  *unspecified*)
+  (call-with-executable-lock
+   exe
+   (lambda ()
+     (let ((err-slot (make-slot)))
+       (let ((st ((proc 'sb_bind_parameter) (executable-ptr exe)
+                  (string->pointer name)
+                  (bytevector->pointer data-bv)
+                  (bytevector-length data-bv)
+                  (slot-ptr err-slot))))
+         (unless (sb-status-ok? st)
+           (sb-check! st err-slot "executable-bind-parameter!"))))
+     *unspecified*)))
 
 (define (executable-bindings-complete? exe)
   "True when EXE has no :bound parameters or every one has been filled.
-executable-run raises until this is true."
+executable-run fails (returning #f and a message) until this is true."
   (check-parameter-query exe "executable-bindings-complete?")
   (let ((complete (make-bytevector 4 0))
         (err-slot (make-slot)))

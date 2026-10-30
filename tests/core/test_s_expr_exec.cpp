@@ -367,6 +367,36 @@ void test_gemm_rank_mismatch() {
       "gemm requires rank-2 A and B", "gemm rank mismatch");
 }
 
+// 10a. gemm whose operands disagree on the contracted dimension → Compile
+// error. Dispatch derives M/K/N from the declared shapes and would otherwise
+// index B outside its buffer.
+void test_gemm_inner_mismatch() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 2 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters"
+      "   (parameter \"b\" (tensor float32 (shape 2 4))"
+      "     (data :external \"b.bin\" 0 32)))"
+      " (nodes (node gemm (inputs \"a\" \"b\")"
+      "   (outputs (\"c\" (tensor float32 (shape 2 4))))))))",
+      "gemm inner dimensions do not match", "gemm inner-dimension mismatch");
+}
+
+// 10b. gemm whose declared result is not [M, N] → Compile error.
+void test_gemm_output_mismatch() {
+  expect_compile_error(
+      "(sonicboom-s-expr (version 0 1) (graph (name \"g\")"
+      " (inputs (input \"a\" (tensor float32 (shape 2 3))))"
+      " (outputs (output \"c\"))"
+      " (parameters"
+      "   (parameter \"b\" (tensor float32 (shape 3 4))"
+      "     (data :external \"b.bin\" 0 48)))"
+      " (nodes (node gemm (inputs \"a\" \"b\")"
+      "   (outputs (\"c\" (tensor float32 (shape 2 3))))))))",
+      "gemm output shape does not match A x B", "gemm output-shape mismatch");
+}
+
 // 10. ReduceMean with a duplicated axis → Compile error (no divisor bloat).
 void test_reduce_mean_duplicate_axes() {
   expect_compile_error(
@@ -392,10 +422,12 @@ int main() {
   test_conv_empty_strides();
   test_conv_empty_dilations();
   test_gemm_rank_mismatch();
+  test_gemm_inner_mismatch();
+  test_gemm_output_mismatch();
   test_reduce_mean_duplicate_axes();
 
   if (g_failures == 0) {
-    std::cout << "test_s_expr_exec OK (10 cases)\n";
+    std::cout << "test_s_expr_exec OK (12 cases)\n";
     return 0;
   }
   std::cerr << "test_s_expr_exec FAILED: " << g_failures << " check(s)\n";

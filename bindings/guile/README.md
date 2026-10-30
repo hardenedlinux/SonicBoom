@@ -113,8 +113,16 @@ parameters: the first runs the text `apply` emits, the second traces the
 layers and lowers the result. Both are checked to agree in
 `tests/test-nn-trace.scm`. `model-forward` emits `(data :bound "<name>")`
 parameters and keeps one compiled, bound executable per model and input shape,
-so the weight values are captured at the first forward and two models never
-share parameter state; see `tests/test-model-binding.scm`.
+so the weight values are captured at the first forward for that shape and two
+models never share parameter state; edits to the parameter tensors afterwards
+are not observed. With `executable-cache-enabled` off, each call recompiles and
+rebinds from the current tensors instead. Concurrent first forwards are safe:
+one thread compiles an entry and the others wait for and share it; see
+`tests/test-model-binding.scm` and `tests/test-model-concurrency.scm`.
+
+A `<model>` has no public destruction procedure. It owns no native handle
+itself; dropping the last reference lets the executable guardian release its
+compiled executables on the next `reap-executables!` call.
 
 ## (sonicboom model)
 
@@ -178,7 +186,7 @@ An S-Expr graph parsed and compiled once, then run many times.
 - `executable-run exe input-bv` — one run; returns `(values output-bv #f)`, or `(values #f message)` on failure
 - `executable-graph-text`, `executable-input-nbytes`, `executable-output-nbytes` — what it was compiled from
 - `executable?`, `executable-freed?`, `free-executable!` — lifetime; freeing is idempotent
-- `executable-bind-parameter! exe name data-bv` — fill a `(data :bound "<name>")` parameter (one-time, before the first run)
+- `executable-bind-parameter! exe name data-bv` — fill a `(data :bound "<name>")` parameter; the bytes are copied, and the parameter may be rebound until the first successful run (after that, binding raises)
 - `executable-bindings-complete? exe` — whether every `:bound` parameter has been filled
 - `run-s-expr/cached text input` — compile-once wrapper over `(sonicboom ffi)`'s `run-s-expr`; only for self-contained text (`:values` / `:external`), never a graph with `:bound` parameters
 - `cached-executable text` — the cache entry for a graph text
@@ -204,6 +212,15 @@ An S-Expr graph parsed and compiled once, then run many times.
 Lifetime: an executable owns a native handle. Guile 3.0.9 has no
 `set-finalizer!`, so executables are registered with a guardian and released by
 `reap-executables!` after the GC collects them.
+
+Binding is a compile-time initialization, not a weight-update mechanism: an
+executable keeps its own copy of the bound bytes, so editing the source tensor
+or bytevector afterwards changes nothing, and the first successful run freezes
+the binding (a later `executable-bind-parameter!` raises). To run with new
+weights, compile a fresh executable and bind it — which is what `model-forward`
+does on every call when `executable-cache-enabled` is `#f`.
+Runs of one executable are serialized (it owns a single set of buffers);
+different executables run in parallel.
 
 ## (sonicboom ffi)
 

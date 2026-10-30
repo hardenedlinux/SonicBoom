@@ -37,8 +37,16 @@
     bv))
 
 (define b-bytes (f32-bv 0.5 -1.0 2.0 -3.0 4.0 -5.0 6.0 -7.0))
+(define b2-bytes (f32-bv 1.0 1.0 1.0 1.0 1.0 1.0 1.0 1.0))
 (define x-input (f32-bv 1.0 2.0 -3.0 4.0 -5.0 6.0 -7.0 8.0))
 (define expected-z (f32-bv 1.5 1.0 0.0 1.0 0.0 1.0 0.0 1.0))
+
+;; The bytes currently bound to EXE's only parameter, copied out of a view.
+(define (bound-bytes exe)
+  (let ((v (executable-parameter-ref exe 0)))
+    (let ((bv (bytevector-copy (tensor-data v))))
+      (tensor-release! v)
+      bv)))
 
 ;; A linear layer with explicit weight/bias values (flat lists).
 (define (linear-with wvals bvals in out)
@@ -118,6 +126,17 @@
   (executable-bind-parameter! exe "b" b-bytes)
   (test-assert "bound: the executable is complete after binding"
                (executable-bindings-complete? exe))
+  ;; Rebinding before the first successful run replaces the bytes.
+  (executable-bind-parameter! exe "b" b2-bytes)
+  (test-assert "a rebind before the first run replaces the bytes"
+               (bytevector=? (bound-bytes exe) b2-bytes))
+  ;; Binding copies: writing through the source afterwards changes nothing.
+  (let ((scratch (bytevector-copy b2-bytes)))
+    (executable-bind-parameter! exe "b" scratch)
+    (bytevector-fill! scratch 0)
+    (test-assert "binding copies: later writes to the source are not observed"
+                 (bytevector=? (bound-bytes exe) b2-bytes)))
+  (executable-bind-parameter! exe "b" b-bytes)
   (let-values (((out err) (executable-run exe x-input)))
     (test-assert "bound: run after binding succeeds" (and out (not err)))
     (test-assert "bound: the result equals the :values graph's"
@@ -209,7 +228,22 @@
   (test-equal "an update after the first forward is not re-bound"
               '(-4.0) (tensor->list (model-forward m x))))
 
-;; 10. With the executable cache disabled the graph is compiled per call and
+;; 10. A fresh model compiles a fresh executable and binds the current tensors,
+;;     while the first model keeps the bytes it bound.
+(let* ((l (linear-with '(1.0 0.0) '(0.0) 2 1))
+       (m1 (sequential l))
+       (x (make-tensor '(3.0 -4.0) '(1 2))))
+  (test-equal "the first model binds the current weight"
+              '(3.0) (tensor->list (model-forward m1 x)))
+  (tensor-set! (layer-parameter-ref l 'weight) 0 0.0)
+  (tensor-set! (layer-parameter-ref l 'weight) 1 1.0)
+  (test-equal "the first model keeps its binding after a weight edit"
+              '(3.0) (tensor->list (model-forward m1 x)))
+  (let ((m2 (sequential l)))
+    (test-equal "a fresh model binds the edited weight"
+                '(-4.0) (tensor->list (model-forward m2 x)))))
+
+;; 11. With the executable cache disabled the graph is compiled per call and
 ;;     bound from the current tensors each time.
 (let* ((m (sequential (linear-with '(1.0 0.0) '(0.0) 2 1)))
        (x (make-tensor '(3.0 -4.0) '(1 2))))

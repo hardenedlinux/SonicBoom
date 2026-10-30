@@ -26,6 +26,8 @@
  *   - run before binding is SB_ERR_BINDING;
  *   - wrong size / unknown name is SB_ERR_BINDING, NULL is SB_ERR_INTERNAL;
  *   - binding fills the slot, completes the bindings and makes run work;
+ *   - rebinding before the first successful run replaces the bytes;
+ *   - binding copies: later writes to the caller's buffer are not observed;
  *   - rebinding after the first successful run is SB_ERR_BINDING;
  *   - two executables bind independently (no shared state);
  *   - a parameter view shows the bound bytes and outlives the handle.
@@ -183,10 +185,31 @@ int main(void) {
         "a failed bind leaves the graph incomplete");
 
   /* --- a successful bind makes the graph runnable ------------------------- */
+  static const float B2[8] = {1, 1, 1, 1, 1, 1, 1, 1};
   check(sb_bind_parameter(exe, "b", B, sizeof(B), &err) == SB_OK,
         "bind_parameter: success");
   check(sb_bindings_complete(exe, &complete, &err) == SB_OK && complete == 1,
         "bindings_complete: complete after binding");
+
+  /* Rebinding before the first successful run replaces the bytes. */
+  check(sb_bind_parameter(exe, "b", B2, sizeof(B2), &err) == SB_OK,
+        "rebinding before the first run: success");
+  sb_storage *rebound = NULL;
+  const void *rb_data = NULL;
+  uint64_t rb_bytes = 0;
+  check(sb_executable_parameter_view(exe, 0, &rebound, &err) == SB_OK &&
+            sb_storage_data(rebound, &rb_data, &rb_bytes, &err) == SB_OK &&
+            rb_bytes == sizeof(B2) && memcmp(rb_data, B2, sizeof(B2)) == 0,
+        "the rebound bytes replace the first binding");
+  sb_storage_release(rebound);
+
+  /* Binding copies: writing through the caller's buffer afterwards changes
+     nothing. */
+  float scratch[8];
+  memcpy(scratch, B, sizeof(B));
+  check(sb_bind_parameter(exe, "b", scratch, sizeof(scratch), &err) == SB_OK,
+        "binding from a caller-owned buffer");
+  memset(scratch, 0, sizeof(scratch));
 
   /* The view observes the bound bytes without copying. */
   sb_storage *view = NULL;
@@ -197,7 +220,8 @@ int main(void) {
   check(sb_storage_data(view, &view_data, &view_bytes, &err) == SB_OK &&
             view_bytes == sizeof(B) &&
             memcmp(view_data, B, sizeof(B)) == 0,
-        "the view sees the bound bytes");
+        "the view sees the bound bytes, not later writes to the caller's "
+        "buffer");
 
   check(run_once(exe, out) && memcmp(out, EXPECTED, sizeof(EXPECTED)) == 0,
         "run after binding produces the :values result");
