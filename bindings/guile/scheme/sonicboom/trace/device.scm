@@ -16,10 +16,21 @@
 ;;; every tensor argument, and the device graph keeps those names. The
 ;;; interpreter in (sonicboom trace interp) is the reference this executes
 ;;; against.
+;;;
+;;; Ownership: a cached segment owns its native sb_executable. A caller that
+;;; looks one up receives a borrowed Scheme reference to the segment. Evicting
+;;; a segment (a different head state needs a fresh graph) only removes it from
+;;; the cache; the native executable stays alive for as long as any caller still
+;;; holds the segment, and is released by a guardian once the last reference is
+;;; gone. Runs of one segment are serialized by a per-segment mutex, because the
+;;; device graph owns one set of device buffers; different segments still run in
+;;; parallel.
 
 (define-module (sonicboom trace device)
   #:use-module (srfi srfi-1)
+  #:use-module (srfi srfi-9)
   #:use-module (ice-9 match)
+  #:use-module (ice-9 threads)
   #:use-module (rnrs bytevectors)
   #:use-module (system foreign)
   #:use-module (sonicboom ffi)
@@ -113,21 +124,72 @@
 
 ;;; --- compile (cached per text) ----------------------------------------------
 
+;; A compiled device graph. The record owns the native handle EXE. INPUTS,
+;; OUTPUTS and RESIDENT? describe the binding contract; STATE is (uploaded? .
+;; snapshot), a mutable pair: UPLOADED? records that the device holds this
+;; segment's resident inputs and SNAPSHOT holds, per resident input, the bytes
+;; of the value the device held after the last run (the input's own bytes for an
+;; input the graph does not update). A call whose resident bytes differ from the
+;; snapshot is running on a different head state; see run-device-executable.
+;;
+;; LOCK serializes every use of the native handle (a device graph owns one set
+;; of device buffers) and the STATE update. FREED? is claimed by whoever
+;; releases the handle first, so a duplicate compile dropped during insertion
+;; and the guardian's later reap cannot double-free.
+(define-record-type <device-segment>
+  (%make-device-segment exe inputs outputs resident state text lock freed)
+  device-segment?
+  (exe device-segment-exe)
+  (inputs device-segment-inputs)
+  (outputs device-segment-outputs)
+  (resident device-segment-resident)
+  (state device-segment-state)
+  (text device-segment-text)
+  (lock device-segment-lock)
+  (freed device-segment-freed? set-device-segment-freed!))
+
 ;; Alist text -> segment, compared with `equal?` so the same emitted text
 ;; shares one compiled graph. A traced function has a handful of segments, so
-;; a list is the right size. A segment is a vector:
-;;   #(exe inputs outputs resident? state text)
-;; RESIDENT? is a list parallel to INPUTS; STATE is (uploaded? . snapshot), a
-;; mutable pair: UPLOADED? records that the device holds this segment's
-;; resident inputs and SNAPSHOT holds, per resident input, the bytes of the
-;; value the device held after the last run (the input's own bytes for an input
-;; the graph does not update). A call whose resident bytes differ from the
-;; snapshot is running on a different head state; see run-device-executable.
+;; a list is the right size. The alist is only ever read or replaced under
+;; %segments-lock, and no native work happens while that lock is held.
 (define %segments '())
+(define %segments-lock (make-mutex))
+
+;; Evicted segments are released only when nothing can reach them any more.
+;; The guardian holds a weak reference; reap-device-segments! drains the ones
+;; the GC has collected and frees their handles. This is the same ownership
+;; rule as (sonicboom executable): a cache eviction never invalidates a handle
+;; a caller still holds.
+(define %segment-guardian (make-guardian))
+(define %segment-reap-lock (make-mutex))
+
+(define (release-device-segment! seg)
+  "Release SEG's native handle once. Idempotent: the loser of a double release
+observes the claimed flag and does nothing."
+  (unless (device-segment-freed? seg)
+    (set-device-segment-freed! seg #t)
+    (let ((p (device-segment-exe seg)))
+      (unless (null-pointer? p)
+        ((proc 'sb_executable_free) p)))))
+
+(define (reap-device-segments!)
+  "Release every evicted segment the GC has collected. Returns the count."
+  (let ((n 0))
+    (with-mutex %segment-reap-lock
+      (let loop ()
+        (let ((dead (%segment-guardian)))
+          (cond ((or (not dead) (null? dead)) n)
+                (else
+                 (release-device-segment! dead)
+                 (set! n (+ n 1))
+                 (loop))))))))
 
 (define (compiled-device-segments)
   "How many distinct segment texts have been compiled for the GPU."
-  (length %segments))
+  (lock-mutex %segments-lock)
+  (let ((n (length %segments)))
+    (unlock-mutex %segments-lock)
+    n))
 
 (define (compile-device text)
   (let ((doc-slot (make-slot))
@@ -142,23 +204,69 @@
       ((proc 'sb_document_free) (slot-ref doc-slot))
       (unless (sb-status-ok? st)
         (fail "sonicboom-device: compile failed" err-slot)))
-    (let* ((exe (slot-ref exe-slot))
-           (n-in (query-count exe 'in))
-           (n-out (query-count exe 'out))
-           (inputs (map (lambda (i) (query-info exe i 'in)) (iota n-in)))
-           (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out)))
-           (resident (map (lambda (i) (query-resident exe i)) (iota n-in))))
-      (unless (every (lambda (d) (car d)) inputs)
-        (error "sonicboom-device: the device graph does not name its inputs"))
-      (unless (every (lambda (d) (car d)) outputs)
-        (error "sonicboom-device: the device graph does not name its outputs"))
-      (vector exe inputs outputs resident (list #f '()) text))))
+    ;; From here the handle is owned by this procedure: if introspection fails,
+    ;; release it before propagating the error rather than leaking it.
+    (let ((exe (slot-ref exe-slot)))
+      (catch #t
+        (lambda ()
+          (let* ((n-in (query-count exe 'in))
+                 (n-out (query-count exe 'out))
+                 (inputs (map (lambda (i) (query-info exe i 'in)) (iota n-in)))
+                 (outputs (map (lambda (i) (query-info exe i 'out)) (iota n-out)))
+                 (resident (map (lambda (i) (query-resident exe i))
+                                (iota n-in))))
+            (unless (every (lambda (d) (car d)) inputs)
+              (error "sonicboom-device: the device graph does not name its inputs"))
+            (unless (every (lambda (d) (car d)) outputs)
+              (error "sonicboom-device: the device graph does not name its outputs"))
+            (let ((seg (%make-device-segment
+                        exe inputs outputs resident (list #f '()) text
+                        (make-mutex) #f)))
+              (%segment-guardian seg)
+              seg)))
+        (lambda (key . args)
+          ;; No segment record owns the handle yet, so release it directly.
+          ((proc 'sb_executable_free) exe)
+          (apply throw key args))))))
+
+(define (cache-lookup text)
+  (lock-mutex %segments-lock)
+  (let ((hit (assoc-ref %segments text)))
+    (unlock-mutex %segments-lock)
+    hit))
+
+(define (cache-remove! text)
+  "Remove TEXT's cache entry and return it. The segment remains owned by any
+caller that still holds it; nothing is released here."
+  (lock-mutex %segments-lock)
+  (let ((old (assoc-ref %segments text)))
+    (set! %segments (filter (lambda (p) (not (equal? (car p) text))) %segments))
+    (unlock-mutex %segments-lock)
+    old))
 
 (define (segment-for text)
-  (or (assoc-ref %segments text)
-      (let ((s (compile-device text)))
-        (set! %segments (acons text s %segments))
-        s)))
+  (let ((hit (cache-lookup text)))
+    (if (and hit (not (device-segment-freed? hit)))
+        hit
+        (let ((fresh (compile-device text)))
+          (lock-mutex %segments-lock)
+          (let ((race (assoc-ref %segments text)))
+            (if (and race (not (device-segment-freed? race)))
+                ;; Another thread won the race; drop ours and use the winner.
+                (begin (unlock-mutex %segments-lock)
+                       (release-device-segment! fresh)
+                       (reap-device-segments!)
+                       race)
+                (begin
+                  ;; Insert FRESH and drop every entry for TEXT, including a
+                  ;; released RACE the lookup refused, so the alist holds one
+                  ;; live entry per text.
+                  (set! %segments
+                        (acons text fresh
+                               (filter (lambda (p) (not (equal? (car p) text)))
+                                       %segments)))
+                  (unlock-mutex %segments-lock)
+                  fresh)))))))
 
 (define (reset-segment! text)
   "Replace the cached executable for TEXT with a freshly compiled one.
@@ -166,11 +274,13 @@
 The C ABI keeps the resident inputs in their device buffers and ignores their
 bytes once a run has uploaded them, so a cached executable cannot be pointed at
 a different head state. A fresh executable starts with nothing uploaded, and
-its first run uploads the whole leaf state (see run-device-executable)."
-  (let ((old (assoc-ref %segments text)))
-    (when old
-      ((proc 'sb_executable_free) (vector-ref old 0))))
-  (set! %segments (filter (lambda (p) (not (equal? (car p) text))) %segments))
+its first run uploads the whole leaf state (see run-device-executable).
+
+The replaced segment is only evicted, never freed: a caller that looked it up
+before this call keeps a valid handle. Its native executable is released by the
+guardian once the last holder drops it."
+  (cache-remove! text)
+  (reap-device-segments!)
   (segment-for text))
 
 ;;; --- ctensor <-> little-endian bytes ----------------------------------------
@@ -228,14 +338,23 @@ its first run uploads the whole leaf state (see run-device-executable)."
        (every (lambda (res bv snap) (or (not res) (equal? bv snap)))
               resident encoded (cdr state))))
 
+(define (call-with-segment-lock segment thunk)
+  "Run THUNK while holding SEGMENT's run lock. The lock also protects STATE."
+  (let ((lock (device-segment-lock segment)))
+    (dynamic-wind
+      (lambda () (lock-mutex lock))
+      thunk
+      (lambda () (unlock-mutex lock)))))
+
 (define (run-executable segment encoded synced?)
   "Run SEGMENT with ENCODED (the resident inputs' bytes, #f when synced), and
-record the resident state the device holds afterwards."
-  (let* ((exe (vector-ref segment 0))
-         (inputs (vector-ref segment 1))
-         (outputs (vector-ref segment 2))
-         (resident (vector-ref segment 3))
-         (state (vector-ref segment 4))
+record the resident state the device holds afterwards. The caller must hold
+SEGMENT's run lock (see run-device-executable)."
+  (let* ((exe (device-segment-exe segment))
+         (inputs (device-segment-inputs segment))
+         (outputs (device-segment-outputs segment))
+         (resident (device-segment-resident segment))
+         (state (device-segment-state segment))
          (in-bvs (map (lambda (bv res)
                         (if (and synced? res) #f bv))
                       encoded resident))
@@ -289,18 +408,33 @@ calls on a different head state (fresh parameter tensors of the same shape).
 The C ABI keeps a resident input in its device buffer and ignores the caller's
 bytes once it has been uploaded, so such a call is detected here by comparing
 the resident bytes with the state the device was left in, and the executable is
-rebuilt so the first run uploads the new head state."
-  (unless (and (vector? segment) (= 6 (vector-length segment)))
+rebuilt so the first run uploads the new head state.
+
+SEGMENT's run lock is held for the whole decision, native call and state update,
+so two callers never drive one set of device buffers at once. The stale path
+drops the lock before replacing the cache entry: the replacement is a different
+segment with its own lock, and evicting SEGMENT does not release it, so a
+concurrent holder keeps using the executable it already has."
+  (unless (device-segment? segment)
     (error "sonicboom-device: bad segment record"))
-  (let* ((inputs (vector-ref segment 1))
-         (resident (vector-ref segment 3))
-         (state (vector-ref segment 4))
-         (encoded (encode-inputs inputs ins-alist))
-         (synced? (resident-synced? state resident encoded)))
-    (if (and (car state) (not synced?))
-        (run-device-executable (reset-segment! (vector-ref segment 5))
+  (let ((outcome
+         (call-with-segment-lock
+          segment
+          (lambda ()
+            (when (device-segment-freed? segment)
+              (error "sonicboom-device: segment has already been released"))
+            (let* ((inputs (device-segment-inputs segment))
+                   (resident (device-segment-resident segment))
+                   (state (device-segment-state segment))
+                   (encoded (encode-inputs inputs ins-alist))
+                   (synced? (resident-synced? state resident encoded)))
+              (if (and (car state) (not synced?))
+                  'stale
+                  (run-executable segment encoded synced?)))))))
+    (if (eq? outcome 'stale)
+        (run-device-executable (reset-segment! (device-segment-text segment))
                                ins-alist)
-        (run-executable segment encoded synced?))))
+        outcome)))
 
 (define (device-executor)
   "An executor (text inputs) → outputs for trace-function #:executor."
