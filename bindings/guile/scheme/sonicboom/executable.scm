@@ -23,6 +23,9 @@
 ;;; a graph with (data :bound ...) parameters carries state supplied after the
 ;;; cache key is computed, so an owner of that state (a <model>, which owns one
 ;;; executable per input shape) must hold its own executable instead. The cache
+;;; enforces this: a freshly compiled executable with unfilled bindings is
+;;; returned to the caller and never enters the cache, so two independent
+;;; owners of the same bound graph text can never share bound state. The cache
 ;;; is never invalidated automatically; `clear-executable-cache!` drops every
 ;;; entry, but an entry a caller still holds stays alive until the caller
 ;;; drops it (the guardian then releases it).
@@ -95,6 +98,12 @@ that starts after the free sees the freed flag and fails instead."
        (let ((p (executable-ptr exe)))
          (unless (null-pointer? p)
            ((proc 'sb_executable_free) p))))))
+  ;; If EXE was a text-cache entry, drop it: a later lookup must not return a
+  ;; released handle. The cache's contract already forbids freeing its entries;
+  ;; this makes a contract violation self-correcting instead of leaving a stale
+  ;; entry behind. The executable lock is not held here (it was released
+  ;; above), so this never nests with a caller's executable operation.
+  (evict-cached-executable! exe)
   *unspecified*)
 
 ;;; --- GC fallback -------------------------------------------------------------
@@ -492,36 +501,85 @@ executable-run fails (returning #f and a message) until this is true."
 (define %cache (make-hash-table))       ; graph text -> <executable>
 (define %cache-lock (make-mutex))
 
-(define (cached-executable text)
-  "Return a compiled executable for TEXT, compiling it on first use. The
-executable is owned by the cache; do not free it. A cache hit returns the same
-object on every call for the same text.
+(define (evict-cached-executable! exe)
+  "Drop EXE's text-cache entry when the entry is EXE itself. Called by
+free-executable! after the handle is released, so a lookup that races a free
+either sees the entry before it is dropped (and gets a handle that run refuses
+for being freed) or compiles a fresh one — never a released entry."
+  (let ((text (executable-graph-text exe)))
+    (lock-mutex %cache-lock)
+    (when (eq? (hash-ref %cache text #f) exe)
+      (hash-remove! %cache text))
+    (unlock-mutex %cache-lock)))
 
-TEXT must be self-contained: :values and :external graphs qualify, but a graph
-with (data :bound ...) parameters does not, because the cached executable holds
-the bytes one caller bound. Give each such graph its own executable (as
-model-forward does) instead of going through this cache."
+(define (cached-executable/ownership text)
+  "Return (values EXE CACHE-OWNED?) for TEXT, compiling it on first use.
+
+A cache hit returns the same object on every call for the same text and
+CACHE-OWNED? is true: the cache holds the handle, so the caller must not free
+it. TEXT is self-contained when every parameter carries its bytes in the text
+(:values or :external, whose sidecar is copied at compile). A graph with
+(data :bound ...) parameters is not: a freshly compiled one has an unfilled
+slot, and the bytes its owner later binds are state the text key does not
+represent. Such an executable is returned uncached with CACHE-OWNED? false —
+two callers that emit the same bound text never share one executable — and its
+owner (the caller) releases it with free-executable! (run-s-expr/cached does
+this itself)."
   (let* ((hit (begin (lock-mutex %cache-lock)
                      (let ((h (hash-ref %cache text #f)))
                        (unlock-mutex %cache-lock)
                        h))))
     (if (and hit (not (executable-freed? hit)))
-        hit
+        (values hit #t)
         (let ((exe (compile-s-expr text)))
-          (lock-mutex %cache-lock)
-          (let ((race (hash-ref %cache text #f)))
-            (if (and race (not (executable-freed? race)))
-                ;; Another thread won the race; drop ours and use the winner.
-                (begin (unlock-mutex %cache-lock) (free-executable! exe) race)
-                (begin (hash-set! %cache text exe)
-                       (unlock-mutex %cache-lock)
-                       exe)))))))
+          (if (not (executable-bindings-complete? exe))
+              ;; A fresh compile reports incomplete bindings exactly when the
+              ;; graph declares a :bound parameter. Exclude that post-compile
+              ;; state from the global cache rather than invent a key for it.
+              (values exe #f)
+              (begin
+                (lock-mutex %cache-lock)
+                (let ((race (hash-ref %cache text #f)))
+                  (if (and race (not (executable-freed? race)))
+                      ;; Another thread won the race; drop ours and use the
+                      ;; winner.
+                      (begin (unlock-mutex %cache-lock)
+                             (free-executable! exe)
+                             (values race #t))
+                      (begin (hash-set! %cache text exe)
+                             (unlock-mutex %cache-lock)
+                             (values exe #t))))))))))
+
+(define (cached-executable text)
+  "Return a compiled executable for TEXT, compiling it on first use. A
+cacheable executable is owned by the cache; do not free it. A hit returns the
+same object on every call for the same text.
+
+TEXT must be self-contained: :values and :external graphs qualify, but a graph
+with (data :bound ...) parameters does not, because its bytes are supplied
+after compile and are not part of the text. Such a graph is still compiled and
+returned, but it is not cached: the returned executable is owned by the caller
+and should be freed with free-executable!. Give each such graph its own
+executable (as model-forward does) instead of going through this cache."
+  (call-with-values (lambda () (cached-executable/ownership text))
+    (lambda (exe _cache-owned?) exe)))
 
 (define (run-s-expr/cached text input-bv)
   "Like `run-s-expr`, but when `executable-cache-enabled` is true the compiled
-executable is cached by graph TEXT and reused across calls."
+executable is cached by graph TEXT and reused across calls.
+
+A text the cache refuses to own (a :bound graph, see cached-executable) is
+compiled for this call only and released as soon as the run returns, so
+repeated calls cannot accumulate handles or share bound state."
   (if (executable-cache-enabled)
-      (executable-run (cached-executable text) input-bv)
+      (call-with-values (lambda () (cached-executable/ownership text))
+        (lambda (exe cache-owned?)
+          (if cache-owned?
+              (executable-run exe input-bv)
+              (call-with-values (lambda () (executable-run exe input-bv))
+                (lambda (out err)
+                  (free-executable! exe)
+                  (values out err))))))
       (run-s-expr text input-bv)))
 
 (define (clear-executable-cache!)
