@@ -461,7 +461,10 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
           }
         }
         Record& r = recs[slot];
-        std::memset(&r, 0, sizeof(r));
+        // Value-initialize: the key arrays become empty strings and every
+        // field below overwrites its default. (memset is not valid on Record:
+        // TileConfig has a non-trivial default constructor.)
+        r = Record{};
         set_field(r.op, kOpBytes, op);
         set_field(r.shape, kShapeBytes, shape_class);
         r.sm = sm_version();
