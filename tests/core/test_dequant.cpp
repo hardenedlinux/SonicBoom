@@ -509,6 +509,11 @@ void test_differential_model() {
             reinterpret_cast<const baseline::block_q6_K*>(sub.data()), ref.data(),
             int64_t(n_blocks * 256));
         break;
+      case sbquant::QuantType::Q5_0:
+      case sbquant::QuantType::Q8_0:
+        // The sampled tensors are K-quants; these types have no reference path
+        // here, so skip rather than compare two untouched buffers.
+        return;
     }
 
     for (uint64_t i = 0; i < n_blocks * 256; ++i)

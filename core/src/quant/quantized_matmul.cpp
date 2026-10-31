@@ -454,6 +454,11 @@ BlockDotFn block_dot_for(QuantType type) {
       case QuantType::Q4_K: return dot_q4_K_block_avx2;
       case QuantType::Q5_K: return dot_q5_K_block_avx2;
       case QuantType::Q6_K: return dot_q6_K_block;
+      case QuantType::Q5_0:
+      case QuantType::Q8_0:
+        // Not K-quants: they have their own matvec (block_dot_q8 path above)
+        // and no block-dot entry here.
+        return nullptr;
     }
     return nullptr;
   }
@@ -462,6 +467,9 @@ BlockDotFn block_dot_for(QuantType type) {
     case QuantType::Q4_K: return dot_q4_K_block;
     case QuantType::Q5_K: return dot_q5_K_block;
     case QuantType::Q6_K: return dot_q6_K_block;
+    case QuantType::Q5_0:
+    case QuantType::Q8_0:
+      return nullptr;
   }
   return nullptr;
 }
