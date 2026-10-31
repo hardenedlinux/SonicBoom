@@ -806,7 +806,8 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
       iw += pl + pr;
     }
     const std::int64_t out_elems = out[0] * out[1] * out[2] * out[3];
-    if (out_elems > s.index_scratch_entries)
+    if (out_elems < 0 ||
+        static_cast<std::uint64_t>(out_elems) > s.index_scratch_entries)
       return fail("pooling output exceeds the compile-time index scratch");
     if (!cpu::detail::aten_cpu_max_pool2d(
             f32(n.outputs[0]), s.index_scratch, src, x[0], x[1], ih, iw,
@@ -1586,7 +1587,7 @@ load_external_weights(const Document& doc, const std::string& base_dir) {
 
     const std::int64_t expected =
         numel(p.type) * static_cast<std::int64_t>(dtype_size(p.type.dtype));
-    if (external->length != static_cast<std::uint64_t>(expected)) {
+    if (external->length < 0 || external->length != expected) {
       return std::unexpected(
           ExecError{ExecErrorKind::Weight,
                     "parameter '" + p.name + "' declares " +
