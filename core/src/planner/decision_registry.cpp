@@ -378,7 +378,7 @@ constexpr KnobRow kKnobRows[] = {
      0, 0},
     {"mmq.tc-max-mb", "SONICBOOM_MMQ_TC_MAX_MB", "2048", "MiB",
      "q8_1 weight-copy budget for the tensor-core path", "none (VRAM only)",
-     2048 * 1024 * 1024, 0},
+     2048LL * 1024 * 1024, 0},
     {"async.vram-threshold-mb", "SONICBOOM_VRAM_THRESHOLD_MB", "6000", "MiB",
      "prefetch only above this VRAM threshold", "none (VRAM only)", 0, 0},
     {"glue.cache", "SONICBOOM_GLUE_CACHE", "on", "on|off",
