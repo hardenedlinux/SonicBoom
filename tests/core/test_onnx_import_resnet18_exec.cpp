@@ -31,7 +31,7 @@
 // fresh checkout. To run the importer by hand (see
 // docs/onnx-to-s-expr-importer.md):
 //
-//   PYTHONPATH=tools models/.venv/bin/python -m onnx2sx models/resnet18.onnx \
+//   PYTHONPATH=tools models/.venv/bin/python -m onnx2sx models/resnet18.onnx
 //       -o build/import/resnet18.sx --weights-dir build/import
 
 #include <sonicboom/sx/exec.h>
