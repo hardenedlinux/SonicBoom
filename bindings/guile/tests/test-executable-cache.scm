@@ -21,8 +21,10 @@
 ;;;     its sidecar changes, because the bytes are copied at compile time;
 ;;;   * free-executable! evicts the corresponding cache entry, so a later
 ;;;     lookup compiles a fresh handle instead of returning a released one;
-;;;   * repeated compile / evict / release stays correct (leak-checked under
-;;;     ASan/LSan in the quality gate).
+;;;   * repeated compile / evict / release stays correct. The quality gate runs
+;;;     this suite under ASan/UBSan; Guile-level leak detection is disabled
+;;;     there (libguile is uninstrumented), so this checks correctness, not
+;;;     heap accounting.
 ;;;
 ;;; Internal cache-table invariants and race orchestration live in the private
 ;;; suite.
