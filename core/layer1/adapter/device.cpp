@@ -42,6 +42,10 @@ Device from_aten(const c10::Device& d) {
       // v0 uses the explicit index, normalizing -1 to 0).
       return Device{DeviceType::CUDA,
                     d.index() < 0 ? 0 : static_cast<int32_t>(d.index())};
+    default:
+      // Every other c10 device type is outside the Layer 2 contract; the
+      // check below turns it into an error rather than a silent mapping.
+      break;
   }
   TORCH_CHECK(false, "unsupported c10::DeviceType");
   return Device{DeviceType::CPU, 0}; // unreachable

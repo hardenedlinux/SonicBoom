@@ -575,7 +575,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
                          << "'";
         return std::nullopt;
       }
-      n.backend = *tag;
+      n.backend = tag;
     }
 
     graph.nodes.push_back(std::move(n));

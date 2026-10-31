@@ -273,7 +273,7 @@ std::expected<void, PlannerError> MemoryPlanner::plan_memory(
                      Phase::Memory);
       e.context.memory_space = space_id;
       e.context.required_bytes = peak;
-      e.context.available_bytes = *budget;
+      e.context.available_bytes = budget;
       return std::unexpected(std::move(e));
     }
   }

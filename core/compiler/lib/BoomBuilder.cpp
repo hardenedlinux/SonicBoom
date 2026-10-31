@@ -382,8 +382,8 @@ int64_t BoomBuilder::addTensor(llvm::StringRef name, llvm::ArrayRef<int64_t> sha
   const int64_t id = int64_t(table_.size());
   table_.push_back(boom::TensorDescAttr::get(
       context_, id, shape, sx::dtype_name(dtype), size_bytes,
-      /*dynamic_base_bytes=*/0, /*is_graph_input=*/is_input,
-      /*is_graph_output=*/false, /*is_constant=*/false,
+      /*dynamic_base_bytes=*/0, /*is_input=*/is_input,
+      /*is_output=*/false, /*is_constant=*/false,
       /*is_external=*/false, name));
   if (is_input)
     inputs_.push_back(id);
@@ -488,7 +488,7 @@ void BoomBuilder::set_output(mlir::Value value) {
   table_[*id] = boom::TensorDescAttr::get(
       context_, *id, desc.getShape(), desc.getDtype(), desc.getByteSize(),
       desc.getDynamicBaseBytes(), desc.getIsInput(),
-      /*is_graph_output=*/true, desc.getIsConstant(), desc.getIsExternal(),
+      /*is_output=*/true, desc.getIsConstant(), desc.getIsExternal(),
       desc.getName());
   outputs_.assign(1, *id);
 }
