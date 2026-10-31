@@ -35,8 +35,6 @@
 
 namespace sonicboom::compiler {
 
-namespace boom = sonicboom::compiler::boom;
-
 namespace {
 
 // The typed view of a node's attributes: the names ODS declares, which are the

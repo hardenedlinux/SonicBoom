@@ -45,8 +45,6 @@
 
 namespace sonicboom::compiler {
 
-namespace boom = sonicboom::compiler::boom;
-
 namespace {
 
 // One tensor as the document defines it. The flags are the TensorDesc fields

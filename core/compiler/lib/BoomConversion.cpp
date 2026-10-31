@@ -40,7 +40,6 @@
 
 namespace sonicboom::compiler {
 
-namespace boom = sonicboom::compiler::boom;
 using planner::BackendTag;
 using planner::Graph;
 using planner::GraphNodeDesc;
