@@ -1755,7 +1755,6 @@ private:
       const uint32_t mask = todo.back();
       todo.pop_back();
       if (pair_rules.count(mask)) continue;
-      const std::string name = tag + "_s" + std::to_string(mask);
       const std::string p_name = tag + "_p_s" + std::to_string(mask);
       const bool complete = (mask & required_mask) == required_mask;
       std::vector<std::string> alts;

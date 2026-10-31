@@ -96,12 +96,16 @@ void AsyncPrefetchRuntime::begin(int layer, uint64_t bytes) {
 void AsyncPrefetchRuntime::wait(int layer) {
   if (!enabled()) return;
 
+#ifdef SONICBOOM_USE_CUDA
   void* stream = nullptr;
+#endif
   {
     std::lock_guard<std::mutex> lock(mutex_);
     ++waits_;
     if (policy_) policy_->touch(layer);
+#ifdef SONICBOOM_USE_CUDA
     stream = stream_;
+#endif
   }
 #ifdef SONICBOOM_USE_CUDA
   // Nothing is queued on the stream yet; the synchronization is the hook the

@@ -1183,6 +1183,9 @@ bool DeviceTrainingGraph::run(const std::byte* const* input_data,
                               std::vector<std::vector<std::byte>>* outputs,
                               std::string* error) {
 #ifndef SONICBOOM_USE_CUDA
+  (void)input_data;
+  (void)input_sizes;
+  (void)outputs;
   if (error) *error = "SonicBoom was built without CUDA";
   return false;
 #else
@@ -1264,6 +1267,11 @@ bool DeviceTrainingGraph::run_resident(
     const std::size_t* download, std::size_t num_download,
     std::vector<std::vector<std::byte>>* outputs, std::string* error) {
 #ifndef SONICBOOM_USE_CUDA
+  (void)input_data;
+  (void)input_sizes;
+  (void)download;
+  (void)num_download;
+  (void)outputs;
   if (error) *error = "SonicBoom was built without CUDA";
   return false;
 #else

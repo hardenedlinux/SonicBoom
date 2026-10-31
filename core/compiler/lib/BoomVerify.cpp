@@ -841,7 +841,6 @@ mlir::LogicalResult StepOp::verify() {
   // 5. Walk the nodes: every operand resolves to a block argument or an earlier
   //    node's result, and a handle operand obeys the cache-op rule.
   for (Operation &op : block) {
-    const llvm::StringRef opName = op.getName().getStringRef();
     bool sawKvHandle = false;
     for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
       if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {

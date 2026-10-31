@@ -507,8 +507,8 @@ std::expected<DitSample, std::string> DiffusionTransformer::forward(
     const std::vector<int64_t>& skip_layers, DitDebug* debug) const {
   Impl& m = *impl_;
   const DitConfig& cfg = m.cfg;
-  const int64_t dim = cfg.dim, hd = cfg.head_dim(), heads = cfg.num_heads;
-  const int64_t ffn = cfg.ffn_dim, channels = cfg.latent_channels;
+  const int64_t dim = cfg.dim, hd = cfg.head_dim();
+  const int64_t channels = cfg.latent_channels;
   if (height <= 0 || width <= 0) return std::unexpected("forward: bad latent grid");
   if (text_len <= 0) return std::unexpected("forward: empty text sequence");
   const int64_t hw = height * width;
