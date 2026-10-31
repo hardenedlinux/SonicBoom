@@ -1,0 +1,7 @@
+# Valgrind Memcheck suppressions for the SonicBoom quality gate.
+#
+# Policy: suppress only known third-party runtime behavior, with a stack from a
+# saved memory-*.log and a date/commit. SonicBoom-owned allocations and invalid
+# accesses are never suppressed.
+#
+# Intentionally empty until a measured entry is needed.

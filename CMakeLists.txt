@@ -85,6 +85,23 @@ if(SONICBOOM_SANITIZE)
   if("undefined" IN_LIST SONICBOOM_SANITIZE)
     set(SONICBOOM_SANITIZE_COMPILE_EXTRA "-fno-sanitize=vptr")
   endif()
+
+  # Mixed-instrumentation accommodation. llvm/Support/Compiler.h defines
+  # LLVM_ADDRESS_SANITIZER_BUILD from the *including* translation unit's
+  # __SANITIZE_ADDRESS__, and llvm::BumpPtrAllocatorImpl then poisons slabs it
+  # hands out. SonicBoom passes MLIR contexts and attributes across the Layer 1
+  # boundary to the uninstrumented MLIR libraries, which allocate from the same
+  # bump allocator but have no unpoison calls; a slab first started by an
+  # instrumented inline allocation turns every later uninstrumented MLIR
+  # allocation into a use-after-poison report (observed in
+  # test_blade_to_boom and guile-inference). Undefining the macro in
+  # SonicBoom-owned TUs keeps LLVM's allocator inert there. ASan
+  # instrumentation itself comes from -fsanitize, not from this macro, so
+  # SonicBoom code remains fully instrumented.
+  set(SONICBOOM_SANITIZE_INCL_EXTRA "")
+  if("address" IN_LIST SONICBOOM_SANITIZE)
+    set(SONICBOOM_SANITIZE_INCL_EXTRA "-U__SANITIZE_ADDRESS__")
+  endif()
 endif()
 
 # Apply the sanitizer flags to one SonicBoom-owned target. Called from the
@@ -101,6 +118,7 @@ function(sonicboom_sanitize target)
   target_compile_options(${target} PRIVATE
     "$<$<COMPILE_LANGUAGE:C,CXX>:${SONICBOOM_SANITIZE_FLAGS}>"
     "$<$<COMPILE_LANGUAGE:C,CXX>:${SONICBOOM_SANITIZE_COMPILE_EXTRA}>"
+    "$<$<COMPILE_LANGUAGE:C,CXX>:${SONICBOOM_SANITIZE_INCL_EXTRA}>"
     "$<$<COMPILE_LANGUAGE:C,CXX>:-fno-omit-frame-pointer>")
   target_link_options(${target} PRIVATE ${SONICBOOM_SANITIZE_FLAGS})
 endfunction()

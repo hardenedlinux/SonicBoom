@@ -24,6 +24,12 @@
              (sonicboom ffi)
              (sonicboom image))
 
+(define (cuda-build?)
+  ;; The image path needs a CUDA-enabled build, not merely a GPU present on
+  ;; the host: a CPU-only libsonicboom.so has no VAE decoder.
+  (let ((cuda (assq-ref (build-info) 'cuda)))
+    (and cuda (eq? (assq-ref cuda 'enabled) #t))))
+
 (define (find-model)
   (let ((cands
          (filter (lambda (p) (and p (file-exists? p)
@@ -51,7 +57,8 @@
 (let ((dir (find-model)))
   (if (or (not dir)
           (not (file-exists? "/dev/nvidia0"))
-          (not (libsonicboom-available?)))
+          (not (libsonicboom-available?))
+          (not (cuda-build?)))
       (test-skip 10)
       (let* ((model (load-image-model dir))
              (w 64) (h 64))

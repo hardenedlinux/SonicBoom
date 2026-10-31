@@ -1,0 +1,11 @@
+# LeakSanitizer suppressions for the SonicBoom quality gate.
+#
+# Policy: suppress only allocations whose root is outside SonicBoom ownership
+# (uninstrumented runtimes or their process-lifetime singletons). A leak rooted
+# in core/, capi/, or a compiled graph must fail the gate.
+#
+# This file is intentionally empty until a measured, reproducible third-party
+# singleton requires an entry. Add a suppression only with:
+#   * the exact stack (from .quality/logs/<run>/sanitizers-lsan-ctest.log)
+#   * why the allocation is process-lifetime / owned by an external runtime
+#   * the date and the commit at which it was observed

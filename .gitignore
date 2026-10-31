@@ -1,6 +1,10 @@
 # build outputs
 /build/
 /build-nocuda/
+# quality-gate build trees, logs, and CI caches (tools/quality/)
+/.quality/
+/.ccache/
+/.soniccross/
 # SONICBOOM_SANITIZE builds (root CMakeLists.txt)
 /build-asan/
 /build-tsan/

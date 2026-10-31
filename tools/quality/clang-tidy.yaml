@@ -1,0 +1,36 @@
+---
+# clang-tidy configuration for the SonicBoom quality gate.
+#
+# HeaderFilterRegex limits diagnostics to SonicBoom-owned headers; clang-tidy
+# still parses third_party/native-torch and MLIR/LLVM headers as inputs.
+#
+# The intentionally disabled checks are either noisy in tensor code
+# (swappable parameters, narrowing arithmetic) or fire on vendored-style
+# identifiers/macros.
+#
+# performance-enum-size is disabled because changing an enum's base type
+# changes the C ABI: the public enums are deliberately int-sized and the ABI
+# target is stable, so the suggestion is not actionable here.
+#
+# Keep this list comment-free. clang-tidy parses Checks line by line rather
+# than as YAML, so an inline `#` becomes part of the glob list and silently
+# disables every entry after it.
+Checks: >
+  -*,
+  bugprone-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-reserved-identifier,
+  -bugprone-branch-clone,
+  -bugprone-macro-parentheses,
+  -performance-inefficient-vector-operation,
+  -performance-enum-size,
+  -portability-avoid-pragma-once,
+  -portability-simd-intrinsics
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|/)(core|capi)/'
+FormatStyle: none

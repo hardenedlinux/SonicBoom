@@ -87,18 +87,26 @@ file(GLOB_RECURSE SONICBOOM_QUANT_SOURCES CONFIGURE_DEPENDS
 # path. No ggml, llama.cpp, MLIR, or device backend.
 file(GLOB_RECURSE SONICBOOM_NN_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/*.cpp)
+# fattn_jit.cpp is the host-side NVRTC JIT for boom_fattn. It includes
+# <cuda_runtime.h> and the configure-time generated fattn_device_src.inc, so it
+# is compiled only when SONICBOOM_USE_CUDA is ON. Exclude it from the
+# unconditional nn glob; it is re-added in the CUDA block below.
+list(REMOVE_ITEM SONICBOOM_NN_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/fattn_jit.cpp)
 
 # Gemma 4 model subsystem (core/src/model/): the explicit model loader + config,
 # weight binding, 42-layer plan, and the per-layer embedding / single-block
 # reference execution path. Pure C++23, depends only on gguf + quant + nn.
 file(GLOB_RECURSE SONICBOOM_MODEL_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/model/*.cpp)
-# cuda_block.cpp is host-only orchestration (no device kernels) but depends on
-# <cuda_runtime.h> and the CUDA _dev primitives, so it is compiled by g++
-# (C++23) instead of nvcc (C++20) and only built when SONICBOOM_USE_CUDA is ON.
-# Exclude it from the unconditional model glob; it is re-added in the CUDA block.
+# cuda_block.cpp and moss_dit_cuda.cpp are host-only orchestration (no device
+# kernels) but depend on <cuda_runtime.h> and the CUDA _dev primitives, so they
+# are compiled by g++ (C++23) instead of nvcc (C++20) and only built when
+# SONICBOOM_USE_CUDA is ON. Exclude them from the unconditional model glob;
+# they are re-added in the CUDA block.
 list(REMOVE_ITEM SONICBOOM_MODEL_SOURCES
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cpp)
 
 # CPU thread pool (core/src/thread_pool.cpp): a process-wide, SonicBoom-owned
 # data-parallel executor used by the quantized matmul (and later the elementwise

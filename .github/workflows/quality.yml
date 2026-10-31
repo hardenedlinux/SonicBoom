@@ -1,0 +1,110 @@
+name: Quality Gate
+
+# CPU-only quality gate. GPU checks (compute-sanitizer) are intentionally not
+# part of this workflow: GitHub-hosted runners have no GPU, and the gate must
+# never report a GPU check as passing when it could not run.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 1G
+      SONICBOOM_QUALITY_JOBS: 4
+      # GCC -fanalyzer needs several GiB per translation unit on MLIR-heavy
+      # files; the hosted runner has 16 GiB, so analyze one TU at a time.
+      SONICBOOM_QUALITY_ANALYZER_JOBS: 1
+      SONICBOOM_MLIR_PREFIX: ${{ github.workspace }}/build/llvm-mlir-install
+      SONICCROSS_GUILD: ${{ github.workspace }}/.soniccross/bin/guild
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve LLVM/MLIR submodule revision
+        id: llvm-rev
+        run: echo "sha=$(git rev-parse HEAD:third_party/llvm-project)" >> "$GITHUB_OUTPUT"
+
+      # The install is ~2.9 GiB uncompressed; the cache is keyed by the pinned
+      # submodule commit and the in-tree build script. A miss builds it from
+      # third_party/llvm-project (no external LLVM download).
+      - name: Restore in-tree MLIR install
+        id: mlir-cache
+        uses: actions/cache@v4
+        with:
+          path: build/llvm-mlir-install
+          key: mlir-${{ steps.llvm-rev.outputs.sha }}-${{ runner.os }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            g++-13 gcc-13 cmake ninja-build ccache \
+            guile-3.0 guile-3.0-dev autoconf automake libtool pkg-config \
+            clang-19 clang-tidy-19
+
+      # Shallow clones only: the four native-torch submodules are always
+      # needed; llvm-project is fetched only when the MLIR cache misses.
+      - name: Check out native-torch submodules (shallow)
+        run: |
+          git submodule update --init --depth 1 --jobs 4 -- \
+            third_party/native-torch/third_party/cpuinfo \
+            third_party/native-torch/third_party/sleef \
+            third_party/native-torch/third_party/FP16 \
+            third_party/native-torch/third_party/fmt
+
+      - name: Build MLIR from the in-tree submodule
+        if: steps.mlir-cache.outputs.cache-hit != 'true'
+        run: |
+          git submodule update --init --depth 1 --jobs 4 -- third_party/llvm-project
+          tools/mlir/build-mlir.sh
+
+      - name: Restore SonicCross
+        id: soniccross-cache
+        uses: actions/cache@v4
+        with:
+          path: .soniccross
+          key: soniccross-v0.0.2-${{ runner.os }}
+
+      - name: Build SonicCross v0.0.2
+        if: steps.soniccross-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v0.0.2 \
+            https://github.com/hardenedlinux/SonicCross .soniccross-src
+          cd .soniccross-src
+          ./bootstrap
+          ./configure --prefix="$GITHUB_WORKSPACE/.soniccross"
+          make -j"$(nproc)"
+          make install
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Run CPU quality gate
+        run: tools/quality/run.sh ci
+
+      - name: Upload quality logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-logs
+          path: .quality/logs
+          if-no-files-found: ignore

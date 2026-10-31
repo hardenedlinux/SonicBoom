@@ -366,9 +366,9 @@ std::vector<DiskChoice> disk_choices() {
   return out;
 }
 
+#ifdef SONICBOOM_USE_CUDA
 double median_launch_ms(const std::function<bool()> &launch,
                         cudaStream_t stream, int warmups, int reps) {
-#ifdef SONICBOOM_USE_CUDA
   for (int i = 0; i < warmups; ++i) {
     // A candidate that cannot launch is dropped after one attempt; the loader
     // has already reported why, and retrying would repeat the message.
@@ -403,12 +403,15 @@ double median_launch_ms(const std::function<bool()> &launch,
   if (samples.empty()) return -1.0;
   std::sort(samples.begin(), samples.end());
   return samples[samples.size() / 2];
+}
 #else
+double median_launch_ms(const std::function<bool()> &launch, int warmups,
+                        int reps) {
   (void)launch;
   (void)warmups;
   (void)reps;
   return -1.0;
-#endif
 }
+#endif
 
 } // namespace sonicboom::tune

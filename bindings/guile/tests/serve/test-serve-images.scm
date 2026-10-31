@@ -26,7 +26,8 @@
              (rnrs bytevectors)
              (web client)
              (web response)
-             (json))
+             (json)
+             (sonicboom ffi))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Preconditions
@@ -39,11 +40,17 @@
 (define (artanis-available?)
   (catch #t (lambda () (resolve-interface '(artanis artanis)) #t) (lambda _ #f)))
 
+(define (cuda-build?)
+  ;; A CPU-only libsonicboom.so has no VAE decoder even on a GPU host.
+  (let ((cuda (assq-ref (build-info) 'cuda)))
+    (and cuda (eq? (assq-ref cuda 'enabled) #t))))
+
 (unless (and (artanis-available?)
              (file-exists? (string-append model-dir "/transformer"))
-             (file-exists? "/dev/nvidia0"))
+             (file-exists? "/dev/nvidia0")
+             (cuda-build?))
   (format (current-error-port)
-          "SKIP: needs GNU Artanis, ~a/transformer and a CUDA device~%"
+          "SKIP: needs GNU Artanis, ~a/transformer and a CUDA-enabled build~%"
           model-dir)
   (exit 0))
 

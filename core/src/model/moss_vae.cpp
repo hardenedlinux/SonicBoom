@@ -104,7 +104,9 @@ struct VaeDecoder::Impl {
   ~Impl() { free_all(); }
 
   void free_all() {
+#if defined(SONICBOOM_USE_CUDA)
     for (float* p : all_) cudaFree(p);
+#endif
     all_.clear();
   }
 
