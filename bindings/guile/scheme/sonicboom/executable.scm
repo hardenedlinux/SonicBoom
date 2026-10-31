@@ -19,21 +19,30 @@
 ;;;
 ;;; `run-s-expr/cached` is a drop-in replacement for `run-s-expr` that keys a
 ;;; process-wide cache by graph text (enable/disable with the
-;;; `executable-cache-enabled` parameter). It is only for self-contained text:
-;;; a graph with (data :bound ...) parameters carries state supplied after the
-;;; cache key is computed, so an owner of that state (a <model>, which owns one
-;;; executable per input shape) must hold its own executable instead. The cache
-;;; enforces this: a freshly compiled executable with unfilled bindings is
-;;; returned to the caller and never enters the cache, so two independent
-;;; owners of the same bound graph text can never share bound state. The cache
-;;; is never invalidated automatically; `clear-executable-cache!` drops every
-;;; entry, but an entry a caller still holds stays alive until the caller
-;;; drops it (the guardian then releases it).
+;;; `executable-cache-enabled` parameter). It is only for text whose compiled
+;;; executable is fully determined by that text:
+;;;
+;;;   - (data :bound ...) parameters carry state supplied after the cache key
+;;;     is computed, so an owner of that state (a <model>, which owns one
+;;;     executable per input shape) must hold its own executable instead.
+;;;   - (data :external ...) parameters resolve a sidecar at compile time
+;;;     relative to the process working directory and copy its bytes in, so
+;;;     the same text can yield different executables. The cache is keyed by
+;;;     text, not by file contents.
+;;;
+;;; The cache enforces both: a freshly compiled executable with unfilled
+;;; bindings, or a text naming an :external sidecar, is returned to the caller
+;;; and never enters the cache, so two independent owners of the same graph
+;;; text can never share bound state or another directory's sidecar bytes.
+;;; The cache is never invalidated automatically; `clear-executable-cache!`
+;;; drops every entry, but an entry a caller still holds stays alive until the
+;;; caller drops it (the guardian then releases it).
 
 (define-module (sonicboom executable)
   #:use-module (system foreign)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-9)
+  #:use-module (srfi srfi-13)
   #:use-module (srfi srfi-34)
   #:use-module (ice-9 hash-table)
   #:use-module (ice-9 threads)
@@ -512,19 +521,37 @@ for being freed) or compiles a fresh one — never a released entry."
       (hash-remove! %cache text))
     (unlock-mutex %cache-lock)))
 
+(define (graph-has-external-data? text)
+  "True when TEXT names the :external parameter-data tag.
+
+This is deliberately lexical: the text cache key is graph text, and the S-Expr
+parser accepts only the exact symbol `:external` for this data kind, so a text
+containing that token may resolve a sidecar. A false positive (the token in a
+string or comment) only declines to cache the text, which is safe."
+  (and (string? text)
+       (string-contains text ":external")
+       #t))
+
 (define (cached-executable/ownership text)
   "Return (values EXE CACHE-OWNED?) for TEXT, compiling it on first use.
 
 A cache hit returns the same object on every call for the same text and
 CACHE-OWNED? is true: the cache holds the handle, so the caller must not free
-it. TEXT is self-contained when every parameter carries its bytes in the text
-(:values or :external, whose sidecar is copied at compile). A graph with
-(data :bound ...) parameters is not: a freshly compiled one has an unfilled
-slot, and the bytes its owner later binds are state the text key does not
-represent. Such an executable is returned uncached with CACHE-OWNED? false —
-two callers that emit the same bound text never share one executable — and its
-owner (the caller) releases it with free-executable! (run-s-expr/cached does
-this itself)."
+it. The cache is used only when the executable is fully determined by the
+text:
+
+  - A graph with (data :bound ...) parameters has an unfilled slot at compile;
+    the bytes its owner later binds are state the text key does not represent.
+  - A graph with (data :external ...) parameters copies a sidecar's bytes in at
+    compile; the path is resolved against the working directory, so the same
+    text can denote different bytes in different directories or after the file
+    changes.
+
+Either kind is returned uncached with CACHE-OWNED? false — two callers with the
+same text never share one executable, hence never share bound state or another
+directory's sidecar bytes. Its owner (the caller) releases it with
+free-executable! (run-s-expr/cached does this itself). :values graphs are
+cached."
   (let* ((hit (begin (lock-mutex %cache-lock)
                      (let ((h (hash-ref %cache text #f)))
                        (unlock-mutex %cache-lock)
@@ -532,10 +559,14 @@ this itself)."
     (if (and hit (not (executable-freed? hit)))
         (values hit #t)
         (let ((exe (compile-s-expr text)))
-          (if (not (executable-bindings-complete? exe))
-              ;; A fresh compile reports incomplete bindings exactly when the
-              ;; graph declares a :bound parameter. Exclude that post-compile
-              ;; state from the global cache rather than invent a key for it.
+          (if (or (graph-has-external-data? text)
+                  (not (executable-bindings-complete? exe)))
+              ;; Two uncacheable kinds. :external graphs copy a sidecar resolved
+              ;; against the working directory at compile; the text key does not
+              ;; capture those bytes. A fresh compile reports incomplete
+              ;; bindings exactly when the graph declares :bound parameters; the
+              ;; bytes bound later are not in the key either. Exclude both rather
+              ;; than invent a key for state the text does not represent.
               (values exe #f)
               (begin
                 (lock-mutex %cache-lock)
@@ -555,12 +586,14 @@ this itself)."
 cacheable executable is owned by the cache; do not free it. A hit returns the
 same object on every call for the same text.
 
-TEXT must be self-contained: :values and :external graphs qualify, but a graph
-with (data :bound ...) parameters does not, because its bytes are supplied
-after compile and are not part of the text. Such a graph is still compiled and
-returned, but it is not cached: the returned executable is owned by the caller
-and should be freed with free-executable!. Give each such graph its own
-executable (as model-forward does) instead of going through this cache."
+TEXT must be self-contained: :values graphs qualify, but the cache does not own
+two other kinds. A graph with (data :bound ...) parameters has bytes supplied
+after compile; a graph with (data :external ...) parameters has sidecar bytes
+resolved from the working directory at compile. Neither is represented by the
+text key. Both kinds are still compiled and returned, but they are not cached:
+the returned executable is owned by the caller and should be freed with
+free-executable!. Give each such graph its own executable (as model-forward
+does) instead of going through this cache."
   (call-with-values (lambda () (cached-executable/ownership text))
     (lambda (exe _cache-owned?) exe)))
 
@@ -568,9 +601,10 @@ executable (as model-forward does) instead of going through this cache."
   "Like `run-s-expr`, but when `executable-cache-enabled` is true the compiled
 executable is cached by graph TEXT and reused across calls.
 
-A text the cache refuses to own (a :bound graph, see cached-executable) is
-compiled for this call only and released as soon as the run returns, so
-repeated calls cannot accumulate handles or share bound state."
+A text the cache refuses to own (a :bound or :external graph, see
+cached-executable) is compiled for this call only and released as soon as the
+run returns, so repeated calls cannot accumulate handles, share bound state, or
+reuse another directory's sidecar bytes."
   (if (executable-cache-enabled)
       (call-with-values (lambda () (cached-executable/ownership text))
         (lambda (exe cache-owned?)
