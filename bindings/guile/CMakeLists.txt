@@ -202,6 +202,20 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-model-concurrency.scm)
 
+  # guile-executable-cache pins the externally observable text-cache contracts:
+  # :values graphs are shared, :bound graphs never are, :external graphs are
+  # never reused across working directories or changed sidecars, and
+  # free-executable! evicts the entry so a later lookup cannot return a
+  # released handle.
+  add_test(
+    NAME guile-executable-cache
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-executable-cache.scm)
+
   # guile-trace-lower lowers a traced forward graph onto the S-Expr v0.1
   # vocabulary and executes it through libsonicboom.so (`run-s-expr`); same
   # shared-library dependency as guile-nn.
