@@ -243,7 +243,10 @@ if(SONICBOOM_USE_CUDA)
     # dispatches them; the fused adjoints are backward_ops.cu above).
     ${CMAKE_CURRENT_SOURCE_DIR}/src/training/device_graph_kernels.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/cuda_block.cpp
-    # MOSS-Image DiT: Q8_0 weights + a device-resident forward (M2).
+    # MOSS-Image DiT: Q8_0 weights + a device-resident forward (M2). The host
+    # orchestration is a .cpp (excluded from the unconditional model glob);
+    # only the device code is a .cu.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
