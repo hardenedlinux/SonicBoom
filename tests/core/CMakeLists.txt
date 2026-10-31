@@ -12,6 +12,14 @@
 # private suites added at the bottom) is SonicBoom-owned test code, so the whole
 # directory takes the flags. Each executable must carry the sanitizer runtime:
 # it loads the instrumented libsonicboom.so.
+# Several suites express their checks with assert(); a Release configuration
+# defines NDEBUG globally, which compiles every one of those checks away and
+# leaves the suite passing without testing anything (the assert-only locals
+# then draw -Wunused warnings). Test code keeps assertions in every
+# configuration: target/directory compile options follow the global -DNDEBUG
+# on the command line, so -UNDEBUG restores them.
+add_compile_options(-UNDEBUG)
+
 if(SONICBOOM_SANITIZE)
   # SONICBOOM_SANITIZE_COMPILE_EXTRA carries -fno-sanitize=vptr for the
   # address;undefined build (no RTTI in MLIR; root CMakeLists.txt explains).
