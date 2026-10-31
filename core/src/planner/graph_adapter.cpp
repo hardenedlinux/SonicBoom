@@ -55,44 +55,53 @@ void hash_attr(detail::Fnv1a& h, const sx::Attribute& a) {
   h.str(a.name);
   h.u8(static_cast<uint8_t>(a.kind()));
   using K = sx::AttrValueKind;
+  // get_if rather than get: model_fingerprint is noexcept, and a throwing
+  // bad_variant_access (a kind/value mismatch, which a well-formed graph never
+  // has) would terminate the process.
   switch (a.kind()) {
     case K::Int:
-      h.u64(static_cast<uint64_t>(std::get<int64_t>(a.value)));
+      if (const auto* v = std::get_if<int64_t>(&a.value))
+        h.u64(static_cast<uint64_t>(*v));
       break;
     case K::Float:
-      h.u64(std::bit_cast<uint64_t>(std::get<double>(a.value)));
+      if (const auto* v = std::get_if<double>(&a.value))
+        h.u64(std::bit_cast<uint64_t>(*v));
       break;
     case K::String:
-      h.str(std::get<std::string>(a.value));
+      if (const auto* v = std::get_if<std::string>(&a.value)) h.str(*v);
       break;
     case K::Bool:
-      h.u8(std::get<bool>(a.value) ? 1 : 0);
+      if (const auto* v = std::get_if<bool>(&a.value)) h.u8(*v ? 1 : 0);
       break;
     case K::Ints: {
-      const auto& v = std::get<std::vector<int64_t>>(a.value);
-      h.u32(static_cast<uint32_t>(v.size()));
-      for (int64_t x : v)
+      const auto* v = std::get_if<std::vector<int64_t>>(&a.value);
+      if (!v) break;
+      h.u32(static_cast<uint32_t>(v->size()));
+      for (int64_t x : *v)
         h.u64(static_cast<uint64_t>(x));
       break;
     }
     case K::Floats: {
-      const auto& v = std::get<std::vector<double>>(a.value);
-      h.u32(static_cast<uint32_t>(v.size()));
-      for (double x : v)
+      const auto* v = std::get_if<std::vector<double>>(&a.value);
+      if (!v) break;
+      h.u32(static_cast<uint32_t>(v->size()));
+      for (double x : *v)
         h.u64(std::bit_cast<uint64_t>(x));
       break;
     }
     case K::Strings: {
-      const auto& v = std::get<std::vector<std::string>>(a.value);
-      h.u32(static_cast<uint32_t>(v.size()));
-      for (const auto& s : v)
+      const auto* v = std::get_if<std::vector<std::string>>(&a.value);
+      if (!v) break;
+      h.u32(static_cast<uint32_t>(v->size()));
+      for (const auto& s : *v)
         h.str(s);
       break;
     }
     case K::Bools: {
-      const auto& v = std::get<std::vector<bool>>(a.value);
-      h.u32(static_cast<uint32_t>(v.size()));
-      for (bool b : v)
+      const auto* v = std::get_if<std::vector<bool>>(&a.value);
+      if (!v) break;
+      h.u32(static_cast<uint32_t>(v->size()));
+      for (bool b : *v)
         h.u8(b ? 1 : 0);
       break;
     }
