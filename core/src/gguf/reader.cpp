@@ -342,19 +342,24 @@ std::expected<Reader, Error> Reader::parse(std::span<const std::byte> data) {
 std::expected<Reader, Error> Reader::load(const std::filesystem::path& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f)
-    return std::unexpected(Error{ErrorCategory::Io, "cannot open file: " + path.string()});
+    return std::unexpected(Error{ErrorCategory::Io,
+                                 "cannot open file: " + path.string(),
+                                 std::nullopt});
   f.seekg(0, std::ios::end);
   std::streamoff sz = f.tellg();
   if (sz < 0)
     return std::unexpected(
-        Error{ErrorCategory::Io, "cannot determine file size: " + path.string()});
+        Error{ErrorCategory::Io,
+              "cannot determine file size: " + path.string(), std::nullopt});
   f.seekg(0, std::ios::beg);
 
   std::vector<std::byte> buf(static_cast<size_t>(sz));
   if (sz > 0) {
     f.read(reinterpret_cast<char*>(buf.data()), sz);
     if (!f)
-      return std::unexpected(Error{ErrorCategory::Io, "read error: " + path.string()});
+      return std::unexpected(Error{ErrorCategory::Io,
+                                   "read error: " + path.string(),
+                                   std::nullopt});
   }
 
   auto r = parse(buf);
