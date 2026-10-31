@@ -90,16 +90,27 @@ std::string mmq_tc_region_text(const MmqTcShape &sh, int sm_arch) {
     return e.val(std::string("arith.constant ") + v + " : f32");
   };
 
+  // Constants are emitted by the initializer, not by their use: each call
+  // appends an arith.constant to the body and numbers it. The pool is shared
+  // by every specialization, so some entries go unreferenced in a given
+  // kernel; they stay (removing them would renumber the SSA values and change
+  // the generated text) and are marked accordingly.
   const std::string c0 = c32(0), c1 = c32(1), c2 = c32(2), c3 = c32(3);
-  const std::string c4 = c32(4), c5 = c32(5), c7 = c32(7), c8 = c32(8);
-  const std::string c15 = c32(15), c16 = c32(16), c31 = c32(31);
+  const std::string c4 = c32(4), c5 = c32(5);
+  [[maybe_unused]] const std::string c7 = c32(7);
+  const std::string c8 = c32(8);
+  [[maybe_unused]] const std::string c15 = c32(15);
+  const std::string c16 = c32(16), c31 = c32(31);
   const std::string c32_ = c32(32), c144 = c32(144);
-  const std::string l0 = c64(0), l1 = c64(1);
-  const std::string i0 = ci(0), i1 = ci(1), i8 = ci(8);
+  [[maybe_unused]] const std::string l0 = c64(0);
+  [[maybe_unused]] const std::string l1 = c64(1);
+  const std::string i0 = ci(0), i1 = ci(1);
+  [[maybe_unused]] const std::string i8 = ci(8);
   const std::string ith = ci(TH);
   const std::string i2bn = ci(2 * BN), ibn = ci(BN);
   const std::string i2bm = ci(2 * BM), ibm = ci(BM);
-  const std::string i12 = ci(kRowWords), i3 = ci(kRowChunks);
+  [[maybe_unused]] const std::string i12 = ci(kRowWords);
+  [[maybe_unused]] const std::string i3 = ci(kRowChunks);
   const std::string zf = f32c("0.0");
 
   const int bw_off = 2 * BN * kRowBytes;
