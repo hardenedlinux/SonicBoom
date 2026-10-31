@@ -181,6 +181,35 @@ for repeated `executable-run`. Raises on a parse or compile failure."
       thunk
       (lambda () (unlock-mutex lock)))))
 
+;; The one rule for every operation that dereferences the native handle: hold
+;; EXE's lock while the handle is in use, and re-check the freed flag *after*
+;; acquiring it. A check made before locking can be overtaken by
+;; free-executable!, which would release the native handle underneath the
+;; caller.
+;;
+;; The lock lives in the <executable> record and is never destroyed explicitly:
+;; free-executable! only marks the record and releases the native handle. A
+;; thread that is using or waiting on the lock keeps the record reachable, so
+;; the GC cannot collect the mutex out from under it; the guardian resurrects a
+;; reference before reaping for the same reason.
+(define (call-with-live-executable exe who thunk)
+  "Call THUNK with EXE's native handle safe to use: THUNK runs while EXE's lock
+is held and after the freed flag has been re-checked under that lock. Raises a
+Scheme error for a non-executable or an already-freed executable. THUNK must
+not call another executable operation on the same EXE (the mutex is not
+recursive)."
+  (unless (executable? exe)
+    (error who "not an executable" exe))
+  (call-with-executable-lock
+   exe
+   (lambda ()
+     (when (executable-freed? exe)
+       (error who "executable has already been freed"))
+     (thunk))))
+
+;; executable-run applies the same rule inline: it takes the lock and re-checks
+;; the freed flag before dispatch, but reports a refusal as its documented
+;; (values #f message) failure instead of raising like the accessors.
 (define (executable-run exe input-bv)
   "Bind INPUT-BV to EXE, run it and return two values: the output bytevector
 and #f on success, or #f and an error-message string on failure. The native
@@ -310,35 +339,33 @@ entries of one model's per-shape cache, run in parallel."
     (bytevector-u64-native-set! bv %desc-off-struct-size %desc-size)
     bv))
 
-(define (check-parameter-query exe who)
-  (unless (executable? exe)
-    (error who "not an executable" exe))
-  (when (executable-freed? exe)
-    (error who "executable has already been freed")))
-
 (define (executable-parameter-count exe)
   "Number of parameters (graph constants) materialized by EXE. A device
 training graph has no host parameter block and raises."
-  (check-parameter-query exe "executable-parameter-count")
-  (let ((count (u64-native-bv 0))
-        (err-slot (make-slot)))
-    (let ((st ((proc 'sb_executable_parameter_count) (executable-ptr exe)
-               (bytevector->pointer count) (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (sb-check! st err-slot "executable-parameter-count")))
-    (bytevector-u64-native-ref count 0)))
+  (call-with-live-executable
+   exe "executable-parameter-count"
+   (lambda ()
+     (let ((count (u64-native-bv 0))
+           (err-slot (make-slot)))
+       (let ((st ((proc 'sb_executable_parameter_count) (executable-ptr exe)
+                  (bytevector->pointer count) (slot-ptr err-slot))))
+         (unless (sb-status-ok? st)
+           (sb-check! st err-slot "executable-parameter-count")))
+       (bytevector-u64-native-ref count 0)))))
 
 (define (executable-parameter-name exe index)
   "The name of parameter INDEX in EXE (a borrowed string, copied here)."
-  (check-parameter-query exe "executable-parameter-name")
-  (let ((name-slot (make-slot))
-        (err-slot (make-slot)))
-    (let ((st ((proc 'sb_executable_parameter_name_at) (executable-ptr exe)
-               index (slot-ptr name-slot) (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (sb-check! st err-slot "executable-parameter-name")))
-    (let ((p (slot-ref name-slot)))
-      (if (null-pointer? p) "" (pointer->string p)))))
+  (call-with-live-executable
+   exe "executable-parameter-name"
+   (lambda ()
+     (let ((name-slot (make-slot))
+           (err-slot (make-slot)))
+       (let ((st ((proc 'sb_executable_parameter_name_at) (executable-ptr exe)
+                  index (slot-ptr name-slot) (slot-ptr err-slot))))
+         (unless (sb-status-ok? st)
+           (sb-check! st err-slot "executable-parameter-name")))
+       (let ((p (slot-ref name-slot)))
+         (if (null-pointer? p) "" (pointer->string p)))))))
 
 (define (executable-parameter-ref exe index)
   "A read-only <tensor> viewing parameter INDEX of EXE without copying. The
@@ -347,60 +374,62 @@ free-executable!; release it with tensor-release! when done (or let the guardian
 release it). tensor-set! on the result raises; tensor-copy gives a writable,
 independent copy. Read-only is enforced by tensor-set!: the bytevector returned
 by tensor-data aliases the native bytes and must not be written directly."
-  (check-parameter-query exe "executable-parameter-ref")
-  (let ((view-slot (make-slot))
-        (err-slot (make-slot)))
-    (let ((st ((proc 'sb_executable_parameter_view) (executable-ptr exe) index
-               (slot-ptr view-slot) (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (sb-check! st err-slot "executable-parameter-ref")))
-    (let ((view (slot-ref view-slot)))
-      (define (release!) ((proc 'sb_storage_release) view))
-      (define (fail! st)
-        (let ((msg (capture-error err-slot)))
-          (release!)
-          (raise-sonicboom-error
-           st 'internal
-           (string-append "executable-parameter-ref: "
-                          (if (string-null? msg) "invalid descriptor" msg)))))
-      (let ((desc (make-desc-bv)))
-        (let ((st ((proc 'sb_storage_desc) view (bytevector->pointer desc)
-                   (slot-ptr err-slot))))
-          (unless (sb-status-ok? st) (fail! st)))
-        (let ((data-slot (make-slot)))
-          (let ((st ((proc 'sb_storage_data) view (slot-ptr data-slot) %null
-                     (slot-ptr err-slot))))
-            (unless (sb-status-ok? st) (fail! st)))
-          (let* ((dtype-code (bytevector-s32-native-ref desc %desc-off-dtype))
-                 (rank (bytevector-s64-native-ref desc %desc-off-rank))
-                 (nbytes (bytevector-u64-native-ref desc %desc-off-num-bytes))
-                 (data (slot-ref data-slot))
-                 (dtype (and (>= dtype-code 0)
-                             (< dtype-code (vector-length %sb-dtypes))
-                             (vector-ref %sb-dtypes dtype-code)))
-                 (shape (if (<= rank 0)
-                            '()
-                            (let ((dims (pointer->bytevector
-                                         (make-pointer
-                                          (bytevector-u64-native-ref
-                                           desc %desc-off-dims))
-                                         (* rank 8))))
-                              (let loop ((i (- rank 1)) (acc '()))
-                                (if (< i 0)
-                                    acc
-                                    (loop (- i 1)
-                                          (cons (bytevector-s64-native-ref
-                                                 dims (* i 8))
-                                                acc)))))))
-                 (elements (if (null? shape) 1 (apply * shape))))
-            (when (or (not dtype)
-                      (null-pointer? data)
-                      (not (= nbytes (* elements (dtype-size dtype)))))
-              (fail! SB_ERR_INTERNAL))
-            (%make-tensor dtype shape
-                          (borrowed-host-storage
-                           (pointer->bytevector data nbytes) exe view)
-                          #f #f)))))))
+  (call-with-live-executable
+   exe "executable-parameter-ref"
+   (lambda ()
+     (let ((view-slot (make-slot))
+           (err-slot (make-slot)))
+       (let ((st ((proc 'sb_executable_parameter_view) (executable-ptr exe) index
+                  (slot-ptr view-slot) (slot-ptr err-slot))))
+         (unless (sb-status-ok? st)
+           (sb-check! st err-slot "executable-parameter-ref")))
+       (let ((view (slot-ref view-slot)))
+         (define (release!) ((proc 'sb_storage_release) view))
+         (define (fail! st)
+           (let ((msg (capture-error err-slot)))
+             (release!)
+             (raise-sonicboom-error
+              st 'internal
+              (string-append "executable-parameter-ref: "
+                             (if (string-null? msg) "invalid descriptor" msg)))))
+         (let ((desc (make-desc-bv)))
+           (let ((st ((proc 'sb_storage_desc) view (bytevector->pointer desc)
+                      (slot-ptr err-slot))))
+             (unless (sb-status-ok? st) (fail! st)))
+           (let ((data-slot (make-slot)))
+             (let ((st ((proc 'sb_storage_data) view (slot-ptr data-slot) %null
+                        (slot-ptr err-slot))))
+               (unless (sb-status-ok? st) (fail! st)))
+             (let* ((dtype-code (bytevector-s32-native-ref desc %desc-off-dtype))
+                    (rank (bytevector-s64-native-ref desc %desc-off-rank))
+                    (nbytes (bytevector-u64-native-ref desc %desc-off-num-bytes))
+                    (data (slot-ref data-slot))
+                    (dtype (and (>= dtype-code 0)
+                                (< dtype-code (vector-length %sb-dtypes))
+                                (vector-ref %sb-dtypes dtype-code)))
+                    (shape (if (<= rank 0)
+                               '()
+                               (let ((dims (pointer->bytevector
+                                            (make-pointer
+                                             (bytevector-u64-native-ref
+                                              desc %desc-off-dims))
+                                            (* rank 8))))
+                                 (let loop ((i (- rank 1)) (acc '()))
+                                   (if (< i 0)
+                                       acc
+                                       (loop (- i 1)
+                                             (cons (bytevector-s64-native-ref
+                                                    dims (* i 8))
+                                                   acc)))))))
+                    (elements (if (null? shape) 1 (apply * shape))))
+               (when (or (not dtype)
+                         (null-pointer? data)
+                         (not (= nbytes (* elements (dtype-size dtype)))))
+                 (fail! SB_ERR_INTERNAL))
+               (%make-tensor dtype shape
+                             (borrowed-host-storage
+                              (pointer->bytevector data nbytes) exe view)
+                             #f #f)))))))))
 
 ;;; --- deferred (:bound) parameters --------------------------------------------
 ;;;
@@ -420,13 +449,12 @@ executable has already run successfully.
 The bytes are copied: subsequent writes to DATA-BV are not observed. A
 parameter may be bound again until the first successful run replaces the
 previous bytes; afterwards binding it raises."
-  (check-parameter-query exe "executable-bind-parameter!")
   (unless (string? name)
     (error "executable-bind-parameter!: parameter name must be a string" name))
   (unless (bytevector? data-bv)
     (error "executable-bind-parameter!: data must be a bytevector" data-bv))
-  (call-with-executable-lock
-   exe
+  (call-with-live-executable
+   exe "executable-bind-parameter!"
    (lambda ()
      (let ((err-slot (make-slot)))
        (let ((st ((proc 'sb_bind_parameter) (executable-ptr exe)
@@ -441,14 +469,16 @@ previous bytes; afterwards binding it raises."
 (define (executable-bindings-complete? exe)
   "True when EXE has no :bound parameters or every one has been filled.
 executable-run fails (returning #f and a message) until this is true."
-  (check-parameter-query exe "executable-bindings-complete?")
-  (let ((complete (make-bytevector 4 0))
-        (err-slot (make-slot)))
-    (let ((st ((proc 'sb_bindings_complete) (executable-ptr exe)
-               (bytevector->pointer complete) (slot-ptr err-slot))))
-      (unless (sb-status-ok? st)
-        (sb-check! st err-slot "executable-bindings-complete?")))
-    (not (zero? (bytevector-s32-native-ref complete 0)))))
+  (call-with-live-executable
+   exe "executable-bindings-complete?"
+   (lambda ()
+     (let ((complete (make-bytevector 4 0))
+           (err-slot (make-slot)))
+       (let ((st ((proc 'sb_bindings_complete) (executable-ptr exe)
+                  (bytevector->pointer complete) (slot-ptr err-slot))))
+         (unless (sb-status-ok? st)
+           (sb-check! st err-slot "executable-bindings-complete?")))
+       (not (zero? (bytevector-s32-native-ref complete 0)))))))
 
 ;;; --- the text-keyed cache ----------------------------------------------------
 

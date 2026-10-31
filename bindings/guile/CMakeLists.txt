@@ -164,6 +164,20 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-executable-parameters.scm)
 
+  # guile-executable-lifetime synchronizes free-executable! against every entry
+  # point that dereferences the native handle: it holds the executable lock to
+  # prove each one waits, races a free against each one from a barrier, and
+  # checks the post-free error, concurrent free, view pinning and double-release
+  # rules.
+  add_test(
+    NAME guile-executable-lifetime
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-executable-lifetime.scm)
+
   # guile-model-binding checks deferred (:bound) parameters and the per-model
   # executable identity: compile without bytes, bind by name, bind-once
   # semantics, and two same-structure models never sharing bound state.

@@ -451,6 +451,7 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
 | `tests/test-nn-trace.scm` | the emitted-text and traced routes agree on the same model |
 | `tests/test-train.scm` | the native autograd tape and XOR training |
 | `tests/test-executable.scm` | compile-once, reuse, lifetime, the cache |
+| `tests/test-executable-lifetime.scm` | free racing every executable entry point; blocking, freed-state and double-release guarantees |
 | `tests/test-trace-lower.scm` | lowering coverage, and the runtime matching the reference interpreter |
 | `tests/trace/test-trace-forms.scm` | the tracer's forms and graph breaks |
 | `tests/trace/test-trace-optim.scm` | DCE, constant folding and static-branch guarantees; results, cache and gradients unchanged |
