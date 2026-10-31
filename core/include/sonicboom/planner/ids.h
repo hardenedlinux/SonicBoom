@@ -22,6 +22,7 @@
 // only for compactness. IDs are unique within their own scope and stable for
 // the lifetime of one plan.
 
+#include <compare>
 #include <cstdint>
 
 namespace sonicboom::planner {
