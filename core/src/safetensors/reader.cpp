@@ -331,6 +331,9 @@ std::expected<Reader, Error> Reader::parse(std::span<const std::byte> file,
     info.end = *end;
 
     const auto element_size = dtype_size(info.dtype);
+    if (!element_size)
+      return make_error(ErrorCategory::Format,
+                        "tensor \"" + key + "\" has a dtype with no byte size");
     uint64_t byte_size = 0;
     if (!mul_overflow(info.n_elements, *element_size, byte_size))
       return make_error(ErrorCategory::Format, "tensor \"" + key + "\" byte size overflows");
