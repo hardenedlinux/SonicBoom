@@ -49,6 +49,10 @@ c10::DispatchKey to_dispatch_key(BackendId backend,
           return c10::DispatchKey::AutogradCUDA;
       }
       break;
+    default:
+      // No other backend is part of the Layer 2 contract; the check below
+      // reports it instead of guessing a dispatch key.
+      break;
   }
   TORCH_CHECK(false, "unsupported nt::BackendId/Functionality");
   return c10::DispatchKey::CPU; // unreachable

@@ -51,7 +51,7 @@ std::string dims_string(const std::vector<uint64_t>& dims) {
 // to be here; they are native now (QuantType::Q5_0 / Q8_0), so they bind
 // through the ordinary quantized path and are never rewritten.
 const char* foreign_type_name(uint32_t id) {
-  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; }
+  switch(id) { case kF16:return "f16"; case kQ4_0:return "q4_0"; default: break; }
   return "unknown";
 }
 
