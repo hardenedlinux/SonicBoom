@@ -25,6 +25,8 @@
 
 namespace sonicboom::safetensors::detail {
 
+JsonValue::~JsonValue() = default;
+
 const JsonValue* JsonValue::find(std::string_view key) const {
   if (type != Type::Object) return nullptr;
   for (const auto& [k, v] : object)

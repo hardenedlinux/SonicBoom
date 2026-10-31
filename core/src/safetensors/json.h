@@ -46,6 +46,21 @@ struct JsonValue {
   std::vector<JsonValue> array;
   std::vector<std::pair<std::string, JsonValue>> object;
 
+  // The object and array members make this type recursive, so its destructor
+  // is declared here and defined out of line (json.cpp) once JsonValue is
+  // complete. A clang/libstdc++ combination eagerly instantiates the implicit
+  // destructor while the value type is still incomplete and rejects
+  // vector<pair<string, JsonValue>>; the out-of-line definition defers that
+  // instantiation to a point where the type is complete. The other special
+  // members are spelled out so declaring a destructor does not silently turn
+  // moves into copies.
+  JsonValue() = default;
+  JsonValue(const JsonValue&) = default;
+  JsonValue& operator=(const JsonValue&) = default;
+  JsonValue(JsonValue&&) = default;
+  JsonValue& operator=(JsonValue&&) = default;
+  ~JsonValue();
+
   // Object member lookup; nullptr when absent or when this is not an object.
   const JsonValue* find(std::string_view key) const;
 };

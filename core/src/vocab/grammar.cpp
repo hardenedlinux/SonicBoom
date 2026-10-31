@@ -982,6 +982,16 @@ struct JVal {
   std::vector<JVal> a;
   std::vector<std::pair<std::string, JVal>> o;
 
+  // Recursive type: the destructor is defined out of line (below the struct)
+  // so clang does not instantiate vector<pair<string, JVal>>'s destructor
+  // while JVal is still incomplete. See safetensors/json.h for the same shape.
+  JVal() = default;
+  JVal(const JVal&) = default;
+  JVal& operator=(const JVal&) = default;
+  JVal(JVal&&) = default;
+  JVal& operator=(JVal&&) = default;
+  ~JVal();
+
   const JVal* get(std::string_view key) const {
     if (k != K::Obj) return nullptr;
     for (const auto& kv : o)
@@ -989,6 +999,8 @@ struct JVal {
     return nullptr;
   }
 };
+
+JVal::~JVal() = default;
 
 class JsonParser {
 public:
