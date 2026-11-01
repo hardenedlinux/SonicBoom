@@ -379,9 +379,9 @@ struct SpecCounters {
   // proposals are worth verifying after all.
   uint64_t probe_verifies = 0;
   uint64_t policy_steps = 0;
-  // The policy's chosen draft budget per policy iteration (k = 0..7). This is
+  // The policy's chosen draft budget per policy iteration (k = 0..15). This is
   // the decision, not the number of drafts a particular proposal contained.
-  uint64_t k_hist[8] = {};
+  uint64_t k_hist[16] = {};
 };
 SpecCounters spec_counters();
 void spec_counters_reset();

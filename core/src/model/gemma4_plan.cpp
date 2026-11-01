@@ -1159,9 +1159,10 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
 }
 
 // B6/B7: the largest draft budget one speculative step verifies. One step
-// runs at most kSpecMaxDrafts + 1 rows, the envelope the row-invariant verify
-// step was built and tested for (B3's verify_k1..k7 classes).
-constexpr int64_t kSpecMaxDrafts = 7;
+// runs at most kSpecMaxDrafts + 1 = 16 rows, the envelope the row-invariant
+// verify step was built and tested for (verify_k1..k15 classes) and the row
+// headroom the decode backend reserves (planner::kMaxVerifyRows).
+constexpr int64_t kSpecMaxDrafts = 15;
 
 // B7 v2: the bursty-acceptance model (plan.h). A per-token acceptance rate is
 // the wrong statistic for prompt lookup: a copy is accepted as a block, so a
@@ -2576,7 +2577,7 @@ static uint64_t run_spec_program_steps(
       for (size_t i = 0; i < decision.emitted; ++i) spec_diag_emit(run[i]);
     }
     ++g_spec_counters.verify_steps;
-    ++g_spec_counters.k_hist[size_t(k) & 7];
+    ++g_spec_counters.k_hist[size_t(k) & 15];
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
     g_spec_counters.emitted_tokens += decision.emitted;
