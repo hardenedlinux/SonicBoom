@@ -45,6 +45,7 @@
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
+#include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
 #endif
 
 #include <dlfcn.h>  // dladdr: identity of the loaded library (cost-cache key)
@@ -3840,6 +3841,33 @@ bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
   return true;
 }
 
+// The verify gemv's warps-per-row split is measured once per (quant type, rows,
+// cols, row count) on this device; the measurement needs only the model's
+// projection shapes, not the weights themselves. It runs with the rest of the
+// warm-up so no generation call pays it, and is a no-op when the split is
+// pinned (SONICBOOM_VERIFY_GEMV_WP), when spec is off, or after the first call.
+static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
+  if (spec_mode() == SpecMode::Off) return;
+  std::vector<const quant::QuantizedTensor*> weights;
+  const auto add = [&weights](const quant::QuantizedTensor& w) {
+    if (w.valid()) weights.push_back(&w);
+  };
+  for (const auto& b : m.weights.blocks) {
+    add(b.attn_q);
+    add(b.attn_k);
+    add(b.attn_v);
+    add(b.attn_output);
+    add(b.ffn_gate);
+    add(b.ffn_up);
+    add(b.ffn_down);
+  }
+  add(m.weights.output);     // untied lm head
+  add(m.weights.token_embd); // tied lm head
+  const std::string fingerprint = spec_kernel_fingerprint();
+  quant::cuda::warm_verify_gemv_wp(weights.data(), weights.size(),
+                                   fingerprint.c_str());
+}
+
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
                        planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
@@ -3864,6 +3892,7 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
     rt->cuda->publish_cache(warm);
     (void)get_sampled_runtime(m, n_ctx, warm);
   }
+  warm_verify_gemv_wp_model(m);
   return true;
 }
 

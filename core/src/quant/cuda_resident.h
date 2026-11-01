@@ -110,6 +110,22 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
                            float* y, int n);
 
+// The warps-per-row split gemv_q8_1_batched_dev uses for this projection and
+// row count: the warm-up's measured pick for (type, rows, cols, n), or 1 (one
+// warp per row, the reference kernel) when nothing has been measured. Every
+// split is bit-identical, so this only ever selects a speed.
+int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n);
+
+// Measure and cache that split for the model's quantized projections (distinct
+// (type, rows, cols) shapes) at row counts 3..16, once per process. Synthetic
+// zeroed weights and activations, sized to the real shapes; the pick is stored
+// in the tune file keyed by the build fingerprint `build_id`, and a bounded
+// time budget (~1 s) either measures every row count or falls back to
+// {3, 8, 16} and fills the rest from those. A no-op when the split is pinned by
+// SONICBOOM_VERIFY_GEMV_WP, when q8_1 is unavailable, or after the first call.
+void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
+                         const char* build_id);
+
 // One member of a sibling launch: a quantized projection reading the shared
 // q8_1 activation, with its optional [rows] bias and its [rows] output.
 struct GemvSibling {

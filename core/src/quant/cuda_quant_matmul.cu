@@ -2420,8 +2420,8 @@ bool verify_gemv_reuse_enabled() noexcept {
 // the grid's y dimension grows accordingly.
 //
 // Debug seam: SONICBOOM_VERIFY_GEMV_WP=1|2|4 pins the split and wins over the
-// warm-up's choice (the warm-up stores its pick in the tune file). Default is
-// 1 = one warp per row, today's kernel.
+// warm-up's choice (the warm-up stores its pick in the tune file). 0 = unset,
+// i.e. the warm-up's pick (or 1 when nothing has been measured).
 int verify_gemv_wp_override() noexcept {
   static const int wp = [] {
     const char* e = std::getenv("SONICBOOM_VERIFY_GEMV_WP");
@@ -2429,7 +2429,7 @@ int verify_gemv_wp_override() noexcept {
       const int v = std::atoi(e);
       if (v == 1 || v == 2 || v == 4) return v;
     }
-    return 1;
+    return 0;
   }();
   return wp;
 }
@@ -2478,7 +2478,12 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                               int blocks_per_row, int num_rows, int n) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
-  const int wp_eff = (wp == 2 || wp == 4) ? wp : 1;
+  int wp_eff = (wp == 2 || wp == 4) ? wp : 1;
+  // grid.y is capped at 65535; with WP > 1 a block covers 8/WP rows, so a very
+  // wide projection (the 262144-row LM head) would overrun it. Fall back to
+  // fewer warps per row rather than fail the launch.
+  while (wp_eff > 1 && (num_rows + (8 / wp_eff) - 1) / (8 / wp_eff) > 65535)
+    wp_eff /= 2;
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
@@ -2539,6 +2544,338 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
 }
 
 #undef SB_LAUNCH_REUSE_WP
+
+// --- warm-up choice of the verify gemv's warps per row (WP) ------------------
+//
+// The WP split trades block occupancy for shorter per-row work: with WP = 1 a
+// warp walks every weight block of one output row serially; with WP = 2 or 4,
+// two or four warps share the row's blocks (each of them re-unpacking the
+// weight side) and that block covers 8/WP rows. Which is fastest depends on the
+// projection's shape and on how many positions the verify step carries, and it
+// is an empirical property of the device, so it is timed once per (quant type,
+// rows, cols, n) at model load and cached in the autotune store, next to the
+// verify cost curve. The choice never changes arithmetic — every WP is
+// bit-identical to WP = 1 (per-position expression, integer grouping and
+// reduction tree untouched) — so a wrong pick costs time, not accuracy.
+//
+// Key: verify-gemv-wp|<type>|n=<n>|<rows>x<cols>; the record also carries the
+// build fingerprint as "k", so a rebuild re-measures. The measurement uses
+// synthetic zeroed weights and activations (the timing does not depend on the
+// values) at the model's own projection shapes.
+
+namespace {
+
+// The row counts a verify step can carry (k + 1 for k = 2..15) that the warm-up
+// times. Unmeasured lengths take the pick of the nearest measured length at or
+// above them; under budget pressure only the fallback set is measured and every
+// other length is filled from it.
+constexpr int kVerifyWpAllN[] = {3, 4, 6, 8, 9, 12, 16};
+constexpr int kVerifyWpFallbackN[] = {3, 8, 16};
+constexpr int kVerifyWpMeasured[] = {1, 2, 4};
+constexpr double kVerifyWpBudgetS = 1.0;   // whole warm-up, per model load
+constexpr int kVerifyWpTimed = 7;          // timed repetitions per candidate
+constexpr int kVerifyWpWarm = 3;
+
+struct VerifyWpShape {
+  QuantType qt = QuantType::Q3_K;
+  int rows = 0;
+  int cols = 0;
+  int bpr = 0;  // weight blocks per row (cols / block size)
+};
+
+// The reuse kernels only exist for the K-quants routed to them; other types
+// (and n < 3) keep one warp per row.
+bool verify_wp_routed(QuantType qt) {
+  return qt == QuantType::Q3_K || qt == QuantType::Q4_K ||
+         qt == QuantType::Q5_K;
+}
+
+int verify_wp_env() noexcept { return verify_gemv_wp_override(); }
+
+// The measured bucket at or above `n`, or the largest measured bucket when `n`
+// exceeds it (n <= 16 is the verify envelope, so this is the last resort only).
+int verify_wp_bucket(int n) {
+  constexpr size_t count = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  for (size_t i = 0; i < count; ++i)
+    if (n <= kVerifyWpAllN[i]) return kVerifyWpAllN[i];
+  return kVerifyWpAllN[count - 1];
+}
+
+std::string verify_wp_type_name(QuantType qt) {
+  const QuantTypeInfo* info = quant_type_info(qt);
+  return info ? info->name : "unknown";
+}
+
+std::string verify_wp_key(QuantType qt, int rows, int cols, int n) {
+  return "verify-gemv-wp|" + verify_wp_type_name(qt) + "|n=" +
+         std::to_string(n) + "|" + std::to_string(rows) + "x" +
+         std::to_string(cols);
+}
+
+// The build fingerprint as a record value (FNV-1a over the carrier string).
+int verify_wp_build_hash(std::string_view build_id) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : build_id) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return int(static_cast<uint32_t>(h ^ (h >> 32)));
+}
+
+std::mutex g_verify_wp_mutex;
+std::map<std::string, int> g_verify_wp;  // key -> chosen WP, per process
+std::string g_verify_wp_build_id;
+
+double verify_wp_seconds_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+// One candidate's median of kVerifyWpTimed timed launches (after
+// kVerifyWpWarm untimed ones).
+double verify_wp_time_ms(QuantType qt, int wp, const uint8_t* dw,
+                         const q8_1::block_q8_1* xq, float* dy, int bpr,
+                         int rows, int n) {
+  for (int i = 0; i < kVerifyWpWarm; ++i)
+    launch_gemv_q8_1_batched(qt, wp, dw, xq, dy, bpr, rows, n);
+  cudaEvent_t begin = nullptr, end = nullptr;
+  if (cudaEventCreate(&begin) != cudaSuccess) return 0.0;
+  if (cudaEventCreate(&end) != cudaSuccess) {
+    cudaEventDestroy(begin);
+    return 0.0;
+  }
+  double times[kVerifyWpTimed];
+  for (int i = 0; i < kVerifyWpTimed; ++i) {
+    times[i] = 0.0;
+    cudaEventRecord(begin, cur_stream());
+    launch_gemv_q8_1_batched(qt, wp, dw, xq, dy, bpr, rows, n);
+    cudaEventRecord(end, cur_stream());
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, begin, end);
+    times[i] = double(ms);
+  }
+  cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  std::sort(times, times + kVerifyWpTimed);
+  return times[kVerifyWpTimed / 2];
+}
+
+// The widths the launcher can actually give this row count (the grid.y cap
+// folds a wide projection back to one warp per row, so those candidates are
+// not distinct choices and are neither timed nor stored).
+bool verify_wp_launchable(int rows, int wp) {
+  if (wp == 1) return true;
+  return (rows + (8 / wp) - 1) / (8 / wp) <= 65535;
+}
+
+// One shape's synthetic buffers, allocated once for the widest timed length and
+// reused for every (n, candidate): the LM head's weight buffer alone is
+// hundreds of MB, and a per-n allocate + memset dominated the warm-up.
+struct VerifyWpBuffers {
+  void* dw = nullptr;
+  void* dxq = nullptr;
+  void* dy = nullptr;
+};
+
+void verify_wp_free(VerifyWpBuffers& b) {
+  if (b.dy) cudaFree(b.dy);
+  if (b.dxq) cudaFree(b.dxq);
+  if (b.dw) cudaFree(b.dw);
+  b = {};
+}
+
+bool verify_wp_alloc(const VerifyWpShape& s, VerifyWpBuffers& b) {
+  constexpr size_t nbuckets = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  const int widest = kVerifyWpAllN[nbuckets - 1];
+  const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
+                        size_t(quant_type_info(s.qt)->bytes_per_block);
+  const size_t abytes =
+      size_t(widest) * size_t(s.cols / 32) * sizeof(q8_1::block_q8_1);
+  const size_t ybytes = size_t(widest) * size_t(s.rows) * sizeof(float);
+  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
+  if (cudaMalloc(&b.dxq, abytes) != cudaSuccess) {
+    verify_wp_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+    verify_wp_free(b);
+    return false;
+  }
+  cudaMemset(b.dw, 0, wbytes);  // no garbage scale in the arithmetic
+  cudaMemset(b.dxq, 0, abytes);
+  return true;
+}
+
+// Time every candidate at one shape and length; return the fastest (a candidate
+// must beat the incumbent by more than 2% to win, so a near-tie keeps the
+// smaller WP).
+int verify_wp_measure(const VerifyWpShape& s, int n,
+                      const VerifyWpBuffers& b) {
+  int candidates = 0;
+  for (int wp : kVerifyWpMeasured)
+    if (verify_wp_launchable(s.rows, wp)) ++candidates;
+  if (candidates <= 1) return 1;  // nothing to choose between
+  int best = 1;
+  double best_ms = 0.0;
+  for (int wp : kVerifyWpMeasured) {
+    if (!verify_wp_launchable(s.rows, wp)) continue;
+    const double ms = verify_wp_time_ms(
+        s.qt, wp, static_cast<const uint8_t*>(b.dw),
+        static_cast<const q8_1::block_q8_1*>(b.dxq),
+        static_cast<float*>(b.dy), s.bpr, s.rows, n);
+    cudaGetLastError();
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms * 0.98)) {
+      best = wp;
+      best_ms = ms;
+    }
+  }
+  return best;
+}
+
+// The pick for one (shape, bucket): the in-process map, then the tune file, then
+// a fresh measurement (stored for the next process).
+int verify_wp_resolve(const VerifyWpShape& s, int n,
+                      const VerifyWpBuffers& b) {
+  const std::string key = verify_wp_key(s.qt, s.rows, s.cols, n);
+  {
+    std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+    const auto it = g_verify_wp.find(key);
+    if (it != g_verify_wp.end()) return it->second;
+  }
+  int chosen = 0;
+  if (tune::enabled()) {
+    const auto rec = tune::lookup("verify-gemv-wp", key);
+    const auto wp_it = rec.find("wp");
+    const auto k_it = rec.find("k");
+    if (wp_it != rec.end() &&
+        (wp_it->second == 1 || wp_it->second == 2 || wp_it->second == 4) &&
+        k_it != rec.end() &&
+        k_it->second == verify_wp_build_hash(g_verify_wp_build_id))
+      chosen = wp_it->second;
+  }
+  if (chosen == 0) {
+    chosen = verify_wp_measure(s, n, b);
+    if (chosen == 0) return 1;  // allocation failed: keep the reference kernel
+    if (tune::enabled() && !g_verify_wp_build_id.empty())
+      tune::store("verify-gemv-wp", key,
+                  {{"wp", chosen},
+                   {"k", verify_wp_build_hash(g_verify_wp_build_id)}});
+  }
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  g_verify_wp[key] = chosen;
+  return chosen;
+}
+
+} // namespace
+
+int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n) {
+  const int pinned = verify_wp_env();
+  if (pinned != 0) return pinned;  // A/B seam: no measurement, no lookup
+  if (n < 3 || !verify_gemv_reuse_enabled() || !verify_wp_routed(qt) ||
+      rows <= 0 || cols <= 0)
+    return 1;
+  const int bucket = verify_wp_bucket(n);
+  const std::string key = verify_wp_key(qt, rows, cols, bucket);
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  const auto it = g_verify_wp.find(key);
+  return it != g_verify_wp.end() ? it->second : 1;
+}
+
+void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
+                         const char* build_id) {
+  if (!available() || !q8_1_enabled() || !weights || count == 0) return;
+  if (verify_wp_env() != 0) return;  // the A/B seam wins over the warm-up
+  if (!verify_gemv_reuse_enabled()) return;
+  {
+    std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+    if (!g_verify_wp_build_id.empty()) return;  // already warmed
+    if (build_id) g_verify_wp_build_id = build_id;
+  }
+  // Distinct projection shapes, largest first: if the budget runs out, the
+  // shapes that dominate a verify step are the ones already priced.
+  std::vector<VerifyWpShape> shapes;
+  for (size_t i = 0; i < count; ++i) {
+    const QuantizedTensor* w = weights[i];
+    if (!w || !w->valid() || w->dims().size() != 2) continue;
+    if (!verify_wp_routed(w->type())) continue;
+    const int cols = int(w->dims()[0]);
+    const int rows = int(w->dims()[1]);
+    const int bpr = cols / int(w->block_size());
+    if (cols % 32 != 0 || bpr <= 0) continue;
+    bool seen = false;
+    for (const auto& s : shapes)
+      if (s.qt == w->type() && s.rows == rows && s.cols == cols) {
+        seen = true;
+        break;
+      }
+    if (!seen) shapes.push_back({w->type(), rows, cols, bpr});
+  }
+  std::sort(shapes.begin(), shapes.end(), [](const VerifyWpShape& a,
+                                             const VerifyWpShape& b) {
+    return int64_t(a.rows) * a.cols > int64_t(b.rows) * b.cols;
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const auto& s : shapes) {
+    VerifyWpBuffers buf;
+    if (!verify_wp_alloc(s, buf)) {
+      verify_wp_free(buf);
+      continue;
+    }
+    bool over_budget = false;
+    for (int n : kVerifyWpFallbackN) {
+      if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) {
+        over_budget = true;
+        break;
+      }
+      (void)verify_wp_resolve(s, n, buf);
+    }
+    if (!over_budget) {
+      for (int n : kVerifyWpAllN) {
+        bool in_fallback = false;
+        for (int f : kVerifyWpFallbackN) in_fallback = in_fallback || f == n;
+        if (in_fallback) continue;
+        if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) break;
+        (void)verify_wp_resolve(s, n, buf);
+      }
+    }
+    verify_wp_free(buf);
+  }
+  // Fill the buckets this run did not reach with the pick of the nearest
+  // measured bucket at or above them (falling back to the nearest below), so a
+  // later lookup is a map read and never a measurement inside generation.
+  constexpr size_t nbuckets = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  for (const auto& s : shapes) {
+    int pick[nbuckets] = {};
+    int highest = 0;
+    for (size_t i = 0; i < nbuckets; ++i) {
+      const auto it = g_verify_wp.find(
+          verify_wp_key(s.qt, s.rows, s.cols, kVerifyWpAllN[i]));
+      if (it != g_verify_wp.end()) pick[i] = it->second;
+    }
+    for (size_t i = nbuckets; i-- > 0;)
+      if (pick[i]) highest = pick[i];
+    if (highest == 0) continue;  // nothing measured for this shape
+    int above = 0;  // the nearest measured bucket at or above
+    for (size_t i = nbuckets; i-- > 0;) {
+      if (pick[i]) above = pick[i];
+      else if (above) pick[i] = above;
+    }
+    for (size_t i = 0; i < nbuckets; ++i) {
+      const std::string key = verify_wp_key(s.qt, s.rows, s.cols,
+                                            kVerifyWpAllN[i]);
+      if (g_verify_wp.find(key) != g_verify_wp.end()) continue;
+      // No measured bucket at or above this one (above the highest): use the
+      // highest measured pick.
+      g_verify_wp[key] = pick[i] ? pick[i] : highest;
+      if (tune::enabled() && !g_verify_wp_build_id.empty())
+        tune::store("verify-gemv-wp", key,
+                    {{"wp", g_verify_wp[key]},
+                     {"k", verify_wp_build_hash(g_verify_wp_build_id)}});
+    }
+  }
+}
 
 // Quantize x -> q8_1 into `yq` (nblocks blocks, nblocks == n / 32). The
 // quantize-once seam: exposed so the CUDA backend can run a planner-inserted
@@ -2840,7 +3177,8 @@ bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   launch_gemv_q8_1_batched(
-      W.type(), verify_gemv_wp_override(), static_cast<const uint8_t*>(d_w),
+      W.type(), verify_gemv_wp_for(W.type(), int(rows), int(cols), n),
+      static_cast<const uint8_t*>(d_w),
       reinterpret_cast<const q8_1::block_q8_1*>(xq), y, int(blocks_per_row),
       int(rows), n);
   return cudaGetLastError() == cudaSuccess;
