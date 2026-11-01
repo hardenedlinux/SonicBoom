@@ -2397,6 +2397,24 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
                         warps);
 }
 
+// Weight-side-unpack hoisting for the batched verify gemv (V2). The hoisted
+// kernels are bit-identical to the per-position vec_dot loop they replace (see
+// mmvq_q8_1.cuh); the switch exists only to A/B the launch's instruction count,
+// and to leave the previous kernel selectable as the reference.
+//
+// The hoist only pays once the row tile is wide enough to amortize its extra
+// registers. Measured at depth 512, 15-iteration medians, three interleaved
+// runs (mean±sd): n=2 (k=1) old 37.23±0.18 ms vs hoisted 39.62±0.10 ms
+// (+6.4%), while n=3 (k=2) is 4.7% faster and n=8 (k=7) 23.9% faster. So n=2
+// keeps the per-position kernel; k>=2 (n>=3) uses the hoisted one.
+bool verify_gemv_reuse_enabled() noexcept {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_VERIFY_GEMV_REUSE");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return on;
+}
+
 // Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
 // position's blocks contiguous). One warp per output row; each weight block is
 // reused across a tile of T positions. dst is [n, num_rows] (position-major).
@@ -2408,25 +2426,49 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (n >= 3 && verify_gemv_reuse_enabled()) {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched_reuse",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q3_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
     case QuantType::Q4_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (n >= 3 && verify_gemv_reuse_enabled()) {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched_reuse",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q4_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
     case QuantType::Q5_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (n >= 3 && verify_gemv_reuse_enabled()) {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched_reuse",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q5_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
     case QuantType::Q6_K:
       SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",

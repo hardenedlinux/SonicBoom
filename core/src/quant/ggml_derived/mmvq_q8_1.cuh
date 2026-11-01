@@ -823,6 +823,291 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
   }
 }
 
+// --- batched warp-per-row mmvq, weight-side unpack hoisted -------------------
+//
+// The kernels above call vec_dot_* once per position, and every call rebuilds
+// the weight-side operands: the 6-bit scale unpack (four __shfl per lane), the
+// dequantized int8 groups, the block/offset indices. None of that depends on
+// the position, so a T-position tile pays it T times. Measured on Gemma 4 E4B
+// Q3_K_M at n = 8 (RTX 3050): ffn_gate (10240 rows, 2560 cols) takes 0.50 ms,
+// while its int8 dot work (209.7 M MACs) is ~0.02 ms at the device's dp4a
+// rate — the repeated unpack dominates, not DRAM (the weight block is already
+// loaded once). The same run shows the batched kernel only 1.24x faster than
+// the per-position serial gemv, so the "weight read once" reuse in the loop
+// above was never captured as a throughput win.
+//
+// These kernels keep the identical lane decomposition and split each vec_dot
+// into the weight-side unpack (once per `b`) and the position-side dot (once per
+// position). The per-position expression, its integer grouping and its float
+// order are unchanged — same dp4a tree, same `d8 * (dot * scale)`, same
+// `d * sumf` — so every output is bit-identical to the single-column gemv on
+// that position, which is the verify step's B3 invariance requirement.
+template <int T>
+__global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = lane & 15;
+  const int ib = lane >> 4;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 110;
+      // --- weight side: the block half of vec_dot_q3_K_q8_1, once ---
+      const uint8_t* qs = wb + 32;
+      const uint8_t* hmask = wb;
+      const uint8_t* scales = wb + 96;
+      const float d = half_to_float(ld_u16(wb + 108));
+      const int bq8_offset = QR3_K * (iqs / (QI3_K / 2));
+      const int scale_offset = (iqs & 8) | ((iqs >> 2) & 1);
+      const int group_base = (lane >> 4) << 4;
+      const int my_sc = ((scales[iqs & 7] >> (4 * (iqs >> 3))) & 0xF)
+                      | (((scales[8 + (iqs & 3)] >> (2 * (iqs >> 2))) & 3) << 4);
+      int sc[QR3_K];
+      #pragma unroll
+      for (int i = 0; i < QR3_K; ++i)
+        sc[i] = __shfl_sync(0xffffffffu, my_sc, group_base + scale_offset + 2 * i);
+      const int vl = get_int_b2(qs, iqs);
+      const int vh = ~get_int_b2(hmask, iqs % (QI3_K / 2)) >> bq8_offset;
+      int vi[QR3_K];
+      #pragma unroll
+      for (int i = 0; i < QR3_K; ++i) {
+        const int vil = (vl >> (2 * i)) & 0x03030303;
+        const int vih = ((vh >> i) << 2) & 0x04040404;
+        vi[i] = __vsub4(vil, vih);
+      }
+      // --- position side: exactly vec_dot_q3_K_q8_1's sum ---
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          int u[QR3_K];
+          float d8[QR3_K];
+          #pragma unroll
+          for (int i = 0; i < QR3_K; ++i) {
+            u[i] = get_int_b4(yb[bq8_offset + i].qs, iqs % QI8_1);
+            d8[i] = yb[bq8_offset + i].d;
+          }
+          float sumf = 0.0f;
+          #pragma unroll
+          for (int i = 0; i < QR3_K; ++i)
+            sumf += d8[i] * (__dp4a(vi[i], u[i], 0) * (sc[i] - 32));
+          sum[t] += d * sumf;
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
+template <int T>
+__global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = 2 * (lane & 15);
+  const int ib = lane >> 4;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 144;
+      // --- weight side: the block half of vec_dot_q4_K_q8_1, once ---
+      const uint8_t* scales = wb + 4;
+      const uint8_t* qs = wb + 16;
+      const float d = half_to_float(ld_u16(wb + 0));
+      const float dmin = half_to_float(ld_u16(wb + 2));
+      const int bq8_offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+      const int* q4 =
+          reinterpret_cast<const int*>(qs + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+      const int v0 = q4[0];
+      const int v1 = q4[4];
+      const uint16_t* sc16 = reinterpret_cast<const uint16_t*>(scales);
+      const int j = bq8_offset / 2;
+      const int jm = j & 1;
+      const uint32_t s0 = sc16[jm + 0];
+      const uint32_t s2 = sc16[jm + 2];
+      const uint32_t s4 = sc16[jm + 4];
+      const uint32_t hi = (uint32_t)-(int32_t)(j >= 2);
+      uint16_t aux[2];
+      aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) |
+                          ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+      aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) |
+                          ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+      const uint8_t* sc8 = reinterpret_cast<const uint8_t*>(aux);
+      int sc[QR4_K], m[QR4_K], v0i[QR4_K], v1i[QR4_K];
+      #pragma unroll
+      for (int i = 0; i < QR4_K; ++i) {
+        sc[i] = sc8[i];
+        m[i] = sc8[2 + i];
+        v0i[i] = (v0 >> (4 * i)) & 0x0F0F0F0F;
+        v1i[i] = (v1 >> (4 * i)) & 0x0F0F0F0F;
+      }
+      const int slot = (iqs / 2) % 4;
+      // --- position side: exactly vec_dot_q4_K_q8_1's sums ---
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          int u[2 * QR4_K];
+          float d8[QR4_K];
+          #pragma unroll
+          for (int i = 0; i < QR4_K; ++i) {
+            const block_q8_1* bq8i = yb + bq8_offset + i;
+            d8[i] = bq8i->d;
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + slot;
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+          }
+          float sumf_d = 0.0f, sumf_m = 0.0f;
+          #pragma unroll
+          for (int i = 0; i < QR4_K; ++i) {
+            const int dot1 = __dp4a(v1i[i], u[2 * i + 1],
+                                    __dp4a(v0i[i], u[2 * i + 0], 0));
+            const int dot2 = __dp4a(0x01010101, u[2 * i + 1],
+                                    __dp4a(0x01010101, u[2 * i + 0], 0));
+            sumf_d += d8[i] * (dot1 * sc[i]);
+            sumf_m += d8[i] * (dot2 * m[i]);
+          }
+          sum[t] += d * sumf_d - dmin * sumf_m;
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
+template <int T>
+__global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= num_rows) return;
+  const int iqs = 2 * (lane & 15);
+  const int ib = lane >> 4;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[T];
+    #pragma unroll
+    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int b = ib; b < blocks_per_row; b += 2) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 176;
+      // --- weight side: the block half of vec_dot_q5_K_q8_1, once ---
+      const uint8_t* scales = wb + 4;
+      const uint8_t* qh = wb + 16;
+      const uint8_t* ql = wb + 48;
+      const float d = half_to_float(ld_u16(wb + 0));
+      const float dmin = half_to_float(ld_u16(wb + 2));
+      const int bq8_offset = QR5_K * ((iqs / 2) / (QI8_1 / 2));
+      const int* ql32 =
+          reinterpret_cast<const int*>(ql + 16 * bq8_offset + 4 * ((iqs / 2) % 4));
+      const int* qh32 = reinterpret_cast<const int*>(qh + 4 * ((iqs / 2) % 4));
+      const int vl0 = ql32[0];
+      const int vl1 = ql32[4];
+      const int vh0 = qh32[0] >> bq8_offset;
+      const int vh1 = qh32[4] >> bq8_offset;
+      const uint16_t* sc16 = reinterpret_cast<const uint16_t*>(scales);
+      const int j = bq8_offset / 2;
+      const int jm = j & 1;
+      const uint32_t s0 = sc16[jm + 0];
+      const uint32_t s2 = sc16[jm + 2];
+      const uint32_t s4 = sc16[jm + 4];
+      const uint32_t hi = (uint32_t)-(int32_t)(j >= 2);
+      uint16_t aux[2];
+      aux[0] = (uint16_t)(((s0 & 0x3f3f) & ~hi) |
+                          ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+      aux[1] = (uint16_t)(((s2 & 0x3f3f) & ~hi) |
+                          ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+      const uint8_t* sc8 = reinterpret_cast<const uint8_t*>(aux);
+      int sc[QR5_K], m[QR5_K], v0i[QR5_K], v1i[QR5_K];
+      #pragma unroll
+      for (int i = 0; i < QR5_K; ++i) {
+        sc[i] = sc8[i];
+        m[i] = sc8[2 + i];
+        const int vl0i = (vl0 >> (4 * i)) & 0x0F0F0F0F;
+        const int vl1i = (vl1 >> (4 * i)) & 0x0F0F0F0F;
+        const int vh0i = ((vh0 >> i) << 4) & 0x10101010;
+        const int vh1i = ((vh1 >> i) << 4) & 0x10101010;
+        v0i[i] = vl0i | vh0i;
+        v1i[i] = vl1i | vh1i;
+      }
+      const int slot = (iqs / 2) % 4;
+      // --- position side: exactly vec_dot_q5_K_q8_1's sums ---
+      #pragma unroll
+      for (int t = 0; t < T; ++t) {
+        if (t < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+          int u[2 * QR5_K];
+          float d8[QR5_K];
+          #pragma unroll
+          for (int i = 0; i < QR5_K; ++i) {
+            const block_q8_1* bq8i = yb + bq8_offset + i;
+            d8[i] = bq8i->d;
+            const int* q8 = reinterpret_cast<const int*>(bq8i->qs) + slot;
+            u[2 * i + 0] = q8[0];
+            u[2 * i + 1] = q8[4];
+          }
+          float sumf_d = 0.0f, sumf_m = 0.0f;
+          #pragma unroll
+          for (int i = 0; i < QR5_K; ++i) {
+            const int dot1 = __dp4a(v0i[i], u[2 * i + 0],
+                                    __dp4a(v1i[i], u[2 * i + 1], 0));
+            const int dot2 = __dp4a(0x01010101, u[2 * i + 0],
+                                    __dp4a(0x01010101, u[2 * i + 1], 0));
+            sumf_d += d8[i] * (dot1 * sc[i]);
+            sumf_m += d8[i] * (dot2 * m[i]);
+          }
+          sum[t] += d * sumf_d - dmin * sumf_m;
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
 template <int T>
 __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
