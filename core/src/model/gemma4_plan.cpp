@@ -1269,7 +1269,10 @@ namespace {
 // P0: the cost-model schema version. Bump when the shape of a record or the
 // meaning of its values changes; the key carries it, so old records are simply
 // never looked up (the tune file is append-or-rewrite, not migrated).
-constexpr int kSpecCostSchema = 2;
+// Schema 3: the record always holds all 16 lengths (c0..c15), measured at load
+// and interpolated where the measurement budget did not reach; schema 2 stored
+// only the lengths the in-request warm-up happened to run.
+constexpr int kSpecCostSchema = 3;
 
 const char* spec_ctx_class(uint64_t n_ctx) {
   return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
@@ -1353,7 +1356,7 @@ std::string spec_kernel_fingerprint() {
 
 std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
                                 uint64_t n_ctx) {
-  return std::string("v2|") + (arch ? arch : "unknown") + "|e" +
+  return std::string("v3|") + (arch ? arch : "unknown") + "|e" +
          std::to_string(embedding_length) + "|ctx=" + spec_ctx_class(n_ctx) +
          "|k=" + spec_kernel_fingerprint();
 }
@@ -2143,6 +2146,232 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
     }
   }
   if (!values.empty()) tune::store("spec-length", p.key, values);
+}
+
+// 4b: the load-time cost curve.
+//
+// The curve used to be measured inside the first generation call: every draft
+// length it prices cost two timed iterations at the head of the stream, so the
+// first request's first token carried the whole warm-up and its early iterations
+// ran forced drafts. It is measured here instead — at load, on synthetic rows,
+// before any request — and stored under the same "spec-length" record the
+// policy already reads, so a generation call starts with every length priced.
+//
+// One iteration is timed whole (staging, launch, sync, readback), exactly the
+// span the policy's own measurement covers. Each length gets kWarmCostReps
+// untimed passes (the first absorbs the row count's graph build and capture)
+// and kWarmTimedReps timed ones; the median is the price. The whole measurement
+// runs inside the load budget (a length is not entered when its repetitions
+// cannot fit), so the lengths it does not reach are interpolated (see
+// spec_interpolate_costs) — which is why the order below matters: a budget stop
+// must leave a curve that is usable at both ends, not one anchored where the
+// measurement happened to stop.
+constexpr int kWarmCostReps = 3;
+constexpr int kWarmTimedReps = 7;
+constexpr double kSpecCostLoadBudgetMs = 2000.0;
+// Priority order. Two knots are load-bearing, and are measured before the
+// budget can run out:
+//   - 0 and 1 anchor the head. A 2-row verify costs more than twice a plain
+//     step (the fixed per-verify cost dominates), so interpolating the head
+//     from c(0) underprices k = 1 and makes the policy spend verifies that
+//     cannot pay.
+//   - 7 anchors the tail slope. The head is flat (c(1) ~ c(3) on this GPU), so
+//     extrapolating the tail from two adjacent head knots reads a flat curve
+//     and prices a 16-row verify like a 4-row one; seven rows past the head
+//     puts the slope on the linear part. The remaining knots refine the shape.
+constexpr int64_t kSpecCostBand[] = {0, 1, 7, 3, 15, 8, 2, 5, 11};
+// Allowance for a length whose row count has not been built yet: the first
+// pass builds the graph and captures it before it can be timed.
+constexpr double kSpecCostCaptureMs = 300.0;
+
+// Fill the lengths the budget did not reach from the ones it did: linear
+// between measured points, and past the deepest measured point the last
+// segment's slope. Verify cost is close to linear in row count (every row
+// repeats the same weight read), so an extrapolated tail is a good estimate
+// rather than a guess. The curve is forced non-decreasing: a noisy median must
+// not price a longer verify below a shorter one, and the record validator
+// treats a decrease as corruption.
+std::array<double, size_t(SpecLengthPolicy::kMax) + 1> spec_interpolate_costs(
+    const std::array<double, size_t(SpecLengthPolicy::kMax) + 1>& known) {
+  constexpr int n = int(SpecLengthPolicy::kMax) + 1;
+  auto c = known;
+  std::vector<int> idx;
+  idx.reserve(size_t(n));
+  for (int k = 0; k < n; ++k)
+    if (known[size_t(k)] > 0.0) idx.push_back(k);
+  if (idx.size() >= 2) {
+    size_t lo = 0;
+    for (int k = 0; k < n; ++k) {
+      if (known[size_t(k)] > 0.0) continue;
+      while (lo + 1 < idx.size() && idx[lo + 1] < k) ++lo;
+      if (idx[lo] > k) {
+        c[size_t(k)] = known[size_t(idx[lo])];  // below the first measured
+      } else if (lo + 1 == idx.size()) {
+        const int a2 = idx[idx.size() - 2];
+        const int a1 = idx[idx.size() - 1];
+        const double slope =
+            (known[size_t(a1)] - known[size_t(a2)]) / double(a1 - a2);
+        c[size_t(k)] = known[size_t(a1)] + slope * double(k - a1);
+      } else {
+        const int a = idx[lo];
+        const int b = idx[lo + 1];
+        const double t = double(k - a) / double(b - a);
+        c[size_t(k)] = known[size_t(a)] + t * (known[size_t(b)] - known[size_t(a)]);
+      }
+    }
+  }
+  for (int k = 1; k < n; ++k)
+    if (c[size_t(k)] < c[size_t(k - 1)]) c[size_t(k)] = c[size_t(k - 1)];
+  return c;
+}
+
+// Measure c(k) for k = 0..kSpecMaxDrafts on synthetic rows and store the curve.
+// Only the adaptive policy prices verify lengths ("on" uses the fixed cap,
+// "off" never verifies), so those modes return without touching the device; an
+// undecided mode is priced too, because the V2 probe may still select auto at
+// the first call. A complete, structurally valid record is reused as-is, but
+// the runtime warm-up below runs either way: it is what keeps the first
+// request free of a first-use graph build, not part of pricing.
+static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
+                                    DecodeRuntime& rt,
+                                    planner::KvCacheSession& session) {
+  if (!tune::enabled()) return;
+  const SpecMode mode = spec_mode();
+  if (mode == SpecMode::Off || mode == SpecMode::On) return;
+  if (!session.caches || session.cache_id == 0) return;
+
+  // The depth the curve is measured at: bounded, so the whole curve fits the
+  // load budget. What the policy compares across lengths is the curve's shape,
+  // and the attention term grows with depth for c(0) and c(k) alike. The rows
+  // the measurement writes are rows the first prefill overwrites before any
+  // attention extent reaches them (the same argument as the V2 probe's rows).
+  const uint64_t pos =
+      n_ctx > uint64_t(planner::kMaxVerifyRows)
+          ? std::min<uint64_t>(n_ctx - uint64_t(planner::kMaxVerifyRows), 512)
+          : 0;
+  const std::vector<uint64_t> feed(size_t(planner::kMaxVerifyRows), 0);
+  std::vector<int64_t> out(size_t(planner::kMaxVerifyRows), -1);
+
+  // Warm-up: build and capture the verify runtimes a request reaches before it
+  // has any evidence — the evidence bootstrap verifies at the full depth
+  // (kMaxVerifyRows rows), the k = 0 recovery lookup at kSpecExploreDepth, and
+  // the V2 probe at 2 rows. A row count is built and captured on its first
+  // use; paying that in a request puts 100-300 ms of graph work inside the
+  // first decode step (the bootstrap's verify runs before the first token).
+  // Load owns that one-time cost instead.
+  {
+    const auto t_warm = std::chrono::steady_clock::now();
+    const int warm_rows[] = {2, int(kSpecExploreDepth) + 1,
+                             int(planner::kMaxVerifyRows)};
+    for (int rows : warm_rows) {
+      if (pos + uint64_t(rows) > n_ctx) continue;
+      (void)verify_step_spine_cuda(
+          m, std::span<const uint64_t>(feed.data(), size_t(rows)), pos,
+          session, std::span<int64_t>(out.data(), size_t(rows)));
+    }
+    if (spec_diag_enabled())
+      std::fprintf(stderr, "[spec-cost] prewarm rows=2,%lld,%lld %.0fms\n",
+                   (long long)kSpecExploreDepth + 1,
+                   (long long)planner::kMaxVerifyRows,
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t_warm).count());
+  }
+
+  SpecLengthPolicy p;
+  p.key = spec_cost_cache_key(
+      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
+      m.config.embedding_length, n_ctx);
+  const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
+  bool complete = true;
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    const auto it = cached.find("c" + std::to_string(k));
+    if (it != cached.end() && it->second > 0)
+      p.cost_us[size_t(k)] = double(it->second);
+    else
+      complete = false;
+  }
+  if (complete && spec_cost_record_valid(p.cost_us)) return;
+
+  const auto t_load = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t_load)
+        .count();
+  };
+  const bool replay_ok =
+      rt.prog && rt.cuda->capture_resources_ok(session.cache_id);
+  const auto plain_us = [&]() -> double {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (greedy_step(rt, 0, pos, replay_ok, [] {}) < 0) return -1.0;
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  std::array<double, size_t(SpecLengthPolicy::kMax) + 1> known{};
+  int measured = 0;
+  double last_us = 0.0;  // the previous knot's median (projection input)
+  for (int64_t k : kSpecCostBand) {
+    if (k > int64_t(SpecLengthPolicy::kMax)) continue;
+    if (pos + uint64_t(k) + 1 > n_ctx) continue;  // no room for k+1 rows
+    // The budget is checked before a length is started and before its timed
+    // passes: a length whose build would overrun it is abandoned rather than
+    // priced from a partial sample. The projection stops a whole length from
+    // being entered when its repetitions cannot fit; the in-loop check below
+    // covers the case where the estimate was too optimistic.
+    if (measured >= 2) {
+      const double est_ms =
+          double(kWarmCostReps + kWarmTimedReps) * last_us / 1000.0 +
+          kSpecCostCaptureMs;
+      if (elapsed_ms() + est_ms > kSpecCostLoadBudgetMs) break;
+    }
+    const size_t rows = size_t(k) + 1;
+    std::vector<double> samples;
+    samples.reserve(size_t(kWarmTimedReps));
+    bool ok = true;
+    for (int i = 0; i < kWarmCostReps + kWarmTimedReps; ++i) {
+      if (i == kWarmCostReps && measured >= 2 &&
+          elapsed_ms() >= kSpecCostLoadBudgetMs) {
+        ok = false;
+        break;
+      }
+      double us = -1.0;
+      if (k == 0) {
+        us = plain_us();
+      } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (verify_step_spine_cuda(
+                m, std::span<const uint64_t>(feed.data(), rows), pos, session,
+                std::span<int64_t>(out.data(), rows)))
+          us = std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+      }
+      if (us < 0.0) {
+        ok = false;
+        break;
+      }
+      if (i >= kWarmCostReps) samples.push_back(us);
+    }
+    if (!ok) continue;  // this length cannot run: leave it to interpolation
+    std::sort(samples.begin(), samples.end());
+    known[size_t(k)] = samples[samples.size() / 2];
+    last_us = known[size_t(k)];
+    ++measured;
+  }
+  if (spec_diag_enabled()) {
+    // The measured points and the budget they consumed, so a diagnostic run can
+    // tell a priced length from an interpolated one.
+    std::fprintf(stderr, "[spec-cost] n=%d load=%.0fms budget=%.0fms",
+                 measured, elapsed_ms(), kSpecCostLoadBudgetMs);
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k)
+      if (known[size_t(k)] > 0.0)
+        std::fprintf(stderr, " c%d=%.0f", k, known[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
+  if (measured < 2) return;  // nothing to anchor a curve on: warm up as before
+  p.cost_us = spec_interpolate_costs(known);
+  if (!spec_cost_record_valid(p.cost_us)) return;
+  spec_policy_store(p);
 }
 
 // In-process evidence store, keyed by context class. The cost model is already
@@ -3918,16 +4147,25 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // runtime-owned cache as before.
   DecodeRuntime* rt = get_decode_runtime(m, n_ctx, session);
   if (!rt) return false;
+  // The cache the runtimes below are bound to: the caller's session cache, or
+  // the anonymous runtime's own (published into a local identity).
+  planner::KvCacheSession local;
+  planner::KvCacheSession* kv = session;
   if (session) {
     if (!session->caches || session->cache_id == 0) return false;
     (void)get_sampled_runtime(m, n_ctx, *session);
   } else {
-    planner::KvCacheSession warm;
-    warm.n_ctx = n_ctx;
-    rt->cuda->publish_cache(warm);
-    (void)get_sampled_runtime(m, n_ctx, warm);
+    local.n_ctx = n_ctx;
+    rt->cuda->publish_cache(local);
+    (void)get_sampled_runtime(m, n_ctx, local);
+    kv = &local;
   }
   warm_verify_gemv_wp_model(m);
+  // 4b: price the verify cost curve here, at load, so the first generation call
+  // starts with every draft length priced and none of the warm-up lands inside
+  // its first token.
+  if (kv->caches && kv->cache_id != 0)
+    spec_measure_cost_curve(m, n_ctx, *rt, *kv);
   return true;
 }
 
