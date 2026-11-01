@@ -181,10 +181,14 @@ __device__ __forceinline__ float vec_dot_q3_K_q8_1(const uint8_t* wb,
   const int group_base = (lane >> 4) << 4;                 // 0 or 16
   const int my_sc = ((scales[iqs & 7] >> (4 * (iqs >> 3))) & 0xF)
                   | (((scales[8 + (iqs & 3)] >> (2 * (iqs >> 2))) & 3) << 4);
+  // The gather stays inside the 16-lane group, so the mask must too: on the
+  // `b += 2` loops an odd blocks_per_row leaves only one half-warp with a
+  // block to process, and a full-warp mask would wait on exited lanes.
+  const unsigned gm = 0xffffu << group_base;
   int sc[QR3_K];
   #pragma unroll
   for (int i = 0; i < QR3_K; ++i)
-    sc[i] = __shfl_sync(0xffffffffu, my_sc, group_base + scale_offset + 2 * i);
+    sc[i] = __shfl_sync(gm, my_sc, group_base + scale_offset + 2 * i);
 
   const int vl = get_int_b2(qs, iqs);
   const int vh = ~get_int_b2(hmask, iqs % (QI3_K / 2)) >> bq8_offset;
@@ -879,10 +883,13 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       const int group_base = (lane >> 4) << 4;
       const int my_sc = ((scales[iqs & 7] >> (4 * (iqs >> 3))) & 0xF)
                       | (((scales[8 + (iqs & 3)] >> (2 * (iqs >> 2))) & 3) << 4);
+      // Group-local mask, as in vec_dot_q3_K_q8_1: odd blocks_per_row leaves
+      // one half-warp without a block on the last `b += 2` iteration.
+      const unsigned gm = 0xffffu << group_base;
       int sc[QR3_K];
       #pragma unroll
       for (int i = 0; i < QR3_K; ++i)
-        sc[i] = __shfl_sync(0xffffffffu, my_sc, group_base + scale_offset + 2 * i);
+        sc[i] = __shfl_sync(gm, my_sc, group_base + scale_offset + 2 * i);
       const int vl = get_int_b2(qs, iqs);
       const int vh = ~get_int_b2(hmask, iqs % (QI3_K / 2)) >> bq8_offset;
       int vi[QR3_K];
