@@ -1158,14 +1158,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t vr = 0;
       if (verify_attr(vr)) {
         // Verify without a quantize fusion (rare: the pipeline quantizes every
-        // activation feeding a matmul): one decode gemv per row.
+        // activation feeding a matmul): quantize all rows in one launch and run
+        // the row-invariant batched gemv. When the q8_1 path is disabled the
+        // per-row decode gemv runs instead.
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
-        const int rows = out_n / int(vr);
-        const int cols = int((in[0].device.size_bytes / sizeof(float)) / vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::matvec_f32_dev(qweight(slot),
-                                           dev(in[0]) + r * cols,
-                                           out + r * rows);
+        if (!quant::cuda::matvec_f32_rows_dev(qweight(slot), dev(in[0]), out,
+                                              int(vr))) {
+          const int rows = out_n / int(vr);
+          const int cols = int((in[0].device.size_bytes / sizeof(float)) / vr);
+          ok = true;
+          for (int64_t r = 0; r < vr && ok; ++r)
+            ok = quant::cuda::matvec_f32_dev(qweight(slot),
+                                             dev(in[0]) + r * cols,
+                                             out + r * rows);
+        }
       } else if (batch_attr(nb)) {
         ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
       } else {
@@ -1241,8 +1247,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                      : std::span<const float>{};
         const float* add_p =
             has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
+        // A type with the fused epilogue adds the bias and the residual in the
+        // gemv's per-row write (same two f32 additions, same order, as the
+        // separate kernels); other types keep the elementwise epilogues.
+        const bool fused_ep =
+            quant::cuda::gemv_bias_epilogue_supported(qw.type());
         if (spec_verify_batch_enabled()) {
-          ok = quant::cuda::gemv_q8_1_batched_dev(qw, xq, out, int(vr));
+          ok = quant::cuda::gemv_q8_1_batched_dev(
+              qw, xq, out, int(vr),
+              (fused_ep && has_bias) ? b : std::span<const float>{},
+              (fused_ep && has_add) ? add_p : nullptr);
         } else {
           // Serial ablation: one decode gemv per query row (the activation row
           // is [cols/32] q8_1 blocks, the output row is out_n/vr floats).
@@ -1253,9 +1267,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             ok = quant::cuda::gemv_q8_1_dev(qw, xq + r * bpr,
                                             out + r * rows_out);
         }
-        if (ok && has_bias && !b.empty())
+        if (ok && has_bias && !b.empty() && !(fused_ep && spec_verify_batch_enabled()))
           ok = nn::cuda::add_bias_dev(b, out, out, out_n);
-        if (ok && has_add) ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        if (ok && has_add && !(fused_ep && spec_verify_batch_enabled()))
+          ok = nn::cuda::add_dev(add_p, out, out, out_n);
         break;
       }
       if (batch_attr(nb)) {

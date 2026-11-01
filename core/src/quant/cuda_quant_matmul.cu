@@ -2455,7 +2455,7 @@ int verify_gemv_wp_override() noexcept {
                 {{"T", T}, {"WP", 4}}),                                        \
             grid_wp, block, 0, cur_stream());                                  \
         q8_1::KERNEL<T, 4><<<grid_wp, block, 0, cur_stream()>>>(               \
-            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
         break;                                                                 \
       case 2:                                                                  \
         SB_NOTE_LAUNCH_TP(                                                     \
@@ -2464,7 +2464,7 @@ int verify_gemv_wp_override() noexcept {
                 {{"T", T}, {"WP", 2}}),                                        \
             grid_wp, block, 0, cur_stream());                                  \
         q8_1::KERNEL<T, 2><<<grid_wp, block, 0, cur_stream()>>>(               \
-            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
         break;                                                                 \
       default:                                                                 \
         SB_NOTE_LAUNCH_TP(                                                     \
@@ -2473,7 +2473,7 @@ int verify_gemv_wp_override() noexcept {
                 {{"T", T}, {"WP", 1}}),                                        \
             grid_wp, block, 0, cur_stream());                                  \
         q8_1::KERNEL<T, 1><<<grid_wp, block, 0, cur_stream()>>>(               \
-            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
         break;                                                                 \
     }                                                                          \
   } while (0)
@@ -2484,7 +2484,9 @@ int verify_gemv_wp_override() noexcept {
 // positions. dst is [n, num_rows] (position-major).
 void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                               const q8_1::block_q8_1* xq, float* yp,
-                              int blocks_per_row, int num_rows, int n) {
+                              int blocks_per_row, int num_rows, int n,
+                              const float* bias = nullptr,
+                              const float* add = nullptr) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
   int wp_eff = (wp == 2 || wp == 4) ? wp : 1;
@@ -2503,7 +2505,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
     case QuantType::Q4_K:
@@ -2514,7 +2516,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
     case QuantType::Q5_K:
@@ -2525,7 +2527,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
     case QuantType::Q6_K:
@@ -2536,7 +2538,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
     case QuantType::Q5_0:
@@ -2547,7 +2549,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
     case QuantType::Q8_0:
@@ -2558,7 +2560,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp_w, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
       }
       break;
   }
@@ -3223,7 +3225,8 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
 }
 
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
-                           float* y, int n) {
+                           float* y, int n, std::span<const float> bias,
+                           const float* add) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
   const uint64_t cols = W.dims()[0];
@@ -3231,14 +3234,55 @@ bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
   if (!xq || !y || n <= 0) return false;
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact
   if (blocks_per_row == 0) return false;
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows || !gemv_bias_epilogue_supported(W.type()))
+      return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+  if (add && !gemv_bias_epilogue_supported(W.type())) return false;
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   launch_gemv_q8_1_batched(
       W.type(), verify_gemv_wp_for(W.type(), int(rows), int(cols), n),
       static_cast<const uint8_t*>(d_w),
       reinterpret_cast<const q8_1::block_q8_1*>(xq), y, int(blocks_per_row),
-      int(rows), n);
+      int(rows), n, d_bias, add);
   return cudaGetLastError() == cudaSuccess;
+}
+
+// Multi-row quantized matvec (the verify step's positions, the
+// QuantizedMatmul form that carries a plain f32 activation): quantize every
+// row to q8_1 with one launch, then the row-invariant batched gemv. Row i is
+// bit-identical to matvec_f32_dev on that row — the q8_1 quantize is per-block
+// elementwise, and the batched mmvq's per-position arithmetic is the
+// single-column gemv's (B2 audit). Declines when the q8_1 path is disabled, so
+// the caller keeps its per-row vec_dot gemv.
+bool matvec_f32_rows_dev(const QuantizedTensor& W, const float* x, float* y,
+                         int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t cols = W.dims()[0];
+  if (!x || !y || n <= 0) return false;
+  if (!q8_1_enabled()) return false;
+  const uint32_t blocks_per_row = uint32_t(cols / W.block_size());
+  if (blocks_per_row == 0) return false;
+  const int nblocks = int(cols / q8_1::QK8_1) * n;
+  if (nblocks <= 0) return false;
+  q8_1::block_q8_1* d_q8 = static_cast<q8_1::block_q8_1*>(
+      grow_scratch(g_q8, g_q8_bytes,
+                   (size_t)nblocks * sizeof(q8_1::block_q8_1)));
+  if (!d_q8) return false;
+  SB_NOTE_LAUNCH(q8_1::quantize_q8_1, q8_1::quantize_q8_1_grid(nblocks),
+                 q8_1::kQuantizeBlockThreads, 0, cur_stream());
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks),
+                        q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+      x, d_q8, nblocks);
+  const bool ok = gemv_q8_1_batched_dev(
+      W, reinterpret_cast<const BlockQ8_1*>(d_q8), y, n);
+  return ok;
 }
 
 // q8_1 activation blocks consumed per *weight* block. A K-quant weight block

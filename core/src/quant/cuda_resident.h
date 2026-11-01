@@ -37,6 +37,13 @@ namespace sonicboom::quant::cuda {
 // floats, zero-initialized before accumulation). No host copies.
 bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 
+// Multi-row matvec (the verify step's positions): x is [n, cols], y is
+// [n, rows]. Quantizes every row with one launch and runs the row-invariant
+// batched gemv, so row i is bit-identical to matvec_f32_dev on that row.
+// Declines (false) when the q8_1 path is disabled.
+bool matvec_f32_rows_dev(const QuantizedTensor& W, const float* x, float* y,
+                         int n);
+
 // One q8_1 activation block: an fp32 scale `d` and 32 int8 quants (amax/127
 // quantization, == llama.cpp's quantize_q8_1). Layout-identical to the .cu
 // kernel's block struct; a pure POD so it needs no CUDA includes.
@@ -107,10 +114,13 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
 // `y` is [n, rows]. The batched gemv's per-position arithmetic is the same lane
 // decomposition and summation order as gemv_q8_1_dev (single vs batched mmvq,
 // B2 audit), so row i of the result is bit-identical to the single-column call
-// on row i. No bias/add epilogue: the verify step adds them with elementwise
-// kernels, which store the same f32 values as the fused epilogue.
+// on row i. `bias`/`add` are the optional epilogue operands of the fused gemv
+// epilogue (applied in that order to each row's reduced sum, exactly as
+// add_bias_dev then add_dev would): a type gemv_bias_epilogue_supported()
+// rejects with a non-empty bias (or a non-null add) fails the call.
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
-                           float* y, int n);
+                           float* y, int n, std::span<const float> bias = {},
+                           const float* add = nullptr);
 
 // The warps-per-row split gemv_q8_1_batched_dev uses for this projection and
 // row count: the warm-up's measured pick for (type, rows, cols, n), or 1 (one

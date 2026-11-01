@@ -561,7 +561,8 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
   template <int T>                                                                \
   __global__ void gemv_##suffix##_q8_1_batched(                                   \
       const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,            \
-      float* __restrict__ dst, int blocks_per_row, int num_rows, int n) {         \
+      float* __restrict__ dst, int blocks_per_row, int num_rows, int n,           \
+      const float* __restrict__ bias, const float* __restrict__ add) {            \
     const int lane = threadIdx.x;                                                 \
     const int row = blockIdx.y * blockDim.y + threadIdx.y;                        \
     if (row >= num_rows) return;                                                  \
@@ -580,7 +581,12 @@ __global__ void gemv_q6_K_q8_1(const uint8_t* __restrict__ w,
           float s = sum[t];                                                       \
           _Pragma("unroll") for (int o = 16; o > 0; o >>= 1)                      \
               s += __shfl_down_sync(0xffffffffu, s, o);                           \
-          if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;              \
+          if (lane == 0) {                                                        \
+            float v = s;                                                          \
+            if (bias) v += bias[row];                                             \
+            if (add) v += add[(size_t)(p0 + t) * num_rows + row];                 \
+            dst[(size_t)(p0 + t) * num_rows + row] = v;                           \
+          }                                                                       \
         }                                                                         \
       }                                                                           \
     }                                                                             \
@@ -717,7 +723,9 @@ template <int T>
 __global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
-                                       int blocks_per_row, int num_rows, int n) {
+                                       int blocks_per_row, int num_rows, int n,
+                                       const float* __restrict__ bias,
+                                       const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -745,7 +753,12 @@ __global__ void gemv_q3_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + t) * num_rows + row];
+          dst[(size_t)(p0 + t) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -755,7 +768,9 @@ template <int T>
 __global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
-                                       int blocks_per_row, int num_rows, int n) {
+                                       int blocks_per_row, int num_rows, int n,
+                                       const float* __restrict__ bias,
+                                       const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -783,7 +798,12 @@ __global__ void gemv_q4_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + t) * num_rows + row];
+          dst[(size_t)(p0 + t) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -793,7 +813,9 @@ template <int T>
 __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
-                                       int blocks_per_row, int num_rows, int n) {
+                                       int blocks_per_row, int num_rows, int n,
+                                       const float* __restrict__ bias,
+                                       const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -821,7 +843,12 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + t) * num_rows + row];
+          dst[(size_t)(p0 + t) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -857,7 +884,9 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -928,7 +957,12 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -939,7 +973,9 @@ __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -1025,7 +1061,12 @@ __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -1036,7 +1077,9 @@ __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -1130,7 +1173,12 @@ __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -1140,7 +1188,9 @@ template <int T>
 __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
                                        float* __restrict__ dst,
-                                       int blocks_per_row, int num_rows, int n) {
+                                       int blocks_per_row, int num_rows, int n,
+                                       const float* __restrict__ bias,
+                                       const float* __restrict__ add) {
   const int lane = threadIdx.x;
   const int row = blockIdx.y * blockDim.y + threadIdx.y;
   if (row >= num_rows) return;
@@ -1166,7 +1216,12 @@ __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + t) * num_rows + row];
+          dst[(size_t)(p0 + t) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -1181,7 +1236,9 @@ __global__ void gemv_q6_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -1246,7 +1303,12 @@ __global__ void gemv_q6_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -1261,7 +1323,9 @@ __global__ void gemv_q8_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -1299,7 +1363,12 @@ __global__ void gemv_q8_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
@@ -1310,7 +1379,9 @@ __global__ void gemv_q5_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
-                                             int n) {
+                                             int n,
+                                             const float* __restrict__ bias,
+                                             const float* __restrict__ add) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
@@ -1369,7 +1440,12 @@ __global__ void gemv_q5_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+        if (lane == 0) {
+          float v = s;
+          if (bias) v += bias[row];
+          if (add) v += add[(size_t)(p0 + po) * num_rows + row];
+          dst[(size_t)(p0 + po) * num_rows + row] = v;
+        }
       }
     }
   }
