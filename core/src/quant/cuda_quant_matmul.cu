@@ -2935,10 +2935,17 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // once (kept in a register and reused by the amax butterfly), so the block
 // costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
 // thread runs a 32-iteration serial chain.
+// `blockIdx.y` is the row of the verify step's multi-position launch; each block
+// runs the per-row code unchanged on its own row's slice (n floats in, n/32
+// q8_1 blocks out), so every row is bit-identical to the single-row launch.
 template <typename R>
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    y += (size_t)blockIdx.y * (size_t)(n / 32);
+  }
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -2967,29 +2974,32 @@ __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
 }
 
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
-                                float eps, BlockQ8_1* yq, int n) {
-  if (!available() || !x || !yq || n <= 0 || (n & 31) != 0) return false;
+                                float eps, BlockQ8_1* yq, int n, int rows) {
+  if (!available() || !x || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
   if (!weight.empty() && weight.size() < (size_t)n) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, 1, 1024, 0, cur_stream());
+  SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, dim3(1, rows), 1024, 0,
+                 cur_stream());
   auto* y = reinterpret_cast<q8_1::block_q8_1*>(yq);
   cudaStream_t st = cur_stream();
+  const dim3 grid(1, rows);
   switch (sonicboom::planner::device_reduce_mode()) {
     case sonicboom::compiler::ReduceMode::Df32:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumDf32>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
     case sonicboom::compiler::ReduceMode::F32:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF32>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
     default:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF64>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
   }
   return cudaGetLastError() == cudaSuccess;
@@ -3001,11 +3011,18 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
 // materialized. Bit-identical to gelu_fp16_dev + mul_dev + quantize_q8_1_dev:
 // the gelu/mul are pure functions of gate/up, recomputed identically in the
 // amax and quantize passes.
+// `blockIdx.y` is the row of the verify step's multi-position launch, as in
+// rms_norm_quantize_q8_1_kernel.
 __global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
                                               const float* __restrict__ up,
                                               int n, q8_1::block_q8_1* __restrict__ y) {
   const int ib = blockIdx.x * blockDim.x + threadIdx.x;
   const int nblocks = n / 32;
+  if (blockIdx.y != 0) {
+    gate += (size_t)blockIdx.y * (size_t)n;
+    up += (size_t)blockIdx.y * (size_t)n;
+    y += (size_t)blockIdx.y * (size_t)nblocks;
+  }
   if (ib >= nblocks) return;
   const float* gb = gate + (size_t)ib * 32;
   const float* ub = up + (size_t)ib * 32;
@@ -3026,10 +3043,12 @@ __global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
 }
 
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n) {
-  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
-  SB_NOTE_LAUNCH(gelu_mul_quantize_q8_1_kernel, (n / 32 + 255) / 256, 256, 0, cur_stream());
-  gelu_mul_quantize_q8_1_kernel<<<(n / 32 + 255) / 256, 256, 0, cur_stream()>>>(
+                                int n, int rows) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
+  const dim3 grid((n / 32 + 255) / 256, rows);
+  SB_NOTE_LAUNCH(gelu_mul_quantize_q8_1_kernel, grid, 256, 0, cur_stream());
+  gelu_mul_quantize_q8_1_kernel<<<grid, 256, 0, cur_stream()>>>(
       gate, up, n, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3047,6 +3066,12 @@ __global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
                                               int nblocks,
                                               q8_1::block_q8_1* __restrict__ y) {
   const int ib = blockIdx.x * q8_1::kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
+  if (blockIdx.y != 0) {
+    const size_t row = (size_t)blockIdx.y * (size_t)nblocks * 32;
+    gate += row;
+    up += row;
+    y += (size_t)blockIdx.y * (size_t)nblocks;
+  }
   if (ib >= nblocks) return;
   const int lane = threadIdx.x & 31;
   const size_t i = (size_t)ib * 32 + lane;
@@ -3062,12 +3087,14 @@ __global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
 }
 
 bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n) {
-  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+                                int n, int rows) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
   const int nblocks = n / 32;
-  SB_NOTE_LAUNCH(silu_mul_quantize_q8_1_kernel, q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream());
-  silu_mul_quantize_q8_1_kernel<<<q8_1::quantize_q8_1_grid(nblocks),
-                                  q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+  const dim3 grid(q8_1::quantize_q8_1_grid(nblocks), rows);
+  SB_NOTE_LAUNCH(silu_mul_quantize_q8_1_kernel, grid, q8_1::kQuantizeBlockThreads, 0, cur_stream());
+  silu_mul_quantize_q8_1_kernel<<<grid, q8_1::kQuantizeBlockThreads, 0,
+                                  cur_stream()>>>(
       gate, up, nblocks, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }

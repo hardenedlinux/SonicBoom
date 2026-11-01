@@ -1097,19 +1097,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // set_kv_write_suppressed); the attention still runs so the split
         // scratch and every launch the capture records are exercised.
         const bool verify_appends = in.size() >= 4 && !kv_write_suppressed_;
-        for (int64_t r = 0; r < vr && ok; ++r) {
-          if (verify_appends &&
-              !nn::cuda::kv_append_dev(
-                  dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
-                  dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
-                  reinterpret_cast<const uint64_t*>(pos_slot()), cache.n_slots,
-                  row_elems, int(r), cache.f16(), cache.q8(),
-                  int(cache.head_dim))) {
-            ok = false;
-            break;
-          }
+        if (verify_appends &&
+            !nn::cuda::kv_append_batched_dev_pos(
+                dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[1]),
+                dev(in[2]), reinterpret_cast<const uint64_t*>(pos_slot()),
+                cache.n_slots, row_elems, int(vr), cache.f16(), cache.q8(),
+                int(cache.head_dim))) {
+          ok = false;
+          break;
         }
-        if (!ok) break;
         if (!nn::cuda::decode_attention_mq_dev(
                 dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                 reinterpret_cast<const uint64_t*>(pos_slot()), window,
@@ -1401,10 +1397,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::rms_norm_quantize_q8_1_dev(
-              fweight(slot), dev(in[0]) + r * row, eps,
-              yq + r * (row / 32), row);
+        ok = quant::cuda::rms_norm_quantize_q8_1_dev(
+            fweight(slot), dev(in[0]), eps, yq, row, int(vr));
         break;
       }
       if (batch_attr(nb)) {
@@ -1472,12 +1466,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         };
         int64_t vr = 0;
         if (verify_attr(vr) && vr > 0) {
-          // Verify: one row per call, into that row's contiguous q8_1 blocks.
+          // Verify: one launch, grid.y over the rows, into each row's
+          // contiguous q8_1 blocks. The generated kernel is byte-identical to
+          // the hand kernel, so the hand kernel's multi-row form (the same
+          // per-row block) is the row-invariant launch.
           const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
           auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
           if (row <= 0 || row % 32 != 0) { ok = false; break; }
-          for (int64_t r = 0; r < vr && ok; ++r)
-            ok = run_row(dev(in[0]) + r * row, yq + r * (row / 32), row, true);
+          ok = quant::cuda::rms_norm_quantize_q8_1_dev(w, dev(in[0]), eps, yq,
+                                                       row, int(vr));
           break;
         }
         ok = run_row(dev(in[0]), reinterpret_cast<quant::cuda::BlockQ8_1*>(out),
@@ -1895,10 +1892,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
-              dev(in[0]) + r * row, dev(in[1]) + r * row, yq + r * (row / 32),
-              row);
+        ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]), yq, row, int(vr));
       } else {
         note_activation_quant("q8_1");
         const int n = int(in[0].device.size_bytes / sizeof(float));
@@ -1930,10 +1925,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::silu_mul_quantize_q8_1_dev(
-              dev(in[0]) + r * row, dev(in[1]) + r * row, yq + r * (row / 32),
-              row);
+        ok = quant::cuda::silu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]), yq, row, int(vr));
       } else {
         note_activation_quant("q8_1");
         const int n = int(in[0].device.size_bytes / sizeof(float));

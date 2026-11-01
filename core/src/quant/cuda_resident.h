@@ -58,8 +58,10 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
 // the f32 normalized activation is never materialized. `weight` is a host span
 // of n floats (empty => unit). Bit-identical to rms_norm_dev followed by
 // quantize_q8_1_dev. Device in/out, no host copies. n must be a multiple of 32.
+// `rows` > 1 is the verify step's multi-position form: x is [rows, n] and yq
+// [rows, n/32]; every row runs the single-row block unchanged.
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
-                                float eps, BlockQ8_1* yq, int n);
+                                float eps, BlockQ8_1* yq, int n, int rows = 1);
 
 // Upload a host byte range to the device once and cache it by (pointer, size).
 // This is the cache the *_dev weight spans above use; it is exposed so the glue
@@ -72,14 +74,14 @@ const void* upload_bytes_cached(const void* host, std::size_t bytes);
 // amax/127-quantizes — the f32 gelu and product intermediates are never
 // materialized. Device in/out, no host copies. n must be a multiple of 32.
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n);
+                                int n, int rows = 1);
 
 // silu×up -> q8_1 fused (T5, SwiGLU): yq = quantize_q8_1(silu(gate) * up). The
 // Silu counterpart of gelu_mul_quantize_q8_1_dev (same fusion, same contract);
 // the two differ only in the activation. Device in/out, no host copies. n must
 // be a multiple of 32.
 bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n);
+                                int n, int rows = 1);
 
 // The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
