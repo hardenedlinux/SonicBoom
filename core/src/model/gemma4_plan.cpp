@@ -47,6 +47,8 @@
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #endif
 
+#include <dlfcn.h>  // dladdr: identity of the loaded library (cost-cache key)
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -56,6 +58,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <list>
 #include <map>
@@ -1155,37 +1158,218 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
   return r;
 }
 
-// B7: the adaptive draft-length policy (plan.h). The objective is emitted
-// tokens per unit of iteration time: with acceptance rate alpha, k drafts yield
-// the expected run E(k) = 1 + alpha + ... + alpha^k, so choose the k that
-// maximizes E(k) / c(k), c(k) being one iteration's measured cost.
-int64_t spec_choose_drafts(double alpha, std::span<const double> cost_us,
-                           int64_t max_k) {
-  if (max_k < 0) return 0;
-  alpha = std::clamp(alpha, 0.0, 1.0);
-  const auto expected = [alpha](int64_t k) {
-    if (alpha >= 1.0 - 1e-9) return double(k) + 1.0;  // the limit of the sum
-    return (1.0 - std::pow(alpha, double(k) + 1.0)) / (1.0 - alpha);
-  };
-  int64_t best_k = max_k;  // nothing measured: the fixed cap
-  double best = 0.0;
-  bool any = false;
-  for (int64_t k = 0; k <= max_k && size_t(k) < cost_us.size(); ++k) {
-    if (!(cost_us[size_t(k)] > 0.0)) continue;  // unmeasured
-    const double score = expected(k) / cost_us[size_t(k)];
-    if (!any || score > best) {
-      any = true;
-      best = score;
-      best_k = k;
+// B6/B7: the largest draft budget one speculative step verifies. One step
+// runs at most kSpecMaxDrafts + 1 rows, the envelope the row-invariant verify
+// step was built and tested for (B3's verify_k1..k7 classes).
+constexpr int64_t kSpecMaxDrafts = 7;
+
+// B7 v2: the bursty-acceptance model (plan.h). A per-token acceptance rate is
+// the wrong statistic for prompt lookup: a copy is accepted as a block, so a
+// stream whose per-draft alpha is 0.41 can still emit three tokens per verify
+// (measured: Qwen 7B chat). The estimate is therefore built from per-position
+// conditional hazards P(accepted >= j | proposed >= j), which keep the block
+// structure: E[A_k] = sum_j prod_{i<=j} p_i, emitted = 1 + E[A_k].
+//
+// The hazard prior is one pseudo-opportunity with half a pseudo-acceptance, so
+// a position with no observation is neutral (0.5) and one with observations
+// converges to the observed rate. A deeper position that was never verified
+// (the budget never reached it) inherits the last observed hazard: a copy that
+// was accepted at position j usually continues, so the prior that a match
+// survives deeper is the local one, not the global neutral one. The window the
+// loop feeds is bounded (64 observations), so the estimate follows a workload
+// whose behaviour changes and old data cannot pin it forever.
+double spec_expected_run(std::span<const uint32_t> proposed,
+                         std::span<const uint32_t> accepted, int64_t k) {
+  const int64_t n = std::clamp<int64_t>(k, 0, kSpecMaxDrafts);
+  const size_t obs = std::min(proposed.size(), accepted.size());
+  double run = 0.0;
+  double last = 0.5;  // no position observed yet: the neutral prior
+  double ceiling = 1.0;  // reach cannot exceed the previous position's
+  for (int64_t j = 1; j <= n; ++j) {
+    uint64_t opportunities = 0;
+    uint64_t accepted_here = 0;
+    for (size_t i = 0; i < obs; ++i) {
+      if (proposed[i] < uint32_t(j)) continue;
+      ++opportunities;
+      if (accepted[i] >= uint32_t(j)) ++accepted_here;
     }
+    // Estimate the reach of position j directly, P(accepted >= j | proposed
+    // >= j), with one Beta-style weak prior. Estimating the conditional
+    // hazards P(A>=j | A>=j-1) and multiplying them compounds one prior per
+    // position, which understates deep reach whenever the observations at
+    // deep positions are few (the common case: every round that proposed k
+    // supplies one sample at each position <= k, but a policy that settles on
+    // a short k stops supplying deep samples at all). Reach is non-increasing
+    // in j — accepting j+1 implies accepting j — so an unobserved position
+    // carries the previous position's estimate forward and a noisier deep
+    // estimate is clipped to it.
+    double reach =
+        opportunities == 0
+            ? last
+            : (double(accepted_here) + 0.5) / (double(opportunities) + 1.0);
+    reach = std::min(reach, ceiling);
+    last = reach;
+    ceiling = reach;
+    run += reach;
   }
-  return best_k;
+  return 1.0 + run;
 }
 
-double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted) {
-  if (drafted == 0) return alpha;
-  const double x = double(accepted) / double(drafted);
-  return 0.5 * alpha + 0.5 * x;
+// B7 v2: the budget choice (plan.h). With c(k)/c0 the measured iteration cost
+// relative to a plain step and d(k)/c0 the drafter's CPU cost, the score is
+// emitted tokens per plain-step-equivalent:
+//
+//   S(k) = (1 + E[A_k]) / (c(k)/c0 + d(k)/c0)
+//
+// and S(0) = 1 (a plain step emits exactly one token for one plain step). The
+// n-gram proposal cost is measured too, even though it is negligible: a future
+// draft model's cost belongs in the same place, so the model has no special
+// case for it.
+int64_t spec_choose_budget(std::span<const double> cost_us,
+                           std::span<const double> draft_us,
+                           std::span<const double> expected_run,
+                           int64_t max_k, int64_t current_k, double margin) {
+  if (max_k < 0) return 0;
+  const size_t n =
+      std::min<size_t>(size_t(max_k) + 1, cost_us.size());
+  bool any = false;
+  for (size_t k = 0; k < n; ++k)
+    if (cost_us[k] > 0.0) { any = true; break; }
+  // No cost model (autotune disabled, or no warm-up yet): the fixed cap,
+  // which is `on`'s behavior.
+  if (!any || !(cost_us[0] > 0.0)) return max_k;
+  const auto score = [&](size_t k) -> double {
+    if (k >= cost_us.size() || !(cost_us[k] > 0.0)) return -1.0;
+    const double draft =
+        k < draft_us.size() ? std::max(0.0, draft_us[k]) : 0.0;
+    const double e = k < expected_run.size() && expected_run[k] > 0.0
+                         ? expected_run[k]
+                         : 1.0;
+    return e * cost_us[0] / (cost_us[k] + draft);
+  };
+  int64_t best = 0;
+  double best_score = score(0);
+  for (size_t k = 1; k < n; ++k) {
+    const double s = score(k);
+    if (s > best_score) {
+      best = int64_t(k);
+      best_score = s;
+    }
+  }
+  if (current_k < 0 || current_k > max_k) return best;
+  if (best == current_k) return current_k;
+  const double current = score(size_t(current_k));
+  return best_score > current * (1.0 + margin) ? best : current_k;
+}
+
+namespace {
+
+// P0: the cost-model schema version. Bump when the shape of a record or the
+// meaning of its values changes; the key carries it, so old records are simply
+// never looked up (the tune file is append-or-rewrite, not migrated).
+constexpr int kSpecCostSchema = 2;
+
+const char* spec_ctx_class(uint64_t n_ctx) {
+  return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
+}
+
+std::string env_value(const char* name) {
+  const char* e = std::getenv(name);
+  return e && *e ? std::string(e) : std::string("unset");
+}
+
+// Identity of the running library. The cost of a verify round is a property
+// of the kernels and dispatch that produced it; a size+mtime identity moves
+// whenever the shared object is rebuilt, so no kernel change can be priced
+// with a record measured before it. (This is deliberately coarser than a
+// kernel-specific version: a conservative extra warm-up is cheaper than a
+// silently stale price.)
+std::string shared_object_identity() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&shared_object_identity), &info) == 0 ||
+      info.dli_fname == nullptr)
+    return "nostat";
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(info.dli_fname, ec);
+  if (ec) return "nostat";
+  const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
+  if (ec) return "nostat";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%llx-%llx",
+                (unsigned long long)size,
+                (unsigned long long)mtime.time_since_epoch().count());
+  return buf;
+}
+
+// The verify-dispatch fingerprint: schema, build identity, the runtime
+// switches that select a different verify kernel, and the numerics profile
+// (it fixes the KV element type). A change in any of them makes every cached
+// cost stale, so the key changes and the policy warms up again.
+std::string spec_kernel_fingerprint() {
+  uint64_t h = 0xcbf29ce484222325ull;
+  const auto add = [&h](std::string_view s) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 0x100000001b3ull;
+    }
+    h ^= 0xff;
+    h *= 0x100000001b3ull;
+  };
+  add("spec-cost");
+  add(std::to_string(kSpecCostSchema));
+#ifdef SONICBOOM_VERSION_STRING
+  add(SONICBOOM_VERSION_STRING);
+#else
+  add("dev");
+#endif
+  add(shared_object_identity());
+  add(env_value("SONICBOOM_SPEC_VERIFY_BATCH"));
+  add(env_value("SONICBOOM_VERIFY_GEMV_REUSE"));
+#ifdef SONICBOOM_USE_CUDA
+  add(quant::cuda::q8_1_enabled() ? "q8_1" : "no-q8_1");
+  add(quant::cuda::mmq_enabled() ? "mmq" : "no-mmq");
+  add(std::to_string(quant::cuda::mmq_min_n()));
+#endif
+  // Host-only resolution: the device reduce mode would query (and thus
+  // initialize) CUDA, and the cost records already live in the per-device tune
+  // directory. The env override is what a process can change per launch.
+  add(planner::reduce_mode_env()
+          ? std::to_string(int(*planner::reduce_mode_env()))
+          : "auto");
+  // Resolving the profile records a per-device decision (which queries CUDA).
+  // Before anything has resolved it, the env switch is the whole input.
+  add(numerics_profile_resolved()
+          ? std::to_string(int(numerics_profile()))
+          : env_value("SONICBOOM_NUMERICS"));
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+  return buf;
+}
+
+} // namespace
+
+std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
+                                uint64_t n_ctx) {
+  return std::string("v2|") + (arch ? arch : "unknown") + "|e" +
+         std::to_string(embedding_length) + "|ctx=" + spec_ctx_class(n_ctx) +
+         "|k=" + spec_kernel_fingerprint();
+}
+
+bool spec_cost_record_valid(std::span<const double> cost_us) {
+  if (cost_us.empty() || !(cost_us[0] > 0.0)) return false;
+  // A decode step is tens of microseconds to a few hundred milliseconds. A
+  // value outside that range is a unit error or a corrupt record, not a price
+  // worth keeping.
+  if (cost_us[0] < 100.0 || cost_us[0] > 6.0e7) return false;
+  double prev = cost_us[0];
+  for (size_t k = 1; k < cost_us.size(); ++k) {
+    if (!(cost_us[k] > 0.0)) continue;
+    // More rows never get cheaper; 10% tolerance absorbs a noisy measurement.
+    if (cost_us[k] < prev * 0.9) return false;
+    if (cost_us[k] / cost_us[0] > 64.0) return false;
+    prev = cost_us[k];
+  }
+  return true;
 }
 
 namespace {
@@ -1213,10 +1397,12 @@ void spec_counters_reset() { g_spec_counters = SpecCounters{}; }
 // free-form text (high entropy: no repetition to look up).
 enum class SpecDiagKind : uint8_t {
   Plain = 0,      // k == 0: the captured single-token decode step
-  Bootstrap,      // S2 forced exploration (k = kSpecBootstrapDrafts)
+  Bootstrap,      // B7 v2: evidence bootstrap (real drafter proposals)
   Warm,           // B7 cost warm-up (forced k)
   Policy,         // the adaptive policy chose k
   Fixed,          // spec=on: the drafter's fixed cap chose k
+  Explore,        // B7 v2: a k = 0 iteration spent its exploration credit
+  Probe,          // B7 v2: a fully accepted run probed the full depth
 };
 
 struct SpecDiagEntry {
@@ -1280,7 +1466,8 @@ static void spec_diag_emit(uint64_t token) {
 static void spec_diag_dump(const char* strategy) {
   SpecDiagState& d = spec_diag();
   if (!d.enabled) return;
-  const char* kinds[] = {"plain", "bootstrap", "warm", "policy", "fixed"};
+  const char* kinds[] = {"plain", "bootstrap", "warm", "policy", "fixed",
+                         "explore", "probe"};
   const uint64_t shown = std::min<uint64_t>(d.total, kSpecDiagRing);
   const uint64_t first = d.total - shown;
   std::fprintf(stderr, "[spec-diag] call=%llu strategy=%s steps=%llu shown=%llu\n",
@@ -1534,17 +1721,8 @@ static bool ir_program_enabled() {
   return v;
 }
 
-// The speculative draft cap (B6). One speculative step runs at most
-// kSpecMaxDrafts + 1 verify rows, which is the envelope the row-invariant
-// verify step was built and tested for (B3's verify_k1..k7 classes); B7's
-// per-step length policy stays inside it.
-constexpr int64_t kSpecMaxDrafts = 7;
-
-// S2 bootstrap draft length: the adaptive policy's forced exploration length.
-// S3 starts at k = 1: the bootstrap only has to supply the EMA with accept /
-// reject data, and on a workload without matches every extra forced draft is
-// verify cost the abort cannot refund.
-constexpr int64_t kSpecBootstrapDrafts = 1;
+// kSpecMaxDrafts (the speculative draft cap) is defined above the policy
+// functions, which need it.
 
 // SONICBOOM_SPEC selects the generation loop:
 //   off  the plain greedy loop (B1's program, step per token);
@@ -1776,54 +1954,82 @@ static uint64_t run_program_steps(
   return step;
 }
 
-// B7: state of the adaptive draft-length policy for one generation call.
+// B7 v2: state of the adaptive draft-length policy for one generation call.
 // `cost_us[k]` is the measured cost of an iteration that verifies k drafts
-// (0 = unmeasured), `alpha` the acceptance-rate EMA, and `warm_next` the next
-// draft length the warm-up still has to measure (negative when it is done).
-// Without a cost cache (autotune disabled) every cost stays unmeasured and the
-// policy reduces to the fixed cap, i.e. `on`'s behavior.
+// (0 = unmeasured), `draft_us[k]` the measured CPU cost of proposing k drafts,
+// and `warm_next` the next draft length the warm-up still has to measure
+// (negative when it is done). Without a cost cache (autotune disabled) every
+// cost stays unmeasured and the policy reduces to the fixed cap, i.e. `on`'s
+// behavior.
+//
+// Acceptance is recorded as bounded (proposed, accepted) pairs rather than a
+// scalar rate: `spec_expected_run` reads per-position hazards from the window,
+// which is what keeps a copy block (accept 3 of 3, then reject) from pricing
+// like independent coin flips. The window is a ring of 64, so the estimate
+// follows a workload whose behaviour changes.
 struct SpecLengthPolicy {
   static constexpr int kMax = int(kSpecMaxDrafts);
+  static constexpr size_t kWindow = 64;
   std::string key;
   std::array<double, kMax + 1> cost_us{};
-  double alpha = 0.5;          // alpha0
+  std::array<double, kMax + 1> draft_us{};
+  std::array<uint32_t, kWindow> proposed{};
+  std::array<uint32_t, kWindow> accepted{};
+  size_t obs_count = 0;
+  size_t obs_next = 0;
+  double alpha = 0.5;          // diagnostics only: accepted/drafted EMA
   int64_t warm_next = -1;      // next k to warm up, < 0 when done
   bool warm_primed = false;    // the first pass at warm_next has run
-  // S2 bootstrap: forced k = 1 iterations still owed after the warm-up. The
-  // cost model cannot break its own cold start: with alpha at its 0.5 prior,
-  // k = 0 wins for any nearly-linear cost curve, no draft is ever proposed, so
-  // alpha is never updated. The bootstrap supplies the drafts the EMA needs.
-  uint64_t bootstrap_left = 0;
-  // S3 early abort: consecutive bootstrap verify steps that accepted nothing.
-  // A workload the drafter cannot match will never teach the EMA anything, so
-  // five rejects in a row end the bootstrap instead of paying 50 iterations.
-  uint64_t consecutive_zero_accept = 0;
+  // B7 v2 bootstrap: real drafter proposals (at the affordable depth) until
+  // enough evidence exists to choose a budget, or until the workload shows it
+  // has nothing to match. The old synthetic last-token probe is gone: it
+  // measured the drafter's rejection, not its availability, and steered the
+  // policy to k = 0 for whole calls on copy-heavy workloads.
+  uint64_t bootstrap_left = 0;   // iterations the bootstrap may still spend
+  uint64_t bootstrap_obs = 0;    // real-proposal verifications observed
+  uint64_t bootstrap_streak = 0; // consecutive no-proposal/no-accept iterations
+  // k = 0 recovery: a workload can start repetitive later (code edit: prose
+  // then a patch). Credit accrues every k = 0 iteration (in thousandths, so
+  // the decision is integer-exact); spending one unit proposes for real and,
+  // if the drafter has a match, verifies at a shallow depth. Bounded and
+  // deterministic, so it cannot oscillate.
+  uint64_t explore_credit = 0;
+  uint64_t since_explore = 0;
+  int64_t current_k = -1;  // the last verified length (hysteresis reference)
+  // Deep-probe evidence: a run of fully accepted rounds at current_k means the
+  // policy has not seen a rejection there, but it has also not sampled deeper
+  // positions (a round proposing k only supplies evidence at positions <= k).
+  // After kSpecProbeRun such rounds, one round every kSpecProbeEvery verifies
+  // at the full allowed depth so reach at deep positions is refreshed rather
+  // than carried forward forever.
+  uint64_t full_run = 0;    // consecutive rounds with accepted == k (k > 0)
+  uint64_t since_probe = 0; // policy iterations since the last deep probe
 };
 
-// SONICBOOM_SPEC_BOOTSTRAP (default 50, 0 disables): number of adaptive
-// iterations after the cost warm-up that force k = 1. Parsed once per process,
-// like SONICBOOM_SPEC.
-//
-// S4 tried exploring with real drafter proposals and a lower default (8). It
-// was reverted with the rest of the S4 behavior changes: the measured cost of
-// one k=1 verify is 2.06 plain steps, so exploration only pays above ~100%
-// acceptance, and on the coding trace the experiments cost more than the
-// k=7 verifies they occasionally unlocked (see the S4 report section).
+// SONICBOOM_SPEC_BOOTSTRAP (default 16, 0 disables): the most adaptive
+// iterations the evidence bootstrap may spend after the cost warm-up. It ends
+// early once kSpecBootstrapObs real proposals have been verified, or after
+// SONICBOOM_SPEC_BOOTSTRAP_ABORT consecutive iterations with no proposal or no
+// acceptance. Eight iterations is enough for a copy-heavy workload to show its
+// hazards; the cap only matters for a workload that matches without accepting.
 static uint64_t spec_bootstrap_steps() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP");
-    if (!e || !*e) return uint64_t(50);
+    if (!e || !*e) return uint64_t(16);
     const long v = std::strtol(e, nullptr, 10);
     return v > 0 ? uint64_t(v) : uint64_t(0);
   }();
   return n;
 }
 
+// Observations after which the bootstrap hands over to the policy: the hazard
+// estimate needs a few real verifications, not a fixed iteration count.
+constexpr uint64_t kSpecBootstrapObs = 3;
+
 // SONICBOOM_SPEC_BOOTSTRAP_ABORT (default 5, 0 disables): consecutive
-// bootstrap verify steps that accept no draft before the bootstrap gives up
-// and the policy takes over. A workload without drafter matches never updates
-// alpha usefully, so the remaining forced iterations are pure verify cost.
-// 0 restores the fixed SONICBOOM_SPEC_BOOTSTRAP stepping (the S2 ablation).
+// bootstrap iterations that propose nothing or accept nothing before the
+// bootstrap gives up and the policy takes over (it will choose k = 0 and rely
+// on exploration credit to notice a later switch to repetitive output).
 static uint64_t spec_bootstrap_abort() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP_ABORT");
@@ -1834,33 +2040,71 @@ static uint64_t spec_bootstrap_abort() {
   return n;
 }
 
-// The warm-up measures c(k) once per (model shape, context class) on this GPU:
-// k = 0..min(7, room) in turn, each iteration timed whole (the second pass at
-// each k: the first absorbs that row count's runtime construction and capture).
-// The costs are cached in the autotune cache under "spec-length"; later runs
-// load them and skip the warm-up. The context class keeps a long-context
-// session's KV traffic from being priced with a short-context measurement (the
-// cache class only widens the key; the kernel/tile choices stay keyed by shape
-// class as before).
+// The policy's switching margin: adopt a different k only if it scores at
+// least 3% better than the current one. Verify costs are measured on a noisy
+// GPU, so without hysteresis the choice would flip between adjacent lengths.
+constexpr double kSpecSwitchMargin = 0.03;
+
+// Exploration cadence: 20 thousandths of credit per k = 0 iteration (one
+// lookup per 50 iterations once the credit is full), spent only after at least
+// 8 iterations without one. A match is verified at no more than
+// kSpecExploreDepth drafts (the cheapest verify that can accept a block); a
+// miss costs only the drafter lookup, no verify.
+constexpr uint64_t kSpecExploreRateMilli = 20;
+constexpr uint64_t kSpecExploreCreditMilli = 1000;
+constexpr uint64_t kSpecExploreSpacing = 8;
+constexpr int64_t kSpecExploreDepth = 2;
+
+// Deep-probe cadence: after kSpecProbeRun consecutive fully accepted rounds,
+// one round every kSpecProbeEvery verifies at the full allowed depth. A round
+// that proposes k only informs positions 1..k, so a policy that settles on a
+// short k stops learning whether deeper drafts are still accepted; the probe
+// refreshes that evidence. It is a real verify (its drafts can be accepted),
+// requires a run with no rejection at all, and fires at k < max_k only, so a
+// workload the policy already runs at full depth never pays it.
+constexpr uint64_t kSpecProbeRun = 8;
+constexpr uint64_t kSpecProbeEvery = 32;
+
+// Cross-call evidence is capped to the most recent verified rounds: enough to
+// carry a workload's hazards from one turn to the next, small enough that a
+// different workload in the same process (a coding request followed by chat)
+// is corrected within a few verifies instead of only after the whole 64-round
+// window has turned over.
+constexpr size_t kSpecEvidenceCarry = 16;
+
+// The warm-up measures c(k) once per (model shape, context class, verify
+// kernel identity) on this GPU: k = 0..min(7, room) in turn, each iteration
+// timed whole (the second pass at each k: the first absorbs that row count's
+// runtime construction and capture). The costs are cached in the autotune cache
+// under "spec-length"; later runs load them and skip the warm-up. The key
+// carries the context class and the kernel/dispatch fingerprint, so a record is
+// only reused by the same verify implementation at the same KV scale; a
+// structurally invalid record (unit error, corrupt, non-monotone beyond
+// tolerance) is discarded instead of priced.
 static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
-  const char* cls = n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
-  // v1: the key version separates costs measured on this loop's code from an
-  // older binary's (a cost is only meaningful for the kernels that produced it).
-  p.key = std::string("v1|") +
-          (m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") + "|e" +
-          std::to_string(m.config.embedding_length) + "|ctx=" + cls;
+  p.key = spec_cost_cache_key(
+      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
+      m.config.embedding_length, n_ctx);
   const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
-  bool any = false;
+  std::array<double, SpecLengthPolicy::kMax + 1> read{};
+  bool complete = true;
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
     const auto it = cached.find("c" + std::to_string(k));
-    if (it != cached.end() && it->second > 0) {
-      p.cost_us[size_t(k)] = double(it->second);
-      any = true;
-    }
+    if (it != cached.end() && it->second > 0)
+      read[size_t(k)] = double(it->second);
+    else
+      complete = false;
   }
-  if (!any) p.warm_next = 0;
+  if (!complete || !spec_cost_record_valid(read)) {
+    // Incomplete (a run ended before the warm-up finished) or structurally
+    // invalid: measure. A stale v1 record is never looked up at all: its key
+    // does not match v2's.
+    p.warm_next = 0;
+    return;
+  }
+  p.cost_us = read;
 }
 
 static void spec_policy_store(const SpecLengthPolicy& p) {
@@ -1872,6 +2116,132 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
     }
   }
   if (!values.empty()) tune::store("spec-length", p.key, values);
+}
+
+// In-process evidence store, keyed by context class. The cost model is already
+// cached per (model shape, context class, verify kernel identity); the
+// acceptance evidence was not, so every generation call relearned it from the
+// weak prior and paid the bootstrap again — on a multi-turn trace (agent,
+// chat) that is three extra verifies per turn for evidence the process already
+// had. The store keeps the same bounded window the policy uses and never mixes
+// contexts: a slot only holds rounds this process actually verified.
+struct SpecEvidenceSlot {
+  std::array<uint32_t, SpecLengthPolicy::kWindow> proposed{};
+  std::array<uint32_t, SpecLengthPolicy::kWindow> accepted{};
+  size_t next = 0;
+  size_t count = 0;
+};
+static std::mutex g_spec_evidence_mutex;
+static std::map<std::string, SpecEvidenceSlot> g_spec_evidence;
+
+// Model shape + context class, the same identity the cost record uses minus
+// the kernel fingerprint: acceptance is a property of the workload, not of
+// the verify kernel build, so it survives a rebuild within the process.
+static std::string spec_evidence_key(const Gemma4Model& m, uint64_t n_ctx) {
+  return std::string(m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") +
+         "|e" + std::to_string(m.config.embedding_length) + "|ctx=" +
+         spec_ctx_class(n_ctx);
+}
+
+// Load the context class's observations from earlier calls. Returns true when
+// the window already holds enough verified rounds to skip the bootstrap.
+static bool spec_evidence_load(const Gemma4Model& m, uint64_t n_ctx,
+                               SpecLengthPolicy& p) {
+  std::lock_guard<std::mutex> lock(g_spec_evidence_mutex);
+  const auto it = g_spec_evidence.find(spec_evidence_key(m, n_ctx));
+  if (it == g_spec_evidence.end()) return false;
+  const SpecEvidenceSlot& s = it->second;
+  // Copy the most recent rounds in chronological order, capped.
+  const size_t n = std::min(s.count, kSpecEvidenceCarry);
+  const size_t begin =
+      (s.next + SpecLengthPolicy::kWindow - n) % SpecLengthPolicy::kWindow;
+  p.obs_count = 0;
+  p.obs_next = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const size_t idx = (begin + i) % SpecLengthPolicy::kWindow;
+    p.proposed[p.obs_next] = s.proposed[idx];
+    p.accepted[p.obs_next] = s.accepted[idx];
+    p.obs_next = (p.obs_next + 1) % SpecLengthPolicy::kWindow;
+  }
+  p.obs_count = n;
+  return s.count >= kSpecBootstrapObs;
+}
+
+static void spec_evidence_store(const Gemma4Model& m, uint64_t n_ctx,
+                                const SpecLengthPolicy& p) {
+  std::lock_guard<std::mutex> lock(g_spec_evidence_mutex);
+  SpecEvidenceSlot& s = g_spec_evidence[spec_evidence_key(m, n_ctx)];
+  s.proposed = p.proposed;
+  s.accepted = p.accepted;
+  s.next = p.obs_next;
+  s.count = p.obs_count;
+}
+
+// Record one verification's proposal/accept outcome into the bounded window
+// and refresh the diagnostic EMA.
+static void spec_policy_observe(SpecLengthPolicy& p, size_t k, size_t accepted) {
+  p.proposed[p.obs_next] = uint32_t(k);
+  p.accepted[p.obs_next] = uint32_t(accepted);
+  p.obs_next = (p.obs_next + 1) % SpecLengthPolicy::kWindow;
+  if (p.obs_count < SpecLengthPolicy::kWindow) ++p.obs_count;
+  if (k > 0) {
+    p.alpha = 0.5 * p.alpha + 0.5 * (double(accepted) / double(k));
+  }
+  p.current_k = int64_t(k);
+  // A fully accepted round extends the run that earns a deep probe; any
+  // rejection (or a plain step, which never reaches here) ends it.
+  if (k > 0 && accepted == k)
+    ++p.full_run;
+  else
+    p.full_run = 0;
+  ++p.since_probe;
+}
+
+static double spec_policy_expected(const SpecLengthPolicy& p, int64_t k) {
+  return spec_expected_run(
+      std::span<const uint32_t>(p.proposed.data(), p.obs_count),
+      std::span<const uint32_t>(p.accepted.data(), p.obs_count), k);
+}
+
+static int64_t spec_policy_choose(const SpecLengthPolicy& p, int64_t max_k,
+                                  bool* probe) {
+  std::span<const double> costs(p.cost_us.data(), size_t(max_k) + 1);
+  std::span<const double> drafts(p.draft_us.data(), size_t(max_k) + 1);
+  std::array<double, SpecLengthPolicy::kMax + 1> e{};
+  for (int64_t k = 0; k <= max_k; ++k) e[size_t(k)] = spec_policy_expected(p, k);
+  int64_t chosen =
+      spec_choose_budget(costs, drafts,
+                         std::span<const double>(e.data(), size_t(max_k) + 1),
+                         max_k, p.current_k, kSpecSwitchMargin);
+  if (probe) *probe = false;
+  // Deep-probe: the policy is verifying and has not seen a rejection in a
+  // while, but rounds at k < max_k only supply evidence at positions <= k.
+  // Refresh the deep reach by verifying at the full allowed depth once per
+  // cadence; without this the estimator keeps carrying the short k's evidence
+  // to deeper positions and the policy can never discover that a longer
+  // proposal pays.
+  if (probe && chosen > 0 && p.current_k > 0 && p.current_k < max_k &&
+      p.full_run >= kSpecProbeRun && p.since_probe >= kSpecProbeEvery) {
+    chosen = max_k;
+    *probe = true;
+  }
+  // S4: one line per decision, so a diagnostic run can say why the policy
+  // chose what it chose (the estimated emitted run and the prices behind it).
+  if (spec_diag_enabled()) {
+    std::fprintf(stderr,
+                 "[spec-choice] max_k=%lld chosen=%lld current=%lld obs=%zu "
+                 "full_run=%llu probe=%d E=",
+                 (long long)max_k, (long long)chosen, (long long)p.current_k,
+                 p.obs_count, (unsigned long long)p.full_run,
+                 probe && *probe ? 1 : 0);
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "", e[size_t(k)]);
+    std::fprintf(stderr, " c=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.0f", k ? "," : "", p.cost_us[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
+  return chosen;
 }
 
 // Execute the program's speculative loop from (token, pos, step). One
@@ -1946,7 +2316,11 @@ static uint64_t run_spec_program_steps(
   SpecLengthPolicy policy;
   if (adaptive) {
     spec_policy_init(m, session.n_ctx, policy);
-    policy.bootstrap_left = spec_bootstrap_steps();
+    // Evidence from an earlier call in this process replaces the bootstrap:
+    // the policy starts this call with the hazards it already measured.
+    policy.bootstrap_left = spec_evidence_load(m, session.n_ctx, policy)
+                                ? 0
+                                : spec_bootstrap_steps();
   }
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
@@ -1975,9 +2349,25 @@ static uint64_t run_spec_program_steps(
     bool warm = false;         // a warm-up iteration (forced k drafts)
     bool measure = false;      // ... whose time is c(k) (its second pass)
     bool finish_warm = false;  // the last measurement: persist after timing
-    bool bootstrap_iter = false;  // a forced bootstrap verify (S3 abort input)
+    bool bootstrap_iter = false;  // a bootstrap verify (evidence input)
     size_t match_n = 0;        // S4: n-gram length behind this proposal
     SpecDiagKind diag_kind = SpecDiagKind::Fixed;
+    // Ask the drafter for at most `budget` drafts and price the lookup. The
+    // CPU cost is measured so the objective charges proposal work explicitly
+    // (today it is negligible; a draft model's cost belongs in the same slot).
+    const auto propose_with = [&](size_t budget) -> size_t {
+      const auto t0 = std::chrono::steady_clock::now();
+      const size_t got = drafter->propose(std::span<uint64_t>(drafts, budget),
+                                          &match_n);
+      if (adaptive && got > 0 && got <= size_t(SpecLengthPolicy::kMax)) {
+        const double dt = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        double& avg = policy.draft_us[got];
+        avg = avg > 0.0 ? 0.7 * avg + 0.3 * dt : dt;
+      }
+      return got;
+    };
     if (repeat) {
       k = size_t(room);
       for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
@@ -2008,24 +2398,63 @@ static uint64_t run_spec_program_steps(
       if (!warm) {
         const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
         if (policy.bootstrap_left > 0) {
-          // S2: force exploration so the EMA sees real acceptance data. Like
-          // the warm-up's forced drafts these are proposals only; the verifier
-          // still decides the emitted run. S3: one draft and an abort on a
-          // run of rejects keep the exploration cheap on unmatched workloads.
-          k = size_t(std::min<uint64_t>(uint64_t(kSpecBootstrapDrafts), max_k));
-          for (size_t i = 0; i < k; ++i) drafts[i] = token;
+          // B7 v2 bootstrap: real drafter proposals at the affordable depth.
+          // No synthetic last-token draft — that probe measured the drafter's
+          // rejection, not its availability. A proposal verifies (and teaches
+          // the per-position hazards); a miss is a plain step and advances the
+          // abort streak. The bootstrap ends after kSpecBootstrapObs real
+          // verifications or the abort streak.
           --policy.bootstrap_left;
           ++g_spec_counters.bootstrap_steps;
           bootstrap_iter = true;
           diag_kind = SpecDiagKind::Bootstrap;
+          k = max_k > 0 ? propose_with(size_t(max_k)) : 0;
         } else {
-          k = drafter->propose(std::span<uint64_t>(
-                                  drafts, size_t(spec_choose_drafts(
-                                              policy.alpha, policy.cost_us,
-                                              int64_t(max_k)))),
-                              &match_n);
+          bool probe = false;
+          const int64_t chosen =
+              spec_policy_choose(policy, int64_t(max_k), &probe);
           ++g_spec_counters.policy_steps;
           diag_kind = SpecDiagKind::Policy;
+          if (probe) {
+            policy.since_probe = 0;
+            ++g_spec_counters.probe_verifies;
+            diag_kind = SpecDiagKind::Probe;
+          }
+          if (chosen > 0) {
+            k = propose_with(size_t(chosen));
+            if (k == 0) ++g_spec_counters.proposal_misses;
+          } else {
+            policy.current_k = 0;
+            if (max_k > 0 && policy.since_explore >= kSpecExploreSpacing) {
+              // k = 0 but the recovery lookup is due: ask the drafter, at the
+              // cheapest verify depth, whether this workload has started to
+              // repeat. The lookup is a table read and costs nothing; only a
+              // match *and* a full credit unit spends a verify, so a
+              // non-repetitive workload never pays for the recovery path.
+              const uint64_t depth = std::min<uint64_t>(
+                  uint64_t(kSpecExploreDepth), max_k);
+              const size_t got = propose_with(size_t(depth));
+              policy.since_explore = 0;
+              if (got > 0) {
+                if (policy.explore_credit >= kSpecExploreCreditMilli) {
+                  k = got;
+                  policy.explore_credit = 0;
+                  ++g_spec_counters.explore_verifies;
+                  diag_kind = SpecDiagKind::Explore;
+                }
+              } else {
+                ++g_spec_counters.proposal_misses;
+              }
+            }
+          }
+        }
+        // A k = 0 policy iteration earns explore credit (rate-limited), and a
+        // plain iteration advances the spacing counter.
+        if (k == 0 && !bootstrap_iter) {
+          policy.explore_credit = std::min(
+              kSpecExploreCreditMilli,
+              policy.explore_credit + kSpecExploreRateMilli);
+          ++policy.since_explore;
         }
       }
     } else {
@@ -2078,9 +2507,21 @@ static uint64_t run_spec_program_steps(
       // policy chose k = 0) that emits the verifier's own token.
       if (spec_diag_enabled()) {
         spec_diag_record(step, L, /*k=*/0, /*accepted=*/0, /*emitted=*/1,
-                         match_n, SpecDiagKind::Plain, policy.alpha,
-                         iter_start);
+                         match_n,
+                         diag_kind == SpecDiagKind::Explore
+                             ? SpecDiagKind::Explore
+                             : SpecDiagKind::Plain,
+                         policy.alpha, iter_start);
         spec_diag_emit(uint64_t(next));
+      }
+      // A bootstrap iteration the drafter had nothing for is evidence too: it
+      // advances the abort streak (and never counts as a k = 0 policy step).
+      if (bootstrap_iter) {
+        if (adaptive) ++policy.bootstrap_streak;
+        const uint64_t abort_after = spec_bootstrap_abort();
+        if (adaptive && abort_after > 0 &&
+            policy.bootstrap_streak >= abort_after)
+          policy.bootstrap_left = 0;
       }
       // The fed token is now resident; the sampled one is emitted but not fed.
       ++L;
@@ -2091,6 +2532,7 @@ static uint64_t run_spec_program_steps(
       token = static_cast<uint64_t>(next);
       ++step;
       ++g_spec_counters.plain_steps;
+      ++g_spec_counters.k_hist[0];
       ++g_spec_counters.emitted_tokens;
       if (measure) {
         policy.cost_us[0] = std::chrono::duration<double, std::micro>(
@@ -2134,12 +2576,13 @@ static uint64_t run_spec_program_steps(
       for (size_t i = 0; i < decision.emitted; ++i) spec_diag_emit(run[i]);
     }
     ++g_spec_counters.verify_steps;
+    ++g_spec_counters.k_hist[size_t(k) & 7];
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
     g_spec_counters.emitted_tokens += decision.emitted;
-    // B7 bookkeeping: a warm-up iteration prices c(k); every other one feeds
-    // the acceptance-rate EMA (warm-up drafts are forced, so their acceptance
-    // says nothing about the drafter).
+    // B7 v2 bookkeeping: a warm-up iteration prices c(k); every other one is
+    // real evidence and feeds the bounded (proposed, accepted) window
+    // (warm-up drafts are forced, so their acceptance says nothing).
     if (measure) {
       policy.cost_us[k] = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - iter_start).count();
@@ -2148,18 +2591,17 @@ static uint64_t run_spec_program_steps(
         spec_policy_store(policy);
       }
     } else if (adaptive && !warm) {
-      policy.alpha = spec_alpha_update(policy.alpha, decision.accepted, k);
-    }
-    // S3 early abort: a bootstrap verify that accepts nothing is a drafter
-    // miss. A run of them means this workload has nothing to match, so the
-    // remaining forced iterations can only add verify cost — switch to the
-    // normal policy now.
-    if (bootstrap_iter) {
-      const uint64_t abort_after = spec_bootstrap_abort();
-      if (abort_after > 0) {
-        policy.consecutive_zero_accept =
-            decision.accepted == 0 ? policy.consecutive_zero_accept + 1 : 0;
-        if (policy.consecutive_zero_accept >= abort_after)
+      spec_policy_observe(policy, k, decision.accepted);
+      ++policy.since_explore;
+      if (bootstrap_iter) {
+        ++policy.bootstrap_obs;
+        const uint64_t abort_after = spec_bootstrap_abort();
+        policy.bootstrap_streak =
+            decision.accepted == 0 ? policy.bootstrap_streak + 1 : 0;
+        // Handover: enough real verifications to choose, or the workload is
+        // not matching (a run of empty/zero-accept proposals).
+        if (policy.bootstrap_obs >= kSpecBootstrapObs ||
+            (abort_after > 0 && policy.bootstrap_streak >= abort_after))
           policy.bootstrap_left = 0;
       }
     }
@@ -2178,6 +2620,30 @@ static uint64_t run_spec_program_steps(
   // A run that ended before the warm-up finished stores what it measured; the
   // policy then compares only the lengths it has prices for.
   if (adaptive && policy.warm_next >= 0) spec_policy_store(policy);
+  if (adaptive) spec_evidence_store(m, session.n_ctx, policy);
+  if (spec_diag_enabled() && adaptive) {
+    // The policy's end-of-call view: what it priced, what it observed, and
+    // what it believed each length would emit. The per-decision scores are in
+    // the [spec-choice] lines; this pins the state at the end of the call.
+    std::fprintf(stderr,
+                 "[spec-policy] obs=%llu alpha=%.3f warm_next=%lld "
+                 "bootstrap_obs=%llu E=",
+                 (unsigned long long)policy.obs_count, policy.alpha,
+                 (long long)policy.warm_next,
+                 (unsigned long long)policy.bootstrap_obs);
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "",
+                   spec_policy_expected(policy, k));
+    std::fprintf(stderr, " c=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.0f", k ? "," : "",
+                   policy.cost_us[size_t(k)]);
+    std::fprintf(stderr, " d=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "",
+                   policy.draft_us[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
   spec_diag_dump(strategy.c_str());
   return step;
 }
@@ -2960,16 +3426,18 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
 // V2: the startup probe behind an unset SONICBOOM_SPEC. One plain decode step
 // and one k=1 verify step are timed on this GPU (after untimed warm replays);
 // their ratio decides the generation loop, because it is the price of a verify
-// row relative to a plain step. A ratio below kSpecProbeAutoRatio means the
-// k=1 iteration costs less than that many plain steps, i.e. the acceptance the
-// length policy needs to come out ahead is under 50% (E(1,a) = 1 + a against
-// c1/c0 = ratio: profitable when a >= ratio - 1).
+// row relative to a plain step. A k=1 iteration emits at most 2 tokens
+// (E(1,a) = 1 + a) for `ratio` plain steps, so even perfect acceptance is
+// unprofitable once the ratio exceeds 2. The probe only rules out the GPU
+// where speculation cannot pay at any workload; which workload pays is the
+// length policy's decision, made from measured acceptance, not from the
+// startup probe. A ratio below kSpecProbeAutoRatio therefore selects auto.
 //
 // The result is cached per SM in the Q1 autotune file under
 // ("spec_verify_ratio", "decode"), so only the first process on a GPU pays the
 // probe. SONICBOOM_SPEC_PROBE_MS="<plain_ms>,<verify_ms>" replaces the measured
 // pair (the test seam; measurement only, no kernel changes).
-constexpr double kSpecProbeAutoRatio = 1.5;
+constexpr double kSpecProbeAutoRatio = 2.0;
 
 // The probe measures whole replays: the captured plain step (position staging,
 // graph replay, token readback) against the captured 2-row verify step (token
@@ -3065,8 +3533,12 @@ static DecodeRuntime* spec_resolve_probe(
   double ratio = 0.0;
   bool measured = false;
   uint64_t verify_cache_id = 0;
+  // P0: the probe's ratio is as much a property of the verify kernel as c(k)
+  // is, so its key carries the same kernel/dispatch fingerprint. A rebuild or a
+  // dispatch switch no longer reuses a ratio measured before it.
+  const std::string ratio_key = std::string("decode/") + spec_kernel_fingerprint();
   if (const auto cached =
-          mlir_tune::lookup_ratio("spec_verify_ratio", "decode")) {
+          mlir_tune::lookup_ratio("spec_verify_ratio", ratio_key)) {
     ratio = *cached;
   } else {
     double plain_ms = 0.0, verify_ms = 0.0;
@@ -3079,7 +3551,7 @@ static DecodeRuntime* spec_resolve_probe(
       ratio = verify_ms / plain_ms;
       measured = true;
     }
-    (void)mlir_tune::store_ratio("spec_verify_ratio", "decode", ratio);
+    (void)mlir_tune::store_ratio("spec_verify_ratio", ratio_key, ratio);
   }
   const SpecMode mode = ratio < kSpecProbeAutoRatio ? SpecMode::Auto
                                                     : SpecMode::Off;

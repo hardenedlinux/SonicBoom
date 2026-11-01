@@ -355,36 +355,92 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
 // draft_tokens — is being reported.
 struct SpecCounters {
   uint64_t iterations = 0;       // loop iterations
-  uint64_t plain_steps = 0;      // iterations the drafter proposed nothing
+  uint64_t plain_steps = 0;      // iterations that took the captured plain step
   uint64_t verify_steps = 0;     // iterations that ran a verify (k > 0)
   uint64_t draft_tokens = 0;     // tokens proposed and verified
   uint64_t accepted_tokens = 0;  // drafts the verifier accepted
   uint64_t emitted_tokens = 0;   // tokens emitted
-  // SONICBOOM_SPEC=auto, S2 bootstrap: iterations after the cost warm-up that
-  // forced k = 1 exploration (so the acceptance-rate EMA sees real drafts
-  // before the cost model starts choosing), and iterations afterwards that the
-  // policy chose. S3 ends the bootstrap early after
-  // SONICBOOM_SPEC_BOOTSTRAP_ABORT consecutive zero-accept iterations.
-  // Warm-up iterations are neither.
+  // SONICBOOM_SPEC=auto bootstrap: iterations after the cost warm-up that
+  // forced exploration on the drafter's real proposals (so the policy sees
+  // realistic n-gram matches before it starts choosing), how many of those ran
+  // a verify, and iterations in which the drafter proposed nothing at all. The
+  // bootstrap hands over as soon as the policy has enough observations, is
+  // aborted after SONICBOOM_SPEC_BOOTSTRAP_ABORT consecutive iterations with
+  // no accepted draft, and is otherwise bounded by SONICBOOM_SPEC_BOOTSTRAP.
+  // Warm-up iterations are none of these.
   uint64_t bootstrap_steps = 0;
+  uint64_t bootstrap_verifies = 0;
+  uint64_t proposal_misses = 0;
+  // Policy iterations that verified beyond the policy's own budget to gather
+  // evidence (bounded by the exploration credit; see the loop).
+  uint64_t explore_verifies = 0;
+  // Policy iterations that probed the full allowed depth after a run of fully
+  // accepted rounds, so a policy settled on a short k can discover that deeper
+  // proposals are worth verifying after all.
+  uint64_t probe_verifies = 0;
   uint64_t policy_steps = 0;
+  // The policy's chosen draft budget per policy iteration (k = 0..7). This is
+  // the decision, not the number of drafts a particular proposal contained.
+  uint64_t k_hist[8] = {};
 };
 SpecCounters spec_counters();
 void spec_counters_reset();
 
-// B7: the adaptive draft-length policy, factored out for testing.
+// B7 v2: expected emitted tokens of one verification round that proposes `k`
+// drafts, including the verifier's bonus token: 1 + E[A_k].
 //
-// With acceptance rate alpha, k drafts yield E(k) = 1 + alpha + ... + alpha^k =
-// (1 - alpha^(k+1)) / (1 - alpha) emitted tokens (a geometric run); c(k) is one
-// iteration's measured cost in microseconds (cost_us[k] == 0 means unmeasured,
-// and k is not considered). Returns the k <= max_k maximizing E(k) / c(k), or
-// max_k when nothing is measured (the fixed cap, the static default).
-int64_t spec_choose_drafts(double alpha, std::span<const double> cost_us,
-                           int64_t max_k);
+// `proposed[i]` / `accepted[i]` are parallel observations of one round each:
+// how many drafts the drafter offered and how many the verifier accepted (a
+// rejected proposal is accepted < proposed; accepted == proposed means the
+// whole proposal was accepted). Acceptance is bursty — a copy is accepted as
+// a block — so the estimate is built from per-position reach
+// P(accepted >= j | proposed >= j), not from a single per-token acceptance
+// rate: E[A_k] = Σ_{j=1..k} reach_j. Each reach gets a weak Beta prior (one
+// pseudo-opportunity, half a pseudo-acceptance) so a position with no
+// observation is neutral (0.5) and one with observations tracks them. Reach
+// is non-increasing in j; an unobserved position carries the previous
+// estimate forward and an observed one is clipped to it, so a handful of
+// deep samples cannot claim more than the shallower positions they sit on.
+// Deterministic for a given observation set.
+double spec_expected_run(std::span<const uint32_t> proposed,
+                         std::span<const uint32_t> accepted, int64_t k);
 
-// B7: the acceptance-rate EMA update, alpha <- 0.5*alpha + 0.5*(accepted/drafted).
-// A run starts at alpha = 0.5 (the policy's initial guess).
-double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted);
+// B7 v2: choose the draft budget maximizing expected emitted tokens per unit
+// of iteration cost:
+//
+//   S(k) = expected_run[k] / (cost_us[k]/cost_us[0] + draft_us[k]/cost_us[0])
+//
+// with S(0) = 1 (a plain step). `expected_run[k]` comes from spec_expected_run;
+// `cost_us` and `draft_us` are microseconds, 0 meaning unmeasured (that k is
+// not considered). When nothing is measured the fixed cap is returned, so the
+// policy degrades to `on`'s behavior without a cost model.
+//
+// `current_k` is the previous decision (negative for none): switching away
+// from it requires `margin` relative improvement, which is what keeps a
+// workload whose estimate straddles break-even from oscillating between k = 0
+// and a verify every iteration.
+int64_t spec_choose_budget(std::span<const double> cost_us,
+                           std::span<const double> draft_us,
+                           std::span<const double> expected_run,
+                           int64_t max_k, int64_t current_k,
+                           double margin = 0.03);
+
+// P0: the cost-cache record key and its plausibility check, exposed so a test
+// can prove that a record written by an older binary (or under a different
+// verify-kernel dispatch) cannot be consumed by the current policy.
+//
+// The key is `v2|<arch>|e<embedding>|ctx=<s|m|l>|k=<fingerprint>`. The
+// fingerprint covers the cost-model schema, the verify dispatch switches, and
+// the running libsonicboom.so's size + mtime, so a kernel change invalidates
+// every record without a manual bump. `n_ctx` selects the context class.
+std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
+                                uint64_t n_ctx);
+
+// True when a cost vector is structurally plausible: c(0) measured and in a
+// sane microsecond range, every measured c(k) >= c(0), non-decreasing in k
+// within 10%, and c(k)/c(0) below 64. A record that fails is discarded and
+// re-warmed rather than trusted.
+bool spec_cost_record_valid(std::span<const double> cost_us);
 
 // Test seam (B6): run the speculative loop over `tokens` on the model's decode
 // runtime with a chosen drafter strategy, bypassing SONICBOOM_SPEC's program.
