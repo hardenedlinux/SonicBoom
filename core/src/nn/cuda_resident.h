@@ -41,8 +41,10 @@ namespace sonicboom::nn::cuda {
 // n floats (or empty). `add` is the optional residual epilogue of
 // fuse_residual_epilogue_pass (null => none), applied in the same launch.
 // Mirrors nn::rms_norm / nn::cuda::rms_norm plus the following nn::add.
+// `rows` > 1 is the verify step's multi-position form: x/y are [rows, n] and
+// every row runs exactly the single-row launch on its own slice.
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n, const float* add = nullptr);
+                  float* y, int n, const float* add = nullptr, int rows = 1);
 
 // Per-head RMSNorm over `heads` heads of `head_dim` floats each:
 //   y[h*head_dim + i] = (x[h*head_dim + i] / sqrt(mean_i(x[h*head_dim+i]^2) + eps)) * weight[i]
@@ -51,7 +53,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
 // unit). Mirrors exec.cpp's per-head nn::rms_norm loop.
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
                         float* y, int head_dim, int heads,
-                        const float* add = nullptr);
+                        const float* add = nullptr, int rows = 1);
 
 // GGML_GELU_FP16 tanh-GELU (fp16 round-trip), elementwise. x/y may alias.
 bool gelu_fp16_dev(const float* x, float* y, int n);
@@ -95,10 +97,12 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
 // Dense (non-K-quant) matvec, device in/out: y[j] = sum_i W[j*cols + i] * x[i].
 // W is row-major with `cols` contiguous (GGUF order); rows = y length. W is a
 // host span uploaded+cached. Mirrors nn::cuda::matvec_f32 / matvec_bf16.
+// `n_rows` > 1 is the verify step's multi-position form: x is [n_rows, cols] and
+// y is [n_rows, rows]; every row runs the per-row kernel on its own slice.
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
-                    float* y, int rows);
+                    float* y, int rows, int n_rows = 1);
 bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
-                     float* y, int rows);
+                     float* y, int rows, int n_rows = 1);
 
 // GQA broadcast for n_k == 1 attention (the SDPA degenerates to copying the
 // single value vector, GQA-broadcast): dst[hq*head_dim + i] =
@@ -344,6 +348,12 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
 // out[0]. Ties are broken toward the lowest index, exactly mirroring
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
+
+// Multi-row argmax (the verify step's positions): x is [n_rows, n] and out
+// [n_rows]; every row runs exactly the single-row reduction on its own slice.
+// `mask` (null => unmasked) is shared by every row.
+bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
+                     float* out);
 
 // Masked argmax: the same selection over the ids whose bit is set in `mask`
 // (a device bitmap of ceil(n / 8) bytes, bit i of byte i / 8, LSB first; the

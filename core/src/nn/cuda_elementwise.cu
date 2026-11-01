@@ -324,8 +324,14 @@ __global__ void rope_neox_heads_pos_kernel(float* __restrict__ x, int head_dim,
 
 // y[j] = sum_i W[j*cols + i] * x[i], fp32 accumulation. W is row-major with
 // `cols` contiguous (GGUF order).
+// `blockIdx.y` selects the activation/output row of a multi-row launch (the
+// verify step's positions); row 0 is the decode call.
 __global__ void gemv_dense_f32(const float* __restrict__ W, const float* __restrict__ x,
                                float* __restrict__ y, int cols, int rows) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < rows;
        j += gridDim.x * blockDim.x) {
     const float* wrow = W + (size_t)j * cols;
@@ -340,6 +346,10 @@ __global__ void gemv_dense_f32(const float* __restrict__ W, const float* __restr
 // rounding exactly.
 __global__ void gemv_bf16(const uint16_t* __restrict__ W, const float* __restrict__ x,
                           float* __restrict__ y, int cols, int rows) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < rows;
        j += gridDim.x * blockDim.x) {
     const uint16_t* wrow = W + (size_t)j * cols;
@@ -364,6 +374,10 @@ __global__ void gemv_dense_f32_v(const float* __restrict__ W,
                                  const float* __restrict__ x,
                                  float* __restrict__ dst, int cols, int rows,
                                  int k_split) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    dst += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+  }
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int row = warp_id / k_split;
@@ -394,6 +408,10 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
                             const float* __restrict__ x,
                             float* __restrict__ dst, int cols, int rows,
                             int k_split) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    dst += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+  }
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int row = warp_id / k_split;
@@ -433,6 +451,10 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
 // construction — no atomics, no scheduling-dependent accumulation order.
 __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
                                    float* __restrict__ y, int rows, int k_split) {
+  if (blockIdx.y != 0) {
+    partial += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
   const float* p = partial + (size_t)row * k_split;
@@ -462,11 +484,20 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 // into the preceding multiply. x/y/add may alias (the executor's buffer reuse
 // can place the result over either input): every index is read before it is
 // written, and the reduction completes before the apply.
+// `blockIdx.y` is the row of a multi-row launch (the verify step's positions);
+// row 0 is the decode call. Each block runs the per-row code unchanged on its
+// own row's slice, so every row is bit-identical to the single-row launch.
 template <typename R>
 __global__ void rms_norm_fused_kernel(const float* x,
                                       const float* __restrict__ weight, int n,
                                       float eps, float* y,
                                       const float* add) {
+  if (blockIdx.y != 0) {
+    const size_t rb = (size_t)blockIdx.y * (size_t)n;
+    x += rb;
+    y += rb;
+    if (add != nullptr) add += rb;
+  }
   const int tid = threadIdx.x;
   __shared__ typename R::part_t wp[32];
   __shared__ float inv;
@@ -496,11 +527,18 @@ __global__ void rms_norm_fused_kernel(const float* x,
 // elementwise so spreading it across the block does not change the result.
 // `add` is the optional residual epilogue, as in rms_norm_fused_kernel: the
 // add folded into this norm's output is applied here, bit-identically.
+// `blockIdx.y` is the row of a multi-row launch; a row holds `gridDim.x` heads.
 template <typename R>
 __global__ void rms_heads_fused_kernel(const float* x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
                                        float* y, const float* add) {
+  if (blockIdx.y != 0) {
+    const size_t rb = (size_t)blockIdx.y * (size_t)gridDim.x * (size_t)head_dim;
+    x += rb;
+    y += rb;
+    if (add != nullptr) add += rb;
+  }
   const int h = blockIdx.x;
   const float* xh = x + (size_t)h * head_dim;
   float* yh = y + (size_t)h * head_dim;
@@ -1699,6 +1737,10 @@ inline int gemv_grid(int rows, int k_split) {
 // the block winner. Single launch, deterministic, no atomics; mirrors nn::argmax.
 __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ out,
                               int n) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    out += blockIdx.y;
+  }
   __shared__ float s_val[1024];
   __shared__ int s_idx[1024];
   const int tid = threadIdx.x;
@@ -1735,6 +1777,10 @@ __device__ __forceinline__ bool mask_bit(const uint8_t* __restrict__ mask, int i
 __global__ void argmax_masked_kernel(const float* __restrict__ x,
                                      const uint8_t* __restrict__ mask,
                                      float* __restrict__ out, int n) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    out += blockIdx.y;
+  }
   __shared__ float s_val[1024];
   __shared__ int s_idx[1024];
   const int tid = threadIdx.x;
@@ -2027,8 +2073,14 @@ __device__ __forceinline__ unsigned long long argmax_key(float v, int mi) {
 // (grid sized from the row length and the SM count) to one packed key, and a
 // single-block finalize picks the winner. Per block the reduction is exactly the
 // single-block one (compare with >, first occurrence wins, so NaN never wins).
+// `blockIdx.y` is the row of a multi-row launch; each block row reduces its own
+// row and writes its own keys slice (gridDim.x keys per row).
 __global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
                                       unsigned long long* __restrict__ keys) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    keys += (size_t)blockIdx.y * (size_t)gridDim.x;
+  }
   __shared__ float s_val[256];
   __shared__ int s_idx[256];
   const int tid = threadIdx.x;
@@ -2070,6 +2122,10 @@ __global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
                                              const uint8_t* __restrict__ mask,
                                              int n,
                                              unsigned long long* __restrict__ keys) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    keys += (size_t)blockIdx.y * (size_t)gridDim.x;
+  }
   __shared__ float s_val[256];
   __shared__ int s_idx[256];
   const int tid = threadIdx.x;
@@ -2104,8 +2160,14 @@ __global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
   if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
 }
 
+// `blockIdx.y` is the row of a multi-row launch (one finalize block per row);
+// its keys slice starts at row * n_keys.
 __global__ void argmax_finalize_kernel(const unsigned long long* __restrict__ keys,
                                        int n_keys, float* __restrict__ out) {
+  if (blockIdx.y != 0) {
+    keys += (size_t)blockIdx.y * (size_t)n_keys;
+    out += blockIdx.y;
+  }
   __shared__ unsigned long long s_key[256];
   const int tid = threadIdx.x;
   unsigned long long k = 0;
@@ -2884,24 +2946,26 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
 // and chains these back-to-back so activations stay resident.
 
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n, const float* add) {
+                  float* y, int n, const float* add, int rows) {
   if (!available()) return false;
-  if (n <= 0 || !x || !y) return false;
+  if (n <= 0 || rows <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)n) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  SB_NOTE_LAUNCH(rms_norm_fused_kernel, 1, 1024, 0, cur_stream());
-  launch_rms_norm_fused(dim3(1), 1024, cur_stream(), x, d_w, n, eps, y, add);
+  SB_NOTE_LAUNCH(rms_norm_fused_kernel, dim3(1, rows), 1024, 0, cur_stream());
+  launch_rms_norm_fused(dim3(1, rows), 1024, cur_stream(), x, d_w, n, eps, y,
+                        add);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
-                        float* y, int head_dim, int heads, const float* add) {
+                        float* y, int head_dim, int heads, const float* add,
+                        int rows) {
   if (!available()) return false;
-  if (head_dim <= 0 || heads <= 0 || !x || !y) return false;
+  if (head_dim <= 0 || heads <= 0 || rows <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)head_dim) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
@@ -2910,9 +2974,9 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   }
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
-  SB_NOTE_LAUNCH(rms_heads_fused_kernel, heads, 256, 0, cur_stream());
-  launch_rms_heads_fused(heads, 256, cur_stream(), x, d_w, head_dim, eps, y,
-                         add);
+  SB_NOTE_LAUNCH(rms_heads_fused_kernel, dim3(heads, rows), 256, 0, cur_stream());
+  launch_rms_heads_fused(dim3(heads, rows), 256, cur_stream(), x, d_w, head_dim,
+                         eps, y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -3035,64 +3099,73 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// `n_rows` > 1 is the verify step's multi-position form: grid.y is the row, and
+// each row runs the same per-row kernel on its own activation slice and writes
+// its own output slice. The weight is shared and uploaded once.
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
-                    float* y, int rows) {
+                    float* y, int rows, int n_rows) {
   if (!available()) return false;
-  if (cols <= 0 || rows <= 0 || !x || !y) return false;
+  if (cols <= 0 || rows <= 0 || n_rows <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const float* d_w = static_cast<const float*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
   if (!d_w) return false;
   if ((cols & 3) == 0) {
     const int k_split = gemv_k_split(rows);
+    const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
           grow_scratch(g_partial, g_partial_bytes,
-                       (size_t)rows * k_split * sizeof(float)));
+                       (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(rows), 256, 0, cur_stream());
-      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
+      const dim3 rgrid(grid_for(rows), n_rows);
+      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_dense_f32, grid_for(rows), 256, 0, cur_stream());
-    gemv_dense_f32<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
+    const dim3 grid(grid_for(rows), n_rows);
+    SB_NOTE_LAUNCH(gemv_dense_f32, grid, 256, 0, cur_stream());
+    gemv_dense_f32<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
-                     float* y, int rows) {
+                     float* y, int rows, int n_rows) {
   if (!available()) return false;
-  if (cols <= 0 || rows <= 0 || !x || !y) return false;
+  if (cols <= 0 || rows <= 0 || n_rows <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const uint16_t* d_w = static_cast<const uint16_t*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
   if ((cols & 7) == 0) {
     const int k_split = gemv_k_split(rows);
+    const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
           grow_scratch(g_partial, g_partial_bytes,
-                       (size_t)rows * k_split * sizeof(float)));
+                       (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(rows), 256, 0, cur_stream());
-      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
+      const dim3 rgrid(grid_for(rows), n_rows);
+      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_bf16, grid_for(rows), 256, 0, cur_stream());
-    gemv_bf16<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
+    const dim3 grid(grid_for(rows), n_rows);
+    SB_NOTE_LAUNCH(gemv_bf16, grid, 256, 0, cur_stream());
+    gemv_bf16<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -5519,6 +5592,48 @@ bool argmax_dev(const float* x, int n, float* out) {
   argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
   SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// Multi-row argmax (the verify step's positions): every row runs the per-row
+// reduction the single-row call runs — same grid, same per-block key packing,
+// same finalize tree — on its own [n] slice, so row i is bit-identical to
+// argmax_dev / argmax_masked_dev at that row's position. `mask` is shared by
+// every row and selects the masked form.
+bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
+                     float* out) {
+  if (!available()) return false;
+  if (n_rows <= 0 || n <= 0 || !x || !out) return false;
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    const dim3 g(1, n_rows);
+    if (mask) {
+      SB_NOTE_LAUNCH(argmax_masked_kernel, g, 1024, 0, cur_stream());
+      argmax_masked_kernel<<<g, 1024, 0, cur_stream()>>>(x, mask, out, n);
+    } else {
+      SB_NOTE_LAUNCH(argmax_kernel, g, 1024, 0, cur_stream());
+      argmax_kernel<<<g, 1024, 0, cur_stream()>>>(x, out, n);
+    }
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * n_rows * sizeof(unsigned long long)));
+  if (!keys) return false;
+  const dim3 g(grid, n_rows);
+  if (mask) {
+    SB_NOTE_LAUNCH(argmax_partial_masked_kernel, g, kThreads, 0, cur_stream());
+    argmax_partial_masked_kernel<<<g, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
+  } else {
+    SB_NOTE_LAUNCH(argmax_partial_kernel, g, kThreads, 0, cur_stream());
+    argmax_partial_kernel<<<g, kThreads, 0, cur_stream()>>>(x, n, keys);
+  }
+  const dim3 fg(1, n_rows);
+  SB_NOTE_LAUNCH(argmax_finalize_kernel, fg, 256, 0, cur_stream());
+  argmax_finalize_kernel<<<fg, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
 

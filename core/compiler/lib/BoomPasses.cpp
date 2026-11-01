@@ -903,9 +903,14 @@ public:
 // `y = norm(x) + residual` in one launch; the f32 value is the one the pair
 // produced (the add of the stored norm value, with no multiply contraction).
 //
-// Decode form only, like the gemv residual fold: a `batch` (prefill) or
-// `verify` node is left alone (prefill has the generated rms_norm_add region;
-// verify runs the per-row decode norm).
+// The verify form folds the same way: its norm runs one row-invariant block
+// per position (row r reads residual row r), so the single-row add the pair
+// produced is exactly the per-row apply the multi-row kernel does. That leaves
+// the verify step without the 127 standalone add launches a decode step no
+// longer has.
+//
+// Batched (prefill) nodes are left alone: prefill has the generated
+// rms_norm_add region instead.
 class FuseResidualEpiloguePass
     : public mlir::PassWrapper<FuseResidualEpiloguePass,
                                mlir::OperationPass<boom::GraphOp>> {
@@ -940,10 +945,9 @@ public:
           node.getNumOperands() != 2 || node.getNumResults() != 1)
         continue;
       // A decode Add may carry no node_attrs at all (the PLE post-norm add);
-      // only the batched/verify forms are excluded.
+      // only the batched (prefill) form is excluded.
       auto addAttrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
-      if (addAttrs && (nodeAttrInt(addAttrs, "batch") ||
-                       nodeAttrInt(addAttrs, "verify")))
+      if (addAttrs && nodeAttrInt(addAttrs, "batch"))
         continue;
       for (unsigned s = 0; s < 2; ++s) {
         const int64_t proj = view.idOf(node.getOperand(s));
@@ -956,8 +960,8 @@ public:
             m->getNumOperands() != 1)
           continue;
         auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
-        if (!attrs || nodeAttrInt(attrs, "batch") || nodeAttrInt(attrs, "verify"))
-          continue; // batched/verify form: no residual epilogue
+        if (!attrs || nodeAttrInt(attrs, "batch"))
+          continue; // batched (prefill) form: no residual epilogue
         if (consumers[proj] != 1)
           continue; // the norm has another reader
         adds.push_back(&node);

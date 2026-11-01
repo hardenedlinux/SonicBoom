@@ -961,21 +961,21 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // `add_input` is set by fuse_residual_epilogue_pass: the residual of the
       // Add that consumed this norm became a second activation input, and the
       // norm kernel applies it in its apply loop (same f32 addition, one
-      // launch). Verify/batch forms keep the separate add; the pass does not
-      // match them.
+      // launch). The verify form applies it per row, on the same row slice the
+      // separate add would have read; the batched (prefill) form keeps the
+      // generated rms_norm_add region instead.
       int64_t add_idx = 0;
       const float* add_p = nullptr;
       if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
           add_idx < int64_t(in.size()))
         add_p = dev(in[add_idx]);
       if (verify_attr(vr)) {
-        // Verify: one decode norm per row (the 1024-thread kernel decode runs;
-        // the batched rms_norm_heads kernel uses a different thread count).
+        // Verify: one launch whose grid.y covers the rows; each row runs the
+        // same 1024-thread decode norm on its own slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int row = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]) + r * row, eps,
-                                      out + r * row, row);
+        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, row,
+                                    add_p, int(vr));
       } else if (batch_attr(nb)) {
         // Row norm over [n, dim]: reuse the per-head norm with a single
         // `dim_i`-wide head per row (position), so each row is normalized
@@ -1004,17 +1004,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           add_idx < int64_t(in.size()))
         add_p = dev(in[add_idx]);
       if (verify_attr(vr) && dim_i > 0) {
-        // Verify: per row, the same heads kernel the decode row runs.
+        // Verify: one launch, grid.y over the rows; each row runs the same
+        // heads kernel the decode row runs on its own slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0 ||
             (out_n / int(vr)) % int(dim_i) != 0) {
           ok = false;
           break;
         }
         const int row = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]) + r * row, eps,
-                                            out + r * row, int(dim_i),
-                                            row / int(dim_i));
+        ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
+                                          row / int(dim_i), add_p, int(vr));
         break;
       }
       ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
@@ -1940,15 +1939,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: the dense projection is a decode instance per row (the
-        // batched dense kernel is not the n == 1 kernel; B2).
+        // Verify: one launch, grid.y over the rows; each row runs the decode
+        // dense kernel on its own activation and output slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int cols =
             int(in[0].device.size_bytes / sizeof(float) / uint64_t(vr));
         const int rows = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]) + r * cols,
-                                        out + r * rows, rows);
+        ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, rows,
+                                      int(vr));
         break;
       }
       if (batch_attr(nb)) {
@@ -1983,23 +1981,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                                        uint64_t(rows) * d);
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: the decode dense instance per row (bf16-round the row on a
-        // scratch copy, then the single-row gemv), as the decode path does.
+        // Verify: bf16-round the whole [rows, cols] activation on one scratch
+        // copy, then one launch whose grid.y covers the rows (each row runs the
+        // decode dense kernel on its own slice).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int cols =
             int(in[0].device.size_bytes / sizeof(float) / uint64_t(vr));
-        const uint64_t xbytes = uint64_t(cols) * sizeof(float);
+        const uint64_t xbytes = uint64_t(cols) * sizeof(float) * uint64_t(vr);
         uint64_t xtmp = device::acquire(xbytes);
         if (!xtmp) { ok = false; break; }
-        for (int64_t r = 0; r < vr && ok; ++r) {
-          ok = device::device_copy(in[0].device.handle +
-                                       uint64_t(r) * xbytes,
-                                   xtmp, xbytes) &&
-               nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols) &&
-               nn::cuda::matvec_bf16_dev(W, cols,
-                                         reinterpret_cast<const float*>(xtmp),
-                                         out + r * int(rows), int(rows));
-        }
+        ok = device::device_copy(in[0].device.handle, xtmp, xbytes) &&
+             nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols * int(vr)) &&
+             nn::cuda::matvec_bf16_dev(W, cols,
+                                       reinterpret_cast<const float*>(xtmp),
+                                       out, int(rows), int(vr));
         device::release(xtmp, xbytes);
         break;
       }
@@ -2084,18 +2079,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_i(*node, "stride", stride);
       int64_t vr = 0;
       if (verify_attr(vr) && stride == 0) {
-        // Verify: the same sub-span copy per row of a [rows, total_per] input.
+        // Verify: one launch copying the same sub-span of every row of a
+        // [rows, total_per] input — exactly the strided row slice with the row
+        // stride equal to the row width.
         if (vr <= 0 || length <= 0) { ok = false; break; }
         const int total = int(in[0].device.size_bytes / sizeof(float) / vr);
         if (total <= 0 || offset + length > total) { ok = false; break; }
-        const int len = int(length);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = device::device_copy(in[0].device.handle +
-                                       (uint64_t(r) * uint64_t(total) +
-                                        uint64_t(offset)) * sizeof(float),
-                                   out_handle + uint64_t(r) * uint64_t(len) *
-                                                    sizeof(float),
-                                   uint64_t(len) * sizeof(float));
+        ok = nn::cuda::slice_strided_dev(dev(in[0]), out, int(vr), int(length),
+                                         int(offset), total);
         break;
       }
       if (stride > 0) {
@@ -2186,10 +2177,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
         const auto* mask = reinterpret_cast<const uint8_t*>(
             masked ? uintptr_t(argmax_mask_.id) : 0);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = masked ? nn::cuda::argmax_masked_dev(dev(in[0]) + r * vocab, vocab,
-                                                    mask, out + r)
-                      : nn::cuda::argmax_dev(dev(in[0]) + r * vocab, vocab, out + r);
+        ok = nn::cuda::argmax_rows_dev(dev(in[0]), int(vr), vocab, mask, out);
         if (ok && token_buf_)
           ok = device::device_copy(out_handle, token_out_slot(),
                                    size_t(vr) * sizeof(float));
