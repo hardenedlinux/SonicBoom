@@ -1841,6 +1841,49 @@ static bool program_stop(const GreedyProgramDesc& p, int64_t token,
          p.eos_tokens.end();
 }
 
+// One plain greedy decode step over a fed (token, pos): stage the position,
+// launch the step — one replay of the captured step graph, or the same graph
+// through the executor when the capture is not replayable — run `after_launch`
+// while the launch is still in flight, then read back the argmax the step
+// wrote. Returns -1 on failure (with the executor's message in `err` when it
+// failed there). Both loops run this one step: the spec-off loop feeds the
+// previous step's argmax (the device token slot already holds it), the
+// speculative loop feeds the token it accepted and seeds it first. The
+// speculative loop passes its host-side drafter update as `after_launch`, so
+// that work overlaps the GPU instead of delaying the launch.
+template <class AfterLaunch>
+static int64_t greedy_step(DecodeRuntime& rt, uint64_t token, uint64_t pos,
+                           bool replay_ok, AfterLaunch&& after_launch,
+                           std::string* err = nullptr) {
+  if (!rt.cuda->set_pos(pos)) return -1;
+  if (replay_ok) {
+    hal::StepProgram* step_prog = rt.step_at(pos);
+    if (!step_prog || !step_prog->replay()) return -1;
+    after_launch();
+    float next_f = -1.0f;
+    if (!rt.cuda->read_token(&next_f)) return -1;
+    return int64_t(next_f);
+  }
+  std::vector<sx::Bytes> in;
+  in.push_back(encode_i64(token));
+  in.push_back(encode_i64(pos));
+  auto res = rt.exec->execute(rt.plan, rt.snap, in);
+  after_launch();
+  if (!res) {
+    if (err) *err = res.error().message;
+    return -1;
+  }
+  if (res->outputs.empty()) {
+    if (err) *err = "no outputs";
+    return -1;
+  }
+  if (res->outputs[0].size() < sizeof(float)) {
+    if (err) *err = "argmax too small";
+    return -1;
+  }
+  return int64_t(*reinterpret_cast<const float*>(res->outputs[0].data()));
+}
+
 // Execute the program's decode loop from `step` (the caller has already emitted
 // `step` tokens and `token` is the next input, at `pos`). The step node is one
 // StepProgram replay — k chained steps per replay in chunk mode — the sample
@@ -1903,18 +1946,12 @@ static uint64_t run_program_steps(
       // SONICBOOM_NVTX so nsys can isolate one steady-state decode window.
       const std::string name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(name.c_str());
-      rt.cuda->set_pos(pos);
-      hal::StepProgram* step_prog = rt.step_at(pos);
-      if (!step_prog || !step_prog->replay()) {
-        if (nvtx_enabled()) nvtxRangePop();
+      const int64_t next = greedy_step(rt, token, pos, replay_ok, [] {});
+      if (nvtx_enabled()) nvtxRangePop();
+      if (next < 0) {
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
       }
-      float next_f = -1.0f;
-      rt.cuda->read_token(&next_f);
-      if (nvtx_enabled()) nvtxRangePop();
-      const int64_t next = int64_t(next_f);
-      if (next < 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -1925,27 +1962,14 @@ static uint64_t run_program_steps(
   } else {
     // No re-playable graph: the step node is one executor dispatch.
     for (; step < limit; ++step) {
-      rt.cuda->set_pos(pos);
-      std::vector<sx::Bytes> in;
-      in.push_back(encode_i64(token));
-      in.push_back(encode_i64(pos));
-      auto res = rt.exec->execute(rt.plan, rt.snap, in);
-      if (!res || res->outputs.empty()) {
-        if (!res)
-          std::cerr << "[program] step " << step << " execute failed: "
-                    << res.error().message << "\n";
-        else
-          std::cerr << "[program] step " << step << " no outputs\n";
+      std::string err;
+      const int64_t next =
+          greedy_step(rt, token, pos, /*replay_ok=*/false, [] {}, &err);
+      if (next < 0) {
+        std::cerr << "[program] step " << step << " execute failed: " << err
+                  << "\n";
         break;
       }
-      const sx::Bytes& arg = res->outputs[0];
-      if (arg.size() < sizeof(float)) {
-        std::cerr << "[program] step " << step << " argmax too small: "
-                  << arg.size() << " < " << sizeof(float) << "\n";
-        break;
-      }
-      const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
-      if (next < 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -2335,6 +2359,7 @@ static uint64_t run_spec_program_steps(
     spec_diag().total = 0;
     spec_diag().hist.clear();
   }
+  const uint64_t first_step = step;
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -2345,7 +2370,20 @@ static uint64_t run_spec_program_steps(
     }
     // The drafter may propose at most what the cache can verify in one step:
     // k+1 rows at positions L..L+k must fit.
-    drafter->push(token);
+    //
+    // The drafter learns the fed token once per iteration, but the update is
+    // deferred: an iteration that proposes flushes it first (the proposal must
+    // see it), and a plain step — which proposes nothing — runs it after the
+    // launch, overlapping the GPU. A k = 0 iteration therefore costs exactly
+    // the spec-off one-decode-step function plus the n-gram index write the
+    // next proposal needs, never host table work in front of a launch.
+    bool pushed = false;
+    const auto ensure_pushed = [&] {
+      if (!pushed) {
+        drafter->push(token);
+        pushed = true;
+      }
+    };
     const uint64_t room = std::min<uint64_t>(
         uint64_t(cap), session.n_ctx - L - 1);
     size_t k = 0;
@@ -2359,6 +2397,7 @@ static uint64_t run_spec_program_steps(
     // CPU cost is measured so the objective charges proposal work explicitly
     // (today it is negligible; a draft model's cost belongs in the same slot).
     const auto propose_with = [&](size_t budget) -> size_t {
+      ensure_pushed();
       const auto t0 = std::chrono::steady_clock::now();
       const size_t got = drafter->propose(std::span<uint64_t>(drafts, budget),
                                           &match_n);
@@ -2400,7 +2439,14 @@ static uint64_t run_spec_program_steps(
       }
       if (!warm) {
         const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
-        if (policy.bootstrap_left > 0) {
+        if (adaptive && step == first_step) {
+          // The first generated token must not wait on a verify: an adaptive
+          // call starts with one plain step (exactly the spec-off step), so a
+          // request's time to first token does not depend on the policy's
+          // choice. The bootstrap and the exploration start at the second
+          // iteration, where their cost is amortized over the decode.
+          k = 0;
+        } else if (policy.bootstrap_left > 0) {
           // B7 v2 bootstrap: real drafter proposals at the affordable depth.
           // No synthetic last-token draft — that probe measured the drafter's
           // rejection, not its availability. A proposal verifies (and teaches
@@ -2461,6 +2507,7 @@ static uint64_t run_spec_program_steps(
         }
       }
     } else {
+      ensure_pushed();
       k = drafter->propose(std::span<uint64_t>(drafts, size_t(room)),
                            &match_n);
     }
@@ -2470,6 +2517,7 @@ static uint64_t run_spec_program_steps(
     // verify" indistinguishable in the record. Probe anyway: propose reads the
     // tables and does not mutate them, so the shadow lookup changes nothing.
     if (spec_diag_enabled() && k == 0 && !repeat) {
+      ensure_pushed();
       uint64_t probe[kSpecMaxDrafts];
       const size_t probe_room =
           size_t(std::min<uint64_t>(uint64_t(cap), room));
@@ -2478,34 +2526,21 @@ static uint64_t run_spec_program_steps(
     }
 
     if (k == 0) {
-      // (k == 0 ? step : verify): the captured single decode step at L, or the
-      // same step through the executor when no capture is replayable.
-      int64_t next = -1;
-      if (replay_ok) {
-        rt.cuda->set_pos(L);
-        hal::StepProgram* step_prog = rt.step_at(L);
-        if (!rt.cuda->seed_token(token) || !step_prog || !step_prog->replay()) {
-          std::cerr << "[spec] the k == 0 decode step failed at position " << L
-                    << "\n";
-          break;
-        }
-        float next_f = -1.0f;
-        rt.cuda->read_token(&next_f);
-        next = int64_t(next_f);
-      } else {
-        rt.cuda->set_pos(L);
-        const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(L)};
-        auto res = rt.exec->execute(rt.plan, rt.snap, in);
-        if (!res || res->outputs.empty() ||
-            res->outputs[0].size() < sizeof(float)) {
-          std::cerr << "[spec] the k == 0 decode step failed at position " << L
-                    << "\n";
-          break;
-        }
-        next = int64_t(*reinterpret_cast<const float*>(
-            res->outputs[0].data()));
+      // The plain step is exactly the spec-off loop's one-decode-step
+      // function, with the fed token seeded into the device slot (the token
+      // this iteration feeds is the accepted one, not what the last replay
+      // wrote). The drafter's index update rides the launch.
+      if (!rt.cuda->seed_token(token)) {
+        std::cerr << "[spec] the k == 0 decode step failed to stage the token "
+                     "at position " << L << "\n";
+        break;
       }
-      if (next < 0) break;
+      const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed);
+      if (next < 0) {
+        std::cerr << "[spec] the k == 0 decode step failed at position " << L
+                  << "\n";
+        break;
+      }
       // S4: a plain step is a proposal of length 0 (the drafter missed or the
       // policy chose k = 0) that emits the verifier's own token.
       if (spec_diag_enabled()) {
