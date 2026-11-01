@@ -1165,4 +1165,207 @@ __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
   }
 }
 
+// Q6_K with the weight side hoisted. Same split as the K-quant reuse kernels:
+// the per-lane operands (vl/vh-derived quads, scales, block scale) are built
+// once per weight block, and the position side keeps vec_dot_q6_K_q8_1's exact
+// expression `d8[i] * (dp4a(q[i], u[i]) * scales[4*i])` and float order.
+template <int T, int WP = 1>
+__global__ void gemv_q6_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  const int iqs = lane;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[TL];
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
+    for (int b = 0; b < blocks_per_row; ++b) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
+      // --- weight side: the block half of vec_dot_q6_K_q8_1, once ---
+      const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K / 2)) +
+                             (iqs % (QI6_K / 2)) / (QI6_K / 4);
+      const int scale_offset = (QI6_K / 4) * (iqs / (QI6_K / 2)) +
+                               (iqs % (QI6_K / 2)) / (QI6_K / 8);
+      const int vh_shift = 2 * ((iqs % (QI6_K / 2)) / (QI6_K / 4));
+      const int vl = get_int_b2(wb, iqs);
+      const int vh = get_int_b2(wb + 128,
+          (QI6_K / 4) * (iqs / (QI6_K / 2)) + iqs % (QI6_K / 4)) >> vh_shift;
+      const int8_t* scales =
+          reinterpret_cast<const int8_t*>(wb + 192) + scale_offset;
+      const float d = half_to_float(ld_u16(wb + 208));
+      int q[QR6_K];
+      int sc[QR6_K];
+      #pragma unroll
+      for (int i = 0; i < QR6_K; ++i) {
+        const int ql = (vl >> (4 * i)) & 0x0F0F0F0F;
+        const int qh = ((vh >> (4 * i)) << 4) & 0x30303030;
+        q[i] = __vsubss4(ql | qh, 0x20202020);
+        sc[i] = scales[4 * i];
+      }
+      // --- position side: exactly vec_dot_q6_K_q8_1's sum ---
+      #pragma unroll
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
+          const block_q8_1* yb =
+              y + ((size_t)(p0 + po) * blocks_per_row + b) * (QK_K / QK8_1);
+          int u[QR6_K];
+          float d8[QR6_K];
+          #pragma unroll
+          for (int i = 0; i < QR6_K; ++i) {
+            u[i] = get_int_b4(yb[bq8_offset + 2 * i].qs, iqs % QI8_1);
+            d8[i] = yb[bq8_offset + 2 * i].d;
+          }
+          float s = 0.0f;
+          #pragma unroll
+          for (int i = 0; i < QR6_K; ++i)
+            s += d8[i] * (__dp4a(q[i], u[i], 0) * sc[i]);
+          sum[t] += d * s;
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
+// Legacy Q5_0 / Q8_0 with the weight side hoisted. A legacy block is one q8_1
+// block, so each lane owns the whole block and its unpacked operands (the
+// per-group 4-byte words) are position-independent; the position side keeps the
+// vec_dot expression verbatim.
+template <int T, int WP = 1>
+__global__ void gemv_q8_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[TL];
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
+    for (int b = lane; b < blocks_per_row; b += 32) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 34;
+      const float d = half_to_float(ld_u16(wb));
+      int wv[8];
+      #pragma unroll
+      for (int i = 0; i < 8; ++i) wv[i] = int(ld_u32(wb + 2 + 4 * i));
+      #pragma unroll
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
+          const block_q8_1* yb = y + (size_t)(p0 + po) * blocks_per_row + b;
+          int sumi = 0;
+          #pragma unroll
+          for (int i = 0; i < 8; ++i)
+            sumi = __dp4a(wv[i], get_int_b4(yb->qs, i), sumi);
+          sum[t] += d * yb->d * float(sumi);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
+template <int T, int WP = 1>
+__global__ void gemv_q5_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+                                             const block_q8_1* __restrict__ y,
+                                             float* __restrict__ dst,
+                                             int blocks_per_row, int num_rows,
+                                             int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  for (int p0 = 0; p0 < n; p0 += T) {
+    const int nt = (n - p0 < T) ? (n - p0) : T;
+    float sum[TL];
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
+    for (int b = lane; b < blocks_per_row; b += 32) {
+      const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 22;
+      const uint32_t xh = ld_u32(wb + 2);
+      const float d = half_to_float(ld_u16(wb));
+      int vi[4], wi[4];
+      #pragma unroll
+      for (int g = 0; g < 4; ++g) {
+        const uint32_t nib = ld_u32(wb + 6 + 4 * g);
+        const uint32_t lo = xh >> (4 * g);
+        vi[g] = int(nib & 0x0F0F0F0Fu);
+        vi[g] |= int((lo << 4) & 0x00000010u);
+        vi[g] |= int((lo << 11) & 0x00001000u);
+        vi[g] |= int((lo << 18) & 0x00100000u);
+        vi[g] |= int((lo << 25) & 0x10000000u);
+        const uint32_t hi = xh >> (4 * g + 16);
+        wi[g] = int((nib >> 4) & 0x0F0F0F0Fu);
+        wi[g] |= int((hi << 4) & 0x00000010u);
+        wi[g] |= int((hi << 11) & 0x00001000u);
+        wi[g] |= int((hi << 18) & 0x00100000u);
+        wi[g] |= int((hi << 25) & 0x10000000u);
+      }
+      #pragma unroll
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
+          const block_q8_1* yb = y + (size_t)(p0 + po) * blocks_per_row + b;
+          int sumi = 0, sumu = 0;
+          #pragma unroll
+          for (int g = 0; g < 4; ++g) {
+            const int u0 = get_int_b4(yb->qs, g);
+            const int u1 = get_int_b4(yb->qs, 4 + g);
+            sumi = __dp4a(vi[g], u0, sumi);
+            sumi = __dp4a(wi[g], u1, sumi);
+            sumu = __dp4a(0x01010101, u0, sumu);
+            sumu = __dp4a(0x01010101, u1, sumu);
+          }
+          sum[t] += d * yb->d * float(sumi - 16 * sumu);
+        }
+      }
+    }
+    #pragma unroll
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
+        float s = sum[t];
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
+      }
+    }
+  }
+}
+
 } // namespace sonicboom::quant::cuda::q8_1

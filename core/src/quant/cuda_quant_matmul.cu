@@ -2415,6 +2415,15 @@ bool verify_gemv_reuse_enabled() noexcept {
   return on;
 }
 
+// The weight-side hoisting is routed from n = 3, where the shared weight block
+// always pays. At n = 2 it only pays on the shapes it was measured on: Q4_K and
+// Q6_K projections are 8-18% faster (Qwen2.5-7B ffn_gate/ffn_down), while Q3_K
+// and Q5_K lose 3-15% (Gemma 4 E4B) and keep the per-position kernel.
+bool verify_gemv_reuse_for(QuantType qt, int n) noexcept {
+  return n >= 3 ||
+         (n == 2 && (qt == QuantType::Q4_K || qt == QuantType::Q6_K));
+}
+
 // The warps-per-row split of the reuse kernels: `wp` warps cooperate on one
 // output row, so a block (8 warps, dim3(32, 8) unchanged) covers 8/wp rows and
 // the grid's y dimension grows accordingly.
@@ -2487,7 +2496,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
-      if (n >= 3 && verify_gemv_reuse_enabled()) {
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
         SB_LAUNCH_REUSE_WP(gemv_q3_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
@@ -2498,7 +2507,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
       }
       break;
     case QuantType::Q4_K:
-      if (n >= 3 && verify_gemv_reuse_enabled()) {
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
         SB_LAUNCH_REUSE_WP(gemv_q4_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
@@ -2509,7 +2518,7 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
       }
       break;
     case QuantType::Q5_K:
-      if (n >= 3 && verify_gemv_reuse_enabled()) {
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
         SB_LAUNCH_REUSE_WP(gemv_q5_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
@@ -2520,25 +2529,37 @@ void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
       }
       break;
     case QuantType::Q6_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp_w, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q6_K_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
     case QuantType::Q5_0:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp_w, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q5_0_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
     case QuantType::Q8_0:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp_w, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q8_0_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
+      }
       break;
   }
 }
@@ -2583,11 +2604,20 @@ struct VerifyWpShape {
   int bpr = 0;  // weight blocks per row (cols / block size)
 };
 
-// The reuse kernels only exist for the K-quants routed to them; other types
-// (and n < 3) keep one warp per row.
+// Every quant type with a reuse kernel is routed to it for n >= 3 (Q3_K,
+// Q4_K, Q5_K and, since the weight-side hoisting, Q6_K, Q5_0, Q8_0); n < 3
+// keeps the per-position kernel.
 bool verify_wp_routed(QuantType qt) {
-  return qt == QuantType::Q3_K || qt == QuantType::Q4_K ||
-         qt == QuantType::Q5_K;
+  switch (qt) {
+    case QuantType::Q3_K:
+    case QuantType::Q4_K:
+    case QuantType::Q5_K:
+    case QuantType::Q6_K:
+    case QuantType::Q5_0:
+    case QuantType::Q8_0:
+      return true;
+  }
+  return false;
 }
 
 int verify_wp_env() noexcept { return verify_gemv_wp_override(); }
