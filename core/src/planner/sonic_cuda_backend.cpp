@@ -1077,11 +1077,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: one decode attention per query row. Row i appends its K/V at
-        // pos+i and attends over the same split/chunk constants as the n == 1
-        // call at that position, in ascending row order (row i must see rows
-        // 0..i in the cache). The fused-prep cache store is not used: the
-        // verify pipeline leaves the append here, where it can be per row.
+        // Verify: every row appends its K/V at pos+i first, then one
+        // multi-query launch serves all k+1 rows and stages each chunk of the
+        // cache once (the per-row fallback runs the single-row call at each
+        // position instead). Row i must see rows 0..i in the cache, and the
+        // SWA ring carries kMaxVerifyRows slots of headroom for appending the
+        // whole step before any attention runs. The fused-prep cache store is
+        // not used: the verify pipeline leaves the append here.
         if (vr <= 0 || kv_appended != 0 || out_n % int(vr) != 0 ||
             (in.size() >= 4 && (!cache.k_buf || !cache.v_buf))) {
           ok = false;
@@ -1091,11 +1093,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         double attn_scale = 1.0;
         attr_f(*node, "scale", attn_scale);
         nn::cuda::attention_trace_set_layer(int(layer));
+        // A warm-up run must not write the session's rows (see
+        // set_kv_write_suppressed); the attention still runs so the split
+        // scratch and every launch the capture records are exercised.
+        const bool verify_appends = in.size() >= 4 && !kv_write_suppressed_;
         for (int64_t r = 0; r < vr && ok; ++r) {
-          // A warm-up run must not write the session's rows (see
-          // set_kv_write_suppressed); the attention still runs so the split
-          // scratch and every launch the capture records are exercised.
-          if (in.size() >= 4 && !kv_write_suppressed_ &&
+          if (verify_appends &&
               !nn::cuda::kv_append_dev(
                   dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
                   dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
@@ -1105,14 +1108,23 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             ok = false;
             break;
           }
-          ok = nn::cuda::decode_attention_dev(
-              dev(in[0]) + r * q_row, dev_mut(cache.k_buf.id),
-              dev_mut(cache.v_buf.id),
-              reinterpret_cast<const uint64_t*>(pos_slot()), window,
-              cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
-              int(cache.head_dim), lc.sliding_window, float(attn_scale),
-              out + r * q_row, int(r), cache.f16(), uint64_t(decode_chunk),
-              cache.q8());
+        }
+        if (!ok) break;
+        if (!nn::cuda::decode_attention_mq_dev(
+                dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
+                reinterpret_cast<const uint64_t*>(pos_slot()), window,
+                cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
+                int(cache.head_dim), lc.sliding_window, float(attn_scale), out,
+                int(vr), 0, cache.f16(), uint64_t(decode_chunk), cache.q8())) {
+          for (int64_t r = 0; r < vr && ok; ++r)
+            ok = nn::cuda::decode_attention_dev(
+                dev(in[0]) + r * q_row, dev_mut(cache.k_buf.id),
+                dev_mut(cache.v_buf.id),
+                reinterpret_cast<const uint64_t*>(pos_slot()), window,
+                cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
+                int(cache.head_dim), lc.sliding_window, float(attn_scale),
+                out + r * q_row, int(r), cache.f16(), uint64_t(decode_chunk),
+                cache.q8());
         }
         break;
       }
