@@ -1326,6 +1326,7 @@ std::string spec_kernel_fingerprint() {
   add(shared_object_identity());
   add(env_value("SONICBOOM_SPEC_VERIFY_BATCH"));
   add(env_value("SONICBOOM_VERIFY_GEMV_REUSE"));
+  add(env_value("SONICBOOM_VERIFY_GEMV_WP"));
 #ifdef SONICBOOM_USE_CUDA
   add(quant::cuda::q8_1_enabled() ? "q8_1" : "no-q8_1");
   add(quant::cuda::mmq_enabled() ? "mmq" : "no-mmq");

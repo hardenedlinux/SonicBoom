@@ -842,22 +842,31 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
 // order are unchanged — same dp4a tree, same `d8 * (dot * scale)`, same
 // `d * sumf` — so every output is bit-identical to the single-column gemv on
 // that position, which is the verify step's B3 invariance requirement.
-template <int T>
+// WP is the number of warps that cooperate on one output row: the block keeps
+// its 8 warps, but they now cover 8/WP rows instead of 8. Warp wsub handles the
+// positions p with p % WP == wsub, every warp still walks all weight blocks
+// (repeating the weight-side unpack), and each warp reduces and writes only its
+// own positions. WP = 1 is the original kernel: same row mapping, same position
+// order, same code path.
+template <int T, int WP = 1>
 __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
   if (row >= num_rows) return;
   const int iqs = lane & 15;
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
-    float sum[T];
+    float sum[TL];
     #pragma unroll
-    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
     for (int b = ib; b < blocks_per_row; b += 2) {
       const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 110;
       // --- weight side: the block half of vec_dot_q3_K_q8_1, once ---
@@ -885,10 +894,11 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       }
       // --- position side: exactly vec_dot_q3_K_q8_1's sum ---
       #pragma unroll
-      for (int t = 0; t < T; ++t) {
-        if (t < nt) {
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
           const block_q8_1* yb =
-              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+              y + ((size_t)(p0 + po) * blocks_per_row + b) * (QK_K / QK8_1);
           int u[QR3_K];
           float d8[QR3_K];
           #pragma unroll
@@ -905,33 +915,37 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       }
     }
     #pragma unroll
-    for (int t = 0; t < T; ++t) {
-      if (t < nt) {
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
       }
     }
   }
 }
 
-template <int T>
+template <int T, int WP = 1>
 __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
-    float sum[T];
+    float sum[TL];
     #pragma unroll
-    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
     for (int b = ib; b < blocks_per_row; b += 2) {
       const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 144;
       // --- weight side: the block half of vec_dot_q4_K_q8_1, once ---
@@ -968,10 +982,11 @@ __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       const int slot = (iqs / 2) % 4;
       // --- position side: exactly vec_dot_q4_K_q8_1's sums ---
       #pragma unroll
-      for (int t = 0; t < T; ++t) {
-        if (t < nt) {
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
           const block_q8_1* yb =
-              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+              y + ((size_t)(p0 + po) * blocks_per_row + b) * (QK_K / QK8_1);
           int u[2 * QR4_K];
           float d8[QR4_K];
           #pragma unroll
@@ -997,33 +1012,37 @@ __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       }
     }
     #pragma unroll
-    for (int t = 0; t < T; ++t) {
-      if (t < nt) {
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
       }
     }
   }
 }
 
-template <int T>
+template <int T, int WP = 1>
 __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n) {
+  static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
+  constexpr int TL = (T + WP - 1) / WP;
   const int lane = threadIdx.x;
-  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
   if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
-    float sum[T];
+    float sum[TL];
     #pragma unroll
-    for (int t = 0; t < T; ++t) sum[t] = 0.0f;
+    for (int t = 0; t < TL; ++t) sum[t] = 0.0f;
     for (int b = ib; b < blocks_per_row; b += 2) {
       const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 176;
       // --- weight side: the block half of vec_dot_q5_K_q8_1, once ---
@@ -1068,10 +1087,11 @@ __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       const int slot = (iqs / 2) % 4;
       // --- position side: exactly vec_dot_q5_K_q8_1's sums ---
       #pragma unroll
-      for (int t = 0; t < T; ++t) {
-        if (t < nt) {
+      for (int t = 0; t < TL; ++t) {
+        const int po = t * WP + wsub;
+        if (po < nt) {
           const block_q8_1* yb =
-              y + ((size_t)(p0 + t) * blocks_per_row + b) * (QK_K / QK8_1);
+              y + ((size_t)(p0 + po) * blocks_per_row + b) * (QK_K / QK8_1);
           int u[2 * QR5_K];
           float d8[QR5_K];
           #pragma unroll
@@ -1097,12 +1117,13 @@ __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
       }
     }
     #pragma unroll
-    for (int t = 0; t < T; ++t) {
-      if (t < nt) {
+    for (int t = 0; t < TL; ++t) {
+      const int po = t * WP + wsub;
+      if (po < nt) {
         float s = sum[t];
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
-        if (lane == 0) dst[(size_t)(p0 + t) * num_rows + row] = s;
+        if (lane == 0) dst[(size_t)(p0 + po) * num_rows + row] = s;
       }
     }
   }

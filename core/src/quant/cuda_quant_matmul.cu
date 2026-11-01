@@ -2415,59 +2415,103 @@ bool verify_gemv_reuse_enabled() noexcept {
   return on;
 }
 
+// The warps-per-row split of the reuse kernels: `wp` warps cooperate on one
+// output row, so a block (8 warps, dim3(32, 8) unchanged) covers 8/wp rows and
+// the grid's y dimension grows accordingly.
+//
+// Debug seam: SONICBOOM_VERIFY_GEMV_WP=1|2|4 pins the split and wins over the
+// warm-up's choice (the warm-up stores its pick in the tune file). Default is
+// 1 = one warp per row, today's kernel.
+int verify_gemv_wp_override() noexcept {
+  static const int wp = [] {
+    const char* e = std::getenv("SONICBOOM_VERIFY_GEMV_WP");
+    if (e) {
+      const int v = std::atoi(e);
+      if (v == 1 || v == 2 || v == 4) return v;
+    }
+    return 1;
+  }();
+  return wp;
+}
+
+#define SB_LAUNCH_REUSE_WP(KERNEL)                                             \
+  do {                                                                         \
+    const int rpb = 8 / wp_eff;                                                \
+    const dim3 grid_wp(1, (num_rows + rpb - 1) / rpb);                         \
+    switch (wp_eff) {                                                          \
+      case 4:                                                                  \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,4>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 4}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 4><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+        break;                                                                 \
+      case 2:                                                                  \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,2>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 2}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 2><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+        break;                                                                 \
+      default:                                                                 \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,1>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 1}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 1><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n);                        \
+        break;                                                                 \
+    }                                                                          \
+  } while (0)
+
 // Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
-// position's blocks contiguous). One warp per output row; each weight block is
-// reused across a tile of T positions. dst is [n, num_rows] (position-major).
-void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
+// position's blocks contiguous). Warps per output row is `wp` for the reuse
+// kernels (1, 2 or 4); each weight block is reused across a tile of T
+// positions. dst is [n, num_rows] (position-major).
+void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                               const q8_1::block_q8_1* xq, float* yp,
                               int blocks_per_row, int num_rows, int n) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
+  const int wp_eff = (wp == 2 || wp == 4) ? wp : 1;
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
       if (n >= 3 && verify_gemv_reuse_enabled()) {
-        SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched_reuse",
-                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                          grid, block, 0, cur_stream());
-        q8_1::gemv_q3_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+        SB_LAUNCH_REUSE_WP(gemv_q3_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
       }
       break;
     case QuantType::Q4_K:
       if (n >= 3 && verify_gemv_reuse_enabled()) {
-        SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched_reuse",
-                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                          grid, block, 0, cur_stream());
-        q8_1::gemv_q4_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+        SB_LAUNCH_REUSE_WP(gemv_q4_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
       }
       break;
     case QuantType::Q5_K:
       if (n >= 3 && verify_gemv_reuse_enabled()) {
-        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched_reuse",
-                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                          grid, block, 0, cur_stream());
-        q8_1::gemv_q5_K_q8_1_batched_reuse<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+        SB_LAUNCH_REUSE_WP(gemv_q5_K_q8_1_batched_reuse);
       } else {
         SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
                           ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                           grid, block, 0, cur_stream());
         q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-            wp, xq, yp, blocks_per_row, num_rows, n);
+            wp_w, xq, yp, blocks_per_row, num_rows, n);
       }
       break;
     case QuantType::Q6_K:
@@ -2475,24 +2519,26 @@ void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
                         ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                         grid, block, 0, cur_stream());
       q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+          wp_w, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q5_0:
       SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
                         ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                         grid, block, 0, cur_stream());
       q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+          wp_w, xq, yp, blocks_per_row, num_rows, n);
       break;
     case QuantType::Q8_0:
       SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
                         ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
                         grid, block, 0, cur_stream());
       q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+          wp_w, xq, yp, blocks_per_row, num_rows, n);
       break;
   }
 }
+
+#undef SB_LAUNCH_REUSE_WP
 
 // Quantize x -> q8_1 into `yq` (nblocks blocks, nblocks == n / 32). The
 // quantize-once seam: exposed so the CUDA backend can run a planner-inserted
@@ -2794,7 +2840,7 @@ bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   launch_gemv_q8_1_batched(
-      W.type(), static_cast<const uint8_t*>(d_w),
+      W.type(), verify_gemv_wp_override(), static_cast<const uint8_t*>(d_w),
       reinterpret_cast<const q8_1::block_q8_1*>(xq), y, int(blocks_per_row),
       int(rows), n);
   return cudaGetLastError() == cudaSuccess;
@@ -3877,7 +3923,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
         X, xq, int(nblocks * n));
 
     // Batched warp-per-row gemv -> Y[n, rows] (position-major).
-    launch_gemv_q8_1_batched(W.type(), wp, xq, Y, int(blocks_per_row), ir, n);
+    launch_gemv_q8_1_batched(W.type(), 1, wp, xq, Y, int(blocks_per_row), ir, n);
     return cudaGetLastError() == cudaSuccess;
   }
 
