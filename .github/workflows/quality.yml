@@ -28,7 +28,12 @@ jobs:
       # files; the hosted runner has 16 GiB, so analyze one TU at a time.
       SONICBOOM_QUALITY_ANALYZER_JOBS: 1
       SONICBOOM_MLIR_PREFIX: ${{ github.workspace }}/build/llvm-mlir-install
-      SONICCROSS_GUILD: ${{ github.workspace }}/.soniccross/bin/guild
+      # `guild` is Guile's own command (installed with guile-3.0); SonicCross
+      # installs no binary of that name. Its Scheme modules are installed under
+      # the workspace prefix below, so point guild at them. An unset
+      # SONICCROSS_GUILD lets tools/quality/config.sh resolve `guild` on PATH.
+      GUILE_LOAD_PATH: ${{ github.workspace }}/.soniccross/share/guile/site/3.0
+      GUILE_LOAD_COMPILED_PATH: ${{ github.workspace }}/.soniccross/lib/guile/3.0/ccache
 
     steps:
       - name: Check out repository
@@ -77,7 +82,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .soniccross
-          key: soniccross-v0.0.2-${{ runner.os }}
+          # v2: the install now lands under the workspace prefix; an older
+          # cache would be missing the Guile module directories.
+          key: soniccross-v0.0.2-prefix-${{ runner.os }}
 
       - name: Build SonicCross v0.0.2
         if: steps.soniccross-cache.outputs.cache-hit != 'true'
@@ -88,7 +95,14 @@ jobs:
           ./bootstrap
           ./configure --prefix="$GITHUB_WORKSPACE/.soniccross"
           make -j"$(nproc)"
-          make install
+          # SonicCross installs its Guile modules to guile-config's site
+          # directories, which do not follow --prefix (they default to the
+          # system-wide /usr/share and /usr/lib paths, not writable here).
+          # Redirect them into the same prefix; the job-level Guile load paths
+          # above make `guild` find them.
+          make install \
+            GUILE_SITE="$GITHUB_WORKSPACE/.soniccross/share/guile/site/3.0" \
+            GUILE_SITE_CCACHE="$GITHUB_WORKSPACE/.soniccross/lib/guile/3.0/ccache"
 
       - name: Restore ccache
         uses: actions/cache@v4
