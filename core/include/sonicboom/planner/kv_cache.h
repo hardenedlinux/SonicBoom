@@ -130,6 +130,12 @@ struct KvCacheSession {
   uint64_t cache_id = 0;
   std::vector<uint64_t> filled_tokens;  // token at each prefilled position
   uint64_t n_ctx = 0;
+  // Speculative-policy evidence (the bounded proposal/accept window) measured
+  // on this session. Owned opaquely so this model-agnostic header carries no
+  // policy type; the speculative loop treats the session as the unit, so one
+  // session's accept evidence never steers another's choices and the bootstrap
+  // is paid once per session instead of once per call.
+  std::shared_ptr<void> spec_evidence;
 
   // Longest prefix of `prompt` that matches the filled token history. 0 when
   // there is no history (or the first token already differs).

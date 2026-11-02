@@ -1390,15 +1390,49 @@ bool spec_cost_record_valid(std::span<const double> cost_us) {
   // value outside that range is a unit error or a corrupt record, not a price
   // worth keeping.
   if (cost_us[0] < 100.0 || cost_us[0] > 6.0e7) return false;
-  double prev = cost_us[0];
   for (size_t k = 1; k < cost_us.size(); ++k) {
     if (!(cost_us[k] > 0.0)) continue;
-    // More rows never get cheaper; 10% tolerance absorbs a noisy measurement.
-    if (cost_us[k] < prev * 0.9) return false;
+    // A longer verify priced above the whole range is corrupt too. A dip
+    // between measured lengths is noise (the medians are independent samples),
+    // not corruption: spec_costs_isotonic repairs it before the curve is used.
     if (cost_us[k] / cost_us[0] > 64.0) return false;
-    prev = cost_us[k];
   }
   return true;
+}
+
+void spec_costs_isotonic(std::span<double> cost_us) {
+  // Pool adjacent violators over the measured (positive) entries, in index
+  // order: push each value as its own block, then merge backwards while the
+  // previous block's mean exceeds the current one. Equal blocks are the
+  // least-squares non-decreasing fit, so an isolated noisy dip is averaged
+  // into its neighbours instead of being overwritten by a hard clamp.
+  struct Block {
+    size_t first;  // first position in the measured sequence
+    size_t count;
+    double sum;
+  };
+  std::vector<size_t> pos;  // measured positions, in index order
+  pos.reserve(cost_us.size());
+  for (size_t k = 0; k < cost_us.size(); ++k)
+    if (cost_us[k] > 0.0) pos.push_back(k);
+  if (pos.size() < 2) return;
+  std::vector<Block> blocks;
+  blocks.reserve(pos.size());
+  for (size_t i = 0; i < pos.size(); ++i) {
+    blocks.push_back(Block{i, 1, cost_us[pos[i]]});
+    while (blocks.size() >= 2) {
+      const Block& prev = blocks[blocks.size() - 2];
+      const Block& cur = blocks.back();
+      if (prev.sum / double(prev.count) <= cur.sum / double(cur.count)) break;
+      Block merged{prev.first, prev.count + cur.count, prev.sum + cur.sum};
+      blocks.pop_back();
+      blocks.back() = merged;
+    }
+  }
+  for (const Block& b : blocks) {
+    const double mean = b.sum / double(b.count);
+    for (size_t i = 0; i < b.count; ++i) cost_us[pos[b.first + i]] = mean;
+  }
 }
 
 namespace {
@@ -2201,6 +2235,9 @@ static void spec_refine_cost(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p, int k) {
   double us = 0.0;
   if (spec_refined_cost_us(m, n_ctx, k, &us)) p.cost_us[size_t(k)] = us;
+  // One freshly measured point, one re-projection: the live curve the policy
+  // prices from is always non-decreasing.
+  spec_costs_isotonic(p.cost_us);
 }
 
 // Fold every refined median into a whole curve (call start).
@@ -2211,6 +2248,9 @@ static void spec_apply_refined_costs(
     double us = 0.0;
     if (spec_refined_cost_us(m, n_ctx, k, &us)) cost_us[size_t(k)] = us;
   }
+  // Medians are independent samples; the merged curve must still be
+  // non-decreasing before the policy prices lengths from it.
+  spec_costs_isotonic(cost_us);
 }
 
 // The warm-up measures c(k) once per (model shape, context class, verify
@@ -2220,8 +2260,9 @@ static void spec_apply_refined_costs(
 // under "spec-length"; later runs load them and skip the warm-up. The key
 // carries the context class and the kernel/dispatch fingerprint, so a record is
 // only reused by the same verify implementation at the same KV scale; a
-// structurally invalid record (unit error, corrupt, non-monotone beyond
-// tolerance) is discarded instead of priced.
+// structurally invalid record (unit error, corrupt) is discarded instead of
+// priced, while a noisy dip inside an otherwise plausible record is projected
+// onto the monotone cone instead of discarding the whole measurement.
 static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
@@ -2252,10 +2293,14 @@ static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
 
 static void spec_policy_store(const SpecLengthPolicy& p) {
   std::map<std::string, int> values;
+  auto cost_us = p.cost_us;
+  // A run that ended mid warm-up stores a partial curve; project what it has,
+  // so the stored record is monotone across its measured entries.
+  spec_costs_isotonic(cost_us);
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
-    if (p.cost_us[size_t(k)] > 0.0) {
+    if (cost_us[size_t(k)] > 0.0) {
       values["c" + std::to_string(k)] =
-          std::max(1, int(std::lround(p.cost_us[size_t(k)])));
+          std::max(1, int(std::lround(cost_us[size_t(k)])));
     }
   }
   if (!values.empty()) tune::store("spec-length", p.key, values);
@@ -2293,16 +2338,29 @@ static void spec_flush_refined_costs(const Gemma4Model& m) {
     }
   }
   for (const auto& [key, us] : ready) {
-    std::map<std::string, int> values;
     const std::map<std::string, int> cached = tune::lookup("spec-length", key);
+    std::array<double, size_t(SpecLengthPolicy::kMax) + 1> curve{};
+    bool any = false;
     for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
       double v = us[size_t(k)];
       if (!(v > 0.0)) {
         const auto it = cached.find("c" + std::to_string(k));
         if (it != cached.end() && it->second > 0) v = double(it->second);
       }
-      if (v > 0.0)
-        values["c" + std::to_string(k)] = std::max(1, int(std::lround(v)));
+      if (v > 0.0) {
+        curve[size_t(k)] = v;
+        any = true;
+      }
+    }
+    if (!any) continue;
+    // Refined medians and the record's own anchors are independent samples:
+    // project the merged curve before it becomes the next process's anchor.
+    spec_costs_isotonic(curve);
+    std::map<std::string, int> values;
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+      if (curve[size_t(k)] > 0.0)
+        values["c" + std::to_string(k)] =
+            std::max(1, int(std::lround(curve[size_t(k)])));
     }
     if (!values.empty()) tune::store("spec-length", key, values);
   }
@@ -2353,9 +2411,8 @@ constexpr double kSpecCostCaptureMs = 300.0;
 // between measured points, and past the deepest measured point the last
 // segment's slope. Verify cost is close to linear in row count (every row
 // repeats the same weight read), so an extrapolated tail is a good estimate
-// rather than a guess. The curve is forced non-decreasing: a noisy median must
-// not price a longer verify below a shorter one, and the record validator
-// treats a decrease as corruption.
+// rather than a guess. The filled curve is then projected onto the monotone
+// cone: a noisy median must not price a longer verify below a shorter one.
 std::array<double, size_t(SpecLengthPolicy::kMax) + 1> spec_interpolate_costs(
     const std::array<double, size_t(SpecLengthPolicy::kMax) + 1>& known) {
   constexpr int n = int(SpecLengthPolicy::kMax) + 1;
@@ -2385,8 +2442,10 @@ std::array<double, size_t(SpecLengthPolicy::kMax) + 1> spec_interpolate_costs(
       }
     }
   }
-  for (int k = 1; k < n; ++k)
-    if (c[size_t(k)] < c[size_t(k - 1)]) c[size_t(k)] = c[size_t(k - 1)];
+  // The independent medians at the knots are noisy in both directions; the
+  // projection makes the whole curve non-decreasing without moving a point
+  // that already is.
+  spec_costs_isotonic(c);
   return c;
 }
 
@@ -2522,39 +2581,36 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   spec_policy_store(p);
 }
 
-// In-process evidence store, keyed by context class. The cost model is already
-// cached per (model shape, context class, verify kernel identity); the
-// acceptance evidence was not, so every generation call relearned it from the
-// weak prior and paid the bootstrap again — on a multi-turn trace (agent,
-// chat) that is three extra verifies per turn for evidence the process already
-// had. The store keeps the same bounded window the policy uses and never mixes
-// contexts: a slot only holds rounds this process actually verified.
+// Per-session evidence store. The cost model is cached per (model shape,
+// context class, verify kernel identity); the acceptance evidence is a
+// property of one conversation's workload, so it lives on the session that
+// measured it. Every generation call on the same session then starts from the
+// hazards that session already observed instead of paying the bootstrap again
+// (on a multi-turn trace that is three extra verifies per turn), while a
+// different session — a concurrent conversation — is never steered by another
+// conversation's acceptance. The store keeps the same bounded window the
+// policy uses and only holds rounds this session actually verified.
 struct SpecEvidenceSlot {
   std::array<uint32_t, SpecLengthPolicy::kWindow> proposed{};
   std::array<uint32_t, SpecLengthPolicy::kWindow> accepted{};
   size_t next = 0;
   size_t count = 0;
 };
-static std::mutex g_spec_evidence_mutex;
-static std::map<std::string, SpecEvidenceSlot> g_spec_evidence;
 
-// Model shape + context class, the same identity the cost record uses minus
-// the kernel fingerprint: acceptance is a property of the workload, not of
-// the verify kernel build, so it survives a rebuild within the process.
-static std::string spec_evidence_key(const Gemma4Model& m, uint64_t n_ctx) {
-  return std::string(m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") +
-         "|e" + std::to_string(m.config.embedding_length) + "|ctx=" +
-         spec_ctx_class(n_ctx);
+// The session's slot, created on first use.
+static SpecEvidenceSlot& spec_evidence_slot(planner::KvCacheSession& session) {
+  if (!session.spec_evidence)
+    session.spec_evidence = std::make_shared<SpecEvidenceSlot>();
+  return *static_cast<SpecEvidenceSlot*>(session.spec_evidence.get());
 }
 
-// Load the context class's observations from earlier calls. Returns true when
-// the window already holds enough verified rounds to skip the bootstrap.
-static bool spec_evidence_load(const Gemma4Model& m, uint64_t n_ctx,
+// Load this session's observations from earlier calls. Returns true when the
+// window already holds enough verified rounds to skip the bootstrap.
+static bool spec_evidence_load(planner::KvCacheSession& session,
                                SpecLengthPolicy& p) {
-  std::lock_guard<std::mutex> lock(g_spec_evidence_mutex);
-  const auto it = g_spec_evidence.find(spec_evidence_key(m, n_ctx));
-  if (it == g_spec_evidence.end()) return false;
-  const SpecEvidenceSlot& s = it->second;
+  if (!session.spec_evidence) return false;
+  const SpecEvidenceSlot& s =
+      *static_cast<const SpecEvidenceSlot*>(session.spec_evidence.get());
   // Copy the most recent rounds in chronological order, capped.
   const size_t n = std::min(s.count, kSpecEvidenceCarry);
   const size_t begin =
@@ -2571,10 +2627,9 @@ static bool spec_evidence_load(const Gemma4Model& m, uint64_t n_ctx,
   return s.count >= kSpecBootstrapObs;
 }
 
-static void spec_evidence_store(const Gemma4Model& m, uint64_t n_ctx,
+static void spec_evidence_store(planner::KvCacheSession& session,
                                 const SpecLengthPolicy& p) {
-  std::lock_guard<std::mutex> lock(g_spec_evidence_mutex);
-  SpecEvidenceSlot& s = g_spec_evidence[spec_evidence_key(m, n_ctx)];
+  SpecEvidenceSlot& s = spec_evidence_slot(session);
   s.proposed = p.proposed;
   s.accepted = p.accepted;
   s.next = p.obs_next;
@@ -2728,11 +2783,11 @@ static uint64_t run_spec_program_steps(
   SpecLengthPolicy policy;
   if (adaptive) {
     spec_policy_init(m, session.n_ctx, policy);
-    // Evidence from an earlier call in this process replaces the bootstrap:
-    // the policy starts this call with the hazards it already measured.
-    policy.bootstrap_left = spec_evidence_load(m, session.n_ctx, policy)
-                                ? 0
-                                : spec_bootstrap_steps();
+    // Evidence from an earlier call on this session replaces the bootstrap:
+    // the policy starts this call with the hazards this session already
+    // measured. A fresh session learns its own.
+    policy.bootstrap_left =
+        spec_evidence_load(session, policy) ? 0 : spec_bootstrap_steps();
   }
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
@@ -3064,7 +3119,7 @@ static uint64_t run_spec_program_steps(
   // A run that ended before the warm-up finished stores what it measured; the
   // policy then compares only the lengths it has prices for.
   if (adaptive && policy.warm_next >= 0) spec_policy_store(policy);
-  if (adaptive) spec_evidence_store(m, session.n_ctx, policy);
+  if (adaptive) spec_evidence_store(session, policy);
   if (spec_diag_enabled() && adaptive) {
     // The policy's end-of-call view: what it priced, what it observed, and
     // what it believed each length would emit. The per-decision scores are in

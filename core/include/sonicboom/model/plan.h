@@ -429,7 +429,7 @@ int64_t spec_choose_budget(std::span<const double> cost_us,
 // can prove that a record written by an older binary (or under a different
 // verify-kernel dispatch) cannot be consumed by the current policy.
 //
-// The key is `v2|<arch>|e<embedding>|ctx=<s|m|l>|k=<fingerprint>`. The
+// The key is `v3|<arch>|e<embedding>|ctx=<s|m|l>|k=<fingerprint>`. The
 // fingerprint covers the cost-model schema, the verify dispatch switches, and
 // the running libsonicboom.so's size + mtime, so a kernel change invalidates
 // every record without a manual bump. `n_ctx` selects the context class.
@@ -437,10 +437,17 @@ std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
                                 uint64_t n_ctx);
 
 // True when a cost vector is structurally plausible: c(0) measured and in a
-// sane microsecond range, every measured c(k) >= c(0), non-decreasing in k
-// within 10%, and c(k)/c(0) below 64. A record that fails is discarded and
-// re-warmed rather than trusted.
+// sane microsecond range, every measured c(k) < 64 * c(0). An unmeasured entry
+// (0) is skipped. Monotonicity is not required: a noisy median may dip, and
+// spec_costs_isotonic repairs the curve instead of discarding the record.
 bool spec_cost_record_valid(std::span<const double> cost_us);
+
+// Make the measured entries of a cost vector non-decreasing in place (pool
+// adjacent violators): the least-squares projection onto the monotone cone.
+// Entries <= 0 are unmeasured and left untouched. A noisy sample then never
+// prices a longer verify below a shorter one, and the projection keeps the
+// points it does not have to move. Exposed for the monotonicity test.
+void spec_costs_isotonic(std::span<double> cost_us);
 
 // Test seam (B6): run the speculative loop over `tokens` on the model's decode
 // runtime with a chosen drafter strategy, bypassing SONICBOOM_SPEC's program.
