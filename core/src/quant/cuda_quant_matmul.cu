@@ -3176,13 +3176,18 @@ static bool gemv_sibling_kquant_enabled() {
 // the group instead of one each. Members may be any of the supported quant
 // types (D1 required all-legacy; G2 adds the K-quants, which is what Gemma's
 // q3_K/q3_K/q5_K attention trio needs).
-bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
-                            const BlockQ8_1* xq) {
-  if (!available() || !xq) return false;
-  if (siblings.size() < 2 || siblings.size() > 3) return false;
+namespace {
 
-  q8_1::legacy_slot slots[3] = {};
-  uint32_t blocks_per_row = 0;
+// Validate the members of a sibling launch and upload what the kernel needs:
+// the merged kernels take 2-3 projections over one activation, each with an
+// optional exact-[rows] bias, and lay their rows end to end. Returns false —
+// having written no output — for anything else, so the caller falls back to
+// the members' separate launches.
+bool prepare_sibling_slots(std::span<const GemvSibling> siblings,
+                           q8_1::legacy_slot* slots, int* total_rows,
+                           int* blocks_per_row) {
+  if (siblings.size() < 2 || siblings.size() > 3) return false;
+  uint32_t bpr_all = 0;
   for (std::size_t i = 0; i < siblings.size(); ++i) {
     const GemvSibling& s = siblings[i];
     if (!s.weight || !s.y) return false;
@@ -3195,11 +3200,15 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     const uint64_t cols = W.dims()[0];
     const uint64_t rows = W.dims()[1];
     if (rows == 0 || cols % q8_1::QK8_1 != 0) return false;
+    // A K-quant row kernel walks 256-element super-blocks; a column count that
+    // is not a whole number of them cannot be expressed (and cannot be a valid
+    // K-quant weight either, but keep the merged launch from assuming it).
+    if (!is_legacy_quant(W.type()) && cols % q8_1::QK_K != 0) return false;
     const uint32_t bpr = uint32_t(cols / q8_1::QK8_1);
     if (bpr == 0) return false;
-    if (blocks_per_row == 0)
-      blocks_per_row = bpr;
-    else if (blocks_per_row != bpr)
+    if (bpr_all == 0)
+      bpr_all = bpr;
+    else if (bpr_all != bpr)
       return false;  // not the same activation
     const float* d_bias = nullptr;
     if (!s.bias.empty()) {
@@ -3213,14 +3222,54 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     slots[i] = q8_1::legacy_slot{static_cast<const uint8_t*>(d_w), d_bias, s.y,
                                  int(rows), slot_type};
   }
+  *total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
+  *blocks_per_row = int(bpr_all);
+  return true;
+}
 
-  const int total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
+}  // namespace
+
+bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
+                            const BlockQ8_1* xq) {
+  if (!available() || !xq) return false;
+  q8_1::legacy_slot slots[3] = {};
+  int total_rows = 0, blocks_per_row = 0;
+  if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
+    return false;
+
   const dim3 block(32, 8);
   const dim3 grid(1, (total_rows + 7) / 8);
   SB_NOTE_LAUNCH(q8_1::gemv_legacy_siblings_q8_1, grid, block, 0, cur_stream());
   q8_1::gemv_legacy_siblings_q8_1<<<grid, block, 0, cur_stream()>>>(
       slots[0], slots[1], slots[2],
-      reinterpret_cast<const q8_1::block_q8_1*>(xq), int(blocks_per_row));
+      reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// Multi-position form of gemv_q8_1_siblings_dev (the verify step): the same
+// merged launch, with each row computing the n positions of the step. Every
+// (row, position) value is bit-identical to the single-position merged kernel
+// on that position.
+bool gemv_q8_1_siblings_batched_dev(std::span<const GemvSibling> siblings,
+                                    const BlockQ8_1* xq, int n) {
+  if (!available() || !xq || n <= 0) return false;
+  q8_1::legacy_slot slots[3] = {};
+  int total_rows = 0, blocks_per_row = 0;
+  if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
+    return false;
+
+  const dim3 block(32, 8);
+  const dim3 grid(1, (total_rows + 7) / 8);
+  if (grid.y > 65535) return false;  // very wide member group; keep it split
+  SB_NOTE_LAUNCH_TP(
+      "q8_1::gemv_legacy_siblings_batched",
+      ::sonicboom::planner::plan_detail::tp_label(
+          {{"T", q8_1::GEMV_BATCH_T}}),
+      grid, block, 0, cur_stream());
+  q8_1::gemv_legacy_siblings_batched_q8_1<q8_1::GEMV_BATCH_T>
+      <<<grid, block, 0, cur_stream()>>>(
+          slots[0], slots[1], slots[2],
+          reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

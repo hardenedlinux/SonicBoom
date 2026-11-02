@@ -158,6 +158,14 @@ struct GemvSibling {
 bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
                             const BlockQ8_1* xq);
 
+// Multi-position form of gemv_q8_1_siblings_dev (the verify step): `xq` is
+// [n, cols/32] q8_1 blocks and every member's `y` is [n, rows]. Row i of
+// position p's output is bit-identical to gemv_q8_1_siblings_dev on position p
+// (same per-row decomposition and bias epilogue); only the position loop is
+// folded into the launch.
+bool gemv_q8_1_siblings_batched_dev(std::span<const GemvSibling> siblings,
+                                    const BlockQ8_1* xq, int n);
+
 // Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
 // gemv kernel carries the epilogue). Callers that must add a bias regardless use
 // this to choose between the epilogue and a separate add_bias_dev.

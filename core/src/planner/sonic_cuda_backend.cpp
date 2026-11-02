@@ -1252,25 +1252,92 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // separate kernels); other types keep the elementwise epilogues.
         const bool fused_ep =
             quant::cuda::gemv_bias_epilogue_supported(qw.type());
-        if (spec_verify_batch_enabled()) {
-          ok = quant::cuda::gemv_q8_1_batched_dev(
-              qw, xq, out, int(vr),
-              (fused_ep && has_bias) ? b : std::span<const float>{},
-              (fused_ep && has_add) ? add_p : nullptr);
-        } else {
-          // Serial ablation: one decode gemv per query row (the activation row
-          // is [cols/32] q8_1 blocks, the output row is out_n/vr floats).
-          const int rows_out = int(out_n / vr);
-          const int bpr = int(qw.dims()[0] / 32);
-          ok = true;
-          for (int64_t r = 0; r < vr && ok; ++r)
-            ok = quant::cuda::gemv_q8_1_dev(qw, xq + r * bpr,
-                                            out + r * rows_out);
+        // One projection over the step's rows: the batched mmvq (or the serial
+        // ablation), then the elementwise epilogues it could not fold.
+        auto run_rows = [&](const quant::QuantizedTensor& w,
+                            std::span<const float> bias, const float* add,
+                            float* y, int64_t rows_n) -> bool {
+          const bool batch_on = spec_verify_batch_enabled();
+          const bool bias_fused =
+              batch_on && fused_ep && !bias.empty() &&
+              bias.size() == size_t(rows_n);
+          const bool add_fused = batch_on && fused_ep && add != nullptr;
+          bool r;
+          if (batch_on) {
+            r = quant::cuda::gemv_q8_1_batched_dev(
+                w, xq, y, int(vr), bias_fused ? bias : std::span<const float>{},
+                add_fused ? add : nullptr);
+          } else {
+            // Serial ablation: one decode gemv per query row (the activation
+            // row is [cols/32] q8_1 blocks, the output row is rows_n floats).
+            const int bpr = int(w.dims()[0] / 32);
+            r = true;
+            for (int64_t q = 0; q < vr && r; ++q)
+              r = quant::cuda::gemv_q8_1_dev(w, xq + q * bpr, y + q * rows_n);
+          }
+          if (r && !bias.empty() && !bias_fused)
+            r = nn::cuda::add_bias_dev(bias, y, y, int(int64_t(rows_n) * vr));
+          if (r && add && !add_fused)
+            r = nn::cuda::add_dev(add, y, y, int(int64_t(rows_n) * vr));
+          return r;
+        };
+        // `s1_slot`/`s2_slot` (fuse_sibling_gemv_pass): the node merges two or
+        // three projections over the step's activation. The batched sibling
+        // kernel runs every member's rows and every position in one launch;
+        // it takes the members' exact-[rows] biases but no residual, which the
+        // pass leaves unmerged. Otherwise the members run as separate batched
+        // launches in order — the unmerged plan's execution.
+        int64_t s1_slot = 0, s2_slot = 0;
+        const bool has_s1 = attr_i(*node, "s1_slot", s1_slot);
+        if (has_s1 && node->outputs.size() >= 2) {
+          const bool has_s2 =
+              attr_i(*node, "s2_slot", s2_slot) && node->outputs.size() >= 3;
+          const size_t members = has_s2 ? 3 : 2;
+          const int64_t slots[3] = {slot_i, s1_slot, s2_slot};
+          std::vector<quant::cuda::GemvSibling> sib;
+          std::vector<std::span<const float>> biases;
+          sib.reserve(members);
+          biases.reserve(members);
+          bool ready = true;
+          int64_t rows[3] = {out_n / vr, 0, 0};
+          for (size_t k = 0; k < members && ready; ++k) {
+            const auto* td = graph_.find_tensor(node->outputs[k]);
+            if (!td) { ready = false; break; }
+            rows[k] = int64_t(td->size_bytes / sizeof(float)) / vr;
+            int64_t bias_idx = 0;
+            bool hb = false;
+            if (k == 0) { bias_idx = bias_slot; hb = has_bias; }
+            else if (k == 1) hb = attr_i(*node, "s1_bias_slot", bias_idx);
+            else hb = attr_i(*node, "s2_bias_slot", bias_idx);
+            const auto& w = qweight(static_cast<model::WeightSlot>(slots[k]));
+            biases.push_back(hb ? fweight(static_cast<model::WeightSlot>(bias_idx))
+                                : std::span<const float>{});
+            float* yp = out;
+            if (k > 0) {
+              const uint64_t bytes = td->size_bytes;
+              const uint64_t h = bytes ? device::acquire(bytes) : 0;
+              if (!h) { ready = false; break; }
+              sibling_outs.push_back({h, bytes});
+              yp = dev_mut(h);
+            }
+            sib.push_back(quant::cuda::GemvSibling{&w, biases.back(), yp});
+          }
+          if (ready && !has_add && spec_verify_batch_enabled() &&
+              quant::cuda::gemv_q8_1_siblings_batched_dev(sib, xq, int(vr))) {
+            ok = true;
+          } else if (ready) {
+            ok = true;
+            for (size_t k = 0; k < members && ok; ++k) {
+              float* yp = k == 0 ? out : dev_mut(sibling_outs[k - 1].first);
+              ok = run_rows(*sib[k].weight, biases[k],
+                            k == 0 ? add_p : nullptr, yp, rows[k]);
+            }
+          } else {
+            ok = false;
+          }
+          break;  // the node's outputs are all written by the branch above
         }
-        if (ok && has_bias && !b.empty() && !(fused_ep && spec_verify_batch_enabled()))
-          ok = nn::cuda::add_bias_dev(b, out, out, out_n);
-        if (ok && has_add && !(fused_ep && spec_verify_batch_enabled()))
-          ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        ok = run_rows(qw, b, add_p, out, out_n / vr);
         break;
       }
       if (batch_attr(nb)) {

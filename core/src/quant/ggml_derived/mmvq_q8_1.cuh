@@ -880,19 +880,16 @@ __global__ void gemv_q5_K_q8_1_batched(const uint8_t* __restrict__ w,
 // own positions. WP = 1 is the original kernel: same row mapping, same position
 // order, same code path.
 template <int T, int WP = 1>
-__global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__device__ __forceinline__ void gemv_q3_K_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   const int iqs = lane & 15;
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
@@ -968,20 +965,32 @@ __global__ void gemv_q3_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
   }
 }
 
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
 template <int T, int WP = 1>
-__global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__global__ void gemv_q3_K_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q3_K_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
+template <int T, int WP = 1>
+__device__ __forceinline__ void gemv_q4_K_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
@@ -1072,20 +1081,32 @@ __global__ void gemv_q4_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
   }
 }
 
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
 template <int T, int WP = 1>
-__global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__global__ void gemv_q4_K_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q4_K_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
+template <int T, int WP = 1>
+__device__ __forceinline__ void gemv_q5_K_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   const int iqs = 2 * (lane & 15);
   const int ib = lane >> 4;
   for (int p0 = 0; p0 < n; p0 += T) {
@@ -1184,6 +1205,21 @@ __global__ void gemv_q5_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
   }
 }
 
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
+template <int T, int WP = 1>
+__global__ void gemv_q5_K_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q5_K_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
 template <int T>
 __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
                                        const block_q8_1* __restrict__ y,
@@ -1232,19 +1268,16 @@ __global__ void gemv_q6_K_q8_1_batched(const uint8_t* __restrict__ w,
 // once per weight block, and the position side keeps vec_dot_q6_K_q8_1's exact
 // expression `d8[i] * (dp4a(q[i], u[i]) * scales[4*i])` and float order.
 template <int T, int WP = 1>
-__global__ void gemv_q6_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__device__ __forceinline__ void gemv_q6_K_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   const int iqs = lane;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
@@ -1314,24 +1347,36 @@ __global__ void gemv_q6_K_q8_1_batched_reuse(const uint8_t* __restrict__ w,
   }
 }
 
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
+template <int T, int WP = 1>
+__global__ void gemv_q6_K_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q6_K_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
 // Legacy Q5_0 / Q8_0 with the weight side hoisted. A legacy block is one q8_1
 // block, so each lane owns the whole block and its unpacked operands (the
 // per-group 4-byte words) are position-independent; the position side keeps the
 // vec_dot expression verbatim.
 template <int T, int WP = 1>
-__global__ void gemv_q8_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__device__ __forceinline__ void gemv_q8_0_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
     float sum[TL];
@@ -1374,20 +1419,32 @@ __global__ void gemv_q8_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
   }
 }
 
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
 template <int T, int WP = 1>
-__global__ void gemv_q5_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
+__global__ void gemv_q8_0_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q8_0_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
+template <int T, int WP = 1>
+__device__ __forceinline__ void gemv_q5_0_q8_1_row_reuse(const uint8_t* __restrict__ w,
                                              const block_q8_1* __restrict__ y,
                                              float* __restrict__ dst,
                                              int blocks_per_row, int num_rows,
                                              int n,
                                              const float* __restrict__ bias,
-                                             const float* __restrict__ add) {
+                                             const float* __restrict__ add,
+    int row, int lane, int wsub) {
   static_assert(WP == 1 || WP == 2 || WP == 4, "WP must be 1, 2 or 4");
   constexpr int TL = (T + WP - 1) / WP;
-  const int lane = threadIdx.x;
-  const int wsub = threadIdx.y % WP;
-  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
-  if (row >= num_rows) return;
   for (int p0 = 0; p0 < n; p0 += T) {
     const int nt = (n - p0 < T) ? (n - p0) : T;
     float sum[TL];
@@ -1448,6 +1505,74 @@ __global__ void gemv_q5_0_q8_1_batched_reuse(const uint8_t* __restrict__ w,
         }
       }
     }
+  }
+}
+
+// Launch form of the row kernel: the block-to-row map the verify gemv uses
+// (WP warps per row, 8/WP rows per block).
+template <int T, int WP = 1>
+__global__ void gemv_q5_0_q8_1_batched_reuse(
+    const uint8_t* __restrict__ w, const block_q8_1* __restrict__ y,
+    float* __restrict__ dst, int blocks_per_row, int num_rows, int n,
+    const float* __restrict__ bias, const float* __restrict__ add) {
+  const int lane = threadIdx.x;
+  const int wsub = threadIdx.y % WP;
+  const int row = blockIdx.y * (8 / WP) + threadIdx.y / WP;
+  if (row >= num_rows) return;
+  gemv_q5_0_q8_1_row_reuse<T, WP>(w, y, dst, blocks_per_row, num_rows, n,
+                                   bias, add, row, lane, wsub);
+}
+
+// Multi-position sibling launch with the weight side hoisted: the verify
+// step's q/k/v trio and gate/up pair as one launch. The members' rows are laid
+// end to end over the grid; each row then runs exactly the per-type row kernel
+// above (same weight-side unpack, per-position expression, shuffle tree and
+// bias epilogue), so every (row, position) value is bit-identical to that
+// member's own batched launch. `blocks_per_row` is in 32-element q8_1 blocks;
+// K-quant rows convert to their 256-element super-block count.
+template <int T>
+__global__ void gemv_legacy_siblings_batched_q8_1(
+    legacy_slot s0, legacy_slot s1, legacy_slot s2,
+    const block_q8_1* __restrict__ y, int blocks_per_row, int n) {
+  const int lane = threadIdx.x;
+  const int row = blockIdx.y * blockDim.y + threadIdx.y;
+  if (row >= s0.rows + s1.rows + s2.rows) return;
+  legacy_slot s = s0;
+  int r = row;
+  if (row >= s0.rows) {
+    s = s1;
+    r -= s0.rows;
+  }
+  if (row >= s0.rows + s1.rows) {
+    s = s2;
+    r -= s1.rows;
+  }
+  const int kbpr = blocks_per_row / (QK_K / QK8_1);
+  switch (s.type) {
+    case kSlotQ8_0:
+      gemv_q8_0_q8_1_row_reuse<T, 1>(s.w, y, s.dst, blocks_per_row, s.rows, n,
+                                     s.bias, nullptr, r, lane, 0);
+      break;
+    case kSlotQ5_0:
+      gemv_q5_0_q8_1_row_reuse<T, 1>(s.w, y, s.dst, blocks_per_row, s.rows, n,
+                                     s.bias, nullptr, r, lane, 0);
+      break;
+    case kSlotQ3_K:
+      gemv_q3_K_q8_1_row_reuse<T, 1>(s.w, y, s.dst, kbpr, s.rows, n, s.bias,
+                                     nullptr, r, lane, 0);
+      break;
+    case kSlotQ4_K:
+      gemv_q4_K_q8_1_row_reuse<T, 1>(s.w, y, s.dst, kbpr, s.rows, n, s.bias,
+                                     nullptr, r, lane, 0);
+      break;
+    case kSlotQ5_K:
+      gemv_q5_K_q8_1_row_reuse<T, 1>(s.w, y, s.dst, kbpr, s.rows, n, s.bias,
+                                     nullptr, r, lane, 0);
+      break;
+    case kSlotQ6_K:
+      gemv_q6_K_q8_1_row_reuse<T, 1>(s.w, y, s.dst, kbpr, s.rows, n, s.bias,
+                                     nullptr, r, lane, 0);
+      break;
   }
 }
 

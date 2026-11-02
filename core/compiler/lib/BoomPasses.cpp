@@ -1038,9 +1038,12 @@ public:
 // (`s2_bias_slot`) for their folded biases, and carries the members' output
 // tensors as extra results. A backend that cannot run the merged form falls
 // back to the members' separate launches in order, so this is a scheduling
-// change only. Decode form only: a `batch` (mmq prefill) or `verify` node is
-// left alone, as is one carrying `add_input` (the merged kernel has no residual
-// epilogue).
+// change only. A `batch` (mmq prefill) node and one carrying `add_input` are
+// left alone (the merged kernel has no residual epilogue). A `verify` node is
+// merged too: its group shares the same activation row for row, and the
+// batched sibling kernel runs the position loop inside the one launch, every
+// (row, position) value again identical to the member's separate batched
+// launch.
 class FuseSiblingGemvPass
     : public mlir::PassWrapper<FuseSiblingGemvPass,
                                mlir::OperationPass<boom::GraphOp>> {
@@ -1062,7 +1065,7 @@ public:
           boomOpName(planner::OpKind::QuantizedMatmulQ8))
         continue;
       auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
-      if (nodeAttrInt(attrs, "batch") || nodeAttrInt(attrs, "verify")) continue;
+      if (nodeAttrInt(attrs, "batch")) continue;
       if (nodeAttrInt(attrs, "add_input")) continue;
       if (!nodeAttrInt(attrs, "slot")) continue;
       if (node.getNumResults() != 1 || node.getNumOperands() != 1) continue;

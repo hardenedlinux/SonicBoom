@@ -2598,6 +2598,28 @@ __global__ void kv_append_batched_pos_kernel(KV* __restrict__ dst,
   kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[idx]);
 }
 
+// K and V of one append in a single launch: the first half of the threads
+// copies K and the second half V. The writes are independent rows of two
+// buffers, so the result is the two launches' concatenation.
+template <typename KV>
+__global__ void kv_append_batched_pos_kv_kernel(
+    KV* __restrict__ dst_k, KV* __restrict__ dst_v,
+    const float* __restrict__ src_k, const float* __restrict__ src_v,
+    const uint64_t* __restrict__ start_pos, uint64_t n_slots, int row_elems,
+    int n) {
+  const int total = row_elems * n;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= 2 * total) return;
+  const bool v = idx >= total;
+  const int i = v ? idx - total : idx;
+  const int row = i / row_elems;
+  const int e = i - row * row_elems;
+  const uint64_t slot = (*start_pos + (uint64_t)row) % n_slots;
+  KV* dst = v ? dst_v : dst_k;
+  const float* src = v ? src_v : src_k;
+  kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[i]);
+}
+
 // --- q8 KV cache append -----------------------------------------------------
 //
 // A q8 cache row is head_dim int8 values then that row's f32 scale at byte
@@ -2681,6 +2703,29 @@ __global__ void kv_append_batched_pos_q8_kernel(
   const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
   kv_q8_store_row(
       dst, src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
+      *start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
+}
+
+// K and V of one q8 append in a single launch (the first half of the blocks is
+// K, the second V). Each block still quantizes one (position, head) row of one
+// buffer exactly as kv_append_batched_pos_q8_kernel does.
+__global__ void kv_append_batched_pos_kv_q8_kernel(
+    int8_t *__restrict__ dst_k, int8_t *__restrict__ dst_v,
+    const float *__restrict__ src_k, const float *__restrict__ src_v,
+    const uint64_t *__restrict__ start_pos, uint64_t n_slots, int n_heads_kv,
+    int head_dim, int n) {
+  const int total = n * n_heads_kv;
+  const int idx = blockIdx.x;
+  if (idx >= 2 * total) return;
+  const bool v = idx >= total;
+  const int i = v ? idx - total : idx;
+  const int head = i % n_heads_kv;
+  const int row = i / n_heads_kv;
+  const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
+  const float *src = v ? src_v : src_k;
+  kv_q8_store_row(
+      v ? dst_v : dst_k,
+      src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
       *start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
 }
 
@@ -7253,35 +7298,23 @@ bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
   if (dst_q8) {
     if (head_dim <= 0 || row_elems % head_dim != 0) return false;
     const int nhkv = row_elems / head_dim;
-    const int grid = n * nhkv;
-    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
+    const int grid = 2 * n * nhkv;
+    SB_NOTE_LAUNCH(kv_append_batched_pos_kv_q8_kernel, grid, 128, 0,
                    cur_stream());
-    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
-        reinterpret_cast<int8_t*>(dst_k), src_k, start_pos, n_slots, nhkv,
-        head_dim, n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
-                   cur_stream());
-    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
-        reinterpret_cast<int8_t*>(dst_v), src_v, start_pos, n_slots, nhkv,
-        head_dim, n);
+    kv_append_batched_pos_kv_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_k), reinterpret_cast<int8_t*>(dst_v),
+        src_k, src_v, start_pos, n_slots, nhkv, head_dim, n);
     return cudaGetLastError() == cudaSuccess;
   }
-  const int grid = grid_for(row_elems * n);
-  SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
+  const int grid = grid_for(2 * row_elems * n);
+  SB_NOTE_LAUNCH(kv_append_batched_pos_kv_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        reinterpret_cast<__half*>(dst_k), src_k, start_pos, n_slots, row_elems,
-        n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        reinterpret_cast<__half*>(dst_v), src_v, start_pos, n_slots, row_elems,
-        n);
+    kv_append_batched_pos_kv_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_k), reinterpret_cast<__half*>(dst_v),
+        src_k, src_v, start_pos, n_slots, row_elems, n);
   } else {
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        dst_k, src_k, start_pos, n_slots, row_elems, n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        dst_v, src_v, start_pos, n_slots, row_elems, n);
+    kv_append_batched_pos_kv_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_k, dst_v, src_k, src_v, start_pos, n_slots, row_elems, n);
   }
   return cudaGetLastError() == cudaSuccess;
 }
