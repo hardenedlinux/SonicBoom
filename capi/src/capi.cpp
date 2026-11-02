@@ -2238,6 +2238,15 @@ sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
         if (!model || !session_out)
           return fail_arg(err_out);
         *session_out = nullptr;
+        // Reckless verification through the prefill kernels is not the strict
+        // profile's decode reference; refuse the combination at the boundary
+        // rather than run a path that breaks the promise.
+        if (model::spec_reckless_unsupported()) {
+          set_error(err_out, SB_ERRKIND_RUNTIME,
+                    "SONICBOOM_SPEC=reckless is unsupported under the strict "
+                    "numerics profile");
+          return SB_ERR_UNSUPPORTED;
+        }
 
         auto *h = new (std::nothrow) sb_llm_session();
         if (!h) {
@@ -2313,6 +2322,14 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         if (!ref) return fail_arg(err_out);
         if (n > 0 && !tokens)
           return fail_arg(err_out);
+        // A strict profile set after the session was created must be refused
+        // here too: the mode decision is process-wide and read lazily.
+        if (model::spec_reckless_unsupported()) {
+          set_error(err_out, SB_ERRKIND_RUNTIME,
+                    "SONICBOOM_SPEC=reckless is unsupported under the strict "
+                    "numerics profile");
+          return SB_ERR_UNSUPPORTED;
+        }
 
         // Longest common prefix with the previous prompt (informational).
         const size_t common =

@@ -43,6 +43,7 @@
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
+#include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
@@ -1788,16 +1789,21 @@ static bool ir_program_enabled() {
 // functions, which need it.
 
 // SONICBOOM_SPEC selects the generation loop:
-//   off  the plain greedy loop (B1's program, step per token);
-//   on   the speculative program: draft, verify, accept;
-//   auto the same program with the draft length decided by policy (B7).
+//   off      the plain greedy loop (B1's program, step per token);
+//   on       the speculative program: draft, verify, accept;
+//   auto     the same program with the draft length decided by policy (B7);
+//   reckless auto's policy, but the verify rows run through the batch prefill
+//            kernels instead of the decode graph dealt over rows. That is
+//            faster on the batched matmuls and gives up the row-invariance
+//            guarantee: a speculative run may emit a different token stream
+//            than plain decoding would (the mode logs this once).
 // Unset is V2's probe: the first generation call measures one plain decode
 // step against one k=1 verify step on this GPU (cached per SM in the Q1
 // autotune file) and picks auto below the threshold, off at or above it. The
 // probe is a startup cost, once per GPU; an explicit SONICBOOM_SPEC bypasses
 // it. Until the probe has decided, Undecided answers like Off, so the greedy
 // runtime is built (and the probe then rebuilds it if it selects auto).
-enum class SpecMode { Undecided, Off, On, Auto };
+enum class SpecMode { Undecided, Off, On, Auto, Reckless };
 
 // The explicit environment choice. Undecided means "no override": the probe
 // decides, once, and stores the result in g_spec_mode.
@@ -1808,8 +1814,9 @@ static SpecMode env_spec_mode() {
     if (std::string_view(e) == "off") return SpecMode::Off;
     if (std::string_view(e) == "on") return SpecMode::On;
     if (std::string_view(e) == "auto") return SpecMode::Auto;
+    if (std::string_view(e) == "reckless") return SpecMode::Reckless;
     std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
-              << "' (expected off|on|auto); using off\n";
+              << "' (expected off|on|auto|reckless); using off\n";
     return SpecMode::Off;
   }();
   return mode;
@@ -1826,7 +1833,17 @@ static SpecMode spec_mode() {
 
 static bool spec_enabled() {
   const SpecMode m = spec_mode();
-  return m == SpecMode::On || m == SpecMode::Auto;
+  return m == SpecMode::On || m == SpecMode::Auto ||
+         m == SpecMode::Reckless;
+}
+
+// Reckless verify rows run through the batch prefill kernels, whose arithmetic
+// is not the decode step's. The strict numerics profile is a promise that the
+// decode path is a fixed reference, so the combination is refused instead of
+// silently picking one contract over the other.
+bool spec_reckless_unsupported() {
+  return spec_mode() == SpecMode::Reckless &&
+         numerics_profile() == NumericsProfile::Strict;
 }
 
 // Read the program back out of the lifted module. The program verifier has
@@ -2204,9 +2221,14 @@ static std::map<std::string,
     g_spec_cost_rings;
 
 static std::string spec_cost_identity(const Gemma4Model& m, uint64_t n_ctx) {
-  return spec_cost_cache_key(
+  std::string key = spec_cost_cache_key(
       m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
       m.config.embedding_length, n_ctx);
+  // The verify path is part of what a price means: reckless prices the prefill
+  // kernels, every other mode the decode-dealt verify set. Sharing one record
+  // would price one path from the other's timings, so the mode is in the key.
+  if (spec_mode() == SpecMode::Reckless) key += "|vm=reckless";
+  return key;
 }
 
 // One observed step time (ms) for length k.
@@ -2266,9 +2288,7 @@ static void spec_apply_refined_costs(
 static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
-  p.key = spec_cost_cache_key(
-      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
-      m.config.embedding_length, n_ctx);
+  p.key = spec_cost_identity(m, n_ctx);
   const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
   std::array<double, SpecLengthPolicy::kMax + 1> read{};
   bool complete = true;
@@ -2484,9 +2504,7 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   // session cache, so later calls at the same context size reuse it.
 
   SpecLengthPolicy p;
-  p.key = spec_cost_cache_key(
-      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
-      m.config.embedding_length, n_ctx);
+  p.key = spec_cost_identity(m, n_ctx);
   const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
   bool complete = true;
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
@@ -2779,7 +2797,9 @@ static uint64_t run_spec_program_steps(
   drafter->push(history);
   // SONICBOOM_SPEC=auto picks k per iteration (B7). The forced-strategy seam
   // keeps the fixed cap so a test can pin every iteration's shape.
-  const bool adaptive = !strategy_override && spec_mode() == SpecMode::Auto;
+  const bool adaptive =
+      !strategy_override && (spec_mode() == SpecMode::Auto ||
+                             spec_mode() == SpecMode::Reckless);
   SpecLengthPolicy policy;
   if (adaptive) {
     spec_policy_init(m, session.n_ctx, policy);
@@ -4020,7 +4040,10 @@ static std::unique_ptr<VerifySet> build_verify_set(
 static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                                  const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return nullptr;
-  if (spec_mode() == SpecMode::Off) return nullptr;
+  // The decode-dealt verify set exists only for modes that run it; reckless
+  // verifies through the prefill path (verify_step_reckless).
+  if (spec_mode() == SpecMode::Off || spec_mode() == SpecMode::Reckless)
+    return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
@@ -4296,6 +4319,149 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Reckless verification: the verify rows through the prefill path.
+//
+// The default verify runs the decode graph dealt over rows, so every row is
+// bit-identical to a plain decode step at that position (the row-invariance
+// contract). Reckless mode instead runs the same k+1 tokens through the batched
+// prefill graph — the block matmuls, batched flash attention and deferred KV
+// append generation uses for a prompt — and projects every row's hidden state
+// through the lm-head. The KV rows land at the same positions in the same
+// order; only the arithmetic differs, and that is what the mode trades away:
+// a speculative run may emit a different stream than plain decoding.
+//
+// One runtime per row count, bound to the session's cache, built on first use:
+// no decode-style capture is involved because every row's hidden state must
+// reach the host.
+struct RecklessVerifyRuntime {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  planner::ResourceSnapshot snap;
+  std::unique_ptr<planner::SonicBackend> cpu;
+  std::unique_ptr<planner::SonicCudaBackend> cuda;
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+  std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
+};
+
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
+                std::unique_ptr<RecklessVerifyRuntime>>
+    g_reckless_verify_runtimes;
+
+static std::unique_ptr<RecklessVerifyRuntime> build_reckless_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  auto rt = std::make_unique<RecklessVerifyRuntime>();
+  GraphIr ir = emit_prefill_ir(m, uint64_t(rows));
+  const bool mmq = quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+                   uint64_t(rows) >= quant::cuda::mmq_min_n();
+  rt->graph = lower_graph(
+      ir, planner::IrPassPhase::Prefill, mmq, /*dynamic_extent=*/0,
+      /*skip_kv_append_fusion=*/false,
+      /*fuse_silu_mul=*/numerics_profile() == NumericsProfile::Standard);
+  if (rt->graph.nodes.empty()) return nullptr;
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap) return nullptr;
+  rt->snap = std::move(*snap);
+  {
+    planner::AnalyticalCpuCostModel cost(rt->snap);
+    auto plan = planner::plan_execution(rt->graph, rt->snap, cost);
+    if (!plan) return nullptr;
+    rt->plan = std::move(*plan);
+  }
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx, session.caches,
+      session.cache_id);
+  if (!rt->cuda->has_caches()) return nullptr;
+  rt->cuda->bind_model(m);
+  rt->cache = session.caches;
+  rt->cache_id = session.cache_id;
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
+static RecklessVerifyRuntime* get_reckless_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_reckless_verify_runtimes.find(key);
+    if (it != g_reckless_verify_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_reckless_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_reckless_verify_runtimes.find(key);
+  if (it != g_reckless_verify_runtimes.end()) return it->second.get();
+  RecklessVerifyRuntime* raw = rt.get();
+  g_reckless_verify_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+static bool verify_step_reckless(const Gemma4Model& m,
+                                 std::span<const uint64_t> tokens,
+                                 uint64_t start_pos,
+                                 planner::KvCacheSession& session,
+                                 std::span<int64_t> out) {
+  const int rows = int(tokens.size());
+  // A batch segment must be a wrap-free run inside the sliding-window ring
+  // (generation's prefill splits there). A verify that would straddle a ring
+  // boundary runs the plain decode steps instead: same rows, same positions,
+  // the strict path's arithmetic.
+  const uint64_t chunk = m.config.sliding_window > 0
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  if (m.config.sliding_window > 0 &&
+      (start_pos % chunk) + uint64_t(rows) > chunk)
+    return decode_steps_spine_cuda(m, tokens, start_pos, session, out);
+
+  RecklessVerifyRuntime* rt =
+      get_reckless_verify_runtime(m, session.n_ctx, rows, session);
+  if (!rt) return false;
+  if (!rt->cuda->set_prefill_tokens(tokens) ||
+      !rt->cuda->set_pos(start_pos))
+    return false;
+  const std::vector<sx::Bytes> in{encode_tokens(tokens),
+                                  encode_i64(start_pos)};
+  auto res = rt->exec->execute(rt->plan, rt->snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const uint64_t d = m.config.embedding_length;
+  const sx::Bytes& hidden_b = res->outputs[0];
+  if (hidden_b.size() < uint64_t(d) * uint64_t(rows) * sizeof(float))
+    return false;
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    std::cerr << "[spec] reckless mode: output may differ between speculative "
+                 "and plain decoding\n";
+  const float* hf = reinterpret_cast<const float*>(hidden_b.data());
+  const quant::QuantizedTensor& lm =
+      m.weights.output.numel() == 0 ? m.weights.token_embd : m.weights.output;
+  std::vector<float> h(d);
+  std::vector<float> logits(m.config.vocab_size);
+  for (int i = 0; i < rows; ++i) {
+    const std::span<const float> row(hf + size_t(i) * d, d);
+    // lm_head without its final softcap: the softcap is monotone, so the
+    // argmax is unchanged, and its [vocab] tanh pass would dominate a row.
+#ifdef SONICBOOM_USE_CUDA
+    if (!nn::cuda::rms_norm(row, m.weights.output_norm,
+                            m.config.rms_epsilon, h) ||
+        !quant::matvec(lm, h, logits, quant::MatmulBackend::Cuda))
+      return false;
+#else
+    if (!lm_head(m, row, logits, quant::MatmulBackend::CpuQ8K)) return false;
+#endif
+    out[size_t(i)] = int64_t(nn::argmax(logits));
+  }
+  return true;
+}
+
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -4312,6 +4478,17 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
   if (start_pos + uint64_t(rows) > session.n_ctx)
     return fail("positions exceed the session cache");
+  if (spec_reckless_unsupported())
+    return fail("reckless mode is unsupported under the strict numerics "
+                "profile");
+  // Reckless verifies through the prefill path instead of the decode-dealt
+  // verify set; the per-row argmax is the prefill graph's hidden state
+  // projected through the lm-head.
+  if (spec_mode() == SpecMode::Reckless) {
+    if (!verify_step_reckless(m, tokens, start_pos, session, out))
+      return fail("reckless prefill verify failed");
+    return true;
+  }
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
 
@@ -4529,7 +4706,11 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // The verify graphs a request can reach are built (and the anchors captured)
   // here, before any request; spec_measure_cost_curve then prices the curve on
   // those captured graphs.
-  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Off)
+  // Reckless verifies through the prefill path, so the decode-dealt verify
+  // set is never reached and is not built (the prefill segments it uses are
+  // built on first use).
+  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Off &&
+      spec_mode() != SpecMode::Reckless)
     warm_verify_set(m, n_ctx, *kv);
   // 4b: price the verify cost curve here, at load, so the first generation call
   // starts with every draft length priced and none of the warm-up lands inside
@@ -4546,6 +4727,11 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  if (spec_reckless_unsupported()) {
+    std::cerr << "[spec] reckless mode is unsupported under the strict "
+                 "numerics profile\n";
+    return 0;
+  }
   const bool masked = !sample_mask.empty();
   if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
     std::cerr << "[spine] sample mask too small: " << sample_mask.size()
@@ -5101,6 +5287,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
     std::cerr << "[prefill-cuda] sample mask too small: " << sample_mask.size()
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
+  if (spec_reckless_unsupported()) {
+    std::cerr << "[spec] reckless mode is unsupported under the strict "
+                 "numerics profile\n";
     return 0;
   }
   // The final logits exist only on the attention prefill path (lm_head over the

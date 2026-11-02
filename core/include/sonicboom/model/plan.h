@@ -307,6 +307,15 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
 uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
                                   const planner::KvCacheSession& session);
 
+// SONICBOOM_SPEC=reckless runs the verify rows through the batch prefill
+// kernels instead of the decode graph dealt over rows, so a speculative run is
+// no longer bit-identical to plain decoding (the mode logs that once). Under
+// the strict numerics profile that trade is not available — strict promises the
+// decode path as a fixed reference — and the combination is refused: callers
+// report SB_ERR_UNSUPPORTED and the generation entry points return 0. True
+// exactly when reckless is selected and the active numerics profile is strict.
+bool spec_reckless_unsupported();
+
 // B4: one speculative step — draft, verify, accept, and roll the session back to
 // the accepted run. `last_token` is the token the previous step sampled (it sits
 // at position L = session.filled_tokens.size(), not yet in the cache); `drafts`
