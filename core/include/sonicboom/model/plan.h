@@ -262,6 +262,28 @@ bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
 void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
                               uint64_t cache_id);
 
+// Lifetime tie between one cache set and the runtimes bound to it.
+// kv_session_allocate stores one in KvCacheSession::runtime_owner, next to
+// `caches`: the owner records the model and the set's identity, and its
+// destructor calls release_session_runtimes(m, 0, cache_id). A session that
+// goes away without the explicit release — a CLI, a tool, a binding that frees
+// in no particular order — therefore still drops its runtimes, their captures
+// and (once the session's own reference goes) the set, instead of pinning
+// device memory for the life of the process. The model must outlive every
+// session holding its caches (the C API keeps the bundle in the session; tools
+// declare the model first), and the owner is destroyed before `caches` because
+// it is declared after it. Release is idempotent, so the explicit call and the
+// destructor may both run.
+struct SessionRuntimeOwner {
+  SessionRuntimeOwner(const Gemma4Model& m, uint64_t cache_id) noexcept;
+  ~SessionRuntimeOwner();
+  SessionRuntimeOwner(const SessionRuntimeOwner&) = delete;
+  SessionRuntimeOwner& operator=(const SessionRuntimeOwner&) = delete;
+
+  const Gemma4Model* model = nullptr;
+  uint64_t cache_id = 0;
+};
+
 // Device-pool accounting for the B0.2 memory measurements. Live bytes are
 // currently held (a session's KV, captures' staging, activations); retained
 // bytes were released back to the pool and are reusable by a new session

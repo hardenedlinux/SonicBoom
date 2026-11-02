@@ -137,6 +137,13 @@ struct KvCacheSession {
   // is paid once per session instead of once per call.
   std::shared_ptr<void> spec_evidence;
 
+  // RAII release for the runtimes bound to this set (a
+  // model::SessionRuntimeOwner). kv_session_allocate stores one when it gives
+  // the set an identity, next to `caches` and declared after it, so the owner
+  // is destroyed — releasing the runtimes and their cache references — before
+  // the set itself is dropped. Opaque here: this header stays model-agnostic.
+  std::shared_ptr<void> runtime_owner;
+
   // Longest prefix of `prompt` that matches the filled token history. 0 when
   // there is no history (or the first token already differs).
   uint64_t common_prefix_len(std::span<const uint64_t> prompt) const noexcept {

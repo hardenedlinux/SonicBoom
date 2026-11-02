@@ -4250,6 +4250,11 @@ bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
   session.cache_id = planner::next_kv_cache_id();
   session.n_ctx = n_ctx;
   session.filled_tokens.clear();
+  // Release the runtimes bound to this set when the set's last owner goes,
+  // even if the caller never calls release_session_runtimes (see
+  // SessionRuntimeOwner). Assigned after `caches`, so it is destroyed first.
+  session.runtime_owner =
+      std::make_shared<SessionRuntimeOwner>(m, session.cache_id);
   return true;
 }
 
@@ -4616,6 +4621,17 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
         std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  // Reckless mode's prefill-dealt verify set is keyed the same way (model,
+  // n_ctx, cache_id, rows) and holds the session's cache too.
+  for (auto it = g_reckless_verify_runtimes.begin();
+       it != g_reckless_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_reckless_verify_runtimes.erase(it);
     else
       ++it;
   }
@@ -5187,6 +5203,16 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
 
 std::string cuda_device_identity() { return "unknown"; }
 #endif
+
+// The RAII release for one cache set (defined here, outside the CUDA guard:
+// without CUDA nothing is ever registered, and the release is the no-op stub).
+SessionRuntimeOwner::SessionRuntimeOwner(const Gemma4Model& m,
+                                         uint64_t cache_id) noexcept
+    : model(&m), cache_id(cache_id) {}
+
+SessionRuntimeOwner::~SessionRuntimeOwner() {
+  if (model && cache_id != 0) release_session_runtimes(*model, 0, cache_id);
+}
 
 // ---------------------------------------------------------------------------
 // Prefill + decode (CUDA spine). Same token-stream contract as the CPU
