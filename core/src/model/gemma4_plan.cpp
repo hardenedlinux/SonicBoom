@@ -3253,11 +3253,15 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   {
     mlir::OwningOpRef<mlir::ModuleOp> program_module(
         mlir::cast<mlir::ModuleOp>((*ir.module)->clone()));
-    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program by
-    // default, the draft/verify/accept program when speculation is on. Both
-    // lift the same decode graph; only the loop around it differs.
+    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program under
+    // an explicit "off", the draft/verify/accept program otherwise. An
+    // undecided mode may still become auto at the probe, and the loop shape is
+    // fixed when the runtime is built, so it is built speculative and the
+    // dispatch gate (spec_enabled()) picks the plain loop if the probe selects
+    // off. Both forms lift the same decode graph; only the loop around it
+    // differs.
     const mlir::LogicalResult lifted =
-        spec_enabled()
+        env_spec_mode() != SpecMode::Off
             ? compiler::addSpeculativeProgram(*program_module, "speculative",
                                               "prefill", {1}, {}, 0,
                                               kSpecMaxDrafts, "ngram")
@@ -3461,6 +3465,18 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   DecodeRuntime* raw = rt.get();
   g_decode_runtimes.emplace(key, std::move(rt));
   return raw;
+}
+
+uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
+                                  const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return 0;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  const auto it =
+      g_decode_runtimes.find(DecodeKey{&m, n_ctx, session.cache_id});
+  return it == g_decode_runtimes.end()
+             ? 0
+             : reinterpret_cast<uintptr_t>(it->second.get());
 }
 
 // ---------------------------------------------------------------------------
@@ -4144,11 +4160,11 @@ static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
 }
 
 // Resolve the mode when SONICBOOM_SPEC was unset: load the cached ratio, or
-// measure it once and store it. Returns the runtime to decode with — `rt`
-// itself, unless auto was selected and this runtime was built (while the mode
-// was still undecided) with the greedy program, in which case it is rebuilt.
-// The rebuild is safe at both call sites: the probe runs before the runtime's
-// KV cache is published into a session, so no capture is bound to it yet.
+// measure it once and store it. Returns the runtime to decode with — always
+// `rt` itself: runtimes built under an undecided mode already carry the
+// speculative program, and the loop dispatch only runs it when spec_enabled()
+// is true, so the decision is a process-wide flag rather than a rebuild of the
+// runtimes other sessions already hold.
 static DecodeRuntime* spec_resolve_probe(
     const Gemma4Model& m, DecodeRuntime* rt, uint64_t n_ctx, uint64_t pos,
     const planner::KvCacheSession* session) {
@@ -4191,28 +4207,11 @@ static DecodeRuntime* spec_resolve_probe(
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, verify_cache_id));
   }
-  if (mode == SpecMode::Auto) {
-    // Every greedy runtime built before the decision (one per live cache
-    // identity) carries the plain program. The loop shape is a per-runtime
-    // property, so each must be rebuilt with the speculative program; doing it
-    // here keeps a second session from silently decoding greedily after the
-    // probe selected auto. Read the flag before erasing: `rt` is one of the
-    // erased entries.
-    const bool was_greedy = !rt->program.speculative;
-    {
-      std::lock_guard<std::mutex> lk(g_registry_mutex);
-      for (auto it = g_decode_runtimes.begin();
-           it != g_decode_runtimes.end();) {
-        const DecodeKey& k = it->first;
-        if (std::get<0>(k) == &m && std::get<1>(k) == n_ctx &&
-            !it->second->program.speculative)
-          it = g_decode_runtimes.erase(it);
-        else
-          ++it;
-      }
-    }
-    if (was_greedy) return get_decode_runtime(m, n_ctx, session);
-  }
+  // No runtime is rebuilt here. Runtimes built while the mode was undecided
+  // already carry the speculative program (build_decode_runtime), and the
+  // dispatch gate decides whether it runs speculatively, so resolving auto
+  // applies to every session — including one already bound to another cache —
+  // without rebuilding anything it owns.
   return rt;
 }
 
@@ -4637,7 +4636,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (masked) {
     // the masked single step above already produced the call's one token
   } else if (ir_program_enabled() && rt->program.valid &&
-             rt->program.speculative) {
+             rt->program.speculative && spec_enabled()) {
     // The speculative program drives the loop. There is no captured prefill
     // here, so the drafter starts from an empty history: its proposals are
     // verified, never trusted, so the token stream is the plain loop's. A
@@ -5592,7 +5591,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   if (rt->prog && !replay_ok)
     log_capture_refusal("prefill-decode", m, n_ctx, rt->cuda->cache_id());
   if (!dump_logits && ir_program_enabled() && rt->program.valid &&
-      rt->program.speculative) {
+      rt->program.speculative && spec_enabled()) {
     // The speculative program drives the loop over the same cache the prefill
     // filled: the session's when the caller passed one, otherwise a session
     // published from this runtime's own cache (the one the step capture was

@@ -300,6 +300,13 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
                              planner::KvCacheSession& session,
                              std::span<int64_t> out);
 
+// Test seam (A6.4): the address of the cached decode runtime a session's cache
+// is bound to, or 0 when none has been built. Does not build one. A test uses
+// it to observe that one session's mode decision (the probe resolving auto)
+// does not replace a runtime another session already holds.
+uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
+                                  const planner::KvCacheSession& session);
+
 // B4: one speculative step — draft, verify, accept, and roll the session back to
 // the accepted run. `last_token` is the token the previous step sampled (it sits
 // at position L = session.filled_tokens.size(), not yet in the cache); `drafts`
