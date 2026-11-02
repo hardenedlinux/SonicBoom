@@ -322,6 +322,39 @@ __global__ void rope_neox_heads_pos_kernel(float* __restrict__ x, int head_dim,
   x[i + half] = x0 * s + x1 * c;
 }
 
+// One vector's contribution to a dense dot, shared by the single-row and the
+// row-tile kernels so both compile the product/sum tree (and the compiler's
+// FMA contraction of it) from the same source expression — that is what keeps
+// the tile form bit-identical to the single-row form.
+__device__ __forceinline__ float dense_dot_f32_4(const float4& w,
+                                                 const float4& xi) {
+  // Pinned left-to-right contraction (FMUL then FFMA chain). Writing the
+  // expression directly lets ptxas start the chain at a different product
+  // depending on the surrounding kernel, which changes the rounding by 1 ULP
+  // and breaks verify-row bit identity. The intrinsics fix the order.
+  float d = __fmul_rn(w.x, xi.x);
+  d = __fmaf_rn(w.y, xi.y, d);
+  d = __fmaf_rn(w.z, xi.z, d);
+  d = __fmaf_rn(w.w, xi.w, d);
+  return d;
+}
+
+__device__ __forceinline__ float dense_dot_bf16_8(const uint4& w,
+                                                  const float4& x0,
+                                                  const float4& x1) {
+  // Pinned left-to-right contraction, element 0 first (same reason as
+  // dense_dot_f32_4).
+  float d = __fmul_rn(bf16_to_float(uint16_t(w.x & 0xffffu)), x0.x);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.x >> 16)), x0.y, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.y & 0xffffu)), x0.z, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.y >> 16)), x0.w, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.z & 0xffffu)), x1.x, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.z >> 16)), x1.y, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.w & 0xffffu)), x1.z, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.w >> 16)), x1.w, d);
+  return d;
+}
+
 // y[j] = sum_i W[j*cols + i] * x[i], fp32 accumulation. W is row-major with
 // `cols` contiguous (GGUF order).
 // `blockIdx.y` selects the activation/output row of a multi-row launch (the
@@ -397,7 +430,7 @@ __global__ void gemv_dense_f32_v(const float* __restrict__ W,
   for (int v = v_begin + lane; v < v_end; v += 32) {
     const float4 w = wv[v];
     const float4 xi = xv[v];
-    acc += w.x * xi.x + w.y * xi.y + w.z * xi.z + w.w * xi.w;
+    acc += dense_dot_f32_4(w, xi);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
@@ -432,18 +465,155 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
     const uint4 w = wv[v];
     const float4 x0 = xv[(v << 1)];
     const float4 x1 = xv[(v << 1) + 1];
-    acc += bf16_to_float(uint16_t(w.x & 0xffffu)) * x0.x +
-           bf16_to_float(uint16_t(w.x >> 16)) * x0.y +
-           bf16_to_float(uint16_t(w.y & 0xffffu)) * x0.z +
-           bf16_to_float(uint16_t(w.y >> 16)) * x0.w +
-           bf16_to_float(uint16_t(w.z & 0xffffu)) * x1.x +
-           bf16_to_float(uint16_t(w.z >> 16)) * x1.y +
-           bf16_to_float(uint16_t(w.w & 0xffffu)) * x1.z +
-           bf16_to_float(uint16_t(w.w >> 16)) * x1.w;
+    acc += dense_dot_bf16_8(w, x0, x1);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
   if (lane == 0) dst[(size_t)row * k_split + chunk] = acc;
+}
+
+// --- dense gemv over a tile of activation rows (verify step) ----------------
+//
+// The verify step runs the same projection on k+1 positions. The grid.y form
+// above launches one block set per position, so every position's blocks walk
+// the whole weight row again — the weight traffic is multiplied by the row
+// count. These kernels keep the weight block in a register and apply it to
+// every activation row of the tile: warp (row, chunk) reads W once, accumulates
+// one T-register tile (one accumulator per position), and writes each
+// position's partial. The per-position expression, the lane-to-element walk and
+// the shuffle tree are the single-row kernel's verbatim, so row i is
+// bit-identical to the grid.y launch (and to the plain decode step).
+//
+// The tile width is fixed at the verify envelope (k + 1 <= 16); a wider call
+// falls back to the per-position launches.
+constexpr int kDenseReuseRows = 16;
+// Output rows per warp in the row-batched dense gemv. Each warp holds the
+// activation chunk of every verify row in registers and streams R weight rows
+// through it, so both operands feed R*T dots from one load each. The per-row
+// arithmetic (lane's v sequence, dot expression, shuffle tree) is unchanged.
+constexpr int kDenseRowsPerWarp = 4;
+
+template <int R, int T>
+__global__ void gemv_dense_f32_v_reuse(const float* __restrict__ W,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ dst, int cols,
+                                       int rows, int k_split, int n_rows) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row0 = (warp_id / k_split) * R;
+  const int chunk = warp_id % k_split;
+  if (row0 >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 2;                       // float4 per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int chunk_len = max(0, min(chunk_nv, nv - v_begin));
+  const size_t x_stride = (size_t)(cols >> 2);
+
+  float acc[R][T];
+#pragma unroll
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+
+  const float4* xv0 = reinterpret_cast<const float4*>(x) + v_begin;
+  for (int i = lane; i < chunk_len; i += 32) {
+    float4 xv[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < n_rows) xv[t] = xv0[(size_t)t * x_stride + (size_t)i];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      if (row0 + r >= rows) continue;
+      const float4* wv = reinterpret_cast<const float4*>(
+          W + (size_t)(row0 + r) * (size_t)cols);
+      const float4 w = wv[v_begin + i];
+#pragma unroll
+      for (int t = 0; t < T; ++t)
+        if (t < n_rows)
+          acc[r][t] = __fadd_rn(acc[r][t], dense_dot_f32_4(w, xv[t]));
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    if (row0 + r >= rows) continue;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t >= n_rows) break;
+      float s = acc[r][t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+      if (lane == 0)
+        dst[(size_t)t * rows * (size_t)k_split +
+            (size_t)(row0 + r) * k_split + chunk] = s;
+    }
+  }
+}
+
+template <int R, int T>
+__global__ void gemv_bf16_v_reuse(const uint16_t* __restrict__ W,
+                                  const float* __restrict__ x,
+                                  float* __restrict__ dst, int cols, int rows,
+                                  int k_split, int n_rows) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row0 = (warp_id / k_split) * R;
+  const int chunk = warp_id % k_split;
+  if (row0 >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 3;                       // uint4 (8 bf16) per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int chunk_len = max(0, min(chunk_nv, nv - v_begin));
+  const size_t x_stride = (size_t)(cols >> 2);
+
+  float acc[R][T];
+#pragma unroll
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+
+  const float4* xv0 = reinterpret_cast<const float4*>(x) + (v_begin << 1);
+  for (int i = lane; i < chunk_len; i += 32) {
+    float4 xa[T], xb[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < n_rows) {
+        xa[t] = xv0[(size_t)t * x_stride + (i << 1)];
+        xb[t] = xv0[(size_t)t * x_stride + (i << 1) + 1];
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      if (row0 + r >= rows) continue;
+      const uint4* wv = reinterpret_cast<const uint4*>(
+          W + (size_t)(row0 + r) * (size_t)cols);
+      const uint4 w = wv[v_begin + i];
+#pragma unroll
+      for (int t = 0; t < T; ++t)
+        if (t < n_rows)
+          acc[r][t] = __fadd_rn(acc[r][t], dense_dot_bf16_8(w, xa[t], xb[t]));
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    if (row0 + r >= rows) continue;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t >= n_rows) break;
+      float s = acc[r][t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+      if (lane == 0)
+        dst[(size_t)t * rows * (size_t)k_split +
+            (size_t)(row0 + r) * k_split + chunk] = s;
+    }
+  }
 }
 
 // Second phase of the split-K dense gemv: sum each row's `k_split` partial
@@ -3099,9 +3269,10 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
   return cudaGetLastError() == cudaSuccess;
 }
 
-// `n_rows` > 1 is the verify step's multi-position form: grid.y is the row, and
-// each row runs the same per-row kernel on its own activation slice and writes
-// its own output slice. The weight is shared and uploaded once.
+// `n_rows` > 1 is the verify step's multi-position form: one launch over a tile
+// of activation rows. The weight is uploaded once and each warp reads its weight
+// block once for the whole tile (gemv_dense_f32_v_reuse); the per-position
+// launch form remains for tiles wider than the verify envelope.
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
                     float* y, int rows, int n_rows) {
   if (!available()) return false;
@@ -3111,6 +3282,56 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
   if (!d_w) return false;
   if ((cols & 3) == 0) {
     const int k_split = gemv_k_split(rows);
+    if (n_rows > 1 && n_rows <= kDenseReuseRows) {
+      float* dst = y;
+      float* partial = nullptr;
+      if (k_split > 1) {
+        partial = static_cast<float*>(
+            grow_scratch(g_partial, g_partial_bytes,
+                         (size_t)rows * k_split * n_rows * sizeof(float)));
+        if (!partial) return false;
+        dst = partial;
+      }
+      // Tall weights (many output rows) tile rows per warp: the activation
+      // chunk is loaded once and reused across R weight rows. Short weights
+      // prefer one row per warp (more warps in flight).
+      const int n_warps_needed = rows * k_split;
+      const int R = n_warps_needed >= 8192 ? 2 : 1;
+      const int row_tiles = (rows + R - 1) / R;
+      const dim3 grid(gemv_grid(row_tiles, k_split));
+      const int block = kGemvWarpsPerBlock * 32;
+      const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
+      SB_NOTE_LAUNCH(gemv_dense_f32_v_reuse, grid, block, 0, cur_stream());
+#define SB_LAUNCH_REUSE(RR, TT)                                              \
+  gemv_dense_f32_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
+      d_w, x, dst, cols, rows, k_split, n_rows)
+      switch (R) {
+        case 1:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(1, 2); break;
+            case 4: SB_LAUNCH_REUSE(1, 4); break;
+            case 8: SB_LAUNCH_REUSE(1, 8); break;
+            default: SB_LAUNCH_REUSE(1, 16); break;
+          }
+          break;
+        default:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(2, 2); break;
+            case 4: SB_LAUNCH_REUSE(2, 4); break;
+            case 8: SB_LAUNCH_REUSE(2, 8); break;
+            default: SB_LAUNCH_REUSE(2, 16); break;
+          }
+          break;
+      }
+#undef SB_LAUNCH_REUSE
+      if (k_split > 1) {
+        const dim3 rgrid(grid_for(rows), n_rows);
+        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
+                                                            k_split);
+      }
+      return cudaGetLastError() == cudaSuccess;
+    }
     const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
@@ -3145,6 +3366,56 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
   if (!d_w) return false;
   if ((cols & 7) == 0) {
     const int k_split = gemv_k_split(rows);
+    if (n_rows > 1 && n_rows <= kDenseReuseRows) {
+      float* dst = y;
+      float* partial = nullptr;
+      if (k_split > 1) {
+        partial = static_cast<float*>(
+            grow_scratch(g_partial, g_partial_bytes,
+                         (size_t)rows * k_split * n_rows * sizeof(float)));
+        if (!partial) return false;
+        dst = partial;
+      }
+      // Tall weights (many output rows) tile rows per warp: the activation
+      // chunk is loaded once and reused across R weight rows. Short weights
+      // prefer one row per warp (more warps in flight).
+      const int n_warps_needed = rows * k_split;
+      const int R = n_warps_needed >= 8192 ? 2 : 1;
+      const int row_tiles = (rows + R - 1) / R;
+      const dim3 grid(gemv_grid(row_tiles, k_split));
+      const int block = kGemvWarpsPerBlock * 32;
+      const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
+      SB_NOTE_LAUNCH(gemv_bf16_v_reuse, grid, block, 0, cur_stream());
+#define SB_LAUNCH_REUSE(RR, TT)                                              \
+  gemv_bf16_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
+      d_w, x, dst, cols, rows, k_split, n_rows)
+      switch (R) {
+        case 1:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(1, 2); break;
+            case 4: SB_LAUNCH_REUSE(1, 4); break;
+            case 8: SB_LAUNCH_REUSE(1, 8); break;
+            default: SB_LAUNCH_REUSE(1, 16); break;
+          }
+          break;
+        default:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(2, 2); break;
+            case 4: SB_LAUNCH_REUSE(2, 4); break;
+            case 8: SB_LAUNCH_REUSE(2, 8); break;
+            default: SB_LAUNCH_REUSE(2, 16); break;
+          }
+          break;
+      }
+#undef SB_LAUNCH_REUSE
+      if (k_split > 1) {
+        const dim3 rgrid(grid_for(rows), n_rows);
+        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
+                                                            k_split);
+      }
+      return cudaGetLastError() == cudaSuccess;
+    }
     const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
