@@ -27,6 +27,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -283,6 +284,15 @@ struct SessionRuntimeOwner {
   const Gemma4Model* model = nullptr;
   uint64_t cache_id = 0;
 };
+
+// The execution lock every CUDA spine entry point holds for a complete
+// operation (prefill, decode step, verify, session-runtime release). A caller
+// that must make a spine call plus its own state update one indivisible
+// mutation — the C API does — holds this lock around the whole sequence. It is
+// recursive: the spine entry points lock it again internally, so a caller may
+// hold it across them. Lock order: this lock (outer), then the runtime registry
+// mutex (inner); no path takes them in the other order.
+std::recursive_mutex& execution_mutex();
 
 // Device-pool accounting for the B0.2 memory measurements. Live bytes are
 // currently held (a session's KV, captures' staging, activations); retained

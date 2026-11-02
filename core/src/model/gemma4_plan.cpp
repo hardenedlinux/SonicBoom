@@ -3208,6 +3208,11 @@ static uint64_t run_spec_program_steps(
 static std::mutex g_registry_mutex;
 static std::recursive_mutex g_exec_mutex;
 
+// Public accessor (plan.h): the C ABI holds this around a whole session
+// mutation, so the spine call and the caller's own session-state update are one
+// unit against every other operation.
+std::recursive_mutex& execution_mutex() { return g_exec_mutex; }
+
 static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
 static std::map<DecodeKey, std::unique_ptr<FedRuntime>> g_fed_runtimes;
 

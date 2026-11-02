@@ -733,7 +733,12 @@ sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
                             sb_error **err_out);
 
 /* Create a session (a prompt/token history + n_ctx). The session holds a
- * reference to the model, so the model handle may be freed first. */
+ * reference to the model, so the model handle may be freed first.
+ *
+ * Calls on the same session from several threads are serialized; a session is
+ * not a unit of parallelism. Use one session per concurrent conversation. A
+ * call through a handle that has already been freed fails with SB_ERR_INTERNAL
+ * ("session is freed") instead of touching freed memory. */
 sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
                              sb_llm_session **session_out, sb_error **err_out);
 void sb_llm_session_free(sb_llm_session *session);

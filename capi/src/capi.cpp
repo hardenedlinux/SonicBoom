@@ -245,6 +245,14 @@ sb_status fail_arg(sb_error **err_out) {
   return SB_ERR_INTERNAL;
 }
 
+// A non-null handle that SessionRef did not accept: sb_llm_session_free has
+// removed it from the live set (or it was never one). The call is well-formed;
+// the session is gone, so it is reported as such instead of as a bad argument.
+sb_status fail_freed(sb_error **err_out) {
+  set_error(err_out, SB_ERRKIND_INTERNAL, "session is freed");
+  return SB_ERR_INTERNAL;
+}
+
 sb_dtype map_dtype(sx::DType d) {
   switch (d) {
   case sx::DType::Float32:  return SB_DTYPE_FLOAT32;
@@ -2306,6 +2314,11 @@ void sb_llm_session_free(sb_llm_session *session) {
   model::sampled_state_free(session->sampled);
   session->sampled = nullptr;
   session->kv.filled_tokens.clear();
+  // Explicit order: runtimes (above), then the owner, then the set. The
+  // owner's destructor releases the same id again — release is idempotent —
+  // and dropping it here keeps the teardown deterministic instead of relying
+  // on member destruction order.
+  session->kv.runtime_owner.reset();
   session->kv.caches.reset();
   session->kv.cache_id = 0;
   session->kv.n_ctx = 0;
@@ -2319,7 +2332,12 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         if (!session)
           return fail_arg(err_out);
         SessionRef ref(session);
-        if (!ref) return fail_arg(err_out);
+        if (!ref) return fail_freed(err_out);
+        // The whole call — prompt bookkeeping, grammar reset, device prefill and
+        // the stored first token — is one mutation of the session. The core's
+        // spine entry points take this lock again internally (it is recursive),
+        // but they do not cover the state this function writes around them.
+        std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
         if (n > 0 && !tokens)
           return fail_arg(err_out);
         // A strict profile set after the session was created must be refused
@@ -2433,7 +2451,11 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
         if (!session || !sampling || !n_out)
           return fail_arg(err_out);
         SessionRef ref(session);
-        if (!ref) return fail_arg(err_out);
+        if (!ref) return fail_freed(err_out);
+        // One mutation: the decode loop writes the session's token/position,
+        // grammar state, sampled history and KV cache; a second call must not
+        // observe it half-done.
+        std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
         *n_out = 0;
 
         if (session->prompt.empty()) {
@@ -2804,7 +2826,8 @@ sb_status sb_llm_session_set_grammar(sb_llm_session *session, const char *gbnf,
         if (!session || !gbnf)
           return fail_arg(err_out);
         SessionRef ref(session);
-        if (!ref) return fail_arg(err_out);
+        if (!ref) return fail_freed(err_out);
+        std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
         return install_grammar(*session, gbnf, err_out);
       },
       err_out);
@@ -2844,7 +2867,8 @@ sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
         if (!session || !schema_json)
           return fail_arg(err_out);
         SessionRef ref(session);
-        if (!ref) return fail_arg(err_out);
+        if (!ref) return fail_freed(err_out);
+        std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
         auto gbnf = vocab::json_schema_to_gbnf(schema_json);
         if (!gbnf) {
           const std::string msg = "JSON schema rejected: " + gbnf.error();
@@ -2861,6 +2885,9 @@ void sb_llm_session_clear_grammar(sb_llm_session *session) {
     return;
   SessionRef ref(session);
   if (!ref) return;
+  // void, so it has no error channel: a freed handle is a no-op like a null
+  // one. The lock still makes the clear one mutation against prefill/decode.
+  std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
   session->grammar.reset();
   session->grammar_text.clear();
   session->grammar_mask.clear();
@@ -2875,7 +2902,10 @@ sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
         if (!session || !active_out || !complete_out)
           return fail_arg(err_out);
         SessionRef ref(const_cast<sb_llm_session *>(session));
-        if (!ref) return fail_arg(err_out);
+        if (!ref) return fail_freed(err_out);
+        // The grammar state is written by prefill/decode; read it as one
+        // mutation of the session, not a torn snapshot.
+        std::lock_guard<std::recursive_mutex> exec_lock(model::execution_mutex());
         *active_out = session->grammar ? 1 : 0;
         *complete_out =
             (session->grammar &&
