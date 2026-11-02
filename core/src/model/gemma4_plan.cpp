@@ -2192,6 +2192,11 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
 constexpr int kWarmCostReps = 3;
 constexpr int kWarmTimedReps = 7;
 constexpr double kSpecCostLoadBudgetMs = 2000.0;
+// The verify set's share of that budget: its graph builds and its anchor
+// warm-ups/captures are paid within this share, the rest belongs to the cost
+// curve. Measured on Gemma 4 E4B: 15 row-count graph builds cost ~0.75 s
+// (constant per row), the four anchor warm-ups + captures ~0.29 s.
+constexpr double kSpecVerifySetBudgetMs = 1100.0;
 // Priority order. Two knots are load-bearing, and are measured before the
 // budget can run out:
 //   - 0 and 1 anchor the head. A 2-row verify costs more than twice a plain
@@ -2275,31 +2280,12 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   const std::vector<uint64_t> feed(size_t(planner::kMaxVerifyRows), 0);
   std::vector<int64_t> out(size_t(planner::kMaxVerifyRows), -1);
 
-  // Warm-up: build and capture the verify runtimes a request reaches before it
-  // has any evidence — the evidence bootstrap verifies at the full depth
-  // (kMaxVerifyRows rows), the k = 0 recovery lookup at kSpecExploreDepth, and
-  // the V2 probe at 2 rows. A row count is built and captured on its first
-  // use; paying that in a request puts 100-300 ms of graph work inside the
-  // first decode step (the bootstrap's verify runs before the first token).
-  // Load owns that one-time cost instead.
-  {
-    const auto t_warm = std::chrono::steady_clock::now();
-    const int warm_rows[] = {2, int(kSpecExploreDepth) + 1,
-                             int(std::min<int64_t>(kSpecMaxDrafts,
-                                                   spec_max_drafts())) + 1};
-    for (int rows : warm_rows) {
-      if (pos + uint64_t(rows) > n_ctx) continue;
-      (void)verify_step_spine_cuda(
-          m, std::span<const uint64_t>(feed.data(), size_t(rows)), pos,
-          session, std::span<int64_t>(out.data(), size_t(rows)));
-    }
-    if (spec_diag_enabled())
-      std::fprintf(stderr, "[spec-cost] prewarm rows=2,%lld,%lld %.0fms\n",
-                   (long long)kSpecExploreDepth + 1,
-                   (long long)planner::kMaxVerifyRows,
-                   std::chrono::duration<double, std::milli>(
-                       std::chrono::steady_clock::now() - t_warm).count());
-  }
+  // Warm-up: build every verify row count the policy can reach and capture the
+  // anchors, so the first request's bootstrap and any later length choice find
+  // their graph already built. Paying that in a request would put 100-300 ms of
+  // graph work inside decode steps (the bootstrap's verify runs before the
+  // first token). Load owns that one-time cost instead; the set is keyed by the
+  // session cache, so later calls at the same context size reuse it.
 
   SpecLengthPolicy p;
   p.key = spec_cost_cache_key(
@@ -2948,7 +2934,7 @@ static uint64_t run_spec_program_steps(
 //
 //   decode   (model, n_ctx, cache_id)
 //   sampled  (model, n_ctx, cache_id)
-//   verify   (model, n_ctx, rows, cache_id)
+//   verify   (model, n_ctx, cache_id), all row counts in one set
 //   fed      (model, n_ctx, cache_id)
 //
 // cache_id 0 is the anonymous key: a non-session caller (tooling, plan records)
@@ -3594,13 +3580,18 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 }
 
 // ---------------------------------------------------------------------------
-// B3: the row-invariant verify step. One runtime per (model, n_ctx, rows):
-// the decode graph emitted with `rows` query positions, run through the verify
-// phase's passes (decode fusions, KV append left on attention), planned and
-// captured as its own graph. Sharing the decode runtime's cache is the point:
-// the verify appends rows at pos..pos+rows-1 exactly as `rows` plain decode
-// steps would, so the cache after a verify is the cache a chained decode would
-// have written.
+// B3: the row-invariant verify step. One verify graph per row count: the decode
+// graph emitted with `rows` query positions, run through the verify phase's
+// passes (decode fusions, KV append left on attention), planned and captured as
+// its own graph. Sharing the decode runtime's cache is the point: the verify
+// appends rows at pos..pos+rows-1 exactly as `rows` plain decode steps would, so
+// the cache after a verify is the cache a chained decode would have written.
+//
+// The graphs are held in one set per (model, n_ctx, cache identity). The load
+// warm-up builds and captures every row count the policy can reach, so no
+// request pays graph construction or capture; the set shares the session's KV
+// cache and the process-wide device-resident weights, and each runtime's
+// staging buffers are sized for the widest row set (planner::kMaxVerifyRows).
 // ---------------------------------------------------------------------------
 struct VerifyRuntime {
   planner::Graph graph;
@@ -3617,9 +3608,27 @@ struct VerifyRuntime {
   uint64_t cache_id = 0;
 };
 
-static std::map<std::tuple<const Gemma4Model*, uint64_t, int, uint64_t>,
-                std::unique_ptr<VerifyRuntime>>
+// One entry per (model, context size, cache set). Index 0/1 are unused: a
+// verify has at least two rows (the fed token and one draft).
+struct VerifySet {
+  std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
+  std::array<std::unique_ptr<VerifyRuntime>, planner::kMaxVerifyRows + 1> rows;
+};
+
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<VerifySet>>
     g_verify_runtimes;
+
+// The widest verify the current mode can run. "on" verifies at one fixed cap,
+// so only that row count is reachable; "auto" and an undecided mode (the probe
+// may still select auto) can verify every length the policy proposes.
+static int verify_row_limit() {
+  const SpecMode mode = spec_mode();
+  if (mode == SpecMode::Off) return 1;
+  const int cap = int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts()));
+  return cap + 1;
+}
 
 static std::unique_ptr<VerifyRuntime>
 build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
@@ -3657,63 +3666,157 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   return rt;
 }
 
-// Build (or fetch) the cached verify runtime bound to `session`'s cache. The
-// capture reads the token ids from `tokens_buf_` and the base position from
-// `pos_buf_`, both restaged before every replay, so one capture serves every
-// call at any depth. Keyed by the cache identity as well as the shape: a capture
-// is only replayable against the set it was recorded with, and a second session
-// must not evict the first session's capture. Returns nullptr on a build/plan
-// failure.
-static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
-                                         int rows,
-                                         const planner::KvCacheSession& session) {
+// Warm one row count and, when `capture`, record its step. The warm-up run
+// allocates every pooled buffer and uploads the weights the capture pass then
+// only records. Its KV stores are suppressed: the rows it would append land on
+// the cache's ring at positions past the session's live length, which a
+// sliding-window ring maps onto live slots. The ids and position are
+// placeholders, every real call stages its own before replay. The capture reads
+// the token ids from `tokens_buf_` and the base position from `pos_buf_`, both
+// restaged before every replay, so one capture per row count serves every call
+// at any depth. Returns whether the runtime ended up captured.
+static bool warm_verify_runtime(VerifyRuntime& rt, uint64_t n_ctx, int rows,
+                                bool capture) {
+  const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
+  const std::vector<uint64_t> warm(size_t(rows), 0);
+  const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+  auto warm_run = [&]() {
+    return bool(rt.exec->execute(rt.plan, rt.snap, warm_in));
+  };
+  const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+  auto run = [&]() {
+    return bool(rt.exec->execute(rt.plan, rt.snap, in));
+  };
+  rt.cuda->set_kv_write_suppressed(true);
+  const bool warmed = rt.cuda->set_prefill_tokens(warm) &&
+                      rt.cuda->set_verify_pos(warm_pos, rows) && warm_run();
+  rt.cuda->set_kv_write_suppressed(false);
+  if (!warmed) return false;
+  rt.cuda->synchronize();
+  if (!capture) return true;
+  // Capture records the launches without executing them, so the graph bakes the
+  // session's pointers while no kernel writes a row of it.
+  if (rt.cuda->set_prefill_tokens(warm) && rt.cuda->set_verify_pos(0, rows))
+    rt.prog = rt.cuda->record_step(run);
+  return bool(rt.prog);
+}
+
+// Build every row count the mode can reach, bound to `session`'s cache, and
+// capture them here at load. Each row count is its own shape-specialized graph
+// (the verify attribute scales every node), so "one runtime" is the set, not a
+// re-planned graph: the cache, the device-resident weights and the process-wide
+// scratch allocator are shared. A build failure for one row count leaves that
+// slot empty; a verify at that width then fails cleanly instead of silently
+// running another graph.
+static std::unique_ptr<VerifySet> build_verify_set(
+    const Gemma4Model& m, uint64_t n_ctx,
+    const planner::KvCacheSession& session) {
+  auto set = std::make_unique<VerifySet>();
+  set->cache = session.caches;
+  set->cache_id = session.cache_id;
+  const int limit = std::min<int>(planner::kMaxVerifyRows, verify_row_limit());
+  if (limit < 2) return nullptr;
+  const bool graphs = cuda_graph_decode_enabled();
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  int built = 0;
+  for (int rows = 2; rows <= limit; ++rows) {
+    auto rt = build_verify_runtime(m, n_ctx, rows, session);
+    if (!rt) continue;
+    set->rows[size_t(rows)] = std::move(rt);
+    ++built;
+  }
+
+  // Warm and capture. The four anchor widths are paid first: they carry the
+  // load cost curve's knots and include the probe's k = 1, so a request's first
+  // bootstrap and the policy's first decision find their graphs captured.
+  // The widest reachable width is paid next (the evidence bootstrap verifies
+  // there). With the budget spent, the remaining widths stay built but
+  // uncaptured: they run the same graph and kernels through the set's executor
+  // without a graph launch, and no build or capture moves into a request.
+  int order[planner::kMaxVerifyRows + 1];
+  int n_order = 0;
+  bool queued[planner::kMaxVerifyRows + 1] = {};
+  bool anchor_row[planner::kMaxVerifyRows + 1] = {};
+  auto enqueue = [&](int rows, bool anchor) {
+    if (rows < 2 || rows > limit) return;
+    if (anchor) anchor_row[rows] = true;
+    if (queued[rows]) return;
+    queued[rows] = true;
+    order[n_order++] = rows;
+  };
+  for (int rows : {2, 4, 8, 16}) enqueue(rows, /*anchor=*/true);
+  enqueue(limit, /*anchor=*/true);
+  for (int rows = 2; rows <= limit; ++rows) enqueue(rows, /*anchor=*/false);
+
+  int captured = 0, warmed = 0;
+  for (int i = 0; graphs && i < n_order; ++i) {
+    const int rows = order[i];
+    VerifyRuntime* rt = set->rows[size_t(rows)].get();
+    if (!rt) continue;
+    // The anchors are always paid; the rest only while the set's share of the
+    // load budget lasts (the curve measures in the rest of it).
+    if (!anchor_row[rows] && elapsed_ms() >= kSpecVerifySetBudgetMs) break;
+    if (warm_verify_runtime(*rt, n_ctx, rows, /*capture=*/true)) {
+      ++warmed;
+      if (rt->prog) ++captured;
+    }
+  }
+  if (spec_diag_enabled()) {
+    std::fprintf(stderr,
+                 "[spec-cost] verify set rows=2..%d built=%d warmed=%d "
+                 "captured=%d %.0fms budget=%.0fms\n",
+                 limit, built, warmed, captured, elapsed_ms(),
+                 kSpecCostLoadBudgetMs);
+  }
+  return built > 0 ? std::move(set) : nullptr;
+}
+
+// Build (or fetch) the verify set bound to `session`'s cache. Keyed by the
+// cache identity as well as the shape: a capture is only replayable against the
+// set it was recorded with, and a second session must not evict the first
+// session's captures. Returns nullptr when the mode never verifies or on a
+// build/plan failure.
+static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
+                                 const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, rows, session.cache_id);
+  if (spec_mode() == SpecMode::Off) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_verify_runtimes.find(key);
     if (it != g_verify_runtimes.end()) return it->second.get();
   }
 
-  auto rt = build_verify_runtime(m, n_ctx, rows, session);
-  if (!rt) return nullptr;
-
-  if (cuda_graph_decode_enabled()) {
-    // Warm-up run: allocates every pooled buffer and uploads the weights the
-    // capture pass then only records. Its KV stores are suppressed: the rows it
-    // would append land on the cache's ring at positions past the session's
-    // live length, which a sliding-window ring maps onto live slots. The ids and
-    // position are placeholders, every real call stages its own before replay.
-    const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
-    const std::vector<uint64_t> warm(size_t(rows), 0);
-    const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
-    auto warm_run = [&]() {
-      return bool(rt->exec->execute(rt->plan, rt->snap, warm_in));
-    };
-    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
-    auto run = [&]() {
-      return bool(rt->exec->execute(rt->plan, rt->snap, in));
-    };
-    rt->cuda->set_kv_write_suppressed(true);
-    const bool warmed = rt->cuda->set_prefill_tokens(warm) &&
-                        rt->cuda->set_verify_pos(warm_pos, rows) && warm_run();
-    rt->cuda->set_kv_write_suppressed(false);
-    if (warmed) {
-      rt->cuda->synchronize();
-      // Capture records the launches without executing them, so the graph bakes
-      // the session's pointers while no kernel writes a row of it.
-      if (rt->cuda->set_prefill_tokens(warm) &&
-          rt->cuda->set_verify_pos(0, rows))
-        rt->prog = rt->cuda->record_step(run);
-    }
-  }
+  auto set = build_verify_set(m, n_ctx, session);
+  if (!set) return nullptr;
 
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_verify_runtimes.find(key);
   if (it != g_verify_runtimes.end()) return it->second.get();
-  VerifyRuntime* raw = rt.get();
-  g_verify_runtimes.emplace(key, std::move(rt));
+  VerifySet* raw = set.get();
+  g_verify_runtimes.emplace(key, std::move(set));
   return raw;
+}
+
+static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
+                            const planner::KvCacheSession& session) {
+  (void)get_verify_set(m, n_ctx, session);
+}
+
+// The verify graph for one width, from the session's set. Never builds: every
+// reachable width was built by the load warm-up (see build_verify_set).
+static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
+                                         int rows,
+                                         const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  VerifySet* set = get_verify_set(m, n_ctx, session);
+  if (!set) return nullptr;
+  return set->rows[size_t(rows)].get();
 }
 
 // V2: the startup probe behind an unset SONICBOOM_SPEC. One plain decode step
@@ -3854,10 +3957,10 @@ static DecodeRuntime* spec_resolve_probe(
                 mode == SpecMode::Auto ? "auto" : "off");
   std::cerr << line;
   if (measured) {
-    // The probe's rows=2 verify runtime is only a measurement; drop it so a
-    // decision for off does not keep a second set of device weights alive.
-    g_verify_runtimes.erase(
-        std::make_tuple(&m, n_ctx, 2, verify_cache_id));
+    // The probe's verify set is only a measurement; drop it so a decision for
+    // off does not keep a second set of device buffers alive.
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, verify_cache_id));
   }
   if (mode == SpecMode::Auto) {
     // Every greedy runtime built before the decision (one per live cache
@@ -4100,7 +4203,7 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
   }
   for (auto it = g_verify_runtimes.begin(); it != g_verify_runtimes.end();) {
     if (std::get<0>(it->first) == &m &&
-        std::get<3>(it->first) == cache_id &&
+        std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_verify_runtimes.erase(it);
     else
@@ -4187,6 +4290,11 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
     kv = &local;
   }
   warm_verify_gemv_wp_model(m);
+  // The verify graphs a request can reach are built (and the anchors captured)
+  // here, before any request; spec_measure_cost_curve then prices the curve on
+  // those captured graphs.
+  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Off)
+    warm_verify_set(m, n_ctx, *kv);
   // 4b: price the verify cost curve here, at load, so the first generation call
   // starts with every draft length priced and none of the warm-up lands inside
   // its first token.
