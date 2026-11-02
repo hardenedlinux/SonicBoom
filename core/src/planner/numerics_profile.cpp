@@ -129,7 +129,8 @@ NumericsProfile numerics_profile() {
   entry.reason = origin.reason;
   entry.numerics =
       chosen == NumericsProfile::Strict
-          ? "historical contract: f32 KV; f64 reductions; fp64-gated dense"
+          ? "historical contract: f16 KV (exact for the fp16-rounded values); "
+            "f64 reductions; fp64-gated dense"
           : "f16 KV storage; the standard acceptance gate (ppl, top-1)";
   planner::decisions::record(entry);
 
@@ -139,7 +140,7 @@ NumericsProfile numerics_profile() {
 }
 
 bool numerics_profile_f16_kv() {
-  return numerics_profile() == NumericsProfile::Standard;
+  return numerics_kv_storage() == KvStorage::F16;
 }
 
 const char *numerics_kv_storage_name(KvStorage storage) noexcept {
@@ -152,16 +153,17 @@ const char *numerics_kv_storage_name(KvStorage storage) noexcept {
 }
 
 KvStorage numerics_kv_storage() {
-  // Resolve the profile first: numerics_profile() takes the same lock.
-  const NumericsProfile profile = numerics_profile();
+  // Resolve the profile first (it takes the same lock, so latch the profile
+  // before the storage). Both profiles store the cache in f16: the prep
+  // kernels rounded K and V to f16 before either storage form existed, so f16
+  // storage holds exactly the values the f32 cache held and halves the bytes.
+  // SONICBOOM_KV=f32 restores the wide form; q8 selects the quantization arm.
+  (void)numerics_profile();
   State &s = state();
   std::lock_guard<std::mutex> lock(s.mutex);
   if (s.kv_latched) return s.kv;
 
-  // The profile decides what the default means: strict pins f32 (its contract
-  // is the pre-rounding values); standard stores f16, or q8 once selected.
-  KvStorage chosen = profile == NumericsProfile::Strict ? KvStorage::F32
-                                                        : KvStorage::F16;
+  KvStorage chosen = KvStorage::F16;
   planner::decisions::Source source = planner::decisions::Source::Default;
   std::string inputs = "none";
   const char *reason = "the numerics profile";

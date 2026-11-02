@@ -626,11 +626,11 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
     // kernels address it as pos % n_slots and every window read spans at most
     // `window` resident slots.
     c.n_slots = (sl.window > 0) ? sl.window + kMaxVerifyRows : n_ctx;
-    // The standard numerics profile stores f16 or q8 instead of f32: f16
-    // halves the cache and is exact for the fp16-rounded values; q8 halves it
-    // again (int8 per head_dim value plus an f32 row scale) at the cost of a
-    // per-row quantization error. The attention kernels and the append know
-    // the row layout from `dtype`.
+    // Both numerics profiles store the cache as f16: it halves the bytes and
+    // is exact for the fp16-rounded values. q8 halves it again (int8 per
+    // head_dim value plus an f32 row scale) at the cost of a per-row
+    // quantization error; f32 (SONICBOOM_KV=f32) is the wide form. The
+    // attention kernels and the append know the row layout from `dtype`.
     const KvStorage storage = sonicboom::numerics_kv_storage();
     c.dtype = storage == KvStorage::F32   ? KvDtype::F32
               : storage == KvStorage::Q8 ? KvDtype::Q8

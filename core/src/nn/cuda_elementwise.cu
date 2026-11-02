@@ -98,19 +98,20 @@ __device__ inline float bf16_roundtrip(float v) {
 
 // --- KV-cache element type --------------------------------------------------
 //
-// The KV cache is f32 under the strict profile and f16 under standard. The
-// values were fp16-rounded before either storage form existed (the prep kernels
-// cast K and V through f16), so f16 storage is exact: widening a stored f16 is
-// the same value the f32 cache held. Every kernel that reads or writes the
-// cache goes through these two helpers and is templated on the element type;
-// the launch sites pick the instantiation from the cache's declared dtype.
+// The KV cache is f16 under both numerics profiles (f32 is the SONICBOOM_KV
+// override). The values were fp16-rounded before either storage form existed
+// (the prep kernels cast K and V through f16), so f16 storage is exact:
+// widening a stored f16 is the same value the f32 cache held. Every kernel that
+// reads or writes the cache goes through these two helpers and is templated on
+// the element type; the launch sites pick the instantiation from the cache's
+// declared dtype.
 __device__ inline float kv_load(const float* p) { return *p; }
 __device__ inline float kv_load(const __half* p) { return __half2float(*p); }
 // Batch (chunk) K/V rows are always f32. Under f16 KV storage the cache append
 // rounds them to f16, so attention must read them through the same rounding:
 // otherwise a fresh prefill (all keys from the batch) sees unrounded values
 // while a cache-reuse prefill sees rounded ones, and the two take different
-// tokens. The strict (f32) instantiation keeps the raw value.
+// tokens. The f32 instantiation (SONICBOOM_KV=f32) keeps the raw value.
 template <typename KV>
 __device__ inline float kv_load_batch(const float* p) {
   if constexpr (std::is_same_v<KV, float>) return *p;
