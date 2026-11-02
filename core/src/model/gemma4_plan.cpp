@@ -1880,11 +1880,18 @@ static bool program_stop(const GreedyProgramDesc& p, int64_t token,
 template <class AfterLaunch>
 static int64_t greedy_step(DecodeRuntime& rt, uint64_t token, uint64_t pos,
                            bool replay_ok, AfterLaunch&& after_launch,
-                           std::string* err = nullptr) {
+                           std::string* err = nullptr,
+                           bool time_step = false) {
   if (!rt.cuda->set_pos(pos)) return -1;
   if (replay_ok) {
     hal::StepProgram* step_prog = rt.step_at(pos);
-    if (!step_prog || !step_prog->replay()) return -1;
+    // Timing is opt-in (the speculative loop's cost refinement): the default
+    // decode path records no events, so it pays nothing for the measurement.
+    // A failed measurement never fails the step; it just leaves it unpriced.
+    if (!step_prog) return -1;
+    const bool timed = time_step && step_prog->timing_begin();
+    if (!step_prog->replay()) return -1;
+    if (timed) step_prog->timing_end();
     after_launch();
     float next_f = -1.0f;
     if (!rt.cuda->read_token(&next_f)) return -1;
@@ -2125,6 +2132,87 @@ constexpr uint64_t kSpecProbeEvery = 32;
 // window has turned over.
 constexpr size_t kSpecEvidenceCarry = 16;
 
+// Online refinement of the verify cost curve.
+//
+// The load anchors price five lengths once; every real step then contributes a
+// measured device time for its own k. A reading is taken with events recorded
+// around the captured replay on the program's own stream and read back without
+// waiting — the step's own token readback has already drained it — so
+// refinement adds no synchronization. Readings are kept per cost-record
+// identity (model shape, context class, verify kernel build) in a ring of the
+// last 16; once a ring holds three observations its median replaces the anchor
+// for that k, and the medians are written back to the cost record when the
+// session is freed.
+struct SpecCostRing {
+  static constexpr int kN = 16;
+  std::array<double, kN> v{};
+  int n = 0;
+  int next = 0;
+  void push(double ms) {
+    v[size_t(next)] = ms;
+    next = (next + 1) % kN;
+    if (n < kN) ++n;
+  }
+  bool median(double* out) const {
+    if (n < 3) return false;
+    std::array<double, kN> c = v;
+    std::sort(c.begin(), c.begin() + n);
+    *out = c[size_t(n / 2)];
+    return true;
+  }
+};
+
+static std::mutex g_spec_cost_mutex;
+// Keyed by the cost record's identity, so a refined median is applied to
+// exactly the record (and the calls) it was measured for.
+static std::map<std::string,
+                std::array<SpecCostRing, size_t(SpecLengthPolicy::kMax) + 1>>
+    g_spec_cost_rings;
+
+static std::string spec_cost_identity(const Gemma4Model& m, uint64_t n_ctx) {
+  return spec_cost_cache_key(
+      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
+      m.config.embedding_length, n_ctx);
+}
+
+// One observed step time (ms) for length k.
+static void spec_note_step_ms(const Gemma4Model& m, uint64_t n_ctx, int k,
+                              double ms) {
+  if (!(ms > 0.0) || k < 0 || k > SpecLengthPolicy::kMax) return;
+  std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+  g_spec_cost_rings[spec_cost_identity(m, n_ctx)][size_t(k)].push(ms);
+}
+
+// The refined median for k in µs, when the ring holds enough observations.
+static bool spec_refined_cost_us(const Gemma4Model& m, uint64_t n_ctx, int k,
+                                 double* us) {
+  std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+  const auto it = g_spec_cost_rings.find(spec_cost_identity(m, n_ctx));
+  if (it == g_spec_cost_rings.end()) return false;
+  double ms = 0.0;
+  if (!it->second[size_t(k)].median(&ms)) return false;
+  *us = ms * 1000.0;
+  return true;
+}
+
+// Replace k's anchor/interpolated price with the refined median, if any, for
+// one length (called after each real step it prices).
+static void spec_refine_cost(const Gemma4Model& m, uint64_t n_ctx,
+                             SpecLengthPolicy& p, int k) {
+  double us = 0.0;
+  if (spec_refined_cost_us(m, n_ctx, k, &us)) p.cost_us[size_t(k)] = us;
+}
+
+// Fold every refined median into a whole curve (call start).
+static void spec_apply_refined_costs(
+    const Gemma4Model& m, uint64_t n_ctx,
+    std::array<double, size_t(SpecLengthPolicy::kMax) + 1>& cost_us) {
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    double us = 0.0;
+    if (spec_refined_cost_us(m, n_ctx, k, &us)) cost_us[size_t(k)] = us;
+  }
+}
+
 // The warm-up measures c(k) once per (model shape, context class, verify
 // kernel identity) on this GPU: k = 0..min(7, room) in turn, each iteration
 // timed whole (the second pass at each k: the first absorbs that row count's
@@ -2158,6 +2246,8 @@ static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
     return;
   }
   p.cost_us = read;
+  // Measurements this process already refined override their anchors.
+  spec_apply_refined_costs(m, n_ctx, p.cost_us);
 }
 
 static void spec_policy_store(const SpecLengthPolicy& p) {
@@ -2169,6 +2259,53 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
     }
   }
   if (!values.empty()) tune::store("spec-length", p.key, values);
+}
+
+// Fold the process's refined medians into the stored cost records. Called
+// when a session is freed, so the next process starts from the curve this one
+// measured. The record identity carries the kernel fingerprint, so a rebuilt
+// verify kernel never inherits a price; every context class of this model shape
+// is flushed (the refined value exists only where this process really ran that
+// length at that class).
+static void spec_flush_refined_costs(const Gemma4Model& m) {
+  if (!tune::enabled()) return;
+  const std::string prefix =
+      std::string("v3|") +
+      (m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") + "|e" +
+      std::to_string(m.config.embedding_length) + "|ctx=";
+  std::vector<std::pair<std::string,
+                        std::array<double, size_t(SpecLengthPolicy::kMax) + 1>>>
+      ready;
+  {
+    std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+    for (const auto& [key, rings] : g_spec_cost_rings) {
+      if (key.compare(0, prefix.size(), prefix) != 0) continue;
+      std::array<double, size_t(SpecLengthPolicy::kMax) + 1> us{};
+      bool any = false;
+      for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+        double ms = 0.0;
+        if (rings[size_t(k)].median(&ms)) {
+          us[size_t(k)] = ms * 1000.0;
+          any = true;
+        }
+      }
+      if (any) ready.emplace_back(key, us);
+    }
+  }
+  for (const auto& [key, us] : ready) {
+    std::map<std::string, int> values;
+    const std::map<std::string, int> cached = tune::lookup("spec-length", key);
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+      double v = us[size_t(k)];
+      if (!(v > 0.0)) {
+        const auto it = cached.find("c" + std::to_string(k));
+        if (it != cached.end() && it->second > 0) v = double(it->second);
+      }
+      if (v > 0.0)
+        values["c" + std::to_string(k)] = std::max(1, int(std::lround(v)));
+    }
+    if (!values.empty()) tune::store("spec-length", key, values);
+  }
 }
 
 // 4b: the load-time cost curve.
@@ -2189,25 +2326,25 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
 // spec_interpolate_costs) — which is why the order below matters: a budget stop
 // must leave a curve that is usable at both ends, not one anchored where the
 // measurement happened to stop.
-constexpr int kWarmCostReps = 3;
-constexpr int kWarmTimedReps = 7;
+constexpr int kWarmCostReps = 1;
+constexpr int kWarmTimedReps = 3;
 constexpr double kSpecCostLoadBudgetMs = 2000.0;
 // The verify set's share of that budget: its graph builds and its anchor
 // warm-ups/captures are paid within this share, the rest belongs to the cost
 // curve. Measured on Gemma 4 E4B: 15 row-count graph builds cost ~0.75 s
 // (constant per row), the four anchor warm-ups + captures ~0.29 s.
 constexpr double kSpecVerifySetBudgetMs = 1100.0;
-// Priority order. Two knots are load-bearing, and are measured before the
-// budget can run out:
+// The load anchors: one plain step and the four widths that put a knot at the
+// head, at both ends of the useful range, and on the linear middle. The other
+// eleven lengths are interpolated here and refined online from real steps
+// (spec_note_step_ms), so the load measurement pays for shape, not coverage.
 //   - 0 and 1 anchor the head. A 2-row verify costs more than twice a plain
 //     step (the fixed per-verify cost dominates), so interpolating the head
 //     from c(0) underprices k = 1 and makes the policy spend verifies that
 //     cannot pay.
-//   - 7 anchors the tail slope. The head is flat (c(1) ~ c(3) on this GPU), so
-//     extrapolating the tail from two adjacent head knots reads a flat curve
-//     and prices a 16-row verify like a 4-row one; seven rows past the head
-//     puts the slope on the linear part. The remaining knots refine the shape.
-constexpr int64_t kSpecCostBand[] = {0, 1, 7, 3, 15, 8, 2, 5, 11};
+//   - 3 sits on the head's flat stretch, 7 on the linear part, 15 at the
+//     envelope the policy can reach.
+constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15};
 // Allowance for a length whose row count has not been built yet: the first
 // pass builds the graph and captures it before it can be timed.
 constexpr double kSpecCostCaptureMs = 300.0;
@@ -2528,6 +2665,13 @@ static int64_t spec_policy_choose(const SpecLengthPolicy& p, int64_t max_k,
 // seeds the drafter, and the drafter only ever proposes — acceptance is the
 // verifier's decision. In `auto` mode the policy above chooses each
 // iteration's draft length.
+// Device time (ms) of the last captured verify step at this width, or 0 when
+// the step ran uncaptured or the end event has not completed yet (never
+// blocks). Defined with the verify runtime below; feeds the cost refiner.
+static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
+                                  int rows,
+                                  const planner::KvCacheSession& session);
+
 static uint64_t run_spec_program_steps(
     const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
@@ -2776,11 +2920,22 @@ static uint64_t run_spec_program_steps(
                      "at position " << L << "\n";
         break;
       }
-      const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed);
+      const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed,
+                                       nullptr, /*time_step=*/true);
       if (next < 0) {
         std::cerr << "[spec] the k == 0 decode step failed at position " << L
                   << "\n";
         break;
+      }
+      // The step's readback has drained its replay, so the event pair is
+      // complete; reading it never waits. A plain step prices c(0).
+      if (adaptive && !warm) {
+        double ms = 0.0;
+        if (hal::StepProgram* sp = rt.step_at(L);
+            sp && sp->timing_read(&ms)) {
+          spec_note_step_ms(m, session.n_ctx, 0, ms);
+          spec_refine_cost(m, session.n_ctx, policy, 0);
+        }
       }
       // S4: a plain step is a proposal of length 0 (the drafter missed or the
       // policy chose k = 0) that emits the verifier's own token.
@@ -2833,6 +2988,16 @@ static uint64_t run_spec_program_steps(
     if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
       std::cerr << "[spec] the verify step failed at position " << L << "\n";
       break;
+    }
+    // A real (non warm-up) verify prices its own k; its sync has completed the
+    // replay, so the event pair reads back without waiting.
+    if (adaptive && !warm) {
+      const double ms =
+          verify_last_step_ms(m, session.n_ctx, int(feed.size()), session);
+      if (ms > 0.0) {
+        spec_note_step_ms(m, session.n_ctx, int(k), ms);
+        spec_refine_cost(m, session.n_ctx, policy, int(k));
+      }
     }
 
     // accept + emit: the run is the accepted drafts plus the verifier's token,
@@ -3819,6 +3984,15 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
   return set->rows[size_t(rows)].get();
 }
 
+static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
+                                  int rows,
+                                  const planner::KvCacheSession& session) {
+  VerifyRuntime* rt = get_verify_runtime(m, n_ctx, rows, session);
+  double ms = 0.0;
+  if (!rt || !rt->prog || !rt->prog->timing_read(&ms)) return 0.0;
+  return ms;
+}
+
 // V2: the startup probe behind an unset SONICBOOM_SPEC. One plain decode step
 // and one k=1 verify step are timed on this GPU (after untimed warm replays);
 // their ratio decides the generation loop, because it is the price of a verify
@@ -4101,7 +4275,12 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
       return fail("staging failed");
     // The replay is async on the graph stream; the token readback must see the
     // completed step (the readback copy orders against the graph's stream).
-    if (!rt->prog->replay() || !rt->prog->sync())
+    // The timing events bracket only the replay, so the curve prices device
+    // work, not the staging or the host round-trip.
+    (void)rt->prog->timing_begin();
+    const bool replayed = rt->prog->replay();
+    (void)rt->prog->timing_end();
+    if (!replayed || !rt->prog->sync())
       return fail("graph replay failed");
   } else {
     if (!rt->cuda->set_prefill_tokens(tokens) ||
@@ -4209,6 +4388,9 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
     else
       ++it;
   }
+  // The session's real-step measurements become the stored curve, so the
+  // next process (or the next session after a restart) starts from them.
+  spec_flush_refined_costs(m);
 }
 
 DevicePoolStats device_pool_stats() {

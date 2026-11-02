@@ -55,6 +55,17 @@ class StepProgram {
   // host memory) copies directly. Returns false on failure.
   virtual bool stage_upload(const Buffer& dst, const void* host,
                             uint64_t bytes) = 0;
+
+  // Optional step timing on the program's own stream. timing_begin()/timing_end()
+  // record an event before/after the next replay(); timing_read() returns the
+  // device time of the last such pair in milliseconds, or false while the end
+  // event has not completed (a caller that already waited for the step's result
+  // never blocks here). The event types are a backend-private detail; none
+  // appears in this interface. The default (uncaptured steps, the CPU backend)
+  // reports unsupported.
+  virtual bool timing_begin() { return false; }
+  virtual bool timing_end() { return false; }
+  virtual bool timing_read(double*) { return false; }
 };
 
 }  // namespace sonicboom::hal

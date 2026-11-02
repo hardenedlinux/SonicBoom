@@ -143,10 +143,45 @@ class CudaStepProgram final : public hal::StepProgram {
   // kernel scratch is retained rather than freed on regrowth (see
   // cuda_scratch_epoch.h).
   CudaStepProgram() { sonicboom::cuda::capture_register(); }
-  ~CudaStepProgram() override { sonicboom::cuda::capture_unregister(); }
+  ~CudaStepProgram() override {
+    sonicboom::cuda::capture_unregister();
+    if (ev_start_) cudaEventDestroy(ev_start_);
+    if (ev_end_) cudaEventDestroy(ev_end_);
+  }
   bool replay() override { return graph_.replay(); }
   bool sync() override { return graph_.sync(); }
   bool valid() const override { return graph_.valid(); }
+
+  // Step timing: two events on the graph's own stream. They are created
+  // on first use, so a program that is never timed allocates nothing.
+  bool timing_begin() override {
+    if (!ev_start_ || !ev_end_) {
+      if (cudaEventCreate(&ev_start_) != cudaSuccess) {
+        ev_start_ = nullptr;
+        return false;
+      }
+      if (cudaEventCreate(&ev_end_) != cudaSuccess) {
+        cudaEventDestroy(ev_start_);
+        ev_start_ = nullptr;
+        return false;
+      }
+    }
+    return cudaEventRecord(ev_start_, graph_.stream()) == cudaSuccess;
+  }
+  bool timing_end() override {
+    return ev_end_ && cudaEventRecord(ev_end_, graph_.stream()) == cudaSuccess;
+  }
+  bool timing_read(double* ms) override {
+    if (!ms || !ev_start_ || !ev_end_) return false;
+    if (cudaEventQuery(ev_end_) != cudaSuccess) {
+      (void)cudaGetLastError();  // clear cudaErrorNotReady: not a sticky error
+      return false;
+    }
+    float t = 0.0f;
+    if (cudaEventElapsedTime(&t, ev_start_, ev_end_) != cudaSuccess) return false;
+    *ms = double(t);
+    return true;
+  }
 
   // Async H2D on the graph's stream, ordered before the next replay(). Unlike
   // the device pool's synchronous cudaMemcpy (which lands on the legacy default
@@ -164,6 +199,8 @@ class CudaStepProgram final : public hal::StepProgram {
 
  private:
   sonicboom::cuda::GraphStep graph_;
+  cudaEvent_t ev_start_ = nullptr;
+  cudaEvent_t ev_end_ = nullptr;
 };
 
 } // namespace
