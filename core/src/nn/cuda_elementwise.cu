@@ -1024,18 +1024,20 @@ __device__ inline void mq_stage_kv(const KV* __restrict__ cache,
 //     `rows_per_block` rows (grid.z picks the row group);
 //   * the chunk's keys are staged in shared memory in tiles; every (row, query
 //     head) task of the block reads K and V from the tile;
-//   * a warp owns one or two tasks, and a task runs the existing phase 1/2/3
-//     over its own key range.
+//   * a warp owns exactly one task, and a task runs the existing phase 1/2/3
+//     over its own key range. The task's q row lives in registers, so the
+//     per-key dot reads only the staged K tile.
 // Block chunk indices are anchored at row 0's first chunk (absolute keys), so
 // row r's partials sit at index (first_r - first_0) + c; the merge walks
 // exactly the chunks the single-row launch at pos[0]+r would, in the same
 // order. The verify caller appends every row before this launch; the SWA ring
 // carries kMaxVerifyRows slots of headroom so no append clobbers a key an
 // earlier row still reads.
-// DPL is head_dim / 32: the accumulators are sized exactly (two tasks x DPL
-// floats), which is what lets a full-row block fit the register file. The host
-// picks the block size from this instantiation's register count
-// (mq_max_warps), so the schedule adapts instead of failing to launch.
+// DPL is head_dim / 32: the accumulators and the resident q row are sized
+// exactly (DPL floats each), which keeps a warp's live set small enough for
+// many resident warps. The host picks the block size from this
+// instantiation's register count (mq_max_warps), so the schedule adapts
+// instead of failing to launch.
 template <typename KV, int DPL>
 __global__ void decode_attention_split_mq_kernel(
     const float* __restrict__ q, const KV* __restrict__ k_cache,
@@ -1077,34 +1079,39 @@ __global__ void decode_attention_split_mq_kernel(
       (c0 + chunk < p_last + 1) ? (c0 + chunk) : (p_last + 1);
   if (ulo >= uhi) return;
 
-  // Per-warp tasks: up to two (row, query-head) pairs, each with its own key
-  // range and score row.
-  constexpr int kTasksPerWarp = 2;
+  // One task per warp: warp `warp` owns the (row, query head) pair `warp` of
+  // this block, with its own key range and score row.
+  const int t = warp;
   const int tasks = rows * group_q;
-  const int tasks_per_warp = (tasks + warps - 1) / warps;
-  bool active[kTasksPerWarp] = {false, false};
-  uint64_t jlo_a[kTasksPerWarp] = {0, 0};
-  uint64_t jhi_a[kTasksPerWarp] = {0, 0};
-  int h_a[kTasksPerWarp] = {0, 0};
-  int r_a[kTasksPerWarp] = {0, 0};
-  float* srow_a[kTasksPerWarp] = {nullptr, nullptr};
-#pragma unroll
-  for (int kk = 0; kk < kTasksPerWarp; ++kk) {
-    const int t = warp + kk * warps;
-    if (kk >= tasks_per_warp || t >= tasks) continue;
+  bool active = false;
+  uint64_t jlo = 0;
+  uint64_t jhi = 0;
+  int h = 0;
+  int r = 0;
+  float* srow = nullptr;
+  if (t < tasks) {
     const int rs = t / group_q;   // row slot in this block
     const int hs = t % group_q;   // query head slot
-    const int r = row_base + rs;
+    r = row_base + rs;
     const uint64_t p = p0 + (uint64_t)r;
     const uint64_t start =
         (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
-    if (c0 > p || c0 + chunk <= start) continue;  // no key of this row here
-    active[kk] = true;
-    jlo_a[kk] = c0 > start ? c0 : start;
-    jhi_a[kk] = (c0 + chunk < p + 1) ? (c0 + chunk) : (p + 1);
-    h_a[kk] = kv_group * group_q + hs;
-    r_a[kk] = r;
-    srow_a[kk] = scores + (size_t)t * (size_t)chunk;
+    if (!(c0 > p || c0 + chunk <= start)) {  // a key of this row is here
+      active = true;
+      jlo = c0 > start ? c0 : start;
+      jhi = (c0 + chunk < p + 1) ? (c0 + chunk) : (p + 1);
+      h = kv_group * group_q + hs;
+      srow = scores + (size_t)t * (size_t)chunk;
+    }
+  }
+
+  // The task's q row, held in registers: every key's dot product reads the
+  // same DPL values, so one load per lane column replaces one per key.
+  float qreg[DPL];
+  if (active) {
+    const float* qrow = q + ((size_t)r * n_heads_q + h) * head_dim;
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) qreg[i] = qrow[lane + i * 32];
   }
 
   // Phase 1: one q·k dot per key (exactly the single-row phase 1), over K tiles
@@ -1115,44 +1122,35 @@ __global__ void decode_attention_split_mq_kernel(
     mq_stage_kv(k_cache, tile, lane, warp, warps, t0, t1 - t0, n_slots,
                 n_heads_kv, kv_group, head_dim);
     __syncthreads();
-#pragma unroll
-    for (int kk = 0; kk < kTasksPerWarp; ++kk) {
-      if (kk >= tasks_per_warp || !active[kk]) continue;
-      const float* qrow =
-          q + ((size_t)r_a[kk] * n_heads_q + h_a[kk]) * head_dim;
-      float* srow = srow_a[kk];
-      const uint64_t ja = t0 > jlo_a[kk] ? t0 : jlo_a[kk];
-      const uint64_t jb = t1 < jhi_a[kk] ? t1 : jhi_a[kk];
+    if (active) {
+      const uint64_t ja = t0 > jlo ? t0 : jlo;
+      const uint64_t jb = t1 < jhi ? t1 : jhi;
 #pragma unroll 4
       for (uint64_t j = ja; j < jb; ++j) {
         const float* krow = tile + (j - t0) * (uint64_t)head_dim;
         float d = 0.0f;
-        for (int i = lane; i < head_dim; i += 32) d += qrow[i] * krow[i];
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) d += qreg[i] * krow[lane + i * 32];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1)
           d += __shfl_down_sync(0xffffffffu, d, o);
-        if (lane == 0) srow[j - jlo_a[kk]] = d * scale;
+        if (lane == 0) srow[j - jlo] = d * scale;
       }
     }
     __syncthreads();
   }
 
   // Phase 2: local max (exact), exp once, local sum.
-  float m_a[kTasksPerWarp] = {0.0f, 0.0f};
-  float l_a[kTasksPerWarp] = {0.0f, 0.0f};
-#pragma unroll
-  for (int kk = 0; kk < kTasksPerWarp; ++kk) {
-    if (kk >= tasks_per_warp || !active[kk]) continue;
-    float* srow = srow_a[kk];
-    const uint64_t cn = jhi_a[kk] - jlo_a[kk];
-    float m = -1e30f;
+  float m = -1e30f;
+  float l = 0.0f;
+  if (active) {
+    const uint64_t cn = jhi - jlo;
     for (uint64_t j = lane; j < cn; j += 32) m = fmaxf(m, srow[j]);
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
       m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
     m = __shfl_sync(0xffffffffu, m, 0);
 
-    float l = 0.0f;
     for (uint64_t j = lane; j < cn; j += 32) {
       const float e = expf(srow[j] - m);
       srow[j] = e;
@@ -1162,18 +1160,14 @@ __global__ void decode_attention_split_mq_kernel(
     for (int o = 16; o > 0; o >>= 1)
       l += __shfl_down_sync(0xffffffffu, l, o);
     l = __shfl_sync(0xffffffffu, l, 0);
-    m_a[kk] = m;
-    l_a[kk] = l;
   }
   __syncwarp();
 
   // Phase 3: V-weighted sum over the chunk, in accumulating V tiles staged once
   // for every task. The accumulators stay in registers across tiles.
-  float acc[kTasksPerWarp][DPL];
+  float acc[DPL];
 #pragma unroll
-  for (int kk = 0; kk < kTasksPerWarp; ++kk)
-#pragma unroll
-    for (int i = 0; i < DPL; ++i) acc[kk][i] = 0.0f;
+  for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
 
   for (uint64_t t0 = ulo; t0 < uhi; t0 += (uint64_t)tile_keys) {
     const uint64_t t1 =
@@ -1181,39 +1175,33 @@ __global__ void decode_attention_split_mq_kernel(
     mq_stage_kv(v_cache, tile, lane, warp, warps, t0, t1 - t0, n_slots,
                 n_heads_kv, kv_group, head_dim);
     __syncthreads();
-#pragma unroll
-    for (int kk = 0; kk < kTasksPerWarp; ++kk) {
-      if (kk >= tasks_per_warp || !active[kk]) continue;
-      const float* srow = srow_a[kk];
-      const uint64_t ja = t0 > jlo_a[kk] ? t0 : jlo_a[kk];
-      const uint64_t jb = t1 < jhi_a[kk] ? t1 : jhi_a[kk];
+    if (active) {
+      const uint64_t ja = t0 > jlo ? t0 : jlo;
+      const uint64_t jb = t1 < jhi ? t1 : jhi;
 #pragma unroll 4
       for (uint64_t j = ja; j < jb; ++j) {
-        const float p = srow[j - jlo_a[kk]];  // exp(score - local max)
+        const float p = srow[j - jlo];  // exp(score - local max)
         const float* vrow = tile + (j - t0) * (uint64_t)head_dim;
 #pragma unroll
-        for (int i = 0; i < DPL; ++i) acc[kk][i] += p * vrow[lane + i * 32];
+        for (int i = 0; i < DPL; ++i) acc[i] += p * vrow[lane + i * 32];
       }
     }
     __syncthreads();
   }
 
-  // Write partial [m, l, o[0..head_dim-1]] for every task, at the row's own
+  // Write partial [m, l, o[0..head_dim-1]] for the task, at the row's own
   // chunk index.
-  const size_t pstride = (size_t)n_heads_q * (size_t)(head_dim + 2);
-#pragma unroll
-  for (int kk = 0; kk < kTasksPerWarp; ++kk) {
-    if (kk >= tasks_per_warp || !active[kk]) continue;
+  if (active) {
+    const size_t pstride = (size_t)n_heads_q * (size_t)(head_dim + 2);
     float* pp = partial +
-                ((size_t)r_a[kk] * (size_t)n_chunks + (size_t)chunk_idx) *
-                    pstride +
-                (size_t)h_a[kk] * (size_t)(head_dim + 2);
+                ((size_t)r * (size_t)n_chunks + (size_t)chunk_idx) * pstride +
+                (size_t)h * (size_t)(head_dim + 2);
     if (lane == 0) {
-      pp[0] = m_a[kk];
-      pp[1] = l_a[kk];
+      pp[0] = m;
+      pp[1] = l;
     }
 #pragma unroll
-    for (int i = 0; i < DPL; ++i) pp[2 + lane + i * 32] = acc[kk][i];
+    for (int i = 0; i < DPL; ++i) pp[2 + lane + i * 32] = acc[i];
   }
 }
 
@@ -3975,13 +3963,13 @@ bool decode_attention_mq_dev_impl(
   // reads: one block per (chunk, kv head) serves every row, so the block's
   // warps must stay resident while the per-row launch instead spreads many
   // small blocks (one per (row, chunk, kv head, head block)) over the SMs.
-  // Measured on both README models with the window at the depth (k=7 and 15):
-  // the multi-query launch wins up to a 1088-key window (-3% to -6% per verify
-  // call), is a wash at 2112 on Qwen2.5-7B, and loses beyond that (Qwen
-  // +7% at 4160 and +25% at 16448; Gemma is at parity from 4160 on). 2048
-  // keeps the measured wins and every measured loss out. The window is the
-  // graph's fixed key extent, so the choice never moves with the position.
-  if (!mq_forced && window > 2048) return false;
+  // Measured k=7 verify-step wall with one task per warp: the multi-query
+  // launch wins at a 576-key window (Gemma -7.4%), at 4160 (Gemma -2.0%,
+  // Qwen2.5-7B -3.3%), is a wash at 8256 on Qwen2.5-7B (-0.25%), and loses at
+  // 16448 (+1.6%). 8192 keeps the measured wins in and every measured loss
+  // out. The window is the graph's fixed key extent, so the choice never
+  // moves with the position.
+  if (!mq_forced && window > 8192) return false;
 
   // Blocks are absolute chunks anchored at row 0's first chunk. The rows' key
   // ranges are contiguous (window start and position both grow with the row)
@@ -3990,9 +3978,10 @@ bool decode_attention_mq_dev_impl(
   const uint64_t n_chunks =
       base_chunks + ((uint64_t)(n_q - 1) + chunk - 1) / chunk;
 
-  // The block is sized by the register file first (two (row, head) pairs per
-  // warp; the V accumulators are DPL floats per lane), then by shared memory:
-  // the block's score rows plus one K (then V) tile must fit 48 KiB.
+  // The block is sized by the register file first (one (row, head) pair per
+  // warp; the V accumulators and the q row are DPL floats per lane each), then
+  // by shared memory: the block's score rows plus one K (then V) tile must fit
+  // 48 KiB.
   const int dpl = head_dim / 32;  // instantiated below for 2, 4, 8, 16
 #define SB_MQ_MAX_WARPS(KVT)                                    \
   (dpl == 2   ? mq_max_warps<KVT, 2>()                          \
@@ -4003,11 +3992,9 @@ bool decode_attention_mq_dev_impl(
       kv_f16 ? SB_MQ_MAX_WARPS(__half) : kv_q8 ? SB_MQ_MAX_WARPS(int8_t)
                                                : SB_MQ_MAX_WARPS(float);
 #undef SB_MQ_MAX_WARPS
-  if (max_warps < 1) return false;
-  const int max_tasks = 2 * max_warps;
-  if (group_q > max_tasks) return false;
+  if (max_warps < 1 || group_q > max_warps) return false;
   const size_t kSmemFloats = 48 * 1024 / sizeof(float);
-  int rows_per_block = std::min(n_q, max_tasks / group_q);
+  int rows_per_block = std::min(n_q, max_warps / group_q);
   int tile_keys = 0;
   for (;;) {
     const size_t scores =
@@ -4021,7 +4008,7 @@ bool decode_attention_mq_dev_impl(
     rows_per_block = std::max(1, rows_per_block / 2);
   }
   const int tasks = rows_per_block * group_q;
-  const int warps = std::min(max_warps, std::max(1, (tasks + 1) / 2));
+  const int warps = tasks;  // one task per warp
   const size_t mq_smem_bytes =
       ((size_t)rows_per_block * (size_t)group_q * (size_t)chunk +
        (size_t)tile_keys * (size_t)head_dim) *
