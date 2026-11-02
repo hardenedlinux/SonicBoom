@@ -1165,6 +1165,26 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
 // headroom the decode backend reserves (planner::kMaxVerifyRows).
 constexpr int64_t kSpecMaxDrafts = 15;
 
+// SONICBOOM_SPEC_MAX_DRAFTS (default kSpecMaxDrafts): a ceiling on the drafts
+// one verify may propose. It never raises the envelope above kSpecMaxDrafts;
+// both the fixed loop and the adaptive policy honour it, so a deployment (or a
+// measurement arm) can ask for a shorter verify than the envelope allows.
+static int64_t spec_max_drafts() {
+  static const int64_t v = []() -> int64_t {
+    const char* e = std::getenv("SONICBOOM_SPEC_MAX_DRAFTS");
+    if (!e || !*e) return kSpecMaxDrafts;
+    char* end = nullptr;
+    const long n = std::strtol(e, &end, 10);
+    if (end == e || *end || n < 0) {
+      std::cerr << "[spec] ignoring SONICBOOM_SPEC_MAX_DRAFTS='" << e
+                << "' (expected 0.." << kSpecMaxDrafts << ")\n";
+      return kSpecMaxDrafts;
+    }
+    return std::min<long>(n, kSpecMaxDrafts);
+  }();
+  return v;
+}
+
 // B7 v2: the bursty-acceptance model (plan.h). A per-token acceptance rate is
 // the wrong statistic for prompt lookup: a copy is accepted as a block, so a
 // stream whose per-draft alpha is 0.41 can still emit three tokens per verify
@@ -1329,6 +1349,9 @@ std::string spec_kernel_fingerprint() {
 #endif
   add(shared_object_identity());
   add(env_value("SONICBOOM_SPEC_VERIFY_BATCH"));
+  // A capped measurement prices only the lengths it can reach and extrapolates
+  // the rest, so its record is not a substitute for the full envelope's.
+  add(std::to_string(spec_max_drafts()));
   add(env_value("SONICBOOM_VERIFY_GEMV_REUSE"));
   add(env_value("SONICBOOM_VERIFY_GEMV_WP"));
 #ifdef SONICBOOM_USE_CUDA
@@ -2262,7 +2285,8 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   {
     const auto t_warm = std::chrono::steady_clock::now();
     const int warm_rows[] = {2, int(kSpecExploreDepth) + 1,
-                             int(planner::kMaxVerifyRows)};
+                             int(std::min<int64_t>(kSpecMaxDrafts,
+                                                   spec_max_drafts())) + 1};
     for (int rows : warm_rows) {
       if (pos + uint64_t(rows) > n_ctx) continue;
       (void)verify_step_spine_cuda(
@@ -2312,6 +2336,7 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   double last_us = 0.0;  // the previous knot's median (projection input)
   for (int64_t k : kSpecCostBand) {
     if (k > int64_t(SpecLengthPolicy::kMax)) continue;
+    if (k > spec_max_drafts()) continue;  // priced only where it can be used
     if (pos + uint64_t(k) + 1 > n_ctx) continue;  // no room for k+1 rows
     // The budget is checked before a length is started and before its timed
     // passes: a length whose build would overrun it is abandoned rather than
@@ -2528,7 +2553,8 @@ static uint64_t run_spec_program_steps(
                                                   tokens.size())
                              : tokens.size();
   const size_t cap =
-      size_t(std::min<int64_t>(p.max_drafts, kSpecMaxDrafts));
+      size_t(std::min<int64_t>({p.max_drafts, kSpecMaxDrafts,
+                                spec_max_drafts()}));
   if (cap == 0 || !session.caches || session.n_ctx == 0) {
     std::cerr << "[spec] the speculative loop needs a drafter cap and a "
                  "session cache\n";
