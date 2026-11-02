@@ -1785,6 +1785,23 @@ static bool ir_program_enabled() {
   return v;
 }
 
+// SONICBOOM_REPRO_PREFILL=decode runs a prompt through the row-invariant verify
+// graph in chunks of at most kMaxVerifyRows rows instead of the batched prefill
+// graph, so its KV is written by exactly the arithmetic a plain decode step
+// uses at each position. A full prefill and a prefix-reuse suffix then produce
+// the same KV row for a shared position, which the batched prefill cannot
+// guarantee (a position computed inside a multi-token segment differs from the
+// one-token segment a reuse boundary can leave). Opt-in: the batched path is
+// the default because it is far faster. Requires a session (the reuse identity
+// is a property of the session cache); without one the normal prefill runs.
+static bool repro_prefill_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_REPRO_PREFILL");
+    return e && std::string_view(e) == "decode";
+  }();
+  return v;
+}
+
 // kSpecMaxDrafts (the speculative draft cap) is defined above the policy
 // functions, which need it.
 
@@ -4078,6 +4095,48 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
   return set->rows[size_t(rows)].get();
 }
 
+// The same row-invariant graph for the opt-in prefill path
+// (SONICBOOM_REPRO_PREFILL=decode). The spec verify set is mode-gated — it is
+// built only when speculation runs — but prefix-reuse identity holds regardless
+// of the spec mode, so this path keeps its own set, keyed the same way and
+// built lazily for the widths it actually visits (16 rows and a remainder).
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
+                std::unique_ptr<VerifyRuntime>>
+    g_repro_verify_runtimes;
+
+// The non-greedy one-row runtime the repro prefill's last prompt token runs
+// through. Built once per session cache and reused across requests; unlike the
+// verify set it has no capture, so each call stages its own token and position.
+// Keeping it here rather than building one per prefill keeps the pp number a
+// measurement of the arithmetic, not of a graph build.
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<DecodeRuntime>>
+    g_repro_eval_runtimes;
+
+static VerifyRuntime* get_repro_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_repro_verify_runtimes.find(key);
+    if (it != g_repro_verify_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return nullptr;
+  // Warm and capture like the spec set. The warm-up's KV writes are suppressed,
+  // so no live row of the session cache is touched before the first chunk.
+  (void)warm_verify_runtime(*rt, n_ctx, rows, cuda_graph_decode_enabled());
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_repro_verify_runtimes.find(key);
+  if (it != g_repro_verify_runtimes.end()) return it->second.get();
+  VerifyRuntime* raw = rt.get();
+  g_repro_verify_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
 static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
                                   int rows,
                                   const planner::KvCacheSession& session) {
@@ -4621,6 +4680,24 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
         std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  for (auto it = g_repro_verify_runtimes.begin();
+       it != g_repro_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_repro_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  for (auto it = g_repro_eval_runtimes.begin();
+       it != g_repro_eval_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_repro_eval_runtimes.erase(it);
     else
       ++it;
   }
@@ -5293,6 +5370,121 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
   return rt;
 }
 
+// The cached non-greedy one-row runtime for the repro prefill's final token
+// (see g_repro_eval_runtimes). Registered under the session's cache identity,
+// so release_session_runtimes drops it with the set.
+static DecodeRuntime* get_repro_eval_runtime(
+    const Gemma4Model& m, uint64_t n_ctx,
+    const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_repro_eval_runtimes.find(key);
+    if (it != g_repro_eval_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false, &session);
+  if (!rt) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_repro_eval_runtimes.find(key);
+  if (it != g_repro_eval_runtimes.end()) return it->second.get();
+  DecodeRuntime* raw = rt.get();
+  g_repro_eval_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+// B1: prefill in decode arithmetic (SONICBOOM_REPRO_PREFILL=decode).
+//
+// The prompt's tokens 0..n-2 are written to the session cache by the same
+// row-invariant verify graph the speculative decoder verifies with, in chunks
+// of at most kMaxVerifyRows rows at absolute positions start_pos+off. Row i of
+// a chunk is bit-identical to a plain decode step at that position (the B3
+// contract), so the cache state is exactly what a chain of decode steps writes
+// — independent of how the prompt is split into chunks, of where a reuse
+// boundary falls, and of the model's batch kernels. The final prompt token runs
+// one non-greedy decode step, which is where the caller's logits (and the first
+// sampled token) come from.
+//
+// Returns false on failure. `logits` (vocab floats, softcapped) and `first` are
+// only meaningful on success.
+static bool prefill_in_decode_arithmetic(
+    const Gemma4Model& m, std::span<const uint64_t> prompt, uint64_t start_pos,
+    planner::KvCacheSession& session, uint64_t n_ctx,
+    std::span<const uint8_t> sample_mask, std::vector<float>& logits,
+    std::span<float> logits_out, int64_t& first) {
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    std::cerr << "[prefill-cuda] repro prefill: token rows through the verify "
+                 "graph (decode arithmetic)\n";
+  const uint64_t n = prompt.size();
+  const uint64_t vocab = m.config.vocab_size;
+  if (n == 0 || logits.size() < vocab) return false;
+  const bool masked = !sample_mask.empty();
+  // A verify chunk must be a wrap-free run inside the sliding-window ring, the
+  // same constraint the verify step observes.
+  const uint64_t ring = m.config.sliding_window > 0 ? m.config.sliding_window
+                                                    : kDefaultPrefillChunk;
+  const uint64_t prefix = n - 1;
+  for (uint64_t off = 0; off < prefix;) {
+    const uint64_t pos = start_pos + off;
+    uint64_t rows = std::min<uint64_t>(planner::kMaxVerifyRows, prefix - off);
+    if (m.config.sliding_window > 0) rows = std::min(rows, ring - pos % ring);
+    if (rows < 2) {
+      // One row: the plain decode step is the row-invariant arithmetic here.
+      std::vector<int64_t> one(1, -1);
+      if (!decode_steps_spine_cuda(m, prompt.subspan(off, 1), pos, session, one))
+        return false;
+      off += 1;
+      continue;
+    }
+    VerifyRuntime* rt =
+        get_repro_verify_runtime(m, n_ctx, int(rows), session);
+    if (!rt) return false;
+    const bool replay_ok =
+        rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+    if (replay_ok) {
+      if (!rt->cuda->stage_prefill_tokens(*rt->prog,
+                                          prompt.subspan(off, rows)) ||
+          !rt->cuda->stage_verify_pos(*rt->prog, pos, int(rows)) ||
+          !rt->prog->replay() || !rt->prog->sync())
+        return false;
+    } else {
+      if (!rt->cuda->set_prefill_tokens(prompt.subspan(off, rows)) ||
+          !rt->cuda->set_verify_pos(pos, int(rows)))
+        return false;
+      const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(pos)};
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
+      if (!res) return false;
+      // The readback-free path has no natural completion point of its own;
+      // the last chunk's KV must be visible to the decode step below.
+      if (!rt->cuda->synchronize()) return false;
+    }
+    off += rows;
+  }
+
+  // Final prompt token: one non-greedy decode step on the session cache. Its
+  // KV row is the plain decode step's row at that position, and its output is
+  // the prompt's final softcapped logits (the same values lm_head hands the
+  // batched path).
+  DecodeRuntime* eval = get_repro_eval_runtime(m, n_ctx, session);
+  if (!eval) return false;
+  const uint64_t last_pos = start_pos + n - 1;
+  if (!eval->cuda->seed_token(prompt[size_t(n - 1)]) ||
+      !eval->cuda->set_pos(last_pos))
+    return false;
+  const std::vector<sx::Bytes> in{encode_i64(prompt[size_t(n - 1)]),
+                                  encode_i64(last_pos)};
+  auto res = eval->exec->execute(eval->plan, eval->snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const sx::Bytes& lo = res->outputs[0];
+  if (lo.size() < vocab * sizeof(float)) return false;
+  std::memcpy(logits.data(), lo.data(), vocab * sizeof(float));
+  if (!logits_out.empty())
+    std::copy(logits.begin(), logits.end(), logits_out.begin());
+  first = masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
+  return first >= 0;
+}
+
 // Shared prefill + decode body. `prompt` is the tokens to actually prefill
 // (already the suffix when prefix reuse skipped a shared prefix); `session`, when
 // non-null, is the persistent prefix-cache session this run adopts/publishes its
@@ -5420,7 +5612,20 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   uint64_t step = 0;
 
   int64_t first = -1;
-  if (use_prefill) {
+  // SONICBOOM_REPRO_PREFILL=decode replaces the batched segments with the
+  // row-invariant verify graph (see prefill_in_decode_arithmetic). It needs a
+  // session cache to be meaningful; without one the batched path runs.
+  const bool repro_prefill =
+      use_prefill && session != nullptr && session->caches &&
+      session->cache_id != 0 && repro_prefill_enabled();
+  if (repro_prefill) {
+    if (!prefill_in_decode_arithmetic(m, prompt, start_pos, *session, n_ctx,
+                                      sample_mask, logits, logits_out, first))
+      return 0;
+    if (dump_logits)
+      dump_logits_top2(dump_logits_file, /*step=*/0, start_pos + prompt.size(),
+                       std::span<const float>(logits.data(), vocab));
+  } else if (use_prefill) {
     // Chunked device-resident prefill: the prompt is processed in segments of
     // `chunk` tokens (the SWA ring size, so a segment is a wrap-free run and the
     // batched kernels' consecutive-slot assumption holds). Each segment runs the
