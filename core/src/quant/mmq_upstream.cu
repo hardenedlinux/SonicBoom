@@ -106,7 +106,7 @@ int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const sb_cuda_props
 //   stride_row_x = K/qk, ncols_max = ncols_opt = n.
 template <ggml_type type>
 bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
-             int64_t M, int64_t K, int64_t n, cudaStream_t stream) {
+             int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg) {
     const sb_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
@@ -132,7 +132,7 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
         1, 1, 0, 0, 0,
         n, n};
 
-    mul_mat_q_case<type>(props, args, stream);
+    mul_mat_q_case<type>(props, args, stream, cfg);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -141,7 +141,7 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
 
 bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    float * dst, int64_t M, int64_t K, int64_t n,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, int cfg) {
     if (weights == nullptr || y_q8 == nullptr || dst == nullptr) {
         return false;
     }
@@ -151,12 +151,12 @@ bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
 
     const ggml_type gtype = to_ggml_type(type);
     switch (gtype) {
-        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream);
-        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream);
-        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream);
-        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream);
-        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream);
-        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream);
+        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg);
         default:             return false;
     }
 }
@@ -203,6 +203,73 @@ int mmq_up_selected_j(MmqUpType type, int64_t M, int64_t n) {
         return 0;
     }
     return pick_J(gtype, M % 128 != 0, n, get_props());
+}
+
+int mmq_up_cfg_count() {
+    return MMQ_CFG_COUNT;
+}
+
+bool mmq_up_cfg_neutral(MmqUpType type, int cfg) {
+    // Filled from test_mmq_cfg_neutral: a candidate is listed only when it
+    // reproduces the table's output bit for bit for this type at every tested
+    // shape and n <= 16.  Config 2 (I = 64, 128 threads) passed for every
+    // type; configs 1, 3, 4 and 5 do not match the MMA warp row mapping
+    // (mmq_cfg_rows_fit), so they were never launched and are not listed.
+    static const bool neutral[6][MMQ_CFG_COUNT] = {
+        /* Q3_K */ {true, false, true, false, false, false, true},
+        /* Q4_K */ {true, false, true, false, false, false, true},
+        /* Q5_K */ {true, false, true, false, false, false, true},
+        /* Q6_K */ {true, false, true, false, false, false, true},
+        /* Q5_0 */ {true, false, true, false, false, false, true},
+        /* Q8_0 */ {true, false, true, false, false, false, true},
+    };
+    const int row = static_cast<int>(type);
+    if (row < 0 || row >= 6 || cfg < 0 || cfg >= MMQ_CFG_COUNT) {
+        return false;
+    }
+    return neutral[row][cfg];
+}
+
+// The MMA path maps one rows_per_warp-row minitile to each warp; with
+// occupancy 1 the tile width must be exactly nthreads/warp_size minitiles,
+// otherwise part of the tile is never computed (or the tile overruns the
+// shared-memory buffer).  The same test the launcher applies.
+static bool mmq_cfg_rows_fit(int I, int nthreads, int J, int warp_size) {
+    if (warp_size <= 0) return false;
+    const int rows_per_warp = (J >= 48 && J % 16 == 0) ? 32 : 16;
+    return I * warp_size == nthreads * rows_per_warp;
+}
+
+bool mmq_up_cfg_allowed(MmqUpType type, int64_t M, int J, int cfg) {
+    const ggml_type gtype = to_ggml_type(type);
+    if (gtype == GGML_TYPE_COUNT || M <= 0 || J < 8 || J > 128 || J % 8 != 0) {
+        return false;
+    }
+    if (cfg < 0 || cfg >= MMQ_CFG_COUNT || (cfg != 0 && J != 8 && J != 16)) {
+        return false;
+    }
+    if (!mmq_up_cfg_neutral(type, cfg)) {
+        return false;
+    }
+    const sb_cuda_props props = get_props();
+    const bool fallback = M % 128 != 0;
+    const ggml_cuda_mmq_config base = ggml_cuda_mmq_get_config_base(gtype, J, fallback, props.cc);
+    if (base.type == GGML_TYPE_COUNT) {
+        return false;
+    }
+    const ggml_cuda_mmq_config config = mmq_apply_cfg(cfg, base);
+    return mmq_get_nbytes_shared(config, props.cc) <= size_t(props.smpbo) &&
+           (cfg == 0 || mmq_cfg_rows_fit(config.I, config.nthreads, J,
+                                         props.warp_size));
+}
+
+void mmq_up_cfg_dims(MmqUpType type, int64_t M, int J, int cfg, int * I, int * nthreads) {
+    const ggml_type gtype = to_ggml_type(type);
+    const sb_cuda_props props = get_props();
+    const bool fallback = M % 128 != 0;
+    const ggml_cuda_mmq_config config = mmq_apply_cfg(cfg, ggml_cuda_mmq_get_config_base(gtype, J, fallback, props.cc));
+    if (I) *I = config.I;
+    if (nthreads) *nthreads = config.nthreads;
 }
 
 }  // namespace sonicboom::quant::cuda
