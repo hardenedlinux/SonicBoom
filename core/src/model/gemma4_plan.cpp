@@ -47,6 +47,7 @@
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
+#include "../quant/mmq_upstream.h"   // mmq_up_warm (decode/verify MMQ pins)
 #include "../spec_diag_counters.h"   // in-request first-use counters (SPEC_DIAG)
 #endif
 
@@ -4881,6 +4882,32 @@ static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
                                    fingerprint.c_str());
 }
 
+// The split count and tile configuration the decode and verify steps run with
+// are measured per projection shape at load, on the same synthetic-weight
+// basis as the verify gemv split above.  No-op unless the decode MMQ lowering
+// is selected, so the off path pays nothing.
+static void warm_mmq_decode_model(const Gemma4Model& m) {
+  if (!quant::cuda::mmq_up_decode_enabled()) return;
+  std::vector<const quant::QuantizedTensor*> weights;
+  const auto add = [&weights](const quant::QuantizedTensor& w) {
+    if (w.valid()) weights.push_back(&w);
+  };
+  for (const auto& b : m.weights.blocks) {
+    add(b.attn_q);
+    add(b.attn_k);
+    add(b.attn_v);
+    add(b.attn_output);
+    add(b.ffn_gate);
+    add(b.ffn_up);
+    add(b.ffn_down);
+  }
+  add(m.weights.output);     // untied lm head
+  add(m.weights.token_embd); // tied lm head
+  const std::string fingerprint = spec_kernel_fingerprint();
+  quant::cuda::mmq_up_warm(weights.data(), weights.size(),
+                           fingerprint.c_str());
+}
+
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
                        planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
@@ -4889,6 +4916,9 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  // The decode/verify pins and the split-K scratch they size must exist before
+  // the runtimes below capture any graph.
+  warm_mmq_decode_model(m);
   // The warm-up builds the same runtimes the first request would, bound to the
   // caller's session cache from construction. The sampled capture bakes that
   // cache's device pointers in, so it cannot be warmed on a temporary set and
