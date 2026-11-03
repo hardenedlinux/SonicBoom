@@ -47,6 +47,23 @@ core/src/quant/ggml_derived/mmq.cuh
     (Adaptation: dropped the MoE / channels / samples / ids_dst / fallback
      branches — Gemma has M%128==0 and no MoE; added the host-side launchers.)
 
+core/src/quant/ggml_derived/mmq_upstream/
+    Verbatim import of llama.cpp's CUDA MMQ kernels, kept separate from the
+    hand-trimmed port above. Device kernel/function bodies are unchanged;
+    SonicBoom adds a compatibility shim (common.cuh) and host-side plumbing.
+    Ported from llama.cpp commit 43fe9c64281ef735046adc025e9e7559a1f659a5:
+      - common.cuh                 ← ggml/src/ggml-cuda/common.cuh and
+                                      ggml/src/ggml-common.h (compatibility shim)
+      - mmq.cuh                    ← ggml/src/ggml-cuda/mmq.cuh
+      - mmq.cu                     ← ggml/src/ggml-cuda/mmq.cu
+      - mmq-config-ampere.cuh      ← ggml/src/ggml-cuda/mmq-config-ampere.cuh
+      - mmq-load-tiles.cuh         ← ggml/src/ggml-cuda/mmq-load-tiles.cuh
+      - mmq-vec-dot.cuh            ← ggml/src/ggml-cuda/mmq-vec-dot.cuh
+      - mma.cuh                    ← ggml/src/ggml-cuda/mma.cuh
+      - vecdotq.cuh                ← ggml/src/ggml-cuda/vecdotq.cuh
+      - quantize_mmq_upstream.cuh  ← ggml/src/ggml-cuda/quantize.cu
+    The new entry point core/src/quant/mmq_upstream.cu instantiates them.
+
 core/src/quant/ggml_derived/vec_dot_qK_q8K.h
     q8_K scalar fixed-point reference (CPU). Ported from:
       - nearest_int              ← ggml/src/ggml-quants.c
