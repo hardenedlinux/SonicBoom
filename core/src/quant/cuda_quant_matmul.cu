@@ -3810,8 +3810,14 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   if (!mmq_up_quantize(X, reinterpret_cast<int32_t*>(y_q8), ic, n, *type,
                        cur_stream()))
     return false;
+  // The shape's pinned tile config and split-K from the warm-up table. The
+  // split count is a function of the shape only; the tile width's config moves
+  // with n (8 for n <= 8, 16 above) and every selectable config is
+  // bit-identical to the imported table (R1).
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
   return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
-                       ic, n, cur_stream());
+                       ic, n, cur_stream(), cfg, pin.split_k);
 }
 
 // MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
@@ -3844,8 +3850,12 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), ic,
                        n, cur_stream());
 
+  // The shape's pinned tile config and split-K from the warm-up table (see
+  // matmul_mmq_dev).
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
   return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
-                       ic, n, cur_stream());
+                       ic, n, cur_stream(), cfg, pin.split_k);
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first

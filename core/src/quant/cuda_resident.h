@@ -176,6 +176,13 @@ bool gemv_bias_epilogue_supported(QuantType qt);
 // n == 1 falls back to matvec_f32_dev. No host copies.
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 
+// The mmq matmul over an f32 activation: quantizes X to block_q8_1_mmq, then
+// runs the mmq kernel with the shape's pinned tile config and split-K. Used at
+// every n, including n == 1 (the decode step and the verify rows share the
+// batched arithmetic). X is device [cols, n], Y device [n, rows]; no host
+// copies.
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
+
 // --- MMQ int8-tensor-core batched/fused prefill ops (C.2/C.4) ---------------
 
 // block_q8_1_mmq activation block — the mmq int8-tensor-core matmul's input. A

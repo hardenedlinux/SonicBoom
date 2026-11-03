@@ -54,9 +54,17 @@ namespace sonicboom::compiler {
 // decision, not a compiler one — the generated region's exp is covered by the
 // standard profile's acceptance gate, while strict keeps the two reference
 // kernels its plan goldens record.
+//
+// `rows_mmq` enables the mmq producer fusions in the decode/verify pipeline:
+// the matmuls of those graphs carry the prefill lowering's `batch`/`dim`/`ds`
+// attributes (the emitter writes them when the decode step runs on the mmq
+// matmul), and the two fusions then fold the norm and the gated activation into
+// the mmq activation producers at this step's row count, resizing the
+// activation buffers to the mmq layout (decode buffers are smaller than the
+// mmq form, so the fusion is allowed to grow them).
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
                    bool skip_kv_append_fusion = false,
-                   bool fuse_silu_mul = false);
+                   bool fuse_silu_mul = false, bool rows_mmq = false);
 
 // The MMQ1 prefill dispatch switch (prefill_dispatch_pass), read from
 // SONICBOOM_MMQ_TC:

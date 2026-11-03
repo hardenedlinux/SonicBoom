@@ -389,6 +389,12 @@ public:
               boomOpName(planner::OpKind::QuantizedMatmul) ||
           node->getNumOperands() != 1)
         continue;
+      // A `batch` matmul takes the mmq lowering: its activation is produced in
+      // the mmq layout by a fused producer (or quantized inside the matmul), so
+      // this pass's 32-element q8_1 activation is not what it reads.
+      if (nodeAttrInt(node->getAttrOfType<mlir::ArrayAttr>("node_attrs"),
+                      "batch"))
+        continue;
 
       const int64_t x = view.idOf(node->getOperand(0));
       mlir::Value q8;
@@ -2006,6 +2012,15 @@ class RmsNormMmqPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RmsNormMmqPass)
 
+  // `allow_grow`: the f32 activation buffer need not already cover the mmq
+  // layout; the pass resizes it. Prefill's [n, dim] f32 buffers do cover it, so
+  // the prefill pipeline keeps the fit as a precondition (a plan that needs
+  // more memory than the emitter declared is a change to the memory plan the
+  // caller asked for). The decode/verify graph's activation is one row, whose
+  // f32 buffer is smaller than the mmq form's tail guard, and the mmq form is
+  // what that graph is asking for.
+  explicit RmsNormMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
+
   void runOnOperation() override {
     boom::GraphOp graph = getOperation();
     GraphEditor view(graph);
@@ -2022,6 +2037,9 @@ public:
     // with.
     llvm::SmallVector<mlir::Operation *> norms;
     llvm::DenseMap<mlir::Operation *, int64_t> dsOfNorm;
+    llvm::DenseMap<mlir::Operation *, int64_t> batchOfNorm;
+    llvm::DenseMap<mlir::Operation *, int64_t> dimOfNorm;
+    llvm::DenseMap<mlir::Operation *, bool> ownExtentOfNorm;
     llvm::DenseMap<mlir::Operation *, int64_t> outOfNorm;
     llvm::DenseMap<mlir::Operation *, uint64_t> q8BytesOfNorm;
     llvm::DenseMap<mlir::Operation *, llvm::SmallVector<mlir::Operation *>>
@@ -2032,15 +2050,19 @@ public:
           node.getNumOperands() != 1 || node.getNumResults() == 0)
         continue;
       auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
-      auto nb = nodeAttrInt(attrs, "batch");
-      auto dim = nodeAttrInt(attrs, "dim");
-      if (!nb || !dim || *nb <= 0 || *dim <= 0)
-        continue;
+      // The prefill graph states the extent on the norm itself; the
+      // decode/verify graph states it on the matmuls it feeds (the emitter
+      // stamps the matmuls). Either way the norm and its consumers must agree.
+      const auto nb = nodeAttrInt(attrs, "batch");
+      const auto dim = nodeAttrInt(attrs, "dim");
+      const bool haveOwn = nb && dim && *nb > 0 && *dim > 0;
       const int64_t out = GraphEditor::resultIds(node)[0];
       auto found = consumers.find(out);
       if (found == consumers.end() || found->second.empty())
         continue;
 
+      int64_t batch = haveOwn ? *nb : 0;
+      int64_t width = haveOwn ? *dim : 0;
       int64_t ds = -1;
       llvm::SmallVector<mlir::Operation *> matmuls;
       bool ok = true;
@@ -2053,8 +2075,21 @@ public:
         }
         auto cAttrs = consumer->getAttrOfType<mlir::ArrayAttr>("node_attrs");
         auto cnb = nodeAttrInt(cAttrs, "batch");
+        auto cdim = nodeAttrInt(cAttrs, "dim");
         auto cds = nodeAttrInt(cAttrs, "ds");
-        if (!cnb || *cnb != *nb || !cds) {
+        if (!cnb || *cnb <= 0 || !cdim || *cdim <= 0 || !cds) {
+          ok = false;
+          break;
+        }
+        if (batch == 0)
+          batch = *cnb;
+        else if (batch != *cnb) {
+          ok = false;
+          break;
+        }
+        if (width == 0)
+          width = *cdim;
+        else if (width != *cdim) {
           ok = false;
           break;
         }
@@ -2072,19 +2107,26 @@ public:
         }
         matmuls.push_back(consumer);
       }
-      if (!ok)
+      if (!ok || batch <= 0 || width <= 0)
+        continue;
+      // The reference quantizer writes whole 128-element blocks.
+      if (width % 128 != 0)
         continue;
 
       // The f32 norm output has to cover the mmq activation buffer, tail guard
-      // included (rewrites.cpp:383-385).
+      // included (rewrites.cpp:383-385), unless the caller allowed the pass to
+      // grow it.
       const boom::TensorDescAttr desc = view.desc(out);
-      if (!mmqQ8Fits(*dim, *nb, desc.getByteSize()))
+      if (!allow_grow_ && !mmqQ8Fits(width, batch, desc.getByteSize()))
         continue;
 
       norms.push_back(&node);
       dsOfNorm.insert({&node, ds});
+      batchOfNorm.insert({&node, batch});
+      dimOfNorm.insert({&node, width});
+      ownExtentOfNorm.insert({&node, haveOwn});
       outOfNorm.insert({&node, out});
-      q8BytesOfNorm.insert({&node, mmqActivationBytes(*dim, *nb)});
+      q8BytesOfNorm.insert({&node, mmqActivationBytes(width, batch)});
       matmulsOfNorm.insert({&node, std::move(matmuls)});
     }
 
@@ -2096,10 +2138,21 @@ public:
       const auto outType =
           mlir::cast<boom::TensorType>(norm->getResult(0).getType());
 
-      // The `ds` the mmq activation layout is selected by, appended to the
-      // attribute record (rewrites.cpp:407).
+      // The extent and the `ds` the mmq activation layout is selected by,
+      // appended to the attribute record (rewrites.cpp:407). A graph that
+      // stated the extent on the norm itself already carries batch/dim; the
+      // decode/verify graph states it on the matmuls, so the fused producer
+      // takes the extent resolved from them — the producer has to write the
+      // same mmq activation its consumers read.
       llvm::SmallVector<mlir::Attribute> nodeAttrs(
           norm->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      if (!ownExtentOfNorm.lookup(norm)) {
+        nodeAttrs.push_back(boom::NodeAttr::get(
+            view.ctx(), "batch",
+            builder.getI64IntegerAttr(batchOfNorm.lookup(norm))));
+        nodeAttrs.push_back(boom::NodeAttr::get(
+            view.ctx(), "dim", builder.getI64IntegerAttr(dimOfNorm.lookup(norm))));
+      }
       nodeAttrs.push_back(boom::NodeAttr::get(
           view.ctx(), "ds",
           builder.getI64IntegerAttr(dsOfNorm.lookup(norm))));
@@ -2158,6 +2211,9 @@ public:
     // unchanged. The pass changes what the graph *says*, not what it holds.
     view.commitTable();
   }
+
+private:
+  bool allow_grow_;
 };
 
 // fuse_act_mul_mmq_pass (rewrites.cpp:421), as a Boom IR pass: the shared body
@@ -2179,7 +2235,7 @@ public:
 // through, so the wrapper does (an empty shape should not be reachable — it
 // would mean the graph cannot be represented as Boom IR at all).
 bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
-                   planner::OpKind fused) {
+                   planner::OpKind fused, bool allow_grow = false) {
   GraphEditor view(graph);
   mlir::OpBuilder builder(view.ctx());
   const mlir::Location loc = graph.getLoc();
@@ -2243,8 +2299,10 @@ bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
     // The Mul's f32 output is the buffer the fused node reuses as the q8_1
     // activation, so it is that buffer the fit is checked against
     // (rewrites.cpp:475-477).
+    if (*dim % 128 != 0)
+      continue;  // the reference quantizer writes whole 128-element blocks
     const boom::TensorDescAttr ft = view.desc(GraphEditor::resultIds(*mul)[0]);
-    if (!mmqQ8Fits(*dim, *nb, ft.getByteSize()))
+    if (!allow_grow && !mmqQ8Fits(*dim, *nb, ft.getByteSize()))
       continue;
 
     acts.push_back(a);
@@ -2341,11 +2399,18 @@ class GeluMulMmqPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GeluMulMmqPass)
 
+  // See RmsNormMmqPass's `allow_grow`: the decode/verify graph's activation
+  // buffer is smaller than the mmq layout and the pass resizes it.
+  explicit GeluMulMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
+
   void runOnOperation() override {
     if (!fuseActMulMmq(getOperation(), planner::OpKind::GeluFp16,
-                       planner::OpKind::GeluMulQuantize))
+                       planner::OpKind::GeluMulQuantize, allow_grow_))
       signalPassFailure();
   }
+
+private:
+  bool allow_grow_;
 };
 
 // fuse_silu_mul_mmq_pass (rewrites.cpp:535), as a Boom IR pass: the same
@@ -2355,11 +2420,16 @@ class SiluMulMmqPass
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SiluMulMmqPass)
 
+  explicit SiluMulMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
+
   void runOnOperation() override {
     if (!fuseActMulMmq(getOperation(), planner::OpKind::Silu,
-                       planner::OpKind::SiluMulQuantize))
+                       planner::OpKind::SiluMulQuantize, allow_grow_))
       signalPassFailure();
   }
+
+private:
+  bool allow_grow_;
 };
 
 // scale_into_dense_pass (step 10c): a scalar `scale` that reads the only output
@@ -3009,7 +3079,8 @@ bool parseDisabledPasses(DisabledPasses &out) {
 // place in the order and with its preconditions. Both phases run entirely here,
 // and the Graph rewrites are gone, so this is the emitter's only rewrite path.
 void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
-               bool skip_kv_append_fusion, bool fuse_silu_mul) {
+               bool skip_kv_append_fusion, bool fuse_silu_mul,
+               bool rows_mmq) {
   DisabledPasses off;
   // A rejected list disables nothing: running the phase with no passes would
   // leave the graph unfused, and an ablation run would then report that as the
@@ -3026,6 +3097,18 @@ void addPasses(mlir::PassManager &pm, planner::IrPassPhase phase,
     off.fuse_kv_append_into_prep = true;
     [[fallthrough]];
   case planner::IrPassPhase::Decode:
+    // The decode/verify graph's matmuls carry the prefill lowering's attributes
+    // (the emitter writes them when the step runs on the mmq matmul): the same
+    // producer fusions run first, at this step's row count, and the decode
+    // passes below then leave those nodes alone (`batch` is their marker).
+    if (rows_mmq) {
+      if (!off.rms_norm_mmq)
+        pm.addPass(std::make_unique<RmsNormMmqPass>(/*allow_grow=*/true));
+      if (!off.gelu_mul_mmq)
+        pm.addPass(std::make_unique<GeluMulMmqPass>(/*allow_grow=*/true));
+      if (!off.silu_mul_mmq)
+        pm.addPass(std::make_unique<SiluMulMmqPass>(/*allow_grow=*/true));
+    }
     if (!off.quantize_once) pm.addPass(std::make_unique<QuantizeOncePass>());
     if (!off.rms_norm_quantize) pm.addPass(std::make_unique<RmsNormQuantizePass>());
     if (!off.gelu_mul_quantize) pm.addPass(std::make_unique<GeluMulQuantizePass>());
@@ -3188,7 +3271,8 @@ int vram_threshold_mb() {
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
-                   bool skip_kv_append_fusion, bool fuse_silu_mul) {
+                   bool skip_kv_append_fusion, bool fuse_silu_mul,
+                   bool rows_mmq) {
   // The unit of meaning in this IR is the graph, not the module that holds it
   // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
   // IsolatedFromAbove, which is what makes it a pass anchor at all.
@@ -3204,7 +3288,7 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
   // a state the dialect rejects fails here, naming that pass, rather than three
   // passes later.
   mlir::PassManager pm(module.getContext());
-  addPasses(pm, phase, skip_kv_append_fusion, fuse_silu_mul);
+  addPasses(pm, phase, skip_kv_append_fusion, fuse_silu_mul, rows_mmq);
   if (mlir::failed(pm.run(graphOp))) {
     std::fprintf(stderr,
                  "runBoomPasses(%s): a Boom IR pass failed (diagnostic "

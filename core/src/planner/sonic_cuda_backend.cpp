@@ -1195,7 +1195,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A node stamped `batch` (the prefill plan, or a decode/verify step running
+      // on the mmq matmul) takes the batched form even when it also carries the
+      // row count: the two attributes describe the same positions.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify without a quantize fusion (rare: the pipeline quantizes every
         // activation feeding a matmul): quantize all rows in one launch and run
         // the row-invariant batched gemv. When the q8_1 path is disabled the
@@ -1212,7 +1215,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                              out + r * rows);
         }
       } else if (batch_attr(nb)) {
-        ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
+        // `mmq_rows` marks a decode/verify step on the mmq matmul whose
+        // activation has no fused producer (the attention output, and the
+        // weight types without an mmq quantize emitter): the activation is
+        // quantized inside the mmq call. The mmq call is used at n == 1 too —
+        // the batched matmul's per-column arithmetic is its n == 1 arithmetic,
+        // so the decode step and every verify row agree by construction.
+        int64_t mmq_rows = 0;
+        if (attr_i(*node, "mmq_rows", mmq_rows))
+          ok = quant::cuda::matmul_mmq_dev(qweight(slot), dev(in[0]), out,
+                                           int(nb));
+        else
+          ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out,
+                                           int(nb));
       } else {
         ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
       }
@@ -1269,7 +1284,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A `batch` node (a decode/verify step on the mmq matmul) takes the
+      // batched mmq form below; only the batched gemv path is the verify form.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify: the row-invariant batched mmvq over k+1 positions (B2: the
         // batched kernel's per-position arithmetic is the single-column gemv's).
         // The bias/residual folds are elementwise epilogues here, which store
@@ -1509,7 +1526,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // `ds`) emits a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A `batch` node (a decode/verify step on the mmq matmul) takes the
+      // batched mmq form below; only the per-row q8_1 form is the verify form.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify: one decode norm+quantize per row into that row's contiguous
         // q8_1 blocks, so the following batched mmvq reads [rows, cols/32].
         if (vr <= 0) { ok = false; break; }

@@ -243,14 +243,23 @@ planner::Graph lower_graph(mlir::ModuleOp module,
 planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite,
                            uint64_t dynamic_extent = 0,
                            bool skip_kv_append_fusion = false,
-                           bool fuse_silu_mul = false) {
+                           bool fuse_silu_mul = false,
+                           bool rows_mmq = false) {
   if (!ir.module)
     return {};
   if (rewrite &&
       !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
-                               fuse_silu_mul))
+                               fuse_silu_mul, rows_mmq))
     return {};
   return lower_graph(*ir.module, dynamic_extent);
+}
+
+// Decode and verify on the mmq matmul: an explicit opt-in that switches both
+// graphs together (they are emitted by the same function), and that requires
+// the q8_1 dispatcher and the mmq kernel the lowering produces.
+bool decode_mmq_enabled() {
+  return quant::cuda::mmq_up_decode_enabled() && quant::cuda::q8_1_enabled() &&
+         quant::cuda::mmq_enabled();
 }
 
 }  // namespace
@@ -309,6 +318,28 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     kv_handles[l] = b.kv(l);
 
   const BlockProfile prof = profile_for(cfg);
+
+  // Decode/verify on the mmq matmul (SONICBOOM_DECODE_MMQ): every quantized
+  // matmul carries the same lowering attributes the prefill emitter writes —
+  // the extent, the input width, and the activation scale layout of the weight
+  // type — so the prefill producer fusions and the mmq matmul dispatch apply at
+  // this step's row count. `ds` = -1 marks a weight type with no fused mmq
+  // quantize (Q6_K); its matmul quantizes the activation inside the mmq call.
+  // `mmq_rows` selects that mmq matmul for an activation with no fused
+  // producer.
+  const bool mmq_rows = decode_mmq_enabled();
+  auto mmq_a = [&](std::vector<sx::Attribute> &a, quant::QuantType qt,
+                   uint64_t in_w) {
+    if (!mmq_rows) return;
+    const int64_t ds =
+        (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
+        : (qt == quant::QuantType::Q6_K)                               ? -1
+                                                                       : 0;
+    a.push_back(attr_i("batch", int64_t(rows)));
+    a.push_back(attr_i("dim", int64_t(in_w)));
+    a.push_back(attr_i("ds", ds));
+    a.push_back(attr_i("mmq_rows", int64_t(1)));
+  };
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
@@ -410,8 +441,10 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     // (24..41) attend over their donor layer's cache instead.
     mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::AttnNorm)});
+    std::vector<sx::Attribute> q_attrs = {layer_a(l), slot(WeightSlot::AttnQ)};
+    mmq_a(q_attrs, m.weights.blocks[l].attn_q.type(), d);
     mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
-                        {layer_a(l), slot(WeightSlot::AttnQ)});
+                        q_attrs);
     if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
       q = b.node(OpKind::AddBias, {q}, "qb" + suff, {int64_t(qw)},
                  {layer_a(l), slot(WeightSlot::AttnQBias)});
@@ -422,10 +455,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
 
     mlir::Value attn;
     if (cfg.has_kv(l)) {
+      std::vector<sx::Attribute> k_attrs = {layer_a(l), slot(WeightSlot::AttnK)};
+      mmq_a(k_attrs, m.weights.blocks[l].attn_k.type(), d);
+      std::vector<sx::Attribute> v_attrs = {layer_a(l), slot(WeightSlot::AttnV)};
+      mmq_a(v_attrs, m.weights.blocks[l].attn_v.type(), d);
       mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
-                          {layer_a(l), slot(WeightSlot::AttnK)});
+                          k_attrs);
       mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
-                          {layer_a(l), slot(WeightSlot::AttnV)});
+                          v_attrs);
       if (prof.proj_bias) {
         k = b.node(OpKind::AddBias, {k}, "kb" + suff, {int64_t(kvw)},
                    {layer_a(l), slot(WeightSlot::AttnKBias)});
@@ -451,8 +488,11 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
                     {int64_t(qw)}, attn_attrs(l));
     }
 
+    std::vector<sx::Attribute> ap_attrs = {layer_a(l),
+                                           slot(WeightSlot::AttnOutput)};
+    mmq_a(ap_attrs, m.weights.blocks[l].attn_output.type(), qw);
     mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::AttnOutput)});
+                         ap_attrs);
     if (prof.attn_out_bias)
       ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, {int64_t(d)},
                   {layer_a(l), slot(WeightSlot::AttnOutputBias)});
@@ -466,18 +506,26 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     // --- gated feed-forward ------------------------------------------------
     mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::FfnNorm)});
+    std::vector<sx::Attribute> up_attrs = {layer_a(l), slot(WeightSlot::FfnUp)};
+    mmq_a(up_attrs, m.weights.blocks[l].ffn_up.type(), d);
+    std::vector<sx::Attribute> gate_attrs = {layer_a(l),
+                                             slot(WeightSlot::FfnGate)};
+    mmq_a(gate_attrs, m.weights.blocks[l].ffn_gate.type(), d);
     mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
-                         {layer_a(l), slot(WeightSlot::FfnUp)});
+                         up_attrs);
     mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
-                           {layer_a(l), slot(WeightSlot::FfnGate)});
+                           gate_attrs);
     gate = prof.silu_ffn
                ? b.node(OpKind::Silu, {gate}, "silu" + suff, {int64_t(ff)}, {layer_a(l)})
                : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)},
                         {layer_a(l)});
     mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
                          {layer_a(l)});
+    std::vector<sx::Attribute> fo_attrs = {layer_a(l),
+                                           slot(WeightSlot::FfnDown)};
+    mmq_a(fo_attrs, m.weights.blocks[l].ffn_down.type(), ff);
     mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::FfnDown)});
+                         fo_attrs);
     mlir::Value f2 = prof.post_ffw_norm
                       ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
                                {layer_a(l), slot(WeightSlot::PostFfwNorm)})
@@ -519,9 +567,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   // --- lm head -------------------------------------------------------------
   mlir::Value hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
                        {slot(WeightSlot::OutputNorm)});
+  const WeightSlot out_slot =
+      prof.tied_output ? WeightSlot::TokenEmbd : WeightSlot::Output;
+  const quant::QuantType out_qt =
+      prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
+  std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
+  mmq_a(logits_attrs, out_qt, d);
   mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
-                           {slot(prof.tied_output ? WeightSlot::TokenEmbd
-                                                  : WeightSlot::Output)});
+                           logits_attrs);
 
   // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
   // change argmax — skip it and reduce the [vocab] logits to a single index on
@@ -3390,7 +3443,9 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   auto rt = std::make_unique<DecodeRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_enabled());
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
   // exactly as it was; the clone is discarded once the desc is extracted. A
@@ -3696,7 +3751,9 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
   auto rt = std::make_unique<SampledRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_enabled());
   if (rt->graph.nodes.empty()) return nullptr;
   if (!append_sample_select_tail(rt->graph, m.config.vocab_size)) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
@@ -4023,7 +4080,9 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   auto rt = std::make_unique<VerifyRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true, uint64_t(rows));
   rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_enabled());
   if (rt->graph.nodes.empty()) return nullptr;
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -5487,7 +5546,9 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
                               /*softcap_output=*/!raw_logits);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_enabled());
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);
