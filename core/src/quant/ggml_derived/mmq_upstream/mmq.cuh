@@ -1071,7 +1071,7 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx) {
+        const uint3 ntx, const int nsplit) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config<CFG>(type, J, fallback, prec_src1).type == GGML_TYPE_COUNT) {
@@ -1103,6 +1103,49 @@ static __global__ void mul_mat_q(
     __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k<CFG>(type, J, fallback, prec_src1)) {
+        // SonicBoom: split-K.  blockIdx.z is the slice index, each slice runs
+        // the regular per-tile body over a contiguous range of K tiles and
+        // writes its float partials to tmp_fixup ([S][ncols_dst][nrows_dst],
+        // column-major).  A separate kernel sums the slices in index order.
+        // Only the 2-D, single-sample, single-channel calls use this path.
+        if (nsplit > 1) {
+            constexpr int ITER_K        = ggml_cuda_mmq_get_K_vram<CFG>(type, J, fallback, prec_src1);
+            constexpr int blocks_per_iter = ITER_K / qk;
+
+            const int s  = blockIdx.z;
+            const int jt = blockIdx.y;
+            const int it = blockIdx.x;
+
+            const int nblocks = blocks_per_ne00.z;
+            const int ntiles  = (nblocks + blocks_per_iter - 1) / blocks_per_iter;
+            const int tile_start = (int)(int64_t(s)    *ntiles / nsplit);
+            const int tile_stop  = (int)(int64_t(s + 1)*ntiles / nsplit);
+            if (tile_start >= tile_stop) {
+                return;
+            }
+            const int kb0_start = tile_start*blocks_per_iter;
+            const int kb0_stop  = min(tile_stop*blocks_per_iter, nblocks);
+
+            float * part = tmp_fixup + size_t(s)*ncols_dst*stride_col_dst + jt*J*stride_col_dst + it*I;
+
+            const int tile_x_max_i = nrows_x   - it*I - 1;
+            const int tile_y_max_j = ncols_dst - jt*J - 1;
+            const int offset_x     = it*I*stride_row_x;
+            const int offset_y     = jt*J*(sizeof(block_q8_1_mmq)/sizeof(int));
+
+            const float * y_scale_tile = nullptr;
+            if constexpr (type == GGML_TYPE_NVFP4) {
+                y_scale_tile = y_scale ? y_scale + jt*J : nullptr;
+            }
+
+            constexpr bool fixup = false;
+            mul_mat_q_process_tile<type, J, fallback, fixup, prec_src1, CFG>
+                (x, offset_x, y + offset_y, ids_dst_shared, part, nullptr, y_scale_tile,
+                 stride_row_x, ncols_y, stride_col_dst,
+                 tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+            return;
+        }
+
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
@@ -1504,11 +1547,33 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
+// SonicBoom: sum the split-K partials [S][ncols_dst][nrows_dst] in slice order.
+// Every pair is combined by one f32 add, so the result is the sequential sum
+// (((p0 + p1) + p2) + ...).
+static __global__ void mul_mat_q_split_k_reduce(const float * __restrict__ part, float * __restrict__ dst,
+                                                const int64_t n_elem, const int nsplit) {
+    const int64_t idx = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (idx >= n_elem) {
+        return;
+    }
+    float acc = part[idx];
+    for (int s = 1; s < nsplit; ++s) {
+        acc = __fadd_rn(acc, part[int64_t(s)*n_elem + idx]);
+    }
+    dst[idx] = acc;
+}
+
 // SonicBoom: replaces `ggml_backend_cuda_context & ctx` with the plain
 // device-properties struct supplied by the host wrapper.  The launch geometry
 // and the stream-K logic are unchanged.
+//
+// nsplit > 1 splits the K tiles into nsplit contiguous slices (grid z extent)
+// and writes float partials to split_scratch; the caller sizes that buffer for
+// nsplit slices and must use the same tile configuration for every call that
+// shares it.  The scratch is only touched on the non-stream-K path.
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8, int CFG = 0>
-static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream) {
+static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream,
+                             const int nsplit = 1, float * split_scratch = nullptr) {
     const int cc = props.cc;
     const int nsm = props.nsm;
     const int warp_size = props.warp_size;
@@ -1540,13 +1605,43 @@ static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args,
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    // SonicBoom: effective split count, capped at the number of K tiles so
+    // every slice holds at least one tile.
+    int split_k_eff = 1;
+    if (nsplit > 1 && split_scratch != nullptr) {
+        const int blocks_per_iter = config.K_vram / ggml_cuda_type_traits<type>::qk;
+        const int nblocks         = (int)(args.ncols_x / ggml_cuda_type_traits<type>::qk);
+        const int ntiles          = (nblocks + blocks_per_iter - 1) / blocks_per_iter;
+        split_k_eff = nsplit < ntiles ? nsplit : ntiles;
+        if (split_k_eff < 2) {
+            split_k_eff = 1;
+        }
+    }
+
     if (!config.stream_k) {
+        if (split_k_eff > 1) {
+            const dim3 block_nums_split(nty, ntx, split_k_eff);
+            mul_mat_q<type, J, fallback, prec_src1, CFG><<<block_nums_split, block_dims, nbytes_shared, stream>>>
+                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, split_scratch, args.y_scale,
+                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+                 ntx_fd, split_k_eff);
+
+            const int64_t n_elem = int64_t(args.nrows_dst)*int64_t(args.ncols_dst);
+            const int     reduce_threads = 256;
+            const int64_t reduce_blocks  = (n_elem + reduce_threads - 1) / reduce_threads;
+            mul_mat_q_split_k_reduce<<<(unsigned)reduce_blocks, reduce_threads, 0, stream>>>
+                (split_scratch, args.dst, n_elem, split_k_eff);
+            return;
+        }
+
         mul_mat_q<type, J, fallback, prec_src1, CFG><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd);
+             ntx_fd, 1);
         return;
     }
 
@@ -1575,7 +1670,7 @@ static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, 1);
 
     if (!fixup_needed) {
         return;
@@ -1592,7 +1687,7 @@ template <ggml_type type, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 // SonicBoom: plain device-properties parameter replaces the ggml context.
 // cfg selects a small-n tile configuration among the MMQ_CFG_COUNT candidates;
 // 0 is the imported table.  SONICBOOM_MMQ_CFG overrides it for testing.
-void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg) {
+void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) {
     const int    cc    = props.cc;
     const size_t smpbo = props.smpbo;
 
@@ -1654,13 +1749,13 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
 
 #define SB_MMQ_LAUNCH_CFG(J_)                                                                  \
     switch (cfg_eff) {                                                                         \
-        case 1: launch_mul_mat_q<type, J_, fallback, prec_src1, 1>(props, args, stream); break; \
-        case 2: launch_mul_mat_q<type, J_, fallback, prec_src1, 2>(props, args, stream); break; \
-        case 3: launch_mul_mat_q<type, J_, fallback, prec_src1, 3>(props, args, stream); break; \
-        case 4: launch_mul_mat_q<type, J_, fallback, prec_src1, 4>(props, args, stream); break; \
-        case 5: launch_mul_mat_q<type, J_, fallback, prec_src1, 5>(props, args, stream); break; \
-        case 6: launch_mul_mat_q<type, J_, fallback, prec_src1, 6>(props, args, stream); break; \
-        default: launch_mul_mat_q<type, J_, fallback, prec_src1, 0>(props, args, stream); break; \
+        case 1: launch_mul_mat_q<type, J_, fallback, prec_src1, 1>(props, args, stream, nsplit, split_scratch); break; \
+        case 2: launch_mul_mat_q<type, J_, fallback, prec_src1, 2>(props, args, stream, nsplit, split_scratch); break; \
+        case 3: launch_mul_mat_q<type, J_, fallback, prec_src1, 3>(props, args, stream, nsplit, split_scratch); break; \
+        case 4: launch_mul_mat_q<type, J_, fallback, prec_src1, 4>(props, args, stream, nsplit, split_scratch); break; \
+        case 5: launch_mul_mat_q<type, J_, fallback, prec_src1, 5>(props, args, stream, nsplit, split_scratch); break; \
+        case 6: launch_mul_mat_q<type, J_, fallback, prec_src1, 6>(props, args, stream, nsplit, split_scratch); break; \
+        default: launch_mul_mat_q<type, J_, fallback, prec_src1, 0>(props, args, stream, nsplit, split_scratch); break; \
     }
 
     switch (J_best) {
@@ -1671,46 +1766,46 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
             SB_MMQ_LAUNCH_CFG( 16);
             break;
         case  24:
-            launch_mul_mat_q<type,  24, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  24, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  32:
-            launch_mul_mat_q<type,  32, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  32, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  40:
-            launch_mul_mat_q<type,  40, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  40, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  48:
-            launch_mul_mat_q<type,  48, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  48, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  56:
-            launch_mul_mat_q<type,  56, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  56, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  64:
-            launch_mul_mat_q<type,  64, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  64, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  72:
-            launch_mul_mat_q<type,  72, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  72, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  80:
-            launch_mul_mat_q<type,  80, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  80, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  88:
-            launch_mul_mat_q<type,  88, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  88, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case  96:
-            launch_mul_mat_q<type,  96, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type,  96, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case 104:
-            launch_mul_mat_q<type, 104, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type, 104, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case 112:
-            launch_mul_mat_q<type, 112, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type, 112, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case 120:
-            launch_mul_mat_q<type, 120, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type, 120, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         case 128:
-            launch_mul_mat_q<type, 128, fallback, prec_src1>(props, args, stream);
+            launch_mul_mat_q<type, 128, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
@@ -1722,24 +1817,25 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
 
 // SonicBoom: plain device-properties parameter replaces the ggml context.
 template <ggml_type type, ggml_prec prec_src1 = GGML_PREC_Q8>
-void mul_mat_q_case(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg = 0) {
+void mul_mat_q_case(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg = 0,
+                      int nsplit = 1, float * split_scratch = nullptr) {
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
-        mul_mat_q_switch_J<type, fallback, prec_src1>(props, args, stream, cfg);
+        mul_mat_q_switch_J<type, fallback, prec_src1>(props, args, stream, cfg, nsplit, split_scratch);
     } else {
         constexpr bool fallback = true;
-        mul_mat_q_switch_J<type, fallback, prec_src1>(props, args, stream, cfg);
+        mul_mat_q_switch_J<type, fallback, prec_src1>(props, args, stream, cfg, nsplit, split_scratch);
     }
 }
 
 // SonicBoom: the explicit instantiation signature follows the plain
 // device-properties parameter.
 #define DECL_MMQ_CASE(type)                                                        \
-    template void mul_mat_q_case<type>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg) \
+    template void mul_mat_q_case<type>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
 
 // SonicBoom: the FP4/W4A4 instantiations are not part of this import.
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
-    template void mul_mat_q_case<type, GGML_PREC_Q4>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg) \
+    template void mul_mat_q_case<type, GGML_PREC_Q4>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
 
 // SonicBoom: only the six quant types used by SonicBoom are instantiated.
 // Upstream puts these definitions in ggml-cuda/template-instances/*.cu; this

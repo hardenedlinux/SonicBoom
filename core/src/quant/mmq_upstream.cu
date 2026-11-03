@@ -99,64 +99,112 @@ int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const sb_cuda_props
     return J_best;
 }
 
+// SonicBoom: device buffer for split-K partials, [split_k][n][M] float.
+// Grown on demand and reused; the largest call seen determines the size, so
+// the first call for a shape must run before CUDA graph capture.
+float * split_scratch_get(size_t bytes) {
+    static std::mutex mutex;
+    static float * ptr = nullptr;
+    static size_t capacity = 0;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (bytes > capacity) {
+        if (ptr != nullptr) {
+            CUDA_CHECK(cudaFree(ptr));
+            ptr = nullptr;
+        }
+        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        capacity = bytes;
+    }
+    return ptr;
+}
+
 // SonicBoom: build the 2-D, non-MoE mmq_args mapping used by upstream
 // ggml_cuda_mul_mat_q()'s non-ids branch:
 //   nchannels_x = nchannels_y = nsamples_x = nsamples_y = 1,
 //   ncols_x = K, nrows_x = M, ncols_dst = n, ncols_y = n, nrows_dst = M,
 //   stride_row_x = K/qk, ncols_max = ncols_opt = n.
+//
+// split_k > 1 runs the K tiles in split_k slices through the partial buffer.
+// Columns beyond 16 are processed 16 at a time with the same partial buffer,
+// which keeps every column's split identical to the n = 16 call.
 template <ggml_type type>
 bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
-             int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg) {
+             int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg,
+             int split_k) {
     const sb_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int y_block_ints = sizeof(block_q8_1_mmq) / sizeof(int);
     const bool fallback = M % 128 != 0;
 
     const ggml_type gtype = type;
 
-    // SonicBoom: the configuration table disables stream-K (it splits K by the
-    // total tile count, which depends on n); reject the launch if a config ever
-    // selects it.
-    const int J_best = pick_J(gtype, fallback, n, props);
-    if (J_best == 0) {
-        return false;
-    }
-    if (ggml_cuda_mmq_get_config(gtype, J_best, fallback, props.cc).stream_k) {
-        return false;
-    }
+    // Launch columns [n_lo, n_lo + n_cnt) of the output.  ncols_y stays the
+    // full column count: it is the row stride of the y block layout.
+    const auto launch_range = [&](int64_t n_lo, int64_t n_cnt) -> bool {
+        // SonicBoom: the configuration table disables stream-K (it splits K by
+        // the total tile count, which depends on n); reject the launch if a
+        // config ever selects it.
+        const int J_best = pick_J(gtype, fallback, n_cnt, props);
+        if (J_best == 0) {
+            return false;
+        }
+        if (ggml_cuda_mmq_get_config(gtype, J_best, fallback, props.cc).stream_k) {
+            return false;
+        }
 
-    const mmq_args args = {
-        (const char *) weights, gtype, (const int *) y_q8, nullptr, nullptr, dst, nullptr,
-        K, M, n, K / qk, n, M,
-        1, 1, 0, 0, 0,
-        1, 1, 0, 0, 0,
-        n, n};
+        float * scratch = nullptr;
+        if (split_k > 1) {
+            scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n_cnt) *
+                                        sizeof(float));
+        }
 
-    mul_mat_q_case<type>(props, args, stream, cfg);
-    CUDA_CHECK(cudaGetLastError());
-    return true;
+        const mmq_args args = {
+            (const char *) weights, gtype, (const int *) y_q8 + n_lo * y_block_ints,
+            nullptr, nullptr, dst + n_lo * M, nullptr,
+            K, M, n_cnt, K / qk, n, M,
+            1, 1, 0, 0, 0,
+            1, 1, 0, 0, 0,
+            n_cnt, n_cnt};
+
+        mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    };
+
+    if (split_k > 1 && n > 16) {
+        for (int64_t c0 = 0; c0 < n; c0 += 16) {
+            const int64_t n_cnt = n - c0 < 16 ? n - c0 : 16;
+            if (!launch_range(c0, n_cnt)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return launch_range(0, n);
 }
 
 }  // namespace
 
 bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    float * dst, int64_t M, int64_t K, int64_t n,
-                   cudaStream_t stream, int cfg) {
+                   cudaStream_t stream, int cfg, int split_k) {
     if (weights == nullptr || y_q8 == nullptr || dst == nullptr) {
         return false;
     }
-    if (M <= 0 || K <= 0 || n <= 0 || K % 128 != 0) {
+    if (M <= 0 || K <= 0 || n <= 0 || split_k <= 0 || K % 128 != 0) {
         return false;
     }
 
     const ggml_type gtype = to_ggml_type(type);
     switch (gtype) {
-        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream, cfg);
-        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream, cfg);
-        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream, cfg);
-        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg);
-        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg);
-        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg);
+        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
         default:             return false;
     }
 }
