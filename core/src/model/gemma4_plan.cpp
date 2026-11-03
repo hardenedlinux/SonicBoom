@@ -2762,6 +2762,24 @@ static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
                                   int rows,
                                   const planner::KvCacheSession& session);
 
+// spec-r3 measurement knobs. Both are read once; unset keeps today's
+// behaviour, so neither changes the engine unless explicitly set.
+static bool spec_force_plain() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_FORCE_PLAIN");
+    return e != nullptr && std::string_view(e) == "1";
+  }();
+  return v;
+}
+
+static bool spec_time_steps() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_TIME_STEPS");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  return v;
+}
+
 static uint64_t run_spec_program_steps(
     const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
@@ -3002,6 +3020,15 @@ static uint64_t run_spec_program_steps(
                              &match_n);
     }
 
+    // spec-r3: force every adaptive iteration to the plain path.
+    if (adaptive && spec_force_plain()) {
+      k = 0;
+      warm = false;
+      measure = false;
+      finish_warm = false;
+      bootstrap_iter = false;
+    }
+
     if (k == 0) {
       // The plain step is exactly the spec-off loop's one-decode-step
       // function, with the fed token seeded into the device slot (the token
@@ -3013,7 +3040,7 @@ static uint64_t run_spec_program_steps(
         break;
       }
       const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed,
-                                       nullptr, /*time_step=*/true);
+                                       nullptr, spec_time_steps());
       if (next < 0) {
         std::cerr << "[spec] the k == 0 decode step failed at position " << L
                   << "\n";
@@ -3021,7 +3048,7 @@ static uint64_t run_spec_program_steps(
       }
       // The step's readback has drained its replay, so the event pair is
       // complete; reading it never waits. A plain step prices c(0).
-      if (adaptive && !warm) {
+      if (adaptive && !warm && spec_time_steps()) {
         double ms = 0.0;
         if (hal::StepProgram* sp = rt.step_at(L);
             sp && sp->timing_read(&ms)) {
