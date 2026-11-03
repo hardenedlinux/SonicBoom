@@ -229,6 +229,7 @@ struct ggml_cuda_mmq_config {
 
 };
 
+// SonicBoom: stream-K splits K by the total tile count, which depends on n; forbidden (column invariance)
 #define CASE(type_, nthreads_, occupancy_, I_, J_, sram_layout_, K_vram_, stream_k_, fallback_)                                           \
     if (type == (type_) && J == (J_) && fallback == (fallback_)) {                                                                        \
         static_assert((nthreads_) %  32 == 0 && (nthreads_)       <= 512, "bad nthreads");                                                \
@@ -236,7 +237,7 @@ struct ggml_cuda_mmq_config {
         static_assert((I_)        %  32 == 0,                             "bad I");                                                       \
         static_assert((J_)        %   8 == 0,                             "bad J");                                                       \
         static_assert((K_vram_)   % 256 == 0,                             "bad K_vram");                                                  \
-        return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), (stream_k_), (fallback_)); \
+        return ggml_cuda_mmq_config((type_), (nthreads_), (occupancy_), (I_), (J_), (sram_layout_), (K_vram_), /*stream_k=*/false, (fallback_)); \
     }                                                                                                                                     \
 
 // SonicBoom: only the Ampere MMQ configuration is imported and only sm_86 is
@@ -1558,6 +1559,17 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
             ntiles_J_best = ntiles_x;
+        }
+    }
+
+    // SonicBoom: debug override that forces one tile width so the column
+    // invariance test can exercise every J; unset in production.
+    if (const char * j_env = getenv("SONICBOOM_MMQ_J")) {
+        const int J_forced = atoi(j_env);
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J_forced, fallback, cc, prec_src1);
+        if (J_forced >= 8 && J_forced <= 128 && J_forced % 8 == 0 &&
+            config.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(config, cc) <= smpbo) {
+            J_best = J_forced;
         }
     }
 

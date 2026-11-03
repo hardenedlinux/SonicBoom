@@ -14,17 +14,20 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 //
-// This translation unit instantiates the imported ggml MMQ kernels (MIT,
-// see the files under ggml_derived/mmq_upstream/ and NOTICE).  It is a new,
-// currently-unused entry point; it does not alter any production dispatch.
+// This translation unit instantiates the imported ggml MMQ kernels (MIT, see
+// the files under ggml_derived/mmq_upstream/ and NOTICE) and exposes them
+// through plain-pointer entry points.  cuda_quant_matmul.cu runs the batch
+// matmul and its activation quantize through these entry points.
 
 #include "mmq_upstream.h"
 
 #include "ggml_derived/mmq_upstream/mmq.cuh"
 #include "ggml_derived/mmq_upstream/quantize_mmq_upstream.cuh"
 
+#include <atomic>
 #include <climits>
 #include <cstdint>
+#include <mutex>
 
 namespace sonicboom::quant::cuda {
 namespace {
@@ -42,20 +45,34 @@ ggml_type to_ggml_type(MmqUpType type) {
     return GGML_TYPE_COUNT;
 }
 
-// SonicBoom: plain replacement for ggml_cuda_info().devices[id].
+// SonicBoom: plain replacement for ggml_cuda_info().devices[id].  The
+// properties are queried once per device: cudaGetDeviceProperties costs
+// hundreds of microseconds, and a prefill calls the matmul thousands of times.
 sb_cuda_props get_props() {
+    static std::mutex mutex;
+    static std::atomic<int> cached_device{-1};
+    static sb_cuda_props cached{};
+
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
+    if (cached_device.load(std::memory_order_acquire) != device) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (cached_device.load(std::memory_order_relaxed) != device) {
+            cudaDeviceProp prop;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
-
-    sb_cuda_props props;
-    props.cc        = prop.major * 10 + prop.minor;
-    props.nsm       = prop.multiProcessorCount;
-    props.warp_size = prop.warpSize;
-    props.smpbo     = static_cast<int>(prop.sharedMemPerBlockOptin);
-    return props;
+            sb_cuda_props props;
+            // Upstream encodes the compute capability as 100*major + 10*minor
+            // (sm_86 -> 860); every GGML_CUDA_CC_* predicate expects that form.
+            props.cc        = 100 * prop.major + 10 * prop.minor;
+            props.nsm       = prop.multiProcessorCount;
+            props.warp_size = prop.warpSize;
+            props.smpbo     = static_cast<int>(prop.sharedMemPerBlockOptin);
+            cached = props;
+            cached_device.store(device, std::memory_order_release);
+        }
+    }
+    return cached;
 }
 
 // SonicBoom: the same J selection as mul_mat_q_switch_J(), used here only to
@@ -97,7 +114,9 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
 
     const ggml_type gtype = type;
 
-    // SonicBoom: the stream-K decomposition is not validated in this step.
+    // SonicBoom: the configuration table disables stream-K (it splits K by the
+    // total tile count, which depends on n); reject the launch if a config ever
+    // selects it.
     const int J_best = pick_J(gtype, fallback, n, props);
     if (J_best == 0) {
         return false;
@@ -161,6 +180,29 @@ bool mmq_up_quantize(const float * x, int32_t * y_q8, int64_t K, int64_t n,
                                /*ne1=*/static_cast<int>(n), stream);
     CUDA_CHECK(cudaGetLastError());
     return true;
+}
+
+bool mmq_up_j_allowed(MmqUpType type, int64_t M, int J) {
+    const ggml_type gtype = to_ggml_type(type);
+    if (gtype == GGML_TYPE_COUNT || M <= 0) {
+        return false;
+    }
+    if (J < 8 || J > 128 || J % 8 != 0) {
+        return false;
+    }
+    const sb_cuda_props props = get_props();
+    const bool fallback = M % 128 != 0;
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(gtype, J, fallback, props.cc);
+    return config.type != GGML_TYPE_COUNT &&
+           mmq_get_nbytes_shared(config, props.cc) <= size_t(props.smpbo);
+}
+
+int mmq_up_selected_j(MmqUpType type, int64_t M, int64_t n) {
+    const ggml_type gtype = to_ggml_type(type);
+    if (gtype == GGML_TYPE_COUNT || M <= 0 || n <= 0) {
+        return 0;
+    }
+    return pick_J(gtype, M % 128 != 0, n, get_props());
 }
 
 }  // namespace sonicboom::quant::cuda

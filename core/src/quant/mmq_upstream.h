@@ -28,8 +28,9 @@
 // type or API appears here: the entry points take raw pointers, integer
 // dimensions and a CUDA stream only.
 //
-// This is a new, currently-unused path (M1).  It does not replace or route any
-// existing production matmul; cuda_quant_matmul.cu's dispatch is untouched.
+// This is the batch (n >= 2) int8 tensor-core matmul for every quant format
+// cuda_quant_matmul.cu routes through MMQ, and the quantizer that produces its
+// block_q8_1_mmq activation.
 
 namespace sonicboom::quant::cuda {
 
@@ -52,16 +53,29 @@ enum class MmqUpType : int {
 //   dst:     [M][n] float32, column-major: dst[i + j*M].
 //
 // Returns false for an unsupported type, malformed dimensions, or when the
-// selected configuration uses the stream-K decomposition (not validated in
-// this step).
+// selected configuration uses the stream-K decomposition (the imported
+// configuration table disables it, so this is a guard only).
 bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    float * dst, int64_t M, int64_t K, int64_t n,
                    cudaStream_t stream);
 
 // Quantize x [n][K] (row-contiguous, row stride K) into the upstream
 // block_q8_1_mmq layout [K/128][n] blocks.  y_q8 must have room for
-// (K/128)*n + 128 blocks.  K must be a multiple of 128.
+// (K/128)*n + 128 blocks.  K must be a multiple of 128.  The bytes written are
+// the upstream quantize_mmq_q8_1 output for the same input.
 bool mmq_up_quantize(const float * x, int32_t * y_q8, int64_t K, int64_t n,
                      MmqUpType type, cudaStream_t stream);
+
+// Test-only helpers.  These query the imported configuration table; they do
+// not launch anything.
+//
+// True when the imported kernel has a configuration for this tile width that
+// fits the current device's shared-memory limit (the same test the launcher
+// applies before choosing J).
+bool mmq_up_j_allowed(MmqUpType type, int64_t M, int J);
+
+// The tile width the launcher would choose for an n-column call, or 0 when no
+// configuration fits.
+int mmq_up_selected_j(MmqUpType type, int64_t M, int64_t n);
 
 }  // namespace sonicboom::quant::cuda

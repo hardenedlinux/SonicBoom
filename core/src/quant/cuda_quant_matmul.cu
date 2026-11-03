@@ -34,6 +34,7 @@
 
 #include "ggml_derived/mmvq_q8_1.cuh"
 #include "ggml_derived/mmq.cuh"
+#include "mmq_upstream.h"  // imported ggml MMQ kernels (ggml_derived/mmq_upstream/)
 
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -3780,28 +3781,34 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// The MMQ-supported quant formats, as the imported kernel's type enum, or
+// nullopt for a type the kernel has no implementation for.
+static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
+  switch (t) {
+    case QuantType::Q3_K: return MmqUpType::Q3_K;
+    case QuantType::Q4_K: return MmqUpType::Q4_K;
+    case QuantType::Q5_K: return MmqUpType::Q5_K;
+    case QuantType::Q6_K: return MmqUpType::Q6_K;
+    case QuantType::Q5_0: return MmqUpType::Q5_0;
+    case QuantType::Q8_0: return MmqUpType::Q8_0;
+  }
+  return std::nullopt;
+}
+
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
 // shared memory as int8 and multiplies against a block_q8_1_mmq activation via
 // m16n8k16/m16n8k32 tensor cores. X is [n, cols] position-major, which is
-// already the layout quantize_activation needs (each position's 128-element
-// q8_1 blocks contiguous), and mul_mat_q natively writes dst [n, rows] — so no
-// transpose on either side of the kernel (C.3a). Q3_K uses a float d4 activation
-// scale layout (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's
-// vec_dot path. Q6_K uses D4 (float activation scales); its signed per-16-value
-// weight scales remain separate from the block's fp16 d, matching ggml's
-// Q6_K MMQ tile layout. The legacy 32-element formats Q5_0/Q8_0 also use the
-// D4 layout (ggml's MMQ_Q8_1_DS_LAYOUT_D4) with their own tile loaders.
+// already the layout the quantizer needs (each position's 128-element q8_1
+// blocks contiguous), and the kernel writes dst [n, rows] — so no transpose on
+// either side (C.3a). The activation scale layout follows the weight type:
+// Q3_K/Q6_K/Q5_0/Q8_0 use float d4 scales, Q4_K/Q5_K use half2 ds4 scales.
 bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
   const int ic = int(cols), ir = int(rows);
-  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
-
-  // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
-  // Until then Q6_K takes the one prefill arithmetic: the blocked fp16 GEMM.
-  if (W.type() == QuantType::Q6_K)
-    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -3817,45 +3824,11 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // before the quantize but touches none of its blocks. No-op when K % 256 == 0.
   mmq::zero_pad_planes(y_q8, ic, n, cur_stream());
 
-  bool ok = false;
-  switch (W.type()) {
-    case QuantType::Q3_K:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q4_K:
-      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q5_K:
-      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    // The legacy 32-element formats use the D4 float activation scale layout
-    // (ggml's MMQ_Q8_1_DS_LAYOUT_D4), same as Q3_K.
-    case QuantType::Q5_0:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q8_0:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    default:
-      return false;
-  }
-  if (!ok) return false;
-  return cudaGetLastError() == cudaSuccess;
+  if (!mmq_up_quantize(X, reinterpret_cast<int32_t*>(y_q8), ic, n, *type,
+                       cur_stream()))
+    return false;
+  return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
+                       ic, n, cur_stream());
 }
 
 // MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
@@ -3869,24 +3842,15 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
-  const int ir = int(rows);
-  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
-  if (blocks_per_row == 0) return false;
+  const int ic = int(cols), ir = int(rows);
+  if (cols / W.block_size() == 0) return false;
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
 
-  if (W.type() == QuantType::Q6_K) {
-    // Keep the Q6_K MMQ weight kernel disabled; dequantize the D4 activation
-    // and take matmul_f32_dev's Q6_K rule (one arithmetic for every prefill n —
-    // see the routing note there).
-    float* X = static_cast<float*>(grow_scratch(
-        g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
-    if (!X) return false;
-    const int64_t nx = int64_t(cols) * n;
-    SB_NOTE_LAUNCH(dequant_mmq_q8_1_d4, (nx + 255) / 256, 256, 0, cur_stream());
-    dequant_mmq_q8_1_d4<<<(nx + 255) / 256, 256, 0, cur_stream()>>>(
-        reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), X, int(cols), n);
-    if (cudaGetLastError() != cudaSuccess) return false;
-    return matmul_f32_dev(W, X, Y, n);
-  }
+  // `decomp` is the plan's work decomposition for this weight class. The
+  // imported kernel schedules whole tiles (stream-K is not used), so the plan
+  // value is accepted for compatibility and has no effect on the launch.
+  (void)decomp;
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -3894,41 +3858,11 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   // A K that is not a multiple of MMQ_ITER_K (256) leaves an odd plane count; the
   // last K-iteration reads one plane past what the fused emitter wrote, so zero
   // it (no-op for K % 256 == 0, i.e. every K-quant weight).
-  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8),
-                       int(cols), n, cur_stream());
+  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), ic,
+                       n, cur_stream());
 
-  const int* yq = reinterpret_cast<const int*>(y_q8);
-  bool ok = false;
-  switch (W.type()) {
-    case QuantType::Q3_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q4_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q5_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q6_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q6_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q5_0:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q8_0:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    default:
-      return false;
-  }
-  if (!ok) return false;
-  return cudaGetLastError() == cudaSuccess;
+  return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
+                       ic, n, cur_stream());
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first
@@ -4365,19 +4299,14 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // 256→434/336, 512→458/396, 2048→324/286), so it is selected for all
   // n >= mmq_min_n(); cuBLAS stays reachable via SONICBOOM_MMQ=0. Only when
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
-  // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K)
-  // and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per 256-value
-  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the blocked fp16
-  // cuBLAS path below — matmul_mmq_dev would reject it anyway, and returning
-  // its false here would fail the whole call instead of falling through.
-  // The MMQ kernel needs K to be a multiple of QK8_1_MMQ (128) and a K below
-  // one 256-element iteration (e.g. the DiT's 128-wide input projection) takes
-  // the dp4a/cuBLAS paths below instead of failing the whole call on
-  // matmul_mmq_dev's precondition. A longer K that is not a multiple of 256
-  // (Qwen 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane, and
-  // the LLM goldens pin that numerics.
-  const bool mmq_type = W.type() != QuantType::Q6_K && cols >= 256 &&
-                        cols % mmq::QK8_1_MMQ == 0;
+  // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K/
+  // Q6_K) and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per
+  // 256-value iteration). The kernel needs K to be a multiple of QK8_1_MMQ
+  // (128); a narrower K (e.g. the DiT's 128-wide input projection) takes the
+  // dp4a/cuBLAS paths below instead of failing the whole call on
+  // matmul_mmq_dev's precondition. A K that is not a multiple of 256 (Qwen
+  // 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane.
+  const bool mmq_type = cols >= 256 && cols % mmq::QK8_1_MMQ == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
@@ -4387,8 +4316,6 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // per-column invariant, so a position computes the same whether its segment
   // is long or short (prefix-reuse identity). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
-  // TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill is Roy's MMQ
-  // kernel, disabled until its incoherent output on Gemma Q4_K_M is fixed.
   if (q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
     return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
 
