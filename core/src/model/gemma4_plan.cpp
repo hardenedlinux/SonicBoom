@@ -2855,6 +2855,10 @@ static uint64_t run_spec_program_steps(
     spec_diag().hist.clear();
   }
   const uint64_t first_step = step;
+  // Sample the plain-step timing 1 in 16. Reading the event pair is host work
+  // in front of the next launch, so a plain step pays for it only when it is
+  // the sampled one.
+  unsigned plain_since_timed = 0;
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -3039,16 +3043,18 @@ static uint64_t run_spec_program_steps(
                      "at position " << L << "\n";
         break;
       }
+      const bool time_step = spec_time_steps() && plain_since_timed == 0;
+      plain_since_timed = (plain_since_timed + 1) % 16;
       const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed,
-                                       nullptr, spec_time_steps());
+                                       nullptr, time_step);
       if (next < 0) {
         std::cerr << "[spec] the k == 0 decode step failed at position " << L
                   << "\n";
         break;
       }
       // The step's readback has drained its replay, so the event pair is
-      // complete; reading it never waits. A plain step prices c(0).
-      if (adaptive && !warm && spec_time_steps()) {
+      // complete; reading it never waits. A timed plain step prices c(0).
+      if (adaptive && !warm && time_step) {
         double ms = 0.0;
         if (hal::StepProgram* sp = rt.step_at(L);
             sp && sp->timing_read(&ms)) {
