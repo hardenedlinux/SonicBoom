@@ -18,6 +18,8 @@
 
 #include "reduce_mode.h"
 
+#include "../spec_diag_counters.h"
+
 #include <sonicboom/compiler/GemmCodegen.h>
 #include <sonicboom/compiler/GlueCodegen.h>
 #include <sonicboom/planner/plan_record.h>
@@ -340,6 +342,7 @@ bool load_mmq_tc(const compiler::MmqTcShape &shape, std::string_view key,
                  int(key.size()), key.data());
     return false;
   }
+  diag::spec_diag_note_jit_load();
   CUresult r = cuModuleLoadData(&out.module, ptx.c_str());
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr,
@@ -374,6 +377,7 @@ bool load_dense_gemm(const compiler::DenseGemmShape &shape,
                  int(key.size()), key.data());
     return false;
   }
+  diag::spec_diag_note_jit_load();
   CUresult r = cuModuleLoadData(&out.module, ptx.c_str());
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr,
@@ -417,6 +421,7 @@ bool load(std::string_view region, LoadedKernel &out) {
     return false;
   }
 
+  diag::spec_diag_note_jit_load();
   CUresult r = cuModuleLoadData(&out.module, ptx.c_str());
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuModuleLoadData failed for '%.*s': %s\n",
@@ -445,6 +450,7 @@ bool load_attention(const compiler::AttentionShape &shape,
                  int(key.size()), key.data());
     return false;
   }
+  diag::spec_diag_note_jit_load();
   CUresult r = cuModuleLoadData(&out.module, ptx.c_str());
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr,

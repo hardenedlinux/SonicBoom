@@ -18,6 +18,8 @@
 
 #include "fattn_jit.h"
 
+#include "../spec_diag_counters.h"
+
 // Generated at build time from boom_fattn_device.cuh (the same text the AOT
 // translation unit includes): `kFattnDeviceSource` is the whole device header.
 #include "fattn_device_src.inc"
@@ -397,6 +399,7 @@ bool prepare(const Spec& spec, std::string* err) {
   if (!read_file(path, &ptx)) {
     ptx = compile_ptx(source, err);
     ++g_compiles;
+    diag::spec_diag_note_jit_compile();
     if (ptx.empty()) {
       modules()[key] = entry;  // remembered as failed; not retried
       return false;
@@ -412,6 +415,7 @@ bool prepare(const Spec& spec, std::string* err) {
   // The runtime API owns the primary context; make sure it exists before the
   // driver API is used.
   ::cudaFree(nullptr);
+  diag::spec_diag_note_jit_load();
   CUresult r = ::cuModuleLoadData(&entry.module, ptx.c_str());
   if (r != CUDA_SUCCESS) {
     *err = "cuModuleLoadData failed (" + std::to_string(int(r)) + ")";

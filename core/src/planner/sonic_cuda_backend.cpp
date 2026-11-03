@@ -34,6 +34,7 @@
 #include "../nn/cuda_scratch_epoch.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
+#include "../spec_diag_counters.h"
 #include "async_prefetch.h"
 #include "decision_registry.h"
 #include "device_allocator.h"
@@ -600,6 +601,7 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
     captured = step_fn();
   }
   if (!captured || !gs.end()) return nullptr;
+  diag::spec_diag_note_graph_capture();
   // Snapshot every device resource the recorded launches reference, so a
   // replay can prove the graph still points at this session's buffers.
   capture_res_.valid = true;

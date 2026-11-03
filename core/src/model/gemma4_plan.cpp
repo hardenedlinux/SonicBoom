@@ -47,6 +47,7 @@
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
+#include "../spec_diag_counters.h"   // in-request first-use counters (SPEC_DIAG)
 #endif
 
 #include <dlfcn.h>  // dladdr: identity of the loaded library (cost-cache key)
@@ -2423,12 +2424,12 @@ static void spec_flush_refined_costs(const Gemma4Model& m) {
 // measurement happened to stop.
 constexpr int kWarmCostReps = 1;
 constexpr int kWarmTimedReps = 3;
-constexpr double kSpecCostLoadBudgetMs = 2000.0;
-// The verify set's share of that budget: its graph builds and its anchor
+constexpr double kSpecCostLoadBudgetMs = 4000.0;
+// The verify set's share of that budget: its graph builds and its
 // warm-ups/captures are paid within this share, the rest belongs to the cost
-// curve. Measured on Gemma 4 E4B: 15 row-count graph builds cost ~0.75 s
-// (constant per row), the four anchor warm-ups + captures ~0.29 s.
-constexpr double kSpecVerifySetBudgetMs = 1100.0;
+// curve. Every row count the verify step can reach (2..kMaxVerifyRows) is
+// warmed and captured here, so no build and no capture can move into a request.
+constexpr double kSpecVerifySetBudgetMs = 4000.0;
 // The load anchors: one plain step and the four widths that put a knot at the
 // head, at both ends of the useful range, and on the linear middle. The other
 // eleven lengths are interpolated here and refined online from real steps
@@ -2786,6 +2787,21 @@ static uint64_t run_spec_program_steps(
     planner::KvCacheSession& session, std::span<const uint64_t> history,
     std::chrono::steady_clock::time_point* first_out = nullptr,
     const char* strategy_override = nullptr) {
+  // First-use counters move only while this scope is live (see
+  // spec_diag_counters.h); the values are printed, as a per-call delta, at the
+  // end of the call below.
+  diag::SpecDiagRequestScope diag_scope;
+  const bool diag_on = spec_diag_enabled();
+  const diag::SpecDiagSnapshot diag_entry =
+      diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
+  struct VerifyWall {
+    size_t iter = 0;
+    size_t k = 0;
+    double wall_ms = 0.0;
+    diag::SpecDiagSnapshot before;
+    diag::SpecDiagSnapshot after;
+  };
+  std::vector<VerifyWall> verify_walls;
   const uint64_t limit = p.max_tokens > 0
                              ? std::min<uint64_t>(uint64_t(p.max_tokens),
                                                   tokens.size())
@@ -3110,6 +3126,8 @@ static uint64_t run_spec_program_steps(
     feed[0] = token;
     std::copy_n(drafts, k, feed.begin() + 1);
     rows.assign(size_t(k) + 1, -1);
+    const diag::SpecDiagSnapshot diag_before =
+        diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
     if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
       std::cerr << "[spec] the verify step failed at position " << L << "\n";
       break;
@@ -3123,6 +3141,17 @@ static uint64_t run_spec_program_steps(
         spec_note_step_ms(m, session.n_ctx, int(k), ms);
         spec_refine_cost(m, session.n_ctx, policy, int(k));
       }
+    }
+    if (diag_on) {
+      VerifyWall w;
+      w.iter = size_t(g_spec_counters.iterations);
+      w.k = k;
+      w.wall_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - iter_start)
+                      .count();
+      w.before = diag_before;
+      w.after = diag::spec_diag_snapshot();
+      verify_walls.push_back(w);
     }
 
     // accept + emit: the run is the accepted drafts plus the verifier's token,
@@ -3212,6 +3241,50 @@ static uint64_t run_spec_program_steps(
       std::fprintf(stderr, "%s%.2f", k ? "," : "",
                    policy.draft_us[size_t(k)]);
     std::fprintf(stderr, "\n");
+  }
+  if (diag_on) {
+    // One line for the whole call: what first-use work moved while the request
+    // ran, and which verify iterations were outliers against their own median.
+    const diag::SpecDiagSnapshot diag_exit = diag::spec_diag_snapshot();
+    std::fprintf(stderr,
+                 "[spec-diag] runtime_builds=%llu graph_captures=%llu "
+                 "jit_compiles=%llu jit_loads=%llu",
+                 (unsigned long long)diag_exit.d_runtime(diag_entry),
+                 (unsigned long long)diag_exit.d_captures(diag_entry),
+                 (unsigned long long)diag_exit.d_compiles(diag_entry),
+                 (unsigned long long)diag_exit.d_loads(diag_entry));
+    if (verify_walls.empty()) {
+      std::fprintf(stderr, " verify_ms_median=na slow=none\n");
+    } else {
+      std::vector<double> walls;
+      walls.reserve(verify_walls.size());
+      for (const VerifyWall& w : verify_walls) walls.push_back(w.wall_ms);
+      std::sort(walls.begin(), walls.end());
+      const double median = walls[walls.size() / 2];
+      std::fprintf(stderr, " verify_ms_median=%.3f slow=", median);
+      bool first = true;
+      for (const VerifyWall& w : verify_walls) {
+        if (!(w.wall_ms > 5.0 * median)) continue;
+        std::fprintf(stderr, "%s{iter=%zu k=%zu wall_ms=%.3f moved=",
+                     first ? "" : ";", w.iter, w.k, w.wall_ms);
+        first = false;
+        bool moved = false;
+        const auto add = [&](const char* name, uint64_t n) {
+          if (n == 0) return;
+          std::fprintf(stderr, "%s%s+%llu", moved ? "," : "", name,
+                       (unsigned long long)n);
+          moved = true;
+        };
+        add("runtime_builds", w.after.d_runtime(w.before));
+        add("graph_captures", w.after.d_captures(w.before));
+        add("jit_compiles", w.after.d_compiles(w.before));
+        add("jit_loads", w.after.d_loads(w.before));
+        if (!moved) std::fprintf(stderr, "none");
+        std::fprintf(stderr, "}");
+      }
+      if (first) std::fprintf(stderr, "none");
+      std::fprintf(stderr, "\n");
+    }
   }
   spec_diag_dump(strategy.c_str());
   return step;
@@ -3313,6 +3386,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const GraphTransform* transform = nullptr,
     const planner::KvCacheSession* session = nullptr) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<DecodeRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
@@ -3618,6 +3692,7 @@ static std::map<DecodeKey, std::unique_ptr<SampledRuntime>> g_sampled_runtimes;
 static std::unique_ptr<SampledRuntime> build_sampled_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<SampledRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
@@ -3944,6 +4019,7 @@ static int verify_row_limit() {
 static std::unique_ptr<VerifyRuntime>
 build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
                      const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<VerifyRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true, uint64_t(rows));
   rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
@@ -4454,6 +4530,7 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
 static std::unique_ptr<RecklessVerifyRuntime> build_reckless_verify_runtime(
     const Gemma4Model& m, uint64_t n_ctx, int rows,
     const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<RecklessVerifyRuntime>();
   GraphIr ir = emit_prefill_ir(m, uint64_t(rows));
   const bool mmq = quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
