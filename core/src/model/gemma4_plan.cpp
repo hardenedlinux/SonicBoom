@@ -2928,6 +2928,12 @@ static uint64_t run_spec_program_steps(
   // in front of the next launch, so a plain step pays for it only when it is
   // the sampled one.
   unsigned plain_since_timed = 0;
+  // A plain step's argmax leaves the sampled token in the device token slot the
+  // next step's embedding reads, so a plain step that follows a plain step has
+  // its token already staged. A verify writes one row per position and the
+  // first iteration starts from whatever the caller left in the slot, so those
+  // still stage the token here.
+  bool prev_plain = false;
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -3104,14 +3110,17 @@ static uint64_t run_spec_program_steps(
 
     if (k == 0) {
       // The plain step is exactly the spec-off loop's one-decode-step
-      // function, with the fed token seeded into the device slot (the token
-      // this iteration feeds is the accepted one, not what the last replay
-      // wrote). The drafter's index update rides the launch.
-      if (!rt.cuda->seed_token(token)) {
+      // function. The fed token is seeded into the device slot unless the
+      // previous iteration was also a plain step: its argmax wrote exactly
+      // this token into the slot the embedding reads, so the upload would be
+      // the same value again. The drafter's index update rides the launch.
+      const bool staged = prev_plain && rt.cuda->decode_chunk() == 1;
+      if (!staged && !rt.cuda->seed_token(token)) {
         std::cerr << "[spec] the k == 0 decode step failed to stage the token "
                      "at position " << L << "\n";
         break;
       }
+      prev_plain = true;
       const bool time_step = spec_time_steps() && plain_since_timed == 0;
       plain_since_timed = (plain_since_timed + 1) % 16;
       const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed,
@@ -3174,6 +3183,8 @@ static uint64_t run_spec_program_steps(
       continue;
     }
 
+    // A verify writes one token per row, so the next iteration stages its own.
+    prev_plain = false;
     // verify: [last token, drafts...] at L..L+k, one row per position.
     feed.assign(size_t(k) + 1, 0);
     feed[0] = token;
