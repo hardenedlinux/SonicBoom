@@ -737,12 +737,17 @@ public:
       if (producedBy == producer.end())
         continue;
       mlir::Operation *m = producedBy->second;
-      if (m->getName().getStringRef() !=
-              boomOpName(planner::OpKind::QuantizedMatmulQ8) ||
+      const mlir::StringRef mop = m->getName().getStringRef();
+      if ((mop != boomOpName(planner::OpKind::QuantizedMatmulQ8) &&
+           mop != boomOpName(planner::OpKind::QuantizedMatmul)) ||
           m->getNumResults() != 1)
         continue;
-      if (nodeAttrInt(m->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "batch"))
-        continue; // no epilogue on the mmq path
+      // A batched node is the prefill form unless the emitter stamped
+      // `mmq_rows`: that is the decode/verify step on the mmq matmul, whose
+      // write-back carries the same bias epilogue.
+      const mlir::ArrayAttr mattrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      if (nodeAttrInt(mattrs, "batch") && !nodeAttrInt(mattrs, "mmq_rows"))
+        continue;
       if (consumers[proj] != 1)
         continue; // the projection has another reader
       biases.push_back(&node);
@@ -769,9 +774,12 @@ public:
       // being a tensor of the graph (rewrites.cpp:580-585).
       const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
       builder.setInsertionPoint(m);
+      // buildNode adds the dialect prefix, so hand it the kind without one.
+      const mlir::StringRef mop = m->getName().getStringRef();
+      const llvm::StringRef kind =
+          mop.starts_with("boom.") ? mop.drop_front(5) : mop;
       mlir::Operation *node = buildNode(
-          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
-          GraphEditor::nodeId(*m),
+          builder, loc, kind, GraphEditor::nodeId(*m),
           m->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
           builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*addBias),
           m->getOperands(), addBias->getResultTypes(),
@@ -835,12 +843,16 @@ public:
         if (producedBy == producer.end())
           continue;
         mlir::Operation *m = producedBy->second;
-        if (m->getName().getStringRef() !=
-                boomOpName(planner::OpKind::QuantizedMatmulQ8) ||
+        const mlir::StringRef mop = m->getName().getStringRef();
+        if ((mop != boomOpName(planner::OpKind::QuantizedMatmulQ8) &&
+             mop != boomOpName(planner::OpKind::QuantizedMatmul)) ||
             m->getNumResults() != 1)
           continue;
-        if (nodeAttrInt(m->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "batch"))
-          continue; // no epilogue on the mmq path
+        // As in BiasIntoGemvPass: only a decode/verify mmq node (`mmq_rows`)
+        // has the write-back residual epilogue; `batch` alone is prefill.
+        const mlir::ArrayAttr mattrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        if (nodeAttrInt(mattrs, "batch") && !nodeAttrInt(mattrs, "mmq_rows"))
+          continue;
         if (consumers[proj] != 1)
           continue; // the projection has another reader
         adds.push_back(&node);
@@ -875,9 +887,11 @@ public:
       // own f32 output tensor becomes dead (rewrites.cpp:660-665).
       const llvm::SmallVector<int64_t> dead(GraphEditor::resultIds(*m));
       builder.setInsertionPoint(m);
+      const mlir::StringRef mop = m->getName().getStringRef();
+      const llvm::StringRef kind =
+          mop.starts_with("boom.") ? mop.drop_front(5) : mop;
       mlir::Operation *node = buildNode(
-          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
-          GraphEditor::nodeId(*m),
+          builder, loc, kind, GraphEditor::nodeId(*m),
           m->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
           builder.getArrayAttr(nodeAttrs), GraphEditor::resultIds(*add), operands,
           add->getResultTypes(),

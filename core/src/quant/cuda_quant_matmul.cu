@@ -3785,7 +3785,8 @@ static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
 // blocks contiguous), and the kernel writes dst [n, rows] — so no transpose on
 // either side (C.3a). The activation scale layout follows the weight type:
 // Q3_K/Q6_K/Q5_0/Q8_0 use float d4 scales, Q4_K/Q5_K use half2 ds4 scales.
-bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
+                    std::span<const float> bias, const float* add) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
@@ -3816,8 +3817,16 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // bit-identical to the imported table (R1).
   const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
   const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
-  return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
-                       ic, n, cur_stream(), cfg, pin.split_k);
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows) return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+  return mmq_up_matmul(
+      wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
+      cur_stream(), cfg, pin.split_k, d_bias, add);
 }
 
 // MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
@@ -3825,7 +3834,8 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
 // (index blk*n + token); Y is [n, rows] position-major (the tensor-core matmul's
 // native output — no transpose, matching matmul_mmq_dev's C.3a path).
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
-                       float* Y, int n, MmqDecomp decomp) {
+                       float* Y, int n, MmqDecomp decomp,
+                       std::span<const float> bias, const float* add) {
   if (!available() || !W.valid() || W.dims().size() != 2 || !y_q8 || !Y || n <= 0)
     return false;
   const uint64_t cols = W.dims()[0];
@@ -3854,8 +3864,16 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   // matmul_mmq_dev).
   const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
   const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
-  return mmq_up_matmul(wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir,
-                       ic, n, cur_stream(), cfg, pin.split_k);
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows) return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+  return mmq_up_matmul(
+      wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
+      cur_stream(), cfg, pin.split_k, d_bias, add);
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first

@@ -143,7 +143,7 @@ float * split_scratch_get(size_t bytes) {
 template <ggml_type type>
 bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
              int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg,
-             int split_k) {
+             int split_k, const float * bias, const float * add) {
     const sb_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
@@ -178,7 +178,8 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
             K, M, n_cnt, K / qk, n, M,
             1, 1, 0, 0, 0,
             1, 1, 0, 0, 0,
-            n_cnt, n_cnt};
+            n_cnt, n_cnt,
+            bias, add == nullptr ? nullptr : add + n_lo * M};
 
         mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
         CUDA_CHECK(cudaGetLastError());
@@ -201,22 +202,22 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
 
 bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    float * dst, int64_t M, int64_t K, int64_t n,
-                   cudaStream_t stream, int cfg, int split_k) {
+                   cudaStream_t stream, int cfg, int split_k,
+                   const float * bias, const float * add) {
     if (weights == nullptr || y_q8 == nullptr || dst == nullptr) {
         return false;
     }
     if (M <= 0 || K <= 0 || n <= 0 || split_k <= 0 || K % 128 != 0) {
         return false;
     }
-
     const ggml_type gtype = to_ggml_type(type);
     switch (gtype) {
-        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
-        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
-        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
-        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
-        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
-        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k);
+        case GGML_TYPE_Q3_K: return run_mmq<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        case GGML_TYPE_Q4_K: return run_mmq<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        case GGML_TYPE_Q5_K: return run_mmq<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
         default:             return false;
     }
 }

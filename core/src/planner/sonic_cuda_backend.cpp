@@ -1221,13 +1221,30 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // quantized inside the mmq call. The mmq call is used at n == 1 too —
         // the batched matmul's per-column arithmetic is its n == 1 arithmetic,
         // so the decode step and every verify row agree by construction.
+        //
+        // `bias_slot`/`add_input` (the decode epilogue folds): the mmq
+        // write-back adds the bias and then the residual, the same two f32
+        // additions the separate kernels performed on the stored output.
+        int64_t bias_slot = 0, add_idx = 0;
+        const bool has_bias = attr_i(*node, "bias_slot", bias_slot);
+        const bool has_add = attr_i(*node, "add_input", add_idx);
+        const std::span<const float> b =
+            has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
+                     : std::span<const float>{};
+        const float* add_p =
+            has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
         int64_t mmq_rows = 0;
-        if (attr_i(*node, "mmq_rows", mmq_rows))
+        if (attr_i(*node, "mmq_rows", mmq_rows)) {
           ok = quant::cuda::matmul_mmq_dev(qweight(slot), dev(in[0]), out,
-                                           int(nb));
-        else
+                                           int(nb), b, add_p);
+        } else {
           ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out,
                                            int(nb));
+          const int rows = int(out_n / nb);
+          if (ok && has_bias)
+            ok = nn::cuda::add_bias_dev(b, out, out, int(nb) * rows);
+          if (ok && add_p) ok = nn::cuda::add_dev(add_p, out, out, int(nb) * rows);
+        }
       } else {
         ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
       }
@@ -1400,6 +1417,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         int64_t ds_i = 0;
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
+        // The decode epilogue folds (bias then residual) are added by the mmq
+        // write-back: the values the separate AddBias/Add kernels stored.
+        int64_t bias_slot = 0, add_idx = 0;
+        const bool has_bias = attr_i(*node, "bias_slot", bias_slot);
+        const bool has_add = attr_i(*node, "add_input", add_idx);
+        const std::span<const float> b =
+            has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
+                     : std::span<const float>{};
+        const float* add_p =
+            has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
         // The node's `decomp` attribute is the plan's work decomposition for
         // this weight shape (set by the emitter from mmq_class_decomp); absent
         // or unrecognized leaves Auto, which the runtime resolves by the same
@@ -1415,7 +1442,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
-            int(nb), decomp);
+            int(nb), decomp, b, add_p);
       } else {
         note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));

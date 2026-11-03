@@ -67,9 +67,18 @@ enum class MmqUpType : int {
 // is capped at the number of K tiles; 1 is the single-pass path.  The partial
 // buffer is owned by this translation unit, reused across calls and sized for
 // the largest call seen; it is not allocated on the single-pass path.
+//
+// bias/add are the optional write-back epilogue, applied with the output: the
+// kernel writes dst = sum + bias[row], then + add[token*M + row], with one f32
+// add each, in that order — the values the separate elementwise kernels would
+// store, without their launches.  bias is a device [M] buffer (one value per
+// output row) and add is a device [n][M] buffer in dst's layout.  They apply to
+// the final output whether the shape runs one pass (added in the tile
+// write-back) or split-K (added once in the partial-combine kernel).
 bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    float * dst, int64_t M, int64_t K, int64_t n,
-                   cudaStream_t stream, int cfg = 0, int split_k = 1);
+                   cudaStream_t stream, int cfg = 0, int split_k = 1,
+                   const float * bias = nullptr, const float * add = nullptr);
 
 // Quantize x [n][K] (row-contiguous, row stride K) into the upstream
 // block_q8_1_mmq layout [K/128][n] blocks.  y_q8 must have room for

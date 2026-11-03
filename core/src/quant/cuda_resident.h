@@ -181,7 +181,15 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 // every n, including n == 1 (the decode step and the verify rows share the
 // batched arithmetic). X is device [cols, n], Y device [n, rows]; no host
 // copies.
-bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
+//
+// `bias`/`add` are the optional write-back epilogue: two f32 additions applied
+// to each output value in that order (bias first, then the residual), at the
+// same rounding as add_bias_dev followed by add_dev, so the fused node stores
+// the values the separate kernels would. `bias` is a host span of `rows`
+// floats (empty => none); `add` is a device [n, rows] buffer (nullptr => none,
+// residual indexed by row).
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
+                    std::span<const float> bias = {}, const float* add = nullptr);
 
 // --- MMQ int8-tensor-core batched/fused prefill ops (C.2/C.4) ---------------
 
@@ -231,8 +239,15 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
 // the J_max tail guard (see mmq_q8_blocks). Device in/out, no host copies.
 // `decomp` is the plan's decomposition for this shape class (the node's `decomp`
 // attribute); Auto lets the runtime choose (class policy / autotuner).
+//
+// `bias`/`add` are matmul_mmq_dev's optional write-back epilogue (bias first,
+// then the residual, one f32 add each): `bias` a host span of `rows` floats,
+// `add` a device [n, rows] buffer, row-indexed like the separate
+// add_bias_dev/add_dev they replace.
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
-                       int n, MmqDecomp decomp = MmqDecomp::Auto);
+                       int n, MmqDecomp decomp = MmqDecomp::Auto,
+                       std::span<const float> bias = {},
+                       const float* add = nullptr);
 
 // MMQ1: Y = W @ X on the compiler-generated int8 tensor-core kernel
 // (compiler/MmqTcCodegen.h), over a per-weight q8_1 copy instead of the packed
