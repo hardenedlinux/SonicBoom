@@ -641,12 +641,11 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
   // mmq path executes therefore has a layout, so the C.4 planner passes may
   // fold a quantize into any of them.
-  // Q6_K gets -1: its mmq weight kernel is disabled (TODO(q6k-mmq)), so it has
-  // no mmq activation layout and must never be folded into a fused emitter —
-  // -1 is the "no layout" marker the C.4 passes skip on (see
-  // fuse_act_mul_mmq_pass / fuse_rms_norm_mmq_pass), which keeps the down
-  // projection on its dequant + cuBLAS route rather than quantizing its
-  // activation to int8.
+  // Q6_K gets -1: no fused quantize emitter is selected for it, so it has no
+  // mmq activation layout and must not be folded into one — -1 is the "no
+  // layout" marker the C.4 passes skip on (see fuse_act_mul_mmq_pass /
+  // fuse_rms_norm_mmq_pass). Its matmul quantizes the activation inside the
+  // matmul instead.
   // `ds` answers one question only: does this weight type have an mmq activation
   // layout the fused emitter can produce? Q6_K does not (above). Every other
   // format does, including the legacy 32-element ones, whose D4 norm+quantize

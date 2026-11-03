@@ -579,8 +579,6 @@ size_t g_ytail_bytes = 0;
 // [K/128][n] (+ J_max tail over-read). Reused across layers.
 void* g_mmq_q8 = nullptr;
 size_t g_mmq_q8_bytes = 0;
-void* g_mmq_q6_x_f32 = nullptr;
-size_t g_mmq_q6_x_f32_bytes = 0;
 // Fused rms_norm+quantize (C.4): one float per token, the per-row `inv` factor
 // produced by phase A and consumed by phase B of
 // rms_norm_quantize_mmq_q8_1_dev. Reused across layers.
@@ -1216,21 +1214,6 @@ __global__ void cast_f32_f16(const float* __restrict__ x, __half* __restrict__ y
                              int64_t n) {
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] = __float2half_rn(x[i]);
-}
-
-// Recover the Q6 fallback activation from D4 MMQ blocks. The Q6 prefill plan
-// selects D4_Q8_1, so d4 holds one float scale per 32 quantized values.
-__global__ void dequant_mmq_q8_1_d4(const mmq::block_q8_1_mmq* __restrict__ q,
-                                    float* __restrict__ x, int cols, int n) {
-  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  const int64_t total = (int64_t)cols * n;
-  if (i >= total) return;
-  const int token = int(i / cols);
-  const int k = int(i % cols);
-  const int block = k / 128;
-  const int offset = k % 128;
-  const mmq::block_q8_1_mmq& qb = q[(int64_t)block * n + token];
-  x[i] = float(qb.qs[offset]) * qb.d4[offset / 32];
 }
 
 } // namespace
