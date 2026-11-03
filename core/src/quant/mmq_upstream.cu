@@ -339,17 +339,13 @@ namespace {
 // Warm-up measurement of the small-n split-K count and tile configuration.
 // ---------------------------------------------------------------------------
 
-// The row counts a decode step (n = 1) and a verify step (n = k+1 <= 16) can
-// carry, and the large-n width whose cost split-K may not disturb.
-constexpr int kMmqTuneNs[]     = {1, 8, 16};
-constexpr int kMmqTuneBigN     = 512;
-constexpr int kMmqTuneSplits[] = {1, 2, 4, 8};
-constexpr int kMmqTuneSplitsReduced[] = {1, 4};
+// The row count a verify step (n = k+1 <= 16) can carry that runs the wide
+// tile: the narrow tile (J = 8) is measured at the decode row count, n = 1.
+constexpr int kMmqTuneNarrowN = 1;
+constexpr int kMmqTuneWideN   = 16;
 // (I, nthreads) = (64, 256) and (128, 256).
 constexpr int kMmqTuneCfgsReduced[]   = {5, 6};
 constexpr double kMmqTuneBudgetS = 1.5;
-constexpr double kMmqTuneBigSlack = 1.03;
-constexpr double kMmqTuneTieSlack = 1.02;
 constexpr int kMmqTuneTimed = 7;
 constexpr int kMmqTuneWarm  = 3;
 
@@ -419,10 +415,10 @@ bool mmq_tune_alloc(const MmqTuneShape & s, MmqTuneBuffers & b) {
     int qk = 0, bytes = 0;
     mmq_block_meta(s.type, &qk, &bytes);
     const size_t wbytes = size_t(s.rows) * size_t(s.cols / qk) * size_t(bytes);
-    const size_t xbytes = size_t(kMmqTuneBigN) * size_t(s.cols) * sizeof(float);
-    const size_t yblocks = size_t(s.cols / 128) * size_t(kMmqTuneBigN) + 128;
+    const size_t xbytes = size_t(kMmqTuneWideN) * size_t(s.cols) * sizeof(float);
+    const size_t yblocks = size_t(s.cols / 128) * size_t(kMmqTuneWideN) + 128;
     const size_t ybytes = yblocks * sizeof(int) * 36;  // block_q8_1_mmq
-    const size_t obytes = size_t(s.rows) * size_t(kMmqTuneBigN) * sizeof(float);
+    const size_t obytes = size_t(s.rows) * size_t(kMmqTuneWideN) * sizeof(float);
     if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
     if (cudaMalloc(&b.dx, xbytes) != cudaSuccess) { mmq_tune_free(b); return false; }
     if (cudaMalloc(&b.dyq8, ybytes) != cudaSuccess) { mmq_tune_free(b); return false; }
@@ -472,18 +468,14 @@ double mmq_tune_time(const MmqTuneShape & s, const MmqTuneBuffers & b, int n,
     return times[valid / 2];
 }
 
-// Position of a split count in the fixed candidate array.
-int mmq_split_index(int S) {
-    return S == 1 ? 0 : (S == 2 ? 1 : (S == 4 ? 2 : 3));
-}
-
-// One shape's sweep; fills t[n][S][cfg] for the small n and big[S] at the
-// default configuration.
+// One shape's sweep: the tile configuration priced at the decode row count
+// (the narrow tile) and at the widest verify row count (the wide tile). The
+// split count is pinned to 1 for every shape.
 struct MmqTuneResult {
-    double t[3][4][MMQ_CFG_COUNT] = {};
-    double big[4] = {};
-    bool have[3][4][MMQ_CFG_COUNT] = {};
-    bool have_big[4] = {};
+    double narrow[MMQ_CFG_COUNT] = {};
+    double wide[MMQ_CFG_COUNT] = {};
+    bool have_narrow[MMQ_CFG_COUNT] = {};
+    bool have_wide[MMQ_CFG_COUNT] = {};
 };
 
 // The configurations worth timing for this shape: any that is neutral, fits
@@ -509,46 +501,34 @@ MmqTuneResult mmq_tune_sweep(const MmqTuneShape & s, const MmqTuneBuffers & b,
     int cfgs8[MMQ_CFG_COUNT], cfgs16[MMQ_CFG_COUNT];
     const int n8 = mmq_tune_cfgs(s, 8, reduced, cfgs8);
     const int n16 = mmq_tune_cfgs(s, 16, reduced, cfgs16);
-    const int * splits = reduced ? kMmqTuneSplitsReduced : kMmqTuneSplits;
-    const int nsplit = reduced ? 2 : 4;
-    for (int si = 0; si < nsplit; ++si) {
-        const int S = splits[si];
-        const int idx = mmq_split_index(S);
-        const int ni[3] = {0, 1, 2};
-        const int * lists[3] = {cfgs8, cfgs8, cfgs16};
-        const int counts[3] = {n8, n8, n16};
-        for (int k = 0; k < 3; ++k) {
-            for (int ci = 0; ci < counts[k]; ++ci) {
-                const int cfg = lists[k][ci];
-                const double ms =
-                    mmq_tune_time(s, b, kMmqTuneNs[ni[k]], cfg, S);
-                if (ms < 0.0) continue;
-                r.t[k][idx][cfg] = ms;
-                r.have[k][idx][cfg] = true;
-            }
-        }
-        const double big = mmq_tune_time(s, b, kMmqTuneBigN, 0, S);
-        if (big >= 0.0) {
-            r.big[idx] = big;
-            r.have_big[idx] = true;
-            std::fprintf(stderr, "mmq-tune %s %lldx%lld S=%d t512=%.3fms\n",
-                         mmq_type_name(s.type), (long long)s.rows,
-                         (long long)s.cols, S, big);
-        }
+    for (int ci = 0; ci < n8; ++ci) {
+        const int cfg = cfgs8[ci];
+        const double ms = mmq_tune_time(s, b, kMmqTuneNarrowN, cfg, 1);
+        if (ms < 0.0) continue;
+        r.narrow[cfg] = ms;
+        r.have_narrow[cfg] = true;
+    }
+    for (int ci = 0; ci < n16; ++ci) {
+        const int cfg = cfgs16[ci];
+        const double ms = mmq_tune_time(s, b, kMmqTuneWideN, cfg, 1);
+        if (ms < 0.0) continue;
+        r.wide[cfg] = ms;
+        r.have_wide[cfg] = true;
     }
     return r;
 }
 
-int mmq_pick_cfg(const MmqTuneResult & r, int ni, int idx,
-                 const int * cfgs, int ncfgs) {
+int mmq_pick_cfg(const MmqTuneResult & r, int J, const int * cfgs, int ncfgs) {
     int best = -1;
     double best_ms = 0.0;
     for (int ci = 0; ci < ncfgs; ++ci) {
         const int cfg = cfgs[ci];
-        if (!r.have[ni][idx][cfg]) continue;
-        if (best < 0 || r.t[ni][idx][cfg] < best_ms) {
+        const bool have = J == 8 ? r.have_narrow[cfg] : r.have_wide[cfg];
+        if (!have) continue;
+        const double ms = J == 8 ? r.narrow[cfg] : r.wide[cfg];
+        if (best < 0 || ms < best_ms) {
             best = cfg;
-            best_ms = r.t[ni][idx][cfg];
+            best_ms = ms;
         }
     }
     return best;
@@ -564,41 +544,20 @@ MmqUpPin mmq_pin_measure(const MmqTuneShape & s, const MmqTuneBuffers & b,
     int cfgs8[MMQ_CFG_COUNT], cfgs16[MMQ_CFG_COUNT];
     const int n8 = mmq_tune_cfgs(s, 8, reduced, cfgs8);
     const int n16 = mmq_tune_cfgs(s, 16, reduced, cfgs16);
-    const int * splits = reduced ? kMmqTuneSplitsReduced : kMmqTuneSplits;
-    const int nsplit = reduced ? 2 : 4;
     const MmqTuneResult r = mmq_tune_sweep(s, b, reduced);
     MmqUpPin pin;
-    int best_idx = -1;
-    double best_score = 0.0;
-    for (int si = 0; si < nsplit; ++si) {
-        const int idx = mmq_split_index(splits[si]);
-        if (!r.have_big[idx] || !r.have_big[0]) continue;
-        if (r.big[idx] > r.big[0] * kMmqTuneBigSlack) continue;
-        const int c8 = mmq_pick_cfg(r, 0, idx, cfgs8, n8);
-        if (c8 < 0 || !r.have[1][idx][c8]) continue;
-        const double score = r.t[0][idx][c8] + r.t[1][idx][c8];
-        // Ascending split counts: a larger split replaces the incumbent only
-        // when it is more than 2% faster, so a tie keeps the smaller one.
-        if (best_idx < 0 || score * kMmqTuneTieSlack < best_score) {
-            best_idx = idx;
-            best_score = score;
-            pin.cfg_j8 = c8;
-        }
-    }
-    if (best_idx < 0) return pin;  // nothing measured: keep the defaults
-    pin.split_k = kMmqTuneSplits[best_idx];
-    const int c16 = mmq_pick_cfg(r, 2, best_idx, cfgs16, n16);
+    const int c8 = mmq_pick_cfg(r, 8, cfgs8, n8);
+    if (c8 < 0) return pin;  // nothing measured: keep the defaults
+    pin.cfg_j8 = c8;
+    const int c16 = mmq_pick_cfg(r, 16, cfgs16, n16);
     pin.cfg_j16 = c16 >= 0 ? c16 : pin.cfg_j8;
     if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
-        const double t1  = r.have[0][best_idx][pin.cfg_j8] ? r.t[0][best_idx][pin.cfg_j8] : -1.0;
-        const double t8  = r.have[1][best_idx][pin.cfg_j8] ? r.t[1][best_idx][pin.cfg_j8] : -1.0;
-        const double t16 = r.have[2][best_idx][pin.cfg_j16] ? r.t[2][best_idx][pin.cfg_j16] : -1.0;
         std::fprintf(stderr,
-                     "mmq-pick %s %lldx%lld S=%d cfg8=%d cfg16=%d "
-                     "t1=%.4f t8=%.4f t16=%.4f t512=%.4f t512_s1=%.4f\n",
+                     "mmq-pick %s %lldx%lld S=1 cfg8=%d cfg16=%d "
+                     "t1=%.4f t16=%.4f\n",
                      mmq_type_name(s.type), (long long)s.rows,
-                     (long long)s.cols, pin.split_k, pin.cfg_j8, pin.cfg_j16,
-                     t1, t8, t16, r.big[best_idx], r.big[0]);
+                     (long long)s.cols, pin.cfg_j8, pin.cfg_j16,
+                     r.narrow[pin.cfg_j8], r.wide[pin.cfg_j16]);
     }
     return pin;
 }
@@ -622,8 +581,10 @@ bool mmq_pin_from_cache(const MmqTuneShape & s, int build_key, MmqUpPin * pin) {
     if (si == rec.end() || ki == rec.end() || ki->second != build_key) {
         return false;
     }
+    // The split count is pinned to 1: a record from a run that chose another
+    // split is stale, and the shape is measured again.
     const int S = si->second;
-    if (S != 1 && S != 2 && S != 4 && S != 8) return false;
+    if (S != 1) return false;
     int cfg[2] = {0, 0};
     for (int jj = 0; jj < 2; ++jj) {
         const int J = jj == 0 ? 8 : 16;
@@ -657,16 +618,6 @@ bool g_mmq_warmed = false;
 
 }  // namespace
 
-bool mmq_up_decode_enabled() {
-    static const bool enabled = [] {
-        const char * v = std::getenv("SONICBOOM_DECODE_MMQ");
-        return v != nullptr && (std::strcmp(v, "1") == 0 ||
-                                std::strcmp(v, "on") == 0 ||
-                                std::strcmp(v, "true") == 0);
-    }();
-    return enabled;
-}
-
 MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K) {
     std::lock_guard<std::mutex> lock(g_mmq_pin_mutex);
     const auto it = g_mmq_pin.find(mmq_pin_key(type, M, K));
@@ -675,7 +626,7 @@ MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K) {
 
 void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                  const char * build_id) {
-    if (!mmq_up_decode_enabled() || !weights || count == 0) return;
+    if (!weights || count == 0) return;
     // The debug pin fixes the configuration, so there is nothing to choose.
     if (std::getenv("SONICBOOM_MMQ_CFG") != nullptr) return;
     {
@@ -739,7 +690,7 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                 std::fprintf(stderr,
                              "mmq_up_warm: %.2fs load budget reached; "
                              "measuring the remaining shapes with the reduced "
-                             "set (S in {1,4}, cfgs {5,6})\n",
+                             "set (cfgs {5,6})\n",
                              elapsed_s());
             }
             MmqTuneBuffers b;
@@ -748,12 +699,6 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                 mmq_tune_free(b);
                 mmq_pin_store(s, pin, build_key);
             }
-        }
-        // Reach the split-K scratch high-water mark for this shape now, so no
-        // generation step ever grows the buffer (and no capture allocates).
-        if (pin.split_k > 1) {
-            (void)split_scratch_get(size_t(pin.split_k) * 16 *
-                                    size_t(s.rows) * sizeof(float));
         }
         std::lock_guard<std::mutex> lock(g_mmq_pin_mutex);
         g_mmq_pin[mmq_pin_key(s.type, s.rows, s.cols)] = pin;

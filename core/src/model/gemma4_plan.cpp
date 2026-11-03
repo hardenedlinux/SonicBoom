@@ -254,12 +254,11 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
   return lower_graph(*ir.module, dynamic_extent);
 }
 
-// Decode and verify on the mmq matmul: an explicit opt-in that switches both
-// graphs together (they are emitted by the same function), and that requires
-// the q8_1 dispatcher and the mmq kernel the lowering produces.
-bool decode_mmq_enabled() {
-  return quant::cuda::mmq_up_decode_enabled() && quant::cuda::q8_1_enabled() &&
-         quant::cuda::mmq_enabled();
+// Decode and verify can run a projection on the mmq matmul only when the q8_1
+// dispatcher and the mmq kernel are both available; which projections actually
+// do is the per-shape family measured at load (decode_family_mmq).
+bool decode_mmq_available() {
+  return quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled();
 }
 
 }  // namespace
@@ -319,18 +318,21 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
 
   const BlockProfile prof = profile_for(cfg);
 
-  // Decode/verify on the mmq matmul (SONICBOOM_DECODE_MMQ): every quantized
-  // matmul carries the same lowering attributes the prefill emitter writes —
-  // the extent, the input width, and the activation scale layout of the weight
-  // type — so the prefill producer fusions and the mmq matmul dispatch apply at
-  // this step's row count. `ds` = -1 marks a weight type with no fused mmq
-  // quantize (Q6_K); its matmul quantizes the activation inside the mmq call.
-  // `mmq_rows` selects that mmq matmul for an activation with no fused
-  // producer.
-  const bool mmq_rows = decode_mmq_enabled();
+  // Decode/verify kernel family: a projection whose (type, rows, cols) shape
+  // was measured faster on the mmq matmul carries the prefill lowering
+  // attributes — the extent, the input width, and the activation scale layout
+  // of the weight type — so the prefill producer fusions and the mmq matmul
+  // dispatch apply at this step's row count. `ds` = -1 marks a weight type with
+  // no fused mmq quantize (Q6_K); its matmul quantizes the activation inside the
+  // mmq call. `mmq_rows` selects that mmq matmul for an activation with no fused
+  // producer. A shape on the gemv carries nothing and takes the ordinary decode
+  // lowering (quantize once, q8_1 gemv).
+  const bool mmq_available = decode_mmq_available();
   auto mmq_a = [&](std::vector<sx::Attribute> &a, quant::QuantType qt,
-                   uint64_t in_w) {
-    if (!mmq_rows) return;
+                   uint64_t in_w, uint64_t out_w) {
+    if (!mmq_available ||
+        !quant::cuda::decode_family_mmq(qt, int(out_w), int(in_w)))
+      return;
     const int64_t ds =
         (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
         : (qt == quant::QuantType::Q6_K)                               ? -1
@@ -442,7 +444,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::AttnNorm)});
     std::vector<sx::Attribute> q_attrs = {layer_a(l), slot(WeightSlot::AttnQ)};
-    mmq_a(q_attrs, m.weights.blocks[l].attn_q.type(), d);
+    mmq_a(q_attrs, m.weights.blocks[l].attn_q.type(), d, qw);
     mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
                         q_attrs);
     if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
@@ -456,9 +458,9 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     mlir::Value attn;
     if (cfg.has_kv(l)) {
       std::vector<sx::Attribute> k_attrs = {layer_a(l), slot(WeightSlot::AttnK)};
-      mmq_a(k_attrs, m.weights.blocks[l].attn_k.type(), d);
+      mmq_a(k_attrs, m.weights.blocks[l].attn_k.type(), d, kvw);
       std::vector<sx::Attribute> v_attrs = {layer_a(l), slot(WeightSlot::AttnV)};
-      mmq_a(v_attrs, m.weights.blocks[l].attn_v.type(), d);
+      mmq_a(v_attrs, m.weights.blocks[l].attn_v.type(), d, kvw);
       mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
                           k_attrs);
       mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
@@ -490,7 +492,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
 
     std::vector<sx::Attribute> ap_attrs = {layer_a(l),
                                            slot(WeightSlot::AttnOutput)};
-    mmq_a(ap_attrs, m.weights.blocks[l].attn_output.type(), qw);
+    mmq_a(ap_attrs, m.weights.blocks[l].attn_output.type(), qw, d);
     mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
                          ap_attrs);
     if (prof.attn_out_bias)
@@ -507,10 +509,10 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::FfnNorm)});
     std::vector<sx::Attribute> up_attrs = {layer_a(l), slot(WeightSlot::FfnUp)};
-    mmq_a(up_attrs, m.weights.blocks[l].ffn_up.type(), d);
+    mmq_a(up_attrs, m.weights.blocks[l].ffn_up.type(), d, ff);
     std::vector<sx::Attribute> gate_attrs = {layer_a(l),
                                              slot(WeightSlot::FfnGate)};
-    mmq_a(gate_attrs, m.weights.blocks[l].ffn_gate.type(), d);
+    mmq_a(gate_attrs, m.weights.blocks[l].ffn_gate.type(), d, ff);
     mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
                          up_attrs);
     mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
@@ -523,7 +525,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
                          {layer_a(l)});
     std::vector<sx::Attribute> fo_attrs = {layer_a(l),
                                            slot(WeightSlot::FfnDown)};
-    mmq_a(fo_attrs, m.weights.blocks[l].ffn_down.type(), ff);
+    mmq_a(fo_attrs, m.weights.blocks[l].ffn_down.type(), ff, d);
     mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
                          fo_attrs);
     mlir::Value f2 = prof.post_ffw_norm
@@ -572,7 +574,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   const quant::QuantType out_qt =
       prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
   std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
-  mmq_a(logits_attrs, out_qt, d);
+  mmq_a(logits_attrs, out_qt, d, vocab);
   mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
                            logits_attrs);
 
@@ -3456,7 +3458,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_enabled());
+                          /*rows_mmq=*/decode_mmq_available());
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
   // exactly as it was; the clone is discarded once the desc is extracted. A
@@ -3764,7 +3766,7 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_enabled());
+                          /*rows_mmq=*/decode_mmq_available());
   if (rt->graph.nodes.empty()) return nullptr;
   if (!append_sample_select_tail(rt->graph, m.config.vocab_size)) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
@@ -4093,7 +4095,7 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_enabled());
+                          /*rows_mmq=*/decode_mmq_available());
   if (rt->graph.nodes.empty()) return nullptr;
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -4952,12 +4954,13 @@ static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
                                    fingerprint.c_str());
 }
 
-// The split count and tile configuration the decode and verify steps run with
-// are measured per projection shape at load, on the same synthetic-weight
-// basis as the verify gemv split above.  No-op unless the decode MMQ lowering
-// is selected, so the off path pays nothing.
+// The tile configuration the decode and verify mmq projections run with, and
+// the gemv-or-mmq family of each projection shape, are measured per shape at
+// load on the same synthetic-weight basis as the verify gemv split above.  The
+// pins must exist before the family timing uses them, and both before the
+// runtimes below build their graphs.
 static void warm_mmq_decode_model(const Gemma4Model& m) {
-  if (!quant::cuda::mmq_up_decode_enabled()) return;
+  if (!quant::cuda::q8_1_enabled() || !quant::cuda::mmq_enabled()) return;
   std::vector<const quant::QuantizedTensor*> weights;
   const auto add = [&weights](const quant::QuantizedTensor& w) {
     if (w.valid()) weights.push_back(&w);
@@ -4976,6 +4979,8 @@ static void warm_mmq_decode_model(const Gemma4Model& m) {
   const std::string fingerprint = spec_kernel_fingerprint();
   quant::cuda::mmq_up_warm(weights.data(), weights.size(),
                            fingerprint.c_str());
+  quant::cuda::warm_decode_family(weights.data(), weights.size(),
+                                  fingerprint.c_str());
 }
 
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
@@ -4986,8 +4991,10 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-  // The decode/verify pins and the split-K scratch they size must exist before
-  // the runtimes below capture any graph.
+  // The verify gemv split is measured first: the decode/verify family table
+  // times the gemv at the same row counts, and the runtimes below must see both
+  // the pins and the family before they build (and capture) any graph.
+  warm_verify_gemv_wp_model(m);
   warm_mmq_decode_model(m);
   // The warm-up builds the same runtimes the first request would, bound to the
   // caller's session cache from construction. The sampled capture bakes that
@@ -5009,7 +5016,6 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
     (void)get_sampled_runtime(m, n_ctx, local);
     kv = &local;
   }
-  warm_verify_gemv_wp_model(m);
   // The verify graphs a request can reach are built (and the anchors captured)
   // here, before any request; spec_measure_cost_curve then prices the curve on
   // those captured graphs.
@@ -5559,7 +5565,7 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_enabled());
+                          /*rows_mmq=*/decode_mmq_available());
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);

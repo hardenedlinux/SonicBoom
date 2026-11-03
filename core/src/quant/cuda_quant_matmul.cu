@@ -3778,6 +3778,288 @@ static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
   return std::nullopt;
 }
 
+// --- per-shape decode/verify kernel family ----------------------------------
+//
+// The decode (n = 1) and verify (n = k+1 <= 16) steps can run each quantized
+// projection either as the q8_1 gemv (one warp per output row, 32-element
+// activation blocks) or as the mmq int8 tensor-core matmul (128-element
+// activation blocks). Which one is faster is a property of the shape and the
+// device, so the two are timed once per (type, rows, cols) at model load and
+// every matmul of that shape takes the recorded family — at decode and at every
+// verify row count alike.
+//
+// Key: decode-family|<type>|<rows>x<cols>; the record carries the family (0
+// gemv, 1 mmq) and the build fingerprint as "k". A record is written once, on
+// the run that measured it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the pick
+// for debugging.
+namespace {
+
+constexpr int kDecodeFamilyN = 8;           // widest verify row count timed
+constexpr double kDecodeFamilyBudgetS = 1.5;  // whole warm-up, per model load
+constexpr int kDecodeFamilyTimed = 7;       // timed repetitions per candidate
+constexpr int kDecodeFamilyWarm = 3;
+// A shape takes mmq only when it is at least as fast at the decode row count
+// (within this slack); a slower mmq is the gemv's.
+constexpr double kDecodeFamilySlack = 1.02;
+
+// 0 none, 1 gemv, 2 mmq.
+int decode_family_override() {
+  static const int v = [] {
+    const char* e = std::getenv("SONICBOOM_DECODE_FAMILY");
+    if (!e) return 0;
+    if (std::strcmp(e, "gemv") == 0) return 1;
+    if (std::strcmp(e, "mmq") == 0) return 2;
+    std::fprintf(stderr,
+                 "SONICBOOM_DECODE_FAMILY: '%s' is not gemv/mmq; using the "
+                 "measured family\n",
+                 e);
+    return 0;
+  }();
+  return v;
+}
+
+std::mutex g_decode_family_mutex;
+std::map<std::string, bool> g_decode_family;  // key -> mmq
+std::string g_decode_family_build_id;
+
+std::string decode_family_key(QuantType qt, int rows, int cols) {
+  return std::string("decode-family|") + verify_wp_type_name(qt) + "|" +
+         std::to_string(rows) + "x" + std::to_string(cols);
+}
+
+int decode_family_build_hash(std::string_view build_id) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : build_id) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return int(static_cast<uint32_t>(h ^ (h >> 32)));
+}
+
+struct DecodeFamilyBuffers {
+  void* dw = nullptr;
+  void* dxq = nullptr;  // q8_1 blocks (gemv activation)
+  void* dmq = nullptr;  // block_q8_1_mmq blocks (mmq activation)
+  void* dy = nullptr;
+};
+
+void decode_family_free(DecodeFamilyBuffers& b) {
+  if (b.dy) cudaFree(b.dy);
+  if (b.dmq) cudaFree(b.dmq);
+  if (b.dxq) cudaFree(b.dxq);
+  if (b.dw) cudaFree(b.dw);
+  b = {};
+}
+
+bool decode_family_alloc(const VerifyWpShape& s, DecodeFamilyBuffers& b) {
+  const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
+                        size_t(quant_type_info(s.qt)->bytes_per_block);
+  const size_t aqbytes = size_t(kDecodeFamilyN) * size_t(s.cols / 32) *
+                         sizeof(q8_1::block_q8_1);
+  const size_t mqblocks =
+      size_t(mmq::mmq_q8_blocks(s.cols, kDecodeFamilyN));
+  const size_t mqbytes = mqblocks * sizeof(mmq::block_q8_1_mmq);
+  const size_t ybytes = size_t(kDecodeFamilyN) * size_t(s.rows) * sizeof(float);
+  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
+  if (cudaMalloc(&b.dxq, aqbytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dmq, mqbytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  cudaMemset(b.dw, 0, wbytes);  // no garbage scale in the arithmetic
+  cudaMemset(b.dxq, 0, aqbytes);
+  cudaMemset(b.dmq, 0, mqbytes);
+  return true;
+}
+
+// Median of the timed launches, after the untimed warm-ups. `launch` runs one
+// candidate.
+template <typename Launch>
+double decode_family_time(Launch&& launch) {
+  for (int i = 0; i < kDecodeFamilyWarm; ++i) launch();
+  cudaEvent_t begin = nullptr, end = nullptr;
+  if (cudaEventCreate(&begin) != cudaSuccess) return 0.0;
+  if (cudaEventCreate(&end) != cudaSuccess) {
+    cudaEventDestroy(begin);
+    return 0.0;
+  }
+  double times[kDecodeFamilyTimed];
+  for (int i = 0; i < kDecodeFamilyTimed; ++i) {
+    times[i] = 0.0;
+    cudaEventRecord(begin, cur_stream());
+    launch();
+    cudaEventRecord(end, cur_stream());
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaEventElapsedTime(&ms, begin, end) != cudaSuccess) {
+      (void)cudaGetLastError();
+      continue;
+    }
+    times[i] = double(ms);
+  }
+  cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  std::sort(times, times + kDecodeFamilyTimed);
+  return times[kDecodeFamilyTimed / 2];
+}
+
+double decode_family_gemv_ms(const VerifyWpShape& s,
+                             const DecodeFamilyBuffers& b, int n) {
+  const int wp = verify_gemv_wp_for(s.qt, s.rows, s.cols, n);
+  const auto* dw = static_cast<const uint8_t*>(b.dw);
+  const auto* xq = static_cast<const q8_1::block_q8_1*>(b.dxq);
+  auto* dy = static_cast<float*>(b.dy);
+  return decode_family_time([&] {
+    launch_gemv_q8_1_batched(s.qt, wp, dw, xq, dy, s.bpr, s.rows, n);
+  });
+}
+
+double decode_family_mmq_ms(const VerifyWpShape& s, MmqUpType type,
+                            const DecodeFamilyBuffers& b, int n) {
+  const MmqUpPin pin = mmq_up_pin_for(type, s.rows, s.cols);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  return decode_family_time([&] {
+    (void)mmq_up_matmul(b.dw, type,
+                        static_cast<const int32_t*>(b.dmq),
+                        static_cast<float*>(b.dy), s.rows, s.cols, n, nullptr,
+                        cfg, 1);
+  });
+}
+
+bool decode_family_cached(const VerifyWpShape& s, int build_key, bool* mmq) {
+  const std::string key = decode_family_key(s.qt, s.rows, s.cols);
+  {
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    const auto it = g_decode_family.find(key);
+    if (it != g_decode_family.end()) {
+      *mmq = it->second;
+      return true;
+    }
+  }
+  if (!tune::enabled() || build_key == 0) return false;
+  const auto rec = tune::lookup("decode-family", key);
+  const auto fi = rec.find("family");
+  const auto ki = rec.find("k");
+  if (fi == rec.end() || ki == rec.end() || ki->second != build_key ||
+      (fi->second != 0 && fi->second != 1))
+    return false;
+  *mmq = fi->second == 1;
+  return true;
+}
+
+void decode_family_store(const VerifyWpShape& s, bool mmq, int build_key) {
+  if (!tune::enabled() || build_key == 0) return;
+  tune::store("decode-family", decode_family_key(s.qt, s.rows, s.cols),
+              {{"family", mmq ? 1 : 0},
+               {"k", decode_family_build_hash(g_decode_family_build_id)}});
+}
+
+}  // namespace
+
+bool decode_family_mmq(QuantType qt, int rows, int cols) {
+  if (!available() || !q8_1_enabled() || !mmq_enabled()) return false;
+  if (rows <= 0 || cols <= 0 || cols % mmq::QK8_1_MMQ != 0) return false;
+  if (!mmq_up_type_of(qt)) return false;
+  const int ov = decode_family_override();
+  if (ov == 1) return false;
+  if (ov == 2) return true;
+  std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+  const auto it = g_decode_family.find(decode_family_key(qt, rows, cols));
+  return it != g_decode_family.end() && it->second;
+}
+
+void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
+                        const char* build_id) {
+  if (!available() || !q8_1_enabled() || !mmq_enabled() || !weights ||
+      count == 0)
+    return;
+  if (decode_family_override() != 0) return;  // the debug pin wins
+  {
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    if (!g_decode_family_build_id.empty()) return;  // already warmed
+    if (build_id) g_decode_family_build_id = build_id;
+  }
+  const int build_key =
+      (build_id && *build_id) ? decode_family_build_hash(build_id) : 0;
+
+  // Distinct projection shapes the mmq matmul can take, largest first: if the
+  // budget runs out, the shapes that dominate a decode step are priced first.
+  std::vector<VerifyWpShape> shapes;
+  for (size_t i = 0; i < count; ++i) {
+    const QuantizedTensor* w = weights[i];
+    if (!w || !w->valid() || w->dims().size() != 2) continue;
+    if (!mmq_up_type_of(w->type())) continue;
+    const int cols = int(w->dims()[0]);
+    const int rows = int(w->dims()[1]);
+    const int bpr = cols / int(w->block_size());
+    if (rows <= 0 || cols % mmq::QK8_1_MMQ != 0 || bpr <= 0) continue;
+    bool seen = false;
+    for (const auto& s : shapes)
+      if (s.qt == w->type() && s.rows == rows && s.cols == cols) {
+        seen = true;
+        break;
+      }
+    if (!seen) shapes.push_back({w->type(), rows, cols, bpr});
+  }
+  std::sort(shapes.begin(), shapes.end(), [](const VerifyWpShape& a,
+                                             const VerifyWpShape& b) {
+    return int64_t(a.rows) * a.cols > int64_t(b.rows) * b.cols;
+  });
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto elapsed_s = [&t0] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  for (const auto& s : shapes) {
+    bool mmq = false;
+    if (!decode_family_cached(s, build_key, &mmq)) {
+      if (elapsed_s() > kDecodeFamilyBudgetS) {
+        std::fprintf(stderr,
+                     "warm_decode_family: %.2fs load budget reached; the "
+                     "remaining shapes keep the gemv\n",
+                     elapsed_s());
+        break;
+      }
+      DecodeFamilyBuffers b{};
+      if (!decode_family_alloc(s, b)) {
+        decode_family_free(b);
+        continue;
+      }
+      // Both families are timed at the decode row count (the choice) and at
+      // the widest verify row count (the table).
+      const double gemv1 = decode_family_gemv_ms(s, b, 1);
+      const double mmq1 =
+          decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, 1);
+      const double gemv8 = decode_family_gemv_ms(s, b, kDecodeFamilyN);
+      const double mmq8 =
+          decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, kDecodeFamilyN);
+      decode_family_free(b);
+      mmq = gemv1 > 0.0 && mmq1 > 0.0 &&
+            mmq1 <= gemv1 * kDecodeFamilySlack;
+      if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
+        std::fprintf(stderr,
+                     "decode-family %s %dx%d family=%s t1=%.4f/%.4f "
+                     "t%d=%.4f/%.4f\n",
+                     verify_wp_type_name(s.qt).c_str(), s.rows, s.cols,
+                     mmq ? "mmq" : "gemv", gemv1, mmq1, kDecodeFamilyN,
+                     gemv8, mmq8);
+      }
+      decode_family_store(s, mmq, build_key);
+    }
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    g_decode_family[decode_family_key(s.qt, s.rows, s.cols)] = mmq;
+  }
+}
+
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
 // shared memory as int8 and multiplies against a block_q8_1_mmq activation via
 // m16n8k16/m16n8k32 tensor cores. X is [n, cols] position-major, which is

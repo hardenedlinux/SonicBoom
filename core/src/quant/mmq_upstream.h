@@ -115,9 +115,10 @@ bool mmq_up_cfg_allowed(MmqUpType type, int64_t M, int J, int cfg);
 void mmq_up_cfg_dims(MmqUpType type, int64_t M, int J, int cfg,
                      int * I, int * nthreads);
 
-// The pinned small-n choice for one (type, rows, cols) shape: split count and
-// the tile configuration for tile width 8 (n <= 8) and 16 (n = 9..16).  The
-// values come from the warm-up's measured table; 1/0/0 means "not tuned".
+// The pinned small-n choice for one (type, rows, cols) shape: the tile
+// configuration for tile width 8 (n <= 8) and 16 (n = 9..16).  The split count
+// is pinned to 1 for every shape.  The values come from the warm-up's measured
+// table; 1/0/0 means "not tuned".
 struct MmqUpPin {
     int split_k = 1;
     int cfg_j8  = 0;
@@ -125,15 +126,10 @@ struct MmqUpPin {
 };
 MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K);
 
-// True when SONICBOOM_DECODE_MMQ selects the MMQ lowering for the decode and
-// verify steps (one switch for both).
-bool mmq_up_decode_enabled();
-
 // Measure (or load from the tune file) the pinned choice for every distinct
 // quantized projection shape, largest first, under the warm-up load budget.
-// Synthetic zeroed weights of the real shapes; no-op unless decode-on-MMQ is
-// enabled.  build_id keys the stored records.  Also sizes the split-K partial
-// buffer for n = 16 at every shape, outside any graph capture.
+// Synthetic zeroed weights of the real shapes.  build_id keys the stored
+// records.
 void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                  const char * build_id);
 

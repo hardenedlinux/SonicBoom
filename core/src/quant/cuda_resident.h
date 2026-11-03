@@ -138,6 +138,21 @@ int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n);
 void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
                          const char* build_id);
 
+// The decode/verify kernel family for one quantized projection shape: the
+// single-column gemv (32-element q8_1 activation per position) or the mmq int8
+// tensor-core matmul (128-element block_q8_1_mmq activation). True when the
+// shape takes mmq; false (the gemv) when it has not been measured or the mmq
+// cannot serve it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the pick.
+bool decode_family_mmq(QuantType qt, int rows, int cols);
+
+// Measure (or load from the tune file) that family for the model's distinct
+// quantized projection shapes, largest first, under a warm-up load budget.
+// Synthetic zeroed weights and activations at the real shapes; the picks are
+// stored keyed by the build fingerprint `build_id`. A no-op when q8_1 or mmq is
+// unavailable, when the debug pin is set, or after the first call.
+void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
+                        const char* build_id);
+
 // One member of a sibling launch: a quantized projection reading the shared
 // q8_1 activation, with its optional [rows] bias and its [rows] output.
 struct GemvSibling {
