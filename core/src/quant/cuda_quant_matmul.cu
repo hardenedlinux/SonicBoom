@@ -3879,6 +3879,64 @@ bool decode_family_alloc(const VerifyWpShape& s, DecodeFamilyBuffers& b) {
   return true;
 }
 
+// M1: trace one line per warm-up candidate. Off unless
+// SONICBOOM_DECODE_FAMILY_TRACE is set.
+bool decode_family_trace() {
+  static const bool on = std::getenv("SONICBOOM_DECODE_FAMILY_TRACE") != nullptr;
+  return on;
+}
+
+// The launches one candidate call makes, read back from the plan recorder the
+// launch hooks feed. Only used when tracing, so the extra call the capture
+// costs never matters to a measurement (the timer has its own warm-ups).
+template <typename Call>
+std::vector<planner::LaunchRecord> decode_family_launches(Call&& call) {
+  planner::PlanRecorder rec;
+  planner::PlanRecorder* saved = planner::recorder();
+  planner::set_thread_recorder(&rec);
+  rec.begin_step(0, 0, 0, "", "", "", {}, nullptr);
+  call();
+  rec.end_step();
+  planner::set_thread_recorder(saved);
+  if (rec.steps().empty()) return {};
+  return rec.steps().back().launches;
+}
+
+// shape, family, n, host function, kernel symbol, grid, block, the family's
+// tuning parameter (warps per row for the gemv, tile config for the mmq), the
+// weight bytes, the median time and the effective weight bandwidth. `ms` is the
+// cudaEvent median; the line reports microseconds.
+void decode_family_trace_line(const char* family, const char* host,
+                              const VerifyWpShape& s, int n, int wp, int cfg,
+                              int S,
+                              const std::vector<planner::LaunchRecord>& l,
+                              double ms) {
+  const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
+                        size_t(quant_type_info(s.qt)->bytes_per_block);
+  const double us = ms * 1000.0;
+  const double gbs = us > 0.0 ? double(wbytes) / (us * 1000.0) : 0.0;
+  if (l.empty()) {
+    std::fprintf(stderr,
+                 "decode-family-trace family=%s type=%s rows=%d cols=%d n=%d "
+                 "host=%s kernel=- grid=- block=- wp=%d cfg=%d S=%d "
+                 "weight_bytes=%zu median_us=%.4f GB_per_s=%.2f\n",
+                 family, verify_wp_type_name(s.qt).c_str(), s.rows, s.cols, n,
+                 host, wp, cfg, S, wbytes, us, gbs);
+    return;
+  }
+  for (const auto& x : l) {
+    std::fprintf(stderr,
+                 "decode-family-trace family=%s type=%s rows=%d cols=%d n=%d "
+                 "host=%s kernel=%s tparams=%s grid=%u,%u,%u block=%u,%u,%u "
+                 "wp=%d cfg=%d S=%d weight_bytes=%zu median_us=%.4f "
+                 "GB_per_s=%.2f\n",
+                 family, verify_wp_type_name(s.qt).c_str(), s.rows, s.cols, n,
+                 host, x.kernel.c_str(), x.tparams.c_str(), x.grid[0], x.grid[1],
+                 x.grid[2], x.block[0], x.block[1], x.block[2], wp, cfg, S,
+                 wbytes, us, gbs);
+  }
+}
+
 // Median of the timed launches, after the untimed warm-ups. `launch` runs one
 // candidate.
 template <typename Launch>
@@ -3911,27 +3969,60 @@ double decode_family_time(Launch&& launch) {
   return times[kDecodeFamilyTimed / 2];
 }
 
+// The gemv candidate is the host call the deployed node makes at that row
+// count: the decode step (n = 1) runs launch_gemv_q8_1_from_quantized, whose
+// warps-per-row comes from the shape's q1 launch-width table; the verify step
+// (n > 1) runs the batched mmvq at the warps-per-row warm_verify_gemv_wp pins.
 double decode_family_gemv_ms(const VerifyWpShape& s,
                              const DecodeFamilyBuffers& b, int n) {
-  const int wp = verify_gemv_wp_for(s.qt, s.rows, s.cols, n);
   const auto* dw = static_cast<const uint8_t*>(b.dw);
   const auto* xq = static_cast<const q8_1::block_q8_1*>(b.dxq);
   auto* dy = static_cast<float*>(b.dy);
-  return decode_family_time([&] {
-    launch_gemv_q8_1_batched(s.qt, wp, dw, xq, dy, s.bpr, s.rows, n);
+  const int wp = n == 1
+                     ? resolve_gemv_warps(s.qt, dw, xq, dy, s.bpr, s.rows,
+                                          nullptr, nullptr)
+                     : verify_gemv_wp_for(s.qt, s.rows, s.cols, n);
+  const char* host = n == 1 ? "gemv_q8_1_dev"
+                            : "gemv_q8_1_batched_dev";
+  const double us = decode_family_time([&] {
+    if (n == 1)
+      launch_gemv_q8_1_from_quantized(s.qt, dw, xq, dy, s.bpr, s.rows);
+    else
+      launch_gemv_q8_1_batched(s.qt, wp, dw, xq, dy, s.bpr, s.rows, n);
   });
+  if (decode_family_trace()) {
+    const auto launches = decode_family_launches([&] {
+      if (n == 1)
+        launch_gemv_q8_1_from_quantized(s.qt, dw, xq, dy, s.bpr, s.rows);
+      else
+        launch_gemv_q8_1_batched(s.qt, wp, dw, xq, dy, s.bpr, s.rows, n);
+    });
+    decode_family_trace_line("gemv", host, s, n, wp, 0, 1, launches, us);
+  }
+  return us;
 }
 
+// The mmq candidate is matmul_mmq_q8_dev's launch: the same pinned tile config,
+// the same split-K count, and the pad-plane pass that precedes the matmul.
 double decode_family_mmq_ms(const VerifyWpShape& s, MmqUpType type,
                             const DecodeFamilyBuffers& b, int n) {
   const MmqUpPin pin = mmq_up_pin_for(type, s.rows, s.cols);
   const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
-  return decode_family_time([&] {
-    (void)mmq_up_matmul(b.dw, type,
-                        static_cast<const int32_t*>(b.dmq),
+  auto* mq = static_cast<mmq::block_q8_1_mmq*>(b.dmq);
+  auto launch = [&] {
+    mmq::zero_pad_planes(mq, s.cols, n, cur_stream());
+    (void)mmq_up_matmul(b.dw, type, reinterpret_cast<const int32_t*>(mq),
                         static_cast<float*>(b.dy), s.rows, s.cols, n, nullptr,
-                        cfg, 1);
-  });
+                        cfg, pin.split_k);
+  };
+  const double us = decode_family_time(launch);
+  if (decode_family_trace()) {
+    const auto launches = decode_family_launches(launch);
+    const int S = launches.empty() ? 1 : int(launches.front().grid[2]);
+    decode_family_trace_line("mmq", "matmul_mmq_q8_dev", s, n, 0, cfg, S,
+                             launches, us);
+  }
+  return us;
 }
 
 bool decode_family_cached(const VerifyWpShape& s, int build_key, bool* mmq) {

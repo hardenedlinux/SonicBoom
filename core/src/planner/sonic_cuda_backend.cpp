@@ -28,6 +28,7 @@
 #include <sonicboom/numerics.h>
 #include <sonicboom/planner/plan_record.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
+#include <sonicboom/quant/quantized_tensor.h>
 
 #include "../nn/cuda_graph.h"
 #include "../nn/cuda_resident.h"
@@ -46,8 +47,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -90,6 +94,33 @@ bool spec_verify_batch_enabled() {
     return !(e && std::string_view(e) == "0");
   }();
   return on;
+}
+
+// SONICBOOM_DECODE_FAMILY_TRACE: one line per distinct host call the deployed
+// decode/verify plan makes, so the calls the graph runs can be compared with
+// the warm-up's timed candidates. Deduplicated by (host, type, rows, cols, n,
+// members), so a 42-layer model prints each projection class once.
+void trace_family_call(const char* host, const quant::QuantizedTensor& w, int n,
+                       int members = 1) {
+  static const bool on = std::getenv("SONICBOOM_DECODE_FAMILY_TRACE") != nullptr;
+  if (!on || !w.valid() || w.dims().size() != 2) return;
+  const auto* info = quant::quant_type_info(w.type());
+  const char* type = info ? info->name : "unknown";
+  const std::string key = std::string(host) + "|" + type + "|" +
+                          std::to_string(w.dims()[1]) + "x" +
+                          std::to_string(w.dims()[0]) + "|" + std::to_string(n) +
+                          "|" + std::to_string(members);
+  static std::mutex mu;
+  static std::map<std::string, bool> seen;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (!seen.emplace(key, true).second) return;
+  }
+  std::fprintf(stderr,
+               "decode-family-plan host=%s type=%s rows=%llu cols=%llu n=%d "
+               "members=%d\n",
+               host, type, (unsigned long long)w.dims()[1],
+               (unsigned long long)w.dims()[0], n, members);
 }
 
 bool attr_i(const GraphNodeDesc& n, std::string_view name, int64_t& out) {
@@ -1335,6 +1366,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
               batch_on && fused_ep && !bias.empty() &&
               bias.size() == size_t(rows_n);
           const bool add_fused = batch_on && fused_ep && add != nullptr;
+          trace_family_call(batch_on ? "gemv_q8_1_batched_dev" : "gemv_q8_1_dev",
+                            w, int(vr));
           bool r;
           if (batch_on) {
             r = quant::cuda::gemv_q8_1_batched_dev(
@@ -1395,6 +1428,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             }
             sib.push_back(quant::cuda::GemvSibling{&w, biases.back(), yp});
           }
+          if (ready && !has_add && spec_verify_batch_enabled())
+            for (const auto& member : sib)
+              trace_family_call("gemv_q8_1_siblings_batched_dev",
+                                *member.weight, int(vr), int(members));
           if (ready && !has_add && spec_verify_batch_enabled() &&
               quant::cuda::gemv_q8_1_siblings_batched_dev(sib, xq, int(vr))) {
             ok = true;
@@ -1439,6 +1476,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           if (decomp_s == "stream_k") decomp = quant::cuda::MmqDecomp::StreamK;
           else if (decomp_s == "tiled") decomp = quant::cuda::MmqDecomp::Tiled;
         }
+        trace_family_call("matmul_mmq_q8_dev", qweight(slot), int(nb));
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
@@ -1475,6 +1513,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           const bool ep = quant::cuda::gemv_bias_epilogue_supported(w.type());
           const bool bias_fused = !bias.empty() && bias.size() == size_t(n) && ep;
           const bool add_fused = add_p != nullptr && ep;
+          trace_family_call("gemv_q8_1_dev", w, 1);
           bool r = quant::cuda::gemv_q8_1_dev(
               w, xq, y, bias_fused ? bias : std::span<const float>{},
               add_fused ? add_p : nullptr);
@@ -1526,6 +1565,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             }
             sib.push_back(quant::cuda::GemvSibling{&w, biases.back(), yp});
           }
+          if (ready)
+            for (const auto& member : sib)
+              trace_family_call("gemv_q8_1_siblings_dev", *member.weight, 1,
+                                int(members));
           if (ready && quant::cuda::gemv_q8_1_siblings_dev(sib, xq)) {
             ok = true;
           } else if (ready) {

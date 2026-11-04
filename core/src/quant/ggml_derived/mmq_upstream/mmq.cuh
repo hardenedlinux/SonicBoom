@@ -28,6 +28,10 @@
 
 #include "common.cuh"
 
+// SonicBoom: plan-record hook for the launches below (no-op unless a recorder
+// is installed on the calling thread).
+#include "../../../planner/plan_hook.h"
+
 #include <climits>
 #include <cstdint>
 
@@ -1636,6 +1640,11 @@ static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args,
     if (!config.stream_k) {
         if (split_k_eff > 1) {
             const dim3 block_nums_split(nty, ntx, split_k_eff);
+            SB_NOTE_LAUNCH_TP(
+                "mul_mat_q",
+                ::sonicboom::planner::plan_detail::tp_label(
+                    {{"type", (long long)type}, {"J", J}, {"cfg", CFG}}),
+                block_nums_split, block_dims, nbytes_shared, stream);
             mul_mat_q<type, J, fallback, prec_src1, CFG><<<block_nums_split, block_dims, nbytes_shared, stream>>>
                 (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, split_scratch, args.y_scale,
                  blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1646,12 +1655,20 @@ static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args,
             const int64_t n_elem = int64_t(args.nrows_dst)*int64_t(args.ncols_dst);
             const int     reduce_threads = 256;
             const int64_t reduce_blocks  = (n_elem + reduce_threads - 1) / reduce_threads;
+            SB_NOTE_LAUNCH(mul_mat_q_split_k_reduce,
+                           dim3((unsigned)reduce_blocks), dim3(reduce_threads), 0,
+                           stream);
             mul_mat_q_split_k_reduce<<<(unsigned)reduce_blocks, reduce_threads, 0, stream>>>
                 (split_scratch, args.dst, n_elem, split_k_eff, args.bias, args.add,
                  args.nrows_dst);
             return;
         }
 
+        SB_NOTE_LAUNCH_TP(
+            "mul_mat_q",
+            ::sonicboom::planner::plan_detail::tp_label(
+                {{"type", (long long)type}, {"J", J}, {"cfg", CFG}}),
+            block_nums_xy_tiling, block_dims, nbytes_shared, stream);
         mul_mat_q<type, J, fallback, prec_src1, CFG><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
