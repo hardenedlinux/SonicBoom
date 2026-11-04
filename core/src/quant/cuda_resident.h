@@ -153,6 +153,16 @@ bool decode_family_mmq(QuantType qt, int rows, int cols);
 void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
                         const char* build_id);
 
+// Measure (or load from the tune file) the family of one sibling group (2-3
+// projections over the shared activation): the merged gemv launch against the
+// grouped mmq launch at the pinned split-K, each timed at the decode and the
+// widest verify row count; the lower t(1) + t(8) total takes every member.
+// The pick is stored under decode-family|<types>|<rows,...>x<cols> with the
+// build fingerprint. A no-op when the members cannot run one of the families,
+// when q8_1 or mmq is unavailable, or when the debug pin is set.
+void warm_decode_family_group(const QuantizedTensor* const* weights, int count,
+                              const char* build_id);
+
 // One member of a sibling launch: a quantized projection reading the shared
 // q8_1 activation, with its optional [rows] bias and its [rows] output.
 struct GemvSibling {

@@ -4983,17 +4983,20 @@ static void warm_mmq_decode_model(const Gemma4Model& m) {
   const std::string fingerprint = spec_kernel_fingerprint();
   quant::cuda::mmq_up_warm(weights.data(), weights.size(),
                            fingerprint.c_str());
+  // The sibling groups first: their family fixes their members' entries, and
+  // the per-shape pass below leaves those shapes alone. The groups' mmq
+  // candidates run on the split-K counts measured here.
+  warm_mmq_group_split_model(m, fingerprint);
   quant::cuda::warm_decode_family(weights.data(), weights.size(),
                                   fingerprint.c_str());
-  warm_mmq_group_split_model(m, fingerprint);
 }
 
 // The sibling projections the plan's MMQ group launch can carry: the attention
 // triple and the feed-forward pair of every block, partitioned by activation
 // layout (one group reads one quantized activation buffer) and restricted to
 // the formats, column counts and row counts the group kernel takes — the same
-// filter the plan's sibling pass applies.  Each group's split-K count is
-// measured once here, before any graph is built.
+// filter the plan's sibling pass applies.  Each group's split-K count and its
+// decode/verify family are measured once here, before any graph is built.
 static void warm_mmq_group_split_model(const Gemma4Model& m,
                                        const std::string& fingerprint) {
   using quant::QuantType;
@@ -5022,6 +5025,7 @@ static void warm_mmq_group_split_model(const Gemma4Model& m,
       MmqUpType type;
       int64_t rows;
       int64_t cols;
+      const quant::QuantizedTensor* src;
     };
     Slot slot[3][3];
     int nslot[3] = {0, 0, 0};
@@ -5036,22 +5040,26 @@ static void warm_mmq_group_split_model(const Gemma4Model& m,
       const int64_t rows = int64_t(w[i]->dims()[1]);
       if (cols <= 0 || cols % 128 != 0 || rows <= 0 || rows % 128 != 0) return;
       Slot& s = slot[kSlotOfDs[ds]][nslot[kSlotOfDs[ds]]++];
-      s = {*t, rows, cols};
+      s = {*t, rows, cols, w[i]};
     }
     for (int b = 0; b < 2; ++b) {
       if (nslot[b] < 2) continue;
       MmqUpType types[3] = {};
       int64_t rows[3] = {};
+      const quant::QuantizedTensor* members[3] = {};
       bool same_cols = true;
       for (int i = 0; i < nslot[b]; ++i) {
         types[i] = slot[b][i].type;
         rows[i] = slot[b][i].rows;
+        members[i] = slot[b][i].src;
         same_cols = same_cols && slot[b][i].cols == slot[b][0].cols;
       }
       if (!same_cols) continue;
       quant::cuda::mmq_up_group_warm_split(types, rows, nslot[b],
                                            slot[b][0].cols,
                                            fingerprint.c_str());
+      quant::cuda::warm_decode_family_group(members, nslot[b],
+                                            fingerprint.c_str());
     }
   };
   for (const auto& b : m.weights.blocks) {

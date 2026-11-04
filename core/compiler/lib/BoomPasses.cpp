@@ -1065,11 +1065,12 @@ public:
 // again identical to the member's separate batched launch.
 //
 // The mmq form of the same merge: nodes that take the mmq matmul (`batch`
-// attributes from the prefill lowering) and read one shared block_q8_1_mmq
-// activation become one node the backend runs as a grouped mmq launch. Members
-// must agree on the extent and on the activation's scale layout (`ds`); a node
-// that quantizes its activation inside the matmul (`mmq_rows`) reads an f32
-// tensor and is left alone. A member's residual input, when it has one, is
+// attributes from the prefill lowering or from the decode/verify family) and
+// read one shared block_q8_1_mmq activation become one node the backend runs as
+// a grouped mmq launch. Members must agree on the extent and on the activation's
+// scale layout (`ds`). The operator already says the activation is quantized: a
+// projection that quantizes inside the matmul stays `quantized_matmul` and never
+// enters this group. A member's residual input, when it has one, is
 // appended to the merged node's operands and named by `s1_add_input` /
 // `s2_add_input`, so the group applies it with that member's output. The merged
 // node's results are in member order, as for the gemv form.
@@ -1161,7 +1162,7 @@ public:
         continue;
       auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
       const auto nb = nodeAttrInt(attrs, "batch");
-      if (!nb || nodeAttrInt(attrs, "mmq_rows")) continue;
+      if (!nb) continue;
       if (!nodeAttrInt(attrs, "slot")) continue;
       if (node.getNumResults() != 1 || node.getNumOperands() < 1) continue;
       const auto ds = nodeAttrInt(attrs, "ds");

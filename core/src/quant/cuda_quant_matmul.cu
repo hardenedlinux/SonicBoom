@@ -3211,6 +3211,35 @@ bool prepare_sibling_slots(std::span<const GemvSibling> siblings,
   return true;
 }
 
+// Launch the merged sibling kernel over prepared slots. `batch` false is the
+// decode form (one activation row); true is the position-batched verify form,
+// where `xq` is [n, cols/32] q8_1 blocks and every member's `y` is [n, rows].
+bool launch_sibling_slots(const q8_1::legacy_slot (&slots)[3], int total_rows,
+                          int blocks_per_row, const BlockQ8_1* xq, bool batch,
+                          int n) {
+  const dim3 block(32, 8);
+  const dim3 grid(1, (total_rows + 7) / 8);
+  if (!batch) {
+    SB_NOTE_LAUNCH(q8_1::gemv_legacy_siblings_q8_1, grid, block, 0,
+                   cur_stream());
+    q8_1::gemv_legacy_siblings_q8_1<<<grid, block, 0, cur_stream()>>>(
+        slots[0], slots[1], slots[2],
+        reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row);
+  } else {
+    if (grid.y > 65535) return false;  // very wide member group; keep it split
+    SB_NOTE_LAUNCH_TP(
+        "q8_1::gemv_legacy_siblings_batched",
+        ::sonicboom::planner::plan_detail::tp_label(
+            {{"T", q8_1::GEMV_BATCH_T}}),
+        grid, block, 0, cur_stream());
+    q8_1::gemv_legacy_siblings_batched_q8_1<q8_1::GEMV_BATCH_T>
+        <<<grid, block, 0, cur_stream()>>>(
+            slots[0], slots[1], slots[2],
+            reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row, n);
+  }
+  return cudaGetLastError() == cudaSuccess;
+}
+
 }  // namespace
 
 bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
@@ -3220,14 +3249,8 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
   int total_rows = 0, blocks_per_row = 0;
   if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
     return false;
-
-  const dim3 block(32, 8);
-  const dim3 grid(1, (total_rows + 7) / 8);
-  SB_NOTE_LAUNCH(q8_1::gemv_legacy_siblings_q8_1, grid, block, 0, cur_stream());
-  q8_1::gemv_legacy_siblings_q8_1<<<grid, block, 0, cur_stream()>>>(
-      slots[0], slots[1], slots[2],
-      reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row);
-  return cudaGetLastError() == cudaSuccess;
+  return launch_sibling_slots(slots, total_rows, blocks_per_row, xq,
+                              /*batch=*/false, 1);
 }
 
 // Multi-position form of gemv_q8_1_siblings_dev (the verify step): the same
@@ -3241,20 +3264,8 @@ bool gemv_q8_1_siblings_batched_dev(std::span<const GemvSibling> siblings,
   int total_rows = 0, blocks_per_row = 0;
   if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
     return false;
-
-  const dim3 block(32, 8);
-  const dim3 grid(1, (total_rows + 7) / 8);
-  if (grid.y > 65535) return false;  // very wide member group; keep it split
-  SB_NOTE_LAUNCH_TP(
-      "q8_1::gemv_legacy_siblings_batched",
-      ::sonicboom::planner::plan_detail::tp_label(
-          {{"T", q8_1::GEMV_BATCH_T}}),
-      grid, block, 0, cur_stream());
-  q8_1::gemv_legacy_siblings_batched_q8_1<q8_1::GEMV_BATCH_T>
-      <<<grid, block, 0, cur_stream()>>>(
-          slots[0], slots[1], slots[2],
-          reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row, n);
-  return cudaGetLastError() == cudaSuccess;
+  return launch_sibling_slots(slots, total_rows, blocks_per_row, xq,
+                              /*batch=*/true, n);
 }
 
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
@@ -3784,23 +3795,23 @@ static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
 // projection either as the q8_1 gemv (one warp per output row, 32-element
 // activation blocks) or as the mmq int8 tensor-core matmul (128-element
 // activation blocks). Which one is faster is a property of the shape and the
-// device, so the two are timed once per (type, rows, cols) at model load and
-// every matmul of that shape takes the recorded family — at decode and at every
-// verify row count alike.
+// device, so the two are timed once per (type, rows, cols) at model load, at
+// the decode row count and the widest verify row count, and the family with the
+// lower total (t(1) + t(8)) is recorded for both alike. Sibling groups — the
+// q/k/v trio and the gate/up pair — are timed as the merged launches they run
+// as, and every member takes the group's family.
 //
-// Key: decode-family|<type>|<rows>x<cols>; the record carries the family (0
-// gemv, 1 mmq) and the build fingerprint as "k". A record is written once, on
-// the run that measured it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the pick
-// for debugging.
+// Key: decode-family|<type>|<rows>x<cols> (groups:
+// decode-family|<types>|<rows,rows,...>x<cols>); the record carries the family
+// (0 gemv, 1 mmq) and the build fingerprint as "k". A record is written once,
+// on the run that measured it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the
+// pick for debugging.
 namespace {
 
 constexpr int kDecodeFamilyN = 8;           // widest verify row count timed
 constexpr double kDecodeFamilyBudgetS = 1.5;  // whole warm-up, per model load
 constexpr int kDecodeFamilyTimed = 7;       // timed repetitions per candidate
 constexpr int kDecodeFamilyWarm = 3;
-// A shape takes mmq only when it is at least as fast at the decode row count
-// (within this slack); a slower mmq is the gemv's.
-constexpr double kDecodeFamilySlack = 1.02;
 
 // 0 none, 1 gemv, 2 mmq.
 int decode_family_override() {
@@ -4053,6 +4064,162 @@ void decode_family_store(const VerifyWpShape& s, bool mmq, int build_key) {
                {"k", decode_family_build_hash(g_decode_family_build_id)}});
 }
 
+// --- sibling-group family ---------------------------------------------------
+//
+// A sibling group runs as the merged gemv launch (the fused sibling gemv at
+// the decode row count, its position-batched form at the verify row count) or
+// as the grouped mmq launch on the group's pinned split-K. The two families are
+// timed once per group; every member records the group's family, so the plan's
+// sibling merge can carry the whole group on one launch.
+std::map<std::string, bool> g_decode_family_group;  // key -> mmq
+
+std::string decode_family_group_key(const QuantizedTensor* const* w, int count,
+                                    int cols) {
+  std::string k = "decode-family|";
+  for (int i = 0; i < count; ++i) {
+    if (i) k += ",";
+    k += verify_wp_type_name(w[i]->type());
+  }
+  k += "|";
+  for (int i = 0; i < count; ++i) {
+    if (i) k += ",";
+    k += std::to_string(int(w[i]->dims()[1]));
+  }
+  return k + "x" + std::to_string(cols);
+}
+
+struct DecodeFamilyGroupBuffers {
+  void* dw[3] = {};
+  void* dy[3] = {};
+  void* dxq = nullptr;  // q8_1 blocks (gemv activation)
+  void* dmq = nullptr;  // block_q8_1_mmq blocks (mmq activation)
+};
+
+void decode_family_group_free(DecodeFamilyGroupBuffers& b) {
+  for (int k = 0; k < 3; ++k) {
+    if (b.dy[k]) cudaFree(b.dy[k]);
+    if (b.dw[k]) cudaFree(b.dw[k]);
+  }
+  if (b.dmq) cudaFree(b.dmq);
+  if (b.dxq) cudaFree(b.dxq);
+  b = {};
+}
+
+bool decode_family_group_alloc(const QuantizedTensor* const* w, int count,
+                               int cols, DecodeFamilyGroupBuffers& b) {
+  const size_t aqbytes = size_t(kDecodeFamilyN) * size_t(cols / 32) *
+                         sizeof(q8_1::block_q8_1);
+  const size_t mqblocks =
+      size_t(mmq::mmq_q8_blocks(cols, kDecodeFamilyN));
+  const size_t mqbytes = mqblocks * sizeof(mmq::block_q8_1_mmq);
+  if (cudaMalloc(&b.dxq, aqbytes) != cudaSuccess) return false;
+  if (cudaMalloc(&b.dmq, mqbytes) != cudaSuccess) {
+    decode_family_group_free(b);
+    return false;
+  }
+  // Zeroed weights and activations: no garbage scale reaches the arithmetic.
+  cudaMemset(b.dxq, 0, aqbytes);
+  cudaMemset(b.dmq, 0, mqbytes);
+  for (int i = 0; i < count; ++i) {
+    const int rows = int(w[i]->dims()[1]);
+    const size_t wbytes =
+        size_t(rows) * size_t(w[i]->dims()[0] / w[i]->block_size()) *
+        size_t(quant_type_info(w[i]->type())->bytes_per_block);
+    const size_t ybytes = size_t(rows) * size_t(kDecodeFamilyN) * sizeof(float);
+    if (cudaMalloc(&b.dw[i], wbytes) != cudaSuccess ||
+        cudaMalloc(&b.dy[i], ybytes) != cudaSuccess) {
+      decode_family_group_free(b);
+      return false;
+    }
+    cudaMemset(b.dw[i], 0, wbytes);
+  }
+  return true;
+}
+
+// The gemv family candidate: the merged sibling launch the deployed node makes
+// at that row count.
+double decode_family_group_gemv_ms(const QuantizedTensor* const* w, int count,
+                                   const DecodeFamilyGroupBuffers& b, int n,
+                                   int cols) {
+  q8_1::legacy_slot slots[3] = {};
+  int total_rows = 0;
+  for (int i = 0; i < count; ++i) {
+    const int rows = int(w[i]->dims()[1]);
+    slots[i] = q8_1::legacy_slot{static_cast<const uint8_t*>(b.dw[i]), nullptr,
+                                 static_cast<float*>(b.dy[i]), rows,
+                                 sibling_slot_type(w[i]->type())};
+    total_rows += rows;
+  }
+  const auto* xq = static_cast<const BlockQ8_1*>(b.dxq);
+  // The merged gemv walks q8_1 blocks (32 elements), not weight blocks.
+  const int bpr = cols / q8_1::QK8_1;
+  return decode_family_time([&] {
+    (void)launch_sibling_slots(slots, total_rows, bpr, xq, n > 1, n);
+  });
+}
+
+// The mmq family candidate: the grouped launch with the group's pinned
+// split-K, and the pad-plane pass that precedes it.
+double decode_family_group_mmq_ms(const QuantizedTensor* const* w, int count,
+                                  const DecodeFamilyGroupBuffers& b, int n,
+                                  int cols) {
+  MmqUpType types[3] = {};
+  MmqGroupArgs args{};
+  args.n_members = count;
+  args.ncols_dst = n;
+  args.ncols_y = n;
+  for (int i = 0; i < count; ++i) {
+    const int rows = int(w[i]->dims()[1]);
+    types[i] = *mmq_up_type_of(w[i]->type());
+    const int bpr = int(w[i]->dims()[0] / w[i]->block_size());
+    MmqGroupMember& m = args.m[i];
+    m.x = static_cast<const uint8_t*>(b.dw[i]);
+    m.y = reinterpret_cast<const int32_t*>(b.dmq);
+    m.dst = static_cast<float*>(b.dy[i]);
+    m.bias = nullptr;
+    m.add = nullptr;
+    m.nrows = rows;
+    m.stride_col_dst = rows;
+    m.stride_row_x = bpr;
+    m.blocks_per_row = bpr;
+  }
+  auto* mq = static_cast<mmq::block_q8_1_mmq*>(b.dmq);
+  return decode_family_time([&] {
+    mmq::zero_pad_planes(mq, cols, n, cur_stream());
+    (void)mmq_up_group_matmul(args, types, cur_stream());
+  });
+}
+
+bool decode_family_group_cached(const std::string& key, int build_key,
+                                bool* mmq) {
+  {
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    const auto it = g_decode_family_group.find(key);
+    if (it != g_decode_family_group.end()) {
+      *mmq = it->second;
+      return true;
+    }
+  }
+  if (!tune::enabled() || build_key == 0) return false;
+  const auto rec = tune::lookup("decode-family", key);
+  const auto fi = rec.find("family");
+  const auto ki = rec.find("k");
+  if (fi == rec.end() || ki == rec.end() || ki->second != build_key ||
+      (fi->second != 0 && fi->second != 1))
+    return false;
+  *mmq = fi->second == 1;
+  return true;
+}
+
+// The activation scale layout of a weight type, as the plan's sibling pass
+// buckets its groups (Q4_K/Q5_K half2-ds4, Q6_K none). -1 marks a type the
+// fused mmq activation emitter does not produce.
+int decode_family_ds(QuantType qt) {
+  if (qt == QuantType::Q4_K || qt == QuantType::Q5_K) return 1;
+  if (qt == QuantType::Q6_K) return -1;
+  return 0;
+}
+
 // The sibling-group kernels' shared-memory limits are set once, before any
 // group launch: cudaFuncSetAttribute is a host-side setup call and never
 // belongs on a launch path. The tuples are the format combinations the grouped
@@ -4144,8 +4311,8 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
         decode_family_free(b);
         continue;
       }
-      // Both families are timed at the decode row count (the choice) and at
-      // the widest verify row count (the table).
+      // Both families are timed at the decode row count and at the widest
+      // verify row count; the sum of the two is the family's cost.
       const double gemv1 = decode_family_gemv_ms(s, b, 1);
       const double mmq1 =
           decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, 1);
@@ -4153,8 +4320,8 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
       const double mmq8 =
           decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, kDecodeFamilyN);
       decode_family_free(b);
-      mmq = gemv1 > 0.0 && mmq1 > 0.0 &&
-            mmq1 <= gemv1 * kDecodeFamilySlack;
+      mmq = gemv1 > 0.0 && mmq1 > 0.0 && gemv8 > 0.0 && mmq8 > 0.0 &&
+            (mmq1 + mmq8) < (gemv1 + gemv8);
       if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
         std::fprintf(stderr,
                      "decode-family %s %dx%d family=%s t1=%.4f/%.4f "
@@ -4168,6 +4335,70 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
     std::lock_guard<std::mutex> lk(g_decode_family_mutex);
     g_decode_family[decode_family_key(s.qt, s.rows, s.cols)] = mmq;
   }
+}
+
+void warm_decode_family_group(const QuantizedTensor* const* weights, int count,
+                              const char* build_id) {
+  if (!available() || !q8_1_enabled() || !mmq_enabled() || !weights ||
+      count < 2 || count > 3)
+    return;
+  if (decode_family_override() != 0) return;  // the debug pin wins
+  const QuantizedTensor* w[3] = {weights[0], weights[1], weights[2]};
+  if (!w[0] || !w[0]->valid() || w[0]->dims().size() != 2) return;
+  const int64_t cols64 = int64_t(w[0]->dims()[0]);
+  if (cols64 <= 0 || cols64 % mmq::QK8_1_MMQ != 0) return;
+  const int cols = int(cols64);
+  int ds0 = 0;
+  for (int i = 0; i < count; ++i) {
+    if (!w[i] || !w[i]->valid() || w[i]->dims().size() != 2) return;
+    if (int64_t(w[i]->dims()[0]) != cols64) return;
+    const int64_t rows = int64_t(w[i]->dims()[1]);
+    if (rows <= 0 || rows % 128 != 0) return;
+    if (!mmq_up_type_of(w[i]->type())) return;
+    if (sibling_slot_type(w[i]->type()) < 0) return;
+    if (!is_legacy_quant(w[i]->type()) && cols % q8_1::QK_K != 0) return;
+    const int ds = decode_family_ds(w[i]->type());
+    if (ds < 0) return;  // no fused mmq activation layout for this member
+    if (i == 0) ds0 = ds;
+    else if (ds != ds0) return;  // the grouped launch needs one layout
+  }
+
+  const std::string key = decode_family_group_key(w, count, cols);
+  const int build_key =
+      (build_id && *build_id) ? decode_family_build_hash(build_id) : 0;
+  bool mmq = false;
+  if (!decode_family_group_cached(key, build_key, &mmq)) {
+    DecodeFamilyGroupBuffers b{};
+    if (!decode_family_group_alloc(w, count, cols, b)) {
+      decode_family_group_free(b);
+      return;  // the members keep the single-shape measurement
+    }
+    const double gemv1 = decode_family_group_gemv_ms(w, count, b, 1, cols);
+    const double mmq1 = decode_family_group_mmq_ms(w, count, b, 1, cols);
+    const double gemv8 =
+        decode_family_group_gemv_ms(w, count, b, kDecodeFamilyN, cols);
+    const double mmq8 =
+        decode_family_group_mmq_ms(w, count, b, kDecodeFamilyN, cols);
+    decode_family_group_free(b);
+    if (!(gemv1 > 0.0 && mmq1 > 0.0 && gemv8 > 0.0 && mmq8 > 0.0)) return;
+    mmq = (mmq1 + mmq8) < (gemv1 + gemv8);
+    if (tune::enabled() && build_key != 0) {
+      tune::store("decode-family", key,
+                  {{"family", mmq ? 1 : 0}, {"k", build_key}});
+    }
+    if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
+      std::fprintf(stderr,
+                   "decode-family-group %s family=%s t1=%.4f/%.4f "
+                   "t%d=%.4f/%.4f\n",
+                   key.c_str(), mmq ? "mmq" : "gemv", gemv1, mmq1,
+                   kDecodeFamilyN, gemv8, mmq8);
+    }
+  }
+  std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+  g_decode_family_group[key] = mmq;
+  for (int i = 0; i < count; ++i)
+    g_decode_family[decode_family_key(w[i]->type(), int(w[i]->dims()[1]),
+                                      cols)] = mmq;
 }
 
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
