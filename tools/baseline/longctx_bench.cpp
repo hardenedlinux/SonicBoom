@@ -2,39 +2,36 @@
 // Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 //
 // longctx_bench — decode tokens/sec at a fixed KV-cache depth, via the CUDA
-// decode spine. The one-shot prefill path rejects prompts longer than the SWA
-// window (its cache write requires a wrap-free run), so instead this measures
-// depth by decoding incrementally and subtracting: it decodes `depth + steps`
-// tokens from position 0 (building the cache), then decodes `depth` tokens from
-// position 0 again, and reports `steps / (t_full - t_warm)` tok/s — the last
-// `steps` steps, whose KV cache is ~`depth` keys deep. Deterministic greedy
-// decode means the first `depth` steps are bit-identical between the two runs,
-// so their time cancels exactly.
+// decode spine.
 //
-// CAVEAT — subtraction is thermal-fragile at large depth. At depth 2048 the two
-// decodes are ~47 s each, and the ~1.3 s tail is ~2.7% of each total; a ~0.4%
-// GPU-thermal drift between the second run (hotter) and the first inflates the
-// tail by ~12% (measured 50.4 tok/s here vs 44.0 tok/s steady). Prefer the
-// runtime's own single-run steady metric instead:
-//   SONICBOOM_GEN_TIMING=1 ./tools/baseline/longctx_bench --depth 2048 --steps 1
-// and read the `steady … tok/s` line (the `depth`-step decode averaged, first
-// step excluded). That is what benchmark.md §1.2 uses.
+// The measured segment is timed directly, inside one run: a session cache is
+// brought to `depth` (by decoding to it, or with --prefill by prefilling to it),
+// warmed for a few steps, and then a cudaEvent is recorded before the first
+// measured step and after the last. `RESULT` is `steps / elapsed`, so the
+// prefill/decode that builds the depth never enters the number and nothing is
+// subtracted across runs.
+//
+// `RESULT_legacy` keeps the previous estimate, `steps / (t_full - t_warm)`, from
+// two separate runs that cancel `depth` decode steps in between. The subtraction
+// is thermal-fragile at large depth (a ~0.4% drift between the two runs inflated
+// a 2048-deep tail by ~12%), which is why the direct number is the one to use;
+// the legacy line remains for continuity with older measurements. `--no-legacy`
+// skips the two extra runs.
 //
 // --prefill reaches the depth with the chunked prefill path instead of decoding
-// to it, which is what makes the 4K/16K/32K tiers affordable: two prefix-session
-// calls (prompt = depth tokens, one with 1 decode token and one with `steps`)
-// are subtracted, so the chunked prefill and the per-call graph/plan rebuild
-// cancel and only `steps-1` decode steps at depth remain. This matches
+// to it, which is what makes the 4K/16K/32K tiers affordable. This matches
 // llama-bench `-d <depth>`, which also prefills the depth.
 //
 // Usage: longctx_bench [--depth N] [--steps N] [--token id] [--n-ctx N]
-//                      [--prefill]
+//                      [--prefill] [--no-legacy]
 // Build: tools/baseline/build_longctx_bench.sh
 
 #include <sonicboom/gguf/reader.h>
 #include <sonicboom/model/loader.h>
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/kv_cache.h>
+
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <cstdint>
@@ -55,12 +52,14 @@ int main(int argc, char** argv) {
   uint64_t seed = 2;
   uint64_t n_ctx = 0;  // 0 = default (depth + steps)
   bool prefill_mode = false;
+  bool legacy = true;
   for (int i = 1; i < argc; ++i) {
     if (!strcmp(argv[i], "--depth")) depth = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--steps")) steps = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--token")) seed = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--n-ctx")) n_ctx = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--prefill")) prefill_mode = true;
+    else if (!strcmp(argv[i], "--no-legacy")) legacy = false;
   }
 
   std::string path;
@@ -87,6 +86,91 @@ int main(int argc, char** argv) {
   // over/under-counts the tail. --n-ctx overrides to probe the chunk-size
   // dependence at a fixed depth (the n_ctx sensitivity sweep).
   const uint64_t ctx = n_ctx ? n_ctx : (depth + steps);
+
+  // Direct measurement: bring a session cache to `depth`, warm a few steps, then
+  // time exactly `steps` decode steps with events on the stream boundary. The
+  // depth-building work is outside the event pair, so it drops out without
+  // subtraction.
+  {
+    sbplanner::KvCacheSession session;
+    session.n_ctx = ctx;
+    if (!sbmodel::kv_session_allocate(*m, session, ctx)) {
+      fprintf(stderr, "session allocate failed at n_ctx %llu\n",
+              (unsigned long long)ctx);
+      return 1;
+    }
+    uint64_t pos = 0;
+    uint64_t token = seed;
+    if (prefill_mode) {
+      std::vector<uint64_t> prompt(depth);
+      for (uint64_t i = 0; i < depth; ++i) prompt[i] = seed + (i % 500);
+      std::vector<int64_t> first(1, -1);
+      if (sbmodel::generate_prefill_spine_cuda_prefix(*m, prompt, 0, first,
+                                                      session, true) == 0) {
+        fprintf(stderr, "prefill-to-depth failed at depth %llu\n",
+                (unsigned long long)depth);
+        return 1;
+      }
+      pos = depth + 1;
+      token = uint64_t(first[0]);
+    } else {
+      std::vector<int64_t> build(depth, -1);
+      const uint64_t built =
+          sbmodel::generate_spine_cuda(*m, seed, 0, build, ctx, {}, &session);
+      if (built != depth) {
+        fprintf(stderr, "decode-to-depth failed at depth %llu (%llu steps)\n",
+                (unsigned long long)depth, (unsigned long long)built);
+        return 1;
+      }
+      pos = depth;
+      token = uint64_t(build.back());
+    }
+    constexpr uint64_t kWarmSteps = 8;
+    {
+      std::vector<int64_t> warm(kWarmSteps, -1);
+      const uint64_t done = sbmodel::generate_spine_cuda(*m, token, pos, warm,
+                                                         ctx, {}, &session);
+      if (done != kWarmSteps) {
+        fprintf(stderr, "warm-up decode failed (%llu steps)\n",
+                (unsigned long long)done);
+        return 1;
+      }
+      pos += done;
+      token = uint64_t(warm.back());
+    }
+    cudaEvent_t begin = nullptr, end = nullptr;
+    if (cudaEventCreate(&begin) != cudaSuccess ||
+        cudaEventCreate(&end) != cudaSuccess) {
+      fprintf(stderr, "cudaEventCreate failed\n");
+      return 1;
+    }
+    std::vector<int64_t> out(steps, -1);
+    cudaEventRecord(begin);
+    const uint64_t done = sbmodel::generate_spine_cuda(*m, token, pos, out, ctx,
+                                                       {}, &session);
+    cudaEventRecord(end);
+    cudaEventSynchronize(end);
+    float elapsed_ms = 0.0f;
+    cudaEventElapsedTime(&elapsed_ms, begin, end);
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    if (done == 0) {
+      fprintf(stderr, "measured decode failed\n");
+      return 1;
+    }
+    const double secs = double(elapsed_ms) / 1000.0;
+    const double rate = secs > 0.0 ? double(done) / secs : 0.0;
+    printf("longctx depth=%llu: %llu decode tokens in %.3f ms = %.3f tok/s "
+           "(CUDA, seed %llu, one-run%s)\n",
+           (unsigned long long)depth, (unsigned long long)done,
+           double(elapsed_ms), rate, (unsigned long long)seed,
+           prefill_mode ? ", prefill-to-depth" : "");
+    printf("RESULT longctx depth=%llu steps=%llu tok_s=%.3f%s\n",
+           (unsigned long long)depth, (unsigned long long)done, rate,
+           prefill_mode ? " mode=prefill" : "");
+  }
+
+  if (!legacy) return 0;
 
   if (prefill_mode) {
     // Chunked prefill to `depth`, then subtraction against a 1-decode-token
@@ -129,7 +213,8 @@ int main(int argc, char** argv) {
            "= %.3f tok/s (CUDA, seed %llu, prefill %.3f ms)\n",
            (unsigned long long)depth, (unsigned long long)tail_toks,
            tail * 1000.0, tok_per_sec, (unsigned long long)seed, t_one * 1000.0);
-    printf("RESULT longctx depth=%llu steps=%llu tok_s=%.3f mode=prefill\n",
+    printf("RESULT_legacy longctx depth=%llu steps=%llu tok_s=%.3f "
+           "mode=prefill\n",
            (unsigned long long)depth, (unsigned long long)steps, tok_per_sec);
     return 0;
   }
@@ -167,9 +252,9 @@ int main(int argc, char** argv) {
          "(CUDA, seed %llu)\n",
          (unsigned long long)depth, (unsigned long long)tail_toks,
          tail_secs * 1000.0, tok_per_sec, (unsigned long long)seed);
-  // Machine-readable canonical result. `tok_s` is the steady-state decode rate
-  // at `depth` (llama-bench `-p 0 -n <steps> -d <depth>` semantics).
-  printf("RESULT longctx depth=%llu steps=%llu tok_s=%.3f\n",
+  // The previous estimate, kept for continuity: the tail of a full decode minus
+  // a shorter one.
+  printf("RESULT_legacy longctx depth=%llu steps=%llu tok_s=%.3f\n",
          (unsigned long long)depth, (unsigned long long)steps, tok_per_sec);
   return 0;
 }

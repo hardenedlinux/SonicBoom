@@ -15,6 +15,18 @@ CXX="${CXX:-g++-13}"
 CXXFLAGS="-std=c++23 -O2 -I$INC"
 LDFLAGS="-L$LIB -Wl,-rpath,$LIB -lsonicboom"
 
+# The measured decode step is bracketed by cudaEvents.
+CUDART=""
+for c in /usr/lib/x86_64-linux-gnu/libcudart.so \
+         /usr/local/cuda/lib64/libcudart.so; do
+  [ -f "$c" ] && { CUDART="$c"; break; }
+done
+if [ -z "${CUDART:-}" ]; then
+  echo "libcudart not found" >&2
+  exit 1
+fi
+LDFLAGS="$LDFLAGS $CUDART"
+
 "$CXX" $CXXFLAGS "$(dirname "$0")/longctx_bench.cpp" -o "$(dirname "$0")/longctx_bench" $LDFLAGS
 
 echo "built $(dirname "$0")/longctx_bench"
