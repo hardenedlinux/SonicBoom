@@ -30,13 +30,19 @@
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 #include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
 
+#include "boom_fdec_device.cuh"  // tensor-core decode/verify attention
+
 #include <cuda_fp16.h>
 #include <type_traits>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
+#include <dlfcn.h>
+
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -3655,6 +3661,17 @@ int attn_decode_hpb(const std::string& key, int tier);
 // Per-tier policies are only meaningful on a captured tier graph.
 bool decode_tier_chunk_enabled();
 bool decode_hpb_enabled();
+// Tensor-core decode/verify attention: the family and chunk size the
+// dispatcher runs for this class (definitions with the other attention
+// schedules below).
+bool fdec_selected(const std::string& key, int head_dim, int gqa, bool kv_f16,
+                   bool kv_q8, uint64_t* chunk);
+bool attn_fdec_launch(const float* q, const __half* k_cache,
+                      const __half* v_cache, const uint64_t* pos,
+                      uint64_t window, uint64_t n_slots, int n_heads_q,
+                      int n_heads_kv, int head_dim, uint64_t sliding_window,
+                      float scale, float* out, int n_q, int pos_offset0,
+                      uint64_t chunk);
 } // namespace
 
 // The identity split's chunk cap, shared by both decode paths. A tuned chunk
@@ -3711,6 +3728,24 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   if (p3) {
     const int h = attn_decode_hpb(class_key, eff_tier);
     if (h > 0 && h < group_q && group_q % h == 0) heads_per_block = h;
+  }
+
+  // Tensor-core decode attention: one block serves a group of query rows for
+  // one absolute KV chunk and one KV head, so the schedule is a class pick
+  // (decided by the load-time warm-up) and not a per-call choice. The grid is
+  // sized from the same capacity rule the split pair uses, so a tier capture
+  // keeps its geometry; chunks beyond the current position exit on entry.
+  if (runtime::feature_enabled(runtime::Feature::SplitKv) && !attn_trace_on() &&
+      std::getenv("SONICBOOM_ATTN_EXP2") == nullptr && kv_f16 && !kv_q8) {
+    uint64_t fdec_chunk = 0;
+    if (fdec_selected(class_key, head_dim, group_q, true, false,
+                      &fdec_chunk) &&
+        attn_fdec_launch(q, reinterpret_cast<const __half*>(k_cache),
+                         reinterpret_cast<const __half*>(v_cache), pos,
+                         grid_window, n_slots, n_heads_q, n_heads_kv,
+                         head_dim, sliding_window, scale, out, 1, 0,
+                         fdec_chunk))
+      return true;
   }
 
   // Generated flash-decoding (codegen) or the hand-written split-KV (own).
@@ -3952,6 +3987,25 @@ bool decode_attention_mq_dev_impl(
     return false;
 
   const int group_q = n_heads_q / n_heads_kv;
+  // Tensor-core verify attention serves all rows of the step in one launch
+  // per (chunk, KV head): the rows' positions are contiguous and the block's
+  // key range spans at most n_q - 1 positions, so the grid is sized once and
+  // every row keeps the per-row reduction tree (the merge reads the same
+  // absolute chunks the single-row call would). The shape rule (short-window
+  // multi-query, chunk cap) belongs to the split pair and does not apply.
+  if (runtime::feature_enabled(runtime::Feature::SplitKv) && kv_f16 && !kv_q8) {
+    uint64_t fdec_chunk = 0;
+    const std::string key = attn_decode_class_key(
+        head_dim, group_q, n_heads_q, n_heads_kv, sliding_window, true, false);
+    if (fdec_selected(key, head_dim, group_q, true, false, &fdec_chunk) &&
+        attn_fdec_launch(q, reinterpret_cast<const __half*>(k_cache),
+                         reinterpret_cast<const __half*>(v_cache), pos, window,
+                         n_slots, n_heads_q, n_heads_kv, head_dim,
+                         sliding_window, scale, out, n_q, pos_offset0,
+                         fdec_chunk))
+      return true;
+  }
+
   // Same chunk rule as the single-row call: the plan's attribute, else the
   // shared class default. A chunk beyond the generated decoder's cap would make
   // the per-row fallback split differently, so it is not taken here.
@@ -4352,14 +4406,516 @@ uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
   return attn_decode_class_chunk(n_heads_kv, sliding_window);
 }
 
+// --- Decode/verify attention family: split pair or tensor-core fdec --------
+//
+// The fdec kernel serves a group of query rows for one KV head and one
+// absolute KV chunk, with per-head_dim shape constants (see
+// boom_fdec_device.cuh). The family is a per-(device, shape class) pick: the
+// load-time warm-up times the split path the model deploys and the fdec kernel
+// at each candidate chunk over the class's key extents, at one row and at the
+// widest verify row count, and keeps fdec only when it is strictly faster on
+// that sum. A split pin is written too, so a class measured once is not
+// measured again.
+constexpr uint64_t kFdecChunks[] = {64, 128, 256, 512};
+constexpr int kFdecMaxRows = 16;  // the verify row cap the scratch covers
+
+struct FdecPick {
+  bool fdec = false;
+  uint64_t chunk = 0;
+};
+
+std::mutex g_fdec_mutex;
+std::unordered_map<std::string, FdecPick> g_fdec_pick;
+// Set while the warm-up times the split arms, so the dispatcher cannot take
+// the fdec branch inside its own measurement.
+thread_local int g_fdec_bypass = 0;
+
+void remember_fdec_pick(const std::string& key, const FdecPick& p) {
+  std::lock_guard<std::mutex> lk(g_fdec_mutex);
+  g_fdec_pick[key] = p;
+}
+
+// SONICBOOM_DECODE_ATTN=split|fdec[:C]: 0 = none, 1 = split, 2 = fdec. Read on
+// every call so a test can run both arms in one process.
+int fdec_env(uint64_t* chunk) {
+  const char* e = std::getenv("SONICBOOM_DECODE_ATTN");
+  if (e == nullptr || *e == '\0') return 0;
+  const std::string_view s(e);
+  if (s == "split") return 1;
+  if (s.substr(0, 4) == "fdec") {
+    *chunk = 0;
+    if (s.size() > 5 && s[4] == ':') {
+      const long v = std::atol(std::string(s.substr(5)).c_str());
+      if (v > 0) *chunk = uint64_t(v);
+    }
+    return 2;
+  }
+  return 0;
+}
+
+bool fdec_shape_supported(int head_dim, int gqa) {
+  if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512)
+    return false;
+  if (gqa <= 0) return false;
+  return gqa <= fdec_mt_max(head_dim) * 16;
+}
+
+// A candidate chunk must be one of the class constants and a multiple of the
+// class's key tile; anything else falls back to 128 (a multiple of every tile).
+uint64_t fdec_chunk_or_default(int head_dim, uint64_t chunk) {
+  for (uint64_t c : kFdecChunks)
+    if (c == chunk && int(c) % fdec_kt(head_dim) == 0) return c;
+  return 128;
+}
+
+bool fdec_selected(const std::string& key, int head_dim, int gqa, bool kv_f16,
+                   bool kv_q8, uint64_t* chunk) {
+  if (!kv_f16 || kv_q8 || g_fdec_bypass != 0) return false;
+  if (!fdec_shape_supported(head_dim, gqa)) return false;
+  uint64_t ec = 0;
+  const int ov = fdec_env(&ec);
+  if (ov == 1) return false;
+  std::lock_guard<std::mutex> lk(g_fdec_mutex);
+  const auto it = g_fdec_pick.find(key);
+  if (ov == 2) {
+    *chunk = ec != 0
+                 ? fdec_chunk_or_default(head_dim, ec)
+                 : (it != g_fdec_pick.end() && it->second.fdec
+                        ? it->second.chunk
+                        : fdec_chunk_or_default(head_dim, 128));
+    return true;
+  }
+  if (it == g_fdec_pick.end() || !it->second.fdec) return false;
+  *chunk = it->second.chunk;
+  return true;
+}
+
+// Identity of the running library for the pin: a rebuild moves it, so no
+// kernel change is priced with a record measured before it.
+int fdec_build_key() {
+  static const int cached = [] {
+    std::string id = "fdec-v1";
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(&fdec_build_key), &info) != 0 &&
+        info.dli_fname != nullptr) {
+      std::error_code ec;
+      const auto size = std::filesystem::file_size(info.dli_fname, ec);
+      if (!ec) {
+        const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
+        if (!ec) {
+          char buf[64];
+          std::snprintf(buf, sizeof(buf), ":%llx-%llx", (unsigned long long)size,
+                        (unsigned long long)mtime.time_since_epoch().count());
+          id += buf;
+        }
+      }
+    }
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (unsigned char c : id) {
+      h ^= c;
+      h *= 0x100000001b3ull;
+    }
+    return int(uint32_t(h ^ (h >> 32)));
+  }();
+  return cached;
+}
+
+template <int D, int KT, int W>
+bool fdec_launch_t(const float* q, const __half* k_cache,
+                   const __half* v_cache, const uint64_t* pos, uint64_t window,
+                   uint64_t n_slots, int n_heads_q, int n_heads_kv,
+                   uint64_t sliding_window, float scale, float* out, int n_q,
+                   int pos_offset0, uint64_t chunk) {
+  constexpr size_t kSmem = fdec_smem_bytes<D, KT, W>();
+  static const bool prepared = [] {
+    return cudaFuncSetAttribute(
+               boom_fdec_kernel<D, KT, W>,
+               cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)) ==
+           cudaSuccess;
+  }();
+  if (!prepared) return false;
+  const int gqa = n_heads_q / n_heads_kv;
+  const int rows_per_block = std::min(16, (fdec_mt_max(D) * 16) / gqa);
+  if (rows_per_block <= 0) return false;
+  // Absolute chunks anchored at row 0's first chunk; the extra chunk covers
+  // the rows' position span (at most n_q - 1 keys).
+  const uint64_t n_chunks =
+      (window - 1) / chunk + 2 + (uint64_t(n_q - 1) + chunk - 1) / chunk;
+  const size_t partial_floats =
+      size_t(n_q) * size_t(n_chunks) * size_t(n_heads_q) * size_t(D + 2);
+  const size_t partial_bytes = partial_floats * sizeof(float);
+  // The plan-time warm-up grows this scratch for every launch the class can
+  // issue; a captured graph therefore never allocates.
+  if (attn_capturing() && partial_bytes > g_attn_partial_mq_bytes) return false;
+  float* partial = static_cast<float*>(
+      grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes, partial_bytes));
+  if (partial == nullptr) return false;
+  const dim3 grid(unsigned(n_chunks), unsigned(n_heads_kv),
+                  unsigned((n_q + rows_per_block - 1) / rows_per_block));
+  const dim3 block(W * 32);
+  SB_NOTE_LAUNCH_TP("boom_fdec_kernel",
+                    ::sonicboom::planner::plan_detail::tp_label(
+                        {{"D", D}, {"KT", KT}, {"W", W}}),
+                    grid, block, kSmem, cur_stream());
+  boom_fdec_kernel<D, KT, W><<<grid, block, kSmem, cur_stream()>>>(
+      q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
+      sliding_window, chunk, int(n_chunks), n_q, pos_offset0, rows_per_block,
+      scale, partial);
+  SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
+                 dim3(unsigned(n_heads_q), unsigned(n_q)), D, 0,
+                 cur_stream());
+  decode_attention_merge_mq_kernel<<<dim3(unsigned(n_heads_q), unsigned(n_q)),
+                                     D, 0, cur_stream()>>>(
+      partial, pos, chunk, sliding_window, int(n_chunks), n_heads_q, D,
+      pos_offset0, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool fdec_launch_chunk(const float* q, const __half* k_cache,
+                       const __half* v_cache, const uint64_t* pos,
+                       uint64_t window, uint64_t n_slots, int n_heads_q,
+                       int n_heads_kv, int head_dim, uint64_t sliding_window,
+                       float scale, float* out, int n_q, int pos_offset0,
+                       uint64_t chunk) {
+  if (n_heads_kv <= 0 || n_heads_q % n_heads_kv != 0) return false;
+  if (chunk < uint64_t(fdec_kt(head_dim)) ||
+      chunk % uint64_t(fdec_kt(head_dim)) != 0)
+    return false;
+  switch (head_dim) {
+    case 64:
+      return fdec_launch_t<64, 64, 4>(q, k_cache, v_cache, pos, window, n_slots,
+                                      n_heads_q, n_heads_kv, sliding_window,
+                                      scale, out, n_q, pos_offset0, chunk);
+    case 128:
+      return fdec_launch_t<128, 32, 8>(q, k_cache, v_cache, pos, window,
+                                       n_slots, n_heads_q, n_heads_kv,
+                                       sliding_window, scale, out, n_q,
+                                       pos_offset0, chunk);
+    case 256:
+      return fdec_launch_t<256, 16, 8>(q, k_cache, v_cache, pos, window,
+                                       n_slots, n_heads_q, n_heads_kv,
+                                       sliding_window, scale, out, n_q,
+                                       pos_offset0, chunk);
+    case 512:
+      return fdec_launch_t<512, 16, 8>(q, k_cache, v_cache, pos, window,
+                                       n_slots, n_heads_q, n_heads_kv,
+                                       sliding_window, scale, out, n_q,
+                                       pos_offset0, chunk);
+  }
+  return false;
+}
+
+bool attn_fdec_launch(const float* q, const __half* k_cache,
+                      const __half* v_cache, const uint64_t* pos,
+                      uint64_t window, uint64_t n_slots, int n_heads_q,
+                      int n_heads_kv, int head_dim, uint64_t sliding_window,
+                      float scale, float* out, int n_q, int pos_offset0,
+                      uint64_t chunk) {
+  return fdec_launch_chunk(q, k_cache, v_cache, pos, window, n_slots,
+                           n_heads_q, n_heads_kv, head_dim, sliding_window,
+                           scale, out, n_q, pos_offset0, chunk);
+}
+
+// The class pick, measured once per (device, class, build). Called from the
+// plan builder (attn_decode_plan_chunk), i.e. before any graph is captured;
+// the split arm runs the deployed single-row and multi-query calls, so the
+// comparison is against the schedule the model would actually run.
+void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
+                       uint64_t sliding_window, uint64_t capacity, bool kv_f16,
+                       bool kv_q8, uint64_t split_chunk) {
+  if (!available() || !kv_f16 || kv_q8) return;
+  if (n_heads_q != gqa * n_heads_kv) return;
+  if (!fdec_shape_supported(head_dim, gqa)) return;
+  if (!runtime::feature_enabled(runtime::Feature::SplitKv)) return;
+  if (attn_exp2_enabled()) return;
+
+  const std::string key = attn_decode_class_key(
+      head_dim, gqa, n_heads_q, n_heads_kv, sliding_window, true, false);
+  const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
+  const int build_key = fdec_build_key();
+  // Grow the merge scratch here, before any graph is captured, for the widest
+  // launch the class can issue: the smallest candidate chunk gives the largest
+  // chunk count and a verify step carries at most kFdecMaxRows rows. The grid
+  // window is the class's reachable extent (a windowed layer saturates at its
+  // window).
+  const auto reserve_fdec_scratch = [&] {
+    // The warm-up measures a causal class up to the 16384-key extent; a
+    // windowed class saturates at its window. A verify step's rows extend the
+    // launch past that extent by at most its row count.
+    uint64_t cover = sliding_window > 0
+                         ? sliding_window
+                         : std::min<uint64_t>(capacity, 16384);
+    if (cover == 0) cover = 16384;
+    cover += uint64_t(kFdecMaxRows);
+    constexpr uint64_t kSmallestChunk = kFdecChunks[0];
+    const uint64_t n_chunks = (cover - 1) / kSmallestChunk + 2 +
+                              (uint64_t(kFdecMaxRows - 1) + kSmallestChunk - 1) /
+                                  kSmallestChunk;
+    const size_t need = size_t(kFdecMaxRows) * size_t(n_chunks) *
+                        size_t(n_heads_q) * size_t(head_dim + 2) * sizeof(float);
+    (void)grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes, need);
+  };
+
+  uint64_t ec = 0;
+  const int ov = fdec_env(&ec);
+  if (ov != 0) {  // the debug pin wins over the warm-up
+    if (ov == 2) reserve_fdec_scratch();
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_fdec_mutex);
+    if (g_fdec_pick.find(key) != g_fdec_pick.end()) return;
+  }
+  const std::map<std::string, int> cached =
+      ::sonicboom::tune::lookup("decode-attn", key);
+  {
+    const auto fam = cached.find("family");
+    const auto kit = cached.find("k");
+    const auto cit = cached.find("chunk");
+    const bool key_ok = kit != cached.end() && kit->second == build_key;
+    const bool family_ok =
+        fam != cached.end() && (fam->second == 0 || fam->second == 1);
+    const bool chunk_ok =
+        cit != cached.end() && cit->second > 0 &&
+        uint64_t(cit->second) >= uint64_t(fdec_kt(head_dim));
+    if (key_ok && family_ok && (fam->second == 0 || chunk_ok)) {
+      FdecPick p;
+      p.fdec = fam->second == 1;
+      p.chunk = p.fdec ? fdec_chunk_or_default(head_dim, uint64_t(cit->second))
+                       : 0;
+      if (verbose)
+        std::fprintf(stderr, "[autotune] decode-attn %s cached=%s\n",
+                     key.c_str(),
+                     p.fdec ? ("fdec:" + std::to_string(p.chunk)).c_str()
+                            : "split");
+      if (p.fdec) reserve_fdec_scratch();
+      remember_fdec_pick(key, p);
+      return;
+    }
+  }
+  if (attn_capturing() || !::sonicboom::tune::enabled()) {
+    remember_fdec_pick(key, FdecPick{});
+    return;
+  }
+  // A plan being recorded must be a function of the plan, not of a
+  // measurement taken on whatever device is recording it.
+  if (planner::recorder() != nullptr) return;
+
+  // Key extents: a windowed class saturates at its window; a causal class is
+  // measured at the depths the model can reach.
+  std::vector<uint64_t> extents;
+  if (sliding_window > 0) {
+    extents.push_back(sliding_window);
+  } else {
+    for (uint64_t k : {512ull, 4096ull, 16384ull})
+      if (capacity == 0 || k <= capacity) extents.push_back(k);
+    if (extents.empty()) extents.push_back(std::max<uint64_t>(1, capacity));
+  }
+  const uint64_t max_extent = extents.back();
+  const uint64_t width = sliding_window > 0 ? sliding_window : max_extent;
+  const uint64_t n_slots = width + uint64_t(kFdecMaxRows);
+  const size_t kv_bytes = size_t(n_slots) * size_t(n_heads_kv) *
+                          size_t(head_dim) * sizeof(__half);
+  const size_t row_elems = size_t(n_heads_q) * size_t(head_dim);
+  const size_t q_bytes = size_t(kFdecMaxRows) * row_elems * sizeof(float);
+  float* qd = nullptr;
+  float* outd = nullptr;
+  __half* kc = nullptr;
+  __half* vc = nullptr;
+  uint64_t* posd = nullptr;
+  bool ok = cudaMalloc(reinterpret_cast<void**>(&qd), q_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&outd), q_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&kc), kv_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&vc), kv_bytes) == cudaSuccess;
+  ok = ok && cudaMalloc(reinterpret_cast<void**>(&posd),
+                        size_t(kFdecMaxRows) * sizeof(uint64_t)) == cudaSuccess;
+  if (!ok) {
+    (void)cudaGetLastError();
+    if (qd) cudaFree(qd);
+    if (outd) cudaFree(outd);
+    if (kc) cudaFree(kc);
+    if (vc) cudaFree(vc);
+    if (posd) cudaFree(posd);
+    remember_fdec_pick(key, FdecPick{});
+    return;
+  }
+  // Zeroed inputs: the work is data-independent, so the comparison does not
+  // depend on the model's values (and there are no denormals in the timing).
+  cudaMemsetAsync(qd, 0, q_bytes, cur_stream());
+  cudaMemsetAsync(outd, 0, q_bytes, cur_stream());
+  cudaMemsetAsync(kc, 0, kv_bytes, cur_stream());
+  cudaMemsetAsync(vc, 0, kv_bytes, cur_stream());
+
+  const float sc = 1.0f / std::sqrt(float(head_dim));
+  // Rows of one launch sit at consecutive positions ending at the cache end, as
+  // a verify step's do. The split arm's per-row fallback reads pos[r], so the
+  // harness must carry a position per row rather than one value.
+  const auto set_pos = [&](uint64_t extent, int rows) {
+    std::vector<uint64_t> ph(static_cast<size_t>(rows), 0);
+    for (int i = 0; i < rows; ++i)
+      ph[size_t(i)] = extent - uint64_t(rows) + uint64_t(i);
+    if (cudaMemcpyAsync(posd, ph.data(), size_t(rows) * sizeof(uint64_t),
+                        cudaMemcpyHostToDevice, cur_stream()) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
+    return true;
+  };
+  const auto split_ms = [&](uint64_t extent, int n_q) {
+    if (!set_pos(extent, n_q)) return -1.0;
+    return ::sonicboom::tune::median_launch_ms(
+        [&] {
+          const uint64_t win = sliding_window > 0 ? sliding_window : extent;
+          const float* kf = reinterpret_cast<const float*>(kc);
+          const float* vf = reinterpret_cast<const float*>(vc);
+          g_fdec_bypass = 1;
+          bool lok = false;
+          if (n_q == 1) {
+            lok = decode_attention_dev(qd, kf, vf, posd, win, n_slots,
+                                       n_heads_q, n_heads_kv, head_dim,
+                                       sliding_window, sc, outd, 0, true,
+                                       split_chunk, false, -1);
+          } else {
+            lok = decode_attention_mq_dev(qd, kf, vf, posd, win, n_slots,
+                                          n_heads_q, n_heads_kv, head_dim,
+                                          sliding_window, sc, outd, n_q, 0,
+                                          true, split_chunk, false, -1);
+            if (!lok) {
+              lok = true;
+              for (int r = 0; r < n_q && lok; ++r)
+                lok = decode_attention_dev(
+                    qd + size_t(r) * row_elems, kf, vf, posd, win, n_slots,
+                    n_heads_q, n_heads_kv, head_dim, sliding_window, sc,
+                    outd + size_t(r) * row_elems, r, true, split_chunk, false,
+                    -1);
+            }
+          }
+          g_fdec_bypass = 0;
+          return lok;
+        },
+        cur_stream(), 2, 5);
+  };
+  const auto fdec_ms = [&](uint64_t extent, int n_q, uint64_t c) {
+    if (!set_pos(extent, n_q)) return -1.0;
+    const uint64_t win = sliding_window > 0 ? sliding_window : extent;
+    return ::sonicboom::tune::median_launch_ms(
+        [&] {
+          return fdec_launch_chunk(qd, kc, vc, posd, win, n_slots, n_heads_q,
+                                   n_heads_kv, head_dim, sliding_window, sc,
+                                   outd, n_q, 0, c);
+        },
+        cur_stream(), 2, 5);
+  };
+
+  // Split arm once per (extent, row count); the candidates are ratios to it.
+  std::vector<std::array<double, 2>> spl(extents.size(), {0.0, 0.0});
+  bool spl_ok = true;
+  for (size_t i = 0; i < extents.size() && spl_ok; ++i) {
+    spl[i][0] = split_ms(extents[i], 1);
+    spl[i][1] = split_ms(extents[i], 8);
+    if (!(spl[i][0] > 0.0) || !(spl[i][1] > 0.0)) spl_ok = false;
+  }
+  struct FdecCand {
+    uint64_t chunk;
+    double cost;
+  };
+  std::vector<FdecCand> cands;
+  const double split_cost = 2.0 * double(extents.size());
+  if (spl_ok) {
+    for (uint64_t c : kFdecChunks) {
+      if (int(c) % fdec_kt(head_dim) != 0) continue;
+      double cost = 0.0;
+      bool valid = true;
+      for (size_t i = 0; i < extents.size() && valid; ++i) {
+        const double t1 = fdec_ms(extents[i], 1, c);
+        const double t8 = fdec_ms(extents[i], 8, c);
+        if (!(t1 >= 0.0) || !(t8 >= 0.0)) {
+          valid = false;
+          break;
+        }
+        cost += t1 / spl[i][0] + t8 / spl[i][1];
+        if (verbose)
+          std::fprintf(stderr,
+                       "[autotune] decode-attn %s fdec:%llu extent=%llu "
+                       "rows1=%.4f/%.4f rows8=%.4f/%.4f ms\n",
+                       key.c_str(), (unsigned long long)c,
+                       (unsigned long long)extents[i], t1, spl[i][0], t8,
+                       spl[i][1]);
+      }
+      if (valid) cands.push_back({c, cost});
+    }
+  }
+
+  FdecPick pick;
+  if (!cands.empty()) {
+    double best = cands.front().cost;
+    for (const auto& x : cands) best = std::min(best, x.cost);
+    // Within 2% of the minimum the smaller chunk wins; the split arm keeps
+    // the class unless an fdec chunk is strictly faster.
+    uint64_t chosen = cands.front().chunk;
+    for (const auto& x : cands)
+      if (x.cost <= best * 1.02) {
+        chosen = x.chunk;
+        break;
+      }
+    if (verbose)
+      std::fprintf(stderr,
+                   "[autotune] decode-attn %s best=%llu cost=%.4f split=%.4f "
+                   "chosen=%llu\n",
+                   key.c_str(), (unsigned long long)chosen, best, split_cost,
+                   (unsigned long long)chosen);
+    if (best < split_cost) {
+      pick.fdec = true;
+      pick.chunk = chosen;
+    }
+  }
+
+  ::sonicboom::tune::store(
+      "decode-attn", key,
+      {{"family", pick.fdec ? 1 : 0}, {"chunk", int(pick.chunk)},
+       {"k", build_key}});
+  std::string inputs = "extents=";
+  for (size_t i = 0; i < extents.size(); ++i)
+    inputs += (i ? "|" : "") + std::to_string(extents[i]);
+  inputs += " rows=1|8";
+  std::string counts;
+  for (const auto& x : cands)
+    counts += std::to_string(x.chunk) + ":" + std::to_string(x.cost) + "|";
+  planner::decisions::Entry e;
+  e.name = "attention.decode-family";
+  e.scope = key;
+  e.value = pick.fdec ? "fdec:" + std::to_string(pick.chunk) : "split";
+  e.source = planner::decisions::Source::Measured;
+  e.env = "SONICBOOM_DECODE_ATTN";
+  e.inputs = inputs;
+  e.candidates = "split|fdec:64|fdec:128|fdec:256|fdec:512";
+  e.reason =
+      "cost = sum over key extents of fdec/split at 1 and 8 rows; " + counts +
+      " split=" + std::to_string(split_cost);
+  e.numerics =
+      "online softmax in fixed row order; chunk partials merge in absolute "
+      "chunk index";
+  planner::decisions::record(std::move(e));
+  if (verbose)
+    std::fprintf(stderr, "[autotune] decode-attn %s -> %s\n", key.c_str(),
+                 pick.fdec ? ("fdec:" + std::to_string(pick.chunk)).c_str()
+                           : "split");
+  reserve_fdec_scratch();
+  remember_fdec_pick(key, pick);
+  cudaFree(qd);
+  cudaFree(outd);
+  cudaFree(kc);
+  cudaFree(vc);
+  cudaFree(posd);
+}
+
 } // namespace
 
-// Public so the model plans can write the schedule into the Boom IR attention
-// op (the chunk size and merge order are plan-visible attributes, not a
-// dispatch-time surprise).
-uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
-                                int n_heads_kv, uint64_t sliding_window,
-                                uint64_t capacity, bool kv_f16, bool kv_q8) {
+// The split-KV chunk a class deploys, tuned once per (device, class).
+uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
+                                     int n_heads_kv, uint64_t sliding_window,
+                                     uint64_t capacity, bool kv_f16,
+                                     bool kv_q8) {
   const uint64_t default_chunk = attn_decode_class_chunk(n_heads_kv, sliding_window);
   compiler::AttentionShape dsh;
   dsh.head_dim = head_dim;
@@ -4886,6 +5442,23 @@ uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
                  key.c_str(), (unsigned long long)default_chunk,
                  (unsigned long long)best, best_score, def_score, tune_s);
   return remember(best);
+}
+
+// Public so the model plans can write the schedule into the Boom IR attention
+// op (the chunk size and merge order are plan-visible attributes, not a
+// dispatch-time surprise). The family (split pair or tensor-core fdec) is
+// resolved here too, once per (device, class, build): the plan builder runs
+// before any graph is captured, so the pick is fixed for the life of the
+// process and a replayed graph never changes its schedule.
+uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
+                                int n_heads_kv, uint64_t sliding_window,
+                                uint64_t capacity, bool kv_f16, bool kv_q8) {
+  const uint64_t chunk = attn_decode_plan_chunk_impl(
+      head_dim, gqa, n_heads_q, n_heads_kv, sliding_window, capacity, kv_f16,
+      kv_q8);
+  attn_fdec_resolve(head_dim, gqa, n_heads_q, n_heads_kv, sliding_window,
+                    capacity, kv_f16, kv_q8, chunk);
+  return chunk;
 }
 
 bool attn_launch_codegen(const compiler::AttentionShape &shape,
