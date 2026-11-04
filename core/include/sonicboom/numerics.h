@@ -18,16 +18,16 @@
 
 // The numerics profile: which numeric contract the runtime executes under.
 //
-//   strict    the historical behavior, unchanged: f32 KV storage, f64
-//             reductions on sm_86, fp64-gated dense. Every golden that
-//             predates the profile switch is a strict golden.
-//   standard  the default. f16 KV storage (the values stored were already
-//             fp16-rounded, so the storage change is exact) and the device
-//             reduction mode as resolved for the device. It is deterministic
-//             and prefix-reuse invariant on a given device exactly as strict
-//             is; the two profiles may differ from each other, and standard is
-//             the one held to the perceptual gate (perplexity, top-1 agreement)
-//             rather than bit identity.
+//   strict    the historical behavior: f64 reductions on sm_86, fp64-gated
+//             dense. Its KV cache is f16 too (the stored values were already
+//             fp16-rounded, so the storage is exact); the profile's remaining
+//             difference from standard is the reduction mode.
+//   standard  the default. f16 KV storage and the device reduction mode as
+//             resolved for the device. It is deterministic and prefix-reuse
+//             invariant on a given device exactly as strict is; the two
+//             profiles may differ from each other, and standard is the one
+//             held to the perceptual gate (perplexity, top-1 agreement) rather
+//             than bit identity.
 //
 // Both profiles guarantee determinism, prefix-reuse identity and KV-capacity
 // independence. Prefill-vs-decode identity is not guaranteed in either: a
@@ -85,19 +85,16 @@ bool numerics_profile_resolved();
 // `error` when the profile is already latched to a different value.
 bool set_numerics_profile(NumericsProfile profile, std::string *error);
 
-// The profile's consequences, in one place so no caller re-derives them:
-//   standard stores the KV cache in f16 (the values were fp16-rounded already)
-//   and launches the f16-KV attention variants; strict does neither. This is
-//   the profile's only arithmetic difference today: the dense and matmul
-//   thresholds are the same in both profiles (the TF32 dense arm is not a
-//   profile default -- it is gate-blocked, reachable only through
-//   SONICBOOM_DENSE_F32=tf32).
+// True when the resolved KV cache is f16 (both profiles' default; the values
+// were fp16-rounded already, so the storage is exact). False when SONICBOOM_KV
+// selected f32 or q8. The attention kernels pick their instantiation from
+// numerics_kv_storage() directly; this is the convenience predicate.
 bool numerics_profile_f16_kv();
 
-// KV-cache element type. Under the standard profile the cache may be f16 or
-// q8; the q8 row is `head_dim` int8 values plus that row's f32 scale, so it
-// halves the bytes again at the cost of a per-row quantization error. The
-// strict profile is f32 (its contract pins the pre-rounding values).
+// KV-cache element type. Both profiles store f16 by default; the q8 row is
+// `head_dim` int8 values plus that row's f32 scale, so it halves the bytes
+// again at the cost of a per-row quantization error. f32 is the wide form,
+// reachable only through SONICBOOM_KV=f32.
 enum class KvStorage { F32, F16, Q8 };
 
 const char *numerics_kv_storage_name(KvStorage storage) noexcept;

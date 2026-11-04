@@ -34,6 +34,7 @@
 #include "../nn/cuda_scratch_epoch.h"
 #include "../nn/cuda_stream.h"
 #include "../quant/cuda_resident.h"
+#include "../spec_diag_counters.h"
 #include "async_prefetch.h"
 #include "decision_registry.h"
 #include "device_allocator.h"
@@ -143,10 +144,45 @@ class CudaStepProgram final : public hal::StepProgram {
   // kernel scratch is retained rather than freed on regrowth (see
   // cuda_scratch_epoch.h).
   CudaStepProgram() { sonicboom::cuda::capture_register(); }
-  ~CudaStepProgram() override { sonicboom::cuda::capture_unregister(); }
+  ~CudaStepProgram() override {
+    sonicboom::cuda::capture_unregister();
+    if (ev_start_) cudaEventDestroy(ev_start_);
+    if (ev_end_) cudaEventDestroy(ev_end_);
+  }
   bool replay() override { return graph_.replay(); }
   bool sync() override { return graph_.sync(); }
   bool valid() const override { return graph_.valid(); }
+
+  // Step timing: two events on the graph's own stream. They are created
+  // on first use, so a program that is never timed allocates nothing.
+  bool timing_begin() override {
+    if (!ev_start_ || !ev_end_) {
+      if (cudaEventCreate(&ev_start_) != cudaSuccess) {
+        ev_start_ = nullptr;
+        return false;
+      }
+      if (cudaEventCreate(&ev_end_) != cudaSuccess) {
+        cudaEventDestroy(ev_start_);
+        ev_start_ = nullptr;
+        return false;
+      }
+    }
+    return cudaEventRecord(ev_start_, graph_.stream()) == cudaSuccess;
+  }
+  bool timing_end() override {
+    return ev_end_ && cudaEventRecord(ev_end_, graph_.stream()) == cudaSuccess;
+  }
+  bool timing_read(double* ms) override {
+    if (!ms || !ev_start_ || !ev_end_) return false;
+    if (cudaEventQuery(ev_end_) != cudaSuccess) {
+      (void)cudaGetLastError();  // clear cudaErrorNotReady: not a sticky error
+      return false;
+    }
+    float t = 0.0f;
+    if (cudaEventElapsedTime(&t, ev_start_, ev_end_) != cudaSuccess) return false;
+    *ms = double(t);
+    return true;
+  }
 
   // Async H2D on the graph's stream, ordered before the next replay(). Unlike
   // the device pool's synchronous cudaMemcpy (which lands on the legacy default
@@ -164,6 +200,8 @@ class CudaStepProgram final : public hal::StepProgram {
 
  private:
   sonicboom::cuda::GraphStep graph_;
+  cudaEvent_t ev_start_ = nullptr;
+  cudaEvent_t ev_end_ = nullptr;
 };
 
 } // namespace
@@ -563,6 +601,7 @@ std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
     captured = step_fn();
   }
   if (!captured || !gs.end()) return nullptr;
+  diag::spec_diag_note_graph_capture();
   // Snapshot every device resource the recorded launches reference, so a
   // replay can prove the graph still points at this session's buffers.
   capture_res_.valid = true;
@@ -626,11 +665,11 @@ SonicCudaBackend::allocate_cache_set(const KvCacheSpec& spec, uint64_t n_ctx) {
     // kernels address it as pos % n_slots and every window read spans at most
     // `window` resident slots.
     c.n_slots = (sl.window > 0) ? sl.window + kMaxVerifyRows : n_ctx;
-    // The standard numerics profile stores f16 or q8 instead of f32: f16
-    // halves the cache and is exact for the fp16-rounded values; q8 halves it
-    // again (int8 per head_dim value plus an f32 row scale) at the cost of a
-    // per-row quantization error. The attention kernels and the append know
-    // the row layout from `dtype`.
+    // Both numerics profiles store the cache as f16: it halves the bytes and
+    // is exact for the fp16-rounded values. q8 halves it again (int8 per
+    // head_dim value plus an f32 row scale) at the cost of a per-row
+    // quantization error; f32 (SONICBOOM_KV=f32) is the wide form. The
+    // attention kernels and the append know the row layout from `dtype`.
     const KvStorage storage = sonicboom::numerics_kv_storage();
     c.dtype = storage == KvStorage::F32   ? KvDtype::F32
               : storage == KvStorage::Q8 ? KvDtype::Q8
@@ -961,21 +1000,21 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // `add_input` is set by fuse_residual_epilogue_pass: the residual of the
       // Add that consumed this norm became a second activation input, and the
       // norm kernel applies it in its apply loop (same f32 addition, one
-      // launch). Verify/batch forms keep the separate add; the pass does not
-      // match them.
+      // launch). The verify form applies it per row, on the same row slice the
+      // separate add would have read; the batched (prefill) form keeps the
+      // generated rms_norm_add region instead.
       int64_t add_idx = 0;
       const float* add_p = nullptr;
       if (attr_i(*node, "add_input", add_idx) && add_idx > 0 &&
           add_idx < int64_t(in.size()))
         add_p = dev(in[add_idx]);
       if (verify_attr(vr)) {
-        // Verify: one decode norm per row (the 1024-thread kernel decode runs;
-        // the batched rms_norm_heads kernel uses a different thread count).
+        // Verify: one launch whose grid.y covers the rows; each row runs the
+        // same 1024-thread decode norm on its own slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int row = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]) + r * row, eps,
-                                      out + r * row, row);
+        ok = nn::cuda::rms_norm_dev(fweight(slot), dev(in[0]), eps, out, row,
+                                    add_p, int(vr));
       } else if (batch_attr(nb)) {
         // Row norm over [n, dim]: reuse the per-head norm with a single
         // `dim_i`-wide head per row (position), so each row is normalized
@@ -1004,17 +1043,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           add_idx < int64_t(in.size()))
         add_p = dev(in[add_idx]);
       if (verify_attr(vr) && dim_i > 0) {
-        // Verify: per row, the same heads kernel the decode row runs.
+        // Verify: one launch, grid.y over the rows; each row runs the same
+        // heads kernel the decode row runs on its own slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0 ||
             (out_n / int(vr)) % int(dim_i) != 0) {
           ok = false;
           break;
         }
         const int row = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]) + r * row, eps,
-                                            out + r * row, int(dim_i),
-                                            row / int(dim_i));
+        ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
+                                          row / int(dim_i), add_p, int(vr));
         break;
       }
       ok = nn::cuda::rms_norm_heads_dev(w, dev(in[0]), eps, out, int(dim_i),
@@ -1077,11 +1115,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const uint64_t window = (lc.sliding_window > 0) ? lc.sliding_window : n_ctx_;
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: one decode attention per query row. Row i appends its K/V at
-        // pos+i and attends over the same split/chunk constants as the n == 1
-        // call at that position, in ascending row order (row i must see rows
-        // 0..i in the cache). The fused-prep cache store is not used: the
-        // verify pipeline leaves the append here, where it can be per row.
+        // Verify: every row appends its K/V at pos+i first, then one
+        // multi-query launch serves all k+1 rows and stages each chunk of the
+        // cache once (the per-row fallback runs the single-row call at each
+        // position instead). Row i must see rows 0..i in the cache, and the
+        // SWA ring carries kMaxVerifyRows slots of headroom for appending the
+        // whole step before any attention runs. The fused-prep cache store is
+        // not used: the verify pipeline leaves the append here.
         if (vr <= 0 || kv_appended != 0 || out_n % int(vr) != 0 ||
             (in.size() >= 4 && (!cache.k_buf || !cache.v_buf))) {
           ok = false;
@@ -1091,28 +1131,34 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         double attn_scale = 1.0;
         attr_f(*node, "scale", attn_scale);
         nn::cuda::attention_trace_set_layer(int(layer));
-        for (int64_t r = 0; r < vr && ok; ++r) {
-          // A warm-up run must not write the session's rows (see
-          // set_kv_write_suppressed); the attention still runs so the split
-          // scratch and every launch the capture records are exercised.
-          if (in.size() >= 4 && !kv_write_suppressed_ &&
-              !nn::cuda::kv_append_dev(
-                  dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
-                  dev(in[1]) + r * row_elems, dev(in[2]) + r * row_elems,
-                  reinterpret_cast<const uint64_t*>(pos_slot()), cache.n_slots,
-                  row_elems, int(r), cache.f16(), cache.q8(),
-                  int(cache.head_dim))) {
-            ok = false;
-            break;
-          }
-          ok = nn::cuda::decode_attention_dev(
-              dev(in[0]) + r * q_row, dev_mut(cache.k_buf.id),
-              dev_mut(cache.v_buf.id),
-              reinterpret_cast<const uint64_t*>(pos_slot()), window,
-              cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
-              int(cache.head_dim), lc.sliding_window, float(attn_scale),
-              out + r * q_row, int(r), cache.f16(), uint64_t(decode_chunk),
-              cache.q8());
+        // A warm-up run must not write the session's rows (see
+        // set_kv_write_suppressed); the attention still runs so the split
+        // scratch and every launch the capture records are exercised.
+        const bool verify_appends = in.size() >= 4 && !kv_write_suppressed_;
+        if (verify_appends &&
+            !nn::cuda::kv_append_batched_dev_pos(
+                dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id), dev(in[1]),
+                dev(in[2]), reinterpret_cast<const uint64_t*>(pos_slot()),
+                cache.n_slots, row_elems, int(vr), cache.f16(), cache.q8(),
+                int(cache.head_dim))) {
+          ok = false;
+          break;
+        }
+        if (!nn::cuda::decode_attention_mq_dev(
+                dev(in[0]), dev_mut(cache.k_buf.id), dev_mut(cache.v_buf.id),
+                reinterpret_cast<const uint64_t*>(pos_slot()), window,
+                cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
+                int(cache.head_dim), lc.sliding_window, float(attn_scale), out,
+                int(vr), 0, cache.f16(), uint64_t(decode_chunk), cache.q8())) {
+          for (int64_t r = 0; r < vr && ok; ++r)
+            ok = nn::cuda::decode_attention_dev(
+                dev(in[0]) + r * q_row, dev_mut(cache.k_buf.id),
+                dev_mut(cache.v_buf.id),
+                reinterpret_cast<const uint64_t*>(pos_slot()), window,
+                cache.n_slots, int(lc.n_heads_q), int(cache.n_heads_kv),
+                int(cache.head_dim), lc.sliding_window, float(attn_scale),
+                out + r * q_row, int(r), cache.f16(), uint64_t(decode_chunk),
+                cache.q8());
         }
         break;
       }
@@ -1149,18 +1195,56 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A node stamped `batch` (the prefill plan, or a decode/verify step running
+      // on the mmq matmul) takes the batched form even when it also carries the
+      // row count: the two attributes describe the same positions.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify without a quantize fusion (rare: the pipeline quantizes every
-        // activation feeding a matmul): one decode gemv per row.
+        // activation feeding a matmul): quantize all rows in one launch and run
+        // the row-invariant batched gemv. When the q8_1 path is disabled the
+        // per-row decode gemv runs instead.
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
-        const int rows = out_n / int(vr);
-        const int cols = int((in[0].device.size_bytes / sizeof(float)) / vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::matvec_f32_dev(qweight(slot),
-                                           dev(in[0]) + r * cols,
-                                           out + r * rows);
+        if (!quant::cuda::matvec_f32_rows_dev(qweight(slot), dev(in[0]), out,
+                                              int(vr))) {
+          const int rows = out_n / int(vr);
+          const int cols = int((in[0].device.size_bytes / sizeof(float)) / vr);
+          ok = true;
+          for (int64_t r = 0; r < vr && ok; ++r)
+            ok = quant::cuda::matvec_f32_dev(qweight(slot),
+                                             dev(in[0]) + r * cols,
+                                             out + r * rows);
+        }
       } else if (batch_attr(nb)) {
-        ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out, int(nb));
+        // `mmq_rows` marks a decode/verify step on the mmq matmul whose
+        // activation has no fused producer (the attention output, and the
+        // weight types without an mmq quantize emitter): the activation is
+        // quantized inside the mmq call. The mmq call is used at n == 1 too —
+        // the batched matmul's per-column arithmetic is its n == 1 arithmetic,
+        // so the decode step and every verify row agree by construction.
+        //
+        // `bias_slot`/`add_input` (the decode epilogue folds): the mmq
+        // write-back adds the bias and then the residual, the same two f32
+        // additions the separate kernels performed on the stored output.
+        int64_t bias_slot = 0, add_idx = 0;
+        const bool has_bias = attr_i(*node, "bias_slot", bias_slot);
+        const bool has_add = attr_i(*node, "add_input", add_idx);
+        const std::span<const float> b =
+            has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
+                     : std::span<const float>{};
+        const float* add_p =
+            has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
+        int64_t mmq_rows = 0;
+        if (attr_i(*node, "mmq_rows", mmq_rows)) {
+          ok = quant::cuda::matmul_mmq_dev(qweight(slot), dev(in[0]), out,
+                                           int(nb), b, add_p);
+        } else {
+          ok = quant::cuda::matmul_f32_dev(qweight(slot), dev(in[0]), out,
+                                           int(nb));
+          const int rows = int(out_n / nb);
+          if (ok && has_bias)
+            ok = nn::cuda::add_bias_dev(b, out, out, int(nb) * rows);
+          if (ok && add_p) ok = nn::cuda::add_dev(add_p, out, out, int(nb) * rows);
+        }
       } else {
         ok = quant::cuda::matvec_f32_dev(qweight(slot), dev(in[0]), out);
       }
@@ -1217,7 +1301,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       note_weight_quant(qweight(slot));
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A `batch` node (a decode/verify step on the mmq matmul) takes the
+      // batched mmq form below; only the batched gemv path is the verify form.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify: the row-invariant batched mmvq over k+1 positions (B2: the
         // batched kernel's per-position arithmetic is the single-column gemv's).
         // The bias/residual folds are elementwise epilogues here, which store
@@ -1234,27 +1320,113 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                      : std::span<const float>{};
         const float* add_p =
             has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
-        if (spec_verify_batch_enabled()) {
-          ok = quant::cuda::gemv_q8_1_batched_dev(qw, xq, out, int(vr));
-        } else {
-          // Serial ablation: one decode gemv per query row (the activation row
-          // is [cols/32] q8_1 blocks, the output row is out_n/vr floats).
-          const int rows_out = int(out_n / vr);
-          const int bpr = int(qw.dims()[0] / 32);
-          ok = true;
-          for (int64_t r = 0; r < vr && ok; ++r)
-            ok = quant::cuda::gemv_q8_1_dev(qw, xq + r * bpr,
-                                            out + r * rows_out);
+        // A type with the fused epilogue adds the bias and the residual in the
+        // gemv's per-row write (same two f32 additions, same order, as the
+        // separate kernels); other types keep the elementwise epilogues.
+        const bool fused_ep =
+            quant::cuda::gemv_bias_epilogue_supported(qw.type());
+        // One projection over the step's rows: the batched mmvq (or the serial
+        // ablation), then the elementwise epilogues it could not fold.
+        auto run_rows = [&](const quant::QuantizedTensor& w,
+                            std::span<const float> bias, const float* add,
+                            float* y, int64_t rows_n) -> bool {
+          const bool batch_on = spec_verify_batch_enabled();
+          const bool bias_fused =
+              batch_on && fused_ep && !bias.empty() &&
+              bias.size() == size_t(rows_n);
+          const bool add_fused = batch_on && fused_ep && add != nullptr;
+          bool r;
+          if (batch_on) {
+            r = quant::cuda::gemv_q8_1_batched_dev(
+                w, xq, y, int(vr), bias_fused ? bias : std::span<const float>{},
+                add_fused ? add : nullptr);
+          } else {
+            // Serial ablation: one decode gemv per query row (the activation
+            // row is [cols/32] q8_1 blocks, the output row is rows_n floats).
+            const int bpr = int(w.dims()[0] / 32);
+            r = true;
+            for (int64_t q = 0; q < vr && r; ++q)
+              r = quant::cuda::gemv_q8_1_dev(w, xq + q * bpr, y + q * rows_n);
+          }
+          if (r && !bias.empty() && !bias_fused)
+            r = nn::cuda::add_bias_dev(bias, y, y, int(int64_t(rows_n) * vr));
+          if (r && add && !add_fused)
+            r = nn::cuda::add_dev(add, y, y, int(int64_t(rows_n) * vr));
+          return r;
+        };
+        // `s1_slot`/`s2_slot` (fuse_sibling_gemv_pass): the node merges two or
+        // three projections over the step's activation. The batched sibling
+        // kernel runs every member's rows and every position in one launch;
+        // it takes the members' exact-[rows] biases but no residual, which the
+        // pass leaves unmerged. Otherwise the members run as separate batched
+        // launches in order — the unmerged plan's execution.
+        int64_t s1_slot = 0, s2_slot = 0;
+        const bool has_s1 = attr_i(*node, "s1_slot", s1_slot);
+        if (has_s1 && node->outputs.size() >= 2) {
+          const bool has_s2 =
+              attr_i(*node, "s2_slot", s2_slot) && node->outputs.size() >= 3;
+          const size_t members = has_s2 ? 3 : 2;
+          const int64_t slots[3] = {slot_i, s1_slot, s2_slot};
+          std::vector<quant::cuda::GemvSibling> sib;
+          std::vector<std::span<const float>> biases;
+          sib.reserve(members);
+          biases.reserve(members);
+          bool ready = true;
+          int64_t rows[3] = {out_n / vr, 0, 0};
+          for (size_t k = 0; k < members && ready; ++k) {
+            const auto* td = graph_.find_tensor(node->outputs[k]);
+            if (!td) { ready = false; break; }
+            rows[k] = int64_t(td->size_bytes / sizeof(float)) / vr;
+            int64_t bias_idx = 0;
+            bool hb = false;
+            if (k == 0) { bias_idx = bias_slot; hb = has_bias; }
+            else if (k == 1) hb = attr_i(*node, "s1_bias_slot", bias_idx);
+            else hb = attr_i(*node, "s2_bias_slot", bias_idx);
+            const auto& w = qweight(static_cast<model::WeightSlot>(slots[k]));
+            biases.push_back(hb ? fweight(static_cast<model::WeightSlot>(bias_idx))
+                                : std::span<const float>{});
+            float* yp = out;
+            if (k > 0) {
+              const uint64_t bytes = td->size_bytes;
+              const uint64_t h = bytes ? device::acquire(bytes) : 0;
+              if (!h) { ready = false; break; }
+              sibling_outs.push_back({h, bytes});
+              yp = dev_mut(h);
+            }
+            sib.push_back(quant::cuda::GemvSibling{&w, biases.back(), yp});
+          }
+          if (ready && !has_add && spec_verify_batch_enabled() &&
+              quant::cuda::gemv_q8_1_siblings_batched_dev(sib, xq, int(vr))) {
+            ok = true;
+          } else if (ready) {
+            ok = true;
+            for (size_t k = 0; k < members && ok; ++k) {
+              float* yp = k == 0 ? out : dev_mut(sibling_outs[k - 1].first);
+              ok = run_rows(*sib[k].weight, biases[k],
+                            k == 0 ? add_p : nullptr, yp, rows[k]);
+            }
+          } else {
+            ok = false;
+          }
+          break;  // the node's outputs are all written by the branch above
         }
-        if (ok && has_bias && !b.empty())
-          ok = nn::cuda::add_bias_dev(b, out, out, out_n);
-        if (ok && has_add) ok = nn::cuda::add_dev(add_p, out, out, out_n);
+        ok = run_rows(qw, b, add_p, out, out_n / vr);
         break;
       }
       if (batch_attr(nb)) {
         int64_t ds_i = 0;
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
+        // The decode epilogue folds (bias then residual) are added by the mmq
+        // write-back: the values the separate AddBias/Add kernels stored.
+        int64_t bias_slot = 0, add_idx = 0;
+        const bool has_bias = attr_i(*node, "bias_slot", bias_slot);
+        const bool has_add = attr_i(*node, "add_input", add_idx);
+        const std::span<const float> b =
+            has_bias ? fweight(static_cast<model::WeightSlot>(bias_slot))
+                     : std::span<const float>{};
+        const float* add_p =
+            has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
         // The node's `decomp` attribute is the plan's work decomposition for
         // this weight shape (set by the emitter from mmq_class_decomp); absent
         // or unrecognized leaves Auto, which the runtime resolves by the same
@@ -1270,7 +1442,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),
             reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])), out,
-            int(nb), decomp);
+            int(nb), decomp, b, add_p);
       } else {
         note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
@@ -1381,7 +1553,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // `ds`) emits a block_q8_1_mmq (128-elem block, D4/DS4 scales) activation.
       int64_t nb = 0, dim_i = 0, ds_i = 0;
       int64_t vr = 0;
-      if (verify_attr(vr)) {
+      // A `batch` node (a decode/verify step on the mmq matmul) takes the
+      // batched mmq form below; only the per-row q8_1 form is the verify form.
+      if (verify_attr(vr) && !batch_attr(nb)) {
         // Verify: one decode norm+quantize per row into that row's contiguous
         // q8_1 blocks, so the following batched mmvq reads [rows, cols/32].
         if (vr <= 0) { ok = false; break; }
@@ -1389,10 +1563,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::rms_norm_quantize_q8_1_dev(
-              fweight(slot), dev(in[0]) + r * row, eps,
-              yq + r * (row / 32), row);
+        ok = quant::cuda::rms_norm_quantize_q8_1_dev(
+            fweight(slot), dev(in[0]), eps, yq, row, int(vr));
         break;
       }
       if (batch_attr(nb)) {
@@ -1460,12 +1632,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         };
         int64_t vr = 0;
         if (verify_attr(vr) && vr > 0) {
-          // Verify: one row per call, into that row's contiguous q8_1 blocks.
+          // Verify: one launch, grid.y over the rows, into each row's
+          // contiguous q8_1 blocks. The generated kernel is byte-identical to
+          // the hand kernel, so the hand kernel's multi-row form (the same
+          // per-row block) is the row-invariant launch.
           const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
           auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
           if (row <= 0 || row % 32 != 0) { ok = false; break; }
-          for (int64_t r = 0; r < vr && ok; ++r)
-            ok = run_row(dev(in[0]) + r * row, yq + r * (row / 32), row, true);
+          ok = quant::cuda::rms_norm_quantize_q8_1_dev(w, dev(in[0]), eps, yq,
+                                                       row, int(vr));
           break;
         }
         ok = run_row(dev(in[0]), reinterpret_cast<quant::cuda::BlockQ8_1*>(out),
@@ -1883,10 +2058,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
-              dev(in[0]) + r * row, dev(in[1]) + r * row, yq + r * (row / 32),
-              row);
+        ok = quant::cuda::gelu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]), yq, row, int(vr));
       } else {
         note_activation_quant("q8_1");
         const int n = int(in[0].device.size_bytes / sizeof(float));
@@ -1918,10 +2091,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const int row = int((in[0].device.size_bytes / sizeof(float)) / vr);
         if (row <= 0 || row % 32 != 0) { ok = false; break; }
         auto* yq = reinterpret_cast<quant::cuda::BlockQ8_1*>(out);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = quant::cuda::silu_mul_quantize_q8_1_dev(
-              dev(in[0]) + r * row, dev(in[1]) + r * row, yq + r * (row / 32),
-              row);
+        ok = quant::cuda::silu_mul_quantize_q8_1_dev(
+            dev(in[0]), dev(in[1]), yq, row, int(vr));
       } else {
         note_activation_quant("q8_1");
         const int n = int(in[0].device.size_bytes / sizeof(float));
@@ -1935,15 +2106,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       int64_t nb = 0;
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: the dense projection is a decode instance per row (the
-        // batched dense kernel is not the n == 1 kernel; B2).
+        // Verify: one launch, grid.y over the rows; each row runs the decode
+        // dense kernel on its own activation and output slice (row-invariant).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int cols =
             int(in[0].device.size_bytes / sizeof(float) / uint64_t(vr));
         const int rows = out_n / int(vr);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]) + r * cols,
-                                        out + r * rows, rows);
+        ok = nn::cuda::matvec_f32_dev(fweight(slot), cols, dev(in[0]), out, rows,
+                                      int(vr));
         break;
       }
       if (batch_attr(nb)) {
@@ -1978,23 +2148,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                                        uint64_t(rows) * d);
       int64_t vr = 0;
       if (verify_attr(vr)) {
-        // Verify: the decode dense instance per row (bf16-round the row on a
-        // scratch copy, then the single-row gemv), as the decode path does.
+        // Verify: bf16-round the whole [rows, cols] activation on one scratch
+        // copy, then one launch whose grid.y covers the rows (each row runs the
+        // decode dense kernel on its own slice).
         if (vr <= 0 || out_n % int(vr) != 0) { ok = false; break; }
         const int cols =
             int(in[0].device.size_bytes / sizeof(float) / uint64_t(vr));
-        const uint64_t xbytes = uint64_t(cols) * sizeof(float);
+        const uint64_t xbytes = uint64_t(cols) * sizeof(float) * uint64_t(vr);
         uint64_t xtmp = device::acquire(xbytes);
         if (!xtmp) { ok = false; break; }
-        for (int64_t r = 0; r < vr && ok; ++r) {
-          ok = device::device_copy(in[0].device.handle +
-                                       uint64_t(r) * xbytes,
-                                   xtmp, xbytes) &&
-               nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols) &&
-               nn::cuda::matvec_bf16_dev(W, cols,
-                                         reinterpret_cast<const float*>(xtmp),
-                                         out + r * int(rows), int(rows));
-        }
+        ok = device::device_copy(in[0].device.handle, xtmp, xbytes) &&
+             nn::cuda::cast_bf16_dev(dev_mut(xtmp), cols * int(vr)) &&
+             nn::cuda::matvec_bf16_dev(W, cols,
+                                       reinterpret_cast<const float*>(xtmp),
+                                       out, int(rows), int(vr));
         device::release(xtmp, xbytes);
         break;
       }
@@ -2079,18 +2246,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       attr_i(*node, "stride", stride);
       int64_t vr = 0;
       if (verify_attr(vr) && stride == 0) {
-        // Verify: the same sub-span copy per row of a [rows, total_per] input.
+        // Verify: one launch copying the same sub-span of every row of a
+        // [rows, total_per] input — exactly the strided row slice with the row
+        // stride equal to the row width.
         if (vr <= 0 || length <= 0) { ok = false; break; }
         const int total = int(in[0].device.size_bytes / sizeof(float) / vr);
         if (total <= 0 || offset + length > total) { ok = false; break; }
-        const int len = int(length);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = device::device_copy(in[0].device.handle +
-                                       (uint64_t(r) * uint64_t(total) +
-                                        uint64_t(offset)) * sizeof(float),
-                                   out_handle + uint64_t(r) * uint64_t(len) *
-                                                    sizeof(float),
-                                   uint64_t(len) * sizeof(float));
+        ok = nn::cuda::slice_strided_dev(dev(in[0]), out, int(vr), int(length),
+                                         int(offset), total);
         break;
       }
       if (stride > 0) {
@@ -2181,10 +2344,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
             argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
         const auto* mask = reinterpret_cast<const uint8_t*>(
             masked ? uintptr_t(argmax_mask_.id) : 0);
-        for (int64_t r = 0; r < vr && ok; ++r)
-          ok = masked ? nn::cuda::argmax_masked_dev(dev(in[0]) + r * vocab, vocab,
-                                                    mask, out + r)
-                      : nn::cuda::argmax_dev(dev(in[0]) + r * vocab, vocab, out + r);
+        ok = nn::cuda::argmax_rows_dev(dev(in[0]), int(vr), vocab, mask, out);
         if (ok && token_buf_)
           ok = device::device_copy(out_handle, token_out_slot(),
                                    size_t(vr) * sizeof(float));

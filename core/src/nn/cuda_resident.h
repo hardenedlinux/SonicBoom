@@ -41,8 +41,10 @@ namespace sonicboom::nn::cuda {
 // n floats (or empty). `add` is the optional residual epilogue of
 // fuse_residual_epilogue_pass (null => none), applied in the same launch.
 // Mirrors nn::rms_norm / nn::cuda::rms_norm plus the following nn::add.
+// `rows` > 1 is the verify step's multi-position form: x/y are [rows, n] and
+// every row runs exactly the single-row launch on its own slice.
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n, const float* add = nullptr);
+                  float* y, int n, const float* add = nullptr, int rows = 1);
 
 // Per-head RMSNorm over `heads` heads of `head_dim` floats each:
 //   y[h*head_dim + i] = (x[h*head_dim + i] / sqrt(mean_i(x[h*head_dim+i]^2) + eps)) * weight[i]
@@ -51,7 +53,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
 // unit). Mirrors exec.cpp's per-head nn::rms_norm loop.
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
                         float* y, int head_dim, int heads,
-                        const float* add = nullptr);
+                        const float* add = nullptr, int rows = 1);
 
 // GGML_GELU_FP16 tanh-GELU (fp16 round-trip), elementwise. x/y may alias.
 bool gelu_fp16_dev(const float* x, float* y, int n);
@@ -95,10 +97,12 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
 // Dense (non-K-quant) matvec, device in/out: y[j] = sum_i W[j*cols + i] * x[i].
 // W is row-major with `cols` contiguous (GGUF order); rows = y length. W is a
 // host span uploaded+cached. Mirrors nn::cuda::matvec_f32 / matvec_bf16.
+// `n_rows` > 1 is the verify step's multi-position form: x is [n_rows, cols] and
+// y is [n_rows, rows]; every row runs the per-row kernel on its own slice.
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
-                    float* y, int rows);
+                    float* y, int rows, int n_rows = 1);
 bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
-                     float* y, int rows);
+                     float* y, int rows, int n_rows = 1);
 
 // GQA broadcast for n_k == 1 attention (the SDPA degenerates to copying the
 // single value vector, GQA-broadcast): dst[hq*head_dim + i] =
@@ -148,6 +152,34 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                           float scale, float* out, int pos_offset = 0,
                           bool kv_f16 = false, uint64_t chunk_attr = 0,
                           bool kv_q8 = false, int tier = -1);
+
+// Multi-query form of the call above, for the speculative verify step: all
+// `n_q` verify rows' queries arrive in one launch, and each block stages a
+// chunk's K/V once and serves every row that reads it, instead of one launch
+// per row re-reading the same cache lines. The verify rows are at
+// pos[pos_offset0] .. pos[pos_offset0] + n_q - 1; q and out are
+// [n_q, n_heads_q, head_dim]. Row i is bit-identical to
+// decode_attention_dev(..., pos_offset = pos_offset0 + i, ...) with the same
+// chunk constants: the per-key arithmetic, warp reduction, per-chunk local
+// max/exp/sum and partial merge order are those of the split/merge pair, and
+// the partial index of row i's chunk c is (first_i - first_0) + c, exactly the
+// chunk the single-row launch at row i's position merges.
+//
+// The caller must append every row's K/V BEFORE this launch (the SWA ring
+// carries kMaxVerifyRows slots of headroom for that). Returns false when the
+// multi-query schedule does not apply (codegen-only shape, forced exp2, tier
+// geometry, tracing, settings out of the block's shared-memory budget, ring
+// too small); the caller then runs the per-row calls. Fallbacks are counted by
+// decode_attention_mq_fallback_count(), not logged.
+bool decode_attention_mq_dev(const float* q, const float* k_cache,
+                             const float* v_cache, const uint64_t* pos,
+                             uint64_t window, uint64_t n_slots, int n_heads_q,
+                             int n_heads_kv, int head_dim,
+                             uint64_t sliding_window, float scale, float* out,
+                             int n_q, int pos_offset0 = 0, bool kv_f16 = false,
+                             uint64_t chunk_attr = 0, bool kv_q8 = false,
+                             int tier = -1);
+uint64_t decode_attention_mq_fallback_count();
 
 // --- multi-tier decode graphs ----------------------------------------------
 //
@@ -316,6 +348,12 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
 // out[0]. Ties are broken toward the lowest index, exactly mirroring
 // nn::argmax. Requires n > 0 and a non-null x/out.
 bool argmax_dev(const float* x, int n, float* out);
+
+// Multi-row argmax (the verify step's positions): x is [n_rows, n] and out
+// [n_rows]; every row runs exactly the single-row reduction on its own slice.
+// `mask` (null => unmasked) is shared by every row.
+bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
+                     float* out);
 
 // Masked argmax: the same selection over the ids whose bit is set in `mask`
 // (a device bitmap of ceil(n / 8) bytes, bit i of byte i / 8, LSB first; the

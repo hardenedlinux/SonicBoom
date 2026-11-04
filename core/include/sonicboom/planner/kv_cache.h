@@ -42,12 +42,12 @@ inline uint64_t next_kv_cache_id() {
   return next.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Element type of the KV cache. The strict numerics profile stores f32 (the
-// pre-rounding values); the standard profile stores f16, or q8 once the
-// quantization arm is enabled. q8 is not a drop-in narrower dtype: a row is
-// `head_dim` int8 values followed by one f32 scale (symmetric, per (slot, KV
-// head), scale = max|x| / 127), so the row stride is head_dim + 4 bytes and
-// every reader dequantizes on load.
+// Element type of the KV cache. Both numerics profiles store f16 (exact for
+// the fp16-rounded values), or q8 once the quantization arm is enabled; f32 is
+// the wide form SONICBOOM_KV=f32 selects. q8 is not a drop-in narrower dtype:
+// a row is `head_dim` int8 values followed by one f32 scale (symmetric, per
+// (slot, KV head), scale = max|x| / 127), so the row stride is head_dim + 4
+// bytes and every reader dequantizes on load.
 enum class KvDtype { F32, F16, Q8 };
 
 // Bytes of one q8 KV row: head_dim int8 values then the f32 scale. head_dim is
@@ -70,9 +70,10 @@ constexpr uint64_t kv_row_bytes(KvDtype dtype, uint64_t head_dim) noexcept {
 // SonicCudaBackend so a session can own it). K is RoPE'd + per-head-normed then
 // fp16-rounded; V per-head-normed then fp16-rounded. Flat
 // [n_slots, n_heads_kv, row]; slot for absolute position j is `j % n_slots`.
-// Element type: f32 under the strict numerics profile, f16 or q8 under
-// standard. Reading an f16 row and widening is exact, since the values were
-// fp16-rounded before either storage existed; q8 re-quantizes those same
+// Element type: f16 under both numerics profiles, or q8 when that arm is
+// selected (f32 is the SONICBOOM_KV override). Reading an f16 row and widening
+// is exact, since the values were fp16-rounded before either storage existed;
+// q8 re-quantizes those same
 // fp16-rounded values (see KvDtype).
 struct KvCacheDev {
   hal::Buffer k_buf;
@@ -129,6 +130,19 @@ struct KvCacheSession {
   uint64_t cache_id = 0;
   std::vector<uint64_t> filled_tokens;  // token at each prefilled position
   uint64_t n_ctx = 0;
+  // Speculative-policy evidence (the bounded proposal/accept window) measured
+  // on this session. Owned opaquely so this model-agnostic header carries no
+  // policy type; the speculative loop treats the session as the unit, so one
+  // session's accept evidence never steers another's choices and the bootstrap
+  // is paid once per session instead of once per call.
+  std::shared_ptr<void> spec_evidence;
+
+  // RAII release for the runtimes bound to this set (a
+  // model::SessionRuntimeOwner). kv_session_allocate stores one when it gives
+  // the set an identity, next to `caches` and declared after it, so the owner
+  // is destroyed — releasing the runtimes and their cache references — before
+  // the set itself is dropped. Opaque here: this header stays model-agnostic.
+  std::shared_ptr<void> runtime_owner;
 
   // Longest prefix of `prompt` that matches the filled token history. 0 when
   // there is no history (or the first token already differs).

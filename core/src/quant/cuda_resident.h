@@ -37,6 +37,13 @@ namespace sonicboom::quant::cuda {
 // floats, zero-initialized before accumulation). No host copies.
 bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 
+// Multi-row matvec (the verify step's positions): x is [n, cols], y is
+// [n, rows]. Quantizes every row with one launch and runs the row-invariant
+// batched gemv, so row i is bit-identical to matvec_f32_dev on that row.
+// Declines (false) when the q8_1 path is disabled.
+bool matvec_f32_rows_dev(const QuantizedTensor& W, const float* x, float* y,
+                         int n);
+
 // One q8_1 activation block: an fp32 scale `d` and 32 int8 quants (amax/127
 // quantization, == llama.cpp's quantize_q8_1). Layout-identical to the .cu
 // kernel's block struct; a pure POD so it needs no CUDA includes.
@@ -58,8 +65,10 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks);
 // the f32 normalized activation is never materialized. `weight` is a host span
 // of n floats (empty => unit). Bit-identical to rms_norm_dev followed by
 // quantize_q8_1_dev. Device in/out, no host copies. n must be a multiple of 32.
+// `rows` > 1 is the verify step's multi-position form: x is [rows, n] and yq
+// [rows, n/32]; every row runs the single-row block unchanged.
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
-                                float eps, BlockQ8_1* yq, int n);
+                                float eps, BlockQ8_1* yq, int n, int rows = 1);
 
 // Upload a host byte range to the device once and cache it by (pointer, size).
 // This is the cache the *_dev weight spans above use; it is exposed so the glue
@@ -72,14 +81,14 @@ const void* upload_bytes_cached(const void* host, std::size_t bytes);
 // amax/127-quantizes — the f32 gelu and product intermediates are never
 // materialized. Device in/out, no host copies. n must be a multiple of 32.
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n);
+                                int n, int rows = 1);
 
 // silu×up -> q8_1 fused (T5, SwiGLU): yq = quantize_q8_1(silu(gate) * up). The
 // Silu counterpart of gelu_mul_quantize_q8_1_dev (same fusion, same contract);
 // the two differ only in the activation. Device in/out, no host copies. n must
 // be a multiple of 32.
 bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n);
+                                int n, int rows = 1);
 
 // The K-quant gemv consuming a pre-quantized q8_1 activation (`xq`), no internal
 // quantize. W's packed bytes are uploaded+cached exactly as matvec_f32_dev.
@@ -105,10 +114,44 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
 // `y` is [n, rows]. The batched gemv's per-position arithmetic is the same lane
 // decomposition and summation order as gemv_q8_1_dev (single vs batched mmvq,
 // B2 audit), so row i of the result is bit-identical to the single-column call
-// on row i. No bias/add epilogue: the verify step adds them with elementwise
-// kernels, which store the same f32 values as the fused epilogue.
+// on row i. `bias`/`add` are the optional epilogue operands of the fused gemv
+// epilogue (applied in that order to each row's reduced sum, exactly as
+// add_bias_dev then add_dev would): a type gemv_bias_epilogue_supported()
+// rejects with a non-empty bias (or a non-null add) fails the call.
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
-                           float* y, int n);
+                           float* y, int n, std::span<const float> bias = {},
+                           const float* add = nullptr);
+
+// The warps-per-row split gemv_q8_1_batched_dev uses for this projection and
+// row count: the warm-up's measured pick for (type, rows, cols, n), or 1 (one
+// warp per row, the reference kernel) when nothing has been measured. Every
+// split is bit-identical, so this only ever selects a speed.
+int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n);
+
+// Measure and cache that split for the model's quantized projections (distinct
+// (type, rows, cols) shapes) at row counts 3..16, once per process. Synthetic
+// zeroed weights and activations, sized to the real shapes; the pick is stored
+// in the tune file keyed by the build fingerprint `build_id`, and a bounded
+// time budget (~1 s) either measures every row count or falls back to
+// {3, 8, 16} and fills the rest from those. A no-op when the split is pinned by
+// SONICBOOM_VERIFY_GEMV_WP, when q8_1 is unavailable, or after the first call.
+void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
+                         const char* build_id);
+
+// The decode/verify kernel family for one quantized projection shape: the
+// single-column gemv (32-element q8_1 activation per position) or the mmq int8
+// tensor-core matmul (128-element block_q8_1_mmq activation). True when the
+// shape takes mmq; false (the gemv) when it has not been measured or the mmq
+// cannot serve it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the pick.
+bool decode_family_mmq(QuantType qt, int rows, int cols);
+
+// Measure (or load from the tune file) that family for the model's distinct
+// quantized projection shapes, largest first, under a warm-up load budget.
+// Synthetic zeroed weights and activations at the real shapes; the picks are
+// stored keyed by the build fingerprint `build_id`. A no-op when q8_1 or mmq is
+// unavailable, when the debug pin is set, or after the first call.
+void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
+                        const char* build_id);
 
 // One member of a sibling launch: a quantized projection reading the shared
 // q8_1 activation, with its optional [rows] bias and its [rows] output.
@@ -130,6 +173,14 @@ struct GemvSibling {
 bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
                             const BlockQ8_1* xq);
 
+// Multi-position form of gemv_q8_1_siblings_dev (the verify step): `xq` is
+// [n, cols/32] q8_1 blocks and every member's `y` is [n, rows]. Row i of
+// position p's output is bit-identical to gemv_q8_1_siblings_dev on position p
+// (same per-row decomposition and bias epilogue); only the position loop is
+// folded into the launch.
+bool gemv_q8_1_siblings_batched_dev(std::span<const GemvSibling> siblings,
+                                    const BlockQ8_1* xq, int n);
+
 // Whether gemv_q8_1_dev can fold a bias for this quant type (i.e. whether the
 // gemv kernel carries the epilogue). Callers that must add a bias regardless use
 // this to choose between the epilogue and a separate add_bias_dev.
@@ -139,6 +190,21 @@ bool gemv_bias_epilogue_supported(QuantType qt);
 // [cols, n] row-major (n innermost), Y is device [rows, n] (n innermost).
 // n == 1 falls back to matvec_f32_dev. No host copies.
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
+
+// The mmq matmul over an f32 activation: quantizes X to block_q8_1_mmq, then
+// runs the mmq kernel with the shape's pinned tile config and split-K. Used at
+// every n, including n == 1 (the decode step and the verify rows share the
+// batched arithmetic). X is device [cols, n], Y device [n, rows]; no host
+// copies.
+//
+// `bias`/`add` are the optional write-back epilogue: two f32 additions applied
+// to each output value in that order (bias first, then the residual), at the
+// same rounding as add_bias_dev followed by add_dev, so the fused node stores
+// the values the separate kernels would. `bias` is a host span of `rows`
+// floats (empty => none); `add` is a device [n, rows] buffer (nullptr => none,
+// residual indexed by row).
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
+                    std::span<const float> bias = {}, const float* add = nullptr);
 
 // --- MMQ int8-tensor-core batched/fused prefill ops (C.2/C.4) ---------------
 
@@ -188,8 +254,15 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
 // the J_max tail guard (see mmq_q8_blocks). Device in/out, no host copies.
 // `decomp` is the plan's decomposition for this shape class (the node's `decomp`
 // attribute); Auto lets the runtime choose (class policy / autotuner).
+//
+// `bias`/`add` are matmul_mmq_dev's optional write-back epilogue (bias first,
+// then the residual, one f32 add each): `bias` a host span of `rows` floats,
+// `add` a device [n, rows] buffer, row-indexed like the separate
+// add_bias_dev/add_dev they replace.
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* Y,
-                       int n, MmqDecomp decomp = MmqDecomp::Auto);
+                       int n, MmqDecomp decomp = MmqDecomp::Auto,
+                       std::span<const float> bias = {},
+                       const float* add = nullptr);
 
 // MMQ1: Y = W @ X on the compiler-generated int8 tensor-core kernel
 // (compiler/MmqTcCodegen.h), over a per-weight q8_1 copy instead of the packed

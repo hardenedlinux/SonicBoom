@@ -569,7 +569,11 @@ the converged prefill-attention path to the v0.0.3 runtime. Its limits:
   emitted stream is bit-identical to greedy by construction
   (`test_guarantees` compares spec on/off on the public models; the exhaustive
   invariance and rollback sweeps are engine regression suites maintained
-  separately). `SONICBOOM_SPEC=off|on|auto`;
+  separately). `SONICBOOM_SPEC=off|on|auto|reckless`;
+  `reckless` runs the verify rows through the batch prefill kernels instead of
+  the decode deal-over-rows, which is faster on the batched matmuls but gives
+  up the row-invariance guarantee (it logs this once, and is refused under
+  `SONICBOOM_NUMERICS=strict`).
   unset runs a per-SM startup probe (verify/plain ratio; auto below 1.5, off
   otherwise) and an explicit value bypasses it. `auto` chooses k from a
   measured verify-cost curve c(k) and an acceptance-rate EMA. On sm_86 the

@@ -222,6 +222,10 @@ if(SONICBOOM_USE_CUDA)
   # other core sources. Its public header exposes only Layer 2 types.
   target_sources(sonicboom PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
+    # New, currently-unused entry point that instantiates the imported upstream
+    # MMQ kernels (ggml_derived/mmq_upstream/). It is not wired into any
+    # production dispatch; cuda_quant_matmul.cu is unchanged.
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/mmq_upstream.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
     # SonicBoom-owned prefill attention (boom_fattn), the prefill attention
     # implementation. Plain device code, no device lambdas, so it needs no
@@ -272,8 +276,14 @@ if(SONICBOOM_USE_CUDA)
   # lets ptxas use 254 registers for Q3_K J=128 instead of 202 (exactly
   # llama.cpp's allocation; measured with cuobjdump). It lives in
   # ggml_derived/mmq.cuh, next to the kernel it constrains.
+  #
+  # The new upstream-MMQ TU mirrors upstream's command line for the imported
+  # kernels (-extended-lambda), but not -use_fast_math: this path is unused for
+  # now, and fast math would change the quantization numerics relative to the
+  # reference build in ways this step does not need to validate.
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/cuda_quant_matmul.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/mmq_upstream.cu
     PROPERTIES COMPILE_OPTIONS "-extended-lambda")
 
   # boom_fattn's runtime JIT compiles the same device code the AOT translation

@@ -98,19 +98,20 @@ __device__ inline float bf16_roundtrip(float v) {
 
 // --- KV-cache element type --------------------------------------------------
 //
-// The KV cache is f32 under the strict profile and f16 under standard. The
-// values were fp16-rounded before either storage form existed (the prep kernels
-// cast K and V through f16), so f16 storage is exact: widening a stored f16 is
-// the same value the f32 cache held. Every kernel that reads or writes the
-// cache goes through these two helpers and is templated on the element type;
-// the launch sites pick the instantiation from the cache's declared dtype.
+// The KV cache is f16 under both numerics profiles (f32 is the SONICBOOM_KV
+// override). The values were fp16-rounded before either storage form existed
+// (the prep kernels cast K and V through f16), so f16 storage is exact:
+// widening a stored f16 is the same value the f32 cache held. Every kernel that
+// reads or writes the cache goes through these two helpers and is templated on
+// the element type; the launch sites pick the instantiation from the cache's
+// declared dtype.
 __device__ inline float kv_load(const float* p) { return *p; }
 __device__ inline float kv_load(const __half* p) { return __half2float(*p); }
 // Batch (chunk) K/V rows are always f32. Under f16 KV storage the cache append
 // rounds them to f16, so attention must read them through the same rounding:
 // otherwise a fresh prefill (all keys from the batch) sees unrounded values
 // while a cache-reuse prefill sees rounded ones, and the two take different
-// tokens. The strict (f32) instantiation keeps the raw value.
+// tokens. The f32 instantiation (SONICBOOM_KV=f32) keeps the raw value.
 template <typename KV>
 __device__ inline float kv_load_batch(const float* p) {
   if constexpr (std::is_same_v<KV, float>) return *p;
@@ -322,10 +323,49 @@ __global__ void rope_neox_heads_pos_kernel(float* __restrict__ x, int head_dim,
   x[i + half] = x0 * s + x1 * c;
 }
 
+// One vector's contribution to a dense dot, shared by the single-row and the
+// row-tile kernels so both compile the product/sum tree (and the compiler's
+// FMA contraction of it) from the same source expression — that is what keeps
+// the tile form bit-identical to the single-row form.
+__device__ __forceinline__ float dense_dot_f32_4(const float4& w,
+                                                 const float4& xi) {
+  // Pinned left-to-right contraction (FMUL then FFMA chain). Writing the
+  // expression directly lets ptxas start the chain at a different product
+  // depending on the surrounding kernel, which changes the rounding by 1 ULP
+  // and breaks verify-row bit identity. The intrinsics fix the order.
+  float d = __fmul_rn(w.x, xi.x);
+  d = __fmaf_rn(w.y, xi.y, d);
+  d = __fmaf_rn(w.z, xi.z, d);
+  d = __fmaf_rn(w.w, xi.w, d);
+  return d;
+}
+
+__device__ __forceinline__ float dense_dot_bf16_8(const uint4& w,
+                                                  const float4& x0,
+                                                  const float4& x1) {
+  // Pinned left-to-right contraction, element 0 first (same reason as
+  // dense_dot_f32_4).
+  float d = __fmul_rn(bf16_to_float(uint16_t(w.x & 0xffffu)), x0.x);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.x >> 16)), x0.y, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.y & 0xffffu)), x0.z, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.y >> 16)), x0.w, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.z & 0xffffu)), x1.x, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.z >> 16)), x1.y, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.w & 0xffffu)), x1.z, d);
+  d = __fmaf_rn(bf16_to_float(uint16_t(w.w >> 16)), x1.w, d);
+  return d;
+}
+
 // y[j] = sum_i W[j*cols + i] * x[i], fp32 accumulation. W is row-major with
 // `cols` contiguous (GGUF order).
+// `blockIdx.y` selects the activation/output row of a multi-row launch (the
+// verify step's positions); row 0 is the decode call.
 __global__ void gemv_dense_f32(const float* __restrict__ W, const float* __restrict__ x,
                                float* __restrict__ y, int cols, int rows) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < rows;
        j += gridDim.x * blockDim.x) {
     const float* wrow = W + (size_t)j * cols;
@@ -340,6 +380,10 @@ __global__ void gemv_dense_f32(const float* __restrict__ W, const float* __restr
 // rounding exactly.
 __global__ void gemv_bf16(const uint16_t* __restrict__ W, const float* __restrict__ x,
                           float* __restrict__ y, int cols, int rows) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < rows;
        j += gridDim.x * blockDim.x) {
     const uint16_t* wrow = W + (size_t)j * cols;
@@ -364,6 +408,10 @@ __global__ void gemv_dense_f32_v(const float* __restrict__ W,
                                  const float* __restrict__ x,
                                  float* __restrict__ dst, int cols, int rows,
                                  int k_split) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    dst += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+  }
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int row = warp_id / k_split;
@@ -383,7 +431,7 @@ __global__ void gemv_dense_f32_v(const float* __restrict__ W,
   for (int v = v_begin + lane; v < v_end; v += 32) {
     const float4 w = wv[v];
     const float4 xi = xv[v];
-    acc += w.x * xi.x + w.y * xi.y + w.z * xi.z + w.w * xi.w;
+    acc += dense_dot_f32_4(w, xi);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
@@ -394,6 +442,10 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
                             const float* __restrict__ x,
                             float* __restrict__ dst, int cols, int rows,
                             int k_split) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)cols;
+    dst += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+  }
   const int warp_id =
       blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
   const int row = warp_id / k_split;
@@ -414,18 +466,155 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
     const uint4 w = wv[v];
     const float4 x0 = xv[(v << 1)];
     const float4 x1 = xv[(v << 1) + 1];
-    acc += bf16_to_float(uint16_t(w.x & 0xffffu)) * x0.x +
-           bf16_to_float(uint16_t(w.x >> 16)) * x0.y +
-           bf16_to_float(uint16_t(w.y & 0xffffu)) * x0.z +
-           bf16_to_float(uint16_t(w.y >> 16)) * x0.w +
-           bf16_to_float(uint16_t(w.z & 0xffffu)) * x1.x +
-           bf16_to_float(uint16_t(w.z >> 16)) * x1.y +
-           bf16_to_float(uint16_t(w.w & 0xffffu)) * x1.z +
-           bf16_to_float(uint16_t(w.w >> 16)) * x1.w;
+    acc += dense_dot_bf16_8(w, x0, x1);
   }
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, o);
   if (lane == 0) dst[(size_t)row * k_split + chunk] = acc;
+}
+
+// --- dense gemv over a tile of activation rows (verify step) ----------------
+//
+// The verify step runs the same projection on k+1 positions. The grid.y form
+// above launches one block set per position, so every position's blocks walk
+// the whole weight row again — the weight traffic is multiplied by the row
+// count. These kernels keep the weight block in a register and apply it to
+// every activation row of the tile: warp (row, chunk) reads W once, accumulates
+// one T-register tile (one accumulator per position), and writes each
+// position's partial. The per-position expression, the lane-to-element walk and
+// the shuffle tree are the single-row kernel's verbatim, so row i is
+// bit-identical to the grid.y launch (and to the plain decode step).
+//
+// The tile width is fixed at the verify envelope (k + 1 <= 16); a wider call
+// falls back to the per-position launches.
+constexpr int kDenseReuseRows = 16;
+// Output rows per warp in the row-batched dense gemv. Each warp holds the
+// activation chunk of every verify row in registers and streams R weight rows
+// through it, so both operands feed R*T dots from one load each. The per-row
+// arithmetic (lane's v sequence, dot expression, shuffle tree) is unchanged.
+constexpr int kDenseRowsPerWarp = 4;
+
+template <int R, int T>
+__global__ void gemv_dense_f32_v_reuse(const float* __restrict__ W,
+                                       const float* __restrict__ x,
+                                       float* __restrict__ dst, int cols,
+                                       int rows, int k_split, int n_rows) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row0 = (warp_id / k_split) * R;
+  const int chunk = warp_id % k_split;
+  if (row0 >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 2;                       // float4 per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int chunk_len = max(0, min(chunk_nv, nv - v_begin));
+  const size_t x_stride = (size_t)(cols >> 2);
+
+  float acc[R][T];
+#pragma unroll
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+
+  const float4* xv0 = reinterpret_cast<const float4*>(x) + v_begin;
+  for (int i = lane; i < chunk_len; i += 32) {
+    float4 xv[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < n_rows) xv[t] = xv0[(size_t)t * x_stride + (size_t)i];
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      if (row0 + r >= rows) continue;
+      const float4* wv = reinterpret_cast<const float4*>(
+          W + (size_t)(row0 + r) * (size_t)cols);
+      const float4 w = wv[v_begin + i];
+#pragma unroll
+      for (int t = 0; t < T; ++t)
+        if (t < n_rows)
+          acc[r][t] = __fadd_rn(acc[r][t], dense_dot_f32_4(w, xv[t]));
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    if (row0 + r >= rows) continue;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t >= n_rows) break;
+      float s = acc[r][t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+      if (lane == 0)
+        dst[(size_t)t * rows * (size_t)k_split +
+            (size_t)(row0 + r) * k_split + chunk] = s;
+    }
+  }
+}
+
+template <int R, int T>
+__global__ void gemv_bf16_v_reuse(const uint16_t* __restrict__ W,
+                                  const float* __restrict__ x,
+                                  float* __restrict__ dst, int cols, int rows,
+                                  int k_split, int n_rows) {
+  const int warp_id =
+      blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int row0 = (warp_id / k_split) * R;
+  const int chunk = warp_id % k_split;
+  if (row0 >= rows) return;
+  const int lane = threadIdx.x & 31;
+
+  const int nv = cols >> 3;                       // uint4 (8 bf16) per row
+  const int chunk_nv = (nv + k_split - 1) / k_split;
+  const int v_begin = chunk * chunk_nv;
+  const int chunk_len = max(0, min(chunk_nv, nv - v_begin));
+  const size_t x_stride = (size_t)(cols >> 2);
+
+  float acc[R][T];
+#pragma unroll
+  for (int r = 0; r < R; ++r)
+#pragma unroll
+    for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+
+  const float4* xv0 = reinterpret_cast<const float4*>(x) + (v_begin << 1);
+  for (int i = lane; i < chunk_len; i += 32) {
+    float4 xa[T], xb[T];
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t < n_rows) {
+        xa[t] = xv0[(size_t)t * x_stride + (i << 1)];
+        xb[t] = xv0[(size_t)t * x_stride + (i << 1) + 1];
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      if (row0 + r >= rows) continue;
+      const uint4* wv = reinterpret_cast<const uint4*>(
+          W + (size_t)(row0 + r) * (size_t)cols);
+      const uint4 w = wv[v_begin + i];
+#pragma unroll
+      for (int t = 0; t < T; ++t)
+        if (t < n_rows)
+          acc[r][t] = __fadd_rn(acc[r][t], dense_dot_bf16_8(w, xa[t], xb[t]));
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    if (row0 + r >= rows) continue;
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+      if (t >= n_rows) break;
+      float s = acc[r][t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+      if (lane == 0)
+        dst[(size_t)t * rows * (size_t)k_split +
+            (size_t)(row0 + r) * k_split + chunk] = s;
+    }
+  }
 }
 
 // Second phase of the split-K dense gemv: sum each row's `k_split` partial
@@ -433,6 +622,10 @@ __global__ void gemv_bf16_v(const uint16_t* __restrict__ W,
 // construction — no atomics, no scheduling-dependent accumulation order.
 __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
                                    float* __restrict__ y, int rows, int k_split) {
+  if (blockIdx.y != 0) {
+    partial += (size_t)blockIdx.y * (size_t)rows * (size_t)k_split;
+    y += (size_t)blockIdx.y * (size_t)rows;
+  }
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
   const float* p = partial + (size_t)row * k_split;
@@ -462,11 +655,20 @@ __global__ void gemv_reduce_kernel(const float* __restrict__ partial,
 // into the preceding multiply. x/y/add may alias (the executor's buffer reuse
 // can place the result over either input): every index is read before it is
 // written, and the reduction completes before the apply.
+// `blockIdx.y` is the row of a multi-row launch (the verify step's positions);
+// row 0 is the decode call. Each block runs the per-row code unchanged on its
+// own row's slice, so every row is bit-identical to the single-row launch.
 template <typename R>
 __global__ void rms_norm_fused_kernel(const float* x,
                                       const float* __restrict__ weight, int n,
                                       float eps, float* y,
                                       const float* add) {
+  if (blockIdx.y != 0) {
+    const size_t rb = (size_t)blockIdx.y * (size_t)n;
+    x += rb;
+    y += rb;
+    if (add != nullptr) add += rb;
+  }
   const int tid = threadIdx.x;
   __shared__ typename R::part_t wp[32];
   __shared__ float inv;
@@ -496,11 +698,18 @@ __global__ void rms_norm_fused_kernel(const float* x,
 // elementwise so spreading it across the block does not change the result.
 // `add` is the optional residual epilogue, as in rms_norm_fused_kernel: the
 // add folded into this norm's output is applied here, bit-identically.
+// `blockIdx.y` is the row of a multi-row launch; a row holds `gridDim.x` heads.
 template <typename R>
 __global__ void rms_heads_fused_kernel(const float* x,
                                        const float* __restrict__ weight,
                                        int head_dim, float eps,
                                        float* y, const float* add) {
+  if (blockIdx.y != 0) {
+    const size_t rb = (size_t)blockIdx.y * (size_t)gridDim.x * (size_t)head_dim;
+    x += rb;
+    y += rb;
+    if (add != nullptr) add += rb;
+  }
   const int h = blockIdx.x;
   const float* xh = x + (size_t)h * head_dim;
   float* yh = y + (size_t)h * head_dim;
@@ -782,6 +991,263 @@ __global__ void decode_attention_merge_kernel(const float* __restrict__ partial,
     acc += w * pp[2 + t];
   }
   out[(uint64_t)h * head_dim + t] = acc / l;
+}
+
+// Stage one tile of a KV cache chunk into shared memory as float: one warp per
+// key, the 32 lanes striding the head dim (coalesced reads, bank-conflict-free
+// shared stores). The staged value is exactly what kv_load_at returns, so the
+// per-key arithmetic that reads it is the single-row kernel's.
+template <typename KV>
+__device__ inline void mq_stage_kv(const KV* __restrict__ cache,
+                                   float* __restrict__ tile, int lane, int warp,
+                                   int warps, uint64_t first_key, uint64_t nk,
+                                   uint64_t n_slots, int n_heads_kv,
+                                   int kv_group, int head_dim) {
+  for (uint64_t jj = warp; jj < nk; jj += (uint64_t)warps) {
+    const uint64_t j = first_key + jj;
+    const KV* row = kv_row(cache,
+                           (j % n_slots) * (uint64_t)n_heads_kv + kv_group,
+                           head_dim);
+    float* dst = tile + jj * (uint64_t)head_dim;
+    for (int i = lane; i < head_dim; i += 32)
+      dst[i] = kv_load_at(row, i, head_dim);
+  }
+}
+
+// Multi-query split-KV decode attention for the verify step: one launch serves
+// every query row, and a chunk's K/V tile is staged and read once per block
+// instead of once per row. Row i must stay bit-identical to the single-row
+// split kernel at its own position, so the per-key arithmetic (lane mapping,
+// warp shuffle tree, local max/exp/sum, V-weighted accumulation and the partial
+// layout) is copied verbatim; only the schedule changes:
+//   * a block owns one absolute chunk of one KV head and up to
+//     `rows_per_block` rows (grid.z picks the row group);
+//   * the chunk's keys are staged in shared memory in tiles; every (row, query
+//     head) task of the block reads K and V from the tile;
+//   * a warp owns exactly one task, and a task runs the existing phase 1/2/3
+//     over its own key range. The task's q row lives in registers, so the
+//     per-key dot reads only the staged K tile.
+// Block chunk indices are anchored at row 0's first chunk (absolute keys), so
+// row r's partials sit at index (first_r - first_0) + c; the merge walks
+// exactly the chunks the single-row launch at pos[0]+r would, in the same
+// order. The verify caller appends every row before this launch; the SWA ring
+// carries kMaxVerifyRows slots of headroom so no append clobbers a key an
+// earlier row still reads.
+// DPL is head_dim / 32: the accumulators and the resident q row are sized
+// exactly (DPL floats each), which keeps a warp's live set small enough for
+// many resident warps. The host picks the block size from this
+// instantiation's register count (mq_max_warps), so the schedule adapts
+// instead of failing to launch.
+template <typename KV, int DPL>
+__global__ void decode_attention_split_mq_kernel(
+    const float* __restrict__ q, const KV* __restrict__ k_cache,
+    const KV* __restrict__ v_cache, const uint64_t* __restrict__ pos,
+    uint64_t n_slots, uint64_t chunk, uint64_t sliding_window, int n_heads_q,
+    int n_heads_kv, int head_dim, float scale, int n_q, int rows_per_block,
+    int warps, int tile_keys, int n_chunks, int pos_offset0,
+    float* __restrict__ partial) {
+  extern __shared__ float mq_smem[];
+  const int group_q = n_heads_q / n_heads_kv;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+
+  const uint64_t chunk_idx = blockIdx.x;  // absolute chunk - first_0
+  const int kv_group = blockIdx.y;
+  const int row_base = blockIdx.z * rows_per_block;
+  const int rows =
+      row_base + rows_per_block <= n_q ? rows_per_block : n_q - row_base;
+
+  float* scores = mq_smem;  // [rows_per_block * group_q][chunk]
+  float* tile =
+      mq_smem + (size_t)rows_per_block * (size_t)group_q * (size_t)chunk;
+
+  const uint64_t p0 = *pos + (uint64_t)pos_offset0;
+  const uint64_t start0 =
+      (sliding_window > 0 && p0 >= sliding_window) ? p0 - sliding_window + 1 : 0;
+  const uint64_t first0 = start0 / chunk;
+  const uint64_t c0 = (first0 + chunk_idx) * chunk;
+  // The union of the block's key ranges is contiguous: both the window start
+  // and the last position grow with the row.
+  const uint64_t p_first = p0 + (uint64_t)row_base;
+  const uint64_t p_last = p_first + (uint64_t)rows - 1;
+  const uint64_t start_first =
+      (sliding_window > 0 && p_first >= sliding_window)
+          ? p_first - sliding_window + 1
+          : 0;
+  const uint64_t ulo = c0 > start_first ? c0 : start_first;
+  const uint64_t uhi =
+      (c0 + chunk < p_last + 1) ? (c0 + chunk) : (p_last + 1);
+  if (ulo >= uhi) return;
+
+  // One task per warp: warp `warp` owns the (row, query head) pair `warp` of
+  // this block, with its own key range and score row.
+  const int t = warp;
+  const int tasks = rows * group_q;
+  bool active = false;
+  uint64_t jlo = 0;
+  uint64_t jhi = 0;
+  int h = 0;
+  int r = 0;
+  float* srow = nullptr;
+  if (t < tasks) {
+    const int rs = t / group_q;   // row slot in this block
+    const int hs = t % group_q;   // query head slot
+    r = row_base + rs;
+    const uint64_t p = p0 + (uint64_t)r;
+    const uint64_t start =
+        (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+    if (!(c0 > p || c0 + chunk <= start)) {  // a key of this row is here
+      active = true;
+      jlo = c0 > start ? c0 : start;
+      jhi = (c0 + chunk < p + 1) ? (c0 + chunk) : (p + 1);
+      h = kv_group * group_q + hs;
+      srow = scores + (size_t)t * (size_t)chunk;
+    }
+  }
+
+  // The task's q row, held in registers: every key's dot product reads the
+  // same DPL values, so one load per lane column replaces one per key.
+  float qreg[DPL];
+  if (active) {
+    const float* qrow = q + ((size_t)r * n_heads_q + h) * head_dim;
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) qreg[i] = qrow[lane + i * 32];
+  }
+
+  // Phase 1: one q·k dot per key (exactly the single-row phase 1), over K tiles
+  // staged once for every task of the block.
+  for (uint64_t t0 = ulo; t0 < uhi; t0 += (uint64_t)tile_keys) {
+    const uint64_t t1 =
+        (t0 + (uint64_t)tile_keys < uhi) ? t0 + (uint64_t)tile_keys : uhi;
+    mq_stage_kv(k_cache, tile, lane, warp, warps, t0, t1 - t0, n_slots,
+                n_heads_kv, kv_group, head_dim);
+    __syncthreads();
+    if (active) {
+      const uint64_t ja = t0 > jlo ? t0 : jlo;
+      const uint64_t jb = t1 < jhi ? t1 : jhi;
+#pragma unroll 4
+      for (uint64_t j = ja; j < jb; ++j) {
+        const float* krow = tile + (j - t0) * (uint64_t)head_dim;
+        float d = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) d += qreg[i] * krow[lane + i * 32];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+          d += __shfl_down_sync(0xffffffffu, d, o);
+        if (lane == 0) srow[j - jlo] = d * scale;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Phase 2: local max (exact), exp once, local sum.
+  float m = -1e30f;
+  float l = 0.0f;
+  if (active) {
+    const uint64_t cn = jhi - jlo;
+    for (uint64_t j = lane; j < cn; j += 32) m = fmaxf(m, srow[j]);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, o));
+    m = __shfl_sync(0xffffffffu, m, 0);
+
+    for (uint64_t j = lane; j < cn; j += 32) {
+      const float e = expf(srow[j] - m);
+      srow[j] = e;
+      l += e;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+      l += __shfl_down_sync(0xffffffffu, l, o);
+    l = __shfl_sync(0xffffffffu, l, 0);
+  }
+  __syncwarp();
+
+  // Phase 3: V-weighted sum over the chunk, in accumulating V tiles staged once
+  // for every task. The accumulators stay in registers across tiles.
+  float acc[DPL];
+#pragma unroll
+  for (int i = 0; i < DPL; ++i) acc[i] = 0.0f;
+
+  for (uint64_t t0 = ulo; t0 < uhi; t0 += (uint64_t)tile_keys) {
+    const uint64_t t1 =
+        (t0 + (uint64_t)tile_keys < uhi) ? t0 + (uint64_t)tile_keys : uhi;
+    mq_stage_kv(v_cache, tile, lane, warp, warps, t0, t1 - t0, n_slots,
+                n_heads_kv, kv_group, head_dim);
+    __syncthreads();
+    if (active) {
+      const uint64_t ja = t0 > jlo ? t0 : jlo;
+      const uint64_t jb = t1 < jhi ? t1 : jhi;
+#pragma unroll 4
+      for (uint64_t j = ja; j < jb; ++j) {
+        const float p = srow[j - jlo];  // exp(score - local max)
+        const float* vrow = tile + (j - t0) * (uint64_t)head_dim;
+#pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] += p * vrow[lane + i * 32];
+      }
+    }
+    __syncthreads();
+  }
+
+  // Write partial [m, l, o[0..head_dim-1]] for the task, at the row's own
+  // chunk index.
+  if (active) {
+    const size_t pstride = (size_t)n_heads_q * (size_t)(head_dim + 2);
+    float* pp = partial +
+                ((size_t)r * (size_t)n_chunks + (size_t)chunk_idx) * pstride +
+                (size_t)h * (size_t)(head_dim + 2);
+    if (lane == 0) {
+      pp[0] = m;
+      pp[1] = l;
+    }
+#pragma unroll
+    for (int i = 0; i < DPL; ++i) pp[2 + lane + i * 32] = acc[i];
+  }
+}
+
+// Merge the multi-query partials: one block per (query head, row). Row r walks
+// the same absolute chunks the single-row merge at pos[0]+r walks, in the same
+// ascending order, at partial index (first_r - first_0) + c.
+__global__ void decode_attention_merge_mq_kernel(
+    const float* __restrict__ partial, const uint64_t* __restrict__ pos,
+    uint64_t chunk, uint64_t sliding_window, int n_chunks, int n_heads_q,
+    int head_dim, int pos_offset0, float* __restrict__ out) {
+  const int h = blockIdx.x;  // one block per query head
+  const int r = blockIdx.y;  // one block per verify row
+  const int t = threadIdx.x;
+  if (t >= head_dim) return;
+
+  const uint64_t p0 = *pos + (uint64_t)pos_offset0;
+  const uint64_t p = p0 + (uint64_t)r;
+  const uint64_t start =
+      (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
+  const uint64_t start0 =
+      (sliding_window > 0 && p0 >= sliding_window) ? p0 - sliding_window + 1 : 0;
+  const uint64_t off = start / chunk - start0 / chunk;
+  const uint64_t n_active = p / chunk - start / chunk + 1;
+  uint64_t nc = n_active < (uint64_t)n_chunks ? n_active : (uint64_t)n_chunks;
+  if (off >= (uint64_t)n_chunks)
+    nc = 0;
+  else if (off + nc > (uint64_t)n_chunks)
+    nc = (uint64_t)n_chunks - off;
+
+  const size_t stride = (size_t)n_heads_q * (size_t)(head_dim + 2);
+  const float* base = partial + (size_t)r * (size_t)n_chunks * stride +
+                      (size_t)h * (size_t)(head_dim + 2) + (size_t)off * stride;
+
+  float m = -1e30f;
+  for (uint64_t c = 0; c < nc; ++c)
+    m = fmaxf(m, base[c * stride]);
+
+  float l = 0.0f;
+  float acc = 0.0f;
+  for (uint64_t c = 0; c < nc; ++c) {
+    const float* pp = base + c * stride;
+    const float w = expf(pp[0] - m);
+    l += w * pp[1];
+    acc += w * pp[2 + t];
+  }
+  out[((size_t)r * n_heads_q + h) * head_dim + t] = acc / l;
 }
 
 // Append one token's K/V row (row_elems floats) into the flat KV cache at slot
@@ -1330,6 +1796,11 @@ void* g_partial = nullptr;      // split-K dense gemv per-chunk partials (rows*k
 size_t g_partial_bytes = 0;
 void* g_attn_partial = nullptr; // split-KV decode attention partials (n_chunks*n_heads_q*(head_dim+2) floats)
 size_t g_attn_partial_bytes = 0;
+// Multi-query verify partials, kept apart from the single-row buffer: a
+// captured decode graph may have baked g_attn_partial's pointer in, and the
+// verify buffer is n_q times larger.
+void* g_attn_partial_mq = nullptr;
+size_t g_attn_partial_mq_bytes = 0;
 void* g_argmax_keys = nullptr;  // per-block packed argmax candidates (grid unsigned long long)
 size_t g_argmax_keys_bytes = 0;
 void* g_select_keys = nullptr;  // per-token packed sampling keys (vocab unsigned long long, r7)
@@ -1425,6 +1896,10 @@ inline int gemv_grid(int rows, int k_split) {
 // the block winner. Single launch, deterministic, no atomics; mirrors nn::argmax.
 __global__ void argmax_kernel(const float* __restrict__ x, float* __restrict__ out,
                               int n) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    out += blockIdx.y;
+  }
   __shared__ float s_val[1024];
   __shared__ int s_idx[1024];
   const int tid = threadIdx.x;
@@ -1461,6 +1936,10 @@ __device__ __forceinline__ bool mask_bit(const uint8_t* __restrict__ mask, int i
 __global__ void argmax_masked_kernel(const float* __restrict__ x,
                                      const uint8_t* __restrict__ mask,
                                      float* __restrict__ out, int n) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    out += blockIdx.y;
+  }
   __shared__ float s_val[1024];
   __shared__ int s_idx[1024];
   const int tid = threadIdx.x;
@@ -1753,8 +2232,14 @@ __device__ __forceinline__ unsigned long long argmax_key(float v, int mi) {
 // (grid sized from the row length and the SM count) to one packed key, and a
 // single-block finalize picks the winner. Per block the reduction is exactly the
 // single-block one (compare with >, first occurrence wins, so NaN never wins).
+// `blockIdx.y` is the row of a multi-row launch; each block row reduces its own
+// row and writes its own keys slice (gridDim.x keys per row).
 __global__ void argmax_partial_kernel(const float* __restrict__ x, int n,
                                       unsigned long long* __restrict__ keys) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    keys += (size_t)blockIdx.y * (size_t)gridDim.x;
+  }
   __shared__ float s_val[256];
   __shared__ int s_idx[256];
   const int tid = threadIdx.x;
@@ -1796,6 +2281,10 @@ __global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
                                              const uint8_t* __restrict__ mask,
                                              int n,
                                              unsigned long long* __restrict__ keys) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    keys += (size_t)blockIdx.y * (size_t)gridDim.x;
+  }
   __shared__ float s_val[256];
   __shared__ int s_idx[256];
   const int tid = threadIdx.x;
@@ -1830,8 +2319,14 @@ __global__ void argmax_partial_masked_kernel(const float* __restrict__ x,
   if (tid == 0) keys[blockIdx.x] = argmax_key(s_val[0], s_idx[0]);
 }
 
+// `blockIdx.y` is the row of a multi-row launch (one finalize block per row);
+// its keys slice starts at row * n_keys.
 __global__ void argmax_finalize_kernel(const unsigned long long* __restrict__ keys,
                                        int n_keys, float* __restrict__ out) {
+  if (blockIdx.y != 0) {
+    keys += (size_t)blockIdx.y * (size_t)n_keys;
+    out += blockIdx.y;
+  }
   __shared__ unsigned long long s_key[256];
   const int tid = threadIdx.x;
   unsigned long long k = 0;
@@ -2092,6 +2587,28 @@ __global__ void kv_append_batched_pos_kernel(KV* __restrict__ dst,
   kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[idx]);
 }
 
+// K and V of one append in a single launch: the first half of the threads
+// copies K and the second half V. The writes are independent rows of two
+// buffers, so the result is the two launches' concatenation.
+template <typename KV>
+__global__ void kv_append_batched_pos_kv_kernel(
+    KV* __restrict__ dst_k, KV* __restrict__ dst_v,
+    const float* __restrict__ src_k, const float* __restrict__ src_v,
+    const uint64_t* __restrict__ start_pos, uint64_t n_slots, int row_elems,
+    int n) {
+  const int total = row_elems * n;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= 2 * total) return;
+  const bool v = idx >= total;
+  const int i = v ? idx - total : idx;
+  const int row = i / row_elems;
+  const int e = i - row * row_elems;
+  const uint64_t slot = (*start_pos + (uint64_t)row) % n_slots;
+  KV* dst = v ? dst_v : dst_k;
+  const float* src = v ? src_v : src_k;
+  kv_store(dst + slot * (uint64_t)row_elems + (uint64_t)e, src[i]);
+}
+
 // --- q8 KV cache append -----------------------------------------------------
 //
 // A q8 cache row is head_dim int8 values then that row's f32 scale at byte
@@ -2175,6 +2692,29 @@ __global__ void kv_append_batched_pos_q8_kernel(
   const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
   kv_q8_store_row(
       dst, src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
+      *start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
+}
+
+// K and V of one q8 append in a single launch (the first half of the blocks is
+// K, the second V). Each block still quantizes one (position, head) row of one
+// buffer exactly as kv_append_batched_pos_q8_kernel does.
+__global__ void kv_append_batched_pos_kv_q8_kernel(
+    int8_t *__restrict__ dst_k, int8_t *__restrict__ dst_v,
+    const float *__restrict__ src_k, const float *__restrict__ src_v,
+    const uint64_t *__restrict__ start_pos, uint64_t n_slots, int n_heads_kv,
+    int head_dim, int n) {
+  const int total = n * n_heads_kv;
+  const int idx = blockIdx.x;
+  if (idx >= 2 * total) return;
+  const bool v = idx >= total;
+  const int i = v ? idx - total : idx;
+  const int head = i % n_heads_kv;
+  const int row = i / n_heads_kv;
+  const uint64_t row_elems = (uint64_t)n_heads_kv * head_dim;
+  const float *src = v ? src_v : src_k;
+  kv_q8_store_row(
+      v ? dst_v : dst_k,
+      src + (uint64_t)row * row_elems + (uint64_t)head * head_dim,
       *start_pos + (uint64_t)row, n_slots, head, n_heads_kv, head_dim);
 }
 
@@ -2610,24 +3150,26 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
 // and chains these back-to-back so activations stay resident.
 
 bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
-                  float* y, int n, const float* add) {
+                  float* y, int n, const float* add, int rows) {
   if (!available()) return false;
-  if (n <= 0 || !x || !y) return false;
+  if (n <= 0 || rows <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)n) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  SB_NOTE_LAUNCH(rms_norm_fused_kernel, 1, 1024, 0, cur_stream());
-  launch_rms_norm_fused(dim3(1), 1024, cur_stream(), x, d_w, n, eps, y, add);
+  SB_NOTE_LAUNCH(rms_norm_fused_kernel, dim3(1, rows), 1024, 0, cur_stream());
+  launch_rms_norm_fused(dim3(1, rows), 1024, cur_stream(), x, d_w, n, eps, y,
+                        add);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps,
-                        float* y, int head_dim, int heads, const float* add) {
+                        float* y, int head_dim, int heads, const float* add,
+                        int rows) {
   if (!available()) return false;
-  if (head_dim <= 0 || heads <= 0 || !x || !y) return false;
+  if (head_dim <= 0 || heads <= 0 || rows <= 0 || !x || !y) return false;
   if (!weight.empty() && weight.size() < (size_t)head_dim) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
@@ -2636,9 +3178,9 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   }
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
-  SB_NOTE_LAUNCH(rms_heads_fused_kernel, heads, 256, 0, cur_stream());
-  launch_rms_heads_fused(heads, 256, cur_stream(), x, d_w, head_dim, eps, y,
-                         add);
+  SB_NOTE_LAUNCH(rms_heads_fused_kernel, dim3(heads, rows), 256, 0, cur_stream());
+  launch_rms_heads_fused(dim3(heads, rows), 256, cur_stream(), x, d_w, head_dim,
+                         eps, y, add);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -2761,64 +3303,174 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// `n_rows` > 1 is the verify step's multi-position form: one launch over a tile
+// of activation rows. The weight is uploaded once and each warp reads its weight
+// block once for the whole tile (gemv_dense_f32_v_reuse); the per-position
+// launch form remains for tiles wider than the verify envelope.
 bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
-                    float* y, int rows) {
+                    float* y, int rows, int n_rows) {
   if (!available()) return false;
-  if (cols <= 0 || rows <= 0 || !x || !y) return false;
+  if (cols <= 0 || rows <= 0 || n_rows <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const float* d_w = static_cast<const float*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(float)));
   if (!d_w) return false;
   if ((cols & 3) == 0) {
     const int k_split = gemv_k_split(rows);
+    if (n_rows > 1 && n_rows <= kDenseReuseRows) {
+      float* dst = y;
+      float* partial = nullptr;
+      if (k_split > 1) {
+        partial = static_cast<float*>(
+            grow_scratch(g_partial, g_partial_bytes,
+                         (size_t)rows * k_split * n_rows * sizeof(float)));
+        if (!partial) return false;
+        dst = partial;
+      }
+      // Tall weights (many output rows) tile rows per warp: the activation
+      // chunk is loaded once and reused across R weight rows. Short weights
+      // prefer one row per warp (more warps in flight).
+      const int n_warps_needed = rows * k_split;
+      const int R = n_warps_needed >= 8192 ? 2 : 1;
+      const int row_tiles = (rows + R - 1) / R;
+      const dim3 grid(gemv_grid(row_tiles, k_split));
+      const int block = kGemvWarpsPerBlock * 32;
+      const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
+      SB_NOTE_LAUNCH(gemv_dense_f32_v_reuse, grid, block, 0, cur_stream());
+#define SB_LAUNCH_REUSE(RR, TT)                                              \
+  gemv_dense_f32_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
+      d_w, x, dst, cols, rows, k_split, n_rows)
+      switch (R) {
+        case 1:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(1, 2); break;
+            case 4: SB_LAUNCH_REUSE(1, 4); break;
+            case 8: SB_LAUNCH_REUSE(1, 8); break;
+            default: SB_LAUNCH_REUSE(1, 16); break;
+          }
+          break;
+        default:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(2, 2); break;
+            case 4: SB_LAUNCH_REUSE(2, 4); break;
+            case 8: SB_LAUNCH_REUSE(2, 8); break;
+            default: SB_LAUNCH_REUSE(2, 16); break;
+          }
+          break;
+      }
+#undef SB_LAUNCH_REUSE
+      if (k_split > 1) {
+        const dim3 rgrid(grid_for(rows), n_rows);
+        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
+                                                            k_split);
+      }
+      return cudaGetLastError() == cudaSuccess;
+    }
+    const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
           grow_scratch(g_partial, g_partial_bytes,
-                       (size_t)rows * k_split * sizeof(float)));
+                       (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(rows), 256, 0, cur_stream());
-      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
+      const dim3 rgrid(grid_for(rows), n_rows);
+      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_dense_f32_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_dense_f32, grid_for(rows), 256, 0, cur_stream());
-    gemv_dense_f32<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
+    const dim3 grid(grid_for(rows), n_rows);
+    SB_NOTE_LAUNCH(gemv_dense_f32, grid, 256, 0, cur_stream());
+    gemv_dense_f32<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
-                     float* y, int rows) {
+                     float* y, int rows, int n_rows) {
   if (!available()) return false;
-  if (cols <= 0 || rows <= 0 || !x || !y) return false;
+  if (cols <= 0 || rows <= 0 || n_rows <= 0 || !x || !y) return false;
   if (W.size() < (size_t)cols * (size_t)rows) return false;
   const uint16_t* d_w = static_cast<const uint16_t*>(upload_bytes(W.data(), (size_t)cols * rows * sizeof(uint16_t)));
   if (!d_w) return false;
   if ((cols & 7) == 0) {
     const int k_split = gemv_k_split(rows);
+    if (n_rows > 1 && n_rows <= kDenseReuseRows) {
+      float* dst = y;
+      float* partial = nullptr;
+      if (k_split > 1) {
+        partial = static_cast<float*>(
+            grow_scratch(g_partial, g_partial_bytes,
+                         (size_t)rows * k_split * n_rows * sizeof(float)));
+        if (!partial) return false;
+        dst = partial;
+      }
+      // Tall weights (many output rows) tile rows per warp: the activation
+      // chunk is loaded once and reused across R weight rows. Short weights
+      // prefer one row per warp (more warps in flight).
+      const int n_warps_needed = rows * k_split;
+      const int R = n_warps_needed >= 8192 ? 2 : 1;
+      const int row_tiles = (rows + R - 1) / R;
+      const dim3 grid(gemv_grid(row_tiles, k_split));
+      const int block = kGemvWarpsPerBlock * 32;
+      const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
+      SB_NOTE_LAUNCH(gemv_bf16_v_reuse, grid, block, 0, cur_stream());
+#define SB_LAUNCH_REUSE(RR, TT)                                              \
+  gemv_bf16_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
+      d_w, x, dst, cols, rows, k_split, n_rows)
+      switch (R) {
+        case 1:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(1, 2); break;
+            case 4: SB_LAUNCH_REUSE(1, 4); break;
+            case 8: SB_LAUNCH_REUSE(1, 8); break;
+            default: SB_LAUNCH_REUSE(1, 16); break;
+          }
+          break;
+        default:
+          switch (T) {
+            case 2: SB_LAUNCH_REUSE(2, 2); break;
+            case 4: SB_LAUNCH_REUSE(2, 4); break;
+            case 8: SB_LAUNCH_REUSE(2, 8); break;
+            default: SB_LAUNCH_REUSE(2, 16); break;
+          }
+          break;
+      }
+#undef SB_LAUNCH_REUSE
+      if (k_split > 1) {
+        const dim3 rgrid(grid_for(rows), n_rows);
+        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
+                                                            k_split);
+      }
+      return cudaGetLastError() == cudaSuccess;
+    }
+    const dim3 grid(gemv_grid(rows, k_split), n_rows);
     if (k_split > 1) {
       float* partial = static_cast<float*>(
           grow_scratch(g_partial, g_partial_bytes,
-                       (size_t)rows * k_split * sizeof(float)));
+                       (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(rows), 256, 0, cur_stream());
-      gemv_reduce_kernel<<<grid_for(rows), 256, 0, cur_stream()>>>(partial, y, rows, k_split);
+      const dim3 rgrid(grid_for(rows), n_rows);
+      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
-      gemv_bf16_v<<<gemv_grid(rows, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
+      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_bf16, grid_for(rows), 256, 0, cur_stream());
-    gemv_bf16<<<grid_for(rows), 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
+    const dim3 grid(grid_for(rows), n_rows);
+    SB_NOTE_LAUNCH(gemv_bf16, grid, 256, 0, cur_stream());
+    gemv_bf16<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3232,6 +3884,195 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                       head_dim, group_q, "own-split-decode", int(split_grid),
                       block, smem);
   return cudaGetLastError() == cudaSuccess;
+}
+
+namespace {
+
+// Multi-query verify calls that had to fall back to the per-row launches.
+// Counted, never logged per step.
+uint64_t g_attn_mq_fallbacks = 0;
+
+// Warps the split kernel's register file can hold for a given KV type and
+// head_dim. The kernel's live set grows with the per-lane V accumulators, so a
+// block sized only from the desired row count can fail to launch; asking the
+// compiled instantiation (once) costs nothing per step and lets the row count
+// fall back instead.
+template <typename KV, int DPL>
+int mq_max_warps() {
+  static const int cached = [] {
+    cudaFuncAttributes attr{};
+    if (cudaFuncGetAttributes(&attr,
+                              decode_attention_split_mq_kernel<KV, DPL>) !=
+        cudaSuccess)
+      return 0;
+    // Registers are allocated per warp in 256-register units, and every warp
+    // of a block has to fit one SM sub-partition's 16K registers (4 per SM):
+    // a block of W warps needs ceil(W/4) warps' worth in the fullest one.
+    const unsigned regs_per_warp =
+        ((unsigned)attr.numRegs * 32u + 255u) / 256u * 256u;
+    const int by_regs =
+        (int)(16384u / regs_per_warp) * 4;  // 4 sub-partitions per SM
+    return std::min(by_regs, 32);  // 32 warps = 1024 threads = block limit
+  }();
+  return cached;
+}
+
+bool decode_attention_mq_dev_impl(
+    const float* q, const float* k_cache, const float* v_cache,
+    const uint64_t* pos, uint64_t window, uint64_t n_slots, int n_heads_q,
+    int n_heads_kv, int head_dim, uint64_t sliding_window, float scale,
+    float* out, int n_q, int pos_offset0, bool kv_f16, uint64_t chunk_attr,
+    bool kv_q8, int tier) {
+  if (!available()) return false;
+  if (n_heads_q <= 0 || n_heads_kv <= 0 || head_dim <= 0 || head_dim > 512 ||
+      head_dim % 32 != 0 || n_q <= 0 || !q || !k_cache || !v_cache || !out ||
+      !pos || n_slots == 0 || window == 0 || pos_offset0 < 0)
+    return false;
+  if (n_heads_q % n_heads_kv != 0) return false;
+  // The multi-query schedule is the hand-written split pair's: the generated
+  // decoder has no multi-query form, and under SONICBOOM_ATTN_EXP2 its
+  // numerics differ from the hand-written pair, which would break row
+  // invariance against the per-row verify. Tier geometry belongs to captured
+  // graphs (the verify dispatch passes tier -1). Tracing wants one line per
+  // row.
+  if (tier >= 0) return false;
+  if (std::getenv("SONICBOOM_ATTN_EXP2") != nullptr) return false;
+  // SONICBOOM_ATTN_MQ=0 forces the per-row launches, =1 bypasses the
+  // short-window rule below (the A/B arms); unset applies the rule.
+  const char* mq_env = std::getenv("SONICBOOM_ATTN_MQ");
+  const bool mq_forced = mq_env && mq_env[0] == '1';
+  if (mq_env && mq_env[0] == '0') return false;
+
+  if (!runtime::feature_enabled(runtime::Feature::SplitKv)) return false;
+  if (attn_trace_on()) return false;
+  // Every row's K/V is appended before this launch, so the ring must hold all
+  // of them ahead of the oldest key row 0 still reads.
+  if (n_slots < (uint64_t)n_q) return false;
+  if (sliding_window > 0 && n_slots < sliding_window + (uint64_t)n_q)
+    return false;
+
+  const int group_q = n_heads_q / n_heads_kv;
+  // Same chunk rule as the single-row call: the plan's attribute, else the
+  // shared class default. A chunk beyond the generated decoder's cap would make
+  // the per-row fallback split differently, so it is not taken here.
+  const uint64_t chunk =
+      attn_decode_requested_chunk(chunk_attr, n_heads_kv, sliding_window);
+  if (chunk == 0 || chunk > (uint64_t)compiler::kAttentionDecodeMaxChunk)
+    return false;
+  // The multi-query block trades occupancy for fewer launches and fewer KV
+  // reads: one block per (chunk, kv head) serves every row, so the block's
+  // warps must stay resident while the per-row launch instead spreads many
+  // small blocks (one per (row, chunk, kv head, head block)) over the SMs.
+  // Measured k=7 verify-step wall with one task per warp: the multi-query
+  // launch wins at a 576-key window (Gemma -7.4%), at 4160 (Gemma -2.0%,
+  // Qwen2.5-7B -3.3%), is a wash at 8256 on Qwen2.5-7B (-0.25%), and loses at
+  // 16448 (+1.6%). 8192 keeps the measured wins in and every measured loss
+  // out. The window is the graph's fixed key extent, so the choice never
+  // moves with the position.
+  if (!mq_forced && window > 8192) return false;
+
+  // Blocks are absolute chunks anchored at row 0's first chunk. The rows' key
+  // ranges are contiguous (window start and position both grow with the row)
+  // and span at most n_q - 1 positions.
+  const uint64_t base_chunks = (window - 1) / chunk + 2;
+  const uint64_t n_chunks =
+      base_chunks + ((uint64_t)(n_q - 1) + chunk - 1) / chunk;
+
+  // The block is sized by the register file first (one (row, head) pair per
+  // warp; the V accumulators and the q row are DPL floats per lane each), then
+  // by shared memory: the block's score rows plus one K (then V) tile must fit
+  // 48 KiB.
+  const int dpl = head_dim / 32;  // instantiated below for 2, 4, 8, 16
+#define SB_MQ_MAX_WARPS(KVT)                                    \
+  (dpl == 2   ? mq_max_warps<KVT, 2>()                          \
+   : dpl == 4 ? mq_max_warps<KVT, 4>()                          \
+   : dpl == 8 ? mq_max_warps<KVT, 8>()                          \
+              : mq_max_warps<KVT, 16>())
+  const int max_warps =
+      kv_f16 ? SB_MQ_MAX_WARPS(__half) : kv_q8 ? SB_MQ_MAX_WARPS(int8_t)
+                                               : SB_MQ_MAX_WARPS(float);
+#undef SB_MQ_MAX_WARPS
+  if (max_warps < 1 || group_q > max_warps) return false;
+  const size_t kSmemFloats = 48 * 1024 / sizeof(float);
+  int rows_per_block = std::min(n_q, max_warps / group_q);
+  int tile_keys = 0;
+  for (;;) {
+    const size_t scores =
+        (size_t)rows_per_block * (size_t)group_q * (size_t)chunk;
+    if (scores < kSmemFloats) {
+      tile_keys = (int)std::min<uint64_t>(
+          chunk, (uint64_t)((kSmemFloats - scores) / (size_t)head_dim));
+      if (tile_keys >= 1) break;
+    }
+    if (rows_per_block == 1) return false;
+    rows_per_block = std::max(1, rows_per_block / 2);
+  }
+  const int tasks = rows_per_block * group_q;
+  const int warps = tasks;  // one task per warp
+  const size_t mq_smem_bytes =
+      ((size_t)rows_per_block * (size_t)group_q * (size_t)chunk +
+       (size_t)tile_keys * (size_t)head_dim) *
+      sizeof(float);
+
+  const size_t partial_floats = (size_t)n_q * (size_t)n_chunks *
+                                (size_t)n_heads_q * (size_t)(head_dim + 2);
+  float* partial = static_cast<float*>(
+      grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes,
+                   partial_floats * sizeof(float)));
+  if (partial == nullptr) return false;
+
+  const dim3 grid((unsigned)n_chunks, (unsigned)n_heads_kv,
+                  (unsigned)((n_q + rows_per_block - 1) / rows_per_block));
+  const dim3 block(32, (unsigned)warps);
+  SB_NOTE_LAUNCH(decode_attention_split_mq_kernel, grid, block, mq_smem_bytes,
+                 cur_stream());
+#define SB_MQ_SPLIT_LAUNCH(KVT, DPLV)                                        \
+  decode_attention_split_mq_kernel<KVT, DPLV><<<grid, block, mq_smem_bytes,  \
+                                                cur_stream()>>>(             \
+      q, reinterpret_cast<const KVT*>(k_cache),                              \
+      reinterpret_cast<const KVT*>(v_cache), pos, n_slots, chunk,            \
+      sliding_window, n_heads_q, n_heads_kv, head_dim, scale, n_q,           \
+      rows_per_block, warps, tile_keys, (int)n_chunks, pos_offset0, partial)
+#define SB_MQ_SPLIT_DPL(KVT)                       \
+  do {                                             \
+    if (dpl == 2) SB_MQ_SPLIT_LAUNCH(KVT, 2);      \
+    else if (dpl == 4) SB_MQ_SPLIT_LAUNCH(KVT, 4); \
+    else if (dpl == 8) SB_MQ_SPLIT_LAUNCH(KVT, 8); \
+    else SB_MQ_SPLIT_LAUNCH(KVT, 16);              \
+  } while (0)
+  if (kv_f16) SB_MQ_SPLIT_DPL(__half);
+  else if (kv_q8) SB_MQ_SPLIT_DPL(int8_t);
+  else SB_MQ_SPLIT_DPL(float);
+#undef SB_MQ_SPLIT_DPL
+#undef SB_MQ_SPLIT_LAUNCH
+  SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
+                 dim3((unsigned)n_heads_q, (unsigned)n_q), head_dim, 0,
+                 cur_stream());
+  decode_attention_merge_mq_kernel<<<dim3((unsigned)n_heads_q, (unsigned)n_q),
+                                     head_dim, 0, cur_stream()>>>(
+      partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
+      pos_offset0, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+} // namespace
+
+uint64_t decode_attention_mq_fallback_count() { return g_attn_mq_fallbacks; }
+
+bool decode_attention_mq_dev(const float* q, const float* k_cache,
+                             const float* v_cache, const uint64_t* pos,
+                             uint64_t window, uint64_t n_slots, int n_heads_q,
+                             int n_heads_kv, int head_dim,
+                             uint64_t sliding_window, float scale, float* out,
+                             int n_q, int pos_offset0, bool kv_f16,
+                             uint64_t chunk_attr, bool kv_q8, int tier) {
+  if (decode_attention_mq_dev_impl(q, k_cache, v_cache, pos, window, n_slots,
+                                   n_heads_q, n_heads_kv, head_dim,
+                                   sliding_window, scale, out, n_q, pos_offset0,
+                                   kv_f16, chunk_attr, kv_q8, tier))
+    return true;
+  ++g_attn_mq_fallbacks;
+  return false;
 }
 
 bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
@@ -5058,6 +5899,48 @@ bool argmax_dev(const float* x, int n, float* out) {
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Multi-row argmax (the verify step's positions): every row runs the per-row
+// reduction the single-row call runs — same grid, same per-block key packing,
+// same finalize tree — on its own [n] slice, so row i is bit-identical to
+// argmax_dev / argmax_masked_dev at that row's position. `mask` is shared by
+// every row and selects the masked form.
+bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
+                     float* out) {
+  if (!available()) return false;
+  if (n_rows <= 0 || n <= 0 || !x || !out) return false;
+  constexpr int kThreads = 256;
+  const int n4 = n >> 2;
+  int grid = (n4 + kThreads - 1) / kThreads;
+  if (grid > sm_count() * 8) grid = sm_count() * 8;
+  if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
+    const dim3 g(1, n_rows);
+    if (mask) {
+      SB_NOTE_LAUNCH(argmax_masked_kernel, g, 1024, 0, cur_stream());
+      argmax_masked_kernel<<<g, 1024, 0, cur_stream()>>>(x, mask, out, n);
+    } else {
+      SB_NOTE_LAUNCH(argmax_kernel, g, 1024, 0, cur_stream());
+      argmax_kernel<<<g, 1024, 0, cur_stream()>>>(x, out, n);
+    }
+    return cudaGetLastError() == cudaSuccess;
+  }
+  unsigned long long* keys = static_cast<unsigned long long*>(grow_scratch(
+      g_argmax_keys, g_argmax_keys_bytes,
+      (size_t)grid * n_rows * sizeof(unsigned long long)));
+  if (!keys) return false;
+  const dim3 g(grid, n_rows);
+  if (mask) {
+    SB_NOTE_LAUNCH(argmax_partial_masked_kernel, g, kThreads, 0, cur_stream());
+    argmax_partial_masked_kernel<<<g, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
+  } else {
+    SB_NOTE_LAUNCH(argmax_partial_kernel, g, kThreads, 0, cur_stream());
+    argmax_partial_kernel<<<g, kThreads, 0, cur_stream()>>>(x, n, keys);
+  }
+  const dim3 fg(1, n_rows);
+  SB_NOTE_LAUNCH(argmax_finalize_kernel, fg, 256, 0, cur_stream());
+  argmax_finalize_kernel<<<fg, 256, 0, cur_stream()>>>(keys, grid, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !mask || !out) return false;
@@ -6403,35 +7286,23 @@ bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
   if (dst_q8) {
     if (head_dim <= 0 || row_elems % head_dim != 0) return false;
     const int nhkv = row_elems / head_dim;
-    const int grid = n * nhkv;
-    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
+    const int grid = 2 * n * nhkv;
+    SB_NOTE_LAUNCH(kv_append_batched_pos_kv_q8_kernel, grid, 128, 0,
                    cur_stream());
-    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
-        reinterpret_cast<int8_t*>(dst_k), src_k, start_pos, n_slots, nhkv,
-        head_dim, n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_q8_kernel, grid, 128, 0,
-                   cur_stream());
-    kv_append_batched_pos_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
-        reinterpret_cast<int8_t*>(dst_v), src_v, start_pos, n_slots, nhkv,
-        head_dim, n);
+    kv_append_batched_pos_kv_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
+        reinterpret_cast<int8_t*>(dst_k), reinterpret_cast<int8_t*>(dst_v),
+        src_k, src_v, start_pos, n_slots, nhkv, head_dim, n);
     return cudaGetLastError() == cudaSuccess;
   }
-  const int grid = grid_for(row_elems * n);
-  SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
+  const int grid = grid_for(2 * row_elems * n);
+  SB_NOTE_LAUNCH(kv_append_batched_pos_kv_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        reinterpret_cast<__half*>(dst_k), src_k, start_pos, n_slots, row_elems,
-        n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        reinterpret_cast<__half*>(dst_v), src_v, start_pos, n_slots, row_elems,
-        n);
+    kv_append_batched_pos_kv_kernel<<<grid, 256, 0, cur_stream()>>>(
+        reinterpret_cast<__half*>(dst_k), reinterpret_cast<__half*>(dst_v),
+        src_k, src_v, start_pos, n_slots, row_elems, n);
   } else {
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        dst_k, src_k, start_pos, n_slots, row_elems, n);
-    SB_NOTE_LAUNCH(kv_append_batched_pos_kernel, grid, 256, 0, cur_stream());
-    kv_append_batched_pos_kernel<<<grid, 256, 0, cur_stream()>>>(
-        dst_v, src_v, start_pos, n_slots, row_elems, n);
+    kv_append_batched_pos_kv_kernel<<<grid, 256, 0, cur_stream()>>>(
+        dst_k, dst_v, src_k, src_v, start_pos, n_slots, row_elems, n);
   }
   return cudaGetLastError() == cudaSuccess;
 }

@@ -34,6 +34,7 @@
 
 #include "ggml_derived/mmvq_q8_1.cuh"
 #include "ggml_derived/mmq.cuh"
+#include "mmq_upstream.h"  // imported ggml MMQ kernels (ggml_derived/mmq_upstream/)
 
 #include <cublasLt.h>
 #include <cublas_v2.h>
@@ -578,8 +579,6 @@ size_t g_ytail_bytes = 0;
 // [K/128][n] (+ J_max tail over-read). Reused across layers.
 void* g_mmq_q8 = nullptr;
 size_t g_mmq_q8_bytes = 0;
-void* g_mmq_q6_x_f32 = nullptr;
-size_t g_mmq_q6_x_f32_bytes = 0;
 // Fused rms_norm+quantize (C.4): one float per token, the per-row `inv` factor
 // produced by phase A and consumed by phase B of
 // rms_norm_quantize_mmq_q8_1_dev. Reused across layers.
@@ -1215,21 +1214,6 @@ __global__ void cast_f32_f16(const float* __restrict__ x, __half* __restrict__ y
                              int64_t n) {
   const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) y[i] = __float2half_rn(x[i]);
-}
-
-// Recover the Q6 fallback activation from D4 MMQ blocks. The Q6 prefill plan
-// selects D4_Q8_1, so d4 holds one float scale per 32 quantized values.
-__global__ void dequant_mmq_q8_1_d4(const mmq::block_q8_1_mmq* __restrict__ q,
-                                    float* __restrict__ x, int cols, int n) {
-  const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
-  const int64_t total = (int64_t)cols * n;
-  if (i >= total) return;
-  const int token = int(i / cols);
-  const int k = int(i % cols);
-  const int block = k / 128;
-  const int offset = k % 128;
-  const mmq::block_q8_1_mmq& qb = q[(int64_t)block * n + token];
-  x[i] = float(qb.qs[offset]) * qb.d4[offset / 32];
 }
 
 } // namespace
@@ -2397,58 +2381,515 @@ void launch_gemv_q8_1_from_quantized(QuantType qt, const uint8_t* wp,
                         warps);
 }
 
+// Weight-side-unpack hoisting for the batched verify gemv (V2). The hoisted
+// kernels are bit-identical to the per-position vec_dot loop they replace (see
+// mmvq_q8_1.cuh); the switch exists only to A/B the launch's instruction count,
+// and to leave the previous kernel selectable as the reference.
+//
+// The hoist only pays once the row tile is wide enough to amortize its extra
+// registers. Measured at depth 512, 15-iteration medians, three interleaved
+// runs (mean±sd): n=2 (k=1) old 37.23±0.18 ms vs hoisted 39.62±0.10 ms
+// (+6.4%), while n=3 (k=2) is 4.7% faster and n=8 (k=7) 23.9% faster. So n=2
+// keeps the per-position kernel; k>=2 (n>=3) uses the hoisted one.
+bool verify_gemv_reuse_enabled() noexcept {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_VERIFY_GEMV_REUSE");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return on;
+}
+
+// The weight-side hoisting is routed from n = 3, where the shared weight block
+// always pays. At n = 2 it only pays on the shapes it was measured on: Q4_K and
+// Q6_K projections are 8-18% faster (Qwen2.5-7B ffn_gate/ffn_down), while Q3_K
+// and Q5_K lose 3-15% (Gemma 4 E4B) and keep the per-position kernel.
+bool verify_gemv_reuse_for(QuantType qt, int n) noexcept {
+  return n >= 3 ||
+         (n == 2 && (qt == QuantType::Q4_K || qt == QuantType::Q6_K));
+}
+
+// The warps-per-row split of the reuse kernels: `wp` warps cooperate on one
+// output row, so a block (8 warps, dim3(32, 8) unchanged) covers 8/wp rows and
+// the grid's y dimension grows accordingly.
+//
+// Debug seam: SONICBOOM_VERIFY_GEMV_WP=1|2|4 pins the split and wins over the
+// warm-up's choice (the warm-up stores its pick in the tune file). 0 = unset,
+// i.e. the warm-up's pick (or 1 when nothing has been measured).
+int verify_gemv_wp_override() noexcept {
+  static const int wp = [] {
+    const char* e = std::getenv("SONICBOOM_VERIFY_GEMV_WP");
+    if (e) {
+      const int v = std::atoi(e);
+      if (v == 1 || v == 2 || v == 4) return v;
+    }
+    return 0;
+  }();
+  return wp;
+}
+
+#define SB_LAUNCH_REUSE_WP(KERNEL)                                             \
+  do {                                                                         \
+    const int rpb = 8 / wp_eff;                                                \
+    const dim3 grid_wp(1, (num_rows + rpb - 1) / rpb);                         \
+    switch (wp_eff) {                                                          \
+      case 4:                                                                  \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,4>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 4}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 4><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
+        break;                                                                 \
+      case 2:                                                                  \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,2>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 2}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 2><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
+        break;                                                                 \
+      default:                                                                 \
+        SB_NOTE_LAUNCH_TP(                                                     \
+            "q8_1::" #KERNEL "<T,1>",                                          \
+            ::sonicboom::planner::plan_detail::tp_label(                       \
+                {{"T", T}, {"WP", 1}}),                                        \
+            grid_wp, block, 0, cur_stream());                                  \
+        q8_1::KERNEL<T, 1><<<grid_wp, block, 0, cur_stream()>>>(               \
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);             \
+        break;                                                                 \
+    }                                                                          \
+  } while (0)
+
 // Batched q8_1 gemv against a pre-quantized [n, blocks_per_row] activation (each
-// position's blocks contiguous). One warp per output row; each weight block is
-// reused across a tile of T positions. dst is [n, num_rows] (position-major).
-void launch_gemv_q8_1_batched(QuantType qt, const uint8_t* wp,
+// position's blocks contiguous). Warps per output row is `wp` for the reuse
+// kernels (1, 2 or 4); each weight block is reused across a tile of T
+// positions. dst is [n, num_rows] (position-major).
+void launch_gemv_q8_1_batched(QuantType qt, int wp, const uint8_t* wp_w,
                               const q8_1::block_q8_1* xq, float* yp,
-                              int blocks_per_row, int num_rows, int n) {
+                              int blocks_per_row, int num_rows, int n,
+                              const float* bias = nullptr,
+                              const float* add = nullptr) {
   const dim3 block(32, 8);
   const dim3 grid(1, (num_rows + 7) / 8);
+  int wp_eff = (wp == 2 || wp == 4) ? wp : 1;
+  // grid.y is capped at 65535; with WP > 1 a block covers 8/WP rows, so a very
+  // wide projection (the 262144-row LM head) would overrun it. Fall back to
+  // fewer warps per row rather than fail the launch.
+  while (wp_eff > 1 && (num_rows + (8 / wp_eff) - 1) / (8 / wp_eff) > 65535)
+    wp_eff /= 2;
   constexpr int T = q8_1::GEMV_BATCH_T;
   switch (qt) {
     case QuantType::Q3_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q3_K_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q3_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q3_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
     case QuantType::Q4_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q4_K_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q4_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q4_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
     case QuantType::Q5_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q5_K_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q5_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
     case QuantType::Q6_K:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q6_K_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q6_K_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q6_K_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
     case QuantType::Q5_0:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q5_0_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q5_0_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q5_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
     case QuantType::Q8_0:
-      SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
-                        ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
-                        grid, block, 0, cur_stream());
-      q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
-          wp, xq, yp, blocks_per_row, num_rows, n);
+      if (verify_gemv_reuse_for(qt, n) && verify_gemv_reuse_enabled()) {
+        SB_LAUNCH_REUSE_WP(gemv_q8_0_q8_1_batched_reuse);
+      } else {
+        SB_NOTE_LAUNCH_TP("q8_1::gemv_q8_0_q8_1_batched",
+                          ::sonicboom::planner::plan_detail::tp_label({{"T", T}}),
+                          grid, block, 0, cur_stream());
+        q8_1::gemv_q8_0_q8_1_batched<T><<<grid, block, 0, cur_stream()>>>(
+            wp_w, xq, yp, blocks_per_row, num_rows, n, bias, add);
+      }
       break;
+  }
+}
+
+#undef SB_LAUNCH_REUSE_WP
+
+// --- warm-up choice of the verify gemv's warps per row (WP) ------------------
+//
+// The WP split trades block occupancy for shorter per-row work: with WP = 1 a
+// warp walks every weight block of one output row serially; with WP = 2 or 4,
+// two or four warps share the row's blocks (each of them re-unpacking the
+// weight side) and that block covers 8/WP rows. Which is fastest depends on the
+// projection's shape and on how many positions the verify step carries, and it
+// is an empirical property of the device, so it is timed once per (quant type,
+// rows, cols, n) at model load and cached in the autotune store, next to the
+// verify cost curve. The choice never changes arithmetic — every WP is
+// bit-identical to WP = 1 (per-position expression, integer grouping and
+// reduction tree untouched) — so a wrong pick costs time, not accuracy.
+//
+// Key: verify-gemv-wp|<type>|n=<n>|<rows>x<cols>; the record also carries the
+// build fingerprint as "k", so a rebuild re-measures. The measurement uses
+// synthetic zeroed weights and activations (the timing does not depend on the
+// values) at the model's own projection shapes.
+
+namespace {
+
+// The row counts a verify step can carry (k + 1 for k = 2..15) that the warm-up
+// times. Unmeasured lengths take the pick of the nearest measured length at or
+// above them; under budget pressure only the fallback set is measured and every
+// other length is filled from it.
+constexpr int kVerifyWpAllN[] = {3, 4, 6, 8, 9, 12, 16};
+constexpr int kVerifyWpFallbackN[] = {3, 8, 16};
+constexpr int kVerifyWpMeasured[] = {1, 2, 4};
+constexpr double kVerifyWpBudgetS = 1.0;   // whole warm-up, per model load
+constexpr int kVerifyWpTimed = 7;          // timed repetitions per candidate
+constexpr int kVerifyWpWarm = 3;
+
+struct VerifyWpShape {
+  QuantType qt = QuantType::Q3_K;
+  int rows = 0;
+  int cols = 0;
+  int bpr = 0;  // weight blocks per row (cols / block size)
+};
+
+// Every quant type with a reuse kernel is routed to it for n >= 3 (Q3_K,
+// Q4_K, Q5_K and, since the weight-side hoisting, Q6_K, Q5_0, Q8_0); n < 3
+// keeps the per-position kernel.
+bool verify_wp_routed(QuantType qt) {
+  switch (qt) {
+    case QuantType::Q3_K:
+    case QuantType::Q4_K:
+    case QuantType::Q5_K:
+    case QuantType::Q6_K:
+    case QuantType::Q5_0:
+    case QuantType::Q8_0:
+      return true;
+  }
+  return false;
+}
+
+int verify_wp_env() noexcept { return verify_gemv_wp_override(); }
+
+// The measured bucket at or above `n`, or the largest measured bucket when `n`
+// exceeds it (n <= 16 is the verify envelope, so this is the last resort only).
+int verify_wp_bucket(int n) {
+  constexpr size_t count = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  for (size_t i = 0; i < count; ++i)
+    if (n <= kVerifyWpAllN[i]) return kVerifyWpAllN[i];
+  return kVerifyWpAllN[count - 1];
+}
+
+std::string verify_wp_type_name(QuantType qt) {
+  const QuantTypeInfo* info = quant_type_info(qt);
+  return info ? info->name : "unknown";
+}
+
+std::string verify_wp_key(QuantType qt, int rows, int cols, int n) {
+  return "verify-gemv-wp|" + verify_wp_type_name(qt) + "|n=" +
+         std::to_string(n) + "|" + std::to_string(rows) + "x" +
+         std::to_string(cols);
+}
+
+// The build fingerprint as a record value (FNV-1a over the carrier string).
+int verify_wp_build_hash(std::string_view build_id) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : build_id) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return int(static_cast<uint32_t>(h ^ (h >> 32)));
+}
+
+std::mutex g_verify_wp_mutex;
+std::map<std::string, int> g_verify_wp;  // key -> chosen WP, per process
+std::string g_verify_wp_build_id;
+
+double verify_wp_seconds_since(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+      .count();
+}
+
+// One candidate's median of kVerifyWpTimed timed launches (after
+// kVerifyWpWarm untimed ones).
+double verify_wp_time_ms(QuantType qt, int wp, const uint8_t* dw,
+                         const q8_1::block_q8_1* xq, float* dy, int bpr,
+                         int rows, int n) {
+  for (int i = 0; i < kVerifyWpWarm; ++i)
+    launch_gemv_q8_1_batched(qt, wp, dw, xq, dy, bpr, rows, n);
+  cudaEvent_t begin = nullptr, end = nullptr;
+  if (cudaEventCreate(&begin) != cudaSuccess) return 0.0;
+  if (cudaEventCreate(&end) != cudaSuccess) {
+    cudaEventDestroy(begin);
+    return 0.0;
+  }
+  double times[kVerifyWpTimed];
+  for (int i = 0; i < kVerifyWpTimed; ++i) {
+    times[i] = 0.0;
+    cudaEventRecord(begin, cur_stream());
+    launch_gemv_q8_1_batched(qt, wp, dw, xq, dy, bpr, rows, n);
+    cudaEventRecord(end, cur_stream());
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, begin, end);
+    times[i] = double(ms);
+  }
+  cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  std::sort(times, times + kVerifyWpTimed);
+  return times[kVerifyWpTimed / 2];
+}
+
+// The widths the launcher can actually give this row count (the grid.y cap
+// folds a wide projection back to one warp per row, so those candidates are
+// not distinct choices and are neither timed nor stored).
+bool verify_wp_launchable(int rows, int wp) {
+  if (wp == 1) return true;
+  return (rows + (8 / wp) - 1) / (8 / wp) <= 65535;
+}
+
+// One shape's synthetic buffers, allocated once for the widest timed length and
+// reused for every (n, candidate): the LM head's weight buffer alone is
+// hundreds of MB, and a per-n allocate + memset dominated the warm-up.
+struct VerifyWpBuffers {
+  void* dw = nullptr;
+  void* dxq = nullptr;
+  void* dy = nullptr;
+};
+
+void verify_wp_free(VerifyWpBuffers& b) {
+  if (b.dy) cudaFree(b.dy);
+  if (b.dxq) cudaFree(b.dxq);
+  if (b.dw) cudaFree(b.dw);
+  b = {};
+}
+
+bool verify_wp_alloc(const VerifyWpShape& s, VerifyWpBuffers& b) {
+  constexpr size_t nbuckets = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  const int widest = kVerifyWpAllN[nbuckets - 1];
+  const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
+                        size_t(quant_type_info(s.qt)->bytes_per_block);
+  const size_t abytes =
+      size_t(widest) * size_t(s.cols / 32) * sizeof(q8_1::block_q8_1);
+  const size_t ybytes = size_t(widest) * size_t(s.rows) * sizeof(float);
+  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
+  if (cudaMalloc(&b.dxq, abytes) != cudaSuccess) {
+    verify_wp_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+    verify_wp_free(b);
+    return false;
+  }
+  cudaMemset(b.dw, 0, wbytes);  // no garbage scale in the arithmetic
+  cudaMemset(b.dxq, 0, abytes);
+  return true;
+}
+
+// Time every candidate at one shape and length; return the fastest (a candidate
+// must beat the incumbent by more than 2% to win, so a near-tie keeps the
+// smaller WP).
+int verify_wp_measure(const VerifyWpShape& s, int n,
+                      const VerifyWpBuffers& b) {
+  int candidates = 0;
+  for (int wp : kVerifyWpMeasured)
+    if (verify_wp_launchable(s.rows, wp)) ++candidates;
+  if (candidates <= 1) return 1;  // nothing to choose between
+  int best = 1;
+  double best_ms = 0.0;
+  for (int wp : kVerifyWpMeasured) {
+    if (!verify_wp_launchable(s.rows, wp)) continue;
+    const double ms = verify_wp_time_ms(
+        s.qt, wp, static_cast<const uint8_t*>(b.dw),
+        static_cast<const q8_1::block_q8_1*>(b.dxq),
+        static_cast<float*>(b.dy), s.bpr, s.rows, n);
+    cudaGetLastError();
+    if (ms > 0.0 && (best_ms <= 0.0 || ms < best_ms * 0.98)) {
+      best = wp;
+      best_ms = ms;
+    }
+  }
+  return best;
+}
+
+// The pick for one (shape, bucket): the in-process map, then the tune file, then
+// a fresh measurement (stored for the next process).
+int verify_wp_resolve(const VerifyWpShape& s, int n,
+                      const VerifyWpBuffers& b) {
+  const std::string key = verify_wp_key(s.qt, s.rows, s.cols, n);
+  {
+    std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+    const auto it = g_verify_wp.find(key);
+    if (it != g_verify_wp.end()) return it->second;
+  }
+  int chosen = 0;
+  if (tune::enabled()) {
+    const auto rec = tune::lookup("verify-gemv-wp", key);
+    const auto wp_it = rec.find("wp");
+    const auto k_it = rec.find("k");
+    if (wp_it != rec.end() &&
+        (wp_it->second == 1 || wp_it->second == 2 || wp_it->second == 4) &&
+        k_it != rec.end() &&
+        k_it->second == verify_wp_build_hash(g_verify_wp_build_id))
+      chosen = wp_it->second;
+  }
+  if (chosen == 0) {
+    chosen = verify_wp_measure(s, n, b);
+    if (chosen == 0) return 1;  // allocation failed: keep the reference kernel
+    if (tune::enabled() && !g_verify_wp_build_id.empty())
+      tune::store("verify-gemv-wp", key,
+                  {{"wp", chosen},
+                   {"k", verify_wp_build_hash(g_verify_wp_build_id)}});
+  }
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  g_verify_wp[key] = chosen;
+  return chosen;
+}
+
+} // namespace
+
+int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n) {
+  const int pinned = verify_wp_env();
+  if (pinned != 0) return pinned;  // A/B seam: no measurement, no lookup
+  if (n < 3 || !verify_gemv_reuse_enabled() || !verify_wp_routed(qt) ||
+      rows <= 0 || cols <= 0)
+    return 1;
+  const int bucket = verify_wp_bucket(n);
+  const std::string key = verify_wp_key(qt, rows, cols, bucket);
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  const auto it = g_verify_wp.find(key);
+  return it != g_verify_wp.end() ? it->second : 1;
+}
+
+void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
+                         const char* build_id) {
+  if (!available() || !q8_1_enabled() || !weights || count == 0) return;
+  if (verify_wp_env() != 0) return;  // the A/B seam wins over the warm-up
+  if (!verify_gemv_reuse_enabled()) return;
+  {
+    std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+    if (!g_verify_wp_build_id.empty()) return;  // already warmed
+    if (build_id) g_verify_wp_build_id = build_id;
+  }
+  // Distinct projection shapes, largest first: if the budget runs out, the
+  // shapes that dominate a verify step are the ones already priced.
+  std::vector<VerifyWpShape> shapes;
+  for (size_t i = 0; i < count; ++i) {
+    const QuantizedTensor* w = weights[i];
+    if (!w || !w->valid() || w->dims().size() != 2) continue;
+    if (!verify_wp_routed(w->type())) continue;
+    const int cols = int(w->dims()[0]);
+    const int rows = int(w->dims()[1]);
+    const int bpr = cols / int(w->block_size());
+    if (cols % 32 != 0 || bpr <= 0) continue;
+    bool seen = false;
+    for (const auto& s : shapes)
+      if (s.qt == w->type() && s.rows == rows && s.cols == cols) {
+        seen = true;
+        break;
+      }
+    if (!seen) shapes.push_back({w->type(), rows, cols, bpr});
+  }
+  std::sort(shapes.begin(), shapes.end(), [](const VerifyWpShape& a,
+                                             const VerifyWpShape& b) {
+    return int64_t(a.rows) * a.cols > int64_t(b.rows) * b.cols;
+  });
+  const auto t0 = std::chrono::steady_clock::now();
+  for (const auto& s : shapes) {
+    VerifyWpBuffers buf;
+    if (!verify_wp_alloc(s, buf)) {
+      verify_wp_free(buf);
+      continue;
+    }
+    bool over_budget = false;
+    for (int n : kVerifyWpFallbackN) {
+      if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) {
+        over_budget = true;
+        break;
+      }
+      (void)verify_wp_resolve(s, n, buf);
+    }
+    if (!over_budget) {
+      for (int n : kVerifyWpAllN) {
+        bool in_fallback = false;
+        for (int f : kVerifyWpFallbackN) in_fallback = in_fallback || f == n;
+        if (in_fallback) continue;
+        if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) break;
+        (void)verify_wp_resolve(s, n, buf);
+      }
+    }
+    verify_wp_free(buf);
+  }
+  // Fill the buckets this run did not reach with the pick of the nearest
+  // measured bucket at or above them (falling back to the nearest below), so a
+  // later lookup is a map read and never a measurement inside generation.
+  constexpr size_t nbuckets = sizeof(kVerifyWpAllN) / sizeof(kVerifyWpAllN[0]);
+  std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+  for (const auto& s : shapes) {
+    int pick[nbuckets] = {};
+    int highest = 0;
+    for (size_t i = 0; i < nbuckets; ++i) {
+      const auto it = g_verify_wp.find(
+          verify_wp_key(s.qt, s.rows, s.cols, kVerifyWpAllN[i]));
+      if (it != g_verify_wp.end()) pick[i] = it->second;
+    }
+    for (size_t i = nbuckets; i-- > 0;)
+      if (pick[i]) highest = pick[i];
+    if (highest == 0) continue;  // nothing measured for this shape
+    int above = 0;  // the nearest measured bucket at or above
+    for (size_t i = nbuckets; i-- > 0;) {
+      if (pick[i]) above = pick[i];
+      else if (above) pick[i] = above;
+    }
+    for (size_t i = 0; i < nbuckets; ++i) {
+      const std::string key = verify_wp_key(s.qt, s.rows, s.cols,
+                                            kVerifyWpAllN[i]);
+      if (g_verify_wp.find(key) != g_verify_wp.end()) continue;
+      // No measured bucket at or above this one (above the highest): use the
+      // highest measured pick.
+      g_verify_wp[key] = pick[i] ? pick[i] : highest;
+      if (tune::enabled() && !g_verify_wp_build_id.empty())
+        tune::store("verify-gemv-wp", key,
+                    {{"wp", g_verify_wp[key]},
+                     {"k", verify_wp_build_hash(g_verify_wp_build_id)}});
+    }
   }
 }
 
@@ -2480,10 +2921,17 @@ bool quantize_q8_1_dev(const float* x, BlockQ8_1* yq, int nblocks) {
 // once (kept in a register and reused by the amax butterfly), so the block
 // costs two coalesced 128 B loads instead of 32 strided lines per warp, and no
 // thread runs a 32-iteration serial chain.
+// `blockIdx.y` is the row of the verify step's multi-position launch; each block
+// runs the per-row code unchanged on its own row's slice (n floats in, n/32
+// q8_1 blocks out), so every row is bit-identical to the single-row launch.
 template <typename R>
 __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
     const float* __restrict__ x, const float* __restrict__ weight, int n, float eps,
     q8_1::block_q8_1* __restrict__ y) {
+  if (blockIdx.y != 0) {
+    x += (size_t)blockIdx.y * (size_t)n;
+    y += (size_t)blockIdx.y * (size_t)(n / 32);
+  }
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
@@ -2512,29 +2960,32 @@ __global__ void __launch_bounds__(1024) rms_norm_quantize_q8_1_kernel(
 }
 
 bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
-                                float eps, BlockQ8_1* yq, int n) {
-  if (!available() || !x || !yq || n <= 0 || (n & 31) != 0) return false;
+                                float eps, BlockQ8_1* yq, int n, int rows) {
+  if (!available() || !x || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
   if (!weight.empty() && weight.size() < (size_t)n) return false;
   const float* d_w = nullptr;
   if (!weight.empty()) {
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, 1, 1024, 0, cur_stream());
+  SB_NOTE_LAUNCH(rms_norm_quantize_q8_1_kernel, dim3(1, rows), 1024, 0,
+                 cur_stream());
   auto* y = reinterpret_cast<q8_1::block_q8_1*>(yq);
   cudaStream_t st = cur_stream();
+  const dim3 grid(1, rows);
   switch (sonicboom::planner::device_reduce_mode()) {
     case sonicboom::compiler::ReduceMode::Df32:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumDf32>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
     case sonicboom::compiler::ReduceMode::F32:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF32>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
     default:
       rms_norm_quantize_q8_1_kernel<sonicboom::nn::cuda::SumF64>
-          <<<1, 1024, 0, st>>>(x, d_w, n, eps, y);
+          <<<grid, 1024, 0, st>>>(x, d_w, n, eps, y);
       break;
   }
   return cudaGetLastError() == cudaSuccess;
@@ -2546,11 +2997,18 @@ bool rms_norm_quantize_q8_1_dev(std::span<const float> weight, const float* x,
 // materialized. Bit-identical to gelu_fp16_dev + mul_dev + quantize_q8_1_dev:
 // the gelu/mul are pure functions of gate/up, recomputed identically in the
 // amax and quantize passes.
+// `blockIdx.y` is the row of the verify step's multi-position launch, as in
+// rms_norm_quantize_q8_1_kernel.
 __global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
                                               const float* __restrict__ up,
                                               int n, q8_1::block_q8_1* __restrict__ y) {
   const int ib = blockIdx.x * blockDim.x + threadIdx.x;
   const int nblocks = n / 32;
+  if (blockIdx.y != 0) {
+    gate += (size_t)blockIdx.y * (size_t)n;
+    up += (size_t)blockIdx.y * (size_t)n;
+    y += (size_t)blockIdx.y * (size_t)nblocks;
+  }
   if (ib >= nblocks) return;
   const float* gb = gate + (size_t)ib * 32;
   const float* ub = up + (size_t)ib * 32;
@@ -2571,10 +3029,12 @@ __global__ void gelu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
 }
 
 bool gelu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n) {
-  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
-  SB_NOTE_LAUNCH(gelu_mul_quantize_q8_1_kernel, (n / 32 + 255) / 256, 256, 0, cur_stream());
-  gelu_mul_quantize_q8_1_kernel<<<(n / 32 + 255) / 256, 256, 0, cur_stream()>>>(
+                                int n, int rows) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
+  const dim3 grid((n / 32 + 255) / 256, rows);
+  SB_NOTE_LAUNCH(gelu_mul_quantize_q8_1_kernel, grid, 256, 0, cur_stream());
+  gelu_mul_quantize_q8_1_kernel<<<grid, 256, 0, cur_stream()>>>(
       gate, up, n, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }
@@ -2592,6 +3052,12 @@ __global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
                                               int nblocks,
                                               q8_1::block_q8_1* __restrict__ y) {
   const int ib = blockIdx.x * q8_1::kQuantizeWarpsPerBlock + (threadIdx.x >> 5);
+  if (blockIdx.y != 0) {
+    const size_t row = (size_t)blockIdx.y * (size_t)nblocks * 32;
+    gate += row;
+    up += row;
+    y += (size_t)blockIdx.y * (size_t)nblocks;
+  }
   if (ib >= nblocks) return;
   const int lane = threadIdx.x & 31;
   const size_t i = (size_t)ib * 32 + lane;
@@ -2607,12 +3073,14 @@ __global__ void silu_mul_quantize_q8_1_kernel(const float* __restrict__ gate,
 }
 
 bool silu_mul_quantize_q8_1_dev(const float* gate, const float* up, BlockQ8_1* yq,
-                                int n) {
-  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0) return false;
+                                int n, int rows) {
+  if (!available() || !gate || !up || !yq || n <= 0 || (n & 31) != 0 || rows <= 0)
+    return false;
   const int nblocks = n / 32;
-  SB_NOTE_LAUNCH(silu_mul_quantize_q8_1_kernel, q8_1::quantize_q8_1_grid(nblocks), q8_1::kQuantizeBlockThreads, 0, cur_stream());
-  silu_mul_quantize_q8_1_kernel<<<q8_1::quantize_q8_1_grid(nblocks),
-                                  q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+  const dim3 grid(q8_1::quantize_q8_1_grid(nblocks), rows);
+  SB_NOTE_LAUNCH(silu_mul_quantize_q8_1_kernel, grid, q8_1::kQuantizeBlockThreads, 0, cur_stream());
+  silu_mul_quantize_q8_1_kernel<<<grid, q8_1::kQuantizeBlockThreads, 0,
+                                  cur_stream()>>>(
       gate, up, nblocks, reinterpret_cast<q8_1::block_q8_1*>(yq));
   return cudaGetLastError() == cudaSuccess;
 }
@@ -2692,13 +3160,18 @@ static bool gemv_sibling_kquant_enabled() {
 // the group instead of one each. Members may be any of the supported quant
 // types (D1 required all-legacy; G2 adds the K-quants, which is what Gemma's
 // q3_K/q3_K/q5_K attention trio needs).
-bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
-                            const BlockQ8_1* xq) {
-  if (!available() || !xq) return false;
-  if (siblings.size() < 2 || siblings.size() > 3) return false;
+namespace {
 
-  q8_1::legacy_slot slots[3] = {};
-  uint32_t blocks_per_row = 0;
+// Validate the members of a sibling launch and upload what the kernel needs:
+// the merged kernels take 2-3 projections over one activation, each with an
+// optional exact-[rows] bias, and lay their rows end to end. Returns false —
+// having written no output — for anything else, so the caller falls back to
+// the members' separate launches.
+bool prepare_sibling_slots(std::span<const GemvSibling> siblings,
+                           q8_1::legacy_slot* slots, int* total_rows,
+                           int* blocks_per_row) {
+  if (siblings.size() < 2 || siblings.size() > 3) return false;
+  uint32_t bpr_all = 0;
   for (std::size_t i = 0; i < siblings.size(); ++i) {
     const GemvSibling& s = siblings[i];
     if (!s.weight || !s.y) return false;
@@ -2711,11 +3184,15 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     const uint64_t cols = W.dims()[0];
     const uint64_t rows = W.dims()[1];
     if (rows == 0 || cols % q8_1::QK8_1 != 0) return false;
+    // A K-quant row kernel walks 256-element super-blocks; a column count that
+    // is not a whole number of them cannot be expressed (and cannot be a valid
+    // K-quant weight either, but keep the merged launch from assuming it).
+    if (!is_legacy_quant(W.type()) && cols % q8_1::QK_K != 0) return false;
     const uint32_t bpr = uint32_t(cols / q8_1::QK8_1);
     if (bpr == 0) return false;
-    if (blocks_per_row == 0)
-      blocks_per_row = bpr;
-    else if (blocks_per_row != bpr)
+    if (bpr_all == 0)
+      bpr_all = bpr;
+    else if (bpr_all != bpr)
       return false;  // not the same activation
     const float* d_bias = nullptr;
     if (!s.bias.empty()) {
@@ -2729,19 +3206,60 @@ bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
     slots[i] = q8_1::legacy_slot{static_cast<const uint8_t*>(d_w), d_bias, s.y,
                                  int(rows), slot_type};
   }
+  *total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
+  *blocks_per_row = int(bpr_all);
+  return true;
+}
 
-  const int total_rows = slots[0].rows + slots[1].rows + slots[2].rows;
+}  // namespace
+
+bool gemv_q8_1_siblings_dev(std::span<const GemvSibling> siblings,
+                            const BlockQ8_1* xq) {
+  if (!available() || !xq) return false;
+  q8_1::legacy_slot slots[3] = {};
+  int total_rows = 0, blocks_per_row = 0;
+  if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
+    return false;
+
   const dim3 block(32, 8);
   const dim3 grid(1, (total_rows + 7) / 8);
   SB_NOTE_LAUNCH(q8_1::gemv_legacy_siblings_q8_1, grid, block, 0, cur_stream());
   q8_1::gemv_legacy_siblings_q8_1<<<grid, block, 0, cur_stream()>>>(
       slots[0], slots[1], slots[2],
-      reinterpret_cast<const q8_1::block_q8_1*>(xq), int(blocks_per_row));
+      reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+// Multi-position form of gemv_q8_1_siblings_dev (the verify step): the same
+// merged launch, with each row computing the n positions of the step. Every
+// (row, position) value is bit-identical to the single-position merged kernel
+// on that position.
+bool gemv_q8_1_siblings_batched_dev(std::span<const GemvSibling> siblings,
+                                    const BlockQ8_1* xq, int n) {
+  if (!available() || !xq || n <= 0) return false;
+  q8_1::legacy_slot slots[3] = {};
+  int total_rows = 0, blocks_per_row = 0;
+  if (!prepare_sibling_slots(siblings, slots, &total_rows, &blocks_per_row))
+    return false;
+
+  const dim3 block(32, 8);
+  const dim3 grid(1, (total_rows + 7) / 8);
+  if (grid.y > 65535) return false;  // very wide member group; keep it split
+  SB_NOTE_LAUNCH_TP(
+      "q8_1::gemv_legacy_siblings_batched",
+      ::sonicboom::planner::plan_detail::tp_label(
+          {{"T", q8_1::GEMV_BATCH_T}}),
+      grid, block, 0, cur_stream());
+  q8_1::gemv_legacy_siblings_batched_q8_1<q8_1::GEMV_BATCH_T>
+      <<<grid, block, 0, cur_stream()>>>(
+          slots[0], slots[1], slots[2],
+          reinterpret_cast<const q8_1::block_q8_1*>(xq), blocks_per_row, n);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
-                           float* y, int n) {
+                           float* y, int n, std::span<const float> bias,
+                           const float* add) {
   if (!available()) return false;
   if (!W.valid() || W.dims().size() != 2) return false;
   const uint64_t cols = W.dims()[0];
@@ -2749,13 +3267,55 @@ bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
   if (!xq || !y || n <= 0) return false;
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact
   if (blocks_per_row == 0) return false;
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows || !gemv_bias_epilogue_supported(W.type()))
+      return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
+  }
+  if (add && !gemv_bias_epilogue_supported(W.type())) return false;
   const void* d_w = upload_weight(W);
   if (!d_w) return false;
   launch_gemv_q8_1_batched(
-      W.type(), static_cast<const uint8_t*>(d_w),
+      W.type(), verify_gemv_wp_for(W.type(), int(rows), int(cols), n),
+      static_cast<const uint8_t*>(d_w),
       reinterpret_cast<const q8_1::block_q8_1*>(xq), y, int(blocks_per_row),
-      int(rows), n);
+      int(rows), n, d_bias, add);
   return cudaGetLastError() == cudaSuccess;
+}
+
+// Multi-row quantized matvec (the verify step's positions, the
+// QuantizedMatmul form that carries a plain f32 activation): quantize every
+// row to q8_1 with one launch, then the row-invariant batched gemv. Row i is
+// bit-identical to matvec_f32_dev on that row — the q8_1 quantize is per-block
+// elementwise, and the batched mmvq's per-position arithmetic is the
+// single-column gemv's (B2 audit). Declines when the q8_1 path is disabled, so
+// the caller keeps its per-row vec_dot gemv.
+bool matvec_f32_rows_dev(const QuantizedTensor& W, const float* x, float* y,
+                         int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t cols = W.dims()[0];
+  if (!x || !y || n <= 0) return false;
+  if (!q8_1_enabled()) return false;
+  const uint32_t blocks_per_row = uint32_t(cols / W.block_size());
+  if (blocks_per_row == 0) return false;
+  const int nblocks = int(cols / q8_1::QK8_1) * n;
+  if (nblocks <= 0) return false;
+  q8_1::block_q8_1* d_q8 = static_cast<q8_1::block_q8_1*>(
+      grow_scratch(g_q8, g_q8_bytes,
+                   (size_t)nblocks * sizeof(q8_1::block_q8_1)));
+  if (!d_q8) return false;
+  SB_NOTE_LAUNCH(q8_1::quantize_q8_1, q8_1::quantize_q8_1_grid(nblocks),
+                 q8_1::kQuantizeBlockThreads, 0, cur_stream());
+  q8_1::quantize_q8_1<<<q8_1::quantize_q8_1_grid(nblocks),
+                        q8_1::kQuantizeBlockThreads, 0, cur_stream()>>>(
+      x, d_q8, nblocks);
+  const bool ok = gemv_q8_1_batched_dev(
+      W, reinterpret_cast<const BlockQ8_1*>(d_q8), y, n);
+  return ok;
 }
 
 // q8_1 activation blocks consumed per *weight* block. A K-quant weight block
@@ -3204,28 +3764,317 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// The MMQ-supported quant formats, as the imported kernel's type enum, or
+// nullopt for a type the kernel has no implementation for.
+static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
+  switch (t) {
+    case QuantType::Q3_K: return MmqUpType::Q3_K;
+    case QuantType::Q4_K: return MmqUpType::Q4_K;
+    case QuantType::Q5_K: return MmqUpType::Q5_K;
+    case QuantType::Q6_K: return MmqUpType::Q6_K;
+    case QuantType::Q5_0: return MmqUpType::Q5_0;
+    case QuantType::Q8_0: return MmqUpType::Q8_0;
+  }
+  return std::nullopt;
+}
+
+// --- per-shape decode/verify kernel family ----------------------------------
+//
+// The decode (n = 1) and verify (n = k+1 <= 16) steps can run each quantized
+// projection either as the q8_1 gemv (one warp per output row, 32-element
+// activation blocks) or as the mmq int8 tensor-core matmul (128-element
+// activation blocks). Which one is faster is a property of the shape and the
+// device, so the two are timed once per (type, rows, cols) at model load and
+// every matmul of that shape takes the recorded family — at decode and at every
+// verify row count alike.
+//
+// Key: decode-family|<type>|<rows>x<cols>; the record carries the family (0
+// gemv, 1 mmq) and the build fingerprint as "k". A record is written once, on
+// the run that measured it. SONICBOOM_DECODE_FAMILY=gemv|mmq overrides the pick
+// for debugging.
+namespace {
+
+constexpr int kDecodeFamilyN = 8;           // widest verify row count timed
+constexpr double kDecodeFamilyBudgetS = 1.5;  // whole warm-up, per model load
+constexpr int kDecodeFamilyTimed = 7;       // timed repetitions per candidate
+constexpr int kDecodeFamilyWarm = 3;
+// A shape takes mmq only when it is at least as fast at the decode row count
+// (within this slack); a slower mmq is the gemv's.
+constexpr double kDecodeFamilySlack = 1.02;
+
+// 0 none, 1 gemv, 2 mmq.
+int decode_family_override() {
+  static const int v = [] {
+    const char* e = std::getenv("SONICBOOM_DECODE_FAMILY");
+    if (!e) return 0;
+    if (std::strcmp(e, "gemv") == 0) return 1;
+    if (std::strcmp(e, "mmq") == 0) return 2;
+    std::fprintf(stderr,
+                 "SONICBOOM_DECODE_FAMILY: '%s' is not gemv/mmq; using the "
+                 "measured family\n",
+                 e);
+    return 0;
+  }();
+  return v;
+}
+
+std::mutex g_decode_family_mutex;
+std::map<std::string, bool> g_decode_family;  // key -> mmq
+std::string g_decode_family_build_id;
+
+std::string decode_family_key(QuantType qt, int rows, int cols) {
+  return std::string("decode-family|") + verify_wp_type_name(qt) + "|" +
+         std::to_string(rows) + "x" + std::to_string(cols);
+}
+
+int decode_family_build_hash(std::string_view build_id) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : build_id) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return int(static_cast<uint32_t>(h ^ (h >> 32)));
+}
+
+struct DecodeFamilyBuffers {
+  void* dw = nullptr;
+  void* dxq = nullptr;  // q8_1 blocks (gemv activation)
+  void* dmq = nullptr;  // block_q8_1_mmq blocks (mmq activation)
+  void* dy = nullptr;
+};
+
+void decode_family_free(DecodeFamilyBuffers& b) {
+  if (b.dy) cudaFree(b.dy);
+  if (b.dmq) cudaFree(b.dmq);
+  if (b.dxq) cudaFree(b.dxq);
+  if (b.dw) cudaFree(b.dw);
+  b = {};
+}
+
+bool decode_family_alloc(const VerifyWpShape& s, DecodeFamilyBuffers& b) {
+  const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
+                        size_t(quant_type_info(s.qt)->bytes_per_block);
+  const size_t aqbytes = size_t(kDecodeFamilyN) * size_t(s.cols / 32) *
+                         sizeof(q8_1::block_q8_1);
+  const size_t mqblocks =
+      size_t(mmq::mmq_q8_blocks(s.cols, kDecodeFamilyN));
+  const size_t mqbytes = mqblocks * sizeof(mmq::block_q8_1_mmq);
+  const size_t ybytes = size_t(kDecodeFamilyN) * size_t(s.rows) * sizeof(float);
+  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
+  if (cudaMalloc(&b.dxq, aqbytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dmq, mqbytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+    decode_family_free(b);
+    return false;
+  }
+  cudaMemset(b.dw, 0, wbytes);  // no garbage scale in the arithmetic
+  cudaMemset(b.dxq, 0, aqbytes);
+  cudaMemset(b.dmq, 0, mqbytes);
+  return true;
+}
+
+// Median of the timed launches, after the untimed warm-ups. `launch` runs one
+// candidate.
+template <typename Launch>
+double decode_family_time(Launch&& launch) {
+  for (int i = 0; i < kDecodeFamilyWarm; ++i) launch();
+  cudaEvent_t begin = nullptr, end = nullptr;
+  if (cudaEventCreate(&begin) != cudaSuccess) return 0.0;
+  if (cudaEventCreate(&end) != cudaSuccess) {
+    cudaEventDestroy(begin);
+    return 0.0;
+  }
+  double times[kDecodeFamilyTimed];
+  for (int i = 0; i < kDecodeFamilyTimed; ++i) {
+    times[i] = 0.0;
+    cudaEventRecord(begin, cur_stream());
+    launch();
+    cudaEventRecord(end, cur_stream());
+    cudaEventSynchronize(end);
+    float ms = 0.0f;
+    if (cudaGetLastError() != cudaSuccess ||
+        cudaEventElapsedTime(&ms, begin, end) != cudaSuccess) {
+      (void)cudaGetLastError();
+      continue;
+    }
+    times[i] = double(ms);
+  }
+  cudaEventDestroy(begin);
+  cudaEventDestroy(end);
+  std::sort(times, times + kDecodeFamilyTimed);
+  return times[kDecodeFamilyTimed / 2];
+}
+
+double decode_family_gemv_ms(const VerifyWpShape& s,
+                             const DecodeFamilyBuffers& b, int n) {
+  const int wp = verify_gemv_wp_for(s.qt, s.rows, s.cols, n);
+  const auto* dw = static_cast<const uint8_t*>(b.dw);
+  const auto* xq = static_cast<const q8_1::block_q8_1*>(b.dxq);
+  auto* dy = static_cast<float*>(b.dy);
+  return decode_family_time([&] {
+    launch_gemv_q8_1_batched(s.qt, wp, dw, xq, dy, s.bpr, s.rows, n);
+  });
+}
+
+double decode_family_mmq_ms(const VerifyWpShape& s, MmqUpType type,
+                            const DecodeFamilyBuffers& b, int n) {
+  const MmqUpPin pin = mmq_up_pin_for(type, s.rows, s.cols);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  return decode_family_time([&] {
+    (void)mmq_up_matmul(b.dw, type,
+                        static_cast<const int32_t*>(b.dmq),
+                        static_cast<float*>(b.dy), s.rows, s.cols, n, nullptr,
+                        cfg, 1);
+  });
+}
+
+bool decode_family_cached(const VerifyWpShape& s, int build_key, bool* mmq) {
+  const std::string key = decode_family_key(s.qt, s.rows, s.cols);
+  {
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    const auto it = g_decode_family.find(key);
+    if (it != g_decode_family.end()) {
+      *mmq = it->second;
+      return true;
+    }
+  }
+  if (!tune::enabled() || build_key == 0) return false;
+  const auto rec = tune::lookup("decode-family", key);
+  const auto fi = rec.find("family");
+  const auto ki = rec.find("k");
+  if (fi == rec.end() || ki == rec.end() || ki->second != build_key ||
+      (fi->second != 0 && fi->second != 1))
+    return false;
+  *mmq = fi->second == 1;
+  return true;
+}
+
+void decode_family_store(const VerifyWpShape& s, bool mmq, int build_key) {
+  if (!tune::enabled() || build_key == 0) return;
+  tune::store("decode-family", decode_family_key(s.qt, s.rows, s.cols),
+              {{"family", mmq ? 1 : 0},
+               {"k", decode_family_build_hash(g_decode_family_build_id)}});
+}
+
+}  // namespace
+
+bool decode_family_mmq(QuantType qt, int rows, int cols) {
+  if (!available() || !q8_1_enabled() || !mmq_enabled()) return false;
+  if (rows <= 0 || cols <= 0 || cols % mmq::QK8_1_MMQ != 0) return false;
+  if (!mmq_up_type_of(qt)) return false;
+  const int ov = decode_family_override();
+  if (ov == 1) return false;
+  if (ov == 2) return true;
+  std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+  const auto it = g_decode_family.find(decode_family_key(qt, rows, cols));
+  return it != g_decode_family.end() && it->second;
+}
+
+void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
+                        const char* build_id) {
+  if (!available() || !q8_1_enabled() || !mmq_enabled() || !weights ||
+      count == 0)
+    return;
+  if (decode_family_override() != 0) return;  // the debug pin wins
+  {
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    if (!g_decode_family_build_id.empty()) return;  // already warmed
+    if (build_id) g_decode_family_build_id = build_id;
+  }
+  const int build_key =
+      (build_id && *build_id) ? decode_family_build_hash(build_id) : 0;
+
+  // Distinct projection shapes the mmq matmul can take, largest first: if the
+  // budget runs out, the shapes that dominate a decode step are priced first.
+  std::vector<VerifyWpShape> shapes;
+  for (size_t i = 0; i < count; ++i) {
+    const QuantizedTensor* w = weights[i];
+    if (!w || !w->valid() || w->dims().size() != 2) continue;
+    if (!mmq_up_type_of(w->type())) continue;
+    const int cols = int(w->dims()[0]);
+    const int rows = int(w->dims()[1]);
+    const int bpr = cols / int(w->block_size());
+    if (rows <= 0 || cols % mmq::QK8_1_MMQ != 0 || bpr <= 0) continue;
+    bool seen = false;
+    for (const auto& s : shapes)
+      if (s.qt == w->type() && s.rows == rows && s.cols == cols) {
+        seen = true;
+        break;
+      }
+    if (!seen) shapes.push_back({w->type(), rows, cols, bpr});
+  }
+  std::sort(shapes.begin(), shapes.end(), [](const VerifyWpShape& a,
+                                             const VerifyWpShape& b) {
+    return int64_t(a.rows) * a.cols > int64_t(b.rows) * b.cols;
+  });
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto elapsed_s = [&t0] {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  for (const auto& s : shapes) {
+    bool mmq = false;
+    if (!decode_family_cached(s, build_key, &mmq)) {
+      if (elapsed_s() > kDecodeFamilyBudgetS) {
+        std::fprintf(stderr,
+                     "warm_decode_family: %.2fs load budget reached; the "
+                     "remaining shapes keep the gemv\n",
+                     elapsed_s());
+        break;
+      }
+      DecodeFamilyBuffers b{};
+      if (!decode_family_alloc(s, b)) {
+        decode_family_free(b);
+        continue;
+      }
+      // Both families are timed at the decode row count (the choice) and at
+      // the widest verify row count (the table).
+      const double gemv1 = decode_family_gemv_ms(s, b, 1);
+      const double mmq1 =
+          decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, 1);
+      const double gemv8 = decode_family_gemv_ms(s, b, kDecodeFamilyN);
+      const double mmq8 =
+          decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, kDecodeFamilyN);
+      decode_family_free(b);
+      mmq = gemv1 > 0.0 && mmq1 > 0.0 &&
+            mmq1 <= gemv1 * kDecodeFamilySlack;
+      if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
+        std::fprintf(stderr,
+                     "decode-family %s %dx%d family=%s t1=%.4f/%.4f "
+                     "t%d=%.4f/%.4f\n",
+                     verify_wp_type_name(s.qt).c_str(), s.rows, s.cols,
+                     mmq ? "mmq" : "gemv", gemv1, mmq1, kDecodeFamilyN,
+                     gemv8, mmq8);
+      }
+      decode_family_store(s, mmq, build_key);
+    }
+    std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+    g_decode_family[decode_family_key(s.qt, s.rows, s.cols)] = mmq;
+  }
+}
+
 // MMQ int8 tensor-core batched matmul (C.2). Dequantizes the weight tile into
 // shared memory as int8 and multiplies against a block_q8_1_mmq activation via
 // m16n8k16/m16n8k32 tensor cores. X is [n, cols] position-major, which is
-// already the layout quantize_activation needs (each position's 128-element
-// q8_1 blocks contiguous), and mul_mat_q natively writes dst [n, rows] — so no
-// transpose on either side of the kernel (C.3a). Q3_K uses a float d4 activation
-// scale layout (D4); Q4_K/Q5_K use half2 ds4 (DS4), matching the weight's
-// vec_dot path. Q6_K uses D4 (float activation scales); its signed per-16-value
-// weight scales remain separate from the block's fp16 d, matching ggml's
-// Q6_K MMQ tile layout. The legacy 32-element formats Q5_0/Q8_0 also use the
-// D4 layout (ggml's MMQ_Q8_1_DS_LAYOUT_D4) with their own tile loaders.
-bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
+// already the layout the quantizer needs (each position's 128-element q8_1
+// blocks contiguous), and the kernel writes dst [n, rows] — so no transpose on
+// either side (C.3a). The activation scale layout follows the weight type:
+// Q3_K/Q6_K/Q5_0/Q8_0 use float d4 scales, Q4_K/Q5_K use half2 ds4 scales.
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
+                    std::span<const float> bias, const float* add) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
   const int ic = int(cols), ir = int(rows);
-  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
-
-  // TODO(q6k-mmq): incoherent output on Gemma Q4_K_M, disabled until fixed.
-  // Until then Q6_K takes the one prefill arithmetic: the blocked fp16 GEMM.
-  if (W.type() == QuantType::Q6_K)
-    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -3241,45 +4090,25 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // before the quantize but touches none of its blocks. No-op when K % 256 == 0.
   mmq::zero_pad_planes(y_q8, ic, n, cur_stream());
 
-  bool ok = false;
-  switch (W.type()) {
-    case QuantType::Q3_K:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q4_K:
-      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q5_K:
-      mmq::quantize_activation<mmq::DS4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    // The legacy 32-element formats use the D4 float activation scale layout
-    // (ggml's MMQ_Q8_1_DS_LAYOUT_D4), same as Q3_K.
-    case QuantType::Q5_0:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    case QuantType::Q8_0:
-      mmq::quantize_activation<mmq::D4>(X, y_q8, ic, n, cur_stream());
-      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
-          reinterpret_cast<const char*>(wp), reinterpret_cast<const int*>(y_q8),
-          Y, ir, n, blocks_per_row, MmqDecomp::Auto, cur_stream());
-      break;
-    default:
-      return false;
+  if (!mmq_up_quantize(X, reinterpret_cast<int32_t*>(y_q8), ic, n, *type,
+                       cur_stream()))
+    return false;
+  // The shape's pinned tile config and split-K from the warm-up table. The
+  // split count is a function of the shape only; the tile width's config moves
+  // with n (8 for n <= 8, 16 above) and every selectable config is
+  // bit-identical to the imported table (R1).
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows) return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
   }
-  if (!ok) return false;
-  return cudaGetLastError() == cudaSuccess;
+  return mmq_up_matmul(
+      wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
+      cur_stream(), cfg, pin.split_k, d_bias, add);
 }
 
 // MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
@@ -3287,30 +4116,22 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
 // (index blk*n + token); Y is [n, rows] position-major (the tensor-core matmul's
 // native output — no transpose, matching matmul_mmq_dev's C.3a path).
 bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
-                       float* Y, int n, MmqDecomp decomp) {
+                       float* Y, int n, MmqDecomp decomp,
+                       std::span<const float> bias, const float* add) {
   if (!available() || !W.valid() || W.dims().size() != 2 || !y_q8 || !Y || n <= 0)
     return false;
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
-  const int ir = int(rows);
-  const int blocks_per_row = int(cols / W.block_size());  // exact (valid())
-  if (blocks_per_row == 0) return false;
+  const int ic = int(cols), ir = int(rows);
+  if (cols / W.block_size() == 0) return false;
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
 
-  if (W.type() == QuantType::Q6_K) {
-    // Keep the Q6_K MMQ weight kernel disabled; dequantize the D4 activation
-    // and take matmul_f32_dev's Q6_K rule (one arithmetic for every prefill n —
-    // see the routing note there).
-    float* X = static_cast<float*>(grow_scratch(
-        g_mmq_q6_x_f32, g_mmq_q6_x_f32_bytes, cols * (size_t)n * sizeof(float)));
-    if (!X) return false;
-    const int64_t nx = int64_t(cols) * n;
-    SB_NOTE_LAUNCH(dequant_mmq_q8_1_d4, (nx + 255) / 256, 256, 0, cur_stream());
-    dequant_mmq_q8_1_d4<<<(nx + 255) / 256, 256, 0, cur_stream()>>>(
-        reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), X, int(cols), n);
-    if (cudaGetLastError() != cudaSuccess) return false;
-    return matmul_f32_dev(W, X, Y, n);
-  }
+  // `decomp` is the plan's work decomposition for this weight class. The
+  // imported kernel schedules whole tiles (stream-K is not used), so the plan
+  // value is accepted for compatibility and has no effect on the launch.
+  (void)decomp;
 
   const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
   if (!wp) return false;
@@ -3318,41 +4139,23 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   // A K that is not a multiple of MMQ_ITER_K (256) leaves an odd plane count; the
   // last K-iteration reads one plane past what the fused emitter wrote, so zero
   // it (no-op for K % 256 == 0, i.e. every K-quant weight).
-  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8),
-                       int(cols), n, cur_stream());
+  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(y_q8), ic,
+                       n, cur_stream());
 
-  const int* yq = reinterpret_cast<const int*>(y_q8);
-  bool ok = false;
-  switch (W.type()) {
-    case QuantType::Q3_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q3_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q4_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q4_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q5_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q6_K:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q6_K>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q5_0:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q5_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    case QuantType::Q8_0:
-      ok = mul_mat_q_tuned<mmq::MMQ_Q8_0>(
-          reinterpret_cast<const char*>(wp), yq, Y, ir, n, blocks_per_row, decomp, cur_stream());
-      break;
-    default:
-      return false;
+  // The shape's pinned tile config and split-K from the warm-up table (see
+  // matmul_mmq_dev).
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  const float* d_bias = nullptr;
+  if (!bias.empty()) {
+    if (bias.size() != rows) return false;
+    d_bias = static_cast<const float*>(
+        upload_bytes(bias.data(), rows * sizeof(float)));
+    if (!d_bias) return false;
   }
-  if (!ok) return false;
-  return cudaGetLastError() == cudaSuccess;
+  return mmq_up_matmul(
+      wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
+      cur_stream(), cfg, pin.split_k, d_bias, add);
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first
@@ -3789,19 +4592,14 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // 256→434/336, 512→458/396, 2048→324/286), so it is selected for all
   // n >= mmq_min_n(); cuBLAS stays reachable via SONICBOOM_MMQ=0. Only when
   // q8_1 is active — the fp32 fallback is the CPU-matching differential path.
-  // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K)
-  // and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per 256-value
-  // iteration). Q6_K (TODO(q6k-mmq)) skips it and takes the blocked fp16
-  // cuBLAS path below — matmul_mmq_dev would reject it anyway, and returning
-  // its false here would fail the whole call instead of falling through.
-  // The MMQ kernel needs K to be a multiple of QK8_1_MMQ (128) and a K below
-  // one 256-element iteration (e.g. the DiT's 128-wide input projection) takes
-  // the dp4a/cuBLAS paths below instead of failing the whole call on
-  // matmul_mmq_dev's precondition. A longer K that is not a multiple of 256
-  // (Qwen 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane, and
-  // the LLM goldens pin that numerics.
-  const bool mmq_type = W.type() != QuantType::Q6_K && cols >= 256 &&
-                        cols % mmq::QK8_1_MMQ == 0;
+  // The MMQ kernel tiles for the 256-element K-quant super-block (Q3_K/Q4_K/Q5_K/
+  // Q6_K) and for the legacy 32-element formats (Q5_0/Q8_0, 8 blocks per
+  // 256-value iteration). The kernel needs K to be a multiple of QK8_1_MMQ
+  // (128); a narrower K (e.g. the DiT's 128-wide input projection) takes the
+  // dp4a/cuBLAS paths below instead of failing the whole call on
+  // matmul_mmq_dev's precondition. A K that is not a multiple of 256 (Qwen
+  // 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane.
+  const bool mmq_type = cols >= 256 && cols % mmq::QK8_1_MMQ == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
     return matmul_mmq_dev(W, X, Y, n);
 
@@ -3811,8 +4609,6 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // per-column invariant, so a position computes the same whether its segment
   // is long or short (prefix-reuse identity). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
-  // TODO(q6k-mmq): the fast batch-invariant path for Q6_K prefill is Roy's MMQ
-  // kernel, disabled until its incoherent output on Gemma Q4_K_M is fixed.
   if (q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
     return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
 
@@ -3835,7 +4631,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
         X, xq, int(nblocks * n));
 
     // Batched warp-per-row gemv -> Y[n, rows] (position-major).
-    launch_gemv_q8_1_batched(W.type(), wp, xq, Y, int(blocks_per_row), ir, n);
+    launch_gemv_q8_1_batched(W.type(), 1, wp, xq, Y, int(blocks_per_row), ir, n);
     return cudaGetLastError() == cudaSuccess;
   }
 

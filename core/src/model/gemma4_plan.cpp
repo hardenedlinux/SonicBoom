@@ -43,9 +43,15 @@
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
+#include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
+#include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
+#include "../quant/mmq_upstream.h"   // mmq_up_warm (decode/verify MMQ pins)
+#include "../spec_diag_counters.h"   // in-request first-use counters (SPEC_DIAG)
 #endif
+
+#include <dlfcn.h>  // dladdr: identity of the loaded library (cost-cache key)
 
 #include <algorithm>
 #include <array>
@@ -56,6 +62,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <list>
 #include <map>
@@ -236,14 +243,22 @@ planner::Graph lower_graph(mlir::ModuleOp module,
 planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite,
                            uint64_t dynamic_extent = 0,
                            bool skip_kv_append_fusion = false,
-                           bool fuse_silu_mul = false) {
+                           bool fuse_silu_mul = false,
+                           bool rows_mmq = false) {
   if (!ir.module)
     return {};
   if (rewrite &&
       !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
-                               fuse_silu_mul))
+                               fuse_silu_mul, rows_mmq))
     return {};
   return lower_graph(*ir.module, dynamic_extent);
+}
+
+// Decode and verify can run a projection on the mmq matmul only when the q8_1
+// dispatcher and the mmq kernel are both available; which projections actually
+// do is the per-shape family measured at load (decode_family_mmq).
+bool decode_mmq_available() {
+  return quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled();
 }
 
 }  // namespace
@@ -302,6 +317,31 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     kv_handles[l] = b.kv(l);
 
   const BlockProfile prof = profile_for(cfg);
+
+  // Decode/verify kernel family: a projection whose (type, rows, cols) shape
+  // was measured faster on the mmq matmul carries the prefill lowering
+  // attributes — the extent, the input width, and the activation scale layout
+  // of the weight type — so the prefill producer fusions and the mmq matmul
+  // dispatch apply at this step's row count. `ds` = -1 marks a weight type with
+  // no fused mmq quantize (Q6_K); its matmul quantizes the activation inside the
+  // mmq call. `mmq_rows` selects that mmq matmul for an activation with no fused
+  // producer. A shape on the gemv carries nothing and takes the ordinary decode
+  // lowering (quantize once, q8_1 gemv).
+  const bool mmq_available = decode_mmq_available();
+  auto mmq_a = [&](std::vector<sx::Attribute> &a, quant::QuantType qt,
+                   uint64_t in_w, uint64_t out_w) {
+    if (!mmq_available ||
+        !quant::cuda::decode_family_mmq(qt, int(out_w), int(in_w)))
+      return;
+    const int64_t ds =
+        (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
+        : (qt == quant::QuantType::Q6_K)                               ? -1
+                                                                       : 0;
+    a.push_back(attr_i("batch", int64_t(rows)));
+    a.push_back(attr_i("dim", int64_t(in_w)));
+    a.push_back(attr_i("ds", ds));
+    a.push_back(attr_i("mmq_rows", int64_t(1)));
+  };
 
   auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
   auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
@@ -403,8 +443,10 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     // (24..41) attend over their donor layer's cache instead.
     mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::AttnNorm)});
+    std::vector<sx::Attribute> q_attrs = {layer_a(l), slot(WeightSlot::AttnQ)};
+    mmq_a(q_attrs, m.weights.blocks[l].attn_q.type(), d, qw);
     mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
-                        {layer_a(l), slot(WeightSlot::AttnQ)});
+                        q_attrs);
     if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
       q = b.node(OpKind::AddBias, {q}, "qb" + suff, {int64_t(qw)},
                  {layer_a(l), slot(WeightSlot::AttnQBias)});
@@ -415,10 +457,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
 
     mlir::Value attn;
     if (cfg.has_kv(l)) {
+      std::vector<sx::Attribute> k_attrs = {layer_a(l), slot(WeightSlot::AttnK)};
+      mmq_a(k_attrs, m.weights.blocks[l].attn_k.type(), d, kvw);
+      std::vector<sx::Attribute> v_attrs = {layer_a(l), slot(WeightSlot::AttnV)};
+      mmq_a(v_attrs, m.weights.blocks[l].attn_v.type(), d, kvw);
       mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
-                          {layer_a(l), slot(WeightSlot::AttnK)});
+                          k_attrs);
       mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
-                          {layer_a(l), slot(WeightSlot::AttnV)});
+                          v_attrs);
       if (prof.proj_bias) {
         k = b.node(OpKind::AddBias, {k}, "kb" + suff, {int64_t(kvw)},
                    {layer_a(l), slot(WeightSlot::AttnKBias)});
@@ -444,8 +490,11 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
                     {int64_t(qw)}, attn_attrs(l));
     }
 
+    std::vector<sx::Attribute> ap_attrs = {layer_a(l),
+                                           slot(WeightSlot::AttnOutput)};
+    mmq_a(ap_attrs, m.weights.blocks[l].attn_output.type(), qw, d);
     mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::AttnOutput)});
+                         ap_attrs);
     if (prof.attn_out_bias)
       ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, {int64_t(d)},
                   {layer_a(l), slot(WeightSlot::AttnOutputBias)});
@@ -459,18 +508,26 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
     // --- gated feed-forward ------------------------------------------------
     mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
                         {layer_a(l), slot(WeightSlot::FfnNorm)});
+    std::vector<sx::Attribute> up_attrs = {layer_a(l), slot(WeightSlot::FfnUp)};
+    mmq_a(up_attrs, m.weights.blocks[l].ffn_up.type(), d, ff);
+    std::vector<sx::Attribute> gate_attrs = {layer_a(l),
+                                             slot(WeightSlot::FfnGate)};
+    mmq_a(gate_attrs, m.weights.blocks[l].ffn_gate.type(), d, ff);
     mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
-                         {layer_a(l), slot(WeightSlot::FfnUp)});
+                         up_attrs);
     mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
-                           {layer_a(l), slot(WeightSlot::FfnGate)});
+                           gate_attrs);
     gate = prof.silu_ffn
                ? b.node(OpKind::Silu, {gate}, "silu" + suff, {int64_t(ff)}, {layer_a(l)})
                : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)},
                         {layer_a(l)});
     mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
                          {layer_a(l)});
+    std::vector<sx::Attribute> fo_attrs = {layer_a(l),
+                                           slot(WeightSlot::FfnDown)};
+    mmq_a(fo_attrs, m.weights.blocks[l].ffn_down.type(), ff, d);
     mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
-                         {layer_a(l), slot(WeightSlot::FfnDown)});
+                         fo_attrs);
     mlir::Value f2 = prof.post_ffw_norm
                       ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
                                {layer_a(l), slot(WeightSlot::PostFfwNorm)})
@@ -512,9 +569,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   // --- lm head -------------------------------------------------------------
   mlir::Value hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
                        {slot(WeightSlot::OutputNorm)});
+  const WeightSlot out_slot =
+      prof.tied_output ? WeightSlot::TokenEmbd : WeightSlot::Output;
+  const quant::QuantType out_qt =
+      prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
+  std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
+  mmq_a(logits_attrs, out_qt, d, vocab);
   mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
-                           {slot(prof.tied_output ? WeightSlot::TokenEmbd
-                                                  : WeightSlot::Output)});
+                           logits_attrs);
 
   // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
   // change argmax — skip it and reduce the [vocab] logits to a single index on
@@ -635,12 +697,11 @@ GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
   // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
   // mmq path executes therefore has a layout, so the C.4 planner passes may
   // fold a quantize into any of them.
-  // Q6_K gets -1: its mmq weight kernel is disabled (TODO(q6k-mmq)), so it has
-  // no mmq activation layout and must never be folded into a fused emitter —
-  // -1 is the "no layout" marker the C.4 passes skip on (see
-  // fuse_act_mul_mmq_pass / fuse_rms_norm_mmq_pass), which keeps the down
-  // projection on its dequant + cuBLAS route rather than quantizing its
-  // activation to int8.
+  // Q6_K gets -1: no fused quantize emitter is selected for it, so it has no
+  // mmq activation layout and must not be folded into one — -1 is the "no
+  // layout" marker the C.4 passes skip on (see fuse_act_mul_mmq_pass /
+  // fuse_rms_norm_mmq_pass). Its matmul quantizes the activation inside the
+  // matmul instead.
   // `ds` answers one question only: does this weight type have an mmq activation
   // layout the fused emitter can produce? Q6_K does not (above). Every other
   // format does, including the legacy 32-element ones, whose D4 norm+quantize
@@ -1155,37 +1216,280 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
   return r;
 }
 
-// B7: the adaptive draft-length policy (plan.h). The objective is emitted
-// tokens per unit of iteration time: with acceptance rate alpha, k drafts yield
-// the expected run E(k) = 1 + alpha + ... + alpha^k, so choose the k that
-// maximizes E(k) / c(k), c(k) being one iteration's measured cost.
-int64_t spec_choose_drafts(double alpha, std::span<const double> cost_us,
-                           int64_t max_k) {
-  if (max_k < 0) return 0;
-  alpha = std::clamp(alpha, 0.0, 1.0);
-  const auto expected = [alpha](int64_t k) {
-    if (alpha >= 1.0 - 1e-9) return double(k) + 1.0;  // the limit of the sum
-    return (1.0 - std::pow(alpha, double(k) + 1.0)) / (1.0 - alpha);
-  };
-  int64_t best_k = max_k;  // nothing measured: the fixed cap
-  double best = 0.0;
-  bool any = false;
-  for (int64_t k = 0; k <= max_k && size_t(k) < cost_us.size(); ++k) {
-    if (!(cost_us[size_t(k)] > 0.0)) continue;  // unmeasured
-    const double score = expected(k) / cost_us[size_t(k)];
-    if (!any || score > best) {
-      any = true;
-      best = score;
-      best_k = k;
+// B6/B7: the largest draft budget one speculative step verifies. One step
+// runs at most kSpecMaxDrafts + 1 = 16 rows, the envelope the row-invariant
+// verify step was built and tested for (verify_k1..k15 classes) and the row
+// headroom the decode backend reserves (planner::kMaxVerifyRows).
+constexpr int64_t kSpecMaxDrafts = 15;
+
+// SONICBOOM_SPEC_MAX_DRAFTS (default kSpecMaxDrafts): a ceiling on the drafts
+// one verify may propose. It never raises the envelope above kSpecMaxDrafts;
+// both the fixed loop and the adaptive policy honour it, so a deployment (or a
+// measurement arm) can ask for a shorter verify than the envelope allows.
+static int64_t spec_max_drafts() {
+  static const int64_t v = []() -> int64_t {
+    const char* e = std::getenv("SONICBOOM_SPEC_MAX_DRAFTS");
+    if (!e || !*e) return kSpecMaxDrafts;
+    char* end = nullptr;
+    const long n = std::strtol(e, &end, 10);
+    if (end == e || *end || n < 0) {
+      std::cerr << "[spec] ignoring SONICBOOM_SPEC_MAX_DRAFTS='" << e
+                << "' (expected 0.." << kSpecMaxDrafts << ")\n";
+      return kSpecMaxDrafts;
     }
-  }
-  return best_k;
+    return std::min<long>(n, kSpecMaxDrafts);
+  }();
+  return v;
 }
 
-double spec_alpha_update(double alpha, uint64_t accepted, uint64_t drafted) {
-  if (drafted == 0) return alpha;
-  const double x = double(accepted) / double(drafted);
-  return 0.5 * alpha + 0.5 * x;
+// B7 v2: the bursty-acceptance model (plan.h). A per-token acceptance rate is
+// the wrong statistic for prompt lookup: a copy is accepted as a block, so a
+// stream whose per-draft alpha is 0.41 can still emit three tokens per verify
+// (measured: Qwen 7B chat). The estimate is therefore built from per-position
+// conditional hazards P(accepted >= j | proposed >= j), which keep the block
+// structure: E[A_k] = sum_j prod_{i<=j} p_i, emitted = 1 + E[A_k].
+//
+// The hazard prior is one pseudo-opportunity with half a pseudo-acceptance, so
+// a position with no observation is neutral (0.5) and one with observations
+// converges to the observed rate. A deeper position that was never verified
+// (the budget never reached it) inherits the last observed hazard: a copy that
+// was accepted at position j usually continues, so the prior that a match
+// survives deeper is the local one, not the global neutral one. The window the
+// loop feeds is bounded (64 observations), so the estimate follows a workload
+// whose behaviour changes and old data cannot pin it forever.
+double spec_expected_run(std::span<const uint32_t> proposed,
+                         std::span<const uint32_t> accepted, int64_t k) {
+  const int64_t n = std::clamp<int64_t>(k, 0, kSpecMaxDrafts);
+  const size_t obs = std::min(proposed.size(), accepted.size());
+  double run = 0.0;
+  double last = 0.5;  // no position observed yet: the neutral prior
+  double ceiling = 1.0;  // reach cannot exceed the previous position's
+  for (int64_t j = 1; j <= n; ++j) {
+    uint64_t opportunities = 0;
+    uint64_t accepted_here = 0;
+    for (size_t i = 0; i < obs; ++i) {
+      if (proposed[i] < uint32_t(j)) continue;
+      ++opportunities;
+      if (accepted[i] >= uint32_t(j)) ++accepted_here;
+    }
+    // Estimate the reach of position j directly, P(accepted >= j | proposed
+    // >= j), with one Beta-style weak prior. Estimating the conditional
+    // hazards P(A>=j | A>=j-1) and multiplying them compounds one prior per
+    // position, which understates deep reach whenever the observations at
+    // deep positions are few (the common case: every round that proposed k
+    // supplies one sample at each position <= k, but a policy that settles on
+    // a short k stops supplying deep samples at all). Reach is non-increasing
+    // in j — accepting j+1 implies accepting j — so an unobserved position
+    // carries the previous position's estimate forward and a noisier deep
+    // estimate is clipped to it.
+    double reach =
+        opportunities == 0
+            ? last
+            : (double(accepted_here) + 0.5) / (double(opportunities) + 1.0);
+    reach = std::min(reach, ceiling);
+    last = reach;
+    ceiling = reach;
+    run += reach;
+  }
+  return 1.0 + run;
+}
+
+// B7 v2: the budget choice (plan.h). With c(k)/c0 the measured iteration cost
+// relative to a plain step and d(k)/c0 the drafter's CPU cost, the score is
+// emitted tokens per plain-step-equivalent:
+//
+//   S(k) = (1 + E[A_k]) / (c(k)/c0 + d(k)/c0)
+//
+// and S(0) = 1 (a plain step emits exactly one token for one plain step). The
+// n-gram proposal cost is measured too, even though it is negligible: a future
+// draft model's cost belongs in the same place, so the model has no special
+// case for it.
+int64_t spec_choose_budget(std::span<const double> cost_us,
+                           std::span<const double> draft_us,
+                           std::span<const double> expected_run,
+                           int64_t max_k, int64_t current_k, double margin) {
+  if (max_k < 0) return 0;
+  const size_t n =
+      std::min<size_t>(size_t(max_k) + 1, cost_us.size());
+  bool any = false;
+  for (size_t k = 0; k < n; ++k)
+    if (cost_us[k] > 0.0) { any = true; break; }
+  // No cost model (autotune disabled, or no warm-up yet): the fixed cap,
+  // which is `on`'s behavior.
+  if (!any || !(cost_us[0] > 0.0)) return max_k;
+  const auto score = [&](size_t k) -> double {
+    if (k >= cost_us.size() || !(cost_us[k] > 0.0)) return -1.0;
+    const double draft =
+        k < draft_us.size() ? std::max(0.0, draft_us[k]) : 0.0;
+    const double e = k < expected_run.size() && expected_run[k] > 0.0
+                         ? expected_run[k]
+                         : 1.0;
+    return e * cost_us[0] / (cost_us[k] + draft);
+  };
+  int64_t best = 0;
+  double best_score = score(0);
+  for (size_t k = 1; k < n; ++k) {
+    const double s = score(k);
+    if (s > best_score) {
+      best = int64_t(k);
+      best_score = s;
+    }
+  }
+  if (current_k < 0 || current_k > max_k) return best;
+  if (best == current_k) return current_k;
+  const double current = score(size_t(current_k));
+  return best_score > current * (1.0 + margin) ? best : current_k;
+}
+
+namespace {
+
+// P0: the cost-model schema version. Bump when the shape of a record or the
+// meaning of its values changes; the key carries it, so old records are simply
+// never looked up (the tune file is append-or-rewrite, not migrated).
+// Schema 3: the record always holds all 16 lengths (c0..c15), measured at load
+// and interpolated where the measurement budget did not reach; schema 2 stored
+// only the lengths the in-request warm-up happened to run.
+constexpr int kSpecCostSchema = 3;
+
+const char* spec_ctx_class(uint64_t n_ctx) {
+  return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
+}
+
+std::string env_value(const char* name) {
+  const char* e = std::getenv(name);
+  return e && *e ? std::string(e) : std::string("unset");
+}
+
+// Identity of the running library. The cost of a verify round is a property
+// of the kernels and dispatch that produced it; a size+mtime identity moves
+// whenever the shared object is rebuilt, so no kernel change can be priced
+// with a record measured before it. (This is deliberately coarser than a
+// kernel-specific version: a conservative extra warm-up is cheaper than a
+// silently stale price.)
+std::string shared_object_identity() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&shared_object_identity), &info) == 0 ||
+      info.dli_fname == nullptr)
+    return "nostat";
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(info.dli_fname, ec);
+  if (ec) return "nostat";
+  const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
+  if (ec) return "nostat";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%llx-%llx",
+                (unsigned long long)size,
+                (unsigned long long)mtime.time_since_epoch().count());
+  return buf;
+}
+
+// The verify-dispatch fingerprint: schema, build identity, the runtime
+// switches that select a different verify kernel, and the numerics profile
+// (it fixes the KV element type). A change in any of them makes every cached
+// cost stale, so the key changes and the policy warms up again.
+std::string spec_kernel_fingerprint() {
+  uint64_t h = 0xcbf29ce484222325ull;
+  const auto add = [&h](std::string_view s) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 0x100000001b3ull;
+    }
+    h ^= 0xff;
+    h *= 0x100000001b3ull;
+  };
+  add("spec-cost");
+  add(std::to_string(kSpecCostSchema));
+#ifdef SONICBOOM_VERSION_STRING
+  add(SONICBOOM_VERSION_STRING);
+#else
+  add("dev");
+#endif
+  add(shared_object_identity());
+  add(env_value("SONICBOOM_SPEC_VERIFY_BATCH"));
+  // A capped measurement prices only the lengths it can reach and extrapolates
+  // the rest, so its record is not a substitute for the full envelope's.
+  add(std::to_string(spec_max_drafts()));
+  add(env_value("SONICBOOM_VERIFY_GEMV_REUSE"));
+  add(env_value("SONICBOOM_VERIFY_GEMV_WP"));
+#ifdef SONICBOOM_USE_CUDA
+  add(quant::cuda::q8_1_enabled() ? "q8_1" : "no-q8_1");
+  add(quant::cuda::mmq_enabled() ? "mmq" : "no-mmq");
+  add(std::to_string(quant::cuda::mmq_min_n()));
+#endif
+  // Host-only resolution: the device reduce mode would query (and thus
+  // initialize) CUDA, and the cost records already live in the per-device tune
+  // directory. The env override is what a process can change per launch.
+  add(planner::reduce_mode_env()
+          ? std::to_string(int(*planner::reduce_mode_env()))
+          : "auto");
+  // Resolving the profile records a per-device decision (which queries CUDA).
+  // Before anything has resolved it, the env switch is the whole input.
+  add(numerics_profile_resolved()
+          ? std::to_string(int(numerics_profile()))
+          : env_value("SONICBOOM_NUMERICS"));
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
+  return buf;
+}
+
+} // namespace
+
+std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
+                                uint64_t n_ctx) {
+  return std::string("v3|") + (arch ? arch : "unknown") + "|e" +
+         std::to_string(embedding_length) + "|ctx=" + spec_ctx_class(n_ctx) +
+         "|k=" + spec_kernel_fingerprint();
+}
+
+bool spec_cost_record_valid(std::span<const double> cost_us) {
+  if (cost_us.empty() || !(cost_us[0] > 0.0)) return false;
+  // A decode step is tens of microseconds to a few hundred milliseconds. A
+  // value outside that range is a unit error or a corrupt record, not a price
+  // worth keeping.
+  if (cost_us[0] < 100.0 || cost_us[0] > 6.0e7) return false;
+  for (size_t k = 1; k < cost_us.size(); ++k) {
+    if (!(cost_us[k] > 0.0)) continue;
+    // A longer verify priced above the whole range is corrupt too. A dip
+    // between measured lengths is noise (the medians are independent samples),
+    // not corruption: spec_costs_isotonic repairs it before the curve is used.
+    if (cost_us[k] / cost_us[0] > 64.0) return false;
+  }
+  return true;
+}
+
+void spec_costs_isotonic(std::span<double> cost_us) {
+  // Pool adjacent violators over the measured (positive) entries, in index
+  // order: push each value as its own block, then merge backwards while the
+  // previous block's mean exceeds the current one. Equal blocks are the
+  // least-squares non-decreasing fit, so an isolated noisy dip is averaged
+  // into its neighbours instead of being overwritten by a hard clamp.
+  struct Block {
+    size_t first;  // first position in the measured sequence
+    size_t count;
+    double sum;
+  };
+  std::vector<size_t> pos;  // measured positions, in index order
+  pos.reserve(cost_us.size());
+  for (size_t k = 0; k < cost_us.size(); ++k)
+    if (cost_us[k] > 0.0) pos.push_back(k);
+  if (pos.size() < 2) return;
+  std::vector<Block> blocks;
+  blocks.reserve(pos.size());
+  for (size_t i = 0; i < pos.size(); ++i) {
+    blocks.push_back(Block{i, 1, cost_us[pos[i]]});
+    while (blocks.size() >= 2) {
+      const Block& prev = blocks[blocks.size() - 2];
+      const Block& cur = blocks.back();
+      if (prev.sum / double(prev.count) <= cur.sum / double(cur.count)) break;
+      Block merged{prev.first, prev.count + cur.count, prev.sum + cur.sum};
+      blocks.pop_back();
+      blocks.back() = merged;
+    }
+  }
+  for (const Block& b : blocks) {
+    const double mean = b.sum / double(b.count);
+    for (size_t i = 0; i < b.count; ++i) cost_us[pos[b.first + i]] = mean;
+  }
 }
 
 namespace {
@@ -1213,10 +1517,12 @@ void spec_counters_reset() { g_spec_counters = SpecCounters{}; }
 // free-form text (high entropy: no repetition to look up).
 enum class SpecDiagKind : uint8_t {
   Plain = 0,      // k == 0: the captured single-token decode step
-  Bootstrap,      // S2 forced exploration (k = kSpecBootstrapDrafts)
+  Bootstrap,      // B7 v2: evidence bootstrap (real drafter proposals)
   Warm,           // B7 cost warm-up (forced k)
   Policy,         // the adaptive policy chose k
   Fixed,          // spec=on: the drafter's fixed cap chose k
+  Explore,        // B7 v2: a k = 0 iteration spent its exploration credit
+  Probe,          // B7 v2: a fully accepted run probed the full depth
 };
 
 struct SpecDiagEntry {
@@ -1280,7 +1586,8 @@ static void spec_diag_emit(uint64_t token) {
 static void spec_diag_dump(const char* strategy) {
   SpecDiagState& d = spec_diag();
   if (!d.enabled) return;
-  const char* kinds[] = {"plain", "bootstrap", "warm", "policy", "fixed"};
+  const char* kinds[] = {"plain", "bootstrap", "warm", "policy", "fixed",
+                         "explore", "probe"};
   const uint64_t shown = std::min<uint64_t>(d.total, kSpecDiagRing);
   const uint64_t first = d.total - shown;
   std::fprintf(stderr, "[spec-diag] call=%llu strategy=%s steps=%llu shown=%llu\n",
@@ -1534,29 +1841,42 @@ static bool ir_program_enabled() {
   return v;
 }
 
-// The speculative draft cap (B6). One speculative step runs at most
-// kSpecMaxDrafts + 1 verify rows, which is the envelope the row-invariant
-// verify step was built and tested for (B3's verify_k1..k7 classes); B7's
-// per-step length policy stays inside it.
-constexpr int64_t kSpecMaxDrafts = 7;
+// SONICBOOM_REPRO_PREFILL=decode runs a prompt through the row-invariant verify
+// graph in chunks of at most kMaxVerifyRows rows instead of the batched prefill
+// graph, so its KV is written by exactly the arithmetic a plain decode step
+// uses at each position. A full prefill and a prefix-reuse suffix then produce
+// the same KV row for a shared position, which the batched prefill cannot
+// guarantee (a position computed inside a multi-token segment differs from the
+// one-token segment a reuse boundary can leave). Opt-in: the batched path is
+// the default because it is far faster. Requires a session (the reuse identity
+// is a property of the session cache); without one the normal prefill runs.
+static bool repro_prefill_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_REPRO_PREFILL");
+    return e && std::string_view(e) == "decode";
+  }();
+  return v;
+}
 
-// S2 bootstrap draft length: the adaptive policy's forced exploration length.
-// S3 starts at k = 1: the bootstrap only has to supply the EMA with accept /
-// reject data, and on a workload without matches every extra forced draft is
-// verify cost the abort cannot refund.
-constexpr int64_t kSpecBootstrapDrafts = 1;
+// kSpecMaxDrafts (the speculative draft cap) is defined above the policy
+// functions, which need it.
 
 // SONICBOOM_SPEC selects the generation loop:
-//   off  the plain greedy loop (B1's program, step per token);
-//   on   the speculative program: draft, verify, accept;
-//   auto the same program with the draft length decided by policy (B7).
+//   off      the plain greedy loop (B1's program, step per token);
+//   on       the speculative program: draft, verify, accept;
+//   auto     the same program with the draft length decided by policy (B7);
+//   reckless auto's policy, but the verify rows run through the batch prefill
+//            kernels instead of the decode graph dealt over rows. That is
+//            faster on the batched matmuls and gives up the row-invariance
+//            guarantee: a speculative run may emit a different token stream
+//            than plain decoding would (the mode logs this once).
 // Unset is V2's probe: the first generation call measures one plain decode
 // step against one k=1 verify step on this GPU (cached per SM in the Q1
 // autotune file) and picks auto below the threshold, off at or above it. The
 // probe is a startup cost, once per GPU; an explicit SONICBOOM_SPEC bypasses
 // it. Until the probe has decided, Undecided answers like Off, so the greedy
 // runtime is built (and the probe then rebuilds it if it selects auto).
-enum class SpecMode { Undecided, Off, On, Auto };
+enum class SpecMode { Undecided, Off, On, Auto, Reckless };
 
 // The explicit environment choice. Undecided means "no override": the probe
 // decides, once, and stores the result in g_spec_mode.
@@ -1567,8 +1887,9 @@ static SpecMode env_spec_mode() {
     if (std::string_view(e) == "off") return SpecMode::Off;
     if (std::string_view(e) == "on") return SpecMode::On;
     if (std::string_view(e) == "auto") return SpecMode::Auto;
+    if (std::string_view(e) == "reckless") return SpecMode::Reckless;
     std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
-              << "' (expected off|on|auto); using off\n";
+              << "' (expected off|on|auto|reckless); using off\n";
     return SpecMode::Off;
   }();
   return mode;
@@ -1585,7 +1906,17 @@ static SpecMode spec_mode() {
 
 static bool spec_enabled() {
   const SpecMode m = spec_mode();
-  return m == SpecMode::On || m == SpecMode::Auto;
+  return m == SpecMode::On || m == SpecMode::Auto ||
+         m == SpecMode::Reckless;
+}
+
+// Reckless verify rows run through the batch prefill kernels, whose arithmetic
+// is not the decode step's. The strict numerics profile is a promise that the
+// decode path is a fixed reference, so the combination is refused instead of
+// silently picking one contract over the other.
+bool spec_reckless_unsupported() {
+  return spec_mode() == SpecMode::Reckless &&
+         numerics_profile() == NumericsProfile::Strict;
 }
 
 // Read the program back out of the lifted module. The program verifier has
@@ -1660,6 +1991,56 @@ static bool program_stop(const GreedyProgramDesc& p, int64_t token,
          p.eos_tokens.end();
 }
 
+// One plain greedy decode step over a fed (token, pos): stage the position,
+// launch the step — one replay of the captured step graph, or the same graph
+// through the executor when the capture is not replayable — run `after_launch`
+// while the launch is still in flight, then read back the argmax the step
+// wrote. Returns -1 on failure (with the executor's message in `err` when it
+// failed there). Both loops run this one step: the spec-off loop feeds the
+// previous step's argmax (the device token slot already holds it), the
+// speculative loop feeds the token it accepted and seeds it first. The
+// speculative loop passes its host-side drafter update as `after_launch`, so
+// that work overlaps the GPU instead of delaying the launch.
+template <class AfterLaunch>
+static int64_t greedy_step(DecodeRuntime& rt, uint64_t token, uint64_t pos,
+                           bool replay_ok, AfterLaunch&& after_launch,
+                           std::string* err = nullptr,
+                           bool time_step = false) {
+  if (!rt.cuda->set_pos(pos)) return -1;
+  if (replay_ok) {
+    hal::StepProgram* step_prog = rt.step_at(pos);
+    // Timing is opt-in (the speculative loop's cost refinement): the default
+    // decode path records no events, so it pays nothing for the measurement.
+    // A failed measurement never fails the step; it just leaves it unpriced.
+    if (!step_prog) return -1;
+    const bool timed = time_step && step_prog->timing_begin();
+    if (!step_prog->replay()) return -1;
+    if (timed) step_prog->timing_end();
+    after_launch();
+    float next_f = -1.0f;
+    if (!rt.cuda->read_token(&next_f)) return -1;
+    return int64_t(next_f);
+  }
+  std::vector<sx::Bytes> in;
+  in.push_back(encode_i64(token));
+  in.push_back(encode_i64(pos));
+  auto res = rt.exec->execute(rt.plan, rt.snap, in);
+  after_launch();
+  if (!res) {
+    if (err) *err = res.error().message;
+    return -1;
+  }
+  if (res->outputs.empty()) {
+    if (err) *err = "no outputs";
+    return -1;
+  }
+  if (res->outputs[0].size() < sizeof(float)) {
+    if (err) *err = "argmax too small";
+    return -1;
+  }
+  return int64_t(*reinterpret_cast<const float*>(res->outputs[0].data()));
+}
+
 // Execute the program's decode loop from `step` (the caller has already emitted
 // `step` tokens and `token` is the next input, at `pos`). The step node is one
 // StepProgram replay — k chained steps per replay in chunk mode — the sample
@@ -1722,18 +2103,12 @@ static uint64_t run_program_steps(
       // SONICBOOM_NVTX so nsys can isolate one steady-state decode window.
       const std::string name = "decode_step_" + std::to_string(step);
       if (nvtx_enabled()) nvtxRangePushA(name.c_str());
-      rt.cuda->set_pos(pos);
-      hal::StepProgram* step_prog = rt.step_at(pos);
-      if (!step_prog || !step_prog->replay()) {
-        if (nvtx_enabled()) nvtxRangePop();
+      const int64_t next = greedy_step(rt, token, pos, replay_ok, [] {});
+      if (nvtx_enabled()) nvtxRangePop();
+      if (next < 0) {
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
       }
-      float next_f = -1.0f;
-      rt.cuda->read_token(&next_f);
-      if (nvtx_enabled()) nvtxRangePop();
-      const int64_t next = int64_t(next_f);
-      if (next < 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -1744,27 +2119,14 @@ static uint64_t run_program_steps(
   } else {
     // No re-playable graph: the step node is one executor dispatch.
     for (; step < limit; ++step) {
-      rt.cuda->set_pos(pos);
-      std::vector<sx::Bytes> in;
-      in.push_back(encode_i64(token));
-      in.push_back(encode_i64(pos));
-      auto res = rt.exec->execute(rt.plan, rt.snap, in);
-      if (!res || res->outputs.empty()) {
-        if (!res)
-          std::cerr << "[program] step " << step << " execute failed: "
-                    << res.error().message << "\n";
-        else
-          std::cerr << "[program] step " << step << " no outputs\n";
+      std::string err;
+      const int64_t next =
+          greedy_step(rt, token, pos, /*replay_ok=*/false, [] {}, &err);
+      if (next < 0) {
+        std::cerr << "[program] step " << step << " execute failed: " << err
+                  << "\n";
         break;
       }
-      const sx::Bytes& arg = res->outputs[0];
-      if (arg.size() < sizeof(float)) {
-        std::cerr << "[program] step " << step << " argmax too small: "
-                  << arg.size() << " < " << sizeof(float) << "\n";
-        break;
-      }
-      const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
-      if (next < 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -1776,54 +2138,82 @@ static uint64_t run_program_steps(
   return step;
 }
 
-// B7: state of the adaptive draft-length policy for one generation call.
+// B7 v2: state of the adaptive draft-length policy for one generation call.
 // `cost_us[k]` is the measured cost of an iteration that verifies k drafts
-// (0 = unmeasured), `alpha` the acceptance-rate EMA, and `warm_next` the next
-// draft length the warm-up still has to measure (negative when it is done).
-// Without a cost cache (autotune disabled) every cost stays unmeasured and the
-// policy reduces to the fixed cap, i.e. `on`'s behavior.
+// (0 = unmeasured), `draft_us[k]` the measured CPU cost of proposing k drafts,
+// and `warm_next` the next draft length the warm-up still has to measure
+// (negative when it is done). Without a cost cache (autotune disabled) every
+// cost stays unmeasured and the policy reduces to the fixed cap, i.e. `on`'s
+// behavior.
+//
+// Acceptance is recorded as bounded (proposed, accepted) pairs rather than a
+// scalar rate: `spec_expected_run` reads per-position hazards from the window,
+// which is what keeps a copy block (accept 3 of 3, then reject) from pricing
+// like independent coin flips. The window is a ring of 64, so the estimate
+// follows a workload whose behaviour changes.
 struct SpecLengthPolicy {
   static constexpr int kMax = int(kSpecMaxDrafts);
+  static constexpr size_t kWindow = 64;
   std::string key;
   std::array<double, kMax + 1> cost_us{};
-  double alpha = 0.5;          // alpha0
+  std::array<double, kMax + 1> draft_us{};
+  std::array<uint32_t, kWindow> proposed{};
+  std::array<uint32_t, kWindow> accepted{};
+  size_t obs_count = 0;
+  size_t obs_next = 0;
+  double alpha = 0.5;          // diagnostics only: accepted/drafted EMA
   int64_t warm_next = -1;      // next k to warm up, < 0 when done
   bool warm_primed = false;    // the first pass at warm_next has run
-  // S2 bootstrap: forced k = 1 iterations still owed after the warm-up. The
-  // cost model cannot break its own cold start: with alpha at its 0.5 prior,
-  // k = 0 wins for any nearly-linear cost curve, no draft is ever proposed, so
-  // alpha is never updated. The bootstrap supplies the drafts the EMA needs.
-  uint64_t bootstrap_left = 0;
-  // S3 early abort: consecutive bootstrap verify steps that accepted nothing.
-  // A workload the drafter cannot match will never teach the EMA anything, so
-  // five rejects in a row end the bootstrap instead of paying 50 iterations.
-  uint64_t consecutive_zero_accept = 0;
+  // B7 v2 bootstrap: real drafter proposals (at the affordable depth) until
+  // enough evidence exists to choose a budget, or until the workload shows it
+  // has nothing to match. The old synthetic last-token probe is gone: it
+  // measured the drafter's rejection, not its availability, and steered the
+  // policy to k = 0 for whole calls on copy-heavy workloads.
+  uint64_t bootstrap_left = 0;   // iterations the bootstrap may still spend
+  uint64_t bootstrap_obs = 0;    // real-proposal verifications observed
+  uint64_t bootstrap_streak = 0; // consecutive no-proposal/no-accept iterations
+  // k = 0 recovery: a workload can start repetitive later (code edit: prose
+  // then a patch). Credit accrues every k = 0 iteration (in thousandths, so
+  // the decision is integer-exact); spending one unit proposes for real and,
+  // if the drafter has a match, verifies at a shallow depth. Bounded and
+  // deterministic, so it cannot oscillate.
+  uint64_t explore_credit = 0;
+  uint64_t since_explore = 0;
+  int64_t current_k = -1;  // the last verified length (hysteresis reference)
+  // Deep-probe evidence: a run of fully accepted rounds at current_k means the
+  // policy has not seen a rejection there, but it has also not sampled deeper
+  // positions (a round proposing k only supplies evidence at positions <= k).
+  // After kSpecProbeRun such rounds, one round every kSpecProbeEvery verifies
+  // at the full allowed depth so reach at deep positions is refreshed rather
+  // than carried forward forever.
+  uint64_t full_run = 0;    // consecutive rounds with accepted == k (k > 0)
+  uint64_t since_probe = 0; // policy iterations since the last deep probe
 };
 
-// SONICBOOM_SPEC_BOOTSTRAP (default 50, 0 disables): number of adaptive
-// iterations after the cost warm-up that force k = 1. Parsed once per process,
-// like SONICBOOM_SPEC.
-//
-// S4 tried exploring with real drafter proposals and a lower default (8). It
-// was reverted with the rest of the S4 behavior changes: the measured cost of
-// one k=1 verify is 2.06 plain steps, so exploration only pays above ~100%
-// acceptance, and on the coding trace the experiments cost more than the
-// k=7 verifies they occasionally unlocked (see the S4 report section).
+// SONICBOOM_SPEC_BOOTSTRAP (default 16, 0 disables): the most adaptive
+// iterations the evidence bootstrap may spend after the cost warm-up. It ends
+// early once kSpecBootstrapObs real proposals have been verified, or after
+// SONICBOOM_SPEC_BOOTSTRAP_ABORT consecutive iterations with no proposal or no
+// acceptance. Eight iterations is enough for a copy-heavy workload to show its
+// hazards; the cap only matters for a workload that matches without accepting.
 static uint64_t spec_bootstrap_steps() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP");
-    if (!e || !*e) return uint64_t(50);
+    if (!e || !*e) return uint64_t(16);
     const long v = std::strtol(e, nullptr, 10);
     return v > 0 ? uint64_t(v) : uint64_t(0);
   }();
   return n;
 }
 
+// Observations after which the bootstrap hands over to the policy: the hazard
+// estimate needs a few real verifications, not a fixed iteration count.
+constexpr uint64_t kSpecBootstrapObs = 3;
+
 // SONICBOOM_SPEC_BOOTSTRAP_ABORT (default 5, 0 disables): consecutive
-// bootstrap verify steps that accept no draft before the bootstrap gives up
-// and the policy takes over. A workload without drafter matches never updates
-// alpha usefully, so the remaining forced iterations are pure verify cost.
-// 0 restores the fixed SONICBOOM_SPEC_BOOTSTRAP stepping (the S2 ablation).
+// bootstrap iterations that propose nothing or accept nothing before the
+// bootstrap gives up and the policy takes over (it will choose k = 0 and rely
+// on exploration credit to notice a later switch to repetitive output).
 static uint64_t spec_bootstrap_abort() {
   static const uint64_t n = [] {
     const char* e = std::getenv("SONICBOOM_SPEC_BOOTSTRAP_ABORT");
@@ -1834,44 +2224,574 @@ static uint64_t spec_bootstrap_abort() {
   return n;
 }
 
-// The warm-up measures c(k) once per (model shape, context class) on this GPU:
-// k = 0..min(7, room) in turn, each iteration timed whole (the second pass at
-// each k: the first absorbs that row count's runtime construction and capture).
-// The costs are cached in the autotune cache under "spec-length"; later runs
-// load them and skip the warm-up. The context class keeps a long-context
-// session's KV traffic from being priced with a short-context measurement (the
-// cache class only widens the key; the kernel/tile choices stay keyed by shape
-// class as before).
+// The policy's switching margin: adopt a different k only if it scores at
+// least 3% better than the current one. Verify costs are measured on a noisy
+// GPU, so without hysteresis the choice would flip between adjacent lengths.
+constexpr double kSpecSwitchMargin = 0.03;
+
+// Exploration cadence: 20 thousandths of credit per k = 0 iteration (one
+// lookup per 50 iterations once the credit is full), spent only after at least
+// 8 iterations without one. A match is verified at no more than
+// kSpecExploreDepth drafts (the cheapest verify that can accept a block); a
+// miss costs only the drafter lookup, no verify.
+constexpr uint64_t kSpecExploreRateMilli = 20;
+constexpr uint64_t kSpecExploreCreditMilli = 1000;
+constexpr uint64_t kSpecExploreSpacing = 8;
+constexpr int64_t kSpecExploreDepth = 2;
+
+// Deep-probe cadence: after kSpecProbeRun consecutive fully accepted rounds,
+// one round every kSpecProbeEvery verifies at the full allowed depth. A round
+// that proposes k only informs positions 1..k, so a policy that settles on a
+// short k stops learning whether deeper drafts are still accepted; the probe
+// refreshes that evidence. It is a real verify (its drafts can be accepted),
+// requires a run with no rejection at all, and fires at k < max_k only, so a
+// workload the policy already runs at full depth never pays it.
+constexpr uint64_t kSpecProbeRun = 8;
+constexpr uint64_t kSpecProbeEvery = 32;
+
+// Cross-call evidence is capped to the most recent verified rounds: enough to
+// carry a workload's hazards from one turn to the next, small enough that a
+// different workload in the same process (a coding request followed by chat)
+// is corrected within a few verifies instead of only after the whole 64-round
+// window has turned over.
+constexpr size_t kSpecEvidenceCarry = 16;
+
+// Online refinement of the verify cost curve.
+//
+// The load anchors price five lengths once; every real step then contributes a
+// measured device time for its own k. A reading is taken with events recorded
+// around the captured replay on the program's own stream and read back without
+// waiting — the step's own token readback has already drained it — so
+// refinement adds no synchronization. Readings are kept per cost-record
+// identity (model shape, context class, verify kernel build) in a ring of the
+// last 16; once a ring holds three observations its median replaces the anchor
+// for that k, and the medians are written back to the cost record when the
+// session is freed.
+struct SpecCostRing {
+  static constexpr int kN = 16;
+  std::array<double, kN> v{};
+  int n = 0;
+  int next = 0;
+  void push(double ms) {
+    v[size_t(next)] = ms;
+    next = (next + 1) % kN;
+    if (n < kN) ++n;
+  }
+  bool median(double* out) const {
+    if (n < 3) return false;
+    std::array<double, kN> c = v;
+    std::sort(c.begin(), c.begin() + n);
+    *out = c[size_t(n / 2)];
+    return true;
+  }
+};
+
+static std::mutex g_spec_cost_mutex;
+// Keyed by the cost record's identity, so a refined median is applied to
+// exactly the record (and the calls) it was measured for.
+static std::map<std::string,
+                std::array<SpecCostRing, size_t(SpecLengthPolicy::kMax) + 1>>
+    g_spec_cost_rings;
+
+static std::string spec_cost_identity(const Gemma4Model& m, uint64_t n_ctx) {
+  std::string key = spec_cost_cache_key(
+      m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2",
+      m.config.embedding_length, n_ctx);
+  // The verify path is part of what a price means: reckless prices the prefill
+  // kernels, every other mode the decode-dealt verify set. Sharing one record
+  // would price one path from the other's timings, so the mode is in the key.
+  if (spec_mode() == SpecMode::Reckless) key += "|vm=reckless";
+  return key;
+}
+
+// One observed step time (ms) for length k.
+static void spec_note_step_ms(const Gemma4Model& m, uint64_t n_ctx, int k,
+                              double ms) {
+  if (!(ms > 0.0) || k < 0 || k > SpecLengthPolicy::kMax) return;
+  std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+  g_spec_cost_rings[spec_cost_identity(m, n_ctx)][size_t(k)].push(ms);
+}
+
+// The refined median for k in µs, when the ring holds enough observations.
+static bool spec_refined_cost_us(const Gemma4Model& m, uint64_t n_ctx, int k,
+                                 double* us) {
+  std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+  const auto it = g_spec_cost_rings.find(spec_cost_identity(m, n_ctx));
+  if (it == g_spec_cost_rings.end()) return false;
+  double ms = 0.0;
+  if (!it->second[size_t(k)].median(&ms)) return false;
+  *us = ms * 1000.0;
+  return true;
+}
+
+// Replace k's anchor/interpolated price with the refined median, if any, for
+// one length (called after each real step it prices).
+static void spec_refine_cost(const Gemma4Model& m, uint64_t n_ctx,
+                             SpecLengthPolicy& p, int k) {
+  double us = 0.0;
+  if (spec_refined_cost_us(m, n_ctx, k, &us)) p.cost_us[size_t(k)] = us;
+  // One freshly measured point, one re-projection: the live curve the policy
+  // prices from is always non-decreasing.
+  spec_costs_isotonic(p.cost_us);
+}
+
+// Fold every refined median into a whole curve (call start).
+static void spec_apply_refined_costs(
+    const Gemma4Model& m, uint64_t n_ctx,
+    std::array<double, size_t(SpecLengthPolicy::kMax) + 1>& cost_us) {
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    double us = 0.0;
+    if (spec_refined_cost_us(m, n_ctx, k, &us)) cost_us[size_t(k)] = us;
+  }
+  // Medians are independent samples; the merged curve must still be
+  // non-decreasing before the policy prices lengths from it.
+  spec_costs_isotonic(cost_us);
+}
+
+// The warm-up measures c(k) once per (model shape, context class, verify
+// kernel identity) on this GPU: k = 0..min(7, room) in turn, each iteration
+// timed whole (the second pass at each k: the first absorbs that row count's
+// runtime construction and capture). The costs are cached in the autotune cache
+// under "spec-length"; later runs load them and skip the warm-up. The key
+// carries the context class and the kernel/dispatch fingerprint, so a record is
+// only reused by the same verify implementation at the same KV scale; a
+// structurally invalid record (unit error, corrupt) is discarded instead of
+// priced, while a noisy dip inside an otherwise plausible record is projected
+// onto the monotone cone instead of discarding the whole measurement.
 static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
-  const char* cls = n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
-  // v1: the key version separates costs measured on this loop's code from an
-  // older binary's (a cost is only meaningful for the kernels that produced it).
-  p.key = std::string("v1|") +
-          (m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") + "|e" +
-          std::to_string(m.config.embedding_length) + "|ctx=" + cls;
+  p.key = spec_cost_identity(m, n_ctx);
   const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
-  bool any = false;
+  std::array<double, SpecLengthPolicy::kMax + 1> read{};
+  bool complete = true;
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
     const auto it = cached.find("c" + std::to_string(k));
-    if (it != cached.end() && it->second > 0) {
-      p.cost_us[size_t(k)] = double(it->second);
-      any = true;
-    }
+    if (it != cached.end() && it->second > 0)
+      read[size_t(k)] = double(it->second);
+    else
+      complete = false;
   }
-  if (!any) p.warm_next = 0;
+  if (!complete || !spec_cost_record_valid(read)) {
+    // Incomplete (a run ended before the warm-up finished) or structurally
+    // invalid: measure. A stale v1 record is never looked up at all: its key
+    // does not match v2's.
+    p.warm_next = 0;
+    return;
+  }
+  p.cost_us = read;
+  // Measurements this process already refined override their anchors.
+  spec_apply_refined_costs(m, n_ctx, p.cost_us);
 }
 
 static void spec_policy_store(const SpecLengthPolicy& p) {
   std::map<std::string, int> values;
+  auto cost_us = p.cost_us;
+  // A run that ended mid warm-up stores a partial curve; project what it has,
+  // so the stored record is monotone across its measured entries.
+  spec_costs_isotonic(cost_us);
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
-    if (p.cost_us[size_t(k)] > 0.0) {
+    if (cost_us[size_t(k)] > 0.0) {
       values["c" + std::to_string(k)] =
-          std::max(1, int(std::lround(p.cost_us[size_t(k)])));
+          std::max(1, int(std::lround(cost_us[size_t(k)])));
     }
   }
   if (!values.empty()) tune::store("spec-length", p.key, values);
+}
+
+// Fold the process's refined medians into the stored cost records. Called
+// when a session is freed, so the next process starts from the curve this one
+// measured. The record identity carries the kernel fingerprint, so a rebuilt
+// verify kernel never inherits a price; every context class of this model shape
+// is flushed (the refined value exists only where this process really ran that
+// length at that class).
+static void spec_flush_refined_costs(const Gemma4Model& m) {
+  if (!tune::enabled()) return;
+  const std::string prefix =
+      std::string("v3|") +
+      (m.config.arch == ModelArch::Gemma4 ? "gemma4" : "qwen2") + "|e" +
+      std::to_string(m.config.embedding_length) + "|ctx=";
+  std::vector<std::pair<std::string,
+                        std::array<double, size_t(SpecLengthPolicy::kMax) + 1>>>
+      ready;
+  {
+    std::lock_guard<std::mutex> lk(g_spec_cost_mutex);
+    for (const auto& [key, rings] : g_spec_cost_rings) {
+      if (key.compare(0, prefix.size(), prefix) != 0) continue;
+      std::array<double, size_t(SpecLengthPolicy::kMax) + 1> us{};
+      bool any = false;
+      for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+        double ms = 0.0;
+        if (rings[size_t(k)].median(&ms)) {
+          us[size_t(k)] = ms * 1000.0;
+          any = true;
+        }
+      }
+      if (any) ready.emplace_back(key, us);
+    }
+  }
+  for (const auto& [key, us] : ready) {
+    const std::map<std::string, int> cached = tune::lookup("spec-length", key);
+    std::array<double, size_t(SpecLengthPolicy::kMax) + 1> curve{};
+    bool any = false;
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+      double v = us[size_t(k)];
+      if (!(v > 0.0)) {
+        const auto it = cached.find("c" + std::to_string(k));
+        if (it != cached.end() && it->second > 0) v = double(it->second);
+      }
+      if (v > 0.0) {
+        curve[size_t(k)] = v;
+        any = true;
+      }
+    }
+    if (!any) continue;
+    // Refined medians and the record's own anchors are independent samples:
+    // project the merged curve before it becomes the next process's anchor.
+    spec_costs_isotonic(curve);
+    std::map<std::string, int> values;
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+      if (curve[size_t(k)] > 0.0)
+        values["c" + std::to_string(k)] =
+            std::max(1, int(std::lround(curve[size_t(k)])));
+    }
+    if (!values.empty()) tune::store("spec-length", key, values);
+  }
+}
+
+// 4b: the load-time cost curve.
+//
+// The curve used to be measured inside the first generation call: every draft
+// length it prices cost two timed iterations at the head of the stream, so the
+// first request's first token carried the whole warm-up and its early iterations
+// ran forced drafts. It is measured here instead — at load, on synthetic rows,
+// before any request — and stored under the same "spec-length" record the
+// policy already reads, so a generation call starts with every length priced.
+//
+// One iteration is timed whole (staging, launch, sync, readback), exactly the
+// span the policy's own measurement covers. Each length gets kWarmCostReps
+// untimed passes (the first absorbs the row count's graph build and capture)
+// and kWarmTimedReps timed ones; the median is the price. The whole measurement
+// runs inside the load budget (a length is not entered when its repetitions
+// cannot fit), so the lengths it does not reach are interpolated (see
+// spec_interpolate_costs) — which is why the order below matters: a budget stop
+// must leave a curve that is usable at both ends, not one anchored where the
+// measurement happened to stop.
+constexpr int kWarmCostReps = 1;
+constexpr int kWarmTimedReps = 3;
+constexpr double kSpecCostLoadBudgetMs = 4000.0;
+// The verify set's share of that budget: its graph builds and its
+// warm-ups/captures are paid within this share, the rest belongs to the cost
+// curve. Every row count the verify step can reach (2..kMaxVerifyRows) is
+// warmed and captured here, so no build and no capture can move into a request.
+constexpr double kSpecVerifySetBudgetMs = 4000.0;
+// The load anchors: one plain step and the four widths that put a knot at the
+// head, at both ends of the useful range, and on the linear middle. The other
+// eleven lengths are interpolated here and refined online from real steps
+// (spec_note_step_ms), so the load measurement pays for shape, not coverage.
+//   - 0 and 1 anchor the head. A 2-row verify costs more than twice a plain
+//     step (the fixed per-verify cost dominates), so interpolating the head
+//     from c(0) underprices k = 1 and makes the policy spend verifies that
+//     cannot pay.
+//   - 3 sits on the head's flat stretch, 7 on the linear part, 15 at the
+//     envelope the policy can reach.
+constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15};
+// Allowance for a length whose row count has not been built yet: the first
+// pass builds the graph and captures it before it can be timed.
+constexpr double kSpecCostCaptureMs = 300.0;
+
+// Fill the lengths the budget did not reach from the ones it did: linear
+// between measured points, and past the deepest measured point the last
+// segment's slope. Verify cost is close to linear in row count (every row
+// repeats the same weight read), so an extrapolated tail is a good estimate
+// rather than a guess. The filled curve is then projected onto the monotone
+// cone: a noisy median must not price a longer verify below a shorter one.
+std::array<double, size_t(SpecLengthPolicy::kMax) + 1> spec_interpolate_costs(
+    const std::array<double, size_t(SpecLengthPolicy::kMax) + 1>& known) {
+  constexpr int n = int(SpecLengthPolicy::kMax) + 1;
+  auto c = known;
+  std::vector<int> idx;
+  idx.reserve(size_t(n));
+  for (int k = 0; k < n; ++k)
+    if (known[size_t(k)] > 0.0) idx.push_back(k);
+  if (idx.size() >= 2) {
+    size_t lo = 0;
+    for (int k = 0; k < n; ++k) {
+      if (known[size_t(k)] > 0.0) continue;
+      while (lo + 1 < idx.size() && idx[lo + 1] < k) ++lo;
+      if (idx[lo] > k) {
+        c[size_t(k)] = known[size_t(idx[lo])];  // below the first measured
+      } else if (lo + 1 == idx.size()) {
+        const int a2 = idx[idx.size() - 2];
+        const int a1 = idx[idx.size() - 1];
+        const double slope =
+            (known[size_t(a1)] - known[size_t(a2)]) / double(a1 - a2);
+        c[size_t(k)] = known[size_t(a1)] + slope * double(k - a1);
+      } else {
+        const int a = idx[lo];
+        const int b = idx[lo + 1];
+        const double t = double(k - a) / double(b - a);
+        c[size_t(k)] = known[size_t(a)] + t * (known[size_t(b)] - known[size_t(a)]);
+      }
+    }
+  }
+  // The independent medians at the knots are noisy in both directions; the
+  // projection makes the whole curve non-decreasing without moving a point
+  // that already is.
+  spec_costs_isotonic(c);
+  return c;
+}
+
+// Measure c(k) for k = 0..kSpecMaxDrafts on synthetic rows and store the curve.
+// Only the adaptive policy prices verify lengths ("on" uses the fixed cap,
+// "off" never verifies), so those modes return without touching the device; an
+// undecided mode is priced too, because the V2 probe may still select auto at
+// the first call. A complete, structurally valid record is reused as-is, but
+// the runtime warm-up below runs either way: it is what keeps the first
+// request free of a first-use graph build, not part of pricing.
+static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
+                                    DecodeRuntime& rt,
+                                    planner::KvCacheSession& session) {
+  if (!tune::enabled()) return;
+  const SpecMode mode = spec_mode();
+  if (mode == SpecMode::Off || mode == SpecMode::On) return;
+  if (!session.caches || session.cache_id == 0) return;
+
+  // The depth the curve is measured at: bounded, so the whole curve fits the
+  // load budget. What the policy compares across lengths is the curve's shape,
+  // and the attention term grows with depth for c(0) and c(k) alike. The rows
+  // the measurement writes are rows the first prefill overwrites before any
+  // attention extent reaches them (the same argument as the V2 probe's rows).
+  const uint64_t pos =
+      n_ctx > uint64_t(planner::kMaxVerifyRows)
+          ? std::min<uint64_t>(n_ctx - uint64_t(planner::kMaxVerifyRows), 512)
+          : 0;
+  const std::vector<uint64_t> feed(size_t(planner::kMaxVerifyRows), 0);
+  std::vector<int64_t> out(size_t(planner::kMaxVerifyRows), -1);
+
+  // Warm-up: build every verify row count the policy can reach and capture the
+  // anchors, so the first request's bootstrap and any later length choice find
+  // their graph already built. Paying that in a request would put 100-300 ms of
+  // graph work inside decode steps (the bootstrap's verify runs before the
+  // first token). Load owns that one-time cost instead; the set is keyed by the
+  // session cache, so later calls at the same context size reuse it.
+
+  SpecLengthPolicy p;
+  p.key = spec_cost_identity(m, n_ctx);
+  const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
+  bool complete = true;
+  for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
+    const auto it = cached.find("c" + std::to_string(k));
+    if (it != cached.end() && it->second > 0)
+      p.cost_us[size_t(k)] = double(it->second);
+    else
+      complete = false;
+  }
+  if (complete && spec_cost_record_valid(p.cost_us)) return;
+
+  const auto t_load = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t_load)
+        .count();
+  };
+  const bool replay_ok =
+      rt.prog && rt.cuda->capture_resources_ok(session.cache_id);
+  const auto plain_us = [&]() -> double {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (greedy_step(rt, 0, pos, replay_ok, [] {}) < 0) return -1.0;
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  std::array<double, size_t(SpecLengthPolicy::kMax) + 1> known{};
+  int measured = 0;
+  double last_us = 0.0;  // the previous knot's median (projection input)
+  for (int64_t k : kSpecCostBand) {
+    if (k > int64_t(SpecLengthPolicy::kMax)) continue;
+    if (k > spec_max_drafts()) continue;  // priced only where it can be used
+    if (pos + uint64_t(k) + 1 > n_ctx) continue;  // no room for k+1 rows
+    // The budget is checked before a length is started and before its timed
+    // passes: a length whose build would overrun it is abandoned rather than
+    // priced from a partial sample. The projection stops a whole length from
+    // being entered when its repetitions cannot fit; the in-loop check below
+    // covers the case where the estimate was too optimistic.
+    if (measured >= 2) {
+      const double est_ms =
+          double(kWarmCostReps + kWarmTimedReps) * last_us / 1000.0 +
+          kSpecCostCaptureMs;
+      if (elapsed_ms() + est_ms > kSpecCostLoadBudgetMs) break;
+    }
+    const size_t rows = size_t(k) + 1;
+    std::vector<double> samples;
+    samples.reserve(size_t(kWarmTimedReps));
+    bool ok = true;
+    for (int i = 0; i < kWarmCostReps + kWarmTimedReps; ++i) {
+      if (i == kWarmCostReps && measured >= 2 &&
+          elapsed_ms() >= kSpecCostLoadBudgetMs) {
+        ok = false;
+        break;
+      }
+      double us = -1.0;
+      if (k == 0) {
+        us = plain_us();
+      } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (verify_step_spine_cuda(
+                m, std::span<const uint64_t>(feed.data(), rows), pos, session,
+                std::span<int64_t>(out.data(), rows)))
+          us = std::chrono::duration<double, std::micro>(
+                   std::chrono::steady_clock::now() - t0)
+                   .count();
+      }
+      if (us < 0.0) {
+        ok = false;
+        break;
+      }
+      if (i >= kWarmCostReps) samples.push_back(us);
+    }
+    if (!ok) continue;  // this length cannot run: leave it to interpolation
+    std::sort(samples.begin(), samples.end());
+    known[size_t(k)] = samples[samples.size() / 2];
+    last_us = known[size_t(k)];
+    ++measured;
+  }
+  if (spec_diag_enabled()) {
+    // The measured points and the budget they consumed, so a diagnostic run can
+    // tell a priced length from an interpolated one.
+    std::fprintf(stderr, "[spec-cost] n=%d load=%.0fms budget=%.0fms",
+                 measured, elapsed_ms(), kSpecCostLoadBudgetMs);
+    for (int k = 0; k <= SpecLengthPolicy::kMax; ++k)
+      if (known[size_t(k)] > 0.0)
+        std::fprintf(stderr, " c%d=%.0f", k, known[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
+  if (measured < 2) return;  // nothing to anchor a curve on: warm up as before
+  p.cost_us = spec_interpolate_costs(known);
+  if (!spec_cost_record_valid(p.cost_us)) return;
+  spec_policy_store(p);
+}
+
+// Per-session evidence store. The cost model is cached per (model shape,
+// context class, verify kernel identity); the acceptance evidence is a
+// property of one conversation's workload, so it lives on the session that
+// measured it. Every generation call on the same session then starts from the
+// hazards that session already observed instead of paying the bootstrap again
+// (on a multi-turn trace that is three extra verifies per turn), while a
+// different session — a concurrent conversation — is never steered by another
+// conversation's acceptance. The store keeps the same bounded window the
+// policy uses and only holds rounds this session actually verified.
+struct SpecEvidenceSlot {
+  std::array<uint32_t, SpecLengthPolicy::kWindow> proposed{};
+  std::array<uint32_t, SpecLengthPolicy::kWindow> accepted{};
+  size_t next = 0;
+  size_t count = 0;
+};
+
+// The session's slot, created on first use.
+static SpecEvidenceSlot& spec_evidence_slot(planner::KvCacheSession& session) {
+  if (!session.spec_evidence)
+    session.spec_evidence = std::make_shared<SpecEvidenceSlot>();
+  return *static_cast<SpecEvidenceSlot*>(session.spec_evidence.get());
+}
+
+// Load this session's observations from earlier calls. Returns true when the
+// window already holds enough verified rounds to skip the bootstrap.
+static bool spec_evidence_load(planner::KvCacheSession& session,
+                               SpecLengthPolicy& p) {
+  if (!session.spec_evidence) return false;
+  const SpecEvidenceSlot& s =
+      *static_cast<const SpecEvidenceSlot*>(session.spec_evidence.get());
+  // Copy the most recent rounds in chronological order, capped.
+  const size_t n = std::min(s.count, kSpecEvidenceCarry);
+  const size_t begin =
+      (s.next + SpecLengthPolicy::kWindow - n) % SpecLengthPolicy::kWindow;
+  p.obs_count = 0;
+  p.obs_next = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const size_t idx = (begin + i) % SpecLengthPolicy::kWindow;
+    p.proposed[p.obs_next] = s.proposed[idx];
+    p.accepted[p.obs_next] = s.accepted[idx];
+    p.obs_next = (p.obs_next + 1) % SpecLengthPolicy::kWindow;
+  }
+  p.obs_count = n;
+  return s.count >= kSpecBootstrapObs;
+}
+
+static void spec_evidence_store(planner::KvCacheSession& session,
+                                const SpecLengthPolicy& p) {
+  SpecEvidenceSlot& s = spec_evidence_slot(session);
+  s.proposed = p.proposed;
+  s.accepted = p.accepted;
+  s.next = p.obs_next;
+  s.count = p.obs_count;
+}
+
+// Record one verification's proposal/accept outcome into the bounded window
+// and refresh the diagnostic EMA.
+static void spec_policy_observe(SpecLengthPolicy& p, size_t k, size_t accepted) {
+  p.proposed[p.obs_next] = uint32_t(k);
+  p.accepted[p.obs_next] = uint32_t(accepted);
+  p.obs_next = (p.obs_next + 1) % SpecLengthPolicy::kWindow;
+  if (p.obs_count < SpecLengthPolicy::kWindow) ++p.obs_count;
+  if (k > 0) {
+    p.alpha = 0.5 * p.alpha + 0.5 * (double(accepted) / double(k));
+  }
+  p.current_k = int64_t(k);
+  // A fully accepted round extends the run that earns a deep probe; any
+  // rejection (or a plain step, which never reaches here) ends it.
+  if (k > 0 && accepted == k)
+    ++p.full_run;
+  else
+    p.full_run = 0;
+  ++p.since_probe;
+}
+
+static double spec_policy_expected(const SpecLengthPolicy& p, int64_t k) {
+  return spec_expected_run(
+      std::span<const uint32_t>(p.proposed.data(), p.obs_count),
+      std::span<const uint32_t>(p.accepted.data(), p.obs_count), k);
+}
+
+static int64_t spec_policy_choose(const SpecLengthPolicy& p, int64_t max_k,
+                                  bool* probe) {
+  std::span<const double> costs(p.cost_us.data(), size_t(max_k) + 1);
+  std::span<const double> drafts(p.draft_us.data(), size_t(max_k) + 1);
+  std::array<double, SpecLengthPolicy::kMax + 1> e{};
+  for (int64_t k = 0; k <= max_k; ++k) e[size_t(k)] = spec_policy_expected(p, k);
+  int64_t chosen =
+      spec_choose_budget(costs, drafts,
+                         std::span<const double>(e.data(), size_t(max_k) + 1),
+                         max_k, p.current_k, kSpecSwitchMargin);
+  if (probe) *probe = false;
+  // Deep-probe: the policy is verifying and has not seen a rejection in a
+  // while, but rounds at k < max_k only supply evidence at positions <= k.
+  // Refresh the deep reach by verifying at the full allowed depth once per
+  // cadence; without this the estimator keeps carrying the short k's evidence
+  // to deeper positions and the policy can never discover that a longer
+  // proposal pays.
+  if (probe && chosen > 0 && p.current_k > 0 && p.current_k < max_k &&
+      p.full_run >= kSpecProbeRun && p.since_probe >= kSpecProbeEvery) {
+    chosen = max_k;
+    *probe = true;
+  }
+  // S4: one line per decision, so a diagnostic run can say why the policy
+  // chose what it chose (the estimated emitted run and the prices behind it).
+  if (spec_diag_enabled()) {
+    std::fprintf(stderr,
+                 "[spec-choice] max_k=%lld chosen=%lld current=%lld obs=%zu "
+                 "full_run=%llu probe=%d E=",
+                 (long long)max_k, (long long)chosen, (long long)p.current_k,
+                 p.obs_count, (unsigned long long)p.full_run,
+                 probe && *probe ? 1 : 0);
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "", e[size_t(k)]);
+    std::fprintf(stderr, " c=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.0f", k ? "," : "", p.cost_us[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
+  return chosen;
 }
 
 // Execute the program's speculative loop from (token, pos, step). One
@@ -1891,18 +2811,59 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
 // seeds the drafter, and the drafter only ever proposes — acceptance is the
 // verifier's decision. In `auto` mode the policy above chooses each
 // iteration's draft length.
+// Device time (ms) of the last captured verify step at this width, or 0 when
+// the step ran uncaptured or the end event has not completed yet (never
+// blocks). Defined with the verify runtime below; feeds the cost refiner.
+static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
+                                  int rows,
+                                  const planner::KvCacheSession& session);
+
+// spec-r3 measurement knobs. Both are read once; unset keeps today's
+// behaviour, so neither changes the engine unless explicitly set.
+static bool spec_force_plain() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_FORCE_PLAIN");
+    return e != nullptr && std::string_view(e) == "1";
+  }();
+  return v;
+}
+
+static bool spec_time_steps() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC_TIME_STEPS");
+    return e == nullptr || std::string_view(e) != "0";
+  }();
+  return v;
+}
+
 static uint64_t run_spec_program_steps(
     const Gemma4Model& m, DecodeRuntime& rt, const GreedyProgramDesc& p,
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
     planner::KvCacheSession& session, std::span<const uint64_t> history,
     std::chrono::steady_clock::time_point* first_out = nullptr,
     const char* strategy_override = nullptr) {
+  // First-use counters move only while this scope is live (see
+  // spec_diag_counters.h); the values are printed, as a per-call delta, at the
+  // end of the call below.
+  diag::SpecDiagRequestScope diag_scope;
+  const bool diag_on = spec_diag_enabled();
+  const diag::SpecDiagSnapshot diag_entry =
+      diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
+  struct VerifyWall {
+    size_t iter = 0;
+    size_t k = 0;
+    double wall_ms = 0.0;
+    diag::SpecDiagSnapshot before;
+    diag::SpecDiagSnapshot after;
+  };
+  std::vector<VerifyWall> verify_walls;
   const uint64_t limit = p.max_tokens > 0
                              ? std::min<uint64_t>(uint64_t(p.max_tokens),
                                                   tokens.size())
                              : tokens.size();
   const size_t cap =
-      size_t(std::min<int64_t>(p.max_drafts, kSpecMaxDrafts));
+      size_t(std::min<int64_t>({p.max_drafts, kSpecMaxDrafts,
+                                spec_max_drafts()}));
   if (cap == 0 || !session.caches || session.n_ctx == 0) {
     std::cerr << "[spec] the speculative loop needs a drafter cap and a "
                  "session cache\n";
@@ -1942,11 +2903,17 @@ static uint64_t run_spec_program_steps(
   drafter->push(history);
   // SONICBOOM_SPEC=auto picks k per iteration (B7). The forced-strategy seam
   // keeps the fixed cap so a test can pin every iteration's shape.
-  const bool adaptive = !strategy_override && spec_mode() == SpecMode::Auto;
+  const bool adaptive =
+      !strategy_override && (spec_mode() == SpecMode::Auto ||
+                             spec_mode() == SpecMode::Reckless);
   SpecLengthPolicy policy;
   if (adaptive) {
     spec_policy_init(m, session.n_ctx, policy);
-    policy.bootstrap_left = spec_bootstrap_steps();
+    // Evidence from an earlier call on this session replaces the bootstrap:
+    // the policy starts this call with the hazards this session already
+    // measured. A fresh session learns its own.
+    policy.bootstrap_left =
+        spec_evidence_load(session, policy) ? 0 : spec_bootstrap_steps();
   }
   // The valid KV length: everything before `pos` the caller prefilled is
   // resident, and every later step appends exactly the tokens it feeds.
@@ -1958,6 +2925,17 @@ static uint64_t run_spec_program_steps(
     spec_diag().total = 0;
     spec_diag().hist.clear();
   }
+  const uint64_t first_step = step;
+  // Sample the plain-step timing 1 in 16. Reading the event pair is host work
+  // in front of the next launch, so a plain step pays for it only when it is
+  // the sampled one.
+  unsigned plain_since_timed = 0;
+  // A plain step's argmax leaves the sampled token in the device token slot the
+  // next step's embedding reads, so a plain step that follows a plain step has
+  // its token already staged. A verify writes one row per position and the
+  // first iteration starts from whatever the caller left in the slot, so those
+  // still stage the token here.
+  bool prev_plain = false;
 
   while (step < limit) {
     ++g_spec_counters.iterations;
@@ -1968,16 +2946,46 @@ static uint64_t run_spec_program_steps(
     }
     // The drafter may propose at most what the cache can verify in one step:
     // k+1 rows at positions L..L+k must fit.
-    drafter->push(token);
+    //
+    // The drafter learns the fed token once per iteration, but the update is
+    // deferred: an iteration that proposes flushes it first (the proposal must
+    // see it), and a plain step — which proposes nothing — runs it after the
+    // launch, overlapping the GPU. A k = 0 iteration therefore costs exactly
+    // the spec-off one-decode-step function plus the n-gram index write the
+    // next proposal needs, never host table work in front of a launch.
+    bool pushed = false;
+    const auto ensure_pushed = [&] {
+      if (!pushed) {
+        drafter->push(token);
+        pushed = true;
+      }
+    };
     const uint64_t room = std::min<uint64_t>(
         uint64_t(cap), session.n_ctx - L - 1);
     size_t k = 0;
     bool warm = false;         // a warm-up iteration (forced k drafts)
     bool measure = false;      // ... whose time is c(k) (its second pass)
     bool finish_warm = false;  // the last measurement: persist after timing
-    bool bootstrap_iter = false;  // a forced bootstrap verify (S3 abort input)
+    bool bootstrap_iter = false;  // a bootstrap verify (evidence input)
     size_t match_n = 0;        // S4: n-gram length behind this proposal
     SpecDiagKind diag_kind = SpecDiagKind::Fixed;
+    // Ask the drafter for at most `budget` drafts and price the lookup. The
+    // CPU cost is measured so the objective charges proposal work explicitly
+    // (today it is negligible; a draft model's cost belongs in the same slot).
+    const auto propose_with = [&](size_t budget) -> size_t {
+      ensure_pushed();
+      const auto t0 = std::chrono::steady_clock::now();
+      const size_t got = drafter->propose(std::span<uint64_t>(drafts, budget),
+                                          &match_n);
+      if (adaptive && got > 0 && got <= size_t(SpecLengthPolicy::kMax)) {
+        const double dt = std::chrono::duration<double, std::micro>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        double& avg = policy.draft_us[got];
+        avg = avg > 0.0 ? 0.7 * avg + 0.3 * dt : dt;
+      }
+      return got;
+    };
     if (repeat) {
       k = size_t(room);
       for (uint64_t i = 0; i < room; ++i) drafts[i] = token;
@@ -2007,28 +3015,75 @@ static uint64_t run_spec_program_steps(
       }
       if (!warm) {
         const uint64_t max_k = std::min<uint64_t>(uint64_t(cap), room);
-        if (policy.bootstrap_left > 0) {
-          // S2: force exploration so the EMA sees real acceptance data. Like
-          // the warm-up's forced drafts these are proposals only; the verifier
-          // still decides the emitted run. S3: one draft and an abort on a
-          // run of rejects keep the exploration cheap on unmatched workloads.
-          k = size_t(std::min<uint64_t>(uint64_t(kSpecBootstrapDrafts), max_k));
-          for (size_t i = 0; i < k; ++i) drafts[i] = token;
+        if (adaptive && step == first_step) {
+          // The first generated token must not wait on a verify: an adaptive
+          // call starts with one plain step (exactly the spec-off step), so a
+          // request's time to first token does not depend on the policy's
+          // choice. The bootstrap and the exploration start at the second
+          // iteration, where their cost is amortized over the decode.
+          k = 0;
+        } else if (policy.bootstrap_left > 0) {
+          // B7 v2 bootstrap: real drafter proposals at the affordable depth.
+          // No synthetic last-token draft — that probe measured the drafter's
+          // rejection, not its availability. A proposal verifies (and teaches
+          // the per-position hazards); a miss is a plain step and advances the
+          // abort streak. The bootstrap ends after kSpecBootstrapObs real
+          // verifications or the abort streak.
           --policy.bootstrap_left;
           ++g_spec_counters.bootstrap_steps;
           bootstrap_iter = true;
           diag_kind = SpecDiagKind::Bootstrap;
+          k = max_k > 0 ? propose_with(size_t(max_k)) : 0;
         } else {
-          k = drafter->propose(std::span<uint64_t>(
-                                  drafts, size_t(spec_choose_drafts(
-                                              policy.alpha, policy.cost_us,
-                                              int64_t(max_k)))),
-                              &match_n);
+          bool probe = false;
+          const int64_t chosen =
+              spec_policy_choose(policy, int64_t(max_k), &probe);
           ++g_spec_counters.policy_steps;
           diag_kind = SpecDiagKind::Policy;
+          if (probe) {
+            policy.since_probe = 0;
+            ++g_spec_counters.probe_verifies;
+            diag_kind = SpecDiagKind::Probe;
+          }
+          if (chosen > 0) {
+            k = propose_with(size_t(chosen));
+            if (k == 0) ++g_spec_counters.proposal_misses;
+          } else {
+            policy.current_k = 0;
+            if (max_k > 0 && policy.since_explore >= kSpecExploreSpacing) {
+              // k = 0 but the recovery lookup is due: ask the drafter, at the
+              // cheapest verify depth, whether this workload has started to
+              // repeat. The lookup is a table read and costs nothing; only a
+              // match *and* a full credit unit spends a verify, so a
+              // non-repetitive workload never pays for the recovery path.
+              const uint64_t depth = std::min<uint64_t>(
+                  uint64_t(kSpecExploreDepth), max_k);
+              const size_t got = propose_with(size_t(depth));
+              policy.since_explore = 0;
+              if (got > 0) {
+                if (policy.explore_credit >= kSpecExploreCreditMilli) {
+                  k = got;
+                  policy.explore_credit = 0;
+                  ++g_spec_counters.explore_verifies;
+                  diag_kind = SpecDiagKind::Explore;
+                }
+              } else {
+                ++g_spec_counters.proposal_misses;
+              }
+            }
+          }
+        }
+        // A k = 0 policy iteration earns explore credit (rate-limited), and a
+        // plain iteration advances the spacing counter.
+        if (k == 0 && !bootstrap_iter) {
+          policy.explore_credit = std::min(
+              kSpecExploreCreditMilli,
+              policy.explore_credit + kSpecExploreRateMilli);
+          ++policy.since_explore;
         }
       }
     } else {
+      ensure_pushed();
       k = drafter->propose(std::span<uint64_t>(drafts, size_t(room)),
                            &match_n);
     }
@@ -2038,6 +3093,7 @@ static uint64_t run_spec_program_steps(
     // verify" indistinguishable in the record. Probe anyway: propose reads the
     // tables and does not mutate them, so the shadow lookup changes nothing.
     if (spec_diag_enabled() && k == 0 && !repeat) {
+      ensure_pushed();
       uint64_t probe[kSpecMaxDrafts];
       const size_t probe_room =
           size_t(std::min<uint64_t>(uint64_t(cap), room));
@@ -2045,42 +3101,66 @@ static uint64_t run_spec_program_steps(
                              &match_n);
     }
 
+    // spec-r3: force every adaptive iteration to the plain path.
+    if (adaptive && spec_force_plain()) {
+      k = 0;
+      warm = false;
+      measure = false;
+      finish_warm = false;
+      bootstrap_iter = false;
+    }
+
     if (k == 0) {
-      // (k == 0 ? step : verify): the captured single decode step at L, or the
-      // same step through the executor when no capture is replayable.
-      int64_t next = -1;
-      if (replay_ok) {
-        rt.cuda->set_pos(L);
-        hal::StepProgram* step_prog = rt.step_at(L);
-        if (!rt.cuda->seed_token(token) || !step_prog || !step_prog->replay()) {
-          std::cerr << "[spec] the k == 0 decode step failed at position " << L
-                    << "\n";
-          break;
-        }
-        float next_f = -1.0f;
-        rt.cuda->read_token(&next_f);
-        next = int64_t(next_f);
-      } else {
-        rt.cuda->set_pos(L);
-        const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(L)};
-        auto res = rt.exec->execute(rt.plan, rt.snap, in);
-        if (!res || res->outputs.empty() ||
-            res->outputs[0].size() < sizeof(float)) {
-          std::cerr << "[spec] the k == 0 decode step failed at position " << L
-                    << "\n";
-          break;
-        }
-        next = int64_t(*reinterpret_cast<const float*>(
-            res->outputs[0].data()));
+      // The plain step is exactly the spec-off loop's one-decode-step
+      // function. The fed token is seeded into the device slot unless the
+      // previous iteration was also a plain step: its argmax wrote exactly
+      // this token into the slot the embedding reads, so the upload would be
+      // the same value again. The drafter's index update rides the launch.
+      const bool staged = prev_plain && rt.cuda->decode_chunk() == 1;
+      if (!staged && !rt.cuda->seed_token(token)) {
+        std::cerr << "[spec] the k == 0 decode step failed to stage the token "
+                     "at position " << L << "\n";
+        break;
       }
-      if (next < 0) break;
+      prev_plain = true;
+      const bool time_step = spec_time_steps() && plain_since_timed == 0;
+      plain_since_timed = (plain_since_timed + 1) % 16;
+      const int64_t next = greedy_step(rt, token, L, replay_ok, ensure_pushed,
+                                       nullptr, time_step);
+      if (next < 0) {
+        std::cerr << "[spec] the k == 0 decode step failed at position " << L
+                  << "\n";
+        break;
+      }
+      // The step's readback has drained its replay, so the event pair is
+      // complete; reading it never waits. A timed plain step prices c(0).
+      if (adaptive && !warm && time_step) {
+        double ms = 0.0;
+        if (hal::StepProgram* sp = rt.step_at(L);
+            sp && sp->timing_read(&ms)) {
+          spec_note_step_ms(m, session.n_ctx, 0, ms);
+          spec_refine_cost(m, session.n_ctx, policy, 0);
+        }
+      }
       // S4: a plain step is a proposal of length 0 (the drafter missed or the
       // policy chose k = 0) that emits the verifier's own token.
       if (spec_diag_enabled()) {
         spec_diag_record(step, L, /*k=*/0, /*accepted=*/0, /*emitted=*/1,
-                         match_n, SpecDiagKind::Plain, policy.alpha,
-                         iter_start);
+                         match_n,
+                         diag_kind == SpecDiagKind::Explore
+                             ? SpecDiagKind::Explore
+                             : SpecDiagKind::Plain,
+                         policy.alpha, iter_start);
         spec_diag_emit(uint64_t(next));
+      }
+      // A bootstrap iteration the drafter had nothing for is evidence too: it
+      // advances the abort streak (and never counts as a k = 0 policy step).
+      if (bootstrap_iter) {
+        if (adaptive) ++policy.bootstrap_streak;
+        const uint64_t abort_after = spec_bootstrap_abort();
+        if (adaptive && abort_after > 0 &&
+            policy.bootstrap_streak >= abort_after)
+          policy.bootstrap_left = 0;
       }
       // The fed token is now resident; the sampled one is emitted but not fed.
       ++L;
@@ -2091,6 +3171,7 @@ static uint64_t run_spec_program_steps(
       token = static_cast<uint64_t>(next);
       ++step;
       ++g_spec_counters.plain_steps;
+      ++g_spec_counters.k_hist[0];
       ++g_spec_counters.emitted_tokens;
       if (measure) {
         policy.cost_us[0] = std::chrono::duration<double, std::micro>(
@@ -2104,14 +3185,39 @@ static uint64_t run_spec_program_steps(
       continue;
     }
 
+    // A verify writes one token per row, so the next iteration stages its own.
+    prev_plain = false;
     // verify: [last token, drafts...] at L..L+k, one row per position.
     feed.assign(size_t(k) + 1, 0);
     feed[0] = token;
     std::copy_n(drafts, k, feed.begin() + 1);
     rows.assign(size_t(k) + 1, -1);
+    const diag::SpecDiagSnapshot diag_before =
+        diag_on ? diag::spec_diag_snapshot() : diag::SpecDiagSnapshot{};
     if (!verify_step_spine_cuda(m, feed, L, session, rows)) {
       std::cerr << "[spec] the verify step failed at position " << L << "\n";
       break;
+    }
+    // A real (non warm-up) verify prices its own k; its sync has completed the
+    // replay, so the event pair reads back without waiting.
+    if (adaptive && !warm) {
+      const double ms =
+          verify_last_step_ms(m, session.n_ctx, int(feed.size()), session);
+      if (ms > 0.0) {
+        spec_note_step_ms(m, session.n_ctx, int(k), ms);
+        spec_refine_cost(m, session.n_ctx, policy, int(k));
+      }
+    }
+    if (diag_on) {
+      VerifyWall w;
+      w.iter = size_t(g_spec_counters.iterations);
+      w.k = k;
+      w.wall_ms = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - iter_start)
+                      .count();
+      w.before = diag_before;
+      w.after = diag::spec_diag_snapshot();
+      verify_walls.push_back(w);
     }
 
     // accept + emit: the run is the accepted drafts plus the verifier's token,
@@ -2134,12 +3240,13 @@ static uint64_t run_spec_program_steps(
       for (size_t i = 0; i < decision.emitted; ++i) spec_diag_emit(run[i]);
     }
     ++g_spec_counters.verify_steps;
+    ++g_spec_counters.k_hist[size_t(k) & 15];
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
     g_spec_counters.emitted_tokens += decision.emitted;
-    // B7 bookkeeping: a warm-up iteration prices c(k); every other one feeds
-    // the acceptance-rate EMA (warm-up drafts are forced, so their acceptance
-    // says nothing about the drafter).
+    // B7 v2 bookkeeping: a warm-up iteration prices c(k); every other one is
+    // real evidence and feeds the bounded (proposed, accepted) window
+    // (warm-up drafts are forced, so their acceptance says nothing).
     if (measure) {
       policy.cost_us[k] = std::chrono::duration<double, std::micro>(
           std::chrono::steady_clock::now() - iter_start).count();
@@ -2148,18 +3255,17 @@ static uint64_t run_spec_program_steps(
         spec_policy_store(policy);
       }
     } else if (adaptive && !warm) {
-      policy.alpha = spec_alpha_update(policy.alpha, decision.accepted, k);
-    }
-    // S3 early abort: a bootstrap verify that accepts nothing is a drafter
-    // miss. A run of them means this workload has nothing to match, so the
-    // remaining forced iterations can only add verify cost — switch to the
-    // normal policy now.
-    if (bootstrap_iter) {
-      const uint64_t abort_after = spec_bootstrap_abort();
-      if (abort_after > 0) {
-        policy.consecutive_zero_accept =
-            decision.accepted == 0 ? policy.consecutive_zero_accept + 1 : 0;
-        if (policy.consecutive_zero_accept >= abort_after)
+      spec_policy_observe(policy, k, decision.accepted);
+      ++policy.since_explore;
+      if (bootstrap_iter) {
+        ++policy.bootstrap_obs;
+        const uint64_t abort_after = spec_bootstrap_abort();
+        policy.bootstrap_streak =
+            decision.accepted == 0 ? policy.bootstrap_streak + 1 : 0;
+        // Handover: enough real verifications to choose, or the workload is
+        // not matching (a run of empty/zero-accept proposals).
+        if (policy.bootstrap_obs >= kSpecBootstrapObs ||
+            (abort_after > 0 && policy.bootstrap_streak >= abort_after))
           policy.bootstrap_left = 0;
       }
     }
@@ -2178,6 +3284,74 @@ static uint64_t run_spec_program_steps(
   // A run that ended before the warm-up finished stores what it measured; the
   // policy then compares only the lengths it has prices for.
   if (adaptive && policy.warm_next >= 0) spec_policy_store(policy);
+  if (adaptive) spec_evidence_store(session, policy);
+  if (spec_diag_enabled() && adaptive) {
+    // The policy's end-of-call view: what it priced, what it observed, and
+    // what it believed each length would emit. The per-decision scores are in
+    // the [spec-choice] lines; this pins the state at the end of the call.
+    std::fprintf(stderr,
+                 "[spec-policy] obs=%llu alpha=%.3f warm_next=%lld "
+                 "bootstrap_obs=%llu E=",
+                 (unsigned long long)policy.obs_count, policy.alpha,
+                 (long long)policy.warm_next,
+                 (unsigned long long)policy.bootstrap_obs);
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "",
+                   spec_policy_expected(policy, k));
+    std::fprintf(stderr, " c=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.0f", k ? "," : "",
+                   policy.cost_us[size_t(k)]);
+    std::fprintf(stderr, " d=");
+    for (int64_t k = 0; k <= kSpecMaxDrafts; ++k)
+      std::fprintf(stderr, "%s%.2f", k ? "," : "",
+                   policy.draft_us[size_t(k)]);
+    std::fprintf(stderr, "\n");
+  }
+  if (diag_on) {
+    // One line for the whole call: what first-use work moved while the request
+    // ran, and which verify iterations were outliers against their own median.
+    const diag::SpecDiagSnapshot diag_exit = diag::spec_diag_snapshot();
+    std::fprintf(stderr,
+                 "[spec-diag] runtime_builds=%llu graph_captures=%llu "
+                 "jit_compiles=%llu jit_loads=%llu",
+                 (unsigned long long)diag_exit.d_runtime(diag_entry),
+                 (unsigned long long)diag_exit.d_captures(diag_entry),
+                 (unsigned long long)diag_exit.d_compiles(diag_entry),
+                 (unsigned long long)diag_exit.d_loads(diag_entry));
+    if (verify_walls.empty()) {
+      std::fprintf(stderr, " verify_ms_median=na slow=none\n");
+    } else {
+      std::vector<double> walls;
+      walls.reserve(verify_walls.size());
+      for (const VerifyWall& w : verify_walls) walls.push_back(w.wall_ms);
+      std::sort(walls.begin(), walls.end());
+      const double median = walls[walls.size() / 2];
+      std::fprintf(stderr, " verify_ms_median=%.3f slow=", median);
+      bool first = true;
+      for (const VerifyWall& w : verify_walls) {
+        if (!(w.wall_ms > 5.0 * median)) continue;
+        std::fprintf(stderr, "%s{iter=%zu k=%zu wall_ms=%.3f moved=",
+                     first ? "" : ";", w.iter, w.k, w.wall_ms);
+        first = false;
+        bool moved = false;
+        const auto add = [&](const char* name, uint64_t n) {
+          if (n == 0) return;
+          std::fprintf(stderr, "%s%s+%llu", moved ? "," : "", name,
+                       (unsigned long long)n);
+          moved = true;
+        };
+        add("runtime_builds", w.after.d_runtime(w.before));
+        add("graph_captures", w.after.d_captures(w.before));
+        add("jit_compiles", w.after.d_compiles(w.before));
+        add("jit_loads", w.after.d_loads(w.before));
+        if (!moved) std::fprintf(stderr, "none");
+        std::fprintf(stderr, "}");
+      }
+      if (first) std::fprintf(stderr, "none");
+      std::fprintf(stderr, "\n");
+    }
+  }
   spec_diag_dump(strategy.c_str());
   return step;
 }
@@ -2189,7 +3363,7 @@ static uint64_t run_spec_program_steps(
 //
 //   decode   (model, n_ctx, cache_id)
 //   sampled  (model, n_ctx, cache_id)
-//   verify   (model, n_ctx, rows, cache_id)
+//   verify   (model, n_ctx, cache_id), all row counts in one set
 //   fed      (model, n_ctx, cache_id)
 //
 // cache_id 0 is the anonymous key: a non-session caller (tooling, plan records)
@@ -2205,6 +3379,11 @@ static uint64_t run_spec_program_steps(
 // sampled/verify/spec step, session free), not one token.
 static std::mutex g_registry_mutex;
 static std::recursive_mutex g_exec_mutex;
+
+// Public accessor (plan.h): the C ABI holds this around a whole session
+// mutation, so the spine call and the caller's own session-state update are one
+// unit against every other operation.
+std::recursive_mutex& execution_mutex() { return g_exec_mutex; }
 
 static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
 static std::map<DecodeKey, std::unique_ptr<FedRuntime>> g_fed_runtimes;
@@ -2273,10 +3452,13 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const GraphTransform* transform = nullptr,
     const planner::KvCacheSession* session = nullptr) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<DecodeRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_available());
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
   // exactly as it was; the clone is discarded once the desc is extracted. A
@@ -2288,11 +3470,15 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   {
     mlir::OwningOpRef<mlir::ModuleOp> program_module(
         mlir::cast<mlir::ModuleOp>((*ir.module)->clone()));
-    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program by
-    // default, the draft/verify/accept program when speculation is on. Both
-    // lift the same decode graph; only the loop around it differs.
+    // The loop's shape follows SONICBOOM_SPEC: the plain greedy program under
+    // an explicit "off", the draft/verify/accept program otherwise. An
+    // undecided mode may still become auto at the probe, and the loop shape is
+    // fixed when the runtime is built, so it is built speculative and the
+    // dispatch gate (spec_enabled()) picks the plain loop if the probe selects
+    // off. Both forms lift the same decode graph; only the loop around it
+    // differs.
     const mlir::LogicalResult lifted =
-        spec_enabled()
+        env_spec_mode() != SpecMode::Off
             ? compiler::addSpeculativeProgram(*program_module, "speculative",
                                               "prefill", {1}, {}, 0,
                                               kSpecMaxDrafts, "ngram")
@@ -2498,6 +3684,18 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   return raw;
 }
 
+uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
+                                  const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return 0;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  const auto it =
+      g_decode_runtimes.find(DecodeKey{&m, n_ctx, session.cache_id});
+  return it == g_decode_runtimes.end()
+             ? 0
+             : reinterpret_cast<uintptr_t>(it->second.get());
+}
+
 // ---------------------------------------------------------------------------
 // r7: sampled decode on the session path.
 //
@@ -2562,10 +3760,13 @@ static std::map<DecodeKey, std::unique_ptr<SampledRuntime>> g_sampled_runtimes;
 static std::unique_ptr<SampledRuntime> build_sampled_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<SampledRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_available());
   if (rt->graph.nodes.empty()) return nullptr;
   if (!append_sample_select_tail(rt->graph, m.config.vocab_size)) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
@@ -2835,13 +4036,18 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 }
 
 // ---------------------------------------------------------------------------
-// B3: the row-invariant verify step. One runtime per (model, n_ctx, rows):
-// the decode graph emitted with `rows` query positions, run through the verify
-// phase's passes (decode fusions, KV append left on attention), planned and
-// captured as its own graph. Sharing the decode runtime's cache is the point:
-// the verify appends rows at pos..pos+rows-1 exactly as `rows` plain decode
-// steps would, so the cache after a verify is the cache a chained decode would
-// have written.
+// B3: the row-invariant verify step. One verify graph per row count: the decode
+// graph emitted with `rows` query positions, run through the verify phase's
+// passes (decode fusions, KV append left on attention), planned and captured as
+// its own graph. Sharing the decode runtime's cache is the point: the verify
+// appends rows at pos..pos+rows-1 exactly as `rows` plain decode steps would, so
+// the cache after a verify is the cache a chained decode would have written.
+//
+// The graphs are held in one set per (model, n_ctx, cache identity). The load
+// warm-up builds and captures every row count the policy can reach, so no
+// request pays graph construction or capture; the set shares the session's KV
+// cache and the process-wide device-resident weights, and each runtime's
+// staging buffers are sized for the widest row set (planner::kMaxVerifyRows).
 // ---------------------------------------------------------------------------
 struct VerifyRuntime {
   planner::Graph graph;
@@ -2858,17 +4064,38 @@ struct VerifyRuntime {
   uint64_t cache_id = 0;
 };
 
-static std::map<std::tuple<const Gemma4Model*, uint64_t, int, uint64_t>,
-                std::unique_ptr<VerifyRuntime>>
+// One entry per (model, context size, cache set). Index 0/1 are unused: a
+// verify has at least two rows (the fed token and one draft).
+struct VerifySet {
+  std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
+  std::array<std::unique_ptr<VerifyRuntime>, planner::kMaxVerifyRows + 1> rows;
+};
+
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<VerifySet>>
     g_verify_runtimes;
+
+// The widest verify the current mode can run. "on" verifies at one fixed cap,
+// so only that row count is reachable; "auto" and an undecided mode (the probe
+// may still select auto) can verify every length the policy proposes.
+static int verify_row_limit() {
+  const SpecMode mode = spec_mode();
+  if (mode == SpecMode::Off) return 1;
+  const int cap = int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts()));
+  return cap + 1;
+}
 
 static std::unique_ptr<VerifyRuntime>
 build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
                      const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<VerifyRuntime>();
   GraphIr ir = emit_decode_ir(m, /*greedy=*/true, uint64_t(rows));
   rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_available());
   if (rt->graph.nodes.empty()) return nullptr;
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -2898,78 +4125,228 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   return rt;
 }
 
-// Build (or fetch) the cached verify runtime bound to `session`'s cache. The
-// capture reads the token ids from `tokens_buf_` and the base position from
-// `pos_buf_`, both restaged before every replay, so one capture serves every
-// call at any depth. Keyed by the cache identity as well as the shape: a capture
-// is only replayable against the set it was recorded with, and a second session
-// must not evict the first session's capture. Returns nullptr on a build/plan
-// failure.
-static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
-                                         int rows,
-                                         const planner::KvCacheSession& session) {
+// Warm one row count and, when `capture`, record its step. The warm-up run
+// allocates every pooled buffer and uploads the weights the capture pass then
+// only records. Its KV stores are suppressed: the rows it would append land on
+// the cache's ring at positions past the session's live length, which a
+// sliding-window ring maps onto live slots. The ids and position are
+// placeholders, every real call stages its own before replay. The capture reads
+// the token ids from `tokens_buf_` and the base position from `pos_buf_`, both
+// restaged before every replay, so one capture per row count serves every call
+// at any depth. Returns whether the runtime ended up captured.
+static bool warm_verify_runtime(VerifyRuntime& rt, uint64_t n_ctx, int rows,
+                                bool capture) {
+  const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
+  const std::vector<uint64_t> warm(size_t(rows), 0);
+  const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
+  auto warm_run = [&]() {
+    return bool(rt.exec->execute(rt.plan, rt.snap, warm_in));
+  };
+  const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
+  auto run = [&]() {
+    return bool(rt.exec->execute(rt.plan, rt.snap, in));
+  };
+  rt.cuda->set_kv_write_suppressed(true);
+  const bool warmed = rt.cuda->set_prefill_tokens(warm) &&
+                      rt.cuda->set_verify_pos(warm_pos, rows) && warm_run();
+  rt.cuda->set_kv_write_suppressed(false);
+  if (!warmed) return false;
+  rt.cuda->synchronize();
+  if (!capture) return true;
+  // Capture records the launches without executing them, so the graph bakes the
+  // session's pointers while no kernel writes a row of it.
+  if (rt.cuda->set_prefill_tokens(warm) && rt.cuda->set_verify_pos(0, rows))
+    rt.prog = rt.cuda->record_step(run);
+  return bool(rt.prog);
+}
+
+// Build every row count the mode can reach, bound to `session`'s cache, and
+// capture them here at load. Each row count is its own shape-specialized graph
+// (the verify attribute scales every node), so "one runtime" is the set, not a
+// re-planned graph: the cache, the device-resident weights and the process-wide
+// scratch allocator are shared. A build failure for one row count leaves that
+// slot empty; a verify at that width then fails cleanly instead of silently
+// running another graph.
+static std::unique_ptr<VerifySet> build_verify_set(
+    const Gemma4Model& m, uint64_t n_ctx,
+    const planner::KvCacheSession& session) {
+  auto set = std::make_unique<VerifySet>();
+  set->cache = session.caches;
+  set->cache_id = session.cache_id;
+  const int limit = std::min<int>(planner::kMaxVerifyRows, verify_row_limit());
+  if (limit < 2) return nullptr;
+  const bool graphs = cuda_graph_decode_enabled();
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+  };
+  int built = 0;
+  for (int rows = 2; rows <= limit; ++rows) {
+    auto rt = build_verify_runtime(m, n_ctx, rows, session);
+    if (!rt) continue;
+    set->rows[size_t(rows)] = std::move(rt);
+    ++built;
+  }
+
+  // Warm and capture. The four anchor widths are paid first: they carry the
+  // load cost curve's knots and include the probe's k = 1, so a request's first
+  // bootstrap and the policy's first decision find their graphs captured.
+  // The widest reachable width is paid next (the evidence bootstrap verifies
+  // there). With the budget spent, the remaining widths stay built but
+  // uncaptured: they run the same graph and kernels through the set's executor
+  // without a graph launch, and no build or capture moves into a request.
+  int order[planner::kMaxVerifyRows + 1];
+  int n_order = 0;
+  bool queued[planner::kMaxVerifyRows + 1] = {};
+  bool anchor_row[planner::kMaxVerifyRows + 1] = {};
+  auto enqueue = [&](int rows, bool anchor) {
+    if (rows < 2 || rows > limit) return;
+    if (anchor) anchor_row[rows] = true;
+    if (queued[rows]) return;
+    queued[rows] = true;
+    order[n_order++] = rows;
+  };
+  for (int rows : {2, 4, 8, 16}) enqueue(rows, /*anchor=*/true);
+  enqueue(limit, /*anchor=*/true);
+  for (int rows = 2; rows <= limit; ++rows) enqueue(rows, /*anchor=*/false);
+
+  int captured = 0, warmed = 0;
+  for (int i = 0; graphs && i < n_order; ++i) {
+    const int rows = order[i];
+    VerifyRuntime* rt = set->rows[size_t(rows)].get();
+    if (!rt) continue;
+    // The anchors are always paid; the rest only while the set's share of the
+    // load budget lasts (the curve measures in the rest of it).
+    if (!anchor_row[rows] && elapsed_ms() >= kSpecVerifySetBudgetMs) break;
+    if (warm_verify_runtime(*rt, n_ctx, rows, /*capture=*/true)) {
+      ++warmed;
+      if (rt->prog) ++captured;
+    }
+  }
+  if (spec_diag_enabled()) {
+    std::fprintf(stderr,
+                 "[spec-cost] verify set rows=2..%d built=%d warmed=%d "
+                 "captured=%d %.0fms budget=%.0fms\n",
+                 limit, built, warmed, captured, elapsed_ms(),
+                 kSpecCostLoadBudgetMs);
+  }
+  return built > 0 ? std::move(set) : nullptr;
+}
+
+// Build (or fetch) the verify set bound to `session`'s cache. Keyed by the
+// cache identity as well as the shape: a capture is only replayable against the
+// set it was recorded with, and a second session must not evict the first
+// session's captures. Returns nullptr when the mode never verifies or on a
+// build/plan failure.
+static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
+                                 const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return nullptr;
-  const auto key = std::make_tuple(&m, n_ctx, rows, session.cache_id);
+  // The decode-dealt verify set exists only for modes that run it; reckless
+  // verifies through the prefill path (verify_step_reckless).
+  if (spec_mode() == SpecMode::Off || spec_mode() == SpecMode::Reckless)
+    return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_verify_runtimes.find(key);
     if (it != g_verify_runtimes.end()) return it->second.get();
   }
 
-  auto rt = build_verify_runtime(m, n_ctx, rows, session);
-  if (!rt) return nullptr;
-
-  if (cuda_graph_decode_enabled()) {
-    // Warm-up run: allocates every pooled buffer and uploads the weights the
-    // capture pass then only records. Its KV stores are suppressed: the rows it
-    // would append land on the cache's ring at positions past the session's
-    // live length, which a sliding-window ring maps onto live slots. The ids and
-    // position are placeholders, every real call stages its own before replay.
-    const uint64_t warm_pos = n_ctx > uint64_t(rows) ? n_ctx - uint64_t(rows) : 0;
-    const std::vector<uint64_t> warm(size_t(rows), 0);
-    const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
-    auto warm_run = [&]() {
-      return bool(rt->exec->execute(rt->plan, rt->snap, warm_in));
-    };
-    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(0)};
-    auto run = [&]() {
-      return bool(rt->exec->execute(rt->plan, rt->snap, in));
-    };
-    rt->cuda->set_kv_write_suppressed(true);
-    const bool warmed = rt->cuda->set_prefill_tokens(warm) &&
-                        rt->cuda->set_verify_pos(warm_pos, rows) && warm_run();
-    rt->cuda->set_kv_write_suppressed(false);
-    if (warmed) {
-      rt->cuda->synchronize();
-      // Capture records the launches without executing them, so the graph bakes
-      // the session's pointers while no kernel writes a row of it.
-      if (rt->cuda->set_prefill_tokens(warm) &&
-          rt->cuda->set_verify_pos(0, rows))
-        rt->prog = rt->cuda->record_step(run);
-    }
-  }
+  auto set = build_verify_set(m, n_ctx, session);
+  if (!set) return nullptr;
 
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_verify_runtimes.find(key);
   if (it != g_verify_runtimes.end()) return it->second.get();
-  VerifyRuntime* raw = rt.get();
-  g_verify_runtimes.emplace(key, std::move(rt));
+  VerifySet* raw = set.get();
+  g_verify_runtimes.emplace(key, std::move(set));
   return raw;
+}
+
+static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
+                            const planner::KvCacheSession& session) {
+  (void)get_verify_set(m, n_ctx, session);
+}
+
+// The verify graph for one width, from the session's set. Never builds: every
+// reachable width was built by the load warm-up (see build_verify_set).
+static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
+                                         int rows,
+                                         const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  VerifySet* set = get_verify_set(m, n_ctx, session);
+  if (!set) return nullptr;
+  return set->rows[size_t(rows)].get();
+}
+
+// The same row-invariant graph for the opt-in prefill path
+// (SONICBOOM_REPRO_PREFILL=decode). The spec verify set is mode-gated — it is
+// built only when speculation runs — but prefix-reuse identity holds regardless
+// of the spec mode, so this path keeps its own set, keyed the same way and
+// built lazily for the widths it actually visits (16 rows and a remainder).
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
+                std::unique_ptr<VerifyRuntime>>
+    g_repro_verify_runtimes;
+
+// The non-greedy one-row runtime the repro prefill's last prompt token runs
+// through. Built once per session cache and reused across requests; unlike the
+// verify set it has no capture, so each call stages its own token and position.
+// Keeping it here rather than building one per prefill keeps the pp number a
+// measurement of the arithmetic, not of a graph build.
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<DecodeRuntime>>
+    g_repro_eval_runtimes;
+
+static VerifyRuntime* get_repro_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_repro_verify_runtimes.find(key);
+    if (it != g_repro_verify_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return nullptr;
+  // Warm and capture like the spec set. The warm-up's KV writes are suppressed,
+  // so no live row of the session cache is touched before the first chunk.
+  (void)warm_verify_runtime(*rt, n_ctx, rows, cuda_graph_decode_enabled());
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_repro_verify_runtimes.find(key);
+  if (it != g_repro_verify_runtimes.end()) return it->second.get();
+  VerifyRuntime* raw = rt.get();
+  g_repro_verify_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
+                                  int rows,
+                                  const planner::KvCacheSession& session) {
+  VerifyRuntime* rt = get_verify_runtime(m, n_ctx, rows, session);
+  double ms = 0.0;
+  if (!rt || !rt->prog || !rt->prog->timing_read(&ms)) return 0.0;
+  return ms;
 }
 
 // V2: the startup probe behind an unset SONICBOOM_SPEC. One plain decode step
 // and one k=1 verify step are timed on this GPU (after untimed warm replays);
 // their ratio decides the generation loop, because it is the price of a verify
-// row relative to a plain step. A ratio below kSpecProbeAutoRatio means the
-// k=1 iteration costs less than that many plain steps, i.e. the acceptance the
-// length policy needs to come out ahead is under 50% (E(1,a) = 1 + a against
-// c1/c0 = ratio: profitable when a >= ratio - 1).
+// row relative to a plain step. A k=1 iteration emits at most 2 tokens
+// (E(1,a) = 1 + a) for `ratio` plain steps, so even perfect acceptance is
+// unprofitable once the ratio exceeds 2. The probe only rules out the GPU
+// where speculation cannot pay at any workload; which workload pays is the
+// length policy's decision, made from measured acceptance, not from the
+// startup probe. A ratio below kSpecProbeAutoRatio therefore selects auto.
 //
 // The result is cached per SM in the Q1 autotune file under
 // ("spec_verify_ratio", "decode"), so only the first process on a GPU pays the
 // probe. SONICBOOM_SPEC_PROBE_MS="<plain_ms>,<verify_ms>" replaces the measured
 // pair (the test seam; measurement only, no kernel changes).
-constexpr double kSpecProbeAutoRatio = 1.5;
+constexpr double kSpecProbeAutoRatio = 2.0;
 
 // The probe measures whole replays: the captured plain step (position staging,
 // graph replay, token readback) against the captured 2-row verify step (token
@@ -3051,11 +4428,11 @@ static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
 }
 
 // Resolve the mode when SONICBOOM_SPEC was unset: load the cached ratio, or
-// measure it once and store it. Returns the runtime to decode with — `rt`
-// itself, unless auto was selected and this runtime was built (while the mode
-// was still undecided) with the greedy program, in which case it is rebuilt.
-// The rebuild is safe at both call sites: the probe runs before the runtime's
-// KV cache is published into a session, so no capture is bound to it yet.
+// measure it once and store it. Returns the runtime to decode with — always
+// `rt` itself: runtimes built under an undecided mode already carry the
+// speculative program, and the loop dispatch only runs it when spec_enabled()
+// is true, so the decision is a process-wide flag rather than a rebuild of the
+// runtimes other sessions already hold.
 static DecodeRuntime* spec_resolve_probe(
     const Gemma4Model& m, DecodeRuntime* rt, uint64_t n_ctx, uint64_t pos,
     const planner::KvCacheSession* session) {
@@ -3065,8 +4442,12 @@ static DecodeRuntime* spec_resolve_probe(
   double ratio = 0.0;
   bool measured = false;
   uint64_t verify_cache_id = 0;
+  // P0: the probe's ratio is as much a property of the verify kernel as c(k)
+  // is, so its key carries the same kernel/dispatch fingerprint. A rebuild or a
+  // dispatch switch no longer reuses a ratio measured before it.
+  const std::string ratio_key = std::string("decode/") + spec_kernel_fingerprint();
   if (const auto cached =
-          mlir_tune::lookup_ratio("spec_verify_ratio", "decode")) {
+          mlir_tune::lookup_ratio("spec_verify_ratio", ratio_key)) {
     ratio = *cached;
   } else {
     double plain_ms = 0.0, verify_ms = 0.0;
@@ -3079,7 +4460,7 @@ static DecodeRuntime* spec_resolve_probe(
       ratio = verify_ms / plain_ms;
       measured = true;
     }
-    (void)mlir_tune::store_ratio("spec_verify_ratio", "decode", ratio);
+    (void)mlir_tune::store_ratio("spec_verify_ratio", ratio_key, ratio);
   }
   const SpecMode mode = ratio < kSpecProbeAutoRatio ? SpecMode::Auto
                                                     : SpecMode::Off;
@@ -3089,33 +4470,16 @@ static DecodeRuntime* spec_resolve_probe(
                 mode == SpecMode::Auto ? "auto" : "off");
   std::cerr << line;
   if (measured) {
-    // The probe's rows=2 verify runtime is only a measurement; drop it so a
-    // decision for off does not keep a second set of device weights alive.
-    g_verify_runtimes.erase(
-        std::make_tuple(&m, n_ctx, 2, verify_cache_id));
+    // The probe's verify set is only a measurement; drop it so a decision for
+    // off does not keep a second set of device buffers alive.
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    g_verify_runtimes.erase(std::make_tuple(&m, n_ctx, verify_cache_id));
   }
-  if (mode == SpecMode::Auto) {
-    // Every greedy runtime built before the decision (one per live cache
-    // identity) carries the plain program. The loop shape is a per-runtime
-    // property, so each must be rebuilt with the speculative program; doing it
-    // here keeps a second session from silently decoding greedily after the
-    // probe selected auto. Read the flag before erasing: `rt` is one of the
-    // erased entries.
-    const bool was_greedy = !rt->program.speculative;
-    {
-      std::lock_guard<std::mutex> lk(g_registry_mutex);
-      for (auto it = g_decode_runtimes.begin();
-           it != g_decode_runtimes.end();) {
-        const DecodeKey& k = it->first;
-        if (std::get<0>(k) == &m && std::get<1>(k) == n_ctx &&
-            !it->second->program.speculative)
-          it = g_decode_runtimes.erase(it);
-        else
-          ++it;
-      }
-    }
-    if (was_greedy) return get_decode_runtime(m, n_ctx, session);
-  }
+  // No runtime is rebuilt here. Runtimes built while the mode was undecided
+  // already carry the speculative program (build_decode_runtime), and the
+  // dispatch gate decides whether it runs speculatively, so resolving auto
+  // applies to every session — including one already bound to another cache —
+  // without rebuilding anything it owns.
   return rt;
 }
 
@@ -3131,6 +4495,11 @@ bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
   session.cache_id = planner::next_kv_cache_id();
   session.n_ctx = n_ctx;
   session.filled_tokens.clear();
+  // Release the runtimes bound to this set when the set's last owner goes,
+  // even if the caller never calls release_session_runtimes (see
+  // SessionRuntimeOwner). Assigned after `caches`, so it is destroyed first.
+  session.runtime_owner =
+      std::make_shared<SessionRuntimeOwner>(m, session.cache_id);
   return true;
 }
 
@@ -3200,6 +4569,150 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Reckless verification: the verify rows through the prefill path.
+//
+// The default verify runs the decode graph dealt over rows, so every row is
+// bit-identical to a plain decode step at that position (the row-invariance
+// contract). Reckless mode instead runs the same k+1 tokens through the batched
+// prefill graph — the block matmuls, batched flash attention and deferred KV
+// append generation uses for a prompt — and projects every row's hidden state
+// through the lm-head. The KV rows land at the same positions in the same
+// order; only the arithmetic differs, and that is what the mode trades away:
+// a speculative run may emit a different stream than plain decoding.
+//
+// One runtime per row count, bound to the session's cache, built on first use:
+// no decode-style capture is involved because every row's hidden state must
+// reach the host.
+struct RecklessVerifyRuntime {
+  planner::Graph graph;
+  planner::ExecutionPlan plan;
+  planner::ResourceSnapshot snap;
+  std::unique_ptr<planner::SonicBackend> cpu;
+  std::unique_ptr<planner::SonicCudaBackend> cuda;
+  std::unique_ptr<planner::RuntimeExecutor> exec;
+  std::shared_ptr<void> cache;
+  uint64_t cache_id = 0;
+};
+
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t, int>,
+                std::unique_ptr<RecklessVerifyRuntime>>
+    g_reckless_verify_runtimes;
+
+static std::unique_ptr<RecklessVerifyRuntime> build_reckless_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  diag::spec_diag_note_runtime_build();
+  auto rt = std::make_unique<RecklessVerifyRuntime>();
+  GraphIr ir = emit_prefill_ir(m, uint64_t(rows));
+  const bool mmq = quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
+                   uint64_t(rows) >= quant::cuda::mmq_min_n();
+  rt->graph = lower_graph(
+      ir, planner::IrPassPhase::Prefill, mmq, /*dynamic_extent=*/0,
+      /*skip_kv_append_fusion=*/false,
+      /*fuse_silu_mul=*/numerics_profile() == NumericsProfile::Standard);
+  if (rt->graph.nodes.empty()) return nullptr;
+  auto snap = planner::CpuResourceProvider::snapshot();
+  if (!snap) return nullptr;
+  rt->snap = std::move(*snap);
+  {
+    planner::AnalyticalCpuCostModel cost(rt->snap);
+    auto plan = planner::plan_execution(rt->graph, rt->snap, cost);
+    if (!plan) return nullptr;
+    rt->plan = std::move(*plan);
+  }
+  rt->cpu = std::make_unique<planner::SonicBackend>(m, rt->graph);
+  rt->cuda = std::make_unique<planner::SonicCudaBackend>(
+      kv_cache_spec(m.config), rt->graph, n_ctx, session.caches,
+      session.cache_id);
+  if (!rt->cuda->has_caches()) return nullptr;
+  rt->cuda->bind_model(m);
+  rt->cache = session.caches;
+  rt->cache_id = session.cache_id;
+  rt->exec = std::make_unique<planner::RuntimeExecutor>(
+      std::map<planner::BackendTag, planner::Backend*>{
+          {planner::BackendTag::Sonic, rt->cuda.get()}});
+  route_host_tasks(*rt->exec, rt->plan, *rt->cpu);
+  return rt;
+}
+
+static RecklessVerifyRuntime* get_reckless_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_reckless_verify_runtimes.find(key);
+    if (it != g_reckless_verify_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_reckless_verify_runtime(m, n_ctx, rows, session);
+  if (!rt) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_reckless_verify_runtimes.find(key);
+  if (it != g_reckless_verify_runtimes.end()) return it->second.get();
+  RecklessVerifyRuntime* raw = rt.get();
+  g_reckless_verify_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+static bool verify_step_reckless(const Gemma4Model& m,
+                                 std::span<const uint64_t> tokens,
+                                 uint64_t start_pos,
+                                 planner::KvCacheSession& session,
+                                 std::span<int64_t> out) {
+  const int rows = int(tokens.size());
+  // A batch segment must be a wrap-free run inside the sliding-window ring
+  // (generation's prefill splits there). A verify that would straddle a ring
+  // boundary runs the plain decode steps instead: same rows, same positions,
+  // the strict path's arithmetic.
+  const uint64_t chunk = m.config.sliding_window > 0
+                             ? m.config.sliding_window
+                             : kDefaultPrefillChunk;
+  if (m.config.sliding_window > 0 &&
+      (start_pos % chunk) + uint64_t(rows) > chunk)
+    return decode_steps_spine_cuda(m, tokens, start_pos, session, out);
+
+  RecklessVerifyRuntime* rt =
+      get_reckless_verify_runtime(m, session.n_ctx, rows, session);
+  if (!rt) return false;
+  if (!rt->cuda->set_prefill_tokens(tokens) ||
+      !rt->cuda->set_pos(start_pos))
+    return false;
+  const std::vector<sx::Bytes> in{encode_tokens(tokens),
+                                  encode_i64(start_pos)};
+  auto res = rt->exec->execute(rt->plan, rt->snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const uint64_t d = m.config.embedding_length;
+  const sx::Bytes& hidden_b = res->outputs[0];
+  if (hidden_b.size() < uint64_t(d) * uint64_t(rows) * sizeof(float))
+    return false;
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    std::cerr << "[spec] reckless mode: output may differ between speculative "
+                 "and plain decoding\n";
+  const float* hf = reinterpret_cast<const float*>(hidden_b.data());
+  const quant::QuantizedTensor& lm =
+      m.weights.output.numel() == 0 ? m.weights.token_embd : m.weights.output;
+  std::vector<float> h(d);
+  std::vector<float> logits(m.config.vocab_size);
+  for (int i = 0; i < rows; ++i) {
+    const std::span<const float> row(hf + size_t(i) * d, d);
+    // lm_head without its final softcap: the softcap is monotone, so the
+    // argmax is unchanged, and its [vocab] tanh pass would dominate a row.
+#ifdef SONICBOOM_USE_CUDA
+    if (!nn::cuda::rms_norm(row, m.weights.output_norm,
+                            m.config.rms_epsilon, h) ||
+        !quant::matvec(lm, h, logits, quant::MatmulBackend::Cuda))
+      return false;
+#else
+    if (!lm_head(m, row, logits, quant::MatmulBackend::CpuQ8K)) return false;
+#endif
+    out[size_t(i)] = int64_t(nn::argmax(logits));
+  }
+  return true;
+}
+
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -3216,6 +4729,17 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
   if (start_pos + uint64_t(rows) > session.n_ctx)
     return fail("positions exceed the session cache");
+  if (spec_reckless_unsupported())
+    return fail("reckless mode is unsupported under the strict numerics "
+                "profile");
+  // Reckless verifies through the prefill path instead of the decode-dealt
+  // verify set; the per-row argmax is the prefill graph's hidden state
+  // projected through the lm-head.
+  if (spec_mode() == SpecMode::Reckless) {
+    if (!verify_step_reckless(m, tokens, start_pos, session, out))
+      return fail("reckless prefill verify failed");
+    return true;
+  }
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
 
@@ -3233,7 +4757,12 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
       return fail("staging failed");
     // The replay is async on the graph stream; the token readback must see the
     // completed step (the readback copy orders against the graph's stream).
-    if (!rt->prog->replay() || !rt->prog->sync())
+    // The timing events bracket only the replay, so the curve prices device
+    // work, not the staging or the host round-trip.
+    (void)rt->prog->timing_begin();
+    const bool replayed = rt->prog->replay();
+    (void)rt->prog->timing_end();
+    if (!replayed || !rt->prog->sync())
       return fail("graph replay failed");
   } else {
     if (!rt->cuda->set_prefill_tokens(tokens) ||
@@ -3335,12 +4864,44 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
   }
   for (auto it = g_verify_runtimes.begin(); it != g_verify_runtimes.end();) {
     if (std::get<0>(it->first) == &m &&
-        std::get<3>(it->first) == cache_id &&
+        std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_verify_runtimes.erase(it);
     else
       ++it;
   }
+  for (auto it = g_repro_verify_runtimes.begin();
+       it != g_repro_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_repro_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  for (auto it = g_repro_eval_runtimes.begin();
+       it != g_repro_eval_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_repro_eval_runtimes.erase(it);
+    else
+      ++it;
+  }
+  // Reckless mode's prefill-dealt verify set is keyed the same way (model,
+  // n_ctx, cache_id, rows) and holds the session's cache too.
+  for (auto it = g_reckless_verify_runtimes.begin();
+       it != g_reckless_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_reckless_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  // The session's real-step measurements become the stored curve, so the
+  // next process (or the next session after a restart) starts from them.
+  spec_flush_refined_costs(m);
 }
 
 DevicePoolStats device_pool_stats() {
@@ -3366,6 +4927,62 @@ bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
   return true;
 }
 
+// The verify gemv's warps-per-row split is measured once per (quant type, rows,
+// cols, row count) on this device; the measurement needs only the model's
+// projection shapes, not the weights themselves. It runs with the rest of the
+// warm-up so no generation call pays it, and is a no-op when the split is
+// pinned (SONICBOOM_VERIFY_GEMV_WP), when spec is off, or after the first call.
+static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
+  if (spec_mode() == SpecMode::Off) return;
+  std::vector<const quant::QuantizedTensor*> weights;
+  const auto add = [&weights](const quant::QuantizedTensor& w) {
+    if (w.valid()) weights.push_back(&w);
+  };
+  for (const auto& b : m.weights.blocks) {
+    add(b.attn_q);
+    add(b.attn_k);
+    add(b.attn_v);
+    add(b.attn_output);
+    add(b.ffn_gate);
+    add(b.ffn_up);
+    add(b.ffn_down);
+  }
+  add(m.weights.output);     // untied lm head
+  add(m.weights.token_embd); // tied lm head
+  const std::string fingerprint = spec_kernel_fingerprint();
+  quant::cuda::warm_verify_gemv_wp(weights.data(), weights.size(),
+                                   fingerprint.c_str());
+}
+
+// The tile configuration the decode and verify mmq projections run with, and
+// the gemv-or-mmq family of each projection shape, are measured per shape at
+// load on the same synthetic-weight basis as the verify gemv split above.  The
+// pins must exist before the family timing uses them, and both before the
+// runtimes below build their graphs.
+static void warm_mmq_decode_model(const Gemma4Model& m) {
+  if (!quant::cuda::q8_1_enabled() || !quant::cuda::mmq_enabled()) return;
+  std::vector<const quant::QuantizedTensor*> weights;
+  const auto add = [&weights](const quant::QuantizedTensor& w) {
+    if (w.valid()) weights.push_back(&w);
+  };
+  for (const auto& b : m.weights.blocks) {
+    add(b.attn_q);
+    add(b.attn_k);
+    add(b.attn_v);
+    add(b.attn_output);
+    add(b.ffn_gate);
+    add(b.ffn_up);
+    add(b.ffn_down);
+  }
+  add(m.weights.output);     // untied lm head
+  add(m.weights.token_embd); // tied lm head
+  const std::string fingerprint = spec_kernel_fingerprint();
+  quant::cuda::mmq_up_warm(weights.data(), weights.size(),
+                           fingerprint.c_str());
+  quant::cuda::warm_decode_family(weights.data(), weights.size(),
+                                  fingerprint.c_str());
+}
+
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
                        planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
@@ -3374,6 +4991,11 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  // The verify gemv split is measured first: the decode/verify family table
+  // times the gemv at the same row counts, and the runtimes below must see both
+  // the pins and the family before they build (and capture) any graph.
+  warm_verify_gemv_wp_model(m);
+  warm_mmq_decode_model(m);
   // The warm-up builds the same runtimes the first request would, bound to the
   // caller's session cache from construction. The sampled capture bakes that
   // cache's device pointers in, so it cannot be warmed on a temporary set and
@@ -3381,15 +5003,33 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // runtime-owned cache as before.
   DecodeRuntime* rt = get_decode_runtime(m, n_ctx, session);
   if (!rt) return false;
+  // The cache the runtimes below are bound to: the caller's session cache, or
+  // the anonymous runtime's own (published into a local identity).
+  planner::KvCacheSession local;
+  planner::KvCacheSession* kv = session;
   if (session) {
     if (!session->caches || session->cache_id == 0) return false;
     (void)get_sampled_runtime(m, n_ctx, *session);
   } else {
-    planner::KvCacheSession warm;
-    warm.n_ctx = n_ctx;
-    rt->cuda->publish_cache(warm);
-    (void)get_sampled_runtime(m, n_ctx, warm);
+    local.n_ctx = n_ctx;
+    rt->cuda->publish_cache(local);
+    (void)get_sampled_runtime(m, n_ctx, local);
+    kv = &local;
   }
+  // The verify graphs a request can reach are built (and the anchors captured)
+  // here, before any request; spec_measure_cost_curve then prices the curve on
+  // those captured graphs.
+  // Reckless verifies through the prefill path, so the decode-dealt verify
+  // set is never reached and is not built (the prefill segments it uses are
+  // built on first use).
+  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Off &&
+      spec_mode() != SpecMode::Reckless)
+    warm_verify_set(m, n_ctx, *kv);
+  // 4b: price the verify cost curve here, at load, so the first generation call
+  // starts with every draft length priced and none of the warm-up lands inside
+  // its first token.
+  if (kv->caches && kv->cache_id != 0)
+    spec_measure_cost_curve(m, n_ctx, *rt, *kv);
   return true;
 }
 
@@ -3400,6 +5040,11 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
+  if (spec_reckless_unsupported()) {
+    std::cerr << "[spec] reckless mode is unsupported under the strict "
+                 "numerics profile\n";
+    return 0;
+  }
   const bool masked = !sample_mask.empty();
   if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
     std::cerr << "[spine] sample mask too small: " << sample_mask.size()
@@ -3490,7 +5135,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (masked) {
     // the masked single step above already produced the call's one token
   } else if (ir_program_enabled() && rt->program.valid &&
-             rt->program.speculative) {
+             rt->program.speculative && spec_enabled()) {
     // The speculative program drives the loop. There is no captured prefill
     // here, so the drafter starts from an empty history: its proposals are
     // verified, never trusted, so the token stream is the plain loop's. A
@@ -3856,6 +5501,16 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model&,
 std::string cuda_device_identity() { return "unknown"; }
 #endif
 
+// The RAII release for one cache set (defined here, outside the CUDA guard:
+// without CUDA nothing is ever registered, and the release is the no-op stub).
+SessionRuntimeOwner::SessionRuntimeOwner(const Gemma4Model& m,
+                                         uint64_t cache_id) noexcept
+    : model(&m), cache_id(cache_id) {}
+
+SessionRuntimeOwner::~SessionRuntimeOwner() {
+  if (model && cache_id != 0) release_session_runtimes(*model, 0, cache_id);
+}
+
 // ---------------------------------------------------------------------------
 // Prefill + decode (CUDA spine). Same token-stream contract as the CPU
 // generate_prefill_spine, but the prefill fills the device-resident KV caches
@@ -3908,7 +5563,9 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
   GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
                               /*softcap_output=*/!raw_logits);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled());
+                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
+                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                          /*rows_mmq=*/decode_mmq_available());
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);
@@ -3935,6 +5592,121 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
   return rt;
 }
 
+// The cached non-greedy one-row runtime for the repro prefill's final token
+// (see g_repro_eval_runtimes). Registered under the session's cache identity,
+// so release_session_runtimes drops it with the set.
+static DecodeRuntime* get_repro_eval_runtime(
+    const Gemma4Model& m, uint64_t n_ctx,
+    const planner::KvCacheSession& session) {
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_repro_eval_runtimes.find(key);
+    if (it != g_repro_eval_runtimes.end()) return it->second.get();
+  }
+  auto rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false, &session);
+  if (!rt) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_repro_eval_runtimes.find(key);
+  if (it != g_repro_eval_runtimes.end()) return it->second.get();
+  DecodeRuntime* raw = rt.get();
+  g_repro_eval_runtimes.emplace(key, std::move(rt));
+  return raw;
+}
+
+// B1: prefill in decode arithmetic (SONICBOOM_REPRO_PREFILL=decode).
+//
+// The prompt's tokens 0..n-2 are written to the session cache by the same
+// row-invariant verify graph the speculative decoder verifies with, in chunks
+// of at most kMaxVerifyRows rows at absolute positions start_pos+off. Row i of
+// a chunk is bit-identical to a plain decode step at that position (the B3
+// contract), so the cache state is exactly what a chain of decode steps writes
+// — independent of how the prompt is split into chunks, of where a reuse
+// boundary falls, and of the model's batch kernels. The final prompt token runs
+// one non-greedy decode step, which is where the caller's logits (and the first
+// sampled token) come from.
+//
+// Returns false on failure. `logits` (vocab floats, softcapped) and `first` are
+// only meaningful on success.
+static bool prefill_in_decode_arithmetic(
+    const Gemma4Model& m, std::span<const uint64_t> prompt, uint64_t start_pos,
+    planner::KvCacheSession& session, uint64_t n_ctx,
+    std::span<const uint8_t> sample_mask, std::vector<float>& logits,
+    std::span<float> logits_out, int64_t& first) {
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    std::cerr << "[prefill-cuda] repro prefill: token rows through the verify "
+                 "graph (decode arithmetic)\n";
+  const uint64_t n = prompt.size();
+  const uint64_t vocab = m.config.vocab_size;
+  if (n == 0 || logits.size() < vocab) return false;
+  const bool masked = !sample_mask.empty();
+  // A verify chunk must be a wrap-free run inside the sliding-window ring, the
+  // same constraint the verify step observes.
+  const uint64_t ring = m.config.sliding_window > 0 ? m.config.sliding_window
+                                                    : kDefaultPrefillChunk;
+  const uint64_t prefix = n - 1;
+  for (uint64_t off = 0; off < prefix;) {
+    const uint64_t pos = start_pos + off;
+    uint64_t rows = std::min<uint64_t>(planner::kMaxVerifyRows, prefix - off);
+    if (m.config.sliding_window > 0) rows = std::min(rows, ring - pos % ring);
+    if (rows < 2) {
+      // One row: the plain decode step is the row-invariant arithmetic here.
+      std::vector<int64_t> one(1, -1);
+      if (!decode_steps_spine_cuda(m, prompt.subspan(off, 1), pos, session, one))
+        return false;
+      off += 1;
+      continue;
+    }
+    VerifyRuntime* rt =
+        get_repro_verify_runtime(m, n_ctx, int(rows), session);
+    if (!rt) return false;
+    const bool replay_ok =
+        rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+    if (replay_ok) {
+      if (!rt->cuda->stage_prefill_tokens(*rt->prog,
+                                          prompt.subspan(off, rows)) ||
+          !rt->cuda->stage_verify_pos(*rt->prog, pos, int(rows)) ||
+          !rt->prog->replay() || !rt->prog->sync())
+        return false;
+    } else {
+      if (!rt->cuda->set_prefill_tokens(prompt.subspan(off, rows)) ||
+          !rt->cuda->set_verify_pos(pos, int(rows)))
+        return false;
+      const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(pos)};
+      auto res = rt->exec->execute(rt->plan, rt->snap, in);
+      if (!res) return false;
+      // The readback-free path has no natural completion point of its own;
+      // the last chunk's KV must be visible to the decode step below.
+      if (!rt->cuda->synchronize()) return false;
+    }
+    off += rows;
+  }
+
+  // Final prompt token: one non-greedy decode step on the session cache. Its
+  // KV row is the plain decode step's row at that position, and its output is
+  // the prompt's final softcapped logits (the same values lm_head hands the
+  // batched path).
+  DecodeRuntime* eval = get_repro_eval_runtime(m, n_ctx, session);
+  if (!eval) return false;
+  const uint64_t last_pos = start_pos + n - 1;
+  if (!eval->cuda->seed_token(prompt[size_t(n - 1)]) ||
+      !eval->cuda->set_pos(last_pos))
+    return false;
+  const std::vector<sx::Bytes> in{encode_i64(prompt[size_t(n - 1)]),
+                                  encode_i64(last_pos)};
+  auto res = eval->exec->execute(eval->plan, eval->snap, in);
+  if (!res || res->outputs.empty()) return false;
+  const sx::Bytes& lo = res->outputs[0];
+  if (lo.size() < vocab * sizeof(float)) return false;
+  std::memcpy(logits.data(), lo.data(), vocab * sizeof(float));
+  if (!logits_out.empty())
+    std::copy(logits.begin(), logits.end(), logits_out.begin());
+  first = masked ? nn::argmax_masked(logits, sample_mask) : nn::argmax(logits);
+  return first >= 0;
+}
+
 // Shared prefill + decode body. `prompt` is the tokens to actually prefill
 // (already the suffix when prefix reuse skipped a shared prefix); `session`, when
 // non-null, is the persistent prefix-cache session this run adopts/publishes its
@@ -3955,6 +5727,11 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   if (masked && sample_mask.size() < (m.config.vocab_size + 7) / 8) {
     std::cerr << "[prefill-cuda] sample mask too small: " << sample_mask.size()
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
+    return 0;
+  }
+  if (spec_reckless_unsupported()) {
+    std::cerr << "[spec] reckless mode is unsupported under the strict "
+                 "numerics profile\n";
     return 0;
   }
   // The final logits exist only on the attention prefill path (lm_head over the
@@ -4057,7 +5834,20 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   uint64_t step = 0;
 
   int64_t first = -1;
-  if (use_prefill) {
+  // SONICBOOM_REPRO_PREFILL=decode replaces the batched segments with the
+  // row-invariant verify graph (see prefill_in_decode_arithmetic). It needs a
+  // session cache to be meaningful; without one the batched path runs.
+  const bool repro_prefill =
+      use_prefill && session != nullptr && session->caches &&
+      session->cache_id != 0 && repro_prefill_enabled();
+  if (repro_prefill) {
+    if (!prefill_in_decode_arithmetic(m, prompt, start_pos, *session, n_ctx,
+                                      sample_mask, logits, logits_out, first))
+      return 0;
+    if (dump_logits)
+      dump_logits_top2(dump_logits_file, /*step=*/0, start_pos + prompt.size(),
+                       std::span<const float>(logits.data(), vocab));
+  } else if (use_prefill) {
     // Chunked device-resident prefill: the prompt is processed in segments of
     // `chunk` tokens (the SWA ring size, so a segment is a wrap-free run and the
     // batched kernels' consecutive-slot assumption holds). Each segment runs the
@@ -4445,7 +6235,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
   if (rt->prog && !replay_ok)
     log_capture_refusal("prefill-decode", m, n_ctx, rt->cuda->cache_id());
   if (!dump_logits && ir_program_enabled() && rt->program.valid &&
-      rt->program.speculative) {
+      rt->program.speculative && spec_enabled()) {
     // The speculative program drives the loop over the same cache the prefill
     // filled: the session's when the caller passed one, otherwise a session
     // published from this runtime's own cache (the one the step capture was
