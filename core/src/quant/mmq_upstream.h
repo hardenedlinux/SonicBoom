@@ -133,4 +133,48 @@ MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K);
 void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                  const char * build_id);
 
+// One projection of a sibling group (see mmq_up_group_matmul).
+struct MmqGroupMember {
+    const void *  x;              // weight blocks, M rows x K columns
+    const int32_t * y;            // the shared activation's blocks
+    float *       dst;            // [M][n] float32, column-major
+    const float * bias;           // optional [M] write-back epilogue
+    const float * add;            // optional [n][M] residual epilogue
+    int nrows;                    // M
+    int stride_col_dst;           // nrows for the dense layout
+    int stride_row_x;             // K / qk
+    int blocks_per_row;           // K / qk
+};
+
+// A group of sibling projections launched as one kernel.  All members read the
+// same activation; each member's output rows are a run of blocks in the grid's
+// x dimension, in member order.  ncols_dst is n and ncols_y is the activation's
+// block-row stride (also n for a decode/verify step).  tile_prefix is completed
+// by mmq_up_group_matmul from the members' row counts and the selected tile
+// height; the caller need not fill it.
+struct MmqGroupArgs {
+    int            n_members;      // 2 or 3
+    MmqGroupMember m[3];
+    int            tile_prefix[4];
+    int            ncols_dst;
+    int            ncols_y;
+};
+
+// dst[k] = weights[k] @ dequant(y_q8) for every member, in one launch: each
+// member runs the same tile body as mmq_up_matmul with the tile configuration
+// the imported table selects for the shared column count.  The members must
+// use formats and shapes this device serves (rows a multiple of 128, K a
+// multiple of 128) and their configurations must agree on the block shape.
+// Returns false when the group is not launchable; the caller then runs the
+// members' separate matmuls.  The epilogue values are the ones mmq_up_matmul
+// produces.
+bool mmq_up_group_matmul(const MmqGroupArgs & args, const MmqUpType * types,
+                         cudaStream_t stream);
+
+// Raise the group kernels' dynamic shared-memory limit for every tile width
+// they can be launched with, for the closed set of format tuples this build
+// instantiates.  Called once at warm-up; returns false for a tuple with no
+// instantiation.
+bool mmq_up_group_warm(const MmqUpType * types, int n_members);
+
 }  // namespace sonicboom::quant::cuda

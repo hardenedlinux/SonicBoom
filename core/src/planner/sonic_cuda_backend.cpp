@@ -1476,6 +1476,82 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           if (decomp_s == "stream_k") decomp = quant::cuda::MmqDecomp::StreamK;
           else if (decomp_s == "tiled") decomp = quant::cuda::MmqDecomp::Tiled;
         }
+        // `s1_slot`/`s2_slot` (fuse_sibling_gemv_pass's mmq form): the node
+        // merges two or three mmq projections over the step's activation, and
+        // one grouped launch runs every member's tiles. When the group is not
+        // launchable (a format tuple this build does not instantiate, a row
+        // count that does not fill whole tiles), the members run as separate
+        // launches in order — the unmerged plan's execution.
+        int64_t s1_slot = 0, s2_slot = 0;
+        if (attr_i(*node, "s1_slot", s1_slot) && node->outputs.size() >= 2) {
+          const bool has_s2 =
+              attr_i(*node, "s2_slot", s2_slot) && node->outputs.size() >= 3;
+          const size_t members = has_s2 ? 3 : 2;
+          const int64_t slots[3] = {slot_i, s1_slot, s2_slot};
+          std::vector<quant::cuda::MmqSibling> sib;
+          std::vector<std::span<const float>> biases;
+          sib.reserve(members);
+          biases.reserve(members);
+          bool ready = true;
+          for (size_t k = 0; k < members && ready; ++k) {
+            const auto* td = graph_.find_tensor(node->outputs[k]);
+            if (!td) { ready = false; break; }
+            int64_t bias_idx = 0, add_k = -1;
+            bool hb = false;
+            if (k == 0) {
+              bias_idx = bias_slot;
+              hb = has_bias;
+              if (has_add) add_k = add_idx;
+            } else if (k == 1) {
+              hb = attr_i(*node, "s1_bias_slot", bias_idx);
+              int64_t ai = 0;
+              if (attr_i(*node, "s1_add_input", ai)) add_k = ai;
+            } else {
+              hb = attr_i(*node, "s2_bias_slot", bias_idx);
+              int64_t ai = 0;
+              if (attr_i(*node, "s2_add_input", ai)) add_k = ai;
+            }
+            const auto& w = qweight(static_cast<model::WeightSlot>(slots[k]));
+            biases.push_back(hb ? fweight(static_cast<model::WeightSlot>(bias_idx))
+                                : std::span<const float>{});
+            float* yp = out;
+            if (k > 0) {
+              const uint64_t bytes = td->size_bytes;
+              const uint64_t h = bytes ? device::acquire(bytes) : 0;
+              if (!h) { ready = false; break; }
+              sibling_outs.push_back({h, bytes});
+              yp = dev_mut(h);
+            }
+            const float* add_kp =
+                add_k >= 0 && add_k < int64_t(in.size())
+                    ? static_cast<const float*>(dev(in[add_k]))
+                    : nullptr;
+            sib.push_back(quant::cuda::MmqSibling{&w, biases.back(), add_kp, yp});
+          }
+          if (ready)
+            for (size_t k = 0; k < members; ++k)
+              trace_family_call("matmul_mmq_q8_siblings_dev", *sib[k].weight,
+                                int(nb), int(members));
+          if (ready &&
+              quant::cuda::matmul_mmq_q8_siblings_dev(
+                  sib,
+                  reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])),
+                  int(nb))) {
+            ok = true;
+          } else if (ready) {
+            ok = true;
+            for (size_t k = 0; k < members && ok; ++k) {
+              float* yp = k == 0 ? out : dev_mut(sibling_outs[k - 1].first);
+              ok = quant::cuda::matmul_mmq_q8_dev(
+                  *sib[k].weight,
+                  reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])),
+                  yp, int(nb), decomp, sib[k].bias, sib[k].add);
+            }
+          } else {
+            ok = false;
+          }
+          break;  // the node's outputs are all written by the branch above
+        }
         trace_family_call("matmul_mmq_q8_dev", qweight(slot), int(nb));
         ok = quant::cuda::matmul_mmq_q8_dev(
             qweight(slot),

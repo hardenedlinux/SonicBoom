@@ -264,6 +264,30 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq, float* 
                        std::span<const float> bias = {},
                        const float* add = nullptr);
 
+// One member of an mmq sibling launch: a quantized projection reading the
+// shared block_q8_1_mmq activation, with its optional [rows] bias, optional
+// [n, rows] residual and its [n, rows] output.
+struct MmqSibling {
+  const QuantizedTensor* weight = nullptr;
+  std::span<const float> bias;  // empty => none
+  const float* add = nullptr;   // nullptr => none
+  float* y = nullptr;
+};
+
+// Two or three projections over one pre-quantized block_q8_1_mmq activation,
+// in a single launch: every member runs matmul_mmq_q8_dev's tile body at the
+// same tile width, and each output value is bit-identical to that member's
+// separate call (same tile configuration's arithmetic, same bias-then-residual
+// epilogue); only the launch grouping differs. Members must share the
+// activation's column count and use a format tuple this build instantiates
+// (the Q3_K/Q4_K/Q5_0/Q8_0 sibling groups of the reference models). Returns
+// false — having written no output — when the group is not launchable, so the
+// caller can fall back to the separate launches. `yq` is the members' shared
+// activation; the caller zeroes its J_max tail guard (zero_pad_planes) once, as
+// the separate calls would.
+bool matmul_mmq_q8_siblings_dev(std::span<const MmqSibling> siblings,
+                                const BlockQ8_1Mmq* yq, int n);
+
 // MMQ1: Y = W @ X on the compiler-generated int8 tensor-core kernel
 // (compiler/MmqTcCodegen.h), over a per-weight q8_1 copy instead of the packed
 // K-quant weight. On first use W is dequantized (quant::dequantize_row_f32,

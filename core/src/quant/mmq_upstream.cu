@@ -222,6 +222,190 @@ bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
     }
 }
 
+// ---------------------------------------------------------------------------
+// SonicBoom: sibling-group matmul.  One launch carries every member's row
+// tiles; see mul_mat_q_group in the imported kernel header.  The tuple of
+// member formats is a template parameter, so only the tuples this build
+// instantiates can be launched — every other group runs its members'
+// separate matmuls.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The group's shared column count fixes the tile width: the same pick_J the
+// imported launcher makes, which depends only on n.  A member whose table has
+// no configuration at that width makes the group unlaunchable.
+template <ggml_type T0, ggml_type T1, ggml_type T2>
+bool group_launch_typed(const sb_cuda_props & props,
+                        const sonicboom::quant::cuda::MmqGroupArgs & args,
+                        cudaStream_t stream) {
+    const int n = args.ncols_dst;
+    if (n <= 0 || args.ncols_y <= 0) {
+        return false;
+    }
+    const int J = pick_J(T0, false, n, props);
+    if (J == 0 || pick_J(T1, false, n, props) != J ||
+        (args.n_members > 2 && pick_J(T2, false, n, props) != J)) {
+        return false;
+    }
+    const ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config<0>(T0, J, false, props.cc);
+    const ggml_cuda_mmq_config c1 = ggml_cuda_mmq_get_config<0>(T1, J, false, props.cc);
+    const ggml_cuda_mmq_config c2 = ggml_cuda_mmq_get_config<0>(T2, J, false, props.cc);
+    if (c0.type == GGML_TYPE_COUNT || c1.type == GGML_TYPE_COUNT ||
+        (args.n_members > 2 && c2.type == GGML_TYPE_COUNT)) {
+        return false;
+    }
+    if (c0.nthreads != c1.nthreads ||
+        (args.n_members > 2 && c0.nthreads != c2.nthreads) ||
+        c0.I != c1.I || (args.n_members > 2 && c0.I != c2.I)) {
+        return false;
+    }
+    const size_t nbs = std::max({mmq_get_nbytes_shared(c0, props.cc),
+                                 mmq_get_nbytes_shared(c1, props.cc),
+                                 mmq_get_nbytes_shared(c2, props.cc)});
+    if (nbs > size_t(props.smpbo)) {
+        return false;
+    }
+
+    sonicboom::quant::cuda::MmqGroupArgs a = args;
+    int prefix = 0;
+    for (int k = 0; k < args.n_members; ++k) {
+        auto & m = a.m[k];
+        const ggml_cuda_mmq_config & ck = k == 0 ? c0 : (k == 1 ? c1 : c2);
+        // The group's tile body runs without the out-of-bounds check and
+        // writes every row of its last tile: the rows must fill whole tiles.
+        if (m.nrows <= 0 || m.nrows % ck.I != 0 || m.blocks_per_row <= 0 ||
+            m.stride_row_x != m.blocks_per_row ||
+            m.stride_col_dst != m.nrows) {
+            return false;
+        }
+        a.tile_prefix[k] = prefix;
+        prefix += (m.nrows + ck.I - 1) / ck.I;
+    }
+    a.tile_prefix[args.n_members] = prefix;
+
+    const dim3 block(props.warp_size, c0.nthreads / props.warp_size, 1);
+    const dim3 grid(unsigned(prefix), unsigned((n + J - 1) / J), 1);
+    switch (J) {
+        case   8: mul_mat_q_group<T0, T1, T2,   8><<<grid, block, nbs, stream>>>(a); break;
+        case  16: mul_mat_q_group<T0, T1, T2,  16><<<grid, block, nbs, stream>>>(a); break;
+        case  24: mul_mat_q_group<T0, T1, T2,  24><<<grid, block, nbs, stream>>>(a); break;
+        case  32: mul_mat_q_group<T0, T1, T2,  32><<<grid, block, nbs, stream>>>(a); break;
+        case  40: mul_mat_q_group<T0, T1, T2,  40><<<grid, block, nbs, stream>>>(a); break;
+        case  48: mul_mat_q_group<T0, T1, T2,  48><<<grid, block, nbs, stream>>>(a); break;
+        case  56: mul_mat_q_group<T0, T1, T2,  56><<<grid, block, nbs, stream>>>(a); break;
+        case  64: mul_mat_q_group<T0, T1, T2,  64><<<grid, block, nbs, stream>>>(a); break;
+        case  72: mul_mat_q_group<T0, T1, T2,  72><<<grid, block, nbs, stream>>>(a); break;
+        case  80: mul_mat_q_group<T0, T1, T2,  80><<<grid, block, nbs, stream>>>(a); break;
+        case  88: mul_mat_q_group<T0, T1, T2,  88><<<grid, block, nbs, stream>>>(a); break;
+        case  96: mul_mat_q_group<T0, T1, T2,  96><<<grid, block, nbs, stream>>>(a); break;
+        case 104: mul_mat_q_group<T0, T1, T2, 104><<<grid, block, nbs, stream>>>(a); break;
+        case 112: mul_mat_q_group<T0, T1, T2, 112><<<grid, block, nbs, stream>>>(a); break;
+        case 120: mul_mat_q_group<T0, T1, T2, 120><<<grid, block, nbs, stream>>>(a); break;
+        case 128: mul_mat_q_group<T0, T1, T2, 128><<<grid, block, nbs, stream>>>(a); break;
+        default:  return false;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// Raise the shared-memory limit for every tile width the group kernel can be
+// launched with.  Nothing is launched here.
+template <ggml_type T0, ggml_type T1, ggml_type T2>
+void group_warm_typed(const sb_cuda_props & props) {
+    for (int J = 8; J <= 128; J += 8) {
+        const ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config<0>(T0, J, false, props.cc);
+        const ggml_cuda_mmq_config c1 = ggml_cuda_mmq_get_config<0>(T1, J, false, props.cc);
+        const ggml_cuda_mmq_config c2 = ggml_cuda_mmq_get_config<0>(T2, J, false, props.cc);
+        if (c0.type == GGML_TYPE_COUNT || c1.type == GGML_TYPE_COUNT ||
+            c2.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+        const size_t nbs = std::max({mmq_get_nbytes_shared(c0, props.cc),
+                                     mmq_get_nbytes_shared(c1, props.cc),
+                                     mmq_get_nbytes_shared(c2, props.cc)});
+        if (nbs > size_t(props.smpbo)) {
+            continue;
+        }
+        switch (J) {
+            case   8: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,   8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  16: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  16>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  24: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  24>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  32: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  32>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  40: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  40>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  48: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  48>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  56: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  56>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  64: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  64>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  72: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  72>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  80: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  80>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  88: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  88>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case  96: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  96>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case 104: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 104>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case 112: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 112>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case 120: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 120>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case 128: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            default:  break;
+        }
+    }
+}
+
+// The format tuples whose group kernels this build instantiates: the sibling
+// projections the four reference models' decode and verify graphs carry.
+bool group_dispatch(const sb_cuda_props & props,
+                    const sonicboom::quant::cuda::MmqGroupArgs & args,
+                    const MmqUpType * types, cudaStream_t stream, bool warm) {
+    const ggml_type t0 = to_ggml_type(types[0]);
+    const ggml_type t1 = to_ggml_type(types[1]);
+    const ggml_type t2 = args.n_members > 2 ? to_ggml_type(types[2]) : t1;
+    if (t0 == GGML_TYPE_Q3_K && t1 == GGML_TYPE_Q3_K && t2 == GGML_TYPE_Q3_K) {
+        if (warm) group_warm_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props);
+        else return group_launch_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props, args, stream);
+        return true;
+    }
+    if (t0 == GGML_TYPE_Q4_K && t1 == GGML_TYPE_Q4_K && t2 == GGML_TYPE_Q4_K) {
+        if (warm) group_warm_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props);
+        else return group_launch_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props, args, stream);
+        return true;
+    }
+    if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q5_0) {
+        if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props);
+        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props, args, stream);
+        return true;
+    }
+    if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q8_0) {
+        if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props);
+        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props, args, stream);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+bool mmq_up_group_matmul(const sonicboom::quant::cuda::MmqGroupArgs & args,
+                         const MmqUpType * types, cudaStream_t stream) {
+    if (types == nullptr || args.n_members < 2 || args.n_members > 3) {
+        return false;
+    }
+    for (int k = 0; k < args.n_members; ++k) {
+        const auto & m = args.m[k];
+        if (m.x == nullptr || m.y == nullptr || m.dst == nullptr ||
+            m.nrows <= 0 || m.blocks_per_row <= 0) {
+            return false;
+        }
+    }
+    return group_dispatch(get_props(), args, types, stream, /*warm=*/false);
+}
+
+bool mmq_up_group_warm(const MmqUpType * types, int n_members) {
+    if (types == nullptr || n_members < 2 || n_members > 3) {
+        return false;
+    }
+    sonicboom::quant::cuda::MmqGroupArgs args{};
+    args.n_members = n_members;
+    return group_dispatch(get_props(), args, types, nullptr, /*warm=*/true);
+}
+
 bool mmq_up_quantize(const float * x, int32_t * y_q8, int64_t K, int64_t n,
                      MmqUpType type, cudaStream_t stream) {
     if (x == nullptr || y_q8 == nullptr) {

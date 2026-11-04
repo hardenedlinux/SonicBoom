@@ -4053,6 +4053,24 @@ void decode_family_store(const VerifyWpShape& s, bool mmq, int build_key) {
                {"k", decode_family_build_hash(g_decode_family_build_id)}});
 }
 
+// The sibling-group kernels' shared-memory limits are set once, before any
+// group launch: cudaFuncSetAttribute is a host-side setup call and never
+// belongs on a launch path. The tuples are the format combinations the grouped
+// launch instantiates (see mmq_up_group_matmul).
+void mmq_group_warm_once() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    using T = MmqUpType;
+    const MmqUpType tuples[4][3] = {
+        {T::Q3_K, T::Q3_K, T::Q3_K},
+        {T::Q4_K, T::Q4_K, T::Q4_K},
+        {T::Q5_0, T::Q5_0, T::Q5_0},
+        {T::Q5_0, T::Q5_0, T::Q8_0},
+    };
+    for (const auto& t : tuples) (void)mmq_up_group_warm(t, 3);
+  });
+}
+
 }  // namespace
 
 bool decode_family_mmq(QuantType qt, int rows, int cols) {
@@ -4072,6 +4090,7 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
   if (!available() || !q8_1_enabled() || !mmq_enabled() || !weights ||
       count == 0)
     return;
+  mmq_group_warm_once();
   if (decode_family_override() != 0) return;  // the debug pin wins
   {
     std::lock_guard<std::mutex> lk(g_decode_family_mutex);
@@ -4247,6 +4266,70 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   return mmq_up_matmul(
       wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
       cur_stream(), cfg, pin.split_k, d_bias, add);
+}
+
+// Grouped form of matmul_mmq_q8_dev: every member runs the same tile body at
+// the shared column count's tile width, in one launch. The members must share
+// the activation's column count; their rows fill whole 128-row tiles (the
+// group kernel's tile body has no out-of-bounds check, exactly as the separate
+// call's non-fallback body for rows % 128 == 0). `yq`'s J_max tail guard is
+// zeroed once for the whole group — the separate calls would each zero it.
+bool matmul_mmq_q8_siblings_dev(std::span<const MmqSibling> siblings,
+                                const BlockQ8_1Mmq* yq, int n) {
+  if (!available() || !yq || n <= 0 || siblings.size() < 2 ||
+      siblings.size() > 3)
+    return false;
+  const QuantizedTensor& head = *siblings[0].weight;
+  if (!head.valid() || head.dims().size() != 2) return false;
+  const uint64_t cols = head.dims()[0];
+  if (cols % mmq::QK8_1_MMQ != 0) return false;
+  const int ic = int(cols);
+
+  MmqGroupArgs args{};
+  args.n_members = int(siblings.size());
+  args.ncols_dst = n;
+  args.ncols_y = n;
+  MmqUpType types[3] = {};
+  for (size_t k = 0; k < siblings.size(); ++k) {
+    const MmqSibling& s = siblings[k];
+    if (!s.weight || !s.weight->valid() || s.weight->dims().size() != 2 ||
+        !s.y)
+      return false;
+    if (s.weight->dims()[0] != cols) return false;  // one shared activation
+    const uint64_t rows = s.weight->dims()[1];
+    if (rows == 0 || rows % 128 != 0) return false;
+    const std::optional<MmqUpType> type = mmq_up_type_of(s.weight->type());
+    if (!type) return false;
+    const int bpr = int(cols / s.weight->block_size());
+    if (bpr <= 0) return false;
+    const uint8_t* wp =
+        static_cast<const uint8_t*>(upload_weight(*s.weight));
+    if (!wp) return false;
+    const float* d_bias = nullptr;
+    if (!s.bias.empty()) {
+      if (s.bias.size() != rows) return false;
+      d_bias = static_cast<const float*>(
+          upload_bytes(s.bias.data(), rows * sizeof(float)));
+      if (!d_bias) return false;
+    }
+    types[k] = *type;
+    MmqGroupMember& m = args.m[k];
+    m.x = wp;
+    m.y = reinterpret_cast<const int32_t*>(yq);
+    m.dst = s.y;
+    m.bias = d_bias;
+    m.add = s.add;
+    m.nrows = int(rows);
+    m.stride_col_dst = int(rows);
+    m.stride_row_x = bpr;
+    m.blocks_per_row = bpr;
+  }
+
+  // The tail plane a K that is not a multiple of MMQ_ITER_K leaves is read by
+  // the last K-iteration; zero it once, before the group runs.
+  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(yq), ic, n,
+                       cur_stream());
+  return mmq_up_group_matmul(args, types, cur_stream());
 }
 
 // MMQ2: the generated kernel's (tile_m, tile_n) for one shape class. The first

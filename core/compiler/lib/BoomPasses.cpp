@@ -1058,12 +1058,21 @@ public:
 // (`s2_bias_slot`) for their folded biases, and carries the members' output
 // tensors as extra results. A backend that cannot run the merged form falls
 // back to the members' separate launches in order, so this is a scheduling
-// change only. A `batch` (mmq prefill) node and one carrying `add_input` are
-// left alone (the merged kernel has no residual epilogue). A `verify` node is
-// merged too: its group shares the same activation row for row, and the
-// batched sibling kernel runs the position loop inside the one launch, every
-// (row, position) value again identical to the member's separate batched
-// launch.
+// change only. A gemv-form node carrying `add_input` is left alone (the merged
+// gemv kernel has no residual epilogue). A `verify` node is merged too: its
+// group shares the same activation row for row, and the batched sibling kernel
+// runs the position loop inside the one launch, every (row, position) value
+// again identical to the member's separate batched launch.
+//
+// The mmq form of the same merge: nodes that take the mmq matmul (`batch`
+// attributes from the prefill lowering) and read one shared block_q8_1_mmq
+// activation become one node the backend runs as a grouped mmq launch. Members
+// must agree on the extent and on the activation's scale layout (`ds`); a node
+// that quantizes its activation inside the matmul (`mmq_rows`) reads an f32
+// tensor and is left alone. A member's residual input, when it has one, is
+// appended to the merged node's operands and named by `s1_add_input` /
+// `s2_add_input`, so the group applies it with that member's output. The merged
+// node's results are in member order, as for the gemv form.
 class FuseSiblingGemvPass
     : public mlir::PassWrapper<FuseSiblingGemvPass,
                                mlir::OperationPass<boom::GraphOp>> {
@@ -1134,6 +1143,89 @@ public:
           head->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
           builder.getArrayAttr(nodeAttrs), resultIds, head->getOperands(),
           resultTypes, head->getAttrOfType<mlir::StringAttr>("backend"));
+
+      for (std::size_t k = 0; k < members; ++k) {
+        view.noteValue(resultIds[k], node->getResult(k));
+        g[k]->getResult(0).replaceAllUsesWith(node->getResult(k));
+      }
+      for (std::size_t k = 0; k < members; ++k) g[k]->erase();
+    }
+
+    // The mmq-form groups, formed after the gemv ones so the nodes the merges
+    // above produced are already in their final form.
+    llvm::DenseMap<int64_t, llvm::SmallVector<mlir::Operation *>> mmq_groups;
+    llvm::SmallVector<int64_t> mmq_order;
+    for (mlir::Operation &node : view.body()) {
+      if (node.getName().getStringRef() !=
+          boomOpName(planner::OpKind::QuantizedMatmulQ8))
+        continue;
+      auto attrs = node.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+      const auto nb = nodeAttrInt(attrs, "batch");
+      if (!nb || nodeAttrInt(attrs, "mmq_rows")) continue;
+      if (!nodeAttrInt(attrs, "slot")) continue;
+      if (node.getNumResults() != 1 || node.getNumOperands() < 1) continue;
+      const auto ds = nodeAttrInt(attrs, "ds");
+      const int64_t act = view.idOf(node.getOperand(0));
+      auto it = mmq_groups.find(act);
+      if (it == mmq_groups.end()) {
+        mmq_groups.try_emplace(act).first->second.push_back(&node);
+        mmq_order.push_back(act);
+        continue;
+      }
+      if (!it->second.empty()) {
+        auto headAttrs =
+            it->second.front()->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        if (nodeAttrInt(headAttrs, "batch") != nb ||
+            nodeAttrInt(headAttrs, "ds") != ds)
+          continue;
+      }
+      it->second.push_back(&node);
+    }
+
+    for (int64_t act : mmq_order) {
+      llvm::SmallVector<mlir::Operation *> &g = mmq_groups.find(act)->second;
+      if (g.size() < 2) continue;
+      const std::size_t members = std::min<std::size_t>(g.size(), 3);
+      mlir::Operation *head = g[0];
+
+      llvm::SmallVector<mlir::Attribute> nodeAttrs(
+          head->getAttrOfType<mlir::ArrayAttr>("node_attrs").getValue());
+      llvm::SmallVector<mlir::Value> operands(head->getOperands());
+      llvm::SmallVector<int64_t> resultIds;
+      llvm::SmallVector<mlir::Type> resultTypes;
+      for (std::size_t k = 0; k < members; ++k) {
+        mlir::Operation *m = g[k];
+        auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+        if (k > 0) {
+          const std::string prefix = k == 1 ? "s1_" : "s2_";
+          nodeAttrs.push_back(boom::NodeAttr::get(
+              view.ctx(), prefix + "slot",
+              builder.getI64IntegerAttr(*nodeAttrInt(attrs, "slot"))));
+          if (auto bias = nodeAttrInt(attrs, "bias_slot")) {
+            nodeAttrs.push_back(boom::NodeAttr::get(
+                view.ctx(), prefix + "bias_slot",
+                builder.getI64IntegerAttr(*bias)));
+          }
+          // The member's residual input goes after the head's operands; the
+          // merged node names its position for that member's epilogue.
+          if (auto add = nodeAttrInt(attrs, "add_input")) {
+            operands.push_back(m->getOperand(*add));
+            nodeAttrs.push_back(boom::NodeAttr::get(
+                view.ctx(), prefix + "add_input",
+                builder.getI64IntegerAttr(int64_t(operands.size() - 1))));
+          }
+        }
+        resultIds.push_back(GraphEditor::resultIds(*m).front());
+        resultTypes.push_back(m->getResult(0).getType());
+      }
+
+      builder.setInsertionPoint(head);
+      mlir::Operation *node = buildNode(
+          builder, loc, planner::op_kind_name(planner::OpKind::QuantizedMatmulQ8),
+          GraphEditor::nodeId(*head),
+          head->getAttrOfType<mlir::StringAttr>("node_name").getValue(),
+          builder.getArrayAttr(nodeAttrs), resultIds, operands, resultTypes,
+          head->getAttrOfType<mlir::StringAttr>("backend"));
 
       for (std::size_t k = 0; k < members; ++k) {
         view.noteValue(resultIds[k], node->getResult(k));

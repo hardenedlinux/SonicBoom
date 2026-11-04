@@ -32,6 +32,9 @@
 // is installed on the calling thread).
 #include "../../../planner/plan_hook.h"
 
+// SonicBoom: the plain-pointer group arguments the sibling-group kernel takes.
+#include "../../mmq_upstream.h"
+
 #include <climits>
 #include <cstdint>
 
@@ -1069,6 +1072,75 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     }
 }
 
+
+// SonicBoom: one member's tile of the sibling-group kernel.  The tile body is
+// the same mul_mat_q_process_tile call the plain kernel makes, with the
+// member's own weight, row count and epilogues; the output column and row
+// offsets are the block's tile in the group's shared column space.
+template <ggml_type type, int J>
+static __device__ __forceinline__ void mul_mat_q_group_tile(
+        const int * __restrict__ ids_dst, const sonicboom::quant::cuda::MmqGroupMember & m,
+        const int it, const int jt, const int ncols_dst, const int ncols_y) {
+    constexpr int I  = ggml_cuda_mmq_get_I<0>(type, J, false);
+    constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+
+    // Same epilogue addressing as the plain kernel's tile body (see its
+    // epi_bias/epi_add): the bias is per output row and the residual is read
+    // through the tile's write-back indices.
+    const float * epi_bias = m.bias != nullptr ? m.bias + it*I : nullptr;
+    const float * epi_add  = m.add  != nullptr ? m.add + it*I : nullptr;
+    (void)jt;
+
+    constexpr bool fallback = false;
+    constexpr bool fixup    = false;
+    mul_mat_q_process_tile<type, J, fallback, fixup>
+        (static_cast<const char *>(m.x), it*I*m.stride_row_x, m.y + jt*J*sz, ids_dst,
+         m.dst + jt*J*m.stride_col_dst + it*I, nullptr, nullptr,
+         m.stride_row_x, ncols_y, m.stride_col_dst,
+         m.nrows - it*I - 1, ncols_dst - jt*J - 1, 0, m.blocks_per_row,
+         epi_bias, epi_add);
+}
+
+// SonicBoom: sibling-group matmul.  Every block belongs to exactly one member:
+// blockIdx.x below tile_prefix[1] is the first member's tiles, and so on, and
+// blockIdx.y is the column tile shared by the whole group.  Each member runs
+// the imported tile body with the table's configuration at this tile width.
+// T0..T2 are the members' weight formats; the entries past n_members are
+// unused (the launcher only forms groups whose tuple this build instantiates).
+template <ggml_type T0, ggml_type T1, ggml_type T2, int J>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads<0>(T0, J, false))
+static __global__ void mul_mat_q_group(const sonicboom::quant::cuda::MmqGroupArgs args) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads<0>(T0, J, false);
+    constexpr int nwarps    = nthreads / warp_size;
+
+    // Identity write-back indices: the group has no MoE routing.
+    extern __shared__ int ids_dst_shared[];
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        if (j0 + nwarps*warp_size > J && j >= J) {
+            break;
+        }
+        ids_dst_shared[j] = j;
+    }
+    __syncthreads();
+
+    int g = 0;
+    while (g + 1 < args.n_members && int(blockIdx.x) >= args.tile_prefix[g + 1]) {
+        ++g;
+    }
+    const int it = int(blockIdx.x) - args.tile_prefix[g];
+    const int jt = int(blockIdx.y);
+
+    if (g == 0) {
+        mul_mat_q_group_tile<T0, J>(ids_dst_shared, args.m[0], it, jt, args.ncols_dst, args.ncols_y);
+    } else if (g == 1) {
+        mul_mat_q_group_tile<T1, J>(ids_dst_shared, args.m[1], it, jt, args.ncols_dst, args.ncols_y);
+    } else {
+        mul_mat_q_group_tile<T2, J>(ids_dst_shared, args.m[2], it, jt, args.ncols_dst, args.ncols_y);
+    }
+}
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
