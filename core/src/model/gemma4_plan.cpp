@@ -68,6 +68,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -4954,6 +4955,9 @@ static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
                                    fingerprint.c_str());
 }
 
+static void warm_mmq_group_split_model(const Gemma4Model& m,
+                                       const std::string& fingerprint);
+
 // The tile configuration the decode and verify mmq projections run with, and
 // the gemv-or-mmq family of each projection shape, are measured per shape at
 // load on the same synthetic-weight basis as the verify gemv split above.  The
@@ -4981,6 +4985,81 @@ static void warm_mmq_decode_model(const Gemma4Model& m) {
                            fingerprint.c_str());
   quant::cuda::warm_decode_family(weights.data(), weights.size(),
                                   fingerprint.c_str());
+  warm_mmq_group_split_model(m, fingerprint);
+}
+
+// The sibling projections the plan's MMQ group launch can carry: the attention
+// triple and the feed-forward pair of every block, partitioned by activation
+// layout (one group reads one quantized activation buffer) and restricted to
+// the formats, column counts and row counts the group kernel takes — the same
+// filter the plan's sibling pass applies.  Each group's split-K count is
+// measured once here, before any graph is built.
+static void warm_mmq_group_split_model(const Gemma4Model& m,
+                                       const std::string& fingerprint) {
+  using quant::QuantType;
+  using quant::cuda::MmqUpType;
+  const auto up_type = [](QuantType qt) -> std::optional<MmqUpType> {
+    switch (qt) {
+      case QuantType::Q3_K: return MmqUpType::Q3_K;
+      case QuantType::Q4_K: return MmqUpType::Q4_K;
+      case QuantType::Q5_K: return MmqUpType::Q5_K;
+      case QuantType::Q6_K: return MmqUpType::Q6_K;
+      case QuantType::Q5_0: return MmqUpType::Q5_0;
+      case QuantType::Q8_0: return MmqUpType::Q8_0;
+      default: return std::nullopt;
+    }
+  };
+  // 0 for the float-d4 activation layout, 1 for the half2-ds4 one; -1 marks a
+  // format the fused activation emitter does not produce (Q6_K).
+  const auto ds_of = [](QuantType qt) {
+    return (qt == QuantType::Q4_K || qt == QuantType::Q5_K)
+               ? 1
+               : (qt == QuantType::Q6_K ? -1 : 0);
+  };
+  const auto try_group = [&](const quant::QuantizedTensor* const* w, int count) {
+    // Members in plan order, one bucket per activation layout.
+    struct Slot {
+      MmqUpType type;
+      int64_t rows;
+      int64_t cols;
+    };
+    Slot slot[3][3];
+    int nslot[3] = {0, 0, 0};
+    constexpr int kSlotOfDs[2] = {0, 1};
+    for (int i = 0; i < count; ++i) {
+      if (!w[i] || !w[i]->valid() || w[i]->dims().size() != 2) return;
+      const int ds = ds_of(w[i]->type());
+      if (ds < 0) continue;
+      const std::optional<MmqUpType> t = up_type(w[i]->type());
+      if (!t) return;
+      const int64_t cols = int64_t(w[i]->dims()[0]);
+      const int64_t rows = int64_t(w[i]->dims()[1]);
+      if (cols <= 0 || cols % 128 != 0 || rows <= 0 || rows % 128 != 0) return;
+      Slot& s = slot[kSlotOfDs[ds]][nslot[kSlotOfDs[ds]]++];
+      s = {*t, rows, cols};
+    }
+    for (int b = 0; b < 2; ++b) {
+      if (nslot[b] < 2) continue;
+      MmqUpType types[3] = {};
+      int64_t rows[3] = {};
+      bool same_cols = true;
+      for (int i = 0; i < nslot[b]; ++i) {
+        types[i] = slot[b][i].type;
+        rows[i] = slot[b][i].rows;
+        same_cols = same_cols && slot[b][i].cols == slot[b][0].cols;
+      }
+      if (!same_cols) continue;
+      quant::cuda::mmq_up_group_warm_split(types, rows, nslot[b],
+                                           slot[b][0].cols,
+                                           fingerprint.c_str());
+    }
+  };
+  for (const auto& b : m.weights.blocks) {
+    const quant::QuantizedTensor* attn[3] = {&b.attn_q, &b.attn_k, &b.attn_v};
+    try_group(attn, 3);
+    const quant::QuantizedTensor* ffn[2] = {&b.ffn_gate, &b.ffn_up};
+    try_group(ffn, 2);
+  }
 }
 
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,

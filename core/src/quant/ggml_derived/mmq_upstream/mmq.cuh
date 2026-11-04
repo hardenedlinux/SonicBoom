@@ -1077,27 +1077,57 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 // the same mul_mat_q_process_tile call the plain kernel makes, with the
 // member's own weight, row count and epilogues; the output column and row
 // offsets are the block's tile in the group's shared column space.
-template <ggml_type type, int J>
+//
+// With split the block is one K slice of the group's split-K pass: the member's
+// tile body runs over that slice only and writes its float partials at the
+// slice's row run within the group's shared [nsplit][n][total_rows] buffer,
+// without epilogues.  The group reduce adds the slices and applies them.
+template <ggml_type type, int J, bool split>
 static __device__ __forceinline__ void mul_mat_q_group_tile(
-        const int * __restrict__ ids_dst, const sonicboom::quant::cuda::MmqGroupMember & m,
-        const int it, const int jt, const int ncols_dst, const int ncols_y) {
+        const int * __restrict__ ids_dst, const sonicboom::quant::cuda::MmqGroupArgs & args,
+        const int g, const int s, const int it, const int jt) {
     constexpr int I  = ggml_cuda_mmq_get_I<0>(type, J, false);
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int ITER_K = ggml_cuda_mmq_get_K_vram<0>(type, J, false);
+    constexpr int blocks_per_iter = ITER_K / qk;
+
+    const sonicboom::quant::cuda::MmqGroupMember & m = args.m[g];
 
     // Same epilogue addressing as the plain kernel's tile body (see its
     // epi_bias/epi_add): the bias is per output row and the residual is read
-    // through the tile's write-back indices.
-    const float * epi_bias = m.bias != nullptr ? m.bias + it*I : nullptr;
-    const float * epi_add  = m.add  != nullptr ? m.add + it*I : nullptr;
-    (void)jt;
+    // through the tile's write-back indices.  The partial pass has none.
+    const float * epi_bias = (!split && m.bias != nullptr) ? m.bias + it*I : nullptr;
+    const float * epi_add  = (!split && m.add  != nullptr) ? m.add  + it*I : nullptr;
+
+    float * dst = m.dst + jt*J*m.stride_col_dst + it*I;
+    int stride_col_dst = m.stride_col_dst;
+    int kb0_start = 0;
+    int kb0_stop  = m.blocks_per_row;
+
+    if constexpr (split) {
+        const int nblocks = m.blocks_per_row;
+        const int ntiles  = (nblocks + blocks_per_iter - 1) / blocks_per_iter;
+        const int tile_start = (int)(int64_t(s)    *ntiles / args.nsplit);
+        const int tile_stop  = (int)(int64_t(s + 1)*ntiles / args.nsplit);
+        if (tile_start >= tile_stop) {
+            return;
+        }
+        kb0_start = tile_start*blocks_per_iter;
+        kb0_stop  = min(tile_stop*blocks_per_iter, nblocks);
+
+        dst = args.part + size_t(s)*args.ncols_dst*args.total_rows +
+              jt*J*args.total_rows + args.rows_prefix[g] + it*I;
+        stride_col_dst = args.total_rows;
+    }
 
     constexpr bool fallback = false;
     constexpr bool fixup    = false;
     mul_mat_q_process_tile<type, J, fallback, fixup>
         (static_cast<const char *>(m.x), it*I*m.stride_row_x, m.y + jt*J*sz, ids_dst,
-         m.dst + jt*J*m.stride_col_dst + it*I, nullptr, nullptr,
-         m.stride_row_x, ncols_y, m.stride_col_dst,
-         m.nrows - it*I - 1, ncols_dst - jt*J - 1, 0, m.blocks_per_row,
+         dst, nullptr, nullptr,
+         m.stride_row_x, args.ncols_y, stride_col_dst,
+         m.nrows - it*I - 1, args.ncols_dst - jt*J - 1, kb0_start, kb0_stop,
          epi_bias, epi_add);
 }
 
@@ -1132,14 +1162,50 @@ static __global__ void mul_mat_q_group(const sonicboom::quant::cuda::MmqGroupArg
     }
     const int it = int(blockIdx.x) - args.tile_prefix[g];
     const int jt = int(blockIdx.y);
+    const bool split = args.nsplit > 1;
+    const int  s     = split ? int(blockIdx.z) : 0;
 
     if (g == 0) {
-        mul_mat_q_group_tile<T0, J>(ids_dst_shared, args.m[0], it, jt, args.ncols_dst, args.ncols_y);
+        if (split) mul_mat_q_group_tile<T0, J, true >(ids_dst_shared, args, 0, s, it, jt);
+        else       mul_mat_q_group_tile<T0, J, false>(ids_dst_shared, args, 0, 0, it, jt);
     } else if (g == 1) {
-        mul_mat_q_group_tile<T1, J>(ids_dst_shared, args.m[1], it, jt, args.ncols_dst, args.ncols_y);
+        if (split) mul_mat_q_group_tile<T1, J, true >(ids_dst_shared, args, 1, s, it, jt);
+        else       mul_mat_q_group_tile<T1, J, false>(ids_dst_shared, args, 1, 0, it, jt);
     } else {
-        mul_mat_q_group_tile<T2, J>(ids_dst_shared, args.m[2], it, jt, args.ncols_dst, args.ncols_y);
+        if (split) mul_mat_q_group_tile<T2, J, true >(ids_dst_shared, args, 2, s, it, jt);
+        else       mul_mat_q_group_tile<T2, J, false>(ids_dst_shared, args, 2, 0, it, jt);
     }
+}
+
+// SonicBoom: combine a group's split-K partials.  One pass over the group's
+// [ncols_dst][total_rows] output space: each entry belongs to the member whose
+// row run holds it, the slices are summed in ascending order with one f32 add
+// each, and the member's bias and residual are applied in the same order the
+// single-pass write-back uses.
+static __global__ void mul_mat_q_group_split_k_reduce(
+        const float * __restrict__ part, const sonicboom::quant::cuda::MmqGroupArgs args) {
+    const int nsplit = args.nsplit;
+    const int64_t total = int64_t(args.ncols_dst)*args.total_rows;
+    const int64_t idx = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (idx >= total) {
+        return;
+    }
+    const int col = int(idx / args.total_rows);
+    const int row = int(idx - int64_t(col)*args.total_rows);
+    int g = 0;
+    while (g + 1 < args.n_members && row >= args.rows_prefix[g + 1]) {
+        ++g;
+    }
+    const int rl = row - args.rows_prefix[g];
+    const sonicboom::quant::cuda::MmqGroupMember & m = args.m[g];
+
+    float acc = part[idx];
+    for (int s = 1; s < nsplit; ++s) {
+        acc = __fadd_rn(acc, part[int64_t(s)*total + idx]);
+    }
+    if (m.bias != nullptr) acc = __fadd_rn(acc, m.bias[rl]);
+    if (m.add  != nullptr) acc = __fadd_rn(acc, m.add[int64_t(col)*m.stride_col_dst + rl]);
+    m.dst[int64_t(col)*m.stride_col_dst + rl] = acc;
 }
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598

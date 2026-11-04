@@ -21,6 +21,7 @@
 
 #include "mmq_upstream.h"
 
+#include "../nn/cuda_scratch_epoch.h"
 #include "../planner/autotune.h"
 
 #include "ggml_derived/mmq_upstream/mmq.cuh"
@@ -112,21 +113,30 @@ int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const sb_cuda_props
 }
 
 // SonicBoom: device buffer for split-K partials, [split_k][n][M] float.
-// Grown on demand and reused; the largest call seen determines the size, so
-// the first call for a shape must run before CUDA graph capture.
+// Grown on demand and reused.  The warm-up measures the split counts, so the
+// buffer reaches its high-water size before any CUDA graph capture is built; a
+// growth after a capture exists retains the old allocation (the capture keeps
+// its baked pointer) and bumps the scratch epoch, as the shared scratch
+// contract requires.
 float * split_scratch_get(size_t bytes) {
     static std::mutex mutex;
     static float * ptr = nullptr;
     static size_t capacity = 0;
+    static std::vector<float *> retired;
 
     std::lock_guard<std::mutex> lock(mutex);
     if (bytes > capacity) {
         if (ptr != nullptr) {
-            CUDA_CHECK(cudaFree(ptr));
+            if (sonicboom::cuda::scratch_may_free()) {
+                CUDA_CHECK(cudaFree(ptr));
+            } else {
+                retired.push_back(ptr);
+            }
             ptr = nullptr;
         }
         CUDA_CHECK(cudaMalloc(&ptr, bytes));
         capacity = bytes;
+        sonicboom::cuda::scratch_epoch_bump();
     }
     return ptr;
 }
@@ -137,9 +147,9 @@ float * split_scratch_get(size_t bytes) {
 //   ncols_x = K, nrows_x = M, ncols_dst = n, ncols_y = n, nrows_dst = M,
 //   stride_row_x = K/qk, ncols_max = ncols_opt = n.
 //
-// split_k > 1 runs the K tiles in split_k slices through the partial buffer.
-// Columns beyond 16 are processed 16 at a time with the same partial buffer,
-// which keeps every column's split identical to the n = 16 call.
+// split_k > 1 runs the K tiles in split_k contiguous slices over all n
+// columns: one slice pass into the [split_k][n][M] partial buffer, then one
+// reduce over its entries in slice order.  n does not change the decomposition.
 template <ggml_type type>
 bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
              int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg,
@@ -147,55 +157,39 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
     const sb_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
-    constexpr int y_block_ints = sizeof(block_q8_1_mmq) / sizeof(int);
     const bool fallback = M % 128 != 0;
 
     const ggml_type gtype = type;
 
-    // Launch columns [n_lo, n_lo + n_cnt) of the output.  ncols_y stays the
-    // full column count: it is the row stride of the y block layout.
-    const auto launch_range = [&](int64_t n_lo, int64_t n_cnt) -> bool {
-        // SonicBoom: the configuration table disables stream-K (it splits K by
-        // the total tile count, which depends on n); reject the launch if a
-        // config ever selects it.
-        const int J_best = pick_J(gtype, fallback, n_cnt, props);
-        if (J_best == 0) {
-            return false;
-        }
-        if (ggml_cuda_mmq_get_config(gtype, J_best, fallback, props.cc).stream_k) {
-            return false;
-        }
-
-        float * scratch = nullptr;
-        if (split_k > 1) {
-            scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n_cnt) *
-                                        sizeof(float));
-        }
-
-        const mmq_args args = {
-            (const char *) weights, gtype, (const int *) y_q8 + n_lo * y_block_ints,
-            nullptr, nullptr, dst + n_lo * M, nullptr,
-            K, M, n_cnt, K / qk, n, M,
-            1, 1, 0, 0, 0,
-            1, 1, 0, 0, 0,
-            n_cnt, n_cnt,
-            bias, add == nullptr ? nullptr : add + n_lo * M};
-
-        mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
-        CUDA_CHECK(cudaGetLastError());
-        return true;
-    };
-
-    if (split_k > 1 && n > 16) {
-        for (int64_t c0 = 0; c0 < n; c0 += 16) {
-            const int64_t n_cnt = n - c0 < 16 ? n - c0 : 16;
-            if (!launch_range(c0, n_cnt)) {
-                return false;
-            }
-        }
-        return true;
+    // SonicBoom: the configuration table disables stream-K (it splits K by the
+    // total tile count, which depends on n); reject the launch if a config ever
+    // selects it.
+    const int J_best = pick_J(gtype, fallback, n, props);
+    if (J_best == 0) {
+        return false;
     }
-    return launch_range(0, n);
+    if (ggml_cuda_mmq_get_config(gtype, J_best, fallback, props.cc).stream_k) {
+        return false;
+    }
+
+    float * scratch = nullptr;
+    if (split_k > 1) {
+        scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n) *
+                                    sizeof(float));
+    }
+
+    const mmq_args args = {
+        (const char *) weights, gtype, (const int *) y_q8,
+        nullptr, nullptr, dst, nullptr,
+        K, M, n, K / qk, n, M,
+        1, 1, 0, 0, 0,
+        1, 1, 0, 0, 0,
+        n, n,
+        bias, add};
+
+    mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 }  // namespace
@@ -232,13 +226,71 @@ bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
 
 namespace {
 
+// Number of K tiles one member's tile body visits at this tile width.  K_vram
+// comes from the member's host-side configuration; the block count divides it
+// the same way the kernel's ITER_K does.
+template <ggml_type type>
+int group_k_tiles(int K_vram, int blocks_per_row) {
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    const int blocks_per_iter = K_vram / qk;
+    return (blocks_per_row + blocks_per_iter - 1) / blocks_per_iter;
+}
+
+// Launch the group at one tile width.  split_k > 1 runs the group's K tiles in
+// that many slices (capped at the smallest member tile count) and then reduces
+// the shared partial buffer once over all members.
+template <ggml_type T0, ggml_type T1, ggml_type T2, int J>
+bool group_launch_j(const sb_cuda_props & props,
+                    const sonicboom::quant::cuda::MmqGroupArgs & args,
+                    const ggml_cuda_mmq_config & c0,
+                    const ggml_cuda_mmq_config & c1,
+                    const ggml_cuda_mmq_config & c2,
+                    size_t nbs, int split_k, cudaStream_t stream) {
+    int ntiles = group_k_tiles<T0>(c0.K_vram, args.m[0].blocks_per_row);
+    ntiles = std::min(ntiles, group_k_tiles<T1>(c1.K_vram, args.m[0].blocks_per_row));
+    if (args.n_members > 2) {
+        ntiles = std::min(ntiles, group_k_tiles<T2>(c2.K_vram, args.m[0].blocks_per_row));
+    }
+    int split_eff = split_k > 1 ? std::min(split_k, ntiles) : 1;
+    if (split_eff < 2) {
+        split_eff = 1;
+    }
+
+    sonicboom::quant::cuda::MmqGroupArgs a = args;
+    a.nsplit = split_eff;
+    a.part = nullptr;
+    if (split_eff > 1) {
+        a.part = split_scratch_get(size_t(split_eff) * size_t(args.ncols_dst) *
+                                   size_t(args.total_rows) * sizeof(float));
+    }
+
+    const dim3 block(props.warp_size, c0.nthreads / props.warp_size, 1);
+    const dim3 grid(unsigned(args.tile_prefix[args.n_members]),
+                    unsigned((args.ncols_dst + J - 1) / J), unsigned(split_eff));
+    mul_mat_q_group<T0, T1, T2, J><<<grid, block, nbs, stream>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (split_eff > 1) {
+        const int64_t n_elem = int64_t(args.ncols_dst) * int64_t(args.total_rows);
+        const int     reduce_threads = 256;
+        const int64_t reduce_blocks  = (n_elem + reduce_threads - 1) / reduce_threads;
+        SB_NOTE_LAUNCH(mul_mat_q_group_split_k_reduce,
+                       dim3((unsigned)reduce_blocks), dim3(reduce_threads), 0,
+                       stream);
+        mul_mat_q_group_split_k_reduce<<<(unsigned)reduce_blocks, reduce_threads,
+                                         0, stream>>>(a.part, a);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    return true;
+}
+
 // The group's shared column count fixes the tile width: the same pick_J the
 // imported launcher makes, which depends only on n.  A member whose table has
 // no configuration at that width makes the group unlaunchable.
 template <ggml_type T0, ggml_type T1, ggml_type T2>
 bool group_launch_typed(const sb_cuda_props & props,
                         const sonicboom::quant::cuda::MmqGroupArgs & args,
-                        cudaStream_t stream) {
+                        int split_k, cudaStream_t stream) {
     const int n = args.ncols_dst;
     if (n <= 0 || args.ncols_y <= 0) {
         return false;
@@ -269,6 +321,7 @@ bool group_launch_typed(const sb_cuda_props & props,
 
     sonicboom::quant::cuda::MmqGroupArgs a = args;
     int prefix = 0;
+    int rows = 0;
     for (int k = 0; k < args.n_members; ++k) {
         auto & m = a.m[k];
         const ggml_cuda_mmq_config & ck = k == 0 ? c0 : (k == 1 ? c1 : c2);
@@ -281,32 +334,32 @@ bool group_launch_typed(const sb_cuda_props & props,
         }
         a.tile_prefix[k] = prefix;
         prefix += (m.nrows + ck.I - 1) / ck.I;
+        a.rows_prefix[k] = rows;
+        rows += m.nrows;
     }
     a.tile_prefix[args.n_members] = prefix;
+    a.rows_prefix[args.n_members] = rows;
+    a.total_rows = rows;
 
-    const dim3 block(props.warp_size, c0.nthreads / props.warp_size, 1);
-    const dim3 grid(unsigned(prefix), unsigned((n + J - 1) / J), 1);
     switch (J) {
-        case   8: mul_mat_q_group<T0, T1, T2,   8><<<grid, block, nbs, stream>>>(a); break;
-        case  16: mul_mat_q_group<T0, T1, T2,  16><<<grid, block, nbs, stream>>>(a); break;
-        case  24: mul_mat_q_group<T0, T1, T2,  24><<<grid, block, nbs, stream>>>(a); break;
-        case  32: mul_mat_q_group<T0, T1, T2,  32><<<grid, block, nbs, stream>>>(a); break;
-        case  40: mul_mat_q_group<T0, T1, T2,  40><<<grid, block, nbs, stream>>>(a); break;
-        case  48: mul_mat_q_group<T0, T1, T2,  48><<<grid, block, nbs, stream>>>(a); break;
-        case  56: mul_mat_q_group<T0, T1, T2,  56><<<grid, block, nbs, stream>>>(a); break;
-        case  64: mul_mat_q_group<T0, T1, T2,  64><<<grid, block, nbs, stream>>>(a); break;
-        case  72: mul_mat_q_group<T0, T1, T2,  72><<<grid, block, nbs, stream>>>(a); break;
-        case  80: mul_mat_q_group<T0, T1, T2,  80><<<grid, block, nbs, stream>>>(a); break;
-        case  88: mul_mat_q_group<T0, T1, T2,  88><<<grid, block, nbs, stream>>>(a); break;
-        case  96: mul_mat_q_group<T0, T1, T2,  96><<<grid, block, nbs, stream>>>(a); break;
-        case 104: mul_mat_q_group<T0, T1, T2, 104><<<grid, block, nbs, stream>>>(a); break;
-        case 112: mul_mat_q_group<T0, T1, T2, 112><<<grid, block, nbs, stream>>>(a); break;
-        case 120: mul_mat_q_group<T0, T1, T2, 120><<<grid, block, nbs, stream>>>(a); break;
-        case 128: mul_mat_q_group<T0, T1, T2, 128><<<grid, block, nbs, stream>>>(a); break;
+        case   8: return group_launch_j<T0, T1, T2,   8>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  16: return group_launch_j<T0, T1, T2,  16>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  24: return group_launch_j<T0, T1, T2,  24>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  32: return group_launch_j<T0, T1, T2,  32>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  40: return group_launch_j<T0, T1, T2,  40>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  48: return group_launch_j<T0, T1, T2,  48>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  56: return group_launch_j<T0, T1, T2,  56>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  64: return group_launch_j<T0, T1, T2,  64>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  72: return group_launch_j<T0, T1, T2,  72>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  80: return group_launch_j<T0, T1, T2,  80>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  88: return group_launch_j<T0, T1, T2,  88>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case  96: return group_launch_j<T0, T1, T2,  96>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case 104: return group_launch_j<T0, T1, T2, 104>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case 112: return group_launch_j<T0, T1, T2, 112>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case 120: return group_launch_j<T0, T1, T2, 120>(props, a, c0, c1, c2, nbs, split_k, stream);
+        case 128: return group_launch_j<T0, T1, T2, 128>(props, a, c0, c1, c2, nbs, split_k, stream);
         default:  return false;
     }
-    CUDA_CHECK(cudaGetLastError());
-    return true;
 }
 
 // Raise the shared-memory limit for every tile width the group kernel can be
@@ -353,28 +406,29 @@ void group_warm_typed(const sb_cuda_props & props) {
 // projections the four reference models' decode and verify graphs carry.
 bool group_dispatch(const sb_cuda_props & props,
                     const sonicboom::quant::cuda::MmqGroupArgs & args,
-                    const MmqUpType * types, cudaStream_t stream, bool warm) {
+                    const MmqUpType * types, int split_k, cudaStream_t stream,
+                    bool warm) {
     const ggml_type t0 = to_ggml_type(types[0]);
     const ggml_type t1 = to_ggml_type(types[1]);
     const ggml_type t2 = args.n_members > 2 ? to_ggml_type(types[2]) : t1;
     if (t0 == GGML_TYPE_Q3_K && t1 == GGML_TYPE_Q3_K && t2 == GGML_TYPE_Q3_K) {
         if (warm) group_warm_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props);
-        else return group_launch_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props, args, stream);
+        else return group_launch_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props, args, split_k, stream);
         return true;
     }
     if (t0 == GGML_TYPE_Q4_K && t1 == GGML_TYPE_Q4_K && t2 == GGML_TYPE_Q4_K) {
         if (warm) group_warm_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props);
-        else return group_launch_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props, args, stream);
+        else return group_launch_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props, args, split_k, stream);
         return true;
     }
     if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q5_0) {
         if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props);
-        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props, args, stream);
+        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props, args, split_k, stream);
         return true;
     }
     if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q8_0) {
         if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props);
-        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props, args, stream);
+        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props, args, split_k, stream);
         return true;
     }
     return false;
@@ -387,6 +441,32 @@ bool mmq_up_group_matmul(const sonicboom::quant::cuda::MmqGroupArgs & args,
     if (types == nullptr || args.n_members < 2 || args.n_members > 3) {
         return false;
     }
+    int64_t rows[3] = {};
+    for (int k = 0; k < args.n_members; ++k) {
+        const auto & m = args.m[k];
+        if (m.x == nullptr || m.y == nullptr || m.dst == nullptr ||
+            m.nrows <= 0 || m.blocks_per_row <= 0) {
+            return false;
+        }
+        rows[k] = m.nrows;
+    }
+    // The members' shared column count, from the first member's block row
+    // stride and its format's element count per block.
+    const int qk = (types[0] == MmqUpType::Q5_0 || types[0] == MmqUpType::Q8_0)
+                       ? 32
+                       : 256;
+    const int64_t cols = int64_t(args.m[0].blocks_per_row) * qk;
+    const int split_k = mmq_up_group_split_for(types, rows, args.n_members, cols);
+    return group_dispatch(get_props(), args, types, split_k, stream, /*warm=*/false);
+}
+
+bool mmq_up_group_matmul_split(const sonicboom::quant::cuda::MmqGroupArgs & args,
+                               const MmqUpType * types, int split_k,
+                               cudaStream_t stream) {
+    if (types == nullptr || args.n_members < 2 || args.n_members > 3 ||
+        split_k < 1) {
+        return false;
+    }
     for (int k = 0; k < args.n_members; ++k) {
         const auto & m = args.m[k];
         if (m.x == nullptr || m.y == nullptr || m.dst == nullptr ||
@@ -394,7 +474,8 @@ bool mmq_up_group_matmul(const sonicboom::quant::cuda::MmqGroupArgs & args,
             return false;
         }
     }
-    return group_dispatch(get_props(), args, types, stream, /*warm=*/false);
+    return group_dispatch(get_props(), args, types, split_k, stream,
+                          /*warm=*/false);
 }
 
 bool mmq_up_group_warm(const MmqUpType * types, int n_members) {
@@ -403,7 +484,7 @@ bool mmq_up_group_warm(const MmqUpType * types, int n_members) {
     }
     sonicboom::quant::cuda::MmqGroupArgs args{};
     args.n_members = n_members;
-    return group_dispatch(get_props(), args, types, nullptr, /*warm=*/true);
+    return group_dispatch(get_props(), args, types, 1, nullptr, /*warm=*/true);
 }
 
 bool mmq_up_quantize(const float * x, int32_t * y_q8, int64_t K, int64_t n,
@@ -527,6 +608,9 @@ namespace {
 // tile: the narrow tile (J = 8) is measured at the decode row count, n = 1.
 constexpr int kMmqTuneNarrowN = 1;
 constexpr int kMmqTuneWideN   = 16;
+// The split-count measurement probes n = 1, 8 and 512 on the same synthetic
+// buffers, so they are sized for the widest probe.
+constexpr int kMmqTuneMaxN = 512;
 // (I, nthreads) = (64, 256) and (128, 256).
 constexpr int kMmqTuneCfgsReduced[]   = {5, 6};
 constexpr double kMmqTuneBudgetS = 1.5;
@@ -599,16 +683,17 @@ bool mmq_tune_alloc(const MmqTuneShape & s, MmqTuneBuffers & b) {
     int qk = 0, bytes = 0;
     mmq_block_meta(s.type, &qk, &bytes);
     const size_t wbytes = size_t(s.rows) * size_t(s.cols / qk) * size_t(bytes);
-    const size_t xbytes = size_t(kMmqTuneWideN) * size_t(s.cols) * sizeof(float);
-    const size_t yblocks = size_t(s.cols / 128) * size_t(kMmqTuneWideN) + 128;
+    const size_t xbytes = size_t(kMmqTuneMaxN) * size_t(s.cols) * sizeof(float);
+    const size_t yblocks = size_t(s.cols / 128) * size_t(kMmqTuneMaxN) + 128;
     const size_t ybytes = yblocks * sizeof(int) * 36;  // block_q8_1_mmq
-    const size_t obytes = size_t(s.rows) * size_t(kMmqTuneWideN) * sizeof(float);
+    const size_t obytes = size_t(s.rows) * size_t(kMmqTuneMaxN) * sizeof(float);
     if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
     if (cudaMalloc(&b.dx, xbytes) != cudaSuccess) { mmq_tune_free(b); return false; }
     if (cudaMalloc(&b.dyq8, ybytes) != cudaSuccess) { mmq_tune_free(b); return false; }
     if (cudaMalloc(&b.dout, obytes) != cudaSuccess) { mmq_tune_free(b); return false; }
     cudaMemset(b.dw, 0, wbytes);
     cudaMemset(b.dx, 0, xbytes);
+    cudaMemset(b.dyq8, 0, ybytes);
     return true;
 }
 
@@ -718,11 +803,55 @@ int mmq_pick_cfg(const MmqTuneResult & r, int J, const int * cfgs, int ncfgs) {
     return best;
 }
 
-// The pinned choice for one shape: the split count that minimizes t(1) + t(8)
-// at its best tile configuration, among the split counts that do not slow the
-// n = 512 call by more than 3%; a candidate within 2% of the incumbent keeps
-// the smaller split count.  The tile configuration at each split count is the
-// fastest at n = 1 (J = 8) and at n = 16 (J = 16).
+// ---------------------------------------------------------------------------
+// Split-K counts.  The candidates are 1 (single pass), 2 and 4; a candidate
+// whose partial buffer at the widest measured column count would exceed 32 MB
+// is not a candidate for that shape.  The choice minimizes the sum of the cost
+// ratios at n = 1, 8 and 512; a candidate within 2% of the minimum keeps the
+// smaller count.
+// ---------------------------------------------------------------------------
+
+constexpr int kMmqSplitCandidates[] = {1, 2, 4};
+constexpr int kMmqSplitCandidateCount = 3;
+constexpr int kMmqSplitProbeN[] = {1, 8, 512};
+constexpr int kMmqSplitProbeCount = 3;
+constexpr int64_t kMmqSplitMaxScratch = int64_t(32) << 20;
+// A larger candidate must beat the incumbent by more than 2% to displace it.
+constexpr double kMmqSplitMinGain = 0.98;
+
+bool mmq_split_candidate(int64_t rows, int split_k) {
+    return split_k <= 1 ||
+           double(split_k) * double(kMmqSplitProbeN[2]) * double(rows) *
+                   sizeof(float) <=
+               double(kMmqSplitMaxScratch);
+}
+
+const char * mmq_split_name(int split_k) {
+    return split_k == 1 ? "1" : (split_k == 2 ? "2" : (split_k == 4 ? "4" : "?"));
+}
+
+// The smallest candidate whose cost is within the tie window of the minimum.
+int mmq_split_choose(const double * cost, const bool * have) {
+    int chosen = 0;
+    if (!have[0]) {
+        return chosen;
+    }
+    double best = cost[0];
+    for (int ci = 1; ci < kMmqSplitCandidateCount; ++ci) {
+        if (!have[ci]) continue;
+        if (cost[ci] < best * kMmqSplitMinGain) {
+            best = cost[ci];
+            chosen = ci;
+        }
+    }
+    return chosen;
+}
+
+// The pinned choice for one shape: the tile configuration at n = 1 (J = 8) and
+// at n = 16 (J = 16) from the configuration sweep, then the split count whose
+// t(1) + t(8) + t(512) cost ratio sum is the minimum.  A candidate within 2% of
+// the minimum keeps the smaller split count; candidates whose partial buffer at
+// n = 512 would exceed 32 MB are not considered.
 MmqUpPin mmq_pin_measure(const MmqTuneShape & s, const MmqTuneBuffers & b,
                          bool reduced) {
     int cfgs8[MMQ_CFG_COUNT], cfgs16[MMQ_CFG_COUNT];
@@ -735,13 +864,46 @@ MmqUpPin mmq_pin_measure(const MmqTuneShape & s, const MmqTuneBuffers & b,
     pin.cfg_j8 = c8;
     const int c16 = mmq_pick_cfg(r, 16, cfgs16, n16);
     pin.cfg_j16 = c16 >= 0 ? c16 : pin.cfg_j8;
+
+    double t[kMmqSplitCandidateCount][kMmqSplitProbeCount] = {};
+    bool have[kMmqSplitCandidateCount] = {};
+    double cost[kMmqSplitCandidateCount] = {};
+    for (int ci = 0; ci < kMmqSplitCandidateCount; ++ci) {
+        const int S = kMmqSplitCandidates[ci];
+        if (!mmq_split_candidate(s.rows, S)) continue;
+        bool ok = true;
+        for (int pi = 0; pi < kMmqSplitProbeCount && ok; ++pi) {
+            const int nprobe = kMmqSplitProbeN[pi];
+            const int cfg = nprobe <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+            t[ci][pi] = mmq_tune_time(s, b, nprobe, cfg, S);
+            ok = t[ci][pi] >= 0.0;
+        }
+        have[ci] = ok;
+        if (ok) {
+            for (int pi = 0; pi < kMmqSplitProbeCount; ++pi) {
+                if (t[0][pi] <= 0.0) {
+                    have[ci] = false;
+                    break;
+                }
+                cost[ci] += t[ci][pi] / t[0][pi];
+            }
+        }
+    }
+    pin.split_k = kMmqSplitCandidates[mmq_split_choose(cost, have)];
     if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
         std::fprintf(stderr,
-                     "mmq-pick %s %lldx%lld S=1 cfg8=%d cfg16=%d "
-                     "t1=%.4f t16=%.4f\n",
+                     "mmq-pick %s %lldx%lld S=%d cfg8=%d cfg16=%d "
+                     "t1=%.4f t16=%.4f",
                      mmq_type_name(s.type), (long long)s.rows,
-                     (long long)s.cols, pin.cfg_j8, pin.cfg_j16,
+                     (long long)s.cols, pin.split_k, pin.cfg_j8, pin.cfg_j16,
                      r.narrow[pin.cfg_j8], r.wide[pin.cfg_j16]);
+        for (int ci = 0; ci < kMmqSplitCandidateCount; ++ci) {
+            if (!have[ci]) continue;
+            std::fprintf(stderr, " S=%s:%.3f/%.3f/%.3f=>%.3f",
+                         mmq_split_name(kMmqSplitCandidates[ci]), t[ci][0],
+                         t[ci][1], t[ci][2], cost[ci]);
+        }
+        std::fprintf(stderr, "\n");
     }
     return pin;
 }
@@ -765,10 +927,9 @@ bool mmq_pin_from_cache(const MmqTuneShape & s, int build_key, MmqUpPin * pin) {
     if (si == rec.end() || ki == rec.end() || ki->second != build_key) {
         return false;
     }
-    // The split count is pinned to 1: a record from a run that chose another
-    // split is stale, and the shape is measured again.
+    // Only the three candidates are valid split counts.
     const int S = si->second;
-    if (S != 1) return false;
+    if (S != 1 && S != 2 && S != 4) return false;
     int cfg[2] = {0, 0};
     for (int jj = 0; jj < 2; ++jj) {
         const int J = jj == 0 ? 8 : 16;
@@ -796,6 +957,142 @@ void mmq_pin_store(const MmqTuneShape & s, const MmqUpPin & pin,
                 {{"cfg", pin.cfg_j8}, {"k", build_key}});
     tune::store("mmq-cfg", mmq_cfg_key(s, 16),
                 {{"cfg", pin.cfg_j16}, {"k", build_key}});
+}
+
+// --- sibling groups --------------------------------------------------------
+
+std::mutex g_mmq_group_pin_mutex;
+std::map<std::string, int> g_mmq_group_pin;
+
+std::string mmq_group_key(const MmqUpType * types, const int64_t * rows,
+                          int n_members, int64_t cols) {
+    std::string k;
+    for (int i = 0; i < n_members; ++i) {
+        if (i) k += ",";
+        k += mmq_type_name(types[i]);
+    }
+    k += "|";
+    for (int i = 0; i < n_members; ++i) {
+        if (i) k += ",";
+        k += std::to_string(rows[i]);
+    }
+    k += "x" + std::to_string(cols);
+    return k;
+}
+
+std::string mmq_group_splitk_key(const MmqUpType * types, const int64_t * rows,
+                                 int n_members, int64_t cols) {
+    return "mmq-splitk|" + mmq_group_key(types, rows, n_members, cols);
+}
+
+struct MmqGroupTuneBuffers {
+    void *  dw[3] = {};
+    float * dout[3] = {};
+    int32_t * dyq8 = nullptr;
+};
+
+void mmq_group_tune_free(MmqGroupTuneBuffers & b) {
+    for (int k = 0; k < 3; ++k) {
+        if (b.dout[k]) cudaFree(b.dout[k]);
+        if (b.dw[k]) cudaFree(b.dw[k]);
+    }
+    if (b.dyq8) cudaFree(b.dyq8);
+    b = {};
+}
+
+bool mmq_group_tune_alloc(const MmqUpType * types, const int64_t * rows,
+                          int n_members, int64_t cols,
+                          MmqGroupTuneBuffers & b) {
+    const int64_t planes = cols / 128 + ((cols / 128) & 1);
+    const size_t yblocks = size_t(planes) * size_t(kMmqSplitProbeN[2]) + 128;
+    const size_t ybytes = yblocks * sizeof(int) * 36;  // block_q8_1_mmq
+    if (cudaMalloc(&b.dyq8, ybytes) != cudaSuccess) {
+        mmq_group_tune_free(b);
+        return false;
+    }
+    cudaMemset(b.dyq8, 0, ybytes);
+    for (int k = 0; k < n_members; ++k) {
+        int qk = 0, bytes = 0;
+        mmq_block_meta(types[k], &qk, &bytes);
+        const size_t wbytes = size_t(rows[k]) * size_t(cols / qk) * size_t(bytes);
+        const size_t obytes = size_t(rows[k]) * size_t(kMmqSplitProbeN[2]) *
+                              sizeof(float);
+        if (cudaMalloc(&b.dw[k], wbytes) != cudaSuccess ||
+            cudaMalloc(&b.dout[k], obytes) != cudaSuccess) {
+            mmq_group_tune_free(b);
+            return false;
+        }
+        cudaMemset(b.dw[k], 0, wbytes);
+    }
+    return true;
+}
+
+sonicboom::quant::cuda::MmqGroupArgs mmq_group_tune_args(
+        const MmqGroupTuneBuffers & b, const MmqUpType * types,
+        const int64_t * rows, int n_members, int64_t cols, int n) {
+    sonicboom::quant::cuda::MmqGroupArgs a{};
+    a.n_members = n_members;
+    a.ncols_dst = n;
+    a.ncols_y = n;
+    for (int k = 0; k < n_members; ++k) {
+        int qk = 0, bytes = 0;
+        mmq_block_meta(types[k], &qk, &bytes);
+        auto & m = a.m[k];
+        m.x = b.dw[k];
+        m.y = b.dyq8;
+        m.dst = b.dout[k];
+        m.bias = nullptr;
+        m.add = nullptr;
+        m.nrows = int(rows[k]);
+        m.stride_col_dst = int(rows[k]);
+        m.blocks_per_row = int(cols / qk);
+        m.stride_row_x = m.blocks_per_row;
+    }
+    return a;
+}
+
+// Median of the timed group launches (3 warm-ups, 7 timings).
+double mmq_group_tune_time(const sb_cuda_props & props, const MmqUpType * types,
+                           const MmqGroupTuneBuffers & b, const int64_t * rows,
+                           int n_members, int64_t cols, int n, int split_k) {
+    const auto args = mmq_group_tune_args(b, types, rows, n_members, cols, n);
+    const auto launch = [&] {
+        return group_dispatch(props, args, types, split_k, nullptr,
+                              /*warm=*/false);
+    };
+    for (int i = 0; i < kMmqTuneWarm; ++i) {
+        (void)launch();
+    }
+    cudaEvent_t begin = nullptr, end = nullptr;
+    if (cudaEventCreate(&begin) != cudaSuccess) return -1.0;
+    if (cudaEventCreate(&end) != cudaSuccess) {
+        cudaEventDestroy(begin);
+        return -1.0;
+    }
+    double times[kMmqTuneTimed];
+    int valid = 0;
+    for (int i = 0; i < kMmqTuneTimed; ++i) {
+        times[i] = 0.0;
+        if (cudaEventRecord(begin, nullptr) != cudaSuccess) continue;
+        const bool ok = launch();
+        if (cudaEventRecord(end, nullptr) != cudaSuccess) continue;
+        if (cudaEventSynchronize(end) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        float ms = 0.0f;
+        if (!ok || cudaEventElapsedTime(&ms, begin, end) != cudaSuccess ||
+            cudaGetLastError() != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        times[valid++] = double(ms);
+    }
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    if (valid == 0) return -1.0;
+    std::sort(times, times + valid);
+    return times[valid / 2];
 }
 
 bool g_mmq_warmed = false;
@@ -887,6 +1184,108 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
         std::lock_guard<std::mutex> lock(g_mmq_pin_mutex);
         g_mmq_pin[mmq_pin_key(s.type, s.rows, s.cols)] = pin;
     }
+}
+
+int mmq_up_group_split_for(const MmqUpType * types, const int64_t * rows,
+                           int n_members, int64_t cols) {
+    if (types == nullptr || rows == nullptr || n_members < 2 || n_members > 3) {
+        return 1;
+    }
+    std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
+    const auto it = g_mmq_group_pin.find(mmq_group_key(types, rows, n_members, cols));
+    return it != g_mmq_group_pin.end() ? it->second : 1;
+}
+
+void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
+                             int n_members, int64_t cols, const char * build_id) {
+    if (types == nullptr || rows == nullptr || n_members < 2 || n_members > 3) {
+        return;
+    }
+    if (std::getenv("SONICBOOM_MMQ_CFG") != nullptr) return;
+    const std::string key = mmq_group_key(types, rows, n_members, cols);
+    {
+        std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
+        if (g_mmq_group_pin.count(key) != 0) return;  // already warmed
+    }
+
+    const int build_key =
+        (build_id && *build_id) ? mmq_build_hash(build_id) : 0;
+    int split = 1;
+    bool cached = false;
+    if (tune::enabled() && build_key != 0) {
+        const auto rec = tune::lookup(
+            "mmq-splitk", mmq_group_splitk_key(types, rows, n_members, cols));
+        const auto si = rec.find("S");
+        const auto ki = rec.find("k");
+        if (si != rec.end() && ki != rec.end() && ki->second == build_key &&
+            (si->second == 1 || si->second == 2 || si->second == 4)) {
+            split = si->second;
+            cached = true;
+        }
+    }
+
+    if (!cached) {
+        const sb_cuda_props props = get_props();
+        // Raise the group kernels' shared-memory limits before the first timed
+        // launch; only the attribute calls matter here.
+        {
+            sonicboom::quant::cuda::MmqGroupArgs warm{};
+            warm.n_members = n_members;
+            (void)group_dispatch(props, warm, types, 1, nullptr, /*warm=*/true);
+        }
+        int64_t total_rows = 0;
+        for (int k = 0; k < n_members; ++k) total_rows += rows[k];
+
+        MmqGroupTuneBuffers b;
+        double t[kMmqSplitCandidateCount][kMmqSplitProbeCount] = {};
+        bool have[kMmqSplitCandidateCount] = {};
+        double cost[kMmqSplitCandidateCount] = {};
+        if (mmq_group_tune_alloc(types, rows, n_members, cols, b)) {
+            for (int ci = 0; ci < kMmqSplitCandidateCount; ++ci) {
+                const int S = kMmqSplitCandidates[ci];
+                if (!mmq_split_candidate(total_rows, S)) continue;
+                bool ok = true;
+                for (int pi = 0; pi < kMmqSplitProbeCount && ok; ++pi) {
+                    t[ci][pi] = mmq_group_tune_time(props, types, b, rows,
+                                                    n_members, cols,
+                                                    kMmqSplitProbeN[pi], S);
+                    ok = t[ci][pi] >= 0.0;
+                }
+                have[ci] = ok;
+                if (ok) {
+                    for (int pi = 0; pi < kMmqSplitProbeCount; ++pi) {
+                        if (t[0][pi] <= 0.0) {
+                            have[ci] = false;
+                            break;
+                        }
+                        cost[ci] += t[ci][pi] / t[0][pi];
+                    }
+                }
+            }
+            mmq_group_tune_free(b);
+        }
+        split = kMmqSplitCandidates[mmq_split_choose(cost, have)];
+        if (tune::enabled() && build_key != 0) {
+            tune::store(
+                "mmq-splitk", mmq_group_splitk_key(types, rows, n_members, cols),
+                {{"S", split}, {"k", build_key}});
+        }
+        if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
+            std::fprintf(stderr, "mmq-group-pick %s S=%d",
+                         mmq_group_key(types, rows, n_members, cols).c_str(),
+                         split);
+            for (int ci = 0; ci < kMmqSplitCandidateCount; ++ci) {
+                if (!have[ci]) continue;
+                std::fprintf(stderr, " S=%s:%.3f/%.3f/%.3f=>%.3f",
+                             mmq_split_name(kMmqSplitCandidates[ci]),
+                             t[ci][0], t[ci][1], t[ci][2], cost[ci]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
+    g_mmq_group_pin[key] = split;
 }
 
 }  // namespace sonicboom::quant::cuda

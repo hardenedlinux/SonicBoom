@@ -116,9 +116,9 @@ void mmq_up_cfg_dims(MmqUpType type, int64_t M, int J, int cfg,
                      int * I, int * nthreads);
 
 // The pinned small-n choice for one (type, rows, cols) shape: the tile
-// configuration for tile width 8 (n <= 8) and 16 (n = 9..16).  The split count
-// is pinned to 1 for every shape.  The values come from the warm-up's measured
-// table; 1/0/0 means "not tuned".
+// configuration for tile width 8 (n <= 8) and 16 (n = 9..16), and the split-K
+// count.  The split count comes from the warm-up's measured table (1, 2 or 4);
+// the defaults 1/0/0 mean "not tuned".
 struct MmqUpPin {
     int split_k = 1;
     int cfg_j8  = 0;
@@ -149,13 +149,18 @@ struct MmqGroupMember {
 // A group of sibling projections launched as one kernel.  All members read the
 // same activation; each member's output rows are a run of blocks in the grid's
 // x dimension, in member order.  ncols_dst is n and ncols_y is the activation's
-// block-row stride (also n for a decode/verify step).  tile_prefix is completed
-// by mmq_up_group_matmul from the members' row counts and the selected tile
-// height; the caller need not fill it.
+// block-row stride (also n for a decode/verify step).  tile_prefix, rows_prefix,
+// total_rows and part are completed by mmq_up_group_matmul; the caller need not
+// fill them.  nsplit is the group's split count (1 is the single-pass path) and
+// selects the [nsplit][n][total_rows] partial buffer the launcher supplies.
 struct MmqGroupArgs {
     int            n_members;      // 2 or 3
     MmqGroupMember m[3];
     int            tile_prefix[4];
+    int            rows_prefix[4];
+    int            total_rows;
+    int            nsplit;
+    float *        part;
     int            ncols_dst;
     int            ncols_y;
 };
@@ -171,10 +176,30 @@ struct MmqGroupArgs {
 bool mmq_up_group_matmul(const MmqGroupArgs & args, const MmqUpType * types,
                          cudaStream_t stream);
 
+// Test-only: launch a group with an explicit split count, bypassing the
+// warm-up pin.  The private tests use it to check the grouped launch against
+// the members' separate matmuls at each split count.
+bool mmq_up_group_matmul_split(const MmqGroupArgs & args,
+                               const MmqUpType * types, int split_k,
+                               cudaStream_t stream);
+
 // Raise the group kernels' dynamic shared-memory limit for every tile width
 // they can be launched with, for the closed set of format tuples this build
 // instantiates.  Called once at warm-up; returns false for a tuple with no
 // instantiation.
 bool mmq_up_group_warm(const MmqUpType * types, int n_members);
+
+// The group's split-K count, as measured (or loaded) by
+// mmq_up_group_warm_split: 1 is the single-pass path.  mmq_up_group_matmul
+// applies it itself.
+int mmq_up_group_split_for(const MmqUpType * types, const int64_t * rows,
+                           int n_members, int64_t cols);
+
+// Measure (or load from the tune file) one sibling group's split-K count: the
+// same S in {1, 2, 4} table, cost rule and row-count probes the per-shape
+// choice uses, timed over the group launch.  The members must share one
+// column count and be launchable as a group.  build_id keys the record.
+void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
+                             int n_members, int64_t cols, const char * build_id);
 
 }  // namespace sonicboom::quant::cuda
