@@ -4520,16 +4520,28 @@ int fdec_build_key() {
   return cached;
 }
 
-template <int D, int KT, int W>
-bool fdec_launch_t(const float* q, const __half* k_cache,
+// Testing pin for the K/V pipeline depth: 2 or 3. The default is the deepest
+// that fits the block's shared memory.
+int fdec_stage_pin() {
+  static const int v = [] {
+    const char* e = std::getenv("SONICBOOM_FDEC_STAGES");
+    if (e == nullptr || *e == '\0') return 0;
+    const int n = std::atoi(e);
+    return n == 2 ? 2 : n == 3 ? 3 : 0;
+  }();
+  return v;
+}
+
+template <int D, int KT, int W, int STAGES>
+bool fdec_launch_k(const float* q, const __half* k_cache,
                    const __half* v_cache, const uint64_t* pos, uint64_t window,
                    uint64_t n_slots, int n_heads_q, int n_heads_kv,
                    uint64_t sliding_window, float scale, float* out, int n_q,
                    int pos_offset0, uint64_t chunk) {
-  constexpr size_t kSmem = fdec_smem_bytes<D, KT, W>();
+  constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES>();
   static const bool prepared = [] {
     return cudaFuncSetAttribute(
-               boom_fdec_kernel<D, KT, W>,
+               boom_fdec_kernel<D, KT, W, STAGES>,
                cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)) ==
            cudaSuccess;
   }();
@@ -4555,9 +4567,9 @@ bool fdec_launch_t(const float* q, const __half* k_cache,
   const dim3 block(W * 32);
   SB_NOTE_LAUNCH_TP("boom_fdec_kernel",
                     ::sonicboom::planner::plan_detail::tp_label(
-                        {{"D", D}, {"KT", KT}, {"W", W}}),
+                        {{"D", D}, {"KT", KT}, {"W", W}, {"S", STAGES}}),
                     grid, block, kSmem, cur_stream());
-  boom_fdec_kernel<D, KT, W><<<grid, block, kSmem, cur_stream()>>>(
+  boom_fdec_kernel<D, KT, W, STAGES><<<grid, block, kSmem, cur_stream()>>>(
       q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
       sliding_window, chunk, int(n_chunks), n_q, pos_offset0, rows_per_block,
       scale, partial);
@@ -4569,6 +4581,23 @@ bool fdec_launch_t(const float* q, const __half* k_cache,
       partial, pos, chunk, sliding_window, int(n_chunks), n_heads_q, D,
       pos_offset0, out);
   return cudaGetLastError() == cudaSuccess;
+}
+
+// The deployed pipeline depth, unless the testing pin asks for shallower.
+template <int D, int KT, int W>
+bool fdec_launch_t(const float* q, const __half* k_cache,
+                   const __half* v_cache, const uint64_t* pos, uint64_t window,
+                   uint64_t n_slots, int n_heads_q, int n_heads_kv,
+                   uint64_t sliding_window, float scale, float* out, int n_q,
+                   int pos_offset0, uint64_t chunk) {
+  const int pin = fdec_stage_pin();
+  if (fdec_max_stages<D, KT, W>() >= 3 && pin != 2)
+    return fdec_launch_k<D, KT, W, 3>(q, k_cache, v_cache, pos, window, n_slots,
+                                      n_heads_q, n_heads_kv, sliding_window,
+                                      scale, out, n_q, pos_offset0, chunk);
+  return fdec_launch_k<D, KT, W, 2>(q, k_cache, v_cache, pos, window, n_slots,
+                                    n_heads_q, n_heads_kv, sliding_window,
+                                    scale, out, n_q, pos_offset0, chunk);
 }
 
 bool fdec_launch_chunk(const float* q, const __half* k_cache,

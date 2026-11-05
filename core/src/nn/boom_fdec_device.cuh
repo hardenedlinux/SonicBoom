@@ -59,21 +59,33 @@ constexpr __host__ __device__ int fdec_mt_max(int D) {
   return D == 64 ? 7 : D == 128 ? 7 : D == 256 ? 4 : 1;
 }
 
-// Dynamic shared memory of one instantiation, bytes:
-//   2 stages x (K + V) x KT x (D + 8) halves
+// Dynamic shared memory of one instantiation with `stages` buffered K/V tiles,
+// bytes:
+//   stages x (K + V) x KT x (D + 8) halves
 //   + Q (MT_max*16 x (D + 8) halves)
 //   + P (MT_max*16 x (KT + 8) halves)
 //   + the per-warp per-row max exchange (W x MT_max*16 floats)
 //   + the per-row per-n-tile sums (MT_max*16 x KT/8 floats)
 //   + the per-row totals (MT_max*16 floats).
-template <int D, int KT, int W>
-constexpr __host__ __device__ size_t fdec_smem_bytes() {
+template <int D, int KT, int W, int STAGES>
+constexpr __host__ __device__ size_t fdec_smem_bytes_s() {
   constexpr size_t m = size_t(fdec_mt_max(D)) * 16;
   constexpr size_t nts = size_t(KT) / 8;
-  return (4 * size_t(KT) * size_t(D + 8) + m * size_t(D + 8) +
-          m * size_t(KT + 8)) *
+  return (2 * size_t(STAGES) * size_t(KT) * size_t(D + 8) +
+          m * size_t(D + 8) + m * size_t(KT + 8)) *
              2 +
          size_t(W) * m * 4 + m * nts * 4 + m * 4;
+}
+
+// Three buffered tiles where they fit the sm_86 block limit, two otherwise.
+template <int D, int KT, int W>
+constexpr __host__ __device__ int fdec_max_stages() {
+  return fdec_smem_bytes_s<D, KT, W, 3>() <= 99 * 1024 ? 3 : 2;
+}
+
+template <int D, int KT, int W>
+constexpr __host__ __device__ size_t fdec_smem_bytes() {
+  return fdec_smem_bytes_s<D, KT, W, fdec_max_stages<D, KT, W>()>();
 }
 
 __device__ __forceinline__ float fdec_neg_inf() {
@@ -144,7 +156,7 @@ __device__ __forceinline__ void fdec_ldm_v(uint32_t b[2],
 // M rows are (query row r_local, query head h of the group) at index
 // `r_local*gqa + h`, the group's rows are zero past `rows*gqa`, and the
 // padded rows are never written to `partial`.
-template <int D, int KT, int W>
+template <int D, int KT, int W, int STAGES>
 __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     const float* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, const uint64_t* __restrict__ pos,
@@ -169,9 +181,9 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
   static_assert(NPAD % 8 == 0 && PPAD % 8 == 0, "16-byte row alignment");
 
   extern __shared__ __half smem[];
-  __half* kbuf = smem;                              // 2 x KT*NPAD
-  __half* vbuf = kbuf + 2 * KT * NPAD;              // 2 x KT*NPAD
-  __half* qbuf = vbuf + 2 * KT * NPAD;              // MAXM*NPAD
+  __half* kbuf = smem;                                 // STAGES x KT*NPAD
+  __half* vbuf = kbuf + STAGES * KT * NPAD;            // STAGES x KT*NPAD
+  __half* qbuf = vbuf + STAGES * KT * NPAD;            // MAXM*NPAD
   __half* pbuf = qbuf + MAXM * NPAD;                   // MAXM*PPAD
   float* wmax = reinterpret_cast<float*>(pbuf + MAXM * PPAD);
   float* tsum = wmax + W * MAXM;                       // [row][n-tile]
@@ -255,12 +267,14 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     }
     sb_cp_commit();
   };
-  stage(t_lo, 0);
-  if (ntiles > 1) {
-    stage(t_lo + 1, 1);
+  const int npre = ntiles < STAGES ? ntiles : STAGES;
+  for (int i = 0; i < npre; ++i) stage(t_lo + i, i);
+  if (npre == 1) {
+    sb_cp_wait<0>();
+  } else if (npre == 2) {
     sb_cp_wait<1>();
   } else {
-    sb_cp_wait<0>();
+    sb_cp_wait<2>();
   }
   __syncthreads();
 
@@ -284,7 +298,7 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
   }
 
   for (int tt = 0; tt < ntiles; ++tt) {
-    const int buf = tt & 1;
+    const int buf = tt % STAGES;
     const uint64_t tbase = cb + uint64_t(t_lo + tt) * KT;
     const __half* kt = kbuf + size_t(buf) * (KT * NPAD);
     const __half* vt = vbuf + size_t(buf) * (KT * NPAD);
@@ -483,9 +497,9 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     __syncthreads();
 
     if (tt + 1 < ntiles) {
-      if (tt + 2 < ntiles) {
-        stage(t_lo + tt + 2, buf);
-        sb_cp_wait<1>();
+      if (tt + STAGES < ntiles) {
+        stage(t_lo + tt + STAGES, buf);
+        sb_cp_wait<STAGES - 1>();
       } else {
         sb_cp_wait<0>();
       }
