@@ -131,10 +131,12 @@ int verify_gemv_wp_for(QuantType qt, int rows, int cols, int n);
 // Measure and cache that split for the model's quantized projections (distinct
 // (type, rows, cols) shapes) at row counts 3..16, once per process. Synthetic
 // zeroed weights and activations, sized to the real shapes; the pick is stored
-// in the tune file keyed by the build fingerprint `build_id`, and a bounded
-// time budget (~1 s) either measures every row count or falls back to
-// {3, 8, 16} and fills the rest from those. A no-op when the split is pinned by
-// SONICBOOM_VERIFY_GEMV_WP, when q8_1 is unavailable, or after the first call.
+// in the tune file keyed by the build fingerprint `build_id`. The fallback set
+// {3, 8, 16} is always measured for every shape (a verify step reads it), and
+// a bounded time budget (~1 s) either extends every shape to the full row-count
+// set or fills the rest of the buckets from the fallback set. A no-op when the
+// split is pinned by SONICBOOM_VERIFY_GEMV_WP or when q8_1 is unavailable; a
+// second model load in the same process only adds its own shapes.
 void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
                          const char* build_id);
 
@@ -146,10 +148,12 @@ void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
 bool decode_family_mmq(QuantType qt, int rows, int cols);
 
 // Measure (or load from the tune file) that family for the model's distinct
-// quantized projection shapes, largest first, under a warm-up load budget.
-// Synthetic zeroed weights and activations at the real shapes; the picks are
-// stored keyed by the build fingerprint `build_id`. A no-op when q8_1 or mmq is
-// unavailable, when the debug pin is set, or after the first call.
+// quantized projection shapes, largest first. Every shape is resolved: the
+// plan builder reads these picks before generation, so none may be left for a
+// decode step to decide. Synthetic zeroed weights and activations at the real
+// shapes; the picks are stored keyed by the build fingerprint `build_id`. A
+// no-op when q8_1 or mmq is unavailable or when the debug pin is set; a second
+// model load in the same process only adds its own shapes.
 void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
                         const char* build_id);
 

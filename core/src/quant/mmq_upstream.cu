@@ -1097,8 +1097,6 @@ double mmq_group_tune_time(const sb_cuda_props & props, const MmqUpType * types,
     return times[valid / 2];
 }
 
-bool g_mmq_warmed = false;
-
 }  // namespace
 
 MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K) {
@@ -1112,11 +1110,6 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
     if (!weights || count == 0) return;
     // The debug pin fixes the configuration, so there is nothing to choose.
     if (std::getenv("SONICBOOM_MMQ_CFG") != nullptr) return;
-    {
-        std::lock_guard<std::mutex> lock(g_mmq_pin_mutex);
-        if (g_mmq_warmed) return;
-        g_mmq_warmed = true;
-    }
     const int build_key =
         (build_id && *build_id) ? mmq_build_hash(build_id) : 0;
 
@@ -1165,6 +1158,13 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
     };
     bool reduced_mode = false;
     for (const MmqTuneShape & s : shapes) {
+        {
+            // A shape this process already pinned (a second model load) is
+            // resolved; the choice is never remeasured behind the first one.
+            std::lock_guard<std::mutex> lock(g_mmq_pin_mutex);
+            if (g_mmq_pin.count(mmq_pin_key(s.type, s.rows, s.cols)) != 0)
+                continue;
+        }
         MmqUpPin pin;
         const bool cached = mmq_pin_from_cache(s, build_key, &pin);
         if (!cached) {
@@ -1186,6 +1186,11 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
             if (mmq_tune_alloc(s, b)) {
                 pin = mmq_pin_measure(s, b, reduced_mode);
                 mmq_tune_free(b);
+                mmq_pin_store(s, pin, build_key);
+            } else {
+                // A shape whose probe buffers do not fit keeps the default
+                // configuration; the resolution is recorded so the split is a
+                // property of the build and not of this process's memory.
                 mmq_pin_store(s, pin, build_key);
             }
         }

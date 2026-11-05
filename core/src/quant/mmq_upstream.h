@@ -127,9 +127,11 @@ struct MmqUpPin {
 MmqUpPin mmq_up_pin_for(MmqUpType type, int64_t M, int64_t K);
 
 // Measure (or load from the tune file) the pinned choice for every distinct
-// quantized projection shape, largest first, under the warm-up load budget.
-// Synthetic zeroed weights of the real shapes.  build_id keys the stored
-// records.
+// quantized projection shape, largest first.  Every shape is resolved: the
+// plan reads the pins before generation, so none may be left for a decode
+// step to decide.  A time budget switches the shapes it has not reached to a
+// reduced candidate set; each still stores a record.  Synthetic zeroed weights
+// of the real shapes.  build_id keys the stored records.
 void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                  const char * build_id);
 

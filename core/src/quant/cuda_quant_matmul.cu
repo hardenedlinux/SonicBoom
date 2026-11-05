@@ -2655,6 +2655,19 @@ std::mutex g_verify_wp_mutex;
 std::map<std::string, int> g_verify_wp;  // key -> chosen WP, per process
 std::string g_verify_wp_build_id;
 
+// Record one split choice for a bucket: the in-process map (the runtime's
+// first read) and, when tunable, the build's record.
+void verify_wp_record(const VerifyWpShape& s, int n, int wp) {
+  const std::string key = verify_wp_key(s.qt, s.rows, s.cols, n);
+  {
+    std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
+    g_verify_wp[key] = wp;
+  }
+  if (tune::enabled() && !g_verify_wp_build_id.empty())
+    tune::store("verify-gemv-wp", key,
+                {{"wp", wp}, {"k", verify_wp_build_hash(g_verify_wp_build_id)}});
+}
+
 double verify_wp_seconds_since(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
       .count();
@@ -2790,7 +2803,12 @@ int verify_wp_resolve(const VerifyWpShape& s, int n,
                       std::to_string(verify_wp_build_hash(g_verify_wp_build_id)),
                       __builtin_FUNCTION());
     chosen = verify_wp_measure(s, n, b);
-    if (chosen == 0) return 1;  // allocation failed: keep the reference kernel
+    if (chosen == 0) {
+      // The probe could not run: the reference split stands, recorded like a
+      // measured pick so the resolution does not move with the process.
+      verify_wp_record(s, n, 1);
+      return 1;
+    }
     if (tune::enabled() && !g_verify_wp_build_id.empty())
       tune::store("verify-gemv-wp", key,
                   {{"wp", chosen},
@@ -2821,10 +2839,11 @@ void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
   if (!available() || !q8_1_enabled() || !weights || count == 0) return;
   if (verify_wp_env() != 0) return;  // the A/B seam wins over the warm-up
   if (!verify_gemv_reuse_enabled()) return;
-  {
+  if (build_id) {
+    // A shape this process already resolved is a map read in the loops below;
+    // a second model load only adds its own shapes.
     std::lock_guard<std::mutex> lk(g_verify_wp_mutex);
-    if (!g_verify_wp_build_id.empty()) return;  // already warmed
-    if (build_id) g_verify_wp_build_id = build_id;
+    if (g_verify_wp_build_id.empty()) g_verify_wp_build_id = build_id;
   }
   // Distinct projection shapes, largest first: if the budget runs out, the
   // shapes that dominate a verify step are the ones already priced.
@@ -2853,25 +2872,25 @@ void warm_verify_gemv_wp(const QuantizedTensor* const* weights, size_t count,
   for (const auto& s : shapes) {
     VerifyWpBuffers buf;
     if (!verify_wp_alloc(s, buf)) {
+      // A shape whose probe buffers do not fit keeps the reference split; the
+      // resolution is recorded so no process has to make this choice inside
+      // generation.
       verify_wp_free(buf);
+      for (int n : kVerifyWpAllN) verify_wp_record(s, n, 1);
       continue;
     }
-    bool over_budget = false;
-    for (int n : kVerifyWpFallbackN) {
-      if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) {
-        over_budget = true;
-        break;
-      }
+    // Every shape resolves its fallback buckets: these are the choices a
+    // verify step reads, so none may be left to generation time.
+    for (int n : kVerifyWpFallbackN) (void)verify_wp_resolve(s, n, buf);
+    // The remaining buckets refine the split beyond the fallback set and stay
+    // inside the warm-up budget; the fill below propagates the nearest
+    // measured pick to any bucket the budget leaves out.
+    for (int n : kVerifyWpAllN) {
+      bool in_fallback = false;
+      for (int f : kVerifyWpFallbackN) in_fallback = in_fallback || f == n;
+      if (in_fallback) continue;
+      if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) break;
       (void)verify_wp_resolve(s, n, buf);
-    }
-    if (!over_budget) {
-      for (int n : kVerifyWpAllN) {
-        bool in_fallback = false;
-        for (int f : kVerifyWpFallbackN) in_fallback = in_fallback || f == n;
-        if (in_fallback) continue;
-        if (verify_wp_seconds_since(t0) > kVerifyWpBudgetS) break;
-        (void)verify_wp_resolve(s, n, buf);
-      }
     }
     verify_wp_free(buf);
   }
@@ -3827,7 +3846,6 @@ static std::optional<MmqUpType> mmq_up_type_of(QuantType t) {
 namespace {
 
 constexpr int kDecodeFamilyN = 8;           // widest verify row count timed
-constexpr double kDecodeFamilyBudgetS = 1.5;  // whole warm-up, per model load
 constexpr int kDecodeFamilyTimed = 7;       // timed repetitions per candidate
 constexpr int kDecodeFamilyWarm = 3;
 
@@ -4279,16 +4297,19 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
     return;
   mmq_group_warm_once();
   if (decode_family_override() != 0) return;  // the debug pin wins
-  {
+  if (build_id) {
+    // A shape this process already resolved is a map read in the loop below;
+    // a second model load only adds its own shapes.
     std::lock_guard<std::mutex> lk(g_decode_family_mutex);
-    if (!g_decode_family_build_id.empty()) return;  // already warmed
-    if (build_id) g_decode_family_build_id = build_id;
+    if (g_decode_family_build_id.empty()) g_decode_family_build_id = build_id;
   }
   const int build_key =
       (build_id && *build_id) ? decode_family_build_hash(build_id) : 0;
 
-  // Distinct projection shapes the mmq matmul can take, largest first: if the
-  // budget runs out, the shapes that dominate a decode step are priced first.
+  // Distinct projection shapes the mmq matmul can take, largest first. Every
+  // shape is priced: the family is read by the plan builder, which runs before
+  // generation, so a shape left unpublished here could only be decided inside a
+  // decode step.
   std::vector<VerifyWpShape> shapes;
   for (size_t i = 0; i < count; ++i) {
     const QuantizedTensor* w = weights[i];
@@ -4311,23 +4332,14 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
     return int64_t(a.rows) * a.cols > int64_t(b.rows) * b.cols;
   });
 
-  const auto t0 = std::chrono::steady_clock::now();
-  const auto elapsed_s = [&t0] {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-        .count();
-  };
   for (const auto& s : shapes) {
     bool mmq = false;
     if (!decode_family_cached(s, build_key, &mmq)) {
-      if (elapsed_s() > kDecodeFamilyBudgetS) {
-        std::fprintf(stderr,
-                     "warm_decode_family: %.2fs load budget reached; the "
-                     "remaining shapes keep the gemv\n",
-                     elapsed_s());
-        break;
-      }
       // Both families are timed at the decode row count and at the widest
-      // verify row count; the sum of the two is the family's cost.
+      // verify row count; the sum of the two is the family's cost. Every
+      // shape resolves here: the choice is a property of the plan, and a
+      // shape left unresolved would have to choose inside generation, where a
+      // different process could choose differently.
       tune::trace_event("measure", "decode-family",
                         decode_family_key(s.qt, s.rows, s.cols),
                         std::to_string(decode_family_build_hash(
@@ -4335,7 +4347,14 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
                         __builtin_FUNCTION());
       DecodeFamilyBuffers b{};
       if (!decode_family_alloc(s, b)) {
+        // A shape whose probe buffers do not fit keeps the gemv; record that
+        // resolution so the table is complete for every process.
         decode_family_free(b);
+        {
+          std::lock_guard<std::mutex> lk(g_decode_family_mutex);
+          g_decode_family[decode_family_key(s.qt, s.rows, s.cols)] = false;
+        }
+        decode_family_store(s, false, build_key);
         continue;
       }
       const double gemv1 = decode_family_gemv_ms(s, b, 1);
@@ -4396,19 +4415,21 @@ void warm_decode_family_group(const QuantizedTensor* const* weights, int count,
     tune::trace_event("measure", "decode-family", key,
                       std::to_string(build_key), __builtin_FUNCTION());
     DecodeFamilyGroupBuffers b{};
-    if (!decode_family_group_alloc(w, count, cols, b)) {
-      decode_family_group_free(b);
-      return;  // the members keep the single-shape measurement
+    bool measured = decode_family_group_alloc(w, count, cols, b);
+    double gemv1 = 0.0, mmq1 = 0.0, gemv8 = 0.0, mmq8 = 0.0;
+    if (measured) {
+      gemv1 = decode_family_group_gemv_ms(w, count, b, 1, cols);
+      mmq1 = decode_family_group_mmq_ms(w, count, b, 1, cols);
+      gemv8 = decode_family_group_gemv_ms(w, count, b, kDecodeFamilyN, cols);
+      mmq8 = decode_family_group_mmq_ms(w, count, b, kDecodeFamilyN, cols);
     }
-    const double gemv1 = decode_family_group_gemv_ms(w, count, b, 1, cols);
-    const double mmq1 = decode_family_group_mmq_ms(w, count, b, 1, cols);
-    const double gemv8 =
-        decode_family_group_gemv_ms(w, count, b, kDecodeFamilyN, cols);
-    const double mmq8 =
-        decode_family_group_mmq_ms(w, count, b, kDecodeFamilyN, cols);
     decode_family_group_free(b);
-    if (!(gemv1 > 0.0 && mmq1 > 0.0 && gemv8 > 0.0 && mmq8 > 0.0)) return;
-    mmq = (mmq1 + mmq8) < (gemv1 + gemv8);
+    // A group that cannot be timed takes the merged gemv launch, and that
+    // resolution is recorded like a measured one: the group's family is read
+    // by the plan builder, so it cannot be left undecided.
+    measured = measured && gemv1 > 0.0 && mmq1 > 0.0 && gemv8 > 0.0 &&
+               mmq8 > 0.0;
+    mmq = measured && (mmq1 + mmq8) < (gemv1 + gemv8);
     if (tune::enabled() && build_key != 0) {
       tune::store("decode-family", key,
                   {{"family", mmq ? 1 : 0}, {"k", build_key}});
