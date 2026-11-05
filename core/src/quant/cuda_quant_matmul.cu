@@ -1937,6 +1937,13 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
     return ms;
   };
 
+  if (!have_class)
+    tune::trace_event("measure", "mmq-j", mmq_class_disk_key(Type, M, bpr),
+                      "-", __builtin_FUNCTION());
+  tune::trace_event("measure", "mmq-j",
+                    mmq_tile_disk_key(Type, M, bpr, bucket), "-",
+                    __builtin_FUNCTION());
+
   const int heuristic_small = mmq::select_J(kMmqSmallProbeN);
   int cand_j[2] = {heuristic, heuristic};
   int cand_j_small[2] = {heuristic_small, heuristic_small};
@@ -2761,7 +2768,9 @@ int verify_wp_resolve(const VerifyWpShape& s, int n,
   }
   int chosen = 0;
   if (tune::enabled()) {
-    const auto rec = tune::lookup("verify-gemv-wp", key);
+    const auto rec = tune::lookup("verify-gemv-wp", key,
+                                  verify_wp_build_hash(g_verify_wp_build_id),
+                                  __builtin_FUNCTION());
     const auto wp_it = rec.find("wp");
     const auto k_it = rec.find("k");
     if (wp_it != rec.end() &&
@@ -2771,6 +2780,9 @@ int verify_wp_resolve(const VerifyWpShape& s, int n,
       chosen = wp_it->second;
   }
   if (chosen == 0) {
+    tune::trace_event("measure", "verify-gemv-wp", key,
+                      std::to_string(verify_wp_build_hash(g_verify_wp_build_id)),
+                      __builtin_FUNCTION());
     chosen = verify_wp_measure(s, n, b);
     if (chosen == 0) return 1;  // allocation failed: keep the reference kernel
     if (tune::enabled() && !g_verify_wp_build_id.empty())
@@ -4047,7 +4059,8 @@ bool decode_family_cached(const VerifyWpShape& s, int build_key, bool* mmq) {
     }
   }
   if (!tune::enabled() || build_key == 0) return false;
-  const auto rec = tune::lookup("decode-family", key);
+  const auto rec = tune::lookup("decode-family", key, build_key,
+                                __builtin_FUNCTION());
   const auto fi = rec.find("family");
   const auto ki = rec.find("k");
   if (fi == rec.end() || ki == rec.end() || ki->second != build_key ||
@@ -4201,7 +4214,8 @@ bool decode_family_group_cached(const std::string& key, int build_key,
     }
   }
   if (!tune::enabled() || build_key == 0) return false;
-  const auto rec = tune::lookup("decode-family", key);
+  const auto rec = tune::lookup("decode-family", key, build_key,
+                                __builtin_FUNCTION());
   const auto fi = rec.find("family");
   const auto ki = rec.find("k");
   if (fi == rec.end() || ki == rec.end() || ki->second != build_key ||
@@ -4306,13 +4320,18 @@ void warm_decode_family(const QuantizedTensor* const* weights, size_t count,
                      elapsed_s());
         break;
       }
+      // Both families are timed at the decode row count and at the widest
+      // verify row count; the sum of the two is the family's cost.
+      tune::trace_event("measure", "decode-family",
+                        decode_family_key(s.qt, s.rows, s.cols),
+                        std::to_string(decode_family_build_hash(
+                            g_decode_family_build_id)),
+                        __builtin_FUNCTION());
       DecodeFamilyBuffers b{};
       if (!decode_family_alloc(s, b)) {
         decode_family_free(b);
         continue;
       }
-      // Both families are timed at the decode row count and at the widest
-      // verify row count; the sum of the two is the family's cost.
       const double gemv1 = decode_family_gemv_ms(s, b, 1);
       const double mmq1 =
           decode_family_mmq_ms(s, *mmq_up_type_of(s.qt), b, 1);
@@ -4368,6 +4387,8 @@ void warm_decode_family_group(const QuantizedTensor* const* weights, int count,
       (build_id && *build_id) ? decode_family_build_hash(build_id) : 0;
   bool mmq = false;
   if (!decode_family_group_cached(key, build_key, &mmq)) {
+    tune::trace_event("measure", "decode-family", key,
+                      std::to_string(build_key), __builtin_FUNCTION());
     DecodeFamilyGroupBuffers b{};
     if (!decode_family_group_alloc(w, count, cols, b)) {
       decode_family_group_free(b);

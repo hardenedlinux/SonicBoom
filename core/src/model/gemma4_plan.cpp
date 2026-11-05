@@ -2590,6 +2590,9 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   }
   if (complete && spec_cost_record_valid(p.cost_us)) return;
 
+  tune::trace_event("measure", "spec-length", p.key,
+                    spec_kernel_fingerprint(), __builtin_FUNCTION());
+
   const auto t_load = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(
@@ -2997,6 +3000,10 @@ static uint64_t run_spec_program_steps(
           // run twice: the first pass absorbs the one-time cost of building and
           // capturing that row-count's verify runtime, the second is timed.
           // Forced drafts are proposals only; the verifier decides the run.
+          if (policy.warm_next == 0 && !policy.warm_primed)
+            tune::trace_event("measure", "spec-length", policy.key,
+                              spec_kernel_fingerprint(),
+                              __builtin_FUNCTION());
           k = size_t(policy.warm_next);
           warm = true;
           diag_kind = SpecDiagKind::Warm;

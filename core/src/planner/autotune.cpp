@@ -22,14 +22,19 @@
 #include <sonicboom/runtime_features.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <sys/file.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -85,6 +90,188 @@ std::string cache_path_locked(const std::string &op) {
           (std::string(op) + ".json"))
       .string();
 }
+
+// Declared here; both are defined with the minimal JSON reader below.
+constexpr int kJsonFormatVersion = 1;
+void parse_op_file(std::string_view s,
+                   std::map<std::string, std::map<std::string, int>> &out);
+
+// --- build identity, trace, resolution epoch ------------------------------
+
+// Identity of the running library, the same size+mtime rule the spec cost
+// cache uses: a rebuild moves it, so no record measured before a kernel change
+// is reused after one.
+std::string shared_object_identity() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void *>(&shared_object_identity), &info) == 0 ||
+      info.dli_fname == nullptr)
+    return "nostat";
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(info.dli_fname, ec);
+  if (ec) return "nostat";
+  const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
+  if (ec) return "nostat";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%llx-%llx", (unsigned long long)size,
+                (unsigned long long)mtime.time_since_epoch().count());
+  return buf;
+}
+
+long long fnv32(std::string_view s) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : s) {
+    h ^= c;
+    h *= 0x100000001b3ull;
+  }
+  return static_cast<int>(static_cast<uint32_t>(h ^ (h >> 32)));
+}
+
+const char *exe_name() {
+  static const std::string name = [] {
+    std::ifstream in("/proc/self/cmdline", std::ios::binary);
+    std::string s;
+    std::getline(in, s, '\0');
+    if (s.empty()) s = "?";
+    return s;
+  }();
+  return name.c_str();
+}
+
+std::atomic<bool> g_sealed{false};
+std::string g_sealed_miss_key;
+
+bool numerics_locked_op(std::string_view op) {
+  return op == "decode-family" || op == "mmq-splitk" || op == "mmq-cfg" ||
+         op == "verify-gemv-wp" || op == "decode-attn" ||
+         op == "attention-decode";
+}
+
+bool trace_line_enabled() {
+  static const bool on = [] {
+    const char *e = std::getenv("SONICBOOM_TUNE_TRACE");
+    return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
+  }();
+  return on;
+}
+
+std::mutex g_trace_mutex;
+
+void trace_line(std::string_view event, std::string_view op,
+                std::string_view key, std::string_view fp,
+                const char *caller) {
+  if (!trace_line_enabled()) return;
+  std::string line;
+  line.reserve(160 + key.size());
+  line += "[tune] ";
+  line += event;
+  line += " file=";
+  line += op;
+  // The mlir autotune store names its own file; the JSON tables take <op>.json.
+  if (op.find('.') == std::string_view::npos) line += ".json";
+  line += " key=";
+  line += key;
+  line += " fp=";
+  line += fp.empty() ? std::string_view("-") : fp;
+  line += " pid=";
+  line += std::to_string(static_cast<long long>(::getpid()));
+  line += " exe=";
+  line += exe_name();
+  line += " caller=";
+  line += caller != nullptr ? caller : "?";
+  line += '\n';
+  std::lock_guard<std::mutex> lk(g_trace_mutex);
+  std::fwrite(line.data(), 1, line.size(), stderr);
+  std::fflush(stderr);
+}
+
+std::string fp_text(long long fp) {
+  return fp == kNoFingerprint ? std::string("-") : std::to_string(fp);
+}
+
+// The "k" a record carries: the effective fingerprint written next to the
+// choice. It is the record's own "k" when the store did not name one.
+long long effective_fp(const std::map<std::string, int> &values, long long fp) {
+  if (fp != kNoFingerprint) return fp;
+  const auto it = values.find("k");
+  if (it == values.end()) return kNoFingerprint;
+  return static_cast<long long>(it->second);
+}
+
+// Parse a `<op>.json` body from disk. Malformed bodies yield what parsed.
+bool read_op_file(const std::string &path,
+                  std::map<std::string, std::map<std::string, int>> &out) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return false;
+  const std::string body((std::istreambuf_iterator<char>(in)),
+                         std::istreambuf_iterator<char>());
+  parse_op_file(body, out);
+  const auto fmt = out.find("__format__");
+  if (fmt != out.end()) {
+    const auto v = fmt->second.find("v");
+    if (v == fmt->second.end() || v->second != kJsonFormatVersion) out.clear();
+  }
+  return true;
+}
+
+bool write_op_file(const std::string &path,
+                   const std::map<std::string, std::map<std::string, int>> &entries) {
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  std::ostringstream os;
+  os << "{\n";
+  bool first_key = true;
+  for (const auto &[key, values] : entries) {
+    if (!first_key) os << ",\n";
+    first_key = false;
+    os << "  \"" << key << "\": {";
+    bool first_value = true;
+    for (const auto &[name, value] : values) {
+      if (!first_value) os << ", ";
+      first_value = false;
+      os << "\"" << name << "\": " << value;
+    }
+    os << "}";
+  }
+  os << "\n}\n";
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << os.str();
+    if (!out) return false;
+  }
+  std::filesystem::rename(tmp, path, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    return false;
+  }
+  return true;
+}
+
+// Exclusive advisory lock on `<op>.json.lock`, released on destruction. Every
+// write is a read-modify-write of the file under this lock, so two processes
+// storing different keys never drop each other's record.
+struct FileLock {
+  int fd = -1;
+  explicit FileLock(const std::string &path) {
+    const std::string lock = path + ".lock";
+    fd = ::open(lock.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+    if (fd >= 0 && ::flock(fd, LOCK_EX) != 0) {
+      ::close(fd);
+      fd = -1;
+    }
+  }
+  ~FileLock() {
+    if (fd >= 0) {
+      ::flock(fd, LOCK_UN);
+      ::close(fd);
+    }
+  }
+  FileLock(const FileLock &) = delete;
+  FileLock &operator=(const FileLock &) = delete;
+};
 
 // --- minimal JSON (object of string -> object of string -> int) ------------
 
@@ -181,7 +368,8 @@ void parse_op_file(std::string_view s,
 // meaning invalidates old picks instead of being misread. A store always
 // writes the current version, and the write is a temp file plus rename, so a
 // reader sees the whole old file or the whole new one.
-constexpr int kJsonFormatVersion = 1;
+//
+// kJsonFormatVersion is declared above (next to the fingerprint helpers).
 
 void load_op_locked(const std::string &op) {
   if (g_loaded[op]) return;
@@ -197,44 +385,6 @@ void load_op_locked(const std::string &op) {
     const auto v = fmt->second.find("v");
     if (v == fmt->second.end() || v->second != kJsonFormatVersion)
       entries.clear();
-  }
-}
-
-void write_op_locked(const std::string &op) {
-  const std::string path = cache_path_locked(op);
-  std::error_code ec;
-  std::filesystem::create_directories(
-      std::filesystem::path(path).parent_path(), ec);
-  g_cache[op]["__format__"] = {{"v", kJsonFormatVersion}};
-  std::ostringstream os;
-  os << "{\n";
-  bool first_key = true;
-  for (const auto &[key, values] : g_cache[op]) {
-    if (!first_key) os << ",\n";
-    first_key = false;
-    os << "  \"" << key << "\": {";
-    bool first_value = true;
-    for (const auto &[name, value] : values) {
-      if (!first_value) os << ", ";
-      first_value = false;
-      os << "\"" << name << "\": " << value;
-    }
-    os << "}";
-  }
-  os << "\n}\n";
-  // Write-then-rename so a concurrent process (ctest runs several GPU tests
-  // in parallel) sees either the old or the new file, never a torn one.
-  const std::string tmp = path + ".tmp";
-  {
-    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) return;
-    out << os.str();
-    if (!out) return;
-  }
-  std::filesystem::rename(tmp, path, ec);
-  if (ec) {
-    std::error_code ignored;
-    std::filesystem::remove(tmp, ignored);
   }
 }
 
@@ -304,26 +454,178 @@ void record_pick(std::string_view op, std::string_view key,
 
 } // namespace
 
-std::map<std::string, int> lookup(std::string_view op, std::string_view key) {
-  if (!enabled() || force()) return {};
+const std::string &build_fingerprint() {
+  static const std::string fp = [] {
+    std::string s;
+#ifdef SONICBOOM_VERSION_STRING
+    s += SONICBOOM_VERSION_STRING;
+#else
+    s += "unknown";
+#endif
+    s += '|';
+    s += shared_object_identity();
+    return s;
+  }();
+  return fp;
+}
+
+long long build_fingerprint_key() {
+  static const long long key = fnv32(build_fingerprint());
+  return key;
+}
+
+bool trace_enabled() { return trace_line_enabled(); }
+
+void trace_event(std::string_view event, std::string_view op,
+                 std::string_view key, std::string_view fp,
+                 const char *caller) {
+  trace_line(event, op, key, fp, caller);
+}
+
+namespace {
+
+// Caller holds g_mutex.
+void late_miss_locked(std::string_view op, std::string_view key) {
+  if (g_sealed_miss_key.empty()) g_sealed_miss_key = std::string(key);
+  std::string line = "[tune] BUG late-miss key=";
+  line += key;
+  line += " file=";
+  line += op;
+  line += ".json pid=";
+  line += std::to_string(static_cast<long long>(::getpid()));
+  line += " exe=";
+  line += exe_name();
+  line += '\n';
+  std::lock_guard<std::mutex> lk(g_trace_mutex);
+  std::fwrite(line.data(), 1, line.size(), stderr);
+  std::fflush(stderr);
+}
+
+void late_write_locked(std::string_view op, std::string_view key) {
+  std::string line = "[tune] BUG late-write key=";
+  line += key;
+  line += " file=";
+  line += op;
+  line += ".json pid=";
+  line += std::to_string(static_cast<long long>(::getpid()));
+  line += " exe=";
+  line += exe_name();
+  line += '\n';
+  std::lock_guard<std::mutex> lk(g_trace_mutex);
+  std::fwrite(line.data(), 1, line.size(), stderr);
+  std::fflush(stderr);
+}
+
+} // namespace
+
+std::map<std::string, int> lookup(std::string_view op, std::string_view key,
+                                  long long expect_fp, const char *caller) {
+  if (!enabled()) return {};
+  const std::string fp_s = fp_text(expect_fp);
+  if (force()) {
+    trace_line("miss", op, key, fp_s, caller);
+    return {};
+  }
   std::lock_guard<std::mutex> lk(g_mutex);
   const std::string op_s(op);
+  const std::string key_s(key);
   load_op_locked(op_s);
-  const auto it = g_cache[op_s].find(std::string(key));
-  if (it == g_cache[op_s].end()) return {};
-  record_pick(op_s, key, it->second, planner::decisions::Source::Cached);
+  const auto it = g_cache[op_s].find(key_s);
+  bool usable = it != g_cache[op_s].end();
+  if (usable && expect_fp != kNoFingerprint) {
+    const auto k = it->second.find("k");
+    if (k == it->second.end() ||
+        static_cast<long long>(k->second) != expect_fp) {
+      usable = false;
+      trace_line("fp-mismatch", op_s, key_s, fp_s, caller);
+    }
+  }
+  if (!usable) {
+    if (it == g_cache[op_s].end())
+      trace_line("miss", op_s, key_s, fp_s, caller);
+    if (sealed() && numerics_locked_op(op_s)) late_miss_locked(op_s, key_s);
+    return {};
+  }
+  trace_line("hit", op_s, key_s, fp_s, caller);
+  record_pick(op_s, key_s, it->second, planner::decisions::Source::Cached);
   return it->second;
 }
 
 void store(std::string_view op, std::string_view key,
-           const std::map<std::string, int> &values) {
+           const std::map<std::string, int> &values, long long fp,
+           const char *caller) {
   if (!enabled()) return;
-  std::lock_guard<std::mutex> lk(g_mutex);
   const std::string op_s(op);
-  load_op_locked(op_s);
-  g_cache[op_s][std::string(key)] = values;
-  write_op_locked(op_s);
-  record_pick(op_s, key, values, planner::decisions::Source::Measured);
+  const std::string key_s(key);
+  const long long new_fp = fp;
+  const std::string fp_s = fp_text(new_fp);
+  std::lock_guard<std::mutex> lk(g_mutex);
+  if (sealed()) {
+    late_write_locked(op_s, key_s);
+    return;
+  }
+  const std::string path = cache_path_locked(op_s);
+  // Read-modify-write under an exclusive lock: the on-disk file is the
+  // authority, so a record another process wrote between our load and our
+  // store is kept.
+  FileLock file_lock(path);
+  std::map<std::string, std::map<std::string, int>> entries;
+  read_op_file(path, entries);
+  const auto existing = entries.find(key_s);
+  bool replaced = false;
+  if (existing != entries.end()) {
+    // Write once: a record already in the file is never replaced by this
+    // build. Only a record measured for a different build (a fingerprint
+    // mismatch) is replaced, which is how a rebuild re-measures each table
+    // exactly once. An unfingerprinted table is frozen by its key, so the
+    // build identity must be part of that key when it is meant to re-measure.
+    // SONICBOOM_AUTOTUNE=force is the explicit "retune" escape hatch.
+    const long long old_fp = effective_fp(existing->second, kNoFingerprint);
+    const bool replace = force() || new_fp == kNoFingerprint ||
+                         old_fp != new_fp;
+    if (!replace) {
+      trace_line("overwrite-refused", op_s, key_s, fp_s, caller);
+      g_cache[op_s] = entries;
+      g_loaded[op_s] = true;
+      return;
+    }
+    replaced = true;
+  }
+  entries[key_s] = values;
+  entries["__format__"] = {{"v", kJsonFormatVersion}};
+  if (!write_op_file(path, entries)) return;
+  g_cache[op_s] = std::move(entries);
+  g_loaded[op_s] = true;
+  trace_line(replaced ? "overwrite" : "write", op_s, key_s, fp_s, caller);
+  record_pick(op_s, key_s, values, planner::decisions::Source::Measured);
+}
+
+void open() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_sealed.store(false);
+  g_sealed_miss_key.clear();
+}
+
+void seal() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_sealed.store(true);
+}
+
+bool sealed() { return g_sealed.load(); }
+
+bool sealed_missed() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  return !g_sealed_miss_key.empty();
+}
+
+std::string sealed_miss_key() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  return g_sealed_miss_key;
+}
+
+void clear_sealed_miss() {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  g_sealed_miss_key.clear();
 }
 
 void clear_memory_cache() {

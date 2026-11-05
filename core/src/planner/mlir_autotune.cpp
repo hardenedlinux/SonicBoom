@@ -16,6 +16,7 @@
 
 #include "mlir_autotune.h"
 
+#include "autotune.h"  // [tune] trace lines
 #include "decision_registry.h"
 
 #include <sonicboom/runtime_features.h>
@@ -365,6 +366,9 @@ CacheLookup AutotuneCache::lookup_ex(std::string_view op,
   const int fd = open_cache_file();
   if (fd < 0) {
     out.status = CacheStatus::Unreadable;
+    tune::trace_event("miss", "autotune/" + sm_file_name(),
+                      std::string(op) + "|" + std::string(shape_class), "-",
+                      __builtin_FUNCTION());
     return out;
   }
   out.status = CacheStatus::Unreadable;  // until the file proves readable
@@ -406,6 +410,10 @@ CacheLookup AutotuneCache::lookup_ex(std::string_view op,
     ::flock(fd, LOCK_UN);
   }
   ::close(fd);
+  tune::trace_event(out.status == CacheStatus::Hit ? "hit" : "miss",
+                    "autotune/" + sm_file_name(),
+                    std::string(op) + "|" + std::string(shape_class), "-",
+                    __builtin_FUNCTION());
   return out;
 }
 
@@ -449,6 +457,9 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
             break;
           }
         }
+        // An existing record, or the oldest one in a full file, is replaced;
+        // a free slot is a new record.
+        const bool replaced = slot < count || count >= kCapacity;
         if (slot == count) {
           if (count < kCapacity) {
             ++h->count;
@@ -474,6 +485,11 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
                       .count();
         ok = ::msync(m, kFileBytes, MS_SYNC) == 0;
         ::munmap(m, kFileBytes);
+        if (ok)
+          tune::trace_event(replaced ? "overwrite" : "write",
+                            "autotune/" + sm_file_name(),
+                            std::string(op) + "|" + std::string(shape_class),
+                            "-", __builtin_FUNCTION());
       }
     }
     ::flock(fd, LOCK_UN);

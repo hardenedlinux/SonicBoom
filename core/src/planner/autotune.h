@@ -70,14 +70,63 @@ const std::string &device_dir();
 // Full path of an op's cache file (for diagnostics/reporting).
 std::string cache_path(std::string_view op);
 
+// A record with this fingerprint value is not fingerprint-checked by lookup()
+// and may be replaced by store(); it marks a numerics-neutral table.
+inline constexpr long long kNoFingerprint = -1;
+
+// The build fingerprint: the version string and the identity (size+mtime) of
+// the running shared object. It is the only fingerprint a tune record carries;
+// per-process switches belong in the key, never here.
+const std::string &build_fingerprint();
+long long build_fingerprint_key();
+
+// SONICBOOM_TUNE_TRACE=1: one line per tune-table event on stderr:
+//   [tune] <event> file=<op>.json key=<key> fp=<fp> pid=<pid> exe=<argv0>
+//          caller=<function>
+// events: hit, miss, fp-mismatch, measure, write (a new record),
+// overwrite (an existing record replaced), overwrite-refused (write-once
+// refused).
+bool trace_enabled();
+
+// The trace line names the function that touched the table. Both g++ and the
+// CUDA host compiler provide __builtin_FUNCTION(), and a default argument is
+// evaluated at the call site, so a caller that does not name itself is still
+// attributed to the function performing the lookup or the store.
+void trace_event(std::string_view event, std::string_view op,
+                 std::string_view key, std::string_view fp,
+                 const char *caller = __builtin_FUNCTION());
+
 // Cached choice for (op, key); empty when absent or when SONICBOOM_AUTOTUNE=0.
-// `force()` makes this always return empty so the caller retunes.
-std::map<std::string, int> lookup(std::string_view op, std::string_view key);
+// `force()` makes this always return empty so the caller retunes. With a
+// non-negative `expect_fp`, a record whose "k" value differs (or is absent)
+// counts as absent: it is traced as fp-mismatch and an empty map is returned.
+std::map<std::string, int> lookup(std::string_view op, std::string_view key,
+                                  long long expect_fp = kNoFingerprint,
+                                  const char *caller = __builtin_FUNCTION());
 
 // Store a choice, updating the in-memory map and rewriting `<op>.json`.
-// A no-op when tuning is disabled.
+// A no-op when tuning is disabled. Writes are read-modify-write under an
+// exclusive flock on `<op>.json.lock`, temp file plus rename, and a record
+// whose "k" equals the new record's (`fp`, or the values' own "k") is never
+// replaced; the refused write is traced as overwrite-refused. An identical record is
+// likewise not rewritten, so a file's digest only moves when a value does.
 void store(std::string_view op, std::string_view key,
-           const std::map<std::string, int> &values);
+           const std::map<std::string, int> &values,
+           long long fp = kNoFingerprint,
+           const char *caller = __builtin_FUNCTION());
+
+// The model-load resolution epoch. Every numerics-affecting choice the loaded
+// model can use is resolved while the epoch is open (measurements and writes
+// are allowed); seal() closes it. After seal(), a lookup miss on a
+// numerics-affecting table is a bug: it is reported and recorded, and the
+// runtime build must fail rather than measure. Writes are refused. open()
+// starts a new epoch for the next model load in the same process.
+void open();
+void seal();
+bool sealed();
+bool sealed_missed();
+std::string sealed_miss_key();
+void clear_sealed_miss();
 
 // Drop the in-memory maps so the next lookup re-reads from disk.
 void clear_memory_cache();

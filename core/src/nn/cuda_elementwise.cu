@@ -4666,8 +4666,8 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     std::lock_guard<std::mutex> lk(g_fdec_mutex);
     if (g_fdec_pick.find(key) != g_fdec_pick.end()) return;
   }
-  const std::map<std::string, int> cached =
-      ::sonicboom::tune::lookup("decode-attn", key);
+  const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
+      "decode-attn", key, build_key, __builtin_FUNCTION());
   {
     const auto fam = cached.find("family");
     const auto kit = cached.find("k");
@@ -4701,6 +4701,9 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   // measurement taken on whatever device is recording it.
   if (planner::recorder() != nullptr) return;
 
+  ::sonicboom::tune::trace_event("measure", "decode-attn", key,
+                                 std::to_string(build_key),
+                                 __builtin_FUNCTION());
   // Key extents: a windowed class saturates at its window; a causal class is
   // measured at the depths the model can reach.
   std::vector<uint64_t> extents;
@@ -5051,6 +5054,8 @@ uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
     return default_chunk;
   }
 
+  ::sonicboom::tune::trace_event("measure", "attention-decode", key, "-",
+                                 __builtin_FUNCTION());
   // Measurement tiers: 1K, 4K, 16K, and the model capacity (capped). A tier at
   // or below the previous one is dropped so short-capacity models are not
   // measured twice at the same extent.
@@ -6207,6 +6212,8 @@ FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
         }
       }
       if (!have) {
+        ::sonicboom::tune::trace_event("measure", "attention-full", key, "-",
+                                       __builtin_FUNCTION());
         choice = full_tune_tiled(head_dim, gqa, n_heads, def, tune_s,
                                  candidate_count);
         const std::map<std::string, int> values{
@@ -7387,6 +7394,8 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
     }
     double tune_s = 0.0;
     int candidate_count = 0;
+    ::sonicboom::tune::trace_event("measure", "dense-f32", key, "-",
+                                   __builtin_FUNCTION());
     choice = dense_f32_tune(rows, cols, cands, pin == 1, tune_s,
                             candidate_count);
     if (pin == 1 && choice.impl != 0) {
@@ -7638,6 +7647,8 @@ DenseChoice dense_resolve(int rows, int cols) {
     planner::set_thread_recorder(nullptr);
     double tune_s = 0.0;
     int candidate_count = 0;
+    ::sonicboom::tune::trace_event("measure", "dense-gemm", key, "-",
+                                   __builtin_FUNCTION());
     choice = dense_tune(rows, cols, tune_s, candidate_count);
     planner::set_thread_recorder(saved);
     std::map<std::string, int> values{{"impl", choice.codegen ? 1 : 0}};

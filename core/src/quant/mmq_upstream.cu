@@ -921,7 +921,8 @@ std::string mmq_cfg_key(const MmqTuneShape & s, int J) {
 // this build's fingerprint, and still pass the neutrality/device filters.
 bool mmq_pin_from_cache(const MmqTuneShape & s, int build_key, MmqUpPin * pin) {
     if (!tune::enabled() || build_key == 0) return false;
-    const auto rec = tune::lookup("mmq-splitk", mmq_splitk_key(s));
+    const auto rec = tune::lookup("mmq-splitk", mmq_splitk_key(s), build_key,
+                                  __builtin_FUNCTION());
     const auto si = rec.find("S");
     const auto ki = rec.find("k");
     if (si == rec.end() || ki == rec.end() || ki->second != build_key) {
@@ -933,7 +934,8 @@ bool mmq_pin_from_cache(const MmqTuneShape & s, int build_key, MmqUpPin * pin) {
     int cfg[2] = {0, 0};
     for (int jj = 0; jj < 2; ++jj) {
         const int J = jj == 0 ? 8 : 16;
-        const auto crec = tune::lookup("mmq-cfg", mmq_cfg_key(s, J));
+        const auto crec = tune::lookup("mmq-cfg", mmq_cfg_key(s, J), build_key,
+                                       __builtin_FUNCTION());
         const auto ci = crec.find("cfg");
         const auto ck = crec.find("k");
         if (ci == crec.end() || ck == crec.end() || ck->second != build_key) {
@@ -1174,6 +1176,12 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                              "set (cfgs {5,6})\n",
                              elapsed_s());
             }
+            tune::trace_event("measure", "mmq-splitk", mmq_splitk_key(s),
+                              std::to_string(build_key), __builtin_FUNCTION());
+            tune::trace_event("measure", "mmq-cfg", mmq_cfg_key(s, 8),
+                              std::to_string(build_key), __builtin_FUNCTION());
+            tune::trace_event("measure", "mmq-cfg", mmq_cfg_key(s, 16),
+                              std::to_string(build_key), __builtin_FUNCTION());
             MmqTuneBuffers b;
             if (mmq_tune_alloc(s, b)) {
                 pin = mmq_pin_measure(s, b, reduced_mode);
@@ -1214,7 +1222,8 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
     bool cached = false;
     if (tune::enabled() && build_key != 0) {
         const auto rec = tune::lookup(
-            "mmq-splitk", mmq_group_splitk_key(types, rows, n_members, cols));
+            "mmq-splitk", mmq_group_splitk_key(types, rows, n_members, cols),
+            build_key, __builtin_FUNCTION());
         const auto si = rec.find("S");
         const auto ki = rec.find("k");
         if (si != rec.end() && ki != rec.end() && ki->second == build_key &&
@@ -1225,6 +1234,9 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
     }
 
     if (!cached) {
+        tune::trace_event("measure", "mmq-splitk",
+                          mmq_group_splitk_key(types, rows, n_members, cols),
+                          std::to_string(build_key), __builtin_FUNCTION());
         const sb_cuda_props props = get_props();
         // Raise the group kernels' shared-memory limits before the first timed
         // launch; only the attribute calls matter here.

@@ -48,6 +48,7 @@
 #include "cuda_stream.h"
 #include "fattn_jit.h"
 
+#include "../planner/autotune.h"  // [tune] trace lines
 #include "../planner/mlir_autotune.h"
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
@@ -2007,6 +2008,11 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
     return t;
   }
 
+  char tune_file[40];
+  std::snprintf(tune_file, sizeof(tune_file), "autotune/sm_%02d.bin",
+                mlir_tune::sm_version());
+  ::sonicboom::tune::trace_event("measure", tune_file, fp.key, fp.software,
+                                 __builtin_FUNCTION());
   Tuned t = tune_class(c, fp);
   t.report.cache_status = cache_status;
   t.report.cache_reason = cache_reason;
