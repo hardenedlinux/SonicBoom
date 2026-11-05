@@ -65,11 +65,14 @@ constexpr uint32_t kMagic = 0x31414253u;  // "SBA1"
 // The wider record changes the file layout, so a version-5 file must not be
 // read as version 6 even though both are fixed-record arrays. An older file
 // misses on lookup and is rewritten by the first store, which is the cache's
-// own reset path.
-constexpr uint32_t kVersion = 6;
+// own reset path. Version 7 adds a per-record build fingerprint and a stable
+// variant name (see Record): a record is reusable only in the build that
+// measured it, and the same build never replaces a record it already owns.
+constexpr uint32_t kVersion = 7;
 constexpr uint32_t kCapacity = 256;
 constexpr size_t kOpBytes = 32;
 constexpr size_t kShapeBytes = 192;
+constexpr size_t kNameBytes = 32;
 
 struct Header {
   uint32_t magic;
@@ -83,12 +86,20 @@ struct Record {
   char shape[kShapeBytes];
   int32_t sm;
   TileConfig cfg;
+  // Build fingerprint of the binary that measured this record (tune's
+  // build_fingerprint_key()). A record from another build is treated as
+  // absent on lookup and replaced by the first store of this build.
+  int64_t build;
+  // Stable variant name, for ops whose choice is a named kernel variant rather
+  // than a geometry (boom_fattn). The name is the record's identity on
+  // lookup; cfg stays as the geometry the build ran for diagnostics.
+  char name[kNameBytes];
   int64_t stamp;
 };
 
 static_assert(sizeof(TileConfig) == 20, "TileConfig is five int32 fields");
 static_assert(sizeof(Header) == 16, "cache header layout");
-static_assert(sizeof(Record) == 256, "cache record layout");
+static_assert(sizeof(Record) == 296, "cache record layout");
 
 constexpr size_t kFileBytes = sizeof(Header) + kCapacity * sizeof(Record);
 
@@ -372,6 +383,7 @@ CacheLookup AutotuneCache::lookup_ex(std::string_view op,
     return out;
   }
   out.status = CacheStatus::Unreadable;  // until the file proves readable
+  bool fp_mismatch = false;
   if (::flock(fd, LOCK_SH) == 0) {
     struct stat st {};
     if (::fstat(fd, &st) == 0) {
@@ -395,12 +407,19 @@ CacheLookup AutotuneCache::lookup_ex(std::string_view op,
           } else {
             out.status = CacheStatus::NotFound;
             const Record* recs = reinterpret_cast<const Record*>(h + 1);
+            const int64_t build = tune::build_fingerprint_key();
             for (size_t i = 0; i < count; ++i) {
-              if (op_matches(recs[i], op, shape_class)) {
-                out.cfg = recs[i].cfg;
-                out.status = CacheStatus::Hit;
-                break;
+              if (!op_matches(recs[i], op, shape_class)) continue;
+              if (recs[i].build != build) {
+                // Measured by another build: absent, never applied.
+                fp_mismatch = true;
+                continue;
               }
+              out.cfg = recs[i].cfg;
+              out.name = std::string(recs[i].name,
+                                     ::strnlen(recs[i].name, kNameBytes));
+              out.status = CacheStatus::Hit;
+              break;
             }
           }
           ::munmap(m, bytes);
@@ -410,7 +429,9 @@ CacheLookup AutotuneCache::lookup_ex(std::string_view op,
     ::flock(fd, LOCK_UN);
   }
   ::close(fd);
-  tune::trace_event(out.status == CacheStatus::Hit ? "hit" : "miss",
+  tune::trace_event(out.status == CacheStatus::Hit ? "hit"
+                    : fp_mismatch                  ? "fp-mismatch"
+                                                   : "miss",
                     "autotune/" + sm_file_name(),
                     std::string(op) + "|" + std::string(shape_class), "-",
                     __builtin_FUNCTION());
@@ -425,10 +446,11 @@ std::optional<TileConfig> AutotuneCache::lookup(std::string_view op,
 }
 
 bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
-                          const TileConfig& cfg) {
+                          const TileConfig& cfg, std::string_view name) {
   const int fd = open_cache_file();
   if (fd < 0) return false;
   bool ok = false;
+  bool refused = false;
   if (::flock(fd, LOCK_EX) == 0) {
     struct stat st {};
     bool ready = false;
@@ -450,6 +472,7 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
         }
         Record* recs = reinterpret_cast<Record*>(h + 1);
         const size_t count = std::min<size_t>(h->count, kCapacity);
+        const int64_t build = tune::build_fingerprint_key();
         size_t slot = count;
         for (size_t i = 0; i < count; ++i) {
           if (op_matches(recs[i], op, shape_class)) {
@@ -457,39 +480,55 @@ bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
             break;
           }
         }
-        // An existing record, or the oldest one in a full file, is replaced;
-        // a free slot is a new record.
-        const bool replaced = slot < count || count >= kCapacity;
-        if (slot == count) {
-          if (count < kCapacity) {
-            ++h->count;
-          } else {
-            // Full: replace the oldest record (smallest stamp).
-            size_t oldest = 0;
-            for (size_t i = 1; i < count; ++i)
-              if (recs[i].stamp < recs[oldest].stamp) oldest = i;
-            slot = oldest;
+        if (slot < count && recs[slot].build == build) {
+          // Write-once: this build already decided this key, so a later
+          // process's measurement cannot move it. The record in the file is
+          // the choice every process of this build will use.
+          refused = true;
+          ok = true;
+        } else {
+          // An existing record from another build, or the oldest one in a
+          // full file, is replaced; a free slot is a new record.
+          const bool replaced = slot < count || count >= kCapacity;
+          if (slot == count) {
+            if (count < kCapacity) {
+              ++h->count;
+            } else {
+              // Full: replace the oldest record (smallest stamp).
+              size_t oldest = 0;
+              for (size_t i = 1; i < count; ++i)
+                if (recs[i].stamp < recs[oldest].stamp) oldest = i;
+              slot = oldest;
+            }
           }
+          Record& r = recs[slot];
+          // Value-initialize: the key arrays become empty strings and every
+          // field below overwrites its default. (memset is not valid on
+          // Record: TileConfig has a non-trivial default constructor.)
+          r = Record{};
+          set_field(r.op, kOpBytes, op);
+          set_field(r.shape, kShapeBytes, shape_class);
+          r.sm = sm_version();
+          r.cfg = cfg;
+          r.build = build;
+          set_field(r.name, kNameBytes, name);
+          r.stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+          ok = ::msync(m, kFileBytes, MS_SYNC) == 0;
+          ::munmap(m, kFileBytes);
+          if (ok)
+            tune::trace_event(replaced ? "overwrite" : "write",
+                              "autotune/" + sm_file_name(),
+                              std::string(op) + "|" + std::string(shape_class),
+                              "-", __builtin_FUNCTION());
         }
-        Record& r = recs[slot];
-        // Value-initialize: the key arrays become empty strings and every
-        // field below overwrites its default. (memset is not valid on Record:
-        // TileConfig has a non-trivial default constructor.)
-        r = Record{};
-        set_field(r.op, kOpBytes, op);
-        set_field(r.shape, kShapeBytes, shape_class);
-        r.sm = sm_version();
-        r.cfg = cfg;
-        r.stamp = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::system_clock::now().time_since_epoch())
-                      .count();
-        ok = ::msync(m, kFileBytes, MS_SYNC) == 0;
-        ::munmap(m, kFileBytes);
-        if (ok)
-          tune::trace_event(replaced ? "overwrite" : "write",
-                            "autotune/" + sm_file_name(),
+        if (refused) {
+          ::munmap(m, kFileBytes);
+          tune::trace_event("overwrite-refused", "autotune/" + sm_file_name(),
                             std::string(op) + "|" + std::string(shape_class),
                             "-", __builtin_FUNCTION());
+        }
       }
     }
     ::flock(fd, LOCK_UN);
@@ -521,7 +560,9 @@ std::vector<DiskRecord> disk_records() {
                 std::string(recs[i].op, ::strnlen(recs[i].op, kOpBytes)),
                 std::string(recs[i].shape,
                             ::strnlen(recs[i].shape, kShapeBytes)),
-                recs[i].cfg});
+                recs[i].cfg,
+                std::string(recs[i].name,
+                            ::strnlen(recs[i].name, kNameBytes))});
           }
         }
         ::munmap(m, bytes);

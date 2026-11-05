@@ -46,11 +46,15 @@
 // device and cached.
 //
 // Determinism: a cache hit is deterministic — the same record is applied on
-// every launch and in every process on the device. A cold measurement is
-// timing dependent, so two cold processes can disagree within the tuner's
-// resolution; the runner only ever picks a candidate whose output is
-// bit-identical to the static default, so a different pick changes the kernel's
-// launch geometry, never the token stream or the numerics.
+// every launch and in every process on the device. Each record carries the
+// build fingerprint of the binary that measured it: a record from another
+// build is absent (looked up as a miss) and the first store of the current
+// build replaces it; a record the current build already owns is never
+// replaced, so the first decision of a build is the one every later process of
+// that build reads (write-once). A cold measurement is timing dependent; the
+// runner only ever picks a candidate whose output is bit-identical to the
+// static default, so a different pick changes the kernel's launch geometry,
+// never the token stream or the numerics.
 //
 // Cache location: $XDG_CACHE_HOME/sonicboom/autotune/sm_<NN>.bin, else
 // $HOME/.cache/sonicboom/autotune/sm_<NN>.bin, where <NN> is the device
@@ -135,6 +139,9 @@ enum class CacheStatus {
 struct CacheLookup {
   CacheStatus status = CacheStatus::NotFound;
   TileConfig cfg{};
+  // Stable variant name stored with the record (boom_fattn's candidate id);
+  // empty for ops whose choice is the geometry itself.
+  std::string name;
   // Schema version found on disk (0 when no header could be read). Set on
   // VersionMismatch so a report can name the store that was ignored.
   int file_version = 0;
@@ -158,8 +165,16 @@ class AutotuneCache {
   static size_t max_shape_class_bytes();
   // Insert or update the record. False when the file cannot be created or
   // locked; the caller keeps its default then.
+  //
+  // Every record carries the build fingerprint of the binary that measured it.
+  // A store from a different build replaces a stale record; a store from the
+  // build that already owns the key is refused (traced as overwrite-refused),
+  // so the first decision of a build is the one every later process of that
+  // build reads. `name` is the stable variant name for ops whose choice is a
+  // named kernel variant rather than a geometry; it is the record's identity
+  // on lookup.
   bool store(std::string_view op, std::string_view shape_class,
-             const TileConfig& cfg);
+             const TileConfig& cfg, std::string_view name = {});
 
   // File this process uses (diagnostics and tests).
   std::string path() const;
@@ -177,6 +192,7 @@ struct DiskRecord {
   std::string op;
   std::string shape_class;
   TileConfig cfg;
+  std::string name;  // stable variant name; empty for geometry-only records
 };
 std::vector<DiskRecord> disk_records();
 

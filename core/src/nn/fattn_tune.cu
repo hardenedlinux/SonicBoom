@@ -101,9 +101,10 @@ constexpr int kMaxIters = 64;
 constexpr int64_t kDefaultBudgetMs = 4000;
 
 // ---------------------------------------------------------------------------
-// Candidates. num is the JIT entry-point suffix, the cache payload and the
-// SONICBOOM_FATTN_CANDIDATE key; id is the stable name used by the report and
-// by SONICBOOM_FATTN_CANDIDATE/CANDIDATES. The table is the experiment record:
+// Candidates. num is the JIT entry-point suffix and the SONICBOOM_FATTN_
+// CANDIDATE key; id is the stable name used by the report, by
+// SONICBOOM_FATTN_CANDIDATE/CANDIDATES and as the cache record's identity.
+// The table is the experiment record:
 // every variant that exists keeps its row, including the ones excluded from
 // the default set and why.
 // ---------------------------------------------------------------------------
@@ -1810,10 +1811,14 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
 
   // ---- persist -----------------------------------------------------------
   if (!fp.cache_disabled) {
+    // The record is identified by the variant's stable name, never by its
+    // table index: renumbering the registry cannot point an old record at a
+    // different kernel. The geometry fields stay as the measured layout.
     mlir_tune::AutotuneCache::instance().store(
         "boom_fattn", fp.key,
-        mlir_tune::TileConfig{winner->num, winner->kpad, winner->vpad,
-                            winner->spw, winner->pipe});
+        mlir_tune::TileConfig{0, winner->kpad, winner->vpad, winner->spw,
+                              winner->pipe},
+        winner->id);
   }
 
   t.ok = true;
@@ -1928,16 +1933,11 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
         mlir_tune::AutotuneCache::instance().lookup_ex("boom_fattn", cls);
     switch (look.status) {
       case mlir_tune::CacheStatus::Hit: {
-        const mlir_tune::TileConfig& cfg = look.cfg;
-        const Cand* cand = cand_by_num(cfg.tile_m);
-        const bool match = cand != nullptr && cfg.tile_n == cand->kpad &&
-                           cfg.tile_k == cand->vpad && cfg.unroll == cand->spw &&
-                           cfg.vectorize == cand->pipe;
-        if (!match) {
+        const Cand* cand = cand_by_id(look.name);
+        if (cand == nullptr) {
           cache_status = "invalidated";
-          cache_reason = "the record names candidate " +
-                         std::to_string(cfg.tile_m) + " (" +
-                         cfg.to_string() + "), which this build does not have";
+          cache_reason = "the record names variant '" + look.name +
+                         "', which this build does not have";
           break;
         }
         Tuned t;

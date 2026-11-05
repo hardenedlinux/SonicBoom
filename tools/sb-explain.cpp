@@ -173,7 +173,9 @@ int main(int argc, char** argv) {
   } else {
     for (const auto& record : records) {
       std::cout << record.op << ' ' << record.shape_class << " = "
-                << record.cfg.to_string() << "\n";
+                << record.cfg.to_string();
+      if (!record.name.empty()) std::cout << " name=" << record.name;
+      std::cout << "\n";
     }
   }
 
