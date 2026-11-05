@@ -259,7 +259,24 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
 // dispatcher and the mmq kernel are both available; which projections actually
 // do is the per-shape family measured at load (decode_family_mmq).
 bool decode_mmq_available() {
+#ifdef SONICBOOM_USE_CUDA
   return quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled();
+#else
+  return false;  // CPU-only build: no device matmul path exists.
+#endif
+}
+
+// The load-time family decision for one projection (-/+/gate/up). A CPU-only
+// build has no family measurement and no device matmul, so it never selects it.
+bool decode_family_mmq(quant::QuantType qt, uint64_t in_w, uint64_t out_w) {
+#ifdef SONICBOOM_USE_CUDA
+  return quant::cuda::decode_family_mmq(qt, int(out_w), int(in_w));
+#else
+  (void)qt;
+  (void)in_w;
+  (void)out_w;
+  return false;
+#endif
 }
 
 }  // namespace
@@ -331,9 +348,7 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   const bool mmq_available = decode_mmq_available();
   auto mmq_a = [&](std::vector<sx::Attribute> &a, quant::QuantType qt,
                    uint64_t in_w, uint64_t out_w) {
-    if (!mmq_available ||
-        !quant::cuda::decode_family_mmq(qt, int(out_w), int(in_w)))
-      return;
+    if (!mmq_available || !decode_family_mmq(qt, in_w, out_w)) return;
     const int64_t ds =
         (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
         : (qt == quant::QuantType::Q6_K)                               ? -1
@@ -1609,6 +1624,68 @@ static void spec_diag_dump(const char* strategy) {
 // default for Sonic and overrides host-memory-space compute tasks back to the
 // CPU SonicBackend. Greedy argmax is identical to generate_spine.
 // ---------------------------------------------------------------------------
+
+// The session execution lock (plan.h): the C ABI holds it around a whole
+// session mutation, so the spine call and the caller's own session-state update
+// are one unit against every other operation. Defined outside the CUDA-only
+// spine section below because every build links it through the C ABI.
+static std::recursive_mutex g_exec_mutex;
+
+std::recursive_mutex& execution_mutex() { return g_exec_mutex; }
+
+// SONICBOOM_SPEC selects the generation loop:
+//   off      the plain greedy loop (B1's program, step per token);
+//   on       the speculative program: draft, verify, accept;
+//   auto     the same program with the draft length decided by policy (B7);
+//   reckless auto's policy, but the verify rows run through the batch prefill
+//            kernels instead of the decode graph dealt over rows. That is
+//            faster on the batched matmuls and gives up the row-invariance
+//            guarantee: a speculative run may emit a different token stream
+//            than plain decoding would (the mode logs this once).
+// Unset is V2's probe: the first generation call measures one plain decode
+// step against one k=1 verify step on this GPU (cached per SM in the Q1
+// autotune file) and picks auto below the threshold, off at or above it. The
+// probe is a startup cost, once per GPU; an explicit SONICBOOM_SPEC bypasses
+// it. Until the probe has decided, Undecided answers like Off, so the greedy
+// runtime is built (and the probe then rebuilds it if it selects auto).
+enum class SpecMode { Undecided, Off, On, Auto, Reckless };
+
+// The explicit environment choice. Undecided means "no override": the probe
+// decides, once, and stores the result in g_spec_mode.
+static SpecMode env_spec_mode() {
+  static const SpecMode mode = [] {
+    const char* e = std::getenv("SONICBOOM_SPEC");
+    if (!e || !*e) return SpecMode::Undecided;
+    if (std::string_view(e) == "off") return SpecMode::Off;
+    if (std::string_view(e) == "on") return SpecMode::On;
+    if (std::string_view(e) == "auto") return SpecMode::Auto;
+    if (std::string_view(e) == "reckless") return SpecMode::Reckless;
+    std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
+              << "' (expected off|on|auto|reckless); using off\n";
+    return SpecMode::Off;
+  }();
+  return mode;
+}
+
+// V2's resolved choice (see spec_resolve_probe). Only read after the
+// environment left the mode undecided.
+static SpecMode g_spec_mode = SpecMode::Undecided;
+
+static SpecMode spec_mode() {
+  const SpecMode env = env_spec_mode();
+  return env != SpecMode::Undecided ? env : g_spec_mode;
+}
+
+// Reckless verify rows run through the batch prefill kernels, whose arithmetic
+// is not the decode step's. The strict numerics profile is a promise that the
+// decode path is a fixed reference, so the combination is refused instead of
+// silently picking one contract over the other. The C ABI applies the same
+// check in every build, so this lives outside the CUDA-only section.
+bool spec_reckless_unsupported() {
+  return spec_mode() == SpecMode::Reckless &&
+         numerics_profile() == NumericsProfile::Strict;
+}
+
 #ifdef SONICBOOM_USE_CUDA
 
 // ---------------------------------------------------------------------------
@@ -1837,62 +1914,10 @@ static bool repro_prefill_enabled() {
 // kSpecMaxDrafts (the speculative draft cap) is defined above the policy
 // functions, which need it.
 
-// SONICBOOM_SPEC selects the generation loop:
-//   off      the plain greedy loop (B1's program, step per token);
-//   on       the speculative program: draft, verify, accept;
-//   auto     the same program with the draft length decided by policy (B7);
-//   reckless auto's policy, but the verify rows run through the batch prefill
-//            kernels instead of the decode graph dealt over rows. That is
-//            faster on the batched matmuls and gives up the row-invariance
-//            guarantee: a speculative run may emit a different token stream
-//            than plain decoding would (the mode logs this once).
-// Unset is V2's probe: the first generation call measures one plain decode
-// step against one k=1 verify step on this GPU (cached per SM in the Q1
-// autotune file) and picks auto below the threshold, off at or above it. The
-// probe is a startup cost, once per GPU; an explicit SONICBOOM_SPEC bypasses
-// it. Until the probe has decided, Undecided answers like Off, so the greedy
-// runtime is built (and the probe then rebuilds it if it selects auto).
-enum class SpecMode { Undecided, Off, On, Auto, Reckless };
-
-// The explicit environment choice. Undecided means "no override": the probe
-// decides, once, and stores the result in g_spec_mode.
-static SpecMode env_spec_mode() {
-  static const SpecMode mode = [] {
-    const char* e = std::getenv("SONICBOOM_SPEC");
-    if (!e || !*e) return SpecMode::Undecided;
-    if (std::string_view(e) == "off") return SpecMode::Off;
-    if (std::string_view(e) == "on") return SpecMode::On;
-    if (std::string_view(e) == "auto") return SpecMode::Auto;
-    if (std::string_view(e) == "reckless") return SpecMode::Reckless;
-    std::cerr << "[spec] unknown SONICBOOM_SPEC='" << e
-              << "' (expected off|on|auto|reckless); using off\n";
-    return SpecMode::Off;
-  }();
-  return mode;
-}
-
-// V2's resolved choice (see spec_resolve_probe). Only read after the
-// environment left the mode undecided.
-static SpecMode g_spec_mode = SpecMode::Undecided;
-
-static SpecMode spec_mode() {
-  const SpecMode env = env_spec_mode();
-  return env != SpecMode::Undecided ? env : g_spec_mode;
-}
-
 static bool spec_enabled() {
   const SpecMode m = spec_mode();
   return m == SpecMode::On || m == SpecMode::Auto ||
          m == SpecMode::Reckless;
-}
-
-// Reckless verify rows run through the batch prefill kernels, whose arithmetic
-// is not the decode step's. The strict numerics profile is a promise that the
-// decode path is a fixed reference, so the combination is refused instead of
-// silently picking one contract over the other.
-bool spec_reckless_unsupported() {
-  return spec_mode() == SpecMode::Reckless &&
-         numerics_profile() == NumericsProfile::Strict;
 }
 
 // Read the program back out of the lifted module. The program verifier has
@@ -3395,12 +3420,6 @@ static uint64_t run_spec_program_steps(
 // execution mutex serializes a complete session operation (prefill, decode,
 // sampled/verify/spec step, session free), not one token.
 static std::mutex g_registry_mutex;
-static std::recursive_mutex g_exec_mutex;
-
-// Public accessor (plan.h): the C ABI holds this around a whole session
-// mutation, so the spine call and the caller's own session-state update are one
-// unit against every other operation.
-std::recursive_mutex& execution_mutex() { return g_exec_mutex; }
 
 static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
 static std::map<DecodeKey, std::unique_ptr<FedRuntime>> g_fed_runtimes;

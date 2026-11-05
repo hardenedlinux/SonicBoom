@@ -18,9 +18,8 @@
 
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda_runtime.h>
-#endif
-
 #include "../nn/cuda_stream.h"
+#endif
 
 #include <mutex>
 #include <unordered_map>
