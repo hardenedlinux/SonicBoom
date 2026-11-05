@@ -2528,13 +2528,23 @@ std::array<double, size_t(SpecLengthPolicy::kMax) + 1> spec_interpolate_costs(
   return c;
 }
 
+// The curve is measured from the verify runtimes, which are otherwise built
+// only for modes that verify. Pricing sets this for the duration of the
+// measurement, so a process whose mode never verifies can still seed the
+// record: the curve is written once per build and every later process, of any
+// mode, reads it as is.
+static thread_local bool g_spec_pricing = false;
+static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
+                            const planner::KvCacheSession& session);
+
 // Measure c(k) for k = 0..kSpecMaxDrafts on synthetic rows and store the curve.
-// Only the adaptive policy prices verify lengths ("on" uses the fixed cap,
-// "off" never verifies), so those modes return without touching the device; an
-// undecided mode is priced too, because the V2 probe may still select auto at
-// the first call. A complete, structurally valid record is reused as-is, but
-// the runtime warm-up below runs either way: it is what keeps the first
-// request free of a first-use graph build, not part of pricing.
+// Reckless verifies through the prefill path, so it is never priced here. Every
+// other mode prices an incomplete record, including the off mode, whose verify
+// runtimes exist only for the measurement: the record belongs to the build, so
+// it must not matter which process happens to write it first. A complete,
+// structurally valid record is reused as-is, but the runtime warm-up below
+// runs either way: it is what keeps the first request free of a first-use
+// graph build, not part of pricing.
 static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
                                     DecodeRuntime& rt,
                                     planner::KvCacheSession& session) {
@@ -2576,6 +2586,16 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
       complete = false;
   }
   if (complete && spec_cost_record_valid(p.cost_us)) return;
+
+  struct PricingScope {
+    bool prev = g_spec_pricing;
+    PricingScope() { g_spec_pricing = true; }
+    ~PricingScope() { g_spec_pricing = prev; }
+  } pricing_scope;
+  // Build (and capture) the verify runtimes the curve is measured on outside
+  // the cost budget, exactly as a verifying mode's load does. The off mode's
+  // set exists only because the record has to be priced once per build.
+  if (spec_mode() == SpecMode::Off) warm_verify_set(m, n_ctx, session);
 
   tune::trace_event("measure", "spec-length", p.key,
                     spec_kernel_fingerprint(), __builtin_FUNCTION());
@@ -4084,9 +4104,12 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
 
 // The widest verify the current mode can run. "on" verifies at one fixed cap,
 // so only that row count is reachable; "auto" and an undecided mode (the probe
-// may still select auto) can verify every length the policy proposes.
+// may still select auto) can verify every length the policy proposes. The cost
+// measurement prices the whole envelope whatever the mode, so it reaches every
+// width: the record it writes is the one every later process reads.
 static int verify_row_limit() {
   const SpecMode mode = spec_mode();
+  if (g_spec_pricing) return planner::kMaxVerifyRows;
   if (mode == SpecMode::Off) return 1;
   const int cap = int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts()));
   return cap + 1;
@@ -4244,15 +4267,16 @@ static std::unique_ptr<VerifySet> build_verify_set(
 // Build (or fetch) the verify set bound to `session`'s cache. Keyed by the
 // cache identity as well as the shape: a capture is only replayable against the
 // set it was recorded with, and a second session must not evict the first
-// session's captures. Returns nullptr when the mode never verifies or on a
+// session's captures. Returns nullptr when the mode never verifies (except
+// under the cost measurement, which needs the runtimes to price them) or on a
 // build/plan failure.
 static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                                  const planner::KvCacheSession& session) {
   if (!session.caches || session.cache_id == 0) return nullptr;
   // The decode-dealt verify set exists only for modes that run it; reckless
   // verifies through the prefill path (verify_step_reckless).
-  if (spec_mode() == SpecMode::Off || spec_mode() == SpecMode::Reckless)
-    return nullptr;
+  if (spec_mode() == SpecMode::Reckless) return nullptr;
+  if (spec_mode() == SpecMode::Off && !g_spec_pricing) return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
