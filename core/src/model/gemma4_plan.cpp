@@ -1356,11 +1356,6 @@ const char* spec_ctx_class(uint64_t n_ctx) {
   return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
 }
 
-std::string env_value(const char* name) {
-  const char* e = std::getenv(name);
-  return e && *e ? std::string(e) : std::string("unset");
-}
-
 // Identity of the running library. The cost of a verify round is a property
 // of the kernels and dispatch that produced it; a size+mtime identity moves
 // whenever the shared object is rebuilt, so no kernel change can be priced
@@ -1384,10 +1379,12 @@ std::string shared_object_identity() {
   return buf;
 }
 
-// The verify-dispatch fingerprint: schema, build identity, the runtime
-// switches that select a different verify kernel, and the numerics profile
-// (it fixes the KV element type). A change in any of them makes every cached
-// cost stale, so the key changes and the policy warms up again.
+// The verify-cost fingerprint: the record schema and the identity of the
+// running library. It is a build identity and nothing else — every process of
+// one build prices the same model the same way, so the cost records are
+// written once and every later process reads them. Per-process switches are
+// not part of it: a price is a timing estimate, not a kernel selection, and
+// the curve covers the whole draft-length envelope this build can reach.
 std::string spec_kernel_fingerprint() {
   uint64_t h = 0xcbf29ce484222325ull;
   const auto add = [&h](std::string_view s) {
@@ -1406,28 +1403,6 @@ std::string spec_kernel_fingerprint() {
   add("dev");
 #endif
   add(shared_object_identity());
-  add(env_value("SONICBOOM_SPEC_VERIFY_BATCH"));
-  // A capped measurement prices only the lengths it can reach and extrapolates
-  // the rest, so its record is not a substitute for the full envelope's.
-  add(std::to_string(spec_max_drafts()));
-  add(env_value("SONICBOOM_VERIFY_GEMV_REUSE"));
-  add(env_value("SONICBOOM_VERIFY_GEMV_WP"));
-#ifdef SONICBOOM_USE_CUDA
-  add(quant::cuda::q8_1_enabled() ? "q8_1" : "no-q8_1");
-  add(quant::cuda::mmq_enabled() ? "mmq" : "no-mmq");
-  add(std::to_string(quant::cuda::mmq_min_n()));
-#endif
-  // Host-only resolution: the device reduce mode would query (and thus
-  // initialize) CUDA, and the cost records already live in the per-device tune
-  // directory. The env override is what a process can change per launch.
-  add(planner::reduce_mode_env()
-          ? std::to_string(int(*planner::reduce_mode_env()))
-          : "auto");
-  // Resolving the profile records a per-device decision (which queries CUDA).
-  // Before anything has resolved it, the env switch is the whole input.
-  add(numerics_profile_resolved()
-          ? std::to_string(int(numerics_profile()))
-          : env_value("SONICBOOM_NUMERICS"));
   char buf[24];
   std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
   return buf;
@@ -2363,7 +2338,8 @@ static void spec_policy_init(const Gemma4Model& m, uint64_t n_ctx,
                              SpecLengthPolicy& p) {
   if (!tune::enabled()) return;
   p.key = spec_cost_identity(m, n_ctx);
-  const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
+  const std::map<std::string, int> cached =
+      tune::lookup("spec-length", p.key, tune::build_fingerprint_key());
   std::array<double, SpecLengthPolicy::kMax + 1> read{};
   bool complete = true;
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
@@ -2397,7 +2373,10 @@ static void spec_policy_store(const SpecLengthPolicy& p) {
           std::max(1, int(std::lround(cost_us[size_t(k)])));
     }
   }
-  if (!values.empty()) tune::store("spec-length", p.key, values);
+  if (values.empty()) return;
+  const long long fp = tune::build_fingerprint_key();
+  values["k"] = int(fp);
+  tune::store("spec-length", p.key, values, fp);
 }
 
 // Fold the process's refined medians into the stored cost records. Called
@@ -2432,7 +2411,8 @@ static void spec_flush_refined_costs(const Gemma4Model& m) {
     }
   }
   for (const auto& [key, us] : ready) {
-    const std::map<std::string, int> cached = tune::lookup("spec-length", key);
+    const std::map<std::string, int> cached =
+        tune::lookup("spec-length", key, tune::build_fingerprint_key());
     std::array<double, size_t(SpecLengthPolicy::kMax) + 1> curve{};
     bool any = false;
     for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
@@ -2456,7 +2436,12 @@ static void spec_flush_refined_costs(const Gemma4Model& m) {
         values["c" + std::to_string(k)] =
             std::max(1, int(std::lround(curve[size_t(k)])));
     }
-    if (!values.empty()) tune::store("spec-length", key, values);
+    if (values.empty()) continue;
+    // Refinement never replaces the build's first record: the file the first
+    // process wrote is the record every later process reads.
+    const long long fp = tune::build_fingerprint_key();
+    values["k"] = int(fp);
+    tune::store("spec-length", key, values, fp);
   }
 }
 
@@ -2554,8 +2539,9 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
                                     DecodeRuntime& rt,
                                     planner::KvCacheSession& session) {
   if (!tune::enabled()) return;
-  const SpecMode mode = spec_mode();
-  if (mode == SpecMode::Off || mode == SpecMode::On) return;
+  // Reckless verifies through the prefill path, whose price is a different
+  // measurement; the decode-dealt curve is not used there.
+  if (spec_mode() == SpecMode::Reckless) return;
   if (!session.caches || session.cache_id == 0) return;
 
   // The depth the curve is measured at: bounded, so the whole curve fits the
@@ -2579,7 +2565,8 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
 
   SpecLengthPolicy p;
   p.key = spec_cost_identity(m, n_ctx);
-  const std::map<std::string, int> cached = tune::lookup("spec-length", p.key);
+  const std::map<std::string, int> cached =
+      tune::lookup("spec-length", p.key, tune::build_fingerprint_key());
   bool complete = true;
   for (int k = 0; k <= SpecLengthPolicy::kMax; ++k) {
     const auto it = cached.find("c" + std::to_string(k));
@@ -2613,7 +2600,9 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
   double last_us = 0.0;  // the previous knot's median (projection input)
   for (int64_t k : kSpecCostBand) {
     if (k > int64_t(SpecLengthPolicy::kMax)) continue;
-    if (k > spec_max_drafts()) continue;  // priced only where it can be used
+    // The whole envelope is priced, not only the lengths this process's cap
+    // can reach: the record belongs to the build, and a later process with a
+    // different cap must read it rather than price the lengths it adds.
     if (pos + uint64_t(k) + 1 > n_ctx) continue;  // no room for k+1 rows
     // The budget is checked before a length is started and before its timed
     // passes: a length whose build would overrun it is abandoned rather than
