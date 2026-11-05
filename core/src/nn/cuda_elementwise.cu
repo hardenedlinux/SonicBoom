@@ -1216,7 +1216,7 @@ __global__ void decode_attention_split_mq_kernel(
 // ascending order, at partial index (first_r - first_0) + c.
 __global__ void decode_attention_merge_mq_kernel(
     const float* __restrict__ partial, const uint64_t* __restrict__ pos,
-    uint64_t chunk, uint64_t sliding_window, int n_chunks, int n_heads_q,
+    FdecPartition part, uint64_t sliding_window, int n_chunks, int n_heads_q,
     int head_dim, int pos_offset0, float* __restrict__ out) {
   const int h = blockIdx.x;  // one block per query head
   const int r = blockIdx.y;  // one block per verify row
@@ -1229,8 +1229,11 @@ __global__ void decode_attention_merge_mq_kernel(
       (sliding_window > 0 && p >= sliding_window) ? p - sliding_window + 1 : 0;
   const uint64_t start0 =
       (sliding_window > 0 && p0 >= sliding_window) ? p0 - sliding_window + 1 : 0;
-  const uint64_t off = start / chunk - start0 / chunk;
-  const uint64_t n_active = p / chunk - start / chunk + 1;
+  // Chunk indices are absolute; block 0 of the launch is the chunk holding row
+  // 0's first key, and a row folds the chunks that intersect its window in
+  // ascending index.
+  const uint64_t off = part.chunk_of(start) - part.chunk_of(start0);
+  const uint64_t n_active = part.chunk_of(p) - part.chunk_of(start) + 1;
   uint64_t nc = n_active < (uint64_t)n_chunks ? n_active : (uint64_t)n_chunks;
   if (off >= (uint64_t)n_chunks)
     nc = 0;
@@ -3661,17 +3664,17 @@ int attn_decode_hpb(const std::string& key, int tier);
 // Per-tier policies are only meaningful on a captured tier graph.
 bool decode_tier_chunk_enabled();
 bool decode_hpb_enabled();
-// Tensor-core decode/verify attention: the family and chunk size the
+// Tensor-core decode/verify attention: the family and key-axis partition the
 // dispatcher runs for this class (definitions with the other attention
 // schedules below).
 bool fdec_selected(const std::string& key, int head_dim, int gqa, bool kv_f16,
-                   bool kv_q8, uint64_t* chunk);
+                   bool kv_q8, int* part);
 bool attn_fdec_launch(const float* q, const __half* k_cache,
                       const __half* v_cache, const uint64_t* pos,
                       uint64_t window, uint64_t n_slots, int n_heads_q,
                       int n_heads_kv, int head_dim, uint64_t sliding_window,
                       float scale, float* out, int n_q, int pos_offset0,
-                      uint64_t chunk);
+                      int part_id);
 } // namespace
 
 // The identity split's chunk cap, shared by both decode paths. A tuned chunk
@@ -3737,14 +3740,14 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   // keeps its geometry; chunks beyond the current position exit on entry.
   if (runtime::feature_enabled(runtime::Feature::SplitKv) && !attn_trace_on() &&
       std::getenv("SONICBOOM_ATTN_EXP2") == nullptr && kv_f16 && !kv_q8) {
-    uint64_t fdec_chunk = 0;
+    int fdec_part = 0;
     if (fdec_selected(class_key, head_dim, group_q, true, false,
-                      &fdec_chunk) &&
+                      &fdec_part) &&
         attn_fdec_launch(q, reinterpret_cast<const __half*>(k_cache),
                          reinterpret_cast<const __half*>(v_cache), pos,
                          grid_window, n_slots, n_heads_q, n_heads_kv,
                          head_dim, sliding_window, scale, out, 1, 0,
-                         fdec_chunk))
+                         fdec_part))
       return true;
   }
 
@@ -3994,15 +3997,15 @@ bool decode_attention_mq_dev_impl(
   // absolute chunks the single-row call would). The shape rule (short-window
   // multi-query, chunk cap) belongs to the split pair and does not apply.
   if (runtime::feature_enabled(runtime::Feature::SplitKv) && kv_f16 && !kv_q8) {
-    uint64_t fdec_chunk = 0;
+    int fdec_part = 0;
     const std::string key = attn_decode_class_key(
         head_dim, group_q, n_heads_q, n_heads_kv, sliding_window, true, false);
-    if (fdec_selected(key, head_dim, group_q, true, false, &fdec_chunk) &&
+    if (fdec_selected(key, head_dim, group_q, true, false, &fdec_part) &&
         attn_fdec_launch(q, reinterpret_cast<const __half*>(k_cache),
                          reinterpret_cast<const __half*>(v_cache), pos, window,
                          n_slots, n_heads_q, n_heads_kv, head_dim,
                          sliding_window, scale, out, n_q, pos_offset0,
-                         fdec_chunk))
+                         fdec_part))
       return true;
   }
 
@@ -4104,8 +4107,8 @@ bool decode_attention_mq_dev_impl(
                  cur_stream());
   decode_attention_merge_mq_kernel<<<dim3((unsigned)n_heads_q, (unsigned)n_q),
                                      head_dim, 0, cur_stream()>>>(
-      partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
-      pos_offset0, out);
+      partial, pos, fdec_uniform_partition(chunk), sliding_window,
+      (int)n_chunks, n_heads_q, head_dim, pos_offset0, out);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -4409,19 +4412,19 @@ uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
 // --- Decode/verify attention family: split pair or tensor-core fdec --------
 //
 // The fdec kernel serves a group of query rows for one KV head and one
-// absolute KV chunk, with per-head_dim shape constants (see
-// boom_fdec_device.cuh). The family is a per-(device, shape class) pick: the
-// load-time warm-up times the split path the model deploys and the fdec kernel
-// at each candidate chunk over the class's key extents, at one row and at the
-// widest verify row count, and keeps fdec only when it is strictly faster on
-// that sum. A split pin is written too, so a class measured once is not
-// measured again.
-constexpr uint64_t kFdecChunks[] = {64, 128, 256, 512};
+// absolute chunk of a key-axis partition, with per-head_dim shape constants
+// (see boom_fdec_device.cuh and fdec_partition.h). The family is a
+// per-(device, shape class) pick: the load-time warm-up times the split path
+// the model deploys and the fdec kernel at each candidate partition over the
+// class's key extents, at one row and at the widest verify row count, and
+// keeps fdec only when it is strictly faster on that sum. A split pin is
+// written too, so a class measured once is not measured again.
 constexpr int kFdecMaxRows = 16;  // the verify row cap the scratch covers
+constexpr uint64_t kFdecMinChunk = 32;  // smallest candidate chunk size
 
 struct FdecPick {
   bool fdec = false;
-  uint64_t chunk = 0;
+  int part = 0;  // FdecPartId when fdec
 };
 
 std::mutex g_fdec_mutex;
@@ -4435,19 +4438,29 @@ void remember_fdec_pick(const std::string& key, const FdecPick& p) {
   g_fdec_pick[key] = p;
 }
 
-// SONICBOOM_DECODE_ATTN=split|fdec[:C]: 0 = none, 1 = split, 2 = fdec. Read on
-// every call so a test can run both arms in one process.
-int fdec_env(uint64_t* chunk) {
+// SONICBOOM_DECODE_ATTN=split|fdec[:PART]: 0 = none, 1 = split, 2 = fdec. PART
+// is a partition name (c32, c64, c128, c256, c512, p1, p2) or its chunk size;
+// without it the pick (or c128) applies. Read on every call so a test can run
+// both arms in one process.
+int fdec_part_from_text(std::string_view s) {
+  if (s == "c32" || s == "32") return kFdecPartC32;
+  if (s == "c64" || s == "64") return kFdecPartC64;
+  if (s == "c128" || s == "128") return kFdecPartC128;
+  if (s == "c256" || s == "256") return kFdecPartC256;
+  if (s == "c512" || s == "512") return kFdecPartC512;
+  if (s == "p1") return kFdecPartP1;
+  if (s == "p2") return kFdecPartP2;
+  return 0;
+}
+
+int fdec_env(int* part) {
   const char* e = std::getenv("SONICBOOM_DECODE_ATTN");
   if (e == nullptr || *e == '\0') return 0;
   const std::string_view s(e);
   if (s == "split") return 1;
   if (s.substr(0, 4) == "fdec") {
-    *chunk = 0;
-    if (s.size() > 5 && s[4] == ':') {
-      const long v = std::atol(std::string(s.substr(5)).c_str());
-      if (v > 0) *chunk = uint64_t(v);
-    }
+    *part = 0;
+    if (s.size() > 5 && s[4] == ':') *part = fdec_part_from_text(s.substr(5));
     return 2;
   }
   return 0;
@@ -4460,33 +4473,32 @@ bool fdec_shape_supported(int head_dim, int gqa) {
   return gqa <= fdec_mt_max(head_dim) * 16;
 }
 
-// A candidate chunk must be one of the class constants and a multiple of the
-// class's key tile; anything else falls back to 128 (a multiple of every tile).
-uint64_t fdec_chunk_or_default(int head_dim, uint64_t chunk) {
-  for (uint64_t c : kFdecChunks)
-    if (c == chunk && int(c) % fdec_kt(head_dim) == 0) return c;
-  return 128;
+// A partition is usable when every segment size is a multiple of the class's
+// key tile; anything else falls back to 128 (a multiple of every tile).
+int fdec_part_or_default(int head_dim, int part) {
+  if (part != 0 && fdec_part_kt_ok(fdec_partition_of(part), fdec_kt(head_dim)))
+    return part;
+  return kFdecPartC128;
 }
 
 bool fdec_selected(const std::string& key, int head_dim, int gqa, bool kv_f16,
-                   bool kv_q8, uint64_t* chunk) {
+                   bool kv_q8, int* part) {
   if (!kv_f16 || kv_q8 || g_fdec_bypass != 0) return false;
   if (!fdec_shape_supported(head_dim, gqa)) return false;
-  uint64_t ec = 0;
+  int ec = 0;
   const int ov = fdec_env(&ec);
   if (ov == 1) return false;
   std::lock_guard<std::mutex> lk(g_fdec_mutex);
   const auto it = g_fdec_pick.find(key);
   if (ov == 2) {
-    *chunk = ec != 0
-                 ? fdec_chunk_or_default(head_dim, ec)
-                 : (it != g_fdec_pick.end() && it->second.fdec
-                        ? it->second.chunk
-                        : fdec_chunk_or_default(head_dim, 128));
+    *part = ec != 0 ? fdec_part_or_default(head_dim, ec)
+                    : (it != g_fdec_pick.end() && it->second.fdec
+                           ? it->second.part
+                           : fdec_part_or_default(head_dim, 0));
     return true;
   }
   if (it == g_fdec_pick.end() || !it->second.fdec) return false;
-  *chunk = it->second.chunk;
+  *part = it->second.part;
   return true;
 }
 
@@ -4537,7 +4549,7 @@ bool fdec_launch_k(const float* q, const __half* k_cache,
                    const __half* v_cache, const uint64_t* pos, uint64_t window,
                    uint64_t n_slots, int n_heads_q, int n_heads_kv,
                    uint64_t sliding_window, float scale, float* out, int n_q,
-                   int pos_offset0, uint64_t chunk) {
+                   int pos_offset0, FdecPartition part) {
   constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES>();
   static const bool prepared = [] {
     return cudaFuncSetAttribute(
@@ -4549,10 +4561,10 @@ bool fdec_launch_k(const float* q, const __half* k_cache,
   const int gqa = n_heads_q / n_heads_kv;
   const int rows_per_block = std::min(16, (fdec_mt_max(D) * 16) / gqa);
   if (rows_per_block <= 0) return false;
-  // Absolute chunks anchored at row 0's first chunk; the extra chunk covers
-  // the rows' position span (at most n_q - 1 keys).
-  const uint64_t n_chunks =
-      (window - 1) / chunk + 2 + (uint64_t(n_q - 1) + chunk - 1) / chunk;
+  // Absolute chunks anchored at row 0's first chunk. The rows sit at
+  // consecutive positions, so the highest key read is window - 1 + n_q - 1;
+  // two spare chunks cover the partial first and last.
+  const uint64_t n_chunks = part.chunk_of(window - 1 + uint64_t(n_q - 1)) + 2;
   const size_t partial_floats =
       size_t(n_q) * size_t(n_chunks) * size_t(n_heads_q) * size_t(D + 2);
   const size_t partial_bytes = partial_floats * sizeof(float);
@@ -4571,14 +4583,14 @@ bool fdec_launch_k(const float* q, const __half* k_cache,
                     grid, block, kSmem, cur_stream());
   boom_fdec_kernel<D, KT, W, STAGES><<<grid, block, kSmem, cur_stream()>>>(
       q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
-      sliding_window, chunk, int(n_chunks), n_q, pos_offset0, rows_per_block,
+      sliding_window, part, int(n_chunks), n_q, pos_offset0, rows_per_block,
       scale, partial);
   SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
                  dim3(unsigned(n_heads_q), unsigned(n_q)), D, 0,
                  cur_stream());
   decode_attention_merge_mq_kernel<<<dim3(unsigned(n_heads_q), unsigned(n_q)),
                                      D, 0, cur_stream()>>>(
-      partial, pos, chunk, sliding_window, int(n_chunks), n_heads_q, D,
+      partial, pos, part, sliding_window, int(n_chunks), n_heads_q, D,
       pos_offset0, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -4589,15 +4601,15 @@ bool fdec_launch_t(const float* q, const __half* k_cache,
                    const __half* v_cache, const uint64_t* pos, uint64_t window,
                    uint64_t n_slots, int n_heads_q, int n_heads_kv,
                    uint64_t sliding_window, float scale, float* out, int n_q,
-                   int pos_offset0, uint64_t chunk) {
+                   int pos_offset0, FdecPartition part) {
   const int pin = fdec_stage_pin();
   if (fdec_max_stages<D, KT, W>() >= 3 && pin != 2)
     return fdec_launch_k<D, KT, W, 3>(q, k_cache, v_cache, pos, window, n_slots,
                                       n_heads_q, n_heads_kv, sliding_window,
-                                      scale, out, n_q, pos_offset0, chunk);
+                                      scale, out, n_q, pos_offset0, part);
   return fdec_launch_k<D, KT, W, 2>(q, k_cache, v_cache, pos, window, n_slots,
                                     n_heads_q, n_heads_kv, sliding_window,
-                                    scale, out, n_q, pos_offset0, chunk);
+                                    scale, out, n_q, pos_offset0, part);
 }
 
 bool fdec_launch_chunk(const float* q, const __half* k_cache,
@@ -4605,31 +4617,30 @@ bool fdec_launch_chunk(const float* q, const __half* k_cache,
                        uint64_t window, uint64_t n_slots, int n_heads_q,
                        int n_heads_kv, int head_dim, uint64_t sliding_window,
                        float scale, float* out, int n_q, int pos_offset0,
-                       uint64_t chunk) {
+                       int part_id) {
   if (n_heads_kv <= 0 || n_heads_q % n_heads_kv != 0) return false;
-  if (chunk < uint64_t(fdec_kt(head_dim)) ||
-      chunk % uint64_t(fdec_kt(head_dim)) != 0)
-    return false;
+  const FdecPartition part = fdec_partition_of(part_id);
+  if (!fdec_part_kt_ok(part, fdec_kt(head_dim))) return false;
   switch (head_dim) {
     case 64:
       return fdec_launch_t<64, 64, 4>(q, k_cache, v_cache, pos, window, n_slots,
                                       n_heads_q, n_heads_kv, sliding_window,
-                                      scale, out, n_q, pos_offset0, chunk);
+                                      scale, out, n_q, pos_offset0, part);
     case 128:
       return fdec_launch_t<128, 32, 8>(q, k_cache, v_cache, pos, window,
                                        n_slots, n_heads_q, n_heads_kv,
                                        sliding_window, scale, out, n_q,
-                                       pos_offset0, chunk);
+                                       pos_offset0, part);
     case 256:
       return fdec_launch_t<256, 16, 8>(q, k_cache, v_cache, pos, window,
                                        n_slots, n_heads_q, n_heads_kv,
                                        sliding_window, scale, out, n_q,
-                                       pos_offset0, chunk);
+                                       pos_offset0, part);
     case 512:
       return fdec_launch_t<512, 16, 8>(q, k_cache, v_cache, pos, window,
                                        n_slots, n_heads_q, n_heads_kv,
                                        sliding_window, scale, out, n_q,
-                                       pos_offset0, chunk);
+                                       pos_offset0, part);
   }
   return false;
 }
@@ -4639,10 +4650,10 @@ bool attn_fdec_launch(const float* q, const __half* k_cache,
                       uint64_t window, uint64_t n_slots, int n_heads_q,
                       int n_heads_kv, int head_dim, uint64_t sliding_window,
                       float scale, float* out, int n_q, int pos_offset0,
-                      uint64_t chunk) {
+                      int part_id) {
   return fdec_launch_chunk(q, k_cache, v_cache, pos, window, n_slots,
                            n_heads_q, n_heads_kv, head_dim, sliding_window,
-                           scale, out, n_q, pos_offset0, chunk);
+                           scale, out, n_q, pos_offset0, part_id);
 }
 
 // The class pick, measured once per (device, class, build). Called from the
@@ -4676,16 +4687,15 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
                          : std::min<uint64_t>(capacity, 16384);
     if (cover == 0) cover = 16384;
     cover += uint64_t(kFdecMaxRows);
-    constexpr uint64_t kSmallestChunk = kFdecChunks[0];
-    const uint64_t n_chunks = (cover - 1) / kSmallestChunk + 2 +
-                              (uint64_t(kFdecMaxRows - 1) + kSmallestChunk - 1) /
-                                  kSmallestChunk;
+    const uint64_t n_chunks = (cover - 1) / kFdecMinChunk + 2 +
+                              (uint64_t(kFdecMaxRows - 1) + kFdecMinChunk - 1) /
+                                  kFdecMinChunk;
     const size_t need = size_t(kFdecMaxRows) * size_t(n_chunks) *
                         size_t(n_heads_q) * size_t(head_dim + 2) * sizeof(float);
     (void)grow_scratch(g_attn_partial_mq, g_attn_partial_mq_bytes, need);
   };
 
-  uint64_t ec = 0;
+  int ec = 0;
   const int ov = fdec_env(&ec);
   if (ov != 0) {  // the debug pin wins over the warm-up
     if (ov == 2) reserve_fdec_scratch();
@@ -4700,22 +4710,23 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   {
     const auto fam = cached.find("family");
     const auto kit = cached.find("k");
-    const auto cit = cached.find("chunk");
+    const auto pit = cached.find("part");
     const bool key_ok = kit != cached.end() && kit->second == build_key;
     const bool family_ok =
         fam != cached.end() && (fam->second == 0 || fam->second == 1);
-    const bool chunk_ok =
-        cit != cached.end() && cit->second > 0 &&
-        uint64_t(cit->second) >= uint64_t(fdec_kt(head_dim));
-    if (key_ok && family_ok && (fam->second == 0 || chunk_ok)) {
+    const bool part_ok =
+        pit != cached.end() && pit->second >= kFdecPartC32 &&
+        pit->second <= kFdecPartP2 &&
+        fdec_part_kt_ok(fdec_partition_of(pit->second), fdec_kt(head_dim));
+    if (key_ok && family_ok && (fam->second == 0 || part_ok)) {
       FdecPick p;
       p.fdec = fam->second == 1;
-      p.chunk = p.fdec ? fdec_chunk_or_default(head_dim, uint64_t(cit->second))
-                       : 0;
+      p.part = p.fdec ? pit->second : 0;
       if (verbose)
         std::fprintf(stderr, "[autotune] decode-attn %s cached=%s\n",
                      key.c_str(),
-                     p.fdec ? ("fdec:" + std::to_string(p.chunk)).c_str()
+                     p.fdec ? ("fdec:" + std::string(fdec_part_name(p.part)))
+                                  .c_str()
                             : "split");
       if (p.fdec) reserve_fdec_scratch();
       remember_fdec_pick(key, p);
@@ -4827,19 +4838,22 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
         },
         cur_stream(), 2, 5);
   };
-  const auto fdec_ms = [&](uint64_t extent, int n_q, uint64_t c) {
+  const auto fdec_ms = [&](uint64_t extent, int n_q, int part) {
     if (!set_pos(extent, n_q)) return -1.0;
     const uint64_t win = sliding_window > 0 ? sliding_window : extent;
     return ::sonicboom::tune::median_launch_ms(
         [&] {
           return fdec_launch_chunk(qd, kc, vc, posd, win, n_slots, n_heads_q,
                                    n_heads_kv, head_dim, sliding_window, sc,
-                                   outd, n_q, 0, c);
+                                   outd, n_q, 0, part);
         },
         cur_stream(), 2, 5);
   };
 
   // Split arm once per (extent, row count); the candidates are ratios to it.
+  // The widest verify row count is measured once, at the longest causal
+  // extent, and enters the cost with weight 1.
+  const bool rows16 = sliding_window == 0 && extents.back() == 16384;
   std::vector<std::array<double, 2>> spl(extents.size(), {0.0, 0.0});
   bool spl_ok = true;
   for (size_t i = 0; i < extents.size() && spl_ok; ++i) {
@@ -4847,15 +4861,27 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     spl[i][1] = split_ms(extents[i], 8);
     if (!(spl[i][0] > 0.0) || !(spl[i][1] > 0.0)) spl_ok = false;
   }
+  double spl16 = 0.0;
+  if (rows16 && spl_ok) {
+    spl16 = split_ms(extents.back(), 16);
+    if (!(spl16 > 0.0)) spl_ok = false;
+  }
   struct FdecCand {
-    uint64_t chunk;
+    int part;
     double cost;
   };
   std::vector<FdecCand> cands;
-  const double split_cost = 2.0 * double(extents.size());
+  const double split_cost =
+      2.0 * double(extents.size()) + (rows16 ? 1.0 : 0.0);
   if (spl_ok) {
-    for (uint64_t c : kFdecChunks) {
-      if (int(c) % fdec_kt(head_dim) != 0) continue;
+    const int* const ids = sliding_window > 0 ? kFdecWindowParts
+                                              : kFdecCausalParts;
+    const size_t n_ids = sliding_window > 0
+                             ? sizeof(kFdecWindowParts) / sizeof(int)
+                             : sizeof(kFdecCausalParts) / sizeof(int);
+    for (size_t ci = 0; ci < n_ids; ++ci) {
+      const int c = ids[ci];
+      if (!fdec_part_kt_ok(fdec_partition_of(c), fdec_kt(head_dim))) continue;
       double cost = 0.0;
       bool valid = true;
       for (size_t i = 0; i < extents.size() && valid; ++i) {
@@ -4868,11 +4894,25 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
         cost += t1 / spl[i][0] + t8 / spl[i][1];
         if (verbose)
           std::fprintf(stderr,
-                       "[autotune] decode-attn %s fdec:%llu extent=%llu "
+                       "[autotune] decode-attn %s fdec:%s extent=%llu "
                        "rows1=%.4f/%.4f rows8=%.4f/%.4f ms\n",
-                       key.c_str(), (unsigned long long)c,
+                       key.c_str(), fdec_part_name(c),
                        (unsigned long long)extents[i], t1, spl[i][0], t8,
                        spl[i][1]);
+      }
+      if (valid && rows16) {
+        const double t16 = fdec_ms(extents.back(), 16, c);
+        if (!(t16 >= 0.0)) {
+          valid = false;
+        } else {
+          cost += t16 / spl16;
+          if (verbose)
+            std::fprintf(stderr,
+                         "[autotune] decode-attn %s fdec:%s extent=%llu "
+                         "rows16=%.4f/%.4f ms\n",
+                         key.c_str(), fdec_part_name(c),
+                         (unsigned long long)extents.back(), t16, spl16);
+        }
       }
       if (valid) cands.push_back({c, cost});
     }
@@ -4882,55 +4922,60 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   if (!cands.empty()) {
     double best = cands.front().cost;
     for (const auto& x : cands) best = std::min(best, x.cost);
-    // Within 2% of the minimum the smaller chunk wins; the split arm keeps
-    // the class unless an fdec chunk is strictly faster.
-    uint64_t chosen = cands.front().chunk;
+    // Within 2% of the minimum the earlier candidate wins; the split arm
+    // keeps the class unless an fdec partition is strictly faster.
+    int chosen = cands.front().part;
     for (const auto& x : cands)
       if (x.cost <= best * 1.02) {
-        chosen = x.chunk;
+        chosen = x.part;
         break;
       }
     if (verbose)
       std::fprintf(stderr,
-                   "[autotune] decode-attn %s best=%llu cost=%.4f split=%.4f "
-                   "chosen=%llu\n",
-                   key.c_str(), (unsigned long long)chosen, best, split_cost,
-                   (unsigned long long)chosen);
+                   "[autotune] decode-attn %s best=%.4f split=%.4f chosen=%s\n",
+                   key.c_str(), best, split_cost, fdec_part_name(chosen));
     if (best < split_cost) {
       pick.fdec = true;
-      pick.chunk = chosen;
+      pick.part = chosen;
     }
   }
 
   ::sonicboom::tune::store(
       "decode-attn", key,
-      {{"family", pick.fdec ? 1 : 0}, {"chunk", int(pick.chunk)},
-       {"k", build_key}});
+      {{"family", pick.fdec ? 1 : 0}, {"part", pick.part}, {"k", build_key}});
   std::string inputs = "extents=";
   for (size_t i = 0; i < extents.size(); ++i)
     inputs += (i ? "|" : "") + std::to_string(extents[i]);
   inputs += " rows=1|8";
+  if (rows16) inputs += "|16@" + std::to_string(extents.back());
   std::string counts;
   for (const auto& x : cands)
-    counts += std::to_string(x.chunk) + ":" + std::to_string(x.cost) + "|";
+    counts += std::string(fdec_part_name(x.part)) + ":" +
+              std::to_string(x.cost) + "|";
   planner::decisions::Entry e;
   e.name = "attention.decode-family";
   e.scope = key;
-  e.value = pick.fdec ? "fdec:" + std::to_string(pick.chunk) : "split";
+  e.value = pick.fdec ? "fdec:" + std::string(fdec_part_name(pick.part))
+                      : "split";
   e.source = planner::decisions::Source::Measured;
   e.env = "SONICBOOM_DECODE_ATTN";
   e.inputs = inputs;
-  e.candidates = "split|fdec:64|fdec:128|fdec:256|fdec:512";
+  e.candidates =
+      sliding_window > 0 ? "split|fdec:c32|fdec:c64|fdec:c128"
+                         : "split|fdec:c128|fdec:c256|fdec:c512|fdec:p1|fdec:p2";
   e.reason =
-      "cost = sum over key extents of fdec/split at 1 and 8 rows; " + counts +
-      " split=" + std::to_string(split_cost);
+      "cost = sum over key extents of fdec/split at 1 and 8 rows, plus 16 "
+      "rows at the longest extent; " +
+      counts + " split=" + std::to_string(split_cost);
   e.numerics =
-      "online softmax in fixed row order; chunk partials merge in absolute "
-      "chunk index";
+      "online softmax in fixed row order; a chunk's partials merge in "
+      "ascending absolute chunk index; chunk boundaries are absolute key "
+      "positions";
   planner::decisions::record(std::move(e));
   if (verbose)
     std::fprintf(stderr, "[autotune] decode-attn %s -> %s\n", key.c_str(),
-                 pick.fdec ? ("fdec:" + std::to_string(pick.chunk)).c_str()
+                 pick.fdec ? ("fdec:" + std::string(fdec_part_name(pick.part)))
+                                 .c_str()
                            : "split");
   reserve_fdec_scratch();
   remember_fdec_pick(key, pick);

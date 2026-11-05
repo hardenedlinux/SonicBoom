@@ -15,7 +15,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 // Tensor-core decode/verify attention. One block serves a group of query rows
-// for one KV head and one absolute KV chunk of C keys: scores go through
+// for one KV head and one absolute key-axis chunk (see fdec_partition.h; the
+// chunk size may grow with the distance from the query): scores go through
 // m16n8k16 f16 mma, keys per tile are KT (a class constant), and the query
 // rows of the block are the (query row, query head) pairs of one GQA group
 // packed as mma rows. The online-softmax reduction order is fixed: per-row
@@ -40,6 +41,7 @@
 #include <cstdint>
 
 #include "boom_fattn_device.cuh"  // sb_mma_f32, sb_cp_commit, sb_cp_wait
+#include "fdec_partition.h"
 
 namespace sonicboom::nn::cuda {
 namespace {
@@ -151,8 +153,9 @@ __device__ __forceinline__ void fdec_ldm_v(uint32_t b[2],
                : "r"(addr));
 }
 
-// Grid (n_chunks, n_heads_kv, row_groups); one block = one absolute KV chunk
-// `first0 + blockIdx.x` of C keys, one KV head, one group of query rows.
+// Grid (n_chunks, n_heads_kv, row_groups); one block = one absolute chunk
+// `chunk_of(first0) + blockIdx.x` of the key-axis partition, one KV head, one
+// group of query rows.
 // M rows are (query row r_local, query head h of the group) at index
 // `r_local*gqa + h`, the group's rows are zero past `rows*gqa`, and the
 // padded rows are never written to `partial`.
@@ -161,7 +164,7 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     const float* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, const uint64_t* __restrict__ pos,
     uint64_t n_slots, int n_heads_q, int n_heads_kv, int gqa,
-    uint64_t sliding_window, uint64_t chunk, int n_chunks, int n_q,
+    uint64_t sliding_window, FdecPartition part, int n_chunks, int n_q,
     int pos_offset0, int rows_per_block, float scale,
     float* __restrict__ partial) {
   constexpr int NPAD = D + 8;
@@ -213,14 +216,15 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
   const uint64_t start0 = (sliding_window > 0 && p_first >= sliding_window)
                               ? p_first - sliding_window + 1
                               : 0;
-  const uint64_t c = start0 / chunk + uint64_t(blockIdx.x);
-  const uint64_t cb = c * chunk;
+  const uint64_t c = part.chunk_of(start0) + uint64_t(blockIdx.x);
+  const uint64_t cb = part.chunk_start(c);
+  const uint64_t clen = part.chunk_len(c);
   const uint64_t sfirst = (sliding_window > 0 && row0 >= sliding_window)
                               ? row0 - sliding_window + 1
                               : 0;
   const uint64_t plast = row0 + uint64_t(rows - 1);
   const uint64_t jlo = cb > sfirst ? cb : sfirst;
-  const uint64_t jhi = (cb + chunk < plast + 1) ? cb + chunk : plast + 1;
+  const uint64_t jhi = (cb + clen < plast + 1) ? cb + clen : plast + 1;
   if (jlo >= jhi) return;
   const int t_lo = int((jlo - cb) / uint64_t(KT));
   const int t_hi = int((jhi - 1 - cb) / uint64_t(KT));
