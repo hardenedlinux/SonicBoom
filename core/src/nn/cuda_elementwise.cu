@@ -4981,8 +4981,9 @@ uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
     }
   }
 
+  const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
   const std::map<std::string, int> cached =
-      ::sonicboom::tune::lookup("attention-decode", key);
+      ::sonicboom::tune::lookup("attention-decode", key, build_fp);
   // Per-tier picks live beside the single pick in the same per-device record.
   // A record written without tier support has none; if W/P3 are on, measure
   // instead of silently deploying the single pick for every tier.
@@ -5054,7 +5055,8 @@ uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
     return default_chunk;
   }
 
-  ::sonicboom::tune::trace_event("measure", "attention-decode", key, "-",
+  ::sonicboom::tune::trace_event("measure", "attention-decode", key,
+                                 std::to_string(build_fp),
                                  __builtin_FUNCTION());
   // Measurement tiers: 1K, 4K, 16K, and the model capacity (capped). A tier at
   // or below the previous one is dropped so short-capacity models are not
@@ -5426,7 +5428,8 @@ uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
       tuned[ht] = it->second;
     }
   }
-  ::sonicboom::tune::store("attention-decode", key, tuned);
+  tuned["k"] = int(build_fp);
+  ::sonicboom::tune::store("attention-decode", key, tuned, build_fp);
   std::string inputs = "depths=";
   for (size_t i = 0; i < depths.size(); ++i)
     inputs += (i ? "|" : "") + std::to_string(depths[i]);
@@ -6203,8 +6206,9 @@ FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
     // Host timing is illegal inside a graph capture, so a capture that misses
     // the cache takes the static default (the class is still recorded).
     if (!attn_capturing()) {
+      const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
       const std::map<std::string, int> cached =
-          ::sonicboom::tune::lookup("attention-full", key);
+          ::sonicboom::tune::lookup("attention-full", key, build_fp);
       if (!cached.empty()) {
         if (const auto c = full_choice_from_values(cached, head_dim, gqa)) {
           choice = *c;
@@ -6212,7 +6216,8 @@ FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
         }
       }
       if (!have) {
-        ::sonicboom::tune::trace_event("measure", "attention-full", key, "-",
+        ::sonicboom::tune::trace_event("measure", "attention-full", key,
+                                       std::to_string(build_fp),
                                        __builtin_FUNCTION());
         choice = full_tune_tiled(head_dim, gqa, n_heads, def, tune_s,
                                  candidate_count);
@@ -6220,8 +6225,9 @@ FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
             {"impl", choice.impl == FullImpl::Codegen ? 1 : 0},
             {"br", choice.tile.br},
             {"bc", choice.tile.bc},
-            {"as", choice.tile.as}};
-        ::sonicboom::tune::store("attention-full", key, values);
+            {"as", choice.tile.as},
+            {"k", int(build_fp)}};
+        ::sonicboom::tune::store("attention-full", key, values, build_fp);
       }
     }
   }
@@ -7367,9 +7373,10 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
 
   DenseF32Choice choice = def;
   bool have = false;
+  const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
   if (pin < 0) {
     const std::map<std::string, int> cached =
-        ::sonicboom::tune::lookup("dense-f32", key);
+        ::sonicboom::tune::lookup("dense-f32", key, build_fp);
     const auto impl = cached.find("impl");
     const auto algo = cached.find("algo");
     if (impl != cached.end() && impl->second == 1) {
@@ -7394,7 +7401,8 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
     }
     double tune_s = 0.0;
     int candidate_count = 0;
-    ::sonicboom::tune::trace_event("measure", "dense-f32", key, "-",
+    ::sonicboom::tune::trace_event("measure", "dense-f32", key,
+                                   std::to_string(build_fp),
                                    __builtin_FUNCTION());
     choice = dense_f32_tune(rows, cols, cands, pin == 1, tune_s,
                             candidate_count);
@@ -7417,8 +7425,9 @@ DenseF32Choice dense_f32_resolve(int rows, int cols) {
     if (pin < 0) {
       std::map<std::string, int> values{{"impl", choice.impl},
                                         {"algo", idx},
-                                        {"tf32", choice.lt.tf32 ? 1 : 0}};
-      ::sonicboom::tune::store("dense-f32", key, values);
+                                        {"tf32", choice.lt.tf32 ? 1 : 0},
+                                        {"k", int(build_fp)}};
+      ::sonicboom::tune::store("dense-f32", key, values, build_fp);
     }
     if (std::getenv("SONICBOOM_AUTOTUNE_VERBOSE"))
       std::fprintf(stderr,
@@ -7633,8 +7642,9 @@ DenseChoice dense_resolve(int rows, int cols) {
 
   DenseChoice choice = def;
   bool have = false;
+  const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
   const std::map<std::string, int> cached =
-      ::sonicboom::tune::lookup("dense-gemm", key);
+      ::sonicboom::tune::lookup("dense-gemm", key, build_fp);
   if (!cached.empty() && dense_choice_from_values(cached, choice)) have = true;
 
   const bool verbose = std::getenv("SONICBOOM_AUTOTUNE_VERBOSE") != nullptr;
@@ -7647,17 +7657,19 @@ DenseChoice dense_resolve(int rows, int cols) {
     planner::set_thread_recorder(nullptr);
     double tune_s = 0.0;
     int candidate_count = 0;
-    ::sonicboom::tune::trace_event("measure", "dense-gemm", key, "-",
+    ::sonicboom::tune::trace_event("measure", "dense-gemm", key,
+                                   std::to_string(build_fp),
                                    __builtin_FUNCTION());
     choice = dense_tune(rows, cols, tune_s, candidate_count);
     planner::set_thread_recorder(saved);
-    std::map<std::string, int> values{{"impl", choice.codegen ? 1 : 0}};
+    std::map<std::string, int> values{{"impl", choice.codegen ? 1 : 0},
+                                      {"k", int(build_fp)}};
     if (choice.codegen) {
       values["bm"] = choice.shape.bm;
       values["bn"] = choice.shape.bn;
       values["bk"] = choice.shape.bk;
     }
-    ::sonicboom::tune::store("dense-gemm", key, values);
+    ::sonicboom::tune::store("dense-gemm", key, values, build_fp);
     if (verbose)
       std::fprintf(stderr,
                    "[autotune] dense-gemm %s default=lt chosen=%s "

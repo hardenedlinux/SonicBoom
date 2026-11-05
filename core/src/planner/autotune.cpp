@@ -557,7 +557,9 @@ void store(std::string_view op, std::string_view key,
   if (!enabled()) return;
   const std::string op_s(op);
   const std::string key_s(key);
-  const long long new_fp = fp;
+  // The record's fingerprint: the explicit one, else the value the record
+  // carries. A table without either is numerics-neutral by key.
+  const long long new_fp = effective_fp(values, fp);
   const std::string fp_s = fp_text(new_fp);
   std::lock_guard<std::mutex> lk(g_mutex);
   // After the model-load epoch closed, a numerics-affecting table is read-only:

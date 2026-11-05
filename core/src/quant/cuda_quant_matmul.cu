@@ -1790,6 +1790,7 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   const int forced = mmq_j_override();
   if (forced != 0) return MmqChoice{forced, policy};
   if (runtime::feature_disabled(runtime::Feature::Autotune)) return fallback;
+  const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
 
   // The probe-scale tile is applied only at the probe scale and above. Below
   // it, upstream's per-call rule (select_J(n)) applies -- a wide tile computes
@@ -1815,8 +1816,9 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
     }
   }
   if (!have_class) {
-    const std::map<std::string, int> cached =
-        ::sonicboom::tune::lookup("mmq-j", mmq_class_disk_key(Type, M, bpr));
+    const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
+        "mmq-j", mmq_class_disk_key(Type, M, bpr), build_fp,
+        __builtin_FUNCTION());
     const auto dt = cached.find("decomp");
     const auto st = cached.find("j_small");
     if (dt != cached.end() && dt->second >= int(MmqDecomp::Tiled) &&
@@ -1850,7 +1852,8 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
     }
     if (!have_tile) {
       const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
-          "mmq-j", mmq_tile_disk_key(Type, M, bpr, bucket));
+          "mmq-j", mmq_tile_disk_key(Type, M, bpr, bucket), build_fp,
+          __builtin_FUNCTION());
       const auto jt = cached.find("j");
       if (jt != cached.end()) {
         bool valid_j = false;
@@ -1939,10 +1942,10 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
 
   if (!have_class)
     tune::trace_event("measure", "mmq-j", mmq_class_disk_key(Type, M, bpr),
-                      "-", __builtin_FUNCTION());
+                      std::to_string(build_fp), __builtin_FUNCTION());
   tune::trace_event("measure", "mmq-j",
-                    mmq_tile_disk_key(Type, M, bpr, bucket), "-",
-                    __builtin_FUNCTION());
+                    mmq_tile_disk_key(Type, M, bpr, bucket),
+                    std::to_string(build_fp), __builtin_FUNCTION());
 
   const int heuristic_small = mmq::select_J(kMmqSmallProbeN);
   int cand_j[2] = {heuristic, heuristic};
@@ -2046,13 +2049,16 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
   if (!have_class) {
     ::sonicboom::tune::store(
         "mmq-j", mmq_class_disk_key(Type, M, bpr),
-        {{"decomp", int(chosen_decomp)}, {"j_small", best.j_small}});
+        {{"decomp", int(chosen_decomp)},
+         {"j_small", best.j_small},
+         {"k", int(build_fp)}},
+        build_fp);
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
     g_mmq_class.emplace(key, MmqClassChoice{chosen_decomp, best.j_small});
   }
   ::sonicboom::tune::store(
       "mmq-j", mmq_tile_disk_key(Type, M, bpr, record_bucket),
-      {{"j", best.j}});
+      {{"j", best.j}, {"k", int(build_fp)}}, build_fp);
   {
     std::lock_guard<std::mutex> lk(g_mmq_j_mutex);
     g_mmq_tile.emplace(MmqTileKey{Type, M, bpr, record_bucket}, best.j);
