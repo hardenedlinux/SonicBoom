@@ -233,6 +233,16 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
                        planner::KvCacheSession* session = nullptr);
 
+// Resolve every numerics-affecting device choice the loaded model can use —
+// the decode/verify family per projection shape, the MMQ split-K and tile,
+// the verify gemv width, and the decode-attention class (schedule family and
+// chunk) — into the per-device tune tables, at load. The choices are measured
+// on synthetic shapes before any cache or graph exists, so every later
+// runtime (decode, verify, session creation, tier capture, tools) reads one
+// immutable table. Closes the resolution epoch when it returns; a miss after
+// that is a bug, not a measurement. Returns false when the build has no CUDA.
+bool resolve_tune_for_model(const Gemma4Model& m);
+
 // ---------------------------------------------------------------------------
 // Speculative verification (Part B). A draft of k tokens is checked by running
 // the model over the k+1 query positions 0..k at once and taking each row's

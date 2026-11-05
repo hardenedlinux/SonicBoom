@@ -560,7 +560,11 @@ void store(std::string_view op, std::string_view key,
   const long long new_fp = fp;
   const std::string fp_s = fp_text(new_fp);
   std::lock_guard<std::mutex> lk(g_mutex);
-  if (sealed()) {
+  // After the model-load epoch closed, a numerics-affecting table is read-only:
+  // its choices were resolved at load and a write here means something missed.
+  // Timing tables (spec-length) and the prefill-path tables (mmq-j,
+  // attention-full, dense-*) resolve on first use and keep writing.
+  if (sealed() && numerics_locked_op(op_s)) {
     late_write_locked(op_s, key_s);
     return;
   }

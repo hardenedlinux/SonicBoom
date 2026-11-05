@@ -2097,6 +2097,15 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
         }
         bundle->model = std::move(*m);
 
+        // Resolve the numerics-affecting device choices for this model now,
+        // before any session or request exists; every runtime below reads the
+        // resulting table rather than measuring inside a request.
+        if (!model::resolve_tune_for_model(bundle->model)) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "device numerics resolution failed at model load");
+          return SB_ERR_INTERNAL;
+        }
+
         auto v = vocab::load_vocab(bundle->reader);
         if (!v) {
           set_error(err_out, SB_ERRKIND_WEIGHT, v.error().c_str());

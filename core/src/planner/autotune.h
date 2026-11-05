@@ -119,8 +119,10 @@ void store(std::string_view op, std::string_view key,
 // model can use is resolved while the epoch is open (measurements and writes
 // are allowed); seal() closes it. After seal(), a lookup miss on a
 // numerics-affecting table is a bug: it is reported and recorded, and the
-// runtime build must fail rather than measure. Writes are refused. open()
-// starts a new epoch for the next model load in the same process.
+// runtime build must fail rather than measure. A write to a numerics-affecting
+// table after seal() is refused the same way; timing tables (and prefill-path
+// tables that resolve on first use) keep their write path. open() starts a new
+// epoch for the next model load in the same process.
 void open();
 void seal();
 bool sealed();

@@ -3556,6 +3556,15 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
 
   auto rt = build_decode_runtime(m, n_ctx, /*transform=*/nullptr, session);
   if (!rt) return nullptr;
+  // The resolution epoch closed at model load: a numerics-affecting miss during
+  // the plan build means the model can launch a choice that was never resolved.
+  // The lookup already reported it; fail the build rather than measure inside
+  // it.
+  if (tune::sealed_missed()) {
+    std::cerr << "[tune] runtime build: unresolved numerics choice key="
+              << tune::sealed_miss_key() << "\n";
+    return nullptr;
+  }
 
   // The Argmax mask buffer (constrained decoding). It is allocated here, before
   // any capture, because the captured graphs bake the Argmax kernel choice in:
@@ -4937,11 +4946,11 @@ bool kv_read_rows_cuda(const planner::KvCacheSession& session, uint32_t layer,
 
 // The verify gemv's warps-per-row split is measured once per (quant type, rows,
 // cols, row count) on this device; the measurement needs only the model's
-// projection shapes, not the weights themselves. It runs with the rest of the
-// warm-up so no generation call pays it, and is a no-op when the split is
-// pinned (SONICBOOM_VERIFY_GEMV_WP), when spec is off, or after the first call.
+// projection shapes, not the weights themselves. It is resolved at model load
+// for every process — the table is a property of the model and the build, so a
+// process that does not verify now must still leave the record a later one
+// reads — and is a no-op when the split is pinned (SONICBOOM_VERIFY_GEMV_WP).
 static void warm_verify_gemv_wp_model(const Gemma4Model& m) {
-  if (spec_mode() == SpecMode::Off) return;
   std::vector<const quant::QuantizedTensor*> weights;
   const auto add = [&weights](const quant::QuantizedTensor& w) {
     if (w.valid()) weights.push_back(&w);
@@ -5077,6 +5086,53 @@ static void warm_mmq_group_split_model(const Gemma4Model& m,
   }
 }
 
+// One resolve per decode-attention class the model can launch: the plan
+// builder uses the same (head_dim, GQA, head counts, mask) class for every
+// layer that shares a KV geometry, so the table is complete once each distinct
+// class has been priced. `capacity` only bounds the depths the tuner times at.
+static void warm_decode_attn_model(const Gemma4Model& m) {
+  const bool kv_f16 = numerics_kv_storage() == KvStorage::F16;
+  const bool kv_q8 = numerics_kv_storage() == KvStorage::Q8;
+  std::vector<std::array<uint64_t, 4>> seen;
+  for (uint32_t l = 0; l < m.config.block_count; ++l) {
+    const LayerConfig& lc = m.config.layer_config(l);
+    const int n_q = int(lc.n_heads_q);
+    const int n_kv = int(lc.n_heads_kv);
+    if (n_kv <= 0 || n_q <= 0) continue;
+    const std::array<uint64_t, 4> cls{uint64_t(lc.head_dim),
+                                      uint64_t(n_q / n_kv), uint64_t(n_q),
+                                      lc.sliding_window != 0 ? 1u : 0u};
+    if (std::find(seen.begin(), seen.end(), cls) != seen.end()) continue;
+    seen.push_back(cls);
+    (void)nn::cuda::attn_decode_plan_chunk(int(lc.head_dim), n_q / n_kv, n_q,
+                                           n_kv, lc.sliding_window,
+                                           m.config.context_length, kv_f16,
+                                           kv_q8);
+  }
+}
+
+bool resolve_tune_for_model(const Gemma4Model& m) {
+  if (m.weights.blocks.empty()) return true;
+#ifdef SONICBOOM_USE_CUDA
+  // The resolution epoch: every choice below may measure and write. The
+  // choices are all per shape class, never per request, so they are final for
+  // the life of the loaded model.
+  tune::open();
+  warm_verify_gemv_wp_model(m);
+  warm_mmq_decode_model(m);
+  warm_decode_attn_model(m);
+  tune::seal();
+  if (tune::sealed_missed()) {
+    std::cerr << "[tune] model load: numerics resolution incomplete key="
+              << tune::sealed_miss_key() << "\n";
+    return false;
+  }
+  return true;
+#else
+  return true;
+#endif
+}
+
 bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
                        planner::KvCacheSession* session) {
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
@@ -5085,11 +5141,12 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-  // The verify gemv split is measured first: the decode/verify family table
-  // times the gemv at the same row counts, and the runtimes below must see both
-  // the pins and the family before they build (and capture) any graph.
-  warm_verify_gemv_wp_model(m);
-  warm_mmq_decode_model(m);
+  // The numerics-affecting choices are resolved at model load. A model that
+  // reached this path without that step (a direct model::load_gemma4 caller)
+  // resolves them here, exactly as the load does, before the runtimes below
+  // build any graph; a loaded model is already sealed, so this is a no-op and
+  // the epoch's table is read as-is.
+  if (!tune::sealed() && !resolve_tune_for_model(m)) return false;
   // The warm-up builds the same runtimes the first request would, bound to the
   // caller's session cache from construction. The sampled capture bakes that
   // cache's device pointers in, so it cannot be warmed on a temporary set and
@@ -5116,8 +5173,7 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // Reckless verifies through the prefill path, so the decode-dealt verify
   // set is never reached and is not built (the prefill segments it uses are
   // built on first use).
-  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Off &&
-      spec_mode() != SpecMode::Reckless)
+  if (kv->caches && kv->cache_id != 0 && spec_mode() != SpecMode::Reckless)
     warm_verify_set(m, n_ctx, *kv);
   // 4b: price the verify cost curve here, at load, so the first generation call
   // starts with every draft length priced and none of the warm-up lands inside
@@ -5537,6 +5593,10 @@ uint64_t spec_generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
 bool warmup_spine_cuda(const Gemma4Model&, uint64_t,
                        planner::KvCacheSession*) {
   return false;  // built without CUDA: there is no runtime to build
+}
+
+bool resolve_tune_for_model(const Gemma4Model&) {
+  return true;  // built without CUDA: there are no device choices to resolve
 }
 
 bool kv_session_allocate(const Gemma4Model&, planner::KvCacheSession&,
