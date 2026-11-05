@@ -204,4 +204,22 @@ int mmq_up_group_split_for(const MmqUpType * types, const int64_t * rows,
 void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
                              int n_members, int64_t cols, const char * build_id);
 
+// True when this group runs as one launch at this column count; false when the
+// members run as separate launches.  The decision is numerics-neutral: the
+// separate path runs every member at the group's split count, so both paths
+// write bit-identical columns.  It is read from the table mmq_up_group_warm_use
+// resolves at load, in two column-count buckets (n <= 16, n > 16).  The
+// SONICBOOM_MMQ_GROUP switch ("0" separate, "1" grouped) overrides the table.
+bool mmq_up_group_use(const MmqUpType * types, const int64_t * rows,
+                      int n_members, int64_t cols, int64_t n);
+
+// Measure (or load) the grouped-vs-separate decision for both buckets: the
+// group launch at n in {1, 8, 16} and at one prefill microbatch against the
+// members' separate launches at the same split count, 3 warm-ups and 7 timed
+// repetitions each, median; the group runs when its total is not larger.  The
+// members must share one column count and be launchable as a group.  build_id
+// keys the record.  A no-op when SONICBOOM_MMQ_GROUP is set.
+void mmq_up_group_warm_use(const MmqUpType * types, const int64_t * rows,
+                           int n_members, int64_t cols, const char * build_id);
+
 }  // namespace sonicboom::quant::cuda

@@ -5106,6 +5106,9 @@ static void warm_mmq_group_split_model(const Gemma4Model& m,
       quant::cuda::mmq_up_group_warm_split(types, rows, nslot[b],
                                            slot[b][0].cols,
                                            fingerprint.c_str());
+      quant::cuda::mmq_up_group_warm_use(types, rows, nslot[b],
+                                         slot[b][0].cols,
+                                         fingerprint.c_str());
       quant::cuda::warm_decode_family_group(members, nslot[b],
                                             fingerprint.c_str());
     }

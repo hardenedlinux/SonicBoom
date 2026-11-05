@@ -987,6 +987,43 @@ std::string mmq_group_splitk_key(const MmqUpType * types, const int64_t * rows,
     return "mmq-splitk|" + mmq_group_key(types, rows, n_members, cols);
 }
 
+// --- grouped vs separate dispatch ------------------------------------------
+//
+// One group launch replaces the members' separate launches. At some column
+// counts the separate launches win: each member then runs its per-shape tile
+// configuration and the smaller grids overlap better. The choice cannot change
+// an output value: the separate path runs every member at the group's split
+// count — the same contiguous K slices, summed in the same ascending order —
+// so both paths write bit-identical columns. It is therefore timed once per
+// build in two column-count buckets (n <= 16 for decode and verify, n > 16 for
+// prefill) and read by the runtime afterwards.
+
+constexpr int64_t kMmqGroupSmallMaxN = 16;
+constexpr int kMmqGroupSmallProbe[] = {1, 8, 16};
+constexpr int kMmqGroupSmallProbeCount = 3;
+// One prefill microbatch: the column count the split-K probes already time.
+constexpr int kMmqGroupLargeProbe = kMmqSplitProbeN[2];
+
+std::mutex g_mmq_group_use_mutex;
+std::map<std::string, bool> g_mmq_group_use;
+
+std::string mmq_group_use_key(const MmqUpType * types, const int64_t * rows,
+                              int n_members, int64_t cols, bool small) {
+    return "mmq-group|" + mmq_group_key(types, rows, n_members, cols) + "|" +
+           (small ? "small" : "large");
+}
+
+// SONICBOOM_MMQ_GROUP: "0" runs the members separately, "1" runs the group,
+// any other value (or no value) leaves the choice to the measured table.
+int mmq_group_env() {
+    const char * e = std::getenv("SONICBOOM_MMQ_GROUP");
+    if (e == nullptr) return -1;
+    if (std::strcmp(e, "0") == 0) return 0;
+    if (std::strcmp(e, "1") == 0) return 1;
+    return -1;
+}
+
+
 struct MmqGroupTuneBuffers {
     void *  dw[3] = {};
     float * dout[3] = {};
@@ -1051,6 +1088,58 @@ sonicboom::quant::cuda::MmqGroupArgs mmq_group_tune_args(
         m.stride_row_x = m.blocks_per_row;
     }
     return a;
+}
+
+// Median of the members' separate launches at the group's split count, each at
+// its own pinned tile configuration — the sequence the plan issues when the
+// group is not used — timed as one unit (3 warm-ups, 7 repetitions).
+double mmq_group_sep_time(const MmqUpType * types, const int64_t * rows,
+                          const MmqGroupTuneBuffers & b, int n_members,
+                          int64_t cols, int n, int split_k) {
+    const auto launch = [&] {
+        for (int k = 0; k < n_members; ++k) {
+            const MmqUpPin pin = mmq_up_pin_for(types[k], rows[k], cols);
+            const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+            if (!mmq_up_matmul(b.dw[k], types[k], b.dyq8, b.dout[k], rows[k],
+                               cols, n, nullptr, cfg, split_k)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    for (int i = 0; i < kMmqTuneWarm; ++i) {
+        (void)launch();
+    }
+    cudaEvent_t begin = nullptr, end = nullptr;
+    if (cudaEventCreate(&begin) != cudaSuccess) return -1.0;
+    if (cudaEventCreate(&end) != cudaSuccess) {
+        cudaEventDestroy(begin);
+        return -1.0;
+    }
+    double times[kMmqTuneTimed];
+    int valid = 0;
+    for (int i = 0; i < kMmqTuneTimed; ++i) {
+        times[i] = 0.0;
+        if (cudaEventRecord(begin, nullptr) != cudaSuccess) continue;
+        const bool ok = launch();
+        if (cudaEventRecord(end, nullptr) != cudaSuccess) continue;
+        if (cudaEventSynchronize(end) != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        float ms = 0.0f;
+        if (!ok || cudaEventElapsedTime(&ms, begin, end) != cudaSuccess ||
+            cudaGetLastError() != cudaSuccess) {
+            (void)cudaGetLastError();
+            continue;
+        }
+        times[valid++] = double(ms);
+    }
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    if (valid == 0) return -1.0;
+    std::sort(times, times + valid);
+    return times[valid / 2];
 }
 
 // Median of the timed group launches (3 warm-ups, 7 timings).
@@ -1303,6 +1392,139 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
 
     std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
     g_mmq_group_pin[key] = split;
+}
+
+bool mmq_up_group_use(const MmqUpType * types, const int64_t * rows,
+                      int n_members, int64_t cols, int64_t n) {
+    const int env = mmq_group_env();
+    if (env >= 0) return env == 1;
+    if (types == nullptr || rows == nullptr || n_members < 2 || n_members > 3) {
+        return true;
+    }
+    const std::string key =
+        mmq_group_use_key(types, rows, n_members, cols,
+                          n <= kMmqGroupSmallMaxN);
+    std::lock_guard<std::mutex> lock(g_mmq_group_use_mutex);
+    const auto it = g_mmq_group_use.find(key);
+    if (it != g_mmq_group_use.end()) return it->second;
+    // The load-time resolution covers every group the plan can launch; a key
+    // that arrives later keeps the grouped launch (the default) and is traced.
+    tune::trace_event("miss", "mmq-group", key, "-", __builtin_FUNCTION());
+    return true;
+}
+
+void mmq_up_group_warm_use(const MmqUpType * types, const int64_t * rows,
+                           int n_members, int64_t cols, const char * build_id) {
+    if (types == nullptr || rows == nullptr || n_members < 2 || n_members > 3) {
+        return;
+    }
+    if (mmq_group_env() >= 0) return;  // the switch fixes the choice
+    if (std::getenv("SONICBOOM_MMQ_CFG") != nullptr) return;
+    const std::string base = mmq_group_key(types, rows, n_members, cols);
+    {
+        std::lock_guard<std::mutex> lock(g_mmq_group_use_mutex);
+        if (g_mmq_group_use.count(
+                mmq_group_use_key(types, rows, n_members, cols, true)) != 0 &&
+            g_mmq_group_use.count(
+                mmq_group_use_key(types, rows, n_members, cols, false)) != 0) {
+            return;  // already resolved for this shape
+        }
+    }
+
+    const int build_key =
+        (build_id && *build_id) ? mmq_build_hash(build_id) : 0;
+    const int split_k = mmq_up_group_split_for(types, rows, n_members, cols);
+
+    bool use[2] = {true, true};
+    MmqGroupTuneBuffers b;
+    const bool allocated =
+        mmq_group_tune_alloc(types, rows, n_members, cols, b);
+    for (int bucket = 0; bucket < 2; ++bucket) {
+        const bool small = bucket == 0;
+        const std::string key = mmq_group_use_key(types, rows, n_members, cols,
+                                                  small);
+        if (tune::enabled() && build_key != 0) {
+            const auto rec =
+                tune::lookup("mmq-group", key, build_key, __builtin_FUNCTION());
+            const auto gi = rec.find("g");
+            const auto ki = rec.find("k");
+            if (gi != rec.end() && ki != rec.end() && ki->second == build_key &&
+                (gi->second == 0 || gi->second == 1)) {
+                use[bucket] = gi->second == 1;
+                continue;
+            }
+        }
+        if (!allocated) continue;  // keep the grouped default
+        tune::trace_event("measure", "mmq-group", key,
+                          std::to_string(build_key), __builtin_FUNCTION());
+        const sb_cuda_props props = get_props();
+        double group_ms = 0.0, sep_ms = 0.0;
+        double probe_g[3] = {0.0, 0.0, 0.0};
+        double probe_s[3] = {0.0, 0.0, 0.0};
+        bool ok = true;
+        if (small) {
+            for (int pi = 0; pi < kMmqGroupSmallProbeCount && ok; ++pi) {
+                const int n = kMmqGroupSmallProbe[pi];
+                const double g = mmq_group_tune_time(props, types, b, rows,
+                                                     n_members, cols, n,
+                                                     split_k);
+                const double s = mmq_group_sep_time(types, rows, b, n_members,
+                                                    cols, n, split_k);
+                ok = g >= 0.0 && s >= 0.0;
+                if (ok) {
+                    group_ms += g;
+                    sep_ms += s;
+                    probe_g[pi] = g;
+                    probe_s[pi] = s;
+                }
+            }
+        } else {
+            const double g =
+                mmq_group_tune_time(props, types, b, rows, n_members, cols,
+                                    kMmqGroupLargeProbe, split_k);
+            const double s = mmq_group_sep_time(types, rows, b, n_members, cols,
+                                                kMmqGroupLargeProbe, split_k);
+            ok = g >= 0.0 && s >= 0.0;
+            if (ok) {
+                group_ms = g;
+                sep_ms = s;
+            }
+        }
+        if (!ok) continue;  // nothing timed: keep the grouped default
+        use[bucket] = group_ms <= sep_ms;
+        if (tune::enabled() && build_key != 0) {
+            tune::store("mmq-group", key,
+                        {{"g", use[bucket] ? 1 : 0}, {"k", build_key}});
+        }
+        if (std::getenv("SONICBOOM_MMQ_TUNE_VERBOSE") != nullptr) {
+            std::fprintf(stderr,
+                         "mmq-group-use %s|%s grouped=%d group_ms=%.4f "
+                         "sep_ms=%.4f split=%d\n",
+                         base.c_str(), small ? "small" : "large",
+                         use[bucket] ? 1 : 0, group_ms, sep_ms, split_k);
+            if (small) {
+                for (int pi = 0; pi < kMmqGroupSmallProbeCount; ++pi)
+                    std::fprintf(stderr,
+                                 "mmq-group-probe %s|small n=%d group_ms=%.4f "
+                                 "sep_ms=%.4f\n",
+                                 base.c_str(), kMmqGroupSmallProbe[pi],
+                                 probe_g[pi], probe_s[pi]);
+            } else {
+                std::fprintf(stderr,
+                             "mmq-group-probe %s|large n=%d group_ms=%.4f "
+                             "sep_ms=%.4f\n",
+                             base.c_str(), kMmqGroupLargeProbe, group_ms,
+                             sep_ms);
+            }
+        }
+    }
+    if (allocated) mmq_group_tune_free(b);
+
+    std::lock_guard<std::mutex> lock(g_mmq_group_use_mutex);
+    g_mmq_group_use[mmq_group_use_key(types, rows, n_members, cols, true)] =
+        use[0];
+    g_mmq_group_use[mmq_group_use_key(types, rows, n_members, cols, false)] =
+        use[1];
 }
 
 }  // namespace sonicboom::quant::cuda

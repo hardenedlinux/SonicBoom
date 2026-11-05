@@ -4569,6 +4569,7 @@ bool matmul_mmq_q8_siblings_dev(std::span<const MmqSibling> siblings,
   args.ncols_dst = n;
   args.ncols_y = n;
   MmqUpType types[3] = {};
+  int64_t rows_v[3] = {};
   for (size_t k = 0; k < siblings.size(); ++k) {
     const MmqSibling& s = siblings[k];
     if (!s.weight || !s.weight->valid() || s.weight->dims().size() != 2 ||
@@ -4592,6 +4593,7 @@ bool matmul_mmq_q8_siblings_dev(std::span<const MmqSibling> siblings,
       if (!d_bias) return false;
     }
     types[k] = *type;
+    rows_v[k] = int64_t(rows);
     MmqGroupMember& m = args.m[k];
     m.x = wp;
     m.y = reinterpret_cast<const int32_t*>(yq);
@@ -4608,6 +4610,25 @@ bool matmul_mmq_q8_siblings_dev(std::span<const MmqSibling> siblings,
   // the last K-iteration; zero it once, before the group runs.
   mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(yq), ic, n,
                        cur_stream());
+
+  // Grouped or separate, per column-count bucket. The separate path runs each
+  // member at the group's split count with its own pinned tile configuration,
+  // so the two paths write bit-identical columns; only the launches differ.
+  const int n_members = int(siblings.size());
+  if (!mmq_up_group_use(types, rows_v, n_members, int64_t(ic), n)) {
+    const int split =
+        mmq_up_group_split_for(types, rows_v, n_members, int64_t(ic));
+    for (int k = 0; k < n_members; ++k) {
+      const MmqUpPin pin = mmq_up_pin_for(types[k], rows_v[k], int64_t(ic));
+      const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+      if (!mmq_up_matmul(args.m[k].x, types[k], args.m[k].y, args.m[k].dst,
+                         rows_v[k], int64_t(ic), n, cur_stream(), cfg, split,
+                         args.m[k].bias, args.m[k].add)) {
+        return false;
+      }
+    }
+    return true;
+  }
   return mmq_up_group_matmul(args, types, cur_stream());
 }
 
