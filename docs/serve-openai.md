@@ -32,9 +32,10 @@ bindings/guile/tests/serve/
 
 Dependencies point down: `app.scm` → `openai`, `engine`, `sse` → `sessions` →
 `backend` ← `mock-backend`, `real-backend`. Only `app.scm` and `sse.scm` import
-Artanis; the other modules need Guile and guile-json only. `real-backend.scm`
-reaches libsonicboom through `(sonicboom inference)`, which sits on the C ABI;
-it never touches the core or native-torch directly.
+Artanis; the other modules need Guile and guile-json (4.7.3, built from
+upstream source) only. `real-backend.scm` reaches libsonicboom through
+`(sonicboom inference)`, which sits on the C ABI; it never touches the core or
+native-torch directly.
 
 ## 2. Backend protocol
 
@@ -308,8 +309,11 @@ running or waiting stream holds a runner).
 
 ## 7. Running
 
-Environment used (Ubuntu 24.04): Guile 3.0.9 and guile-json from apt;
-guile-curl and guile-redis from git; libargon2; GNU Artanis from
+Environment used (Ubuntu 24.04): Guile 3.0.9 from apt and guile-json 4.7.3
+built from its upstream source (`https://github.com/aconchillo/guile-json`,
+tag `4.7.3`, `autoreconf -i && ./configure --prefix=… && make install`, with
+that prefix on `GUILE_LOAD_PATH`/`GUILE_LOAD_COMPILED_PATH`); guile-curl and
+guile-redis from git; libargon2; GNU Artanis from
 `https://gitlab.com/hardenedlinux/artanis` (commit `9100e1d`,
 `./autogen.sh && ./configure && make && make install`).
 

@@ -358,9 +358,20 @@ shipped in this release.
   newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. v0.0.4 is built
   and tested for **sm_86** only (RTX 30-series).
 - GNU Guile 3.0 and
-  [guile-json](https://github.com/aconchillo/guile-json) (the `(json)` module,
-  used by the Guile binding for build info and by the serve front end).
-  `apt install guile-3.0 guile-json` on Debian/Ubuntu.
+  [guile-json](https://github.com/aconchillo/guile-json) 4.7.3 built from its
+  upstream source (the `(json)` module, used by the Guile binding for build
+  info and by the serve front end):
+
+  ```sh
+  git clone --depth 1 --branch 4.7.3 https://github.com/aconchillo/guile-json.git
+  cd guile-json && autoreconf -i && ./configure --prefix="$PWD/../guile-json-install"
+  make && make install
+  export GUILE_LOAD_PATH="$PWD/../guile-json-install/share/guile/site/3.0:$GUILE_LOAD_PATH"
+  export GUILE_LOAD_COMPILED_PATH="$PWD/../guile-json-install/lib/guile/3.0/site-ccache:$GUILE_LOAD_COMPILED_PATH"
+  ```
+
+  (Guile itself is packaged as `guile-3.0` on Debian/Ubuntu; the quality gate
+  installs guile-json the same way, see `.github/workflows/quality.yml`.)
 - [SonicCross](https://github.com/hardenedlinux/SonicCross), a required
   build-time dependency (see below)
 

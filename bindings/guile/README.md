@@ -14,11 +14,25 @@ Scheme does is build graphs, hold handles, and drive loops. Per-element
 arithmetic is not written in Scheme.
 
 Guile 3.0.9 or later, plus
-[guile-json](https://github.com/aconchillo/guile-json) for its `(json)` module:
-[`(sonicboom ffi)`](scheme/sonicboom/ffi.scm) decodes `sb_build_info()` with it,
-and [`(sonicboom serve)`](scheme/sonicboom/serve) uses it for chat templates and
-the OpenAI-compatible API. Both are packaged as `guile-3.0` and `guile-json` on
-Debian/Ubuntu.
+[guile-json](https://github.com/aconchillo/guile-json) 4.7.3 for its `(json)`
+module: [`(sonicboom ffi)`](scheme/sonicboom/ffi.scm) decodes `sb_build_info()`
+with it, and [`(sonicboom serve)`](scheme/sonicboom/serve) uses it for chat
+templates and the OpenAI-compatible API.
+
+Guile itself is packaged as `guile-3.0` on Debian/Ubuntu. guile-json is built
+from its upstream source into a prefix of your choice:
+
+```sh
+git clone --depth 1 --branch 4.7.3 https://github.com/aconchillo/guile-json.git
+cd guile-json && autoreconf -i && ./configure --prefix="$PWD/../guile-json-install"
+make && make install
+export GUILE_LOAD_PATH="$PWD/../guile-json-install/share/guile/site/3.0:$GUILE_LOAD_PATH"
+export GUILE_LOAD_COMPILED_PATH="$PWD/../guile-json-install/lib/guile/3.0/site-ccache:$GUILE_LOAD_COMPILED_PATH"
+```
+
+The CTest configure step probes for `(json)` with the same `GUILE_LOAD_PATH`, so
+`ctest -R guile-serve-units` runs once those variables are set. The quality gate
+installs guile-json the same way (`.github/workflows/quality.yml`).
 
 ## Running
 

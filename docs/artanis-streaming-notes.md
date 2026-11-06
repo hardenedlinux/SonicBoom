@@ -9,8 +9,9 @@ workarounds can go.
 Source examined: `https://gitlab.com/hardenedlinux/artanis`, commit `9100e1d`
 ("Add text type to postgresql"). `github.com/HardenedLinux/artanis` was not
 reachable from the build environment (no such repository visible), so the
-GitLab tree was used. Built with Guile 3.0.9, guile-json 4.7.3, guile-redis
-(git), guile-curl (git), libargon2.
+GitLab tree was used. Built with Guile 3.0.9, guile-json 4.7.3 from its
+upstream source (`https://github.com/aconchillo/guile-json`, tag `4.7.3`),
+guile-redis (git), guile-curl (git), libargon2.
 
 ## 1. Streaming HTTP responses: not supported
 

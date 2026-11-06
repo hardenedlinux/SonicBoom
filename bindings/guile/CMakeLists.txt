@@ -361,7 +361,10 @@ if(GUILE_EXECUTABLE)
   # guile-serve-units drives the serving layer below HTTP — chat templates, the
   # mock backend and its sampler, the session pool, the engine — with no GGUF
   # and no HTTP server. It needs guile-json but not Artanis, so it is registered
-  # on its own (before this block it was only runnable by hand).
+  # on its own (before this block it was only runnable by hand). guile-json is
+  # not a distribution package here: it is built from its upstream source
+  # (https://github.com/aconchillo/guile-json, tag 4.7.3) into a prefix, and the
+  # probe below finds it when that prefix is on GUILE_LOAD_PATH.
   execute_process(COMMAND ${GUILE_EXECUTABLE} --no-auto-compile -c
                           "(use-modules (json))"
                   RESULT_VARIABLE GUILE_JSON_RESULT
@@ -378,7 +381,10 @@ if(GUILE_EXECUTABLE)
     set_tests_properties(guile-serve-units PROPERTIES
       WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   else()
-    message(STATUS "guile-json not found; skipping the guile-serve-units test")
+    message(STATUS
+      "guile-json not found (build https://github.com/aconchillo/guile-json "
+      "tag 4.7.3 into a prefix and add its share/guile/site/3.0 to "
+      "GUILE_LOAD_PATH); skipping the guile-serve-units test")
   endif()
 
   # guile-cpp-e2e: the full training → export → independent C++ load loop. The
