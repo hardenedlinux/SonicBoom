@@ -104,6 +104,48 @@ void apply_penalties_exact(std::span<const float> logits,
   }
 }
 
+// Penalties applied to a compacted list, entry j belonging to vocabulary id
+// ids[j]. `legacy` selects the historic float expression (greedy path, which
+// must stay bit-identical); otherwise the explicit single-rounding form. Both
+// touch exactly the entries whose id appears in the window, with the same
+// operations per entry as the dense forms.
+void apply_penalties_compact(std::span<const int32_t> ids,
+                             const SamplingParams& p,
+                             std::span<const int64_t> history, bool legacy,
+                             std::vector<float>& adv) {
+  if (history.empty() || (p.repeat_penalty == 1.0f &&
+                          p.presence_penalty == 0.0f &&
+                          p.frequency_penalty == 0.0f))
+    return;
+  const size_t window =
+      std::min<size_t>(history.size(), size_t(p.repeat_last_n));
+  std::unordered_map<int64_t, uint32_t> count;
+  count.reserve(window);
+  for (size_t i = history.size() - window; i < history.size(); ++i) {
+    const int64_t t = history[i];
+    if (t >= 0) ++count[t];
+  }
+  if (count.empty()) return;
+  for (size_t j = 0; j < ids.size(); ++j) {
+    const auto it = count.find(int64_t(ids[j]));
+    if (it == count.end()) continue;
+    const uint32_t c = it->second;
+    float& v = adv[j];
+    if (legacy) {
+      if (p.repeat_penalty != 1.0f)
+        v = v > 0.0f ? v / p.repeat_penalty : v * p.repeat_penalty;
+      v -= p.frequency_penalty * float(c) + p.presence_penalty;
+    } else {
+      if (p.repeat_penalty != 1.0f)
+        v = v > 0.0f ? v / p.repeat_penalty
+                     : std::fma(v, p.repeat_penalty, 0.0f);
+      const float adjust =
+          std::fma(p.frequency_penalty, float(c), p.presence_penalty);
+      v = std::fma(-1.0f, adjust, v);
+    }
+  }
+}
+
 auto by_z_desc_id_asc = [](const Candidate& a, const Candidate& b) {
   if (a.z != b.z) return a.z > b.z;
   return a.id < b.id;
@@ -274,6 +316,14 @@ int64_t sample_token(std::span<const float> logits, const SamplingParams& p,
                      std::span<const uint8_t> mask) {
   if (logits.empty()) return -1;
 
+  // A grammar mask narrows the choice to its allowed list: compact the logits
+  // onto that list and select over it (identical selection, fewer entries).
+  if (!mask.empty()) {
+    const std::vector<int32_t> ids = allowed_ids(mask, int64_t(logits.size()));
+    if (grammar_gather_ok(int64_t(ids.size())))
+      return sample_token_compact(logits, ids, p, position, history);
+  }
+
   // Greedy: the argmax of the penalized logits (ties -> lowest id), with the
   // historic arithmetic so temperature-0 streams stay bit-identical.
   if (!(p.temperature > 0.0f)) {
@@ -307,6 +357,25 @@ std::vector<int64_t> sample_candidates(std::span<const float> logits,
                                        std::span<const uint8_t> mask) {
   std::vector<int64_t> ids;
   if (logits.empty()) return ids;
+  // Same choice as sample_token: the compacted list when the mask is narrow.
+  if (!mask.empty()) {
+    const std::vector<int32_t> list =
+        allowed_ids(mask, int64_t(logits.size()));
+    if (grammar_gather_ok(int64_t(list.size()))) {
+      if (!(p.temperature > 0.0f)) {
+        ids.reserve(list.size());
+        for (int32_t id : list) ids.push_back(id);
+        return ids;
+      }
+      const std::vector<Candidate> cands =
+          select_candidates_compact(logits, list, p, history);
+      const std::vector<Candidate> kept = filter_candidates(cands, p);
+      ids.reserve(kept.size());
+      for (const Candidate& c : kept) ids.push_back(c.id);
+      std::sort(ids.begin(), ids.end());
+      return ids;
+    }
+  }
   if (!(p.temperature > 0.0f)) {
     for (size_t i = 0; i < logits.size(); ++i) {
       const size_t byte = i >> 3;
@@ -323,6 +392,78 @@ std::vector<int64_t> sample_candidates(std::span<const float> logits,
   for (const Candidate& c : kept) ids.push_back(c.id);
   std::sort(ids.begin(), ids.end());
   return ids;
+}
+
+std::vector<int32_t> allowed_ids(std::span<const uint8_t> mask,
+                                 int64_t vocab) {
+  std::vector<int32_t> ids;
+  if (mask.empty() || vocab <= 0) return ids;
+  ids.reserve(mask.size() * 8);
+  for (size_t byte = 0; byte < mask.size(); ++byte) {
+    unsigned bits = mask[byte];
+    while (bits != 0u) {
+      const unsigned bit = unsigned(__builtin_ctz(bits));
+      const int64_t id = int64_t(byte) * 8 + bit;
+      if (id >= vocab) return ids;  // ascending, so nothing valid follows
+      ids.push_back(int32_t(id));
+      bits &= bits - 1u;
+    }
+  }
+  return ids;
+}
+
+int64_t argmax_compact(std::span<const float> logits,
+                       std::span<const int32_t> ids) {
+  const size_t n = std::min(logits.size(), ids.size());
+  int64_t best = -1;
+  float best_v = 0.0f;
+  for (size_t j = 0; j < n; ++j) {
+    const float v = logits[j];
+    // ids ascending: a strict compare keeps the lowest id on a tie.
+    if (best < 0 || v > best_v) {
+      best = int64_t(ids[j]);
+      best_v = v;
+    }
+  }
+  return best;
+}
+
+std::vector<Candidate> select_candidates_compact(
+    std::span<const float> logits, std::span<const int32_t> ids,
+    const SamplingParams& p, std::span<const int64_t> history) {
+  std::vector<Candidate> out;
+  const size_t m = std::min(logits.size(), ids.size());
+  if (!(p.temperature > 0.0f) || m == 0) return out;
+
+  std::vector<float> adv(logits.begin(), logits.begin() + m);
+  apply_penalties_compact(ids.first(m), p, history, /*legacy=*/false, adv);
+
+  out.reserve(m);
+  for (size_t j = 0; j < m; ++j)
+    out.push_back({ids[j], adv[j] / p.temperature});
+  if (int(out.size()) > kSampleCandidates) {
+    std::nth_element(out.begin(), out.begin() + kSampleCandidates, out.end(),
+                     by_z_desc_id_asc);
+    out.resize(size_t(kSampleCandidates));
+  }
+  std::sort(out.begin(), out.end(), by_z_desc_id_asc);
+  return out;
+}
+
+int64_t sample_token_compact(std::span<const float> logits,
+                             std::span<const int32_t> ids,
+                             const SamplingParams& p, uint64_t position,
+                             std::span<const int64_t> history) {
+  const size_t m = std::min(logits.size(), ids.size());
+  if (m == 0) return -1;
+  if (!(p.temperature > 0.0f)) {
+    std::vector<float> adv(logits.begin(), logits.begin() + m);
+    apply_penalties_compact(ids.first(m), p, history, /*legacy=*/true, adv);
+    return argmax_compact(std::span<const float>(adv), ids.first(m));
+  }
+  const std::vector<Candidate> cands =
+      select_candidates_compact(logits, ids, p, history);
+  return sample_from_candidates(cands, p, position);
 }
 
 } // namespace sonicboom::nn
