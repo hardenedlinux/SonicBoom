@@ -32,8 +32,13 @@ jobs:
       # installs no binary of that name. Its Scheme modules are installed under
       # the workspace prefix below, so point guild at them. An unset
       # SONICCROSS_GUILD lets tools/quality/config.sh resolve `guild` on PATH.
-      GUILE_LOAD_PATH: ${{ github.workspace }}/.soniccross/share/guile/site/3.0
-      GUILE_LOAD_COMPILED_PATH: ${{ github.workspace }}/.soniccross/lib/guile/3.0/ccache
+      # guile-json is built from its upstream source (aconchillo/guile-json)
+      # into a second workspace prefix; the `(json)` modules the Guile binding
+      # imports live there, not in a distribution package.
+      GUILE_LOAD_PATH: >-
+        ${{ github.workspace }}/.soniccross/share/guile/site/3.0:${{ github.workspace }}/.guile-json/share/guile/site/3.0
+      GUILE_LOAD_COMPILED_PATH: >-
+        ${{ github.workspace }}/.soniccross/lib/guile/3.0/ccache:${{ github.workspace }}/.guile-json/lib/guile/3.0/site-ccache
 
     steps:
       - name: Check out repository
@@ -103,6 +108,16 @@ jobs:
           make install \
             GUILE_SITE="$GITHUB_WORKSPACE/.soniccross/share/guile/site/3.0" \
             GUILE_SITE_CCACHE="$GITHUB_WORKSPACE/.soniccross/lib/guile/3.0/ccache"
+
+      - name: Build guile-json
+        run: |
+          git clone --depth 1 --branch 4.7.3 \
+            https://github.com/aconchillo/guile-json.git .guile-json-src
+          cd .guile-json-src
+          autoreconf -i
+          ./configure --prefix="$GITHUB_WORKSPACE/.guile-json"
+          make -j"$(nproc)"
+          make install
 
       - name: Restore ccache
         uses: actions/cache@v4
