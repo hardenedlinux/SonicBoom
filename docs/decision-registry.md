@@ -172,6 +172,29 @@ sb_status sb_explain_json (char *buf, size_t cap, size_t *len_out, sb_error **);
 Two-call sizing: a NULL/short buffer yields `SB_ERR_BINDING` and the byte count
 in `*len_out`.
 
+## Moving the warm-up table: sb-tune export and import
+
+`tools/build_sb_tune.sh` builds `tools/sb-tune`. The warm-up table is the set
+of per-device records the runtime resolves before its first inference: the
+hand-written tuner's `<op>.json` files (decode family, MMQ tiles, decode
+attention, ...), the reduction acceptance verdict, and the JIT candidate
+tuner's `autotune/sm_<NN>.bin`. The append-only logs (`decisions.jsonl`,
+`fattn-reports.jsonl`) and the table lock files are runtime bookkeeping, not
+choices, and are not part of the table.
+
+```sh
+sb-tune export --out table.sbt
+sb-tune import --in table.sbt [--replace]
+```
+
+The archive carries the build fingerprint and the device directory of the
+machine that recorded it. `import` refuses a table from another build or
+another device: the record keys embed both, and a foreign table would either
+be ignored or be read as a decision this device never made. It also refuses a
+non-empty destination unless `--replace` is given. The records are moved
+verbatim — the runtime's own reader validates and applies them — so an import
+restores exactly the choices the warm-up produced.
+
 ## Adding a decision
 
 1. Give it a stable `name` and a scope that is a device or a static class —
