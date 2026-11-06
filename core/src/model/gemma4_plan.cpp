@@ -4361,11 +4361,13 @@ static bool warm_verify_runtime(VerifyRuntime& rt, uint64_t n_ctx, int rows,
 // running another graph.
 static std::unique_ptr<VerifySet> build_verify_set(
     const Gemma4Model& m, uint64_t n_ctx,
-    const planner::KvCacheSession& session) {
+    const planner::KvCacheSession& session, int limit_override = 0) {
   auto set = std::make_unique<VerifySet>();
   set->cache = session.caches;
   set->cache_id = session.cache_id;
-  const int limit = std::min<int>(planner::kMaxVerifyRows, verify_row_limit());
+  const int limit =
+      std::min<int>(planner::kMaxVerifyRows,
+                    limit_override > 0 ? limit_override : verify_row_limit());
   if (limit < 2) return nullptr;
   const bool graphs = cuda_graph_decode_enabled();
   const auto t0 = std::chrono::steady_clock::now();
@@ -4516,6 +4518,40 @@ static VerifyRuntime* get_repro_verify_runtime(
   VerifyRuntime* raw = rt.get();
   g_repro_verify_runtimes.emplace(key, std::move(rt));
   return raw;
+}
+
+// Forced-token runs: a grammar step with exactly one allowed token runs as one
+// verify batch, whose row i is the plain decode at position start_pos+i. The
+// spec set exists only for modes that speculate, and a forced run is
+// grammar-driven and independent of speculation, so this set is its own, keyed
+// like the others and built for every reachable width on first use (the first
+// batch pays the replay, not the build).
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<VerifySet>>
+    g_forced_verify_runtimes;
+
+static VerifyRuntime* get_forced_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_forced_verify_runtimes.find(key);
+    if (it != g_forced_verify_runtimes.end())
+      return it->second->rows[size_t(rows)].get();
+  }
+  auto built = build_verify_set(m, n_ctx, session, planner::kMaxVerifyRows);
+  if (!built) return nullptr;
+  if (tune_resolution_failed("forced verify set")) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_forced_verify_runtimes.find(key);
+  if (it != g_forced_verify_runtimes.end())
+    return it->second->rows[size_t(rows)].get();
+  VerifySet* raw = built.get();
+  g_forced_verify_runtimes.emplace(key, std::move(built));
+  return raw->rows[size_t(rows)].get();
 }
 
 static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
@@ -4910,6 +4946,59 @@ static bool verify_step_reckless(const Gemma4Model& m,
   return true;
 }
 
+// One verify width, run against an already-resolved runtime: replay the
+// capture when it is still bound to this session's resources, otherwise run
+// the same graph through the uncaptured executor, then read the per-row argmax
+// back. `tag` prefixes the diagnostic, so a failure names the caller's path.
+static bool run_verify_step(const Gemma4Model& m,
+                            planner::KvCacheSession& session,
+                            std::span<const uint64_t> tokens,
+                            uint64_t start_pos, VerifyRuntime* rt,
+                            std::span<int64_t> out, const char* tag) {
+  auto fail = [tag](const char* why) {
+    std::cerr << tag << why << "\n";
+    return false;
+  };
+  const int rows = int(tokens.size());
+  // Replay only while the capture's recorded resources are still this
+  // session's; otherwise run the same graph through the uncaptured executor.
+  const bool replay_ok =
+      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
+  if (replay_ok) {
+    // Stage the row token ids and the base position on the captured graph's
+    // stream, then one replay: the whole verify step is one graph launch.
+    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
+        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
+      return fail("staging failed");
+    // The replay is async on the graph stream; the token readback must see the
+    // completed step (the readback copy orders against the graph's stream).
+    // The timing events bracket only the replay, so the curve prices device
+    // work, not the staging or the host round-trip.
+    (void)rt->prog->timing_begin();
+    const bool replayed = rt->prog->replay();
+    (void)rt->prog->timing_end();
+    if (!replayed || !rt->prog->sync())
+      return fail("graph replay failed");
+  } else {
+    if (!rt->cuda->set_prefill_tokens(tokens) ||
+        !rt->cuda->set_verify_pos(start_pos, rows))
+      return fail("staging failed");
+    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (!res) {
+      std::cerr << tag << "execute failed: " << res.error().message << "\n";
+      return false;
+    }
+  }
+  float host[planner::kMaxVerifyRows];
+  if (!rt->cuda->read_verify_tokens(host, rows))
+    return fail("token readback failed");
+  for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
+  return true;
+}
+
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -4939,45 +5028,36 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   }
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
+  return run_verify_step(m, session, tokens, start_pos, rt, out,
+                         "[spec] verify: ");
+}
 
-  // Replay only while the capture's recorded resources are still this
-  // session's; otherwise run the same graph through the uncaptured executor.
-  const bool replay_ok =
-      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
-  if (rt->prog && !replay_ok)
-    log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
-  if (replay_ok) {
-    // Stage the row token ids and the base position on the captured graph's
-    // stream, then one replay: the whole verify step is one graph launch.
-    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
-        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
-      return fail("staging failed");
-    // The replay is async on the graph stream; the token readback must see the
-    // completed step (the readback copy orders against the graph's stream).
-    // The timing events bracket only the replay, so the curve prices device
-    // work, not the staging or the host round-trip.
-    (void)rt->prog->timing_begin();
-    const bool replayed = rt->prog->replay();
-    (void)rt->prog->timing_end();
-    if (!replayed || !rt->prog->sync())
-      return fail("graph replay failed");
-  } else {
-    if (!rt->cuda->set_prefill_tokens(tokens) ||
-        !rt->cuda->set_verify_pos(start_pos, rows))
-      return fail("staging failed");
-    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
-    auto res = rt->exec->execute(rt->plan, rt->snap, in);
-    if (!res) {
-      std::cerr << "[spec] verify: execute failed: "
-                << res.error().message << "\n";
-      return false;
-    }
-  }
-  float host[planner::kMaxVerifyRows];
-  if (!rt->cuda->read_verify_tokens(host, rows))
-    return fail("token readback failed");
-  for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
-  return true;
+// One batch of forced tokens: rows 2..15, the same per-row arithmetic as plain
+// decode, through the set that does not depend on the speculation mode.
+bool verify_step_forced_cuda(const Gemma4Model& m,
+                             std::span<const uint64_t> tokens,
+                             uint64_t start_pos,
+                             planner::KvCacheSession& session,
+                             std::span<int64_t> out) {
+  auto fail = [](const char* why) {
+    std::cerr << "[grammar] verify: " << why << "\n";
+    return false;
+  };
+  const int rows = int(tokens.size());
+  if (rows < 2 || rows > planner::kMaxVerifyRows || out.size() < tokens.size())
+    return fail("bad row count");
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
+  if (start_pos + uint64_t(rows) > session.n_ctx)
+    return fail("positions exceed the session cache");
+  if (spec_reckless_unsupported())
+    return fail("reckless mode is unsupported under the strict numerics "
+                "profile");
+  VerifyRuntime* rt =
+      get_forced_verify_runtime(m, session.n_ctx, rows, session);
+  if (!rt) return fail("verify runtime build failed");
+  return run_verify_step(m, session, tokens, start_pos, rt, out,
+                         "[grammar] verify: ");
 }
 
 bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
@@ -5082,6 +5162,15 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
         std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_repro_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  for (auto it = g_forced_verify_runtimes.begin();
+       it != g_forced_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_forced_verify_runtimes.erase(it);
     else
       ++it;
   }
@@ -5832,6 +5921,12 @@ bool decode_steps_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
 bool verify_step_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
                             uint64_t, planner::KvCacheSession&,
                             std::span<int64_t>) {
+  return false;  // built without CUDA: no device spine to run
+}
+
+bool verify_step_forced_cuda(const Gemma4Model&, std::span<const uint64_t>,
+                             uint64_t, planner::KvCacheSession&,
+                             std::span<int64_t>) {
   return false;  // built without CUDA: no device spine to run
 }
 
