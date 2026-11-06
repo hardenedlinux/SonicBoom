@@ -415,6 +415,32 @@ bool sample_select_dev_dyn(const float* logits, int vocab, const uint8_t* mask,
                            const SampleSelectParams* params_dev,
                            Candidate* out, int* out_count);
 
+// Compacted form: `logits` holds `m` values already gathered onto the allowed
+// list, value j belonging to vocabulary id ids[j]. Selection covers exactly
+// that list (pass no mask). Same candidate set and order as the dense form.
+bool sample_select_ids_dev(const float* logits, int m, const int32_t* ids,
+                           const int32_t* window, int window_len,
+                           float temperature, float repeat_penalty,
+                           float presence, float frequency, Candidate* out,
+                           int* out_count);
+// Count-staged form for a captured step: the launch width is `cap` (fixed at
+// capture) and the live entry count is read from `count` on the device.
+bool sample_select_ids_dev_dyn(const float* logits, int cap,
+                               const int32_t* ids, const int32_t* count,
+                               const int32_t* window,
+                               const SampleSelectParams* params_dev,
+                               Candidate* out, int* out_count);
+
+// Greedy selection over a compacted list: the maximum of the first *count
+// entries of x, ties toward the lowest id (the list is ascending), written as
+// the vocabulary id. -1 when the list is empty.
+bool argmax_ids_dev(const float* x, int cap, const int32_t* ids,
+                    const int32_t* count, float* out);
+
+// y[j] = x[ids[j]], 0 for a negative id. Compacts a dense logits vector onto
+// the allowed list that sample_select_ids_dev consumes.
+bool compact_f32_dev(const float* x, const int32_t* ids, int m, float* y);
+
 // --- batched prefill primitives (the decode *_dev kernels generalized to an
 // n dimension; decode is n == 1). Activations are [n, dim] position-major
 // (dim innermost). Each mirrors the CPU batched prefill op (SonicBackend) and,
