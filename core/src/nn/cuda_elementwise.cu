@@ -4544,22 +4544,78 @@ int fdec_stage_pin() {
   return v;
 }
 
-template <int D, int KT, int W, int STAGES>
-bool fdec_launch_k(const float* q, const __half* k_cache,
-                   const __half* v_cache, const uint64_t* pos, uint64_t window,
-                   uint64_t n_slots, int n_heads_q, int n_heads_kv,
-                   uint64_t sliding_window, float scale, float* out, int n_q,
-                   int pos_offset0, FdecPartition part) {
-  constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES>();
+// Testing pin for the m-tile count: "max" forces the class maximum, an
+// integer forces that MT (raised to the row group's need). Read on every call
+// so a test can run both geometries in one process.
+int fdec_mt_pin() {
+  const char* e = std::getenv("SONICBOOM_FDEC_MT");
+  if (e == nullptr || *e == '\0') return 0;
+  if (std::string_view(e) == "max") return 1000;
+  const int n = std::atoi(e);
+  return n > 0 ? n : 0;
+}
+
+// Opt-in the dynamic shared-memory maximum for one instantiation. The plan
+// builder does this for every (MT, pipeline depth) a class can launch, before
+// any graph is captured; a launch re-checks it lazily.
+template <int D, int KT, int W, int STAGES, int MT>
+void fdec_prepare_mt() {
+  constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES, MT>();
+  (void)cudaFuncSetAttribute(boom_fdec_kernel<D, KT, W, STAGES, MT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             int(kSmem));
+}
+
+template <int D, int KT, int W, int MT>
+void fdec_prepare_stages() {
+  fdec_prepare_mt<D, KT, W, 2, MT>();
+  if constexpr (fdec_max_stages<D, KT, W>() >= 3)
+    fdec_prepare_mt<D, KT, W, 3, MT>();
+}
+
+template <int D, int KT, int W, int MT = 1>
+void fdec_prepare_class_mt() {
+  fdec_prepare_stages<D, KT, W, MT>();
+  if constexpr (MT < fdec_mt_max(D)) fdec_prepare_class_mt<D, KT, W, MT + 1>();
+}
+
+// Every m-tile count and pipeline depth the class can launch.
+void fdec_prepare_class(int head_dim) {
+  switch (head_dim) {
+    case 64:
+      fdec_prepare_class_mt<64, 64, 4>();
+      break;
+    case 128:
+      fdec_prepare_class_mt<128, 32, 8>();
+      break;
+    case 256:
+      fdec_prepare_class_mt<256, 16, 8>();
+      break;
+    case 512:
+      fdec_prepare_class_mt<512, 16, 8>();
+      break;
+  }
+}
+
+template <int D, int KT, int W, int STAGES, int MT>
+bool fdec_launch_mt(const float* q, const __half* k_cache,
+                    const __half* v_cache, const uint64_t* pos,
+                    uint64_t window, uint64_t n_slots, int n_heads_q,
+                    int n_heads_kv, uint64_t sliding_window, float scale,
+                    float* out, int n_q, int pos_offset0, FdecPartition part) {
+  constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES, MT>();
   static const bool prepared = [] {
     return cudaFuncSetAttribute(
-               boom_fdec_kernel<D, KT, W, STAGES>,
+               boom_fdec_kernel<D, KT, W, STAGES, MT>,
                cudaFuncAttributeMaxDynamicSharedMemorySize, int(kSmem)) ==
            cudaSuccess;
   }();
   if (!prepared) return false;
   const int gqa = n_heads_q / n_heads_kv;
-  const int rows_per_block = std::min(16, (fdec_mt_max(D) * 16) / gqa);
+  // The row group this launch serves: at most the class's m-tile capacity, the
+  // 16-row cap and the rows actually launched.
+  const int rows_per_block =
+      std::min(std::min(16, (fdec_mt_max(D) * 16) / gqa), n_q);
   if (rows_per_block <= 0) return false;
   // Absolute chunks anchored at row 0's first chunk. The rows sit at
   // consecutive positions, so the highest key read is window - 1 + n_q - 1;
@@ -4577,14 +4633,16 @@ bool fdec_launch_k(const float* q, const __half* k_cache,
   const dim3 grid(unsigned(n_chunks), unsigned(n_heads_kv),
                   unsigned((n_q + rows_per_block - 1) / rows_per_block));
   const dim3 block(W * 32);
-  SB_NOTE_LAUNCH_TP("boom_fdec_kernel",
-                    ::sonicboom::planner::plan_detail::tp_label(
-                        {{"D", D}, {"KT", KT}, {"W", W}, {"S", STAGES}}),
-                    grid, block, kSmem, cur_stream());
-  boom_fdec_kernel<D, KT, W, STAGES><<<grid, block, kSmem, cur_stream()>>>(
-      q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
-      sliding_window, part, int(n_chunks), n_q, pos_offset0, rows_per_block,
-      scale, partial);
+  SB_NOTE_LAUNCH_TP(
+      "boom_fdec_kernel",
+      ::sonicboom::planner::plan_detail::tp_label(
+          {{"D", D}, {"KT", KT}, {"W", W}, {"S", STAGES}, {"MT", MT}}),
+      grid, block, kSmem, cur_stream());
+  boom_fdec_kernel<D, KT, W, STAGES, MT>
+      <<<grid, block, kSmem, cur_stream()>>>(
+          q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
+          sliding_window, part, int(n_chunks), n_q, pos_offset0,
+          rows_per_block, scale, partial);
   SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
                  dim3(unsigned(n_heads_q), unsigned(n_q)), D, 0,
                  cur_stream());
@@ -4595,6 +4653,50 @@ bool fdec_launch_k(const float* q, const __half* k_cache,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Dispatch to the instantiation sized for the launch's row group, starting at
+// MT = 1 and walking up to the first count that holds `want` m-tiles.
+template <int D, int KT, int W, int STAGES, int MT>
+bool fdec_launch_mt_at(int want, const float* q, const __half* k_cache,
+                       const __half* v_cache, const uint64_t* pos,
+                       uint64_t window, uint64_t n_slots, int n_heads_q,
+                       int n_heads_kv, uint64_t sliding_window, float scale,
+                       float* out, int n_q, int pos_offset0,
+                       FdecPartition part) {
+  if (want <= MT)
+    return fdec_launch_mt<D, KT, W, STAGES, MT>(
+        q, k_cache, v_cache, pos, window, n_slots, n_heads_q, n_heads_kv,
+        sliding_window, scale, out, n_q, pos_offset0, part);
+  if constexpr (MT < fdec_mt_max(D))
+    return fdec_launch_mt_at<D, KT, W, STAGES, MT + 1>(
+        want, q, k_cache, v_cache, pos, window, n_slots, n_heads_q, n_heads_kv,
+        sliding_window, scale, out, n_q, pos_offset0, part);
+  return fdec_launch_mt<D, KT, W, STAGES, MT>(
+      q, k_cache, v_cache, pos, window, n_slots, n_heads_q, n_heads_kv,
+      sliding_window, scale, out, n_q, pos_offset0, part);
+}
+
+// The m-tile count follows the row group: MT = ceil(rows_per_block * gqa / 16),
+// raised by the testing pin and capped at the class maximum.
+template <int D, int KT, int W, int STAGES>
+bool fdec_launch_k(const float* q, const __half* k_cache,
+                   const __half* v_cache, const uint64_t* pos, uint64_t window,
+                   uint64_t n_slots, int n_heads_q, int n_heads_kv,
+                   uint64_t sliding_window, float scale, float* out, int n_q,
+                   int pos_offset0, FdecPartition part) {
+  const int gqa = n_heads_q / n_heads_kv;
+  const int rows_per_block =
+      std::min(std::min(16, (fdec_mt_max(D) * 16) / gqa), n_q);
+  if (rows_per_block <= 0) return false;
+  int mt = (rows_per_block * gqa + 15) / 16;
+  const int pin = fdec_mt_pin();
+  if (pin > mt) mt = pin;
+  if (mt > fdec_mt_max(D)) mt = fdec_mt_max(D);
+  if (mt < 1) mt = 1;
+  return fdec_launch_mt_at<D, KT, W, STAGES, 1>(
+      mt, q, k_cache, v_cache, pos, window, n_slots, n_heads_q, n_heads_kv,
+      sliding_window, scale, out, n_q, pos_offset0, part);
+}
+
 // The deployed pipeline depth, unless the testing pin asks for shallower.
 template <int D, int KT, int W>
 bool fdec_launch_t(const float* q, const __half* k_cache,
@@ -4603,13 +4705,74 @@ bool fdec_launch_t(const float* q, const __half* k_cache,
                    uint64_t sliding_window, float scale, float* out, int n_q,
                    int pos_offset0, FdecPartition part) {
   const int pin = fdec_stage_pin();
-  if (fdec_max_stages<D, KT, W>() >= 3 && pin != 2)
-    return fdec_launch_k<D, KT, W, 3>(q, k_cache, v_cache, pos, window, n_slots,
-                                      n_heads_q, n_heads_kv, sliding_window,
-                                      scale, out, n_q, pos_offset0, part);
+  // Only instantiate the depth the class can actually size: a deeper pipeline
+  // is a launch that could not be prepared.
+  if constexpr (fdec_max_stages<D, KT, W>() >= 3)
+    if (pin != 2)
+      return fdec_launch_k<D, KT, W, 3>(q, k_cache, v_cache, pos, window,
+                                        n_slots, n_heads_q, n_heads_kv,
+                                        sliding_window, scale, out, n_q,
+                                        pos_offset0, part);
   return fdec_launch_k<D, KT, W, 2>(q, k_cache, v_cache, pos, window, n_slots,
                                     n_heads_q, n_heads_kv, sliding_window,
                                     scale, out, n_q, pos_offset0, part);
+}
+
+// One instantiation's shared-memory footprint and resident blocks: the pair a
+// launch of that MT with `stages` buffered tiles would use.
+template <int D, int KT, int W, int STAGES, int MT>
+bool fdec_mt_info_one(size_t* smem_bytes, int* blocks_per_sm) {
+  constexpr size_t kSmem = fdec_smem_bytes_s<D, KT, W, STAGES, MT>();
+  (void)cudaFuncSetAttribute(boom_fdec_kernel<D, KT, W, STAGES, MT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             int(kSmem));
+  int n = 0;
+  if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+          &n, boom_fdec_kernel<D, KT, W, STAGES, MT>, W * 32, kSmem) !=
+      cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+  if (smem_bytes) *smem_bytes = kSmem;
+  if (blocks_per_sm) *blocks_per_sm = n;
+  return true;
+}
+
+template <int D, int KT, int W, int MT>
+bool fdec_mt_info_depth(int stages, size_t* smem_bytes, int* blocks_per_sm) {
+  if (stages == 2)
+    return fdec_mt_info_one<D, KT, W, 2, MT>(smem_bytes, blocks_per_sm);
+  if constexpr (fdec_max_stages<D, KT, W>() >= 3)
+    if (stages == 3)
+      return fdec_mt_info_one<D, KT, W, 3, MT>(smem_bytes, blocks_per_sm);
+  return false;
+}
+
+template <int D, int KT, int W, int MT = 1>
+bool fdec_mt_info_at(int want_mt, int stages, size_t* smem_bytes,
+                     int* blocks_per_sm) {
+  if (want_mt == MT)
+    return fdec_mt_info_depth<D, KT, W, MT>(stages, smem_bytes, blocks_per_sm);
+  if constexpr (MT < fdec_mt_max(D))
+    return fdec_mt_info_at<D, KT, W, MT + 1>(want_mt, stages, smem_bytes,
+                                             blocks_per_sm);
+  return false;
+}
+
+bool fdec_mt_info_impl(int head_dim, int mt, int stages, size_t* smem_bytes,
+                       int* blocks_per_sm) {
+  if (mt < 1 || mt > fdec_mt_max(head_dim)) return false;
+  switch (head_dim) {
+    case 64:
+      return fdec_mt_info_at<64, 64, 4>(mt, stages, smem_bytes, blocks_per_sm);
+    case 128:
+      return fdec_mt_info_at<128, 32, 8>(mt, stages, smem_bytes, blocks_per_sm);
+    case 256:
+      return fdec_mt_info_at<256, 16, 8>(mt, stages, smem_bytes, blocks_per_sm);
+    case 512:
+      return fdec_mt_info_at<512, 16, 8>(mt, stages, smem_bytes, blocks_per_sm);
+  }
+  return false;
 }
 
 bool fdec_launch_chunk(const float* q, const __half* k_cache,
@@ -4666,6 +4829,30 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
   if (!available() || !kv_f16 || kv_q8) return;
   if (n_heads_q != gqa * n_heads_kv) return;
   if (!fdec_shape_supported(head_dim, gqa)) return;
+  // Opt in the dynamic shared-memory maximum for every instantiation this
+  // class can launch, before any graph is captured.
+  fdec_prepare_class(head_dim);
+  {
+    // The m-tile count is derived, not tuned: one m-tile per 16 rows of the
+    // launch's row group (rows are query positions x query heads of a group),
+    // capped at the class maximum. Recorded so sb-explain shows the geometry a
+    // class's launches use and the pinned comparison arm.
+    planner::decisions::Entry e;
+    e.name = "attention.decode-mt";
+    e.scope = attn_decode_class_key(head_dim, gqa, n_heads_q, n_heads_kv,
+                                    sliding_window, true, false);
+    e.value = "ceil(rows*gqa/16),max=" + std::to_string(fdec_mt_max(head_dim));
+    e.source = planner::decisions::Source::Default;
+    e.env = "SONICBOOM_FDEC_MT";
+    e.inputs = "head_dim=" + std::to_string(head_dim) +
+               " gqa=" + std::to_string(gqa) + " rows<=16";
+    e.candidates = "mt=1.." + std::to_string(fdec_mt_max(head_dim));
+    e.reason =
+        "the row group a launch serves fixes the m-tiles it needs; shared "
+        "memory and occupancy follow that count";
+    e.numerics = "bit-identical to the class-maximum launch";
+    planner::decisions::record(std::move(e));
+  }
   if (!runtime::feature_enabled(runtime::Feature::SplitKv)) return;
   if (attn_exp2_enabled()) return;
 
@@ -4987,6 +5174,13 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
 }
 
 } // namespace
+
+// Shared memory and resident blocks of one decode-attention instantiation, for
+// the occupancy report (the knobs are otherwise internal).
+bool fdec_mt_info(int head_dim, int mt, int stages, size_t* smem_bytes,
+                  int* blocks_per_sm) {
+  return fdec_mt_info_impl(head_dim, mt, stages, smem_bytes, blocks_per_sm);
+}
 
 // The split-KV chunk a class deploys, tuned once per (device, class).
 uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,

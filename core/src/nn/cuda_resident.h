@@ -212,6 +212,12 @@ uint64_t attn_decode_plan_chunk(int head_dim, int gqa, int n_heads_q,
                                 uint64_t capacity, bool kv_f16,
                                 bool kv_q8 = false);
 
+// Shared memory and resident blocks of one decode-attention instantiation:
+// head-size class, MT m-tiles, `stages` buffered K/V tiles (2 or 3). Used by
+// the occupancy report; returns false when that combination does not exist.
+bool fdec_mt_info(int head_dim, int mt, int stages, size_t* smem_bytes,
+                  int* blocks_per_sm);
+
 // Append one token's K and V rows (row_elems floats each) into a device-resident
 // KV cache at slot (pos % n_slots). src/dst are device buffers; `pos` is a DEVICE
 // uint64_t, so the append is capturable into a CUDA Graph (the slot offset is

@@ -61,17 +61,19 @@ constexpr __host__ __device__ int fdec_mt_max(int D) {
   return D == 64 ? 7 : D == 128 ? 7 : D == 256 ? 4 : 1;
 }
 
-// Dynamic shared memory of one instantiation with `stages` buffered K/V tiles,
-// bytes:
+// Dynamic shared memory of one instantiation with `stages` buffered K/V tiles
+// and MT m-tiles, bytes:
 //   stages x (K + V) x KT x (D + 8) halves
-//   + Q (MT_max*16 x (D + 8) halves)
-//   + P (MT_max*16 x (KT + 8) halves)
-//   + the per-warp per-row max exchange (W x MT_max*16 floats)
-//   + the per-row per-n-tile sums (MT_max*16 x KT/8 floats)
-//   + the per-row totals (MT_max*16 floats).
-template <int D, int KT, int W, int STAGES>
+//   + Q (MT*16 x (D + 8) halves)
+//   + P (MT*16 x (KT + 8) halves)
+//   + the per-warp per-row max exchange (W x MT*16 floats)
+//   + the per-row per-n-tile sums (MT*16 x KT/8 floats)
+//   + the per-row totals (MT*16 floats).
+// MT defaults to the class maximum; a launch that serves fewer rows sizes it
+// to ceil(rows*gqa/16).
+template <int D, int KT, int W, int STAGES, int MT = fdec_mt_max(D)>
 constexpr __host__ __device__ size_t fdec_smem_bytes_s() {
-  constexpr size_t m = size_t(fdec_mt_max(D)) * 16;
+  constexpr size_t m = size_t(MT) * 16;
   constexpr size_t nts = size_t(KT) / 8;
   return (2 * size_t(STAGES) * size_t(KT) * size_t(D + 8) +
           m * size_t(D + 8) + m * size_t(KT + 8)) *
@@ -159,7 +161,7 @@ __device__ __forceinline__ void fdec_ldm_v(uint32_t b[2],
 // M rows are (query row r_local, query head h of the group) at index
 // `r_local*gqa + h`, the group's rows are zero past `rows*gqa`, and the
 // padded rows are never written to `partial`.
-template <int D, int KT, int W, int STAGES>
+template <int D, int KT, int W, int STAGES, int MT = fdec_mt_max(D)>
 __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     const float* __restrict__ q, const __half* __restrict__ k_cache,
     const __half* __restrict__ v_cache, const uint64_t* __restrict__ pos,
@@ -169,7 +171,6 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     float* __restrict__ partial) {
   constexpr int NPAD = D + 8;
   constexpr int PPAD = KT + 8;
-  constexpr int MT = fdec_mt_max(D);
   constexpr int MAXM = MT * 16;
   constexpr int NTS = KT / 8;             // 8-key n-tiles per K tile
   constexpr int SN = (NTS + W - 1) / W;   // score n-tiles per warp
@@ -179,8 +180,9 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
   constexpr bool SPLIT_M = NTS < W;
   constexpr int MG = SPLIT_M ? W / NTS : 1;  // m-tile stride
   static_assert(!SPLIT_M || W % NTS == 0, "warps must divide into n-tile groups");
-  static_assert(fdec_smem_bytes<D, KT, W>() <= 99 * 1024,
+  static_assert(fdec_smem_bytes_s<D, KT, W, STAGES, MT>() <= 99 * 1024,
                 "fdec shared memory exceeds the sm_86 per-block limit");
+  static_assert(MT >= 1 && MT <= fdec_mt_max(D), "MT outside the class range");
   static_assert(NPAD % 8 == 0 && PPAD % 8 == 0, "16-byte row alignment");
 
   extern __shared__ __half smem[];
