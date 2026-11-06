@@ -6698,12 +6698,17 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                 acc_env != nullptr && std::string_view(acc_env) == "f32"
                     ? "f32"
                     : "f16");
-  attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
-                     sliding_window,
-                     kv_f16 ? "boom_fattn-mma-kv16"
-                            : kv_q8 ? "boom_fattn-mma-kv8" : "boom_fattn-mma",
-                     scfg, sbr, sbk, (n + sbr - 1) / sbr, n_heads_kv, sblock,
-                     ssmem);
+  // The trace reads the start position back from the device, so it is only
+  // evaluated when the trace is on. Building its report calls the read
+  // unconditionally, which puts a synchronous D2H copy in every prefill
+  // attention call.
+  if (attn_trace_on())
+    attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                       sliding_window,
+                       kv_f16 ? "boom_fattn-mma-kv16"
+                              : kv_q8 ? "boom_fattn-mma-kv8" : "boom_fattn-mma",
+                       scfg, sbr, sbk, (n + sbr - 1) / sbr, n_heads_kv, sblock,
+                       ssmem);
   return true;
 }
 
