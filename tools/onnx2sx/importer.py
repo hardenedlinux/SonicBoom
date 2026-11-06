@@ -382,7 +382,7 @@ def convert(model, sidecar_name="weights.bin"):
     # --- nodes ---------------------------------------------------------------
     nodes = []
     defined = set(env)  # SSA names defined so far (inputs + parameters)
-    for node in graph.node:
+    for node_index, node in enumerate(graph.node):
         if node.domain not in ("", "ai.onnx"):
             raise ImportError_(
                 "node '%s' uses unsupported domain '%s'" % (node.op_type, node.domain)
@@ -410,6 +410,20 @@ def convert(model, sidecar_name="weights.bin"):
                 raise ImportError_(
                     "node '%s' references unknown value '%s'" % (node.op_type, in_name)
                 )
+
+        # A Reshape target shape must be an initializer constant: the executor's
+        # reshape takes the shape from its result type, so a runtime-computed
+        # shape has no representation. Named here, where the node index and
+        # name are known.
+        if op == "reshape" and (
+            len(node.input) < 2 or node.input[1] not in const_values
+        ):
+            node_name = node.name if node.name else node.output[0]
+            shape_name = node.input[1] if len(node.input) > 1 else ""
+            raise ImportError_(
+                "node %d '%s' (Reshape): shape input '%s' is not a constant "
+                "initializer" % (node_index, node_name, shape_name)
+            )
 
         out_dtype, out_shape = _infer_node(node, op, env, const_values)
         env[out_name] = (out_dtype, out_shape)
