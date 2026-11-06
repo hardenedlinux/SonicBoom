@@ -29,7 +29,8 @@
 // Shapes without an instantiation decline (return false); there is no
 // fallback backend. f32, f16 and q8 KV caches are all ingested through the
 // gather into the f16 workspace. The d128/GQA-6 class is served by the
-// strict-order path in boom_fattn_strict.cu.
+// strict-order path in boom_fattn_strict.cu by default; SONICBOOM_FATTN_G6=mma
+// routes it to the regular tensor-core kernel at its own GQA unit count.
 //
 // Structure, and where it differs from the llama.cpp prefill kernel:
 //
@@ -198,6 +199,15 @@ int d64_mode() {
   if (std::string_view(e) == "6") return 6;
   if (std::string_view(e) == "7") return 7;
   return 1;
+}
+// SONICBOOM_FATTN_G6 selects the d128/GQA-6 prefill kernel:
+//   mma    the regular boom_fattn tensor-core kernel at this class's geometry
+//          (BR16/BK16/NW4, the d128/GQA-7 family with the GQA-6 unit count)
+//   strict the strict-order SIMT pair in boom_fattn_strict.cu (default)
+int g6_mode() {
+  const char* e = std::getenv("SONICBOOM_FATTN_G6");
+  if (e != nullptr && std::string_view(e) == "mma") return 1;
+  return 0;
 }
 int d256_mode() {
   const char* e = std::getenv("SONICBOOM_BOOM_FATTN_D256");
@@ -440,15 +450,18 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
   // Strict-order class: the DeepSeek d128/GQA-6 prefill geometry, served by
   // the scalar reference kernel and the byte-identical strict-order tiled
   // kernel (boom_fattn_strict.cu). Tensor cores cannot reproduce that FP
-  // association, so it stays a separate path inside boom_fattn.
-  if (head_dim == 128 && gqa == 6)
+  // association, so it stays the default separate path inside boom_fattn;
+  // SONICBOOM_FATTN_G6=mma selects the tensor-core path instead.
+  if (head_dim == 128 && gqa == 6 && g6_mode() == 0)
     return flash_attention_boom_fattn_strict_chunk_dev_pos(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8);
-  // Instantiated tensor-core classes: the two Gemma head widths at GQA 4 and
-  // the Qwen 7:1 group ratio at head dims 64 and 128.
+  // Instantiated tensor-core classes: the two Gemma head widths at GQA 4, the
+  // Qwen 7:1 group ratio at head dims 64 and 128, and the DeepSeek 6:1 group
+  // ratio at d128.
   if (!((head_dim == 512 && gqa == 4) || (head_dim == 256 && gqa == 4) ||
-        (head_dim == 128 && gqa == 7) || (head_dim == 64 && gqa == 7)))
+        (head_dim == 128 && gqa == 7) || (head_dim == 128 && gqa == 6) ||
+        (head_dim == 64 && gqa == 7)))
     return false;
   // A 1024-thread block caps ptxas at 64 registers/thread, so the per-warp PV
   // output slice is kept at <= 16 mma tiles (32 accumulator registers). The
@@ -508,7 +521,16 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
   }
-  if (head_dim == 128) {  // gqa == 7
+  if (head_dim == 128) {  // gqa == 7, or gqa == 6 with SONICBOOM_FATTN_G6=mma
+    if (gqa == 6) {
+      if (acc_f16())
+        return run_tuned<128, 6>(q, k_batch, v_batch, k_cache, v_cache, start,
+                                 n_slots, n, n_heads_q, n_heads_kv,
+                                 sliding_window, scale, out, kv_f16, kv_q8);
+      return run_chunk<128, 6, 16, 16, 4, false>(
+          q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
+          n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
+    }
     if (acc_f16())
       return run_tuned<128, 7>(q, k_batch, v_batch, k_cache, v_cache, start,
                                n_slots, n, n_heads_q, n_heads_kv,
@@ -574,6 +596,11 @@ bool describe_tuned(int head_dim, int gqa, int* br, int* bk, int* block,
 bool flash_attention_boom_fattn_config(int head_dim, int gqa, int* br, int* bk,
                                    int* block, size_t* smem) {
   if (head_dim == 128 && gqa == 6) {
+    if (g6_mode() == 1) {
+      if (acc_f16()) return describe_tuned(128, 6, br, bk, block, smem);
+      describe<128, 6, 16, 16, 4, false>(br, bk, block, smem);
+      return true;
+    }
     // Strict-order path: kExactNQ query positions x 12 warps per block; the
     // scalar arm is one position per block with the same 32-key tiles.
     if (br) *br = 2;
@@ -691,6 +718,8 @@ void* fattn_tune::aot_kernel(int candidate, int head_dim, int gqa) {
     return qreg_aot_candidate<256, 4, 16, 16, 4>(candidate);
   if (head_dim == 128 && gqa == 7)
     return qreg_aot_candidate<128, 7, 16, 16, 4>(candidate);
+  if (head_dim == 128 && gqa == 6)
+    return qreg_aot_candidate<128, 6, 16, 16, 4>(candidate);
   if (head_dim == 64 && gqa == 7)
     return qreg_aot_candidate<64, 7, 16, 16, 1>(candidate);
   return nullptr;
