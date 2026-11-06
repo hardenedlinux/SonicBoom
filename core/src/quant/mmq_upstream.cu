@@ -185,7 +185,51 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
         1, 1, 0, 0, 0,
         1, 1, 0, 0, 0,
         n, n,
-        bias, add};
+        bias, add, nullptr};
+
+    mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// SonicBoom: row-gathered matmul.  The same tile body and launch as run_mmq,
+// with each compact output row r reading weight row row_idx[r] (see the
+// row-idx argument of the tile loader).  M is the compact row count; the last
+// tile's padding rows read the last table entry and are not written.  The lm
+// head this serves has no bias or residual, so the epilogue is not accepted.
+template <ggml_type type>
+bool run_mmq_gather(const void * weights, const int32_t * y_q8, float * dst,
+                    int64_t M, int64_t K, int64_t n, const int * row_idx,
+                    cudaStream_t stream, int cfg, int split_k) {
+    const sb_cuda_props props = get_props();
+
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    const bool fallback = M % 128 != 0;
+
+    const ggml_type gtype = type;
+
+    const int J_best = pick_J(gtype, fallback, n, props);
+    if (J_best == 0) {
+        return false;
+    }
+    if (ggml_cuda_mmq_get_config(gtype, J_best, fallback, props.cc).stream_k) {
+        return false;
+    }
+
+    float * scratch = nullptr;
+    if (split_k > 1) {
+        scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n) *
+                                    sizeof(float));
+    }
+
+    const mmq_args args = {
+        (const char *) weights, gtype, (const int *) y_q8,
+        nullptr, nullptr, dst, nullptr,
+        K, M, n, K / qk, n, M,
+        1, 1, 0, 0, 0,
+        1, 1, 0, 0, 0,
+        n, n,
+        nullptr, nullptr, row_idx};
 
     mul_mat_q_case<type>(props, args, stream, cfg, split_k, scratch);
     CUDA_CHECK(cudaGetLastError());
@@ -212,6 +256,29 @@ bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
         case GGML_TYPE_Q6_K: return run_mmq<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
         case GGML_TYPE_Q5_0: return run_mmq<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
         case GGML_TYPE_Q8_0: return run_mmq<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, stream, cfg, split_k, bias, add);
+        default:             return false;
+    }
+}
+
+bool mmq_up_matmul_gather(const void * weights, MmqUpType type,
+                          const int32_t * y_q8, float * dst, int64_t M,
+                          int64_t K, int64_t n, const int * row_idx,
+                          cudaStream_t stream, int cfg, int split_k) {
+    if (weights == nullptr || y_q8 == nullptr || dst == nullptr ||
+        row_idx == nullptr) {
+        return false;
+    }
+    if (M <= 0 || K <= 0 || n <= 0 || split_k <= 0 || K % 128 != 0) {
+        return false;
+    }
+    const ggml_type gtype = to_ggml_type(type);
+    switch (gtype) {
+        case GGML_TYPE_Q3_K: return run_mmq_gather<GGML_TYPE_Q3_K>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
+        case GGML_TYPE_Q4_K: return run_mmq_gather<GGML_TYPE_Q4_K>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
+        case GGML_TYPE_Q5_K: return run_mmq_gather<GGML_TYPE_Q5_K>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
+        case GGML_TYPE_Q6_K: return run_mmq_gather<GGML_TYPE_Q6_K>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
+        case GGML_TYPE_Q5_0: return run_mmq_gather<GGML_TYPE_Q5_0>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
+        case GGML_TYPE_Q8_0: return run_mmq_gather<GGML_TYPE_Q8_0>(weights, y_q8, dst, M, K, n, row_idx, stream, cfg, split_k);
         default:             return false;
     }
 }
