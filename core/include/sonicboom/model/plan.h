@@ -240,7 +240,9 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
 // on synthetic shapes before any cache or graph exists, so every later
 // runtime (decode, verify, session creation, tier capture, tools) reads one
 // immutable table. Closes the resolution epoch when it returns; a miss after
-// that is a bug, not a measurement. Returns false when the build has no CUDA.
+// that is a bug, not a measurement: the lookup reports it and the runtime build
+// fails. Called by the common model load (model::load_gemma4), so every entry
+// point that loads a model resolves exactly once.
 bool resolve_tune_for_model(const Gemma4Model& m);
 
 // ---------------------------------------------------------------------------

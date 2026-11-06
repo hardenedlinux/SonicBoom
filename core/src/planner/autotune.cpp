@@ -138,6 +138,9 @@ const char *exe_name() {
 }
 
 std::atomic<bool> g_sealed{false};
+// True between open() and seal(): the model-load resolution epoch, the only
+// window in which a numerics-affecting lookup may miss (and measure) or write.
+std::atomic<bool> g_resolving{false};
 std::string g_sealed_miss_key;
 
 bool numerics_locked_op(std::string_view op) {
@@ -484,10 +487,12 @@ void trace_event(std::string_view event, std::string_view op,
 
 namespace {
 
-// Caller holds g_mutex.
-void late_miss_locked(std::string_view op, std::string_view key) {
+// Caller holds g_mutex. A numerics-affecting lookup that cannot be answered:
+// the model's resolution epoch either closed without it (late miss) or was
+// never run (an entry point bypassed the common model load). Both are bugs.
+void unresolved_locked(std::string_view op, std::string_view key) {
   if (g_sealed_miss_key.empty()) g_sealed_miss_key = std::string(key);
-  std::string line = "[tune] BUG late-miss key=";
+  std::string line = "[tune] BUG unresolved key=";
   line += key;
   line += " file=";
   line += op;
@@ -543,7 +548,12 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key,
   if (!usable) {
     if (it == g_cache[op_s].end())
       trace_line("miss", op_s, key_s, fp_s, caller);
-    if (sealed() && numerics_locked_op(op_s)) late_miss_locked(op_s, key_s);
+    // A numerics-affecting choice may be measured only inside the model-load
+    // resolution epoch. Outside it the miss is a bug, whether the epoch
+    // already closed (sealed) or never ran (an entry point skipped the common
+    // model load); the runtime build fails on sealed_missed().
+    if (numerics_locked_op(op_s) && !resolving())
+      unresolved_locked(op_s, key_s);
     return {};
   }
   trace_line("hit", op_s, key_s, fp_s, caller);
@@ -566,7 +576,7 @@ void store(std::string_view op, std::string_view key,
   // its choices were resolved at load and a write here means something missed.
   // Timing tables (spec-length) and the prefill-path tables (mmq-j,
   // attention-full, dense-*) resolve on first use and keep writing.
-  if (sealed() && numerics_locked_op(op_s)) {
+  if (numerics_locked_op(op_s) && !resolving()) {
     late_write_locked(op_s, key_s);
     return;
   }
@@ -608,16 +618,20 @@ void store(std::string_view op, std::string_view key,
 
 void open() {
   std::lock_guard<std::mutex> lk(g_mutex);
+  g_resolving.store(true);
   g_sealed.store(false);
   g_sealed_miss_key.clear();
 }
 
 void seal() {
   std::lock_guard<std::mutex> lk(g_mutex);
+  g_resolving.store(false);
   g_sealed.store(true);
 }
 
 bool sealed() { return g_sealed.load(); }
+
+bool resolving() { return g_resolving.load(); }
 
 bool sealed_missed() {
   std::lock_guard<std::mutex> lk(g_mutex);

@@ -126,6 +126,9 @@ void store(std::string_view op, std::string_view key,
 void open();
 void seal();
 bool sealed();
+// True only inside the open resolution epoch. A lookup miss or a write on a
+// numerics-affecting table outside it is refused and recorded.
+bool resolving();
 bool sealed_missed();
 std::string sealed_miss_key();
 void clear_sealed_miss();

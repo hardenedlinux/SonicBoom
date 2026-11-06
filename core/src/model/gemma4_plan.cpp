@@ -3480,6 +3480,17 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 // capture: a captured step replays as one graph launch and bypasses the
 // executor, so no per-step launches would be visible to record. Returns nullptr
 // on a build/plan failure (the caller falls back to 0).
+// A numerics-affecting lookup that missed while the model-load resolution
+// epoch was closed (or never ran) is a bug: the runtime build fails instead of
+// measuring a choice the loaded model did not resolve. The lookup itself
+// already printed the `[tune] BUG unresolved` line with the key.
+static bool tune_resolution_failed(const char *where) {
+  if (!tune::sealed_missed()) return false;
+  std::cerr << "[tune] runtime build: unresolved numerics choice key="
+            << tune::sealed_miss_key() << " (" << where << ")\n";
+  return true;
+}
+
 // `session`, when non-null, is the cache this runtime must be bound to from
 // construction. Every execution backend takes the bind-existing constructor:
 // allocating a full KV set and replacing it later is what B0.2 removes. A null
@@ -3588,11 +3599,7 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   // the plan build means the model can launch a choice that was never resolved.
   // The lookup already reported it; fail the build rather than measure inside
   // it.
-  if (tune::sealed_missed()) {
-    std::cerr << "[tune] runtime build: unresolved numerics choice key="
-              << tune::sealed_miss_key() << "\n";
-    return nullptr;
-  }
+  if (tune_resolution_failed("decode runtime")) return nullptr;
 
   // The Argmax mask buffer (constrained decoding). It is allocated here, before
   // any capture, because the captured graphs bake the Argmax kernel choice in:
@@ -3856,6 +3863,9 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
 
   auto rt = build_sampled_runtime(m, n_ctx, session);
   if (!rt) return nullptr;
+  // Same rule as the greedy runtime: a numerics-affecting miss during the
+  // build fails it instead of resolving outside the model-load epoch.
+  if (tune_resolution_failed("sampled runtime")) return nullptr;
   rt->cache = session.caches;
   rt->cache_id = session.cache_id;
   // The candidate/parameter/window buffers (and the grammar mask bitmap) exist
