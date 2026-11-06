@@ -478,13 +478,20 @@ bool SonicCudaBackend::clear_argmax_mask() {
 
 bool SonicCudaBackend::grammar_gather_init() {
   const uint64_t bytes = uint64_t(nn::kGrammarGatherCap) * sizeof(int32_t);
+  // Both buffers outlive the captures that reference them, and a runtime built
+  // earlier may have captured launches over free-list blocks: take fresh
+  // allocations so a replay of another graph can never overwrite the table.
   if (!grammar_ids_) {
-    grammar_ids_ = g_alloc.allocate(bytes);
-    if (!grammar_ids_) return false;
+    const uint64_t h = device::acquire_fresh(bytes);
+    if (!h) return false;
+    grammar_ids_ = hal::Buffer{h, bytes, hal::DeviceId{0},
+                               hal::MemoryKind::DeviceLocal};
   }
   if (!grammar_count_) {
-    grammar_count_ = g_alloc.allocate(sizeof(int32_t));
-    if (!grammar_count_) return false;
+    const uint64_t h = device::acquire_fresh(sizeof(int32_t));
+    if (!h) return false;
+    grammar_count_ = hal::Buffer{h, sizeof(int32_t), hal::DeviceId{0},
+                                 hal::MemoryKind::DeviceLocal};
   }
   // A one-entry list (row 0) is a valid configuration: the capture's warm-up
   // step reads a live device list, and the first real step replaces both the
@@ -503,7 +510,8 @@ bool SonicCudaBackend::set_grammar_ids(std::span<const int32_t> ids) {
                               ids.size() * sizeof(int32_t)))
     return false;
   const int32_t n = int32_t(ids.size());
-  return g_alloc.copy_to_device(grammar_count_, &n, sizeof(n));
+  if (!g_alloc.copy_to_device(grammar_count_, &n, sizeof(n))) return false;
+  return true;
 }
 
 namespace {

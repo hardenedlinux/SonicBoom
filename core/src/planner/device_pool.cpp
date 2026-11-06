@@ -96,6 +96,24 @@ uint64_t acquire(uint64_t bytes) {
 #endif
 }
 
+uint64_t acquire_fresh(uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (bytes == 0 || !available()) return 0;
+  const uint64_t size = align_up(bytes);
+  std::lock_guard<std::mutex> lk(g_mutex);
+  void* p = nullptr;
+  if (cudaMalloc(&p, size) != cudaSuccess) return 0;
+  const uint64_t h = reinterpret_cast<uint64_t>(p);
+  g_sizes[h] = size;
+  g_stats.live_blocks++;
+  g_stats.live_bytes += size;
+  return h;
+#else
+  (void)bytes;
+  return 0;
+#endif
+}
+
 void release(uint64_t handle, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (handle == 0) return;
