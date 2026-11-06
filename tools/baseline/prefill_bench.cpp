@@ -60,7 +60,9 @@
 //
 // The canonical `RESULT prefill ... pp_marginal_tok_s=` line is the reused
 // number; `pp_wall_tok_s` is the same steady-state throughput (no session build
-// in the timed region). Session creation is never folded into it.
+// in the timed region), taken as N / median(cudaEvent elapsed around the call):
+// the device wall time of the prefill itself, synchronized per repetition.
+// Session creation is never folded into it.
 //
 // Before either section an untimed warm-up session/prefill initializes
 // process-wide first-use state (CUDA module loading, autotune selection
@@ -79,6 +81,7 @@
 #include <sonicboom/model/plan.h>
 #include <sonicboom/planner/kv_cache.h>
 
+#include <cuda_runtime.h>
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 
 #include <algorithm>
@@ -258,6 +261,75 @@ int main(int argc, char** argv) {
     fprintf(stderr, " best=%.3f median=%.3f\n", s.best, s.median);
   };
 
+  // Device wall time of one full N-token prefill. A cudaEvent pair brackets the
+  // call and the end event is synchronized per repetition, so each sample is
+  // the device time of the prefill itself. Every repetition starts from an
+  // empty logical session state (filled_tokens cleared), like prefill().
+  auto measure_wall = [&](sbplanner::KvCacheSession& session,
+                          std::span<const uint64_t> p, uint64_t count,
+                          const char* label, double* median_ms,
+                          bool* ok) -> void {
+    cudaEvent_t begin = nullptr, end = nullptr;
+    *median_ms = 0.0;
+    *ok = false;
+    if (cudaEventCreate(&begin) != cudaSuccess ||
+        cudaEventCreate(&end) != cudaSuccess) {
+      fprintf(stderr, "cudaEventCreate failed\n");
+      return;
+    }
+    // One untimed warm-up prefill of the same length: the first call of a
+    // shape builds what it has not seen yet, and the wall time is the steady
+    // state, not that build.
+    {
+      session.filled_tokens.clear();
+      std::vector<int64_t> toks(1, -1);
+      if (sbmodel::generate_prefill_spine_cuda_prefix(
+              *m, p, 0, toks, session, /*use_prefill=*/true) == 0) {
+        fprintf(stderr, "wall warm-up rejected\n");
+        cudaEventDestroy(begin);
+        cudaEventDestroy(end);
+        return;
+      }
+    }
+    std::vector<double> ms;
+    ms.reserve(count);
+    for (uint64_t rep = 0; rep < count; ++rep) {
+      session.filled_tokens.clear();
+      std::vector<int64_t> toks(1, -1);
+      if (nvtx_on) nvtxRangePushA(label);
+      cudaEventRecord(begin);
+      const uint64_t done = sbmodel::generate_prefill_spine_cuda_prefix(
+          *m, p, 0, toks, session, /*use_prefill=*/true);
+      cudaEventRecord(end);
+      cudaEventSynchronize(end);
+      if (nvtx_on) nvtxRangePop();
+      if (done == 0) {
+        fprintf(stderr, "wall prefill rejected\n");
+        break;
+      }
+      float t = 0.0f;
+      if (cudaEventElapsedTime(&t, begin, end) != cudaSuccess) {
+        fprintf(stderr, "cudaEventElapsedTime failed\n");
+        break;
+      }
+      ms.push_back(double(t));
+    }
+    cudaEventDestroy(begin);
+    cudaEventDestroy(end);
+    std::sort(ms.begin(), ms.end());
+    const size_t k = ms.size();
+    fprintf(stderr, "[reps] %s ms=", label);
+    for (size_t i = 0; i < ms.size(); ++i)
+      fprintf(stderr, "%s%.3f", i ? "," : "", ms[i]);
+    if (k == 0) {
+      fprintf(stderr, " no wall samples\n");
+      return;
+    }
+    *median_ms = (k % 2) ? ms[k / 2] : 0.5 * (ms[k / 2 - 1] + ms[k / 2]);
+    *ok = true;
+    fprintf(stderr, " best=%.3f median=%.3f\n", ms.front(), *median_ms);
+  };
+
   // Session creation, exactly what sb_llm_session_new charges to the session:
   // allocate the session's own KV cache, then build and warm the runtimes bound
   // to it (with SONICBOOM_WARMUP=0 the build moves into the first prefill).
@@ -329,6 +401,17 @@ int main(int argc, char** argv) {
     }
     print_reps("reused_N", sn);
 
+    // Device wall time of the same work, after the untimed first prefill above
+    // has warmed the session's segment/capture: N tokens into an empty session.
+    double wall_median_ms = 0.0;
+    bool wall_ok = false;
+    measure_wall(session, prompt, reps, "bench:reused_wall", &wall_median_ms,
+                 &wall_ok);
+    if (!wall_ok) {
+      fprintf(stderr, "reused wall measurement failed\n");
+      return 1;
+    }
+
     // Marginal baseline on the same session: one untimed warm call (so a
     // non-symbolic plan for this length is built outside the measurement),
     // then the reps.
@@ -350,6 +433,8 @@ int main(int argc, char** argv) {
 
     const double t_warm = sn.best;  // ms
     canonical_pp_warm = t_warm > 0.0 ? 1000.0 * double(n) / t_warm : 0.0;
+    const double pp_wall =
+        wall_median_ms > 0.0 ? 1000.0 * double(n) / wall_median_ms : 0.0;
     double pp_marginal = 0.0;
     if (have_marginal) {
       const double dt = t_warm - s0.best;  // ms
@@ -365,9 +450,9 @@ int main(int argc, char** argv) {
            first_prefill_ms, reused_create_ms);
     printf("RESULT prefill prompt=%llu pp_marginal_tok_s=%.1f "
            "pp_wall_tok_s=%.1f session=reused t_warm_ms=%.3f "
-           "t_baseline_ms=%.3f baseline=%llu first_prefill_ms=%.3f "
-           "session_create_ms=%.3f\n",
-           (unsigned long long)n, pp_marginal, canonical_pp_warm, t_warm,
+           "t_wall_ms=%.3f t_baseline_ms=%.3f baseline=%llu "
+           "first_prefill_ms=%.3f session_create_ms=%.3f\n",
+           (unsigned long long)n, pp_marginal, pp_wall, t_warm, wall_median_ms,
            have_marginal ? s0.best : 0.0, (unsigned long long)n0,
            first_prefill_ms, reused_create_ms);
     // Median-of-reps view, alongside the canonical best-of line above.
