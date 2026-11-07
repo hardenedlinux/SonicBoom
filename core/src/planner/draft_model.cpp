@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace sonicboom::planner {
 
@@ -66,7 +67,12 @@ std::unique_ptr<DraftModel> make_draft_model(size_t max_drafts) {
   const char *env = std::getenv("SONICBOOM_DRAFT_MODEL");
   if (env != nullptr && *env != '\0')
     return std::make_unique<LlmDraftModel>(env, max_drafts);
-  return std::make_unique<NgramDraftModel>(max_drafts);
+  // The long-match n-gram drafter is the default; SONICBOOM_SPEC_DRAFTER=legacy
+  // selects the original 2..4-gram prompt-lookup drafter.
+  const char *legacy = std::getenv("SONICBOOM_SPEC_DRAFTER");
+  if (legacy != nullptr && std::string_view(legacy) == "legacy")
+    return std::make_unique<NgramDraftModel>(max_drafts);
+  return std::make_unique<NgramLongDraftModel>(max_drafts);
 }
 
 } // namespace sonicboom::planner

@@ -2938,11 +2938,12 @@ static uint64_t run_spec_program_steps(
     std::cerr << "[spec] unknown draft strategy '" << strategy << "'\n";
     return step;
   }
-  // Drafter selection: the prompt-lookup n-gram drafter by default, or the
-  // model-backed drafter named by SONICBOOM_DRAFT_MODEL (SD1). Everything below
-  // is drafter-agnostic: the verify graph, the accept rule and the emitted
-  // stream depend only on the proposals, so a different drafter plugs in here
-  // with the verification path reused unchanged. LlmDraftModel still throws
+  // Drafter selection: the long-match n-gram drafter by default (the original
+  // 2..4-gram drafter with SONICBOOM_SPEC_DRAFTER=legacy), or the model-backed
+  // drafter named by SONICBOOM_DRAFT_MODEL (SD1). Everything below is
+  // drafter-agnostic: the verify graph, the accept rule and the emitted stream
+  // depend only on the proposals, so a different drafter plugs in here with the
+  // verification path reused unchanged. LlmDraftModel still throws
   // "LlmDraftModel not yet implemented" from its constructor, so asking for it
   // fails loudly instead of silently running n-gram.
   std::unique_ptr<planner::DraftModel> drafter =
