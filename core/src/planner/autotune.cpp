@@ -443,6 +443,16 @@ bool force() {
   return e != nullptr && std::strcmp(e, "force") == 0;
 }
 
+std::atomic<bool> g_canonical{false};
+
+bool canonical() {
+  if (g_canonical.load()) return true;
+  const char *e = std::getenv("SONICBOOM_TUNE");
+  return e != nullptr && std::strcmp(e, "canonical") == 0;
+}
+
+void set_canonical(bool on) { g_canonical.store(on); }
+
 const std::string &device_dir() {
   std::lock_guard<std::mutex> lk(g_mutex);
   return device_dir_locked();
@@ -576,6 +586,13 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key,
                                   long long expect_fp, const char *caller) {
   if (!enabled()) return {};
   const std::string fp_s = fp_text(expect_fp);
+  // Canonical numerics reads no record whose pick changes arithmetic: the
+  // table's callers take their reference default instead. Neutral tables keep
+  // reading (and writing) their picks.
+  if (canonical() && numerics_class(op) != NumericsClass::Neutral) {
+    trace_line("canonical", op, key, fp_s, caller);
+    return {};
+  }
   if (force()) {
     trace_line("miss", op, key, fp_s, caller);
     return {};
@@ -616,6 +633,13 @@ void store(std::string_view op, std::string_view key,
   if (!enabled()) return;
   const std::string op_s(op);
   const std::string key_s(key);
+  // Canonical numerics writes no record whose pick changes arithmetic: the
+  // class keeps its reference default for this process. Neutral tables are
+  // still measured and stored.
+  if (canonical() && numerics_class(op_s) != NumericsClass::Neutral) {
+    trace_line("canonical", op_s, key_s, fp_text(fp), caller);
+    return;
+  }
   // The record's fingerprint: the explicit one, else the value the record
   // carries. A table without either is numerics-neutral by key.
   const long long new_fp = effective_fp(values, fp);

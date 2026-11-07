@@ -46,6 +46,7 @@
 
 // core/src is a private include directory for this target (core/CMakeLists):
 // the decision registry is internal runtime state, not a Layer 2 header.
+#include "planner/autotune.h"
 #include "planner/decision_registry.h"
 // Private to this directory: sb_error's definition + the guard/set_error
 // helpers shared with capi_image.cpp.
@@ -136,6 +137,7 @@ namespace nn = sonicboom::nn;
 namespace gguf = sonicboom::gguf;
 namespace planner = sonicboom::planner;
 namespace quant = sonicboom::quant;
+namespace tune = sonicboom::tune;
 namespace vocab = sonicboom::vocab;
 
 // The GGUF reader owns the byte buffer every Gemma4Model weight span borrows
@@ -2123,6 +2125,15 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
         return SB_OK;
       },
       err_out);
+}
+
+sb_status sb_llm_model_load_ex(const char *gguf_path, uint32_t flags,
+                               sb_llm_model **model_out,
+                               sb_error **err_out) {
+  if ((flags & ~uint32_t(SB_LLM_LOAD_CANONICAL)) != 0)
+    return fail_arg(err_out);
+  if ((flags & SB_LLM_LOAD_CANONICAL) != 0) tune::set_canonical(true);
+  return sb_llm_model_load(gguf_path, model_out, err_out);
 }
 
 void sb_llm_model_free(sb_llm_model *model) { delete model; }

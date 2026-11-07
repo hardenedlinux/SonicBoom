@@ -91,6 +91,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | decisions | override |
 |---|---|
 | numerics profile (f16 KV, TF32 dense) | `SONICBOOM_NUMERICS=strict\|standard` |
+| tuner numerics (tables that change arithmetic) | `SONICBOOM_TUNE=canonical` |
 | reduction mode | `SONICBOOM_REDUCE=f64\|df32\|f32` |
 | hand-written tuner picks | `SONICBOOM_AUTOTUNE=0` (defaults), `=force` (retime) |
 | JIT candidate picks | `SONICBOOM_AUTOTUNE_JIT=0`, `SONICBOOM_AUTOTUNE_BUDGET_MS` |
@@ -98,6 +99,31 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto\|reckless`, `SONICBOOM_SPEC_PROBE_MS` |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 | attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |
+
+## Canonical numerics
+
+`SONICBOOM_TUNE=canonical` (or `sb_llm_model_load_ex` with
+`SB_LLM_LOAD_CANONICAL`) fixes every tuner whose pick changes arithmetic to its
+documented reference default and makes it read and write no tune record; the
+same model and prompt then produce the same tokens on an empty and on a
+populated tune directory. The tables are:
+
+| table | canonical value |
+|---|---|
+| `decode-family` | mmq for every shape and sibling group |
+| `mmq-splitk` | one K pass (`S = 1`) |
+| `decode-attn` | fdec; partition P1 for a causal class, uniform `c64` for a windowed one |
+| `attention-decode` | the class-derived chunk (no per-tier picks) |
+| `attention-full` | the static tiled default |
+| `boom_fattn` | reference candidate 1 |
+| `dense-gemm` | cuBLASLt |
+| `dense-f32` | chunked sgemm |
+| `mmq-j` | the policy decomposition and upstream's J rule |
+
+Numerics-neutral tables (`mmq-cfg`, `mmq-group`, `verify-gemv-wp`,
+`spec-length`) keep tuning; a canonical run still writes their records. The
+shape-derived `attention.class` and `attention.decode-mt` geometry depend only
+on the op attributes and the device, not on the tune directory.
 
 Attention class selection is keyed on the **op's attributes**, never on the
 model that issued the call. The op carries `causal`, `kv_cache`

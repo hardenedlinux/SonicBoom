@@ -4908,6 +4908,32 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     std::lock_guard<std::mutex> lk(g_fdec_mutex);
     if (g_fdec_pick.find(key) != g_fdec_pick.end()) return;
   }
+  if (::sonicboom::tune::canonical()) {
+    // Canonical numerics: the fdec family with the reference partition -- P1
+    // for a causal class, a uniform 64-key chunk for a windowed one -- and no
+    // tune record read or written.
+    FdecPick p;
+    p.fdec = true;
+    p.part = sliding_window > 0 ? kFdecPartC64 : kFdecPartP1;
+    planner::decisions::Entry e;
+    e.name = "attention.decode-family";
+    e.scope = key;
+    e.value = "fdec:" + std::string(fdec_part_name(p.part));
+    e.source = planner::decisions::Source::Default;
+    e.env = "SONICBOOM_TUNE";
+    e.inputs = "canonical numerics";
+    e.candidates = "fdec:" + std::string(fdec_part_name(p.part));
+    e.reason = "canonical numerics mode fixes the decode attention family and "
+               "partition";
+    e.numerics =
+        "online softmax in fixed row order; a chunk's partials merge in "
+        "ascending absolute chunk index; chunk boundaries are absolute key "
+        "positions";
+    planner::decisions::record(std::move(e));
+    reserve_fdec_scratch();
+    remember_fdec_pick(key, p);
+    return;
+  }
   const std::map<std::string, int> cached = ::sonicboom::tune::lookup(
       "decode-attn", key, build_key, __builtin_FUNCTION());
   {
@@ -5263,6 +5289,13 @@ uint64_t attn_decode_plan_chunk_impl(int head_dim, int gqa, int n_heads_q,
              "SONICBOOM_ATTN_DECODE_CHUNK set", 0);
       return remember(c);
     }
+  }
+  if (::sonicboom::tune::canonical()) {
+    // Canonical numerics: the class's derived chunk, no tune record. Every
+    // depth tier uses it (no per-tier picks).
+    record(default_chunk, planner::decisions::Source::Default,
+           "canonical numerics", "canonical numerics mode", 0);
+    return remember(default_chunk);
   }
 
   const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
@@ -6488,6 +6521,16 @@ FullResolution full_resolve_tiled(int head_dim, int gqa, int n_heads,
     }
   }
 
+  if (::sonicboom::tune::canonical()) {
+    // Canonical numerics: the static tiled default, no tune record.
+    src = planner::decisions::Source::Default;
+    tune_s = 0.0;
+    candidate_count = 0;
+    std::lock_guard<std::mutex> lk(g_full_choice_mutex);
+    g_full_choice[key] = FullMemo{def, src};
+    return def;
+  }
+
   FullResolution choice = def;
   bool have = false;
   if (::sonicboom::tune::enabled()) {
@@ -7709,6 +7752,9 @@ DenseF32Choice dense_f32_tune(int rows, int cols,
 // there) and the class is left unmemoized so a later launch can decide it.
 DenseF32Choice dense_f32_resolve(int rows, int cols) {
   const DenseF32Choice def;  // chunked
+  // Canonical numerics: the chunked sgemm (the static default), no tune
+  // record.
+  if (::sonicboom::tune::canonical()) return def;
   const int pin = dense_f32_pin();
   if (pin == 0) return def;
   if (!::sonicboom::tune::enabled() && pin < 0) return def;
@@ -8020,6 +8066,8 @@ DenseChoice dense_tune(int rows, int cols, double &tune_s,
 // batch size or position.
 DenseChoice dense_resolve(int rows, int cols) {
   const DenseChoice def;
+  // Canonical numerics: cuBLASLt (the static default), no tune record.
+  if (::sonicboom::tune::canonical()) return def;
   if (!::sonicboom::tune::enabled()) return def;
   const std::string key = compiler::dense_gemm_codegen_version() + "|m" +
                           std::to_string(rows) + "k" + std::to_string(cols);

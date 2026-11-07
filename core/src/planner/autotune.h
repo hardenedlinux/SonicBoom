@@ -63,6 +63,13 @@ bool enabled();
 // SONICBOOM_AUTOTUNE=force: ignore the disk cache, retune every class.
 bool force();
 
+// Canonical numerics: the tables whose pick changes arithmetic keep their
+// reference default and neither read nor write a tune record, while the
+// numerics-neutral tables keep tuning. Selected by SONICBOOM_TUNE=canonical or
+// by an application through sb_llm_model_load_ex(SB_LLM_LOAD_CANONICAL).
+bool canonical();
+void set_canonical(bool on);
+
 // The device directory name (<gpu-name>-sm<arch>-<driver>). Computed once.
 // "cpu" when the build has no CUDA support.
 const std::string &device_dir();

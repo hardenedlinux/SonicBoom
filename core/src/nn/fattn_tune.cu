@@ -1898,6 +1898,17 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
     return t;
   }
 
+  // Canonical numerics: the reference candidate, no tune record read or
+  // written (the JIT kernel cache is keyed by candidate and stays usable).
+  if (::sonicboom::tune::canonical()) {
+    Tuned t = reference_tuned(c, fp, "canonical",
+                              "canonical numerics mode: reference candidate");
+    t.report.cache_status = "disabled";
+    t.report.cache_reason = "SONICBOOM_TUNE=canonical";
+    emit_report(t.report);
+    return t;
+  }
+
   // A forced candidate still goes through legality and compilation: it is a
   // selection override, not a way to run something the device cannot.
   if (const char* forced = env("SONICBOOM_FATTN_CANDIDATE"); forced != nullptr) {
