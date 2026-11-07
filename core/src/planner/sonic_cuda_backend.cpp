@@ -1013,6 +1013,14 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           ? out_td->dynamic_stride_bytes * segment_extent_ +
                 out_td->dynamic_base_bytes
           : out_td->size_bytes;
+  // A dynamic tensor's buffer is sized at the plan's extent, not at this call's:
+  // the plan is the runtime unit (it is built once per shape class and replayed
+  // for every segment), so every execution of it asks the pool for the same
+  // buffer sizes and a session's reused memory stops growing with each new
+  // prompt length. The kernel still sees `out_bytes` — the plan's tensors carry
+  // the per-execution geometry.
+  const uint64_t alloc_bytes =
+      out_td->dynamic_stride_bytes != 0 ? out_td->size_bytes : out_bytes;
   //
   // In-place: BufferReusePass marks a same-type elementwise node whose operand
   // 0 dies at this node; the result can be written into that operand's buffer.
@@ -1030,7 +1038,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     borrowed = true;
   }
   if (!out_handle) {
-    out_handle = device::acquire(out_bytes);
+    out_handle = device::acquire(alloc_bytes);
     if (!out_handle)
       return std::unexpected(fail("device buffer allocation failed"));
   }
@@ -1043,7 +1051,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // first output is `out` above; this is the one the region allocates for the
   // second, and it is returned after `out`.
   uint64_t extra_handle = 0;
-  uint64_t extra_bytes = 0;
+  uint64_t extra_bytes = 0;   // logical (this execution's) bytes
+  uint64_t extra_alloc = 0;   // bytes the pool holds for the buffer
   // A merged gemv node (fuse_sibling_gemv_pass) writes one output per member
   // projection, in node->outputs order; the first is `out` above and these are
   // the rest, allocated here and returned after it.
@@ -1870,7 +1879,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                           ? res_td->dynamic_stride_bytes * segment_extent_ +
                                 res_td->dynamic_base_bytes
                           : res_td->size_bytes;
-        extra_handle = device::acquire(extra_bytes);
+        // Sized at the plan's extent, like the first output above.
+        extra_alloc = res_td->dynamic_stride_bytes != 0 ? res_td->size_bytes
+                                                        : extra_bytes;
+        extra_handle = device::acquire(extra_alloc);
         if (!extra_handle) {
           ok = false;
           break;
@@ -2684,10 +2696,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   if (nvtx_enabled()) nvtxRangePop();
 
   if (!ok) {
-    if (extra_handle) device::release(extra_handle, extra_bytes);
+    if (extra_handle) device::release(extra_handle, extra_alloc);
     for (const auto& e : sibling_outs) device::release(e.first, e.second);
     // A borrowed buffer belongs to the input value; the executor still owns it.
-    if (!borrowed) device::release(out_handle, out_bytes);
+    if (!borrowed) device::release(out_handle, alloc_bytes);
     return std::unexpected(fail("Sonic CUDA kernel failed for node '" + node->name +
                                 "'"));
   }
@@ -2697,7 +2709,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // task's declared output count. The output buffer was allocated but is never
   // consumed; release it rather than leak it.
   if (task.outputs.empty()) {
-    if (!borrowed) device::release(out_handle, out_bytes);
+    if (!borrowed) device::release(out_handle, alloc_bytes);
     for (const auto& e : sibling_outs) device::release(e.first, e.second);
     return std::vector<TensorValue>{};
   }
