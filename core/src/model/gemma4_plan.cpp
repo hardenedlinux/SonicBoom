@@ -1241,26 +1241,33 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
   return r;
 }
 
-// B6/B7: the largest draft budget one speculative step verifies. One step
-// runs at most kSpecMaxDrafts + 1 = 16 rows, the envelope the row-invariant
-// verify step was built and tested for (verify_k1..k15 classes) and the row
-// headroom the decode backend reserves (planner::kMaxVerifyRows).
-constexpr int64_t kSpecMaxDrafts = 15;
+// B6/B7/B3: the largest draft budget one speculative step verifies. One step
+// runs at most kSpecMaxDrafts + 1 = 64 rows, the envelope the row-invariant
+// verify step is built and tested for and the row headroom the decode backend
+// reserves (planner::kMaxVerifyRows).
+constexpr int64_t kSpecMaxDrafts = 63;
 
-// SONICBOOM_SPEC_MAX_DRAFTS (default kSpecMaxDrafts): a ceiling on the drafts
-// one verify may propose. It never raises the envelope above kSpecMaxDrafts;
-// both the fixed loop and the adaptive policy honour it, so a deployment (or a
-// measurement arm) can ask for a shorter verify than the envelope allows.
+// The ceiling a process uses when SONICBOOM_SPEC_MAX_DRAFTS is unset. The
+// envelope is wider, but a shorter default keeps the adaptive policy's reach
+// where the load-time cost curve anchors it; a deployment (or a measurement
+// arm) raises the ceiling explicitly to exercise the deeper buckets.
+constexpr int64_t kSpecDefaultDrafts = 15;
+
+// SONICBOOM_SPEC_MAX_DRAFTS (default kSpecDefaultDrafts): a ceiling on the
+// drafts one verify may propose. It never raises the envelope above
+// kSpecMaxDrafts; both the fixed loop and the adaptive policy honour it, so a
+// deployment (or a measurement arm) can ask for a shorter verify than the
+// envelope allows.
 static int64_t spec_max_drafts() {
   static const int64_t v = []() -> int64_t {
     const char* e = std::getenv("SONICBOOM_SPEC_MAX_DRAFTS");
-    if (!e || !*e) return kSpecMaxDrafts;
+    if (!e || !*e) return kSpecDefaultDrafts;
     char* end = nullptr;
     const long n = std::strtol(e, &end, 10);
     if (end == e || *end || n < 0) {
       std::cerr << "[spec] ignoring SONICBOOM_SPEC_MAX_DRAFTS='" << e
                 << "' (expected 0.." << kSpecMaxDrafts << ")\n";
-      return kSpecMaxDrafts;
+      return kSpecDefaultDrafts;
     }
     return std::min<long>(n, kSpecMaxDrafts);
   }();
@@ -1371,10 +1378,11 @@ namespace {
 // P0: the cost-model schema version. Bump when the shape of a record or the
 // meaning of its values changes; the key carries it, so old records are simply
 // never looked up (the tune file is append-or-rewrite, not migrated).
-// Schema 3: the record always holds all 16 lengths (c0..c15), measured at load
-// and interpolated where the measurement budget did not reach; schema 2 stored
-// only the lengths the in-request warm-up happened to run.
-constexpr int kSpecCostSchema = 3;
+// Schema 4: the record always holds all 64 lengths (c0..c63), measured at
+// load and interpolated where the measurement budget did not reach; schema 3
+// held c0..c15 only (schema 2 stored only the lengths the in-request warm-up
+// happened to run).
+constexpr int kSpecCostSchema = 4;
 
 const char* spec_ctx_class(uint64_t n_ctx) {
   return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
@@ -2520,6 +2528,12 @@ constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15};
 // pass builds the graph and captures it before it can be timed.
 constexpr double kSpecCostCaptureMs = 300.0;
 
+// The row buckets and the two bucket lookups are defined with the verify
+// runtime below; the cost curve and the speculative loop ask which bucket a
+// length's launch takes before that definition is in scope.
+static int verify_bucket_of(int rows);
+static int verify_bucket_at_most(int rows);
+
 // Fill the lengths the budget did not reach from the ones it did: linear
 // between measured points, and past the deepest measured point the last
 // segment's slope. Verify cost is close to linear in row count (every row
@@ -2657,7 +2671,10 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
     // The whole envelope is priced, not only the lengths this process's cap
     // can reach: the record belongs to the build, and a later process with a
     // different cap must read it rather than price the lengths it adds.
-    if (pos + uint64_t(k) + 1 > n_ctx) continue;  // no room for k+1 rows
+    // No room for this length's bucket (its rows plus the padding the graph
+    // writes).
+    const int bucket = verify_bucket_of(int(k) + 1);
+    if (bucket == 0 || pos + uint64_t(bucket) > n_ctx) continue;
     // The budget is checked before a length is started and before its timed
     // passes: a length whose build would overrun it is abandoned rather than
     // priced from a partial sample. The projection stops a whole length from
@@ -3008,8 +3025,16 @@ static uint64_t run_spec_program_steps(
         pushed = true;
       }
     };
-    const uint64_t room = std::min<uint64_t>(
-        uint64_t(cap), session.n_ctx - L - 1);
+    // A verify with k drafts runs the smallest row bucket >= k+1 at positions
+    // L..L+bucket-1, padding included, so the cache must hold the bucket and
+    // not just the k+1 positions the drafts occupy.
+    const uint64_t max_rows = std::min<uint64_t>(
+        session.n_ctx - L, uint64_t(planner::kMaxVerifyRows));
+    const int fit_bucket = verify_bucket_at_most(int(max_rows));
+    const uint64_t room =
+        fit_bucket >= 2
+            ? std::min<uint64_t>(uint64_t(cap), uint64_t(fit_bucket - 1))
+            : 0;
     size_t k = 0;
     bool warm = false;         // a warm-up iteration (forced k drafts)
     bool measure = false;      // ... whose time is c(k) (its second pass)
@@ -3292,7 +3317,7 @@ static uint64_t run_spec_program_steps(
       for (size_t i = 0; i < decision.emitted; ++i) spec_diag_emit(run[i]);
     }
     ++g_spec_counters.verify_steps;
-    ++g_spec_counters.k_hist[size_t(k) & 15];
+    ++g_spec_counters.k_hist[size_t(k)];
     g_spec_counters.draft_tokens += k;
     g_spec_counters.accepted_tokens += decision.accepted;
     g_spec_counters.emitted_tokens += decision.emitted;
@@ -4241,6 +4266,33 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 // cache and the process-wide device-resident weights, and each runtime's
 // staging buffers are sized for the widest row set (planner::kMaxVerifyRows).
 // ---------------------------------------------------------------------------
+// The row buckets a verify step runs in. Counts 2..16 are each their own
+// bucket; above that the buckets widen to 24, 32, 48 and 64. A step with r
+// rows runs the smallest bucket >= r, so the set holds one captured graph per
+// bucket (19) rather than one per reachable width (63), while every width in
+// 2..64 stays reachable. The rows a step adds past its own feed repeat the
+// last draft token: their logits are ignored and their KV entries lie beyond
+// the accepted length, where the next steps overwrite them in order.
+constexpr int kVerifyBuckets[] = {2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
+                                  12, 13, 14, 15, 16, 24, 32, 48, 64};
+
+// The smallest bucket that can serve `rows` rows, or 0 above the envelope.
+static int verify_bucket_of(int rows) {
+  for (int b : kVerifyBuckets)
+    if (b >= rows) return b;
+  return 0;
+}
+
+// The largest bucket that fits in `rows` positions, or 0 when none does. This
+// is the widest step whose whole launch (its own rows plus the bucket's
+// padding) stays inside the requested span.
+static int verify_bucket_at_most(int rows) {
+  int b = 0;
+  for (int x : kVerifyBuckets)
+    if (x <= rows) b = x;
+  return b;
+}
+
 struct VerifyRuntime {
   planner::Graph graph;
   planner::ExecutionPlan plan;
@@ -4254,10 +4306,14 @@ struct VerifyRuntime {
   // capture can be replayed; the id is the registry and capture-check identity.
   std::shared_ptr<void> cache;
   uint64_t cache_id = 0;
+  // The bucket this graph was built for: the widest run it serves. A call with
+  // `rows` <= rows_capacity stages `rows` tokens padded to this many.
+  int rows_capacity = 0;
 };
 
 // One entry per (model, context size, cache set). Index 0/1 are unused: a
-// verify has at least two rows (the fed token and one draft).
+// verify has at least two rows (the fed token and one draft). Only bucket
+// sizes (kVerifyBuckets) are populated.
 struct VerifySet {
   std::shared_ptr<void> cache;
   uint64_t cache_id = 0;
@@ -4271,14 +4327,17 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
 // The widest verify the current mode can run. "on" verifies at one fixed cap,
 // so only that row count is reachable; "auto" and an undecided mode (the probe
 // may still select auto) can verify every length the policy proposes. The cost
-// measurement prices the whole envelope whatever the mode, so it reaches every
-// width: the record it writes is the one every later process reads.
+// measurement prices c(k) at its 0/1/3/7/15 anchors, so it needs the 16-row
+// bucket; a process whose cap reaches deeper warms those buckets too, so no
+// request pays a first-use build. The record it writes still covers every
+// length (the ones not measured are interpolated).
 static int verify_row_limit() {
   const SpecMode mode = spec_mode();
-  if (g_spec_pricing) return planner::kMaxVerifyRows;
-  if (mode == SpecMode::Off) return 1;
   const int cap = int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts()));
-  return cap + 1;
+  if (g_spec_pricing)
+    return std::max(verify_bucket_of(cap + 1), verify_bucket_of(16));
+  if (mode == SpecMode::Off) return 1;
+  return verify_bucket_of(cap + 1);
 }
 
 static std::unique_ptr<VerifyRuntime>
@@ -4313,6 +4372,7 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
   // suppressed, so no session row is touched.
   rt->cache = session.caches;
   rt->cache_id = session.cache_id;
+  rt->rows_capacity = rows;
   rt->exec = std::make_unique<planner::RuntimeExecutor>(
       std::map<planner::BackendTag, planner::Backend*>{
           {planner::BackendTag::Sonic, rt->cuda.get()}});
@@ -4372,6 +4432,10 @@ static std::unique_ptr<VerifySet> build_verify_set(
       std::min<int>(planner::kMaxVerifyRows,
                     limit_override > 0 ? limit_override : verify_row_limit());
   if (limit < 2) return nullptr;
+  // Only the bucket widths are built; every row count up to `limit` rounds up
+  // to one of them.
+  const int build_upto = verify_bucket_at_most(limit);
+  if (build_upto < 2) return nullptr;
   const bool graphs = cuda_graph_decode_enabled();
   const auto t0 = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
@@ -4380,7 +4444,8 @@ static std::unique_ptr<VerifySet> build_verify_set(
         .count();
   };
   int built = 0;
-  for (int rows = 2; rows <= limit; ++rows) {
+  for (int rows : kVerifyBuckets) {
+    if (rows > build_upto) break;
     auto rt = build_verify_runtime(m, n_ctx, rows, session);
     if (!rt) continue;
     set->rows[size_t(rows)] = std::move(rt);
@@ -4399,15 +4464,15 @@ static std::unique_ptr<VerifySet> build_verify_set(
   bool queued[planner::kMaxVerifyRows + 1] = {};
   bool anchor_row[planner::kMaxVerifyRows + 1] = {};
   auto enqueue = [&](int rows, bool anchor) {
-    if (rows < 2 || rows > limit) return;
+    if (rows < 2 || rows > build_upto) return;
     if (anchor) anchor_row[rows] = true;
     if (queued[rows]) return;
     queued[rows] = true;
     order[n_order++] = rows;
   };
   for (int rows : {2, 4, 8, 16}) enqueue(rows, /*anchor=*/true);
-  enqueue(limit, /*anchor=*/true);
-  for (int rows = 2; rows <= limit; ++rows) enqueue(rows, /*anchor=*/false);
+  enqueue(build_upto, /*anchor=*/true);
+  for (int rows : kVerifyBuckets) enqueue(rows, /*anchor=*/false);
 
   int captured = 0, warmed = 0;
   for (int i = 0; graphs && i < n_order; ++i) {
@@ -4424,9 +4489,9 @@ static std::unique_ptr<VerifySet> build_verify_set(
   }
   if (spec_diag_enabled()) {
     std::fprintf(stderr,
-                 "[spec-cost] verify set rows=2..%d built=%d warmed=%d "
-                 "captured=%d %.0fms budget=%.0fms\n",
-                 limit, built, warmed, captured, elapsed_ms(),
+                 "[spec-cost] verify set rows=2..%d (buckets) built=%d "
+                 "warmed=%d captured=%d %.0fms budget=%.0fms\n",
+                 build_upto, built, warmed, captured, elapsed_ms(),
                  kSpecCostLoadBudgetMs);
   }
   return built > 0 ? std::move(set) : nullptr;
@@ -4476,9 +4541,11 @@ static VerifyRuntime* get_verify_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                          int rows,
                                          const planner::KvCacheSession& session) {
   if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  const int bucket = verify_bucket_of(rows);
+  if (bucket == 0) return nullptr;
   VerifySet* set = get_verify_set(m, n_ctx, session);
   if (!set) return nullptr;
-  return set->rows[size_t(rows)].get();
+  return set->rows[size_t(bucket)].get();
 }
 
 // The same row-invariant graph for the opt-in prefill path
@@ -4541,12 +4608,14 @@ static VerifyRuntime* get_forced_verify_runtime(
   if (!ensure_device_ready(m)) return nullptr;
   if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
+  const int bucket = verify_bucket_of(rows);
+  if (bucket == 0) return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
     auto it = g_forced_verify_runtimes.find(key);
     if (it != g_forced_verify_runtimes.end())
-      return it->second->rows[size_t(rows)].get();
+      return it->second->rows[size_t(bucket)].get();
   }
   auto built = build_verify_set(m, n_ctx, session, planner::kMaxVerifyRows);
   if (!built) return nullptr;
@@ -4554,10 +4623,10 @@ static VerifyRuntime* get_forced_verify_runtime(
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_forced_verify_runtimes.find(key);
   if (it != g_forced_verify_runtimes.end())
-    return it->second->rows[size_t(rows)].get();
+    return it->second->rows[size_t(bucket)].get();
   VerifySet* raw = built.get();
   g_forced_verify_runtimes.emplace(key, std::move(built));
-  return raw->rows[size_t(rows)].get();
+  return raw->rows[size_t(bucket)].get();
 }
 
 static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
@@ -4968,6 +5037,19 @@ static bool run_verify_step(const Gemma4Model& m,
     return false;
   };
   const int rows = int(tokens.size());
+  const int capacity = rt->rows_capacity;
+  if (capacity < rows) return fail("runtime is narrower than the feed");
+  // Pad the feed up to the bucket the graph was built for: the extra rows
+  // repeat the last draft token. Their logits are read back and discarded,
+  // and their KV entries lie past the accepted length, where the next steps
+  // overwrite them in order (the same rollback rejected drafts take).
+  std::vector<uint64_t> padded;
+  std::span<const uint64_t> staged = tokens;
+  if (capacity > rows) {
+    padded.assign(tokens.begin(), tokens.end());
+    padded.resize(size_t(capacity), tokens.empty() ? 0 : tokens.back());
+    staged = padded;
+  }
   // Replay only while the capture's recorded resources are still this
   // session's; otherwise run the same graph through the uncaptured executor.
   const bool replay_ok =
@@ -4977,8 +5059,8 @@ static bool run_verify_step(const Gemma4Model& m,
   if (replay_ok) {
     // Stage the row token ids and the base position on the captured graph's
     // stream, then one replay: the whole verify step is one graph launch.
-    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
-        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
+    if (!rt->cuda->stage_prefill_tokens(*rt->prog, staged) ||
+        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, capacity))
       return fail("staging failed");
     // The replay is async on the graph stream; the token readback must see the
     // completed step (the readback copy orders against the graph's stream).
@@ -4990,8 +5072,8 @@ static bool run_verify_step(const Gemma4Model& m,
     if (!replayed || !rt->prog->sync())
       return fail("graph replay failed");
   } else {
-    if (!rt->cuda->set_prefill_tokens(tokens) ||
-        !rt->cuda->set_verify_pos(start_pos, rows))
+    if (!rt->cuda->set_prefill_tokens(staged) ||
+        !rt->cuda->set_verify_pos(start_pos, capacity))
       return fail("staging failed");
     const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
     auto res = rt->exec->execute(rt->plan, rt->snap, in);
@@ -5001,7 +5083,7 @@ static bool run_verify_step(const Gemma4Model& m,
     }
   }
   float host[planner::kMaxVerifyRows];
-  if (!rt->cuda->read_verify_tokens(host, rows))
+  if (!rt->cuda->read_verify_tokens(host, capacity))
     return fail("token readback failed");
   for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
   return true;
@@ -5036,6 +5118,10 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   }
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
+  // The whole bucket's rows are written, padding included, so the cache must
+  // hold the bucket, not just the feed.
+  if (start_pos + uint64_t(rt->rows_capacity) > session.n_ctx)
+    return fail("the verify bucket exceeds the session cache");
   return run_verify_step(m, session, tokens, start_pos, rt, out,
                          "[spec] verify: ");
 }
@@ -5064,6 +5150,8 @@ bool verify_step_forced_cuda(const Gemma4Model& m,
   VerifyRuntime* rt =
       get_forced_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
+  if (start_pos + uint64_t(rt->rows_capacity) > session.n_ctx)
+    return fail("the verify bucket exceeds the session cache");
   return run_verify_step(m, session, tokens, start_pos, rt, out,
                          "[grammar] verify: ");
 }
@@ -6157,9 +6245,13 @@ static bool prefill_in_decode_arithmetic(
   const uint64_t ring = m.config.sliding_window > 0 ? m.config.sliding_window
                                                     : kDefaultPrefillChunk;
   const uint64_t prefix = n - 1;
+  // The repro path's chunk width is pinned to the width it was introduced
+  // with (not derived from the verify envelope), so its chunking — and the
+  // graphs it builds — do not move when the envelope widens.
+  constexpr uint64_t kReproChunkRows = 16;
   for (uint64_t off = 0; off < prefix;) {
     const uint64_t pos = start_pos + off;
-    uint64_t rows = std::min<uint64_t>(planner::kMaxVerifyRows, prefix - off);
+    uint64_t rows = std::min<uint64_t>(kReproChunkRows, prefix - off);
     if (m.config.sliding_window > 0) rows = std::min(rows, ring - pos % ring);
     if (rows < 2) {
       // One row: the plain decode step is the row-invariant arithmetic here.

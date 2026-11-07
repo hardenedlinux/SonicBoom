@@ -431,7 +431,7 @@ constexpr KnobRow kKnobRows[] = {
      "drafter selection", "accept rule is drafter-agnostic", 0, 0},
     {"spec.verify-batch", "SONICBOOM_SPEC_VERIFY_BATCH", "batched", "batched|single",
      "one batched mmvq per projection", "bit-identical launch shapes", 0, 0},
-    {"spec.max-drafts", "SONICBOOM_SPEC_MAX_DRAFTS", "15", "0..15",
+    {"spec.max-drafts", "SONICBOOM_SPEC_MAX_DRAFTS", "15", "0..63",
      "ceiling on drafts per verify", "a shorter verify runs the same kernels", 0, 0},
     {"prefix.align", "SONICBOOM_PREFIX_ALIGN", "on", "on|off",
      "hold the reuse boundary on a prefill chunk", "restores identical reuse", 0, 0},

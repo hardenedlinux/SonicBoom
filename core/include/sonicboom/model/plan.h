@@ -332,10 +332,13 @@ DevicePoolStats device_pool_stats();
 // The verify step: feed `tokens` at positions `start_pos .. start_pos+rows-1`
 // through the row-invariant verify graph on `session`'s cache and write each
 // row's argmax into `out` (out.size() >= tokens.size(), rows <=
-// planner::kMaxVerifyRows, start_pos + rows <= session.n_ctx). The cache is left
-// holding those rows, as `rows` plain decode steps would leave it. Returns false
-// on a build/step failure. The first call for a (model, n_ctx, rows, cache)
-// builds, plans and captures the step; later calls replay it.
+// planner::kMaxVerifyRows). The step runs the smallest row bucket >= rows, so
+// the cache must hold start_pos + bucket <= session.n_ctx; the padded rows
+// repeat the last draft token and their outputs are discarded. The cache is
+// left holding the whole bucket, as a bucket's worth of plain decode steps
+// would leave it.
+// Returns false on a build/step failure. The first call for a (model, n_ctx,
+// bucket, cache) builds, plans and captures the step; later calls replay it.
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -463,9 +466,10 @@ struct SpecCounters {
   // proposals are worth verifying after all.
   uint64_t probe_verifies = 0;
   uint64_t policy_steps = 0;
-  // The policy's chosen draft budget per policy iteration (k = 0..15). This is
-  // the decision, not the number of drafts a particular proposal contained.
-  uint64_t k_hist[16] = {};
+  // The policy's chosen draft budget per policy iteration (k = 0..63, one bin
+  // per reachable length). This is the decision, not the number of drafts a
+  // particular proposal contained.
+  uint64_t k_hist[64] = {};
 };
 SpecCounters spec_counters();
 void spec_counters_reset();

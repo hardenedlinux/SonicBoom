@@ -4435,7 +4435,7 @@ uint64_t attn_decode_requested_chunk(uint64_t chunk_attr, int n_heads_kv,
 // class's key extents, at one row and at the widest verify row count, and
 // keeps fdec only when it is strictly faster on that sum. A split pin is
 // written too, so a class measured once is not measured again.
-constexpr int kFdecMaxRows = 16;  // the verify row cap the scratch covers
+constexpr int kFdecMaxRows = 64;  // the verify row cap the scratch covers
 constexpr uint64_t kFdecMinChunk = 32;  // smallest candidate chunk size
 
 struct FdecPick {
@@ -4861,7 +4861,8 @@ void attn_fdec_resolve(int head_dim, int gqa, int n_heads_q, int n_heads_kv,
     e.source = planner::decisions::Source::Default;
     e.env = "SONICBOOM_FDEC_MT";
     e.inputs = "head_dim=" + std::to_string(head_dim) +
-               " gqa=" + std::to_string(gqa) + " rows<=16";
+               " gqa=" + std::to_string(gqa) + " rows<=" +
+               std::to_string(kFdecMaxRows);
     e.candidates = "mt=1.." + std::to_string(fdec_mt_max(head_dim));
     e.reason =
         "the row group a launch serves fixes the m-tiles it needs; shared "

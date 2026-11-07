@@ -45,9 +45,11 @@
 
 namespace sonicboom::planner {
 
-// The verify step's widest row set: a draft length of at most 7 gives k+1 = 8
-// query rows; the token slot is sized for this many argmax results.
-inline constexpr int kMaxVerifyRows = 16;
+// The verify step's widest row set: a draft length of at most 63 gives k+1 = 64
+// query rows. Row counts are grouped into buckets (2..16 by one, then 24, 32,
+// 48, 64): a step with r rows runs the smallest bucket >= r, and the token slot
+// is sized for the widest bucket's argmax results.
+inline constexpr int kMaxVerifyRows = 64;
 
 class SonicCudaBackend : public Backend {
 public:

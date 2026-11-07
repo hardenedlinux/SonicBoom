@@ -98,6 +98,7 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 | `boom_fattn` kernel candidates | `SONICBOOM_FATTN_AUTOTUNE`, `SONICBOOM_FATTN_CANDIDATE` (see `fattn-autotune.md`) |
 | spec mode / probe | `SONICBOOM_SPEC=off\|on\|auto\|reckless`, `SONICBOOM_SPEC_PROBE_MS` |
 | spec drafter | `SONICBOOM_SPEC_DRAFTER=legacy` (original 2..4-gram); unset = long-match n-gram |
+| spec draft budget | `SONICBOOM_SPEC_MAX_DRAFTS=0..63` (default 15) |
 | the T0b algorithm switches | each keeps its documented variable (table in `decisions.cpp`) |
 | attention class (any op) | `SONICBOOM_ATTN_CLASS=<class>`; `SONICBOOM_DIT_ATTN` is kept as its alias |
 
