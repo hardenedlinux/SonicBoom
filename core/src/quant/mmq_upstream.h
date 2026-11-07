@@ -80,6 +80,17 @@ bool mmq_up_matmul(const void * weights, MmqUpType type, const int32_t * y_q8,
                    cudaStream_t stream, int cfg = 0, int split_k = 1,
                    const float * bias = nullptr, const float * add = nullptr);
 
+// SonicBoom: row-gathered matmul of the lm head.  dst is [n][M] position-major
+// with M the compact output rows; compact row r reads weight row row_idx[r]
+// (a device [M] table).  The tile body, configuration and split-K are the
+// dense call's; each compact row's value is the dense row's value bit for bit.
+// The last tile's padding rows read the last table entry and are not written,
+// so M need not be a multiple of 128.  No bias/residual epilogue.
+bool mmq_up_matmul_gather(const void * weights, MmqUpType type,
+                          const int32_t * y_q8, float * dst, int64_t M,
+                          int64_t K, int64_t n, const int * row_idx,
+                          cudaStream_t stream, int cfg = 0, int split_k = 1);
+
 // Quantize x [n][K] (row-contiguous, row stride K) into the upstream
 // block_q8_1_mmq layout [K/128][n] blocks.  y_q8 must have room for
 // (K/128)*n + 128 blocks.  K must be a multiple of 128.  The bytes written are

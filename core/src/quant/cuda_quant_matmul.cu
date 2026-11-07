@@ -2191,6 +2191,182 @@ static void launch_gemv_q8_1_rows(QuantType qt, const uint8_t* wp,
   }
 }
 
+// --- SonicBoom: row-gathered lm head (grammar steps) ------------------------
+// The compact logits of one decode step: compact row r carries the dense lm-head
+// row idx[r].  Each kernel repeats its dense warp-per-row kernel's arithmetic
+// for a row taken from the table, so every value is the dense row's value bit
+// for bit; only which weight row the warp reads and where it writes differ.
+namespace {
+
+__global__ void gemv_gather_q3_K_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  const int iqs = lane & 15;
+  const int ib = lane >> 4;
+  float sum = 0.0f;
+  for (int b = ib; b < blocks_per_row; b += 2) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 110;
+    const q8_1::block_q8_1* yb = y + (size_t)b * (q8_1::QK_K / q8_1::QK8_1);
+    sum += q8_1::vec_dot_q3_K_q8_1(wb, yb, iqs);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+__global__ void gemv_gather_q4_K_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  const int iqs = 2 * (lane & 15);
+  const int ib = lane >> 4;
+  float sum = 0.0f;
+  for (int b = ib; b < blocks_per_row; b += 2) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 144;
+    const q8_1::block_q8_1* yb = y + (size_t)b * (q8_1::QK_K / q8_1::QK8_1);
+    sum += q8_1::vec_dot_q4_K_q8_1(wb, yb, iqs);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+__global__ void gemv_gather_q5_K_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  const int iqs = 2 * (lane & 15);
+  const int ib = lane >> 4;
+  float sum = 0.0f;
+  for (int b = ib; b < blocks_per_row; b += 2) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 176;
+    const q8_1::block_q8_1* yb = y + (size_t)b * (q8_1::QK_K / q8_1::QK8_1);
+    sum += q8_1::vec_dot_q5_K_q8_1(wb, yb, iqs);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+__global__ void gemv_gather_q6_K_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  const int iqs = lane;
+  float sum = 0.0f;
+  for (int b = 0; b < blocks_per_row; ++b) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 210;
+    const q8_1::block_q8_1* yb = y + (size_t)b * (q8_1::QK_K / q8_1::QK8_1);
+    sum += q8_1::vec_dot_q6_K_q8_1(wb, yb, iqs);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+__global__ void gemv_gather_q5_0_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  float sum = 0.0f;
+  for (int b = lane; b < blocks_per_row; b += 32) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 22;
+    sum += q8_1::vec_dot_q5_0_q8_1(wb, y + b);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+__global__ void gemv_gather_q8_0_q8_1(const uint8_t* __restrict__ w,
+                                      const q8_1::block_q8_1* __restrict__ y,
+                                      float* __restrict__ dst,
+                                      int blocks_per_row,
+                                      const int* __restrict__ idx, int m) {
+  const int lane = threadIdx.x;
+  const int r = blockIdx.y * blockDim.y + threadIdx.y;
+  if (r >= m) return;
+  const int row = idx[r];
+  float sum = 0.0f;
+  for (int b = lane; b < blocks_per_row; b += 32) {
+    const uint8_t* wb = w + ((size_t)row * blocks_per_row + b) * 34;
+    sum += q8_1::vec_dot_q8_0_q8_1(wb, y + b);
+  }
+  #pragma unroll
+  for (int o = 16; o > 0; o >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, o);
+  if (lane == 0) dst[r] = sum;
+}
+
+}  // namespace
+
+// The gathered launch: one warp per compact row, block width from the shape
+// class's resolved dense width (a width moves the launch geometry only).
+static void launch_gemv_gather_rows(QuantType qt, const uint8_t* wp,
+                                    const q8_1::block_q8_1* xq,
+                                    const int* idx, float* yp,
+                                    int blocks_per_row, int m, int warps) {
+  const dim3 block(32, warps);
+  const dim3 grid(1, (m + warps - 1) / warps);
+  switch (qt) {
+    case QuantType::Q3_K:
+      SB_NOTE_LAUNCH(gemv_gather_q3_K_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q3_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+    case QuantType::Q4_K:
+      SB_NOTE_LAUNCH(gemv_gather_q4_K_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q4_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+    case QuantType::Q5_K:
+      SB_NOTE_LAUNCH(gemv_gather_q5_K_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q5_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+    case QuantType::Q6_K:
+      SB_NOTE_LAUNCH(gemv_gather_q6_K_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q6_K_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+    case QuantType::Q5_0:
+      SB_NOTE_LAUNCH(gemv_gather_q5_0_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q5_0_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+    case QuantType::Q8_0:
+      SB_NOTE_LAUNCH(gemv_gather_q8_0_q8_1, grid, block, 0, cur_stream());
+      gemv_gather_q8_0_q8_1<<<grid, block, 0, cur_stream()>>>(
+          wp, xq, yp, blocks_per_row, idx, m);
+      break;
+  }
+}
+
 // tile_m is the block width in threads — Q1's meaning for the fp32 gemv launch
 // — so 128 and 512 threads are 4 and 16 rows per block; anything else is the
 // pre-Q1 (32, 8).
@@ -3158,6 +3334,36 @@ bool gemv_q8_1_dev(const QuantizedTensor& W, const BlockQ8_1* xq, float* y,
   if (e != cudaSuccess)
     std::fprintf(stderr, "[gemv] rows=%llu bpr=%u: %s\n",
                  (unsigned long long)rows, blocks_per_row,
+                 cudaGetErrorString(e));
+  return e == cudaSuccess;
+}
+
+// The row-gathered gemv of the lm head: y[r] = W[:, idx[r]] * xq for the m
+// compact rows, each row computed by the dense kernel's own lane walk and
+// reduction.  `m` is the compact row count; idx is a device [m] table of the
+// dense rows.
+bool gemv_q8_1_gather_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
+                          const int* idx, float* y, int m) {
+  if (!available() || !q8_1_enabled()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (!xq || !idx || !y || m <= 0 || uint64_t(m) > rows) return false;
+  const uint32_t blocks_per_row = uint32_t(cols / W.block_size());
+  if (blocks_per_row == 0) return false;
+
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  const int warps = gemv_warps_for_launch(
+      mlir_tune::gemv_choice(int(blocks_per_row), int(rows)).cfg, m);
+  launch_gemv_gather_rows(
+      W.type(), static_cast<const uint8_t*>(d_w),
+      reinterpret_cast<const q8_1::block_q8_1*>(xq), idx, y,
+      int(blocks_per_row), m, warps);
+  const cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess)
+    std::fprintf(stderr, "[gemv-gather] rows=%llu m=%d bpr=%u: %s\n",
+                 (unsigned long long)rows, m, blocks_per_row,
                  cudaGetErrorString(e));
   return e == cudaSuccess;
 }
@@ -4545,6 +4751,69 @@ bool matmul_mmq_q8_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* y_q8,
   return mmq_up_matmul(
       wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
       cur_stream(), cfg, pin.split_k, d_bias, add);
+}
+
+// Row-gathered MMQ over an f32 activation: the lm head's compact logits.
+// Quantizes X exactly as matmul_mmq_dev, then runs the same tile body with each
+// compact output row reading weight row row_idx[r]; Y is [n][m] position-major.
+bool matmul_mmq_gather_dev(const QuantizedTensor& W, const float* X,
+                           const int* row_idx, float* Y, int n, int m) {
+  if (!available() || !W.valid() || W.dims().size() != 2 || !X || !row_idx ||
+      !Y || n <= 0)
+    return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (cols % mmq::QK8_1_MMQ != 0 || m <= 0 || uint64_t(m) > rows) return false;
+  const int ic = int(cols), ir = int(rows);
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
+
+  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  if (!wp) return false;
+
+  mmq::block_q8_1_mmq* y_q8 = static_cast<mmq::block_q8_1_mmq*>(
+      grow_scratch(g_mmq_q8, g_mmq_q8_bytes,
+                   mmq::mmq_q8_blocks(ic, n) * sizeof(mmq::block_q8_1_mmq)));
+  if (!y_q8) return false;
+
+  mmq::zero_pad_planes(y_q8, ic, n, cur_stream());
+  if (!mmq_up_quantize(X, reinterpret_cast<int32_t*>(y_q8), ic, n, *type,
+                       cur_stream()))
+    return false;
+
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  return mmq_up_matmul_gather(
+      wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, m, ic, n, row_idx,
+      cur_stream(), cfg, pin.split_k);
+}
+
+// Row-gathered MMQ consuming a pre-quantized block_q8_1_mmq activation; the
+// y_q8 operand and its J_max tail guard are matmul_mmq_q8_dev's.
+bool matmul_mmq_q8_gather_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
+                              const int* row_idx, float* Y, int n, int m) {
+  if (!available() || !W.valid() || W.dims().size() != 2 || !yq || !row_idx ||
+      !Y || n <= 0)
+    return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (cols % mmq::QK8_1_MMQ != 0 || m <= 0 || uint64_t(m) > rows) return false;
+  const int ic = int(cols), ir = int(rows);
+  if (cols / W.block_size() == 0) return false;
+  const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
+  if (!type) return false;
+
+  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  if (!wp) return false;
+
+  mmq::zero_pad_planes(reinterpret_cast<const mmq::block_q8_1_mmq*>(yq), ic, n,
+                       cur_stream());
+
+  const MmqUpPin pin = mmq_up_pin_for(*type, ir, ic);
+  const int cfg = n <= 8 ? pin.cfg_j8 : pin.cfg_j16;
+  return mmq_up_matmul_gather(
+      wp, *type, reinterpret_cast<const int32_t*>(yq), Y, m, ic, n, row_idx,
+      cur_stream(), cfg, pin.split_k);
 }
 
 // Grouped form of matmul_mmq_q8_dev: every member runs the same tile body at

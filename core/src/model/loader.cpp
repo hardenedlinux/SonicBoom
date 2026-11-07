@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <sonicboom/model/loader.h>
+#include <sonicboom/model/plan.h>
 
 #include "../quant/foreign_dequant.h"
 #include "../quant/ggml_derived/quantize_q5_k.h"
@@ -622,7 +623,16 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   // architecture in advance (detect_arch reads general.architecture).
   const auto arch = detect_arch(r);
   if (!arch) return std::unexpected(std::move(arch.error()));
-  if (*arch == ModelArch::Qwen2) return load_qwen2(r);
+  if (*arch == ModelArch::Qwen2) {
+    auto q = load_qwen2(r);
+    if (!q) return q;
+    // The resolution epoch is part of loading, for every architecture: the
+    // choices are per shape class and final for the model's lifetime.
+    if (!resolve_tune_for_model(*q))
+      return std::unexpected(
+          std::string("device numerics resolution failed at model load"));
+    return q;
+  }
 
   auto cfg = load_gemma4_config(r);
   if (!cfg) return std::unexpected(std::move(cfg.error()));
@@ -737,6 +747,12 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   m.plan.reserve(c.block_count);
   for (uint32_t l = 0; l < c.block_count; ++l) m.plan.push_back(c.layer_config(l));
 
+  // One resolution for the model's numerics-affecting device choices, here in
+  // the common load so no entry point can skip it (the C API, tools and tests
+  // all reach the model through this function).
+  if (!resolve_tune_for_model(m))
+    return std::unexpected(
+        std::string("device numerics resolution failed at model load"));
   return m;
 }
 

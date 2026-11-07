@@ -126,4 +126,47 @@ std::vector<int64_t> sample_candidates(std::span<const float> logits,
                                        std::span<const int64_t> history,
                                        std::span<const uint8_t> mask);
 
+// --- selection over the compacted allowed list ------------------------------
+//
+// A grammar mask restricts the next token to a small set of vocabulary ids.
+// Instead of scanning the full vocabulary per step, the logits are compacted
+// onto that list (entry j belongs to vocabulary id ids[j]) and selection runs
+// over the entries. A compacted selection is exact: it produces the same
+// candidate set, the same z values and the same draw as the dense selection
+// restricted to the mask.
+
+// The ids whose bit is set in `mask`, ascending. Bits past the bitmap's end
+// are disallowed, matching argmax_masked.
+std::vector<int32_t> allowed_ids(std::span<const uint8_t> mask, int64_t vocab);
+
+// Compacted selection is used for allowed lists up to this width; wider lists
+// (or no mask) keep the dense path. Also the gathered lm head's cap.
+inline constexpr int64_t kGrammarGatherCap = 4096;
+
+// True when a compacted (and, for the lm head, row-gathered) selection is used.
+inline bool grammar_gather_ok(int64_t allowed) {
+  return allowed > 0 && allowed <= kGrammarGatherCap;
+}
+
+// Greedy selection over a compacted list: the maximum entry, ties toward the
+// lowest vocabulary id (the ids are ascending). Returns the vocabulary id.
+int64_t argmax_compact(std::span<const float> logits,
+                       std::span<const int32_t> ids);
+
+// Stage (1) over a compacted list: the same penalties (keyed by the entry's
+// vocabulary id), the temperature division, and the kSampleCandidates highest
+// z in (z descending, id ascending) order.
+std::vector<Candidate> select_candidates_compact(
+    std::span<const float> logits, std::span<const int32_t> ids,
+    const SamplingParams& p, std::span<const int64_t> history);
+
+// sample_token over a compacted list. Temperature <= 0 returns argmax_compact
+// (penalized); temperature > 0 runs select_candidates_compact followed by
+// sample_from_candidates, whose draw is keyed by the vocabulary id and is
+// therefore identical to the dense draw over the same allowed set.
+int64_t sample_token_compact(std::span<const float> logits,
+                             std::span<const int32_t> ids,
+                             const SamplingParams& p, uint64_t position,
+                             std::span<const int64_t> history);
+
 } // namespace sonicboom::nn

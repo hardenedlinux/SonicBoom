@@ -240,7 +240,9 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
 // on synthetic shapes before any cache or graph exists, so every later
 // runtime (decode, verify, session creation, tier capture, tools) reads one
 // immutable table. Closes the resolution epoch when it returns; a miss after
-// that is a bug, not a measurement. Returns false when the build has no CUDA.
+// that is a bug, not a measurement: the lookup reports it and the runtime build
+// fails. Called by the common model load (model::load_gemma4), so every entry
+// point that loads a model resolves exactly once.
 bool resolve_tune_for_model(const Gemma4Model& m);
 
 // ---------------------------------------------------------------------------
@@ -328,6 +330,19 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
                             uint64_t start_pos,
                             planner::KvCacheSession& session,
                             std::span<int64_t> out);
+
+// The same step for a forced-token run: a grammar step with exactly one allowed
+// token continues through the next ones the same way, so a whole run of them
+// (2..kMaxVerifyRows tokens) runs as one batch whose row i is the plain decode
+// at start_pos+i. Independent of the speculation mode; the cache is left
+// holding the rows, as that many plain decode steps would leave it. The first
+// call builds, plans and captures the widths; later calls replay. Returns false
+// on a build/step failure.
+bool verify_step_forced_cuda(const Gemma4Model& m,
+                             std::span<const uint64_t> tokens,
+                             uint64_t start_pos,
+                             planner::KvCacheSession& session,
+                             std::span<int64_t> out);
 
 // The plain-decode reference for the verify step: feed `tokens[i]` at
 // `start_pos + i` through the captured single-token decode step on `session`'s

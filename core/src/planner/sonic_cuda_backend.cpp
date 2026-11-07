@@ -331,6 +331,8 @@ SonicCudaBackend::~SonicCudaBackend() {
   if (token_ring_) g_alloc.deallocate(token_ring_);
   if (carry_buf_) g_alloc.deallocate(carry_buf_);
   if (argmax_mask_) g_alloc.deallocate(argmax_mask_);
+  if (grammar_ids_) g_alloc.deallocate(grammar_ids_);
+  if (grammar_count_) g_alloc.deallocate(grammar_count_);
   if (sample_params_) g_alloc.deallocate(sample_params_);
   if (sample_window_) g_alloc.deallocate(sample_window_);
   if (sample_cands_) g_alloc.deallocate(sample_cands_);
@@ -471,6 +473,44 @@ bool SonicCudaBackend::clear_argmax_mask() {
       !g_alloc.fill(argmax_mask_, 0xFF, argmax_mask_bytes_))
     return false;
   argmax_mask_dirty_ = false;
+  return true;
+}
+
+bool SonicCudaBackend::grammar_gather_init() {
+  const uint64_t bytes = uint64_t(nn::kGrammarGatherCap) * sizeof(int32_t);
+  // Both buffers outlive the captures that reference them, and a runtime built
+  // earlier may have captured launches over free-list blocks: take fresh
+  // allocations so a replay of another graph can never overwrite the table.
+  if (!grammar_ids_) {
+    const uint64_t h = device::acquire_fresh(bytes);
+    if (!h) return false;
+    grammar_ids_ = hal::Buffer{h, bytes, hal::DeviceId{0},
+                               hal::MemoryKind::DeviceLocal};
+  }
+  if (!grammar_count_) {
+    const uint64_t h = device::acquire_fresh(sizeof(int32_t));
+    if (!h) return false;
+    grammar_count_ = hal::Buffer{h, sizeof(int32_t), hal::DeviceId{0},
+                                 hal::MemoryKind::DeviceLocal};
+  }
+  // A one-entry list (row 0) is a valid configuration: the capture's warm-up
+  // step reads a live device list, and the first real step replaces both the
+  // entry and the count.
+  if (!g_alloc.fill(grammar_ids_, 0, bytes)) return false;
+  const int32_t one = 1;
+  return g_alloc.copy_to_device(grammar_count_, &one, sizeof(one));
+}
+
+bool SonicCudaBackend::set_grammar_ids(std::span<const int32_t> ids) {
+  if (!grammar_ids_ || !grammar_count_) return false;
+  if (ids.empty() || ids.size() > size_t(nn::kGrammarGatherCap)) return false;
+  // Entries past the live count are never read (the selection stops at the
+  // count), so only the listing itself is uploaded.
+  if (!g_alloc.copy_to_device(grammar_ids_, ids.data(),
+                              ids.size() * sizeof(int32_t)))
+    return false;
+  const int32_t n = int32_t(ids.size());
+  if (!g_alloc.copy_to_device(grammar_count_, &n, sizeof(n))) return false;
   return true;
 }
 
@@ -1265,7 +1305,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         const float* add_p =
             has_add ? static_cast<const float*>(dev(in[add_idx])) : nullptr;
         int64_t mmq_rows = 0;
-        if (attr_i(*node, "mmq_rows", mmq_rows)) {
+        int64_t gather = 0;
+        if (attr_i(*node, "gather", gather) && gather != 0) {
+          // The lm head of a grammar-constrained step: the compact rows are
+          // the allowed vocabulary rows, in ascending id order.
+          if (!grammar_ids_) { ok = false; break; }
+          ok = quant::cuda::matmul_mmq_gather_dev(
+              qweight(slot), dev(in[0]),
+              reinterpret_cast<const int32_t*>(uintptr_t(grammar_ids_.id)),
+              out, int(nb), out_n / int(nb));
+        } else if (attr_i(*node, "mmq_rows", mmq_rows)) {
           ok = quant::cuda::matmul_mmq_dev(qweight(slot), dev(in[0]), out,
                                            int(nb), b, add_p);
         } else {
@@ -1454,6 +1503,19 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         int64_t ds_i = 0;
         attr_i(*node, "ds", ds_i);
         note_activation_quant(mmq_activation(ds_i));
+        // The lm head of a grammar-constrained step: the compact rows are the
+        // allowed vocabulary rows, in ascending id order, over the activation
+        // the pass already quantized for the mmq.
+        int64_t gather = 0;
+        if (attr_i(*node, "gather", gather) && gather != 0) {
+          if (!grammar_ids_ || out_n % int(nb) != 0) { ok = false; break; }
+          ok = quant::cuda::matmul_mmq_q8_gather_dev(
+              qweight(slot),
+              reinterpret_cast<const quant::cuda::BlockQ8_1Mmq*>(dev(in[0])),
+              reinterpret_cast<const int32_t*>(uintptr_t(grammar_ids_.id)), out,
+              int(nb), int(out_n / int(nb)));
+          break;
+        }
         // The decode epilogue folds (bias then residual) are added by the mmq
         // write-back: the values the separate AddBias/Add kernels stored.
         int64_t bias_slot = 0, add_idx = 0;
@@ -1560,6 +1622,17 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       } else {
         note_activation_quant("q8_1");
         const auto* xq = reinterpret_cast<const quant::cuda::BlockQ8_1*>(dev(in[0]));
+        int64_t gather = 0;
+        if (attr_i(*node, "gather", gather) && gather != 0) {
+          // The lm head of a grammar-constrained step (gemv family): the
+          // single position's compact logits over the allowed rows.
+          if (!grammar_ids_) { ok = false; break; }
+          ok = quant::cuda::gemv_q8_1_gather_dev(
+              qweight(slot), xq,
+              reinterpret_cast<const int32_t*>(uintptr_t(grammar_ids_.id)), out,
+              out_n);
+          break;
+        }
         const auto& qw = qweight(slot);
         // `bias_slot` is set by fuse_bias_into_gemv_pass: the projection's bias
         // (a bound [rows] model weight) was folded into this matmul node by
@@ -2469,6 +2542,20 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                    size_t(vr) * sizeof(float));
         break;
       }
+      // A grammar-constrained decode step selects over the compacted allowed
+      // list: the reduction covers the live count entries on the device and
+      // writes the vocabulary id.
+      int64_t gather = 0;
+      if (attr_i(*node, "gather", gather) && gather != 0) {
+        if (!grammar_ids_ || !grammar_count_) { ok = false; break; }
+        ok = nn::cuda::argmax_ids_dev(
+            dev(in[0]), int(in[0].device.size_bytes / sizeof(float)),
+            reinterpret_cast<const int32_t*>(uintptr_t(grammar_ids_.id)),
+            reinterpret_cast<const int32_t*>(uintptr_t(grammar_count_.id)), out);
+        if (ok && token_buf_)
+          ok = device::device_copy(out_handle, token_out_slot(), sizeof(float));
+        break;
+      }
       // The kernel choice is part of a captured decode graph: a backend whose
       // mask buffer was initialized before capture always runs the masked form
       // (all-ones = the unmasked result, bit for bit).
@@ -2501,11 +2588,28 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      const bool masked =
-          argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
       const uint64_t cands = sample_cands_.id;
       const uint64_t count = cands + uint64_t(nn::kSampleCandidates) *
                                           sizeof(nn::Candidate);
+      // A grammar-constrained step selects over the compacted allowed list:
+      // the launch width is the cap, the live entry count is read on device.
+      int64_t gather = 0;
+      if (attr_i(*node, "gather", gather) && gather != 0) {
+        if (!grammar_ids_ || !grammar_count_) { ok = false; break; }
+        ok = nn::cuda::sample_select_ids_dev_dyn(
+            dev(in[0]), vocab,
+            reinterpret_cast<const int32_t*>(uintptr_t(grammar_ids_.id)),
+            reinterpret_cast<const int32_t*>(uintptr_t(grammar_count_.id)),
+            reinterpret_cast<const int32_t*>(uintptr_t(sample_window_.id)),
+            reinterpret_cast<const nn::cuda::SampleSelectParams*>(
+                uintptr_t(sample_params_.id)),
+            reinterpret_cast<nn::Candidate*>(uintptr_t(cands)),
+            reinterpret_cast<int*>(uintptr_t(count)));
+        if (ok) ok = device::device_copy(count, out_handle, sizeof(int32_t));
+        break;
+      }
+      const bool masked =
+          argmax_mask_ && argmax_mask_bytes_ >= size_t((vocab + 7) / 8);
       ok = nn::cuda::sample_select_dev_dyn(
           dev(in[0]), vocab,
           masked ? reinterpret_cast<const uint8_t*>(uintptr_t(argmax_mask_.id))

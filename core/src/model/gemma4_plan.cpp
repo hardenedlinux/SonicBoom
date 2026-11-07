@@ -303,7 +303,7 @@ bool decode_family_mmq(quant::QuantType qt, uint64_t in_w, uint64_t out_w) {
 // on the host instead (see score_spine_cuda) — same distribution, one less
 // device op.
 GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
-                       bool softcap_output = true) {
+                       bool softcap_output = true, bool gather = false) {
   using namespace planner;
 
   const auto& cfg = m.config;
@@ -591,8 +591,14 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
       prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
   std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
   mmq_a(logits_attrs, out_qt, d, vocab);
-  mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits", {int64_t(vocab)},
-                           logits_attrs);
+  // Grammar-compacted decode: the lm head computes only the allowed list's
+  // rows (`gather`), a fixed-capacity tensor so one captured graph covers every
+  // step; the terminal node selects over the live prefix of that list.
+  const uint64_t logits_w =
+      gather ? uint64_t(nn::kGrammarGatherCap) : vocab;
+  if (gather) logits_attrs.push_back(attr_i("gather", int64_t(1)));
+  mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits",
+                           {int64_t(logits_w)}, logits_attrs);
 
   // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
   // change argmax — skip it and reduce the [vocab] logits to a single index on
@@ -601,9 +607,12 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
   // sampler needs the distribution).
   mlir::Value out;
   if (greedy) {
-    out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)}, {});
+    std::vector<sx::Attribute> argmax_attrs;
+    if (gather) argmax_attrs.push_back(attr_i("gather", int64_t(1)));
+    out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)},
+                 argmax_attrs);
   } else if (prof.softcap && softcap_output) {
-    out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(vocab)},
+    out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(logits_w)},
                  {attr_f("scale", double(cfg.final_logit_softcapping))});
   } else {
     out = logits;  // no softcapping: the raw logits are the graph output
@@ -3422,6 +3431,10 @@ static uint64_t run_spec_program_steps(
 static std::mutex g_registry_mutex;
 
 static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_decode_runtimes;
+// Grammar sessions' decode runtimes: the same step with the row-gathered lm
+// head and the compacted terminal selection, bound to the same session cache
+// and keyed identically. Built and captured on the first constrained step.
+static std::map<DecodeKey, std::unique_ptr<DecodeRuntime>> g_grammar_runtimes;
 static std::map<DecodeKey, std::unique_ptr<FedRuntime>> g_fed_runtimes;
 
 // A captured step was refused because a resource it recorded no longer has its
@@ -3457,6 +3470,24 @@ static bool capture_reuse_enabled() {
 // is captured one step per graph.
 static uint32_t decode_chunk_size() { return 1; }
 
+// A grammar mask that allows at most nn::kGrammarGatherCap ids selects over the
+// compacted allowed list with a row-gathered lm head. SONICBOOM_GRAMMAR_GATHER=0
+// keeps the dense lm head and the dense masked selection.
+static bool grammar_gather_enabled() {
+  static const bool v = [] {
+    const char* e = std::getenv("SONICBOOM_GRAMMAR_GATHER");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return v;
+}
+
+// SONICBOOM_GRAMMAR_DIAG: one line per constrained step with the allowed-list
+// width and the path it ran (measurement only, off by default).
+static bool grammar_diag_enabled() {
+  static const bool v = std::getenv("SONICBOOM_GRAMMAR_DIAG") != nullptr;
+  return v;
+}
+
 // Route host-memory-space compute tasks (Embedding / Softcap) to the CPU backend
 // and leave device-memory-space tasks on the CUDA backend. Shared by the decode
 // and prefill runtimes so each executor gets the same placement overrides.
@@ -3477,6 +3508,17 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 // Build the greedy decode graph, plan it, and wire up its backends — everything
 // a decode runtime is except the captured step. Split out of
 // get_decode_runtime so the plan recorder can run the very same plan *without*
+// A numerics-affecting lookup that missed while the model-load resolution
+// epoch was closed (or never ran) is a bug: the runtime build fails instead of
+// measuring a choice the loaded model did not resolve. The lookup itself
+// already printed the `[tune] BUG unresolved` line with the key.
+static bool tune_resolution_failed(const char* where) {
+  if (!tune::sealed_missed()) return false;
+  std::cerr << "[tune] runtime build: unresolved numerics choice key="
+            << tune::sealed_miss_key() << " (" << where << ")\n";
+  return true;
+}
+
 // capture: a captured step replays as one graph launch and bypasses the
 // executor, so no per-step launches would be visible to record. Returns nullptr
 // on a build/plan failure (the caller falls back to 0).
@@ -3487,10 +3529,11 @@ static void route_host_tasks(planner::RuntimeExecutor& exec,
 static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
     const GraphTransform* transform = nullptr,
-    const planner::KvCacheSession* session = nullptr) {
+    const planner::KvCacheSession* session = nullptr, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<DecodeRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/true);
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/true, /*rows=*/1,
+                              /*softcap_output=*/true, gather);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
@@ -3572,35 +3615,48 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
 // construction; null builds the anonymous runtime-owned runtime (non-session
 // callers, keyed by cache_id 0). Returns nullptr on a build/plan failure.
 static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
-                                         const planner::KvCacheSession* session) {
+                                         const planner::KvCacheSession* session,
+                                         bool gather = false) {
   const uint64_t cache_id = session ? session->cache_id : 0;
   if (session && (!session->caches || cache_id == 0)) return nullptr;
   const DecodeKey key{&m, n_ctx, cache_id};
+  auto& reg = gather ? g_grammar_runtimes : g_decode_runtimes;
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
-    auto it = g_decode_runtimes.find(key);
-    if (it != g_decode_runtimes.end()) return it->second.get();
+    auto it = reg.find(key);
+    if (it != reg.end()) return it->second.get();
   }
 
-  auto rt = build_decode_runtime(m, n_ctx, /*transform=*/nullptr, session);
+  auto rt = build_decode_runtime(m, n_ctx, /*transform=*/nullptr, session,
+                                 gather);
   if (!rt) return nullptr;
   // The resolution epoch closed at model load: a numerics-affecting miss during
   // the plan build means the model can launch a choice that was never resolved.
   // The lookup already reported it; fail the build rather than measure inside
   // it.
-  if (tune::sealed_missed()) {
-    std::cerr << "[tune] runtime build: unresolved numerics choice key="
-              << tune::sealed_miss_key() << "\n";
-    return nullptr;
-  }
+  if (tune_resolution_failed("decode runtime")) return nullptr;
 
-  // The Argmax mask buffer (constrained decoding). It is allocated here, before
-  // any capture, because the captured graphs bake the Argmax kernel choice in:
-  // with the buffer present the masked kernel is recorded for every decode
-  // runtime, and all-ones makes it bit-identical to the unmasked one. A runtime
-  // without it (the build failed) simply cannot be constrained.
-  if (m.config.vocab_size > 0)
+  if (gather) {
+    // The compacted allowed list and its live count exist before any capture:
+    // the captured launches bake their device addresses in. The warm-up below
+    // runs with the full capacity staged, so every buffer the gather matmul
+    // allocates lazily is allocated before the capture records.
+    if (!rt->cuda->grammar_gather_init()) return nullptr;
+    const int cap = int(nn::kGrammarGatherCap);
+    const int rows = int(m.config.vocab_size);
+    std::vector<int32_t> warm_ids(static_cast<size_t>(cap));
+    for (int i = 0; i < cap; ++i)
+      warm_ids[static_cast<size_t>(i)] = rows > 0 ? i % rows : 0;
+    if (!rt->cuda->set_grammar_ids(warm_ids)) return nullptr;
+  } else if (m.config.vocab_size > 0) {
+    // The Argmax mask buffer (constrained decoding). It is allocated here,
+    // before any capture, because the captured graphs bake the Argmax kernel
+    // choice in: with the buffer present the masked kernel is recorded for
+    // every decode runtime, and all-ones makes it bit-identical to the unmasked
+    // one. A runtime without it (the build failed) simply cannot be
+    // constrained.
     rt->cuda->argmax_mask_init(size_t((m.config.vocab_size + 7) / 8));
+  }
 
   // Capture the greedy decode step once (the warm-up run allocates every pooled
   // device buffer and weight-upload so the capture pass only records).
@@ -3722,10 +3778,10 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   // Another thread may have built the same key while we did: keep the one in
   // the map (a capture bound to this cache is equivalent) and drop ours.
   std::lock_guard<std::mutex> lk(g_registry_mutex);
-  auto it = g_decode_runtimes.find(key);
-  if (it != g_decode_runtimes.end()) return it->second.get();
+  auto it = reg.find(key);
+  if (it != reg.end()) return it->second.get();
   DecodeRuntime* raw = rt.get();
-  g_decode_runtimes.emplace(key, std::move(rt));
+  reg.emplace(key, std::move(rt));
   return raw;
 }
 
@@ -3756,7 +3812,8 @@ uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
 // SampleSelect node, and make the node's 4-byte candidate count the graph
 // output. The logits stay device-resident; the planner sees the count as a
 // scalar float tensor (the same shape the greedy graph's Argmax output has).
-static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab) {
+static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab,
+                                      bool gather = false) {
   if (g.outputs.size() != 1 || vocab == 0) return false;
   const planner::TensorId logits_id = g.outputs[0];
   const planner::TensorDesc* logits = g.find_tensor(logits_id);
@@ -3781,6 +3838,7 @@ static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab) {
   node.outputs = {count_id};
   node.name = "sample_select";
   node.backend = planner::BackendTag::Sonic;
+  if (gather) node.attributes.push_back(sx::Attribute{"gather", int64_t(1)});
   g.nodes.push_back(std::move(node));
   for (auto& t : g.tensors) t.is_graph_output = (t.id == count_id);
   g.outputs = {count_id};
@@ -3801,19 +3859,26 @@ struct SampledRuntime {
 };
 
 static std::map<DecodeKey, std::unique_ptr<SampledRuntime>> g_sampled_runtimes;
+// The same, with the row-gathered lm head and the compacted-list selection
+// (grammar-constrained steps).
+static std::map<DecodeKey, std::unique_ptr<SampledRuntime>>
+    g_sampled_grammar_runtimes;
 
 static std::unique_ptr<SampledRuntime> build_sampled_runtime(
     const Gemma4Model& m, uint64_t n_ctx,
-    const planner::KvCacheSession& session) {
+    const planner::KvCacheSession& session, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<SampledRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/false);
+  GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
+                              /*softcap_output=*/true, gather);
   rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
                           quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
                           /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
                           /*rows_mmq=*/decode_mmq_available());
   if (rt->graph.nodes.empty()) return nullptr;
-  if (!append_sample_select_tail(rt->graph, m.config.vocab_size)) return nullptr;
+  const uint64_t logits_w =
+      gather ? uint64_t(nn::kGrammarGatherCap) : m.config.vocab_size;
+  if (!append_sample_select_tail(rt->graph, logits_w, gather)) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);
@@ -3843,24 +3908,43 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
 // pays the capture, which is why the session warm-up builds it ahead of the
 // first request.
 static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
-                                           const planner::KvCacheSession& session) {
+                                           const planner::KvCacheSession& session,
+                                           bool gather = false) {
   if (!session.caches || session.cache_id == 0 ||
       m.config.vocab_size == 0)
     return nullptr;
   const DecodeKey key{&m, n_ctx, session.cache_id};
+  auto& reg = gather ? g_sampled_grammar_runtimes : g_sampled_runtimes;
   {
     std::lock_guard<std::mutex> lk(g_registry_mutex);
-    auto it = g_sampled_runtimes.find(key);
-    if (it != g_sampled_runtimes.end()) return it->second.get();
+    auto it = reg.find(key);
+    if (it != reg.end()) return it->second.get();
   }
 
-  auto rt = build_sampled_runtime(m, n_ctx, session);
+  auto rt = build_sampled_runtime(m, n_ctx, session, gather);
   if (!rt) return nullptr;
+  // Same rule as the greedy runtime: a numerics-affecting miss during the
+  // build fails it instead of resolving outside the model-load epoch.
+  if (tune_resolution_failed("sampled runtime")) return nullptr;
   rt->cache = session.caches;
   rt->cache_id = session.cache_id;
   // The candidate/parameter/window buffers (and the grammar mask bitmap) exist
-  // before any capture: a captured launch bakes their device pointers in.
-  if (!rt->cuda->sample_select_init(int(m.config.vocab_size))) return nullptr;
+  // before any capture: a captured launch bakes their device pointers in. The
+  // gathered runtime's candidate geometry is the compacted cap, and its allowed
+  // list starts as a valid full-capacity list so the capture's warm-up step
+  // allocates every buffer the gathered lm head needs.
+  if (gather) {
+    if (!rt->cuda->grammar_gather_init()) return nullptr;
+    const int cap = int(nn::kGrammarGatherCap);
+    const int rows = int(m.config.vocab_size);
+    std::vector<int32_t> warm_ids(static_cast<size_t>(cap));
+    for (int i = 0; i < cap; ++i)
+      warm_ids[static_cast<size_t>(i)] = rows > 0 ? i % rows : 0;
+    if (!rt->cuda->set_grammar_ids(warm_ids)) return nullptr;
+    if (!rt->cuda->sample_select_init(cap)) return nullptr;
+  } else if (!rt->cuda->sample_select_init(int(m.config.vocab_size))) {
+    return nullptr;
+  }
 
   // Warm-up on the session cache with KV stores suppressed: the step would
   // otherwise append a row at a tail position, which a sliding-window ring maps
@@ -3889,10 +3973,10 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
   }
 
   std::lock_guard<std::mutex> lk(g_registry_mutex);
-  auto it = g_sampled_runtimes.find(key);
-  if (it != g_sampled_runtimes.end()) return it->second.get();
+  auto it = reg.find(key);
+  if (it != reg.end()) return it->second.get();
   SampledRuntime* raw = rt.get();
-  g_sampled_runtimes.emplace(key, std::move(rt));
+  reg.emplace(key, std::move(rt));
   return raw;
 }
 
@@ -3914,6 +3998,12 @@ struct SampledState {
   uint64_t mask_bytes = 0;
   uint64_t cands = 0;    // device kSampleCandidates Candidates, then the int count
   uint64_t cand_bytes = 0;
+  // Grammar selection over the compacted allowed list: the list itself and the
+  // logits gathered onto it, kGrammarGatherCap entries each.
+  uint64_t ids = 0;      // device int32[kGrammarGatherCap]
+  uint64_t compact = 0;  // device float[kGrammarGatherCap]
+  uint64_t ids_bytes = 0;
+  uint64_t compact_bytes = 0;
   std::vector<int32_t> window_host;
   std::vector<nn::Candidate> cand_host;
 };
@@ -3939,6 +4029,9 @@ void sampled_state_free(SampledState* state) {
                                  sizeof(int32_t));
   if (state->mask) planner::device::release(state->mask, state->mask_bytes);
   if (state->cands) planner::device::release(state->cands, state->cand_bytes);
+  if (state->ids) planner::device::release(state->ids, state->ids_bytes);
+  if (state->compact)
+    planner::device::release(state->compact, state->compact_bytes);
   delete state;
 }
 
@@ -4004,24 +4097,63 @@ int64_t sampled_first_token_cuda(const Gemma4Model& m, SampledState& state,
                                uint64_t(n) * sizeof(int32_t)))
     return -1;
   const uint8_t* mask_dev = nullptr;
+  std::vector<int32_t> allowed;
   if (!sample_mask.empty()) {
     if (sample_mask.size() != state.mask_bytes ||
         !planner::device::upload(sample_mask.data(), state.mask,
                                  state.mask_bytes))
       return -1;
     mask_dev = reinterpret_cast<const uint8_t*>(uintptr_t(state.mask));
+    allowed = nn::allowed_ids(sample_mask, int64_t(state.vocab));
   }
   const uint64_t count_dev =
       state.cands + uint64_t(nn::kSampleCandidates) * sizeof(nn::Candidate);
-  if (!nn::cuda::sample_select_dev(
-          reinterpret_cast<const float*>(uintptr_t(state.logits)), state.vocab,
-          mask_dev,
-          reinterpret_cast<const int32_t*>(uintptr_t(state.window)), int(n),
-          sampling.temperature, sampling.repeat_penalty,
-          sampling.presence_penalty, sampling.frequency_penalty,
-          reinterpret_cast<nn::Candidate*>(uintptr_t(state.cands)),
-          reinterpret_cast<int*>(uintptr_t(count_dev))))
-    return -1;
+  const auto* logits_dev =
+      reinterpret_cast<const float*>(uintptr_t(state.logits));
+  const auto* window_dev =
+      reinterpret_cast<const int32_t*>(uintptr_t(state.window));
+  auto* cands_dev = reinterpret_cast<nn::Candidate*>(uintptr_t(state.cands));
+  auto* count_out = reinterpret_cast<int*>(uintptr_t(count_dev));
+  bool ok = false;
+  if (nn::grammar_gather_ok(int64_t(allowed.size()))) {
+    // The mask narrows the choice to a small list: gather the dense logits onto
+    // it and select over the list (same candidates, same draw).
+    const uint64_t ids_bytes =
+        uint64_t(nn::kGrammarGatherCap) * sizeof(int32_t);
+    const uint64_t compact_bytes =
+        uint64_t(nn::kGrammarGatherCap) * sizeof(float);
+    if (!state.ids) {
+      state.ids = planner::device::acquire(ids_bytes);
+      state.compact = planner::device::acquire(compact_bytes);
+      if (!state.ids || !state.compact) {
+        if (state.ids) planner::device::release(state.ids, ids_bytes);
+        if (state.compact) planner::device::release(state.compact, compact_bytes);
+        state.ids = state.compact = 0;
+        return -1;
+      }
+      state.ids_bytes = ids_bytes;
+      state.compact_bytes = compact_bytes;
+    }
+    const int m = int(allowed.size());
+    const auto* ids_dev =
+        reinterpret_cast<const int32_t*>(uintptr_t(state.ids));
+    auto* compact_dev = reinterpret_cast<float*>(uintptr_t(state.compact));
+    ok = planner::device::upload(allowed.data(), state.ids,
+                                 uint64_t(m) * sizeof(int32_t)) &&
+         nn::cuda::compact_f32_dev(logits_dev, ids_dev, m, compact_dev) &&
+         nn::cuda::sample_select_ids_dev(
+             compact_dev, m, ids_dev, window_dev, int(n),
+             sampling.temperature, sampling.repeat_penalty,
+             sampling.presence_penalty, sampling.frequency_penalty, cands_dev,
+             count_out);
+  } else {
+    ok = nn::cuda::sample_select_dev(
+        logits_dev, state.vocab, mask_dev, window_dev, int(n),
+        sampling.temperature, sampling.repeat_penalty,
+        sampling.presence_penalty, sampling.frequency_penalty, cands_dev,
+        count_out);
+  }
+  if (!ok) return -1;
   int count = 0;
   if (!planner::device::download(count_dev, &count, sizeof(count))) return -1;
   if (count < 0 || count > nn::kSampleCandidates) return -1;
@@ -4043,9 +4175,21 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
   if (m.config.vocab_size == 0 || token >= m.config.vocab_size) return -1;
   if (!(sampling.temperature > 0.0f) || session.n_ctx == 0) return -1;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-  SampledRuntime* rt = get_sampled_runtime(m, session.n_ctx, session);
+  // A narrow grammar mask selects over the compacted allowed list and the
+  // row-gathered lm head; a dense step keeps the full-vocabulary graph.
+  std::vector<int32_t> allowed;
+  if (!sample_mask.empty())
+    allowed = nn::allowed_ids(sample_mask, int64_t(m.config.vocab_size));
+  const bool gather =
+      grammar_gather_enabled() && nn::grammar_gather_ok(int64_t(allowed.size()));
+  if (grammar_diag_enabled())
+    std::fprintf(stderr, "[grammar] m=%zu gather=%d\n", allowed.size(),
+                 gather ? 1 : 0);
+  SampledRuntime* rt = get_sampled_runtime(m, session.n_ctx, session, gather);
   if (!rt) return -1;
-  if (sample_mask.empty()) {
+  if (gather) {
+    if (!rt->cuda->set_grammar_ids(allowed)) return -1;
+  } else if (sample_mask.empty()) {
     if (!rt->cuda->clear_argmax_mask()) return -1;
   } else if (!rt->cuda->set_argmax_mask(sample_mask)) {
     return -1;
@@ -4217,11 +4361,13 @@ static bool warm_verify_runtime(VerifyRuntime& rt, uint64_t n_ctx, int rows,
 // running another graph.
 static std::unique_ptr<VerifySet> build_verify_set(
     const Gemma4Model& m, uint64_t n_ctx,
-    const planner::KvCacheSession& session) {
+    const planner::KvCacheSession& session, int limit_override = 0) {
   auto set = std::make_unique<VerifySet>();
   set->cache = session.caches;
   set->cache_id = session.cache_id;
-  const int limit = std::min<int>(planner::kMaxVerifyRows, verify_row_limit());
+  const int limit =
+      std::min<int>(planner::kMaxVerifyRows,
+                    limit_override > 0 ? limit_override : verify_row_limit());
   if (limit < 2) return nullptr;
   const bool graphs = cuda_graph_decode_enabled();
   const auto t0 = std::chrono::steady_clock::now();
@@ -4305,6 +4451,7 @@ static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
 
   auto set = build_verify_set(m, n_ctx, session);
   if (!set) return nullptr;
+  if (tune_resolution_failed("verify set")) return nullptr;
 
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_verify_runtimes.find(key);
@@ -4361,6 +4508,7 @@ static VerifyRuntime* get_repro_verify_runtime(
   }
   auto rt = build_verify_runtime(m, n_ctx, rows, session);
   if (!rt) return nullptr;
+  if (tune_resolution_failed("repro verify runtime")) return nullptr;
   // Warm and capture like the spec set. The warm-up's KV writes are suppressed,
   // so no live row of the session cache is touched before the first chunk.
   (void)warm_verify_runtime(*rt, n_ctx, rows, cuda_graph_decode_enabled());
@@ -4370,6 +4518,40 @@ static VerifyRuntime* get_repro_verify_runtime(
   VerifyRuntime* raw = rt.get();
   g_repro_verify_runtimes.emplace(key, std::move(rt));
   return raw;
+}
+
+// Forced-token runs: a grammar step with exactly one allowed token runs as one
+// verify batch, whose row i is the plain decode at position start_pos+i. The
+// spec set exists only for modes that speculate, and a forced run is
+// grammar-driven and independent of speculation, so this set is its own, keyed
+// like the others and built for every reachable width on first use (the first
+// batch pays the replay, not the build).
+static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
+                std::unique_ptr<VerifySet>>
+    g_forced_verify_runtimes;
+
+static VerifyRuntime* get_forced_verify_runtime(
+    const Gemma4Model& m, uint64_t n_ctx, int rows,
+    const planner::KvCacheSession& session) {
+  if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
+  if (!session.caches || session.cache_id == 0) return nullptr;
+  const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
+  {
+    std::lock_guard<std::mutex> lk(g_registry_mutex);
+    auto it = g_forced_verify_runtimes.find(key);
+    if (it != g_forced_verify_runtimes.end())
+      return it->second->rows[size_t(rows)].get();
+  }
+  auto built = build_verify_set(m, n_ctx, session, planner::kMaxVerifyRows);
+  if (!built) return nullptr;
+  if (tune_resolution_failed("forced verify set")) return nullptr;
+  std::lock_guard<std::mutex> lk(g_registry_mutex);
+  auto it = g_forced_verify_runtimes.find(key);
+  if (it != g_forced_verify_runtimes.end())
+    return it->second->rows[size_t(rows)].get();
+  VerifySet* raw = built.get();
+  g_forced_verify_runtimes.emplace(key, std::move(built));
+  return raw->rows[size_t(rows)].get();
 }
 
 static double verify_last_step_ms(const Gemma4Model& m, uint64_t n_ctx,
@@ -4588,6 +4770,8 @@ bool decode_steps_spine_cuda(const Gemma4Model& m,
   if (!fr) {
     auto rt = build_decode_runtime(m, session.n_ctx, nullptr, &session);
     if (!rt) return fail("decode runtime build failed");
+    if (tune_resolution_failed("fed decode runtime"))
+      return fail("decode runtime numerics unresolved");
     auto entry = std::make_unique<FedRuntime>(
         FedRuntime{std::move(rt), std::shared_ptr<void>(session.caches),
                    session.cache_id});
@@ -4762,6 +4946,59 @@ static bool verify_step_reckless(const Gemma4Model& m,
   return true;
 }
 
+// One verify width, run against an already-resolved runtime: replay the
+// capture when it is still bound to this session's resources, otherwise run
+// the same graph through the uncaptured executor, then read the per-row argmax
+// back. `tag` prefixes the diagnostic, so a failure names the caller's path.
+static bool run_verify_step(const Gemma4Model& m,
+                            planner::KvCacheSession& session,
+                            std::span<const uint64_t> tokens,
+                            uint64_t start_pos, VerifyRuntime* rt,
+                            std::span<int64_t> out, const char* tag) {
+  auto fail = [tag](const char* why) {
+    std::cerr << tag << why << "\n";
+    return false;
+  };
+  const int rows = int(tokens.size());
+  // Replay only while the capture's recorded resources are still this
+  // session's; otherwise run the same graph through the uncaptured executor.
+  const bool replay_ok =
+      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
+  if (rt->prog && !replay_ok)
+    log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
+  if (replay_ok) {
+    // Stage the row token ids and the base position on the captured graph's
+    // stream, then one replay: the whole verify step is one graph launch.
+    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
+        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
+      return fail("staging failed");
+    // The replay is async on the graph stream; the token readback must see the
+    // completed step (the readback copy orders against the graph's stream).
+    // The timing events bracket only the replay, so the curve prices device
+    // work, not the staging or the host round-trip.
+    (void)rt->prog->timing_begin();
+    const bool replayed = rt->prog->replay();
+    (void)rt->prog->timing_end();
+    if (!replayed || !rt->prog->sync())
+      return fail("graph replay failed");
+  } else {
+    if (!rt->cuda->set_prefill_tokens(tokens) ||
+        !rt->cuda->set_verify_pos(start_pos, rows))
+      return fail("staging failed");
+    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
+    auto res = rt->exec->execute(rt->plan, rt->snap, in);
+    if (!res) {
+      std::cerr << tag << "execute failed: " << res.error().message << "\n";
+      return false;
+    }
+  }
+  float host[planner::kMaxVerifyRows];
+  if (!rt->cuda->read_verify_tokens(host, rows))
+    return fail("token readback failed");
+  for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
+  return true;
+}
+
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -4791,45 +5028,36 @@ bool verify_step_spine_cuda(const Gemma4Model& m,
   }
   VerifyRuntime* rt = get_verify_runtime(m, session.n_ctx, rows, session);
   if (!rt) return fail("verify runtime build failed");
+  return run_verify_step(m, session, tokens, start_pos, rt, out,
+                         "[spec] verify: ");
+}
 
-  // Replay only while the capture's recorded resources are still this
-  // session's; otherwise run the same graph through the uncaptured executor.
-  const bool replay_ok =
-      rt->prog && rt->cuda->capture_resources_ok(session.cache_id);
-  if (rt->prog && !replay_ok)
-    log_capture_refusal("verify", m, session.n_ctx, session.cache_id);
-  if (replay_ok) {
-    // Stage the row token ids and the base position on the captured graph's
-    // stream, then one replay: the whole verify step is one graph launch.
-    if (!rt->cuda->stage_prefill_tokens(*rt->prog, tokens) ||
-        !rt->cuda->stage_verify_pos(*rt->prog, start_pos, rows))
-      return fail("staging failed");
-    // The replay is async on the graph stream; the token readback must see the
-    // completed step (the readback copy orders against the graph's stream).
-    // The timing events bracket only the replay, so the curve prices device
-    // work, not the staging or the host round-trip.
-    (void)rt->prog->timing_begin();
-    const bool replayed = rt->prog->replay();
-    (void)rt->prog->timing_end();
-    if (!replayed || !rt->prog->sync())
-      return fail("graph replay failed");
-  } else {
-    if (!rt->cuda->set_prefill_tokens(tokens) ||
-        !rt->cuda->set_verify_pos(start_pos, rows))
-      return fail("staging failed");
-    const std::vector<sx::Bytes> in{encode_i64(0), encode_i64(start_pos)};
-    auto res = rt->exec->execute(rt->plan, rt->snap, in);
-    if (!res) {
-      std::cerr << "[spec] verify: execute failed: "
-                << res.error().message << "\n";
-      return false;
-    }
-  }
-  float host[planner::kMaxVerifyRows];
-  if (!rt->cuda->read_verify_tokens(host, rows))
-    return fail("token readback failed");
-  for (int i = 0; i < rows; ++i) out[i] = int64_t(host[i]);
-  return true;
+// One batch of forced tokens: rows 2..15, the same per-row arithmetic as plain
+// decode, through the set that does not depend on the speculation mode.
+bool verify_step_forced_cuda(const Gemma4Model& m,
+                             std::span<const uint64_t> tokens,
+                             uint64_t start_pos,
+                             planner::KvCacheSession& session,
+                             std::span<int64_t> out) {
+  auto fail = [](const char* why) {
+    std::cerr << "[grammar] verify: " << why << "\n";
+    return false;
+  };
+  const int rows = int(tokens.size());
+  if (rows < 2 || rows > planner::kMaxVerifyRows || out.size() < tokens.size())
+    return fail("bad row count");
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+  if (session.n_ctx == 0 || !session.caches) return fail("session has no cache");
+  if (start_pos + uint64_t(rows) > session.n_ctx)
+    return fail("positions exceed the session cache");
+  if (spec_reckless_unsupported())
+    return fail("reckless mode is unsupported under the strict numerics "
+                "profile");
+  VerifyRuntime* rt =
+      get_forced_verify_runtime(m, session.n_ctx, rows, session);
+  if (!rt) return fail("verify runtime build failed");
+  return run_verify_step(m, session, tokens, start_pos, rt, out,
+                         "[grammar] verify: ");
 }
 
 bool spec_step_spine_cuda(const Gemma4Model& m, uint64_t last_token,
@@ -4903,8 +5131,17 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
     if (matches(it->first)) it = g_decode_runtimes.erase(it);
     else ++it;
   }
+  for (auto it = g_grammar_runtimes.begin(); it != g_grammar_runtimes.end();) {
+    if (matches(it->first)) it = g_grammar_runtimes.erase(it);
+    else ++it;
+  }
   for (auto it = g_sampled_runtimes.begin(); it != g_sampled_runtimes.end();) {
     if (matches(it->first)) it = g_sampled_runtimes.erase(it);
+    else ++it;
+  }
+  for (auto it = g_sampled_grammar_runtimes.begin();
+       it != g_sampled_grammar_runtimes.end();) {
+    if (matches(it->first)) it = g_sampled_grammar_runtimes.erase(it);
     else ++it;
   }
   for (auto it = g_fed_runtimes.begin(); it != g_fed_runtimes.end();) {
@@ -4925,6 +5162,15 @@ void release_session_runtimes(const Gemma4Model& m, uint64_t n_ctx,
         std::get<2>(it->first) == cache_id &&
         (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
       it = g_repro_verify_runtimes.erase(it);
+    else
+      ++it;
+  }
+  for (auto it = g_forced_verify_runtimes.begin();
+       it != g_forced_verify_runtimes.end();) {
+    if (std::get<0>(it->first) == &m &&
+        std::get<2>(it->first) == cache_id &&
+        (n_ctx == 0 || std::get<1>(it->first) == n_ctx))
+      it = g_forced_verify_runtimes.erase(it);
     else
       ++it;
   }
@@ -5158,8 +5404,8 @@ bool resolve_tune_for_model(const Gemma4Model& m) {
   warm_decode_attn_model(m);
   tune::seal();
   if (tune::sealed_missed()) {
-    std::cerr << "[tune] model load: numerics resolution incomplete key="
-              << tune::sealed_miss_key() << "\n";
+    std::cerr << "[tune] BUG unresolved key=" << tune::sealed_miss_key()
+              << " at model load\n";
     return false;
   }
   return true;
@@ -5176,12 +5422,11 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
   // region. Reported as success: skipping the warm-up is not a failure.
   if (!runtime::feature_enabled(runtime::Feature::Warmup)) return true;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-  // The numerics-affecting choices are resolved at model load. A model that
-  // reached this path without that step (a direct model::load_gemma4 caller)
-  // resolves them here, exactly as the load does, before the runtimes below
-  // build any graph; a loaded model is already sealed, so this is a no-op and
-  // the epoch's table is read as-is.
-  if (!tune::sealed() && !resolve_tune_for_model(m)) return false;
+  // The numerics-affecting choices are resolved by the common model load
+  // (model::load_gemma4), which is the only resolver. A model that reached
+  // this path without that step is refused by the runtime build below: the
+  // unresolved lookup is reported and the build fails, rather than silently
+  // resolving outside the load epoch.
   // The warm-up builds the same runtimes the first request would, bound to the
   // caller's session cache from construction. The sampled capture bakes that
   // cache's device pointers in, so it cannot be warmed on a temporary set and
@@ -5248,6 +5493,25 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   if (!rt) return 0;
   rt = spec_resolve_probe(m, rt, n_ctx, start_pos, session);
   if (!rt) return 0;
+  // A narrow grammar mask runs the gathered decode graph: the lm head reads
+  // only the allowed vocabulary rows and the Argmax reduces the compacted list.
+  // The runtime is bound to the same session cache and captured per tier, so
+  // the step below is the same replay path with a different graph.
+  std::vector<int32_t> allowed;
+  bool gather_step = false;
+  if (masked) {
+    allowed = nn::allowed_ids(sample_mask, int64_t(m.config.vocab_size));
+    gather_step =
+        grammar_gather_enabled() && nn::grammar_gather_ok(int64_t(allowed.size()));
+    if (gather_step) {
+      DecodeRuntime* gathered = get_decode_runtime(m, n_ctx, session, true);
+      if (!gathered) return 0;
+      rt = gathered;
+    }
+    if (grammar_diag_enabled())
+      std::fprintf(stderr, "[grammar] m=%zu gather=%d\n", allowed.size(),
+                   gather_step ? 1 : 0);
+  }
   // Every replay below is gated on the capture's recorded resources still
   // having their identities. A refused capture falls back to the uncaptured
   // executor for the same step (same graph, same kernels).
@@ -5270,8 +5534,16 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     // Constrained decoding: one masked step, then return (the caller accepts
     // the token and supplies the next position's mask). The captured graphs bake
     // in the masked Argmax kernel (get_decode_runtime initializes the mask
-    // buffer before capture), so this only stages the bitmap and the inputs.
-    if (!rt->cuda->set_argmax_mask(sample_mask)) {
+    // buffer before capture), so this only stages the bitmap and the inputs. A
+    // gathered step stages the allowed list and its count instead, and re-seeds
+    // the token slot on the gathered runtime.
+    if (gather_step) {
+      if (!rt->cuda->set_grammar_ids(allowed)) {
+        std::cerr << "[spine] constrained step: grammar list upload failed\n";
+        return 0;
+      }
+      rt->cuda->seed_token(start_token);
+    } else if (!rt->cuda->set_argmax_mask(sample_mask)) {
       std::cerr << "[spine] constrained step: mask upload failed\n";
       return 0;
     }
@@ -5536,6 +5808,7 @@ std::optional<planner::PlanRunRecord> record_decode_plan(
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   auto rt = build_decode_runtime(m, n_ctx, &transform);
   if (!rt) return std::nullopt;
+  if (tune_resolution_failed("record decode plan")) return std::nullopt;
 
   planner::PlanRecorder rec;
   RecorderScope scope(&rec);
@@ -5648,6 +5921,12 @@ bool decode_steps_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
 bool verify_step_spine_cuda(const Gemma4Model&, std::span<const uint64_t>,
                             uint64_t, planner::KvCacheSession&,
                             std::span<int64_t>) {
+  return false;  // built without CUDA: no device spine to run
+}
+
+bool verify_step_forced_cuda(const Gemma4Model&, std::span<const uint64_t>,
+                             uint64_t, planner::KvCacheSession&,
+                             std::span<int64_t>) {
   return false;  // built without CUDA: no device spine to run
 }
 
@@ -5796,6 +6075,7 @@ static DecodeRuntime* get_repro_eval_runtime(
   }
   auto rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false, &session);
   if (!rt) return nullptr;
+  if (tune_resolution_failed("eval runtime")) return nullptr;
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_repro_eval_runtimes.find(key);
   if (it != g_repro_eval_runtimes.end()) return it->second.get();
@@ -5977,6 +6257,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     Phase _p("prefill:build_decode_graph", phase_timing);
     dump_rt = build_eval_runtime(m, n_ctx, /*raw_logits=*/false, session);
     if (!dump_rt) return 0;
+    if (tune_resolution_failed("prefill eval runtime")) return 0;
     rt = dump_rt.get();
   }
   // Either stage this call's grammar mask or make sure a previous call's mask
@@ -6589,6 +6870,7 @@ bool score_spine_cuda_impl(const Gemma4Model& m,
     std::cerr << "[score] eval runtime build failed\n";
     return false;
   }
+  if (tune_resolution_failed("score eval runtime")) return false;
   std::vector<float> lf(vocab);
   // The model's distribution is the softcapped one. Gemma defines its output
   // logits as cap * tanh(logits / cap) — HF's GemmaForCausalLM applies it inside

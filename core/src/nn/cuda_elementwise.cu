@@ -2047,15 +2047,19 @@ __device__ __forceinline__ int select_hash_count(const unsigned long long* ht,
   }
 }
 
-// z for token i. The window lookup is skipped when the window is empty; neutral
-// penalties reproduce v exactly (fmaf(0, c, 0) == 0, fmaf(-1, 0, v) == v).
+// z for token i. `token` is the vocabulary id the logit belongs to: i itself
+// for a dense logits vector, ids[i] when the logits are compacted onto the
+// grammar's allowed list. The window lookup is skipped when the window is
+// empty; neutral penalties reproduce v exactly (fmaf(0, c, 0) == 0,
+// fmaf(-1, 0, v) == v).
 __device__ __forceinline__ float select_z(const float* __restrict__ logits, int i,
+                                          int token,
                                           const unsigned long long* ht,
                                           int window_len, float temperature,
                                           float rp, float pres, float freq) {
   float v = logits[i];
   if (window_len > 0) {
-    const int c = select_hash_count(ht, uint32_t(i));
+    const int c = select_hash_count(ht, uint32_t(token));
     if (c > 0 && (rp != 1.0f || pres != 0.0f || freq != 0.0f))
       v = select_adjust_logit(v, unsigned(c), rp, pres, freq);
   }
@@ -2064,7 +2068,8 @@ __device__ __forceinline__ float select_z(const float* __restrict__ logits, int 
 
 __global__ void sample_select_kernel(
     const float* __restrict__ logits, int vocab,
-    const uint8_t* __restrict__ mask, const int32_t* __restrict__ window,
+    const uint8_t* __restrict__ mask, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ count, const int32_t* __restrict__ window,
     const SampleSelectParams* __restrict__ dyn, int window_len,
     float temperature, float repeat_penalty, float presence, float frequency,
     unsigned long long* __restrict__ keys, Candidate* __restrict__ out,
@@ -2076,6 +2081,10 @@ __global__ void sample_select_kernel(
     presence = dyn->presence_penalty;
     frequency = dyn->frequency_penalty;
   }
+  // Compacted form: the launch width is the list capacity and the live entry
+  // count is staged on the device, so one captured launch covers every step.
+  int limit = vocab;
+  if (count) limit = min(*count, vocab);
   const int tid = threadIdx.x;
 
   __shared__ int32_t s_window[kSampleSelectMaxWindow];
@@ -2097,22 +2106,28 @@ __global__ void sample_select_kernel(
   __syncthreads();
   for (int i = tid; i < window_len; i += blockDim.x) {
     const int t = s_window[i];
-    if (t >= 0 && t < vocab) select_hash_insert(s_hash, uint32_t(t));
+    // Dense: tokens outside the vocabulary never adjust a logit. Compact: the
+    // window ids are vocabulary ids while `vocab` is the allowed-list width,
+    // so the vocabulary bound does not apply; any window id absent from the
+    // list simply matches no candidate.
+    if (t >= 0 && (ids != nullptr || t < vocab))
+      select_hash_insert(s_hash, uint32_t(t));
   }
   __syncthreads();
 
   // z per token, packed into a key; masked ids carry the sentinel key 0 (a real
   // key always has a non-zero low word or ordinal, and the sentinel is checked
   // explicitly in the passes below).
-  for (int i = tid; i < vocab; i += blockDim.x) {
+  for (int i = tid; i < limit; i += blockDim.x) {
     if (mask && !mask_bit(mask, i)) {
       keys[i] = 0ull;
       continue;
     }
+    const int token = ids != nullptr ? ids[i] : i;
     const float z =
-        select_z(logits, i, s_hash, window_len, temperature, repeat_penalty,
-                 presence, frequency);
-    keys[i] = select_key(z, i);
+        select_z(logits, i, token, s_hash, window_len, temperature,
+                 repeat_penalty, presence, frequency);
+    keys[i] = select_key(z, token);
     atomicAdd(&s_total, 1u);
   }
   __syncthreads();
@@ -2134,7 +2149,7 @@ __global__ void sample_select_kernel(
       const int shift = 56 - 8 * pass;
       for (int d = tid; d < 256; d += blockDim.x) s_hist[d] = 0u;
       __syncthreads();
-      for (int i = tid; i < vocab; i += blockDim.x) {
+      for (int i = tid; i < limit; i += blockDim.x) {
         const unsigned long long k = keys[i];
         if (k == 0ull) continue;
         if (pass > 0 && (k >> (shift + 8)) != (prefix >> (shift + 8)))
@@ -2170,23 +2185,24 @@ __global__ void sample_select_kernel(
   // deterministic.
   if (tid == 0) s_fill = 0;
   __syncthreads();
-  for (int i = tid; i < vocab; i += blockDim.x) {
+  for (int i = tid; i < limit; i += blockDim.x) {
     const unsigned long long k = keys[i];
     if (k == 0ull) continue;
     if (total >= kSampleCandidates && k < threshold) continue;
     const int slot = atomicAdd(&s_fill, 1);
     if (slot < kSampleCandidates) {
+      const int token = ids != nullptr ? ids[i] : i;
       s_keys[slot] = k;
-      s_z[slot] = select_z(logits, i, s_hash, window_len, temperature,
+      s_z[slot] = select_z(logits, i, token, s_hash, window_len, temperature,
                            repeat_penalty, presence, frequency);
-      s_id[slot] = i;
+      s_id[slot] = token;
     }
   }
   __syncthreads();
 
-  const int count = total < kSampleCandidates ? total : kSampleCandidates;
+  const int nfill = total < kSampleCandidates ? total : kSampleCandidates;
   for (int i = tid; i < kSampleCandidates; i += blockDim.x) {
-    if (i >= count) {
+    if (i >= nfill) {
       s_keys[i] = 0ull;
       s_z[i] = 0.0f;
       s_id[i] = -1;
@@ -2219,8 +2235,8 @@ __global__ void sample_select_kernel(
     }
   }
 
-  if (tid < count) out[tid] = Candidate{s_id[tid], s_z[tid]};
-  if (tid == 0) *out_count = count;
+  if (tid < nfill) out[tid] = Candidate{s_id[tid], s_z[tid]};
+  if (tid == 0) *out_count = nfill;
 }
 
 // Packed argmax candidate: value in the high word as a monotone unsigned key
@@ -6682,12 +6698,17 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
                 acc_env != nullptr && std::string_view(acc_env) == "f32"
                     ? "f32"
                     : "f16");
-  attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
-                     sliding_window,
-                     kv_f16 ? "boom_fattn-mma-kv16"
-                            : kv_q8 ? "boom_fattn-mma-kv8" : "boom_fattn-mma",
-                     scfg, sbr, sbk, (n + sbr - 1) / sbr, n_heads_kv, sblock,
-                     ssmem);
+  // The trace reads the start position back from the device, so it is only
+  // evaluated when the trace is on. Building its report calls the read
+  // unconditionally, which puts a synchronous D2H copy in every prefill
+  // attention call.
+  if (attn_trace_on())
+    attn_trace_prefill(attn_trace_read_start(start), n, head_dim, gqa,
+                       sliding_window,
+                       kv_f16 ? "boom_fattn-mma-kv16"
+                              : kv_q8 ? "boom_fattn-mma-kv8" : "boom_fattn-mma",
+                       scfg, sbr, sbk, (n + sbr - 1) / sbr, n_heads_kv, sblock,
+                       ssmem);
   return true;
 }
 
@@ -6795,6 +6816,48 @@ bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
   return cudaGetLastError() == cudaSuccess;
 }
 
+// Greedy selection over a compacted allowed list: entry j belongs to vocabulary
+// id ids[j], and the live entry count is staged on the device (so a captured
+// launch covers every step). Ties go to the lowest vocabulary id: the ids are
+// ascending, and the packed key orders equal values by the smaller entry index.
+__global__ void argmax_ids_kernel(const float* __restrict__ x, int cap,
+                                  const int32_t* __restrict__ ids,
+                                  const int32_t* __restrict__ count,
+                                  float* __restrict__ out) {
+  const int n = min(*count, cap);
+  __shared__ unsigned long long s_key[1024];
+  const int tid = threadIdx.x;
+  unsigned long long k = 0ull;
+  for (int i = tid; i < n; i += blockDim.x) {
+    const unsigned long long c = argmax_key(x[i], i);
+    k = c > k ? c : k;
+  }
+  s_key[tid] = k;
+  __syncthreads();
+  for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+    if (tid < s && s_key[tid + s] > s_key[tid]) s_key[tid] = s_key[tid + s];
+    __syncthreads();
+  }
+  if (tid == 0) {
+    const unsigned long long best = s_key[0];
+    if (best == 0ull) {
+      out[0] = -1.0f;
+      return;
+    }
+    const int j = int(0xFFFFFFFFu - unsigned(best & 0xFFFFFFFFull));
+    out[0] = float(ids[j]);
+  }
+}
+
+bool argmax_ids_dev(const float* x, int cap, const int32_t* ids,
+                    const int32_t* count, float* out) {
+  if (!available()) return false;
+  if (cap <= 0 || cap > 1024 * 4 || !x || !ids || !count || !out) return false;
+  SB_NOTE_LAUNCH(argmax_ids_kernel, 1, 1024, 0, cur_stream());
+  argmax_ids_kernel<<<1, 1024, 0, cur_stream()>>>(x, cap, ids, count, out);
+  return cudaGetLastError() == cudaSuccess;
+}
+
 bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
   if (!available()) return false;
   if (n <= 0 || !x || !mask || !out) return false;
@@ -6824,20 +6887,24 @@ namespace {
 // allocated (never freed) before the launch, so a capture always sees a buffer
 // that is large enough.
 bool sample_select_launch(const float* logits, int vocab, const uint8_t* mask,
-                          const int32_t* window, const SampleSelectParams* dyn,
+                          const int32_t* ids, const int32_t* count,
+                          const int32_t* window,
+                          const SampleSelectParams* dyn,
                           int window_len, float temperature,
                           float repeat_penalty, float presence, float frequency,
                           Candidate* out, int* out_count) {
   if (!available()) return false;
   if (vocab <= 0 || !logits || !out || !out_count) return false;
+  if (ids != nullptr && mask != nullptr) return false;  // one gate at a time
+  if (count != nullptr && ids == nullptr) return false;
   unsigned long long* keys = static_cast<unsigned long long*>(
       grow_scratch_keep(g_select_keys, g_select_keys_bytes,
                         size_t(vocab) * sizeof(unsigned long long)));
   if (!keys) return false;
   SB_NOTE_LAUNCH(sample_select_kernel, 1, kSelectThreads, 0, cur_stream());
   sample_select_kernel<<<1, kSelectThreads, 0, cur_stream()>>>(
-      logits, vocab, mask, window, dyn, window_len, temperature, repeat_penalty,
-      presence, frequency, keys, out, out_count);
+      logits, vocab, mask, ids, count, window, dyn, window_len, temperature,
+      repeat_penalty, presence, frequency, keys, out, out_count);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -6850,9 +6917,9 @@ bool sample_select_dev(const float* logits, int vocab, const uint8_t* mask,
   if (window_len < 0 || window_len > kSampleSelectMaxWindow) return false;
   if (window_len > 0 && !window) return false;
   if (!(temperature > 0.0f)) return false;
-  return sample_select_launch(logits, vocab, mask, window, nullptr, window_len,
-                              temperature, repeat_penalty, presence, frequency,
-                              out, out_count);
+  return sample_select_launch(logits, vocab, mask, nullptr, nullptr, window,
+                              nullptr, window_len, temperature, repeat_penalty,
+                              presence, frequency, out, out_count);
 }
 
 bool sample_select_dev_dyn(const float* logits, int vocab, const uint8_t* mask,
@@ -6860,8 +6927,59 @@ bool sample_select_dev_dyn(const float* logits, int vocab, const uint8_t* mask,
                            const SampleSelectParams* params_dev,
                            Candidate* out, int* out_count) {
   if (!params_dev || !window) return false;
-  return sample_select_launch(logits, vocab, mask, window, params_dev, 0, 0.0f,
-                              0.0f, 0.0f, 0.0f, out, out_count);
+  return sample_select_launch(logits, vocab, mask, nullptr, nullptr, window,
+                              params_dev, 0, 0.0f, 0.0f, 0.0f, 0.0f, out,
+                              out_count);
+}
+
+// Compacted logits: `m` values, value j belonging to vocabulary id ids[j].
+// Same selection as the dense form over that list; the mask must be folded
+// into the list (pass nullptr).
+bool sample_select_ids_dev(const float* logits, int m, const int32_t* ids,
+                           const int32_t* window, int window_len,
+                           float temperature, float repeat_penalty,
+                           float presence, float frequency, Candidate* out,
+                           int* out_count) {
+  if (!ids) return false;
+  if (window_len < 0 || window_len > kSampleSelectMaxWindow) return false;
+  if (window_len > 0 && !window) return false;
+  if (!(temperature > 0.0f)) return false;
+  return sample_select_launch(logits, m, nullptr, ids, nullptr, window, nullptr,
+                              window_len, temperature, repeat_penalty, presence,
+                              frequency, out, out_count);
+}
+
+// Count-staged form: the launch width is `cap` (the captured geometry) and the
+// live entry count is read from the device at replay.
+bool sample_select_ids_dev_dyn(const float* logits, int cap,
+                               const int32_t* ids, const int32_t* count,
+                               const int32_t* window,
+                               const SampleSelectParams* params_dev,
+                               Candidate* out, int* out_count) {
+  if (!params_dev || !window || !ids || !count) return false;
+  return sample_select_launch(logits, cap, nullptr, ids, count, window,
+                              params_dev, 0, 0.0f, 0.0f, 0.0f, 0.0f, out,
+                              out_count);
+}
+
+// y[j] = x[ids[j]] (0 for a negative id), one thread per output element.
+__global__ void compact_f32_kernel(const float* __restrict__ x,
+                                   const int32_t* __restrict__ ids, int m,
+                                   float* __restrict__ y) {
+  const int j = blockIdx.x * blockDim.x + threadIdx.x;
+  if (j >= m) return;
+  const int idx = ids[j];
+  y[j] = idx >= 0 ? x[idx] : 0.0f;
+}
+
+bool compact_f32_dev(const float* x, const int32_t* ids, int m, float* y) {
+  if (!available()) return false;
+  if (m <= 0 || !x || !ids || !y) return false;
+  constexpr int kThreads = 256;
+  const int grid = (m + kThreads - 1) / kThreads;
+  SB_NOTE_LAUNCH(compact_f32_kernel, grid, kThreads, 0, cur_stream());
+  compact_f32_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, ids, m, y);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 // Strided row slice (Section C.5): copies `rows` contiguous `length`-element

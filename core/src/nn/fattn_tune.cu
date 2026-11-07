@@ -2025,10 +2025,13 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
 // Shape classes with a boom_fattn tensor-core instantiation. Every production
 // prefill geometry has one; a shape outside this table is served by the
 // strict-order SIMT path in boom_fattn.cu, which does not go through this
-// tuner (its arithmetic is fixed, so there is nothing to choose).
+// tuner (its arithmetic is fixed, so there is nothing to choose). The
+// d128/GQA-6 class reaches this tuner only when SONICBOOM_FATTN_G6=mma selects
+// its tensor-core kernel; its default is the strict-order path.
 bool supported(int head_dim, int gqa) {
-  return (head_dim == 64 && gqa == 7) || (head_dim == 128 && gqa == 7) ||
-         (head_dim == 256 && gqa == 4) || (head_dim == 512 && gqa == 4);
+  return (head_dim == 64 && gqa == 7) || (head_dim == 128 && gqa == 6) ||
+         (head_dim == 128 && gqa == 7) || (head_dim == 256 && gqa == 4) ||
+         (head_dim == 512 && gqa == 4);
 }
 
 bool run(const Call& call) {

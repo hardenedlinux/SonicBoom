@@ -122,6 +122,22 @@ bool gemv_q8_1_batched_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
                            float* y, int n, std::span<const float> bias = {},
                            const float* add = nullptr);
 
+// Row-gathered lm head (grammar-constrained decode): the compact logits of one
+// step.  y[r] / Y[col][r] for r < m is the dense row idx[r], computed by that
+// lm head's own kernel and arithmetic — the dense value bit for bit.  idx is a
+// device [m] table of dense rows, m <= rows.  The MMQ form takes either an f32
+// activation (quantized internally, as matmul_mmq_dev) or a pre-quantized
+// block_q8_1_mmq activation (as matmul_mmq_q8_dev); the compact output is
+// position-major [n][m].  The gemv form takes a pre-quantized q8_1 activation
+// and writes the single position's [m] values.
+struct BlockQ8_1Mmq;  // defined below (the mmq activation block)
+bool matmul_mmq_gather_dev(const QuantizedTensor& W, const float* X,
+                           const int* row_idx, float* Y, int n, int m);
+bool matmul_mmq_q8_gather_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
+                              const int* row_idx, float* Y, int n, int m);
+bool gemv_q8_1_gather_dev(const QuantizedTensor& W, const BlockQ8_1* xq,
+                          const int* row_idx, float* y, int m);
+
 // The warps-per-row split gemv_q8_1_batched_dev uses for this projection and
 // row count: the warm-up's measured pick for (type, rows, cols, n), or 1 (one
 // warp per row, the reference kernel) when nothing has been measured. Every

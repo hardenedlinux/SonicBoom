@@ -39,6 +39,13 @@ bool available() noexcept;
 // an opaque handle, or 0 on failure.
 uint64_t acquire(uint64_t bytes);
 
+// Like acquire(), but never satisfied from the free list. A captured graph's
+// launches keep pointers into blocks the pool has handed back after it, so a
+// long-lived buffer that took a free block could be overwritten by a replay of
+// an older graph. Buffers that outlive captures (the grammar gather table, for
+// one) take a fresh allocation instead.
+uint64_t acquire_fresh(uint64_t bytes);
+
 // Return `handle` (of the given size) to the free list. No-op on handle == 0.
 void release(uint64_t handle, uint64_t bytes);
 

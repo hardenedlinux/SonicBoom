@@ -2095,16 +2095,10 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
           set_error(err_out, SB_ERRKIND_WEIGHT, m.error().c_str());
           return SB_ERR_WEIGHT;
         }
+        // The model load resolved every numerics-affecting device choice for
+        // this model; every runtime below reads the sealed table rather than
+        // measuring inside a request.
         bundle->model = std::move(*m);
-
-        // Resolve the numerics-affecting device choices for this model now,
-        // before any session or request exists; every runtime below reads the
-        // resulting table rather than measuring inside a request.
-        if (!model::resolve_tune_for_model(bundle->model)) {
-          set_error(err_out, SB_ERRKIND_INTERNAL,
-                    "device numerics resolution failed at model load");
-          return SB_ERR_INTERNAL;
-        }
 
         auto v = vocab::load_vocab(bundle->reader);
         if (!v) {
@@ -2452,6 +2446,108 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
       err_out);
 }
 
+namespace {
+
+// --- forced-token runs ------------------------------------------------------
+//
+// When the grammar allows exactly one next token, the constraint alone fixes
+// it: no model computation is needed to choose it, only the KV rows the
+// equivalent decode steps would write. A run of forced tokens is therefore
+// fed through the verify step as one batch instead of one decode step each.
+// The batch writes the same rows (the verify step is bit-identical to the
+// decode steps), so the cache and every later selection are unchanged.
+// SONICBOOM_GRAMMAR_JUMP=0 disables the batch and keeps the per-token loop.
+
+bool grammar_jump_enabled() {
+  static const bool v = [] {
+    const char *e = std::getenv("SONICBOOM_GRAMMAR_JUMP");
+    return !(e && std::string_view(e) == "0");
+  }();
+  return v;
+}
+
+// SONICBOOM_GRAMMAR_DIAG: one line per forced batch, next to the per-step
+// "[grammar]" lines the decode path already prints. Measurement only.
+bool grammar_jump_diag() {
+  static const bool v = std::getenv("SONICBOOM_GRAMMAR_DIAG") != nullptr;
+  return v;
+}
+
+// The one id an allowed bitmap admits; false when it admits none or two.
+bool mask_only_token(const std::vector<uint8_t> &mask, int32_t *id) {
+  int32_t found = -1;
+  for (size_t b = 0; b < mask.size(); ++b) {
+    unsigned v = mask[b];
+    while (v != 0) {
+      const int32_t t = int32_t(b * 8 + unsigned(__builtin_ctz(v)));
+      if (found >= 0) return false;  // a second set bit
+      found = t;
+      v &= v - 1;
+    }
+  }
+  if (found < 0) return false;
+  *id = found;
+  return true;
+}
+
+struct ForcedRun {
+  std::vector<int32_t> tokens;  // produced tokens, in order
+  bool stop = false;            // the last token finished the grammar
+};
+
+// Accept forced tokens for at most `cap` steps. The grammar advances exactly
+// as the per-token loop would advance it, so a caller that uses only part of
+// the run still holds a consistent grammar state.
+ForcedRun build_forced_run(vocab::Grammar &g, size_t cap) {
+  ForcedRun run;
+  while (run.tokens.size() < cap) {
+    int32_t only = -1;
+    if (!mask_only_token(g.mask(), &only)) break;
+    if (!g.accept(only)) break;
+    run.tokens.push_back(only);
+    if (g.finished()) {
+      run.stop = true;
+      break;
+    }
+  }
+  return run;
+}
+
+// The longest run a jump may take: at most 15 tokens (one below the verify
+// row cap, its argmax rows being ignored), no more than the caller still
+// wants, and no more than the session cache has room for.
+size_t grammar_jump_cap(uint32_t remaining, uint64_t pos, uint64_t n_ctx) {
+  size_t cap = 15;
+  if (cap > remaining) cap = remaining;
+  if (pos >= n_ctx) return 0;
+  const uint64_t room = n_ctx - pos;
+  if (cap > room) cap = size_t(room);
+  return cap;
+}
+
+// Run a forced batch of k = run.tokens.size() (>= 2) rows: the session's
+// current token followed by the run's first k-1 tokens. The cache is left
+// exactly as k decode steps would leave it, and the session's next token is
+// the run's last one.
+bool run_forced_batch(const model::Gemma4Model &m, sb_llm_session *session,
+                      const ForcedRun &run) {
+  const size_t k = run.tokens.size();
+  if (k < 2) return false;
+  std::vector<uint64_t> feed(k);
+  feed[0] = session->token;
+  for (size_t i = 1; i < k; ++i) feed[i] = uint64_t(run.tokens[i - 1]);
+  std::vector<int64_t> row_argmax(k, -1);
+  if (!model::verify_step_forced_cuda(m, feed, session->pos, session->kv,
+                                      row_argmax))
+    return false;
+  for (uint64_t t : feed) session->kv.filled_tokens.push_back(t);
+  session->pos += k;
+  session->token = uint64_t(run.tokens[k - 1]);
+  return true;
+}
+
+}  // namespace
+
 sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling,
                         sb_llm_token_cb cb, void *user, uint32_t *n_out,
                         sb_error **err_out) {
@@ -2642,6 +2738,46 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
               if (session->grammar_mask.empty()) break;
               mask = session->grammar_mask;
             }
+            // A forced run is produced by the constraint, not by the model:
+            // feed it through the verify step as one batch.
+            bool pre_accepted = false;
+            if (session->grammar && grammar_jump_enabled()) {
+              const size_t cap = grammar_jump_cap(max_tokens - n, session->pos,
+                                                  session->n_ctx);
+              if (cap >= 2) {
+                std::vector<uint8_t> pre_mask = session->grammar_mask;
+                const ForcedRun run = build_forced_run(*session->grammar, cap);
+                const size_t k = run.tokens.size();
+                if (k >= 2) {
+                  if (!run_forced_batch(m, session, run)) {
+                    set_error(err_out, SB_ERRKIND_INTERNAL,
+                              "grammar jump: verify batch failed");
+                    return SB_ERR_INTERNAL;
+                  }
+                  if (grammar_jump_diag())
+                    std::fprintf(stderr, "[grammar] jump=%zu\n", k);
+                  for (size_t i = 0; i < k; ++i) {
+                    if (run.stop && i + 1 == k) break;  // a stop is not text
+                    if (cb && cb(user, static_cast<sb_token>(run.tokens[i]))) {
+                      *n_out = n;  // aborted before run.tokens[i]
+                      return SB_OK;
+                    }
+                    history.push_back(run.tokens[i]);
+                    ++n;
+                  }
+                  if (run.stop) {
+                    session->grammar_done = true;
+                    break;
+                  }
+                  continue;
+                }
+                // One forced token: the plain step below produces it under the
+                // pre-accept mask, and the accept is skipped.
+                session->grammar_mask = std::move(pre_mask);
+                mask = session->grammar_mask;
+                pre_accepted = k == 1;
+              }
+            }
             const uint64_t fed = session->token;  // this step writes fed's KV
             const int64_t next = model::sampled_step_cuda(
                 m, fed, session->pos, session->kv, sp, history, mask);
@@ -2652,7 +2788,8 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             session->token = static_cast<uint64_t>(next);
             ++session->pos;
             if (session->grammar) {
-              if (!session->grammar->accept(int32_t(next))) break;
+              if (!pre_accepted && !session->grammar->accept(int32_t(next)))
+                break;
               if (session->grammar->finished()) {
                 session->grammar_done = true;
                 break;  // a stop token ends the constrained output; not emitted
@@ -2700,6 +2837,45 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
               session->grammar_mask = session->grammar->mask();
               if (session->grammar_mask.empty()) break;
             }
+            // A forced run is produced by the constraint, not by the model:
+            // feed it through the verify step as one batch.
+            bool pre_accepted = false;
+            if (session->grammar && grammar_jump_enabled()) {
+              const size_t cap =
+                  grammar_jump_cap(max_tokens - n, session->pos, n_ctx);
+              if (cap >= 2) {
+                std::vector<uint8_t> pre_mask = session->grammar_mask;
+                const ForcedRun run = build_forced_run(*session->grammar, cap);
+                const size_t k = run.tokens.size();
+                if (k >= 2) {
+                  if (!run_forced_batch(m, session, run)) {
+                    set_error(err_out, SB_ERRKIND_INTERNAL,
+                              "grammar jump: verify batch failed");
+                    return SB_ERR_INTERNAL;
+                  }
+                  if (grammar_jump_diag())
+                    std::fprintf(stderr, "[grammar] jump=%zu\n", k);
+                  for (size_t i = 0; i < k; ++i) {
+                    if (run.stop && i + 1 == k) break;  // a stop is not text
+                    if (cb && cb(user, static_cast<sb_token>(run.tokens[i]))) {
+                      *n_out = n;  // aborted before run.tokens[i]
+                      return SB_OK;
+                    }
+                    ++n;
+                  }
+                  if (run.stop) {
+                    session->grammar_done = true;
+                    break;
+                  }
+                  continue;
+                }
+                // A one-token run is not worth a batch; the token is already
+                // accepted, so the plain step below runs under the pre-accept
+                // mask and skips the accept.
+                session->grammar_mask = std::move(pre_mask);
+                pre_accepted = k == 1;
+              }
+            }
             const uint64_t done = model::generate_spine_cuda(
                 m, session->token, session->pos, one, n_ctx,
                 session->grammar_mask, &session->kv);
@@ -2712,7 +2888,7 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             session->token = static_cast<uint64_t>(one[0]);
             ++session->pos;
             if (session->grammar) {
-              if (!session->grammar->accept(int32_t(one[0])))
+              if (!pre_accepted && !session->grammar->accept(int32_t(one[0])))
                 break;  // the sampler returned a token the grammar forbids
               if (session->grammar->finished()) {
                 // A stop token ends the constrained output; it is not text, so

@@ -196,6 +196,21 @@ public:
   // Fill the mask with all-ones = every token allowed.
   bool clear_argmax_mask();
 
+  // --- row-gathered lm head ------------------------------------------------
+  //
+  // A decode graph emitted with the `gather` attribute computes the lm head
+  // over a compact [nn::kGrammarGatherCap] output whose entry j is vocabulary
+  // row ids[j], and selects from that list (gathered Argmax / SampleSelect).
+  // The ids table and the live entry count live in persistent device buffers:
+  // the captured step's launch geometry is the fixed cap, and the selection
+  // reads the live count on the device, so one capture serves every allowed
+  // list up to the cap.
+  bool grammar_gather_init();
+  bool grammar_gather_ready() const { return static_cast<bool>(grammar_ids_); }
+  // Upload this step's allowed rows (ascending, at most kGrammarGatherCap) and
+  // its count.
+  bool set_grammar_ids(std::span<const int32_t> ids);
+
   // --- decode chunking (§10) ------------------------------------------------
   //
   // k greedy decode steps are captured into one graph: step j reads the token
@@ -369,6 +384,11 @@ private:
   hal::Buffer argmax_mask_;         // allowed-token bitmap for the Argmax node
   size_t argmax_mask_bytes_ = 0;    // its size (ceil(vocab / 8)), 0 = never initialized
   bool argmax_mask_dirty_ = false;  // a constrained mask has been uploaded and not cleared
+
+  // Row-gathered lm head: the allowed vocabulary rows ([cap] int32) and the
+  // live entry count, both device-resident and read by the captured step.
+  hal::Buffer grammar_ids_;         // int32[kGrammarGatherCap]
+  hal::Buffer grammar_count_;       // int32: live entry count
 
   // Sampled decode (r7): the persistent device buffers the captured
   // SampleSelect node reads. They are allocated by sample_select_init() before

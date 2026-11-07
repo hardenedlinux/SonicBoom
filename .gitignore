@@ -89,6 +89,9 @@ tools/bench_train
 # numeric-acceptance tool (tools/build_sb_numerics.sh builds it)
 tools/sb-numerics
 
+# warm-up table tool (tools/build_sb_tune.sh builds it)
+tools/sb-tune
+
 # decision explainer (tools/build_sb_explain.sh builds it)
 tools/sb-explain
 
