@@ -27,12 +27,14 @@
 //
 // The span bucket is the one component that varies between the chunks of one
 // prefill (their slots+queries bounds differ). That is sound only because every
-// selectable candidate is bit-identical to the reference on this input class --
-// measured as rel-L2 exactly 0 for all in-set candidates on both head dims, and
-// asserted by the fattn report test. Two chunks of one prefill may therefore
-// run different candidates and still produce the same bytes as an unchunked
-// call. A future candidate that is not bit-identical must not be added to the
-// tuning set while the span bucket is in the key.
+// candidate the tuner may select is bit-identical to the reference on every
+// input class -- measured byte for byte for both head dimensions and asserted
+// by the fattn report test. Two chunks of one prefill may therefore run
+// different candidates and still produce the same bytes as an unchunked call.
+// The tuning set is filtered to candidates marked bit-identical (a future
+// candidate whose phase-1b warp split changes the summation order is not in it,
+// and a cache record naming one is invalidated); such a candidate stays
+// reachable, for measurement only, through SONICBOOM_FATTN_CANDIDATE.
 //
 // The class is resolved once per key per process from whatever call arrives
 // first; the 2% incumbent margin keeps a low-signal decision (the candidates
@@ -88,9 +90,9 @@ namespace {
 // never displace the reference.
 constexpr double kMarginPct = 2.0;
 // Correctness gate against the reference output (relative L2 of the whole
-// output). Layout-only candidates are bit-identical (0); the 4-warp phase-1b
-// variant differs only by summation order (~1e-6 here); a broken candidate is
-// off by orders of magnitude.
+// output). Every candidate the tuner times is bit-identical to the reference
+// (rel-L2 exactly 0); the gate remains as the structural check for a broken
+// candidate, which is off by orders of magnitude.
 constexpr double kMaxRelL2 = 1e-2;
 constexpr int kMaxReps = 5;
 // A timed sample is a batch of launches (see time_launch) aimed at this
@@ -116,28 +118,34 @@ struct Cand {
   int spw;   // phase-1b warps per unit (2 = row-half split, 8 warps)
   int pipe;  // 1 = QK/PV pipeline (V triple buffered)
   bool in_set;        // part of the default tuning set
-  bool experimental;  // reachable only by forcing it by id
+  // A candidate the tuner may select must produce the reference's bytes on
+  // every shape class: the span bucket in the selection key means two chunks
+  // of one prefill can resolve differently, and they must still agree.
+  bool bit_identical;  // byte-identical output to the reference on every class
+  bool experimental;   // reachable only by forcing it by id
   const char* note;
 };
 
 constexpr Cand kCands[] = {
-    {1, "k8-v0-s2-pipe", 8, 0, 2, 1, true, false,
+    {1, "k8-v0-s2-pipe", 8, 0, 2, 1, true, true, false,
      "RTX 3050 reference: KSTRIDE padding, 8-warp phase-1b row-half split, "
      "unpadded V, QK/PV pipeline"},
-    {2, "k8-v0-s2-seq", 8, 0, 2, 0, true, false,
+    {2, "k8-v0-s2-seq", 8, 0, 2, 0, true, true, false,
      "same layout without the QK/PV pipeline (V double buffered); the pipeline "
      "gain shows up at long context"},
-    {3, "k8-v0-s1-pipe", 8, 0, 1, 1, true, false,
-     "phase 1b on 4 warps (the row half is not split)"},
-    {4, "k0-v0-s2-pipe", 0, 0, 2, 1, true, false,
+    {3, "k8-v0-s1-pipe", 8, 0, 1, 1, true, true, false,
+     "phase 1b on 4 warps (the row half is not split): the split is across "
+     "row groups, so the output is byte-identical to the reference"},
+    {4, "k0-v0-s2-pipe", 0, 0, 2, 1, true, true, false,
      "K rows unpadded: 8-way bank conflict on every K fragment load"},
-    {5, "k8-v8-s2-seq", 8, 8, 2, 0, true, false,
+    {5, "k8-v8-s2-seq", 8, 8, 2, 0, true, true, false,
      "V rows padded to 48 B, sequential phases; needs the full sm_8.x opt-in cap"},
-    {6, "k8-v8-s2-pipe", 8, 8, 2, 1, true, false,
+    {6, "k8-v8-s2-pipe", 8, 8, 2, 1, true, true, false,
      "V padding plus the pipeline's third V buffer: over the sm_8.x cap, legal on "
      "parts with a larger shared-memory budget"},
-    {7, "k8-v4-s2-seq", 8, 4, 2, 0, false, true,
-     "V rows padded to 40 B: 8-byte cp.async.ca, measured 20% slower on sm_86"},
+    {7, "k8-v4-s2-seq", 8, 4, 2, 0, false, false, true,
+     "V rows padded to 40 B: 8-byte cp.async.ca, measured 20% slower on sm_86; "
+     "experimental, so its byte identity is not part of the tuning contract"},
 };
 const Cand* cand_by_num(int num) {
   for (const Cand& c : kCands)
@@ -1368,10 +1376,33 @@ bool parse_ids(const char* text, std::vector<int>* out, std::string* why) {
   return true;
 }
 
+// The tuner may select only a candidate that is bit-identical to the
+// reference: the span bucket in the selection key can differ between the
+// chunks of one prefill, and those chunks must compose to the unchunked
+// bytes. A candidate whose phase-1b warp split changes the summation order
+// stays reachable, for measurement only, through SONICBOOM_FATTN_CANDIDATE
+// (which bypasses the tuner and this set).
+void drop_non_identical(std::vector<int>* ids) {
+  for (auto it = ids->begin(); it != ids->end();) {
+    const Cand* cand = cand_by_num(*it);
+    if (cand != nullptr && !cand->bit_identical) {
+      std::fprintf(stderr,
+                   "[fattn] candidate %d (%s) is not bit-identical to the "
+                   "reference: excluded from tuning (force it with "
+                   "SONICBOOM_FATTN_CANDIDATE)\n",
+                   cand->num, cand->id);
+      it = ids->erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 std::vector<int> tuning_set(std::string* why) {
   std::vector<int> ids;
   if (const char* e = env("SONICBOOM_FATTN_CANDIDATES"); e != nullptr) {
     if (!parse_ids(e, &ids, why)) return {};
+    drop_non_identical(&ids);
     return ids;
   }
   for (const Cand& c : kCands)
@@ -1938,6 +1969,16 @@ Tuned resolve_class(const Call& c, const Fingerprints& fp) {
           cache_status = "invalidated";
           cache_reason = "the record names variant '" + look.name +
                          "', which this build does not have";
+          break;
+        }
+        if (!cand->bit_identical) {
+          // A record written before the tuning set was restricted (or by a
+          // measurement arm) can name a candidate whose output differs from
+          // the reference by summation order; the class is measured again
+          // among the bit-identical candidates.
+          cache_status = "invalidated";
+          cache_reason = "the record names variant '" + std::string(cand->id) +
+                         "', which is not bit-identical to the reference";
           break;
         }
         Tuned t;

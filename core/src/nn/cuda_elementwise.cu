@@ -6243,8 +6243,12 @@ void full_record_class(const FullResolution& r, int head_dim, int gqa,
     e.reason = "n > 2048: score planes exceed the scratch budget; online "
                "tiling (R1 capacity exception; no prefix reuse, deterministic)";
   e.numerics = r.cls == FullClass::ScoreGemm
-                   ? "f16 GEMM operands, fp32 accumulate, row softmax in f32"
-                   : "f16 K/V, fp32 accumulate, deterministic per resolution";
+                   ? "affecting; resolves on first use (prefill path), outside "
+                     "the model-load epoch: f16 GEMM operands, fp32 "
+                     "accumulate, row softmax in f32"
+                   : "affecting; resolves on first use (prefill path), outside "
+                     "the model-load epoch: f16 K/V, fp32 accumulate, "
+                     "deterministic per resolution";
   e.vram_bytes = r.cls == FullClass::ScoreGemm ? score_gemm_vram : 0;
   full_record_once(std::move(e));
 }
@@ -6557,7 +6561,8 @@ void full_record_tune(const FullResolution& r, int head_dim, int gqa,
              "full-attention call; the default is kept unless a candidate wins "
              "by the switch margin";
   e.numerics =
-      "f16 K/V, fp32 accumulate; deterministic per resolution, not "
+      "affecting; resolves on first use (prefill path), outside the model-load "
+      "epoch: f16 K/V, fp32 accumulate; deterministic per resolution, not "
       "token-identical to the hand-written kernel's S/P association";
   e.tuning_ms = int64_t(std::llround(tune_s * 1000.0));
   full_record_once(std::move(e));
