@@ -241,9 +241,20 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
 // runtime (decode, verify, session creation, tier capture, tools) reads one
 // immutable table. Closes the resolution epoch when it returns; a miss after
 // that is a bug, not a measurement: the lookup reports it and the runtime build
-// fails. Called by the common model load (model::load_gemma4), so every entry
-// point that loads a model resolves exactly once.
+// fails. Called by ensure_device_ready(), which every entry point that builds a
+// CUDA runtime, session or plan runs first.
 bool resolve_tune_for_model(const Gemma4Model& m);
+
+// Initialize the device for `m` on first device use and resolve the model's
+// numerics-affecting choices: the load itself is host-side only, so a caller
+// that forks before touching CUDA forks a process with no device state. The
+// first call initializes the CUDA context, uploads any weight the load left on
+// the host, and runs resolve_tune_for_model(); later calls are a no-op for the
+// same model. Every function that builds a CUDA runtime, session or plan calls
+// this first, as does the C API model load. After it returns the resolution
+// epoch is closed: a numerics-affecting lookup miss or write is a [tune] BUG
+// and fails the runtime build. Returns true when the build has no CUDA support.
+bool ensure_device_ready(const Gemma4Model& m);
 
 // ---------------------------------------------------------------------------
 // Speculative verification (Part B). A draft of k tokens is checked by running

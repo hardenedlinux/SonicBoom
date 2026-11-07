@@ -2095,10 +2095,16 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
           set_error(err_out, SB_ERRKIND_WEIGHT, m.error().c_str());
           return SB_ERR_WEIGHT;
         }
-        // The model load resolved every numerics-affecting device choice for
-        // this model; every runtime below reads the sealed table rather than
-        // measuring inside a request.
+        // The loader is host-side only; the device comes up here, in the
+        // process that will serve, so the C API load keeps its "ready to
+        // serve" behaviour. Every runtime below reads the sealed table rather
+        // than measuring inside a request.
         bundle->model = std::move(*m);
+        if (!model::ensure_device_ready(bundle->model)) {
+          set_error(err_out, SB_ERRKIND_INTERNAL,
+                    "device initialization failed at model load");
+          return SB_ERR_INTERNAL;
+        }
 
         auto v = vocab::load_vocab(bundle->reader);
         if (!v) {

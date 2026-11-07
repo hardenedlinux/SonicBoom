@@ -624,14 +624,10 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   const auto arch = detect_arch(r);
   if (!arch) return std::unexpected(std::move(arch.error()));
   if (*arch == ModelArch::Qwen2) {
-    auto q = load_qwen2(r);
-    if (!q) return q;
-    // The resolution epoch is part of loading, for every architecture: the
-    // choices are per shape class and final for the model's lifetime.
-    if (!resolve_tune_for_model(*q))
-      return std::unexpected(
-          std::string("device numerics resolution failed at model load"));
-    return q;
+    // Host-side only, like the Gemma path: the device and the per-shape
+    // numerics resolution are paid by ensure_device_ready() on first device
+    // use.
+    return load_qwen2(r);
   }
 
   auto cfg = load_gemma4_config(r);
@@ -747,12 +743,9 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   m.plan.reserve(c.block_count);
   for (uint32_t l = 0; l < c.block_count; ++l) m.plan.push_back(c.layer_config(l));
 
-  // One resolution for the model's numerics-affecting device choices, here in
-  // the common load so no entry point can skip it (the C API, tools and tests
-  // all reach the model through this function).
-  if (!resolve_tune_for_model(m))
-    return std::unexpected(
-        std::string("device numerics resolution failed at model load"));
+  // Host-side only. The device context and the model's numerics-affecting
+  // choices are resolved by ensure_device_ready() on first device use, so a
+  // caller can load and fork without leaving a CUDA context in the parent.
   return m;
 }
 

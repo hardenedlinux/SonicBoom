@@ -3617,6 +3617,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
 static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                          const planner::KvCacheSession* session,
                                          bool gather = false) {
+  if (!ensure_device_ready(m)) return nullptr;
   const uint64_t cache_id = session ? session->cache_id : 0;
   if (session && (!session->caches || cache_id == 0)) return nullptr;
   const DecodeKey key{&m, n_ctx, cache_id};
@@ -3910,6 +3911,7 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
 static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
                                            const planner::KvCacheSession& session,
                                            bool gather = false) {
+  if (!ensure_device_ready(m)) return nullptr;
   if (!session.caches || session.cache_id == 0 ||
       m.config.vocab_size == 0)
     return nullptr;
@@ -4437,6 +4439,7 @@ static std::unique_ptr<VerifySet> build_verify_set(
 // build/plan failure.
 static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                                  const planner::KvCacheSession& session) {
+  if (!ensure_device_ready(m)) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
   // The decode-dealt verify set exists only for modes that run it; reckless
   // verifies through the prefill path (verify_step_reckless).
@@ -4498,6 +4501,7 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
 static VerifyRuntime* get_repro_verify_runtime(
     const Gemma4Model& m, uint64_t n_ctx, int rows,
     const planner::KvCacheSession& session) {
+  if (!ensure_device_ready(m)) return nullptr;
   if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
@@ -4533,6 +4537,7 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
 static VerifyRuntime* get_forced_verify_runtime(
     const Gemma4Model& m, uint64_t n_ctx, int rows,
     const planner::KvCacheSession& session) {
+  if (!ensure_device_ready(m)) return nullptr;
   if (rows < 2 || rows > planner::kMaxVerifyRows) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id);
@@ -4716,6 +4721,7 @@ static DecodeRuntime* spec_resolve_probe(
 
 bool kv_session_allocate(const Gemma4Model& m, planner::KvCacheSession& session,
                          uint64_t n_ctx) {
+  if (!ensure_device_ready(m)) return false;
   if (m.weights.blocks.empty() || n_ctx == 0) return false;
   // Allocate first, assign only on success: a failure must not leave the
   // session with a cleared cache (or a new id pointing at nothing).
@@ -4872,6 +4878,7 @@ static std::unique_ptr<RecklessVerifyRuntime> build_reckless_verify_runtime(
 static RecklessVerifyRuntime* get_reckless_verify_runtime(
     const Gemma4Model& m, uint64_t n_ctx, int rows,
     const planner::KvCacheSession& session) {
+  if (!ensure_device_ready(m)) return nullptr;
   if (!session.caches || session.cache_id == 0) return nullptr;
   const auto key = std::make_tuple(&m, n_ctx, session.cache_id, rows);
   {
@@ -5392,6 +5399,33 @@ static void warm_decode_attn_model(const Gemma4Model& m) {
   }
 }
 
+// Serializes the one-time device initialization of a loaded model. The
+// per-model flag makes every later call a single atomic read.
+static std::mutex g_device_ready_mutex;
+
+bool ensure_device_ready(const Gemma4Model& m) {
+  // Nothing device-side exists for a model with no weights (the stub tools and
+  // the non-CUDA path pass one through).
+  if (m.weights.blocks.empty() || !m.device_ready) return true;
+  if (m.device_ready->load(std::memory_order_acquire)) return true;
+  std::lock_guard<std::mutex> lk(g_device_ready_mutex);
+  if (m.device_ready->load(std::memory_order_acquire)) return true;
+  // The runtime API owns the primary context; create it here so the driver
+  // calls and measurements below have one, in this process. A parent that
+  // loaded the model host-side and forked never reaches this point, so the
+  // child initializes its own context.
+  ::cudaFree(nullptr);
+  if (!quant::cuda::available()) {
+    std::cerr << "[cuda] no device available for this model\n";
+    return false;
+  }
+  // The loaded weights are host-side only; the runtimes upload what they use
+  // on first execution.
+  if (!resolve_tune_for_model(m)) return false;
+  m.device_ready->store(true, std::memory_order_release);
+  return true;
+}
+
 bool resolve_tune_for_model(const Gemma4Model& m) {
   if (m.weights.blocks.empty()) return true;
 #ifdef SONICBOOM_USE_CUDA
@@ -5805,6 +5839,7 @@ std::optional<planner::PlanRunRecord> record_decode_plan(
   // Deliberately not get_decode_runtime: that runtime is captured, and a
   // captured step replays as a single graph launch with no executor walk, so
   // there would be no per-step kernels to record.
+  if (!ensure_device_ready(m)) return std::nullopt;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   auto rt = build_decode_runtime(m, n_ctx, &transform);
   if (!rt) return std::nullopt;
@@ -5833,6 +5868,7 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(const Gemma4Model& m,
 std::optional<planner::PlanRunRecord> record_prefill_plan(
     const Gemma4Model& m, uint64_t n, const GraphTransform& transform) {
   if (n == 0) return std::nullopt;
+  if (!ensure_device_ready(m)) return std::nullopt;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
   GraphIr ir = emit_prefill_ir(m, n);
   // The same mmq fusion the prefill segments use, under the same conditions, so
@@ -5905,6 +5941,10 @@ bool warmup_spine_cuda(const Gemma4Model&, uint64_t,
 
 bool resolve_tune_for_model(const Gemma4Model&) {
   return true;  // built without CUDA: there are no device choices to resolve
+}
+
+bool ensure_device_ready(const Gemma4Model&) {
+  return true;  // built without CUDA: there is no device to initialize
 }
 
 bool kv_session_allocate(const Gemma4Model&, planner::KvCacheSession&,
@@ -6190,6 +6230,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                          std::span<const uint64_t> history,
                                          std::span<const uint8_t> sample_mask,
                                          std::span<float> logits_out) {
+  if (!ensure_device_ready(m)) return 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
   const bool masked = !sample_mask.empty();
@@ -6837,6 +6878,7 @@ bool score_spine_cuda_impl(const Gemma4Model& m,
     trace->logits.clear();
     trace->ids.clear();
   }
+  if (!ensure_device_ready(m)) return false;
   if (m.weights.blocks.empty() || tokens.size() < 2) {
     std::cerr << "[score] empty model (" << m.weights.blocks.size()
               << " blocks) or short input (" << tokens.size() << ")\n";
@@ -7005,6 +7047,7 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
     trace->logits.clear();
     trace->ids.clear();
   }
+  if (!ensure_device_ready(m)) return false;
   if (m.weights.blocks.empty() || tokens.size() < 2) {
     std::cerr << "[score-prefill] empty model (" << m.weights.blocks.size()
               << " blocks) or short input (" << tokens.size() << ")\n";
@@ -7237,6 +7280,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint8_t> sample_mask,
                                             std::span<float> logits_out) {
   if (n_reused_out) *n_reused_out = 0;
+  if (!ensure_device_ready(m)) return 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
 
