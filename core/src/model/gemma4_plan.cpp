@@ -1247,31 +1247,38 @@ SpecAccept spec_accept_run(std::span<const uint64_t> drafts,
 // reserves (planner::kMaxVerifyRows).
 constexpr int64_t kSpecMaxDrafts = 63;
 
-// The ceiling a process uses when SONICBOOM_SPEC_MAX_DRAFTS is unset. The
-// envelope is wider, but a shorter default keeps the adaptive policy's reach
-// where the load-time cost curve anchors it; a deployment (or a measurement
-// arm) raises the ceiling explicitly to exercise the deeper buckets.
+// The ceiling a fixed-length process uses when SONICBOOM_SPEC_MAX_DRAFTS is
+// unset: the loop verifies at one length, so its default is the length the
+// policy's cost curve anchors at. A policy-driven mode reaches the whole
+// envelope instead.
 constexpr int64_t kSpecDefaultDrafts = 15;
 
-// SONICBOOM_SPEC_MAX_DRAFTS (default kSpecDefaultDrafts): a ceiling on the
-// drafts one verify may propose. It never raises the envelope above
-// kSpecMaxDrafts; both the fixed loop and the adaptive policy honour it, so a
-// deployment (or a measurement arm) can ask for a shorter verify than the
-// envelope allows.
-static int64_t spec_max_drafts() {
+// The parsed SONICBOOM_SPEC_MAX_DRAFTS, or -1 when it is unset or unusable.
+static int64_t spec_env_max_drafts() {
   static const int64_t v = []() -> int64_t {
     const char* e = std::getenv("SONICBOOM_SPEC_MAX_DRAFTS");
-    if (!e || !*e) return kSpecDefaultDrafts;
+    if (!e || !*e) return -1;
     char* end = nullptr;
     const long n = std::strtol(e, &end, 10);
     if (end == e || *end || n < 0) {
       std::cerr << "[spec] ignoring SONICBOOM_SPEC_MAX_DRAFTS='" << e
                 << "' (expected 0.." << kSpecMaxDrafts << ")\n";
-      return kSpecDefaultDrafts;
+      return -1;
     }
     return std::min<long>(n, kSpecMaxDrafts);
   }();
   return v;
+}
+
+// The draft ceiling this process uses. SONICBOOM_SPEC_MAX_DRAFTS, when set,
+// is the ceiling for every mode; it never raises the envelope above
+// kSpecMaxDrafts. When unset, a fixed-length loop uses kSpecDefaultDrafts and
+// a policy-driven one (`adaptive`: auto, reckless, or an undecided mode the
+// probe may resolve to auto) may choose any length up to the envelope.
+static int64_t spec_max_drafts(bool adaptive) {
+  const int64_t e = spec_env_max_drafts();
+  if (e >= 0) return e;
+  return adaptive ? kSpecMaxDrafts : kSpecDefaultDrafts;
 }
 
 // B7 v2: the bursty-acceptance model (plan.h). A per-token acceptance rate is
@@ -1691,6 +1698,15 @@ static SpecMode g_spec_mode = SpecMode::Undecided;
 static SpecMode spec_mode() {
   const SpecMode env = env_spec_mode();
   return env != SpecMode::Undecided ? env : g_spec_mode;
+}
+
+// Whether the mode's verify length is chosen by the policy rather than fixed.
+// Off and a fixed "on" never reach a length the policy picked; auto, reckless,
+// and an undecided mode (the probe may resolve to auto) do.
+static bool spec_adaptive() {
+  const SpecMode m = spec_mode();
+  return m == SpecMode::Auto || m == SpecMode::Reckless ||
+         m == SpecMode::Undecided;
 }
 
 // Reckless verify rows run through the batch prefill kernels, whose arithmetic
@@ -2513,17 +2529,22 @@ constexpr double kSpecCostLoadBudgetMs = 4000.0;
 // curve. Every row count the verify step can reach (2..kMaxVerifyRows) is
 // warmed and captured here, so no build and no capture can move into a request.
 constexpr double kSpecVerifySetBudgetMs = 4000.0;
-// The load anchors: one plain step and the four widths that put a knot at the
-// head, at both ends of the useful range, and on the linear middle. The other
-// eleven lengths are interpolated here and refined online from real steps
-// (spec_note_step_ms), so the load measurement pays for shape, not coverage.
+// The load anchors: one plain step and the widths that put a knot at the head,
+// at both ends of the useful range, and on every verify row bucket the policy
+// can reach. The lengths between anchors are interpolated here and refined
+// online from real steps (spec_note_step_ms), so the load measurement pays for
+// shape, not coverage.
 //   - 0 and 1 anchor the head. A 2-row verify costs more than twice a plain
 //     step (the fixed per-verify cost dominates), so interpolating the head
 //     from c(0) underprices k = 1 and makes the policy spend verifies that
 //     cannot pay.
-//   - 3 sits on the head's flat stretch, 7 on the linear part, 15 at the
-//     envelope the policy can reach.
-constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15};
+//   - 3 sits on the head's flat stretch, 7 on the linear part, 15 at the first
+//     bucket boundary.
+//   - 23, 31, 47 and 63 end the 24/32/48/64-row buckets. Verify cost is not
+//     linear across the bucket boundaries (the 24-row bucket costs more than
+//     the 7..15 slope extrapolates), so the tail is measured rather than
+//     extrapolated.
+constexpr int64_t kSpecCostBand[] = {0, 1, 3, 7, 15, 23, 31, 47, 63};
 // Allowance for a length whose row count has not been built yet: the first
 // pass builds the graph and captures it before it can be timed.
 constexpr double kSpecCostCaptureMs = 300.0;
@@ -2927,7 +2948,7 @@ static uint64_t run_spec_program_steps(
                              : tokens.size();
   const size_t cap =
       size_t(std::min<int64_t>({p.max_drafts, kSpecMaxDrafts,
-                                spec_max_drafts()}));
+                                spec_max_drafts(spec_adaptive())}));
   if (cap == 0 || !session.caches || session.n_ctx == 0) {
     std::cerr << "[spec] the speculative loop needs a drafter cap and a "
                  "session cache\n";
@@ -4326,16 +4347,18 @@ static std::map<std::tuple<const Gemma4Model*, uint64_t, uint64_t>,
 
 // The widest verify the current mode can run. "on" verifies at one fixed cap,
 // so only that row count is reachable; "auto" and an undecided mode (the probe
-// may still select auto) can verify every length the policy proposes. The cost
-// measurement prices c(k) at its 0/1/3/7/15 anchors, so it needs the 16-row
-// bucket; a process whose cap reaches deeper warms those buckets too, so no
-// request pays a first-use build. The record it writes still covers every
-// length (the ones not measured are interpolated).
+// may still select auto) can verify every length the policy proposes, up to
+// the envelope unless the environment shortens the cap. The cost measurement
+// prices every knot of its band, and the deepest knot is the 64-row bucket, so
+// the pricing path builds the whole envelope whatever the mode's own cap is:
+// the record belongs to the build, and a process of any mode may be the one
+// that prices it. The record still covers every length (the ones between
+// knots are interpolated).
 static int verify_row_limit() {
   const SpecMode mode = spec_mode();
-  const int cap = int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts()));
-  if (g_spec_pricing)
-    return std::max(verify_bucket_of(cap + 1), verify_bucket_of(16));
+  const int cap =
+      int(std::min<int64_t>(kSpecMaxDrafts, spec_max_drafts(spec_adaptive())));
+  if (g_spec_pricing) return verify_bucket_of(int(kSpecMaxDrafts) + 1);
   if (mode == SpecMode::Off) return 1;
   return verify_bucket_of(cap + 1);
 }
