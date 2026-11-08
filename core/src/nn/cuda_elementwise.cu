@@ -69,7 +69,7 @@
 // CPU reference to fp32 tolerance — the CPU accumulates mean/matvec in double
 // (ggml_float) while these kernels accumulate in fp32, the same relaxation the
 // K-quant gemv in cuda_quant_matmul.cu makes. fp16 conversions use CUDA's
-// round-to-nearest __float2half_rn / __half2float, matching std::float16_t.
+// round-to-nearest __float2half_rn / __half2float, matching IEEE binary16.
 
 namespace sonicboom::nn::cuda {
 
@@ -84,7 +84,7 @@ __device__ inline float bf16_to_float(uint16_t h) {
   return __uint_as_float(uint32_t(h) << 16);
 }
 
-// f32 -> fp16 -> f32 round-trip (matches std::float16_t, round to nearest even).
+// f32 -> fp16 -> f32 round-trip (IEEE binary16, round to nearest even).
 __device__ inline float half_roundtrip(float v) {
   return __half2float(__float2half_rn(v));
 }

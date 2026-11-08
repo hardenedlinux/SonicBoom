@@ -59,11 +59,11 @@ constexpr bool is_legacy_quant(QuantType type) {
 }
 
 struct QuantTypeInfo {
-  QuantType type;
   const char* name;          // "q3_K" etc.
   uint32_t ggml_type_id;     // id in the GGUF/ggml type table
   uint32_t block_size;       // elements per super-block (256 for the K-quants)
   uint32_t bytes_per_block;  // serialized bytes per block
+  QuantType type;
 };
 
 // Size/geometry entry for a supported format, or nullptr for unknown ids.

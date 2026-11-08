@@ -528,7 +528,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       : e.val("arith.addi " + keyend0 + ", " + nblk + " : i64");
   const std::string keyend =
       e.val("arith.subi " + keyend1 + ", " + C["l1"] + " : i64");
-  const std::string abs_pb = keyend0;
+  const std::string &abs_pb = keyend0;
   std::string j0s = C["l0"];
   if (sh.window_mask) {
     const std::string haswin =
@@ -1342,7 +1342,7 @@ std::string attention_region_text(const AttentionShape &sh, int sm_arch) {
       e.op("} else {");
       e.op("  scf.yield " + cur["%o" + s(nt)] + " : vector<2x2xf32>");
       e.op("}");
-      const std::string o = ifr;
+      const std::string &o = ifr;
       std::string ccol = e.val("arith.constant " + s(nt * 8) + " : index");
       if (DPS != 1)
         ccol = e.val("arith.addi " + ccol + ", " + dbase_i + " : index");
@@ -1533,7 +1533,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const std::string nhkv64 = e.val("arith.extui %nhkv : i32 to i64");
   const std::string start = e.val("llvm.load %startp : !llvm.ptr -> i64");
   const std::string gqa_c = GQA == 7 ? C["c7"] : GQA == 4 ? C["c4"] : C["gqa"];
-  const std::string hkv = by_i;
+  const std::string &hkv = by_i;
   const std::string hkv64 = e.val("arith.extui " + hkv + " : i32 to i64");
   // Query head this warp owns: hq = kv head * gqa + warp.
   const std::string hqw0 = e.val("arith.muli " + hkv + ", " + gqa_c + " : i32");
@@ -2039,7 +2039,7 @@ std::string attention_decode_region_text(const AttentionShape &sh, int sm_arch) 
   const std::string nm = f.val("arith.maximumf %mm, " + mv2 + " : f32");
   f.op("scf.yield " + nm + " : f32");
   f.op("}");
-  const std::string mmax = mr;
+  const std::string &mmax = mr;
   // Pass 2: ascending-chunk weighted sum.
   f.op("%ca, %cw = scf.for %s = " + C2["x0"] + " to " + sn + " step " +
        C2["x1"] + " iter_args(%a = " + C2["cf0"] + ", %w = " + C2["cf0"] +

@@ -12,6 +12,11 @@
 # changes the C ABI: the public enums are deliberately int-sized and the ABI
 # target is stable, so the suggestion is not actionable here.
 #
+# performance-inefficient-string-concatenation is disabled in the codegen
+# emitters, which build IR text by appending to a single std::string line by
+# line; the check's suggestion (reserve/append) would replace that readable
+# shape without changing the emitted text.
+#
 # Keep this list comment-free. clang-tidy parses Checks line by line rather
 # than as YAML, so an inline `#` becomes part of the glob list and silently
 # disables every entry after it.
@@ -28,6 +33,7 @@ Checks: >
   -bugprone-branch-clone,
   -bugprone-macro-parentheses,
   -performance-inefficient-vector-operation,
+  -performance-inefficient-string-concatenation,
   -performance-enum-size,
   -portability-avoid-pragma-once,
   -portability-simd-intrinsics

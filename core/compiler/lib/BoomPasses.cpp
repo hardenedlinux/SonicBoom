@@ -1120,11 +1120,15 @@ public:
         auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
         if (k > 0) {
           // The member's weight and its folded bias (when it has one), named
-          // after its position in the merged launch.
+          // after its position in the merged launch. Members are grouped only
+          // when they carry a slot.
+          const auto slot = nodeAttrInt(attrs, "slot");
+          if (!slot)
+            continue;
           const std::string prefix = k == 1 ? "s1_" : "s2_";
           const std::string slotName = prefix + "slot";
           nodeAttrs.push_back(boom::NodeAttr::get(
-              view.ctx(), slotName, builder.getI64IntegerAttr(*nodeAttrInt(attrs, "slot"))));
+              view.ctx(), slotName, builder.getI64IntegerAttr(*slot)));
           if (auto bias = nodeAttrInt(attrs, "bias_slot")) {
             const std::string biasName = prefix + "bias_slot";
             nodeAttrs.push_back(boom::NodeAttr::get(
@@ -1198,10 +1202,14 @@ public:
         mlir::Operation *m = g[k];
         auto attrs = m->getAttrOfType<mlir::ArrayAttr>("node_attrs");
         if (k > 0) {
+          // Members are grouped only when they carry a slot.
+          const auto slot = nodeAttrInt(attrs, "slot");
+          if (!slot)
+            continue;
           const std::string prefix = k == 1 ? "s1_" : "s2_";
           nodeAttrs.push_back(boom::NodeAttr::get(
               view.ctx(), prefix + "slot",
-              builder.getI64IntegerAttr(*nodeAttrInt(attrs, "slot"))));
+              builder.getI64IntegerAttr(*slot)));
           if (auto bias = nodeAttrInt(attrs, "bias_slot")) {
             nodeAttrs.push_back(boom::NodeAttr::get(
                 view.ctx(), prefix + "bias_slot",
@@ -1824,6 +1832,8 @@ public:
 
     for (const Match &m : matches) {
       mlir::Operation *last = m.cast ? m.cast : m.rope;
+      if (!last)
+        continue;
       auto attrs = llvm::to_vector(
           m.norm->getAttrOfType<mlir::ArrayAttr>("node_attrs"));
       attrs.push_back(boom::NodeAttr::get(

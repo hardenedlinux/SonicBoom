@@ -393,33 +393,33 @@ std::expected<Gemma4Config, std::string> load_gemma4_config(const gguf::Reader& 
   const auto freq_base_swa = read_f64(r, "gemma4.rope.freq_base_swa");
   const auto shared_kv = read_u64(r, "gemma4.attention.shared_kv_layers");
 
-  std::string errs;
-  auto need = [&](bool ok, const char* what) {
-    if (!ok) {
-      errs += "missing/invalid metadata: ";
-      errs += what;
-      errs += "\n";
-    }
+  auto invalid = [](const char* what) {
+    return std::unexpected(std::string("missing/invalid metadata: ") + what);
   };
-  need(block_count && *block_count > 0, "gemma4.block_count");
-  need(embd_len && *embd_len > 0, "gemma4.embedding_length");
-  need(ff_len && *ff_len > 0, "gemma4.feed_forward_length");
-  need(head_count && *head_count > 0, "gemma4.attention.head_count");
-  need(head_count_kv && *head_count_kv > 0, "gemma4.attention.head_count_kv");
-  need(key_len && *key_len > 0, "gemma4.attention.key_length");
-  need(key_len_swa && *key_len_swa > 0, "gemma4.attention.key_length_swa");
-  need(per_layer_input && *per_layer_input > 0,
-       "gemma4.embedding_length_per_layer_input");
-  need(context_len && *context_len > 0, "gemma4.context_length");
-  need(sliding_window && *sliding_window > 0, "gemma4.attention.sliding_window");
-  need(pattern.has_value(), "gemma4.attention.sliding_window_pattern");
-  need(rms_eps && *rms_eps >= 0.0, "gemma4.attention.layer_norm_rms_epsilon");
-  need(softcap && *softcap > 0.0, "gemma4.final_logit_softcapping");
-  need(freq_base && *freq_base > 0.0, "gemma4.rope.freq_base");
-  need(freq_base_swa && *freq_base_swa > 0.0, "gemma4.rope.freq_base_swa");
-  need(shared_kv.has_value(), "gemma4.attention.shared_kv_layers");
-
-  if (!errs.empty()) return std::unexpected(std::move(errs));
+  if (!block_count || *block_count == 0) return invalid("gemma4.block_count");
+  if (!embd_len || *embd_len == 0) return invalid("gemma4.embedding_length");
+  if (!ff_len || *ff_len == 0) return invalid("gemma4.feed_forward_length");
+  if (!head_count || *head_count == 0)
+    return invalid("gemma4.attention.head_count");
+  if (!head_count_kv || *head_count_kv == 0)
+    return invalid("gemma4.attention.head_count_kv");
+  if (!key_len || *key_len == 0) return invalid("gemma4.attention.key_length");
+  if (!key_len_swa || *key_len_swa == 0)
+    return invalid("gemma4.attention.key_length_swa");
+  if (!per_layer_input || *per_layer_input == 0)
+    return invalid("gemma4.embedding_length_per_layer_input");
+  if (!context_len || *context_len == 0) return invalid("gemma4.context_length");
+  if (!sliding_window || *sliding_window == 0)
+    return invalid("gemma4.attention.sliding_window");
+  if (!pattern) return invalid("gemma4.attention.sliding_window_pattern");
+  if (!rms_eps || *rms_eps < 0.0)
+    return invalid("gemma4.attention.layer_norm_rms_epsilon");
+  if (!softcap || *softcap <= 0.0)
+    return invalid("gemma4.final_logit_softcapping");
+  if (!freq_base || *freq_base <= 0.0) return invalid("gemma4.rope.freq_base");
+  if (!freq_base_swa || *freq_base_swa <= 0.0)
+    return invalid("gemma4.rope.freq_base_swa");
+  if (!shared_kv) return invalid("gemma4.attention.shared_kv_layers");
 
   c.block_count = uint32_t(*block_count);
   c.embedding_length = uint32_t(*embd_len);
@@ -436,7 +436,7 @@ std::expected<Gemma4Config, std::string> load_gemma4_config(const gguf::Reader& 
   c.rope_base = float(*freq_base);
   c.rope_base_swa = float(*freq_base_swa);
   c.shared_kv_layers = uint32_t(*shared_kv);
-  c.sliding_window_pattern = std::move(*pattern);
+  c.sliding_window_pattern = *pattern;
 
   // token_embd.shape[1] defines vocab_size (shared with the weight binder).
   {
@@ -465,24 +465,20 @@ std::expected<Gemma4Config, std::string> load_qwen2_config(const gguf::Reader& r
   const auto rms_eps = read_f64(r, "qwen2.attention.layer_norm_rms_epsilon");
   const auto freq_base = read_f64(r, "qwen2.rope.freq_base");
 
-  std::string errs;
-  auto need = [&](bool ok, const char* what) {
-    if (!ok) {
-      errs += "missing/invalid metadata: ";
-      errs += what;
-      errs += "\n";
-    }
+  auto invalid = [](const char* what) {
+    return std::unexpected(std::string("missing/invalid metadata: ") + what);
   };
-  need(block_count && *block_count > 0, "qwen2.block_count");
-  need(context_len && *context_len > 0, "qwen2.context_length");
-  need(embd_len && *embd_len > 0, "qwen2.embedding_length");
-  need(ff_len && *ff_len > 0, "qwen2.feed_forward_length");
-  need(head_count && *head_count > 0, "qwen2.attention.head_count");
-  need(head_count_kv && *head_count_kv > 0, "qwen2.attention.head_count_kv");
-  need(rms_eps && *rms_eps >= 0.0, "qwen2.attention.layer_norm_rms_epsilon");
-  need(freq_base && *freq_base > 0.0, "qwen2.rope.freq_base");
-
-  if (!errs.empty()) return std::unexpected(std::move(errs));
+  if (!block_count || *block_count == 0) return invalid("qwen2.block_count");
+  if (!context_len || *context_len == 0) return invalid("qwen2.context_length");
+  if (!embd_len || *embd_len == 0) return invalid("qwen2.embedding_length");
+  if (!ff_len || *ff_len == 0) return invalid("qwen2.feed_forward_length");
+  if (!head_count || *head_count == 0)
+    return invalid("qwen2.attention.head_count");
+  if (!head_count_kv || *head_count_kv == 0)
+    return invalid("qwen2.attention.head_count_kv");
+  if (!rms_eps || *rms_eps < 0.0)
+    return invalid("qwen2.attention.layer_norm_rms_epsilon");
+  if (!freq_base || *freq_base <= 0.0) return invalid("qwen2.rope.freq_base");
 
   c.block_count = uint32_t(*block_count);
   c.context_length = *context_len;
@@ -525,7 +521,7 @@ std::expected<ModelArch, std::string> detect_arch(const gguf::Reader& r) {
 
 std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r) {
   const auto arch = detect_arch(r);
-  if (!arch) return std::unexpected(std::move(arch.error()));
+  if (!arch) return std::unexpected(arch.error());
   switch (*arch) {
     case ModelArch::Gemma4: return load_gemma4_config(r);
     case ModelArch::Qwen2:  return load_qwen2_config(r);
@@ -622,7 +618,7 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   // stays single so a caller can load either model family without knowing the
   // architecture in advance (detect_arch reads general.architecture).
   const auto arch = detect_arch(r);
-  if (!arch) return std::unexpected(std::move(arch.error()));
+  if (!arch) return std::unexpected(arch.error());
   if (*arch == ModelArch::Qwen2) {
     // Host-side only, like the Gemma path: the device and the per-shape
     // numerics resolution are paid by ensure_device_ready() on first device

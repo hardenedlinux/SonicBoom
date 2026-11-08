@@ -53,7 +53,7 @@ class OperatorHandle {
 
   // Invoke the operator on the given arguments (boxed). v0 dispatches to the
   // CPU backend; returns the operator's results.
-  ResultList call(ArgumentList args) const;
+  ResultList call(const ArgumentList &args) const;
 
  private:
   std::shared_ptr<detail::OperatorHandleImpl> impl_;

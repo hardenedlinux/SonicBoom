@@ -100,7 +100,7 @@ at::Tensor to_aten(const Tensor& t);
 Tensor from_aten(at::Tensor t);
 
 c10::Stack to_aten(const ArgumentList& args);
-ArgumentList from_aten(c10::Stack stack);
+ArgumentList from_aten(const c10::Stack& stack);
 
 // --- schema ---
 c10::Argument to_aten(const Argument& a);

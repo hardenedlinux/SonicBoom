@@ -1084,8 +1084,8 @@ bool validate_node(const planner::Graph& g, const GraphNodeDesc& n, std::string*
     // them, so an inconsistent operand or result shape would read outside B.
     // Reject it here (a model whose input shape does not match its weights
     // reaches this check instead of the kernel).
-    const auto a = shape(n.inputs[0]);
-    const auto b = shape(n.inputs[1]);
+    const auto &a = shape(n.inputs[0]);
+    const auto &b = shape(n.inputs[1]);
     const bool trans_a = int_attr(n, "transA", 0) != 0;
     const bool trans_b = int_attr(n, "transB", 0) != 0;
     const std::int64_t M = trans_a ? a[1] : a[0];
@@ -1093,7 +1093,7 @@ bool validate_node(const planner::Graph& g, const GraphNodeDesc& n, std::string*
     if (K != (trans_b ? b[1] : b[0]))
       return fail("gemm inner dimensions do not match");
     const std::int64_t N = trans_b ? b[0] : b[1];
-    const auto out = shape(n.outputs[0]);
+    const auto &out = shape(n.outputs[0]);
     if (out.size() != 2 || out[0] != M || out[1] != N)
       return fail("gemm output shape does not match A x B");
     if (n.inputs.size() == 3) {

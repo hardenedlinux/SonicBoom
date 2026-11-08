@@ -38,10 +38,12 @@ namespace {
 // operator is looked up by (name, overload) and invoked through the Layer 1
 // adapter's boxed dispatch; any failure is reported as a std::runtime_error so
 // callers (the C API guard, tests) see a clean message, never a c10 exception.
-nt::Tensor call1(std::string name, std::string overload, nt::ArgumentList args) {
+nt::Tensor call1(const std::string &name, std::string overload,
+                 const nt::ArgumentList &args) {
   try {
-    nt::OperatorHandle op = nt::find_operator(nt::OperatorName{name, overload});
-    nt::ResultList out = op.call(std::move(args));
+    nt::OperatorHandle op =
+        nt::find_operator(nt::OperatorName{name, std::move(overload)});
+    nt::ResultList out = op.call(args);
     if (out.size() != 1 || !out[0].isTensor())
       throw std::runtime_error("unexpected result arity/kind");
     return out[0].toTensor();

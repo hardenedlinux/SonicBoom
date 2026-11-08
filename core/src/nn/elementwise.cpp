@@ -16,8 +16,6 @@
 
 #include <sonicboom/nn/elementwise.h>
 
-#include <stdfloat>
-
 namespace sonicboom::nn {
 
 bool mul(std::span<const float> a, std::span<const float> b, std::span<float> y) {
@@ -54,7 +52,7 @@ bool axpy(std::span<const float> a, float alpha, std::span<float> y) {
 }
 
 void cast_fp16(std::span<float> v) {
-  for (float& x : v) x = float(std::float16_t(x));
+  for (float& x : v) x = float(_Float16(x));
 }
 
 } // namespace sonicboom::nn

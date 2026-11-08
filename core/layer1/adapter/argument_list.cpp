@@ -28,7 +28,7 @@ c10::Stack to_aten(const ArgumentList& args) {
   return stack;
 }
 
-ArgumentList from_aten(c10::Stack stack) {
+ArgumentList from_aten(const c10::Stack &stack) {
   std::vector<Value> values;
   values.reserve(stack.size());
   for (const auto& iv : stack) {

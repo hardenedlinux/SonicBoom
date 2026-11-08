@@ -270,7 +270,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
   host.capacity_bytes = budget;
   host.reserved_bytes = cfg.reserved_bytes;
   host.alignment_bytes = cfg.alignment_bytes;
-  s.memory_spaces.push_back(std::move(host));
+  s.memory_spaces.push_back(host);
 
   // M3: enumerate a CUDA device + device-local memory space when one is present
   // and the caller has not requested a host-only snapshot (a CPU-only spine sets
@@ -348,7 +348,7 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
     device_local.capacity_bytes = 0;  // unknown; not budget-checked in v0
     device_local.reserved_bytes = 0;
     device_local.alignment_bytes = 256;
-    s.memory_spaces.push_back(std::move(device_local));
+    s.memory_spaces.push_back(device_local);
   }
 
   s.fingerprint = resource_fingerprint(s);

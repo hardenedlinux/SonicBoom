@@ -32,8 +32,8 @@
 
 namespace sonicboom {
 
-std::expected<Model, ModelError> Model::compile_document(const sx::Document& doc,
-                                                         std::string base_dir) {
+std::expected<Model, ModelError> Model::compile_document(
+    const sx::Document& doc, const std::string &base_dir) {
   // (data :bound ...) parameters are a deferred-binding extension of the
   // S-Expr executable path. The plan path resolves constants at compile time
   // and has no binding contract, so reject them instead of compiling a graph

@@ -36,7 +36,7 @@ OperatorSchema OperatorHandle::schema() const {
   return detail::from_aten(impl_->handle.schema());
 }
 
-ResultList OperatorHandle::call(ArgumentList args) const {
+ResultList OperatorHandle::call(const ArgumentList &args) const {
   c10::Stack stack = detail::to_aten(args);
   // Tensor-driven dispatch: derive the dispatch key set from the tensor
   // arguments, then resolve the kernel through redispatchBoxed →
@@ -63,7 +63,7 @@ ResultList OperatorHandle::call(ArgumentList args) const {
     keys = c10::DispatchKeySet(c10::DispatchKey::CPU);
   }
   impl_->handle.redispatchBoxed(keys, &stack);
-  return detail::from_aten(std::move(stack));
+  return detail::from_aten(stack);
 }
 
 OperatorHandle find_operator(const OperatorName& name) {

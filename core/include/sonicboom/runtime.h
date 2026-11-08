@@ -90,7 +90,7 @@ private:
   // whole-graph MLIR region, and wire the executor. `base_dir` resolves
   // relative external-weight sidecars. Used by `load`.
   static std::expected<Model, ModelError> compile_document(
-      const sx::Document& doc, std::string base_dir);
+      const sx::Document& doc, const std::string &base_dir);
 
   planner::ResourceSnapshot snapshot_;
   planner::ExecutionPlan plan_;

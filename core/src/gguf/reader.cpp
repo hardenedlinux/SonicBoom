@@ -33,28 +33,28 @@ std::optional<GgmlTypeInfo> ggml_type_info(uint32_t id) {
   // (block size, bytes per block) pair used to compute a tensor's byte size.
   // This mirrors the on-disk layout, never the dequantization kernels.
   struct Entry {
-    uint32_t id;
     const char* name;
-    uint32_t block_size;
     uint64_t bytes_per_block;
+    uint32_t id;
+    uint32_t block_size;
   };
   static constexpr Entry kTable[] = {
-      {0, "f32", 1, 4},          {1, "f16", 1, 2},
-      {2, "q4_0", 32, 18},       {3, "q4_1", 32, 20},
-      {4, "q4_2", 32, 16},       {5, "q4_3", 32, 18},
-      {6, "q5_0", 32, 22},       {7, "q5_1", 32, 24},
-      {8, "q8_0", 32, 34},       {9, "q8_1", 32, 36},
-      {10, "q2_K", 256, 84},     {11, "q3_K", 256, 110},
-      {12, "q4_K", 256, 144},    {13, "q5_K", 256, 176},
-      {14, "q6_K", 256, 210},    {15, "q8_K", 256, 292},
-      {16, "iq2_xxs", 256, 66},  {17, "iq2_xs", 256, 74},
-      {18, "iq3_xxs", 256, 98},  {19, "iq1_s", 256, 66},
-      {20, "iq4_nl", 32, 18},    {21, "iq3_s", 256, 110},
-      {22, "iq2_s", 256, 66},    {23, "iq4_xs", 256, 136},
-      {24, "i8", 1, 1},          {25, "i16", 1, 2},
-      {26, "i32", 1, 4},         {27, "i64", 1, 8},
-      {28, "f64", 1, 8},         {29, "iq1_m", 256, 66},
-      {30, "bf16", 1, 2},
+      {"f32", 4, 0, 1},          {"f16", 2, 1, 1},
+      {"q4_0", 18, 2, 32},       {"q4_1", 20, 3, 32},
+      {"q4_2", 16, 4, 32},       {"q4_3", 18, 5, 32},
+      {"q5_0", 22, 6, 32},       {"q5_1", 24, 7, 32},
+      {"q8_0", 34, 8, 32},       {"q8_1", 36, 9, 32},
+      {"q2_K", 84, 10, 256},     {"q3_K", 110, 11, 256},
+      {"q4_K", 144, 12, 256},    {"q5_K", 176, 13, 256},
+      {"q6_K", 210, 14, 256},    {"q8_K", 292, 15, 256},
+      {"iq2_xxs", 66, 16, 256},  {"iq2_xs", 74, 17, 256},
+      {"iq3_xxs", 98, 18, 256},  {"iq1_s", 66, 19, 256},
+      {"iq4_nl", 18, 20, 32},    {"iq3_s", 110, 21, 256},
+      {"iq2_s", 66, 22, 256},    {"iq4_xs", 136, 23, 256},
+      {"i8", 1, 24, 1},          {"i16", 2, 25, 1},
+      {"i32", 4, 26, 1},         {"i64", 8, 27, 1},
+      {"f64", 8, 28, 1},         {"iq1_m", 66, 29, 256},
+      {"bf16", 2, 30, 1},
   };
   for (const auto& e : kTable)
     if (e.id == id)
@@ -150,7 +150,8 @@ std::expected<Value, Error> read_value(Cursor& c, uint32_t vtype) {
     case 1: {  // int8
       auto x = c.u8();
       if (!x) return std::unexpected(x.error());
-      v.i = static_cast<int8_t>(*x);
+      // The on-disk byte is a two's-complement int8.
+      v.i = static_cast<int8_t>(*x);  // NOLINT(bugprone-signed-char-misuse)
       break;
     }
     case 2: {  // uint16

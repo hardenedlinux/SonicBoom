@@ -19,7 +19,6 @@
 #include <sonicboom/thread_pool.h>
 
 #include <cmath>
-#include <stdfloat>
 
 namespace sonicboom::nn {
 
@@ -72,8 +71,8 @@ bool gelu_fp16(std::span<const float> x, std::span<float> y) {
       } else if (v >= 10.0f) {
         y[i] = v;
       } else {
-        const float vf = float(std::float16_t(v));  // input -> fp16 (table index)
-        y[i] = float(std::float16_t(gelu_tanh_f32(vf)));  // result -> fp16
+        const float vf = float(_Float16(v));  // input -> IEEE binary16 (table index)
+        y[i] = float(_Float16(gelu_tanh_f32(vf)));  // result -> IEEE binary16
       }
     }
   });

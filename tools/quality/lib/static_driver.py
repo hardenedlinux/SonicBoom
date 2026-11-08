@@ -128,11 +128,23 @@ def run_one(entry: dict, mode: str, args, root: Path) -> dict:
         # (measured on core/compiler/lib/BoomDialect.cpp), which makes the
         # pass unusable on a normal CI runner. Every other flag still comes
         # from compile_commands.json.
+        #
+        # The lowered budget also makes three checks lose track of values inside
+        # inlined libstdc++ code, where they report container reallocation
+        # (`__cur`/`__location`), allocation (`operator new`) and
+        # `vector::data()` as null or uninitialized reads. GCC has no
+        # per-diagnostic suppression attribute and the reports name SonicBoom
+        # files at the inline site, so the three classes are switched off for
+        # this mode. The analyzer's pointer-lifetime checks (use-after-free,
+        # double-free, leaks, out-of-bounds) stay active.
         obj = Path(tempfile.gettempdir()) / f"sb-analyzer-{os.getpid()}-{abs(hash(str(src))) % 10**8}.o"
         cmd = [args.gxx] + argv + [
             "-fanalyzer",
             "--param=analyzer-bb-explosion-factor=1",
             "--param=analyzer-max-enodes-per-program-point=2",
+            "-Wno-analyzer-null-dereference",
+            "-Wno-analyzer-possible-null-dereference",
+            "-Wno-analyzer-use-of-uninitialized-value",
             "-fdiagnostics-color=never",
             "-c", "-o", str(obj),
         ]

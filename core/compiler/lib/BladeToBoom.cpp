@@ -212,9 +212,14 @@ mlir::OwningOpRef<mlir::ModuleOp> bladeToBoom(const sx::Document &doc,
   llvm::SmallVector<mlir::Attribute> table;
   table.reserve(entries.size());
   for (const Entry &e : entries) {
+    const auto bytes = sx::tensor_byte_size(*e.type);
+    if (!bytes) {
+      mlir::emitError(loc) << "tensor '" << e.name << "' has no static byte size";
+      return {};
+    }
     table.push_back(boom::TensorDescAttr::get(
         context, e.id, llvm::ArrayRef<int64_t>(e.type->shape.dims),
-        sx::dtype_name(e.type->dtype), uint64_t(*sx::tensor_byte_size(*e.type)),
+        sx::dtype_name(e.type->dtype), uint64_t(*bytes),
         /*dynamic_base_bytes=*/0, e.is_input, e.is_output, e.is_constant,
         e.is_external, e.name));
   }

@@ -299,8 +299,15 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
 
     // The cache handle is the cache-touching op's last operand (BoomVerify.cpp
     // checks the placement and the layer).
-    if (isCacheOp(n))
-      operands.push_back(kvOf[*cacheLayer(n)]);
+    if (isCacheOp(n)) {
+      const auto layer = cacheLayer(n);
+      if (!layer) {
+        mlir::emitError(loc) << "node '" << n.name
+                             << "' accesses the KV cache without a layer";
+        return {};
+      }
+      operands.push_back(kvOf[*layer]);
+    }
 
     llvm::SmallVector<mlir::Type> results;
     for (TensorId out : n.outputs) {

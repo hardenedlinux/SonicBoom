@@ -607,7 +607,7 @@ private:
             continue;
           }
           int e = b;
-          while (e + 1 < 256 && a.cls[size_t(e + 1)]) ++e;
+          while (e + 1 < 256 && a.cls[static_cast<size_t>(e) + 1]) ++e;
           st_[size_t(at)].bytes.push_back(
               ByteEdge{uint8_t(b), uint8_t(e), n});
           b = e + 1;
@@ -1649,7 +1649,7 @@ private:
     if (!target) return err("unsupported $ref '" + path + "'");
     auto it = ref_names_.find(path);
     if (it != ref_names_.end()) return it->second;
-    const std::string name = fresh("ref");
+    std::string name = fresh("ref");
     ref_names_[path] = name;
     add_rule(name, "");  // reserve before compiling a recursive reference
     auto body = emit(*target, depth + 1);

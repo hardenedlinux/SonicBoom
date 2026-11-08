@@ -661,7 +661,7 @@ bool SonicCudaBackend::read_sample_candidates(nn::Candidate* out,
 }
 
 std::unique_ptr<hal::StepProgram> SonicCudaBackend::record_step(
-    std::function<bool()> step_fn) {
+    const std::function<bool()> &step_fn) {
   auto prog = std::make_unique<CudaStepProgram>();
   auto& gs = prog->graph();
   if (!gs.begin()) return nullptr;

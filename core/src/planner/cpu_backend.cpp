@@ -45,7 +45,9 @@ class CpuStepProgram final : public hal::StepProgram {
   bool stage_upload(const hal::Buffer& dst, const void* host,
                     uint64_t bytes) override {
     if (dst.id == 0 || (!host && bytes != 0)) return false;
-    if (bytes != 0) std::memcpy(reinterpret_cast<void*>(dst.id), host, bytes);
+    // Buffer ids on the CPU backend are host addresses.
+    if (bytes != 0)
+      std::memcpy(reinterpret_cast<void*>(dst.id), host, bytes);  // NOLINT(performance-no-int-to-ptr)
     return true;
   }
 
@@ -100,9 +102,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> CpuBackend::execute(
 }
 
 std::unique_ptr<hal::StepProgram> CpuBackend::record_step(
-    std::function<bool()> step_fn) {
+    const std::function<bool()> &step_fn) {
   if (!step_fn) return nullptr;
-  return std::make_unique<CpuStepProgram>(std::move(step_fn));
+  return std::make_unique<CpuStepProgram>(step_fn);
 }
 
 } // namespace sonicboom::planner

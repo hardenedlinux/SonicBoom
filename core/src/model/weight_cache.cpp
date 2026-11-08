@@ -261,7 +261,8 @@ std::vector<uint8_t> encode_record(const TensorRecord &r) {
   std::vector<uint8_t> b(kFixedRecordBytes + r.name.size());
   uint8_t *p = b.data();
   write_le(p, r.name.size(), 2); p += 2;
-  std::memcpy(p, r.name.data(), r.name.size()); p += r.name.size();
+  // A binary record field, not a C string: the name is length-prefixed.
+  std::memcpy(p, r.name.data(), r.name.size()); p += r.name.size();  // NOLINT(bugprone-not-null-terminated-result)
   for (uint64_t v : {r.rows, r.cols, r.q8_offset, r.q8_bytes, r.q8_hash,
                      r.bias_offset, r.bias_count, r.bias_hash}) {
     write_le(p, v, 8);
@@ -306,18 +307,18 @@ std::optional<std::filesystem::path> directory() {
 }
 
 std::string sha256_file(const std::filesystem::path &path) {
-  std::FILE *f = std::fopen(path.c_str(), "rb");
-  if (f == nullptr) return {};
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return {};
   Sha256 s;
   std::vector<uint8_t> buf(1u << 20);
   for (;;) {
-    const size_t got = std::fread(buf.data(), 1, buf.size(), f);
-    if (got > 0) s.update(buf.data(), got);
-    if (got < buf.size()) break;
+    f.read(reinterpret_cast<char *>(buf.data()),
+           static_cast<std::streamsize>(buf.size()));
+    const auto got = f.gcount();
+    if (got > 0) s.update(buf.data(), static_cast<size_t>(got));
+    if (!f) break;  // short read: end of file or an I/O error
   }
-  const bool bad = std::ferror(f) != 0;
-  std::fclose(f);
-  if (bad) return {};
+  if (f.bad()) return {};  // an I/O error, not a clean end of file
   return hex(s.finish().data(), 32);
 }
 
@@ -483,7 +484,7 @@ std::expected<std::filesystem::path, std::string> store(
   if (tensors.empty()) return std::unexpected("no tensors to cache");
   if (sha.size() != 64) return std::unexpected("no checkpoint digest");
 
-  const auto path = cache_path(*dir, sha);
+  auto path = cache_path(*dir, sha);
   const auto side = sidecar_path(*dir, path_fingerprint(shards));
 
   const auto lock_path = *dir / ".sbw.lock";

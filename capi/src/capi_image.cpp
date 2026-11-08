@@ -137,8 +137,8 @@ template <typename T>
 T field(const sb_image_request *req, size_t offset, T fallback) {
   if (req->struct_size >= offset + sizeof(T)) {
     T value;
-    std::memcpy(&value, reinterpret_cast<const uint8_t *>(req) + offset,
-                sizeof(T));
+    std::memcpy(static_cast<void *>(&value),
+                reinterpret_cast<const uint8_t *>(req) + offset, sizeof(T));
     return value;
   }
   return fallback;

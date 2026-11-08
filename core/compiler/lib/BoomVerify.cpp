@@ -747,10 +747,15 @@ mlir::LogicalResult StepOp::verify() {
   if (getNumResults() != getOutputIds().size())
     return emitOpError() << "has " << getNumResults() << " results but "
                          << getOutputIds().size() << " outputs";
-  for (auto [index, id] : llvm::enumerate(getOutputIds()))
-    if (llvm::failed(checkStepValue(getOperation(), id, getResult(index).getType(),
-                                    *lookup(id))))
+  for (auto [index, id] : llvm::enumerate(getOutputIds())) {
+    const auto desc = lookup(id);
+    if (!desc)
+      return emitOpError() << "output tensor id " << id
+                           << " is not in the tensor table";
+    if (llvm::failed(
+            checkStepValue(getOperation(), id, getResult(index).getType(), *desc)))
       return mlir::failure();
+  }
 
   if (!llvm::hasSingleElement(getBody()))
     return emitOpError() << "must have exactly one block";

@@ -1588,7 +1588,7 @@ static void spec_diag_record(uint64_t step, uint64_t pos, size_t k,
                                       .count());
   e = SpecDiagEntry{step, pos, uint32_t(k), uint32_t(accepted),
                     uint32_t(emitted), uint8_t(ngram), uint8_t(kind),
-                    uint32_t(a * 1000.0 + 0.5), dt_us};
+                    uint32_t(std::lround(a * 1000.0)), dt_us};
   ++d.total;
 }
 

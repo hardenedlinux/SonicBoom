@@ -72,7 +72,7 @@ public:
   // capture/replay mechanism (CUDA Graph, re-executed task list, …) is the
   // backend's own. Default: unsupported.
   virtual std::unique_ptr<hal::StepProgram> record_step(
-      std::function<bool()> step_fn) {
+      const std::function<bool()> &step_fn) {
     (void)step_fn;
     return nullptr;
   }
@@ -97,7 +97,7 @@ public:
   // synchronous and has no launch overhead to amortize). This is the CPU analog
   // of the CUDA backend's pre-recorded graph, satisfying the same interface.
   std::unique_ptr<hal::StepProgram> record_step(
-      std::function<bool()> step_fn) override;
+      const std::function<bool()> &step_fn) override;
 
 private:
   explicit CpuBackend(std::unique_ptr<sx::Executable> exe);

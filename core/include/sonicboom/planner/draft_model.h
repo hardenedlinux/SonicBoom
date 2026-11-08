@@ -124,7 +124,7 @@ class NgramLongDraftModel final : public DraftModel {
 // fixed before the drafter model itself lands.
 class LlmDraftModel final : public DraftModel {
  public:
-  explicit LlmDraftModel(std::string model_path, size_t max_drafts = 7);
+  explicit LlmDraftModel(const std::string &model_path, size_t max_drafts = 7);
 
   void reset() noexcept override;
   void push(uint64_t token) override;

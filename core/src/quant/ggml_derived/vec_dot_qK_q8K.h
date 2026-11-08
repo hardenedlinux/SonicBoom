@@ -385,7 +385,8 @@ inline void dot_q6_K_block(const std::byte* wp, const Q8KBlock& q8,
   a = aux8;
   int is = 0;
   for (int j = 0; j < 16; ++j) {
-    const int scale = scales[is++];
+    // Quant scales are signed int8 values.
+    const int scale = scales[is++];  // NOLINT(bugprone-signed-char-misuse)
     for (int l = 0; l < 8; ++l) aux16[l] = int16_t(q8s[l] * a[l]);
     for (int l = 0; l < 8; ++l) aux32[l] += scale * aux16[l];
     q8s += 8; a += 8;

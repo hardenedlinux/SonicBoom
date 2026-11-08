@@ -266,7 +266,7 @@ public:
   // caller falls back to per-step execute(). The CUDA stream / graph machinery
   // stays behind this method; the planner and executor never see it.
   std::unique_ptr<hal::StepProgram> record_step(
-      std::function<bool()> step_fn) override;
+      const std::function<bool()> &step_fn) override;
 
   // Share another backend's KV cache (same session). The prefill graph's
   // FlashAttention nodes fill the cache that the decode graph's Attention nodes

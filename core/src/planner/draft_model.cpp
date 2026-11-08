@@ -29,7 +29,7 @@ constexpr const char *kLlmNotImplemented = "LlmDraftModel not yet implemented";
 // The constructor is the whole skeleton: selecting the model-backed drafter
 // fails loudly here rather than silently falling back to the n-gram drafter,
 // so a run that asks for it cannot be mistaken for an n-gram run.
-LlmDraftModel::LlmDraftModel(std::string model_path, size_t max_drafts) {
+LlmDraftModel::LlmDraftModel(const std::string &model_path, size_t max_drafts) {
   (void)model_path;
   (void)max_drafts;
   throw std::runtime_error(kLlmNotImplemented);
