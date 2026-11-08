@@ -39,6 +39,25 @@ uint64_t ngram_key(const uint64_t* toks, size_t n) {
   return h;
 }
 
+// The long-match drafter's n-gram classes and the polynomial rolling hash.
+// The base is odd so the modulo-2^64 product stays invertible (an even base
+// would drop low bits as the window slides); kLongPow[i] is B^(n-1) for class
+// i, the shift the departing token sits at when the window slides.
+constexpr size_t kLongNs[8] = {32, 24, 16, 12, 8, 6, 4, 3};
+constexpr uint64_t kRollBase = 0x00000100000001B3ull;  // FNV prime
+
+uint64_t roll_pow(size_t e) {
+  uint64_t p = 1;
+  for (size_t i = 0; i < e; ++i) p *= kRollBase;
+  return p;
+}
+
+const uint64_t kLongPow[8] = {
+    roll_pow(kLongNs[0] - 1), roll_pow(kLongNs[1] - 1),
+    roll_pow(kLongNs[2] - 1), roll_pow(kLongNs[3] - 1),
+    roll_pow(kLongNs[4] - 1), roll_pow(kLongNs[5] - 1),
+    roll_pow(kLongNs[6] - 1), roll_pow(kLongNs[7] - 1)};
+
 } // namespace
 
 void NGramDrafter::reset() noexcept {
@@ -89,6 +108,68 @@ size_t NGramDrafter::propose(std::span<uint64_t> out, size_t* matched_n) const {
     const size_t count = std::min(k, hist_.size() - 1 - end);
     if (count == 0) continue;
     for (size_t i = 0; i < count; ++i) out[i] = hist_[end + 1 + i];
+    return count;
+  }
+  return 0;
+}
+
+void NGramLongDrafter::reset() noexcept {
+  hist_.clear();
+  for (auto& m : ngram_) m.clear();
+  for (auto& h : roll_) h = 0;
+}
+
+void NGramLongDrafter::push(uint64_t token) {
+  const size_t s = hist_.size();  // position of the token being pushed
+  hist_.push_back(token);
+  for (size_t i = 0; i < kClasses; ++i) {
+    const size_t n = kLongNs[i];
+    if (s >= n) {
+      // The rolling state covers the window ending at s-1 — exactly the n-gram
+      // whose following token is the one just pushed. Record it, then slide the
+      // window one token forward.
+      ngram_[i][roll_[i]] = s - 1;
+      roll_[i] = (roll_[i] - hist_[s - n] * kLongPow[i]) * kRollBase + token;
+    } else {
+      roll_[i] = roll_[i] * kRollBase + token;
+    }
+  }
+}
+
+void NGramLongDrafter::push(std::span<const uint64_t> tokens) {
+  for (uint64_t t : tokens) push(t);
+}
+
+size_t NGramLongDrafter::propose(std::span<uint64_t> out) const {
+  return propose(out, nullptr);
+}
+
+size_t NGramLongDrafter::propose(std::span<uint64_t> out,
+                                 size_t* matched_n) const {
+  if (matched_n) *matched_n = 0;
+  const size_t k = std::min(out.size(), max_drafts_);
+  if (k == 0) return 0;
+  const size_t size = hist_.size();
+  // Longest context first: a 32-gram hit repeats a whole run of tokens, so its
+  // continuation is far more specific than a 3-gram hit's.
+  for (size_t i = 0; i < kClasses; ++i) {
+    const size_t n = kLongNs[i];
+    if (size < n) continue;
+    const auto it = ngram_[i].find(roll_[i]);
+    if (it == ngram_[i].end()) continue;
+    const size_t end = it->second;
+    // The table is a hash index: compare the occurrence's tokens with the
+    // current suffix before trusting it, so a collision falls through to the
+    // next shorter class instead of proposing an unrelated continuation.
+    const size_t occ = end + 1 - n;
+    const auto at = [this](size_t i) {
+      return hist_.begin() + static_cast<std::ptrdiff_t>(i);
+    };
+    if (!std::equal(at(occ), at(occ + n), at(size - n))) continue;
+    const size_t count = std::min(k, size - 1 - end);
+    if (count == 0) continue;
+    if (matched_n) *matched_n = n;
+    for (size_t j = 0; j < count; ++j) out[j] = hist_[end + 1 + j];
     return count;
   }
   return 0;

@@ -241,9 +241,20 @@ bool warmup_spine_cuda(const Gemma4Model& m, uint64_t n_ctx,
 // runtime (decode, verify, session creation, tier capture, tools) reads one
 // immutable table. Closes the resolution epoch when it returns; a miss after
 // that is a bug, not a measurement: the lookup reports it and the runtime build
-// fails. Called by the common model load (model::load_gemma4), so every entry
-// point that loads a model resolves exactly once.
+// fails. Called by ensure_device_ready(), which every entry point that builds a
+// CUDA runtime, session or plan runs first.
 bool resolve_tune_for_model(const Gemma4Model& m);
+
+// Initialize the device for `m` on first device use and resolve the model's
+// numerics-affecting choices: the load itself is host-side only, so a caller
+// that forks before touching CUDA forks a process with no device state. The
+// first call initializes the CUDA context, uploads any weight the load left on
+// the host, and runs resolve_tune_for_model(); later calls are a no-op for the
+// same model. Every function that builds a CUDA runtime, session or plan calls
+// this first, as does the C API model load. After it returns the resolution
+// epoch is closed: a numerics-affecting lookup miss or write is a [tune] BUG
+// and fails the runtime build. Returns true when the build has no CUDA support.
+bool ensure_device_ready(const Gemma4Model& m);
 
 // ---------------------------------------------------------------------------
 // Speculative verification (Part B). A draft of k tokens is checked by running
@@ -321,10 +332,13 @@ DevicePoolStats device_pool_stats();
 // The verify step: feed `tokens` at positions `start_pos .. start_pos+rows-1`
 // through the row-invariant verify graph on `session`'s cache and write each
 // row's argmax into `out` (out.size() >= tokens.size(), rows <=
-// planner::kMaxVerifyRows, start_pos + rows <= session.n_ctx). The cache is left
-// holding those rows, as `rows` plain decode steps would leave it. Returns false
-// on a build/step failure. The first call for a (model, n_ctx, rows, cache)
-// builds, plans and captures the step; later calls replay it.
+// planner::kMaxVerifyRows). The step runs the smallest row bucket >= rows, so
+// the cache must hold start_pos + bucket <= session.n_ctx; the padded rows
+// repeat the last draft token and their outputs are discarded. The cache is
+// left holding the whole bucket, as a bucket's worth of plain decode steps
+// would leave it.
+// Returns false on a build/step failure. The first call for a (model, n_ctx,
+// bucket, cache) builds, plans and captures the step; later calls replay it.
 bool verify_step_spine_cuda(const Gemma4Model& m,
                             std::span<const uint64_t> tokens,
                             uint64_t start_pos,
@@ -452,9 +466,10 @@ struct SpecCounters {
   // proposals are worth verifying after all.
   uint64_t probe_verifies = 0;
   uint64_t policy_steps = 0;
-  // The policy's chosen draft budget per policy iteration (k = 0..15). This is
-  // the decision, not the number of drafts a particular proposal contained.
-  uint64_t k_hist[16] = {};
+  // The policy's chosen draft budget per policy iteration (k = 0..63, one bin
+  // per reachable length). This is the decision, not the number of drafts a
+  // particular proposal contained.
+  uint64_t k_hist[64] = {};
 };
 SpecCounters spec_counters();
 void spec_counters_reset();

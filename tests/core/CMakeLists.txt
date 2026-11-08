@@ -174,8 +174,12 @@ if(SONICBOOM_USE_CUDA)
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
     SONICBOOM_PRIVATE_DATA_DIR="${SB_PRIVATE_DATA_DIR}")
   sb_add_cpp_test(test_capi_sampling)
+  # The token goldens are recorded under canonical numerics: the tuner's
+  # arithmetic-bearing picks are fixed, so a rebuild (and an empty tune
+  # directory) does not move the stream.
   set_tests_properties(test_capi_sampling PROPERTIES
-    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long
+    ENVIRONMENT "SONICBOOM_TUNE=canonical")
 endif()
 
 # Image generation through the C ABI (MOSS-Image, CUDA, 512x512, 4 steps): the
@@ -205,8 +209,10 @@ if(SONICBOOM_USE_CUDA)
   target_compile_definitions(test_guarantees PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
   sb_add_cpp_test(test_guarantees)
+  # Its token goldens are canonical numerics (see test_capi_sampling).
   set_tests_properties(test_guarantees PROPERTIES
-    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long
+    ENVIRONMENT "SONICBOOM_TUNE=canonical")
 endif()
 
 # R2: SonicBoomParam + fused AdamW through the C ABI, 10 steps against an

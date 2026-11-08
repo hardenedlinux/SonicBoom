@@ -148,7 +148,9 @@ void record_choice(std::string_view op, const std::string& shape_class,
                 : source == planner::decisions::Source::Skipped
                       ? "cold budget exhausted: static default"
                       : "static default";
-  entry.numerics = "bit-identical to candidates[0] (the static default)";
+  entry.numerics =
+      "neutral (bit-identical to candidates[0], the static default; "
+      "AutotuneRunner memcmp gate)";
   entry.tuning_ms = tuning_ms;
   planner::decisions::record(entry);
 }
@@ -168,7 +170,9 @@ void record_ratio(std::string_view op, std::string_view shape,
   entry.reason = source == planner::decisions::Source::Cached
                      ? "per-SM cache record"
                      : "measured in this process";
-  entry.numerics = "informational: the ratio selects the spec path, not arithmetic";
+  entry.numerics =
+      "neutral (path selection only; the ratio selects the spec path, not "
+      "arithmetic; test_spec_invariance)";
   planner::decisions::record(entry);
 }
 

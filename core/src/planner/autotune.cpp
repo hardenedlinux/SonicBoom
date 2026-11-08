@@ -143,10 +143,45 @@ std::atomic<bool> g_sealed{false};
 std::atomic<bool> g_resolving{false};
 std::string g_sealed_miss_key;
 
+// The numerics class of an autotune table, as the sealing rule and the
+// decision registry see it.
+//
+//   neutral             the candidates produce the same bytes, or the table
+//                       selects a path/timing rather than arithmetic; the op is
+//                       allowed to miss and write late, and a test names the
+//                       invariant.
+//   affecting           the pick changes the arithmetic. The ones resolved in
+//                       the model-load epoch are locked: a miss or a write
+//                       after the epoch closes is a bug.
+//   affecting-first-use the pick changes the arithmetic, but the class resolves
+//                       on its first use (the first prefill chunk), outside the
+//                       load epoch, so the table keeps writing; the owning
+//                       suites gate it.
+enum class NumericsClass { Neutral, Affecting, AffectingFirstUse };
+
+NumericsClass numerics_class(std::string_view op) {
+  if (op == "mmq-cfg" || op == "mmq-group" || op == "verify-gemv-wp" ||
+      op == "spec-length")
+    return NumericsClass::Neutral;
+  if (op == "decode-family" || op == "mmq-splitk" || op == "decode-attn" ||
+      op == "attention-decode")
+    return NumericsClass::Affecting;
+  // attention-full, attention.class, boom_fattn, dense-gemm, dense-f32,
+  // mmq-j, and any op this table does not know: affecting, first-use.
+  return NumericsClass::AffectingFirstUse;
+}
+
+const char *neutral_test(std::string_view op) {
+  if (op == "mmq-cfg") return "test_mmq_cfg_neutral";
+  if (op == "mmq-group") return "test_mmq_group_neutral";
+  if (op == "verify-gemv-wp") return "test_verify_gemv_wp";
+  if (op == "spec-length")
+    return "path selection only; test_spec_invariance";
+  return "the owning test suite";
+}
+
 bool numerics_locked_op(std::string_view op) {
-  return op == "decode-family" || op == "mmq-splitk" || op == "mmq-cfg" ||
-         op == "verify-gemv-wp" || op == "decode-attn" ||
-         op == "attention-decode";
+  return numerics_class(op) == NumericsClass::Affecting;
 }
 
 bool trace_line_enabled() {
@@ -408,6 +443,16 @@ bool force() {
   return e != nullptr && std::strcmp(e, "force") == 0;
 }
 
+std::atomic<bool> g_canonical{false};
+
+bool canonical() {
+  if (g_canonical.load()) return true;
+  const char *e = std::getenv("SONICBOOM_TUNE");
+  return e != nullptr && std::strcmp(e, "canonical") == 0;
+}
+
+void set_canonical(bool on) { g_canonical.store(on); }
+
 const std::string &device_dir() {
   std::lock_guard<std::mutex> lk(g_mutex);
   return device_dir_locked();
@@ -451,7 +496,21 @@ void record_pick(std::string_view op, std::string_view key,
   entry.reason = source == planner::decisions::Source::Cached
                      ? "per-device JSON cache record"
                      : "timed in the eager warm-up (3% win required)";
-  entry.numerics = "kernel-specific; gated by the owning test suite";
+  switch (numerics_class(op)) {
+    case NumericsClass::Neutral:
+      entry.numerics = std::string("neutral (") + neutral_test(op) + ")";
+      break;
+    case NumericsClass::Affecting:
+      entry.numerics =
+          "affecting: resolved in the model-load epoch; a late miss or write "
+          "fails the runtime build";
+      break;
+    case NumericsClass::AffectingFirstUse:
+      entry.numerics =
+          "affecting; resolves on first use (prefill path), outside the "
+          "model-load epoch";
+      break;
+  }
   planner::decisions::record(entry);
 }
 
@@ -527,6 +586,13 @@ std::map<std::string, int> lookup(std::string_view op, std::string_view key,
                                   long long expect_fp, const char *caller) {
   if (!enabled()) return {};
   const std::string fp_s = fp_text(expect_fp);
+  // Canonical numerics reads no record whose pick changes arithmetic: the
+  // table's callers take their reference default instead. Neutral tables keep
+  // reading (and writing) their picks.
+  if (canonical() && numerics_class(op) != NumericsClass::Neutral) {
+    trace_line("canonical", op, key, fp_s, caller);
+    return {};
+  }
   if (force()) {
     trace_line("miss", op, key, fp_s, caller);
     return {};
@@ -567,6 +633,13 @@ void store(std::string_view op, std::string_view key,
   if (!enabled()) return;
   const std::string op_s(op);
   const std::string key_s(key);
+  // Canonical numerics writes no record whose pick changes arithmetic: the
+  // class keeps its reference default for this process. Neutral tables are
+  // still measured and stored.
+  if (canonical() && numerics_class(op_s) != NumericsClass::Neutral) {
+    trace_line("canonical", op_s, key_s, fp_text(fp), caller);
+    return;
+  }
   // The record's fingerprint: the explicit one, else the value the record
   // carries. A table without either is numerics-neutral by key.
   const long long new_fp = effective_fp(values, fp);

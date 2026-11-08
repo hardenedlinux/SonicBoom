@@ -1322,7 +1322,9 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                 continue;
         }
         MmqUpPin pin;
-        const bool cached = mmq_pin_from_cache(s, build_key, &pin);
+        const bool cached = tune::canonical()
+                                ? false
+                                : mmq_pin_from_cache(s, build_key, &pin);
         if (!cached) {
             if (!reduced_mode && elapsed_s() > kMmqTuneBudgetS) {
                 reduced_mode = true;
@@ -1332,8 +1334,11 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
                              "set (cfgs {5,6})\n",
                              elapsed_s());
             }
-            tune::trace_event("measure", "mmq-splitk", mmq_splitk_key(s),
-                              std::to_string(build_key), __builtin_FUNCTION());
+            if (!tune::canonical()) {
+                tune::trace_event("measure", "mmq-splitk", mmq_splitk_key(s),
+                                  std::to_string(build_key),
+                                  __builtin_FUNCTION());
+            }
             tune::trace_event("measure", "mmq-cfg", mmq_cfg_key(s, 8),
                               std::to_string(build_key), __builtin_FUNCTION());
             tune::trace_event("measure", "mmq-cfg", mmq_cfg_key(s, 16),
@@ -1342,7 +1347,18 @@ void mmq_up_warm(const QuantizedTensor * const * weights, size_t count,
             if (mmq_tune_alloc(s, b)) {
                 pin = mmq_pin_measure(s, b, reduced_mode);
                 mmq_tune_free(b);
-                mmq_pin_store(s, pin, build_key);
+            }
+            if (tune::canonical()) {
+                // Canonical numerics: one K pass (S = 1). The tile
+                // configuration is numerics-neutral and still measured, but
+                // only its record is written.
+                pin.split_k = 1;
+                if (tune::enabled() && build_key != 0) {
+                    tune::store("mmq-cfg", mmq_cfg_key(s, 8),
+                                {{"cfg", pin.cfg_j8}, {"k", build_key}});
+                    tune::store("mmq-cfg", mmq_cfg_key(s, 16),
+                                {{"cfg", pin.cfg_j16}, {"k", build_key}});
+                }
             } else {
                 // A shape whose probe buffers do not fit keeps the default
                 // configuration; the resolution is recorded so the split is a
@@ -1375,6 +1391,19 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
     {
         std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
         if (g_mmq_group_pin.count(key) != 0) return;  // already warmed
+    }
+    if (tune::canonical()) {
+        // Canonical numerics: one K pass (S = 1), no tune record. The group
+        // kernels' shared-memory opt-in is host-side setup, not a choice: run
+        // it here as the measuring path does, or the first grouped launch in
+        // the group-use resolution fails with an invalid launch argument.
+        const sb_cuda_props props = get_props();
+        sonicboom::quant::cuda::MmqGroupArgs warm{};
+        warm.n_members = n_members;
+        (void)group_dispatch(props, warm, types, 1, nullptr, /*warm=*/true);
+        std::lock_guard<std::mutex> lock(g_mmq_group_pin_mutex);
+        g_mmq_group_pin[key] = 1;
+        return;
     }
 
     const int build_key =

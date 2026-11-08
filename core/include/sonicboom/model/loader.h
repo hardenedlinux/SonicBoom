@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <expected>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,6 +41,12 @@ struct Gemma4Model {
   std::vector<LayerConfig> plan;  // one per block, index == layer
   // Owns converted Q5_K bytes referenced by weight QuantizedTensors.
   std::vector<std::vector<uint8_t>> owned_quant_buffers;
+  // Device initialization state: false until ensure_device_ready() runs for
+  // this model. The load is host-side only, so a process that forks before its
+  // first device use forks with no CUDA state; the child's first runtime build
+  // initializes the device in the child.
+  std::shared_ptr<std::atomic<bool>> device_ready =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 // Load and validate `r` as a Gemma 4 E4B model. Returns an error string when

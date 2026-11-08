@@ -955,7 +955,7 @@ mlir::LogicalResult SampleOp::verify() {
 // The verify step's row budget. The planner's resident verify kernels are
 // built for at most this many query rows (planner::kMaxVerifyRows, the device
 // token slot's size); a draft of k tokens needs k+1 rows.
-constexpr int64_t kVerifyRowCap = 16;
+constexpr int64_t kVerifyRowCap = 64;
 
 // The draft node: a named strategy and a proposal cap inside the verify step's
 // row budget. The draft array's last dimension is the cap — that is what the

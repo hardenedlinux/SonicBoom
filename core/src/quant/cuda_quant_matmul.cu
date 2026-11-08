@@ -1789,6 +1789,9 @@ MmqChoice mmq_j_select(const char* w, const int* y, float* dst, int M, int n,
 
   const int forced = mmq_j_override();
   if (forced != 0) return MmqChoice{forced, policy};
+  // Canonical numerics: the policy decomposition and upstream's J rule, no
+  // tune record read or written.
+  if (::sonicboom::tune::canonical()) return fallback;
   if (runtime::feature_disabled(runtime::Feature::Autotune)) return fallback;
   const long long build_fp = ::sonicboom::tune::build_fingerprint_key();
 
@@ -4280,6 +4283,11 @@ double decode_family_mmq_ms(const VerifyWpShape& s, MmqUpType type,
 
 bool decode_family_cached(const VerifyWpShape& s, int build_key, bool* mmq) {
   const std::string key = decode_family_key(s.qt, s.rows, s.cols);
+  if (::sonicboom::tune::canonical()) {
+    // Canonical numerics: the mmq family for every shape, no tune record.
+    *mmq = true;
+    return true;
+  }
   {
     std::lock_guard<std::mutex> lk(g_decode_family_mutex);
     const auto it = g_decode_family.find(key);
@@ -4435,6 +4443,11 @@ double decode_family_group_mmq_ms(const QuantizedTensor* const* w, int count,
 
 bool decode_family_group_cached(const std::string& key, int build_key,
                                 bool* mmq) {
+  if (::sonicboom::tune::canonical()) {
+    // Canonical numerics: the mmq family for every sibling group, no record.
+    *mmq = true;
+    return true;
+  }
   {
     std::lock_guard<std::mutex> lk(g_decode_family_mutex);
     const auto it = g_decode_family_group.find(key);

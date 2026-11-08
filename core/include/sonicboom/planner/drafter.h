@@ -88,4 +88,47 @@ class NGramDrafter {
   size_t max_drafts_ = 7;
 };
 
+// The long-match n-gram drafter: the same prompt-lookup idea over a wide span
+// of n-grams, so a copy that repeats far back in the history still matches from
+// its tail. It indexes n in {3, 4, 6, 8, 12, 16, 24, 32}; the proposal comes
+// from the largest n whose current suffix occurred earlier (the most recent
+// such occurrence), and the occurrence is compared token by token before its
+// continuation is proposed, so a hash collision only costs the lookup.
+//
+// The index is maintained incrementally: each n keeps a polynomial rolling hash
+// of the last n tokens, updated when a token is pushed, so a push costs eight
+// hash steps and one table insert per n-gram class rather than a re-hash of
+// every window.
+class NGramLongDrafter {
+ public:
+  static constexpr size_t kMinN = 3;
+  static constexpr size_t kMaxN = 32;
+
+  explicit NGramLongDrafter(size_t max_drafts = 7) : max_drafts_(max_drafts) {}
+
+  void reset() noexcept;
+  void push(uint64_t token);
+  void push(std::span<const uint64_t> tokens);
+
+  size_t max_drafts() const noexcept { return max_drafts_; }
+  void set_max_drafts(size_t k) noexcept { max_drafts_ = k; }
+
+  size_t propose(std::span<uint64_t> out) const;
+  size_t propose(std::span<uint64_t> out, size_t* matched_n) const;
+
+  std::span<const uint64_t> history() const noexcept { return hist_; }
+  size_t size() const noexcept { return hist_.size(); }
+
+ private:
+  static constexpr size_t kClasses = 8;
+
+  std::vector<uint64_t> hist_;
+  // Per class: the window length, its rolling hash over the last `n` tokens,
+  // the hash of B^(n-1) (for the out-rolling step), and the table of the most
+  // recent occurrence ending at each hash.
+  std::unordered_map<uint64_t, size_t> ngram_[kClasses];
+  uint64_t roll_[kClasses] = {};
+  size_t max_drafts_ = 7;
+};
+
 } // namespace sonicboom::planner

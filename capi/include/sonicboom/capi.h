@@ -685,6 +685,20 @@ typedef int (*sb_llm_token_cb)(void *user, sb_token token);
  * session keeps the model alive after sb_llm_model_free. */
 sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
                             sb_error **err_out);
+
+/* sb_llm_model_load_ex flags.
+ *
+ * SB_LLM_LOAD_CANONICAL selects canonical numerics for the process: every
+ * tuner whose pick changes arithmetic takes its documented reference default
+ * and neither reads nor writes a tune record, so the same model and prompt
+ * produce the same tokens on an empty and on a populated tune directory.
+ * Numerics-neutral picks (tile grids, timing tables) keep tuning. It is the
+ * programmatic form of SONICBOOM_TUNE=canonical and is sticky for the
+ * process, like the numerics profile. Any other bit is SB_ERR_BINDING. */
+#define SB_LLM_LOAD_CANONICAL 1u
+sb_status sb_llm_model_load_ex(const char *gguf_path, uint32_t flags,
+                               sb_llm_model **model_out, sb_error **err_out);
+
 void sb_llm_model_free(sb_llm_model *model);
 
 /* The loaded model's architecture, exactly as its GGUF declares it in

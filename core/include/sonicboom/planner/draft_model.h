@@ -29,10 +29,12 @@
 // accept rule, or the emitted stream (which stays the plain greedy stream).
 //
 // Implementations:
-//   * NgramDraftModel — the existing prompt-lookup NGramDrafter (B5).
-//   * LlmDraftModel  — skeleton; constructing it throws
-//                      "LlmDraftModel not yet implemented". Selected by the
-//                      SONICBOOM_DRAFT_MODEL environment variable.
+//   * NgramLongDraftModel — the long-match n-gram drafter (default).
+//   * NgramDraftModel     — the original 2..4-gram prompt-lookup drafter
+//                           (SONICBOOM_SPEC_DRAFTER=legacy).
+//   * LlmDraftModel       — skeleton; constructing it throws
+//                           "LlmDraftModel not yet implemented". Selected by
+//                           the SONICBOOM_DRAFT_MODEL environment variable.
 
 #include <cstddef>
 #include <cstdint>
@@ -90,6 +92,32 @@ class NgramDraftModel final : public DraftModel {
   NGramDrafter drafter_;
 };
 
+// The long-match n-gram drafter behind the same interface (NGramLongDrafter).
+class NgramLongDraftModel final : public DraftModel {
+ public:
+  explicit NgramLongDraftModel(size_t max_drafts = 7)
+      : drafter_(max_drafts) {}
+
+  void reset() noexcept override { drafter_.reset(); }
+  void push(uint64_t token) override { drafter_.push(token); }
+  void push(std::span<const uint64_t> tokens) override {
+    drafter_.push(tokens);
+  }
+  size_t max_drafts() const noexcept override { return drafter_.max_drafts(); }
+  void set_max_drafts(size_t k) noexcept override {
+    drafter_.set_max_drafts(k);
+  }
+  size_t propose(std::span<uint64_t> out) const override {
+    return drafter_.propose(out);
+  }
+  size_t propose(std::span<uint64_t> out, size_t* matched_n) const override {
+    return drafter_.propose(out, matched_n);
+  }
+
+ private:
+  NGramLongDrafter drafter_;
+};
+
 // Model-backed drafter. Not implemented: every entry point (including the
 // constructor) throws std::runtime_error("LlmDraftModel not yet implemented").
 // It exists so the interface, the environment switch, and the call sites are
@@ -107,9 +135,10 @@ class LlmDraftModel final : public DraftModel {
   size_t propose(std::span<uint64_t> out, size_t* matched_n) const override;
 };
 
-// SONICBOOM_DRAFT_MODEL unset or empty  -> NgramDraftModel(max_drafts).
 // SONICBOOM_DRAFT_MODEL set to a path  -> LlmDraftModel(path, max_drafts),
 //                                         which throws (not implemented).
+// otherwise SONICBOOM_SPEC_DRAFTER=legacy -> NgramDraftModel(max_drafts)
+//           unset or any other value      -> NgramLongDraftModel(max_drafts)
 std::unique_ptr<DraftModel> make_draft_model(size_t max_drafts);
 
 } // namespace sonicboom::planner
