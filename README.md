@@ -49,7 +49,7 @@ the DeepSeek-R1-Distill-Qwen family and the other Qwen2.5 sizes run as well.
 
 ## Reproducible
 
-- **Same input, same output.** This holds with the same version, the same GPU
+- **Same prompt, same output.** This holds with the same version, the same GPU
   and the same warm-up table.
 - **Speculation doesn't change the result.** Turning speculative decoding on
   or off gives bit-identical token sequences. It is on by default.
