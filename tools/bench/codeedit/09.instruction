@@ -1,0 +1,2 @@
+Apply this edit to the file below and return the complete file: convert the first counted loop to a range-for over the same range and leave every other line unchanged.
+
