@@ -55,6 +55,11 @@ export LC_ALL=C LANG=C
 #                                       [--gpu-clock MHZ] [--no-lock-clocks]
 #                                       [--long]
 # Env:   LLAMA_BENCH=/path/to/llama-bench   (optional; enables the llama.cpp column)
+#        LLAMA_BIN=/path/to/llama.cpp/build/bin
+#            a llama.cpp build directory; fills LLAMA_BENCH and LLAMA_SERVER
+#            from it when those are not set explicitly. LLAMA_BENCH on its own
+#            keeps working exactly as before.
+#        LLAMA_SERVER=/path/to/llama-server  (optional; the code-edit arms)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -82,6 +87,13 @@ while [ $# -gt 0 ]; do
     *)  GGUF="$1"; shift ;;
   esac
 done
+
+# LLAMA_BIN names a llama.cpp build directory; it fills the two binary paths
+# that are not set explicitly. An explicit LLAMA_BENCH keeps precedence.
+if [ -n "${LLAMA_BIN:-}" ]; then
+  [ -n "${LLAMA_BENCH:-}" ]  || LLAMA_BENCH="$LLAMA_BIN/llama-bench"
+  [ -n "${LLAMA_SERVER:-}" ] || LLAMA_SERVER="$LLAMA_BIN/llama-server"
+fi
 
 # The run count drives the reported spread, so a non-numeric one is an error,
 # not a default.
@@ -331,7 +343,7 @@ if [ -n "${LLAMA_BENCH:-}" ] && [ -x "${LLAMA_BENCH}" ]; then
   csvs=()
   for ((i=1;i<=RUNS;i++)); do
     f=$(mktemp)
-    "$LLAMA_BENCH" -m "$GGUF" -p 0,512 -n 64,0 -d 0,512 -ngl 99 -r 3 -o csv \
+    "$LLAMA_BENCH" -m "$GGUF" -p 0,512 -n 64,0 -d 0,512 -ngl 99 -fa on -r 3 -o csv \
       >"$f" 2>/dev/null || true
     csvs+=("$f")
   done
@@ -380,7 +392,7 @@ if [ "$LONG" = 1 ]; then
     local vals="" i f
     for ((i=1;i<=RUNS;i++)); do
       f=$(mktemp)
-      "$LLAMA_BENCH" -m "$GGUF" -p "$p" -n "$g" -d "$d" -ngl 99 -r 1 -o csv \
+      "$LLAMA_BENCH" -m "$GGUF" -p "$p" -n "$g" -d "$d" -ngl 99 -fa on -r 1 -o csv \
         >"$f" 2>/dev/null || true
       local v
       v=$(awk -F, -v P="$p" -v G="$g" -v D="$d" '
