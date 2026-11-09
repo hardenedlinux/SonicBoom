@@ -7443,6 +7443,26 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
       prefix_len -= mmq_min_n - (chunk - rem);
     }
   }
+  // Let a sliding-window session reuse only a prefix whose KV is still resident
+  // in the ring. The windowed ring holds `window + kMaxVerifyRows` slots, and a
+  // verify writes its whole bucket (padding included), and a verify accepts at
+  // least the verifier's own token, so rows past the accepted length reach at
+  // most kMaxVerifyRows-2 positions past the last token the session records.
+  // Those writes overwrite the slots of positions at or below
+  // `history - window - 2`. A prefill starting at `prefix_len`
+  // first attends position `prefix_len` over `prefix_len - window + 1 ..
+  // prefix_len`, so the reuse is sound only when that earliest position is at
+  // or above the overwritten frontier — or when the prefill restarts at 0 and
+  // writes every row it reads before attending. Continuing the recorded
+  // history (the one-token hold-back above included) always lands above the
+  // frontier.
+  if (m.config.sliding_window > 0) {
+    const int64_t window = int64_t(m.config.sliding_window);
+    const int64_t history = int64_t(session.filled_tokens.size());
+    const int64_t earliest =
+        std::max<int64_t>(0, int64_t(prefix_len) - window + 1);
+    if (earliest < history - window - 1) prefix_len = 0;
+  }
   if (n_reused_out) *n_reused_out = prefix_len;
 
   // The cache size is the session's n_ctx (pre-set by the caller for its largest
