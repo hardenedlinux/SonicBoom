@@ -147,9 +147,10 @@ Thanks to:
 - [@svenha](https://github.com/svenha)
 - [@mmssix](https://github.com/mmssix)
 
-- 0.0.3 #1 #2
-- 0.0.4 #3
-- 0.0.5 #4
+Results:
+- 0.0.3 [#1](https://github.com/hardenedlinux/SonicBoom/issues/1) [#2](https://github.com/hardenedlinux/SonicBoom/issues/2)
+- 0.0.4 [#3](https://github.com/hardenedlinux/SonicBoom/issues/3)
+- 0.0.5 [#4](https://github.com/hardenedlinux/SonicBoom/issues/4)
 
 ## What's inside
 
