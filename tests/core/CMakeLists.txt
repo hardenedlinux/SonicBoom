@@ -215,6 +215,24 @@ if(SONICBOOM_USE_CUDA)
     ENVIRONMENT "SONICBOOM_TUNE=canonical")
 endif()
 
+# Plan recording smoke: the six model/mode cases recorded twice each in one
+# process are identical, and no CUDA error survives a recording. The
+# recordings themselves (device lines, kernel geometry, dispatch decisions) and
+# the pinned tune table they were recorded against are engine internals: their
+# byte-exact goldens live in the private tree's test data, not here. Skips (77)
+# without a CUDA device or the model GGUFs.
+if(SONICBOOM_USE_CUDA)
+  add_executable(test_plan_record_smoke test_plan_record_smoke.cpp)
+  target_link_libraries(test_plan_record_smoke PRIVATE sonicboom m
+                                                       CUDA::cudart)
+  target_compile_definitions(test_plan_record_smoke PRIVATE
+    SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+  sb_add_cpp_test(test_plan_record_smoke)
+  set_tests_properties(test_plan_record_smoke PROPERTIES
+    SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long
+    ENVIRONMENT "SONICBOOM_TUNE=canonical")
+endif()
+
 # R2: SonicBoomParam + fused AdamW through the C ABI, 10 steps against an
 # independent double-precision reference (max-abs <= 1e-6).
 add_executable(test_adamw test_adamw.cpp)
@@ -247,6 +265,26 @@ add_executable(test_blade_to_boom test_blade_to_boom.cpp)
 target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
 sb_add_cpp_test(test_blade_to_boom)
+
+# Graph -> Boom IR -> graph smoke test on the six model/mode cases: the
+# emitter's graph comes back structurally identical (tensor table and every
+# node field, in order), and therefore with the same model fingerprint. The
+# conversion is a translation, not a transformation. Compiler-side and CPU-only;
+# the byte-exact plan goldens live in the private tree's test data. Skips (77)
+# when no model GGUF is found.
+add_executable(test_boom_conversion_smoke test_boom_conversion_smoke.cpp)
+target_link_libraries(test_boom_conversion_smoke PRIVATE sonicboom
+                                                    sonicboom_compiler
+                                                    MLIRAsmParser)
+target_compile_definitions(test_boom_conversion_smoke PRIVATE
+  SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
+sb_add_cpp_test(test_boom_conversion_smoke)
+# The graph's decode-attention geometry is a numerics-affecting choice: outside
+# canonical mode, building a graph without a model-load resolution is reported
+# as a [tune] BUG. The round trip is a structural property and takes the
+# reference default.
+set_tests_properties(test_boom_conversion_smoke PROPERTIES
+  SKIP_RETURN_CODE 77 ENVIRONMENT "SONICBOOM_TUNE=canonical")
 
 # The GPU tests run one at a time (RESOURCE_LOCK gpu_vram).
 #
