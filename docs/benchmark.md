@@ -91,10 +91,10 @@ Medians of 3 process runs, both runtimes on the same GGUF in the same session,
 on the machine in [Conditions](#conditions). Every claim is bounded by that: one
 GPU, one quant file.
 
-Four language-model families are benchmarked: d64 dense (Gemma 4, Qwen2.5-0.5B)
-and d128 grouped-query attention (DeepSeek-R1-Distill-1.5B GQA-6, Qwen2.5-7B
-GQA-7). DeepSeek and Qwen2.5-7B are benchmark-only: they carry no public
-token-stream golden.
+Two language models are benchmarked: Gemma 4 E4B (d64 dense) and
+Qwen2.5-7B-Instruct-1M (d128 grouped-query attention, GQA-7). The Gemma table
+below was recorded with the Q3_K_M file; the file the tools default to, and the
+model list in [Conditions](#conditions), name Q5_K_M.
 
 **Gemma 4 E4B-it Q3_K_M** (RTX 3050 8 GB, sm_86)
 
@@ -105,24 +105,6 @@ token-stream golden.
 | Prefill, 512-token prompt (marginal) | 2261.7 tok/s | 1998.7 tok/s | 1.13× |
 | Prefix reuse, 512-token prefix + 64 new | 51.1 ms to first token | — | — |
 
-**Qwen2.5-0.5B-Instruct Q4_K_M** (same machine, same session)
-
-| metric | SonicBoom | llama.cpp | ratio |
-|---|---:|---:|---:|
-| **Decode**, 64-step steady state | **350.7 tok/s** | 306.9 tok/s | **1.14×** |
-| Decode at KV depth 512 | 297.9 tok/s | 303.2 tok/s | 0.98× |
-| Prefill, 512-token prompt (marginal) | 17932 tok/s | 14017.3 tok/s | 1.28× |
-| Prefix reuse, 512-token prefix + 64 new | 11.7 ms to first token | — | — |
-
-**DeepSeek-R1-Distill-Qwen-1.5B Q4_K_M** (d128/GQA-6, same machine)
-
-| metric | SonicBoom | llama.cpp | ratio |
-|---|---:|---:|---:|
-| **Decode**, 64-step steady state | **154.0 tok/s** | 149.0 tok/s | **1.03×** |
-| Decode at KV depth 512 | 138.4 tok/s | 147.1 tok/s | 0.94× |
-| Prefill, 512-token prompt (marginal) | 4795.7 tok/s | 5815.0 tok/s | 0.82× |
-| Prefix reuse, 512-token prefix + 64 new | 33.1 ms to first token | — | — |
-
 **Qwen2.5-7B-Instruct-1M Q4_K_M** (d128/GQA-7, same machine)
 
 | metric | SonicBoom | llama.cpp | ratio |
@@ -132,12 +114,9 @@ token-stream golden.
 | Prefill, 512-token prompt (marginal) | 1475.4 tok/s | 1587.9 tok/s | 0.93× |
 | Prefix reuse, 512-token prefix + 64 new | 101.7 ms to first token | — | — |
 
-Decode leads on the two d64 families at depth 0 (1.19× Gemma, 1.14× Qwen2.5-0.5B).
-Qwen2.5-0.5B has no sliding window, so it attends all 512 keys while Gemma's
-ring buffer wraps — that is why it is level at depth 512. DeepSeek is at decode
-parity (1.03×) and Qwen2.5-7B is 6–8% behind. Prefill is ahead on both d64
-families (1.13× / 1.28×, the converged `boom_fattn` path) and behind on the d128
-families (0.82× / 0.93×). Prefix reuse has no llama.cpp counterpart
+Gemma decodes 1.19× ahead of llama.cpp at depth 0, and Qwen2.5-7B is 6–8%
+behind. Prefill is ahead on Gemma (1.13×, the converged `boom_fattn` path) and
+behind on Qwen2.5-7B (0.93×). Prefix reuse has no llama.cpp counterpart
 (`llama-bench` cannot measure it), so it is reported as first-token latency
 only; the exactness claim beside it is a test, not a benchmark — a reuse
 continuation is token-identical to a full prefill (`test_guarantees` covers the
@@ -148,9 +127,48 @@ The v0.0.3 values for the two original families are kept in the
 [README numbers table](../README.md#numbers) so the release-over-release change
 stays visible; the doc here reports the current release only.
 
-SM clock medians over the published runs: 1927 MHz (Gemma), 1942 MHz
-(Qwen2.5-0.5B), 1935 MHz (DeepSeek) and 1852 MHz (Qwen2.5-7B); the script
-prints its own clock readings per run.
+SM clock medians over the published runs: 1927 MHz (Gemma) and 1852 MHz
+(Qwen2.5-7B); the script prints its own clock readings per run.
+
+## Code editing
+
+The code-editing measurement is ten frozen edit requests in
+[`tools/bench/codeedit`](../tools/bench/codeedit). `manifest.tsv` lists each
+turn's index, source path, sha256 and `add_special` flag; `NN.instruction` is
+the edit request and `NN.file` the pasted source. A turn's prompt is the
+instruction bytes followed by the file bytes (only the first turn carries a
+special token), and its generation length is the pasted file's own token count,
+so the reply has to return the whole file.
+
+`codeedit_bench` runs the turns through the public C ABI on one session
+(`--warm-session`, `--warmup`, greedy, seed 1234), two prefills per turn the
+way a stateless request API re-sends the file: prefill(prompt), decode one
+token, prefill(prompt + that token), decode the file's token count. The
+speculative arm is chosen with `SONICBOOM_SPEC=off|auto`; `--ctx-only` prints
+the smallest context that holds the largest request with its generation,
+`max_t(prompt_tokens_t + gen_tokens_t + 1) + 2`.
+
+`tools/bench/llama-codeedit.scm` runs the same requests through llama-server:
+
+```sh
+llama-server -m GGUF -ngl 99 -fa on -np 1 --no-webui --seed 1234 \
+             -c CTX --port PORT [--spec-type ngram-mod]
+```
+
+with every other speculative option at its server default. Each turn posts to
+`/completion` with `temperature` 0, `top_k` 1, `top_p` 1.0, `min_p` 0.0,
+`repeat_penalty` 1.0, `seed` 1234, `cache_prompt` true, `ignore_eos` true,
+`stream` true, the manifest's `add_special`, and the turn's `n_predict`;
+`prompt_n`, `predicted_n` and `predicted_ms` are read from the reply's
+`timings`.
+
+The arms are SonicBoom spec off (1 rep, deterministic), SonicBoom spec auto
+(`--runs` reps), llama.cpp no spec (1 rep) and llama.cpp ngram-mod (`--runs`
+reps, a fresh server per rep because the n-gram container is per server).
+Identity is per turn: a SonicBoom auto rep is identical to the off arm when all
+ten token hashes match, and a llama.cpp ngram-mod rep is identical when all ten
+generated texts match the no-spec arm byte for byte. `tools/bench.sh MODEL
+--spec` runs all four arms and prints the table.
 
 ## Correctness gates
 
@@ -187,19 +205,16 @@ on/off on the public models).
 | CPU | AMD Ryzen 5 5500 (6C/12T, Zen 3), PCIe 3.0 |
 | RAM | 32 GB DDR4-2400, single channel |
 | Host | Desktop, Ubuntu 24.04, Linux 6.8, x86-64, g++-13, build type Release |
-| Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q3_K_M.gguf` (4,058,137,728 bytes, sha256 `0980898d0e7d9c75cea05141bf4010393312101ef6cf5b31f8197e0de18655f4`) |
-| Qwen2.5-0.5B model | [`Qwen/Qwen2.5-0.5B-Instruct-GGUF`](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF) → `qwen2.5-0.5b-instruct-q4_k_m.gguf` (491,400,032 bytes, sha256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`) |
-| DeepSeek model | [`unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF`](https://huggingface.co/unsloth/DeepSeek-R1-Distill-Qwen-1.5B-GGUF) → `DeepSeek-R1-Distill-Qwen-1.5B-Q4_K_M.gguf` (1,117,321,312 bytes, sha256 `f3bdf9cf31dee4b57ae4e455a1cb0d01b5c2c1b50d72d3112141c195506c2840`) |
+| Gemma model | [`unsloth/gemma-4-e4b-it-GGUF`](https://huggingface.co/unsloth/gemma-4-e4b-it-GGUF) → `gemma-4-E4B-it-Q5_K_M.gguf` (5,481,798,784 bytes, sha256 `a5d6e634db151368d2caa4270fd32ab604d96c2d1291950586989f46d8e17d36`) |
 | Qwen2.5-7B model | [`ngxson/Qwen2.5-7B-Instruct-1M-Q4_K_M-GGUF`](https://huggingface.co/ngxson/Qwen2.5-7B-Instruct-1M-Q4_K_M-GGUF) → `qwen2.5-7b-instruct-1m-q4_k_m.gguf` (4,683,073,888 bytes, sha256 `6dba997502a27b5f0c840346f45d9d62c0a04e6eb3cf72adc6c7ceb18804f380`) |
 | llama.cpp | commit `43fe9c64281`, CUDA build, `llama-bench -ngl 99` |
 | SonicBoom build | `tools/sb-report.sh`: git commit, CUDA archs actually compiled, LLVM version |
 
 The comparison is against llama.cpp at the commit above; newer versions may be
-faster or slower. The Qwen2.5-0.5B greedy token stream agrees with llama.cpp
-except at llama.cpp's own near-ties, where a different prefill batch geometry
-flips the last-place logits (first divergent step and top-1/top-2 margin
-recorded by the tests). DeepSeek and Qwen2.5-7B are benchmark-only and carry no
-token-stream claim.
+faster or slower. A greedy token stream agrees with llama.cpp except at
+llama.cpp's own near-ties, where a different prefill batch geometry flips the
+last-place logits (first divergent step and top-1/top-2 margin recorded by the
+tests).
 
 ## Reproduce
 
@@ -223,6 +238,34 @@ LLAMA_BENCH=$LLAMA_ROOT/build-cuda/bin/llama-bench \
 
 # correctness
 ctest --test-dir build
+```
+
+## Standard run
+
+The standard run on Qwen2.5-7B-Instruct-1M, in three commands:
+
+```sh
+export CUDA_VISIBLE_DEVICES=0
+MODEL=models/qwen2.5-7b-instruct-1m-q4_k_m.gguf
+LLAMA=/path/to/llama.cpp/build/bin
+
+# 1. What is being measured
+tools/sb-report.sh --model "$MODEL" --no-bench
+git -C /path/to/llama.cpp rev-parse --short HEAD
+
+# 2. Code editing, speculation off and on, SonicBoom and llama.cpp
+LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --spec
+
+# 3. Plain decode and prefill, short and long context
+LLAMA_BIN="$LLAMA" tools/bench.sh "$MODEL" --runs 3 --long
+```
+
+The optional export/import pair checks cross-machine identity of the code-edit
+token streams:
+
+```sh
+tools/bench.sh "$MODEL" --spec --tune-export qwen7b-tune.tar
+tools/bench.sh "$MODEL" --runs 1 --spec --tune-import qwen7b-tune.tar
 ```
 
 ## Community runs
