@@ -17,6 +17,7 @@
 #include "autotune.h"
 
 #include "decision_registry.h"
+#include "mlir_autotune.h"
 #include "reduce_mode.h"
 
 #include <sonicboom/runtime_features.h>
@@ -31,6 +32,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <sys/file.h>
@@ -758,6 +760,38 @@ std::vector<DiskChoice> disk_choices() {
   std::sort(out.begin(), out.end(), [](const DiskChoice &a, const DiskChoice &b) {
     return a.op != b.op ? a.op < b.op : a.key < b.key;
   });
+  return out;
+}
+
+std::vector<std::string_view> record_families() {
+  static constexpr std::string_view kFamilies[] = {
+      "attention-decode", "attention-full", "decode-attn", "decode-family",
+      "dense-f32",        "dense-gemm",     "mmq-cfg",     "mmq-group",
+      "mmq-j",            "mmq-splitk",     "spec-length", "verify-gemv-wp",
+  };
+  return {std::begin(kFamilies), std::end(kFamilies)};
+}
+
+std::vector<TableFile> table_files() {
+  std::vector<TableFile> out;
+  const std::filesystem::path root(cache_root());
+  for (const std::string_view op : record_families())
+    out.push_back({"tune/" + std::string(op) + ".json", cache_path(op)});
+  // The reduction-acceptance verdicts sit beside the device directory, keyed
+  // by the plain device identity (the hosted verdict under cpu/), not in the
+  // tuner's device directory; name them explicitly rather than deriving them
+  // from an op.
+  out.push_back({"tune/reduce-acceptance-v1",
+                 (root / planner::device_identity() /
+                  "reduce-acceptance-v1").string()});
+  out.push_back({"tune/reduce-acceptance-cpu-v1",
+                 (root / "cpu" / "reduce-acceptance-cpu-v1").string()});
+  // The JIT candidate tuner's per-shape records are one file per SM version.
+  const std::string autotune =
+      mlir_tune::AutotuneCache::instance().path();
+  out.push_back({"autotune/" +
+                     std::filesystem::path(autotune).filename().string(),
+                 autotune});
   return out;
 }
 

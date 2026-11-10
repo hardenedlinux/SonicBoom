@@ -153,6 +153,27 @@ struct DiskChoice {
 };
 std::vector<DiskChoice> disk_choices();
 
+// The families the hand-written tuner writes, one `<op>.json` per name. This
+// is the single list the writers' store() calls use and the warm-up table is
+// enumerated from, so a family added here is exported/imported without a
+// second edit. (A store() of an unlisted family is not rejected at runtime —
+// the list is a table definition, not a validation gate.)
+std::vector<std::string_view> record_families();
+
+// One record of the warm-up table. `name` is the archive name tools/sb-tune
+// uses ("tune/<file>" or "autotune/<file>"); `path` is where this process
+// reads and writes it. The list is derived from the writers, not from a cache
+// directory listing: the tuner's `<op>.json` files, the reduction-acceptance
+// verdicts (device and hosted), and the JIT candidate cache
+// (autotune/sm_<NN>.bin). Append-only logs (decisions.jsonl,
+// fattn-reports.jsonl), lock files, and compiled-kernel artifacts are
+// bookkeeping or derived output, not choices, and are not listed.
+struct TableFile {
+  std::string name;
+  std::string path;
+};
+std::vector<TableFile> table_files();
+
 #ifdef SONICBOOM_USE_CUDA
 // Median of `reps` individually timed launches after `warmups` untimed ones.
 // The events are recorded on `stream`, which must be the stream the launch

@@ -174,7 +174,10 @@ sb-tune import --in FILE [--replace]
 ```
 
 An imported table is refused when the library's build fingerprint differs, so
-a stale export cannot be applied to a different build.
+a stale export cannot be applied to a different build. The table holds every
+record family the cache writers produce: each tuner `<op>.json` family, the
+device and hosted reduction verdicts, and the JIT candidate cache
+(`autotune/sm_<NN>.bin`); append-only logs and lock files are not packed.
 
 `SONICBOOM_TUNE=canonical` fixes every tuner whose pick changes arithmetic to
 its documented reference default and makes it read and write no such tune
