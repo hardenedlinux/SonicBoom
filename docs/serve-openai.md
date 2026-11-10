@@ -51,6 +51,7 @@ native-torch directly.
 | `fork-session session n` (optional) | a new session holding the first n tokens, without recomputing them |
 | `prefill session tokens [constraint]` | the session holds exactly `tokens` afterwards; the longest common prefix with what it held is kept; a grammar constraint starts at this turn's first token; → number of reused tokens |
 | `step session sampler constraint` | sample the next token, append it, return it; `#f` when the constraint has closed the reply |
+| `generate session sampler constraint max-tokens on-token` (optional) | decode up to `max-tokens` in one call, calling `(on-token token)` per produced token; `#f` from `on-token` stops the decode; → number of tokens produced |
 | `stats model` | counters (optional) |
 
 A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed
@@ -63,6 +64,13 @@ sampled path keeps its draw state across calls, so the per-step stream matches
 a one-shot decode with the same parameters. `presence_penalty` and
 `frequency_penalty` reach the C ABI's sampled path; the mock sampler has no
 penalty model.
+
+The real backend also implements `generate`: one `sb_llm_decode` call covers
+the whole reply, and its token callback drives the engine's per-token work
+(the session history, the text filter, cancellation). A reply is therefore one
+decode call rather than one per token, which is what speculative decoding
+needs. `SONICBOOM_SERVE_STEP=1` selects the per-token `step` loop instead; the
+two paths produce the same content, finish reasons and usage.
 
 A **constraint** shapes the reply. There are two forms:
 
@@ -89,7 +97,9 @@ token).
 ### The real backend
 
 `real-backend.scm` loads one GGUF through `(sonicboom inference)` (the default
-is `models/gemma-4-E4B-it-Q3_K_M.gguf`, `--model` / `--model-id` override it).
+is `models/qwen2.5-7b-instruct-1m-q4_k_m.gguf` served as `qwen2.5-7b`, with a
+context length of 16384 and one pooled session; `--model` / `--model-id` /
+`--context-length` / `--max-sessions` override them).
 The chat-template family is selected from the GGUF architecture (`gemma4` →
 `gemma`, `qwen2` → `qwen`), stop tokens are the union of the model's EOS ids
 and the template's end-of-turn markers, and sessions are KV-cache handles from
@@ -195,7 +205,7 @@ Endpoints:
 
 | endpoint | |
 |---|---|
-| `GET /v1/models`, `GET /v1/models/:id` | the served models: one real model (default `gemma-4-E4B-it-Q3_K_M`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
+| `GET /v1/models`, `GET /v1/models/:id` | the served models: one real model (default `qwen2.5-7b`), or under `--backend mock` the two mock models (`sonicboom-mock-gemma`, `sonicboom-mock-qwen`) |
 | `POST /v1/chat/completions` | `stream: false` → `chat.completion`; `stream: true` → SSE of `chat.completion.chunk`, then `data: [DONE]` |
 | `POST /v1/images/generations` | MOSS-Image: `{"created", "data": [{"b64_json": …}]}`, each entry a PNG |
 | `GET /v1/ws/chat` | WebSocket: one request (the same JSON body) per text message; the reply is the chunk objects as text messages, then `[DONE]`; a bad request gets an `error` object |
@@ -301,9 +311,12 @@ the WebSocket replies are generated in a thread so the connection task can
 write each chunk. Details, and the Artanis changes that would replace both
 workarounds: [`artanis-streaming-notes.md`](artanis-streaming-notes.md).
 
-Options: `--backend real|mock`, `--model`, `--model-id`, `--image-model`,
-`--host`, `--port`, `--queue`, `--max-sessions`, `--token-budget`,
-`--context-length`, `--step-delay`, `--prefill-delay`, `--runtime-dir`. The
+Options: `--backend real|mock`, `--model` (default
+`models/qwen2.5-7b-instruct-1m-q4_k_m.gguf`), `--model-id` (default
+`qwen2.5-7b`), `--image-model`, `--host`, `--port`, `--queue`,
+`--max-sessions` (default 1 for the real backend, 4 for the mock), `--token-budget`,
+`--context-length` (default 16384 for the real backend, 8192 for the mock),
+`--step-delay`, `--prefill-delay`, `--runtime-dir`. The
 app sets `server.websocket = true` and `server.runners = queue + 2` (each
 running or waiting stream holds a runner).
 
@@ -319,7 +332,9 @@ guile-redis from git; libargon2; GNU Artanis from
 
 ```sh
 # the service (default --backend real; needs libsonicboom.so and a GGUF)
-guile -L bindings/guile/scheme bindings/guile/scheme/sonicboom/serve/app.scm --port 8000
+guile -L bindings/guile/scheme bindings/guile/scheme/sonicboom/serve/app.scm \
+      --port 8000 --model models/qwen2.5-7b-instruct-1m-q4_k_m.gguf \
+      --model-id qwen2.5-7b --context-length 16384 --max-sessions 1
 
 # the same service with no model file or shared library
 guile -L bindings/guile/scheme bindings/guile/scheme/sonicboom/serve/app.scm --backend mock --port 8000

@@ -216,10 +216,10 @@
     (lambda () #t)
     (lambda ()
       (wait-turn! engine ticket)
-      (generate engine request on-event))
+      (run-request engine request on-event))
     (lambda () (engine-drop! engine ticket))))
 
-(define (generate engine request on-event)
+(define (run-request engine request on-event)
   (let* ((id (chat-request-model request))
          (model (or (engine-model engine id) (throw 'model-not-found id)))
          (pool (engine-pool engine id))
@@ -279,6 +279,7 @@
                    (unless (or cancelled?
                                (apply on-event 'tool-call (1- (length calls)) call))
                      (set! cancelled? #t))))))
+            (define eos-seen? #f)
             (define (feed! text final?)
               (set! buffer (string-append buffer text))
               (let lp ()
@@ -308,37 +309,67 @@
                      (let ((keep (if final? 0 (held-back buffer (append stops tool-markers)))))
                        (emit-content! (substring buffer 0 (- (string-length buffer) keep)))
                        (set! buffer (substring buffer (- (string-length buffer) keep))))))))))
-            (define finish
-              (let lp ((n 0))
-                (cond
-                 (cancelled? "cancelled")
-                 (stopped? "stop")
-                 ((>= n limit) (feed! "" #t) "length")
-                 (else
-                  (let ((t (step session sampler (chat-request-constraint request))))
+            ;; One token of the reply: bookkeeping, the end-of-turn check and
+            ;; the text side. Returns #t to keep decoding and #f when the reply
+            ;; is over (an end-of-turn token, a stop string, the client gone, or
+            ;; the limit reached).
+            (define (handle-token! t)
+              (set! generated (cons t generated))
+              (if (memv t eos)
+                  (begin
+                    (set! eos-seen? #t)
+                    (feed! "" #t)
+                    #f)
+                  (begin
+                    ;; Decode everything generated so far and feed the new
+                    ;; part; a trailing U+FFFD may be an incomplete multi-byte
+                    ;; character, so wait.
+                    (let* ((text (detokenize model (reverse generated)))
+                           (ready (if (string-suffix? "\xfffd;" text)
+                                      (1- (string-length text))
+                                      (string-length text))))
+                      (when (> ready decoded)
+                        (feed! (substring text decoded ready) #f)
+                        (set! decoded ready)))
                     (cond
-                     ;; A grammar constraint closed the reply: the stop token
-                     ;; was consumed by the decoder and is not text.
-                     ((not t)
+                     (cancelled? #f)
+                     (stopped? #f)
+                     ((>= (length generated) limit)
                       (feed! "" #t)
-                      (if cancelled? "cancelled" "stop"))
-                     ((memv t eos)
-                      (set! generated (cons t generated))
-                      (feed! "" #t)
-                      (if cancelled? "cancelled" "stop"))
-                     (else
-                      (set! generated (cons t generated))
-                      ;; Decode everything generated so far (minus the end
-                      ;; token) and feed the new part; a trailing U+FFFD may
-                      ;; be an incomplete multi-byte character, so wait.
-                      (let* ((text (detokenize model (reverse generated)))
-                             (ready (if (string-suffix? "\xfffd;" text)
-                                        (1- (string-length text))
-                                        (string-length text))))
-                        (when (> ready decoded)
-                          (feed! (substring text decoded ready) #f)
-                          (set! decoded ready)))
-                      (lp (1+ n)))))))))
+                      #f)
+                     (else #t)))))
+            (define (finish-reason)
+              (cond
+               (cancelled? "cancelled")
+               ((or stopped? eos-seen?) "stop")
+               ((>= (length generated) limit) "length")
+               (else "stop")))
+            (define finish
+              (cond
+               ((>= 0 limit) (feed! "" #t) "length")
+               ;; A backend that produces the whole reply in one call drives
+               ;; the token loop through its callback. Ending short of the
+               ;; limit without a stop means a grammar closed the reply: the
+               ;; stop token was consumed by the decoder and is not text, the
+               ;; same as the step loop's (not t).
+               ((and (not (getenv "SONICBOOM_SERVE_STEP"))
+                     (can-generate? model))
+                (let ((produced (generate session sampler
+                                          (chat-request-constraint request)
+                                          limit handle-token!)))
+                  (when (and (< produced limit)
+                             (not cancelled?)
+                             (not stopped?))
+                    (feed! "" #t))
+                  (finish-reason)))
+               (else
+                (let lp ()
+                  (let ((t (step session sampler
+                                 (chat-request-constraint request))))
+                    (cond
+                     ((not t) (feed! "" #t) (finish-reason))
+                     ((handle-token! t) (lp))
+                     (else (finish-reason))))))))
             (let* ((reason (cond ((equal? finish "cancelled") "cancelled")
                                  ((and (pair? calls) (equal? finish "stop")) "tool_calls")
                                  (else finish)))
