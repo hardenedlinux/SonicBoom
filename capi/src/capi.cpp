@@ -56,6 +56,7 @@
 // rewritten only when the revision changes.
 #include "sb_build_tag.h"
 
+#include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
@@ -2388,6 +2389,21 @@ sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens,
         if (n > 0 && reused == n) reused = n - 1;
         if (n_reused_out) *n_reused_out = reused;
 
+        // The auto policy's evidence records this session's recent accept
+        // pattern. It carries over a prefill that continues the session's
+        // history (the previous prompt plus the tokens generated since) and is
+        // dropped when the new prompt is not a continuation, so one
+        // conversation's evidence does not steer an unrelated request. The
+        // evidence only affects how many drafts are proposed and when; it
+        // never changes the emitted tokens.
+        {
+          const std::vector<uint64_t>& history = session->kv.filled_tokens;
+          const bool continuation =
+              !history.empty() && n >= history.size() &&
+              std::equal(history.begin(), history.end(), tokens);
+          if (!continuation) session->kv.spec_evidence.reset();
+        }
+
         // Update the stored prompt first, then remember it as the previous
         // prompt: prev_prompt must hold the prompt that was *just* prefilled so
         // the next call compares against it (not the one before last).
@@ -2843,6 +2859,49 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
             }
             session->pending = -1;
             n = 1;
+          }
+          // Greedy decode without a session grammar: one core call over the
+          // whole remaining reply, so the speculative program can verify a
+          // draft batch per iteration instead of one token per call. The hook
+          // applies this path's per-token bookkeeping in emission order (the
+          // session's token history, the KV row record, the reported count,
+          // the callback), so the session state and the callback order are the
+          // per-token loop's. A grammar, a sampled request and the CPU paths
+          // keep their per-token loops below.
+          //
+          // The greedy CUDA path stops only when a step fails or the callback
+          // aborts; there is no implicit EOS stop here (the caller checks the
+          // model's stop tokens, as the per-token loop did). A callback abort
+          // at a token returns the tokens before it, so the core commits those
+          // and stops exactly where the per-token loop returned.
+          if (!session->grammar && n < max_tokens) {
+            std::vector<int64_t> tail(max_tokens - n, -1);
+            uint32_t produced = 0;
+            bool aborted = false;
+            const model::EmitHook on_emit =
+                [&](const int64_t* toks, size_t count) -> size_t {
+              size_t took = 0;
+              for (; took < count; ++took) {
+                const uint64_t fed = session->token;  // this step writes fed's KV
+                session->kv.filled_tokens.push_back(fed);
+                session->token = static_cast<uint64_t>(toks[took]);
+                ++session->pos;
+                if (cb && cb(user, static_cast<sb_token>(toks[took]))) {
+                  // The aborted token's bookkeeping is done (the session
+                  // advanced past it) but it is not reported; the run stops
+                  // before it, which is the count returned here.
+                  aborted = true;
+                  break;
+                }
+                ++produced;
+              }
+              return aborted ? took : count;
+            };
+            (void)model::generate_spine_cuda(
+                m, session->token, session->pos, tail, n_ctx, {}, &session->kv,
+                &on_emit);
+            *n_out = n + produced;
+            return SB_OK;
           }
           while (n < max_tokens) {
             std::vector<int64_t> one(1, -1);

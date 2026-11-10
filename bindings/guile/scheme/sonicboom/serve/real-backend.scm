@@ -7,7 +7,10 @@
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
   #:use-module (srfi srfi-34)
+  #:use-module (system foreign)
+  #:use-module (rnrs bytevectors)
   #:use-module (sonicboom error)
+  #:use-module (sonicboom ffi)
   #:use-module ((sonicboom inference) #:prefix inference:)
   #:use-module (sonicboom serve backend)
   #:use-module (sonicboom serve chat-template)
@@ -169,6 +172,50 @@
      ((constraint? constraint) #f)
      (else (error "SonicBoom backend produced no token")))))
 
+;; One sb_llm_decode call over the whole remaining reply. The callback appends
+;; the token to the session history, so a session released after the reply holds
+;; prompt + reply exactly as the per-step path leaves it, and calls ON-TOKEN;
+;; ON-TOKEN returning #f aborts the decode, which commits the reply up to that
+;; token. The decode's own callback contract is generate-stream's: an exception
+;; in the callback stops the decode and is re-thrown here, not through the
+;; decoder's stack frame. A grammar, when requested, was installed by prefill
+;; and masks every step inside this same call.
+(define (real-generate session sampler constraint max-tokens on-token)
+  (let* ((handle (real-session-handle session))
+         (produced 0)
+         (failure #f)
+         (cb (lambda (user token)
+               (catch #t
+                 (lambda ()
+                   (set-real-session-history!
+                    session (append (real-session-history session)
+                                    (list token)))
+                   (set! produced (1+ produced))
+                   (if (on-token token) 0 1))   ; 0 = continue, else stop
+                 (lambda (key . args)
+                   (set! failure (cons key args))
+                   1))))
+         (cb-ptr (procedure->pointer int cb (list '* int32)))
+         (smp-bv (inference:make-sampling-bv
+                  max-tokens
+                  #:temperature (if (sampler-greedy? sampler)
+                                    0.0
+                                    (sampler-temperature sampler))
+                  #:top-k (sampler-top-k sampler)
+                  #:top-p (sampler-top-p sampler)
+                  #:seed (or (sampler-seed sampler) 0)
+                  #:presence-penalty (sampler-presence-penalty sampler)
+                  #:frequency-penalty (sampler-frequency-penalty sampler)))
+         (n-slot (make-bytevector 4 0))
+         (err-slot (make-slot))
+         (st ((proc 'sb_llm_decode) handle (bytevector->pointer smp-bv)
+              cb-ptr %null-pointer (bytevector->pointer n-slot)
+              (slot-ptr err-slot))))
+    (if failure
+        (apply throw failure)
+        (sb-check! st err-slot "decode"))
+    produced))
+
 (define (make-real-backend)
   (make-backend
    #:name "libsonicboom"
@@ -184,5 +231,7 @@
    #:free-session real-free-session
    #:prefill real-prefill
    #:step real-step
-   ;; real-step passes the sampler to sb_llm_decode's sampled session path.
+   #:generate real-generate
+   ;; real-step and real-generate pass the sampler to sb_llm_decode's sampled
+   ;; session path.
    #:sampling? #t))

@@ -31,11 +31,16 @@
 ;;;   --host ADDR --port N            listen address (127.0.0.1:8000)
 ;;;   --backend real|mock             libsonicboom C ABI (real) or the
 ;;;                                   deterministic in-process mock (real)
+;;;   --model FILE --model-id ID      the real backend's GGUF and served id
+;;;                                   (models/qwen2.5-7b-instruct-1m-q4_k_m.gguf,
+;;;                                   qwen2.5-7b)
 ;;;   --image-model DIR               MOSS-Image root, loaded on the first
 ;;;                                   image request (models/MOSS-Image-SFT)
 ;;;   --queue N                       requests allowed to wait (8)
-;;;   --max-sessions N --token-budget N   session pool, per model (4, 32768)
-;;;   --context-length N              of the mock models (8192)
+;;;   --max-sessions N --token-budget N   session pool, per model (1 for the
+;;;                                   real backend, 4 for the mock; 32768)
+;;;   --context-length N              of the loaded model (16384 real, 8192
+;;;                                   mock)
 ;;;   --step-delay S --prefill-delay S    simulated device time, seconds
 ;;;   --runtime-dir DIR               Artanis' working directory
 ;;;                                   ($TMPDIR/sonicboom-serve-<pid>)
@@ -113,8 +118,8 @@
                         (step-delay . ,(option 'step-delay 0))
                         (prefill-delay . ,(option 'prefill-delay 0)))))
 
-(define model-path (option 'model "models/gemma-4-E4B-it-Q3_K_M.gguf"))
-(define model-id (option 'model-id "gemma-4-E4B-it-Q3_K_M"))
+(define model-path (option 'model "models/qwen2.5-7b-instruct-1m-q4_k_m.gguf"))
+(define model-id (option 'model-id "qwen2.5-7b"))
 
 (define models
   (case (string->symbol backend-name)
@@ -123,12 +128,13 @@
     (else
      (list (load-model backend
                        `((id . ,model-id) (path . ,model-path)
-                         (context-length . ,(option 'context-length 512))))))))
+                         (context-length . ,(option 'context-length 16384))))))))
 
 (define engine
   (make-engine models
                #:queue-limit queue-limit
-               #:max-sessions (option 'max-sessions 4)
+               #:max-sessions (option 'max-sessions
+                                      (if (equal? backend-name "real") 1 4))
                #:token-budget (option 'token-budget 32768)))
 
 (define start-time (car (gettimeofday)))

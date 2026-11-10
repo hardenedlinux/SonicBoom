@@ -6,7 +6,7 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(SonicBoom
-  VERSION 0.0.4
+  VERSION 0.0.6
   DESCRIPTION "Native tensor runtime"
   LANGUAGES C CXX)
 
@@ -393,6 +393,9 @@ add_subdirectory(capi)
 # SonicBoom core: Layer 2 public API (core/include/sonicboom/) + Layer 1 adapter
 # (core/layer1/). The adapter is the only SonicBoom-owned code that uses c10/ATen.
 add_subdirectory(core)
+
+# Public benchmark tools (C ABI).
+add_subdirectory(tools/bench)
 
 # M2 Layer 2 boundary tests.
 add_subdirectory(tests/core)

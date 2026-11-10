@@ -20,8 +20,8 @@ export LC_ALL=C LANG=C
 #   tools/test-api-server.sh [MODEL.gguf ...]
 #
 # With no argument it runs the suite once per model that is present: the Gemma 4
-# GGUF (models/gemma-4-E4B-it-Q3_K_M.gguf, or $SONICBOOM_GEMMA_GGUF) and, when
-# present, the Qwen2 GGUF (models/qwen2.5-0.5b-instruct-q4_k_m.gguf, or
+# GGUF (models/gemma-4-E4B-it-Q5_K_M.gguf, or $SONICBOOM_GEMMA_GGUF) and, when
+# present, the Qwen2.5 GGUF (models/qwen2.5-7b-instruct-1m-q4_k_m.gguf, or
 # $SONICBOOM_QWEN_GGUF). The chat family is NOT an argument: the script reads it
 # from the server's /v1/models, which the backend fills from the loaded model's
 # own architecture — so running the suite against a second family also checks
@@ -499,8 +499,8 @@ models=()
 if [ "$#" -gt 0 ]; then
   models=("$@")
 else
-  models=("${SONICBOOM_GEMMA_GGUF:-$root/models/gemma-4-E4B-it-Q3_K_M.gguf}")
-  qwen=${SONICBOOM_QWEN_GGUF:-$root/models/qwen2.5-0.5b-instruct-q4_k_m.gguf}
+  models=("${SONICBOOM_GEMMA_GGUF:-$root/models/gemma-4-E4B-it-Q5_K_M.gguf}")
+  qwen=${SONICBOOM_QWEN_GGUF:-$root/models/qwen2.5-7b-instruct-1m-q4_k_m.gguf}
   [ -f "$qwen" ] && models+=("$qwen")
 fi
 

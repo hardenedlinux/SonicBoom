@@ -2081,11 +2081,21 @@ static int64_t greedy_step(DecodeRuntime& rt, uint64_t token, uint64_t pos,
 // node is the argmax the replay wrote, emit writes the host token, stop_check
 // tests the program's stop set and pos_inc advances the position. Returns the
 // number of tokens written.
+// How many of a step's `n` tokens the caller's emit hook took. A null hook
+// takes the whole batch; the clamp keeps a misbehaving hook from committing
+// past the step.
+static size_t emit_take(const EmitHook* on_emit, const int64_t* toks, size_t n) {
+  if (!on_emit || n == 0) return n;
+  const size_t took = (*on_emit)(toks, n);
+  return took < n ? took : n;
+}
+
 static uint64_t run_program_steps(
     const Gemma4Model& m, uint64_t n_ctx, DecodeRuntime& rt,
     const GreedyProgramDesc& p, uint64_t token, uint64_t pos,
     std::span<int64_t> tokens, uint64_t step,
-    std::chrono::steady_clock::time_point* first_out = nullptr) {
+    std::chrono::steady_clock::time_point* first_out = nullptr,
+    const EmitHook* on_emit = nullptr) {
   const uint64_t limit = p.max_tokens > 0
                              ? std::min<uint64_t>(uint64_t(p.max_tokens),
                                                   tokens.size())
@@ -2121,6 +2131,7 @@ static uint64_t run_program_steps(
       for (uint32_t j = 0; j < chunk && step < limit; ++j) {
         const int64_t next = int64_t(out[j]);
         if (next < 0) { stopped = true; break; }
+        if (emit_take(on_emit, &next, 1) == 0) { stopped = true; break; }
         tokens[step] = next;
         const bool stop = program_stop(p, next, step);
         carry = out[j];
@@ -2143,6 +2154,7 @@ static uint64_t run_program_steps(
         std::cerr << "[program] step " << step << " graph replay failed\n";
         break;
       }
+      if (emit_take(on_emit, &next, 1) == 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -2161,6 +2173,7 @@ static uint64_t run_program_steps(
                   << "\n";
         break;
       }
+      if (emit_take(on_emit, &next, 1) == 0) break;
       tokens[step] = next;
       const bool stop = program_stop(p, next, step);
       token = static_cast<uint64_t>(next);
@@ -2926,7 +2939,7 @@ static uint64_t run_spec_program_steps(
     uint64_t token, uint64_t pos, std::span<int64_t> tokens, uint64_t step,
     planner::KvCacheSession& session, std::span<const uint64_t> history,
     std::chrono::steady_clock::time_point* first_out = nullptr,
-    const char* strategy_override = nullptr) {
+    const char* strategy_override = nullptr, const EmitHook* on_emit = nullptr) {
   // First-use counters move only while this scope is live (see
   // spec_diag_counters.h); the values are printed, as a per-call delta, at the
   // end of the call below.
@@ -3260,6 +3273,10 @@ static uint64_t run_spec_program_steps(
             policy.bootstrap_streak >= abort_after)
           policy.bootstrap_left = 0;
       }
+      // The emit hook sees the token before it is committed. A plain step
+      // commits as one token or not at all, so a take of 0 stops the run with
+      // the session exactly where the step found it.
+      if (emit_take(on_emit, &next, 1) == 0) break;
       // The fed token is now resident; the sampled one is emitted but not fed.
       ++L;
       tokens[step] = next;
@@ -3368,16 +3385,28 @@ static uint64_t run_spec_program_steps(
       }
     }
     if (decision.emitted == 0) break;  // the bound was already reached
-    for (size_t i = 0; i < decision.emitted; ++i) {
+    // The emit hook sees the run in order before it is committed. A stop
+    // inside the batch commits only the tokens it took; the verify rows past
+    // them are dead (the same rollback a rejected draft takes), so the
+    // session stops at exactly the token the caller stopped on.
+    size_t emit_n = size_t(decision.emitted);
+    if (on_emit) {
+      const std::vector<int64_t> batch(run, run + decision.emitted);
+      emit_n = emit_take(on_emit, batch.data(), batch.size());
+      if (emit_n < decision.emitted)
+        g_spec_counters.emitted_tokens -= decision.emitted - emit_n;
+    }
+    if (emit_n == 0) break;
+    for (size_t i = 0; i < emit_n; ++i) {
       tokens[step + i] = int64_t(run[i]);
       if (first_out && step + i == 1)
         *first_out = std::chrono::steady_clock::now();
     }
-    step += decision.emitted;
-    L += decision.emitted;
-    for (size_t i = 0; i + 1 < decision.emitted; ++i) drafter->push(run[i]);
-    token = run[decision.emitted - 1];
-    if (decision.stopped) break;
+    step += emit_n;
+    L += emit_n;
+    for (size_t i = 0; i + 1 < emit_n; ++i) drafter->push(run[i]);
+    token = run[emit_n - 1];
+    if (decision.stopped || emit_n < decision.emitted) break;
   }
   // A run that ended before the warm-up finished stores what it measured; the
   // policy then compares only the lengths it has prices for.
@@ -5613,7 +5642,8 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx,
                              std::span<const uint8_t> sample_mask,
-                             planner::KvCacheSession* session) {
+                             planner::KvCacheSession* session,
+                             const EmitHook* on_emit) {
   if (m.weights.blocks.empty() || start_token >= m.config.vocab_size) return 0;
   if (n_ctx == 0) n_ctx = start_pos + tokens.size();
   if (spec_reckless_unsupported()) {
@@ -5739,10 +5769,11 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
     // the masked single step above already produced the call's one token
   } else if (ir_program_enabled() && rt->program.valid &&
              rt->program.speculative && spec_enabled()) {
-    // The speculative program drives the loop. There is no captured prefill
-    // here, so the drafter starts from an empty history: its proposals are
-    // verified, never trusted, so the token stream is the plain loop's. A
-    // non-session caller uses the runtime's own cache, published into a local
+    // The speculative program drives the loop. Its proposals are verified,
+    // never trusted, so the token stream is the plain loop's. The drafter is
+    // seeded with the session's filled history (the prompt plus the tokens fed
+    // since), which is the sequence this call continues; a non-session caller
+    // has no history and uses the runtime's own cache, published into a local
     // identity (no implicit fallback: a session caller always passes its own).
     planner::KvCacheSession local;
     planner::KvCacheSession* kv = session;
@@ -5751,12 +5782,13 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       kv = &local;
     }
     step = run_spec_program_steps(m, *rt, rt->program, token, pos, tokens, step,
-                                  *kv, {}, &t_first);
+                                  *kv, kv->filled_tokens, &t_first, nullptr,
+                                  on_emit);
   } else if (ir_program_enabled() && rt->program.valid) {
     // The lowered boom.program drives the loop; each step node is the captured
     // StepProgram replay (or the executor dispatch when nothing was captured).
     step = run_program_steps(m, n_ctx, *rt, rt->program, token, pos, tokens,
-                             step, &t_first);
+                             step, &t_first, on_emit);
   } else if (replay_ok && chunk > 1) {
     // Replay one captured k-step chunk: stage the carry token and the k
     // positions on the graph's stream, launch once, then read the k tokens in
@@ -5781,6 +5813,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       for (uint32_t j = 0; j < chunk && step < tokens.size(); ++j) {
         const int64_t next = int64_t(out[j]);
         if (next < 0) { stopped = true; break; }
+        if (emit_take(on_emit, &next, 1) == 0) { stopped = true; break; }
         tokens[step] = next;
         carry = out[j];
         ++pos;
@@ -5808,6 +5841,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       if (nvtx_enabled()) nvtxRangePop();
       const int64_t next = int64_t(next_f);
       if (next < 0) break;
+      if (emit_take(on_emit, &next, 1) == 0) break;
       tokens[step] = next;
       token = static_cast<uint64_t>(next);
       ++pos;
@@ -5846,6 +5880,7 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
       }
       const int64_t next = int64_t(*reinterpret_cast<const float*>(arg.data()));
       if (next < 0) break;
+      if (emit_take(on_emit, &next, 1) == 0) break;
       tokens[step] = next;
       token = static_cast<uint64_t>(next);
       ++pos;
@@ -5927,6 +5962,12 @@ std::string device_identity() {
 bool decode_step_through_executor(DecodeRuntime& rt, uint64_t token, uint64_t pos,
                                   int64_t* next_out) {
   const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(pos)};
+  // The device Embedding reads the token id from the persistent token slot, not
+  // from the host graph input (Phase 3.2 B4). Every generate loop seeds it
+  // before its first step; a recorder that skipped the seed made step 0 read
+  // whatever the pooled slot last held, which is another model's f32 when two
+  // models are recorded in one process.
+  if (!rt.cuda->seed_token(token)) return false;
   rt.cuda->set_pos(pos);
   auto res = rt.exec->execute(rt.plan, rt.snap, in);
   if (!res || res->outputs.empty()) return false;
@@ -6036,7 +6077,7 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
 uint64_t generate_spine_cuda(const Gemma4Model&, uint64_t, uint64_t,
                              std::span<int64_t>, uint64_t,
                              std::span<const uint8_t>,
-                             planner::KvCacheSession*) {
+                             planner::KvCacheSession*, const EmitHook*) {
   return 0;  // built without CUDA: no device spine is available
 }
 

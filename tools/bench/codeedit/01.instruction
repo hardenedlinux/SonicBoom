@@ -1,0 +1,2 @@
+Apply this edit to the file below and return the complete file: add a bounds check before the first indexed write and leave every other line unchanged.
+

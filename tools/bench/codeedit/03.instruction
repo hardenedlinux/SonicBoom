@@ -1,0 +1,2 @@
+Apply this edit to the file below and return the complete file: hoist the first loop bound into a local constant and leave every other line unchanged.
+

@@ -16,14 +16,23 @@
 
 // sb-tune — move the warm-up table between machines or cache directories.
 //
-// export packs every tune record this device resolved:
-//   tune/<op>.json          the hand-written tuner's per-shape-class choices
-//   tune/reduce-acceptance-<id>
-//                           the published reduction's acceptance verdict
-//   autotune/sm_<NN>.bin    the JIT candidate tuner's per-shape records
-// into one file with the build fingerprint and the device directory it was
-// measured on. Append-only logs (decisions.jsonl, fattn-reports.jsonl) and
-// the table lock files are not part of the table and are not packed.
+// export packs every record family the cache writers produce, enumerated by
+// sonicboom::tune::table_files() from the writers themselves rather than from
+// a directory listing:
+//   tune/<op>.json            the hand-written tuner's per-shape-class choices
+//                             (every family in tune::record_families())
+//   tune/reduce-acceptance-v1 the device reduction's acceptance verdict
+//   tune/reduce-acceptance-cpu-v1
+//                             the hosted (CPU) acceptance verdict
+//   autotune/sm_<NN>.bin      the JIT candidate tuner's per-shape records
+// Each file is packed only when it exists — a family this run did not touch
+// stays absent. A record file the table does not name is still packed, so a
+// family added by a future writer travels with the table before this list
+// learns about it. All of it goes into one file with the build fingerprint and
+// the device directory it was measured on. Append-only logs
+// (decisions.jsonl, fattn-reports.jsonl), the table lock files, and the JIT
+// PTX/cubin caches are bookkeeping or derived artifacts, not choices, and are
+// not part of the table.
 //
 // import writes such a file into this process's cache locations. It refuses a
 // table recorded by another build or another device (the record keys embed
@@ -46,6 +55,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -162,9 +173,10 @@ int usage() {
       << "usage: sb-tune export --out FILE\n"
          "       sb-tune import --in FILE [--replace]\n"
          "\n"
-         "export packs this device's warm-up table (the tuner's <op>.json\n"
-         "choices, the reduction verdict, and autotune/sm_<NN>.bin) with the\n"
-         "build fingerprint and device it was measured on.\n"
+         "export packs this device's warm-up table (every tuner <op>.json\n"
+         "family, the device and hosted reduction verdicts, and\n"
+         "autotune/sm_<NN>.bin) with the build fingerprint and device it was\n"
+         "measured on.\n"
          "import writes it back into this process's cache locations; it\n"
          "refuses a table from another build or device, and refuses to\n"
          "overwrite a non-empty table unless --replace is given.\n";
@@ -175,36 +187,42 @@ int cmd_export(const std::string& out_path) {
   const std::string fingerprint = sonicboom::tune::build_fingerprint();
   const std::string device = sonicboom::tune::device_dir();
   const std::string sm_name = sm_file_name();
-  const std::string autotune_path = autotune_file();
 
+  // The table is defined by the code that writes it, not by what happens to
+  // be in the directory: a family the run did not touch is simply absent.
   std::vector<Entry> entries;
+  std::set<std::string> packed;
   std::error_code ec;
+  for (const auto& file : sonicboom::tune::table_files()) {
+    if (!fs::is_regular_file(file.path, ec)) continue;
+    Entry entry;
+    entry.name = file.name;
+    if (!read_file(file.path, entry.data)) {
+      std::cerr << "sb-tune: cannot read " << file.path << "\n";
+      return 2;
+    }
+    packed.insert(entry.name);
+    entries.push_back(std::move(entry));
+  }
+  // Forward compatibility: a record family a future writer adds without
+  // updating record_families() still travels with the table. Bookkeeping
+  // (lock files, append-only logs) is named and skipped.
   const fs::path tdir = tune_dir();
   if (fs::is_directory(tdir, ec)) {
     std::vector<fs::path> paths;
-    for (const auto& e : fs::directory_iterator(tdir, ec)) {
-      if (!is_tune_record(e)) continue;
-      paths.push_back(e.path());
-    }
+    for (const auto& e : fs::directory_iterator(tdir, ec))
+      if (is_tune_record(e)) paths.push_back(e.path());
     std::sort(paths.begin(), paths.end());
     for (const auto& p : paths) {
       Entry entry;
       entry.name = "tune/" + p.filename().string();
+      if (packed.count(entry.name)) continue;
       if (!read_file(p, entry.data)) {
         std::cerr << "sb-tune: cannot read " << p << "\n";
         return 2;
       }
       entries.push_back(std::move(entry));
     }
-  }
-  if (fs::is_regular_file(autotune_path, ec)) {
-    Entry entry;
-    entry.name = "autotune/" + sm_name;
-    if (!read_file(autotune_path, entry.data)) {
-      std::cerr << "sb-tune: cannot read " << autotune_path << "\n";
-      return 2;
-    }
-    entries.push_back(std::move(entry));
   }
 
   std::string body;
@@ -302,18 +320,25 @@ int cmd_import(const std::string& in_path, bool replace) {
     return 2;
   }
 
+  // The archive's names are resolved through the same code-derived table the
+  // export used, so importing cannot invent a path and a record family this
+  // build no longer knows is refused instead of written.
+  std::map<std::string, std::string> targets;
+  for (const auto& file : sonicboom::tune::table_files())
+    targets.emplace(file.name, file.path);
   const fs::path tdir = tune_dir();
   const fs::path adir = fs::path(autotune_file()).parent_path();
 
-  // Non-empty means the destination already holds a choice the runtime could
-  // read: a record file in the tune directory, or the JIT cache file.
+  // Non-empty means the destination already holds a record the runtime could
+  // read.
   bool non_empty = false;
   std::error_code ec;
   if (fs::is_directory(tdir, ec)) {
     for (const auto& e : fs::directory_iterator(tdir, ec))
       if (is_tune_record(e)) non_empty = true;
   }
-  if (fs::is_regular_file(autotune_file(), ec)) non_empty = true;
+  for (const auto& file : sonicboom::tune::table_files())
+    if (fs::is_regular_file(file.path, ec)) non_empty = true;
   if (non_empty && !replace) {
     std::cerr << "sb-tune: the destination table is not empty (pass "
                  "--replace to overwrite it)\n";
@@ -322,7 +347,12 @@ int cmd_import(const std::string& in_path, bool replace) {
 
   for (const auto& entry : archive.entries) {
     fs::path target;
-    if (entry.name.rfind("tune/", 0) == 0) {
+    const auto it = targets.find(entry.name);
+    if (it != targets.end()) {
+      target = it->second;
+    } else if (entry.name.rfind("tune/", 0) == 0) {
+      // A record family this build does not enumerate (see export's
+      // forward-compatibility note); it lives in the tuner's device directory.
       const std::string leaf = entry.name.substr(5);
       if (leaf.empty() || leaf.find('/') != std::string::npos ||
           leaf == "." || leaf == "..") {

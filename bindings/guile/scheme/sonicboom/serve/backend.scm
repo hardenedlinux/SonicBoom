@@ -19,6 +19,12 @@
 ;;;                                         tokens of session (optional)
 ;;;   prefill      session token-ids      -> number of reused tokens
 ;;;   step         session sampler constraint -> next token id
+;;;   generate     session sampler constraint max-tokens on-token
+;;;                -> number of tokens produced               (optional)
+;;;
+;;; generate decodes up to max-tokens in one call, handing each produced token
+;;; to (on-token token) in order; on-token returns #t to continue and #f to stop
+;;; the decode. A backend without generate keeps working through step.
 ;;;
 ;;; A session is a KV cache: it holds a token sequence. prefill makes the
 ;;; session hold exactly the given tokens, keeping the longest common prefix
@@ -54,7 +60,7 @@
             tokenize detokenize render-chat render-chat-segments tokenize-chat
             create-session free-session fork-session can-fork?
             session? session-model session-handle
-            prefill step backend-stats
+            prefill step generate can-generate? backend-stats
 
             make-sampler sampler? sampler-temperature sampler-top-p
             sampler-top-k sampler-seed sampler-greedy? sampler-random-state
@@ -73,8 +79,8 @@
 (define-record-type <backend>
   (%make-backend name load-model model-info tokenize detokenize render-chat
                  tokenize-chat
-                 create-session free-session fork-session prefill step stats
-                 sampling?)
+                 create-session free-session fork-session prefill step
+                 generate stats sampling?)
   backend?
   (name backend-name)
   (load-model %backend-load-model)
@@ -88,6 +94,7 @@
   (fork-session %backend-fork-session)
   (prefill %backend-prefill)
   (step %backend-step)
+  (generate %backend-generate)
   (stats %backend-stats)
   (sampling? backend-sampling?))
 
@@ -113,6 +120,11 @@
 ;;   prefill        (session token-ids constraint) -> reused count
 ;;   step           (session sampler constraint)   -> token id, or #f when the
 ;;                  constraint has closed the reply (nothing left to produce)
+;;   generate       (session sampler constraint max-tokens on-token)
+;;                  -> number of tokens produced (optional)
+;;                  Decodes in one call, calling (on-token token) per produced
+;;                  token; #f from on-token stops the decode. The session
+;;                  history ends at the last token handed out.
 ;;   stats          (model)                        -> alist (optional)
 ;; The sampling? capability says whether `step` honors the sampler's
 ;; temperature / top-p / top-k / seed and penalties. The libsonicboom backend
@@ -134,12 +146,13 @@
                        (fork-session #f)
                        (prefill (required 'prefill))
                        (step (required 'step))
+                       (generate #f)
                        (stats (lambda (model) '()))
                        (sampling? #f))
   (%make-backend name load-model model-info tokenize detokenize render-chat
                  tokenize-chat
-                 create-session free-session fork-session prefill step stats
-                 sampling?))
+                 create-session free-session fork-session prefill step
+                 generate stats sampling?))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Models and sessions
@@ -236,6 +249,15 @@
 (define* (step session sampler #:optional (constraint #f))
   ((%backend-step (model-backend (session-model session)))
    (session-handle session) sampler constraint))
+
+;; Whether this model's backend can produce a reply in one call. A backend
+;; without generate is driven token by token through step.
+(define (can-generate? model)
+  (and (%backend-generate (model-backend model)) #t))
+
+(define (generate session sampler constraint max-tokens on-token)
+  ((%backend-generate (model-backend (session-model session)))
+   (session-handle session) sampler constraint max-tokens on-token))
 
 (define (backend-stats model)
   ((%backend-stats (model-backend model)) (model-handle model)))
