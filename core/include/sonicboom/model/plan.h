@@ -25,6 +25,7 @@
 // weights out of the planner's tensor/buffer model (which is sized for host
 // float32 activations).
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -159,11 +160,21 @@ uint64_t generate_spine(const Gemma4Model& m, uint64_t start_token,
 // `session`, when non-null, is the KV cache the decode runtime is bound to from
 // construction; a null session keeps the non-session tooling behavior (one
 // anonymous runtime owning its own cache per (model, n_ctx)).
+//
+// `on_emit` (optional) sees each step's tokens, in order, before that step is
+// committed to the session, and returns how many of them the caller took. A
+// return of 0 stops the run before the step is committed; a return below the
+// batch size commits only that prefix and stops (the rows past it are dead,
+// like a rejected draft's). The hook is how a caller that owns session state
+// outside the core (the C ABI's token history and KV row record) keeps that
+// state in step with a run that emits more than one token per step.
+using EmitHook = std::function<size_t(const int64_t* toks, size_t n)>;
 uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
                              uint64_t start_pos, std::span<int64_t> tokens,
                              uint64_t n_ctx = 0,
                              std::span<const uint8_t> sample_mask = {},
-                             planner::KvCacheSession* session = nullptr);
+                             planner::KvCacheSession* session = nullptr,
+                             const EmitHook* on_emit = nullptr);
 
 // --- sampled decode on the session path (r7) -------------------------------
 //
