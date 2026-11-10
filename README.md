@@ -5,14 +5,19 @@
 **A native tensor runtime. No Python. One `.so`.**
 
 On a desktop RTX 3050, SonicBoom edits code with Qwen2.5-7B at
-**490 tok/s, 12.7× its own plain decode**. llama.cpp's fastest speculative
-mode reaches 448 tok/s, and its output then differs from its own
-non-speculative output on up to half of the turns. SonicBoom's output is
-identical, bit for bit, with speculation on or off.
+**{{CE_AUTO_R}} tok/s, {{CE_X}}× its own plain decode**. llama.cpp's fastest speculative
+mode reaches {{LL_NGRAM_R}} tok/s, and its output then differs from its own
+non-speculative output on some turns. SonicBoom's output is identical, bit for
+bit, with speculation on or off.
 
 SonicBoom is written from the ground up in C++ and CUDA, exposed through a
 stable C ABI, with GNU Guile as its first-class language. No Python
 interpreter, pip or wheel tree is involved in inference.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.svg">
+  <img alt="SonicBoom: fast, exact and lean. The stack runs from Guile, C or an OpenAI-compatible server through one libsonicboom.so to the runtime, the Boom IR compiler, SonicBoom's own kernels and the GPU. Each speculative step drafts tokens, verifies them in one pass with every row bit-identical to a plain decode step, and commits them unchanged; kernel choices are tuned at load and sealed." src="assets/architecture.svg" width="100%">
+</picture>
 
 ## Numbers
 
@@ -20,36 +25,37 @@ interpreter, pip or wheel tree is involved in inference.
 
 | Workload | SonicBoom | llama.cpp | Ratio |
 |---|---:|---:|---:|
-| **Code editing, speculative decoding** | **489.8 tok/s** | 448.0 tok/s ¹ | **1.09×** |
-| **Same output with speculation on and off** | **10 of 10 turns** | 5–8 of 10 turns ¹ | |
-| Decode, speculation off, context 512 | 40.6 tok/s | 43.2 tok/s | 0.94× |
-| Decode, speculation off, context 4K | 38.2 tok/s | 41.4 tok/s | 0.92× |
-| Prefill, 512-token prompt | 1557 tok/s | 1584 tok/s | 0.98× |
-| Prefill, 8K-token prompt | 1200 tok/s | 1420 tok/s | 0.85× |
+| **Code editing, speculative decoding** | **{{CE_AUTO}} tok/s** | {{LL_NGRAM}} tok/s ¹ | **{{CE_RATIO}}×** |
+| **Same output with speculation on and off** | **{{SB_SAME}}** | {{LL_SAME}} ¹ | |
+| Decode, speculation off, context 512 | {{D512_SB}} tok/s | {{D512_LL}} tok/s | {{D512_R}}× |
+| Decode, speculation off, context 4K | {{D4K_SB}} tok/s | {{D4K_LL}} tok/s | {{D4K_R}}× |
+| Prefill, 512-token prompt | {{PP512_SB}} tok/s | {{PP512_LL}} tok/s | {{PP512_R}}× |
+| Prefill, 8K-token prompt | {{PP8K_SB}} tok/s | {{PP8K_LL}} tok/s | {{PP8K_R}}× |
 
-On coding chat, speculation makes SonicBoom 4.4× faster than its own plain
-decode (176.8 tok/s), with the same output.
+Through the OpenAI-compatible server, the same kind of edit request streams at
+{{API_AUTO}} tok/s with speculation on and {{API_OFF}} tok/s with it off, with
+the same text.
 
 Both runtimes run the same GGUF on the same machine: RTX 3050 8 GB (sm_86),
 Ryzen 5 5500, llama.cpp `43fe9c64281` with `-ngl 99 -fa on`. Each figure is the
-median of several process runs. Prefill is wall-clock time for the whole
-prompt.
+median of 3 process runs. Prefill is wall-clock time for the whole prompt.
 
 ¹ The code-editing workload is ten turns, each asking for an edit of a
 100–300-line source file; generation is greedy, as long as the file.
 llama.cpp runs `llama-server -ngl 99 -fa on -np 1 --spec-type ngram-mod`, its
-fastest of the eight speculative modes on this workload. In the same test,
-llama.cpp's non-speculative output also differed between repeated runs on 5 of
-10 turns.
+fastest of the eight speculative modes on this workload. Its identity count
+compares each speculative run with its non-speculative run, turn by turn.
 
-Model files, checksums, command lines and the long-context tiers (up to 32K)
-are in [docs/benchmarks.md](docs/benchmarks.md). Models under 2B parameters are
-no longer benchmarked, because they have little practical use. Gemma 4 E4B,
-the DeepSeek-R1-Distill-Qwen family and the other Qwen2.5 sizes run as well.
+Every row comes from the two commands under
+[Reproduce the table](#reproduce-the-table). Model files, checksums and the
+long-context tiers are in [docs/benchmark.md](docs/benchmark.md). Models under
+2B parameters are no longer benchmarked, because they have little practical
+use. Gemma 4 E4B, the DeepSeek-R1-Distill-Qwen family and the other Qwen2.5
+sizes run as well.
 
 ## Reproducible
 
-- **Same prompt, same output.** This holds with the same version, the same GPU
+- **Same input, same output.** This holds with the same version, the same GPU
   and the same warm-up table.
 - **Speculation doesn't change the result.** Turning speculative decoding on
   or off gives bit-identical token sequences. It is on by default.
@@ -59,14 +65,18 @@ The warm-up table is measured on your own GPU when a model loads. You can
 export it and import it elsewhere with `sb-tune`, which carries a run to
 another machine with the same GPU. Batched execution is not covered yet.
 
-## What's new in v0.0.5
+## What's new in v0.0.6
 
+- Speculative decoding runs through every entry point: the C ABI, Guile and
+  the OpenAI-compatible server, which makes one decode call per reply and
+  streams verified tokens as they are accepted.
+- `tools/bench.sh --spec` reproduces the code-editing comparison against
+  llama-server on your own GPU, and `--tune-export` / `--tune-import` carry the
+  warm-up table between machines.
 - Speculative decoding is on by default and verifies up to 64 drafted tokens
   per step; a long-match drafter targets code and document edits.
 - Grammar- and JSON-constrained decoding computes only the LM-head rows the
   grammar allows.
-- Warm-up tables can be exported and imported (`sb-tune`), and a canonical
-  numerics mode is available (`SONICBOOM_TUNE=canonical`).
 
 ## Quick start
 
@@ -109,7 +119,7 @@ The server is a GNU Artanis app; its dependencies are listed in
 LD_LIBRARY_PATH=build/core guile -L bindings/guile/scheme \
   bindings/guile/scheme/sonicboom/serve/app.scm \
   --model models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --model-id qwen2.5-7b \
-  --context-length 16384 --max-sessions 1 --port 8000
+  --context-length {{CTX}} --max-sessions 1 --port 8000
 ```
 
 ```sh
@@ -129,28 +139,25 @@ conversations at once.
 ### Reproduce the table
 
 ```sh
-LLAMA_BENCH=/path/to/llama-bench tools/bench.sh models/your-model.gguf --runs 3 --long
+LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3 --spec
+LLAMA_BIN=/path/to/llama.cpp/build/bin tools/bench.sh models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --runs 3 --long
 ```
 
-This prints the decode and prefill rows for your GPU. The code-editing
-workload and its llama-server command line are in
-[docs/benchmarks.md](docs/benchmarks.md#code-editing). Post your run in the
-[v0.0.5 results issue]({{ISSUE_URL}}); earlier runs are in issues
+The first command prints the code-editing rows, and the second the decode and
+prefill rows, for your GPU. The protocol is described in
+[docs/benchmark.md](docs/benchmark.md#code-editing). Post your run in the
+[v0.0.6 results issue]({{ISSUE_URL}}); earlier runs are in issues
 [#1](https://github.com/hardenedlinux/SonicBoom/issues/1),
 [#2](https://github.com/hardenedlinux/SonicBoom/issues/2) and
 [#3](https://github.com/hardenedlinux/SonicBoom/issues/3).
 
 ### Thanks
 
-Community runs keep these numbers honest beyond one card. 
-Thanks to:
-- [@svenha](https://github.com/svenha)
-- [@mmssix](https://github.com/mmssix)
-
-Results:
-- 0.0.3 [#1](https://github.com/hardenedlinux/SonicBoom/issues/1) [#2](https://github.com/hardenedlinux/SonicBoom/issues/2)
-- 0.0.4 [#3](https://github.com/hardenedlinux/SonicBoom/issues/3)
-- 0.0.5 [#4](https://github.com/hardenedlinux/SonicBoom/issues/4)
+Community runs keep these numbers honest beyond one card. Thanks to
+[@svenha](https://github.com/svenha) for the RTX 4060 Ti report in issue #1,
+and to [@mmssix](https://github.com/mmssix) for the four-GPU sweep in issue #2
+(RTX 3090 Ti, RTX 3090, RTX 4090 Laptop and RTX PRO 6000 Blackwell), which
+also surfaced the CUDA 12.9/13.x build and benchmark-harness fixes.
 
 ## What's inside
 
