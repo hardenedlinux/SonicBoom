@@ -369,6 +369,14 @@ bool group_launch_j(const sb_cuda_props & props,
     const dim3 block(props.warp_size, c0.nthreads / props.warp_size, 1);
     const dim3 grid(unsigned(args.tile_prefix[args.n_members]),
                     unsigned((args.ncols_dst + J - 1) / J), unsigned(split_eff));
+    // The grouped launch is one kernel for every member, so the record names it
+    // once, the way the separate launches would name each member's matmul.
+    SB_NOTE_LAUNCH_TP(
+        "mul_mat_q_group",
+        ::sonicboom::planner::plan_detail::tp_label(
+            {{"t0", (long long)T0}, {"t1", (long long)T1},
+             {"t2", (long long)T2}, {"J", J}}),
+        grid, block, nbs, stream);
     mul_mat_q_group<T0, T1, T2, J><<<grid, block, nbs, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
 
