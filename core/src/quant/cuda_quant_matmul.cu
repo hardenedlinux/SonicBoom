@@ -640,7 +640,7 @@ void* grow_scratch(void*& buf, size_t& have, size_t need) {
 // finite: that iteration's activation scale is 0, but (C.x * dA) * 0 is still
 // NaN when dA is. An over-read into the next row is finite by construction; the
 // last row needs this zeroed tail pad (ggml pads weight rows the same way).
-constexpr size_t kWeightTailPad = 256;
+constexpr size_t kWeightTailPad = kMmqWeightTailPad;
 
 // Upload W's packed bytes to the device, caching by (data pointer, byte size)
 // so repeated calls with the same weight reuse the device copy.
@@ -2914,12 +2914,12 @@ bool verify_wp_alloc(const VerifyWpShape& s, VerifyWpBuffers& b) {
   const size_t abytes =
       size_t(widest) * size_t(s.cols / 32) * sizeof(q8_1::block_q8_1);
   const size_t ybytes = size_t(widest) * size_t(s.rows) * sizeof(float);
-  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
-  if (cudaMalloc(&b.dxq, abytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dw, wbytes)) return false;
+  if (!mmq_probe_alloc(&b.dxq, abytes)) {
     verify_wp_free(b);
     return false;
   }
-  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dy, ybytes)) {
     verify_wp_free(b);
     return false;
   }
@@ -4108,24 +4108,27 @@ void decode_family_free(DecodeFamilyBuffers& b) {
 }
 
 bool decode_family_alloc(const VerifyWpShape& s, DecodeFamilyBuffers& b) {
+  // The mmq candidate reads whole 256-value K-iterations, so the probe weight
+  // carries the same zeroed tail pad as the uploaded production copy.
   const size_t wbytes = size_t(s.rows) * size_t(s.bpr) *
-                        size_t(quant_type_info(s.qt)->bytes_per_block);
+                            size_t(quant_type_info(s.qt)->bytes_per_block) +
+                        kMmqWeightTailPad;
   const size_t aqbytes = size_t(kDecodeFamilyN) * size_t(s.cols / 32) *
                          sizeof(q8_1::block_q8_1);
   const size_t mqblocks =
       size_t(mmq::mmq_q8_blocks(s.cols, kDecodeFamilyN));
   const size_t mqbytes = mqblocks * sizeof(mmq::block_q8_1_mmq);
   const size_t ybytes = size_t(kDecodeFamilyN) * size_t(s.rows) * sizeof(float);
-  if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
-  if (cudaMalloc(&b.dxq, aqbytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dw, wbytes)) return false;
+  if (!mmq_probe_alloc(&b.dxq, aqbytes)) {
     decode_family_free(b);
     return false;
   }
-  if (cudaMalloc(&b.dmq, mqbytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dmq, mqbytes)) {
     decode_family_free(b);
     return false;
   }
-  if (cudaMalloc(&b.dy, ybytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dy, ybytes)) {
     decode_family_free(b);
     return false;
   }
@@ -4363,8 +4366,8 @@ bool decode_family_group_alloc(const QuantizedTensor* const* w, int count,
   const size_t mqblocks =
       size_t(mmq::mmq_q8_blocks(cols, kDecodeFamilyN));
   const size_t mqbytes = mqblocks * sizeof(mmq::block_q8_1_mmq);
-  if (cudaMalloc(&b.dxq, aqbytes) != cudaSuccess) return false;
-  if (cudaMalloc(&b.dmq, mqbytes) != cudaSuccess) {
+  if (!mmq_probe_alloc(&b.dxq, aqbytes)) return false;
+  if (!mmq_probe_alloc(&b.dmq, mqbytes)) {
     decode_family_group_free(b);
     return false;
   }
@@ -4373,12 +4376,15 @@ bool decode_family_group_alloc(const QuantizedTensor* const* w, int count,
   cudaMemset(b.dmq, 0, mqbytes);
   for (int i = 0; i < count; ++i) {
     const int rows = int(w[i]->dims()[1]);
+    // The grouped mmq launch over-reads the same weight tail as the per-shape
+    // matmul; the probe buffer carries the zeroed pad.
     const size_t wbytes =
         size_t(rows) * size_t(w[i]->dims()[0] / w[i]->block_size()) *
-        size_t(quant_type_info(w[i]->type())->bytes_per_block);
+            size_t(quant_type_info(w[i]->type())->bytes_per_block) +
+        kMmqWeightTailPad;
     const size_t ybytes = size_t(rows) * size_t(kDecodeFamilyN) * sizeof(float);
-    if (cudaMalloc(&b.dw[i], wbytes) != cudaSuccess ||
-        cudaMalloc(&b.dy[i], ybytes) != cudaSuccess) {
+    if (!mmq_probe_alloc(&b.dw[i], wbytes) ||
+        !mmq_probe_alloc(&b.dy[i], ybytes)) {
       decode_family_group_free(b);
       return false;
     }

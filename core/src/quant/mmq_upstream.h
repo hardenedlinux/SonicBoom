@@ -47,9 +47,38 @@ enum class MmqUpType : int {
     Q8_0,
 };
 
+// Every device copy of a packed weight carries this zeroed tail.  The tiled
+// kernels read whole 256-value K-iterations, so a row whose K is not a
+// multiple of 256 over-reads up to four legacy blocks (4 * 34 = 136 bytes)
+// past its last block; the tail keeps that read inside the allocation and
+// finite.  upload_weight pads the production copies; the tuning probes pad
+// theirs the same way.
+inline constexpr size_t kMmqWeightTailPad = 256;
+
+// Probe-buffer allocation for the tuners that price candidates against
+// synthetic weights (the per-shape tile sweep, the group split/use probes, the
+// decode-family probes and the verify split probes).  Returns false on failure
+// and leaves no CUDA error state behind, so the caller skips the candidate
+// instead of launching against an unallocated buffer.  The test switch
+// SONICBOOM_MMQ_TUNE_ALLOC_FAIL (set to a nonzero value) reports failure
+// without allocating, exercising those skip paths.
+bool mmq_probe_alloc_impl(void ** ptr, size_t bytes);
+
+template <typename T>
+bool mmq_probe_alloc(T ** ptr, size_t bytes) {
+    void * p = nullptr;
+    if (!mmq_probe_alloc_impl(&p, bytes)) {
+        *ptr = nullptr;
+        return false;
+    }
+    *ptr = static_cast<T *>(p);
+    return true;
+}
+
 // Compute dst = weights @ dequant(y_q8).
 //
-//   weights: raw GGUF blocks, M rows x K columns (row stride K/qk blocks).
+//   weights: raw GGUF blocks, M rows x K columns (row stride K/qk blocks),
+//            followed by kMmqWeightTailPad zeroed bytes (see above).
 //   y_q8:    activation blocks in the upstream block_q8_1_mmq layout,
 //            [K/128][n] blocks, followed by room for J_max (<= 128) trailing
 //            blocks that the tiled kernel may read past the end of a row.

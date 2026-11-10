@@ -43,6 +43,23 @@
 #include <vector>
 
 namespace sonicboom::quant::cuda {
+
+bool mmq_probe_alloc_impl(void ** ptr, size_t bytes) {
+    *ptr = nullptr;
+    const char * fail = std::getenv("SONICBOOM_MMQ_TUNE_ALLOC_FAIL");
+    if (fail != nullptr && *fail != '\0' && std::strcmp(fail, "0") != 0) {
+        return false;
+    }
+    if (cudaMalloc(ptr, bytes) == cudaSuccess) {
+        return true;
+    }
+    *ptr = nullptr;
+    // cudaMalloc records its failure in the last-error slot; clear it so the
+    // caller's clean skip is not reported as the error of a later call.
+    (void)cudaGetLastError();
+    return false;
+}
+
 namespace {
 
 // SonicBoom: map the public enum onto the upstream ggml type values.
@@ -127,14 +144,23 @@ float * split_scratch_get(size_t bytes) {
     std::lock_guard<std::mutex> lock(mutex);
     if (bytes > capacity) {
         if (ptr != nullptr) {
-            if (sonicboom::cuda::scratch_may_free()) {
-                CUDA_CHECK(cudaFree(ptr));
+            if (sonicboom::cuda::scratch_may_free() &&
+                cudaFree(ptr) == cudaSuccess) {
+                ptr = nullptr;
             } else {
+                // A free that failed leaves the pointer live: retire it rather
+                // than lose the allocation.
+                (void)cudaGetLastError();
                 retired.push_back(ptr);
+                ptr = nullptr;
             }
-            ptr = nullptr;
         }
-        CUDA_CHECK(cudaMalloc(&ptr, bytes));
+        if (!mmq_probe_alloc(&ptr, bytes)) {
+            // No scratch, no split path: the caller returns false instead of
+            // launching a kernel whose partial buffer is null.
+            capacity = 0;
+            return nullptr;
+        }
         capacity = bytes;
         sonicboom::cuda::scratch_epoch_bump();
     }
@@ -176,6 +202,9 @@ bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
     if (split_k > 1) {
         scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n) *
                                     sizeof(float));
+        if (scratch == nullptr) {
+            return false;  // no partial buffer: never launch the split path
+        }
     }
 
     const mmq_args args = {
@@ -220,6 +249,9 @@ bool run_mmq_gather(const void * weights, const int32_t * y_q8, float * dst,
     if (split_k > 1) {
         scratch = split_scratch_get(size_t(split_k) * size_t(M) * size_t(n) *
                                     sizeof(float));
+        if (scratch == nullptr) {
+            return false;  // no partial buffer: never launch the split path
+        }
     }
 
     const mmq_args args = {
@@ -329,6 +361,9 @@ bool group_launch_j(const sb_cuda_props & props,
     if (split_eff > 1) {
         a.part = split_scratch_get(size_t(split_eff) * size_t(args.ncols_dst) *
                                    size_t(args.total_rows) * sizeof(float));
+        if (a.part == nullptr) {
+            return false;  // no partial buffer: never launch the split path
+        }
     }
 
     const dim3 block(props.warp_size, c0.nthreads / props.warp_size, 1);
@@ -429,10 +464,24 @@ bool group_launch_typed(const sb_cuda_props & props,
     }
 }
 
+// Raise one kernel's dynamic shared-memory limit.  A failure is cleared and
+// reported, never fatal: the warm-up then returns a clean error and the caller
+// keeps the untuned default instead of aborting the process.
+template <typename Kernel>
+bool set_group_smem(Kernel kernel, size_t nbs) {
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             int(nbs)) == cudaSuccess) {
+        return true;
+    }
+    (void)cudaGetLastError();
+    return false;
+}
+
 // Raise the shared-memory limit for every tile width the group kernel can be
-// launched with.  Nothing is launched here.
+// launched with.  Nothing is launched here; returns false when a limit could
+// not be raised.
 template <ggml_type T0, ggml_type T1, ggml_type T2>
-void group_warm_typed(const sb_cuda_props & props) {
+bool group_warm_typed(const sb_cuda_props & props) {
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config<0>(T0, J, false, props.cc);
         const ggml_cuda_mmq_config c1 = ggml_cuda_mmq_get_config<0>(T1, J, false, props.cc);
@@ -447,26 +496,31 @@ void group_warm_typed(const sb_cuda_props & props) {
         if (nbs > size_t(props.smpbo)) {
             continue;
         }
+        bool ok = true;
         switch (J) {
-            case   8: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,   8>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  16: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  16>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  24: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  24>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  32: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  32>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  40: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  40>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  48: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  48>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  56: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  56>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  64: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  64>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  72: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  72>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  80: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  80>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  88: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  88>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case  96: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2,  96>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case 104: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 104>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case 112: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 112>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case 120: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 120>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
-            case 128: CUDA_CHECK(cudaFuncSetAttribute(mul_mat_q_group<T0, T1, T2, 128>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(nbs))); break;
+            case   8: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,   8>, nbs); break;
+            case  16: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  16>, nbs); break;
+            case  24: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  24>, nbs); break;
+            case  32: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  32>, nbs); break;
+            case  40: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  40>, nbs); break;
+            case  48: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  48>, nbs); break;
+            case  56: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  56>, nbs); break;
+            case  64: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  64>, nbs); break;
+            case  72: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  72>, nbs); break;
+            case  80: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  80>, nbs); break;
+            case  88: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  88>, nbs); break;
+            case  96: ok = set_group_smem(mul_mat_q_group<T0, T1, T2,  96>, nbs); break;
+            case 104: ok = set_group_smem(mul_mat_q_group<T0, T1, T2, 104>, nbs); break;
+            case 112: ok = set_group_smem(mul_mat_q_group<T0, T1, T2, 112>, nbs); break;
+            case 120: ok = set_group_smem(mul_mat_q_group<T0, T1, T2, 120>, nbs); break;
+            case 128: ok = set_group_smem(mul_mat_q_group<T0, T1, T2, 128>, nbs); break;
             default:  break;
         }
+        if (!ok) {
+            return false;
+        }
     }
+    return true;
 }
 
 // The format tuples whose group kernels this build instantiates: the sibling
@@ -479,24 +533,20 @@ bool group_dispatch(const sb_cuda_props & props,
     const ggml_type t1 = to_ggml_type(types[1]);
     const ggml_type t2 = args.n_members > 2 ? to_ggml_type(types[2]) : t1;
     if (t0 == GGML_TYPE_Q3_K && t1 == GGML_TYPE_Q3_K && t2 == GGML_TYPE_Q3_K) {
-        if (warm) group_warm_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props);
-        else return group_launch_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props, args, split_k, stream);
-        return true;
+        if (warm) return group_warm_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props);
+        return group_launch_typed<GGML_TYPE_Q3_K, GGML_TYPE_Q3_K, GGML_TYPE_Q3_K>(props, args, split_k, stream);
     }
     if (t0 == GGML_TYPE_Q4_K && t1 == GGML_TYPE_Q4_K && t2 == GGML_TYPE_Q4_K) {
-        if (warm) group_warm_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props);
-        else return group_launch_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props, args, split_k, stream);
-        return true;
+        if (warm) return group_warm_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props);
+        return group_launch_typed<GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K>(props, args, split_k, stream);
     }
     if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q5_0) {
-        if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props);
-        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props, args, split_k, stream);
-        return true;
+        if (warm) return group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props);
+        return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_0>(props, args, split_k, stream);
     }
     if (t0 == GGML_TYPE_Q5_0 && t1 == GGML_TYPE_Q5_0 && t2 == GGML_TYPE_Q8_0) {
-        if (warm) group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props);
-        else return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props, args, split_k, stream);
-        return true;
+        if (warm) return group_warm_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props);
+        return group_launch_typed<GGML_TYPE_Q5_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0>(props, args, split_k, stream);
     }
     return false;
 }
@@ -749,16 +799,22 @@ void mmq_tune_free(MmqTuneBuffers & b) {
 bool mmq_tune_alloc(const MmqTuneShape & s, MmqTuneBuffers & b) {
     int qk = 0, bytes = 0;
     mmq_block_meta(s.type, &qk, &bytes);
-    const size_t wbytes = size_t(s.rows) * size_t(s.cols / qk) * size_t(bytes);
+    const size_t wbytes = size_t(s.rows) * size_t(s.cols / qk) * size_t(bytes) +
+                          kMmqWeightTailPad;
     const size_t xbytes = size_t(kMmqTuneMaxN) * size_t(s.cols) * sizeof(float);
-    const size_t yblocks = size_t(s.cols / 128) * size_t(kMmqTuneMaxN) + 128;
+    // Whole 256-value K-iterations: an odd 128-value plane count gets one
+    // trailing (zeroed) plane, exactly as mmq_q8_blocks sizes the production
+    // activation buffer. The trailing I blocks are the J_max over-read guard.
+    const int64_t planes128 = s.cols / 128;
+    const size_t planes = size_t(planes128 + (planes128 & 1));
+    const size_t yblocks = planes * size_t(kMmqTuneMaxN) + 128;
     const size_t ybytes = yblocks * sizeof(int) * 36;  // block_q8_1_mmq
     const size_t obytes = size_t(s.rows) * size_t(kMmqTuneMaxN) * sizeof(float);
-    if (cudaMalloc(&b.dw, wbytes) != cudaSuccess) return false;
-    if (cudaMalloc(&b.dx, xbytes) != cudaSuccess) { mmq_tune_free(b); return false; }
-    if (cudaMalloc(&b.dyq8, ybytes) != cudaSuccess) { mmq_tune_free(b); return false; }
-    if (cudaMalloc(&b.dout, obytes) != cudaSuccess) { mmq_tune_free(b); return false; }
-    cudaMemset(b.dw, 0, wbytes);
+    if (!mmq_probe_alloc(&b.dw, wbytes)) return false;
+    if (!mmq_probe_alloc(&b.dx, xbytes)) { mmq_tune_free(b); return false; }
+    if (!mmq_probe_alloc(&b.dyq8, ybytes)) { mmq_tune_free(b); return false; }
+    if (!mmq_probe_alloc(&b.dout, obytes)) { mmq_tune_free(b); return false; }
+    cudaMemset(b.dw, 0, wbytes);  // includes the zeroed over-read tail
     cudaMemset(b.dx, 0, xbytes);
     cudaMemset(b.dyq8, 0, ybytes);
     return true;
@@ -1112,7 +1168,7 @@ bool mmq_group_tune_alloc(const MmqUpType * types, const int64_t * rows,
     const int64_t planes = cols / 128 + ((cols / 128) & 1);
     const size_t yblocks = size_t(planes) * size_t(kMmqSplitProbeN[2]) + 128;
     const size_t ybytes = yblocks * sizeof(int) * 36;  // block_q8_1_mmq
-    if (cudaMalloc(&b.dyq8, ybytes) != cudaSuccess) {
+    if (!mmq_probe_alloc(&b.dyq8, ybytes)) {
         mmq_group_tune_free(b);
         return false;
     }
@@ -1120,15 +1176,16 @@ bool mmq_group_tune_alloc(const MmqUpType * types, const int64_t * rows,
     for (int k = 0; k < n_members; ++k) {
         int qk = 0, bytes = 0;
         mmq_block_meta(types[k], &qk, &bytes);
-        const size_t wbytes = size_t(rows[k]) * size_t(cols / qk) * size_t(bytes);
+        const size_t wbytes = size_t(rows[k]) * size_t(cols / qk) * size_t(bytes) +
+                              kMmqWeightTailPad;
         const size_t obytes = size_t(rows[k]) * size_t(kMmqSplitProbeN[2]) *
                               sizeof(float);
-        if (cudaMalloc(&b.dw[k], wbytes) != cudaSuccess ||
-            cudaMalloc(&b.dout[k], obytes) != cudaSuccess) {
+        if (!mmq_probe_alloc(&b.dw[k], wbytes) ||
+            !mmq_probe_alloc(&b.dout[k], obytes)) {
             mmq_group_tune_free(b);
             return false;
         }
-        cudaMemset(b.dw[k], 0, wbytes);
+        cudaMemset(b.dw[k], 0, wbytes);  // includes the zeroed over-read tail
     }
     return true;
 }
