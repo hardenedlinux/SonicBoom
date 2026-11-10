@@ -5962,6 +5962,12 @@ std::string device_identity() {
 bool decode_step_through_executor(DecodeRuntime& rt, uint64_t token, uint64_t pos,
                                   int64_t* next_out) {
   const std::vector<sx::Bytes> in{encode_i64(token), encode_i64(pos)};
+  // The device Embedding reads the token id from the persistent token slot, not
+  // from the host graph input (Phase 3.2 B4). Every generate loop seeds it
+  // before its first step; a recorder that skipped the seed made step 0 read
+  // whatever the pooled slot last held, which is another model's f32 when two
+  // models are recorded in one process.
+  if (!rt.cuda->seed_token(token)) return false;
   rt.cuda->set_pos(pos);
   auto res = rt.exec->execute(rt.plan, rt.snap, in);
   if (!res || res->outputs.empty()) return false;
