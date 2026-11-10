@@ -5,8 +5,8 @@
 **A native tensor runtime. No Python. One `.so`.**
 
 On a desktop RTX 3050, SonicBoom edits code with Qwen2.5-7B at
-**{{CE_AUTO_R}} tok/s, {{CE_X}}× its own plain decode**. llama.cpp's fastest speculative
-mode reaches {{LL_NGRAM_R}} tok/s, and its output then differs from its own
+**471 tok/s, 12.2× its own plain decode**. llama.cpp's fastest speculative
+mode reaches 408 tok/s, and its output then differs from its own
 non-speculative output on some turns. SonicBoom's output is identical, bit for
 bit, with speculation on or off.
 
@@ -25,15 +25,15 @@ interpreter, pip or wheel tree is involved in inference.
 
 | Workload | SonicBoom | llama.cpp | Ratio |
 |---|---:|---:|---:|
-| **Code editing, speculative decoding** | **{{CE_AUTO}} tok/s** | {{LL_NGRAM}} tok/s ¹ | **{{CE_RATIO}}×** |
-| **Same output with speculation on and off** | **{{SB_SAME}}** | {{LL_SAME}} ¹ | |
-| Decode, speculation off, context 512 | {{D512_SB}} tok/s | {{D512_LL}} tok/s | {{D512_R}}× |
-| Decode, speculation off, context 4K | {{D4K_SB}} tok/s | {{D4K_LL}} tok/s | {{D4K_R}}× |
-| Prefill, 512-token prompt | {{PP512_SB}} tok/s | {{PP512_LL}} tok/s | {{PP512_R}}× |
-| Prefill, 8K-token prompt | {{PP8K_SB}} tok/s | {{PP8K_LL}} tok/s | {{PP8K_R}}× |
+| **Code editing, speculative decoding** | **471.1 tok/s** | 407.7 tok/s ¹ | **1.16×** |
+| **Same output with speculation on and off** | **10 of 10 turns** | 8 of 10 turns ¹ | |
+| Decode, speculation off, context 512 | 40.6 tok/s | 43.3 tok/s | 0.94× |
+| Decode, speculation off, context 4K | 38.3 tok/s | 41.4 tok/s | 0.92× |
+| Prefill, 512-token prompt | 1600 tok/s | 1594 tok/s | 1.00× |
+| Prefill, 8K-token prompt | 1008 tok/s | 1425 tok/s | 0.71× |
 
 Through the OpenAI-compatible server, the same kind of edit request streams at
-{{API_AUTO}} tok/s with speculation on and {{API_OFF}} tok/s with it off, with
+523.7 tok/s with speculation on and 38.2 tok/s with it off, with
 the same text.
 
 Both runtimes run the same GGUF on the same machine: RTX 3050 8 GB (sm_86),
@@ -119,7 +119,7 @@ The server is a GNU Artanis app; its dependencies are listed in
 LD_LIBRARY_PATH=build/core guile -L bindings/guile/scheme \
   bindings/guile/scheme/sonicboom/serve/app.scm \
   --model models/qwen2.5-7b-instruct-1m-q4_k_m.gguf --model-id qwen2.5-7b \
-  --context-length {{CTX}} --max-sessions 1 --port 8000
+  --context-length 16384 --max-sessions 1 --port 8000
 ```
 
 ```sh

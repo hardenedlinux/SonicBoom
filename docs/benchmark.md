@@ -109,14 +109,16 @@ model list in [Conditions](#conditions), name Q5_K_M.
 
 | metric | SonicBoom | llama.cpp | ratio |
 |---|---:|---:|---:|
-| **Decode**, 64-step steady state | 41.1 tok/s | 43.5 tok/s | 0.94× |
-| Decode at KV depth 512 | 39.7 tok/s | 43.2 tok/s | 0.92× |
-| Prefill, 512-token prompt (marginal) | 1475.4 tok/s | 1587.9 tok/s | 0.93× |
-| Prefix reuse, 512-token prefix + 64 new | 101.7 ms to first token | — | — |
+| **Decode**, 64-step steady state | 41.0 tok/s | 43.5 tok/s | 0.94× |
+| Decode at KV depth 512 | 40.6 tok/s | 43.2 tok/s | 0.94× |
+| Prefill, 512-token prompt (marginal) | 1598.2 tok/s | 1589.9 tok/s | 1.01× |
+| Prefix reuse, 512-token prefix + 64 new | 62.7 ms to first token | — | — |
 
-Gemma decodes 1.19× ahead of llama.cpp at depth 0, and Qwen2.5-7B is 6–8%
-behind. Prefill is ahead on Gemma (1.13×, the converged `boom_fattn` path) and
-behind on Qwen2.5-7B (0.93×). Prefix reuse has no llama.cpp counterpart
+Gemma decodes 1.19× ahead of llama.cpp at depth 0, and Qwen2.5-7B is 6%
+behind at depths 0 and 512. Prefill is ahead on Gemma (1.13×, the converged
+`boom_fattn` path) and level on Qwen2.5-7B at 512 tokens (1.01×); it falls
+behind as the prompt grows (see [Long-context tiers](#long-context-tiers)).
+Prefix reuse has no llama.cpp counterpart
 (`llama-bench` cannot measure it), so it is reported as first-token latency
 only; the exactness claim beside it is a test, not a benchmark — a reuse
 continuation is token-identical to a full prefill (`test_guarantees` covers the
@@ -125,10 +127,35 @@ suite maintained separately).
 
 The v0.0.3 values for the two original families are kept in the
 [README numbers table](../README.md#numbers) so the release-over-release change
-stays visible; the doc here reports the current release only.
+stays visible; the doc here reports the latest published measurement of each
+model (Gemma 4 from v0.0.4; Qwen2.5-7B from the v0.0.6 run).
 
-SM clock medians over the published runs: 1927 MHz (Gemma) and 1852 MHz
-(Qwen2.5-7B); the script prints its own clock readings per run.
+SM clock medians over the published runs: 1927 MHz (Gemma, v0.0.4), 1867 MHz
+(Qwen2.5-7B, code-edit run) and 1882 MHz (Qwen2.5-7B, long-context run); the
+script prints its own clock readings per run.
+
+## Long-context tiers
+
+The same model and session, `tools/bench.sh --long`: decode is 64 tokens at
+the given KV depth, prefill is the whole prompt. Medians of 3 process runs;
+both runtimes on the same GGUF in the same session.
+
+**Qwen2.5-7B-Instruct-1M Q4_K_M** (d128/GQA-7)
+
+| tier | SonicBoom | llama.cpp | ratio |
+|---|---:|---:|---:|
+| d4096 | 38.3 tok/s | 41.4 tok/s | 0.92× |
+| d8192 | 36.6 tok/s | 39.6 tok/s | 0.93× |
+| d16384 | 33.2 tok/s | 36.4 tok/s | 0.91× |
+| d32768 | 28.5 tok/s | 31.3 tok/s | 0.91× |
+| pp4096 | 1234.2 tok/s | 1517.7 tok/s | 0.81× |
+| pp8192 | 1007.6 tok/s | 1425.0 tok/s | 0.71× |
+| pp16384 | 701.7 tok/s | 1272.5 tok/s | 0.55× |
+| pp32768 | 442.6 tok/s | 1046.9 tok/s | 0.42× |
+
+Decode stays within 0.91–0.93× of llama.cpp out to 32K. Prefill is level at
+512 tokens and diverges as the prompt grows: the d128 batched path is the
+remaining gap, and it is where the next prefill work lands.
 
 ## Code editing
 
@@ -169,6 +196,10 @@ Identity is per turn: a SonicBoom auto rep is identical to the off arm when all
 ten token hashes match, and a llama.cpp ngram-mod rep is identical when all ten
 generated texts match the no-spec arm byte for byte. `tools/bench.sh MODEL
 --spec` runs all four arms and prints the table.
+
+On a coding-chat workload, speculation makes SonicBoom 4.4× faster than its own
+plain decode (176.8 tok/s), with the same output. In the same test, llama.cpp's
+non-speculative output also differed between repeated runs on 5 of 10 turns.
 
 ## Correctness gates
 
@@ -274,7 +305,14 @@ Numbers from other people's hardware are collected in the README's *Community
 results* section, as reported and marked not reproduced by us. The copy-paste
 standard run — hardware/build record, canonical bench, extended-context tiers,
 clock pinning and what to send — is
-[README: Standard run](../README.md#standard-run).
+[README: Reproduce the table](../README.md#reproduce-the-table).
+
+Earlier per-release results threads:
+
+- 0.0.3: [#1](https://github.com/hardenedlinux/SonicBoom/issues/1),
+  [#2](https://github.com/hardenedlinux/SonicBoom/issues/2)
+- 0.0.4: [#3](https://github.com/hardenedlinux/SonicBoom/issues/3)
+- 0.0.5: [#4](https://github.com/hardenedlinux/SonicBoom/issues/4)
 
 A community submission follows the same protocol as the published numbers:
 
