@@ -99,9 +99,12 @@ int main(int argc, char** argv) {
               (unsigned long long)ctx);
       return 1;
     }
+    // Depth 0 is an empty context: the first measured step consumes the seed
+    // token at position 0, so there is nothing to build and nothing to take
+    // from a build vector.
     uint64_t pos = 0;
     uint64_t token = seed;
-    if (prefill_mode) {
+    if (prefill_mode && depth > 0) {
       std::vector<uint64_t> prompt(depth);
       for (uint64_t i = 0; i < depth; ++i) prompt[i] = seed + (i % 500);
       std::vector<int64_t> first(1, -1);
@@ -113,7 +116,7 @@ int main(int argc, char** argv) {
       }
       pos = depth + 1;
       token = uint64_t(first[0]);
-    } else {
+    } else if (depth > 0) {
       std::vector<int64_t> build(depth, -1);
       const uint64_t built =
           sbmodel::generate_spine_cuda(*m, seed, 0, build, ctx, {}, &session);
