@@ -31,6 +31,7 @@
 
 #include <sonicboom/compiler/BoomOps.h>
 #include <sonicboom/compiler/BoomPasses.h>
+#include <sonicboom/compiler/BoomDemand.h>
 #include <sonicboom/compiler/BoomTypes.h>
 #include <sonicboom/planner/ir_passes.h>
 #include <sonicboom/planner/op_kind.h>
@@ -40,6 +41,8 @@
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinAttributes.h>
 #include <mlir/IR/Diagnostics.h>
+#include <mlir/IR/Verifier.h>
+#include <mlir/Interfaces/SideEffectInterfaces.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Pass/PassManager.h>
 
@@ -141,6 +144,26 @@ public:
         ctx_, id, d.getShape(), d.getDtype(), sizeBytes, dynamicBaseBytes,
         d.getIsInput(), d.getIsOutput(), d.getIsConstant(), d.getIsExternal(),
         d.getName());
+  }
+
+  // Replace a tensor's shape and its declared byte size, keeping every other
+  // field: a result some reader narrowed to the part of it that is read.
+  void setTensorShape(int64_t id, llvm::ArrayRef<int64_t> shape,
+                      uint64_t sizeBytes) {
+    const boom::TensorDescAttr d = descs_.lookup(id);
+    descs_[id] = boom::TensorDescAttr::get(
+        ctx_, id, shape, d.getDtype(), sizeBytes, d.getDynamicBaseBytes(),
+        d.getIsInput(), d.getIsOutput(), d.getIsConstant(), d.getIsExternal(),
+        d.getName());
+  }
+
+  // Mark a tensor as the graph's output, or clear the mark.
+  void setTensorOutput(int64_t id, bool isOutput) {
+    const boom::TensorDescAttr d = descs_.lookup(id);
+    descs_[id] = boom::TensorDescAttr::get(
+        ctx_, id, d.getShape(), d.getDtype(), d.getByteSize(),
+        d.getDynamicBaseBytes(), d.getIsInput(), isOutput, d.getIsConstant(),
+        d.getIsExternal(), d.getName());
   }
 
   // Drop a tensor from the table. Only for a tensor nothing references any more:
@@ -3120,6 +3143,7 @@ struct DisabledPasses {
   bool dense_layout_propagation = false;
   bool buffer_reuse = false;
   bool async_prefetch = false;
+  bool prune_by_demand = false;
 };
 
 // The names the switch accepts: the pass class names, one table so the parser
@@ -3154,6 +3178,7 @@ constexpr PassName kPassNames[] = {
     {"DenseLayoutPropagationPass", &DisabledPasses::dense_layout_propagation},
     {"BufferReusePass", &DisabledPasses::buffer_reuse},
     {"AsyncPrefetchPass", &DisabledPasses::async_prefetch},
+    {"PruneByDemandPass", &DisabledPasses::prune_by_demand},
 };
 
 // Read SONICBOOM_IR_PASS_DISABLE into `out`. Returns false, having named both
@@ -3399,6 +3424,343 @@ int vram_threshold_mb() {
   if (env == nullptr || *env == '\0') return 6000;
   const long v = std::strtol(env, nullptr, 10);
   return v > 0 ? int(std::min<long>(v, 1L << 20)) : 6000;
+}
+
+//--- consumer resolution -----------------------------------------------------
+//
+// An emitter writes one decode graph — the model's own computation, ending in
+// its logits — and declares what reads the output (GraphOp::consumer, and
+// consumer_list when only a runtime list of indices is eligible). What that
+// reader needs of the graph is not written by the emitter: it is the demand
+// the reader places on the output, propagated backward (BoomDemand.h), and the
+// graph is cut to it here.
+//
+//   * A node whose result is only ranked, and which is a non-decreasing map of
+//     its operand, is not computed: its readers take the operand. (The logit
+//     softcap under an argmax.)
+//   * A node nothing reads, with no effect of its own, is removed.
+//   * A result read only on a runtime index list along its innermost dimension
+//     is narrowed to the list's capacity, and the weight matmul that produces
+//     such a result reads only those weight rows (`gather`).
+//
+// The first two are optimizations and carry the pass switch PruneByDemandPass.
+// The third is not: the list is part of what the consumer asked for — the
+// runtime uploads a compacted list and reads a compacted result — so a graph
+// that declares one is always narrowed.
+//
+// The consumer itself then becomes nodes. A reduction the phase's passes are
+// written to see as the graph's tail (the argmax) is appended here, before
+// them. The candidate selection of a sampling consumer is appended by
+// finishConsumer after them: it reads the finished logits buffer and takes no
+// part in buffer assignment, which is the graph the sampled plans are built
+// from. Either way a graph that reaches the lowering declares nothing.
+
+namespace {
+
+// The row count a row-dealt graph stamps on every node (the verify step). A
+// node appended to such a graph carries it as the emitter's nodes do.
+constexpr llvm::StringLiteral kRowsAttr = "verify";
+constexpr llvm::StringLiteral kGatherAttr = "gather";
+
+mlir::ArrayAttr nodeAttrsOf(mlir::Operation *node) {
+  return node->getAttrOfType<mlir::ArrayAttr>("node_attrs");
+}
+
+int64_t rowsOf(mlir::Operation *node) {
+  mlir::ArrayAttr attrs = node ? nodeAttrsOf(node) : mlir::ArrayAttr();
+  return attrs ? nodeAttrInt(attrs, kRowsAttr).value_or(1) : 1;
+}
+
+// The graph's single output: its tensor id, its value and the node that
+// produces it (null when the output is a free variable).
+struct GraphOutput {
+  int64_t id = 0;
+  mlir::Value value;
+  mlir::Operation *producer = nullptr;
+};
+
+std::optional<GraphOutput> singleOutput(GraphEditor &view) {
+  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  if (outputs.size() != 1)
+    return std::nullopt;
+  GraphOutput out;
+  out.id = outputs[0];
+  out.value = view.value(out.id);
+  if (!out.value)
+    return std::nullopt;
+  out.producer = out.value.getDefiningOp();
+  return out;
+}
+
+// Make `to` the graph's output in place of `from`.
+void moveOutput(GraphEditor &view, int64_t from, int64_t to) {
+  if (view.hasTensor(from))
+    view.setTensorOutput(from, false);
+  view.setTensorOutput(to, true);
+  mlir::Builder builder(view.ctx());
+  view.graph().setOutputsAttr(
+      builder.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{to}));
+}
+
+// Remove a one-operand node whose readers take its operand instead.
+void bypassNode(GraphEditor &view, mlir::Operation *node) {
+  mlir::Value operand = node->getOperand(0);
+  mlir::Value result = node->getResult(0);
+  const int64_t resultId = view.idOf(result);
+  const int64_t operandId = view.idOf(operand);
+  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  const bool wasOutput = llvm::is_contained(outputs, resultId);
+  result.replaceAllUsesWith(operand);
+  node->erase();
+  view.dropTensor(resultId);
+  if (wasOutput)
+    moveOutput(view, resultId, operandId);
+}
+
+// A node the demand analysis may bypass under a ranking observer: it declares
+// itself a non-decreasing elementwise map of one tensor operand of its own
+// shape, and has no effect.
+bool isMonotoneMap(mlir::Operation *node) {
+  return node->hasTrait<boom::OpTrait::Monotone>() &&
+         node->getNumOperands() == 1 && node->getNumResults() == 1 &&
+         node->getOperand(0).getType() == node->getResult(0).getType() &&
+         mlir::isMemoryEffectFree(node);
+}
+
+// Cut the graph to its demand: bypass the monotone maps that are only ranked,
+// then remove what nothing reads. Returns the number of nodes removed.
+unsigned pruneByDemand(GraphEditor &view, const DemandFacts &facts) {
+  unsigned removed = 0;
+  llvm::SmallVector<mlir::Operation *> nodes;
+  for (mlir::Operation &node : view.body())
+    nodes.push_back(&node);
+
+  for (mlir::Operation *node : nodes) {
+    if (!isMonotoneMap(node))
+      continue;
+    if (facts.of(node->getResult(0)).obs != Observation::Order)
+      continue;
+    bypassNode(view, node);
+    ++removed;
+  }
+
+  // Reverse order, so a chain nothing reads goes from its end.
+  nodes.clear();
+  for (mlir::Operation &node : view.body())
+    nodes.push_back(&node);
+  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  for (mlir::Operation *node : llvm::reverse(nodes)) {
+    if (!mlir::isMemoryEffectFree(node) || !node->use_empty())
+      continue;
+    bool dead = node->getNumResults() > 0;
+    for (mlir::Value result : node->getResults())
+      if (!facts.of(result).isNone() ||
+          llvm::is_contained(outputs, view.idOf(result)))
+        dead = false;
+    if (!dead)
+      continue;
+    llvm::SmallVector<int64_t> ids(GraphEditor::resultIds(*node));
+    node->erase();
+    for (int64_t id : ids)
+      view.dropTensor(id);
+    ++removed;
+  }
+  return removed;
+}
+
+// Narrow every result that is read only on a runtime index list to the list's
+// capacity. False, with a diagnostic, when a listed result cannot be narrowed.
+bool narrowToLists(GraphEditor &view, const DemandFacts &facts) {
+  mlir::Builder builder(view.ctx());
+  for (mlir::Operation &node : view.body()) {
+    if (node.getNumResults() != 1)
+      continue;
+    mlir::Value result = node.getResult(0);
+    const Demand demand = facts.of(result);
+    if (demand.dims.empty() || !demand.dims.back().isList())
+      continue;
+    const int64_t capacity = demand.dims.back().capacity;
+
+    auto type = llvm::dyn_cast<boom::TensorType>(result.getType());
+    if (!type || type.getShape().empty()) {
+      node.emitOpError() << "is read on an index list of " << capacity
+                         << " but its result is not a plain tensor";
+      return false;
+    }
+    if (rowsOf(&node) != 1) {
+      node.emitOpError() << "is read on an index list of " << capacity
+                         << " in a row-dealt graph, which has no list form";
+      return false;
+    }
+
+    const int64_t id = view.idOf(result);
+    const boom::TensorDescAttr desc = view.desc(id);
+    llvm::SmallVector<int64_t, 4> shape(type.getShape());
+    const int64_t inner = shape.back();
+    if (inner != capacity) {
+      if (inner <= 0 || desc.getByteSize() % uint64_t(inner) != 0) {
+        node.emitOpError() << "result of innermost extent " << inner
+                           << " cannot be narrowed to " << capacity;
+        return false;
+      }
+      shape.back() = capacity;
+      view.setTensorShape(id, shape,
+                          desc.getByteSize() / uint64_t(inner) *
+                              uint64_t(capacity));
+      result.setType(boom::TensorType::get(view.ctx(), shape, type.getDtype()));
+    }
+
+    // The weight matmul reads only the listed weight rows.
+    if (facts.weightRows(&node).isList()) {
+      mlir::ArrayAttr attrs = nodeAttrsOf(&node);
+      if (!nodeAttrInt(attrs, kGatherAttr)) {
+        llvm::SmallVector<mlir::Attribute> entries(attrs.begin(), attrs.end());
+        entries.push_back(boom::NodeAttr::get(view.ctx(), kGatherAttr,
+                                              builder.getI64IntegerAttr(1)));
+        node.setAttr("node_attrs", builder.getArrayAttr(entries));
+      }
+    }
+  }
+  return true;
+}
+
+// Append the consumer's own node, reading the graph's output and producing a
+// new one: `rows` values of `width` f32 each.
+bool appendConsumerNode(boom::GraphOp graph, planner::OpKind kind,
+                        llvm::StringRef tensorName, bool listed) {
+  GraphEditor view(graph);
+  const std::optional<GraphOutput> out = singleOutput(view);
+  if (!out) {
+    graph.emitOpError() << "a consumer reads exactly one output";
+    return false;
+  }
+  mlir::MLIRContext *ctx = view.ctx();
+  mlir::OpBuilder builder(ctx);
+  const mlir::Location loc = graph.getLoc();
+  const int64_t rows = rowsOf(out->producer);
+
+  // The emitter's order: the node's own attributes, then the row count.
+  llvm::SmallVector<mlir::Attribute> attrs;
+  if (listed)
+    attrs.push_back(boom::NodeAttr::get(ctx, kGatherAttr,
+                                        builder.getI64IntegerAttr(1)));
+  if (rows > 1)
+    attrs.push_back(boom::NodeAttr::get(ctx, kRowsAttr,
+                                        builder.getI64IntegerAttr(rows)));
+
+  const llvm::SmallVector<int64_t, 1> shape{rows};
+  const llvm::StringRef dtype = sx::dtype_name(sx::DType::Float32);
+  const int64_t tensorId = view.nextTensorId();
+  view.appendTensor(boom::TensorDescAttr::get(
+      ctx, tensorId, shape, dtype, uint64_t(rows) * sizeof(float),
+      /*dynamic_base_bytes=*/0, /*is_input=*/false, /*is_output=*/false,
+      /*is_constant=*/false, /*is_external=*/false, tensorName));
+
+  builder.setInsertionPointToEnd(&view.body());
+  mlir::Operation *node = buildNode(
+      builder, loc, planner::op_kind_name(kind), view.nextNodeId(),
+      planner::op_kind_name(kind), builder.getArrayAttr(attrs), {tensorId},
+      {out->value}, {boom::TensorType::get(ctx, shape, dtype)},
+      builder.getStringAttr(
+          planner::backend_tag_name(planner::BackendTag::Sonic)));
+  view.noteValue(tensorId, node->getResult(0));
+  moveOutput(view, out->id, tensorId);
+  view.commitTable();
+  return true;
+}
+
+void clearConsumer(boom::GraphOp graph) {
+  graph.removeConsumerAttr();
+  graph.removeConsumerListAttr();
+}
+
+bool verifyResolved(mlir::ModuleOp module, const char *what) {
+  if (mlir::succeeded(mlir::verify(module.getOperation())))
+    return true;
+  std::fprintf(stderr, "%s: the resolved graph does not verify (diagnostic "
+                       "above)\n",
+               what);
+  return false;
+}
+
+} // namespace
+
+bool resolveConsumer(mlir::ModuleOp module) {
+  DisabledPasses off;
+  if (!parseDisabledPasses(off)) off = DisabledPasses{};
+
+  bool resolved = false;
+  for (boom::GraphOp graph : module.getOps<boom::GraphOp>()) {
+    const std::optional<llvm::StringRef> declared = graph.getConsumer();
+    if (!declared)
+      continue;
+    resolved = true;
+    const std::string consumer = declared->str();
+    const bool listed = graph.getConsumerList().has_value();
+
+    const DemandFacts facts = analyzeDemand(graph.getOperation());
+    if (!facts.ok) {
+      graph.emitOpError() << "the demand analysis did not converge";
+      return false;
+    }
+
+    {
+      GraphEditor view(graph);
+      if (!off.prune_by_demand)
+        pruneByDemand(view, facts);
+      if (!narrowToLists(view, facts))
+        return false;
+      // A consumer that applies the trailing monotone map itself takes the
+      // graph without it. This is the consumer's statement, not an inference.
+      if (consumer == "precap_logits") {
+        while (true) {
+          const std::optional<GraphOutput> out = singleOutput(view);
+          if (!out || !out->producer || !isMonotoneMap(out->producer))
+            break;
+          bypassNode(view, out->producer);
+        }
+      }
+      view.commitTable();
+    }
+
+    if (consumer == "argmax") {
+      if (!appendConsumerNode(graph, planner::OpKind::Argmax, "argmax", listed))
+        return false;
+      clearConsumer(graph);
+    } else if (consumer != "sample_select") {
+      clearConsumer(graph);
+    }
+  }
+  return !resolved || verifyResolved(module, "resolveConsumer");
+}
+
+bool finishConsumer(mlir::ModuleOp module) {
+  bool resolved = false;
+  for (boom::GraphOp graph : module.getOps<boom::GraphOp>()) {
+    const std::optional<llvm::StringRef> declared = graph.getConsumer();
+    if (!declared)
+      continue;
+    resolved = true;
+    if (*declared != "sample_select") {
+      graph.emitOpError() << "consumer '" << *declared
+                          << "' was not resolved before the phase's passes";
+      return false;
+    }
+    const bool listed = graph.getConsumerList().has_value();
+    {
+      GraphEditor view(graph);
+      const std::optional<GraphOutput> out = singleOutput(view);
+      if (out && rowsOf(out->producer) != 1) {
+        graph.emitOpError() << "a row-dealt graph has no sampling consumer";
+        return false;
+      }
+    }
+    if (!appendConsumerNode(graph, planner::OpKind::SampleSelect,
+                            "sample_count", listed))
+      return false;
+    clearConsumer(graph);
+  }
+  return !resolved || verifyResolved(module, "finishConsumer");
 }
 
 // The phase's passes over the IR a caller built (compiler/BoomPasses.h).

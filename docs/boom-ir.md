@@ -107,7 +107,7 @@ of the model identity, so an empty array keeps it.
 | `boom.program` | one greedy generation: `boom.prefill`, then an `scf.while` body of step/sample/emit/stop |
 | `boom.prefill` | call the named prefill graph over the prompt |
 | `boom.step` | one decode step (carries its own tensor table); operands are the loop-carried values and cache handles |
-| `boom.sample` | choose the next token (greedy argmax when no sampling attributes are set) |
+| `boom.sample` | choose the next token (greedy argmax when no sampling attributes are set); `stochastic` marks a draw whose parameters the session supplies per step, `allowed_list` bounds the eligible token ids to a runtime list of that capacity |
 | `boom.stop_check` | EOS-set + max-token stop test |
 | `boom.emit` | append token(s) to the host-visible ring |
 | `boom.pos_inc` | advance the staged position |
@@ -144,7 +144,8 @@ arity is checked with the shape/dtype/quant checks rather than fixed per op.
   `boom.rms_norm_heads`, `boom.gelu_fp16`, `boom.silu`, `boom.rope`,
   `boom.attention`, `boom.gqa_broadcast`, `boom.embedding`, `boom.matvec_f32`,
   `boom.matvec_bf16`, `boom.add_bias`, `boom.mul`, `boom.scale`,
-  `boom.cast_fp16`, `boom.softcap`, `boom.argmax`, `boom.slice`,
+  `boom.cast_fp16`, `boom.softcap`, `boom.argmax`, `boom.sample_select`,
+  `boom.slice`,
   `boom.flash_attention`, `boom.kv_append`.
 - **Scheduling:** `boom.async_weight_prefetch`, `boom.sync_prefetch` are
   layer-boundary markers for the runtime's prefetch stream, and
@@ -157,6 +158,59 @@ arity is checked with the shape/dtype/quant checks rather than fixed per op.
   primitives `boom.matmul`, `boom.bmm`, `boom.permute`, `boom.index_select`,
   `boom.reduce_sum`, `boom.silu_mul`, `boom.cross_entropy`.
 
+### Consumers
+
+A decode graph ends at the model's logits. What reads them is declared on the
+graph rather than written as nodes by the emitter:
+
+| `consumer` | the reader |
+|---|---|
+| `"logits"` | the output, whole |
+| `"precap_logits"` | the output before its trailing monotone map (the logit softcap), which the reader applies itself |
+| `"argmax"` | the index of the largest element, reduced in the graph |
+| `"sample_select"` | the best candidates, selected in the graph |
+
+`consumer_list = N` adds that only a runtime list of at most `N` indices along
+the output's innermost dimension is eligible (a grammar's allowed set); it is
+valid with the two selecting consumers.
+
+`resolveConsumer(module)` turns the declaration into the graph that reader
+needs, and runs before the phase's passes on every path to the lowering. It
+runs the demand analysis (below) from the declared consumer, removes what the
+reader does not need, narrows what is read only on the index list to the
+list's capacity (the weight matmul producing it is marked `gather`), and
+appends the `argmax` node. `finishConsumer(module)` runs after the passes and
+appends the `sample_select` node, which reads the finished logits buffer. A
+graph that still declares a consumer does not lower.
+
+When an unresolved graph is lifted into a `boom.program`, the declaration
+moves to the program's `boom.sample` (`stochastic`, `allowed_list`), which is
+then the reader the analysis starts from.
+
+### Demand
+
+`analyzeDemand(op)` is a backward data-flow analysis over a module, a graph or
+a program. For every SSA value it computes how closely the value is observed
+— not at all, only ranked (`order`), or for its elements (`exact`) — and, per
+dimension, which indices are read: none, an interval, a runtime list of
+bounded length, or all. It runs together with MLIR's dead-code analysis, so a
+reader on an unreachable path demands nothing, and it does not modify the IR.
+
+Demand flows through a node according to what the op declares:
+
+| trait | statement | effect on demand |
+|---|---|---|
+| `Elementwise` | element *i* of the result depends only on element *i* of the operands | operands get the result's region |
+| `Monotone` | elementwise, one operand, non-decreasing | a ranking of the result is a ranking of the operand |
+| `RowIndependent` | slice *r* along the leading dimension depends only on slice *r* of the operands | the row set is kept |
+| `NoMemoryEffect` | the op has no effect of its own | an unread result demands nothing |
+
+A weight matmul keeps the row set of its activation and records which weight
+rows are read. An op that declares nothing is opaque: it is kept, and its
+operands are demanded whole. A trait is a statement about the operator's
+semantics; declaring one on an op whose kernel does not have the property
+makes a rewrite unsound.
+
 ### Effects
 
 The KV cache is a memory-effect resource, not a side channel: `boom.attention`
@@ -167,6 +221,7 @@ MLIR can order them. The three cache-touching ops carry their
 
 ## Pass pipeline
 
+`resolveConsumer(module)` runs first (see Consumers), then
 `runBoomPasses(module, phase, skip_kv_append_fusion)` runs one phase's passes
 over the module's graph, verifying after every pass. A pass order is
 significant: later passes consume the nodes earlier ones produce. A pass
@@ -205,6 +260,7 @@ What each pass does:
 | `DenseLayoutPropagationPass` | mark the projections with their dense layout (attribute only) |
 | `BufferReusePass` | mark single-use elementwise results the executor may write in place |
 | `AsyncPrefetchPass` | insert prefetch markers when model weights exceed `SONICBOOM_VRAM_THRESHOLD_MB` (`SONICBOOM_ASYNC_PREFETCH=on`) |
+| `PruneByDemandPass` | the optional part of `resolveConsumer`: bypass a monotone map whose result is only ranked, and remove effect-free nodes nothing reads |
 
 ### Ablation
 
@@ -214,6 +270,11 @@ named pass ignores it; an unrecognized name is reported on stderr with the
 valid names and disables nothing. A disabled pass can also remove a later
 pass's fusion (the passes run in sequence), so a plan delta measures that pass
 and the folds it feeds together.
+
+`PruneByDemandPass` names the demand-driven pruning inside `resolveConsumer`.
+With it disabled an argmax consumer reads the softcapped logits; the index-list
+narrowing is not part of the switch, because the list is what the consumer
+asked for rather than an optimization of it.
 
 ## Adding a pass
 

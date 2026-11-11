@@ -66,6 +66,30 @@ bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
                    bool skip_kv_append_fusion = false,
                    bool fuse_silu_mul = false, bool rows_mmq = false);
 
+// Resolve the consumer a graph declares (BoomOps.td, GraphOp::consumer) into
+// the graph that consumer needs. Run on the emitter's IR before the phase's
+// passes — and before lowering a graph the passes do not run on. It:
+//
+//   * runs the demand analysis (BoomDemand.h) from the declared consumer;
+//   * removes what the consumer does not need — a monotone map whose result is
+//     only ranked, a node nothing reads (ablation switch: PruneByDemandPass);
+//   * narrows what is read only on a runtime index list to the list's
+//     capacity, marking the weight matmul that produces it `gather`;
+//   * appends the argmax of an "argmax" consumer.
+//
+// A "sample_select" consumer stays declared for finishConsumer; every other
+// declaration is gone when this returns. A module with no declaration is left
+// alone, so every caller may run it. False, with a diagnostic, on failure.
+bool resolveConsumer(mlir::ModuleOp module);
+
+// The second half, after the phase's passes: append the candidate selection of
+// a "sample_select" consumer to the finished graph and drop the declaration.
+// The selection reads the logits buffer the passes laid out; it is added last
+// so that it takes no part in their buffer assignment. A module that declares
+// nothing is left alone. False when a declaration resolveConsumer should have
+// consumed is still present.
+bool finishConsumer(mlir::ModuleOp module);
+
 // Run BufferReusePass alone over every boom.graph in `module`, so a caller can
 // see the `inplace`/`buf` marks a full pipeline would produce on that node
 // list. Analysis tooling only (boom-r4 F2): the runtime never calls it — the

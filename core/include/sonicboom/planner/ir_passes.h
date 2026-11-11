@@ -35,8 +35,10 @@
 // QuantizeOncePass, RmsNormQuantizePass, GeluMulQuantizePass,
 // SiluMulQuantizePass, BiasIntoGemvPass, ResidualAddIntoGemvPass,
 // FuseResidualEpiloguePass (decode) and
-// RmsNormMmqPass, GeluMulMmqPass, SiluMulMmqPass (prefill); a phase that does
-// not contain a named pass simply ignores it. A disabled pass can also remove a
+// RmsNormMmqPass, GeluMulMmqPass, SiluMulMmqPass (prefill), and
+// PruneByDemandPass (the demand-driven pruning of the consumer resolution,
+// which runs before either phase); a phase that does not contain a named pass
+// simply ignores it. A disabled pass can also remove a
 // later pass's fusion — the passes run in sequence over one graph, and the
 // Quantize nodes QuantizeOncePass inserts are what RmsNormQuantizePass and
 // GeluMulQuantizePass fold away — so a plan delta is read as what that pass and
