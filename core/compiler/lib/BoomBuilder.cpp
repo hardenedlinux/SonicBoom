@@ -365,7 +365,8 @@ BoomBuilder::BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name,
       builder_.getArrayAttr(llvm::ArrayRef<mlir::Attribute>{}),
       builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
       builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
-      builder_.getI64IntegerAttr(int64_t(extent_)));
+      builder_.getI64IntegerAttr(int64_t(extent_)),
+      /*consumer=*/mlir::StringAttr(), /*consumer_list=*/mlir::IntegerAttr());
   body_ = builder_.createBlock(&graph_op_.getBody());
 }
 
@@ -474,6 +475,12 @@ mlir::Value BoomBuilder::node(planner::OpKind op,
   mlir::Value value = node->getResult(0);
   ids_[value] = id;
   return value;
+}
+
+void BoomBuilder::set_consumer(llvm::StringRef kind, int64_t list_capacity) {
+  graph_op_.setConsumerAttr(builder_.getStringAttr(kind));
+  if (list_capacity > 0)
+    graph_op_.setConsumerListAttr(builder_.getI64IntegerAttr(list_capacity));
 }
 
 void BoomBuilder::set_output(mlir::Value value) {
@@ -601,6 +608,17 @@ static mlir::LogicalResult buildGenerationProgram(
   for (size_t i = freeIds.size(); i < graphBody.getNumArguments(); ++i)
     kvTypes.push_back(graphBody.getArgument(i).getType());
 
+  // A graph lifted before its consumer is resolved still declares it. The
+  // program's sample op is that consumer, so the declaration moves there: a
+  // selecting consumer over the distribution is a stochastic sample, and the
+  // index list is the sample's allowed list. (A resolved graph declares
+  // nothing, and its sample is the plain one.)
+  const std::optional<llvm::StringRef> consumer = graph.getConsumer();
+  const mlir::UnitAttr stochastic =
+      consumer && *consumer == "sample_select" ? mlir::UnitAttr::get(context)
+                                               : mlir::UnitAttr();
+  const mlir::IntegerAttr allowedList = graph.getConsumerListAttr();
+
   // The decode graph's output type is the step's result type.
   if (graph.getOutputs().size() != 1)
     return graph.emitOpError()
@@ -656,7 +674,9 @@ static mlir::LogicalResult buildGenerationProgram(
           auto sample = boom::SampleOp::create(b, l, tokenType, step.getResult(0),
                                                mlir::FloatAttr(),
                                                mlir::IntegerAttr(),
-                                               mlir::FloatAttr());
+                                               mlir::FloatAttr(),
+                                               /*stochastic=*/stochastic,
+                                               /*allowed_list=*/allowedList);
           boom::EmitOp::create(b, l, mlir::ValueRange{sample.getToken()});
           auto stop = boom::StopCheckOp::create(
               b, l, b.getI1Type(), sample.getToken(), args[2],

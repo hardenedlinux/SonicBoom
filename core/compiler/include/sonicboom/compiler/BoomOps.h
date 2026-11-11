@@ -25,8 +25,26 @@
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "sonicboom/compiler/BoomTypes.h"
+
+// The demand traits BoomOps.td declares (see there for what each one states).
+// They carry no members: a pass asks `op->hasTrait<...>()`.
+namespace sonicboom::compiler::boom::OpTrait {
+
+template <typename ConcreteType>
+class Elementwise : public mlir::OpTrait::TraitBase<ConcreteType, Elementwise> {
+};
+
+template <typename ConcreteType>
+class Monotone : public mlir::OpTrait::TraitBase<ConcreteType, Monotone> {};
+
+template <typename ConcreteType>
+class RowIndependent
+    : public mlir::OpTrait::TraitBase<ConcreteType, RowIndependent> {};
+
+} // namespace sonicboom::compiler::boom::OpTrait
 
 // The generated op classes. The define is consumed by the include, so a
 // translation unit that also includes BoomOps.cpp.inc (the definitions)
@@ -45,6 +63,10 @@ llvm::ArrayRef<llvm::StringRef> boomTypedAttrNames();
 
 // True when `name` is one of boomTypedAttrNames().
 bool isBoomTypedAttrName(llvm::StringRef name);
+
+// True when `name` is one of the consumer kinds a boom.graph may declare
+// (BoomOps.td, GraphOp::consumer).
+bool isBoomConsumerName(llvm::StringRef name);
 
 // The typed attributes `op` actually carries, as (name, value) pairs.
 llvm::SmallVector<mlir::NamedAttribute> typedNodeAttributes(mlir::Operation *op);

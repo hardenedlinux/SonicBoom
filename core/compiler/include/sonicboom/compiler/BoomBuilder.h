@@ -175,6 +175,13 @@ public:
   // (B3) emits one decode graph over k+1 query rows this way; 0 disables.
   void set_row_scale(int64_t rows, llvm::StringRef attr_name);
 
+  // Declare what reads the graph's output instead of writing the reader's
+  // nodes: one of the consumer kinds of BoomOps.td (GraphOp::consumer), and,
+  // when only a runtime list of indices along the output's innermost dimension
+  // is eligible, that list's capacity (0 = no list). The consumer resolution
+  // (BoomPasses.h) turns the declaration into the graph the consumer needs.
+  void set_consumer(llvm::StringRef kind, int64_t list_capacity = 0);
+
   // A node and its one result tensor: an f32 activation of `out_shape`. The
   // node's name is its operator's (op_kind_name), the tensor's is `out_name`.
   mlir::Value node(planner::OpKind op, llvm::ArrayRef<mlir::Value> operands,

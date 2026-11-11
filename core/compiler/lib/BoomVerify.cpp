@@ -89,6 +89,11 @@ bool isBoomTypedAttrName(llvm::StringRef name) {
   return llvm::is_contained(kBoomTypedAttrNames, name);
 }
 
+bool isBoomConsumerName(llvm::StringRef name) {
+  return name == "logits" || name == "precap_logits" || name == "argmax" ||
+         name == "sample_select";
+}
+
 llvm::SmallVector<NamedAttribute> typedNodeAttributes(Operation *op) {
   llvm::SmallVector<NamedAttribute> out;
   for (llvm::StringRef name : kBoomTypedAttrNames)
@@ -233,6 +238,31 @@ std::string describeAttrs(llvm::ArrayRef<NamedAttribute> attrs) {
 
 mlir::LogicalResult GraphOp::verify() {
   const llvm::StringRef graphName = getGraphName();
+
+  // 0. The declared consumer, if the graph still has one: a known kind, over
+  //    exactly one output, and an index list only where a consumer selects
+  //    (a list narrows what a selection ranges over; a consumer that takes the
+  //    whole output has nothing for it to narrow).
+  if (auto consumer = getConsumer()) {
+    if (!isBoomConsumerName(*consumer))
+      return emitOpError() << "graph '" << graphName << "': consumer '"
+                           << *consumer << "' is not a known consumer kind";
+    if (getOutputs().size() != 1)
+      return emitOpError() << "graph '" << graphName
+                           << "': a consumer reads exactly one output, the "
+                              "graph has "
+                           << getOutputs().size();
+  }
+  if (auto list = getConsumerList()) {
+    const auto consumer = getConsumer();
+    if (!consumer || (*consumer != "argmax" && *consumer != "sample_select"))
+      return emitOpError() << "graph '" << graphName
+                           << "': consumer_list needs a selecting consumer "
+                              "(argmax or sample_select)";
+    if (*list <= 0)
+      return emitOpError() << "graph '" << graphName
+                           << "': consumer_list must be positive";
+  }
 
   // 1. The tensor table: every entry is a #boom.tensor_desc and the ids are
   //    unique, so an id identifies exactly one tensor.
@@ -954,6 +984,9 @@ mlir::LogicalResult SampleOp::verify() {
   if (auto p = getTopP())
     if (!(p->convertToDouble() > 0.0) || p->convertToDouble() > 1.0)
       return emitOpError() << "top_p must be in (0, 1]";
+  if (auto n = getAllowedList())
+    if (*n <= 0)
+      return emitOpError() << "allowed_list must be positive";
   return mlir::success();
 }
 

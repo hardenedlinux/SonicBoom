@@ -96,7 +96,22 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
     // fixed part of its affine size. 0 when the table has no dynamic entry.
     // The lowering binds any extent up to this one by evaluating the affine
     // size; it never exceeds it.
-    I64Attr:$dynamic_extent);
+    I64Attr:$dynamic_extent,
+
+    // What reads the graph's single output, while that is still a declaration
+    // rather than nodes (BoomDemand.h, docs/boom-ir.md "Consumers"). Present on
+    // a graph as its emitter wrote it; the consumer resolution replaces it with
+    // the nodes it implies, so a graph that reaches the lowering carries
+    // neither attribute.
+    //   "logits"        the output, whole and exact;
+    //   "precap_logits" the same, the consumer applying the trailing monotone
+    //                   map (the logit softcap) itself;
+    //   "argmax"        the index of the largest element, reduced in the graph;
+    //   "sample_select" the best candidates, selected in the graph.
+    OptionalAttr<StrAttr>:$consumer,
+    // The consumer reads only a runtime list of at most this many indices
+    // along the output's innermost dimension (a grammar's allowed set).
+    OptionalAttr<I64Attr>:$consumer_list);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -174,7 +189,13 @@ def Boom_SampleOp : Op<Boom_Dialect, "sample", [Pure]> {
     Boom_AnyType:$logits,
     OptionalAttr<F64Attr>:$temperature,
     OptionalAttr<I64Attr>:$top_k,
-    OptionalAttr<F64Attr>:$top_p);
+    OptionalAttr<F64Attr>:$top_p,
+    // The draw is over the distribution rather than its mode, with parameters
+    // the session supplies per step (so none of the three above is fixed here).
+    UnitAttr:$stochastic,
+    // Only a runtime list of at most this many token ids is eligible (a
+    // grammar's allowed set); absent = the whole vocabulary.
+    OptionalAttr<I64Attr>:$allowed_list);
 
   let results = (outs Boom_AnyType:$token);
 
@@ -286,6 +307,39 @@ def Boom_AcceptOp : Op<Boom_Dialect, "accept"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Demand traits
+//===----------------------------------------------------------------------===//
+//
+// What a node op declares about how its results depend on its operands, which
+// is what the backward demand analysis (BoomDemand.h) propagates through. A
+// node without any of them is opaque to the analysis: it is kept, and every
+// one of its operands is demanded whole and exactly. A trait is therefore a
+// statement about the operator's semantics, not a hint — declaring one on an
+// op whose kernel does not have the property makes a rewrite unsound.
+
+// Element i of every result depends only on element i of the operands (a
+// model-bound constant named by `slot`, e.g. a bias, counts as a constant).
+def Boom_Elementwise : NativeOpTrait<"Elementwise"> {
+  let cppNamespace = "::sonicboom::compiler::boom::OpTrait";
+}
+
+// Elementwise, one tensor operand, and non-decreasing in it. An observer that
+// only ranks the result (Observation::Order) may be handed the operand
+// instead: the ranking it then sees refines the result's (elements the map
+// sends to one value are told apart). Declaring this trait accepts that
+// refinement as the op's meaning under a ranking observer.
+def Boom_Monotone : NativeOpTrait<"Monotone"> {
+  let cppNamespace = "::sonicboom::compiler::boom::OpTrait";
+}
+
+// Slice r of every result along the leading (row / position) dimension depends
+// only on slice r of the tensor operands: the per-token kernels the backends
+// loop over the batch.
+def Boom_RowIndependent : NativeOpTrait<"RowIndependent"> {
+  let cppNamespace = "::sonicboom::compiler::boom::OpTrait";
+}
+
+//===----------------------------------------------------------------------===//
 // Node ops — one per planner::OpKind
 //===----------------------------------------------------------------------===//
 
@@ -331,9 +385,11 @@ class Boom_Op<string mnemonic, string opSummary, list<Trait> traits = []>
 def Boom_ConvOp : Boom_Op<"conv",
     "frozen S-Expr v0.1 convolution">;
 def Boom_ReluOp : Boom_Op<"relu",
-    "frozen S-Expr v0.1 ReLU">;
+    "frozen S-Expr v0.1 ReLU",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_AddOp : Boom_Op<"add",
-    "frozen S-Expr v0.1 elementwise add">;
+    "frozen S-Expr v0.1 elementwise add",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_MaxPoolOp : Boom_Op<"max_pool",
     "frozen S-Expr v0.1 max pooling">;
 def Boom_ReduceMeanOp : Boom_Op<"reduce_mean",
@@ -351,7 +407,8 @@ def Boom_WholeGraphOp : Boom_Op<"whole_graph",
 //--- transformer operators --------------------------------------------------
 
 def Boom_QuantizedMatmulOp : Boom_Op<"quantized_matmul",
-    "K-quant matvec/matmul over a model-bound weight (quant::matvec)">;
+    "K-quant matvec/matmul over a model-bound weight (quant::matvec)",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_QuantizeOp : Boom_Op<"quantize",
     "f32 activation -> q8_1, the explicit quantize-once node (CUDA)">;
 def Boom_QuantizedMatmulQ8Op : Boom_Op<"quantized_matmul_q8",
@@ -365,38 +422,54 @@ def Boom_GeluMulQuantizeOp : Boom_Op<"gelu_mul_quantize",
 def Boom_SiluMulQuantizeOp : Boom_Op<"silu_mul_quantize",
     "silu(gate) * up + q8_1 quantize, fused (SwiGLU)">;
 def Boom_RmsNormOp : Boom_Op<"rms_norm",
-    "RMS normalization">;
+    "RMS normalization",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_RmsNormHeadsOp : Boom_Op<"rms_norm_heads",
     "per-head RMS normalization, in place">;
 def Boom_GeluFp16Op : Boom_Op<"gelu_fp16",
-    "fp16 GELU activation">;
+    "fp16 GELU activation",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_SiluOp : Boom_Op<"silu",
-    "SiLU activation (SwiGLU gate)">;
+    "SiLU activation (SwiGLU gate)",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_RopeOp : Boom_Op<"rope",
-    "multi-head NEOX RoPE">;
+    "multi-head NEOX RoPE",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_AttentionOp : Boom_Op<"attention",
     "incremental KV-cache SDPA; appends iff kc/vc are present",
     [Boom_KvReadWrite]>;
 def Boom_GqaBroadcastOp : Boom_Op<"gqa_broadcast",
     "n_k == 1 donor-V spread across query heads">;
 def Boom_EmbeddingOp : Boom_Op<"embedding",
-    "token embedding lookup">;
+    "token embedding lookup",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_MatvecF32Op : Boom_Op<"matvec_f32",
-    "dense f32 matvec">;
+    "dense f32 matvec",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_MatvecBf16Op : Boom_Op<"matvec_bf16",
-    "dense bf16 projection (attrs offset/rows)">;
+    "dense bf16 projection (attrs offset/rows)",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_AddBiasOp : Boom_Op<"add_bias",
-    "add an optional projection bias named by `slot`">;
+    "add an optional projection bias named by `slot`",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_MulOp : Boom_Op<"mul",
-    "elementwise multiply">;
+    "elementwise multiply",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_ScaleOp : Boom_Op<"scale",
-    "multiply by the `scale` attribute">;
+    "multiply by the `scale` attribute",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_CastFp16Op : Boom_Op<"cast_fp16",
-    "cast to fp16">;
+    "cast to fp16",
+    [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
 def Boom_SoftcapOp : Boom_Op<"softcap",
-    "final-logit softcapping, sc * tanh(x / sc)">;
+    "final-logit softcapping, sc * tanh(x / sc)",
+    [NoMemoryEffect, Boom_Elementwise, Boom_Monotone, Boom_RowIndependent]>;
 def Boom_ArgmaxOp : Boom_Op<"argmax",
-    "greedy argmax over the logits">;
+    "greedy argmax over the logits",
+    [NoMemoryEffect]>;
+def Boom_SampleSelectOp : Boom_Op<"sample_select",
+    "select the best candidate (id, z) pairs from the logits, on the device",
+    [NoMemoryEffect]>;
 def Boom_SliceOp : Boom_Op<"slice",
     "sub-span copy (attrs offset, length, optional stride)">;
 def Boom_FlashAttentionOp : Boom_Op<"flash_attention",

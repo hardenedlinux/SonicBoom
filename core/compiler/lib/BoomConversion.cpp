@@ -220,7 +220,8 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
       builder, loc, builder.getStringAttr(graph.name), builder.getArrayAttr(table),
       builder.getDenseI64ArrayAttr(flatten(graph.inputs)),
       builder.getDenseI64ArrayAttr(flatten(graph.outputs)),
-      builder.getI64IntegerAttr(build_extent));
+      builder.getI64IntegerAttr(build_extent), /*consumer=*/mlir::StringAttr(),
+      /*consumer_list=*/mlir::IntegerAttr());
 
   mlir::Block *body = builder.createBlock(&graphOp.getBody());
 
@@ -360,6 +361,16 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
   }
   if (!graphOp) {
     module.emitError() << "the module holds no boom.graph op";
+    return std::nullopt;
+  }
+
+  // A declared consumer is not a node: a graph that still carries one has not
+  // been through the consumer resolution, and lowering it would plan the
+  // model's logits where the caller asked for something else.
+  if (auto consumer = graphOp.getConsumer()) {
+    graphOp.emitOpError() << "still declares the consumer '" << *consumer
+                          << "'; resolveConsumer/finishConsumer "
+                             "(BoomPasses.h) run before the lowering";
     return std::nullopt;
   }
 
