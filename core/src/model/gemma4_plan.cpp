@@ -325,8 +325,16 @@ void maybe_analyze(mlir::ModuleOp module, llvm::StringRef label) {
   }
 }
 
-planner::Graph lower_graph(mlir::ModuleOp module,
-                           uint64_t dynamic_extent = 0) {
+// The lowering proper, of IR whose declared consumer (if it had one) has been
+// through resolveConsumer: the consumer's remaining node is appended, and the
+// graph read out.
+planner::Graph lower_resolved(mlir::ModuleOp module,
+                              uint64_t dynamic_extent = 0) {
+  if (!compiler::finishConsumer(module)) {
+    std::cerr << "[plan] resolving the graph's consumer failed (diagnostic "
+                 "above)\n";
+    return {};
+  }
   maybe_analyze(module, "graph");
   auto graph = compiler::boomToGraph(module, dynamic_extent);
   if (!graph) {
@@ -334,6 +342,19 @@ planner::Graph lower_graph(mlir::ModuleOp module,
     return {};
   }
   return std::move(*graph);
+}
+
+// The emitter's IR, lowered with no phase passes. The consumer resolution is
+// not one of those: it is what makes the declared graph the graph the caller
+// asked for, so it runs on every path to the lowering.
+planner::Graph lower_graph(mlir::ModuleOp module,
+                           uint64_t dynamic_extent = 0) {
+  if (!compiler::resolveConsumer(module)) {
+    std::cerr << "[plan] resolving the graph's consumer failed (diagnostic "
+                 "above)\n";
+    return {};
+  }
+  return lower_resolved(module, dynamic_extent);
 }
 
 // What every plan site runs: the emitter's IR, the phase's passes, the
@@ -348,11 +369,16 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
                            bool rows_mmq = false) {
   if (!ir.module)
     return {};
+  if (!compiler::resolveConsumer(*ir.module)) {
+    std::cerr << "[plan] resolving the graph's consumer failed (diagnostic "
+                 "above)\n";
+    return {};
+  }
   if (rewrite &&
       !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
                                fuse_silu_mul, rows_mmq))
     return {};
-  return lower_graph(*ir.module, dynamic_extent);
+  return lower_resolved(*ir.module, dynamic_extent);
 }
 
 // Decode and verify can run a projection on the mmq matmul only when the q8_1
@@ -396,18 +422,27 @@ bool decode_family_mmq(quant::QuantType qt, uint64_t in_w, uint64_t out_w) {
 // attribute): the row-invariant verify step of §B3. The backend then runs the
 // decode kernel per row, with the row-invariant batched mmvq for the quantized
 // matmuls — so row i is bit-identical to a plain decode step at pos+i.
-// What reads the output is `spec.consumer` (model/plan.h): PrecapLogits keeps
-// the raw logits as the graph output even when the model has a logit softcap.
-// The softcap is monotonic (argmax unchanged), but it is a lossy transform: the
-// sampler and the logit dump take the capped graph output, while the perplexity
-// scorer takes the raw output and applies the cap on the host instead (see
-// score_spine_cuda) — same distribution, one less device op.
+// The graph is the same for every consumer: it ends at the model's logits
+// (softcapped when the model caps them) and declares `spec.consumer` as what
+// reads them. The softcap is monotonic (argmax unchanged), but it is a lossy
+// transform: the sampler and the logit dump take the capped output, while the
+// perplexity scorer (PrecapLogits) takes the raw output and applies the cap on
+// the host instead (see score_spine_cuda) — same distribution, one less device
+// op. Which of those a plan gets is the consumer resolution's decision.
+// The consumer kind a spec's consumer declares (BoomOps.td, GraphOp::consumer).
+const char* decode_consumer_name(DecodeConsumer consumer) {
+  switch (consumer) {
+  case DecodeConsumer::Logits: return "logits";
+  case DecodeConsumer::PrecapLogits: return "precap_logits";
+  case DecodeConsumer::Argmax: return "argmax";
+  case DecodeConsumer::SampleSelect: return "sample_select";
+  }
+  return "logits";
+}
+
 GraphIr emit_decode_ir(const Gemma4Model& m, const DecodeGraphSpec& spec) {
   using namespace planner;
 
-  const bool greedy = spec.consumer == DecodeConsumer::Argmax;
-  const bool softcap_output = spec.consumer != DecodeConsumer::PrecapLogits;
-  const bool gather = spec.allowed_list;
   const uint64_t rows = spec.rows;
 
   const auto& cfg = m.config;
@@ -695,34 +730,20 @@ GraphIr emit_decode_ir(const Gemma4Model& m, const DecodeGraphSpec& spec) {
       prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
   std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
   mmq_a(logits_attrs, out_qt, d, vocab);
-  // Grammar-compacted decode: the lm head computes only the allowed list's
-  // rows (`gather`), a fixed-capacity tensor so one captured graph covers every
-  // step; the terminal node selects over the live prefix of that list.
-  const uint64_t logits_w =
-      gather ? uint64_t(nn::kGrammarGatherCap) : vocab;
-  if (gather) logits_attrs.push_back(attr_i("gather", int64_t(1)));
-  mlir::Value logits = b.node(OpKind::QuantizedMatmul, {hn}, "logits",
-                           {int64_t(logits_w)}, logits_attrs);
-
-  // Greedy decode: softcapping (sc * tanh(x/sc)) is monotonic so it does not
-  // change argmax — skip it and reduce the [vocab] logits to a single index on
-  // the device, so the per-token host transfer shrinks from the full 1 MiB
-  // logits to 4 bytes. Sampling mode keeps the softcapped full logits (the
-  // sampler needs the distribution).
-  mlir::Value out;
-  if (greedy) {
-    std::vector<sx::Attribute> argmax_attrs;
-    if (gather) argmax_attrs.push_back(attr_i("gather", int64_t(1)));
-    out = b.node(OpKind::Argmax, {logits}, "argmax", {int64_t(1)},
-                 argmax_attrs);
-  } else if (prof.softcap && softcap_output) {
-    out = b.node(OpKind::Softcap, {logits}, "logits_sc", {int64_t(logits_w)},
+  mlir::Value out = b.node(OpKind::QuantizedMatmul, {hn}, "logits",
+                           {int64_t(vocab)}, logits_attrs);
+  if (prof.softcap)
+    out = b.node(OpKind::Softcap, {out}, "logits_sc", {int64_t(vocab)},
                  {attr_f("scale", double(cfg.final_logit_softcapping))});
-  } else {
-    out = logits;  // no softcapping: the raw logits are the graph output
-  }
 
+  // The graph ends at the model's logits. What reads them — and so whether the
+  // softcap is computed, how much of the lm head is, and what leaves the
+  // device — is declared, not written: the compiler derives the graph the
+  // consumer needs from the demand it places on this output (BoomDemand.h,
+  // BoomPasses.h resolveConsumer).
   b.set_output(out);
+  b.set_consumer(decode_consumer_name(spec.consumer),
+                 spec.allowed_list ? int64_t(nn::kGrammarGatherCap) : 0);
 
   ir.module = b.finish();
   return ir;
@@ -737,75 +758,23 @@ planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
   return build_decode_graph(m, spec);
 }
 
-// Turn the lowered graph's output (the [vocab] logits) into the input of a
-// SampleSelect node, and make the node's 4-byte candidate count the graph
-// output. The logits stay device-resident; the planner sees the count as a
-// scalar float tensor (the same shape the greedy graph's Argmax output has).
-static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab,
-                                      bool gather = false) {
-  if (g.outputs.size() != 1 || vocab == 0) return false;
-  const planner::TensorId logits_id = g.outputs[0];
-  const planner::TensorDesc* logits = g.find_tensor(logits_id);
-  if (!logits || logits->size_bytes != vocab * sizeof(float)) return false;
-  uint32_t max_tensor = 0;
-  uint32_t max_node = 0;
-  for (const auto& t : g.tensors) max_tensor = std::max(max_tensor, t.id.value);
-  for (const auto& n : g.nodes) max_node = std::max(max_node, n.id.value);
-  if (max_tensor == UINT32_MAX || max_node == UINT32_MAX) return false;
-  const planner::TensorId count_id{max_tensor + 1};
-  planner::TensorDesc count;
-  count.id = count_id;
-  count.shape = {1};
-  count.dtype = sx::DType::Float32;
-  count.size_bytes = sizeof(int32_t);  // the device-resident candidate count
-  count.name = "sample_count";
-  g.tensors.push_back(std::move(count));
-  planner::GraphNodeDesc node;
-  node.id = planner::GraphNodeId{max_node + 1};
-  node.op = planner::OpKind::SampleSelect;
-  node.inputs = {logits_id};
-  node.outputs = {count_id};
-  node.name = "sample_select";
-  node.backend = planner::BackendTag::Sonic;
-  if (gather) node.attributes.push_back(sx::Attribute{"gather", int64_t(1)});
-  g.nodes.push_back(std::move(node));
-  for (auto& t : g.tensors) t.is_graph_output = (t.id == count_id);
-  g.outputs = {count_id};
-  return true;
-}
-
 // The emitter's IR for `spec`, through the phase's passes when the quantized
 // path is in use, to the graph the plan is derived from. The caller keeps the
 // IR: the decode runtime lifts the same module into the generation program.
-static planner::Graph lower_decode_graph(const Gemma4Model& m, GraphIr& ir,
+static planner::Graph lower_decode_graph(GraphIr& ir,
                                          const DecodeGraphSpec& spec) {
-  if (!ir.module)
-    return {};
-  planner::Graph graph =
-      spec.rewrite
-          ? lower_graph(ir,
-                        spec.rows > 1 ? planner::IrPassPhase::Verify
-                                      : planner::IrPassPhase::Decode,
-                        /*rewrite=*/true, /*dynamic_extent=*/0,
-                        /*skip_kv_append_fusion=*/false,
-                        /*fuse_silu_mul=*/false, spec.rows_mmq)
-          : lower_graph(*ir.module);
-  if (graph.nodes.empty())
-    return {};
-  if (spec.consumer == DecodeConsumer::SampleSelect) {
-    const uint64_t logits_w = spec.allowed_list
-                                  ? uint64_t(nn::kGrammarGatherCap)
-                                  : m.config.vocab_size;
-    if (!append_sample_select_tail(graph, logits_w, spec.allowed_list))
-      return {};
-  }
-  return graph;
+  return lower_graph(ir,
+                     spec.rows > 1 ? planner::IrPassPhase::Verify
+                                   : planner::IrPassPhase::Decode,
+                     spec.rewrite, /*dynamic_extent=*/0,
+                     /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
+                     spec.rows_mmq);
 }
 
 planner::Graph build_decode_graph(const Gemma4Model& m,
                                   const DecodeGraphSpec& spec) {
   GraphIr ir = emit_decode_ir(m, spec);
-  return lower_decode_graph(m, ir, spec);
+  return lower_decode_graph(ir, spec);
 }
 
 // The spec of a plan site on this device: the passes run when the quantized
@@ -3803,7 +3772,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   const DecodeGraphSpec spec =
       device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
   GraphIr ir = emit_decode_ir(m, spec);
-  rt->graph = lower_decode_graph(m, ir, spec);
+  rt->graph = lower_decode_graph(ir, spec);
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
   // exactly as it was; the clone is discarded once the desc is extracted. A
