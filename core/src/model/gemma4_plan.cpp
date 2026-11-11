@@ -396,15 +396,19 @@ bool decode_family_mmq(quant::QuantType qt, uint64_t in_w, uint64_t out_w) {
 // attribute): the row-invariant verify step of §B3. The backend then runs the
 // decode kernel per row, with the row-invariant batched mmvq for the quantized
 // matmuls — so row i is bit-identical to a plain decode step at pos+i.
-// `softcap_output` false keeps the raw logits as the graph output even when the
-// model has a logit softcap. The softcap is monotonic (argmax unchanged), but it
-// is a lossy transform: the sampler and the logit dump take the capped graph
-// output, while the perplexity scorer takes the raw output and applies the cap
-// on the host instead (see score_spine_cuda) — same distribution, one less
-// device op.
-GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
-                       bool softcap_output = true, bool gather = false) {
+// What reads the output is `spec.consumer` (model/plan.h): PrecapLogits keeps
+// the raw logits as the graph output even when the model has a logit softcap.
+// The softcap is monotonic (argmax unchanged), but it is a lossy transform: the
+// sampler and the logit dump take the capped graph output, while the perplexity
+// scorer takes the raw output and applies the cap on the host instead (see
+// score_spine_cuda) — same distribution, one less device op.
+GraphIr emit_decode_ir(const Gemma4Model& m, const DecodeGraphSpec& spec) {
   using namespace planner;
+
+  const bool greedy = spec.consumer == DecodeConsumer::Argmax;
+  const bool softcap_output = spec.consumer != DecodeConsumer::PrecapLogits;
+  const bool gather = spec.allowed_list;
+  const uint64_t rows = spec.rows;
 
   const auto& cfg = m.config;
   const uint32_t d = cfg.embedding_length;
@@ -728,10 +732,98 @@ GraphIr emit_decode_ir(const Gemma4Model& m, bool greedy, uint64_t rows = 1,
 // which is what a caller that runs the pipeline itself — or records what the
 // emitter wrote — wants (model/plan.h).
 planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy) {
-  GraphIr ir = emit_decode_ir(m, greedy);
+  DecodeGraphSpec spec;
+  spec.consumer = greedy ? DecodeConsumer::Argmax : DecodeConsumer::Logits;
+  return build_decode_graph(m, spec);
+}
+
+// Turn the lowered graph's output (the [vocab] logits) into the input of a
+// SampleSelect node, and make the node's 4-byte candidate count the graph
+// output. The logits stay device-resident; the planner sees the count as a
+// scalar float tensor (the same shape the greedy graph's Argmax output has).
+static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab,
+                                      bool gather = false) {
+  if (g.outputs.size() != 1 || vocab == 0) return false;
+  const planner::TensorId logits_id = g.outputs[0];
+  const planner::TensorDesc* logits = g.find_tensor(logits_id);
+  if (!logits || logits->size_bytes != vocab * sizeof(float)) return false;
+  uint32_t max_tensor = 0;
+  uint32_t max_node = 0;
+  for (const auto& t : g.tensors) max_tensor = std::max(max_tensor, t.id.value);
+  for (const auto& n : g.nodes) max_node = std::max(max_node, n.id.value);
+  if (max_tensor == UINT32_MAX || max_node == UINT32_MAX) return false;
+  const planner::TensorId count_id{max_tensor + 1};
+  planner::TensorDesc count;
+  count.id = count_id;
+  count.shape = {1};
+  count.dtype = sx::DType::Float32;
+  count.size_bytes = sizeof(int32_t);  // the device-resident candidate count
+  count.name = "sample_count";
+  g.tensors.push_back(std::move(count));
+  planner::GraphNodeDesc node;
+  node.id = planner::GraphNodeId{max_node + 1};
+  node.op = planner::OpKind::SampleSelect;
+  node.inputs = {logits_id};
+  node.outputs = {count_id};
+  node.name = "sample_select";
+  node.backend = planner::BackendTag::Sonic;
+  if (gather) node.attributes.push_back(sx::Attribute{"gather", int64_t(1)});
+  g.nodes.push_back(std::move(node));
+  for (auto& t : g.tensors) t.is_graph_output = (t.id == count_id);
+  g.outputs = {count_id};
+  return true;
+}
+
+// The emitter's IR for `spec`, through the phase's passes when the quantized
+// path is in use, to the graph the plan is derived from. The caller keeps the
+// IR: the decode runtime lifts the same module into the generation program.
+static planner::Graph lower_decode_graph(const Gemma4Model& m, GraphIr& ir,
+                                         const DecodeGraphSpec& spec) {
   if (!ir.module)
     return {};
-  return lower_graph(*ir.module);
+  planner::Graph graph =
+      spec.rewrite
+          ? lower_graph(ir,
+                        spec.rows > 1 ? planner::IrPassPhase::Verify
+                                      : planner::IrPassPhase::Decode,
+                        /*rewrite=*/true, /*dynamic_extent=*/0,
+                        /*skip_kv_append_fusion=*/false,
+                        /*fuse_silu_mul=*/false, spec.rows_mmq)
+          : lower_graph(*ir.module);
+  if (graph.nodes.empty())
+    return {};
+  if (spec.consumer == DecodeConsumer::SampleSelect) {
+    const uint64_t logits_w = spec.allowed_list
+                                  ? uint64_t(nn::kGrammarGatherCap)
+                                  : m.config.vocab_size;
+    if (!append_sample_select_tail(graph, logits_w, spec.allowed_list))
+      return {};
+  }
+  return graph;
+}
+
+planner::Graph build_decode_graph(const Gemma4Model& m,
+                                  const DecodeGraphSpec& spec) {
+  GraphIr ir = emit_decode_ir(m, spec);
+  return lower_decode_graph(m, ir, spec);
+}
+
+// The spec of a plan site on this device: the passes run when the quantized
+// path is available, the decode matmuls on the mmq kernel when that is.
+static DecodeGraphSpec device_decode_spec(DecodeConsumer consumer,
+                                          uint64_t rows = 1,
+                                          bool allowed_list = false) {
+  DecodeGraphSpec spec;
+  spec.consumer = consumer;
+  spec.rows = rows;
+  spec.allowed_list = allowed_list;
+#ifdef SONICBOOM_USE_CUDA
+  spec.rewrite = quant::cuda::q8_1_enabled();
+#else
+  spec.rewrite = false;  // CPU-only build: no quantized device path exists.
+#endif
+  spec.rows_mmq = decode_mmq_available();
+  return spec;
 }
 
 // ---------------------------------------------------------------------------
@@ -3708,12 +3800,10 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
     const planner::KvCacheSession* session = nullptr, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<DecodeRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/true, /*rows=*/1,
-                              /*softcap_output=*/true, gather);
-  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
-                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_available());
+  const DecodeGraphSpec spec =
+      device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
+  GraphIr ir = emit_decode_ir(m, spec);
+  rt->graph = lower_decode_graph(m, ir, spec);
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
   // exactly as it was; the clone is discarded once the desc is extracted. A
@@ -3986,43 +4076,6 @@ uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
 // only 256 candidate pairs do, once per step.
 // ---------------------------------------------------------------------------
 
-// Turn the lowered graph's output (the [vocab] logits) into the input of a
-// SampleSelect node, and make the node's 4-byte candidate count the graph
-// output. The logits stay device-resident; the planner sees the count as a
-// scalar float tensor (the same shape the greedy graph's Argmax output has).
-static bool append_sample_select_tail(planner::Graph& g, uint64_t vocab,
-                                      bool gather = false) {
-  if (g.outputs.size() != 1 || vocab == 0) return false;
-  const planner::TensorId logits_id = g.outputs[0];
-  const planner::TensorDesc* logits = g.find_tensor(logits_id);
-  if (!logits || logits->size_bytes != vocab * sizeof(float)) return false;
-  uint32_t max_tensor = 0;
-  uint32_t max_node = 0;
-  for (const auto& t : g.tensors) max_tensor = std::max(max_tensor, t.id.value);
-  for (const auto& n : g.nodes) max_node = std::max(max_node, n.id.value);
-  if (max_tensor == UINT32_MAX || max_node == UINT32_MAX) return false;
-  const planner::TensorId count_id{max_tensor + 1};
-  planner::TensorDesc count;
-  count.id = count_id;
-  count.shape = {1};
-  count.dtype = sx::DType::Float32;
-  count.size_bytes = sizeof(int32_t);  // the device-resident candidate count
-  count.name = "sample_count";
-  g.tensors.push_back(std::move(count));
-  planner::GraphNodeDesc node;
-  node.id = planner::GraphNodeId{max_node + 1};
-  node.op = planner::OpKind::SampleSelect;
-  node.inputs = {logits_id};
-  node.outputs = {count_id};
-  node.name = "sample_select";
-  node.backend = planner::BackendTag::Sonic;
-  if (gather) node.attributes.push_back(sx::Attribute{"gather", int64_t(1)});
-  g.nodes.push_back(std::move(node));
-  for (auto& t : g.tensors) t.is_graph_output = (t.id == count_id);
-  g.outputs = {count_id};
-  return true;
-}
-
 struct SampledRuntime {
   planner::Graph graph;
   planner::ExecutionPlan plan;
@@ -4047,16 +4100,9 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
     const planner::KvCacheSession& session, bool gather = false) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<SampledRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
-                              /*softcap_output=*/true, gather);
-  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
-                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_available());
+  rt->graph = build_decode_graph(
+      m, device_decode_spec(DecodeConsumer::SampleSelect, /*rows=*/1, gather));
   if (rt->graph.nodes.empty()) return nullptr;
-  const uint64_t logits_w =
-      gather ? uint64_t(nn::kGrammarGatherCap) : m.config.vocab_size;
-  if (!append_sample_select_tail(rt->graph, logits_w, gather)) return nullptr;
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);
@@ -4498,11 +4544,8 @@ build_verify_runtime(const Gemma4Model& m, uint64_t n_ctx, int rows,
                      const planner::KvCacheSession& session) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<VerifyRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/true, uint64_t(rows));
-  rt->graph = lower_graph(ir, planner::IrPassPhase::Verify,
-                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
-                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_available());
+  rt->graph = build_decode_graph(
+      m, device_decode_spec(DecodeConsumer::Argmax, uint64_t(rows)));
   if (rt->graph.nodes.empty()) return nullptr;
 
   auto snap = planner::CpuResourceProvider::snapshot();
@@ -6322,12 +6365,9 @@ static std::unique_ptr<DecodeRuntime> build_eval_runtime(
     const Gemma4Model& m, uint64_t n_ctx, bool raw_logits,
     const planner::KvCacheSession* session = nullptr) {
   auto rt = std::make_unique<DecodeRuntime>();
-  GraphIr ir = emit_decode_ir(m, /*greedy=*/false, /*rows=*/1,
-                              /*softcap_output=*/!raw_logits);
-  rt->graph = lower_graph(ir, planner::IrPassPhase::Decode,
-                          quant::cuda::q8_1_enabled(), /*dynamic_extent=*/0,
-                          /*skip_kv_append_fusion=*/false, /*fuse_silu_mul=*/false,
-                          /*rows_mmq=*/decode_mmq_available());
+  rt->graph = build_decode_graph(
+      m, device_decode_spec(raw_logits ? DecodeConsumer::PrecapLogits
+                                       : DecodeConsumer::Logits));
   auto s = planner::CpuResourceProvider::snapshot();
   if (!s) return nullptr;
   rt->snap = std::move(*s);

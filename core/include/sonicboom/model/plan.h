@@ -96,6 +96,46 @@ enum class WeightSlot : uint8_t {
 // generate loop so the oracle arithmetic stays bit-identical.
 planner::Graph build_gemma4_graph(const Gemma4Model& m, bool greedy);
 
+// What reads a decode step's output. The step is the same computation for every
+// consumer; the consumer decides what of it has to leave the device.
+enum class DecodeConsumer : uint8_t {
+  // The model's logits (softcapped when the model caps them), whole: the logit
+  // dump and the CPU oracle.
+  Logits,
+  // The logits before the softcap: a consumer that applies the cap itself (the
+  // perplexity scorer, in f32 on the host).
+  PrecapLogits,
+  // The index of the largest logit, reduced on the device: greedy decode and
+  // the verify step.
+  Argmax,
+  // The best candidate (id, z) pairs, selected on the device: sampled decode.
+  SampleSelect,
+};
+
+// One decode graph: what reads it, over how many positions, and how it is
+// lowered.
+struct DecodeGraphSpec {
+  DecodeConsumer consumer = DecodeConsumer::Argmax;
+  // Query positions the step covers. 1 is the decode step; more is the
+  // row-invariant verify step (row i bit-identical to a decode step at pos+i).
+  uint64_t rows = 1;
+  // Only a runtime list of token ids is eligible (a grammar's allowed set):
+  // the lm head computes just those rows and the consumer selects among them.
+  // Argmax and SampleSelect only.
+  bool allowed_list = false;
+  // Run the phase's Boom IR passes (Verify when rows > 1, Decode otherwise).
+  // False lowers the graph as the emitter wrote it.
+  bool rewrite = false;
+  // With `rewrite`: the decode matmuls run on the mmq kernel, so the mmq
+  // producer fusions apply (compiler/BoomPasses.h).
+  bool rows_mmq = false;
+};
+
+// The decode graph for `spec`: the one entry every decode, verify, sampled and
+// evaluation plan site builds its graph through. An empty graph on failure.
+planner::Graph build_decode_graph(const Gemma4Model& m,
+                                  const DecodeGraphSpec& spec);
+
 // Build the model-agnostic KV-cache geometry spec from the Gemma 4 config
 // (Section C de-Gemma decoupling). Keeps the Gemma-specific per-layer mapping
 // (layer_config / kv_donor_layer) inside the model layer; the CUDA backend only
