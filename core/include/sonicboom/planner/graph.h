@@ -23,6 +23,7 @@
 // frozen sx IR is never mutated.
 
 #include <sonicboom/planner/errors.h>
+#include <sonicboom/planner/facts.h>
 #include <sonicboom/planner/ids.h>
 #include <sonicboom/planner/op_kind.h>
 #include <sonicboom/planner/partition.h>
@@ -92,6 +93,10 @@ struct Graph {
   std::vector<GraphNodeDesc> nodes;
   std::vector<TensorId> inputs;
   std::vector<TensorId> outputs;
+
+  // What the compiler proved about the tensors (facts.h). Not part of the
+  // graph's identity: the fingerprint and the plan do not read it.
+  GraphFacts facts;
 
   const TensorDesc* find_tensor(TensorId id) const noexcept;
   const GraphNodeDesc* find_node(GraphNodeId id) const noexcept;
