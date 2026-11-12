@@ -59,6 +59,11 @@ endforeach()
 if(SONICBOOM_USE_CUDA)
   target_compile_definitions(test_clip_grad_norm PRIVATE SB_TEST_CUDA=1)
   set_tests_properties(test_clip_grad_norm PROPERTIES RESOURCE_LOCK gpu_vram)
+  # The same arrangement for test_nn: its sigmoid check also runs the internal
+  # device kernel (core/src/nn/cuda_resident.h) when the build has CUDA.
+  target_compile_definitions(test_nn PRIVATE SB_TEST_CUDA=1)
+  target_link_libraries(test_nn PRIVATE CUDA::cudart)
+  set_tests_properties(test_nn PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
 # The host-only tests that read a real GGUF (dequantization diff, model load,

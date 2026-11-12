@@ -61,6 +61,9 @@ bool gelu_fp16_dev(const float* x, float* y, int n);
 // SiLU (SwiGLU) elementwise: y[i] = x[i] / (1 + exp(-x[i])). x/y may alias.
 bool silu_dev(const float* x, float* y, int n);
 
+// Sigmoid elementwise: y[i] = 1 / (1 + exp(-x[i])). x/y may alias.
+bool sigmoid_dev(const float* x, float* y, int n);
+
 bool mul_dev(const float* a, const float* b, float* y, int n);
 bool add_dev(const float* a, const float* b, float* y, int n);
 // y[i] = x[i] + bias[i % bias.size()]: a [width] bias broadcast over the rows of

@@ -215,6 +215,15 @@ __global__ void silu_kernel(const float* __restrict__ x, float* __restrict__ y,
   y[i] = v / (1.0f + expf(-v));
 }
 
+__global__ void sigmoid_kernel(const float* __restrict__ x,
+                               float* __restrict__ y, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  // 1 / (1 + exp(-x)); expf (not __expf) so the result is the accurate float
+  // sigmoid on both sides of zero.
+  y[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
 __global__ void mul_kernel(const float* __restrict__ a, const float* __restrict__ b,
                            float* __restrict__ y, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3222,6 +3231,14 @@ bool silu_dev(const float* x, float* y, int n) {
   if (n <= 0 || !x || !y) return false;
   SB_NOTE_LAUNCH(silu_kernel, grid_for(n), 256, 0, cur_stream());
   silu_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool sigmoid_dev(const float* x, float* y, int n) {
+  if (!available()) return false;
+  if (n <= 0 || !x || !y) return false;
+  SB_NOTE_LAUNCH(sigmoid_kernel, grid_for(n), 256, 0, cur_stream());
+  sigmoid_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
 

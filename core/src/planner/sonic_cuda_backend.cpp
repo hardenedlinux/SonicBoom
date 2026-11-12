@@ -2393,6 +2393,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       ok = nn::cuda::silu_dev(dev(in[0]), out, out_n);
       break;
     }
+    case OpKind::Sigmoid: {
+      ok = nn::cuda::sigmoid_dev(dev(in[0]), out, out_n);
+      break;
+    }
     case OpKind::Mul: {
       ok = nn::cuda::mul_dev(dev(in[0]), dev(in[1]), out, out_n);
       break;

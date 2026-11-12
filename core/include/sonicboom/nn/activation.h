@@ -29,6 +29,11 @@ namespace sonicboom::nn {
 // Requires y.size() >= x.size(); returns false (writing nothing) otherwise.
 bool silu(std::span<const float> x, std::span<float> y);
 
+// Sigmoid: y[i] = 1 / (1 + exp(-x[i])), elementwise, same shape as the input.
+//
+// Requires y.size() >= x.size(); returns false (writing nothing) otherwise.
+bool sigmoid(std::span<const float> x, std::span<float> y);
+
 // GELU (tanh approximation, a.k.a. gelu_pytorch_tanh / gelu_new):
 // y[i] = 0.5 * x[i] * (1 + tanh(sqrt(2/pi) * (x[i] + 0.044715 * x[i]^3))).
 // This is the mathematically accurate reference.

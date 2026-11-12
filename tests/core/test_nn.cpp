@@ -1,5 +1,5 @@
 // Tests for the Phase 4 transformer operator primitives (sonicboom::nn):
-// SiLU, GELU, and RMSNorm. These are pure C++23 float32 reference kernels with
+// SiLU, Sigmoid, GELU, and RMSNorm. These are pure C++23 float32 reference kernels with
 // no device backend, so correctness is anchored on known values and simple
 // algebraic invariants (RMSNorm maps any input to unit RMS with unit weights).
 
@@ -16,7 +16,14 @@
 #include <sonicboom/dtype.h>
 #include <sonicboom/quant/dequant.h>
 
+#ifdef SB_TEST_CUDA
+#include <cuda_runtime.h>
+
+#include "../../core/src/nn/cuda_resident.h"
+#endif
+
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -50,6 +57,69 @@ void test_silu() {
   std::vector<float> short_y(x.size() - 1);
   check(!sbnn::silu(x, short_y), "silu rejects a too-short output span");
 }
+
+// Sigmoid is the same arithmetic as the reference on the CPU: both compute
+// 1 / (1 + exp(-x)), so the results agree bit for bit (not just numerically).
+// The values cover the flat tails where the activated value is 1 or 0 to f32
+// (|x| = 20 and 100), the near-linear region around zero (|x| = 1e-3) and 0
+// itself.
+void test_sigmoid() {
+  std::vector<float> x = {0.0f, 1e-3f, -1e-3f, 20.0f, -20.0f, 100.0f, -100.0f};
+  std::vector<float> y(x.size());
+
+  check(sbnn::sigmoid(x, y),
+        "sigmoid returns true with a matching output span");
+  for (size_t i = 0; i < x.size(); ++i) {
+    const float ref = 1.0f / (1.0f + std::exp(-x[i]));
+    check(std::bit_cast<uint32_t>(y[i]) == std::bit_cast<uint32_t>(ref),
+          "sigmoid agrees with 1 / (1 + exp(-x)) bit for bit");
+  }
+  check(y[0] == 0.5f, "sigmoid(0) == 0.5");
+  check(y[3] == 1.0f, "sigmoid(20) rounds to 1");
+  check(y[4] > 0.0f && y[4] < 1e-6f, "sigmoid(-20) ~= 0");
+  check(y[5] == 1.0f, "sigmoid(100) rounds to 1");
+  check(y[6] == 0.0f, "sigmoid(-100) == 0 (exp(100) overflows f32)");
+
+  // A too-short output span is rejected and writes nothing.
+  std::vector<float> short_y(x.size() - 1);
+  check(!sbnn::sigmoid(x, short_y),
+        "sigmoid rejects a too-short output span");
+}
+
+#ifdef SB_TEST_CUDA
+// The device sigmoid against the CPU one on the same values. Device expf and
+// host exp are not required to be bit-identical, so this is the comparison the
+// tree's other device-kernel suites use (an independent reference within
+// 1e-5): the arithmetic is the same 1 / (1 + exp(-x)) on both sides.
+void test_sigmoid_cuda() {
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::cout << "sigmoid: no CUDA device, device case skipped\n";
+    return;
+  }
+  const std::vector<float> x = {0.0f,  1e-3f, -1e-3f, 20.0f,
+                                -20.0f, 100.0f, -100.0f};
+  const std::size_t bytes = x.size() * sizeof(float);
+  std::vector<float> cpu(x.size()), dev(x.size());
+
+  float* dx = nullptr;
+  float* dy = nullptr;
+  check(cudaMalloc(&dx, bytes) == cudaSuccess, "sigmoid: allocate the input");
+  check(cudaMalloc(&dy, bytes) == cudaSuccess, "sigmoid: allocate the output");
+  check(cudaMemcpy(dx, x.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess,
+        "sigmoid: upload the input");
+  check(sbnn::sigmoid(x, cpu), "sigmoid: the CPU reference runs");
+  check(sbnn::cuda::sigmoid_dev(dx, dy, int(x.size())),
+        "sigmoid_dev returns true");
+  check(cudaMemcpy(dev.data(), dy, bytes, cudaMemcpyDeviceToHost) == cudaSuccess,
+        "sigmoid: download the result");
+  for (std::size_t i = 0; i < x.size(); ++i)
+    check(std::abs(dev[i] - cpu[i]) <= 1e-5f,
+          "sigmoid_dev agrees with the CPU sigmoid");
+  cudaFree(dx);
+  cudaFree(dy);
+}
+#endif
 
 void test_gelu() {
   std::vector<float> x = {0.0f, 1.0f};
@@ -689,6 +759,10 @@ void test_layer_combine() {
 
 int main() {
   test_silu();
+  test_sigmoid();
+#ifdef SB_TEST_CUDA
+  test_sigmoid_cuda();
+#endif
   test_gelu();
   test_gelu_fp16();
   test_rms_norm_known();

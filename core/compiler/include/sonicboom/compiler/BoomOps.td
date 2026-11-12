@@ -442,6 +442,9 @@ def Boom_GeluFp16Op : Boom_Op<"gelu_fp16",
 def Boom_SiluOp : Boom_Op<"silu",
     "SiLU activation (SwiGLU gate)",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
+def Boom_SigmoidOp : Boom_Op<"sigmoid",
+    "sigmoid activation, 1 / (1 + exp(-x))",
+    [NoMemoryEffect, Boom_Elementwise, Boom_Monotone, Boom_RowIndependent]>;
 def Boom_RopeOp : Boom_Op<"rope",
     "multi-head NEOX RoPE",
     [NoMemoryEffect, Boom_RowIndependent]>;

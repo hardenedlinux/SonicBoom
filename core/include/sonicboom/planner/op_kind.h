@@ -189,6 +189,12 @@ enum class OpKind : uint8_t {
   // transfer stay on the device while the nucleus and the random draw stay on
   // the host. Appended last for the same reason as ClipGradNorm.
   SampleSelect,
+
+  // Sigmoid activation: y = 1 / (1 + exp(-x)), elementwise, same shape. It
+  // joins Silu and GeluFp16 as a plain activation and has no fused form of its
+  // own (no model emits it yet). Appended last for the same reason as
+  // ClipGradNorm.
+  Sigmoid,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

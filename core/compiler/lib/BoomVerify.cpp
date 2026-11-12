@@ -146,6 +146,7 @@ bool carriesDs(llvm::StringRef opName) {
 bool isShapePreserving(llvm::StringRef opName) {
   return opName == "boom.relu" || opName == "boom.scale" ||
          opName == "boom.gelu_fp16" || opName == "boom.silu" ||
+         opName == "boom.sigmoid" ||
          opName == "boom.cast_fp16" || opName == "boom.softcap" ||
          opName == "boom.add_bias";
 }

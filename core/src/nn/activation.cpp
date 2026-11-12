@@ -49,6 +49,17 @@ bool silu(std::span<const float> x, std::span<float> y) {
   return true;
 }
 
+bool sigmoid(std::span<const float> x, std::span<float> y) {
+  if (y.size() < x.size()) return false;
+  // 1 / (1 + exp(-x)): for x >= 0 exp(-x) stays in (0,1] and for x < 0 it grows
+  // but remains finite down to ~ -88, beyond which it overflows to inf and the
+  // quotient -> 0, which is the correct float value.
+  for (size_t i = 0; i < x.size(); ++i) {
+    y[i] = 1.0f / (1.0f + std::exp(-x[i]));
+  }
+  return true;
+}
+
 bool gelu(std::span<const float> x, std::span<float> y) {
   if (y.size() < x.size()) return false;
   for (size_t i = 0; i < x.size(); ++i) y[i] = gelu_tanh_f32(x[i]);

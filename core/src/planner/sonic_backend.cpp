@@ -429,6 +429,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = nn::silu(f32(inputs[0]), f32_mut(out));
       break;
     }
+    case OpKind::Sigmoid: {
+      ok = nn::sigmoid(f32(inputs[0]), f32_mut(out));
+      break;
+    }
     case OpKind::AddBias: {
       // inputs[0] is the projection output ([width] when decoding, [n, width]
       // when prefilling); the bias is a [width] weight vector broadcast over the

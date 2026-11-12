@@ -127,6 +127,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::ClipGradNorm;
   if (name == "sample_select")
     return OpKind::SampleSelect;
+  if (name == "sigmoid")
+    return OpKind::Sigmoid;
   return std::nullopt;
 }
 
@@ -187,6 +189,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::AsyncWeightPrefetch: return "async_weight_prefetch";
     case OpKind::SyncPrefetch: return "sync_prefetch";
     case OpKind::SampleSelect: return "sample_select";
+    case OpKind::Sigmoid: return "sigmoid";
   }
   return "?";
 }
