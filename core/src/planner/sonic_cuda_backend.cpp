@@ -915,46 +915,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   double scale_d = 0.0;
   attr_f(*node, "scale", scale_d);
 
-  const model::BlockWeights& block =
-      model_->weights.blocks[layer >= 0 ? uint32_t(layer) : 0];
   const model::LayerConfig& lc = cfg.layer_config(layer >= 0 ? uint32_t(layer) : 0);
 
+  // The weights this node's roles address (model/weights.h): a block role in
+  // the node's layer, a model role wherever the layer points.
+  const uint32_t weight_layer = layer >= 0 ? uint32_t(layer) : 0;
   auto fweight = [&](model::WeightSlot s) -> std::span<const float> {
-    switch (s) {
-      case model::WeightSlot::AttnNorm: return block.attn_norm;
-      case model::WeightSlot::FfnNorm: return block.ffn_norm;
-      case model::WeightSlot::AttnQNorm: return block.attn_q_norm;
-      case model::WeightSlot::AttnKNorm: return block.attn_k_norm;
-      case model::WeightSlot::PostAttentionNorm: return block.post_attention_norm;
-      case model::WeightSlot::PostFfwNorm: return block.post_ffw_norm;
-      case model::WeightSlot::PostNorm: return block.post_norm;
-      case model::WeightSlot::AttnQBias: return block.attn_q_bias;
-      case model::WeightSlot::AttnKBias: return block.attn_k_bias;
-      case model::WeightSlot::AttnVBias: return block.attn_v_bias;
-      case model::WeightSlot::AttnOutputBias: return block.attn_output_bias;
-      case model::WeightSlot::InpGate: return block.inp_gate;
-      case model::WeightSlot::Proj: return block.proj;
-      case model::WeightSlot::PerLayerProjNorm: return model_->weights.per_layer_proj_norm;
-      case model::WeightSlot::OutputNorm: return model_->weights.output_norm;
-      case model::WeightSlot::RopeFreqs: return model_->weights.rope_freqs;
-      default: return {};
-    }
+    return model::weight_f32(model_->weights, {s, weight_layer});
   };
-
   auto qweight = [&](model::WeightSlot s) -> const quant::QuantizedTensor& {
-    static const quant::QuantizedTensor kEmpty;
-    switch (s) {
-      case model::WeightSlot::AttnQ: return block.attn_q;
-      case model::WeightSlot::AttnK: return block.attn_k;
-      case model::WeightSlot::AttnV: return block.attn_v;
-      case model::WeightSlot::AttnOutput: return block.attn_output;
-      case model::WeightSlot::FfnGate: return block.ffn_gate;
-      case model::WeightSlot::FfnUp: return block.ffn_up;
-      case model::WeightSlot::FfnDown: return block.ffn_down;
-      case model::WeightSlot::TokenEmbd: return model_->weights.token_embd;
-      case model::WeightSlot::Output: return model_->weights.output;
-      default: return kEmpty;
-    }
+    return model::weight_quant(model_->weights, {s, weight_layer});
   };
 
   // Plan-record annotations (plan_record.h). OpKind names the operation but not
