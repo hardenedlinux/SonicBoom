@@ -40,6 +40,51 @@ namespace sonicboom::model {
 using sonicboom::bf16_to_f32;
 using sonicboom::f32_to_bf16;
 
+// The role a weight plays. A graph node that reads a weight carries its role as
+// the `slot` attribute (and its block as `layer`); weight_f32 and weight_quant
+// below are how a role is found in the loaded weights. Block roles
+// (AttnNorm .. LayerOutputScale, and the biases) are one per block; the rest
+// are one per model. A value never changes once assigned: it is written into
+// plans.
+enum class WeightSlot : uint8_t {
+  None = 0,
+  TokenEmbd,
+  PerLayerTokenEmbd,
+  PerLayerModelProj,
+  PerLayerProjNorm,
+  OutputNorm,
+  RopeFreqs,
+  AttnNorm,
+  FfnNorm,
+  AttnQNorm,
+  AttnKNorm,
+  PostAttentionNorm,
+  PostFfwNorm,
+  PostNorm,
+  AttnQ,
+  AttnK,
+  AttnV,
+  AttnOutput,
+  FfnGate,
+  FfnUp,
+  FfnDown,
+  InpGate,
+  Proj,
+  LayerOutputScale,
+  // Optional linear-layer biases, f32 [width]. An architecture either carries
+  // them (Qwen2's Q/K/V) or does not (Gemma 4); the loader binds what the file
+  // has and the emitter emits an AddBias node only for a bound span, so an
+  // absent bias costs nothing. Added after the original slots so a slot's
+  // numeric value never moves.
+  AttnQBias,
+  AttnKBias,
+  AttnVBias,
+  AttnOutputBias,
+  // The untied output projection (lm head); empty when the model ties its
+  // embedding and output weights, in which case the emitter reuses TokenEmbd.
+  Output,
+};
+
 // One transformer block's weights (block_count of these, layers 0..41).
 //
 // All 17 per-block tensor groups are bound. The 7 added in Phase 5C-1
@@ -106,5 +151,29 @@ struct Gemma4Weights {
 
   bool empty() const noexcept { return blocks.empty(); }
 };
+
+// The address of one weight: its role, the block it belongs to, and — for a
+// role a block holds several weights of — which of them. Every role today has
+// one weight per block (or per model), so `index` is 0; it is part of the
+// address so that a layer kind with many weights of one role (the experts of a
+// mixture) is addressed the same way as every other weight, by one lookup,
+// instead of by a second mechanism beside it.
+struct WeightKey {
+  WeightSlot slot = WeightSlot::None;
+  uint32_t layer = 0;  // ignored by a per-model role
+  uint32_t index = 0;
+
+  constexpr bool operator==(const WeightKey&) const noexcept = default;
+};
+
+// The f32 weight at `key`; empty when the role is not an f32 role, the model
+// has no such weight, or the address is out of range.
+std::span<const float> weight_f32(const Gemma4Weights& weights,
+                                  WeightKey key) noexcept;
+
+// The quantized weight at `key`; a tensor of no elements under the same
+// conditions.
+const quant::QuantizedTensor& weight_quant(const Gemma4Weights& weights,
+                                           WeightKey key) noexcept;
 
 } // namespace sonicboom::model
