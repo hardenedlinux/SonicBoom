@@ -22,6 +22,7 @@
 #include <sonicboom/compiler/BoomBuilder.h>
 #include <sonicboom/compiler/BoomConversion.h>
 #include <sonicboom/compiler/BoomPasses.h>
+#include <sonicboom/compiler/BoomStage.h>
 #include <sonicboom/model/exec.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/numerics.h>
@@ -298,6 +299,8 @@ planner::Graph lower_graph(mlir::ModuleOp module,
                  "above)\n";
     return {};
   }
+  // What each tensor depends on, recorded while the ops are still readable.
+  (void)compiler::recordStages(module);
   return lower_resolved(module, dynamic_extent);
 }
 
@@ -318,6 +321,8 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
                  "above)\n";
     return {};
   }
+  // What each tensor depends on, recorded while the ops are still readable.
+  (void)compiler::recordStages(*ir.module);
   if (rewrite &&
       !compiler::runBoomPasses(*ir.module, phase, skip_kv_append_fusion,
                                fuse_silu_mul, rows_mmq))
