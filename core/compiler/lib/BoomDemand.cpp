@@ -18,6 +18,7 @@
 
 #include "sonicboom/compiler/BoomDemand.h"
 
+#include "BoomUnit.h"
 #include "sonicboom/compiler/BoomOps.h"
 #include "sonicboom/compiler/BoomTypes.h"
 
@@ -195,42 +196,6 @@ unsigned rankOf(mlir::Type type) {
 
 unsigned rankOf(mlir::Value v) { return rankOf(v.getType()); }
 
-// A node op: one of the per-OpKind ops, which all carry the graph-node record.
-bool isNode(mlir::Operation *op) {
-  return op->getName().getDialectNamespace() == "boom" &&
-         op->getAttrOfType<mlir::IntegerAttr>("node_id") &&
-         op->getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");
-}
-
-// The SSA value of tensor `id` in a graph/step body, by the relation the
-// verifier states: a node result named in `result_ids`, or — for a tensor no
-// node produces — the block argument at its rank among the free ids.
-mlir::Value bodyValue(mlir::Block &body, mlir::ArrayAttr tensors, int64_t id) {
-  llvm::DenseSet<int64_t> produced;
-  for (mlir::Operation &node : body) {
-    auto ids = node.getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");
-    if (!ids)
-      continue;
-    for (auto [index, rid] : llvm::enumerate(ids.asArrayRef())) {
-      if (rid == id && index < node.getNumResults())
-        return node.getResult(unsigned(index));
-      produced.insert(rid);
-    }
-  }
-  llvm::SmallVector<int64_t> freeIds;
-  for (mlir::Attribute entry : tensors)
-    if (auto desc = llvm::dyn_cast<boom::TensorDescAttr>(entry))
-      if (!produced.count(desc.getId()))
-        freeIds.push_back(desc.getId());
-  llvm::sort(freeIds);
-  auto it = llvm::find(freeIds, id);
-  if (it == freeIds.end())
-    return {};
-  const unsigned index = unsigned(it - freeIds.begin());
-  return index < body.getNumArguments() ? mlir::Value(body.getArgument(index))
-                                        : mlir::Value();
-}
-
 // The demand a graph's declared consumer places on its output.
 Demand consumerDemand(boom::GraphOp graph, unsigned rank) {
   const std::optional<llvm::StringRef> consumer = graph.getConsumer();
@@ -265,7 +230,7 @@ public:
       visitSample(sample, operands, results);
       return mlir::success();
     }
-    if (isNode(op)) {
+    if (unit::isNode(op)) {
       visitNode(op, operands, results);
       return mlir::success();
     }
@@ -300,7 +265,7 @@ private:
   void visitGraph(boom::GraphOp graph) {
     mlir::Block &body = graph.getBody().front();
     for (int64_t id : graph.getOutputs()) {
-      mlir::Value out = bodyValue(body, graph.getTensors(), id);
+      mlir::Value out = unit::valueOf(body, graph.getTensors(), id);
       if (!out)
         continue;
       demand(getLatticeElement(out), consumerDemand(graph, rankOf(out)));
@@ -315,7 +280,7 @@ private:
     for (auto [index, id] : llvm::enumerate(step.getOutputIds())) {
       if (index >= results.size())
         break;
-      mlir::Value out = bodyValue(body, step.getTensors(), id);
+      mlir::Value out = unit::valueOf(body, step.getTensors(), id);
       if (out)
         demand(getLatticeElement(out), results[index]->getValue());
     }
@@ -503,7 +468,7 @@ DemandFacts analyzeDemand(mlir::Operation *top) {
       for (mlir::Block &block : region)
         for (mlir::BlockArgument arg : block.getArguments())
           record(arg);
-    if (isNode(op) && op->getNumResults() == 1 && isWeightMatmul(op)) {
+    if (unit::isNode(op) && op->getNumResults() == 1 && isWeightMatmul(op)) {
       const Demand d = facts.of(op->getResult(0));
       facts.weight_rows[op] = d.dims.empty() ? (d.isNone() ? IndexSet::empty()
                                                            : IndexSet::all())
