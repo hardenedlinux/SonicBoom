@@ -15,6 +15,7 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include <sonicboom/model/plan.h>
+#include <sonicboom/model/recipe.h>
 
 #include <sonicboom/runtime_features.h>
 #include <sonicboom/compiler/BoomAnalysis.h>
@@ -34,6 +35,7 @@
 #include <sonicboom/planner/sonic_cuda_backend.h>
 #include <sonicboom/sx/exec.h>
 
+#include "emit.h"  // the recipe emitters
 #include "../planner/autotune.h"        // B7 draft-length cost cache
 #include "../planner/decision_registry.h"  // the plan-cache decision fingerprint
 #include "../planner/device_pool.h"      // the sampled state's device logits buffer
@@ -124,60 +126,6 @@ sx::Attribute attr_s(const char* name, std::string v) {
 // graph's token buffer). 512 matches the segment size the windowed models use.
 constexpr uint64_t kDefaultPrefillChunk = 512;
 
-// Which generic pieces of the transformer block an architecture uses. This is
-// the ONE architecture-conditional in SonicBoom: the emitter (together with the
-// loader) is the model-specific front end, so an architecture's structural
-// differences are expressed here and nowhere else — the planner, the
-// partitioning seam, and both backends stay model-agnostic, and every field
-// below selects between existing generic OpKinds/attributes rather than
-// introducing a model-specific one.
-//
-// Gemma 4 turns every field on except the projection biases and the untied
-// output; Qwen2 turns on the projection bias, the SiLU gate, the attention
-// temperature, and the untied output, and leaves the rest off.
-struct BlockProfile {
-  bool embd_scale = false;     // token embedding × sqrt(d)
-  bool qk_norm = false;        // per-head RMSNorm on Q and K
-  bool v_norm = false;         // unit-weight per-head RMSNorm on V
-  bool proj_bias = false;      // Q/K/V projections carry a bias
-  bool attn_out_bias = false;  // attention output projection carries a bias
-  bool post_attn_norm = false; // norm between the attn projection and its residual
-  bool post_ffw_norm = false;  // norm between the FFN down-projection and its residual
-  bool silu_ffn = false;       // SiLU (Qwen2) vs fp16 GELU (Gemma 4) gate
-  bool per_layer_input = false; // per-layer embedding gate + its whole block
-  bool layer_scale = false;    // whole-block output scale
-  bool kv_shared = false;      // some layers attend over another layer's KV cache
-  bool softcap = false;        // logit softcapping
-  bool tied_output = false;    // lm head reuses the token embedding
-  float attn_scale = 1.0f;     // logit temperature (1.0 with Q/K RMSNorm)
-};
-
-BlockProfile profile_for(const Gemma4Config& cfg) {
-  BlockProfile p;
-  switch (cfg.arch) {
-    case ModelArch::Gemma4:
-      p.embd_scale = true;
-      p.qk_norm = true;
-      p.v_norm = true;
-      p.post_attn_norm = true;
-      p.post_ffw_norm = true;
-      p.per_layer_input = cfg.per_layer_input > 0;
-      p.layer_scale = true;
-      p.kv_shared = cfg.shared_kv_layers > 0;
-      p.softcap = cfg.final_logit_softcapping > 0.0f;
-      p.tied_output = true;
-      p.attn_scale = 1.0f;  // Q/K are unit-normed, so the dot product is a cosine
-      break;
-    case ModelArch::Qwen2:
-      p.proj_bias = true;
-      p.silu_ffn = true;
-      p.tied_output = false;
-      p.attn_scale = 1.0f / std::sqrt(float(cfg.head_dim_global));
-      break;
-  }
-  return p;
-}
-
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -219,10 +167,6 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
 // ---------------------------------------------------------------------------
 namespace {
 
-struct GraphIr {
-  std::unique_ptr<mlir::MLIRContext> context;
-  mlir::OwningOpRef<mlir::ModuleOp> module;
-};
 
 // Boom IR -> the graph the plan is derived from. A lowering that fails is
 // reported and leaves an empty graph, which fails the plan — there is
@@ -381,373 +325,7 @@ planner::Graph lower_graph(GraphIr& ir, planner::IrPassPhase phase, bool rewrite
   return lower_resolved(*ir.module, dynamic_extent);
 }
 
-// Decode and verify can run a projection on the mmq matmul only when the q8_1
-// dispatcher and the mmq kernel are both available; which projections actually
-// do is the per-shape family measured at load (decode_family_mmq).
-bool decode_mmq_available() {
-#ifdef SONICBOOM_USE_CUDA
-  return quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled();
-#else
-  return false;  // CPU-only build: no device matmul path exists.
-#endif
-}
-
-// The load-time family decision for one projection (-/+/gate/up). A CPU-only
-// build has no family measurement and no device matmul, so it never selects it.
-bool decode_family_mmq(quant::QuantType qt, uint64_t in_w, uint64_t out_w) {
-#ifdef SONICBOOM_USE_CUDA
-  return quant::cuda::decode_family_mmq(qt, int(out_w), int(in_w));
-#else
-  (void)qt;
-  (void)in_w;
-  (void)out_w;
-  return false;
-#endif
-}
-
 }  // namespace
-
-// ---------------------------------------------------------------------------
-// Plan emitter. Mirrors forward()/lm_head in exec.cpp — the same per-stage
-// arithmetic, re-expressed as a static acyclic graph of transformer OpKind
-// nodes. The graph is stateless (acyclic): the multi-token KV cache lives in the
-// SonicBackend, keyed by layer. The `Attention` node appends its RoPE'd fp16 K
-// and normed fp16 V to the layer's cache and attends over the accumulated keys;
-// a shared-KV layer (24..41) omits the K/V inputs and attends over its donor
-// layer's (22 SWA / 23 global) cache, selected by the node's `kv_source_layer`
-// attribute. The residual stream is the *scaled* l_out of the previous block.
-// ---------------------------------------------------------------------------
-// `rows` > 1 emits the same graph dealt over that many query positions
-// (position-major [rows, dim] activations, each node stamped with a `verify`
-// attribute): the row-invariant verify step of §B3. The backend then runs the
-// decode kernel per row, with the row-invariant batched mmvq for the quantized
-// matmuls — so row i is bit-identical to a plain decode step at pos+i.
-// The graph is the same for every consumer: it ends at the model's logits
-// (softcapped when the model caps them) and declares `spec.consumer` as what
-// reads them. The softcap is monotonic (argmax unchanged), but it is a lossy
-// transform: the sampler and the logit dump take the capped output, while the
-// perplexity scorer (PrecapLogits) takes the raw output and applies the cap on
-// the host instead (see score_spine_cuda) — same distribution, one less device
-// op. Which of those a plan gets is the consumer resolution's decision.
-// The consumer kind a spec's consumer declares (BoomOps.td, GraphOp::consumer).
-const char* decode_consumer_name(DecodeConsumer consumer) {
-  switch (consumer) {
-  case DecodeConsumer::Logits: return "logits";
-  case DecodeConsumer::PrecapLogits: return "precap_logits";
-  case DecodeConsumer::Argmax: return "argmax";
-  case DecodeConsumer::SampleSelect: return "sample_select";
-  }
-  return "logits";
-}
-
-GraphIr emit_decode_ir(const Gemma4Model& m, const DecodeGraphSpec& spec) {
-  using namespace planner;
-
-  const uint64_t rows = spec.rows;
-
-  const auto& cfg = m.config;
-  const uint32_t d = cfg.embedding_length;
-  const uint32_t ff = cfg.feed_forward_length;
-  const uint32_t per = cfg.per_layer_input;
-  const uint32_t block_count = cfg.block_count;
-  const uint32_t total_per = block_count * per;
-  const uint64_t vocab = cfg.vocab_size;
-
-  GraphIr ir;
-  ir.context = std::make_unique<mlir::MLIRContext>();
-  compiler::BoomBuilder b(ir.context.get(),
-                          rows > 1 ? "gemma4_verify" : "gemma4_decode");
-  if (rows > 1) b.set_row_scale(int64_t(rows), "verify");
-
-  // Graph inputs: token id + absolute position (Int64 scalars), declared to the
-  // builder — they are the graph's free variables, and a free variable is a block
-  // argument in the IR the emitter writes.
-  const mlir::Value token_id = b.input("token_id", {}, sx::DType::Int64);
-  const mlir::Value pos = b.input("pos", {}, sx::DType::Int64);
-
-  // The per-layer KV cache handles: the cache a node reads or appends to is a
-  // `!boom.kv<layer>` operand stating the access as an effect, not a pointer
-  // bound at plan time. A shared layer's attention takes its donor's handle.
-  const uint32_t n_kv = cfg.n_layer_kv();
-  std::vector<mlir::Value> kv_handles(n_kv);
-  for (uint32_t l = 0; l < n_kv; ++l)
-    kv_handles[l] = b.kv(l);
-
-  const BlockProfile prof = profile_for(cfg);
-
-  // Decode/verify kernel family: a projection whose (type, rows, cols) shape
-  // was measured faster on the mmq matmul carries the prefill lowering
-  // attributes — the extent, the input width, and the activation scale layout
-  // of the weight type — so the prefill producer fusions and the mmq matmul
-  // dispatch apply at this step's row count. `ds` = -1 marks a weight type with
-  // no fused mmq quantize (Q6_K); its matmul quantizes the activation inside the
-  // mmq call. `mmq_rows` selects that mmq matmul for an activation with no fused
-  // producer. A shape on the gemv carries nothing and takes the ordinary decode
-  // lowering (quantize once, q8_1 gemv).
-  const bool mmq_available = decode_mmq_available();
-  auto mmq_a = [&](std::vector<sx::Attribute> &a, quant::QuantType qt,
-                   uint64_t in_w, uint64_t out_w) {
-    if (!mmq_available || !decode_family_mmq(qt, in_w, out_w)) return;
-    const int64_t ds =
-        (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
-        : (qt == quant::QuantType::Q6_K)                               ? -1
-                                                                       : 0;
-    a.push_back(attr_i("batch", int64_t(rows)));
-    a.push_back(attr_i("dim", int64_t(in_w)));
-    a.push_back(attr_i("ds", ds));
-    a.push_back(attr_i("mmq_rows", int64_t(1)));
-  };
-
-  auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
-  auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
-  auto kv_src = [&cfg](uint32_t l) {
-    return attr_i("kv_source_layer", int64_t(cfg.kv_donor_layer(l)));
-  };
-  // The attention temperature is emitted only when it is not the identity, so a
-  // model whose Q/K are unit-normed (Gemma 4) gets a byte-identical graph to the
-  // one before the generalization. `rope_attn_scale` carries YaRN's magnitude
-  // term (q and k are each m-scaled, so the scores are m^2), 1.0 for every model
-  // without YaRN metadata.
-  auto attn_attrs = [&](uint32_t l) {
-    std::vector<sx::Attribute> a = {layer_a(l), kv_src(l)};
-    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
-    if (scale != 1.0) a.push_back(attr_f("scale", scale));
-#ifdef SONICBOOM_USE_CUDA
-    // Split-KV decode schedule, carried by the op: the chunk size (keys per
-    // split) and the partial-combine order. Chunk boundaries are absolute
-    // (chunk index = key position / C) and partials merge in ascending chunk
-    // index, so a query's reduction tree depends only on the key positions —
-    // never on n_ctx/capacity, the current depth or prefix reuse. The value is
-    // the class default or the per-device tuned pick (both capacity-free);
-    // `context_length` only bounds the depths the tuner measures at.
-    const LayerConfig& lc = cfg.layer_config(l);
-    const int n_kv = int(lc.n_heads_kv);
-    const int n_q = int(lc.n_heads_q);
-    a.push_back(attr_i("decode_chunk",
-                       int64_t(nn::cuda::attn_decode_plan_chunk(
-                           int(lc.head_dim), n_q / std::max(1, n_kv), n_q, n_kv,
-                           lc.sliding_window, cfg.context_length,
-                           numerics_kv_storage() == KvStorage::F16,
-                           numerics_kv_storage() == KvStorage::Q8))));
-    a.push_back(attr_s("decode_combine", "chunk_index_asc"));
-#endif
-    return a;
-  };
-
-  // Preamble: the shared token embedding (scaled where the architecture scales
-  // it), and — only for a model with per-layer inputs — the full per-layer token
-  // embedding row (dequantized once; each block slices its `per`-element column
-  // out of the combined `ple_all`). Both are deterministic, so hoisting them out
-  // of the block loop is bit-identical to exec.cpp recomputing them per block.
-  const mlir::Value embd = b.node(OpKind::Embedding, {token_id}, "embd", {int64_t(d)},
-                               {slot(WeightSlot::TokenEmbd)});
-  const mlir::Value inp = prof.embd_scale
-                           ? b.node(OpKind::Scale, {embd}, "inp", {int64_t(d)},
-                                    {attr_f("scale", std::sqrt(float(d)))})
-                           : embd;
-
-  // Hoisted per-layer input (Phase 2.3a): one full-width 2560→10752 bf16 gemv +
-  // scale + segmented rms_norm + combine per token, done once over [total_per].
-  // Each block's gate then slices its [per] segment instead of recomputing the
-  // 2560→256 projection. Decomposed (C.5) into the general ops below: a
-  // full-width MatvecBf16 (offset 0, rows total_per) + Scale(1/sqrt(d)) +
-  // RmsNormHeads(dim == per, weight == per_layer_proj_norm) + the combine
-  // (proj + ple*sqrt(per)) / sqrt(2) as Scale/Add/Scale. A model without
-  // per-layer inputs (Qwen2) emits none of this and runs the block alone.
-  mlir::Value ple_all{};
-  if (prof.per_layer_input) {
-    const mlir::Value ple_row = b.node(OpKind::Embedding, {token_id}, "ple_row",
-                                    {int64_t(total_per)},
-                                    {slot(WeightSlot::PerLayerTokenEmbd)});
-    const float proj_scale = 1.0f / std::sqrt(float(d));
-    const float ple_scale = std::sqrt(float(per));
-    const float combine_scale = 1.0f / std::sqrt(2.0f);
-    ple_all = b.node(OpKind::MatvecBf16, {inp}, "ple_proj",
-                     {int64_t(total_per)},
-                     {attr_i("offset", int64_t(0)),
-                      attr_i("rows", int64_t(total_per))});
-    ple_all = b.node(OpKind::Scale, {ple_all}, "ple_projs", {int64_t(total_per)},
-                     {attr_f("scale", double(proj_scale))});
-    ple_all = b.node(OpKind::RmsNormHeads, {ple_all}, "ple_projn",
-                     {int64_t(total_per)},
-                     {layer_a(0), slot(WeightSlot::PerLayerProjNorm),
-                      attr_i("dim", int64_t(per))});
-    const mlir::Value ple_s = b.node(OpKind::Scale, {ple_row}, "ple_s",
-                                  {int64_t(total_per)},
-                                  {attr_f("scale", double(ple_scale))});
-    const mlir::Value ple_add = b.node(OpKind::Add, {ple_all, ple_s}, "ple_add",
-                                    {int64_t(total_per)}, {});
-    ple_all = b.node(OpKind::Scale, {ple_add}, "ple_all", {int64_t(total_per)},
-                     {attr_f("scale", double(combine_scale))});
-  }
-
-  mlir::Value residual = inp;
-  for (uint32_t l = 0; l < block_count; ++l) {
-    const LayerConfig& lc = cfg.layer_config(l);
-    const uint32_t n_q = lc.n_heads_q;
-    const uint32_t n_kv = lc.n_heads_kv;
-    const uint32_t hd = lc.head_dim;
-    const uint32_t qw = n_q * hd;
-    const uint32_t kvw = n_kv * hd;
-    const std::string suff = std::to_string(l);
-
-    // --- attention ---------------------------------------------------------
-    // Q is computed for every layer (llama.cpp projects Q before the has_kv
-    // branch). KV layers append their RoPE'd K (fp16) and normed V (fp16) to the
-    // per-layer cache then attend over the accumulated keys; shared layers
-    // (24..41) attend over their donor layer's cache instead.
-    mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, {int64_t(d)},
-                        {layer_a(l), slot(WeightSlot::AttnNorm)});
-    std::vector<sx::Attribute> q_attrs = {layer_a(l), slot(WeightSlot::AttnQ)};
-    mmq_a(q_attrs, m.weights.blocks[l].attn_q.type(), d, qw);
-    mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff, {int64_t(qw)},
-                        q_attrs);
-    if (prof.proj_bias)  // bias is added before RoPE (llama.cpp build_qkv order)
-      q = b.node(OpKind::AddBias, {q}, "qb" + suff, {int64_t(qw)},
-                 {layer_a(l), slot(WeightSlot::AttnQBias)});
-    if (prof.qk_norm)
-      q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, {int64_t(qw)},
-                 {layer_a(l), slot(WeightSlot::AttnQNorm)});
-    q = b.node(OpKind::Rope, {q, pos}, "qr" + suff, {int64_t(qw)}, {layer_a(l)});
-
-    mlir::Value attn;
-    if (cfg.has_kv(l)) {
-      std::vector<sx::Attribute> k_attrs = {layer_a(l), slot(WeightSlot::AttnK)};
-      mmq_a(k_attrs, m.weights.blocks[l].attn_k.type(), d, kvw);
-      std::vector<sx::Attribute> v_attrs = {layer_a(l), slot(WeightSlot::AttnV)};
-      mmq_a(v_attrs, m.weights.blocks[l].attn_v.type(), d, kvw);
-      mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff, {int64_t(kvw)},
-                          k_attrs);
-      mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff, {int64_t(kvw)},
-                          v_attrs);
-      if (prof.proj_bias) {
-        k = b.node(OpKind::AddBias, {k}, "kb" + suff, {int64_t(kvw)},
-                   {layer_a(l), slot(WeightSlot::AttnKBias)});
-        v = b.node(OpKind::AddBias, {v}, "vb" + suff, {int64_t(kvw)},
-                   {layer_a(l), slot(WeightSlot::AttnVBias)});
-      }
-      if (prof.qk_norm)
-        k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, {int64_t(kvw)},
-                   {layer_a(l), slot(WeightSlot::AttnKNorm)});
-      if (prof.v_norm)
-        v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, {int64_t(kvw)},
-                   {layer_a(l)});  // V norm: unit weight
-      const mlir::Value vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, {int64_t(kvw)},
-                                 {layer_a(l)});
-      k = b.node(OpKind::Rope, {k, pos}, "kr" + suff, {int64_t(kvw)}, {layer_a(l)});
-      const mlir::Value kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, {int64_t(kvw)},
-                                 {layer_a(l)});
-      attn = b.node(OpKind::Attention, {q, kc, vc, pos, kv_handles[l]},
-                    "attn" + suff, {int64_t(qw)}, attn_attrs(l));
-    } else {
-      attn = b.node(OpKind::Attention,
-                    {q, pos, kv_handles[cfg.kv_donor_layer(l)]}, "attn" + suff,
-                    {int64_t(qw)}, attn_attrs(l));
-    }
-
-    std::vector<sx::Attribute> ap_attrs = {layer_a(l),
-                                           slot(WeightSlot::AttnOutput)};
-    mmq_a(ap_attrs, m.weights.blocks[l].attn_output.type(), qw, d);
-    mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff, {int64_t(d)},
-                         ap_attrs);
-    if (prof.attn_out_bias)
-      ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, {int64_t(d)},
-                  {layer_a(l), slot(WeightSlot::AttnOutputBias)});
-    mlir::Value o = prof.post_attn_norm
-                     ? b.node(OpKind::RmsNorm, {ap}, "o" + suff, {int64_t(d)},
-                              {layer_a(l), slot(WeightSlot::PostAttentionNorm)})
-                     : ap;
-    mlir::Value x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, {int64_t(d)},
-                         {layer_a(l)});
-
-    // --- gated feed-forward ------------------------------------------------
-    mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, {int64_t(d)},
-                        {layer_a(l), slot(WeightSlot::FfnNorm)});
-    std::vector<sx::Attribute> up_attrs = {layer_a(l), slot(WeightSlot::FfnUp)};
-    mmq_a(up_attrs, m.weights.blocks[l].ffn_up.type(), d, ff);
-    std::vector<sx::Attribute> gate_attrs = {layer_a(l),
-                                             slot(WeightSlot::FfnGate)};
-    mmq_a(gate_attrs, m.weights.blocks[l].ffn_gate.type(), d, ff);
-    mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, {int64_t(ff)},
-                         up_attrs);
-    mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, {int64_t(ff)},
-                           gate_attrs);
-    gate = prof.silu_ffn
-               ? b.node(OpKind::Silu, {gate}, "silu" + suff, {int64_t(ff)}, {layer_a(l)})
-               : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, {int64_t(ff)},
-                        {layer_a(l)});
-    mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, {int64_t(ff)},
-                         {layer_a(l)});
-    std::vector<sx::Attribute> fo_attrs = {layer_a(l),
-                                           slot(WeightSlot::FfnDown)};
-    mmq_a(fo_attrs, m.weights.blocks[l].ffn_down.type(), ff, d);
-    mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, {int64_t(d)},
-                         fo_attrs);
-    mlir::Value f2 = prof.post_ffw_norm
-                      ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, {int64_t(d)},
-                               {layer_a(l), slot(WeightSlot::PostFfwNorm)})
-                      : fo;
-    mlir::Value x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, {int64_t(d)},
-                         {layer_a(l)});
-
-    // --- per-layer gate ----------------------------------------------------
-    // The per-layer input (proj/scale/rms/combine) was hoisted to the preamble;
-    // each block slices its [per] segment of ple_all. A model without per-layer
-    // inputs (Qwen2) ends the block here.
-    mlir::Value x3 = x2;
-    if (prof.per_layer_input) {
-      mlir::Value ple = b.node(OpKind::Slice, {ple_all}, "ple" + suff, {int64_t(per)},
-                            {attr_i("offset", int64_t(l) * per),
-                             attr_i("length", int64_t(per))});
-      mlir::Value g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, {int64_t(per)},
-                           {layer_a(l), slot(WeightSlot::InpGate)});
-      g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, {int64_t(per)}, {layer_a(l)});
-      g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, {int64_t(per)}, {layer_a(l)});
-      mlir::Value g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, {int64_t(d)},
-                           {layer_a(l), slot(WeightSlot::Proj)});
-      mlir::Value g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, {int64_t(d)},
-                           {layer_a(l), slot(WeightSlot::PostNorm)});
-      x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, {int64_t(d)},
-                  {layer_a(l)});
-    }
-
-    // --- whole-block output scale ------------------------------------------
-    mlir::Value out;
-    if (prof.layer_scale && !m.weights.blocks[l].layer_output_scale.empty())
-      out = b.node(OpKind::Scale, {x3}, "out" + suff, {int64_t(d)},
-                   {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
-    else
-      out = x3;
-    residual = out;
-  }
-
-  // --- lm head -------------------------------------------------------------
-  mlir::Value hn = b.node(OpKind::RmsNorm, {residual}, "result_norm", {int64_t(d)},
-                       {slot(WeightSlot::OutputNorm)});
-  const WeightSlot out_slot =
-      prof.tied_output ? WeightSlot::TokenEmbd : WeightSlot::Output;
-  const quant::QuantType out_qt =
-      prof.tied_output ? m.weights.token_embd.type() : m.weights.output.type();
-  std::vector<sx::Attribute> logits_attrs = {slot(out_slot)};
-  mmq_a(logits_attrs, out_qt, d, vocab);
-  mlir::Value out = b.node(OpKind::QuantizedMatmul, {hn}, "logits",
-                           {int64_t(vocab)}, logits_attrs);
-  if (prof.softcap)
-    out = b.node(OpKind::Softcap, {out}, "logits_sc", {int64_t(vocab)},
-                 {attr_f("scale", double(cfg.final_logit_softcapping))});
-
-  // The graph ends at the model's logits. What reads them — and so whether the
-  // softcap is computed, how much of the lm head is, and what leaves the
-  // device — is declared, not written: the compiler derives the graph the
-  // consumer needs from the demand it places on this output (BoomDemand.h,
-  // BoomPasses.h resolveConsumer).
-  b.set_output(out);
-  b.set_consumer(decode_consumer_name(spec.consumer),
-                 spec.allowed_list ? int64_t(nn::kGrammarGatherCap) : 0);
-
-  ir.module = b.finish();
-  return ir;
-}
 
 // The emitter's IR, lowered with no passes: the graph as the emitter wrote it,
 // which is what a caller that runs the pipeline itself — or records what the
@@ -771,10 +349,15 @@ static planner::Graph lower_decode_graph(GraphIr& ir,
                      spec.rows_mmq);
 }
 
+planner::Graph build_decode_graph(const Recipe& recipe,
+                                  const DecodeGraphSpec& spec) {
+  GraphIr ir = emit_decode_ir(recipe, spec);
+  return lower_decode_graph(ir, spec);
+}
+
 planner::Graph build_decode_graph(const Gemma4Model& m,
                                   const DecodeGraphSpec& spec) {
-  GraphIr ir = emit_decode_ir(m, spec);
-  return lower_decode_graph(ir, spec);
+  return build_decode_graph(recipe_for(m), spec);
 }
 
 // The spec of a plan site on this device: the passes run when the quantized
@@ -795,337 +378,21 @@ static DecodeGraphSpec device_decode_spec(DecodeConsumer consumer,
   return spec;
 }
 
-// ---------------------------------------------------------------------------
-// Prefill graph emitter (Phase 7 / Section C.3). Mirrors build_gemma4_graph per
-// block, but on [n, dim] position-major batched tensors (n == the prompt
-// length, dim innermost) so the whole prompt is processed in one graph pass
-// through the spine. The batch size n and per-node `dim` are baked into node
-// attributes; the per-token OpKinds (Embedding, QuantizedMatmul, RmsNorm,
-// RmsNormHeads, Rope, MatvecF32, MatvecBf16, Slice) carry the `batch`
-// attribute and the SonicBackend loops their per-token kernel over the batch
-// dim, while the elementwise nodes (Scale/Add/Mul/GeluFp16/CastFp16) are reused
-// unchanged on the flat batched buffers. C.3 removed the [dim, n] column-major
-// layout and its Transpose nodes: every batched matmul/gather/norm writes
-// [n, dim] directly, so the attention path (which always consumed [n, dim]) no
-// longer needs a data-movement transpose on either side of it. FlashAttention
-// runs full-sequence causal SDPA over prior cache + the current chunk's n
-// fp16-rounded K/V rows (no append — the deferred KvAppend node does that); a
-// shared-KV layer passes its donor's fp16-rounded K/V graph tensors instead of
-// its own, and the node's `kv_source_layer` attribute selects the donor cache,
-// so the memory planner keeps the donor K/V alive across layers 24..41 via
-// ordinary tensor liveness. Graph inputs are `tokens` (Int64 [n]) and
-// `start_pos` (Int64); the graph output is the final residual [n, dim].
-// ---------------------------------------------------------------------------
-GraphIr emit_prefill_ir(const Gemma4Model& m, uint64_t n,
-                        bool dynamic_extent = false) {
-  using namespace planner;
-
-  const auto& cfg = m.config;
-  const uint32_t d = cfg.embedding_length;
-  const uint32_t ff = cfg.feed_forward_length;
-  const uint32_t per = cfg.per_layer_input;
-  const uint32_t block_count = cfg.block_count;
-  const uint32_t total_per = block_count * per;
-
-  GraphIr ir;
-  ir.context = std::make_unique<mlir::MLIRContext>();
-  // Sized at `n`: a dynamic (symbolic-extent) build still records every byte
-  // count at the segment length it was emitted for, so the passes see the same
-  // graph the concrete build at `n` carries and choose the same fusions. The
-  // lowering re-derives the sizes from the extent it binds.
-  compiler::BoomBuilder b(ir.context.get(), "gemma4_prefill", n);
-
-  // Graph inputs: the prompt token ids (Int64 [n]) and the absolute start
-  // position (Int64 scalar).
-  const mlir::Value tokens = b.input(
-      "tokens",
-      {dynamic_extent ? mlir::ShapedType::kDynamic : int64_t(n)},
-      sx::DType::Int64);
-  const mlir::Value start_pos = b.input("start_pos", {}, sx::DType::Int64);
-
-  // The per-layer KV cache handles (see emit_decode_ir): the cache a node reads
-  // or appends to is a `!boom.kv<layer>` operand stating the access as an
-  // effect, not a pointer bound at plan time.
-  const uint32_t n_kv = cfg.n_layer_kv();
-  std::vector<mlir::Value> kv_handles(n_kv);
-  for (uint32_t l = 0; l < n_kv; ++l)
-    kv_handles[l] = b.kv(l);
-
-  auto slot = [](WeightSlot s) { return attr_i("slot", int64_t(s)); };
-  auto layer_a = [](uint32_t l) { return attr_i("layer", int64_t(l)); };
-  auto kv_src = [&cfg](uint32_t l) {
-    return attr_i("kv_source_layer", int64_t(cfg.kv_donor_layer(l)));
-  };
-  auto batch_a = [](uint64_t v) { return attr_i("batch", int64_t(v)); };
-  auto dim_a = [](uint64_t v) { return attr_i("dim", int64_t(v)); };
-  // The MMQ work decomposition for this weight shape (Stage 1): the runtime's
-  // policy (mmq_class_decomp) over the projection's (rows, K, quant type) and
-  // this device's SM count. Deliberately independent of the segment length n —
-  // split-K changes the summation order, so a batch-size-dependent choice would
-  // make prefix-cache reuse diverge from a full prefill. Recorded on every
-  // batched matmul so the plan says which kernel the class runs; the runtime
-  // resolves Auto (and unannotated nodes) with the same policy. A CPU-only
-  // build has no MMQ to classify and records tiled.
-  auto decomp_a = [](uint64_t rows, uint64_t cols, quant::QuantType type) {
-#ifdef SONICBOOM_USE_CUDA
-    const bool stream_k = quant::cuda::mmq_class_decomp(rows, cols, type) ==
-                          quant::cuda::MmqDecomp::StreamK;
-    return attr_s("decomp", stream_k ? "stream_k" : "tiled");
-#else
-    (void)rows;
-    (void)cols;
-    (void)type;
-    return attr_s("decomp", "tiled");
-#endif
-  };
-  // The fused mmq quantize's activation scale layout follows the consuming
-  // matmul's weight type: Q3_K and the legacy 32-element formats Q5_0/Q8_0 ->
-  // ggml D4 (float scales), Q4_K/Q5_K -> DS4 (half2 scales). Every format the
-  // mmq path executes therefore has a layout, so the C.4 planner passes may
-  // fold a quantize into any of them.
-  // Q6_K gets -1: no fused quantize emitter is selected for it, so it has no
-  // mmq activation layout and must not be folded into one — -1 is the "no
-  // layout" marker the C.4 passes skip on (see fuse_act_mul_mmq_pass /
-  // fuse_rms_norm_mmq_pass). Its matmul quantizes the activation inside the
-  // matmul instead.
-  // `ds` answers one question only: does this weight type have an mmq activation
-  // layout the fused emitter can produce? Q6_K does not (above). Every other
-  // format does, including the legacy 32-element ones, whose D4 norm+quantize
-  // emitter is now bandwidth-bound at any d_model (its quantize phase uses the
-  // standalone quantizer's 128-thread/one-128-block-per-warp geometry — see
-  // rms_norm_quantize_mmq_q8_1_dev). It used to be keyed out by quant type as a
-  // proxy for "slow at small dim"; that was a property of the old emitter, not
-  // of the format, so the decision belongs to the emitter, not here.
-  // Baked here (not in the planner pass) because only the emitter knows the
-  // weight type; the C.4 planner pass reads `ds` to decide fusion eligibility.
-  auto ds_a = [](quant::QuantType qt) {
-    const int64_t ds = (qt == quant::QuantType::Q4_K || qt == quant::QuantType::Q5_K) ? 1
-                       : (qt == quant::QuantType::Q6_K) ? -1 : 0;
-    return attr_i("ds", ds);
-  };
-  // Every activation is [n, width]. A symbolic segment emits the token
-  // dimension as `?` (the graph's dynamic extent) and leaves the width static:
-  // the shape function that makes this a valid graph is the verifier's
-  // shape-preserving rule plus the emitter's [n, width] layout, and the
-  // lowering binds `?` to the shape class's maximum (see boomToGraph).
-  auto shape2 = [dynamic_extent](uint64_t r, uint64_t c) {
-    return std::vector<int64_t>{
-        dynamic_extent ? mlir::ShapedType::kDynamic : int64_t(r), int64_t(c)};
-  };
-
-  const BlockProfile prof = profile_for(cfg);
-  // The attention temperature is emitted only when it is not the identity (see
-  // build_gemma4_graph).
-  auto attn_attrs = [&](uint32_t l) {
-    std::vector<sx::Attribute> a = {layer_a(l), batch_a(n), kv_src(l)};
-    const double scale = double(prof.attn_scale) * m.weights.rope_attn_scale;
-    if (scale != 1.0) a.push_back(attr_f("scale", scale));
-    return a;
-  };
-
-  const mlir::Value embd = b.node(OpKind::Embedding, {tokens}, "embd",
-                               shape2(n, d), {slot(WeightSlot::TokenEmbd), batch_a(n)});
-  const mlir::Value inp = prof.embd_scale
-                           ? b.node(OpKind::Scale, {embd}, "inp", shape2(n, d),
-                                    {attr_f("scale", std::sqrt(float(d)))})
-                           : embd;
-  // Only a model with per-layer inputs (Gemma 4) reads the per-layer embedding
-  // row; the whole gate — including this gather — is skipped otherwise.
-  mlir::Value ple_row{};
-  if (prof.per_layer_input)
-    ple_row = b.node(OpKind::Embedding, {tokens}, "ple_row", shape2(n, total_per),
-                     {slot(WeightSlot::PerLayerTokenEmbd), batch_a(n)});
-
-  const float proj_scale = 1.0f / std::sqrt(float(d));
-  const uint32_t donor_swa_layer = n_kv - 2;
-  const uint32_t donor_global_layer = n_kv - 1;
-  mlir::Value donor_swa_k{}, donor_swa_v{}, donor_global_k{}, donor_global_v{};
-  // The fp16-rounded K/V of each KV layer, kept alive past the layer loop so the
-  // deferred cache append can run after every layer (see the KvAppend nodes
-  // emitted below).
-  std::vector<mlir::Value> kv_k(n_kv), kv_v(n_kv);
-
-  mlir::Value residual = inp;
-  for (uint32_t l = 0; l < block_count; ++l) {
-    const LayerConfig& lc = cfg.layer_config(l);
-    const uint32_t n_q = lc.n_heads_q;
-    const uint32_t n_kvh = lc.n_heads_kv;
-    const uint32_t hd = lc.head_dim;
-    const uint32_t qw = n_q * hd;
-    const uint32_t kvw = n_kvh * hd;
-    const std::string suff = std::to_string(l);
-
-    // --- attention ---------------------------------------------------------
-    mlir::Value h = b.node(OpKind::RmsNorm, {residual}, "h" + suff, shape2(n, d),
-                        {layer_a(l), slot(WeightSlot::AttnNorm), batch_a(n), dim_a(d)});
-    mlir::Value q = b.node(OpKind::QuantizedMatmul, {h}, "q" + suff,
-                        shape2(n, qw), {layer_a(l), slot(WeightSlot::AttnQ), batch_a(n),
-                        dim_a(d), ds_a(m.weights.blocks[l].attn_q.type()), decomp_a(qw, d, m.weights.blocks[l].attn_q.type())});
-    if (prof.proj_bias)
-      q = b.node(OpKind::AddBias, {q}, "qb" + suff, shape2(n, qw),
-                 {layer_a(l), slot(WeightSlot::AttnQBias), batch_a(n)});
-    if (prof.qk_norm)
-      q = b.node(OpKind::RmsNormHeads, {q}, "qn" + suff, shape2(n, qw),
-                 {layer_a(l), slot(WeightSlot::AttnQNorm), batch_a(n)});
-    q = b.node(OpKind::Rope, {q, start_pos}, "qr" + suff, shape2(n, qw),
-               {layer_a(l), batch_a(n)});
-
-    mlir::Value attn;
-    if (cfg.has_kv(l)) {
-      mlir::Value k = b.node(OpKind::QuantizedMatmul, {h}, "k" + suff,
-                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnK), batch_a(n),
-                          dim_a(d), ds_a(m.weights.blocks[l].attn_k.type()), decomp_a(kvw, d, m.weights.blocks[l].attn_k.type())});
-      mlir::Value v = b.node(OpKind::QuantizedMatmul, {h}, "v" + suff,
-                          shape2(n, kvw), {layer_a(l), slot(WeightSlot::AttnV), batch_a(n),
-                          dim_a(d), ds_a(m.weights.blocks[l].attn_v.type()), decomp_a(kvw, d, m.weights.blocks[l].attn_v.type())});
-      if (prof.proj_bias) {
-        k = b.node(OpKind::AddBias, {k}, "kb" + suff, shape2(n, kvw),
-                   {layer_a(l), slot(WeightSlot::AttnKBias), batch_a(n)});
-        v = b.node(OpKind::AddBias, {v}, "vb" + suff, shape2(n, kvw),
-                   {layer_a(l), slot(WeightSlot::AttnVBias), batch_a(n)});
-      }
-      if (prof.qk_norm)
-        k = b.node(OpKind::RmsNormHeads, {k}, "kn" + suff, shape2(n, kvw),
-                   {layer_a(l), slot(WeightSlot::AttnKNorm), batch_a(n)});
-      if (prof.v_norm)
-        v = b.node(OpKind::RmsNormHeads, {v}, "vn" + suff, shape2(n, kvw),
-                   {layer_a(l), batch_a(n)});  // V norm: unit weight
-      const mlir::Value vc = b.node(OpKind::CastFp16, {v}, "vc" + suff, shape2(n, kvw),
-                                 {layer_a(l)});
-      k = b.node(OpKind::Rope, {k, start_pos}, "kr" + suff, shape2(n, kvw),
-                 {layer_a(l), batch_a(n)});
-      const mlir::Value kc = b.node(OpKind::CastFp16, {k}, "kc" + suff, shape2(n, kvw),
-                                 {layer_a(l)});
-      attn = b.node(OpKind::FlashAttention,
-                    {q, kc, vc, start_pos, kv_handles[l]}, "attn" + suff,
-                    shape2(n, qw), attn_attrs(l));
-      kv_k[l] = kc;
-      kv_v[l] = vc;
-      if (l == donor_swa_layer) {
-        donor_swa_k = kc;
-        donor_swa_v = vc;
-      } else if (l == donor_global_layer) {
-        donor_global_k = kc;
-        donor_global_v = vc;
-      }
-    } else {
-      const uint32_t donor = cfg.kv_donor_layer(l);
-      const mlir::Value dk = (donor == donor_swa_layer) ? donor_swa_k : donor_global_k;
-      const mlir::Value dv = (donor == donor_swa_layer) ? donor_swa_v : donor_global_v;
-      attn = b.node(OpKind::FlashAttention,
-                    {q, dk, dv, start_pos, kv_handles[donor]}, "attn" + suff,
-                    shape2(n, qw), attn_attrs(l));
-    }
-
-    mlir::Value ap = b.node(OpKind::QuantizedMatmul, {attn}, "ap" + suff,
-                         shape2(n, d), {layer_a(l), slot(WeightSlot::AttnOutput), batch_a(n),
-                         dim_a(qw), ds_a(m.weights.blocks[l].attn_output.type()), decomp_a(d, qw, m.weights.blocks[l].attn_output.type())});
-    if (prof.attn_out_bias)
-      ap = b.node(OpKind::AddBias, {ap}, "apb" + suff, shape2(n, d),
-                  {layer_a(l), slot(WeightSlot::AttnOutputBias), batch_a(n)});
-    mlir::Value o = prof.post_attn_norm
-                     ? b.node(OpKind::RmsNorm, {ap}, "o" + suff, shape2(n, d),
-                              {layer_a(l), slot(WeightSlot::PostAttentionNorm), batch_a(n),
-                               dim_a(d)})
-                     : ap;
-    mlir::Value x1 = b.node(OpKind::Add, {o, residual}, "x1" + suff, shape2(n, d), {layer_a(l)});
-
-    // --- gated feed-forward ------------------------------------------------
-    mlir::Value f = b.node(OpKind::RmsNorm, {x1}, "f" + suff, shape2(n, d),
-                        {layer_a(l), slot(WeightSlot::FfnNorm), batch_a(n), dim_a(d)});
-    mlir::Value up = b.node(OpKind::QuantizedMatmul, {f}, "up" + suff, shape2(n, ff),
-                         {layer_a(l), slot(WeightSlot::FfnUp), batch_a(n),
-                         dim_a(d), ds_a(m.weights.blocks[l].ffn_up.type()), decomp_a(ff, d, m.weights.blocks[l].ffn_up.type())});
-    mlir::Value gate = b.node(OpKind::QuantizedMatmul, {f}, "gate" + suff, shape2(n, ff),
-                           {layer_a(l), slot(WeightSlot::FfnGate), batch_a(n),
-                           dim_a(d), ds_a(m.weights.blocks[l].ffn_gate.type()), decomp_a(ff, d, m.weights.blocks[l].ffn_gate.type())});
-    gate = prof.silu_ffn
-               ? b.node(OpKind::Silu, {gate}, "silu" + suff, shape2(n, ff), {layer_a(l)})
-               : b.node(OpKind::GeluFp16, {gate}, "gelu" + suff, shape2(n, ff),
-                        {layer_a(l)});
-    mlir::Value fh = b.node(OpKind::Mul, {gate, up}, "fh" + suff, shape2(n, ff), {layer_a(l)});
-    mlir::Value fo = b.node(OpKind::QuantizedMatmul, {fh}, "fo" + suff, shape2(n, d),
-                         {layer_a(l), slot(WeightSlot::FfnDown), batch_a(n),
-                         dim_a(ff), ds_a(m.weights.blocks[l].ffn_down.type()), decomp_a(d, ff, m.weights.blocks[l].ffn_down.type())});
-    mlir::Value f2 = prof.post_ffw_norm
-                      ? b.node(OpKind::RmsNorm, {fo}, "f2" + suff, shape2(n, d),
-                               {layer_a(l), slot(WeightSlot::PostFfwNorm), batch_a(n),
-                                dim_a(d)})
-                      : fo;
-    mlir::Value x2 = b.node(OpKind::Add, {f2, x1}, "x2" + suff, shape2(n, d), {layer_a(l)});
-
-    // --- per-layer gate ----------------------------------------------------
-    mlir::Value x3 = x2;
-    if (prof.per_layer_input) {
-      mlir::Value proj = b.node(OpKind::MatvecBf16, {inp}, "proj" + suff, shape2(n, per),
-                             {layer_a(l), batch_a(n),
-                              attr_i("offset", int64_t(l) * per),
-                              attr_i("rows", int64_t(per))});
-      proj = b.node(OpKind::Scale, {proj}, "projs" + suff, shape2(n, per),
-                    {attr_f("scale", proj_scale)});
-      proj = b.node(OpKind::RmsNorm, {proj}, "projn" + suff, shape2(n, per),
-                    {layer_a(l), slot(WeightSlot::PerLayerProjNorm), batch_a(n), dim_a(per)});
-      // Layer combine (C.5): ple = (projn + ple_row[:, l*per:(l+1)*per] * sqrt(per))
-      // / sqrt(2), decomposed into a strided Slice of the per-layer embedding row
-      // + Scale/Add/Scale.
-      const mlir::Value ple_col = b.node(OpKind::Slice, {ple_row}, "ple_col" + suff,
-                                      shape2(n, per),
-                                      {attr_i("offset", int64_t(l) * per),
-                                       attr_i("length", int64_t(per)),
-                                       attr_i("stride", int64_t(total_per))});
-      const mlir::Value ple_scaled = b.node(OpKind::Scale, {ple_col}, "ple_scaled" + suff,
-                                         shape2(n, per),
-                                         {attr_f("scale", double(std::sqrt(float(per))))});
-      const mlir::Value ple_sum = b.node(OpKind::Add, {proj, ple_scaled}, "ple_sum" + suff,
-                                      shape2(n, per), {});
-      mlir::Value ple = b.node(OpKind::Scale, {ple_sum}, "ple" + suff, shape2(n, per),
-                            {attr_f("scale", 1.0 / std::sqrt(2.0))});
-      mlir::Value g0 = b.node(OpKind::MatvecF32, {x2}, "g0" + suff, shape2(n, per),
-                           {layer_a(l), slot(WeightSlot::InpGate), batch_a(n)});
-      g0 = b.node(OpKind::GeluFp16, {g0}, "g0g" + suff, shape2(n, per), {layer_a(l)});
-      g0 = b.node(OpKind::Mul, {g0, ple}, "g0m" + suff, shape2(n, per), {layer_a(l)});
-      mlir::Value g1 = b.node(OpKind::MatvecF32, {g0}, "g1" + suff, shape2(n, d),
-                           {layer_a(l), slot(WeightSlot::Proj), batch_a(n)});
-      mlir::Value g2 = b.node(OpKind::RmsNorm, {g1}, "g2" + suff, shape2(n, d),
-                           {layer_a(l), slot(WeightSlot::PostNorm), batch_a(n), dim_a(d)});
-      x3 = b.node(OpKind::Add, {x2, g2}, "x3" + suff, shape2(n, d), {layer_a(l)});
-    }
-
-    mlir::Value out;
-    if (prof.layer_scale && !m.weights.blocks[l].layer_output_scale.empty())
-      out = b.node(OpKind::Scale, {x3}, "out" + suff, shape2(n, d),
-                   {attr_f("scale", double(m.weights.blocks[l].layer_output_scale[0]))});
-    else
-      out = x3;
-    residual = out;
-  }
-
-  // Defer the KV-cache append to after every layer: a shared layer's attention
-  // reads its donor's *prior* cache, so the donor's own chunk must not overwrite
-  // it until all layers have consumed it. This is what lets a chunk that wraps
-  // the SWA ring (start_pos >= sliding_window) still attend over the prior
-  // window. The output is a dummy scalar — the append is a cache side effect.
-  for (uint32_t l = 0; l < n_kv; ++l) {
-    b.node(OpKind::KvAppend, {kv_k[l], kv_v[l], start_pos, kv_handles[l]},
-           "kv_append" + std::to_string(l), {}, {layer_a(l), batch_a(n)});
-  }
-
-  b.set_output(residual);
-
-  ir.module = b.finish();
-  return ir;
-}
-
 // The prefill emitter's IR, lowered with no passes, like build_gemma4_graph.
 // `symbolic` emits the token dimension as `?` and binds it to `n`, so the graph
 // is the same graph a concrete `n` produces plus the dynamic extent record a
 // smaller execution can bind (TensorDesc::dynamic_stride_bytes).
-planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
-                                          bool symbolic) {
-  GraphIr ir = emit_prefill_ir(m, n, symbolic);
+planner::Graph build_prefill_graph(const Recipe& recipe, uint64_t n,
+                                   bool dynamic_extent) {
+  GraphIr ir = emit_prefill_ir(recipe, n, dynamic_extent);
   if (!ir.module)
     return {};
-  return lower_graph(*ir.module, symbolic ? n : 0);
+  return lower_graph(*ir.module, dynamic_extent ? n : 0);
+}
+
+planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n,
+                                          bool symbolic) {
+  return build_prefill_graph(recipe_for(m), n, symbolic);
 }
 
 planner::Graph build_gemma4_prefill_graph(const Gemma4Model& m, uint64_t n) {
@@ -3771,7 +3038,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   auto rt = std::make_unique<DecodeRuntime>();
   const DecodeGraphSpec spec =
       device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
-  GraphIr ir = emit_decode_ir(m, spec);
+  GraphIr ir = emit_decode_ir(recipe_for(m), spec);
   rt->graph = lower_decode_graph(ir, spec);
   // §10: lift the post-pass decode graph into the generation program and read
   // the loop back. Done on a clone so the module that produced the plan is left
@@ -5078,7 +4345,7 @@ static std::unique_ptr<RecklessVerifyRuntime> build_reckless_verify_runtime(
     const planner::KvCacheSession& session) {
   diag::spec_diag_note_runtime_build();
   auto rt = std::make_unique<RecklessVerifyRuntime>();
-  GraphIr ir = emit_prefill_ir(m, uint64_t(rows));
+  GraphIr ir = emit_prefill_ir(recipe_for(m), uint64_t(rows));
   const bool mmq = quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&
                    uint64_t(rows) >= quant::cuda::mmq_min_n();
   rt->graph = lower_graph(
@@ -6136,7 +5403,7 @@ std::optional<planner::PlanRunRecord> record_prefill_plan(
   if (n == 0) return std::nullopt;
   if (!ensure_device_ready(m)) return std::nullopt;
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-  GraphIr ir = emit_prefill_ir(m, n);
+  GraphIr ir = emit_prefill_ir(recipe_for(m), n);
   // The same mmq fusion the prefill segments use, under the same conditions, so
   // the recorded steps are the ones a real prefill segment would run.
   planner::Graph graph = lower_graph(
@@ -6713,7 +5980,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       auto seg = std::make_unique<PrefillSegment>();
       {
         Phase _b("prefill:segment_build_graph", phase_timing);
-        GraphIr seg_ir = emit_prefill_ir(m, extent,
+        GraphIr seg_ir = emit_prefill_ir(recipe_for(m), extent,
                                          /*dynamic_extent=*/symbolic_plans);
         // C.4: fold the mmq activation quantize into the norm/gelu kernels when
         // the mmq tensor-core path is active for this segment (same conditions
@@ -7369,7 +6636,7 @@ bool score_spine_cuda_prefill_impl(const Gemma4Model& m,
     auto it = segs.find(extent);
     if (it != segs.end()) return it->second.get();
     auto seg = std::make_unique<PrefillSegment>();
-    GraphIr seg_ir = emit_prefill_ir(m, extent, symbolic_plans);
+    GraphIr seg_ir = emit_prefill_ir(recipe_for(m), extent, symbolic_plans);
     seg->graph = lower_graph(
         seg_ir, planner::IrPassPhase::Prefill,
         quant::cuda::q8_1_enabled() && quant::cuda::mmq_enabled() &&

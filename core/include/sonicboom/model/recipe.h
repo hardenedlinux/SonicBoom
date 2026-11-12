@@ -147,4 +147,15 @@ struct Recipe {
 // widths of its config and the quantization of its weights.
 Recipe recipe_for(const Gemma4Model& m);
 
+// The graphs of a recipe. These are what the model entry points
+// (build_decode_graph, build_gemma4_prefill_graph in model/plan.h) build for
+// `recipe_for(m)`; a recipe written by hand goes through the same emitter, the
+// same consumer resolution and the same passes.
+planner::Graph build_decode_graph(const Recipe& recipe,
+                                  const DecodeGraphSpec& spec);
+// One prefill segment of `n` positions, lowered with no passes; over a dynamic
+// extent bound to `n` when `dynamic_extent`.
+planner::Graph build_prefill_graph(const Recipe& recipe, uint64_t n,
+                                   bool dynamic_extent = false);
+
 } // namespace sonicboom::model
