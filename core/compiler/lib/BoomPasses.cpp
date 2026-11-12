@@ -29,6 +29,8 @@
 // the switch between the two paths were removed once the port was complete; this
 // pipeline is now the only rewrite path.
 
+#include "BoomUnit.h"
+
 #include <sonicboom/compiler/BoomOps.h>
 #include <sonicboom/compiler/BoomPasses.h>
 #include <sonicboom/compiler/BoomDemand.h>
@@ -72,17 +74,21 @@ namespace {
 // pass adds at the end and never sorts. Both the table and the value relation
 // are edited only here, so a pass cannot restate the encoding and get it
 // subtly wrong — the rules are stated once, in BoomConversion.cpp.
+//
+// A pass edits a unit (BoomUnit.h): a standalone boom.graph or the boom.step a
+// lifted program carries. The two differ only in how the output set is spelled
+// and in what declares the inputs, which is what unit::Unit absorbs.
 class GraphEditor {
 public:
-  explicit GraphEditor(boom::GraphOp graph) : graph_(graph), ctx_(graph.getContext()) {
-    for (mlir::Attribute entry : graph.getTensors()) {
+  explicit GraphEditor(unit::Unit u) : unit_(u), ctx_(u.context()) {
+    for (mlir::Attribute entry : unit_.tensors()) {
       auto desc = mlir::cast<boom::TensorDescAttr>(entry);
       ids_.push_back(desc.getId());
       descs_.insert({desc.getId(), desc});
       maxTensorId_ = std::max(maxTensorId_, desc.getId());
     }
 
-    mlir::Block &body = graph_.getBody().front();
+    mlir::Block &body = unit_.body();
     llvm::DenseSet<int64_t> produced;
     for (mlir::Operation &node : body) {
       maxNodeId_ = std::max(maxNodeId_, nodeId(node));
@@ -105,11 +111,16 @@ public:
       note(id, body.getArgument(index));
   }
 
-  boom::GraphOp graph() const { return graph_; }
+  // The second constructor keeps the graph-only callers (resolveConsumer and
+  // finishConsumer, and their helpers) spelled as they were.
+  explicit GraphEditor(boom::GraphOp g)
+      : GraphEditor(unit::Unit::from(g.getOperation())) {}
+
+  unit::Unit unit() const { return unit_; }
   mlir::MLIRContext *ctx() const { return ctx_; }
   // Not const: the generated region accessors are not (a region is editable
   // through its op), and a pass's whole job is to edit this one.
-  mlir::Block &body() { return graph_.getBody().front(); }
+  mlir::Block &body() { return unit_.body(); }
 
   // The SSA value of tensor `id`, and the id of a value.
   mlir::Value value(int64_t id) const { return valueOf_.lookup(id); }
@@ -197,7 +208,7 @@ public:
     table.reserve(ids_.size());
     for (int64_t id : ids_)
       table.push_back(descs_.lookup(id));
-    graph_.setTensorsAttr(mlir::ArrayAttr::get(ctx_, table));
+    unit_.setTensors(mlir::ArrayAttr::get(ctx_, table));
   }
 
   // The generated attribute accessors are not const, so neither are these.
@@ -219,7 +230,7 @@ private:
     idOfValue_[v] = id;
   }
 
-  boom::GraphOp graph_;
+  unit::Unit unit_;
   mlir::MLIRContext *ctx_;
   llvm::SmallVector<int64_t> ids_;                       // table order
   llvm::DenseMap<int64_t, boom::TensorDescAttr> descs_;  // by id
@@ -3480,7 +3491,7 @@ struct GraphOutput {
 };
 
 std::optional<GraphOutput> singleOutput(GraphEditor &view) {
-  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  const llvm::ArrayRef<int64_t> outputs = view.unit().outputs();
   if (outputs.size() != 1)
     return std::nullopt;
   GraphOutput out;
@@ -3498,7 +3509,7 @@ void moveOutput(GraphEditor &view, int64_t from, int64_t to) {
     view.setTensorOutput(from, false);
   view.setTensorOutput(to, true);
   mlir::Builder builder(view.ctx());
-  view.graph().setOutputsAttr(
+  view.unit().setOutputs(
       builder.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{to}));
 }
 
@@ -3508,7 +3519,7 @@ void bypassNode(GraphEditor &view, mlir::Operation *node) {
   mlir::Value result = node->getResult(0);
   const int64_t resultId = view.idOf(result);
   const int64_t operandId = view.idOf(operand);
-  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  const llvm::ArrayRef<int64_t> outputs = view.unit().outputs();
   const bool wasOutput = llvm::is_contained(outputs, resultId);
   result.replaceAllUsesWith(operand);
   node->erase();
@@ -3548,7 +3559,7 @@ unsigned pruneByDemand(GraphEditor &view, const DemandFacts &facts) {
   nodes.clear();
   for (mlir::Operation &node : view.body())
     nodes.push_back(&node);
-  const llvm::ArrayRef<int64_t> outputs = view.graph().getOutputs();
+  const llvm::ArrayRef<int64_t> outputs = view.unit().outputs();
   for (mlir::Operation *node : llvm::reverse(nodes)) {
     if (!mlir::isMemoryEffectFree(node) || !node->use_empty())
       continue;
