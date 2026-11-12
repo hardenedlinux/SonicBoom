@@ -386,6 +386,18 @@ constexpr uint64_t mmqActivationBaseBytes() {
   return kMmqTailGuardBlocks * kMmqBlockBytes;
 }
 
+// The passes' shared base: one that can run on either unit op. A unit is a
+// standalone boom.graph or the boom.step a lifted program carries (BoomUnit.h);
+// the two hold the same node list and tensor table, so the same pass applies to
+// both and is scheduled on whichever the module holds.
+template <class P>
+struct UnitPass : mlir::PassWrapper<P, mlir::OperationPass<>> {
+  bool canScheduleOn(mlir::RegisteredOperationName name) const override {
+    return name.getStringRef() == "boom.graph" ||
+           name.getStringRef() == "boom.step";
+  }
+};
+
 //--- the passes -------------------------------------------------------------
 
 // quantize_once_pass (rewrites.cpp:79), as a Boom IR pass.
@@ -395,15 +407,15 @@ constexpr uint64_t mmqActivationBaseBytes() {
 // q8_1-consuming QuantizedMatmulQ8, and every later matmul over the same
 // activation shares the one Quantize node.
 class QuantizeOncePass
-    : public mlir::PassWrapper<QuantizeOncePass, mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<QuantizeOncePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(QuantizeOncePass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     // The activations already quantized, by tensor id: two Quantize nodes are
     // identical iff their input tensor is — the quantization is a pure function
@@ -504,16 +516,15 @@ public:
 // identity (its id, its attributes, its operands, its backend) and takes the
 // Quantize's output, so the matmuls that read the q8_1 activation read on.
 class RmsNormQuantizePass
-    : public mlir::PassWrapper<RmsNormQuantizePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<RmsNormQuantizePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RmsNormQuantizePass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     // The producer of each tensor, and how many operands read it: the two
     // relations the match is stated in (rewrites.cpp:146-157). Every tensor in
@@ -599,11 +610,11 @@ public:
 // first operand is a single-reader activation node, the activation node becomes
 // one fused act_mul_quantize(gate, up) taking over the Quantize's output; the
 // activation's output and the act×up product stop being tensors of the graph.
-void fuseActMulQuantize(boom::GraphOp graph, planner::OpKind act,
+void fuseActMulQuantize(unit::Unit unit, planner::OpKind act,
                         planner::OpKind fused) {
-  GraphEditor view(graph);
+  GraphEditor view(unit);
   mlir::OpBuilder builder(view.ctx());
-  const mlir::Location loc = graph.getLoc();
+  const mlir::Location loc = unit.loc();
 
   llvm::DenseMap<int64_t, mlir::Operation *> producer;
   llvm::DenseMap<int64_t, unsigned> consumers;
@@ -693,13 +704,13 @@ void fuseActMulQuantize(boom::GraphOp graph, planner::OpKind act,
 
 // fuse_gelu_mul_quantize_pass (rewrites.cpp:315), as a Boom IR pass.
 class GeluMulQuantizePass
-    : public mlir::PassWrapper<GeluMulQuantizePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<GeluMulQuantizePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GeluMulQuantizePass)
 
   void runOnOperation() override {
-    fuseActMulQuantize(getOperation(), planner::OpKind::GeluFp16,
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    fuseActMulQuantize(unit, planner::OpKind::GeluFp16,
                        planner::OpKind::GeluMulQuantize);
   }
 };
@@ -707,13 +718,13 @@ public:
 // fuse_silu_mul_quantize_pass (rewrites.cpp:319), as a Boom IR pass: the same
 // rewrite over the SwiGLU activation.
 class SiluMulQuantizePass
-    : public mlir::PassWrapper<SiluMulQuantizePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<SiluMulQuantizePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SiluMulQuantizePass)
 
   void runOnOperation() override {
-    fuseActMulQuantize(getOperation(), planner::OpKind::Silu,
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    fuseActMulQuantize(unit, planner::OpKind::Silu,
                        planner::OpKind::SiluMulQuantize);
   }
 };
@@ -728,16 +739,15 @@ public:
 // either node means the batched (prefill) shape, and the mmq path has no
 // epilogue for it.
 class BiasIntoGemvPass
-    : public mlir::PassWrapper<BiasIntoGemvPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<BiasIntoGemvPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BiasIntoGemvPass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     // A projection whose output feeds anything besides the AddBias cannot take
     // the bias over: that reader would read the fused node's output instead
@@ -840,16 +850,15 @@ public:
 // it one node earlier, at the projection), so liveness only shortens. Either
 // operand may be the projection. Decode form only, as above.
 class ResidualAddIntoGemvPass
-    : public mlir::PassWrapper<ResidualAddIntoGemvPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<ResidualAddIntoGemvPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ResidualAddIntoGemvPass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::DenseMap<int64_t, mlir::Operation *> producer;
     llvm::DenseMap<int64_t, unsigned> consumers;
@@ -966,16 +975,15 @@ public:
 // Batched (prefill) nodes are left alone: prefill has the generated
 // rms_norm_add region instead.
 class FuseResidualEpiloguePass
-    : public mlir::PassWrapper<FuseResidualEpiloguePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseResidualEpiloguePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseResidualEpiloguePass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::DenseMap<int64_t, mlir::Operation *> producer;
     llvm::DenseMap<int64_t, unsigned> consumers;
@@ -1109,16 +1117,15 @@ public:
 // `s2_add_input`, so the group applies it with that member's output. The merged
 // node's results are in member order, as for the gemv form.
 class FuseSiblingGemvPass
-    : public mlir::PassWrapper<FuseSiblingGemvPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseSiblingGemvPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSiblingGemvPass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     // Projections grouped by the activation tensor they read (operand 0 — the
     // only operand of a decode gemv), in body order.
@@ -1298,8 +1305,7 @@ public:
 // run, so the ablation arm plans exactly the hand-written kernel's graph.
 // SONICBOOM_IR_PASS_DISABLE=FuseGlueRegionsPass does the same from the pass side.
 class FuseGlueRegionsPass
-    : public mlir::PassWrapper<FuseGlueRegionsPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseGlueRegionsPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseGlueRegionsPass)
 
@@ -1307,10 +1313,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::SmallVector<mlir::Operation *> regions;
     for (mlir::Operation &node : view.body()) {
@@ -1371,8 +1377,7 @@ public:
 // The region is still a glue region in the codegen sense, so it is gated by the
 // same `glue_codegen` feature and has its own entry in the pass-disable list.
 class FuseAddRmsNormMmqPass
-    : public mlir::PassWrapper<FuseAddRmsNormMmqPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseAddRmsNormMmqPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseAddRmsNormMmqPass)
 
@@ -1380,10 +1385,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::DenseMap<int64_t, mlir::Operation *> producer;
     for (mlir::Operation &node : view.body())
@@ -1484,8 +1489,7 @@ public:
 // Gated by the `glue_codegen` feature like the other regions, with its own
 // entry in the pass-disable list.
 class FuseRmsNormAddPass
-    : public mlir::PassWrapper<FuseRmsNormAddPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseRmsNormAddPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseRmsNormAddPass)
 
@@ -1493,10 +1497,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     struct Match {
       mlir::Operation *norm;
@@ -1588,8 +1592,7 @@ public:
 // arithmetic with scale_kernel's multiply folded in, so the output is
 // byte-identical to the pair.
 class FuseSliceScalePass
-    : public mlir::PassWrapper<FuseSliceScalePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseSliceScalePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSliceScalePass)
 
@@ -1597,10 +1600,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     const std::string sliceName = boomOpName(planner::OpKind::Slice);
     const std::string scaleName = boomOpName(planner::OpKind::Scale);
@@ -1679,11 +1682,11 @@ public:
 // that feed a quantized matmul; what remains here feeds a dense projection.
 namespace {
 
-void fuseActivationMul(boom::GraphOp graph, planner::OpKind actKind,
+void fuseActivationMul(unit::Unit unit, planner::OpKind actKind,
                        llvm::StringRef region) {
-  GraphEditor view(graph);
+  GraphEditor view(unit);
   mlir::OpBuilder builder(view.ctx());
-  const mlir::Location loc = graph.getLoc();
+  const mlir::Location loc = unit.loc();
 
   const std::string actName = boomOpName(actKind);
   const std::string mulName = boomOpName(planner::OpKind::Mul);
@@ -1742,15 +1745,15 @@ void fuseActivationMul(boom::GraphOp graph, planner::OpKind actKind,
 
 // FuseGeluMulPass — the GELU form (Gemma's FFN and PLE gate).
 class FuseGeluMulPass
-    : public mlir::PassWrapper<FuseGeluMulPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseGeluMulPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseGeluMulPass)
 
   void runOnOperation() override {
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
-    fuseActivationMul(getOperation(), planner::OpKind::GeluFp16, "gelu_mul");
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    fuseActivationMul(unit, planner::OpKind::GeluFp16, "gelu_mul");
   }
 };
 
@@ -1762,15 +1765,15 @@ public:
 // down projection has no mmq activation layout (Q6_K): SiluMulMmqPass has
 // already folded every chain that feeds an mmq matmul.
 class FuseSiluMulPass
-    : public mlir::PassWrapper<FuseSiluMulPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseSiluMulPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseSiluMulPass)
 
   void runOnOperation() override {
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
-    fuseActivationMul(getOperation(), planner::OpKind::Silu, "silu_mul");
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    fuseActivationMul(unit, planner::OpKind::Silu, "silu_mul");
   }
 };
 
@@ -1797,8 +1800,7 @@ public:
 // quantizer or a matmul; the attention-prep norms feed rope/cast, which none of
 // them match, so the ordering is by construction and not by luck.
 class FuseHeadsNormRopeCastPass
-    : public mlir::PassWrapper<FuseHeadsNormRopeCastPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseHeadsNormRopeCastPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseHeadsNormRopeCastPass)
 
@@ -1806,10 +1808,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     struct Match {
       mlir::Operation *norm;
@@ -1935,8 +1937,7 @@ public:
 // Decode only: the prefill graph appends a whole segment with
 // kv_append_batched, and has no OpKind::Attention node to match.
 class FuseKvAppendIntoPrepPass
-    : public mlir::PassWrapper<FuseKvAppendIntoPrepPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FuseKvAppendIntoPrepPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseKvAppendIntoPrepPass)
 
@@ -1944,8 +1945,8 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    mlir::OpBuilder builder(graph.getContext());
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    mlir::OpBuilder builder(unit.context());
     const std::string attnName = boomOpName(planner::OpKind::Attention);
 
     // The region `op` is a heads_norm_rope_cast chain with `rope` and a cast:
@@ -1965,12 +1966,12 @@ public:
                             int32_t value) {
       auto attrs = op->getAttrOfType<mlir::ArrayAttr>("node_attrs");
       llvm::SmallVector<mlir::Attribute> entries(attrs.getValue());
-      entries.push_back(boom::NodeAttr::get(graph.getContext(), name,
+      entries.push_back(boom::NodeAttr::get(unit.context(), name,
                                             builder.getI32IntegerAttr(value)));
       op->setAttr("node_attrs", builder.getArrayAttr(entries));
     };
 
-    for (mlir::Operation &node : graph.getBody().front()) {
+    for (mlir::Operation &node : unit.body()) {
       if (node.getName().getStringRef() != attnName) continue;
       // {q, kc, vc, pos, handle}: only a KV layer has K/V to append. A shared
       // layer reads its donor's cache and has nothing to write.
@@ -2029,18 +2030,17 @@ public:
 // allocation, so a mark can make a backend refuse an optimization but cannot
 // make it compute a wrong value.
 class BufferReusePass
-    : public mlir::PassWrapper<BufferReusePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<BufferReusePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(BufferReusePass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
 
     llvm::DenseSet<int64_t> outputs;
-    for (int64_t id : graph.getOutputs()) outputs.insert(id);
+    for (int64_t id : unit.outputs()) outputs.insert(id);
 
     // Liveness over the flat node list: the last node position that reads a
     // tensor (a graph output is live through the whole graph), and the position
@@ -2054,7 +2054,7 @@ public:
       for (int64_t id : GraphEditor::resultIds(node)) producedAt[id] = pos;
       ++pos;
     }
-    for (int64_t id : graph.getOutputs()) lastUse[id] = INT64_MAX;
+    for (int64_t id : unit.outputs()) lastUse[id] = INT64_MAX;
 
     struct BufferClass {
       uint64_t bytes = 0;
@@ -2166,7 +2166,7 @@ public:
 // system these become type properties and the predicate goes away (see the
 // weight-format design note, docs/weight-quant-format.md).
 class RmsNormMmqPass
-    : public mlir::PassWrapper<RmsNormMmqPass, mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<RmsNormMmqPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(RmsNormMmqPass)
 
@@ -2180,10 +2180,10 @@ public:
   explicit RmsNormMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     // The consumers of each tensor, as ops (rewrites.cpp:324-328).
     llvm::DenseMap<int64_t, llvm::SmallVector<mlir::Operation *>> consumers;
@@ -2392,11 +2392,11 @@ private:
 // rather than something to work around: the shared body has no pass to signal
 // through, so the wrapper does (an empty shape should not be reachable — it
 // would mean the graph cannot be represented as Boom IR at all).
-bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
+bool fuseActMulMmq(unit::Unit unit, planner::OpKind act,
                    planner::OpKind fused, bool allow_grow = false) {
-  GraphEditor view(graph);
+  GraphEditor view(unit);
   mlir::OpBuilder builder(view.ctx());
-  const mlir::Location loc = graph.getLoc();
+  const mlir::Location loc = unit.loc();
 
   const std::string actNode = boomOpName(act);
   const llvm::StringRef fusedName = planner::op_kind_name(fused);
@@ -2553,7 +2553,7 @@ bool fuseActMulMmq(boom::GraphOp graph, planner::OpKind act,
 
 // fuse_gelu_mul_mmq_pass (rewrites.cpp:531), as a Boom IR pass.
 class GeluMulMmqPass
-    : public mlir::PassWrapper<GeluMulMmqPass, mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<GeluMulMmqPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(GeluMulMmqPass)
 
@@ -2562,7 +2562,8 @@ public:
   explicit GeluMulMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
 
   void runOnOperation() override {
-    if (!fuseActMulMmq(getOperation(), planner::OpKind::GeluFp16,
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    if (!fuseActMulMmq(unit, planner::OpKind::GeluFp16,
                        planner::OpKind::GeluMulQuantize, allow_grow_))
       signalPassFailure();
   }
@@ -2574,14 +2575,15 @@ private:
 // fuse_silu_mul_mmq_pass (rewrites.cpp:535), as a Boom IR pass: the same
 // rewrite over the SwiGLU activation.
 class SiluMulMmqPass
-    : public mlir::PassWrapper<SiluMulMmqPass, mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<SiluMulMmqPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SiluMulMmqPass)
 
   explicit SiluMulMmqPass(bool allow_grow = false) : allow_grow_(allow_grow) {}
 
   void runOnOperation() override {
-    if (!fuseActMulMmq(getOperation(), planner::OpKind::Silu,
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    if (!fuseActMulMmq(unit, planner::OpKind::Silu,
                        planner::OpKind::SiluMulQuantize, allow_grow_))
       signalPassFailure();
   }
@@ -2608,16 +2610,15 @@ private:
 // GEMM off) has exactly the semantics it had before. Prefill only: the batched
 // form, as dense_layout_propagation is.
 class ScaleIntoDensePass
-    : public mlir::PassWrapper<ScaleIntoDensePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<ScaleIntoDensePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ScaleIntoDensePass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::DenseMap<int64_t, mlir::Operation *> producer;
     llvm::DenseMap<int64_t, unsigned> consumers;
@@ -2736,8 +2737,7 @@ public:
 // (GlueCodegen disabled) this pass does not run, so the ablation arm plans the
 // separate scale kernel it always had.
 class FoldScaleIntoGluePass
-    : public mlir::PassWrapper<FoldScaleIntoGluePass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<FoldScaleIntoGluePass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FoldScaleIntoGluePass)
 
@@ -2745,10 +2745,10 @@ public:
     if (runtime::feature_disabled(runtime::Feature::GlueCodegen))
       return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::DenseMap<int64_t, mlir::Operation *> producer;
     llvm::DenseMap<int64_t, unsigned> consumers;
@@ -2844,16 +2844,15 @@ public:
 // keeps its fixed 128-position block width, so per-position numerics stay
 // independent of batch size and offset (prefix-cache reuse).
 class DenseLayoutPropagationPass
-    : public mlir::PassWrapper<DenseLayoutPropagationPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<DenseLayoutPropagationPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DenseLayoutPropagationPass)
 
   void runOnOperation() override {
-    boom::GraphOp graph = getOperation();
-    mlir::OpBuilder builder(graph.getContext());
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    mlir::OpBuilder builder(unit.context());
 
-    for (mlir::Operation &node : graph.getBody().front()) {
+    for (mlir::Operation &node : unit.body()) {
       const llvm::StringRef name = node.getName().getStringRef();
       if (name != boomOpName(planner::OpKind::MatvecF32) &&
           name != boomOpName(planner::OpKind::MatvecBf16))
@@ -2869,7 +2868,7 @@ public:
       if (already) continue;
       llvm::SmallVector<mlir::Attribute> entries(attrs.getValue());
       entries.push_back(boom::NodeAttr::get(
-          graph.getContext(), "dense_layout", builder.getStringAttr("strided")));
+          unit.context(), "dense_layout", builder.getStringAttr("strided")));
       node.setAttr("node_attrs", builder.getArrayAttr(entries));
     }
   }
@@ -2906,8 +2905,7 @@ public:
 // The path exists for the fused prologue/epilogue seam the generated kernel
 // gives us, not for standalone matmul speed.
 class PrefillDispatchPass
-    : public mlir::PassWrapper<PrefillDispatchPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<PrefillDispatchPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PrefillDispatchPass)
 
@@ -2915,10 +2913,10 @@ public:
     const MmqTcMode mode = mmq_tc_mode();
     if (mode == MmqTcMode::Off) return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
     mlir::OpBuilder builder(view.ctx());
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
 
     llvm::SmallVector<mlir::Operation *> eligible;
     uint64_t copy_bytes = 0;
@@ -3014,16 +3012,15 @@ public:
 // alone. Idempotence: markers already present are skipped, so running the
 // phase twice would not stack two prefetch schedules.
 class AsyncPrefetchPass
-    : public mlir::PassWrapper<AsyncPrefetchPass,
-                               mlir::OperationPass<boom::GraphOp>> {
+    : public UnitPass<AsyncPrefetchPass> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AsyncPrefetchPass)
 
   void runOnOperation() override {
     if (async_prefetch_mode() == AsyncPrefetchMode::Off) return;
 
-    boom::GraphOp graph = getOperation();
-    GraphEditor view(graph);
+    const unit::Unit unit = unit::Unit::from(getOperation());
+    GraphEditor view(unit);
 
     // The resident model-bound weight footprint.
     uint64_t footprint = 0;
@@ -3072,7 +3069,7 @@ public:
       }
     }
 
-    const mlir::Location loc = graph.getLoc();
+    const mlir::Location loc = unit.loc();
     mlir::OpBuilder builder(view.ctx());
     auto insertMarker = [&](llvm::StringRef opName, int64_t layer,
                             uint64_t bytes,
