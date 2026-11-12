@@ -366,7 +366,8 @@ BoomBuilder::BoomBuilder(mlir::MLIRContext *context, llvm::StringRef graph_name,
       builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
       builder_.getDenseI64ArrayAttr(llvm::ArrayRef<int64_t>{}),
       builder_.getI64IntegerAttr(int64_t(extent_)),
-      /*consumer=*/mlir::StringAttr(), /*consumer_list=*/mlir::IntegerAttr());
+      /*consumer=*/mlir::StringAttr(), /*consumer_list=*/mlir::IntegerAttr(),
+      /*stages=*/mlir::DenseI64ArrayAttr());
   body_ = builder_.createBlock(&graph_op_.getBody());
 }
 
@@ -666,7 +667,8 @@ static mlir::LogicalResult buildGenerationProgram(
           auto step = boom::StepOp::create(
               b, l, mlir::TypeRange{outType}, stepOperands,
               graph.getTensorsAttr(), graph.getInputsAttr(),
-              graph.getOutputsAttr(), graph.getDynamicExtentAttr());
+              graph.getOutputsAttr(), graph.getDynamicExtentAttr(),
+              graph.getStagesAttr());
           // The decode graph's body becomes the step's: the same block
           // arguments, now bound to the loop's SSA values.
           step.getBody().takeBody(graph.getBody());
@@ -728,7 +730,8 @@ static mlir::LogicalResult buildGenerationProgram(
           auto step = boom::StepOp::create(
               b, l, mlir::TypeRange{outType}, stepOperands,
               graph.getTensorsAttr(), graph.getInputsAttr(),
-              graph.getOutputsAttr(), graph.getDynamicExtentAttr());
+              graph.getOutputsAttr(), graph.getDynamicExtentAttr(),
+              graph.getStagesAttr());
           step.getBody().takeBody(graph.getBody());
 
           // Verify: the last token and the drafts, at the base position, over

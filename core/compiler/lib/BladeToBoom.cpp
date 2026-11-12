@@ -230,7 +230,8 @@ mlir::OwningOpRef<mlir::ModuleOp> bladeToBoom(const sx::Document &doc,
       builder, loc, builder.getStringAttr(sg.name), builder.getArrayAttr(table),
       builder.getDenseI64ArrayAttr(input_ids),
       builder.getDenseI64ArrayAttr(output_ids), builder.getI64IntegerAttr(0),
-      /*consumer=*/mlir::StringAttr(), /*consumer_list=*/mlir::IntegerAttr());
+      /*consumer=*/mlir::StringAttr(), /*consumer_list=*/mlir::IntegerAttr(),
+      /*stages=*/mlir::DenseI64ArrayAttr());
 
   mlir::Block *body = builder.createBlock(&graphOp.getBody());
 

@@ -160,6 +160,21 @@ mlir::Type valueType(mlir::MLIRContext *context, mlir::Location loc,
       mlir::detail::getDefaultDiagnosticEmitFn(loc), context, shape, dtypeName);
 }
 
+// A graph's recorded stages as the op attribute: (tensor id, source bits)
+// pairs in the graph's own (ascending) order; null when it records none.
+mlir::DenseI64ArrayAttr stagesAttr(mlir::OpBuilder &builder,
+                                   const Graph &graph) {
+  if (graph.facts.stages.empty())
+    return {};
+  llvm::SmallVector<int64_t> flat;
+  flat.reserve(graph.facts.stages.size() * 2);
+  for (const planner::TensorSources &entry : graph.facts.stages) {
+    flat.push_back(int64_t(entry.tensor.value));
+    flat.push_back(int64_t(entry.sources.bits));
+  }
+  return builder.getDenseI64ArrayAttr(flat);
+}
+
 // Every id a graph lists, as the plain int64s the array attributes carry.
 llvm::SmallVector<int64_t> flatten(llvm::ArrayRef<TensorId> ids) {
   llvm::SmallVector<int64_t> out;
@@ -221,7 +236,7 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
       builder.getDenseI64ArrayAttr(flatten(graph.inputs)),
       builder.getDenseI64ArrayAttr(flatten(graph.outputs)),
       builder.getI64IntegerAttr(build_extent), /*consumer=*/mlir::StringAttr(),
-      /*consumer_list=*/mlir::IntegerAttr());
+      /*consumer_list=*/mlir::IntegerAttr(), stagesAttr(builder, graph));
 
   mlir::Block *body = builder.createBlock(&graphOp.getBody());
 
@@ -600,6 +615,17 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
 
     for (auto [index, id] : llvm::enumerate(resultIds.asArrayRef()))
       idOfValue[node.getResult(index)] = id;
+  }
+
+  // The recorded facts, for the tensors the graph has (the verifier keeps the
+  // entries ascending and unique).
+  if (auto stages = graphOp.getStages()) {
+    const llvm::ArrayRef<int64_t> flat = *stages;
+    for (size_t i = 0; i + 1 < flat.size(); i += 2)
+      if (graph.find_tensor(tensorId(flat[i])))
+        graph.facts.stages.push_back(
+            {tensorId(flat[i]),
+             planner::Sources{uint8_t(flat[i + 1] & planner::Sources::kAll)}});
   }
 
   return graph;

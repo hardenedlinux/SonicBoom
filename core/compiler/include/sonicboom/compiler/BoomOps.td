@@ -111,7 +111,14 @@ def Boom_GraphOp : Op<Boom_Dialect, "graph",
     OptionalAttr<StrAttr>:$consumer,
     // The consumer reads only a runtime list of at most this many indices
     // along the output's innermost dimension (a grammar's allowed set).
-    OptionalAttr<I64Attr>:$consumer_list);
+    OptionalAttr<I64Attr>:$consumer_list,
+
+    // What each tensor depends on, as recorded by the stage analysis
+    // (BoomStage.h recordStages): (tensor id, source bits) pairs, ascending
+    // id. A fact about a tensor's meaning, so a pass that keeps the tensor
+    // keeps the entry true; an id the table no longer has is ignored. Absent
+    // on a graph nothing has been recorded for.
+    OptionalAttr<DenseI64ArrayAttr>:$stages);
 
   let regions = (region SizedRegion<1>:$body);
 
@@ -171,7 +178,10 @@ def Boom_StepOp : Op<Boom_Dialect, "step", [SingleBlock, NoTerminator]> {
     ArrayAttr:$tensors,
     DenseI64ArrayAttr:$input_ids,
     DenseI64ArrayAttr:$output_ids,
-    I64Attr:$dynamic_extent);
+    I64Attr:$dynamic_extent,
+    // The lifted graph's recorded stages (GraphOp::stages), carried with its
+    // tensor table.
+    OptionalAttr<DenseI64ArrayAttr>:$stages);
 
   let results = (outs Variadic<Boom_ValueType>:$results);
 

@@ -236,7 +236,36 @@ std::string describeAttrs(llvm::ArrayRef<NamedAttribute> attrs) {
 
 //--- boom.graph --------------------------------------------------------------
 
+// The recorded stages: (tensor id, source bits) pairs, the ids ascending and
+// so unique, the bits within the four sources. An id the table does not have
+// is allowed — a pass may have removed the tensor — and is ignored by readers.
+static mlir::LogicalResult
+verifyStages(mlir::Operation *op, std::optional<llvm::ArrayRef<int64_t>> stages) {
+  if (!stages)
+    return mlir::success();
+  if (stages->size() % 2 != 0)
+    return op->emitOpError() << "stages must hold (tensor id, source bits) "
+                                "pairs, but has an odd number of entries";
+  int64_t previous = -1;
+  for (size_t i = 0; i < stages->size(); i += 2) {
+    const int64_t id = (*stages)[i];
+    const int64_t bits = (*stages)[i + 1];
+    if (id <= previous)
+      return op->emitOpError()
+             << "stages must list each tensor id once, ascending, but id " << id
+             << " follows " << previous;
+    if (bits < 0 || bits > 0x0f)
+      return op->emitOpError() << "stages entry for tensor id " << id
+                               << " has source bits " << bits
+                               << " outside the four sources";
+    previous = id;
+  }
+  return mlir::success();
+}
+
 mlir::LogicalResult GraphOp::verify() {
+  if (mlir::failed(verifyStages(getOperation(), getStages())))
+    return mlir::failure();
   const llvm::StringRef graphName = getGraphName();
 
   // 0. The declared consumer, if the graph still has one: a known kind, over
@@ -732,6 +761,8 @@ bool isArithOp(Operation &op) {
 // variables. The node-level attribute and quant rules are the graph verifier's;
 // a step is checked here for the table/SSA structure the execution needs.
 mlir::LogicalResult StepOp::verify() {
+  if (mlir::failed(verifyStages(getOperation(), getStages())))
+    return mlir::failure();
   // 1. The tensor table: unique ids, every entry a #boom.tensor_desc.
   TensorTable table;
   for (Attribute entry : getTensors()) {
