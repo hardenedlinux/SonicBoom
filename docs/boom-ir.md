@@ -211,6 +211,44 @@ operands are demanded whole. A trait is a statement about the operator's
 semantics; declaring one on an op whose kernel does not have the property
 makes a rewrite unsound.
 
+### Stages
+
+`analyzeStage(op)` (`BoomStage.h`) computes, for every SSA value under a
+module, a graph or a program, the inputs of a generation the value depends on:
+
+| source | enters at |
+|---|---|
+| `prompt` | a program's arguments other than the cache handles |
+| `counter` | a loop-carried value that an iteration replaces |
+| `token` | the result of `boom.sample`, `boom.draft`, `boom.accept` |
+| `cache` | a cache handle |
+
+It is a sparse forward analysis on the same framework as the demand analysis,
+solved with the same reachability. A result depends on what the operands
+depend on; an op not declared free of memory effects depends on every source;
+`boom.step` is transparent. A standalone graph has no loop to read from, so
+its arguments are taken by name: `token_id` is `{token}`, `pos` is
+`{prompt, counter}`, a cache handle `{cache}`, anything else every source.
+
+The set orders into a stage, the earliest moment the value can be computed:
+
+| stage | sources | computable |
+|---|---|---|
+| `model` | none | at load |
+| `request` | `prompt` | once per generation |
+| `schedule` | + `counter` | for every iteration, ahead of time |
+| `token` | + `token` | once the iteration's token is chosen |
+| `state` | + `cache` | in the iteration, in order |
+
+`recordStages(op)` writes the result on each unit as `stages`: `(tensor id,
+source bits)` pairs in ascending id order, with `prompt`, `counter`, `token`
+and `cache` as bits 0 to 3. A stage is a fact about what a tensor means, so it
+stays true through any pass that keeps the tensor; recording again keeps, for
+each tensor, the sources both recordings name. The lift into a program carries
+the attribute to the step, and the lowering carries it into
+`planner::Graph::facts` (`planner/facts.h`), where a tensor with no entry reads
+as every source. The facts take no part in the model fingerprint or the plan.
+
 ### Effects
 
 The KV cache is a memory-effect resource, not a side channel: `boom.attention`
@@ -307,4 +345,7 @@ The verifier (`BoomVerify.cpp`) rejects, with the offending node named:
 - a KV handle anywhere but the last operand of the three cache-touching ops, or
   whose layer disagrees with the op's `layer`/`kv_source_layer`;
 - an unknown op kind, an unsupported dtype, or a quantized shape whose
-  block-contiguous dimension is not a multiple of the block size.
+  block-contiguous dimension is not a multiple of the block size;
+- a `stages` record that is not `(tensor id, source bits)` pairs with the ids
+  ascending and the bits within the four sources (an id the table does not
+  have is allowed, and ignored).

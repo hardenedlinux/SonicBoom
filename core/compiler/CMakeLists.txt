@@ -85,6 +85,7 @@ add_library(sonicboom_compiler STATIC
   lib/BoomConversion.cpp
   lib/BoomAnalysis.cpp
   lib/BoomDemand.cpp
+  lib/BoomStage.cpp
   lib/BladeToBoom.cpp
   lib/BoomPasses.cpp
   lib/GlueCodegen.cpp
