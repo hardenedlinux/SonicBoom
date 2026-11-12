@@ -71,6 +71,15 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const planner::Graph &graph,
 std::optional<planner::Graph> boomToGraph(mlir::ModuleOp module,
                                           uint64_t dynamic_extent = 0);
 
+// The same lowering for one unit: a boom.graph or a boom.step (BoomUnit.h).
+// The two carry the same tensor table and node list, so they lower the same
+// way; the differences are the ones the unit spells. A step has no graph name
+// of its own, so its graph is named "step", and its inputs are its free
+// tensors in ascending id — the block arguments a graph would list in `inputs`.
+// Outputs come from `outputs` / `output_ids` either way.
+std::optional<planner::Graph> boomToGraph(mlir::Operation *unit,
+                                          int64_t dynamic_extent);
+
 // The IR as text, for inspection and for diffing two conversions. The ops carry
 // no custom assembly format, so this is MLIR's generic form: verbose, but
 // unambiguous and parseable back.

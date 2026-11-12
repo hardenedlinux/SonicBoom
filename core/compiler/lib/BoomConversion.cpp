@@ -18,6 +18,8 @@
 
 #include "sonicboom/compiler/BoomConversion.h"
 
+#include "BoomUnit.h"
+
 #include "sonicboom/compiler/BoomBuilder.h"
 #include "sonicboom/compiler/BoomTypes.h"
 
@@ -378,32 +380,49 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
     module.emitError() << "the module holds no boom.graph op";
     return std::nullopt;
   }
+  return boomToGraph(graphOp.getOperation(), int64_t(dynamic_extent));
+}
+
+std::optional<Graph> boomToGraph(mlir::Operation *unitOp,
+                                 int64_t dynamic_extent) {
+  const unit::Unit u = unit::Unit::from(unitOp);
+  if (!u) {
+    unitOp->emitOpError() << "is neither a boom.graph nor a boom.step";
+    return std::nullopt;
+  }
+  const bool step = u.isStep();
+  const uint64_t extent = dynamic_extent > 0 ? uint64_t(dynamic_extent) : 0;
 
   // A declared consumer is not a node: a graph that still carries one has not
   // been through the consumer resolution, and lowering it would plan the
-  // model's logits where the caller asked for something else.
-  if (auto consumer = graphOp.getConsumer()) {
-    graphOp.emitOpError() << "still declares the consumer '" << *consumer
-                          << "'; resolveConsumer/finishConsumer "
-                             "(BoomPasses.h) run before the lowering";
-    return std::nullopt;
-  }
+  // model's logits where the caller asked for something else. A step carries
+  // no consumer declaration (it is the graph after the resolution).
+  if (!step)
+    if (auto consumer = llvm::cast<boom::GraphOp>(unitOp).getConsumer()) {
+      u.emitError() << "still declares the consumer '" << *consumer
+                    << "'; resolveConsumer/finishConsumer "
+                       "(BoomPasses.h) run before the lowering";
+      return std::nullopt;
+    }
 
   Graph graph;
-  graph.name = graphOp.getGraphName().str();
+  // A step carries no name of its own: the program it belongs to names the
+  // graph it was lifted from, and the lowering does not re-read that.
+  graph.name =
+      step ? "step" : llvm::cast<boom::GraphOp>(unitOp).getGraphName().str();
 
-  for (mlir::Attribute entry : graphOp.getTensors()) {
+  for (mlir::Attribute entry : u.tensors()) {
     auto desc = llvm::dyn_cast<boom::TensorDescAttr>(entry);
     if (!desc) {
-      graphOp.emitError() << "tensor table entry " << entry
-                          << " is not a #boom.tensor_desc";
+      u.emitError() << "tensor table entry " << entry
+                    << " is not a #boom.tensor_desc";
       return std::nullopt;
     }
     const auto dtype = boom::boomDTypeFromName(desc.getDtype());
     if (!dtype) {
-      graphOp.emitError() << "tensor id " << desc.getId() << " has the dtype '"
-                          << desc.getDtype()
-                          << "', which is not one of the frozen sx::DType names";
+      u.emitError() << "tensor id " << desc.getId() << " has the dtype '"
+                    << desc.getDtype()
+                    << "', which is not one of the frozen sx::DType names";
       return std::nullopt;
     }
     TensorDesc t;
@@ -422,7 +441,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
       if (t.shape[axis] != mlir::ShapedType::kDynamic)
         continue;
       if (axis != 0) {
-        graphOp.emitError()
+        u.emitError()
             << "tensor id " << desc.getId()
             << " has a dynamic dimension at axis " << axis
             << ", but only the leading dimension is the graph's extent";
@@ -431,14 +450,14 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
       dynamic = true;
     }
     if (dynamic) {
-      if (dynamic_extent == 0) {
-        graphOp.emitError()
+      if (extent == 0) {
+        u.emitError()
             << "tensor id " << desc.getId()
             << " has a dynamic leading dimension, but no extent was bound to "
                "the graph";
         return std::nullopt;
       }
-      t.shape.front() = int64_t(dynamic_extent);
+      t.shape.front() = int64_t(extent);
       // The table's byte size is the size at the extent the IR was sized at
       // (the graph op's `dynamic_extent`), not a hard bound, and it is
       // authoritative there: the planner passes rewrite the byte size of a
@@ -450,12 +469,12 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
       //
       // Binding evaluates that at the requested extent; a larger extent than
       // the sized one would overrun the buffers the plan reserved.
-      const int64_t sized_i = graphOp.getDynamicExtent();
+      const int64_t sized_i = u.dynamicExtent();
       const uint64_t sized = uint64_t(sized_i < 0 ? 0 : sized_i);
-      if (sized == 0 || dynamic_extent > sized) {
-        graphOp.emitError()
+      if (sized == 0 || extent > sized) {
+        u.emitError()
             << "tensor id " << desc.getId() << " ('" << desc.getName()
-            << "') has a dynamic dimension to bind at extent " << dynamic_extent
+            << "') has a dynamic dimension to bind at extent " << extent
             << ", but the IR records no sizing extent at or above it (sized "
             << sized << ")";
         return std::nullopt;
@@ -463,7 +482,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
       const uint64_t bound = desc.getByteSize();
       const uint64_t base = desc.getDynamicBaseBytes();
       if (bound <= base || (bound - base) % sized != 0) {
-        graphOp.emitError()
+        u.emitError()
             << "tensor id " << desc.getId() << " ('" << desc.getName()
             << "') has byte size " << bound << " at extent " << sized
             << " with a fixed part of " << base
@@ -471,7 +490,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
         return std::nullopt;
       }
       const uint64_t stride = (bound - base) / sized;
-      t.size_bytes = stride * dynamic_extent + base;
+      t.size_bytes = stride * extent + base;
       t.dynamic_base_bytes = base;
       t.dynamic_stride_bytes = stride;
     } else {
@@ -485,12 +504,20 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
     graph.tensors.push_back(std::move(t));
   }
 
-  for (int64_t id : graphOp.getInputs())
-    graph.inputs.push_back(tensorId(id));
-  for (int64_t id : graphOp.getOutputs())
-    graph.outputs.push_back(tensorId(id));
+  mlir::Block &body = u.body();
 
-  mlir::Block &body = graphOp.getBody().front();
+  // A step's inputs are the tensors no node of its body produces, in ascending
+  // id: the free variables its leading block arguments bind (BoomUnit.h). A
+  // graph lists the same ids in `inputs`.
+  if (step) {
+    for (int64_t id : unit::freeIds(body, u.tensors()))
+      graph.inputs.push_back(tensorId(id));
+  } else {
+    for (int64_t id : llvm::cast<boom::GraphOp>(unitOp).getInputs())
+      graph.inputs.push_back(tensorId(id));
+  }
+  for (int64_t id : u.outputs())
+    graph.outputs.push_back(tensorId(id));
 
   // Values are identified the way the verifier identifies them: a node's results
   // by its `result_ids`, then the block arguments by the free variables the
@@ -511,7 +538,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
       freeIds.push_back(raw(t.id));
   llvm::sort(freeIds);
   if (body.getNumArguments() < freeIds.size()) {
-    graphOp.emitError() << "the body has " << body.getNumArguments()
+    u.emitError() << "the body has " << body.getNumArguments()
                         << " block arguments but " << freeIds.size()
                         << " tensors in the table are not produced by a node";
     return std::nullopt;
@@ -525,7 +552,7 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
   // attributes — the same graph the IR was converted from.
   for (size_t index = freeIds.size(); index < body.getNumArguments(); ++index)
     if (!llvm::isa<boom::KvType>(body.getArgument(unsigned(index)).getType())) {
-      graphOp.emitError()
+      u.emitError()
           << "block argument " << index << " is typed "
           << body.getArgument(unsigned(index)).getType()
           << ", but every argument after the free tensor variables must be a "
@@ -619,8 +646,11 @@ std::optional<Graph> boomToGraph(mlir::ModuleOp module,
 
   // The recorded facts, for the tensors the graph has (the verifier keeps the
   // entries ascending and unique).
-  if (auto stages = graphOp.getStages()) {
-    const llvm::ArrayRef<int64_t> flat = *stages;
+  const std::optional<llvm::ArrayRef<int64_t>> stageList =
+      step ? llvm::cast<boom::StepOp>(unitOp).getStages()
+           : llvm::cast<boom::GraphOp>(unitOp).getStages();
+  if (stageList) {
+    const llvm::ArrayRef<int64_t> flat = *stageList;
     for (size_t i = 0; i + 1 < flat.size(); i += 2)
       if (graph.find_tensor(tensorId(flat[i])))
         graph.facts.stages.push_back(
