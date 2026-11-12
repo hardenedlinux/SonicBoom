@@ -38,6 +38,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 
@@ -129,5 +131,65 @@ inline int64_t idOf(mlir::Value value) {
   const unsigned index = llvm::cast<mlir::OpResult>(value).getResultNumber();
   return index < ids.size() ? ids[index] : -1;
 }
+
+// A boom.graph or a boom.step, edited through one interface.
+//
+// The two ops hold the same node list and tensor table; they differ in how the
+// output set is spelled (`outputs` / `output_ids`) and in what declares the
+// inputs (a graph's `inputs` attribute, a step's operands). A pass edits either
+// through here, so the same pipeline can run on a standalone graph and on the
+// step a lifted program carries.
+class Unit {
+public:
+  Unit() = default;
+  // Null unless `op` is one of the two.
+  static Unit from(mlir::Operation *op) {
+    Unit u;
+    if (llvm::isa_and_nonnull<boom::GraphOp, boom::StepOp>(op))
+      u.op_ = op;
+    return u;
+  }
+
+  explicit operator bool() const { return op_ != nullptr; }
+  mlir::Operation *op() const { return op_; }
+  mlir::MLIRContext *context() const { return op_->getContext(); }
+  mlir::Location loc() const { return op_->getLoc(); }
+  bool isStep() const { return llvm::isa<boom::StepOp>(op_); }
+
+  mlir::Block &body() const { return op_->getRegion(0).front(); }
+  mlir::ArrayAttr tensors() const {
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(op_))
+      return g.getTensors();
+    return llvm::cast<boom::StepOp>(op_).getTensors();
+  }
+  void setTensors(mlir::ArrayAttr table) const {
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(op_)) {
+      g.setTensorsAttr(table);
+      return;
+    }
+    llvm::cast<boom::StepOp>(op_).setTensorsAttr(table);
+  }
+  llvm::ArrayRef<int64_t> outputs() const {  // `outputs` / `output_ids`
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(op_))
+      return g.getOutputs();
+    return llvm::cast<boom::StepOp>(op_).getOutputIds();
+  }
+  void setOutputs(llvm::ArrayRef<int64_t> ids) const {
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(op_)) {
+      g.setOutputs(ids);
+      return;
+    }
+    llvm::cast<boom::StepOp>(op_).setOutputIds(ids);
+  }
+  int64_t dynamicExtent() const {
+    if (auto g = llvm::dyn_cast<boom::GraphOp>(op_))
+      return int64_t(g.getDynamicExtent());
+    return int64_t(llvm::cast<boom::StepOp>(op_).getDynamicExtent());
+  }
+  mlir::InFlightDiagnostic emitError() const { return op_->emitOpError(); }
+
+private:
+  mlir::Operation *op_ = nullptr;
+};
 
 } // namespace sonicboom::compiler::unit
