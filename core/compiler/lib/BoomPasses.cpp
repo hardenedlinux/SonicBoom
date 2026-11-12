@@ -3775,28 +3775,37 @@ bool finishConsumer(mlir::ModuleOp module) {
 bool runBoomPasses(mlir::ModuleOp module, planner::IrPassPhase phase,
                    bool skip_kv_append_fusion, bool fuse_silu_mul,
                    bool rows_mmq) {
-  // The unit of meaning in this IR is the graph, not the module that holds it
-  // (BoomVerify.cpp:21-24), and that is where the passes run: the graph op is
-  // IsolatedFromAbove, which is what makes it a pass anchor at all.
-  auto graphs = module.getOps<boom::GraphOp>();
-  if (graphs.empty()) {
-    std::fprintf(stderr, "runBoomPasses(%s): the module holds no graph\n",
+  // The unit of meaning in this IR is the graph or the step, not the module
+  // that holds it (BoomVerify.cpp:21-24), and that is where the passes run:
+  // both ops are IsolatedFromAbove, which is what makes them a pass anchor at
+  // all. A module holds one or the other — the step is the graph's lifted form
+  // (BoomBuilder.h) — and the same pipeline runs on whichever it finds.
+  llvm::SmallVector<mlir::Operation *> units;
+  module->walk([&](mlir::Operation *op) {
+    if (unit::Unit::from(op))
+      units.push_back(op);
+  });
+  if (units.empty()) {
+    std::fprintf(stderr,
+                 "runBoomPasses(%s): the module holds no boom.graph or "
+                 "boom.step\n",
                  phaseName(phase));
     return false;
   }
-  boom::GraphOp graphOp = *graphs.begin();
 
   // The pass manager verifies after every pass, so a pass that leaves the IR in
   // a state the dialect rejects fails here, naming that pass, rather than three
   // passes later.
-  mlir::PassManager pm(module.getContext());
-  addPasses(pm, phase, skip_kv_append_fusion, fuse_silu_mul, rows_mmq);
-  if (mlir::failed(pm.run(graphOp))) {
-    std::fprintf(stderr,
-                 "runBoomPasses(%s): a Boom IR pass failed (diagnostic "
-                 "above); the IR is not a phase output\n",
-                 phaseName(phase));
-    return false;
+  for (mlir::Operation *op : units) {
+    mlir::PassManager pm(op->getName());
+    addPasses(pm, phase, skip_kv_append_fusion, fuse_silu_mul, rows_mmq);
+    if (mlir::failed(pm.run(op))) {
+      std::fprintf(stderr,
+                   "runBoomPasses(%s): a Boom IR pass failed (diagnostic "
+                   "above); the IR is not a phase output\n",
+                   phaseName(phase));
+      return false;
+    }
   }
   return true;
 }
