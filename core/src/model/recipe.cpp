@@ -87,12 +87,6 @@ Recipe recipe_for(const Gemma4Model& m) {
   const uint32_t d = cfg.embedding_length;
   const uint32_t ff = cfg.feed_forward_length;
 
-  // A block whose mixer is the recurrent (gated DeltaNet) kind has no layer
-  // kind in the vocabulary, so the model has no recipe: the caller reports it
-  // rather than substituting a layer the model does not have.
-  for (bool recurrent : cfg.recurrent_layers)
-    if (recurrent) return {};
-
   Recipe r;
   r.width = d;
   r.vocab = cfg.vocab_size;
@@ -101,40 +95,81 @@ Recipe recipe_for(const Gemma4Model& m) {
   if (t.per_layer_input)
     r.per_layer_input = PerLayerInput{cfg.per_layer_input};
   r.caches = cfg.n_layer_kv();
+  for (bool recurrent : cfg.recurrent_layers)
+    r.states += recurrent ? 1 : 0;
 
   auto bias = [](bool has, WeightSlot slot) {
     return has ? slot : WeightSlot::None;
   };
 
   r.blocks.reserve(cfg.block_count);
+  uint32_t next_state = 0;
   for (uint32_t l = 0; l < cfg.block_count; ++l) {
     const LayerConfig lc = cfg.layer_config(l);
     const BlockWeights& w = m.weights.blocks[l];
 
-    SelfAttention at;
-    at.heads_q = lc.n_heads_q;
-    at.heads_kv = lc.n_heads_kv;
-    at.head_dim = lc.head_dim;
-    at.window = lc.sliding_window;
-    const uint32_t qw = at.q_width();
-    const uint32_t kvw = at.kv_width();
-    at.q = {WeightSlot::AttnQ, bias(t.qkv_bias, WeightSlot::AttnQBias),
-            w.attn_q.type(), d, t.output_gate ? 2 * qw : qw};
-    at.k = {WeightSlot::AttnK, bias(t.qkv_bias, WeightSlot::AttnKBias),
-            w.attn_k.type(), d, kvw};
-    at.v = {WeightSlot::AttnV, bias(t.qkv_bias, WeightSlot::AttnVBias),
-            w.attn_v.type(), d, kvw};
-    at.out = {WeightSlot::AttnOutput, WeightSlot::None, w.attn_output.type(),
-              qw, d};
-    at.qk_norm = t.qk_norm;
-    at.v_norm = t.v_norm;
-    at.output_gate = t.output_gate;
-    at.rotary_dims = cfg.rope_dimension_count;
-    // The architecture's temperature times YaRN's magnitude term (1.0 for a
-    // model without YaRN metadata).
-    at.scale = double(t.score_scale) * m.weights.rope_attn_scale;
-    at.cache = cfg.kv_donor_layer(l);
-    at.owns_cache = cfg.has_kv(l);
+    Block block;
+    const bool recurrent =
+        l < cfg.recurrent_layers.size() && cfg.recurrent_layers[l];
+    if (recurrent) {
+      // Gated DeltaNet: the four projections the scan consumes, the output
+      // projection, and the convolution/dt/a kernels the scan reads by slot.
+      GatedDeltaNet gdn;
+      gdn.heads_k = cfg.ssm_group_count;
+      gdn.heads_v = cfg.ssm_time_step_rank;
+      gdn.head_dim = cfg.ssm_state_size;
+      gdn.conv_kernel = cfg.ssm_conv_kernel;
+      // A projection stored as f32 in the file takes the f32 matvec; one
+      // stored quantized keeps its format.
+      auto projection = [](WeightSlot slot, const quant::QuantizedTensor& q,
+                           std::span<const float> f, uint32_t in,
+                           uint32_t out) {
+        Projection p{slot, WeightSlot::None, q.type(), in, out};
+        p.f32 = !f.empty();
+        return p;
+      };
+      const uint32_t kd = gdn.key_dim();
+      const uint32_t vd = gdn.value_dim();
+      gdn.qkv = projection(WeightSlot::GdnQkv, w.gdn_qkv, w.gdn_qkv_f32, d,
+                           2 * kd + vd);
+      gdn.gate =
+          projection(WeightSlot::GdnGate, w.gdn_gate, w.gdn_gate_f32, d, vd);
+      gdn.beta = projection(WeightSlot::GdnBeta, w.gdn_beta, w.gdn_beta_f32, d,
+                            gdn.heads_v);
+      gdn.alpha = projection(WeightSlot::GdnAlpha, w.gdn_alpha,
+                             w.gdn_alpha_f32, d, gdn.heads_v);
+      gdn.out =
+          projection(WeightSlot::GdnOut, w.gdn_out, w.gdn_out_f32, vd, d);
+      gdn.state = next_state++;
+      block.mixer = gdn;
+    } else {
+      SelfAttention at;
+      at.heads_q = lc.n_heads_q;
+      at.heads_kv = lc.n_heads_kv;
+      at.head_dim = lc.head_dim;
+      at.window = lc.sliding_window;
+      const uint32_t qw = at.q_width();
+      const uint32_t kvw = at.kv_width();
+      at.q = {WeightSlot::AttnQ, bias(t.qkv_bias, WeightSlot::AttnQBias),
+              w.attn_q.type(), d, t.output_gate ? 2 * qw : qw};
+      at.k = {WeightSlot::AttnK, bias(t.qkv_bias, WeightSlot::AttnKBias),
+              w.attn_k.type(), d, kvw};
+      at.v = {WeightSlot::AttnV, bias(t.qkv_bias, WeightSlot::AttnVBias),
+              w.attn_v.type(), d, kvw};
+      at.out = {WeightSlot::AttnOutput, WeightSlot::None, w.attn_output.type(),
+                qw, d};
+      at.qk_norm = t.qk_norm;
+      at.v_norm = t.v_norm;
+      at.output_gate = t.output_gate;
+      at.rotary_dims = cfg.rope_dimension_count;
+      // The architecture's temperature times YaRN's magnitude term (1.0 for a
+      // model without YaRN metadata).
+      at.scale = double(t.score_scale) * m.weights.rope_attn_scale;
+      at.cache = cfg.kv_donor_layer(l);
+      at.owns_cache = cfg.has_kv(l);
+      block.mixer = at;
+      block.post_mixer_norm = t.post_mixer_norm;
+    }
 
     FeedForward ffn;
     if (cfg.arch == ModelArch::Qwen35Moe) {
@@ -177,9 +212,6 @@ Recipe recipe_for(const Gemma4Model& m) {
       ffn = dense;
     }
 
-    Block block;
-    block.mixer = at;
-    block.post_mixer_norm = t.post_mixer_norm;
     block.ffn = std::move(ffn);
     block.post_ffn_norm = t.post_ffn_norm;
     block.per_layer_gate = t.per_layer_input;
