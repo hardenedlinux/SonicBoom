@@ -17,6 +17,8 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
+#include <string>
 #include <span>
 #include <vector>
 
@@ -83,6 +85,18 @@ enum class WeightSlot : uint8_t {
   // The untied output projection (lm head); empty when the model ties its
   // embedding and output weights, in which case the emitter reuses TokenEmbd.
   Output,
+  // Mixture-of-experts roles (Qwen3.6-MoE). The three expert roles carry one
+  // weight per expert, addressed by WeightKey::index == the expert number: each
+  // is a view over that expert's slice of the stacked tensor. The router, the
+  // three shared-expert projections and the shared gate are one per block.
+  ExpertRouter,
+  ExpertGate,
+  ExpertUp,
+  ExpertDown,
+  SharedGate,
+  SharedUp,
+  SharedDown,
+  SharedGateIn,
 };
 
 // One transformer block's weights (block_count of these, layers 0..41).
@@ -118,6 +132,23 @@ struct BlockWeights {
   std::span<const float> inp_gate;    // [embedding_length, per_layer_input] (f32)
   std::span<const float> proj;        // [per_layer_input, embedding_length] (f32)
   std::span<const float> layer_output_scale;  // [1]
+
+  // Mixture-of-experts weights (Qwen3.6-MoE); empty for the other archs.
+  // The router is bound in exactly one of the two forms, whichever the file
+  // stores: a quantized [embedding_length, n_expert] tensor, or the same shape
+  // as f32. weight_quant / weight_f32 (slot ExpertRouter) return whichever was
+  // loaded and empty for the other.
+  quant::QuantizedTensor expert_router;        // [embedding_length, n_expert]
+  std::span<const float> expert_router_f32;    // [embedding_length, n_expert]
+  // One 2-D view per expert over the stacked tensor's expert slice, no copy:
+  // expert e starts at e * bytes_per_expert in the tensor's byte range.
+  std::vector<quant::QuantizedTensor> expert_gate;  // [embedding_length, expert_ff] each
+  std::vector<quant::QuantizedTensor> expert_up;    // [embedding_length, expert_ff] each
+  std::vector<quant::QuantizedTensor> expert_down;  // [expert_ff, embedding_length] each
+  quant::QuantizedTensor shared_gate;  // [embedding_length, shared_expert_ff]
+  quant::QuantizedTensor shared_up;    // [embedding_length, shared_expert_ff]
+  quant::QuantizedTensor shared_down;  // [shared_expert_ff, embedding_length]
+  std::span<const float> shared_gate_in;  // [embedding_length]
 };
 
 struct Gemma4Weights {
@@ -175,5 +206,31 @@ std::span<const float> weight_f32(const Gemma4Weights& weights,
 // conditions.
 const quant::QuantizedTensor& weight_quant(const Gemma4Weights& weights,
                                            WeightKey key) noexcept;
+
+// Split a stacked expert tensor into one view per expert. `dims` is the whole
+// tensor's shape in GGUF order (fastest-moving first, expert last), `data` its
+// bytes, and `per_expert_dims` the shape of one expert's view (the whole shape
+// without the last dimension). Expert e's view starts at e * bytes_per_expert;
+// no bytes are copied. The tensor's type must be a supported quantized type
+// and every expert's slice a whole number of blocks, otherwise an error is
+// returned and nothing is bound.
+std::expected<std::vector<quant::QuantizedTensor>, std::string>
+expert_views(uint32_t ggml_type, const std::vector<uint64_t>& dims,
+             std::span<const std::byte> data, uint64_t n_expert,
+             const std::vector<uint64_t>& per_expert_dims);
+
+// The two views of a merged gate+up expert tensor `[n_embd, 2*ff, n_expert]`:
+// within each expert's slice the first `ff` rows are the gate projection and
+// the next `ff` the up projection (the reference splits its merged matmul the
+// same way).
+struct ExpertGateUpViews {
+  std::vector<quant::QuantizedTensor> gate;
+  std::vector<quant::QuantizedTensor> up;
+};
+
+std::expected<ExpertGateUpViews, std::string>
+expert_gate_up_views(uint32_t ggml_type, const std::vector<uint64_t>& dims,
+                     std::span<const std::byte> data, uint64_t n_expert,
+                     uint64_t n_embd, uint64_t ff);
 
 } // namespace sonicboom::model
