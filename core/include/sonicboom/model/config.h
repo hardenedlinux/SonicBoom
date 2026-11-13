@@ -36,7 +36,7 @@ enum class AttentionKind : uint8_t { SlidingWindow, Global };
 // from the standard decoder block (SwiGLU SiLU, no Q/K norm, no post-norms,
 // attention scale 1/sqrt(head_dim)). Both are carried by the same config/weight
 // containers; the plan emitter branches on this value.
-enum class ModelArch : uint8_t { Gemma4, Qwen2 };
+enum class ModelArch : uint8_t { Gemma4, Qwen2, Qwen35Moe };
 
 // The per-layer configuration that differs between the two attention kinds.
 // n_heads_q / n_heads_kv are constant (8 / 2); head_dim and rope_base flip
@@ -72,6 +72,45 @@ struct Gemma4Config {
 
   // Layer 0..41: true = sliding-window, false = global.
   std::vector<bool> sliding_window_pattern;
+
+  // Qwen3.6-MoE (qwen35moe). Every field is defaulted, so the configurations
+  // read for the other architectures are unaffected.
+  //
+  // The mixture of experts in every block: n_expert routed experts, of which
+  // n_expert_used are selected per token; expert_ff is one expert's
+  // feed-forward length and shared_expert_ff the always-on shared expert's
+  // (0 = none). Routed gate/up/down weights are selected by the router, whose
+  // output is scaled by expert_weights_scale before the expert sums.
+  uint32_t n_expert = 0;
+  uint32_t n_expert_used = 0;
+  uint32_t expert_ff = 0;
+  uint32_t shared_expert_ff = 0;
+  float expert_weights_scale = 1.0f;
+
+  // Layer kinds: every full_attention_interval-th layer is full attention and
+  // the others are gated DeltaNet (linear attention). recurrent_layers has one
+  // entry per block (true = DeltaNet); it is read from the file's explicit
+  // array when present and derived from full_attention_interval otherwise.
+  uint32_t full_attention_interval = 4;
+  std::vector<bool> recurrent_layers;
+
+  // Gated DeltaNet hyperparameters. Read and shape-validated; the recurrent
+  // path does not run yet.
+  uint32_t ssm_conv_kernel = 0;
+  uint32_t ssm_inner_size = 0;
+  uint32_t ssm_state_size = 0;
+  uint32_t ssm_time_step_rank = 0;
+  uint32_t ssm_group_count = 0;
+
+  // Partial rotary embedding: only the leading rope_dimension_count values of
+  // each head are rotated, and rope_dimension_sections (4 entries) splits that
+  // range into the sections the reference rotates. 0 = the whole head.
+  uint32_t rope_dimension_count = 0;
+  std::vector<uint32_t> rope_dimension_sections;
+
+  // The trailing multi-token-prediction blocks. Read only: those blocks are
+  // not loaded or executed.
+  uint32_t n_layer_nextn = 0;
 
   // Structural sanity: non-zero head dims, a consistent block count, an
   // embedding length that matches head_count * head_dim_swa, etc.
