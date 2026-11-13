@@ -30,6 +30,19 @@ bool scale(std::span<const float> x, float s, std::span<float> y) {
   return true;
 }
 
+bool mul_row(std::span<const float> x, std::span<const float> s,
+             std::span<float> y) {
+  if (s.empty() || x.size() % s.size() != 0 || y.size() < x.size())
+    return false;
+  const size_t width = x.size() / s.size();
+  for (size_t r = 0; r < s.size(); ++r) {
+    const float by = s[r];
+    for (size_t i = 0; i < width; ++i)
+      y[r * width + i] = x[r * width + i] * by;
+  }
+  return true;
+}
+
 bool add(std::span<const float> a, std::span<const float> b, std::span<float> y) {
   if (a.size() != b.size() || y.size() < a.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) y[i] = a[i] + b[i];

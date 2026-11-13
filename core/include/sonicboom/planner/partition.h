@@ -77,6 +77,7 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::MatvecBf16:
     case OpKind::AddBias:
     case OpKind::Mul:
+    case OpKind::ScaleBy:
     case OpKind::Scale:
     case OpKind::CastFp16:
     case OpKind::Softcap:

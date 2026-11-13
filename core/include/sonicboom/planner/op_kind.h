@@ -207,6 +207,13 @@ enum class OpKind : uint8_t {
   // Appended last for the same reason as ClipGradNorm.
   MoeRoute,
   MoeExperts,
+
+  // A row-broadcast multiply: operand 0 is [rows, width], operand 1 is [rows],
+  // and the result is [rows, width] with each row scaled by its own value. The
+  // shared expert of a mixture-of-experts block gates its output this way (the
+  // sigmoid of a width-1 projection). Appended last for the same reason as
+  // ClipGradNorm.
+  ScaleBy,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

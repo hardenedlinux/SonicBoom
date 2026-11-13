@@ -247,8 +247,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // sigmoid of the Q projection's gate half.
       OpKind::Sigmoid,
       // The mixture-of-experts route and expert nodes run the SonicBoom-owned
-      // quantized matmuls on the CPU.
-      OpKind::MoeRoute,        OpKind::MoeExperts,
+      // quantized matmuls on the CPU; the shared expert's row gate is a plain
+      // elementwise scale.
+      OpKind::MoeRoute,        OpKind::MoeExperts, OpKind::ScaleBy,
   };
   // VS1 prefetch markers are registered only under the switch that can place
   // them. They carry no outputs and no kernels; the backend executes them as
@@ -333,8 +334,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // gate never leaves it.
         OpKind::Sigmoid,
         // The mixture-of-experts route and expert nodes (decode gemv / verify
-        // per-row gemv / prefill group-by-expert batched matmul).
-        OpKind::MoeRoute,       OpKind::MoeExperts,
+        // per-row gemv / prefill group-by-expert batched matmul), and the
+        // shared expert's row gate.
+        OpKind::MoeRoute,       OpKind::MoeExperts, OpKind::ScaleBy,
     };
     // MMQ1: the prefill dispatch of the same projections onto the
     // compiler-generated int8 tensor-core kernel. Registered only while that

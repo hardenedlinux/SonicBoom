@@ -51,6 +51,10 @@ bool mul(std::span<const float> a, std::span<const float> b, std::span<float> y)
 bool add(std::span<const float> a, std::span<const float> b, std::span<float> y);
 bool scale(std::span<const float> x, float s, std::span<float> y);
 
+// Device row-broadcast multiply (mirrors nn::mul_row): x/y are [rows, width]
+// with width = n / rows, s is [rows], and y[i] = x[i] * s[i / width].
+bool mul_row_dev(const float* x, const float* s, float* y, int n, int rows);
+
 // In-place f32 -> fp16 -> f32 round-trip (mirrors nn::cast_fp16).
 bool cast_fp16(std::span<float> v);
 

@@ -33,6 +33,13 @@ bool scale(std::span<const float> x, float s, std::span<float> y);
 // y[i] = a[i] + b[i]. Requires a.size() == b.size() and y.size() >= a.size().
 bool add(std::span<const float> a, std::span<const float> b, std::span<float> y);
 
+// y[r*width + i] = x[r*width + i] * s[r], where width = x.size() / s.size():
+// each row of a [rows, width] buffer is scaled by that row's single value (the
+// shared expert's gate). Requires a non-empty s, an x whose size is a whole
+// multiple of it, and y.size() >= x.size().
+bool mul_row(std::span<const float> x, std::span<const float> s,
+             std::span<float> y);
+
 // y[i] = x[i] + bias[i % bias.size()]: broadcast a bias vector over the rows of
 // a [rows, bias.size()] buffer (a plain vector when rows == 1). This is the
 // optional bias a linear projection may carry, e.g. Qwen2's Q/K/V projections.

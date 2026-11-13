@@ -107,7 +107,33 @@ struct GatedFfn {
   Activation activation = Activation::GeluFp16;
 };
 
-using FeedForward = std::variant<GatedFfn>;
+// One routed expert: act(gate(x)) * up(x), projected back down, the same three
+// projections a GatedFfn has. The roles are indexed by the expert's number, so
+// one record describes every expert of a block.
+struct Expert {
+  Projection gate, up, down;
+};
+
+// A mixture of experts: per position the router projects the activation onto
+// `experts` logits, a softmax over them picks `used` experts, and the position's
+// feed-forward is the weighted sum of those experts. `weight_scale` multiplies
+// the routed weights (1.0 when the router's weights are used as they are).
+//
+// A shared expert, when the model has one, is always on: its gated projection
+// runs alongside the routed sum and the result is gated by the sigmoid of a
+// dense projection onto one value per position (`shared_gate`, an f32 [width]).
+struct MoeFfn {
+  Projection router;           // width -> experts
+  uint32_t experts = 0;
+  uint32_t used = 0;
+  Expert routed;
+  double weight_scale = 1.0;
+  std::optional<Expert> shared;
+  WeightSlot shared_gate = WeightSlot::None;  // None: no shared expert
+  Activation activation = Activation::Silu;
+};
+
+using FeedForward = std::variant<GatedFfn, MoeFfn>;
 
 // ---- the stack -------------------------------------------------------------
 

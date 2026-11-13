@@ -133,6 +133,8 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::MoeRoute;
   if (name == "moe_experts")
     return OpKind::MoeExperts;
+  if (name == "scale_by")
+    return OpKind::ScaleBy;
   return std::nullopt;
 }
 
@@ -196,6 +198,7 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::Sigmoid: return "sigmoid";
     case OpKind::MoeRoute: return "moe_route";
     case OpKind::MoeExperts: return "moe_experts";
+    case OpKind::ScaleBy: return "scale_by";
   }
   return "?";
 }

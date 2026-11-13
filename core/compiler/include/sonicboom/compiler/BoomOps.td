@@ -485,6 +485,9 @@ def Boom_AddBiasOp : Boom_Op<"add_bias",
 def Boom_MulOp : Boom_Op<"mul",
     "elementwise multiply",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;
+def Boom_ScaleByOp : Boom_Op<"scale_by",
+    "multiply each row of [rows, width] by that row's single value ([rows])",
+    [NoMemoryEffect, Boom_RowIndependent]>;
 def Boom_ScaleOp : Boom_Op<"scale",
     "multiply by the `scale` attribute",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;

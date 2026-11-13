@@ -230,6 +230,13 @@ __global__ void mul_kernel(const float* __restrict__ a, const float* __restrict_
   if (i < n) y[i] = a[i] * b[i];
 }
 
+__global__ void mul_row_kernel(const float* __restrict__ x,
+                               const float* __restrict__ s,
+                               float* __restrict__ y, int n, int width) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = x[i] * s[i / width];
+}
+
 __global__ void add_kernel(const float* __restrict__ a, const float* __restrict__ b,
                            float* __restrict__ y, int n) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -3257,6 +3264,14 @@ bool mul_dev(const float* a, const float* b, float* y, int n) {
   if (n <= 0 || !a || !b || !y) return false;
   SB_NOTE_LAUNCH(mul_kernel, grid_for(n), 256, 0, cur_stream());
   mul_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
+  return cudaGetLastError() == cudaSuccess;
+}
+
+bool mul_row_dev(const float* x, const float* s, float* y, int n, int rows) {
+  if (!available()) return false;
+  if (n <= 0 || rows <= 0 || n % rows != 0 || !x || !s || !y) return false;
+  SB_NOTE_LAUNCH(mul_row_kernel, grid_for(n), 256, 0, cur_stream());
+  mul_row_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, s, y, n, n / rows);
   return cudaGetLastError() == cudaSuccess;
 }
 

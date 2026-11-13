@@ -24,6 +24,7 @@
 #include <sonicboom/nn/elementwise.h>
 #include <sonicboom/nn/embedding.h>
 #include <sonicboom/nn/matmul.h>
+#include <sonicboom/nn/moe.h>
 #include <sonicboom/nn/norm.h>
 #include <sonicboom/nn/rope.h>
 #include <sonicboom/nn/sampling.h>
@@ -85,6 +86,17 @@ bool attr_f(const GraphNodeDesc& n, std::string_view name, double& out) {
   for (const auto& a : n.attributes)
     if (a.name == name && a.kind() == sx::AttrValueKind::Float) {
       out = std::get<double>(a.value);
+      return true;
+    }
+  return false;
+}
+
+// The string an attribute record carries for `name`, or false.
+bool attr_s(const GraphNodeDesc& n, std::string_view name,
+            std::string_view& out) {
+  for (const auto& a : n.attributes)
+    if (a.name == name && a.kind() == sx::AttrValueKind::String) {
+      out = std::get<std::string>(a.value);
       return true;
     }
   return false;
@@ -205,7 +217,31 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
                 out_td->dynamic_base_bytes
           : out_td->size_bytes;
   sx::Bytes out(out_bytes);
+  // A node with two results (MoeRoute: the expert ids and their weights) fills
+  // this second buffer; it is returned after the first output.
+  sx::Bytes out2;
   bool ok = true;
+
+  // The buffer `idx`-th output of this node needs for this execution. A tensor
+  // that scales with the plan's dynamic extent is sized from the extent.
+  auto output_bytes = [&](size_t idx) -> uint64_t {
+    const auto* td = graph_.find_tensor(node->outputs[idx]);
+    if (!td) return 0;
+    return td->dynamic_stride_bytes != 0
+               ? td->dynamic_stride_bytes * segment_extent_ +
+                     td->dynamic_base_bytes
+               : td->size_bytes;
+  };
+
+  // The positions this execution covers: a verify step's row count, else the
+  // plan's batch, else one decode position.
+  auto row_count = [&]() -> uint64_t {
+    int64_t vr = 0;
+    if (attr_i(*node, "verify", vr) && vr > 0) return uint64_t(vr);
+    int64_t nb = 0;
+    if (batch_attr(nb) && nb > 0) return uint64_t(nb);
+    return 1;
+  };
 
   switch (node->op) {
     case OpKind::Embedding: {
@@ -456,6 +492,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = nn::add(f32(inputs[0]), f32(inputs[1]), f32_mut(out));
       break;
     }
+    case OpKind::ScaleBy: {
+      // [rows, width] * [rows]: each row scaled by its own value.
+      ok = nn::mul_row(f32(inputs[0]), f32(inputs[1]), f32_mut(out));
+      break;
+    }
     case OpKind::Slice: {
       // Sub-span copy. `offset`/`length` name the contiguous span; when `stride`
       // is present it is a strided row slice over `rows` rows of `length`
@@ -530,6 +571,107 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
       ok = true;
       break;
     }
+    case OpKind::MoeRoute: {
+      // inputs: {activation}. The router's ids (int64) and weights (f32) come
+      // out as this node's two results, one pair per position.
+      int64_t experts = 0, used = 0;
+      if (!attr_i(*node, "experts", experts) || !attr_i(*node, "used", used) ||
+          experts <= 0 || used <= 0 || used > experts) {
+        ok = false;
+        break;
+      }
+      double route_scale = 1.0;
+      attr_f(*node, "scale", route_scale);
+      const uint64_t rows = row_count();
+      const std::span<const float> x = f32(inputs[0]);
+      if (rows == 0 || x.size() % rows != 0) {
+        ok = false;
+        break;
+      }
+      const uint64_t dim = x.size() / rows;
+      const uint64_t k = uint64_t(used);
+      const uint64_t ids_bytes = rows * k * sizeof(int64_t);
+      const uint64_t w_bytes = rows * k * sizeof(float);
+      if (out.size() < ids_bytes || output_bytes(1) < w_bytes) {
+        ok = false;
+        break;
+      }
+      out2.assign(w_bytes, std::byte(0));
+      auto* ids_out = reinterpret_cast<int64_t*>(out.data());
+      float* w_out = reinterpret_cast<float*>(out2.data());
+      const quant::QuantizedTensor* router_q = nullptr;
+      if (qweight(slot).valid()) router_q = &qweight(slot);
+      const std::span<const float> router_f32 = fweight(slot);
+      if (!router_q && router_f32.empty()) {
+        ok = false;
+        break;
+      }
+      for (uint64_t r = 0; r < rows && ok; ++r)
+        ok = nn::moe_route(x.subspan(r * dim, dim), router_q, router_f32,
+                           uint32_t(experts), uint32_t(used),
+                           float(route_scale), {ids_out + r * k, k},
+                           {w_out + r * k, k});
+      break;
+    }
+    case OpKind::MoeExperts: {
+      // inputs: {activation, ids, weights}. Each position's selected experts
+      // are evaluated and summed in ascending expert index.
+      int64_t experts = 0, slot_up_i = 0, slot_down_i = 0;
+      if (!attr_i(*node, "experts", experts) ||
+          !attr_i(*node, "slot_up", slot_up_i) ||
+          !attr_i(*node, "slot_down", slot_down_i) || experts <= 0) {
+        ok = false;
+        break;
+      }
+      std::string_view activation = "silu";
+      attr_s(*node, "activation", activation);
+      const nn::MoeActivation act = activation == "gelu"
+                                        ? nn::MoeActivation::GeluFp16
+                                        : nn::MoeActivation::Silu;
+      const uint64_t rows = row_count();
+      const std::span<const float> x = f32(inputs[0]);
+      if (rows == 0 || x.size() % rows != 0 ||
+          inputs[1].size() % (rows * sizeof(int64_t)) != 0 ||
+          inputs[2].size() != inputs[1].size() / sizeof(int64_t) * sizeof(float)) {
+        ok = false;
+        break;
+      }
+      const uint64_t dim = x.size() / rows;
+      const uint64_t k = inputs[1].size() / sizeof(int64_t) / rows;
+      std::span<float> y = f32_mut(out);
+      if (k == 0 || y.size() < rows * dim) {
+        ok = false;
+        break;
+      }
+      const auto* ids_in = reinterpret_cast<const int64_t*>(inputs[1].data());
+      const auto* w_in = reinterpret_cast<const float*>(inputs[2].data());
+      const auto up_slot = static_cast<model::WeightSlot>(slot_up_i);
+      const auto down_slot = static_cast<model::WeightSlot>(slot_down_i);
+      std::vector<quant::QuantizedTensor> gates, ups, downs;
+      gates.reserve(size_t(experts));
+      ups.reserve(size_t(experts));
+      downs.reserve(size_t(experts));
+      for (int64_t e = 0; e < experts; ++e) {
+        gates.push_back(model::weight_quant(
+            model_.weights, {slot, weight_layer, uint32_t(e)}));
+        ups.push_back(model::weight_quant(
+            model_.weights, {up_slot, weight_layer, uint32_t(e)}));
+        downs.push_back(model::weight_quant(
+            model_.weights, {down_slot, weight_layer, uint32_t(e)}));
+      }
+      const nn::MoeExpertWeights views{std::span<const quant::QuantizedTensor>(
+                                           gates.data(), gates.size()),
+                                       std::span<const quant::QuantizedTensor>(
+                                           ups.data(), ups.size()),
+                                       std::span<const quant::QuantizedTensor>(
+                                           downs.data(), downs.size())};
+      std::fill(y.begin(), y.begin() + rows * dim, 0.0f);
+      for (uint64_t r = 0; r < rows && ok; ++r)
+        ok = nn::moe_experts(x.subspan(r * dim, dim), {ids_in + r * k, k},
+                             {w_in + r * k, k}, views, act,
+                             y.subspan(r * dim, dim));
+      break;
+    }
     default:
       ok = false;
       break;
@@ -555,6 +697,8 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
 
   std::vector<TensorValue> res;
   res.push_back(TensorValue::from_host(std::move(out)));
+  if (!out2.empty())
+    res.push_back(TensorValue::from_host(std::move(out2)));
   return res;
 }
 

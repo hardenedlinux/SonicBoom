@@ -300,6 +300,64 @@ protected:
     return matmul(fh, "fo" + s, ffn.down, l);
   }
 
+  // The mixture-of-experts feed-forward. The router node produces the selected
+  // expert ids and their weights as its two results; the expert node consumes
+  // them and sums the routed experts. A shared expert, when the model has one,
+  // adds its gated projection scaled by the sigmoid of the shared gate.
+  mlir::Value feed(const MoeFfn& ffn, uint32_t l, mlir::Value f) {
+    const std::string s = std::to_string(l);
+    const uint32_t d = r.width;
+    const Activation act = ffn.activation;
+
+    Attrs route_a = {layer_a(l), slot_a(ffn.router.weight),
+                     attr_i("experts", int64_t(ffn.experts)),
+                     attr_i("used", int64_t(ffn.used))};
+    if (ffn.weight_scale != 1.0)
+      route_a.push_back(attr_f("scale", ffn.weight_scale));
+    rows(route_a);
+    // The ids and weights are `used` values per position, so their shape is the
+    // phase's, like every other node's (a prefill position is a row).
+    const std::vector<mlir::Value> routed =
+        b.nodes(OpKind::MoeRoute, {f}, {"moe_ids" + s, "moe_w" + s},
+                {shape(ffn.used), shape(ffn.used)},
+                {sx::DType::Int64, sx::DType::Float32}, route_a);
+    if (routed.size() != 2) return mlir::Value{};
+
+    Attrs expert_a = {
+        layer_a(l), slot_a(ffn.routed.gate.weight),
+        attr_i("slot_up", int64_t(ffn.routed.up.weight)),
+        attr_i("slot_down", int64_t(ffn.routed.down.weight)),
+        attr_i("experts", int64_t(ffn.experts)),
+        attr_i("used", int64_t(ffn.used)),
+        attr_s("activation", act == Activation::Silu ? "silu" : "gelu")};
+    // The phase's row marker: the executor groups a prefill's rows by expert on
+    // it, and runs one decode gemv per (row, expert) without it.
+    rows(expert_a);
+    const mlir::Value moe = node(OpKind::MoeExperts, {f, routed[0], routed[1]},
+                                 "moe" + s, d, std::move(expert_a));
+    if (!ffn.shared || ffn.shared_gate == WeightSlot::None) return moe;
+
+    const Expert& shared = *ffn.shared;
+    const uint32_t ff = shared.up.out;
+    const mlir::Value sup = matmul(f, "sup" + s, shared.up, l);
+    mlir::Value sgate = matmul(f, "sgate" + s, shared.gate, l);
+    sgate = act == Activation::Silu
+                ? pointwise(OpKind::Silu, {sgate}, "silu" + s, ff, l)
+                : pointwise(OpKind::GeluFp16, {sgate}, "gelu" + s, ff, l);
+    const mlir::Value sfh =
+        pointwise(OpKind::Mul, {sgate, sup}, "sfh" + s, ff, l);
+    const mlir::Value sfo = matmul(sfh, "sfo" + s, shared.down, l);
+    Attrs gate_a = {layer_a(l), slot_a(ffn.shared_gate)};
+    rows(gate_a);
+    const mlir::Value sgi = node(OpKind::MatvecF32, {f}, "sgi" + s, 1,
+                                 std::move(gate_a));
+    const mlir::Value sgs =
+        pointwise(OpKind::Sigmoid, {sgi}, "sgs" + s, 1, l);
+    const mlir::Value sg =
+        pointwise(OpKind::ScaleBy, {sfo, sgs}, "sg" + s, d, l);
+    return pointwise(OpKind::Add, {moe, sg}, "ffo" + s, d, l);
+  }
+
   // ---- the block -----------------------------------------------------------
 
   mlir::Value block(const Block& blk, uint32_t l, mlir::Value residual) {
