@@ -246,6 +246,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // A gated attention output multiplies the attention result by the
       // sigmoid of the Q projection's gate half.
       OpKind::Sigmoid,
+      // The mixture-of-experts route and expert nodes run the SonicBoom-owned
+      // quantized matmuls on the CPU.
+      OpKind::MoeRoute,        OpKind::MoeExperts,
   };
   // VS1 prefetch markers are registered only under the switch that can place
   // them. They carry no outputs and no kernels; the backend executes them as
@@ -329,6 +332,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // Gated attention's sigmoid runs on the device (sigmoid_dev), so the
         // gate never leaves it.
         OpKind::Sigmoid,
+        // The mixture-of-experts route and expert nodes (decode gemv / verify
+        // per-row gemv / prefill group-by-expert batched matmul).
+        OpKind::MoeRoute,       OpKind::MoeExperts,
     };
     // MMQ1: the prefill dispatch of the same projections onto the
     // compiler-generated int8 tensor-core kernel. Registered only while that

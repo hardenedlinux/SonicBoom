@@ -129,6 +129,10 @@ std::optional<OpKind> op_kind_from_name(std::string_view name) noexcept {
     return OpKind::SampleSelect;
   if (name == "sigmoid")
     return OpKind::Sigmoid;
+  if (name == "moe_route")
+    return OpKind::MoeRoute;
+  if (name == "moe_experts")
+    return OpKind::MoeExperts;
   return std::nullopt;
 }
 
@@ -190,6 +194,8 @@ const char* op_kind_name(OpKind k) noexcept {
     case OpKind::SyncPrefetch: return "sync_prefetch";
     case OpKind::SampleSelect: return "sample_select";
     case OpKind::Sigmoid: return "sigmoid";
+    case OpKind::MoeRoute: return "moe_route";
+    case OpKind::MoeExperts: return "moe_experts";
   }
   return "?";
 }

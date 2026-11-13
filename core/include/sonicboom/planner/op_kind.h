@@ -195,6 +195,18 @@ enum class OpKind : uint8_t {
   // own (no model emits it yet). Appended last for the same reason as
   // ClipGradNorm.
   Sigmoid,
+
+  // Mixture-of-experts feed-forward (qwen35moe). The router turns one
+  // position's activation into the experts it uses: moe_route has one operand,
+  // the activation, and two results, the selected expert ids ([used], int64)
+  // and their renormalised weights ([used], f32); `layer`, `slot` (the
+  // router), `experts`, `used` and an optional `scale` ride on node_attrs.
+  // moe_experts operands are [activation, ids, weights] and its single result
+  // is the routed experts' weighted sum ([width], f32); `slot`, `slot_up`,
+  // `slot_down`, `experts`, `used` and `activation` ride on node_attrs.
+  // Appended last for the same reason as ClipGradNorm.
+  MoeRoute,
+  MoeExperts,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

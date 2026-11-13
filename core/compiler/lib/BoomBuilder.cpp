@@ -478,6 +478,75 @@ mlir::Value BoomBuilder::node(planner::OpKind op,
   return value;
 }
 
+std::vector<mlir::Value> BoomBuilder::nodes(
+    planner::OpKind op, llvm::ArrayRef<mlir::Value> operands,
+    llvm::ArrayRef<llvm::StringRef> names,
+    llvm::ArrayRef<llvm::ArrayRef<int64_t>> shapes,
+    llvm::ArrayRef<sx::DType> dtypes,
+    llvm::ArrayRef<sx::Attribute> attributes, planner::BackendTag backend) {
+  std::vector<mlir::Value> values;
+  if (names.size() != shapes.size() || names.size() != dtypes.size() ||
+      names.empty()) {
+    mlir::emitError(loc_) << "a multi-result node needs one name, shape and "
+                             "dtype per result";
+    failed_ = true;
+    return values;
+  }
+
+  // The same row-dealt layout and stamp as node(): every result shape is
+  // multiplied by the row count and the node carries it once.
+  llvm::SmallVector<int64_t, 4> scaled_shape;
+  llvm::SmallVector<sx::Attribute, 6> scaled_attrs;
+  if (row_scale_ > 0) {
+    scaled_attrs.assign(attributes.begin(), attributes.end());
+    scaled_attrs.push_back(
+        sx::Attribute{row_scale_attr_, int64_t(row_scale_)});
+    attributes = scaled_attrs;
+  }
+
+  llvm::SmallVector<mlir::Type, 2> results;
+  llvm::SmallVector<int64_t, 2> result_ids;
+  std::vector<std::vector<int64_t>> kept;  // the shapes the table records
+  kept.reserve(names.size());
+  for (size_t i = 0; i < names.size(); ++i) {
+    llvm::ArrayRef<int64_t> shape = shapes[i];
+    if (row_scale_ > 0) {
+      scaled_shape.assign(shape.begin(), shape.end());
+      for (int64_t& v : scaled_shape) v *= row_scale_;
+      kept.push_back(std::vector<int64_t>(scaled_shape.begin(),
+                                          scaled_shape.end()));
+      shape = kept.back();
+    }
+    const int64_t id = int64_t(table_.size());
+    auto form = tensorForm(context_, loc_, id, names[i], shape, dtypes[i],
+                           extent_);
+    if (!form) {
+      failed_ = true;
+      return {};
+    }
+    addTensor(names[i], shape, dtypes[i], form->size_bytes,
+              /*is_input=*/false);
+    results.push_back(form->type);
+    result_ids.push_back(id);
+  }
+
+  const int64_t node_id = nodes_++;
+  mlir::Operation *node =
+      createBoomNode(builder_, loc_, op, operands, results,
+                     planner::op_kind_name(op), node_id, result_ids, attributes,
+                     backend);
+  if (!node) {
+    failed_ = true;
+    return {};
+  }
+  values.reserve(names.size());
+  for (size_t i = 0; i < names.size(); ++i) {
+    values.push_back(node->getResult(unsigned(i)));
+    ids_[values.back()] = result_ids[i];
+  }
+  return values;
+}
+
 void BoomBuilder::set_consumer(llvm::StringRef kind, int64_t list_capacity) {
   graph_op_.setConsumerAttr(builder_.getStringAttr(kind));
   if (list_capacity > 0)

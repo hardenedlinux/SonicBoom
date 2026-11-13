@@ -447,6 +447,21 @@ def Boom_SiluOp : Boom_Op<"silu",
 def Boom_SigmoidOp : Boom_Op<"sigmoid",
     "sigmoid activation, 1 / (1 + exp(-x))",
     [NoMemoryEffect, Boom_Elementwise, Boom_Monotone, Boom_RowIndependent]>;
+
+// moe_route: a mixture-of-experts router. Operand [activation]; results
+// [ids ([used], int64), weights ([used], f32)]. The attributes that decide the
+// computation — layer, slot (the router weight), experts, used, and an
+// optional scale — ride on node_attrs.
+def Boom_MoeRouteOp : Boom_Op<"moe_route",
+    "mixture-of-experts routing: selected expert ids and their weights",
+    [NoMemoryEffect, Boom_RowIndependent]>;
+
+// moe_experts: the routed experts' weighted sum. Operands
+// [activation, ids, weights]; result [width] f32. The expert roles
+// (slot/slot_up/slot_down), experts, used and activation ride on node_attrs.
+// The weights it reads are chosen by the ids operand.
+def Boom_MoeExpertsOp : Boom_Op<"moe_experts",
+    "routed mixture-of-experts feed-forward">;
 def Boom_RopeOp : Boom_Op<"rope",
     "multi-head NEOX RoPE",
     [NoMemoryEffect, Boom_RowIndependent]>;

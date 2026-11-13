@@ -189,6 +189,18 @@ public:
                    llvm::ArrayRef<sx::Attribute> attributes,
                    planner::BackendTag backend = planner::BackendTag::Sonic);
 
+  // A node with several results, each its own tensor: names[i] is tensor i's
+  // name, shapes[i] its shape, dtypes[i] its element type. The same record as
+  // node() (one node id, one result_ids list) with the result list of a
+  // multi-result op such as the mixture-of-experts route (ids + weights).
+  std::vector<mlir::Value> nodes(planner::OpKind op,
+                                 llvm::ArrayRef<mlir::Value> operands,
+                                 llvm::ArrayRef<llvm::StringRef> names,
+                                 llvm::ArrayRef<llvm::ArrayRef<int64_t>> shapes,
+                                 llvm::ArrayRef<sx::DType> dtypes,
+                                 llvm::ArrayRef<sx::Attribute> attributes,
+                                 planner::BackendTag backend = planner::BackendTag::Sonic);
+
   // Name `value`'s tensor the graph's output. The last call wins: a graph has
   // one output, and an emitter that set two would be a graph the round trip
   // could not reproduce.

@@ -65,6 +65,10 @@ inline BackendTag route_op(OpKind op) noexcept {
     case OpKind::GeluFp16:
     case OpKind::Silu:
     case OpKind::Sigmoid:
+    // The mixture-of-experts route and expert nodes are Sonic-owned kernels
+    // like the projections around them.
+    case OpKind::MoeRoute:
+    case OpKind::MoeExperts:
     case OpKind::Rope:
     case OpKind::Attention:
     case OpKind::GqaBroadcast:
