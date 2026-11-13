@@ -97,6 +97,18 @@ enum class WeightSlot : uint8_t {
   SharedUp,
   SharedDown,
   SharedGateIn,
+  // Gated DeltaNet roles (Qwen3.6-A3B recurrent layers). The five projections
+  // are quantized; the convolution kernel, the per-value-head dt bias and A,
+  // and the per-key-head norm are f32.
+  GdnQkv,
+  GdnGate,
+  GdnBeta,
+  GdnAlpha,
+  GdnOut,
+  GdnConv,
+  GdnDt,
+  GdnA,
+  GdnNorm,
 };
 
 // One transformer block's weights (block_count of these, layers 0..41).
@@ -149,6 +161,27 @@ struct BlockWeights {
   quant::QuantizedTensor shared_up;    // [embedding_length, shared_expert_ff]
   quant::QuantizedTensor shared_down;  // [shared_expert_ff, embedding_length]
   std::span<const float> shared_gate_in;  // [embedding_length]
+
+  // Gated DeltaNet weights (Qwen3.6-A3B recurrent mixers); empty for the other
+  // archs. The five projections are stored "as in the file", the way the
+  // router is: a quantized tensor is bound in the quantized form, an f32 tensor
+  // is bound in the f32 form. The convolution kernel is stored
+  // [conv_kernel, channels] in GGUF order, so tap i of channel c is element
+  // c*conv_kernel + i.
+  quant::QuantizedTensor gdn_qkv;    // [embedding_length, 2*key_dim + value_dim]
+  quant::QuantizedTensor gdn_gate;   // [embedding_length, value_dim]
+  quant::QuantizedTensor gdn_beta;   // [embedding_length, n_heads_v]
+  quant::QuantizedTensor gdn_alpha;  // [embedding_length, n_heads_v]
+  quant::QuantizedTensor gdn_out;    // [value_dim, embedding_length]
+  std::span<const float> gdn_qkv_f32;   // same shape, when the file stores f32
+  std::span<const float> gdn_gate_f32;  // same shape, when the file stores f32
+  std::span<const float> gdn_beta_f32;  // same shape, when the file stores f32
+  std::span<const float> gdn_alpha_f32; // same shape, when the file stores f32
+  std::span<const float> gdn_out_f32;   // same shape, when the file stores f32
+  std::span<const float> gdn_conv;   // [conv_kernel, channels] (f32)
+  std::span<const float> gdn_dt;     // [n_heads_v] (f32)
+  std::span<const float> gdn_a;      // [n_heads_v] (f32)
+  std::span<const float> gdn_norm;   // [state_size] (f32)
 };
 
 struct Gemma4Weights {

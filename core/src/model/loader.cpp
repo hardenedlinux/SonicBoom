@@ -431,6 +431,24 @@ std::optional<std::span<const float>> bind_f32_2d(const gguf::Reader& r,
                                 t->n_elements);
 }
 
+// A projection stored either way ("as in the file", the way the mixture's
+// router is bound): an f32 tensor is held as f32, anything else goes through the
+// quantized path (a native quantized type as it is, F16/Q4_0 converted).
+void bind_quant_or_f32(const gguf::Reader& r, std::string_view name,
+                       std::initializer_list<uint64_t> dims,
+                       quant::QuantizedTensor& quant_out,
+                       std::span<const float>& f32_out, std::string& errs,
+                       std::vector<std::vector<uint8_t>>& owned,
+                       std::map<uint32_t,uint64_t>& converted) {
+  const gguf::TensorInfo* t = r.tensor(name);
+  if (t && t->type == kF32) {
+    if (auto s = bind_f32_2d(r, name, dims, errs)) f32_out = *s;
+    return;
+  }
+  if (auto q = bind_quant(r, name, {}, dims, errs, owned, converted))
+    quant_out = *q;
+}
+
 std::optional<std::span<const uint16_t>> bind_bf16(const gguf::Reader& r,
                                                    std::string_view name,
                                                    std::initializer_list<uint64_t> dims,
@@ -451,26 +469,6 @@ std::optional<std::span<const uint16_t>> bind_bf16(const gguf::Reader& r,
   }
   return std::span<const uint16_t>(reinterpret_cast<const uint16_t*>(data->data()),
                                    n);
-}
-
-// Existence + exact shape, without binding: the recurrent (gated DeltaNet)
-// tensors are checked, not loaded (the recurrent path does not run yet).
-bool require_tensor(const gguf::Reader& r, std::string_view name,
-                    std::initializer_list<uint64_t> dims, std::string& errs) {
-  const gguf::TensorInfo* t = r.tensor(name);
-  if (!t) {
-    errs += "missing tensor: ";
-    errs += name;
-    errs += "\n";
-    return false;
-  }
-  if (!dims_match(t->dims, dims)) {
-    errs += "tensor shape mismatch: ";
-    errs += name; errs += " (dims "; errs += dims_string(t->dims); errs += ")";
-    errs += "\n";
-    return false;
-  }
-  return true;
 }
 
 // One 2-D view per expert over a stacked quantized tensor
@@ -954,9 +952,10 @@ std::expected<Gemma4Model, std::string> load_qwen2(const gguf::Reader& r) {
 // container. The MoE part binds one router per block (quantized or f32,
 // whichever the file stores), per-expert views over the stacked gate/up/down
 // tensors, and the shared expert's three projections plus its gate vector.
-// Recurrent (gated DeltaNet) layers are validated by shape and not loaded; the
-// recurrent path does not run yet. The vision tower and the trailing
-// multi-token-prediction blocks are not read.
+// Recurrent (gated DeltaNet) layers bind their QKV+gate, beta, alpha and out
+// projections, the convolution kernel, dt and A, and the per-key-head norm; the
+// recurrence itself is kernel/state work downstream. The vision tower and the
+// trailing multi-token-prediction blocks are not read.
 std::expected<Gemma4Model, std::string> load_qwen35moe(const gguf::Reader& r) {
   Gemma4Model m;
 
@@ -987,6 +986,21 @@ std::expected<Gemma4Model, std::string> load_qwen35moe(const gguf::Reader& r) {
   const uint64_t key_dim = uint64_t(c.ssm_state_size) * c.ssm_group_count;
   const uint64_t value_dim = uint64_t(c.ssm_state_size) * c.ssm_time_step_rank;
   const uint64_t conv_dim = key_dim * 2 + value_dim;
+  // The three conditions the recurrence and its CUDA layout require; a model
+  // that violates one fails to load, naming the condition.
+  if (c.ssm_group_count == 0 ||
+      c.ssm_time_step_rank % c.ssm_group_count != 0)
+    errs += "gated delta net: ssm_time_step_rank (" +
+            std::to_string(c.ssm_time_step_rank) +
+            ") is not a multiple of ssm_group_count (" +
+            std::to_string(c.ssm_group_count) + ")\n";
+  if (value_dim != uint64_t(c.ssm_inner_size))
+    errs += "gated delta net: ssm_state_size * ssm_time_step_rank (" +
+            std::to_string(value_dim) + ") does not equal ssm_inner_size (" +
+            std::to_string(c.ssm_inner_size) + ")\n";
+  if (c.ssm_state_size % 32 != 0)
+    errs += "gated delta net: ssm_state_size (" +
+            std::to_string(c.ssm_state_size) + ") is not a multiple of 32\n";
 
   w.blocks.clear();
   w.blocks.reserve(c.block_count);
@@ -1006,16 +1020,31 @@ std::expected<Gemma4Model, std::string> load_qwen35moe(const gguf::Reader& r) {
     const bool recurrent = l < c.recurrent_layers.size() &&
                            c.recurrent_layers[l];
     if (recurrent) {
-      // Validate the gated DeltaNet tensors; do not bind them.
-      require_tensor(r, p + "attn_qkv.weight", {d, key_dim * 2 + value_dim}, errs);
-      require_tensor(r, p + "attn_gate.weight", {d, value_dim}, errs);
-      require_tensor(r, p + "ssm_conv1d.weight", {c.ssm_conv_kernel, conv_dim}, errs);
-      require_tensor(r, p + "ssm_dt.bias", {c.ssm_time_step_rank}, errs);
-      require_tensor(r, p + "ssm_a", {c.ssm_time_step_rank}, errs);
-      require_tensor(r, p + "ssm_beta.weight", {d, c.ssm_time_step_rank}, errs);
-      require_tensor(r, p + "ssm_alpha.weight", {d, c.ssm_time_step_rank}, errs);
-      require_tensor(r, p + "ssm_norm.weight", {c.ssm_state_size}, errs);
-      require_tensor(r, p + "ssm_out.weight", {value_dim, d}, errs);
+      // Gated DeltaNet: five projections stored as in the file, the
+      // convolution kernel, the dt bias and A, and the per-key-head norm.
+      bind_quant_or_f32(r, p + "attn_qkv.weight",
+                        {d, key_dim * 2 + value_dim}, bw.gdn_qkv,
+                        bw.gdn_qkv_f32, errs, m.owned_quant_buffers, converted);
+      bind_quant_or_f32(r, p + "attn_gate.weight", {d, value_dim},
+                        bw.gdn_gate, bw.gdn_gate_f32, errs,
+                        m.owned_quant_buffers, converted);
+      bind_quant_or_f32(r, p + "ssm_beta.weight", {d, c.ssm_time_step_rank},
+                        bw.gdn_beta, bw.gdn_beta_f32, errs,
+                        m.owned_quant_buffers, converted);
+      bind_quant_or_f32(r, p + "ssm_alpha.weight", {d, c.ssm_time_step_rank},
+                        bw.gdn_alpha, bw.gdn_alpha_f32, errs,
+                        m.owned_quant_buffers, converted);
+      bind_quant_or_f32(r, p + "ssm_out.weight", {value_dim, d}, bw.gdn_out,
+                        bw.gdn_out_f32, errs, m.owned_quant_buffers, converted);
+      if (auto s = bind_f32_2d(r, p + "ssm_conv1d.weight",
+                               {c.ssm_conv_kernel, conv_dim}, errs))
+        bw.gdn_conv = *s;
+      if (auto s = bind_f32(r, p + "ssm_dt.bias", c.ssm_time_step_rank, errs))
+        bw.gdn_dt = *s;
+      if (auto s = bind_f32(r, p + "ssm_a", c.ssm_time_step_rank, errs))
+        bw.gdn_a = *s;
+      if (auto s = bind_f32(r, p + "ssm_norm.weight", c.ssm_state_size, errs))
+        bw.gdn_norm = *s;
     } else {
       // Full attention: the Q projection is twice as wide as the attention
       // head output (its second half per head gates the attention result).

@@ -63,6 +63,15 @@ std::span<const float> weight_f32(const Gemma4Weights& weights,
     case WeightSlot::LayerOutputScale: return block->layer_output_scale;
     case WeightSlot::ExpertRouter: return block->expert_router_f32;
     case WeightSlot::SharedGateIn: return block->shared_gate_in;
+    case WeightSlot::GdnQkv: return block->gdn_qkv_f32;
+    case WeightSlot::GdnGate: return block->gdn_gate_f32;
+    case WeightSlot::GdnBeta: return block->gdn_beta_f32;
+    case WeightSlot::GdnAlpha: return block->gdn_alpha_f32;
+    case WeightSlot::GdnOut: return block->gdn_out_f32;
+    case WeightSlot::GdnConv: return block->gdn_conv;
+    case WeightSlot::GdnDt: return block->gdn_dt;
+    case WeightSlot::GdnA: return block->gdn_a;
+    case WeightSlot::GdnNorm: return block->gdn_norm;
     default: return {};
   }
 }
@@ -112,6 +121,11 @@ const quant::QuantizedTensor& weight_quant(const Gemma4Weights& weights,
       return key.index == 0 ? block->shared_up : kEmpty;
     case WeightSlot::SharedDown:
       return key.index == 0 ? block->shared_down : kEmpty;
+    case WeightSlot::GdnQkv: return block->gdn_qkv;
+    case WeightSlot::GdnGate: return block->gdn_gate;
+    case WeightSlot::GdnBeta: return block->gdn_beta;
+    case WeightSlot::GdnAlpha: return block->gdn_alpha;
+    case WeightSlot::GdnOut: return block->gdn_out;
     default: return kEmpty;
   }
 }
