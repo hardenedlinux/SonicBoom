@@ -37,6 +37,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -112,6 +113,7 @@ SonicBackend::SonicBackend(const model::Gemma4Model& model, const Graph& graph,
 
 void SonicBackend::share_caches(const SonicBackend& other) {
   caches_ = other.caches_;
+  states_ = other.states_;
 }
 
 void SonicBackend::ensure_caches(uint64_t n_ctx) {
@@ -130,6 +132,19 @@ void SonicBackend::ensure_caches(uint64_t n_ctx) {
     c.k.assign(total, 0.0f);
     c.v.assign(total, 0.0f);
   }
+
+  // One zeroed state per recurrent block, in the order the blocks appear: the
+  // state index a gdn_scan node carries numbers them from 0 the same way. A
+  // model with no recurrent block gets an empty set.
+  const model::Gemma4Config& mc = model_.config;
+  size_t n_states = 0;
+  for (bool recurrent : mc.recurrent_layers)
+    n_states += recurrent ? 1 : 0;
+  const nn::GdnDims dims{mc.ssm_group_count, mc.ssm_time_step_rank,
+                         mc.ssm_state_size, mc.ssm_conv_kernel,
+                         mc.rms_epsilon};
+  states_ = std::make_shared<StateSet>(
+      std::vector<nn::GdnDims>(n_states, dims));
 }
 
 std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
@@ -670,6 +685,41 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
         ok = nn::moe_experts(x.subspan(r * dim, dim), {ids_in + r * k, k},
                              {w_in + r * k, k}, views, act,
                              y.subspan(r * dim, dim));
+      break;
+    }
+    case OpKind::GdnScan: {
+      // The gated DeltaNet recurrence of one block over this execution's
+      // positions, committed to the sequence's state: inputs {qkv [n, C],
+      // beta logits [n, heads_v], alpha logits [n, heads_v], pos}. The
+      // geometry and the state's index are the node's attributes; the
+      // convolution, dt and a weights are the node's `slot`, `slot_dt` and
+      // `slot_a` roles in its layer.
+      int64_t state_index = -1, heads_k = 0, heads_v = 0, gdim = 0, kernel = 0;
+      int64_t slot_dt_i = 0, slot_a_i = 0;
+      if (!attr_i(*node, "state", state_index) || state_index < 0 ||
+          !attr_i(*node, "heads_k", heads_k) ||
+          !attr_i(*node, "heads_v", heads_v) || !attr_i(*node, "dim", gdim) ||
+          !attr_i(*node, "kernel", kernel) ||
+          !attr_i(*node, "slot_dt", slot_dt_i) ||
+          !attr_i(*node, "slot_a", slot_a_i)) {
+        ok = false;
+        break;
+      }
+      if (!states_ || size_t(state_index) >= states_->size()) {
+        ok = false;
+        break;
+      }
+      const nn::GdnWeights w{
+          fweight(slot),
+          fweight(static_cast<model::WeightSlot>(slot_dt_i)),
+          fweight(static_cast<model::WeightSlot>(slot_a_i))};
+      const uint64_t start = read_i64(inputs[3]);
+      const auto r = states_->commit(size_t(state_index), uint32_t(layer), start,
+                                     w, f32(inputs[0]), f32(inputs[1]),
+                                     f32(inputs[2]), f32_mut(out));
+      if (!r)
+        return std::unexpected(fail(r.error()));
+      ok = true;
       break;
     }
     default:

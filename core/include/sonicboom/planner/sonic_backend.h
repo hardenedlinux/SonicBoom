@@ -30,6 +30,7 @@
 
 #include <sonicboom/model/loader.h>
 #include <sonicboom/planner/backend.h>
+#include <sonicboom/planner/gdn_state.h>
 #include <sonicboom/planner/graph.h>
 
 #include <memory>
@@ -57,11 +58,13 @@ public:
   // node and sizes every dynamic tensor's buffer.
   void bind_segment_extent(uint64_t extent) override { segment_extent_ = extent; }
 
-  // Share another backend's KV cache (same session). The prefill graph's
-  // FlashAttention nodes fill the cache that the decode graph's Attention nodes
-  // then read, so the prefill backend and decode backend must reference the same
-  // cache. Both backends stay bound to their own Graph (for node lookup); only
-  // the per-KV-layer cache state is shared.
+  // Share another backend's KV cache and recurrent-block state (same session).
+  // The prefill graph's FlashAttention nodes fill the cache that the decode
+  // graph's Attention nodes then read, and a prefill segment's gdn_scan nodes
+  // leave the state that the decode steps' scans continue from, so the prefill
+  // backend and decode backend must reference the same caches and states. Both
+  // backends stay bound to their own Graph (for node lookup); only the
+  // per-KV-layer cache and the per-sequence recurrent state are shared.
   void share_caches(const SonicBackend& other);
 
 private:
@@ -80,6 +83,9 @@ private:
   const model::Gemma4Model& model_;
   const Graph& graph_;
   std::shared_ptr<std::vector<KvCache>> caches_;  // index == KV layer
+  // One state per recurrent block of the graph, indexed the way a gdn_scan
+  // node's `state` attribute numbers them; null for a graph with no scan.
+  std::shared_ptr<StateSet> states_;
   uint64_t segment_extent_ = 0;  // bound prefill segment length (0: static)
 
   void ensure_caches(uint64_t n_ctx);

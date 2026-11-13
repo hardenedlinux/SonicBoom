@@ -250,6 +250,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // quantized matmuls on the CPU; the shared expert's row gate is a plain
       // elementwise scale.
       OpKind::MoeRoute,        OpKind::MoeExperts, OpKind::ScaleBy,
+      // The gated DeltaNet scan of a recurrent block runs the SonicBoom-owned
+      // CPU kernel against the sequence's state.
+      OpKind::GdnScan,
   };
   // VS1 prefetch markers are registered only under the switch that can place
   // them. They carry no outputs and no kernels; the backend executes them as
