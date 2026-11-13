@@ -74,6 +74,10 @@ struct SelfAttention {
   // covers only a prefix of each head (Qwen3.6) sets this, and the emitter
   // writes it on the block's Rope node.
   uint32_t rotary_dims = 0;
+  // A gated attention output: the Q projection is twice as wide and the second
+  // half of each head gates the attention result through a sigmoid, so `q.out`
+  // is 2*q_width() and the attention's output stays q_width().
+  bool output_gate = false;
   // Multiplies the attention scores; 1.0 when the model applies none (unit-
   // normed Q and K make the dot product a cosine already).
   double scale = 1.0;

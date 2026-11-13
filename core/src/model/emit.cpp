@@ -238,6 +238,21 @@ protected:
 
     mlir::Value q = matmul(h, "q" + s, at.q, l);
     q = bias(q, "qb" + s, at.q, l);
+    // Gated attention: the Q projection is [head_dim query | head_dim gate] per
+    // head, so the gate slice takes the second half of each head and the query
+    // keeps the first. Both are strided slices of the same projection.
+    mlir::Value qgate;
+    if (at.output_gate) {
+      const int64_t hd = int64_t(at.head_dim);
+      const int64_t stride = 2 * hd;
+      const mlir::Value qfull = q;
+      q = node(OpKind::Slice, {qfull}, "qq" + s, qw,
+               {attr_i("offset", int64_t(0)), attr_i("length", hd),
+                attr_i("stride", stride)});
+      qgate = node(OpKind::Slice, {qfull}, "qg" + s, qw,
+                   {attr_i("offset", hd), attr_i("length", hd),
+                    attr_i("stride", stride)});
+    }
     if (at.qk_norm)
       q = norm_heads(q, "qn" + s, qw, l, WeightSlot::AttnQNorm);
     q = rope(q, "qr" + s, qw, l, at.rotary_dims);
@@ -258,6 +273,13 @@ protected:
       attn = attend(at, l, q, kc, vc);
     } else {
       attn = attend(at, l, q, {}, {});
+    }
+
+    // The gate multiplies the attention result before the output projection.
+    if (at.output_gate) {
+      const mlir::Value g =
+          pointwise(OpKind::Sigmoid, {qgate}, "gs" + s, qw, l);
+      attn = pointwise(OpKind::Mul, {attn, g}, "gm" + s, qw, l);
     }
 
     mlir::Value out = matmul(attn, "ap" + s, at.out, l);
