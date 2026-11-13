@@ -21,6 +21,8 @@
 #ifdef SB_TEST_CUDA
 #include <cuda_runtime.h>
 
+#include <sonicboom/nn/cuda_moe.h>
+
 #include "../../core/src/nn/cuda_resident.h"
 #endif
 
@@ -642,12 +644,18 @@ void test_moe() {
                                     *bytes);
   };
   constexpr uint16_t kF16_1 = 0x3C00;
+  // 2^-5: with unit scales the 256-wide gate/up sums reach ~1e5 and the hidden
+  // product ~1e8. The CUDA prefill batched matmul routes through the fp16
+  // activation path, so a scale that large takes the example outside the range
+  // that path handles; 1/32 keeps the intermediates small enough and leaves the
+  // arithmetic identical.
+  constexpr uint16_t kF16_1_16 = 0x2800;
 
   std::vector<sbquant::QuantizedTensor> gate, up, down;
   for (uint32_t e = 0; e < E; ++e) {
-    gate.push_back(make(d, ff, kF16_1, 1000 + e));
-    up.push_back(make(d, ff, kF16_1, 2000 + e));
-    down.push_back(make(ff, d, kF16_1, 3000 + e));
+    gate.push_back(make(d, ff, kF16_1_16, 1000 + e));
+    up.push_back(make(d, ff, kF16_1_16, 2000 + e));
+    down.push_back(make(ff, d, kF16_1_16, 3000 + e));
   }
   check(gate[0].valid() && down[0].valid(), "moe: the expert views are valid");
 
@@ -854,6 +862,96 @@ void test_moe() {
                                    std::bit_cast<uint32_t>(asc[i]);
     check(asc_exact, "moe_experts sums the routed experts in ascending order");
   }
+
+#ifdef SB_TEST_CUDA
+  // The CUDA twin on the same example: decode within the tree's fp32
+  // tolerance of the CPU kernel, a four-row verify bit-identical row by row to
+  // four single-row decodes, and a four-row prefill within tolerance of the
+  // CPU.
+  {
+    int devices = 0;
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+      std::cout << "moe: no CUDA device, device cases skipped\n";
+    } else {
+      std::vector<int64_t> cids(used);
+      std::vector<float> cw(used);
+      check(sbnn::cuda::moe_route(x, &router, std::span<const float>{}, E, used,
+                                  1.0f, cids, cw, 1),
+            "moe cuda: the route runs");
+      check(cids[0] == ids[0] && cids[1] == ids[1],
+            "moe cuda: the route selects the CPU's experts");
+      std::vector<float> y_cuda(d, 0.0f), y_cpu(d, 0.0f);
+      check(sbnn::cuda::moe_experts(x, cids, cw, views,
+                                    sbnn::MoeActivation::Silu, y_cuda, 1, false),
+            "moe cuda: the decode runs");
+      check(sbnn::moe_experts(x, cids, cw, views, sbnn::MoeActivation::Silu,
+                              y_cpu),
+            "moe cuda: the CPU reference runs");
+      bool close = true;
+      for (uint32_t i = 0; i < d; ++i)
+        close = close && std::abs(y_cuda[i] - y_cpu[i]) <=
+                             2e-3f * std::max(1.0f, std::abs(y_cpu[i]));
+      check(close, "moe cuda: decode agrees with the CPU within tolerance");
+
+      // Verify: four rows through one call, then each row decoded alone.
+      constexpr uint64_t rows = 4;
+      std::vector<float> x4(rows * d);
+      for (uint64_t r = 0; r < rows; ++r)
+        for (uint32_t i = 0; i < d; ++i)
+          x4[r * d + i] = x[i] * (0.5f + 0.25f * float(r));
+      std::vector<int64_t> ids4(rows * used);
+      std::vector<float> w4(rows * used);
+      check(sbnn::cuda::moe_route(x4, &router, std::span<const float>{}, E,
+                                  used, 1.0f, ids4, w4, rows),
+            "moe cuda: the verify route runs");
+      std::vector<float> yv(rows * d, 0.0f);
+      check(sbnn::cuda::moe_experts(x4, ids4, w4, views,
+                                    sbnn::MoeActivation::Silu, yv, rows, false),
+            "moe cuda: the verify step runs");
+      bool bitwise = true;
+      for (uint64_t r = 0; r < rows && bitwise; ++r) {
+        std::vector<float> one(d, 0.0f);
+        if (!sbnn::cuda::moe_experts(
+                std::span<const float>(x4).subspan(r * d, d),
+                std::span<const int64_t>(ids4).subspan(r * used, used),
+                std::span<const float>(w4).subspan(r * used, used), views,
+                sbnn::MoeActivation::Silu, one, 1, false)) {
+          bitwise = false;
+          break;
+        }
+        for (uint32_t i = 0; i < d; ++i)
+          bitwise = bitwise && std::bit_cast<uint32_t>(yv[r * d + i]) ==
+                                   std::bit_cast<uint32_t>(one[i]);
+      }
+      check(bitwise,
+            "moe cuda: every verify row matches one decode bit for bit");
+
+      // Prefill: the grouped form against the CPU row by row.
+      std::vector<float> yp(rows * d, 0.0f);
+      check(sbnn::cuda::moe_experts(x4, ids4, w4, views,
+                                    sbnn::MoeActivation::Silu, yp, rows, true),
+            "moe cuda: the prefill runs");
+      bool prefill_close = true;
+      for (uint64_t r = 0; r < rows && prefill_close; ++r) {
+        std::vector<float> want(d, 0.0f);
+        if (!sbnn::moe_experts(
+                std::span<const float>(x4).subspan(r * d, d),
+                std::span<const int64_t>(ids4).subspan(r * used, used),
+                std::span<const float>(w4).subspan(r * used, used), views,
+                sbnn::MoeActivation::Silu, want)) {
+          prefill_close = false;
+          break;
+        }
+        for (uint32_t i = 0; i < d; ++i)
+          prefill_close = prefill_close &&
+                          std::abs(yp[r * d + i] - want[i]) <=
+                              2e-3f * std::max(1.0f, std::abs(want[i]));
+      }
+      check(prefill_close,
+            "moe cuda: prefill agrees with the CPU within tolerance");
+    }
+  }
+#endif
 }
 
 void test_validation() {

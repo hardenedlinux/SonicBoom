@@ -227,6 +227,9 @@ if(SONICBOOM_USE_CUDA)
     # production dispatch; cuda_quant_matmul.cu is unchanged.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/quant/mmq_upstream.cu
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_elementwise.cu
+    # Mixture-of-experts projections: the decode/verify per-(row, expert) gemv
+    # and the prefill per-expert batched matmul (CUDA twins of nn/moe.cpp).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_moe.cu
     # SonicBoom-owned prefill attention (boom_fattn), the prefill attention
     # implementation. Plain device code, no device lambdas, so it needs no
     # per-source flags.
