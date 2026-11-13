@@ -28,12 +28,15 @@ namespace {
 // norms Q, K and V per head, norms after each sub-layer as well as before,
 // scales the embedding and each block's output, ties the head to the
 // embedding and softcaps its logits; Qwen2 biases Q, K and V, gates with SiLU,
-// and scales the scores by 1/sqrt(head_dim).
+// and scales the scores by 1/sqrt(head_dim); Qwen3.6-MoE gates its attention
+// output through the second half of the Q projection and scales the scores the
+// same way, and its feed-forward is a mixture of experts (the recipe below).
 struct Traits {
   bool scale_embedding = false;
   bool qk_norm = false;
   bool v_norm = false;
   bool qkv_bias = false;
+  bool output_gate = false;
   bool post_mixer_norm = false;
   bool post_ffn_norm = false;
   Activation activation = Activation::GeluFp16;
@@ -65,6 +68,13 @@ Traits traits_of(const Gemma4Config& cfg) {
       t.tied_head = false;
       t.score_scale = 1.0f / std::sqrt(float(cfg.head_dim_global));
       break;
+    case ModelArch::Qwen35Moe:
+      t.qk_norm = true;
+      t.output_gate = true;
+      t.activation = Activation::Silu;
+      t.tied_head = false;
+      t.score_scale = 1.0f / std::sqrt(float(cfg.head_dim_global));
+      break;
   }
   return t;
 }
@@ -76,6 +86,12 @@ Recipe recipe_for(const Gemma4Model& m) {
   const Traits t = traits_of(cfg);
   const uint32_t d = cfg.embedding_length;
   const uint32_t ff = cfg.feed_forward_length;
+
+  // A block whose mixer is the recurrent (gated DeltaNet) kind has no layer
+  // kind in the vocabulary, so the model has no recipe: the caller reports it
+  // rather than substituting a layer the model does not have.
+  for (bool recurrent : cfg.recurrent_layers)
+    if (recurrent) return {};
 
   Recipe r;
   r.width = d;
@@ -103,7 +119,7 @@ Recipe recipe_for(const Gemma4Model& m) {
     const uint32_t qw = at.q_width();
     const uint32_t kvw = at.kv_width();
     at.q = {WeightSlot::AttnQ, bias(t.qkv_bias, WeightSlot::AttnQBias),
-            w.attn_q.type(), d, qw};
+            w.attn_q.type(), d, t.output_gate ? 2 * qw : qw};
     at.k = {WeightSlot::AttnK, bias(t.qkv_bias, WeightSlot::AttnKBias),
             w.attn_k.type(), d, kvw};
     at.v = {WeightSlot::AttnV, bias(t.qkv_bias, WeightSlot::AttnVBias),
@@ -112,22 +128,59 @@ Recipe recipe_for(const Gemma4Model& m) {
               qw, d};
     at.qk_norm = t.qk_norm;
     at.v_norm = t.v_norm;
+    at.output_gate = t.output_gate;
+    at.rotary_dims = cfg.rope_dimension_count;
     // The architecture's temperature times YaRN's magnitude term (1.0 for a
     // model without YaRN metadata).
     at.scale = double(t.score_scale) * m.weights.rope_attn_scale;
     at.cache = cfg.kv_donor_layer(l);
     at.owns_cache = cfg.has_kv(l);
 
-    GatedFfn ffn;
-    ffn.up = {WeightSlot::FfnUp, WeightSlot::None, w.ffn_up.type(), d, ff};
-    ffn.gate = {WeightSlot::FfnGate, WeightSlot::None, w.ffn_gate.type(), d, ff};
-    ffn.down = {WeightSlot::FfnDown, WeightSlot::None, w.ffn_down.type(), ff, d};
-    ffn.activation = t.activation;
+    FeedForward ffn;
+    if (cfg.arch == ModelArch::Qwen35Moe) {
+      MoeFfn moe;
+      moe.router = {WeightSlot::ExpertRouter, WeightSlot::None,
+                    w.expert_router.type(), d, cfg.n_expert};
+      moe.experts = cfg.n_expert;
+      moe.used = cfg.n_expert_used;
+      const quant::QuantType et = w.expert_gate.empty()
+                                      ? quant::QuantType{}
+                                      : w.expert_gate[0].type();
+      moe.routed.gate = {WeightSlot::ExpertGate, WeightSlot::None, et, d,
+                         cfg.expert_ff};
+      moe.routed.up = {WeightSlot::ExpertUp, WeightSlot::None, et, d,
+                       cfg.expert_ff};
+      moe.routed.down = {WeightSlot::ExpertDown, WeightSlot::None, et,
+                         cfg.expert_ff, d};
+      moe.weight_scale = double(cfg.expert_weights_scale);
+      moe.activation = Activation::Silu;
+      if (cfg.shared_expert_ff > 0) {
+        Expert shared;
+        shared.gate = {WeightSlot::SharedGate, WeightSlot::None,
+                       w.shared_gate.type(), d, cfg.shared_expert_ff};
+        shared.up = {WeightSlot::SharedUp, WeightSlot::None, w.shared_up.type(),
+                     d, cfg.shared_expert_ff};
+        shared.down = {WeightSlot::SharedDown, WeightSlot::None,
+                       w.shared_down.type(), cfg.shared_expert_ff, d};
+        moe.shared = shared;
+        moe.shared_gate = WeightSlot::SharedGateIn;
+      }
+      ffn = moe;
+    } else {
+      GatedFfn dense;
+      dense.up = {WeightSlot::FfnUp, WeightSlot::None, w.ffn_up.type(), d, ff};
+      dense.gate = {WeightSlot::FfnGate, WeightSlot::None, w.ffn_gate.type(), d,
+                    ff};
+      dense.down = {WeightSlot::FfnDown, WeightSlot::None, w.ffn_down.type(), ff,
+                    d};
+      dense.activation = t.activation;
+      ffn = dense;
+    }
 
     Block block;
     block.mixer = at;
     block.post_mixer_norm = t.post_mixer_norm;
-    block.ffn = ffn;
+    block.ffn = std::move(ffn);
     block.post_ffn_norm = t.post_ffn_norm;
     block.per_layer_gate = t.per_layer_input;
     if (t.output_scale && !w.layer_output_scale.empty())

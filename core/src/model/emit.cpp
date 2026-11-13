@@ -47,6 +47,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <variant>
@@ -675,6 +676,16 @@ private:
   std::vector<mlir::Value> k_, v_;  // the segment's K and V, by cache index
 };
 
+// An empty recipe is a model whose layer kinds the recipe cannot express
+// (recipe_for leaves it empty for one): there is no graph to write, and it is
+// said so instead of building one from no blocks.
+bool recipe_expressible(const Recipe& recipe) {
+  if (!recipe.blocks.empty()) return true;
+  std::fprintf(stderr,
+               "sonicboom: model not supported yet (recurrent mixer layers)\n");
+  return false;
+}
+
 const char* consumer_name(DecodeConsumer consumer) {
   switch (consumer) {
     case DecodeConsumer::Logits: return "logits";
@@ -690,6 +701,7 @@ const char* consumer_name(DecodeConsumer consumer) {
 GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
+  if (!recipe_expressible(recipe)) return ir;
   compiler::BoomBuilder b(ir.context.get(),
                           spec.rows > 1 ? "gemma4_verify" : "gemma4_decode");
   if (spec.rows > 1)
@@ -712,6 +724,7 @@ GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
 GraphIr emit_prefill_ir(const Recipe& recipe, uint64_t n, bool dynamic_extent) {
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
+  if (!recipe_expressible(recipe)) return ir;
   compiler::BoomBuilder b(ir.context.get(), "gemma4_prefill", n);
 
   PrefillPhase phase(b, recipe, n, dynamic_extent);
