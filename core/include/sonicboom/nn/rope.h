@@ -57,11 +57,21 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base,
 // thread pool (trig-heavy RoPE is big enough to amortise the handshake, unlike
 // the trivial elementwise ops).
 //
+// `rot_dims` is the number of leading values per head that are rotated; 0
+// means the whole head, which is every model before Qwen3.6. When non-zero,
+// only the first rot_dims values of each head are rotated, the angle
+// denominator is rot_dims (not head_dim), and the head's remaining values are
+// copied through unchanged (partial rotary embedding with the unrotated tail
+// contiguous, llama.cpp's rope type NEOX + n_rot). Partial rope is applied to
+// the first rot_dims/2 pairs exactly as full rope is applied to head_dim/2.
+//
 // Returns false (writing nothing) when head_dim is 0 or odd, x.size() is 0 or
-// not a multiple of head_dim, or freq_factors is non-empty and shorter than
-// head_dim/2.
+// not a multiple of head_dim, rot_dims is odd or larger than head_dim, or
+// freq_factors is non-empty and shorter than rot_dims/2 (head_dim/2 with
+// rot_dims == 0).
 bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
                      float theta_base, float freq_scale,
-                     std::span<const float> freq_factors);
+                     std::span<const float> freq_factors,
+                     uint64_t rot_dims = 0);
 
 } // namespace sonicboom::nn

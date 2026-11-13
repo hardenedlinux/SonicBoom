@@ -85,17 +85,20 @@ bool cast_bf16_dev(float* v, int n);
 
 // In-place multi-head NEOX RoPE over a concatenated buffer of `heads` heads of
 // `head_dim` floats each (mirrors nn::cuda::rope_neox_heads). freq_factors is a
-// host span of head_dim/2 floats (empty => 1.0 per pair).
+// host span of head_dim/2 floats (empty => 1.0 per pair). `rot_dims` (0 = the
+// whole head) rotates only that many leading values of each head.
 bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
                          float base, float freq_scale,
-                         std::span<const float> freq_factors);
+                         std::span<const float> freq_factors,
+                         uint64_t rot_dims = 0);
 
 // Device-position variant of rope_neox_heads_dev: `pos` is a DEVICE uint64_t
 // read in-kernel, so the whole decode step is capturable into a CUDA Graph (the
 // position is an input to the graph, not a value baked into a node at capture).
 bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
                              const uint64_t* pos, float base, float freq_scale,
-                             std::span<const float> freq_factors);
+                             std::span<const float> freq_factors,
+                             uint64_t rot_dims = 0);
 
 // Dense (non-K-quant) matvec, device in/out: y[j] = sum_i W[j*cols + i] * x[i].
 // W is row-major with `cols` contiguous (GGUF order); rows = y length. W is a
@@ -456,14 +459,16 @@ bool compact_f32_dev(const float* x, const int32_t* ids, int m, float* y);
 bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
                                  int n_pos, uint64_t start_pos, float base,
                                  float freq_scale,
-                                 std::span<const float> freq_factors);
+                                 std::span<const float> freq_factors,
+                                 uint64_t rot_dims = 0);
 
 // Device-position variant of rope_neox_heads_batched_dev: `start_pos` is a DEVICE
 // uint64_t read in-kernel (CUDA Graphs for chunked prefill).
 bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
                                      int n_pos, const uint64_t* start_pos,
                                      float base, float freq_scale,
-                                     std::span<const float> freq_factors);
+                                     std::span<const float> freq_factors,
+                                     uint64_t rot_dims = 0);
 
 // Dense batched matvec (position-major): y[c*rows+r] = sum_i W[r*cols+i] *
 // x[c*cols+i]. x is [ncols, cols], y is [ncols, rows] (dim innermost); W

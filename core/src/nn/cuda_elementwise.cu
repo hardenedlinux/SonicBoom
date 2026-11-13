@@ -292,19 +292,22 @@ __global__ void rope_neox_kernel(float* __restrict__ x, int half, int n, uint64_
 }
 
 // Multi-head RoPE: rotate each contiguous head slice independently. `i` is the
-// flat index; head = i/head_dim, off = i%head_dim. Only the low half of each head
-// participates (off < head_dim/2), pairing off with off + head_dim/2.
+// flat index; head = i/head_dim, off = i%head_dim. Only the low half of the
+// rotated prefix participates (off < dims/2, dims = rot_dims or head_dim),
+// pairing off with off + dims/2. With rot_dims == 0 this is the whole head.
 __global__ void rope_neox_heads_kernel(float* __restrict__ x, int head_dim, int n,
                                        uint64_t pos, float freq_scale,
                                        float log_base,
-                                       const float* __restrict__ freq_factors) {
+                                       const float* __restrict__ freq_factors,
+                                       int rot_dims) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const int half = head_dim >> 1;
+  const int dims = rot_dims ? rot_dims : head_dim;
+  const int half = dims >> 1;
   const int off = i % head_dim;
   if (off >= half) return;
   float theta = freq_scale * float(pos) *
-                expf(-2.0f * float(off) / float(head_dim) * log_base);
+                expf(-2.0f * float(off) / float(dims) * log_base);
   if (freq_factors) theta /= freq_factors[off];
   const float c = cosf(theta);
   const float s = sinf(theta);
@@ -321,14 +324,16 @@ __global__ void rope_neox_heads_pos_kernel(float* __restrict__ x, int head_dim,
                                            int n,
                                            const uint64_t* __restrict__ pos,
                                            float freq_scale, float log_base,
-                                           const float* __restrict__ freq_factors) {
+                                           const float* __restrict__ freq_factors,
+                                           int rot_dims) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const int half = head_dim >> 1;
+  const int dims = rot_dims ? rot_dims : head_dim;
+  const int half = dims >> 1;
   const int off = i % head_dim;
   if (off >= half) return;
   float theta = freq_scale * float(*pos) *
-                expf(-2.0f * float(off) / float(head_dim) * log_base);
+                expf(-2.0f * float(off) / float(dims) * log_base);
   if (freq_factors) theta /= freq_factors[off];
   const float c = cosf(theta);
   const float s = sinf(theta);
@@ -2394,15 +2399,17 @@ __global__ void rope_neox_heads_batched_kernel(float* __restrict__ x, int n,
                                                int head_dim, int heads_per_pos,
                                                uint64_t start_pos, float freq_scale,
                                                float log_base,
-                                               const float* __restrict__ freq_factors) {
+                                               const float* __restrict__ freq_factors,
+                                               int rot_dims) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const int half = head_dim >> 1;
+  const int dims = rot_dims ? rot_dims : head_dim;
+  const int half = dims >> 1;
   const int off = i % head_dim;
   if (off >= half) return;
   const uint64_t pos = start_pos + (uint64_t)(i / (heads_per_pos * head_dim));
   float theta = freq_scale * float(pos) *
-                expf(-2.0f * float(off) / float(head_dim) * log_base);
+                expf(-2.0f * float(off) / float(dims) * log_base);
   if (freq_factors) theta /= freq_factors[off];
   const float c = cosf(theta);
   const float s = sinf(theta);
@@ -2418,15 +2425,16 @@ __global__ void rope_neox_heads_batched_kernel(float* __restrict__ x, int n,
 __global__ void rope_neox_heads_batched_pos_kernel(
     float* __restrict__ x, int n, int head_dim, int heads_per_pos,
     const uint64_t* __restrict__ start_pos, float freq_scale, float log_base,
-    const float* __restrict__ freq_factors) {
+    const float* __restrict__ freq_factors, int rot_dims) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
-  const int half = head_dim >> 1;
+  const int dims = rot_dims ? rot_dims : head_dim;
+  const int half = dims >> 1;
   const int off = i % head_dim;
   if (off >= half) return;
   const uint64_t pos = *start_pos + (uint64_t)(i / (heads_per_pos * head_dim));
   float theta = freq_scale * float(pos) *
-                expf(-2.0f * float(off) / float(head_dim) * log_base);
+                expf(-2.0f * float(off) / float(dims) * log_base);
   if (freq_factors) theta /= freq_factors[off];
   const float c = cosf(theta);
   const float s = sinf(theta);
@@ -2972,12 +2980,14 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base, float freq_sc
 
 bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
                      float theta_base, float freq_scale,
-                     std::span<const float> freq_factors) {
+                     std::span<const float> freq_factors, uint64_t rot_dims) {
   if (!available()) return false;
   const size_t n = x.size();
   if (head_dim == 0 || (head_dim & 1) != 0 || n == 0 || (n % head_dim) != 0)
     return false;
-  const size_t half = head_dim / 2;
+  const uint64_t dims = rot_dims == 0 ? head_dim : rot_dims;
+  if ((dims & 1) != 0 || dims > head_dim) return false;
+  const size_t half = dims / 2;
   if (!freq_factors.empty() && freq_factors.size() < half) return false;
 
   void* d_x = grow_scratch(g_dx, g_dx_bytes, n * sizeof(float));
@@ -2997,7 +3007,7 @@ bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
   SB_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(int(n)), 256, 0, cur_stream());
   rope_neox_heads_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(
       static_cast<float*>(d_x), int(head_dim), int(n), pos, freq_scale, log_base,
-      d_ff);
+      d_ff, int(dims));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(x.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost) ==
          cudaSuccess;
@@ -3306,12 +3316,14 @@ bool cast_bf16_dev(float* v, int n) {
 
 bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
                          float base, float freq_scale,
-                         std::span<const float> freq_factors) {
+                         std::span<const float> freq_factors,
+                         uint64_t rot_dims) {
   if (!available()) return false;
   if (head_dim <= 0 || heads <= 0 || !x) return false;
   const int n = head_dim * heads;
-  const int half = head_dim >> 1;
-  if ((head_dim & 1) != 0) return false;
+  const int dims = rot_dims ? int(rot_dims) : head_dim;
+  const int half = dims >> 1;
+  if ((head_dim & 1) != 0 || (dims & 1) != 0 || dims > head_dim) return false;
   if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
   const float* d_ff = nullptr;
   if (!freq_factors.empty()) {
@@ -3320,18 +3332,20 @@ bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
   }
   const float log_base = std::log(base);
   SB_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(n), 256, 0, cur_stream());
-  rope_neox_heads_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, head_dim, n, pos, freq_scale, log_base, d_ff);
+  rope_neox_heads_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, head_dim, n, pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
                              const uint64_t* pos, float base, float freq_scale,
-                             std::span<const float> freq_factors) {
+                             std::span<const float> freq_factors,
+                             uint64_t rot_dims) {
   if (!available()) return false;
   if (head_dim <= 0 || heads <= 0 || !x || !pos) return false;
   const int n = head_dim * heads;
-  const int half = head_dim >> 1;
-  if ((head_dim & 1) != 0) return false;
+  const int dims = rot_dims ? int(rot_dims) : head_dim;
+  const int half = dims >> 1;
+  if ((head_dim & 1) != 0 || (dims & 1) != 0 || dims > head_dim) return false;
   if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
   const float* d_ff = nullptr;
   if (!freq_factors.empty()) {
@@ -3341,7 +3355,7 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
   const float log_base = std::log(base);
   SB_NOTE_LAUNCH(rope_neox_heads_pos_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
-      x, head_dim, n, pos, freq_scale, log_base, d_ff);
+      x, head_dim, n, pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
 }
 
@@ -7107,12 +7121,14 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
 bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
                                  int n_pos, uint64_t start_pos, float base,
                                  float freq_scale,
-                                 std::span<const float> freq_factors) {
+                                 std::span<const float> freq_factors,
+                                 uint64_t rot_dims) {
   if (!available()) return false;
   if (head_dim <= 0 || heads_per_pos <= 0 || n_pos <= 0 || !x) return false;
   const int n = head_dim * heads_per_pos * n_pos;
-  const int half = head_dim >> 1;
-  if ((head_dim & 1) != 0) return false;
+  const int dims = rot_dims ? int(rot_dims) : head_dim;
+  const int half = dims >> 1;
+  if ((head_dim & 1) != 0 || (dims & 1) != 0 || dims > head_dim) return false;
   if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
   const float* d_ff = nullptr;
   if (!freq_factors.empty()) {
@@ -7123,20 +7139,22 @@ bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
   const float log_base = std::log(base);
   SB_NOTE_LAUNCH(rope_neox_heads_batched_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_batched_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
-      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
+      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
 }
 
 bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
                                      int n_pos, const uint64_t* start_pos,
                                      float base, float freq_scale,
-                                     std::span<const float> freq_factors) {
+                                     std::span<const float> freq_factors,
+                                     uint64_t rot_dims) {
   if (!available()) return false;
   if (head_dim <= 0 || heads_per_pos <= 0 || n_pos <= 0 || !x || !start_pos)
     return false;
   const int n = head_dim * heads_per_pos * n_pos;
-  const int half = head_dim >> 1;
-  if ((head_dim & 1) != 0) return false;
+  const int dims = rot_dims ? int(rot_dims) : head_dim;
+  const int half = dims >> 1;
+  if ((head_dim & 1) != 0 || (dims & 1) != 0 || dims > head_dim) return false;
   if (!freq_factors.empty() && freq_factors.size() < (size_t)half) return false;
   const float* d_ff = nullptr;
   if (!freq_factors.empty()) {
@@ -7147,7 +7165,8 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
   const float log_base = std::log(base);
   SB_NOTE_LAUNCH(rope_neox_heads_batched_pos_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_batched_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
-      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff);
+      x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff,
+      dims);
   return cudaGetLastError() == cudaSuccess;
 }
 

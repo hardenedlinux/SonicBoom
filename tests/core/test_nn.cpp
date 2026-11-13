@@ -713,6 +713,97 @@ void test_rope_heads() {
         "rope_neox_heads rejects non-multiple span");
 }
 
+// Partial rotary embedding: rot_dims (0 = the whole head) rotates only that many
+// leading values of each head, with rot_dims as the angle denominator and the
+// head's tail copied through unchanged. The reference is rope_neox applied to
+// the leading rot_dims values with the same freq_factors prefix.
+void test_rope_heads_partial() {
+  const uint64_t head_dim = 64, heads = 4;
+  const size_t n = head_dim * heads;
+  const uint64_t pos = 7, rot = head_dim / 4;
+  std::mt19937 rng(0xE0F1);
+  std::vector<float> x(n), ff(head_dim / 2, 1.0f);
+  for (auto& v : x) v = std::uniform_real_distribution<float>(-2.0f, 2.0f)(rng);
+  for (size_t i = 4; i < ff.size(); ++i) ff[i] = 1e30f;
+
+  // rot_dims == head_dim is the whole head: bit-identical to leaving it 0.
+  std::vector<float> a = x, b = x;
+  check(sbnn::rope_neox_heads(a, head_dim, pos, 10000.0f, 1.0f, ff),
+        "rope_neox_heads (whole head) returns true");
+  check(sbnn::rope_neox_heads(b, head_dim, pos, 10000.0f, 1.0f, ff, head_dim),
+        "rope_neox_heads (rot_dims = head_dim) returns true");
+  bool same = true;
+  for (size_t i = 0; i < n; ++i)
+    same = same && std::bit_cast<uint32_t>(a[i]) == std::bit_cast<uint32_t>(b[i]);
+  check(same, "rot_dims == head_dim is bit-identical to the whole head");
+
+  std::vector<float> p = x;
+  check(sbnn::rope_neox_heads(p, head_dim, pos, 10000.0f, 1.0f, ff, rot),
+        "rope_neox_heads (partial) returns true");
+  for (uint64_t h = 0; h < heads; ++h) {
+    std::vector<float> ref(x.begin() + h * head_dim,
+                           x.begin() + h * head_dim + head_dim);
+    check(sbnn::rope_neox(std::span<float>(ref).subspan(0, rot), pos,
+                          10000.0f, 1.0f,
+                          std::span<const float>(ff).subspan(0, rot / 2)),
+          "partial-rope reference runs");
+    for (uint64_t d = 0; d < head_dim; ++d)
+      check(p[h * head_dim + d] == ref[d],
+            "partial rope matches the reference of the leading dims");
+    // The tail is copied through unchanged.
+    for (uint64_t d = rot; d < head_dim; ++d)
+      check(p[h * head_dim + d] == x[h * head_dim + d],
+            "partial rope leaves the tail of each head untouched");
+  }
+
+  check(!sbnn::rope_neox_heads(p, head_dim, pos, 10000.0f, 1.0f, {}, 17),
+        "rope_neox_heads rejects odd rot_dims");
+  check(!sbnn::rope_neox_heads(p, head_dim, pos, 10000.0f, 1.0f, {},
+                               head_dim + 2),
+        "rope_neox_heads rejects rot_dims > head_dim");
+  std::vector<float> short_ff(rot / 2 - 1, 1.0f);
+  check(!sbnn::rope_neox_heads(p, head_dim, pos, 10000.0f, 1.0f, short_ff, rot),
+        "rope_neox_heads rejects short freq_factors for rot_dims");
+}
+
+#ifdef SB_TEST_CUDA
+// The device partial rope against the CPU reference on the same values. Device
+// arithmetic is not required to be bit-identical, so this is a tolerance check.
+void test_rope_heads_cuda() {
+  int devices = 0;
+  if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
+    std::cout << "rope_heads: no CUDA device, device case skipped\n";
+    return;
+  }
+  const int head_dim = 64, heads = 4;
+  const std::size_t n = head_dim * heads;
+  const uint64_t rot = head_dim / 4;
+  std::mt19937 rng(0xE0F2);
+  std::vector<float> x(n), cpu(n), dev(n), ff(head_dim / 2, 1.0f);
+  for (auto& v : x) v = std::uniform_real_distribution<float>(-2.0f, 2.0f)(rng);
+
+  float* dx = nullptr;
+  const std::size_t bytes = n * sizeof(float);
+  check(cudaMalloc(&dx, bytes) == cudaSuccess, "rope_heads: allocate");
+  check(cudaMemcpy(dx, x.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess,
+        "rope_heads: upload");
+  check(sbnn::cuda::rope_neox_heads_dev(dx, head_dim, heads, 7, 10000.0f, 1.0f,
+                                        ff, rot),
+        "rope_neox_heads_dev (partial) returns true");
+  check(cudaMemcpy(dev.data(), dx, bytes, cudaMemcpyDeviceToHost) ==
+            cudaSuccess,
+        "rope_heads: download");
+
+  cpu = x;
+  check(sbnn::rope_neox_heads(cpu, head_dim, 7, 10000.0f, 1.0f, ff, rot),
+        "rope_heads: the CPU reference runs");
+  for (std::size_t i = 0; i < n; ++i)
+    check(std::abs(dev[i] - cpu[i]) <= 1e-4f,
+          "rope_neox_heads_dev (partial) agrees with the CPU reference");
+  cudaFree(dx);
+}
+#endif
+
 void test_gqa_broadcast() {
   // n_q = 4, n_kv = 2, head_dim = 2: query heads 0,1 -> kv head 0; 2,3 -> kv 1.
   const uint64_t n_q = 4, n_kv = 2, head_dim = 2;
@@ -778,6 +869,10 @@ int main() {
   test_matvec_bf16();
   test_rms_norm_heads();
   test_rope_heads();
+  test_rope_heads_partial();
+#ifdef SB_TEST_CUDA
+  test_rope_heads_cuda();
+#endif
   test_gqa_broadcast();
   test_layer_combine();
 

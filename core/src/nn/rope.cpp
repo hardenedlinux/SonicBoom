@@ -57,11 +57,16 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base,
 
 bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
                      float theta_base, float freq_scale,
-                     std::span<const float> freq_factors) {
+                     std::span<const float> freq_factors, uint64_t rot_dims) {
   if (head_dim == 0 || (head_dim & 1) != 0 || x.size() == 0 ||
       x.size() % head_dim != 0)
     return false;
-  if (!freq_factors.empty() && freq_factors.size() < head_dim / 2) return false;
+  // Partial rope rotates the leading rot_dims values of each head; the rest of
+  // the head is left untouched. The rotated prefix is itself a NEOX buffer
+  // whose width is the angle denominator.
+  const uint64_t dims = rot_dims == 0 ? head_dim : rot_dims;
+  if ((dims & 1) != 0 || dims > head_dim) return false;
+  if (!freq_factors.empty() && freq_factors.size() < dims / 2) return false;
 
   const uint64_t heads = x.size() / head_dim;
   // Each head writes its own span, so the result is deterministic even though the
@@ -69,7 +74,7 @@ bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
   std::atomic<bool> ok{true};
   ThreadPool::instance().parallel_for(0, heads, [&](uint64_t b, uint64_t e) {
     for (uint64_t h = b; h < e; ++h)
-      if (!rope_neox(x.subspan(h * head_dim, head_dim), pos, theta_base,
+      if (!rope_neox(x.subspan(h * head_dim, dims), pos, theta_base,
                      freq_scale, freq_factors))
         ok = false;
   });

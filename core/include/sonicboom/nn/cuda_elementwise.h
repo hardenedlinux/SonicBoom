@@ -66,9 +66,14 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base,
 // over the whole Q/K span). freq_factors (if non-empty, length head_dim/2) is
 // shared across heads — it is indexed by the intra-head offset, not by the flat
 // index. Requires head_dim > 0, even, and dividing x.size() exactly.
+//
+// `rot_dims` (0 = the whole head) rotates only that many leading values of each
+// head, with rot_dims the angle denominator and the head's tail copied through
+// unchanged; see nn::rope_neox_heads.
 bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
                      float theta_base, float freq_scale,
-                     std::span<const float> freq_factors);
+                     std::span<const float> freq_factors,
+                     uint64_t rot_dims = 0);
 
 // Dense (non-K-quant) matvec, for the per-layer gate weights: the f32
 // inp_gate/proj matrices and the bf16 per_layer_model_proj. W is row-major in
