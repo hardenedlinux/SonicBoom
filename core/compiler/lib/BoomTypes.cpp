@@ -158,6 +158,16 @@ llvm::LogicalResult KvType::verify(
   return llvm::success();
 }
 
+// The state index is the key the backend stores the state under: the rank of
+// the recurrent block among all blocks, which is a non-negative index.
+llvm::LogicalResult StateType::verify(
+    llvm::function_ref<mlir::InFlightDiagnostic()> emitError, int64_t index) {
+  if (index < 0)
+    return emitError() << "a state handle names state " << index
+                       << ", but a state index is a non-negative number";
+  return llvm::success();
+}
+
 //--- quant-format helpers ---------------------------------------------------
 
 bool isBoomWeightQuantType(mlir::Type type) {

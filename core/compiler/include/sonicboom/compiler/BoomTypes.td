@@ -23,6 +23,7 @@
 //   !boom.q4_k<[4096, 2048]>                a weight in the Q4_K format
 //   !boom.q5_k<...> !boom.q6_k<...> !boom.q5_0<...> !boom.q8_0<...
 //   !boom.kv<3>                             layer 3's KV cache handle
+//   !boom.state<2>                          recurrent block 2's state handle
 //
 // `!boom.tensor` is the type of every SSA value whose element type is one of
 // the frozen ten sx::DType names. The quantized types exist because a quantized
@@ -161,6 +162,24 @@ def Boom_KvType : Boom_Type<"Kv", "kv"> {
   let genVerifyDecl = 1;
 }
 
+//--- recurrent state handle --------------------------------------------------
+
+// A recurrent block's state handle. Declared and verified like !boom.kv: not a
+// tensor, no shape, no dtype, no tensor-table entry, and not the storage — the
+// state remains backend-resident and keyed by index (planner/gdn_state.h).
+// boom.gdn_scan takes it as its last operand and carries Boom_StateReadWrite
+// (BoomDialect.td); the node's `state` attribute is the key the handle names,
+// which is what makes the two checkable against each other.
+def Boom_StateType : Boom_Type<"State", "state"> {
+  let summary = "recurrent block state handle";
+
+  let parameters = (ins "int64_t":$index);
+
+  let assemblyFormat = "`<` $index `>`";
+
+  let genVerifyDecl = 1;
+}
+
 //--- value-type constraint --------------------------------------------------
 
 // The types an SSA value in Boom IR may have. Every op's results are
@@ -178,10 +197,10 @@ def Boom_ValueType : AnyTypeOf<[
 ]>;
 
 // The operand constraint: every Boom value, plus the KV handle the three
-// cache-touching ops carry. It is deliberately wider than Boom_ValueType — the
-// handle is not a value — and the graph verifier (BoomVerify.cpp) states which
-// ops may carry one, that it is their last operand, and that its layer is the
-// cache layer the op names.
-def Boom_AnyType : AnyTypeOf<[Boom_ValueType, Boom_KvType]>;
+// cache-touching ops carry and the state handle boom.gdn_scan carries. It is
+// deliberately wider than Boom_ValueType — a handle is not a value — and the
+// graph verifier (BoomVerify.cpp) states which ops may carry one, that it is
+// their last operand, and that it names the layer or state the op names.
+def Boom_AnyType : AnyTypeOf<[Boom_ValueType, Boom_KvType, Boom_StateType]>;
 
 #endif // SONICBOOM_COMPILER_BOOMTYPES_TD

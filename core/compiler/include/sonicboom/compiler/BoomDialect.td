@@ -119,6 +119,22 @@ def Boom_KvWrite : MemoryEffects<[MemWrite<Boom_KvCache>]>;
 def Boom_KvReadWrite
     : MemoryEffects<[MemRead<Boom_KvCache>, MemWrite<Boom_KvCache>]>;
 
+// A recurrent block's state, as a memory-effect resource. Like the KV cache it
+// is device-resident state the IR names with a handle operand —
+// `!boom.state<index>` (BoomTypes.td), storage backend-owned — and a scan is an
+// effect on it:
+//
+//   boom.gdn_scan  reads the state and updates it in place.
+//
+// The effect is what keeps the scan from being removed, duplicated, split by
+// rows or moved against another scan on the same handle: its rows depend on
+// each other.
+def Boom_State
+    : Resource<"::sonicboom::compiler::boom::StateResource">;
+
+def Boom_StateReadWrite
+    : MemoryEffects<[MemRead<Boom_State>, MemWrite<Boom_State>]>;
+
 //===----------------------------------------------------------------------===//
 // Node-parameter attributes
 //===----------------------------------------------------------------------===//
