@@ -651,12 +651,16 @@ public:
     v_.resize(r.caches);
   }
 
-  // Every owned cache takes the segment's K and V, in cache order.
+  // Every owned cache takes the segment's K and V, in cache order. A cache no
+  // block owns (the blocks of a recurrent model own no cache) has no segment K
+  // or V to append and is left alone.
   void append_caches() {
-    for (uint32_t c = 0; c < r.caches; ++c)
+    for (uint32_t c = 0; c < r.caches; ++c) {
+      if (!k_[c]) continue;
       b.node(OpKind::KvAppend, {k_[c], v_[c], start_pos_, kv_[c]},
              "kv_append" + std::to_string(c), {},
              {layer_a(c), batch_a()});
+    }
   }
 
 protected:
