@@ -157,8 +157,14 @@ int main(int argc, char** argv) {
     cudaEventElapsedTime(&elapsed_ms, begin, end);
     cudaEventDestroy(begin);
     cudaEventDestroy(end);
-    if (done == 0) {
-      fprintf(stderr, "measured decode failed\n");
+    // A shortfall is not a smaller measurement: the rate would be taken over
+    // the steps that fit rather than the steps asked for. Report it and fail.
+    if (done < steps) {
+      fprintf(stderr,
+              "measured decode completed %llu of %llu steps at depth %llu "
+              "(session capacity %llu)\n",
+              (unsigned long long)done, (unsigned long long)steps,
+              (unsigned long long)depth, (unsigned long long)ctx);
       return 1;
     }
     const double secs = double(elapsed_ms) / 1000.0;
@@ -209,6 +215,14 @@ int main(int argc, char** argv) {
       return 1;
     }
     const uint64_t done = run(prompt, steps, &t_all);
+    if (done < steps) {
+      fprintf(stderr,
+              "measured decode completed %llu of %llu steps at depth %llu "
+              "(session capacity %llu)\n",
+              (unsigned long long)done, (unsigned long long)steps,
+              (unsigned long long)depth, (unsigned long long)ctx);
+      return 1;
+    }
     const double tail = t_all - t_one;
     const uint64_t tail_toks = done > 1 ? done - 1 : 0;
     const double tok_per_sec = tail > 0.0 ? double(tail_toks) / tail : 0.0;
@@ -246,6 +260,14 @@ int main(int argc, char** argv) {
   double t_full = 0.0, t_warm = 0.0;
   const uint64_t done_full = run_decode(depth + steps, &t_full);
   const uint64_t done_warm = run_decode(depth, &t_warm);
+  if (done_full < depth + steps || done_warm < depth) {
+    fprintf(stderr,
+            "measured decode completed %llu of %llu steps at depth %llu "
+            "(session capacity %llu)\n",
+            (unsigned long long)done_full, (unsigned long long)(depth + steps),
+            (unsigned long long)depth, (unsigned long long)ctx);
+    return 1;
+  }
 
   const double tail_secs = t_full - t_warm;      // first `depth` steps cancel
   const uint64_t tail_toks = done_full > done_warm ? done_full - done_warm : 0;

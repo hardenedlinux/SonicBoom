@@ -15,7 +15,8 @@ comparable. All of it is the CUDA spine with the whole model resident on the GPU
 | metric | meaning |
 |---|---|
 | `tg64` | decode 64 tokens from position 0 |
-| `d512` | decode 64 tokens at KV depth 512 |
+| `d512` | decode 64 tokens at KV depth 512, speculation off |
+| `d512-spec` | the same segment with speculation left to the startup probe |
 | `pp512` | prefill a 512-token prompt, reported *marginal* (per-token prefill cost) |
 | `reuse` | 512-token prefix + 64-token continuation, first-token latency through the prefix cache |
 

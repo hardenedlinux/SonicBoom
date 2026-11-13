@@ -16,6 +16,8 @@ export LC_ALL=C LANG=C
 # Canonical set (CUDA spine, whole model resident on the GPU — llama.cpp -ngl 99):
 #   tg64    decode 64 tokens from position 0        (llama-bench -p 0 -n 64 -d 0)
 #   d512    decode 64 tokens at KV depth 512        (llama-bench -p 0 -n 64 -d 512)
+#   d512-spec  the same, speculation left to the startup probe (no llama-bench
+#           equivalent: it has no speculative decode)
 #   pp512   prefill a 512-token prompt, marginal    (llama-bench -p 512 -n 0)
 #   reuse   512-token prefix + 64-token continuation, first-token latency
 #           (SonicBoom's prefix cache; llama-bench has no equivalent)
@@ -392,7 +394,18 @@ fi
 # alone cannot say whether a later comparison's difference is bigger than this
 # harness's own repeatability.
 sb_tg64_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
-sb_d512_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 512 --steps 64)
+# d512 measures plain decode: speculation is pinned off for the row (not left to
+# whatever this script exports) and the session is sized for the whole measured
+# segment — depth + steps + the tool's 8 warm steps + margin — so all 64 steps
+# complete. d512-spec is the same segment with SONICBOOM_SPEC unset, i.e. the
+# startup probe decides, and is reported separately.
+D512_NCTX=600
+sb_d512_stats=$(bench_stats tok_s env SONICBOOM_SPEC=off \
+                  "$BASELINE/longctx_bench" --depth 512 --steps 64 \
+                  --n-ctx "$D512_NCTX")
+sb_d512_spec_stats=$(bench_stats tok_s env -u SONICBOOM_SPEC \
+                       "$BASELINE/longctx_bench" --depth 512 --steps 64 \
+                       --n-ctx "$D512_NCTX")
 # pp is the steady-state (reused-session) number; the fresh-session lifecycle
 # cost is a separate scenario and is measured by the tool itself, not folded in.
 sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
@@ -412,6 +425,7 @@ rm -f "$TOKFILE"
 
 sb_tg64="${sb_tg64_stats%% *}"; sb_tg64_sd="${sb_tg64_stats##* }"
 sb_d512="${sb_d512_stats%% *}"; sb_d512_sd="${sb_d512_stats##* }"
+sb_d512_spec="${sb_d512_spec_stats%% *}"; sb_d512_spec_sd="${sb_d512_spec_stats##* }"
 sb_pp512="${sb_pp512_stats%% *}"; sb_pp512_sd="${sb_pp512_stats##* }"
 sb_reuse="${sb_reuse_stats%% *}"; sb_reuse_sd="${sb_reuse_stats##* }"
 
@@ -453,10 +467,11 @@ echo "| metric         | SonicBoom          | llama.cpp      |  ratio |"
 echo "|----------------|--------------------|----------------|--------|"
 row "tg64 (depth 0)" "$sb_tg64" "$sb_tg64_sd" "$ll_tg64" "$(ratio "$sb_tg64" "$ll_tg64")" "tok/s"
 row "d512"           "$sb_d512" "$sb_d512_sd" "$ll_d512" "$(ratio "$sb_d512" "$ll_d512")" "tok/s"
+row "d512-spec"      "$sb_d512_spec" "$sb_d512_spec_sd" "n/a" "n/a" "tok/s"
 row "pp512"          "$sb_pp512" "$sb_pp512_sd" "$ll_pp512" "$(ratio "$sb_pp512" "$ll_pp512")" "tok/s"
 row "reuse 512+64"   "$sb_reuse" "$sb_reuse_sd" "n/a" "n/a" "ms"
 echo
-echo "RESULT bench model=$LABEL tg64=$sb_tg64 d512=$sb_d512 pp512=$sb_pp512 reuse_ms=$sb_reuse"
+echo "RESULT bench model=$LABEL tg64=$sb_tg64 d512=$sb_d512 d512_spec=$sb_d512_spec pp512=$sb_pp512 reuse_ms=$sb_reuse"
 
 # --- extended-context tiers (--long) ---------------------------------------
 # One llama-bench invocation per run with -r 1: the deep tiers are long enough
