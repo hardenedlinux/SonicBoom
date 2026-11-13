@@ -999,8 +999,8 @@ std::expected<Gemma4Model, std::string> load_qwen35moe(const gguf::Reader& r) {
     const std::string p = "blk." + std::to_string(l) + ".";
     BlockWeights bw;
     if (auto s = bind_f32(r, p + "attn_norm.weight", d, errs)) bw.attn_norm = *s;
-    // The block's pre-FFN norm is attn_post_norm in this architecture.
-    if (auto s = bind_f32(r, p + "attn_post_norm.weight", d, errs))
+    // The block's pre-FFN norm is post_attention_norm in this architecture.
+    if (auto s = bind_f32(r, p + "post_attention_norm.weight", d, errs))
       bw.ffn_norm = *s;
 
     const bool recurrent = l < c.recurrent_layers.size() &&
