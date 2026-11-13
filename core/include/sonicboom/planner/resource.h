@@ -61,6 +61,13 @@ struct DeviceCapability {
   bool supports(OpKind op, sx::DType dtype) const noexcept;
 };
 
+// True for an integer dtype that carries indices (token ids, positions, the
+// experts a router selects) rather than arithmetic. A capability's declared
+// compute dtypes describe its floating-point arithmetic; an index tensor is
+// bookkeeping a backend reads and writes as integers, so the dtype capability
+// does not gate it.
+bool is_index_dtype(sx::DType dtype) noexcept;
+
 struct Device {
   DeviceId id;
   DeviceKind kind;

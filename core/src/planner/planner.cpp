@@ -150,7 +150,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       // constrains the device's compute dtypes. Only computed tensors (other
       // nodes' outputs) are checked.
       if (t && !t->is_constant && !t->is_graph_input &&
-          !supports_dtype(*dev, t->dtype)) {
+          !is_index_dtype(t->dtype) && !supports_dtype(*dev, t->dtype)) {
         PlannerError e(PlannerErrorCode::UnsupportedDType,
                        "device does not support dtype of tensor '" + t->name +
                            "'",
@@ -162,7 +162,7 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
     }
     for (TensorId tid : node.outputs) {
       const auto* t = graph.find_tensor(tid);
-      if (t && !supports_dtype(*dev, t->dtype)) {
+      if (t && !is_index_dtype(t->dtype) && !supports_dtype(*dev, t->dtype)) {
         PlannerError e(PlannerErrorCode::UnsupportedDType,
                        "device does not support dtype of tensor '" + t->name +
                            "'",
@@ -199,9 +199,13 @@ std::expected<ExecutionPlan, PlannerError> StaticPlanner::plan(
       if (const auto* t = graph.find_tensor(tid))
         out_bytes += t->size_bytes;
 
+    // An index tensor is bookkeeping, not arithmetic: the cost model prices
+    // the node's floating-point work, so a node whose first output is a set of
+    // indices (the router's expert ids) is priced as Float32.
     sx::DType dtype = sx::DType::Float32;
     if (!node.outputs.empty())
-      if (const auto* t = graph.find_tensor(node.outputs.front()))
+      if (const auto* t = graph.find_tensor(node.outputs.front());
+          t && !is_index_dtype(t->dtype))
         dtype = t->dtype;
 
     ComputeRequest req;

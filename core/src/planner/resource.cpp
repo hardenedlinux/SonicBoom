@@ -52,6 +52,10 @@ const char* memory_kind_name(MemoryKind k) noexcept {
   return "?";
 }
 
+bool is_index_dtype(sx::DType dtype) noexcept {
+  return dtype == sx::DType::Int32 || dtype == sx::DType::Int64;
+}
+
 bool DeviceCapability::supports(OpKind op, sx::DType dtype) const noexcept {
   if (!can_execute)
     return false;
