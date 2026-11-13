@@ -42,6 +42,14 @@ inline bool isBoomValueType(mlir::Type type) {
                    Q5_0Type, Q8_0Type>(type);
 }
 
+// True for the two handle types: operands that name backend state rather than
+// carrying a value. The cache handle (`!boom.kv`) and the recurrent state
+// handle (`!boom.state`) are treated alike by the analyses — they are not
+// tensors, carry no shape and have no demand of their own.
+inline bool isBoomHandleType(mlir::Type type) {
+  return llvm::isa<KvType, StateType>(type);
+}
+
 // The quantized *weight* formats, in the order quant::QuantType lists them
 // (quant/quantized_tensor.h). `!boom.q8_1` is deliberately not here: it is an
 // activation layout, not a stored weight format.

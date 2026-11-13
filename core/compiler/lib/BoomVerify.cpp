@@ -1006,7 +1006,7 @@ mlir::LogicalResult StepOp::verify() {
                            << " is typed " << getOperand(index).getType();
 
   // 5. Walk the nodes: every operand resolves to a block argument or an earlier
-  //    node's result, and a handle operand obeys the cache-op rule.
+  //    node's result, and a handle operand obeys its op's handle rule.
   for (Operation &op : block) {
     bool sawKvHandle = false;
     bool sawStateHandle = false;

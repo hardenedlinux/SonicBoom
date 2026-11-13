@@ -26,7 +26,7 @@
 //            first token;
 //   Counter  how many loop iterations have run;
 //   Token    a token the loop chose and fed back;
-//   Cache    the contents of the KV cache.
+//   Cache    the contents of the KV cache or of a recurrent block's state.
 //
 // The empty set is a value that depends on the model alone. Sets are ordered
 // by inclusion and joined by union, so the lattice has height four and the
@@ -34,16 +34,17 @@
 //
 // Where a source enters:
 //
-//   * a program's arguments are the request: a cache handle carries Cache,
-//     every other argument Prompt;
+//   * a program's arguments are the request: a cache or state handle carries
+//     Cache, every other argument Prompt;
 //   * a loop-carried value that an iteration replaces carries Counter;
 //   * the ops that choose a token — sample, draft, accept — are binding
 //     points: their results carry Token and nothing else, because once the
 //     token is chosen, what it was chosen from no longer has to be known;
 //   * a standalone boom.graph has no loop around it to read these from, so its
 //     arguments are taken by the names the program lift itself binds
-//     (`token_id` carries Token, `pos` carries Prompt and Counter), a cache
-//     handle carries Cache, and any other argument is unknown — every source.
+//     (`token_id` carries Token, `pos` carries Prompt and Counter), a cache or
+//     state handle carries Cache, and any other argument is unknown — every
+//     source.
 //
 // Through an op, the result depends on what the operands depend on. An op that
 // is not declared free of memory effects may read state the IR does not name,

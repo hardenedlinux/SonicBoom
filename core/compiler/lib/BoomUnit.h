@@ -21,8 +21,9 @@
 // tensor by id; the body's SSA values are bound to the ids by the relation the
 // verifier states: a node result is the id at the same index of the node's
 // `result_ids`, and a tensor no node produces — a free tensor — is the block
-// argument at its rank among the free ids, ascending. The cache handles follow
-// the free tensors and have no table entry.
+// argument at its rank among the free ids, ascending. The handles (cache
+// handles, then state handles) follow the free tensors and have no table
+// entry.
 //
 // The analyses read a unit through these helpers so that relation is written
 // once.

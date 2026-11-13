@@ -64,9 +64,9 @@ public:
   using Lattice::Lattice;
 };
 
-bool isCacheHandle(mlir::Value v) {
-  return llvm::isa<boom::KvType>(v.getType());
-}
+// A handle names state the IR does not contain — the KV cache or a recurrent
+// block's state — and a request's handle is part of what the request brings.
+bool isHandle(mlir::Value v) { return boom::isBoomHandleType(v.getType()); }
 
 // A standalone graph's free tensor, by the name the program lift binds it by.
 Sources graphArgumentSources(mlir::BlockArgument arg) {
@@ -166,7 +166,7 @@ public:
       }
       return;
     }
-    if (isCacheHandle(anchor)) {
+    if (isHandle(anchor)) {
       add(lattice, Sources::of(Source::Cache));
       return;
     }

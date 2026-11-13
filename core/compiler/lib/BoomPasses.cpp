@@ -3033,7 +3033,7 @@ public:
     // The resident model-bound weight footprint.
     uint64_t footprint = 0;
     for (mlir::BlockArgument arg : view.body().getArguments()) {
-      if (llvm::isa<boom::KvType>(arg.getType())) continue;  // cache handle
+      if (boom::isBoomHandleType(arg.getType())) continue;  // a handle
       const auto id = view.idOf(arg);
       if (!view.hasTensor(id)) continue;
       const boom::TensorDescAttr desc = view.desc(id);
@@ -3068,7 +3068,7 @@ public:
       if (!layer || layer.getInt() < 0) continue;
       const int64_t l = layer.getInt();
       for (mlir::Value operand : node.getOperands()) {
-        if (llvm::isa<boom::KvType>(operand.getType())) continue;
+        if (boom::isBoomHandleType(operand.getType())) continue;
         const auto id = view.idOf(operand);
         if (!view.hasTensor(id) || !view.desc(id).getIsConstant()) continue;
         if (!seen[l].insert(id).second) continue;

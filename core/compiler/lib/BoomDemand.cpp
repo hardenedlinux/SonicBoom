@@ -326,18 +326,22 @@ private:
         });
     if (!observed && mlir::isMemoryEffectFree(op))
       return;
-    for (DemandLattice *operand : operands)
-      demandWhole(operand);
+    for (auto [index, operand] : llvm::enumerate(operands))
+      if (!boom::isBoomHandleType(op->getOperand(index).getType()))
+        demandWhole(operand);
   }
 
   void visitNode(mlir::Operation *node,
                  llvm::ArrayRef<DemandLattice *> operands,
                  llvm::ArrayRef<const DemandLattice *> results) {
-    // A node that does not declare itself effect-free (a KV append, a prefetch
-    // marker, an optimizer step) is kept whatever reads its results.
+    // A node that does not declare itself effect-free (a KV append, a
+    // recurrent state scan, a prefetch marker, an optimizer step) is kept
+    // whatever reads its results, and reads all of every value operand; a
+    // handle operand names state, not a tensor, and has no demand.
     if (!mlir::isMemoryEffectFree(node)) {
-      for (DemandLattice *operand : operands)
-        demandWhole(operand);
+      for (auto [index, operand] : llvm::enumerate(operands))
+        if (!boom::isBoomHandleType(node->getOperand(index).getType()))
+          demandWhole(operand);
       return;
     }
 
