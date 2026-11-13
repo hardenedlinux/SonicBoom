@@ -105,6 +105,90 @@ std::optional<std::string_view> read_string(const gguf::Reader& r,
   return std::string_view(v->s);
 }
 
+// An array of integers (e.g. rope dimension sections, per-layer expert widths).
+std::optional<std::vector<uint64_t>> read_u64_array(const gguf::Reader& r,
+                                                    std::string_view key) {
+  const gguf::Value* v = r.find(key);
+  if (!v || v->type != gguf::ValueType::Array) return std::nullopt;
+  std::vector<uint64_t> out;
+  out.reserve(v->elems.size());
+  for (const gguf::Value& e : v->elems) {
+    switch (e.type) {
+      case gguf::ValueType::UInt8:
+      case gguf::ValueType::UInt16:
+      case gguf::ValueType::UInt32:
+      case gguf::ValueType::UInt64:
+        out.push_back(e.u);
+        break;
+      case gguf::ValueType::Int8:
+      case gguf::ValueType::Int16:
+      case gguf::ValueType::Int32:
+      case gguf::ValueType::Int64:
+        if (e.i < 0) return std::nullopt;
+        out.push_back(uint64_t(e.i));
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+  return out;
+}
+
+// A per-layer flag array, either bools or integers (nonzero = set). The
+// reference stores recurrent_layers as an integer array.
+std::optional<std::vector<bool>> read_flag_array(const gguf::Reader& r,
+                                                 std::string_view key) {
+  const gguf::Value* v = r.find(key);
+  if (!v || v->type != gguf::ValueType::Array) return std::nullopt;
+  std::vector<bool> out;
+  out.reserve(v->elems.size());
+  for (const gguf::Value& e : v->elems) {
+    switch (e.type) {
+      case gguf::ValueType::Bool:
+        out.push_back(e.b);
+        break;
+      case gguf::ValueType::UInt8:
+      case gguf::ValueType::UInt16:
+      case gguf::ValueType::UInt32:
+      case gguf::ValueType::UInt64:
+        out.push_back(e.u != 0);
+        break;
+      case gguf::ValueType::Int8:
+      case gguf::ValueType::Int16:
+      case gguf::ValueType::Int32:
+      case gguf::ValueType::Int64:
+        if (e.i < 0) return std::nullopt;
+        out.push_back(e.i != 0);
+        break;
+      default:
+        return std::nullopt;
+    }
+  }
+  return out;
+}
+
+// A key the file may write as one integer or as a per-layer array. The config
+// carries one value for the whole model, so a non-uniform array is refused
+// rather than approximated. Absent reads as an empty optional.
+std::expected<std::optional<uint64_t>, std::string>
+read_u64_or_arr(const gguf::Reader& r, std::string_view key) {
+  const gguf::Value* v = r.find(key);
+  if (!v) return std::optional<uint64_t>();
+  if (v->type != gguf::ValueType::Array) {
+    const auto x = read_u64(r, key);
+    if (!x) return std::unexpected(std::string(key) + " is not an integer");
+    return std::optional<uint64_t>(*x);
+  }
+  const auto arr = read_u64_array(r, key);
+  if (!arr || arr->empty())
+    return std::unexpected(std::string(key) + " is not an integer array");
+  for (uint64_t x : *arr)
+    if (x != arr->front())
+      return std::unexpected(std::string(key) +
+                             " has per-layer values that differ");
+  return std::optional<uint64_t>(arr->front());
+}
+
 // --- generic RoPE frequency scaling -----------------------------------------
 //
 // `{arch}.rope.scaling.*` is the GGUF form of the long-context RoPE schemes
@@ -369,6 +453,97 @@ std::optional<std::span<const uint16_t>> bind_bf16(const gguf::Reader& r,
                                    n);
 }
 
+// Existence + exact shape, without binding: the recurrent (gated DeltaNet)
+// tensors are checked, not loaded (the recurrent path does not run yet).
+bool require_tensor(const gguf::Reader& r, std::string_view name,
+                    std::initializer_list<uint64_t> dims, std::string& errs) {
+  const gguf::TensorInfo* t = r.tensor(name);
+  if (!t) {
+    errs += "missing tensor: ";
+    errs += name;
+    errs += "\n";
+    return false;
+  }
+  if (!dims_match(t->dims, dims)) {
+    errs += "tensor shape mismatch: ";
+    errs += name; errs += " (dims "; errs += dims_string(t->dims); errs += ")";
+    errs += "\n";
+    return false;
+  }
+  return true;
+}
+
+// One 2-D view per expert over a stacked quantized tensor
+// `[per_expert_dims..., n_expert]` (GGUF order, expert last). The slicing and
+// its validation live in weights.cpp (expert_views); this resolves the tensor
+// and reports its name with any error.
+std::vector<quant::QuantizedTensor> bind_experts(
+    const gguf::Reader& r, std::string_view name,
+    std::initializer_list<uint64_t> per_expert_dims, uint64_t n_expert,
+    std::string& errs) {
+  const gguf::TensorInfo* t = r.tensor(name);
+  if (!t) {
+    errs += "missing tensor: ";
+    errs += name;
+    errs += "\n";
+    return {};
+  }
+  auto data = r.tensor_data(*t);
+  if (!data) {
+    errs += "tensor data unresolvable: ";
+    errs += name;
+    errs += "\n";
+    return {};
+  }
+  auto views = expert_views(t->type, t->dims, *data, n_expert,
+                            std::vector<uint64_t>(per_expert_dims));
+  if (!views) {
+    errs += "cannot bind expert tensor ";
+    errs += name;
+    errs += ": ";
+    errs += views.error();
+    errs += "\n";
+    return {};
+  }
+  return std::move(*views);
+}
+
+// The merged form of the routed gate and up projections:
+// `[n_embd, 2*ff, n_expert]`, split per expert into gate/up halves.
+bool bind_expert_gate_up(const gguf::Reader& r, std::string_view name,
+                         uint64_t n_embd, uint64_t ff, uint64_t n_expert,
+                         std::vector<quant::QuantizedTensor>& gate,
+                         std::vector<quant::QuantizedTensor>& up,
+                         std::string& errs) {
+  const gguf::TensorInfo* t = r.tensor(name);
+  if (!t) {
+    errs += "missing tensor: ";
+    errs += name;
+    errs += "\n";
+    return false;
+  }
+  auto data = r.tensor_data(*t);
+  if (!data) {
+    errs += "tensor data unresolvable: ";
+    errs += name;
+    errs += "\n";
+    return false;
+  }
+  auto views = expert_gate_up_views(t->type, t->dims, *data, n_expert, n_embd,
+                                    ff);
+  if (!views) {
+    errs += "cannot bind expert tensor ";
+    errs += name;
+    errs += ": ";
+    errs += views.error();
+    errs += "\n";
+    return false;
+  }
+  gate = std::move(views->gate);
+  up = std::move(views->up);
+  return true;
+}
+
 } // namespace
 
 std::expected<Gemma4Config, std::string> load_gemma4_config(const gguf::Reader& r) {
@@ -511,11 +686,172 @@ std::expected<Gemma4Config, std::string> load_qwen2_config(const gguf::Reader& r
   return c;
 }
 
+// Qwen3.6-MoE: 40 gated-DeltaNet blocks with a full-attention block every
+// `full_attention_interval`-th, each block a 256-expert MoE (8 selected) plus
+// one shared expert, partial sectioned RoPE, and gated attention (the Q
+// projection is twice as wide). The hparam readers follow the reference's
+// qwen35moe load_arch_hparams: expert feed-forward length may be a per-layer
+// array, the recurrent-layer flags are an explicit array when the file carries
+// one and are derived from the interval otherwise, and the DeltaNet
+// hyperparameters are required.
+std::expected<Gemma4Config, std::string> load_qwen35moe_config(
+    const gguf::Reader& r) {
+  Gemma4Config c;
+  c.arch = ModelArch::Qwen35Moe;
+
+  const auto block_count = read_u64(r, "qwen35moe.block_count");
+  const auto context_len = read_u64(r, "qwen35moe.context_length");
+  const auto embd_len = read_u64(r, "qwen35moe.embedding_length");
+  const auto ff_res = read_u64_or_arr(r, "qwen35moe.feed_forward_length");
+  const auto expert_ff_res =
+      read_u64_or_arr(r, "qwen35moe.expert_feed_forward_length");
+  const auto shared_ff =
+      read_u64(r, "qwen35moe.expert_shared_feed_forward_length");
+  const auto expert_count = read_u64(r, "qwen35moe.expert_count");
+  const auto expert_used = read_u64(r, "qwen35moe.expert_used_count");
+  const auto weights_scale = read_f64(r, "qwen35moe.expert_weights_scale");
+  const auto head_count = read_u64(r, "qwen35moe.attention.head_count");
+  const auto head_count_kv = read_u64(r, "qwen35moe.attention.head_count_kv");
+  const auto key_len = read_u64(r, "qwen35moe.attention.key_length");
+  const auto value_len = read_u64(r, "qwen35moe.attention.value_length");
+  const auto rms_eps = read_f64(r, "qwen35moe.attention.layer_norm_rms_epsilon");
+  const auto freq_base = read_f64(r, "qwen35moe.rope.freq_base");
+  const auto rope_dims = read_u64(r, "qwen35moe.rope.dimension_count");
+  const auto rope_sections = read_u64_array(r, "qwen35moe.rope.dimension_sections");
+  const auto interval = read_u64(r, "qwen35moe.full_attention_interval");
+  const auto recurrent =
+      read_flag_array(r, "qwen35moe.attention.recurrent_layers");
+  const auto ssm_conv = read_u64(r, "qwen35moe.ssm.conv_kernel");
+  const auto ssm_inner = read_u64(r, "qwen35moe.ssm.inner_size");
+  const auto ssm_state = read_u64(r, "qwen35moe.ssm.state_size");
+  const auto ssm_dt = read_u64(r, "qwen35moe.ssm.time_step_rank");
+  const auto ssm_group = read_u64(r, "qwen35moe.ssm.group_count");
+  const auto nextn = read_u64(r, "qwen35moe.nextn_predict_layers");
+
+  auto invalid = [](const char* what) {
+    return std::unexpected(std::string("missing/invalid metadata: ") + what);
+  };
+  if (!ff_res)
+    return std::unexpected(std::string("invalid metadata: ") + ff_res.error());
+  if (!expert_ff_res)
+    return std::unexpected(std::string("invalid metadata: ") +
+                           expert_ff_res.error());
+  const std::optional<uint64_t> ff_len = *ff_res;
+  const std::optional<uint64_t> expert_ff = *expert_ff_res;
+  if (!block_count || *block_count == 0) return invalid("qwen35moe.block_count");
+  if (!context_len || *context_len == 0) return invalid("qwen35moe.context_length");
+  if (!embd_len || *embd_len == 0) return invalid("qwen35moe.embedding_length");
+  if (ff_len && *ff_len == 0) return invalid("qwen35moe.feed_forward_length");
+  if (!head_count || *head_count == 0)
+    return invalid("qwen35moe.attention.head_count");
+  if (!head_count_kv || *head_count_kv == 0)
+    return invalid("qwen35moe.attention.head_count_kv");
+  if (!key_len || *key_len == 0) return invalid("qwen35moe.attention.key_length");
+  if (!value_len || *value_len != *key_len)
+    return invalid("qwen35moe.attention.value_length (must equal key_length)");
+  if (!rms_eps || *rms_eps < 0.0)
+    return invalid("qwen35moe.attention.layer_norm_rms_epsilon");
+  if (!freq_base || *freq_base <= 0.0) return invalid("qwen35moe.rope.freq_base");
+  if (!expert_count || *expert_count == 0) return invalid("qwen35moe.expert_count");
+  if (!expert_used || *expert_used == 0 || *expert_used > *expert_count)
+    return invalid("qwen35moe.expert_used_count");
+  if (!rope_sections || rope_sections->size() != 4)
+    return invalid("qwen35moe.rope.dimension_sections (4 sections)");
+  if (!ssm_conv || *ssm_conv == 0) return invalid("qwen35moe.ssm.conv_kernel");
+  if (!ssm_inner || *ssm_inner == 0) return invalid("qwen35moe.ssm.inner_size");
+  if (!ssm_state || *ssm_state == 0) return invalid("qwen35moe.ssm.state_size");
+  if (!ssm_dt || *ssm_dt == 0) return invalid("qwen35moe.ssm.time_step_rank");
+  if (!ssm_group || *ssm_group == 0) return invalid("qwen35moe.ssm.group_count");
+
+  c.block_count = uint32_t(*block_count);
+  c.context_length = *context_len;
+  c.embedding_length = uint32_t(*embd_len);
+  c.head_count = uint32_t(*head_count);
+  c.head_count_kv = uint32_t(*head_count_kv);
+  c.head_dim_global = uint32_t(*key_len);
+  c.head_dim_swa = 0;         // no sliding-window attention
+  c.per_layer_input = 0;
+  c.sliding_window = 0;
+  c.rms_epsilon = float(*rms_eps);
+  c.final_logit_softcapping = 0.0f;
+  c.rope_base = float(*freq_base);
+  c.rope_base_swa = 0.0f;
+  c.shared_kv_layers = 0;
+  c.sliding_window_pattern.clear();
+  c.n_expert = uint32_t(*expert_count);
+  c.n_expert_used = uint32_t(*expert_used);
+  // The reference falls back to feed_forward_length / expert_used_count when
+  // the expert width is absent and to feed_forward_length for the shared
+  // expert. Both keys may be written as per-layer arrays; a non-uniform array
+  // was refused above.
+  if (expert_ff) {
+    c.expert_ff = uint32_t(*expert_ff);
+  } else if (ff_len && *ff_len % c.n_expert_used == 0) {
+    c.expert_ff = uint32_t(*ff_len / c.n_expert_used);
+  }
+  if (c.expert_ff == 0) return invalid("qwen35moe.expert_feed_forward_length");
+  if (shared_ff) {
+    c.shared_expert_ff = uint32_t(*shared_ff);
+  } else if (ff_len) {
+    c.shared_expert_ff = uint32_t(*ff_len);
+  }
+  if (c.shared_expert_ff == 0)
+    return invalid("qwen35moe.expert_shared_feed_forward_length");
+  // The file may omit feed_forward_length (there is no dense FFN). The
+  // config's field then carries the expert width, so the generic readers see
+  // the block's feed-forward size and valid() holds.
+  c.feed_forward_length = ff_len ? uint32_t(*ff_len) : c.expert_ff;
+  c.expert_weights_scale = weights_scale ? float(*weights_scale) : 1.0f;
+  c.full_attention_interval = interval ? uint32_t(*interval) : 4;
+  if (c.full_attention_interval == 0)
+    return invalid("qwen35moe.full_attention_interval");
+  c.ssm_conv_kernel = uint32_t(*ssm_conv);
+  c.ssm_inner_size = uint32_t(*ssm_inner);
+  c.ssm_state_size = uint32_t(*ssm_state);
+  c.ssm_time_step_rank = uint32_t(*ssm_dt);
+  c.ssm_group_count = uint32_t(*ssm_group);
+  c.n_layer_nextn = nextn ? uint32_t(*nextn) : 0;
+  c.rope_dimension_count = rope_dims ? uint32_t(*rope_dims) : 0;
+  if (c.rope_dimension_count > c.head_dim_global)
+    return invalid("qwen35moe.rope.dimension_count (exceeds head_dim)");
+  c.rope_dimension_sections.reserve(rope_sections->size());
+  for (uint64_t v : *rope_sections) c.rope_dimension_sections.push_back(uint32_t(v));
+
+  // Layer kinds: the explicit per-layer array wins; the file may cover the
+  // MTP blocks too, so only the trunk's entries are kept. Without the array,
+  // every layer whose 1-based index is not a multiple of the interval is a
+  // recurrent (gated DeltaNet) layer.
+  if (recurrent) {
+    if (recurrent->size() < c.block_count)
+      return invalid("qwen35moe.attention.recurrent_layers (too short)");
+    c.recurrent_layers.assign(recurrent->begin(),
+                              recurrent->begin() + c.block_count);
+  } else {
+    c.recurrent_layers.resize(c.block_count);
+    for (uint32_t i = 0; i < c.block_count; ++i)
+      c.recurrent_layers[i] = (i + 1) % c.full_attention_interval != 0;
+  }
+
+  // token_embd.shape[1] defines vocab_size (shared with the weight binder).
+  {
+    const gguf::TensorInfo* t = r.tensor("token_embd.weight");
+    if (!t || t->dims.size() != 2 || t->dims[0] != c.embedding_length ||
+        t->dims[1] == 0) {
+      return std::unexpected(std::string("token_embd.weight absent or malformed"));
+    }
+    c.vocab_size = t->dims[1];
+  }
+
+  if (!c.valid()) return std::unexpected(std::string("inconsistent config"));
+  return c;
+}
+
 std::expected<ModelArch, std::string> detect_arch(const gguf::Reader& r) {
   const auto a = read_string(r, "general.architecture");
   if (!a) return std::unexpected(std::string("missing general.architecture"));
   if (*a == "gemma4") return ModelArch::Gemma4;
   if (*a == "qwen2") return ModelArch::Qwen2;
+  if (*a == "qwen35moe") return ModelArch::Qwen35Moe;
   return std::unexpected("unknown architecture: " + std::string(*a));
 }
 
@@ -525,6 +861,7 @@ std::expected<Gemma4Config, std::string> load_config(const gguf::Reader& r) {
   switch (*arch) {
     case ModelArch::Gemma4: return load_gemma4_config(r);
     case ModelArch::Qwen2:  return load_qwen2_config(r);
+    case ModelArch::Qwen35Moe: return load_qwen35moe_config(r);
   }
   return std::unexpected(std::string("unknown architecture"));
 }
@@ -611,6 +948,154 @@ std::expected<Gemma4Model, std::string> load_qwen2(const gguf::Reader& r) {
   return m;
 }
 
+// Qwen3.6-MoE weight binding. The trunk (embedding, output, output norm, a pre-
+// attention norm and a pre-FFN norm per block) and the full-attention layers
+// (Q/K/V/output projections, Q/K per-head norms) bind into the existing
+// container. The MoE part binds one router per block (quantized or f32,
+// whichever the file stores), per-expert views over the stacked gate/up/down
+// tensors, and the shared expert's three projections plus its gate vector.
+// Recurrent (gated DeltaNet) layers are validated by shape and not loaded; the
+// recurrent path does not run yet. The vision tower and the trailing
+// multi-token-prediction blocks are not read.
+std::expected<Gemma4Model, std::string> load_qwen35moe(const gguf::Reader& r) {
+  Gemma4Model m;
+
+  auto cfg = load_qwen35moe_config(r);
+  if (!cfg) return std::unexpected(std::move(cfg.error()));
+  m.config = std::move(*cfg);
+
+  Gemma4Config& c = m.config;
+  Gemma4Weights& w = m.weights;
+  const uint32_t d = c.embedding_length;
+  const uint64_t vocab = c.vocab_size;
+
+  std::string errs;
+  std::map<uint32_t,uint64_t> converted;
+  if (auto q = bind_quant(r, "token_embd.weight", {}, {d, vocab}, errs,
+                          m.owned_quant_buffers, converted))
+    w.token_embd = *q;
+  // The output projection is optional; without it the model ties the output to
+  // the token embedding (the emitter reuses TokenEmbd).
+  if (r.tensor("output.weight") != nullptr)
+    if (auto q = bind_quant(r, "output.weight", {}, {d, vocab}, errs,
+                            m.owned_quant_buffers, converted))
+      w.output = *q;
+  if (auto s = bind_f32(r, "output_norm.weight", d, errs))
+    w.output_norm = *s;
+
+  // Gated DeltaNet geometry (validated for the recurrent layers).
+  const uint64_t key_dim = uint64_t(c.ssm_state_size) * c.ssm_group_count;
+  const uint64_t value_dim = uint64_t(c.ssm_state_size) * c.ssm_time_step_rank;
+  const uint64_t conv_dim = key_dim * 2 + value_dim;
+
+  w.blocks.clear();
+  w.blocks.reserve(c.block_count);
+  for (uint32_t l = 0; l < c.block_count; ++l) {
+    const LayerConfig lc = c.layer_config(l);
+    const uint64_t head_width = uint64_t(lc.n_heads_q) * lc.head_dim;
+    const uint64_t q_width = 2 * head_width;
+    const uint64_t kv_width = uint64_t(lc.n_heads_kv) * lc.head_dim;
+
+    const std::string p = "blk." + std::to_string(l) + ".";
+    BlockWeights bw;
+    if (auto s = bind_f32(r, p + "attn_norm.weight", d, errs)) bw.attn_norm = *s;
+    // The block's pre-FFN norm is attn_post_norm in this architecture.
+    if (auto s = bind_f32(r, p + "attn_post_norm.weight", d, errs))
+      bw.ffn_norm = *s;
+
+    const bool recurrent = l < c.recurrent_layers.size() &&
+                           c.recurrent_layers[l];
+    if (recurrent) {
+      // Validate the gated DeltaNet tensors; do not bind them.
+      require_tensor(r, p + "attn_qkv.weight", {d, key_dim * 2 + value_dim}, errs);
+      require_tensor(r, p + "attn_gate.weight", {d, value_dim}, errs);
+      require_tensor(r, p + "ssm_conv1d.weight", {c.ssm_conv_kernel, conv_dim}, errs);
+      require_tensor(r, p + "ssm_dt.bias", {c.ssm_time_step_rank}, errs);
+      require_tensor(r, p + "ssm_a", {c.ssm_time_step_rank}, errs);
+      require_tensor(r, p + "ssm_beta.weight", {d, c.ssm_time_step_rank}, errs);
+      require_tensor(r, p + "ssm_alpha.weight", {d, c.ssm_time_step_rank}, errs);
+      require_tensor(r, p + "ssm_norm.weight", {c.ssm_state_size}, errs);
+      require_tensor(r, p + "ssm_out.weight", {value_dim, d}, errs);
+    } else {
+      // Full attention: the Q projection is twice as wide as the attention
+      // head output (its second half per head gates the attention result).
+      if (auto q = bind_quant(r, p + "attn_q.weight", {}, {d, q_width}, errs,
+                              m.owned_quant_buffers, converted))
+        bw.attn_q = *q;
+      if (auto q = bind_quant(r, p + "attn_k.weight", {}, {d, kv_width}, errs,
+                              m.owned_quant_buffers, converted))
+        bw.attn_k = *q;
+      if (auto q = bind_quant(r, p + "attn_v.weight", {}, {d, kv_width}, errs,
+                              m.owned_quant_buffers, converted))
+        bw.attn_v = *q;
+      if (auto q = bind_quant(r, p + "attn_output.weight", {},
+                              {head_width, d}, errs, m.owned_quant_buffers,
+                              converted))
+        bw.attn_output = *q;
+      if (auto s = bind_f32(r, p + "attn_q_norm.weight", lc.head_dim, errs))
+        bw.attn_q_norm = *s;
+      if (auto s = bind_f32(r, p + "attn_k_norm.weight", lc.head_dim, errs))
+        bw.attn_k_norm = *s;
+    }
+
+    // Router: whichever form the file stores.
+    const std::string router_name = p + "ffn_gate_inp.weight";
+    const gguf::TensorInfo* rt = r.tensor(router_name);
+    if (!rt) {
+      errs += "missing tensor: ";
+      errs += router_name;
+      errs += "\n";
+    } else if (rt->type == kF32) {
+      if (auto s = bind_f32_2d(r, router_name, {d, c.n_expert}, errs))
+        bw.expert_router_f32 = *s;
+    } else if (auto q = bind_quant(r, router_name, {}, {d, c.n_expert}, errs,
+                                   m.owned_quant_buffers, converted)) {
+      bw.expert_router = *q;
+    }
+
+    // Routed experts: one merged gate/up tensor when the file has it,
+    // otherwise two.
+    const std::string gate_up_name = p + "ffn_gate_up_exps.weight";
+    if (r.tensor(gate_up_name) != nullptr) {
+      bind_expert_gate_up(r, gate_up_name, d, c.expert_ff, c.n_expert,
+                          bw.expert_gate, bw.expert_up, errs);
+    } else {
+      bw.expert_gate = bind_experts(r, p + "ffn_gate_exps.weight",
+                                    {d, c.expert_ff}, c.n_expert, errs);
+      bw.expert_up = bind_experts(r, p + "ffn_up_exps.weight",
+                                  {d, c.expert_ff}, c.n_expert, errs);
+    }
+    bw.expert_down = bind_experts(r, p + "ffn_down_exps.weight",
+                                  {c.expert_ff, d}, c.n_expert, errs);
+
+    // Shared expert.
+    if (auto q = bind_quant(r, p + "ffn_gate_shexp.weight", {},
+                            {d, c.shared_expert_ff}, errs,
+                            m.owned_quant_buffers, converted))
+      bw.shared_gate = *q;
+    if (auto q = bind_quant(r, p + "ffn_up_shexp.weight", {},
+                            {d, c.shared_expert_ff}, errs,
+                            m.owned_quant_buffers, converted))
+      bw.shared_up = *q;
+    if (auto q = bind_quant(r, p + "ffn_down_shexp.weight", {},
+                            {c.shared_expert_ff, d}, errs,
+                            m.owned_quant_buffers, converted))
+      bw.shared_down = *q;
+    if (auto s = bind_f32(r, p + "ffn_gate_inp_shexp.weight", d, errs))
+      bw.shared_gate_in = *s;
+
+    w.blocks.push_back(bw);
+  }
+
+  if (!errs.empty()) return std::unexpected(std::move(errs));
+
+  m.plan.clear();
+  m.plan.reserve(c.block_count);
+  for (uint32_t l = 0; l < c.block_count; ++l) m.plan.push_back(c.layer_config(l));
+
+  return m;
+}
+
 std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
   Gemma4Model m;
 
@@ -625,6 +1110,7 @@ std::expected<Gemma4Model, std::string> load_gemma4(const gguf::Reader& r) {
     // use.
     return load_qwen2(r);
   }
+  if (*arch == ModelArch::Qwen35Moe) return load_qwen35moe(r);
 
   auto cfg = load_gemma4_config(r);
   if (!cfg) return std::unexpected(std::move(cfg.error()));
