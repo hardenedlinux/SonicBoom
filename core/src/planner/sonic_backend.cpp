@@ -292,6 +292,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
           lc.attention == model::AttentionKind::Global
               ? model_.weights.rope_freqs
               : std::span<const float>{};
+      // 0 = the whole head; a partial-rope model rotates only the leading
+      // values of each head (the angle denominator becomes rot_dims).
+      int64_t rot_dims = 0;
+      attr_i(*node, "rot_dims", rot_dims);
       std::span<float> o = f32_mut(out);
       std::span<const float> x = f32(inputs[0]);
       std::copy(x.begin(), x.end(), o.begin());
@@ -301,13 +305,15 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
         const uint64_t dim = n ? x.size() / n : 0;
         for (uint64_t c = 0; c < n; ++c) {
           if (!nn::rope_neox_heads(o.subspan(c * dim, dim), lc.head_dim, pos + c,
-                                   lc.rope_base, 1.0f, ff)) {
+                                   lc.rope_base, 1.0f, ff,
+                                   uint64_t(rot_dims))) {
             ok = false;
             break;
           }
         }
       } else {
-        ok = nn::rope_neox_heads(o, lc.head_dim, pos, lc.rope_base, 1.0f, ff);
+        ok = nn::rope_neox_heads(o, lc.head_dim, pos, lc.rope_base, 1.0f, ff,
+                                 uint64_t(rot_dims));
       }
       break;
     }

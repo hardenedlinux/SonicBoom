@@ -603,11 +603,16 @@ bool dispatch_node(const NodeContext& s, const GraphNodeDesc& n,
         static_cast<std::uint64_t>(int_attr(n, "pos0", 0));
     const float theta = float_attr(n, "theta_base", 10000.0f);
     const float freq_scale = float_attr(n, "freq_scale", 1.0f);
+    // 0 = the whole head (every model before Qwen3.6); non-zero rotates only the
+    // leading values of each head.
+    const std::uint64_t rot_dims =
+        static_cast<std::uint64_t>(int_attr(n, "rot_dims", 0));
     for (std::int64_t r = 0; r < rows; ++r)
       if (!nn::rope_neox_heads(
               std::span<float>(out + r * x.back(), x.back()),
               static_cast<std::uint64_t>(head_dim),
-              pos0 + static_cast<std::uint64_t>(r), theta, freq_scale, {}))
+              pos0 + static_cast<std::uint64_t>(r), theta, freq_scale, {},
+              rot_dims))
         return fail("rope kernel failed");
     return true;
   }

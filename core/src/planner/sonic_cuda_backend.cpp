@@ -1114,6 +1114,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           lc.attention == model::AttentionKind::Global
               ? model_->weights.rope_freqs
               : std::span<const float>{};
+      // 0 = the whole head; a partial-rope model rotates only the leading
+      // values of each head (the angle denominator becomes rot_dims).
+      int64_t rot_dims = 0;
+      attr_i(*node, "rot_dims", rot_dims);
       if (!device::device_copy(in[0].device.handle, out_handle, out_bytes)) {
         ok = false;
         break;
@@ -1124,11 +1128,13 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (nb > 0 || batch_attr(nb)) {
         ok = nn::cuda::rope_neox_heads_batched_dev_pos(
             out, int(lc.head_dim), out_n / int(nb) / int(lc.head_dim), int(nb),
-            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff);
+            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff,
+            uint64_t(rot_dims));
       } else {
         ok = nn::cuda::rope_neox_heads_dev_pos(
             out, int(lc.head_dim), out_n / int(lc.head_dim),
-            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff);
+            reinterpret_cast<const uint64_t*>(pos_slot()), lc.rope_base, 1.0f, ff,
+            uint64_t(rot_dims));
       }
       break;
     }
@@ -2063,6 +2069,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         int64_t rope_i = 0, cast_i = 0, kv_store = 0, nb = 1;
         attr_i(*node, "rope", rope_i);
         attr_i(*node, "cast", cast_i);
+        // A partial-rope model (rot_dims != 0) rotates only the leading values
+        // of each head; the generated kernel rotates whole heads, so such a
+        // chain runs the reference path below.
+        int64_t rot_dims = 0;
+        attr_i(*node, "rot_dims", rot_dims);
         // Stage 6d: a KV layer's K/V prep region stores its own output row into
         // that layer's cache (kv_store 1 = K, 2 = V); the attention node it
         // feeds is marked `kv_appended` and skips its kv_append launches.
@@ -2121,11 +2132,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                      ? nn::cuda::rope_neox_heads_dev_pos(
                            out, dim, heads,
                            reinterpret_cast<const uint64_t*>(pos_slot()),
-                           lc.rope_base, 1.0f, ff)
+                           lc.rope_base, 1.0f, ff, uint64_t(rot_dims))
                      : nn::cuda::rope_neox_heads_batched_dev_pos(
                            out, dim, hpp, int(nb),
                            reinterpret_cast<const uint64_t*>(pos_slot()),
-                           lc.rope_base, 1.0f, ff);
+                           lc.rope_base, 1.0f, ff, uint64_t(rot_dims));
           }
           if (ok && cast_i != 0) ok = nn::cuda::cast_fp16_dev(out, out_n);
           // A cache-writing chain appends here too, so the fallback leaves the
@@ -2142,7 +2153,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         // The region is an optimization: a head wider than its shared stage
         // falls back to the reference chain (Gemma's global layers are 512,
         // its local layers 256; the region covers both).
-        if (dim > compiler::kHeadsNormRopeCastMaxHeadDim) {
+        if (dim > compiler::kHeadsNormRopeCastMaxHeadDim || rot_dims != 0) {
           reference();
           break;
         }

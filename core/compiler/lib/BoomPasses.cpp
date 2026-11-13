@@ -1878,6 +1878,14 @@ public:
       attrs.push_back(boom::NodeAttr::get(
           view.ctx(), "cast",
           builder.getI32IntegerAttr(m.cast ? 1 : 0)));
+      // A rope that rotates only part of each head carries `rot_dims`; the
+      // fused node keeps it so the backend can run the reference chain (the
+      // generated kernel rotates whole heads).
+      if (m.rope)
+        if (auto rd = nodeAttrInt(
+                m.rope->getAttrOfType<mlir::ArrayAttr>("node_attrs"), "rot_dims"))
+          attrs.push_back(boom::NodeAttr::get(
+              view.ctx(), "rot_dims", builder.getI32IntegerAttr(int32_t(*rd))));
       attrs.push_back(boom::NodeAttr::get(
           view.ctx(), "fused_region",
           builder.getStringAttr("heads_norm_rope_cast")));

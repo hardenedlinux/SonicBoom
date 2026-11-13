@@ -70,6 +70,10 @@ struct SelfAttention {
 
   bool qk_norm = false;  // per-head RMSNorm on Q and K, with learned weights
   bool v_norm = false;   // per-head RMSNorm on V, unit weight
+  // Values per head that are rotated; 0 = the whole head. A model whose rope
+  // covers only a prefix of each head (Qwen3.6) sets this, and the emitter
+  // writes it on the block's Rope node.
+  uint32_t rotary_dims = 0;
   // Multiplies the attention scores; 1.0 when the model applies none (unit-
   // normed Q and K make the dot product a cosine already).
   double scale = 1.0;

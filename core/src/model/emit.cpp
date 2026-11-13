@@ -188,10 +188,14 @@ protected:
     return node(OpKind::AddBias, {x}, name, p.out, std::move(a));
   }
 
+  // `rot_dims` > 0 rotates only that many leading values of each head, and is
+  // written on the node; 0 is the whole head and writes nothing, so the graph
+  // of a model with full rope is unchanged.
   mlir::Value rope(mlir::Value x, const std::string& name, uint64_t width,
-                   uint32_t layer) {
+                   uint32_t layer, uint32_t rot_dims) {
     Attrs a = {layer_a(layer)};
     rows(a);
+    if (rot_dims != 0) a.push_back(attr_i("rot_dims", int64_t(rot_dims)));
     return node(OpKind::Rope, {x, position()}, name, width, std::move(a));
   }
 
@@ -236,7 +240,7 @@ protected:
     q = bias(q, "qb" + s, at.q, l);
     if (at.qk_norm)
       q = norm_heads(q, "qn" + s, qw, l, WeightSlot::AttnQNorm);
-    q = rope(q, "qr" + s, qw, l);
+    q = rope(q, "qr" + s, qw, l, at.rotary_dims);
 
     mlir::Value attn;
     if (at.owns_cache) {
@@ -249,7 +253,7 @@ protected:
       if (at.v_norm)
         v = norm_heads(v, "vn" + s, kvw, l, WeightSlot::None);
       const mlir::Value vc = pointwise(OpKind::CastFp16, {v}, "vc" + s, kvw, l);
-      k = rope(k, "kr" + s, kvw, l);
+      k = rope(k, "kr" + s, kvw, l, at.rotary_dims);
       const mlir::Value kc = pointwise(OpKind::CastFp16, {k}, "kc" + s, kvw, l);
       attn = attend(at, l, q, kc, vc);
     } else {
