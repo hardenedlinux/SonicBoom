@@ -8,6 +8,7 @@
 #include <sonicboom/nn/elementwise.h>
 #include <sonicboom/nn/embedding.h>
 #include <sonicboom/nn/matmul.h>
+#include <sonicboom/nn/moe.h>
 #include <sonicboom/nn/norm.h>
 #include <sonicboom/nn/rope.h>
 #include <sonicboom/nn/sampling.h>
@@ -15,6 +16,7 @@
 
 #include <sonicboom/dtype.h>
 #include <sonicboom/quant/dequant.h>
+#include <sonicboom/quant/quantized_matmul.h>
 
 #ifdef SB_TEST_CUDA
 #include <cuda_runtime.h>
@@ -26,7 +28,9 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <span>
 #include <vector>
@@ -602,6 +606,256 @@ void test_embedding() {
   }
 }
 
+void test_moe() {
+  namespace sbquant = sonicboom::quant;
+  // q4_K stores 256-element blocks and its contiguous dimension must be a whole
+  // number of blocks (QuantizedTensor::valid), so the smallest expert pair is
+  // 256 wide on both sides. The gate's d = 64 / width 32 cannot be a q4_K row.
+  constexpr uint32_t d = 256, ff = 256, E = 8, used = 2;
+
+  // q4_K weights assembled block by block (the format's own test block, as in
+  // test_dequant): d = 1 and dmin = 0, and every sub-block's scale is 1 with a
+  // zero minimum, so a dequantized weight is its stored 4-bit nibble. The
+  // nibbles are a deterministic pseudo-random sequence keyed by the tensor and
+  // the expert, so no two experts share a matrix.
+  std::vector<std::shared_ptr<std::vector<std::byte>>> keep;
+  auto make = [&](uint64_t cols, uint64_t rows, uint16_t scale, uint32_t seed) {
+    auto bytes = std::make_shared<std::vector<std::byte>>();
+    const uint64_t blocks = cols * rows / 256;
+    uint32_t h = seed * 2654435761u + 1u;
+    for (uint64_t b = 0; b < blocks; ++b) {
+      bytes->push_back(std::byte(scale & 0xFF));  // d (fp16, LE)
+      bytes->push_back(std::byte(scale >> 8));
+      bytes->push_back(std::byte(0x00));          // dmin = 0
+      bytes->push_back(std::byte(0x00));
+      const uint8_t scales[12] = {1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1};
+      for (uint8_t s : scales) bytes->push_back(std::byte(s));
+      for (int i = 0; i < 128; ++i) {
+        h ^= h << 13;
+        h ^= h >> 17;
+        h ^= h << 5;
+        bytes->push_back(std::byte(uint8_t(h & 0xFF)));
+      }
+    }
+    keep.push_back(bytes);
+    return sbquant::QuantizedTensor(sbquant::QuantType::Q4_K, {cols, rows},
+                                    *bytes);
+  };
+  constexpr uint16_t kF16_1 = 0x3C00;
+
+  std::vector<sbquant::QuantizedTensor> gate, up, down;
+  for (uint32_t e = 0; e < E; ++e) {
+    gate.push_back(make(d, ff, kF16_1, 1000 + e));
+    up.push_back(make(d, ff, kF16_1, 2000 + e));
+    down.push_back(make(ff, d, kF16_1, 3000 + e));
+  }
+  check(gate[0].valid() && down[0].valid(), "moe: the expert views are valid");
+
+  std::vector<float> x(d);
+  for (uint32_t i = 0; i < d; ++i) x[i] = float(int(i % 7) - 3) * 0.25f + 0.5f;
+
+  // The routing written out directly: the logits through the same CPU
+  // quantized dot the kernel's router uses, then the stable f32 softmax over
+  // all experts in ascending index, the top-k with a strict comparison and the
+  // ascending sum of the selected probabilities.
+  auto route_reference = [&](std::span<const float> logits,
+                             std::vector<int64_t>& want_ids,
+                             std::vector<float>& want_w) {
+    std::vector<float> probs(E, 0.0f);
+    float mx = logits[0];
+    for (float l : logits) mx = std::max(mx, l);
+    float sum = 0.0f;
+    for (uint32_t e = 0; e < E; ++e) {
+      probs[e] = std::exp(logits[e] - mx);
+      sum += probs[e];
+    }
+    for (uint32_t e = 0; e < E; ++e) probs[e] /= sum;
+    std::vector<bool> taken(E, false);
+    std::vector<uint32_t> sel;
+    for (uint32_t j = 0; j < used; ++j) {
+      uint32_t best = E;
+      for (uint32_t e = 0; e < E; ++e) {
+        if (taken[e]) continue;
+        if (best == E || probs[e] > probs[best]) best = e;
+      }
+      taken[best] = true;
+      sel.push_back(best);
+    }
+    std::sort(sel.begin(), sel.end());
+    float denom = 0.0f;
+    for (uint32_t e : sel) denom += probs[e];
+    denom = std::max(denom, 6.103515625e-5f);
+    want_ids.assign(used, 0);
+    want_w.assign(used, 0.0f);
+    for (uint32_t j = 0; j < used; ++j) {
+      want_ids[j] = int64_t(sel[j]);
+      want_w[j] = probs[sel[j]] / denom;
+    }
+  };
+
+  const sbquant::QuantizedTensor router = make(d, E, kF16_1, 4000);
+  std::vector<int64_t> ids(used);
+  std::vector<float> weights(used);
+  check(sbnn::moe_route(x, &router, std::span<const float>{}, E, used, 1.0f,
+                        ids, weights),
+        "moe_route returns true");
+  {
+    std::vector<float> logits(E);
+    check(sbquant::matvec(router, x, logits, sbquant::MatmulBackend::CpuQ8K),
+          "moe_route: the reference router runs");
+    std::vector<int64_t> want_ids;
+    std::vector<float> want_w;
+    route_reference(logits, want_ids, want_w);
+    check(ids[0] == want_ids[0] && ids[1] == want_ids[1],
+          "moe_route selects the same experts as the reference");
+    check(std::bit_cast<uint32_t>(weights[0]) ==
+                  std::bit_cast<uint32_t>(want_w[0]) &&
+              std::bit_cast<uint32_t>(weights[1]) ==
+                  std::bit_cast<uint32_t>(want_w[1]),
+          "moe_route weights are bit-identical to the reference");
+  }
+
+  // The float32 router branch routes through the dense matvec.
+  {
+    std::vector<float> router_f32(size_t(d) * E);
+    for (uint32_t k = 0; k < d; ++k)
+      for (uint32_t e = 0; e < E; ++e)
+        router_f32[size_t(e) * d + k] =
+            float(e) * 0.05f + float(k % 3) * 0.01f;
+    std::vector<int64_t> fids(used);
+    std::vector<float> fw(used);
+    check(sbnn::moe_route(x, nullptr, router_f32, E, used, 1.0f, fids, fw),
+          "moe_route: a float32 router returns true");
+    std::vector<float> logits(E);
+    check(sbnn::matvec_f32(router_f32, d, x, logits),
+          "moe_route: the float32 reference router runs");
+    std::vector<int64_t> want_ids;
+    std::vector<float> want_w;
+    route_reference(logits, want_ids, want_w);
+    check(fids[0] == want_ids[0] && fids[1] == want_ids[1],
+          "moe_route: the float32 router selects the same experts");
+  }
+
+  // Tie rule: a zero router makes every expert equally likely, and equal
+  // probabilities select the lowest indices with equal weights.
+  {
+    const sbquant::QuantizedTensor zero_router =
+        make(d, E, 0x0000, 5000);  // d = 0 -> every weight is zero
+    std::vector<int64_t> tids(used);
+    std::vector<float> tw(used);
+    check(sbnn::moe_route(x, &zero_router, std::span<const float>{}, E, used,
+                          1.0f, tids, tw),
+          "moe_route: a flat router returns true");
+    check(tids[0] == 0 && tids[1] == 1, "moe_route: a tie takes lower indices");
+    check(tw[0] == 0.5f && tw[1] == 0.5f, "moe_route: tied weights are equal");
+  }
+  // Validation: more experts used than exist, and a short output span.
+  {
+    std::vector<int64_t> bad_ids(E + 1);
+    std::vector<float> bad_w(E + 1);
+    check(!sbnn::moe_route(x, &router, std::span<const float>{}, E, E + 1,
+                           1.0f, bad_ids, bad_w),
+          "moe_route rejects used > experts");
+    std::vector<int64_t> short_ids(used - 1);
+    check(!sbnn::moe_route(x, &router, std::span<const float>{}, E, used, 1.0f,
+                           short_ids, weights),
+          "moe_route rejects a short id span");
+    check(!sbnn::moe_route(x, nullptr, std::span<const float>{}, E, used, 1.0f,
+                           std::span<int64_t>(ids), weights),
+          "moe_route rejects a missing router");
+    check(!sbnn::moe_route(std::span<const float>{}, &router,
+                           std::span<const float>{}, E, used, 1.0f,
+                           std::span<int64_t>(ids), weights),
+          "moe_route rejects an empty activation");
+  }
+
+  // The routed experts: the same projections, each expert's weight applied to
+  // its own output, accumulated in ascending expert index.
+  sbnn::MoeExpertWeights views{gate, up, down};
+  std::vector<float> y(d, 0.0f);
+  check(sbnn::moe_experts(x, ids, weights, views, sbnn::MoeActivation::Silu, y),
+        "moe_experts returns true");
+  {
+    std::vector<float> want(d, 0.0f);
+    for (size_t k = 0; k < ids.size(); ++k) {
+      std::vector<float> g(ff), u(ff), h(ff), out(d);
+      sbquant::matvec(gate[size_t(ids[k])], x, g,
+                      sbquant::MatmulBackend::CpuQ8K);
+      sbquant::matvec(up[size_t(ids[k])], x, u, sbquant::MatmulBackend::CpuQ8K);
+      sbnn::silu(g, g);
+      for (uint32_t i = 0; i < ff; ++i) h[i] = g[i] * u[i];
+      sbquant::matvec(down[size_t(ids[k])], h, out,
+                      sbquant::MatmulBackend::CpuQ8K);
+      for (uint32_t i = 0; i < d; ++i) want[i] += weights[k] * out[i];
+    }
+    bool exact = true;
+    for (uint32_t i = 0; i < d; ++i)
+      exact = exact && std::bit_cast<uint32_t>(y[i]) ==
+                           std::bit_cast<uint32_t>(want[i]);
+    check(exact, "moe_experts output is bit-identical to the reference");
+  }
+  // A zero-weight expert contributes nothing; an out-of-range id is refused.
+  {
+    std::vector<float> zero_w = {0.0f, 0.0f};
+    std::vector<float> z(d);
+    check(sbnn::moe_experts(x, ids, zero_w, views, sbnn::MoeActivation::Silu, z),
+          "moe_experts: zero weights return true");
+    bool all_zero = true;
+    for (float v : z) all_zero = all_zero && v == 0.0f;
+    check(all_zero, "moe_experts: zero weights add nothing");
+    std::vector<int64_t> bad = {int64_t(E)};
+    std::vector<float> w1 = {1.0f}, out(d);
+    check(!sbnn::moe_experts(x, bad, w1, views, sbnn::MoeActivation::Silu, out),
+          "moe_experts rejects an expert index past the end");
+  }
+
+  // The routed sum accumulates in ascending expert index. Contributions that
+  // differ in magnitude by many binades make the ascending and the descending
+  // sums differ in their low bits, so the reference can tell the two apart and
+  // the kernel has to match the ascending one bit for bit.
+  {
+    constexpr uint32_t kUsed = 4;
+    const uint16_t scales[kUsed] = {0x6400, 0x3C00, 0x1400, 0x0010};
+    std::vector<sbquant::QuantizedTensor> g4, u4, d4;
+    for (uint32_t e = 0; e < kUsed; ++e) {
+      g4.push_back(make(d, ff, kF16_1, 6000 + e));
+      u4.push_back(make(d, ff, kF16_1, 7000 + e));
+      d4.push_back(make(ff, d, scales[e], 8000 + e));
+    }
+    sbnn::MoeExpertWeights v4{g4, u4, d4};
+    const std::vector<int64_t> order = {0, 1, 2, 3};
+    const std::vector<float> w4 = {0.4f, 0.3f, 0.2f, 0.1f};
+    std::vector<std::vector<float>> outs(kUsed, std::vector<float>(d));
+    for (uint32_t e = 0; e < kUsed; ++e) {
+      std::vector<float> g(ff), u(ff), h(ff);
+      sbquant::matvec(g4[e], x, g, sbquant::MatmulBackend::CpuQ8K);
+      sbquant::matvec(u4[e], x, u, sbquant::MatmulBackend::CpuQ8K);
+      sbnn::silu(g, g);
+      for (uint32_t i = 0; i < ff; ++i) h[i] = g[i] * u[i];
+      sbquant::matvec(d4[e], h, outs[e], sbquant::MatmulBackend::CpuQ8K);
+    }
+    std::vector<float> asc(d, 0.0f), desc(d, 0.0f);
+    for (uint32_t i = 0; i < d; ++i) {
+      for (uint32_t e = 0; e < kUsed; ++e) asc[i] += w4[e] * outs[e][i];
+      for (uint32_t j = kUsed; j-- > 0;) desc[i] += w4[j] * outs[j][i];
+    }
+    bool order_matters = false;
+    for (uint32_t i = 0; i < d; ++i)
+      order_matters = order_matters || std::bit_cast<uint32_t>(asc[i]) !=
+                                          std::bit_cast<uint32_t>(desc[i]);
+    check(order_matters,
+          "moe_experts: the example distinguishes the two summation orders");
+    std::vector<float> y4(d, 0.0f);
+    check(sbnn::moe_experts(x, order, w4, v4, sbnn::MoeActivation::Silu, y4),
+          "moe_experts: the four-expert order case returns true");
+    bool asc_exact = true;
+    for (uint32_t i = 0; i < d; ++i)
+      asc_exact = asc_exact && std::bit_cast<uint32_t>(y4[i]) ==
+                                   std::bit_cast<uint32_t>(asc[i]);
+    check(asc_exact, "moe_experts sums the routed experts in ascending order");
+  }
+}
+
 void test_validation() {
   std::vector<float> x(8, 1.0f);
 
@@ -875,6 +1129,7 @@ int main() {
 #endif
   test_gqa_broadcast();
   test_layer_combine();
+  test_moe();
 
   if (g_failures == 0) {
     std::cout << "test_nn OK\n";
