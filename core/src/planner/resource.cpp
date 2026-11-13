@@ -243,6 +243,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
       // elementwise ops Scale/Add/Mul/GeluFp16/CastFp16 are reused unchanged on
       // the flat batched buffers).
       OpKind::FlashAttention, OpKind::KvAppend,
+      // A gated attention output multiplies the attention result by the
+      // sigmoid of the Q projection's gate half.
+      OpKind::Sigmoid,
   };
   // VS1 prefetch markers are registered only under the switch that can place
   // them. They carry no outputs and no kernels; the backend executes them as
@@ -323,6 +326,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // Compiler-generated glue regions (Stage 5): the PTX kernel is loaded
         // and launched by the SonicCudaBackend itself.
         OpKind::FusedRegion,
+        // Gated attention's sigmoid runs on the device (sigmoid_dev), so the
+        // gate never leaves it.
+        OpKind::Sigmoid,
     };
     // MMQ1: the prefill dispatch of the same projections onto the
     // compiler-generated int8 tensor-core kernel. Registered only while that
