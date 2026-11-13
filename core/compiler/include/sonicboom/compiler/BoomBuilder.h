@@ -169,6 +169,11 @@ public:
   // that is the block-argument order the verifier recomputes.
   mlir::Value kv(uint32_t layer);
 
+  // The recurrent state handle (`!boom.state<index>`): a block argument after
+  // every KV cache handle, returned to boom.gdn_scan as its last operand.
+  // Declare the handles before any node, in ascending index order.
+  mlir::Value state(uint32_t index);
+
   // Deal each node's single-row output out over `rows` positions: every
   // node() shape is multiplied by `rows` (position-major [rows, dim]) and each
   // node carries `attr_name` = rows as an extra attribute. The verify step
@@ -234,6 +239,7 @@ private:
   std::vector<int64_t> outputs_;
   llvm::DenseMap<mlir::Value, int64_t> ids_;
   llvm::DenseMap<uint32_t, mlir::Value> kv_;
+  llvm::DenseMap<uint32_t, mlir::Value> state_;
   int64_t nodes_ = 0;
   int64_t row_scale_ = 0;        // out_shape multiplier (verify rows); 0 = off
   std::string row_scale_attr_;   // attribute stamped on each node when on

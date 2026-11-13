@@ -488,6 +488,22 @@ def Boom_MulOp : Boom_Op<"mul",
 def Boom_ScaleByOp : Boom_Op<"scale_by",
     "multiply each row of [rows, width] by that row's single value ([rows])",
     [NoMemoryEffect, Boom_RowIndependent]>;
+
+// gdn_scan: the update of a recurrent block's state. Operands
+// [qkv [n, C], beta_logit [n, H_v], alpha_logit [n, H_v], pos [1]] and the
+// block's `!boom.state<index>` handle as the last operand; the single result is
+// the rows' output [n, value_dim] f32. `layer`, `state` (the state index),
+// `slot` (the convolution), `slot_dt`, `slot_a`, `heads_k`, `heads_v`, `dim`
+// (S), `kernel` (K) and the phase's row marking ride on node_attrs.
+//
+// Its rows are sequential: row t+1 reads the state row t wrote. It therefore
+// carries no purity, elementwise or row-independence trait — the demand
+// analysis reads all of each input through it, and nothing may remove,
+// duplicate, split by rows or reorder it against another scan on the same
+// handle. The state access is the effect stated in BoomDialect.td.
+def Boom_GdnScanOp : Boom_Op<"gdn_scan",
+    "gated DeltaNet state update over a block's recurrent state",
+    [Boom_StateReadWrite]>;
 def Boom_ScaleOp : Boom_Op<"scale",
     "multiply by the `scale` attribute",
     [NoMemoryEffect, Boom_Elementwise, Boom_RowIndependent]>;

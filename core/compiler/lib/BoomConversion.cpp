@@ -125,6 +125,16 @@ std::optional<int64_t> cacheLayer(const GraphNodeDesc &n) {
   return intAttr(n.attributes, "layer");
 }
 
+// The ops whose state access is a stated effect on the StateResource
+// (BoomDialect.td): they carry the block's `!boom.state` handle as their last
+// operand. Today the scan is the only such op.
+bool isStateOp(const GraphNodeDesc &n) { return n.op == OpKind::GdnScan; }
+
+// The state a state-touching node acts on: its `state` attribute.
+std::optional<int64_t> stateIndex(const GraphNodeDesc &n) {
+  return intAttr(n.attributes, "state");
+}
+
 // A tensor's IR shape. A tensor whose leading dimension is the graph's dynamic
 // extent states it as `?`; the lowering binds it back to a concrete extent.
 std::vector<int64_t> irShape(const TensorDesc &t) {
@@ -302,6 +312,34 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
     kvOf[layer] = body->addArgument(type, loc);
   }
 
+  // The state handles, one per state the graph touches, after the cache handles
+  // in ascending index order: the same block-argument rule.
+  llvm::SmallVector<int64_t> stateIndices;
+  for (const GraphNodeDesc &n : graph.nodes) {
+    if (!isStateOp(n))
+      continue;
+    auto index = stateIndex(n);
+    if (!index) {
+      mlir::emitError(loc) << "node '" << n.name << "' ("
+                           << planner::op_kind_name(n.op)
+                           << ") updates a recurrent state but carries no "
+                              "`state` attribute";
+      return {};
+    }
+    stateIndices.push_back(*index);
+  }
+  llvm::sort(stateIndices);
+  stateIndices.erase(llvm::unique(stateIndices), stateIndices.end());
+
+  llvm::DenseMap<int64_t, mlir::Value> stateOf;
+  for (int64_t index : stateIndices) {
+    auto type = boom::StateType::getChecked(
+        mlir::detail::getDefaultDiagnosticEmitFn(loc), context, index);
+    if (!type)
+      return {};
+    stateOf[index] = body->addArgument(type, loc);
+  }
+
   for (const GraphNodeDesc &n : graph.nodes) {
     llvm::SmallVector<mlir::Value> operands;
     for (TensorId in : n.inputs) {
@@ -325,6 +363,15 @@ mlir::OwningOpRef<mlir::ModuleOp> graphToBoom(const Graph &graph,
         return {};
       }
       operands.push_back(kvOf[*layer]);
+    }
+    if (isStateOp(n)) {
+      const auto index = stateIndex(n);
+      if (!index) {
+        mlir::emitError(loc) << "node '" << n.name
+                             << "' updates a recurrent state without a `state`";
+        return {};
+      }
+      operands.push_back(stateOf[*index]);
     }
 
     llvm::SmallVector<mlir::Type> results;
@@ -547,16 +594,17 @@ std::optional<Graph> boomToGraph(mlir::Operation *unitOp,
   llvm::DenseMap<mlir::Value, int64_t> idOfValue;
   for (auto [index, id] : llvm::enumerate(freeIds))
     idOfValue[body.getArgument(index)] = id;
-  // The trailing arguments are the cache handles. They name backend state, not
-  // tensors, so the rebuilt graph carries that state in the ops' layer
-  // attributes — the same graph the IR was converted from.
+  // The trailing arguments are the cache and state handles. They name backend
+  // state, not tensors, so the rebuilt graph carries that state in the ops'
+  // layer and state attributes — the same graph the IR was converted from.
   for (size_t index = freeIds.size(); index < body.getNumArguments(); ++index)
-    if (!llvm::isa<boom::KvType>(body.getArgument(unsigned(index)).getType())) {
+    if (!llvm::isa<boom::KvType, boom::StateType>(
+            body.getArgument(unsigned(index)).getType())) {
       u.emitError()
           << "block argument " << index << " is typed "
           << body.getArgument(unsigned(index)).getType()
           << ", but every argument after the free tensor variables must be a "
-             "!boom.kv handle";
+             "!boom.kv or !boom.state handle";
       return std::nullopt;
     }
 
@@ -583,9 +631,10 @@ std::optional<Graph> boomToGraph(mlir::Operation *unitOp,
     n.name = nameAttr.getValue().str();
 
     for (mlir::Value operand : node.getOperands()) {
-      // The cache handle is backend state, not a graph tensor: the rebuilt node
-      // names the layer with its attributes (checked by the dialect verifier).
-      if (llvm::isa<boom::KvType>(operand.getType()))
+      // A handle is backend state, not a graph tensor: the rebuilt node names
+      // the layer or state with its attributes (checked by the dialect
+      // verifier).
+      if (llvm::isa<boom::KvType, boom::StateType>(operand.getType()))
         continue;
       auto it = idOfValue.find(operand);
       if (it == idOfValue.end()) {

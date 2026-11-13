@@ -207,6 +207,29 @@ bool carriesKvHandle(Operation &op) {
   return false;
 }
 
+// The ops whose state access is stated on the StateResource (BoomDialect.td):
+// they carry the block's `!boom.state` handle as their last operand. Today the
+// scan is the only such op.
+bool carriesStateHandle(Operation &op) {
+  return op.getName().getStringRef() == "boom.gdn_scan";
+}
+
+// The integer a node's attribute record carries for `name`, or nullopt. The
+// state index is a node attribute, not one of the typed vocabulary entries, so
+// it is read from `node_attrs`.
+std::optional<int64_t> nodeAttrInt(Operation &op, llvm::StringRef name) {
+  auto attrs = op.getAttrOfType<mlir::ArrayAttr>("node_attrs");
+  if (!attrs) return std::nullopt;
+  for (Attribute entry : attrs) {
+    auto nodeAttr = mlir::dyn_cast<NodeAttr>(entry);
+    if (!nodeAttr || nodeAttr.getName() != name) continue;
+    if (auto value = mlir::dyn_cast<mlir::IntegerAttr>(nodeAttr.getValue()))
+      return value.getInt();
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
 // The logical dimensions of any Boom value type. Every one of them carries a
 // shape, but they are separate TypeDefs (not builtin ShapedTypes), so this is
 // how the shape is reached without a cast that would be invalid for the
@@ -412,8 +435,10 @@ mlir::LogicalResult GraphOp::verify() {
 
   // 4. The block arguments are the free variables in ascending id order,
   //    followed by one `!boom.kv` handle per cache layer the graph touches, in
-  //    ascending layer order. A handle is not a tensor — it has no table entry
-  //    — so a block argument is the only place it can be defined.
+  //    ascending layer order, then one `!boom.state` handle per recurrent state
+  //    the graph updates, in ascending index order. A handle is not a tensor —
+  //    it has no table entry — so a block argument is the only place it can be
+  //    defined.
   llvm::SmallVector<int64_t> freeIds;
   for (const auto &[id, desc] : table)
     if (!produced.count(id))
@@ -429,10 +454,10 @@ mlir::LogicalResult GraphOp::verify() {
   llvm::DenseMap<Value, int64_t> tensorOf;
   for (auto [index, id] : llvm::enumerate(freeIds)) {
     Value arg = entry.getArgument(index);
-    if (llvm::isa<KvType>(arg.getType()))
+    if (llvm::isa<KvType, StateType>(arg.getType()))
       return emitOpError()
              << "graph '" << graphName << "': block argument " << index
-             << " is a KV cache handle, but the first " << freeIds.size()
+             << " is a handle, but the first " << freeIds.size()
              << " arguments must be the graph's free tensor variables";
     if (llvm::failed(checkAgainstTable(arg.getType(), id, table[id])))
       return mlir::failure();
@@ -440,24 +465,44 @@ mlir::LogicalResult GraphOp::verify() {
   }
 
   llvm::DenseMap<Value, int64_t> kvLayerOf;
+  llvm::DenseMap<Value, int64_t> stateIndexOf;
   int64_t previousLayer = -1;
+  int64_t previousState = -1;
+  bool sawStateHandle = false;
   for (size_t index = freeIds.size(); index < entry.getNumArguments();
        ++index) {
     Value arg = entry.getArgument(index);
-    auto kv = llvm::dyn_cast<KvType>(arg.getType());
-    if (!kv)
+    if (auto kv = llvm::dyn_cast<KvType>(arg.getType())) {
+      if (sawStateHandle)
+        return emitOpError()
+               << "graph '" << graphName << "': block argument " << index
+               << " is a KV cache handle after a state handle; the cache "
+                  "handles come first";
+      if (kv.getLayer() <= previousLayer)
+        return emitOpError()
+               << "graph '" << graphName << "': the KV cache handles are in "
+               << "strict ascending layer order, but layer " << kv.getLayer()
+               << " follows layer " << previousLayer;
+      previousLayer = kv.getLayer();
+      kvLayerOf[arg] = kv.getLayer();
+      continue;
+    }
+    auto state = llvm::dyn_cast<StateType>(arg.getType());
+    if (!state)
       return emitOpError()
              << "graph '" << graphName << "': block argument " << index
              << " is typed " << arg.getType() << ", but every argument after "
              << "the " << freeIds.size()
-             << " free tensor variables must be a !boom.kv handle";
-    if (kv.getLayer() <= previousLayer)
+             << " free tensor variables must be a !boom.kv or !boom.state "
+                "handle";
+    sawStateHandle = true;
+    if (state.getIndex() <= previousState)
       return emitOpError()
-             << "graph '" << graphName << "': the KV cache handles are in "
-             << "strict ascending layer order, but layer " << kv.getLayer()
-             << " follows layer " << previousLayer;
-    previousLayer = kv.getLayer();
-    kvLayerOf[arg] = kv.getLayer();
+             << "graph '" << graphName << "': the state handles are in strict "
+                "ascending index order, but state "
+             << state.getIndex() << " follows state " << previousState;
+    previousState = state.getIndex();
+    stateIndexOf[arg] = state.getIndex();
   }
 
   // A graph input is fed from outside, so no node may produce it.
@@ -474,8 +519,11 @@ mlir::LogicalResult GraphOp::verify() {
     // 5a. Operands resolve to tensor ids, and their types agree with the table.
     //     A `!boom.kv` operand is the cache handle: only the three
     //     cache-touching ops may carry one, it is their last operand, and it
-    //     names exactly the layer the op's attributes select.
+    //     names exactly the layer the op's attributes select. A `!boom.state`
+    //     operand follows the same three rules, with the node's `state`
+    //     attribute as the key.
     bool sawKvHandle = false;
+    bool sawStateHandle = false;
     for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
       if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
         if (!carriesKvHandle(op))
@@ -509,6 +557,35 @@ mlir::LogicalResult GraphOp::verify() {
                  << "` attribute names layer " << named.getInt();
         continue;
       }
+      if (auto state = llvm::dyn_cast<StateType>(operand.getType())) {
+        if (!carriesStateHandle(op))
+          return op.emitOpError()
+                 << "reads a " << state
+                 << " state handle, but it does not update a recurrent state";
+        if (sawStateHandle)
+          return op.emitOpError() << "reads more than one state handle";
+        if (index + 1 != op.getNumOperands())
+          return op.emitOpError()
+                 << "carries its state handle at operand " << index
+                 << ", but it must be the last operand";
+        sawStateHandle = true;
+        auto stateIt = stateIndexOf.find(operand);
+        if (stateIt == stateIndexOf.end())
+          return op.emitOpError()
+                 << "reads a state handle that is not one of the graph's "
+                    "block arguments";
+        auto named = nodeAttrInt(op, "state");
+        if (!named)
+          return op.emitOpError()
+                 << "reads a state handle without a `state` attribute to check "
+                    "it against";
+        if (stateIt->second != *named)
+          return op.emitOpError()
+                 << "reads state " << stateIt->second
+                 << "'s handle, but its `state` attribute names state "
+                 << *named;
+        continue;
+      }
       auto it = tensorOf.find(operand);
       if (it == tensorOf.end())
         return op.emitOpError()
@@ -521,6 +598,10 @@ mlir::LogicalResult GraphOp::verify() {
     if (carriesKvHandle(op) && !sawKvHandle)
       return op.emitOpError()
              << "accesses the KV cache but carries no !boom.kv handle operand";
+    if (carriesStateHandle(op) && !sawStateHandle)
+      return op.emitOpError()
+             << "updates a recurrent state but carries no !boom.state handle "
+                "operand";
 
     // 5b. `node_attrs` is an ordered list of #boom.attr with unique names, and
     //     the typed attributes are exactly its int/float subset.
@@ -586,8 +667,8 @@ mlir::LogicalResult GraphOp::verify() {
     for (Value operand : op.getOperands()) {
       if (llvm::isa<TensorType>(operand.getType()))
         continue;
-      // The cache handle, checked in 5a.
-      if (llvm::isa<KvType>(operand.getType()))
+      // A handle, checked in 5a.
+      if (llvm::isa<KvType, StateType>(operand.getType()))
         continue;
       // The ops whose point is a pre-quantized activation.
       if (readsQ8_1FirstOperand(opName) && operand == op.getOperand(0))
@@ -867,10 +948,9 @@ mlir::LogicalResult StepOp::verify() {
   llvm::DenseMap<Value, int64_t> tensorOf;
   for (auto [index, id] : llvm::enumerate(freeIds)) {
     Value arg = block.getArgument(index);
-    if (llvm::isa<KvType>(arg.getType()))
+    if (llvm::isa<KvType, StateType>(arg.getType()))
       return emitOpError() << "block argument " << index
-                           << " is a KV cache handle, but the first "
-                           << freeIds.size()
+                           << " is a handle, but the first " << freeIds.size()
                            << " arguments must be the free tensor variables";
     if (llvm::failed(checkStepValue(getOperation(), id, arg.getType(), table[id])))
       return mlir::failure();
@@ -878,23 +958,43 @@ mlir::LogicalResult StepOp::verify() {
   }
 
   llvm::DenseMap<Value, int64_t> kvLayerOf;
+  llvm::DenseMap<Value, int64_t> stateIndexOf;
   int64_t previousLayer = -1;
+  int64_t previousState = -1;
+  bool sawStateHandle = false;
   for (size_t index = freeIds.size(); index < block.getNumArguments();
        ++index) {
     Value arg = block.getArgument(index);
-    auto kv = llvm::dyn_cast<KvType>(arg.getType());
-    if (!kv)
+    if (auto kv = llvm::dyn_cast<KvType>(arg.getType())) {
+      if (sawStateHandle)
+        return emitOpError()
+               << "block argument " << index
+               << " is a KV cache handle after a state handle; the cache "
+                  "handles come first";
+      if (kv.getLayer() <= previousLayer)
+        return emitOpError() << "the KV cache handles are in strict ascending "
+                                "layer order, but layer "
+                             << kv.getLayer() << " follows layer "
+                             << previousLayer;
+      previousLayer = kv.getLayer();
+      kvLayerOf[arg] = kv.getLayer();
+      continue;
+    }
+    auto state = llvm::dyn_cast<StateType>(arg.getType());
+    if (!state)
       return emitOpError() << "block argument " << index << " is typed "
                            << arg.getType() << ", but every argument after the "
                            << freeIds.size()
-                           << " free tensor variables must be a !boom.kv handle";
-    if (kv.getLayer() <= previousLayer)
-      return emitOpError() << "the KV cache handles are in strict ascending "
-                              "layer order, but layer "
-                           << kv.getLayer() << " follows layer "
-                           << previousLayer;
-    previousLayer = kv.getLayer();
-    kvLayerOf[arg] = kv.getLayer();
+                           << " free tensor variables must be a !boom.kv or "
+                              "!boom.state handle";
+    sawStateHandle = true;
+    if (state.getIndex() <= previousState)
+      return emitOpError() << "the state handles are in strict ascending index "
+                              "order, but state "
+                           << state.getIndex() << " follows state "
+                           << previousState;
+    previousState = state.getIndex();
+    stateIndexOf[arg] = state.getIndex();
   }
 
   // The operands and the block arguments agree, one for one: a step's body is
@@ -909,6 +1009,7 @@ mlir::LogicalResult StepOp::verify() {
   //    node's result, and a handle operand obeys the cache-op rule.
   for (Operation &op : block) {
     bool sawKvHandle = false;
+    bool sawStateHandle = false;
     for (auto [index, operand] : llvm::enumerate(op.getOperands())) {
       if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
         if (!carriesKvHandle(op))
@@ -940,6 +1041,34 @@ mlir::LogicalResult StepOp::verify() {
                                   << named.getInt();
         continue;
       }
+      if (auto state = llvm::dyn_cast<StateType>(operand.getType())) {
+        if (!carriesStateHandle(op))
+          return op.emitOpError()
+                 << "reads a " << state
+                 << " state handle, but it does not update a recurrent state";
+        if (sawStateHandle)
+          return op.emitOpError() << "reads more than one state handle";
+        if (index + 1 != op.getNumOperands())
+          return op.emitOpError() << "carries its state handle at operand "
+                                  << index << ", but it must be the last operand";
+        sawStateHandle = true;
+        auto stateIt = stateIndexOf.find(operand);
+        if (stateIt == stateIndexOf.end())
+          return op.emitOpError()
+                 << "reads a state handle that is not one of the step's block "
+                    "arguments";
+        auto named = nodeAttrInt(op, "state");
+        if (!named)
+          return op.emitOpError()
+                 << "reads a state handle without a `state` attribute to check "
+                    "it against";
+        if (stateIt->second != *named)
+          return op.emitOpError() << "reads state " << stateIt->second
+                                  << "'s handle, but its `state` attribute "
+                                     "names state "
+                                  << *named;
+        continue;
+      }
       auto it = tensorOf.find(operand);
       if (it == tensorOf.end())
         return op.emitOpError()
@@ -952,6 +1081,10 @@ mlir::LogicalResult StepOp::verify() {
     if (carriesKvHandle(op) && !sawKvHandle)
       return op.emitOpError()
              << "accesses the KV cache but carries no !boom.kv handle operand";
+    if (carriesStateHandle(op) && !sawStateHandle)
+      return op.emitOpError()
+             << "updates a recurrent state but carries no !boom.state handle "
+                "operand";
 
     auto resultIds = op.getAttrOfType<mlir::DenseI64ArrayAttr>("result_ids");
     for (auto [index, id] : llvm::enumerate(resultIds.asArrayRef()))

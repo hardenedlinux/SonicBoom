@@ -51,6 +51,17 @@ struct KVCacheResource
   llvm::StringRef getName() const final { return "boom KV cache"; }
 };
 
+// A recurrent block's state as a memory-effect resource. The IR names a block's
+// state with a `!boom.state<index>` handle (BoomTypes.td) and states the
+// access as an effect on this resource; the state's storage stays in the
+// backend, keyed by index. Because a scan's rows depend on each other, the
+// effect is what keeps it from being removed, duplicated, split by rows or
+// reordered against another scan on the same handle.
+struct StateResource
+    : public mlir::SideEffects::Resource::Base<StateResource> {
+  llvm::StringRef getName() const final { return "boom state"; }
+};
+
 // `custom<DimList>` — the shape syntax shared by every Boom type and by the
 // tensor-table attribute: `[4096, 2048]` (an empty shape, `[]`, is a scalar).
 // Declared here because the generated parse/print bodies refer to it

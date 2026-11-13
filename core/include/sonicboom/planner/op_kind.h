@@ -214,6 +214,17 @@ enum class OpKind : uint8_t {
   // sigmoid of a width-1 projection). Appended last for the same reason as
   // ClipGradNorm.
   ScaleBy,
+
+  // Gated DeltaNet state update (qwen35moe's recurrent blocks). Operands
+  // [qkv [n, C], beta_logit [n, H_v], alpha_logit [n, H_v], pos [1], state
+  // handle]; the handle is last and names the block's state in the backend's
+  // state set. The single result is the rows' output [n, value_dim] f32. The
+  // rows are sequential — row t+1 sees the state row t left — so the node is
+  // neither pure nor row-independent. `layer`, `state` (the state index),
+  // `slot` (the convolution weights), `slot_dt`, `slot_a`, `heads_k`,
+  // `heads_v`, `dim` (S), `kernel` (K) and the phase's row marking ride on
+  // node_attrs. Appended last for the same reason as ClipGradNorm.
+  GdnScan,
 };
 
 // Map a canonical operator name (e.g. "conv", "rms_norm") to its OpKind;

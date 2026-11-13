@@ -421,6 +421,21 @@ mlir::Value BoomBuilder::kv(uint32_t layer) {
   return value;
 }
 
+mlir::Value BoomBuilder::state(uint32_t index) {
+  auto it = state_.find(index);
+  if (it != state_.end())
+    return it->second;
+  auto type = boom::StateType::getChecked(
+      mlir::detail::getDefaultDiagnosticEmitFn(loc_), context_, int64_t(index));
+  if (!type) {
+    failed_ = true;
+    return {};
+  }
+  mlir::Value value = body_->addArgument(type, loc_);
+  state_[index] = value;
+  return value;
+}
+
 void BoomBuilder::set_row_scale(int64_t rows, llvm::StringRef attr_name) {
   if (rows < 0) {
     failed_ = true;
