@@ -1101,14 +1101,22 @@ mlir::LogicalResult StepOp::verify() {
   return mlir::success();
 }
 
-// The prefill call: value operands then the cache handles it fills.
+// The prefill call: value operands, then the cache handles it fills, then the
+// recurrent state handles it updates — the graph body's block-argument order.
 mlir::LogicalResult PrefillOp::verify() {
   if (getGraphName().empty())
     return emitOpError() << "names no prefill graph";
   bool sawKvHandle = false;
+  bool sawStateHandle = false;
   int64_t previousLayer = -1;
+  int64_t previousState = -1;
   for (auto [index, operand] : llvm::enumerate(getInputs())) {
     if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
+      if (sawStateHandle)
+        return emitOpError()
+               << "operand " << index
+               << " is a KV cache handle after a state handle; the cache "
+                  "handles come first";
       if (kv.getLayer() <= previousLayer)
         return emitOpError() << "the KV cache handles are in strict ascending "
                                 "layer order, but layer "
@@ -1118,14 +1126,24 @@ mlir::LogicalResult PrefillOp::verify() {
       sawKvHandle = true;
       continue;
     }
+    if (auto state = llvm::dyn_cast<StateType>(operand.getType())) {
+      sawStateHandle = true;
+      if (state.getIndex() <= previousState)
+        return emitOpError() << "the state handles are in strict ascending "
+                                "index order, but state "
+                             << state.getIndex() << " follows state "
+                             << previousState;
+      previousState = state.getIndex();
+      continue;
+    }
     if (!isBoomValueType(operand.getType()))
       return emitOpError() << "operand " << index << " is typed "
                            << operand.getType() << ", which is neither a Boom "
-                           << "value nor a KV cache handle";
-    if (sawKvHandle)
+                           << "value nor a cache or state handle";
+    if (sawKvHandle || sawStateHandle)
       return emitOpError()
              << "operand " << index
-             << " is a value after a KV cache handle; the handles come last";
+             << " is a value after a handle; the handles come last";
   }
   return mlir::success();
 }
@@ -1200,9 +1218,16 @@ mlir::LogicalResult VerifyOp::verify() {
                          << " but max_rows is " << rows;
 
   bool sawKvHandle = false;
+  bool sawStateHandle = false;
   int64_t previousLayer = -1;
+  int64_t previousState = -1;
   for (auto [index, operand] : llvm::enumerate(getInputs())) {
     if (auto kv = llvm::dyn_cast<KvType>(operand.getType())) {
+      if (sawStateHandle)
+        return emitOpError()
+               << "operand " << index
+               << " is a KV cache handle after a state handle; the cache "
+                  "handles come first";
       if (kv.getLayer() <= previousLayer)
         return emitOpError() << "the KV cache handles are in strict ascending "
                                 "layer order, but layer "
@@ -1212,15 +1237,25 @@ mlir::LogicalResult VerifyOp::verify() {
       sawKvHandle = true;
       continue;
     }
+    if (auto state = llvm::dyn_cast<StateType>(operand.getType())) {
+      sawStateHandle = true;
+      if (state.getIndex() <= previousState)
+        return emitOpError() << "the state handles are in strict ascending "
+                                "index order, but state "
+                             << state.getIndex() << " follows state "
+                             << previousState;
+      previousState = state.getIndex();
+      continue;
+    }
     if (!isBoomValueType(operand.getType()))
       return emitOpError() << "operand " << index << " is typed "
                            << operand.getType()
-                           << ", which is neither a Boom value nor a KV cache "
-                              "handle";
-    if (sawKvHandle)
+                           << ", which is neither a Boom value nor a cache or "
+                              "state handle";
+    if (sawKvHandle || sawStateHandle)
       return emitOpError()
              << "operand " << index
-             << " is a value after a KV cache handle; the handles come last";
+             << " is a value after a handle; the handles come last";
   }
   if (!sawKvHandle)
     return emitOpError() << "takes no KV cache handle, but a verify step "
@@ -1266,11 +1301,19 @@ mlir::LogicalResult ProgramOp::verify() {
   mlir::Block &block = getBody().front();
 
   // The body's arguments: Boom values, then the cache handles in ascending
-  // layer order (the same convention the graph body follows).
+  // layer order, then the state handles in ascending index order (the same
+  // convention the graph body follows).
   bool sawKvHandle = false;
+  bool sawStateHandle = false;
   int64_t previousLayer = -1;
+  int64_t previousState = -1;
   for (auto [index, arg] : llvm::enumerate(block.getArguments())) {
     if (auto kv = llvm::dyn_cast<KvType>(arg.getType())) {
+      if (sawStateHandle)
+        return emitOpError()
+               << "block argument " << index
+               << " is a KV cache handle after a state handle; the cache "
+                  "handles come first";
       if (kv.getLayer() <= previousLayer)
         return emitOpError() << "the KV cache handles are in strict ascending "
                                 "layer order, but layer "
@@ -1280,15 +1323,25 @@ mlir::LogicalResult ProgramOp::verify() {
       sawKvHandle = true;
       continue;
     }
+    if (auto state = llvm::dyn_cast<StateType>(arg.getType())) {
+      sawStateHandle = true;
+      if (state.getIndex() <= previousState)
+        return emitOpError() << "the state handles are in strict ascending "
+                                "index order, but state "
+                             << state.getIndex() << " follows state "
+                             << previousState;
+      previousState = state.getIndex();
+      continue;
+    }
     if (!isBoomValueType(arg.getType()))
       return emitOpError() << "block argument " << index << " is typed "
                            << arg.getType()
-                           << ", which is neither a Boom value nor a KV cache "
-                              "handle";
-    if (sawKvHandle)
+                           << ", which is neither a Boom value nor a cache or "
+                              "state handle";
+    if (sawKvHandle || sawStateHandle)
       return emitOpError() << "block argument " << index
-                           << " is a value after a KV cache handle; the "
-                              "handles come last";
+                           << " is a value after a handle; the handles come "
+                              "last";
   }
 
   Operation *prefill = nullptr;
