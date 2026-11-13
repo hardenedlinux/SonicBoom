@@ -6364,6 +6364,35 @@ std::string full_tune_key(int head_dim, int gqa, int n_heads) {
   return k;
 }
 
+// The key patterns of this file's tune tables, for the build fingerprint:
+// attn_decode_class_key (attention-decode, decode-attn), full_tune_key
+// (attention-full), the dense-f32 policy keys and the dense-gemm key. The
+// decode schedules are decoded into the same numbers, attention-full picks a
+// tiling class, and the dense picks choose between implementations of the same
+// product.
+[[maybe_unused]] const bool elementwise_key_patterns_registered = [] {
+  ::sonicboom::tune::register_key_pattern(
+      {"attention-decode.json",
+       "<codegen>|decode-d<head_dim>-g<gqa>-h<heads>-kv<nkv>-m<window|causal>"
+       "-kv<16|8|32>[-x2]",
+       true});
+  ::sonicboom::tune::register_key_pattern(
+      {"decode-attn.json",
+       "<codegen>|decode-d<head_dim>-g<gqa>-h<heads>-kv<nkv>-m<window|causal>"
+       "-kv<16|8|32>[-x2]",
+       true});
+  ::sonicboom::tune::register_key_pattern(
+      {"attention-full.json",
+       "<codegen>|<scope>|h<heads>|wl<tokens>|dflt-<default>", true});
+  ::sonicboom::tune::register_key_pattern(
+      {"dense-f32.json", "dense-f32-3|m<rows>k<cols>", true});
+  ::sonicboom::tune::register_key_pattern(
+      {"dense-f32.json", "dense-f32-tf32-pin|m<rows>k<cols>", true});
+  ::sonicboom::tune::register_key_pattern(
+      {"dense-gemm.json", "<codegen>|m<rows>k<cols>", true});
+  return true;
+}();
+
 std::optional<FullResolution>
 full_choice_from_values(const std::map<std::string, int>& v, int head_dim,
                         int gqa) {

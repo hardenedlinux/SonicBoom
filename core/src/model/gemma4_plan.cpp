@@ -889,6 +889,15 @@ std::string spec_cost_cache_key(const char* arch, int64_t embedding_length,
          "|k=" + spec_kernel_fingerprint();
 }
 
+// The spec-length table's key pattern, for the build fingerprint. The prices
+// select a dispatch length, never an arithmetic.
+[[maybe_unused]] const bool spec_key_pattern_registered = [] {
+  ::sonicboom::tune::register_key_pattern(
+      {"spec-length.json", "v3|<arch>|e<embedding>|ctx=<s|m|l>|k=<kernel>",
+       false});
+  return true;
+}();
+
 bool spec_cost_record_valid(std::span<const double> cost_us) {
   if (cost_us.empty() || !(cost_us[0] > 0.0)) return false;
   // A decode step is tens of microseconds to a few hundred milliseconds. A

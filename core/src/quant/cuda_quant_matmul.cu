@@ -4083,6 +4083,21 @@ std::string decode_family_key(QuantType qt, int rows, int cols) {
          std::to_string(rows) + "x" + std::to_string(cols);
 }
 
+// The key patterns of the three tables built in this file, for the build
+// fingerprint. The verify per-position pick and the J tile are arithmetic-
+// neutral (the split amounts only divide the same order); the decode family
+// selects between two kernels' arithmetic.
+[[maybe_unused]] const bool quant_key_patterns_registered = [] {
+  ::sonicboom::tune::register_key_pattern(
+      {"verify-gemv-wp.json", "verify-gemv-wp|<type>|n=<n>|<rows>x<cols>",
+       false});
+  ::sonicboom::tune::register_key_pattern(
+      {"decode-family.json", "decode-family|<type>|<rows>x<cols>", true});
+  ::sonicboom::tune::register_key_pattern(
+      {"mmq-j.json", "mmq-j|c6:t<type>-M<rows>-bpr<bpr>[-n<bucket>|-nk]", true});
+  return true;
+}();
+
 int decode_family_build_hash(std::string_view build_id) {
   uint64_t h = 0xcbf29ce484222325ull;
   for (unsigned char c : build_id) {

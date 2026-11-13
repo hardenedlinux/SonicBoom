@@ -730,6 +730,18 @@ std::string mmq_tc_shape_class(int m_tokens, int n_rows, int k) {
          std::to_string(k);
 }
 
+// The key patterns of this file's two tables, for the build fingerprint. Both
+// pick a launch/tile class for a generated kernel; the other candidates are
+// not claimed bit-identical, so both count as numerics-affecting.
+[[maybe_unused]] const bool jit_key_patterns_registered = [] {
+  ::sonicboom::tune::register_key_pattern(
+      {"autotune/sm_<NN>.bin", "gemv|bpr<bpr>-r<rows bucket>", true});
+  ::sonicboom::tune::register_key_pattern(
+      {"autotune/sm_<NN>.bin",
+       "matmul_q8_tc|m<token bucket>-n<rows>-k<k>", true});
+  return true;
+}();
+
 namespace {
 std::mutex& mmq_tc_memo_mutex() {
   static std::mutex m;

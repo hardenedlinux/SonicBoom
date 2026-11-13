@@ -1144,6 +1144,20 @@ std::string mmq_group_use_key(const MmqUpType * types, const int64_t * rows,
            (small ? "small" : "large");
 }
 
+// The key patterns of the three tables above, for the build fingerprint. The
+// shared split count and the group policy are numerics-neutral by their own
+// comments; the per-shape split count is not.
+[[maybe_unused]] const bool mmq_key_patterns_registered = [] {
+    ::sonicboom::tune::register_key_pattern(
+        {"mmq-splitk.json", "mmq-splitk|<type>|<rows>x<cols>", true});
+    ::sonicboom::tune::register_key_pattern(
+        {"mmq-cfg.json", "mmq-cfg|<type>|<rows>x<cols>|J=<8|16>", false});
+    ::sonicboom::tune::register_key_pattern(
+        {"mmq-group.json", "mmq-group|<types>|<rows>x<cols>|<small|large>",
+         false});
+    return true;
+}();
+
 // SONICBOOM_MMQ_GROUP: "0" runs the members separately, "1" runs the group,
 // any other value (or no value) leaves the choice to the measured table.
 int mmq_group_env() {

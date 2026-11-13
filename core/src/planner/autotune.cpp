@@ -28,7 +28,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -100,23 +99,19 @@ void parse_op_file(std::string_view s,
 
 // --- build identity, trace, resolution epoch ------------------------------
 
-// Identity of the running library, the same size+mtime rule the spec cost
-// cache uses: a rebuild moves it, so no record measured before a kernel change
-// is reused after one.
-std::string shared_object_identity() {
-  Dl_info info{};
-  if (dladdr(reinterpret_cast<void *>(&shared_object_identity), &info) == 0 ||
-      info.dli_fname == nullptr)
-    return "nostat";
-  std::error_code ec;
-  const auto size = std::filesystem::file_size(info.dli_fname, ec);
-  if (ec) return "nostat";
-  const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
-  if (ec) return "nostat";
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%llx-%llx", (unsigned long long)size,
-                (unsigned long long)mtime.time_since_epoch().count());
-  return buf;
+// The registry of tune-table key patterns: one entry per family, registered at
+// the family's key builder (the definition site). A rebuild does not move it;
+// changing the set of keys or what one of them means does. The state is
+// function-local so a registration from any translation unit's static
+// initializer sees it already constructed.
+std::mutex &key_pattern_mutex() {
+  static std::mutex m;
+  return m;
+}
+
+std::vector<TuneKeyPattern> &key_patterns() {
+  static std::vector<TuneKeyPattern> v;
+  return v;
 }
 
 long long fnv32(std::string_view s) {
@@ -430,6 +425,44 @@ void load_op_locked(const std::string &op) {
 
 } // namespace
 
+void register_key_pattern(TuneKeyPattern pattern) {
+  std::lock_guard<std::mutex> lk(key_pattern_mutex());
+  key_patterns().push_back(pattern);
+}
+
+std::vector<std::string> key_pattern_list() {
+  std::lock_guard<std::mutex> lk(key_pattern_mutex());
+  std::vector<std::string> out;
+  out.reserve(key_patterns().size());
+  for (const TuneKeyPattern &p : key_patterns()) {
+    std::string s(p.file);
+    s += '\t';
+    s += p.keys;
+    s += '\t';
+    s += p.numerics ? "numerics" : "neutral";
+    out.push_back(std::move(s));
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+std::string key_pattern_digest() {
+  // 64-bit FNV-1a over the sorted, concatenated patterns; the low 32 bits are
+  // what the fingerprint shows.
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (const std::string &s : key_pattern_list()) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 0x100000001b3ull;
+    }
+    h ^= '\n';
+    h *= 0x100000001b3ull;
+  }
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%08x", static_cast<uint32_t>(h));
+  return buf;
+}
+
 bool enabled() {
   // SONICBOOM_FEATURE_DISABLE=autotune is the ablation-group alias of the
   // per-feature switch; either one turns the tuner off.
@@ -518,17 +551,20 @@ void record_pick(std::string_view op, std::string_view key,
 
 } // namespace
 
+std::string fingerprint_for_version(std::string_view version) {
+  std::string s(version);
+  s += '|';
+  s += key_pattern_digest();
+  return s;
+}
+
 const std::string &build_fingerprint() {
   static const std::string fp = [] {
-    std::string s;
 #ifdef SONICBOOM_VERSION_STRING
-    s += SONICBOOM_VERSION_STRING;
+    return fingerprint_for_version(SONICBOOM_VERSION_STRING);
 #else
-    s += "unknown";
+    return fingerprint_for_version("unknown");
 #endif
-    s += '|';
-    s += shared_object_identity();
-    return s;
   }();
   return fp;
 }

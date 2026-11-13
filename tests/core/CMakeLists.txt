@@ -48,7 +48,7 @@ function(sb_add_cpp_test name)
                    $<TARGET_FILE:${name}>)
 endfunction()
 
-foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_ops test_autograd test_gguf test_dequant test_nn test_gemma4 test_qwen2_config test_vocab test_clip_grad_norm test_safetensors test_grammar test_sampling test_png)
+foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_ops test_autograd test_gguf test_dequant test_nn test_gemma4 test_qwen2_config test_vocab test_clip_grad_norm test_safetensors test_grammar test_sampling test_png test_tune_fingerprint)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
   sb_add_cpp_test(${test_name})

@@ -81,9 +81,37 @@ std::string cache_path(std::string_view op);
 // and may be replaced by store(); it marks a numerics-neutral table.
 inline constexpr long long kNoFingerprint = -1;
 
-// The build fingerprint: the version string and the identity (size+mtime) of
-// the running shared object. It is the only fingerprint a tune record carries;
-// per-process switches belong in the key, never here.
+// A tune table's key pattern: the file the table lives in, the shape of the
+// keys its builder produces (the variable parts left as names), and whether a
+// different choice can change the arithmetic. Registered by each family at its
+// key builder.
+struct TuneKeyPattern {
+  std::string_view file;
+  std::string_view keys;
+  bool numerics;
+};
+
+// Register one table's key pattern. Registrations are process-wide and only
+// added; the fingerprint lists them in lexicographic order.
+void register_key_pattern(TuneKeyPattern pattern);
+
+// The registered patterns, sorted, one `file<TAB>keys<TAB>numerics|neutral`
+// line each.
+std::vector<std::string> key_pattern_list();
+
+// 64-bit FNV-1a over the sorted pattern list, low 32 bits as hex. It moves when
+// the set of tune keys or what one of them means changes, and not when the
+// library is rebuilt.
+std::string key_pattern_digest();
+
+// The build fingerprint for an arbitrary version string:
+//   <version>|<key-pattern digest>
+// The device is not part of it (the cache directory already separates
+// devices); per-process switches belong in the key, never here.
+std::string fingerprint_for_version(std::string_view version);
+
+// The build fingerprint: the version string and the key-pattern digest. It is
+// the only fingerprint a tune record carries.
 const std::string &build_fingerprint();
 long long build_fingerprint_key();
 
