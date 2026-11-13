@@ -169,8 +169,10 @@ def Boom_PrefillOp : Op<Boom_Dialect, "prefill", [Boom_KvReadWrite]> {
 // One decode step. The body is the decode graph's node list, carried with its
 // tensor table; its block arguments (in ascending tensor-id order, then the
 // cache handles) are the step's operands. The result is the tensor the table's
-// `output_ids` names.
-def Boom_StepOp : Op<Boom_Dialect, "step", [SingleBlock, NoTerminator]> {
+// `output_ids` names. The step's body uses only its own block arguments; the
+// loop-carried values reach it as operands.
+def Boom_StepOp : Op<Boom_Dialect, "step",
+                     [IsolatedFromAbove, SingleBlock, NoTerminator]> {
   let summary = "one decode step over the loop-carried position/token/cache";
 
   let arguments = (ins
