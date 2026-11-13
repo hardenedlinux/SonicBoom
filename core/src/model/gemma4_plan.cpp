@@ -55,8 +55,6 @@
 #include "../spec_diag_counters.h"   // in-request first-use counters (SPEC_DIAG)
 #endif
 
-#include <dlfcn.h>  // dladdr: identity of the loaded library (cost-cache key)
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -66,7 +64,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <iostream>
 #include <list>
 #include <map>
@@ -828,35 +825,13 @@ const char* spec_ctx_class(uint64_t n_ctx) {
   return n_ctx <= 1024 ? "s" : n_ctx <= 4096 ? "m" : "l";
 }
 
-// Identity of the running library. The cost of a verify round is a property
-// of the kernels and dispatch that produced it; a size+mtime identity moves
-// whenever the shared object is rebuilt, so no kernel change can be priced
-// with a record measured before it. (This is deliberately coarser than a
-// kernel-specific version: a conservative extra warm-up is cheaper than a
-// silently stale price.)
-std::string shared_object_identity() {
-  Dl_info info{};
-  if (dladdr(reinterpret_cast<void*>(&shared_object_identity), &info) == 0 ||
-      info.dli_fname == nullptr)
-    return "nostat";
-  std::error_code ec;
-  const auto size = std::filesystem::file_size(info.dli_fname, ec);
-  if (ec) return "nostat";
-  const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
-  if (ec) return "nostat";
-  char buf[64];
-  std::snprintf(buf, sizeof(buf), "%llx-%llx",
-                (unsigned long long)size,
-                (unsigned long long)mtime.time_since_epoch().count());
-  return buf;
-}
-
-// The verify-cost fingerprint: the record schema and the identity of the
-// running library. It is a build identity and nothing else — every process of
-// one build prices the same model the same way, so the cost records are
-// written once and every later process reads them. Per-process switches are
-// not part of it: a price is a timing estimate, not a kernel selection, and
-// the curve covers the whole draft-length envelope this build can reach.
+// The verify-cost fingerprint: the record schema and the tune build
+// fingerprint. It is a build identity and nothing else — every process of one
+// build prices the same model the same way, so the cost records are written
+// once and every later process reads them; and two builds of the same sources
+// agree, as with every other tune record. Per-process switches are not part
+// of it: a price is a timing estimate, not a kernel selection, and the curve
+// covers the whole draft-length envelope this build can reach.
 std::string spec_kernel_fingerprint() {
   uint64_t h = 0xcbf29ce484222325ull;
   const auto add = [&h](std::string_view s) {
@@ -874,7 +849,7 @@ std::string spec_kernel_fingerprint() {
 #else
   add("dev");
 #endif
-  add(shared_object_identity());
+  add(::sonicboom::tune::build_fingerprint());
   char buf[24];
   std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)h);
   return buf;

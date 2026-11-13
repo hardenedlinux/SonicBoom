@@ -38,11 +38,7 @@
 #include <cublas_v2.h>
 #include <cublasLt.h>
 
-#include <dlfcn.h>
-
 #include <algorithm>
-#include <filesystem>
-#include <system_error>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -4564,26 +4560,13 @@ bool fdec_selected(const std::string& key, int head_dim, int gqa, bool kv_f16,
   return true;
 }
 
-// Identity of the running library for the pin: a rebuild moves it, so no
-// kernel change is priced with a record measured before it.
+// Identity of the build for the pin: the tune build fingerprint, so a record
+// measured by one build is read by every rebuild of the same sources and by a
+// second build directory, while a change in the tune keys still moves it.
 int fdec_build_key() {
   static const int cached = [] {
-    std::string id = "fdec-v1";
-    Dl_info info{};
-    if (dladdr(reinterpret_cast<void*>(&fdec_build_key), &info) != 0 &&
-        info.dli_fname != nullptr) {
-      std::error_code ec;
-      const auto size = std::filesystem::file_size(info.dli_fname, ec);
-      if (!ec) {
-        const auto mtime = std::filesystem::last_write_time(info.dli_fname, ec);
-        if (!ec) {
-          char buf[64];
-          std::snprintf(buf, sizeof(buf), ":%llx-%llx", (unsigned long long)size,
-                        (unsigned long long)mtime.time_since_epoch().count());
-          id += buf;
-        }
-      }
-    }
+    std::string id = "fdec-v1:";
+    id += ::sonicboom::tune::build_fingerprint();
     uint64_t h = 0xcbf29ce484222325ull;
     for (unsigned char c : id) {
       h ^= c;
