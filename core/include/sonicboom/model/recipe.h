@@ -54,6 +54,10 @@ struct Projection {
   quant::QuantType type{};
   uint32_t in = 0;
   uint32_t out = 0;
+  // True when the file stores the weight as f32 rather than in a quantized
+  // format (some models keep their recurrent mixers' projections that way):
+  // the emitter writes the f32 matvec and `type` is not used.
+  bool f32 = false;
 };
 
 // ---- mixers ----------------------------------------------------------------
@@ -92,7 +96,28 @@ struct SelfAttention {
   uint32_t kv_width() const noexcept { return heads_kv * head_dim; }
 };
 
-using Mixer = std::variant<SelfAttention>;
+// A gated DeltaNet: one recurrence over the positions, with the state the
+// model carries per sequence. The output is gate * norm(scan(qkv)) projected
+// back; the scan's inputs are projected by `qkv`, `beta` and `alpha`, and
+// `gate` produces the second factor of the output.
+struct GatedDeltaNet {
+  uint32_t heads_k = 0;    // key heads (H_k)
+  uint32_t heads_v = 0;    // value heads (H_v), a multiple of heads_k
+  uint32_t head_dim = 0;   // the state size S, keys and values alike
+  uint32_t conv_kernel = 0;  // convolution taps K
+
+  Projection qkv, gate, beta, alpha, out;
+
+  // Which state it owns, numbered from 0 over the recurrent blocks in the
+  // order they appear in the stack.
+  uint32_t state = 0;
+
+  uint32_t key_dim() const noexcept { return heads_k * head_dim; }
+  uint32_t value_dim() const noexcept { return heads_v * head_dim; }
+  uint32_t channels() const noexcept { return 2 * key_dim() + value_dim(); }
+};
+
+using Mixer = std::variant<SelfAttention, GatedDeltaNet>;
 
 // ---- feed-forwards ---------------------------------------------------------
 
@@ -172,6 +197,8 @@ struct Recipe {
   std::optional<PerLayerInput> per_layer_input;
 
   uint32_t caches = 0;  // KV caches; a block's mixer names the one it uses
+  // Recurrent-block states; a GatedDeltaNet mixer names the one it owns.
+  uint32_t states = 0;
   std::vector<Block> blocks;
 
   Head head;

@@ -119,8 +119,9 @@ public:
 protected:
   compiler::BoomBuilder& b;
   const Recipe& r;
-  std::vector<mlir::Value> kv_;  // the cache handles, by cache index
-  mlir::Value inp_{};            // the (scaled) token embedding
+  std::vector<mlir::Value> kv_;     // the cache handles, by cache index
+  std::vector<mlir::Value> state_;  // the recurrent state handles, by index
+  mlir::Value inp_{};               // the (scaled) token embedding
 
   // ---- what a phase supplies -----------------------------------------------
 
@@ -141,6 +142,10 @@ protected:
   // `k` and `v` are null for a layer that does not own it.
   virtual mlir::Value attend(const SelfAttention& at, uint32_t layer,
                              mlir::Value q, mlir::Value k, mlir::Value v) = 0;
+  // The recurrent scan of a gated DeltaNet block: the phase supplies the
+  // position its rows start at and the row marking.
+  virtual mlir::Value recur(const GatedDeltaNet& gdn, uint32_t layer,
+                            mlir::Value qkv, mlir::Value bl, mlir::Value al) = 0;
   // Whatever the phase computes from the token alone ahead of the blocks.
   virtual void per_layer_preamble() = 0;
   // Block `layer`'s slice of the per-layer input.
@@ -161,13 +166,19 @@ protected:
     return node(OpKind::RmsNorm, {x}, name, width, std::move(a));
   }
 
-  // RMSNorm per head; unit weight when `weight` is None.
+  // RMSNorm per head; unit weight when `weight` is None. `segment` > 0 splits
+  // the width into segments of that size and writes it on the node; 0 is the
+  // layer's head dim and writes nothing, so the graph of a model that uses it
+  // is unchanged.
   mlir::Value norm_heads(mlir::Value x, const std::string& name, uint64_t width,
-                         uint32_t layer, WeightSlot weight) {
+                         uint32_t layer, WeightSlot weight,
+                         int64_t segment = 0) {
     Attrs a = {layer_a(layer)};
     if (weight != WeightSlot::None)
       a.push_back(slot_a(weight));
     rows(a);
+    if (segment != 0)
+      a.push_back(attr_i("dim", segment));
     return node(OpKind::RmsNormHeads, {x}, name, width, std::move(a));
   }
 
@@ -285,6 +296,58 @@ protected:
 
     mlir::Value out = matmul(attn, "ap" + s, at.out, l);
     return bias(out, "apb" + s, at.out, l);
+  }
+
+  // A projection of the recurrent mixer: the quantized matmul, or, for a
+  // weight the file stores f32, the f32 matvec (the node the shared expert's
+  // gate uses), which is what the backend dispatches on the projection's type.
+  mlir::Value mixer_projection(mlir::Value x, const std::string& name,
+                               const Projection& p, uint32_t layer) {
+    if (!p.f32)
+      return matmul(x, name, p, layer);
+    Attrs a = {layer_a(layer), slot_a(p.weight)};
+    rows(a);
+    return node(OpKind::MatvecF32, {x}, name, p.out, std::move(a));
+  }
+
+  // The gated DeltaNet mixer: the four projections the scan consumes, the scan
+  // over the block's state, the per-key-head norm of its output, the gate, and
+  // the output projection. Node names and order are fixed.
+  mlir::Value mix(const GatedDeltaNet& gdn, uint32_t l, mlir::Value h) {
+    const std::string s = std::to_string(l);
+    const uint64_t vd = gdn.value_dim();
+    const mlir::Value dq = mixer_projection(h, "dq" + s, gdn.qkv, l);
+    const mlir::Value dz = mixer_projection(h, "dz" + s, gdn.gate, l);
+    const mlir::Value db = mixer_projection(h, "db" + s, gdn.beta, l);
+    const mlir::Value da = mixer_projection(h, "da" + s, gdn.alpha, l);
+    const mlir::Value ds = recur(gdn, l, dq, db, da);
+    const mlir::Value dno = norm_heads(ds, "dno" + s, vd, l, WeightSlot::GdnNorm,
+                                       int64_t(gdn.head_dim));
+    const mlir::Value dzs = pointwise(OpKind::Silu, {dz}, "dzs" + s, vd, l);
+    const mlir::Value dm = pointwise(OpKind::Mul, {dno, dzs}, "dm" + s, vd, l);
+    return mixer_projection(dm, "dp" + s, gdn.out, l);
+  }
+
+  // The scan's attributes: the block's layer, its kernel weights, the
+  // recurrence's geometry, its state, and the phase's row marking.
+  Attrs scan_attrs(const GatedDeltaNet& gdn, uint32_t l) {
+    Attrs a = {layer_a(l),
+               slot_a(WeightSlot::GdnConv),
+               attr_i("slot_dt", int64_t(WeightSlot::GdnDt)),
+               attr_i("slot_a", int64_t(WeightSlot::GdnA)),
+               attr_i("heads_k", int64_t(gdn.heads_k)),
+               attr_i("heads_v", int64_t(gdn.heads_v)),
+               attr_i("dim", int64_t(gdn.head_dim)),
+               attr_i("kernel", int64_t(gdn.conv_kernel)),
+               attr_i("state", int64_t(gdn.state))};
+    rows(a);
+    return a;
+  }
+
+  mlir::Value scan(const GatedDeltaNet& gdn, uint32_t l, mlir::Value qkv,
+                   mlir::Value bl, mlir::Value al) {
+    return node(OpKind::GdnScan, {qkv, bl, al, position(), state_[gdn.state]},
+                "ds" + std::to_string(l), gdn.value_dim(), scan_attrs(gdn, l));
   }
 
   // ---- feed-forwards -------------------------------------------------------
@@ -430,6 +493,9 @@ public:
     kv_.resize(r.caches);
     for (uint32_t c = 0; c < r.caches; ++c)
       kv_[c] = b.kv(c);
+    state_.resize(r.states);
+    for (uint32_t i = 0; i < r.states; ++i)
+      state_[i] = b.state(i);
   }
 
   // The model's logits: the final norm, the output projection, the softcap
@@ -489,6 +555,13 @@ protected:
                     {int64_t(at.q_width())}, std::move(a));
     return b.node(OpKind::Attention, {q, pos_, kv_[at.cache]}, name,
                   {int64_t(at.q_width())}, std::move(a));
+  }
+
+  // The scan starts at the decode position (the verify row scale deals the
+  // rows out; the node needs no batch).
+  mlir::Value recur(const GatedDeltaNet& gdn, uint32_t l, mlir::Value qkv,
+                    mlir::Value bl, mlir::Value al) override {
+    return scan(gdn, l, qkv, bl, al);
   }
 
   // One full-width projection of the embedding and one per-layer row per
@@ -571,6 +644,9 @@ public:
     kv_.resize(r.caches);
     for (uint32_t c = 0; c < r.caches; ++c)
       kv_[c] = b.kv(c);
+    state_.resize(r.states);
+    for (uint32_t i = 0; i < r.states; ++i)
+      state_[i] = b.state(i);
     k_.resize(r.caches);
     v_.resize(r.caches);
   }
@@ -617,6 +693,12 @@ protected:
     return node(OpKind::FlashAttention,
                 {q, k_[at.cache], v_[at.cache], start_pos_, kv_[at.cache]},
                 "attn" + std::to_string(l), at.q_width(), std::move(a));
+  }
+
+  // The scan covers this segment's rows, starting at its start position.
+  mlir::Value recur(const GatedDeltaNet& gdn, uint32_t l, mlir::Value qkv,
+                    mlir::Value bl, mlir::Value al) override {
+    return scan(gdn, l, qkv, bl, al);
   }
 
   void per_layer_preamble() override {
