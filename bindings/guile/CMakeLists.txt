@@ -399,6 +399,16 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-e2e-export.scm
             $<TARGET_FILE:test_e2e_load>
             $<TARGET_FILE_DIR:sonicboom>)
+  # docs-site: generate the static documentation site. The generator reads the
+  # Scheme sources in place and writes into <build>/site/sonicboom/.
+  add_custom_target(docs-site
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../docs/site/build.scm
+            --out ${CMAKE_BINARY_DIR}/site
+    COMMENT "Generating the documentation site"
+    VERBATIM)
+
 else()
   message(STATUS "Guile interpreter not found; skipping Guile binding tests")
 endif()

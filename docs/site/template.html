@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$page-title$ — SonicBoom</title>
+$styles.html()$
+<link rel="stylesheet" href="$root$site.css">
+<script defer src="$root$search.js"></script>
+$if(pytorch)$<script defer src="$root$pytorch.js"></script>$endif$
+$for(header-includes)$$header-includes$$endfor$
+</head>
+<body data-root="$root$">
+<header class="topbar">
+  <a class="site-name" href="$root$index.html">SonicBoom</a>
+  <div class="search">
+    <input id="site-search" class="site-search-input" type="search"
+           placeholder="Search the site"
+           aria-label="Search the site" autocomplete="off">
+    <div id="search-results" class="search-results" hidden></div>
+  </div>
+</header>
+<div class="layout">
+<nav class="sidebar">
+$nav$
+</nav>
+<main class="content">
+$if(toc)$<aside class="toc">
+$toc$
+</aside>$endif$
+$body$
+</main>
+</div>
+<footer class="footer">
+  <p>SonicBoom — a native tensor runtime. Documentation generated from the
+  sources.</p>
+</footer>
+</body>
+</html>
