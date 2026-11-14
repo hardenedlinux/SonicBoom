@@ -399,6 +399,44 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-e2e-export.scm
             $<TARGET_FILE:test_e2e_load>
             $<TARGET_FILE_DIR:sonicboom>)
+  # The documentation tests (ctest -L docs) hold the docstrings, the PyTorch
+  # cross-reference and the generated site to docs/site/CONVENTIONS.md. They
+  # need no model and no GPU: test-docs-examples loads libsonicboom.so for the
+  # arithmetic the examples do, and test-docs-site runs the site generator.
+  add_test(
+    NAME test-docs-coverage
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/docs/test-docs-coverage.scm)
+
+  add_test(
+    NAME test-docs-examples
+    COMMAND ${CMAKE_COMMAND} -E env
+            GUILE_AUTO_COMPILE=0
+            LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/docs/test-docs-examples.scm)
+
+  add_test(
+    NAME test-docs-map
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/docs/test-docs-map.scm)
+
+  add_test(
+    NAME test-docs-site
+    COMMAND ${CMAKE_COMMAND} -E env GUILE_AUTO_COMPILE=0
+            ${GUILE_EXECUTABLE} --no-auto-compile
+            -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/docs/test-docs-site.scm)
+
+  set_tests_properties(
+    test-docs-coverage test-docs-examples test-docs-map test-docs-site
+    PROPERTIES LABELS docs TIMEOUT 900)
+
   # docs-site: generate the static documentation site. The generator reads the
   # Scheme sources in place and writes into <build>/site/sonicboom/.
   add_custom_target(docs-site

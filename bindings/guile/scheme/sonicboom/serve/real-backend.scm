@@ -2,6 +2,12 @@
 ;;;
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+;;;
+;;; The backend that runs a real model: it loads a GGUF through the C ABI,
+;;; chooses the chat template from the model's architecture, keeps a KV-cache
+;;; session per conversation, installs a JSON-schema or GBNF constraint at
+;;; prefill, and samples on the device. The OpenAI-compatible server uses this
+;;; backend when it is started with a model file.
 
 (define-module (sonicboom serve real-backend)
   #:use-module (srfi srfi-1)
