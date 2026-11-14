@@ -53,6 +53,20 @@ bool moe_route(std::span<const float> x, const quant::QuantizedTensor* router,
                uint32_t used, float weight_scale, std::span<int64_t> ids,
                std::span<float> weights, uint64_t rows);
 
+// The device-resident form: x is a [rows, d] device buffer, and ids and weights
+// are [rows, used] device buffers that the router fills in place. The router
+// projection is the same device gemv as above; one thread block per row then
+// runs the softmax, the top-k (ties to the lower index) and the ascending
+// renormalisation in one thread, in the same operation order as nn::moe_route.
+// The host never sees an intermediate. The result may differ from the host
+// form by a few ulp (device expf for std::exp); see the M2 gate in the round-7
+// notes. `router_f32` is a host weight span, uploaded and cached by the f32
+// gemv exactly as in moe_route.
+bool moe_route_dev(const float* x, const quant::QuantizedTensor* router,
+                   std::span<const float> router_f32, uint32_t experts,
+                   uint32_t used, float weight_scale, int64_t* ids,
+                   float* weights, uint64_t rows);
+
 // A routed expert's matrices already resident on the device, in the planner's
 // bounded expert pool (design §9): one slot per (block, expert), slot s of role
 // r at role_bytes + s * role_stride. `slots` holds one int32 slot per

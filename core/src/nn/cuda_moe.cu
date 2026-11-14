@@ -22,8 +22,13 @@
 
 #include <cuda_runtime.h>
 
+#include "cuda_resident.h"
+#include "cuda_scratch_epoch.h"
+#include "cuda_stream.h"
+
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace sonicboom::nn::cuda {
@@ -95,6 +100,123 @@ const void* pooled(const void* bytes, uint64_t stride, int32_t slot) {
   return static_cast<const char*>(bytes) + uint64_t(slot) * stride;
 }
 
+// --- device-resident form ----------------------------------------------------
+
+int moe_grid(int64_t n) { return int((n + 255) / 256); }
+
+// Process-global workspace for the device-resident experts. Buffers are grown
+// as the model's geometry requires and kept, like the other kernel scratch (see
+// cuda_scratch_epoch.h: a live capture may still hold an older pointer).
+enum ScratchSlot {
+  kRouteLogits = 0,  // [rows, experts]
+  kDecodeOut,        // [rows, k, d]
+  kA,                // decode gate; prefill X
+  kB,                // decode up; prefill G
+  kC,                // prefill U
+  kD,                // prefill down result
+  kRowOf,            // prefill int32 row per (expert, row)
+  kKwOf,             // prefill int32 r*k+j per entry (weights_dev index)
+  kOffsets,          // prefill int32 per-expert start (e_count + 1)
+  kWeightOf,         // prefill f32 weight per entry
+  kScratchSlots
+};
+
+struct Scratch {
+  void* ptr = nullptr;
+  size_t bytes = 0;
+};
+Scratch g_scratch[kScratchSlots];
+
+void* scratch(int slot, size_t need) {
+  Scratch& s = g_scratch[slot];
+  if (s.bytes >= need) return s.ptr;
+  sonicboom::cuda::scratch_epoch_bump();
+  void* old = s.ptr;
+  if (old && sonicboom::cuda::scratch_may_free()) {
+    cudaFree(old);
+    old = nullptr;
+  }
+  void* p = nullptr;
+  if (cudaMalloc(&p, need) != cudaSuccess) {
+    s.ptr = old;
+    return nullptr;
+  }
+  s.ptr = p;
+  s.bytes = need;
+  return p;
+}
+
+__global__ void moe_route_topk_kernel(float* __restrict__ logits,
+                                      uint32_t experts, uint32_t used,
+                                      float weight_scale,
+                                      int64_t* __restrict__ ids,
+                                      float* __restrict__ weights) {
+  extern __shared__ unsigned char smem[];
+  if (threadIdx.x != 0) return;
+  const uint64_t r = blockIdx.x;
+  float* p = logits + r * experts;
+  unsigned char* taken = smem;
+  uint32_t* selected = reinterpret_cast<uint32_t*>(
+      smem + ((uint64_t(experts) + 3u) & ~uint64_t(3)));
+  int64_t* idrow = ids + r * used;
+  float* wrow = weights + r * used;
+
+  float mx = p[0];
+  for (uint32_t e = 1; e < experts; ++e) mx = fmaxf(mx, p[e]);
+  float sum = 0.0f;
+  for (uint32_t e = 0; e < experts; ++e) {
+    p[e] = expf(p[e] - mx);
+    sum += p[e];
+  }
+  if (!(sum > 0.0f)) {
+    for (uint32_t j = 0; j < used; ++j) {
+      idrow[j] = -1;
+      wrow[j] = 0.0f;
+    }
+    return;
+  }
+  const float inv = 1.0f / sum;
+  for (uint32_t e = 0; e < experts; ++e) {
+    p[e] *= inv;
+    taken[e] = 0;
+  }
+  // Top-k with a strict comparison, so a tie keeps the lower index.
+  for (uint32_t j = 0; j < used; ++j) {
+    uint32_t best = experts;
+    for (uint32_t e = 0; e < experts; ++e) {
+      if (taken[e]) continue;
+      if (best == experts || p[e] > p[best]) best = e;
+    }
+    if (best == experts) {
+      for (uint32_t q = 0; q < used; ++q) {
+        idrow[q] = -1;
+        wrow[q] = 0.0f;
+      }
+      return;
+    }
+    taken[best] = 1;
+    selected[j] = best;
+  }
+  // Ascending order, as std::sort gives on the host (ties cannot occur here —
+  // the selected indices are distinct).
+  for (uint32_t a = 1; a < used; ++a) {
+    const uint32_t v = selected[a];
+    int32_t b = int32_t(a) - 1;
+    while (b >= 0 && selected[b] > v) {
+      selected[b + 1] = selected[b];
+      --b;
+    }
+    selected[b + 1] = v;
+  }
+  float denom = 0.0f;
+  for (uint32_t j = 0; j < used; ++j) denom += p[selected[j]];
+  denom = fmaxf(denom, kMoeWeightSumFloor);
+  for (uint32_t j = 0; j < used; ++j) {
+    idrow[j] = int64_t(selected[j]);
+    wrow[j] = p[selected[j]] / denom * weight_scale;
+  }
+}
+
 // One expert's routed FFN for one row: gate and up through the decode gemv,
 // the activation, then down. `out` receives the expert's d values, unwritten
 // on failure. With `pool` set the matrices come from the pool's slot `slot`;
@@ -152,6 +274,49 @@ bool moe_route(std::span<const float> x, const quant::QuantizedTensor* router,
       return false;
   }
   return true;
+}
+
+bool moe_route_dev(const float* x, const quant::QuantizedTensor* router,
+                   std::span<const float> router_f32, uint32_t experts,
+                   uint32_t used, float weight_scale, int64_t* ids,
+                   float* weights, uint64_t rows) {
+  if (!quant::cuda::available() || rows == 0 || experts == 0 || used == 0 ||
+      used > experts || !x || !ids || !weights)
+    return false;
+  uint64_t d = 0;
+  if (!router_f32.empty()) {
+    if (router_f32.size() % experts != 0) return false;
+    d = router_f32.size() / experts;
+  } else if (router && router->valid()) {
+    if (router->dims().size() != 2 || router->dims()[1] != experts) return false;
+    d = router->dims()[0];
+  } else {
+    return false;
+  }
+  if (d == 0) return false;
+
+  float* logits = static_cast<float*>(
+      scratch(kRouteLogits, rows * experts * sizeof(float)));
+  if (!logits) return false;
+  for (uint64_t r = 0; r < rows; ++r) {
+    if (!router_f32.empty()) {
+      // The dense f32 router's device gemv; the weight is uploaded and cached
+      // by the host pointer, as in matvec_f32.
+      if (!nn::cuda::matvec_f32_dev(router_f32, int(d), x + r * d,
+                                    logits + r * experts, int(experts), 1))
+        return false;
+    } else if (!quant::cuda::matvec_f32_dev(*router, x + r * d,
+                                            logits + r * experts)) {
+      return false;
+    }
+  }
+
+  const size_t smem =
+      ((size_t(experts) + 3u) & ~size_t(3)) + size_t(used) * sizeof(uint32_t);
+  if (smem > 48u * 1024u) return false;
+  moe_route_topk_kernel<<<rows, 1, smem, sonicboom::cuda::sb_current_stream()>>>(
+      logits, experts, used, weight_scale, ids, weights);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
