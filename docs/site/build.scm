@@ -28,6 +28,7 @@
 
 (load (string-append tools-directory "/extract.scm"))
 (load (string-append tools-directory "/nav.scm"))
+(load (string-append tools-directory "/pytorch-map.scm"))
 
 (define (repository-root)
   (canonicalize-path (string-append tools-directory "/../..")))
@@ -460,15 +461,250 @@
                           "\n"))))
                  by-group)))))
 
+;;; ------------------------------------------------------- pytorch lookup ----
+
+(define (pytorch-entry-ref entry key)
+  (assq-ref (cdr entry) key))
+
+(define (torch-entries)
+  (filter (lambda (entry) (eq? (car entry) 'torch)) pytorch-map))
+
+(define (prefix-entries)
+  (filter (lambda (entry) (eq? (car entry) 'prefix)) pytorch-map))
+
+(define (entry-name entry)
+  (cadr entry))
+
+(define (entry-status entry)
+  (let ((status (pytorch-entry-ref entry 'status)))
+    (and status (car status))))
+
+(define (exact-entry name)
+  (find (lambda (entry) (string=? (entry-name entry) name)) (torch-entries)))
+
+;; Every PyTorch name resolves to its own entry, a same-as entry, or the
+;; longest matching prefix.
+(define (longest-prefix name)
+  (let loop ((rest (prefix-entries)) (best #f))
+    (cond ((null? rest) best)
+          ((string-prefix? (entry-name (car rest)) name)
+           (if (and best (>= (string-length (entry-name best))
+                             (string-length (entry-name (car rest)))))
+               (loop (cdr rest) best)
+               (loop (cdr rest) (car rest))))
+          (else (loop (cdr rest) best)))))
+
+(define (resolved-entry name)
+  (let ((exact (exact-entry name)))
+    (if (and exact (pytorch-entry-ref exact 'same-as))
+        (exact-entry (car (pytorch-entry-ref exact 'same-as)))
+        (or exact (longest-prefix name)))))
+
+;; The names the lookup knows, with their official documentation links. The
+;; file is read once; the table is consulted once per name.
+(define pytorch-name-links-cache #f)
+
+(define (pytorch-name-links)
+  (or pytorch-name-links-cache
+      (set! pytorch-name-links-cache
+            (if (not (file-exists? (string-append tools-directory
+                                                   "/pytorch-names.tsv")))
+                '()
+                (filter-map
+                 (lambda (line)
+                   (and (not (string-null? line))
+                        (not (string-prefix? "#" line))
+                        (let ((fields (string-split line #\tab)))
+                          (and (= (length fields) 3)
+                               (cons (car fields) (caddr fields))))))
+                 (string-split
+                  (read-file (string-append tools-directory
+                                            "/pytorch-names.tsv"))
+                  #\newline))))))
+
+(define (documentation-link name)
+  (or (assoc-ref (pytorch-name-links) name) ""))
+
+(define (pytorch-alias-forms name)
+  (let* ((forms
+          (if (string-prefix? "torch." name)
+              (list (substring name 6 (string-length name)))
+              '()))
+         (functional (string-prefix? "torch.nn.functional." name)))
+    (if functional
+        (cons (string-append "F." (substring name 20 (string-length name)))
+              forms)
+        forms)))
+
+(define (pytorch-aliases name entry)
+  (delete-duplicates
+   (append (pytorch-alias-forms name)
+           (let ((aliases (and (eq? (car entry) 'torch)
+                               (pytorch-entry-ref entry 'aliases))))
+             (or aliases '())))
+   string=?))
+
+(define (pytorch-use-link module symbol)
+  (format #f "api/~a.html#~a" module (symbol-anchor symbol)))
+
+(define (pytorch-use-objects entry)
+  (and (eq? (car entry) 'torch)
+       (let ((uses (pytorch-entry-ref entry 'use)))
+         (and uses
+              (map (lambda (use)
+                     (let ((module (string-join
+                                    (map symbol->string (car use)) "/"))
+                           (symbol (symbol->string (cadr use))))
+                       (list (cons 'module module)
+                             (cons 'symbol symbol)
+                             (cons 'link (pytorch-use-link module symbol)))))
+                   uses)))))
+
+(define (json-string text)
+  (string-append "\"" (json-escape text) "\""))
+
+(define (json-string-list items)
+  (string-append "[" (string-join (map json-string items) ",") "]"))
+
+(define (json-object fields)
+  (string-append
+   "{"
+   (string-join
+    (map (lambda (field)
+           (format #f "~a:~a" (json-string (symbol->string (car field)))
+                   (cdr field)))
+         fields)
+    ",")
+   "}"))
+
+(define (pytorch-json-entry name)
+  (let* ((entry (resolved-entry name))
+         (status (entry-status entry))
+         (uses (pytorch-use-objects entry))
+         (recipe (pytorch-entry-ref entry 'recipe))
+         (note (pytorch-entry-ref entry 'note))
+         (fields
+          (list (cons 'n (json-string name))
+                (cons 'a (json-string-list (pytorch-aliases name entry)))
+                (cons 'st (json-string (symbol->string status)))
+                (cons 'doc (json-string (documentation-link name))))))
+    (when uses
+      (set! fields
+            (append fields
+                    (list (cons 'use
+                                (string-append
+                                 "["
+                                 (string-join
+                                  (map (lambda (use)
+                                         (json-object
+                                          (list
+                                           (cons 'module
+                                                 (json-string
+                                                  (assoc-ref use 'module)))
+                                           (cons 'symbol
+                                                 (json-string
+                                                  (assoc-ref use 'symbol)))
+                                           (cons 'link
+                                                 (json-string
+                                                  (assoc-ref use 'link))))))
+                                       uses)
+                                  ",")
+                                 "]"))))))
+    (when recipe
+      (set! fields
+            (append fields (list (cons 'recipe (json-string (car recipe)))))))
+    (when note
+      (set! fields
+            (append fields (list (cons 'note (json-string (car note)))))))
+    (json-object fields)))
+
+(define (pytorch-json-names)
+  (delete-duplicates
+   (append (map car (pytorch-name-links))
+           '("torch.Tensor.__getitem__" "torch.Tensor.__setitem__"))
+   string=?))
+
+(define (write-pytorch-map site)
+  (let ((names (sort (pytorch-json-names) string<?)))
+    (write-file (string-append site "/pytorch-map.json")
+                (string-append "[\n"
+                               (string-join (map pytorch-json-entry names) ",\n")
+                               "\n]\n"))
+    (length names)))
+
+;; The module a name comes from: everything before its last dot.
+(define (pytorch-module-of name)
+  (let ((parts (string-split name #\.)))
+    (if (<= (length parts) 2)
+        (car parts)
+        (string-join (drop-right parts 1) "."))))
+
+(define (markdown-code text)
+  (format #f "`~a`" text))
+
+(define (pytorch-table-cell entry)
+  (let ((status (entry-status entry)))
+    (cond
+     ((eq? status 'recipe)
+      (markdown-code (car (pytorch-entry-ref entry 'recipe))))
+     (else
+      (string-join
+       (map (lambda (use)
+              (format #f "[~a](~a)"
+                      (markdown-code (assoc-ref use 'symbol))
+                      (assoc-ref use 'link)))
+            (pytorch-use-objects entry))
+       ", ")))))
+
+(define (pytorch-table-markdown)
+  (let* ((entries (filter (lambda (entry)
+                            (memq (entry-status entry) '(supported recipe)))
+                          (torch-entries)))
+         (rows (map (lambda (entry)
+                      (list (pytorch-module-of (entry-name entry))
+                            (entry-name entry)
+                            entry))
+                    entries))
+         (groups (sort (delete-duplicates (map car rows) string=?) string<?)))
+    (apply string-append
+           (map (lambda (group)
+                  (let ((members (sort (filter (lambda (row)
+                                                 (string=? (car row) group))
+                                               rows)
+                                       (lambda (a b)
+                                         (string<? (cadr a) (cadr b))))))
+                    (string-append
+                     (format #f "### ~a\n\n" group)
+                     "| Name | Status | SonicBoom |\n"
+                     "| --- | --- | --- |\n"
+                     (apply string-append
+                            (map (lambda (row)
+                                   (let* ((name (cadr row))
+                                          (entry (caddr row))
+                                          (link (documentation-link name)))
+                                     (format #f "| ~a | ~a | ~a |\n"
+                                             (if (string-null? link)
+                                                 (markdown-code name)
+                                                 (format #f "[~a](~a)"
+                                                         (markdown-code name)
+                                                         link))
+                                             (symbol->string
+                                              (entry-status entry))
+                                             (pytorch-table-cell entry))))
+                                 members))
+                     "\n")))
+                groups))))
+
 ;;; ------------------------------------------------------------- generation ---
 
-(define (render-page site slug source title pytorch)
+(define (render-page site slug source title pytorch extra)
   (let* ((relative (page-path slug))
          (output (string-append site "/" relative))
          (root (root-prefix relative))
          (nav (nav-html slug root)))
     (if source
-        (let* ((text (rewrite-markdown-links (read-file source)))
+        (let* ((text (string-append (rewrite-markdown-links (read-file source))
+                                    (or extra "")))
                (temporary (temporary-file ".md")))
           (write-file temporary text)
           (run-pandoc temporary output title root nav pytorch)
@@ -521,8 +757,10 @@
              (delete-file temporary)))
           (else
            (let* ((source (page-source slug))
+                  (pytorch? (string=? slug "pytorch"))
                   (title (or (and source (first-heading source)) nav-title)))
-             (render-page site slug source title (string=? slug "pytorch")))))))
+             (render-page site slug source title pytorch?
+                          (if pytorch? (pytorch-table-markdown) "")))))))
      entries)
     (for-each
      (lambda (module)
@@ -531,10 +769,13 @@
        (render-api-page site module))
      modules)
     (site-index-redirect-script site)
-    (let ((indexed (write-search-index site modules)))
+    (let ((indexed (write-search-index site modules))
+          (mapped (write-pytorch-map site)))
       (format (current-error-port)
-              "site generated: ~a (~a pages, ~a api pages, ~a search entries)\n"
-              site (length entries) (length modules) indexed))))
+              "site generated: ~a (~a pages, ~a api pages, ~a search entries,"
+              site (length entries) (length modules) indexed)
+      (format (current-error-port)
+              " ~a PyTorch names)\n" mapped))))
 
 ;; /sonicboom without the trailing slash redirects to /sonicboom/, so that the
 ;; relative links of index.html resolve.

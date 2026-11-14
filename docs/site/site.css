@@ -265,6 +265,9 @@ a:hover { text-decoration: underline; }
                      font-weight: 700; }
 .pt-status { margin-left: 0.6rem; font-size: 0.8rem; color: var(--muted);
              border: 1px solid var(--line); border-radius: 3px; padding: 0 0.3rem; }
+.pt-entry .pt-use, .pt-entry .pt-note { margin: 0.5rem 0 0.2rem; font-size: 0.95rem; }
+.pt-entry .pt-module { color: var(--muted); }
+.pt-entry .pt-recipe { margin: 0.5rem 0 0.2rem; }
 
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; gap: 1rem; }
