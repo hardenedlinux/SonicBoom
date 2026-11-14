@@ -217,6 +217,20 @@
     produced))
 
 (define (make-real-backend)
+  "Create the backend that runs models with libsonicboom.
+
+The backend loads a GGUF file, tokenizes with the model's own tokenizer, applies
+the chat template its architecture selects (gemma4 to gemma, qwen2 to qwen), and
+decodes on the device. Sessions hold a KV cache; a grammar constraint is
+compiled and installed at prefill.
+
+Returns: a backend.
+Example:
+  (use-modules (sonicboom serve backend) (sonicboom serve real-backend))
+  (backend-name (make-real-backend))
+  => \"libsonicboom\"
+PyTorch: none
+Note: the libsonicboom shared library must be loadable by the process."
   (make-backend
    #:name "libsonicboom"
    #:load-model load-real-model
