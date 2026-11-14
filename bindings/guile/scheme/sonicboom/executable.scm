@@ -65,6 +65,17 @@
 
 ;;; --- the executable record ---------------------------------------------------
 
+;; A compiled S-Expr graph, created by compile-s-expr.
+;;
+;; The record carries the graph text and the flat input and output byte sizes;
+;; executable-run binds input bytes to it and runs it. The native handle is
+;; released by free-executable! or, for a record that is collected without an
+;; explicit free, by a later reap-executables!.
+;; Runs of one executable are serialized because it owns a single set of
+;; buffers; different executables run in parallel.
+;; PyTorch: none
+;; Note: The nearest PyTorch concept is a compiled graph from torch.compile,
+;; which SonicBoom does not use.
 (define-record-type <executable>
   (%make-executable text ptr in-nbytes out-nbytes in-count out-count freed lock)
   executable?
@@ -93,12 +104,15 @@
     bv))
 
 (define (free-executable! exe)
-  "Release EXE's native handle. Idempotent: freeing an already-freed (or
-guardian-reaped) executable is a no-op, never an error.
+  "Release an executable's native handle.
 
-The run lock is taken first, so an explicit free waits for an in-flight
-`executable-run` instead of releasing the native handle underneath it. A run
-that starts after the free sees the freed flag and fails instead."
+Idempotent: freeing an already-freed executable is a no-op. A run that is in
+flight finishes first; a run started after the free returns an error. Do not
+free an executable obtained from cached-executable; the cache owns it.
+Args:
+  exe: an executable.
+Returns: unspecified.
+PyTorch: none"
   (call-with-executable-lock
    exe
    (lambda ()
@@ -124,9 +138,14 @@ that starts after the free sees the freed flag and fails instead."
 (define %exe-guardian (make-guardian))
 
 (define (reap-executables!)
-  "Release every executable whose record has been collected without an explicit
-`free-executable!`, and every parameter view whose tensor was collected. Returns
-the number of executable handles released."
+  "Release native handles of executables collected without an explicit free.
+
+The module keeps a weak reference to every compiled executable; this call
+releases those whose record has been collected, plus parameter views whose
+tensor was collected. Call it between batches of short-lived executables.
+Args:
+Returns: the number of executable handles released.
+PyTorch: none"
   (let loop ((n 0))
     (let ((dead (%exe-guardian)))
       (if (or (not dead) (null? dead))
@@ -136,8 +155,20 @@ the number of executable handles released."
 ;;; --- compiling ---------------------------------------------------------------
 
 (define (compile-s-expr text)
-  "Parse and compile the S-Expr v0.1 graph TEXT once, returning an <executable>
-for repeated `executable-run`. Raises on a parse or compile failure."
+  "Parse and compile an S-Expr graph text once.
+
+The result can be run many times with executable-run, which avoids parsing
+and compiling the text on every call. A parse or compile failure signals a
+&sonicboom-error.
+Args:
+  text: the graph in SonicBoom S-Expr v0.1 format.
+Returns: an <executable>.
+Example:
+  (use-modules (sonicboom executable))
+  (executable-input-nbytes
+   (compile-s-expr \"(sonicboom-s-expr (version 0 1) (graph (name \\\"add-self\\\") (inputs (input \\\"x\\\" (tensor float32 (shape 2 2)))) (outputs (output \\\"y\\\")) (parameters) (nodes (node add (inputs \\\"x\\\" \\\"x\\\") (outputs (\\\"y\\\" (tensor float32 (shape 2 2)))) (attrs)))))\"))
+  => 16
+PyTorch: none"
   (let* ((doc-slot (make-slot))
          (exe-slot (make-slot))
          (err-slot (make-slot))
@@ -229,14 +260,25 @@ recursive)."
 ;; the freed flag before dispatch, but reports a refusal as its documented
 ;; (values #f message) failure instead of raising like the accessors.
 (define (executable-run exe input-bv)
-  "Bind INPUT-BV to EXE, run it and return two values: the output bytevector
-and #f on success, or #f and an error-message string on failure. The native
-handle is retained, so EXE may be run again; the C ABI copies the input, so
-INPUT-BV may be reused or freed immediately.
+  "Bind input bytes to an executable, run it, and return its output.
 
-Runs of one executable are serialized, because the compiled graph owns a single
-set of input, output and scratch buffers. Different executables, including two
-entries of one model's per-shape cache, run in parallel."
+The caller owns the executable and may run it again; the input is copied, so
+the bytevector may be reused immediately. Runs of one executable are
+serialized.
+Args:
+  exe: an executable.
+  input-bv: the input bytes, exactly executable-input-nbytes long.
+Returns: two values: the output bytevector and #f on success, or #f and an
+error-message string on failure.
+Example:
+  (use-modules (sonicboom executable) (rnrs bytevectors))
+  (let* ((exe (compile-s-expr \"(sonicboom-s-expr (version 0 1) (graph (name \\\"add-self\\\") (inputs (input \\\"x\\\" (tensor float32 (shape 2 2)))) (outputs (output \\\"y\\\")) (parameters) (nodes (node add (inputs \\\"x\\\" \\\"x\\\") (outputs (\\\"y\\\" (tensor float32 (shape 2 2)))) (attrs)))))\"))
+         (out (call-with-values
+                  (lambda () (executable-run exe (make-bytevector 16 0)))
+                (lambda (bytes err) bytes))))
+    (bytevector-length out))
+  => 16
+PyTorch: none"
   (call-with-executable-lock
    exe
    (lambda ()
@@ -358,8 +400,14 @@ entries of one model's per-shape cache, run in parallel."
     bv))
 
 (define (executable-parameter-count exe)
-  "Number of parameters (graph constants) materialized by EXE. A device
-training graph has no host parameter block and raises."
+  "The number of parameters (graph constants) an executable materialized.
+
+A device training graph has no host parameter block and signals a
+&sonicboom-error.
+Args:
+  exe: an executable.
+Returns: an integer.
+PyTorch: none"
   (call-with-live-executable
    exe "executable-parameter-count"
    (lambda ()
@@ -372,7 +420,13 @@ training graph has no host parameter block and raises."
        (bytevector-u64-native-ref count 0)))))
 
 (define (executable-parameter-name exe index)
-  "The name of parameter INDEX in EXE (a borrowed string, copied here)."
+  "The name of one parameter in an executable.
+
+Args:
+  exe: an executable.
+  index: the parameter index, below executable-parameter-count.
+Returns: the name as a string.
+PyTorch: none"
   (call-with-live-executable
    exe "executable-parameter-name"
    (lambda ()
@@ -386,12 +440,17 @@ training graph has no host parameter block and raises."
          (if (null-pointer? p) "" (pointer->string p)))))))
 
 (define (executable-parameter-ref exe index)
-  "A read-only <tensor> viewing parameter INDEX of EXE without copying. The
-tensor's storage owns an independent native view, so it stays valid after
-free-executable!; release it with tensor-release! when done (or let the guardian
-release it). tensor-set! on the result raises; tensor-copy gives a writable,
-independent copy. Read-only is enforced by tensor-set!: the bytevector returned
-by tensor-data aliases the native bytes and must not be written directly."
+  "A read-only view of one parameter, without copying its bytes.
+
+The returned tensor owns an independent native view, so it stays valid after
+free-executable!; release it with tensor-release! when done. tensor-set! on
+it raises, and the bytevector from tensor-data aliases the native bytes and
+must not be written.
+Args:
+  exe: an executable.
+  index: the parameter index.
+Returns: a read-only <tensor>.
+PyTorch: none"
   (call-with-live-executable
    exe "executable-parameter-ref"
    (lambda ()
@@ -460,13 +519,19 @@ by tensor-data aliases the native bytes and must not be written directly."
 ;;; binding raises, because the executable is bound once and then run.
 
 (define (executable-bind-parameter! exe name data-bv)
-  "Copy DATA-BV into EXE's (:bound NAME) parameter. NAME is the binding name
-from the graph. Raises on an unknown name, a byte-count mismatch, or when the
-executable has already run successfully.
+  "Fill a (data :bound NAME) parameter of an executable.
 
-The bytes are copied: subsequent writes to DATA-BV are not observed. A
-parameter may be bound again until the first successful run replaces the
-previous bytes; afterwards binding it raises."
+The bytes are copied, so later writes to data-bv are not observed. A
+parameter may be rebound until the first successful run; afterwards binding
+raises.
+Args:
+  exe: an executable with a :bound parameter.
+  name: the binding name from the graph.
+  data-bv: the parameter bytes.
+Returns: unspecified.
+PyTorch: none
+Note: Until every :bound parameter is filled, executable-run fails and
+executable-bindings-complete? is false."
   (unless (string? name)
     (error "executable-bind-parameter!: parameter name must be a string" name))
   (unless (bytevector? data-bv)
@@ -485,8 +550,13 @@ previous bytes; afterwards binding it raises."
      *unspecified*)))
 
 (define (executable-bindings-complete? exe)
-  "True when EXE has no :bound parameters or every one has been filled.
-executable-run fails (returning #f and a message) until this is true."
+  "Whether every (data :bound ...) parameter of an executable is filled.
+
+A graph with no bound parameters is always complete.
+Args:
+  exe: an executable.
+Returns: #t or #f.
+PyTorch: none"
   (call-with-live-executable
    exe "executable-bindings-complete?"
    (lambda ()
@@ -500,6 +570,10 @@ executable-run fails (returning #f and a message) until this is true."
 
 ;;; --- the text-keyed cache ----------------------------------------------------
 
+;; Whether cached-executable and run-s-expr/cached use the text-keyed cache.
+;;
+;; A parameter, true by default; set it to #f to compile every call.
+;; PyTorch: none
 (define executable-cache-enabled
   (make-parameter #t
     (lambda (on?)
@@ -582,29 +656,34 @@ cached."
                              (values exe #t))))))))))
 
 (define (cached-executable text)
-  "Return a compiled executable for TEXT, compiling it on first use. A
-cacheable executable is owned by the cache; do not free it. A hit returns the
-same object on every call for the same text.
+  "A compiled executable for a graph text, from a process-wide cache.
 
-TEXT must be self-contained: :values graphs qualify, but the cache does not own
-two other kinds. A graph with (data :bound ...) parameters has bytes supplied
-after compile; a graph with (data :external ...) parameters has sidecar bytes
-resolved from the working directory at compile. Neither is represented by the
-text key. Both kinds are still compiled and returned, but they are not cached:
-the returned executable is owned by the caller and should be freed with
-free-executable!. Give each such graph its own executable (as model-forward
-does) instead of going through this cache."
+The same text returns the same object on every call. The cache owns a
+self-contained executable; do not free it. Two kinds of graph are compiled
+for the caller instead and are not cached, because the text does not record
+their state: graphs with (data :bound ...) parameters, whose bytes are
+supplied after compile, and graphs with (data :external ...) parameters,
+whose sidecar bytes are resolved from the working directory at compile.
+Their owner must free them with free-executable!.
+Args:
+  text: the graph in SonicBoom S-Expr v0.1 format.
+Returns: an executable.
+PyTorch: none"
   (call-with-values (lambda () (cached-executable/ownership text))
     (lambda (exe _cache-owned?) exe)))
 
 (define (run-s-expr/cached text input-bv)
-  "Like `run-s-expr`, but when `executable-cache-enabled` is true the compiled
-executable is cached by graph TEXT and reused across calls.
+  "Run an S-Expr graph, reusing a cached executable by graph text.
 
-A text the cache refuses to own (a :bound or :external graph, see
-cached-executable) is compiled for this call only and released as soon as the
-run returns, so repeated calls cannot accumulate handles, share bound state, or
-reuse another directory's sidecar bytes."
+Equivalent to run-s-expr, but when executable-cache-enabled is true the
+compiled executable is cached by text and reused. A text the cache does not
+own is compiled for this call only and released when the run returns.
+Args:
+  text: the graph in SonicBoom S-Expr v0.1 format.
+  input-bv: the input bytes.
+Returns: two values, the output bytevector and #f on success, or #f and an
+error-message string.
+PyTorch: none"
   (if (executable-cache-enabled)
       (call-with-values (lambda () (cached-executable/ownership text))
         (lambda (exe cache-owned?)
@@ -617,13 +696,14 @@ reuse another directory's sidecar bytes."
       (run-s-expr text input-bv)))
 
 (define (clear-executable-cache!)
-  "Drop every cached entry and reap any other collected executables.
+  "Drop every cached executable and reap collected ones.
 
-Eviction does not free an executable a caller still holds: the entry stops
-being shared, but the held handle stays valid and runnable until the caller
-drops it, when the executable guardian releases its native handle. This keeps
-eviction from invalidating an executable (or a parameter view it pins)
-underneath an active user."
+An executable a caller still holds stays valid and runnable; eviction only
+stops sharing it. Its native handle is released when the caller drops it and
+reap-executables! next runs.
+Args:
+Returns: unspecified.
+PyTorch: none"
   (lock-mutex %cache-lock)
   (set! %cache (make-hash-table))
   (unlock-mutex %cache-lock)
