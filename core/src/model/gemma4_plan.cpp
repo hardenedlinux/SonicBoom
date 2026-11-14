@@ -5807,15 +5807,13 @@ static bool prefill_in_decode_arithmetic(
 // non-null, is the persistent prefix-cache session this run adopts/publishes its
 // device cache to. The full prompt prefill (generate_prefill_spine_cuda) passes
 // null; the prefix-reuse path passes the live session.
-static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
-                                         std::span<const uint64_t> prompt,
-                                         uint64_t start_pos,
-                                         std::span<int64_t> tokens,
-                                         uint64_t n_ctx, bool use_prefill,
-                                         planner::KvCacheSession* session,
-                                         std::span<const uint64_t> history,
-                                         std::span<const uint8_t> sample_mask,
-                                         std::span<float> logits_out) {
+static uint64_t prefill_decode_cuda_impl(
+    const Gemma4Model& m, std::span<const uint64_t> prompt, uint64_t start_pos,
+    std::span<int64_t> tokens, uint64_t n_ctx, bool use_prefill,
+    planner::KvCacheSession* session, std::span<const uint64_t> history,
+    std::span<const uint8_t> sample_mask, std::span<float> logits_out,
+    const std::vector<planner::GdnStateSnapshot>* restore_state = nullptr,
+    bool reset_state = false) {
   if (!ensure_device_ready(m)) return 0;
   if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
   if (n_ctx == 0) n_ctx = start_pos + prompt.size() + tokens.size();
@@ -5921,6 +5919,26 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       std::cerr << "[prefill-cuda] decode runtime is bound to cache "
                 << rt->cuda->cache_id() << ", session owns "
                 << session->cache_id << "\n";
+      return 0;
+    }
+  }
+
+  // Section 11: the prefix-reuse caller rolled the recurrent state back to the
+  // position it picked (or found none and resets). Restore into the state set
+  // of the runtime that will run the segments — a cached greedy runtime, or
+  // the dump path's own throwaway one — so the scan resumes where the KV cache
+  // does. A model with no recurrent state never gets here.
+  if (restore_state || reset_state) {
+    const std::shared_ptr<planner::StateSetDev>& st = rt->cuda->states();
+    if (!st) {
+      std::cerr << "[prefill-cuda] state restore requested, but the runtime "
+                   "holds no recurrent state\n";
+      return 0;
+    }
+    if (reset_state) {
+      st->reset();
+    } else if (auto r = st->restore(*restore_state); !r) {
+      std::cerr << "[prefill-cuda] state restore failed: " << r.error() << "\n";
       return 0;
     }
   }
@@ -6894,26 +6912,16 @@ bool prefix_align_enabled() {
   return v;
 }
 
-} // namespace
-
-uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
-                                            std::span<const uint64_t> prompt,
-                                            uint64_t start_pos,
-                                            std::span<int64_t> tokens,
-                                            planner::KvCacheSession& session,
-                                            bool use_prefill,
-                                            uint64_t* n_reused_out,
-                                            std::span<const uint8_t> sample_mask,
-                                            std::span<float> logits_out) {
-  if (n_reused_out) *n_reused_out = 0;
-  if (!ensure_device_ready(m)) return 0;
-  if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
-  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
-
-  // Prefix reuse only anchors at position 0 (the session's token history is a
-  // contiguous run from 0); a non-zero start_pos disables reuse.
-  uint64_t prefix_len =
-      (start_pos == 0) ? session.common_prefix_len(prompt) : 0;
+// The reuse length a prefill keeps when `candidate` tokens of the request are
+// already resident. `prompt_size` is the request's full length. This is the
+// prefill's own rule, callable with any candidate boundary: the one-token
+// hold-back, the chunk alignment that keeps every segment off a one-token run,
+// and the sliding-window frontier check. 0 means nothing can be reused.
+uint64_t accepted_reuse_len(const Gemma4Model& m,
+                            const planner::KvCacheSession& session,
+                            uint64_t prompt_size, uint64_t candidate) {
+  if (prompt_size == 0) return 0;
+  uint64_t prefix_len = candidate;
 
   // A prompt the session already holds in full leaves an empty suffix, and
   // prefilling nothing produces no logits at all (the backend returns 0, which
@@ -6921,8 +6929,8 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // what yields the next-token logits, so that token always has to be
   // processed: keep all but it resident and prefill it as a one-token suffix.
   // The reported reuse count stays honest — this is exactly what was reused.
-  if (prefix_len == prompt.size())
-    prefix_len = prompt.size() - 1;
+  if (prefix_len == prompt_size)
+    prefix_len = prompt_size - 1;
 
   // Prefill lays its segments on absolute multiples of the chunk and a segment
   // shorter than the mmq threshold (i.e. a single token) takes the
@@ -6973,6 +6981,85 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
         std::max<int64_t>(0, int64_t(prefix_len) - window + 1);
     if (earliest < history - window - 1) prefix_len = 0;
   }
+  return prefix_len;
+}
+
+} // namespace
+
+uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
+                                            std::span<const uint64_t> prompt,
+                                            uint64_t start_pos,
+                                            std::span<int64_t> tokens,
+                                            planner::KvCacheSession& session,
+                                            bool use_prefill,
+                                            uint64_t* n_reused_out,
+                                            std::span<const uint8_t> sample_mask,
+                                            std::span<float> logits_out) {
+  if (n_reused_out) *n_reused_out = 0;
+  if (!ensure_device_ready(m)) return 0;
+  if (m.weights.blocks.empty() || prompt.empty() || tokens.empty()) return 0;
+  std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
+
+  // Prefix reuse only anchors at position 0 (the session's token history is a
+  // contiguous run from 0); a non-zero start_pos disables reuse. Common is the
+  // session's recorded history's match with this request; the existing rule
+  // then yields the reuse length R.
+  const uint64_t common =
+      (start_pos == 0) ? session.common_prefix_len(prompt) : 0;
+  uint64_t prefix_len = accepted_reuse_len(m, session, prompt.size(), common);
+
+  // Section 11: both memories of a model with recurrent state restart from one
+  // position. R (above) is the most the KV cache can keep; the state can only
+  // resume at a checkpoint at or below it, or — when the request continues the
+  // whole session and that session ends on a prefill segment boundary — at the
+  // live state, which is already there. The segment boundary matters: a seed
+  // prefill that ended mid-segment computed its last positions in a shorter
+  // segment than a prefill from zero would, and those KV rows and that state
+  // carry its bits, not the full prefill's. Resuming from the segment's start
+  // checkpoint recomputes at most one segment and restores the agreement. The
+  // checkpoints live in the session (opaque, next to `states`): the device
+  // state set that runs the segments may be replaced between calls, while the
+  // checkpoints outlive it. The restore itself happens in
+  // prefill_decode_cuda_impl, on the state set the runtime that will run the
+  // segments actually holds.
+  const std::vector<planner::GdnStateSnapshot>* restore_state = nullptr;
+  bool reset_state = false;
+  if (model_has_recurrent_state(m) && start_pos == 0) {
+    if (!session.state_checkpoints)
+      session.state_checkpoints =
+          std::make_shared<planner::StateCheckpointStoreDev>();
+    auto* checkpoints = static_cast<planner::StateCheckpointStoreDev*>(
+        session.state_checkpoints.get());
+    const uint64_t session_len = session.filled_tokens.size();
+    // A checkpoint above the common prefix belongs to the abandoned
+    // continuation and cannot describe this request.
+    checkpoints->drop_checkpoints_above(common);
+    const uint64_t chunk = (m.config.sliding_window > 0)
+                               ? m.config.sliding_window
+                               : kDefaultPrefillChunk;
+    const bool continues_live =
+        prefix_len == session_len && session_len % chunk == 0;
+    if (!continues_live) {
+      // The highest checkpoint the existing rule accepts as a reuse length.
+      uint64_t pick_pos = 0;
+      uint64_t bound = prefix_len;
+      while (checkpoints->checkpoint_below(bound, pick_pos, restore_state)) {
+        if (accepted_reuse_len(m, session, prompt.size(), pick_pos) == pick_pos)
+          break;
+        restore_state = nullptr;
+        if (pick_pos == 0) break;
+        bound = pick_pos - 1;
+      }
+      if (restore_state) {
+        prefix_len = pick_pos;
+      } else {
+        // No checkpoint describes a position the cache can still serve: start
+        // both memories over.
+        prefix_len = 0;
+        reset_state = true;
+      }
+    }
+  }
   if (n_reused_out) *n_reused_out = prefix_len;
 
   // The cache size is the session's n_ctx (pre-set by the caller for its largest
@@ -7002,10 +7089,9 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // only what the cache still needs prefilled. The spec drafter is seeded with
   // the former so its n-gram tables cover the whole session, not just the
   // reuse tail.
-  const uint64_t done = prefill_decode_cuda_impl(m, suffix, prefill_start,
-                                                 tokens, n_ctx, use_prefill,
-                                                 &session, prompt, sample_mask,
-                                                 logits_out);
+  const uint64_t done = prefill_decode_cuda_impl(
+      m, suffix, prefill_start, tokens, n_ctx, use_prefill, &session, prompt,
+      sample_mask, logits_out, restore_state, reset_state);
   if (done == 0) return 0;
 
   // Record every token whose KV this call actually wrote, for the next
