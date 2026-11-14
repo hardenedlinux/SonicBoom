@@ -52,12 +52,13 @@ Guile and the OpenAI-compatible server — to the v0.0.5 runtime. Its limits:
   so it reproduces the token stream bit-for-bit (`SONICBOOM_ATTN_DECODE=own`
   selects the hand-written pair, which remains the numerical reference).
   Prefill attention is the hand-written `boom_fattn` kernel and the only
-  implementation: one kernel covers d64/GQA-7, d128/GQA-6 (strict exact order)
-  and d128/GQA-7, gathering f32, f16 and q8 KV rows into a f16 workspace, with
-  tiled MMA, an online softmax, GQA query grouping, cp.async staging and a
-  per-shape-class autotuned layout ([Fattn autotune](fattn-autotune.md)). The
-  KV gather launches a fixed key-lane grid and loops over key tiles, so the
-  recorded plan body does not depend on `n_ctx`. The generated prefill route
+  implementation: one kernel covers d64/GQA-7, d128/GQA-6 (strict exact order),
+  d128/GQA-7 and d256/GQA-8, gathering f32, f16 and q8 KV rows into a f16
+  workspace, with tiled MMA, an online softmax, GQA query grouping, cp.async
+  staging and a per-shape-class autotuned layout
+  ([Fattn autotune](fattn-autotune.md)). The KV gather launches a fixed
+  key-lane grid and loops over key tiles, so the recorded plan body does not
+  depend on `n_ctx`. The generated prefill route
   (and its exp2 arm) is not reachable: that exp2 arm changed the token stream
   and did not meet the d64 fp64-error bound.
 - **Speculative decoding:** a CPU n-gram/prompt-lookup drafter proposes draft

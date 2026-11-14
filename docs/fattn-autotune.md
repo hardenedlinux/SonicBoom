@@ -368,9 +368,10 @@ Rules that hold for this table:
   geometry within `boom_fattn`.
 - **Geometry is per shape class.** The d64/GQA-7 class (Qwen2.5) runs the same
   family at BR16/BK16 with one warp per query-head unit (NW 1, phase 1b
-  unsplit); the wider classes run BR16/BK16/NW 4 with the row-half split. The
-  tuner still selects among the layout/schedule candidates of the class's
-  family, and the query count is never part of the selection key (R1).
+  unsplit); the wider classes, d256/GQA-8 among them, run BR16/BK16/NW 4 with
+  the row-half split. The tuner still selects among the layout/schedule
+  candidates of the class's family, and the query count is never part of the
+  selection key (R1).
 
 ## Community diagnostics
 
