@@ -88,6 +88,9 @@ class ExpertPool {
   // the node's `ids`, as written by the last select().
   const void* selection() const noexcept;
 
+  // The host copy of that buffer, valid until the next select().
+  const int32_t* selection_host() const noexcept { return sel_host_.data(); }
+
   // Steps 2-4 of a node: bring every selected expert resident (evicting the
   // lowest-stamped slot this node does not need), stamp every slot this node
   // uses, and write the selection buffer. `block` indexes the weights' blocks;

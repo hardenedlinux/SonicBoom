@@ -33,6 +33,7 @@
 
 #include <sonicboom/hal/buffer.h>
 #include <sonicboom/model/loader.h>
+#include <sonicboom/nn/moe.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/backend.h>
 #include <sonicboom/planner/gdn_state_dev.h>
@@ -40,6 +41,7 @@
 #include <sonicboom/planner/kv_cache.h>
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <span>
 #include <vector>
@@ -425,6 +427,19 @@ private:
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
   std::unique_ptr<NodeDump> dump_;  // null unless the debug dump is on
   bool kv_write_suppressed_ = false;  // warm-up: skip KV stores (see setter)
+
+  // The routed experts' per-layer views (3 x experts QuantizedTensor views and
+  // the roles they bind), built once per layer and reused by every
+  // MoeExperts node of that layer instead of once per node.
+  struct MoeLayerViews {
+    int64_t slot_up = -1;
+    int64_t slot_down = -1;
+    std::vector<quant::QuantizedTensor> gates;
+    std::vector<quant::QuantizedTensor> ups;
+    std::vector<quant::QuantizedTensor> downs;
+    nn::MoeExpertWeights weights{};
+  };
+  std::map<uint32_t, MoeLayerViews> moe_views_;
 
   // The device address of the position / token a kernel reads or writes for the
   // current step: the single-step slots outside chunk mode, the step's own ring

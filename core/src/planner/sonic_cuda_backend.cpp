@@ -2784,26 +2784,10 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       double route_scale = 1.0;
       attr_f(*node, "scale", route_scale);
       const uint64_t rows = row_count();
-      std::vector<float> x;
-      if (in[0].on_device) {
-        const uint64_t bytes = in[0].device.size_bytes;
-        x.resize(bytes / sizeof(float));
-        if (!device::download(in[0].device.handle, x.data(), bytes)) {
-          ok = false;
-          break;
-        }
-      } else {
-        const auto& h = in[0].host;
-        x.assign(reinterpret_cast<const float*>(h.data()),
-                 reinterpret_cast<const float*>(h.data()) +
-                     h.size() / sizeof(float));
-      }
-      if (rows == 0 || x.size() % rows != 0) {
+      if (rows == 0) {
         ok = false;
         break;
       }
-      const uint64_t dim = x.size() / rows;
-      (void)dim;
       const uint64_t k = uint64_t(used);
       const uint64_t ids_bytes = rows * k * sizeof(int64_t);
       const uint64_t w_bytes = rows * k * sizeof(float);
@@ -2829,8 +2813,6 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         break;
       }
       sibling_outs.push_back({w_handle, w_logical});
-      std::vector<int64_t> ids(rows * k);
-      std::vector<float> wts(rows * k);
       const quant::QuantizedTensor& router = qweight(slot);
       const quant::QuantizedTensor* router_q = router.valid() ? &router : nullptr;
       const std::span<const float> router_f32 = fweight(slot);
@@ -2838,17 +2820,43 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
         ok = false;
         break;
       }
-      ok = nn::cuda::moe_route(x, router_q, router_f32, uint32_t(experts),
-                               uint32_t(used), float(route_scale), ids, wts,
-                               rows);
-      if (!ok) {
-        device::release(sibling_outs.back().first,
-                        sibling_outs.back().second);
-        sibling_outs.pop_back();
+      const uint64_t route_dim =
+          router_q ? (router.dims().size() == 2 ? router.dims()[0] : 0)
+                   : router_f32.size() / uint64_t(experts);
+      if (route_dim == 0) {
+        ok = false;
         break;
       }
-      ok = device::upload(ids.data(), out_handle, ids_bytes) &&
-           device::upload(wts.data(), w_handle, w_bytes);
+      // The activation stays on the device; a host-only input (not produced by
+      // this backend) is staged once so the router kernel still sees a device
+      // buffer.
+      const uint64_t xb = in[0].on_device ? in[0].device.size_bytes
+                                          : uint64_t(in[0].host.size());
+      if (xb == 0 || xb % (rows * sizeof(float)) != 0 ||
+          xb / sizeof(float) != rows * route_dim) {
+        ok = false;
+        break;
+      }
+      uint64_t staged = 0;
+      const float* xdev = nullptr;
+      if (in[0].on_device) {
+        xdev = dev(in[0]);
+      } else {
+        staged = device::acquire(xb);
+        if (!staged || !device::upload(in[0].host.data(), staged, xb)) {
+          if (staged) device::release(staged, xb);
+          ok = false;
+          break;
+        }
+        xdev = dev_mut(staged);
+      }
+      // Both results land in this node's device buffers: the host never sees
+      // the logits, the probabilities or the selected ids here.
+      ok = nn::cuda::moe_route_dev(
+          xdev, router_q, router_f32, uint32_t(experts), uint32_t(used),
+          float(route_scale), reinterpret_cast<int64_t*>(out_handle),
+          reinterpret_cast<float*>(w_handle), rows);
+      if (staged) device::release(staged, xb);
       if (!ok) {
         device::release(sibling_outs.back().first,
                         sibling_outs.back().second);
@@ -2862,6 +2870,9 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // the rows by selected expert and runs one batched projection per expert,
       // scattering the weighted result back. Each row still accumulates in
       // ascending expert index.
+      //
+      // All three inputs and the output stay on the device: the kernels run
+      // there and only the ids are read back (the pool selects by host id).
       int64_t experts = 0, slot_up_i = 0, slot_down_i = 0;
       if (!attr_i(*node, "experts", experts) ||
           !attr_i(*node, "slot_up", slot_up_i) ||
@@ -2879,53 +2890,64 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       const bool prefill = !verify && batch_attr(nb);
       const uint64_t rows = verify ? uint64_t(vr)
                                    : prefill ? uint64_t(nb) : uint64_t(1);
-      std::vector<float> x, wts;
-      std::vector<int64_t> ids;
-      {
-        const uint64_t xb = in[0].device.size_bytes;
-        x.resize(xb / sizeof(float));
-        const uint64_t ib = in[1].device.size_bytes;
-        ids.resize(ib / sizeof(int64_t));
-        const uint64_t wb = in[2].device.size_bytes;
-        wts.resize(wb / sizeof(float));
-        if (!device::download(in[0].device.handle, x.data(), xb) ||
-            !device::download(in[1].device.handle, ids.data(), ib) ||
-            !device::download(in[2].device.handle, wts.data(), wb)) {
-          ok = false;
-          break;
+      if (!in[0].on_device || !in[1].on_device || !in[2].on_device) {
+        ok = false;
+        break;
+      }
+      const uint64_t xb = in[0].device.size_bytes;
+      const uint64_t ib = in[1].device.size_bytes;
+      const uint64_t wb = in[2].device.size_bytes;
+      if (rows == 0 || xb == 0 || ib == 0 || wb == 0 ||
+          xb % (rows * sizeof(float)) != 0 ||
+          ib % (rows * sizeof(int64_t)) != 0) {
+        ok = false;
+        break;
+      }
+      const uint64_t dim = xb / sizeof(float) / rows;
+      const uint64_t k = ib / sizeof(int64_t) / rows;
+      if (k == 0 || wb / sizeof(float) != rows * k) {
+        ok = false;
+        break;
+      }
+      std::vector<int64_t> ids(rows * k);
+      if (!device::download(in[1].device.handle, ids.data(), ib)) {
+        ok = false;
+        break;
+      }
+      // The 3 x experts views and the roles they bind are a property of the
+      // layer (and its up/down slots): build them once per layer and reuse
+      // them for every node of that layer.
+      auto views_it = moe_views_.find(uint32_t(layer));
+      if (views_it == moe_views_.end() ||
+          views_it->second.slot_up != slot_up_i ||
+          views_it->second.slot_down != slot_down_i) {
+        MoeLayerViews built;
+        built.slot_up = slot_up_i;
+        built.slot_down = slot_down_i;
+        built.gates.reserve(size_t(experts));
+        built.ups.reserve(size_t(experts));
+        built.downs.reserve(size_t(experts));
+        const auto up_slot = static_cast<model::WeightSlot>(slot_up_i);
+        const auto down_slot = static_cast<model::WeightSlot>(slot_down_i);
+        for (int64_t e = 0; e < experts; ++e) {
+          built.gates.push_back(model::weight_quant(
+              model_->weights, {slot, weight_layer, uint32_t(e)}));
+          built.ups.push_back(model::weight_quant(
+              model_->weights, {up_slot, weight_layer, uint32_t(e)}));
+          built.downs.push_back(model::weight_quant(
+              model_->weights, {down_slot, weight_layer, uint32_t(e)}));
         }
+        built.weights = nn::MoeExpertWeights{
+            std::span<const quant::QuantizedTensor>(built.gates.data(),
+                                                    built.gates.size()),
+            std::span<const quant::QuantizedTensor>(built.ups.data(),
+                                                    built.ups.size()),
+            std::span<const quant::QuantizedTensor>(built.downs.data(),
+                                                    built.downs.size())};
+        views_it = moe_views_.insert_or_assign(uint32_t(layer),
+                                               std::move(built)).first;
       }
-      if (rows == 0 || x.size() % rows != 0 || ids.size() % rows != 0 ||
-          ids.size() / rows != wts.size() / rows) {
-        ok = false;
-        break;
-      }
-      const uint64_t dim = x.size() / rows;
-      const uint64_t k = ids.size() / rows;
-      if (k == 0) {
-        ok = false;
-        break;
-      }
-      const auto up_slot = static_cast<model::WeightSlot>(slot_up_i);
-      const auto down_slot = static_cast<model::WeightSlot>(slot_down_i);
-      std::vector<quant::QuantizedTensor> gates, ups, downs;
-      gates.reserve(size_t(experts));
-      ups.reserve(size_t(experts));
-      downs.reserve(size_t(experts));
-      for (int64_t e = 0; e < experts; ++e) {
-        gates.push_back(model::weight_quant(
-            model_->weights, {slot, weight_layer, uint32_t(e)}));
-        ups.push_back(model::weight_quant(
-            model_->weights, {up_slot, weight_layer, uint32_t(e)}));
-        downs.push_back(model::weight_quant(
-            model_->weights, {down_slot, weight_layer, uint32_t(e)}));
-      }
-      const nn::MoeExpertWeights views{std::span<const quant::QuantizedTensor>(
-                                           gates.data(), gates.size()),
-                                       std::span<const quant::QuantizedTensor>(
-                                           ups.data(), ups.size()),
-                                       std::span<const quant::QuantizedTensor>(
-                                           downs.data(), downs.size())};
+      const nn::MoeExpertWeights& views = views_it->second.weights;
       // The experts live in the bounded device pool, not the upload-once
       // cache: select() brings this node's experts resident (the ids above are
       // this node's one synchronous read) and records each one's slot for the
@@ -2945,15 +2967,18 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           (*pool)->slot_bytes(ExpertPool::kUp),
           (*pool)->slot_bytes(ExpertPool::kDown),
           static_cast<const int32_t*>((*pool)->selection())};
-      std::vector<float> y(rows * dim, 0.0f);
+      if (!device::memset_device(out_handle, 0, rows * dim * sizeof(float))) {
+        ok = false;
+        break;
+      }
       {
         ExpertStageTimer experts_timer(ExpertStageTimer::kExperts);
-        ok = nn::cuda::moe_experts(x, ids, wts, views, act, y, rows, prefill,
-                                   &pooled);
+        ok = nn::cuda::moe_experts_dev(
+            dev(in[0]), ids.data(), dev(in[2]),
+            static_cast<const int32_t*>((*pool)->selection()),
+            (*pool)->selection_host(), views, act, dev_mut(out_handle), rows, k,
+            dim, prefill, pooled, nullptr);
       }
-      if (ok)
-        ok = device::upload(y.data(), out_handle,
-                            rows * dim * sizeof(float));
       break;
     }
     case OpKind::GdnScan: {
