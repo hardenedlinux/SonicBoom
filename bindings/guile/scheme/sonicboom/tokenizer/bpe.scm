@@ -159,10 +159,24 @@ so training is deterministic."
              (loop (+ i 1) (+ w 1)))))))
 
 (define (bpe-train source vocab-size)
-  "Train a byte-level BPE tokenizer on SOURCE, a text port (or a string), with
-VOCAB-SIZE tokens in total: 256 byte tokens, the 3 built-in specials and
-VOCAB-SIZE - 259 merges (fewer when the corpus runs out of pairs). Each
-iteration merges the most frequent adjacent pair; ties break deterministically."
+  "Train a byte-level BPE tokenizer on a text source.
+
+The vocabulary always starts with the 256 byte tokens and the three special
+tokens <unk>, <bos> and <eos>; each remaining slot is one merge of the most
+frequent adjacent pair. Ties break on the smaller pair, so training is
+deterministic. A corpus that runs out of pairs stops early with a smaller
+vocabulary.
+Args:
+  source: a text input port, or a string taken as its UTF-8 bytes.
+  vocab-size: the total number of tokens, at least 259.
+Returns: a tokenizer.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-vocab-size (bpe-train (open-input-string \"abab\") 259))
+  => 259
+PyTorch: none
+Note: A string source is convenient for small examples; a port is how a
+dataset is fed without holding it all in memory."
   (unless (and (integer? vocab-size) (>= vocab-size (+ 256 3)))
     (error "bpe-train: vocab-size must be at least 259" vocab-size))
   (let* ((bytes (port->bytes source))
@@ -234,8 +248,22 @@ in which case the lower id is canonical."
               (loop)))))))
 
 (define (bpe-encode tok string)
-  "Encode STRING to a list of token ids. Special tokens are matched first
-(longest match) wherever they occur; the text between them is byte-level BPE."
+  "Encode a string to a list of token ids.
+
+Special tokens are matched verbatim first, longest match first, wherever they
+occur. The text between them is encoded as greedy lowest-rank BPE over its
+UTF-8 bytes, so every string round-trips.
+Args:
+  tok: a tokenizer.
+  string: the text to encode.
+Returns: a list of integer token ids.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-encode (bpe-train (open-input-string \"abc\") 259) \"abc\")
+  => (97 98 99)
+PyTorch: none
+Note: With a 259-token vocabulary no merge is learned, so each character maps
+to its own byte id."
   (let ((bv (string->utf8 string))
         (specials (bpe-specials tok)))
     (let loop ((i 0) (acc '()))
@@ -256,7 +284,18 @@ in which case the lower id is canonical."
                   (loop j (append (reverse ids) acc)))))))))
 
 (define (bpe-decode tok ids)
-  "Decode IDS back to a string. An id outside the vocabulary decodes as <unk>."
+  "Decode token ids back to a string.
+
+An id outside the vocabulary decodes as the text of the <unk> token.
+Args:
+  tok: a tokenizer.
+  ids: a list of integer token ids.
+Returns: the decoded string.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-decode (bpe-train (open-input-string \"hi\") 259) '(104 105))
+  => \"hi\"
+PyTorch: none"
   (let* ((unk (hash-ref (bpe-token->id tok) (string->utf8 "<unk>") #f))
          (parts (map (lambda (id)
                        (if (and (integer? id) (>= id 0)
@@ -268,19 +307,65 @@ in which case the lower id is canonical."
 
 ;;; --- special tokens ---------------------------------------------------------
 
-(define (bpe-vocab-size tok) (vector-length (bpe-vocab tok)))
+(define (bpe-vocab-size tok)
+  "The number of tokens in a tokenizer's vocabulary.
 
-(define (bpe-special-ids tok) (map cdr (bpe-specials tok)))
+Args:
+  tok: a tokenizer.
+Returns: an integer, including the special tokens.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-vocab-size (bpe-train (open-input-string \"hi\") 259))
+  => 259
+PyTorch: none"
+  (vector-length (bpe-vocab tok)))
+
+(define (bpe-special-ids tok)
+  "The ids of every special token, longest token text first.
+
+The built-in specials are <unk> at 256, <bos> at 257 and <eos> at 258; tokens
+added with bpe-add-special! come first once their text is longer, and
+otherwise keep insertion order among equal lengths.
+Args:
+  tok: a tokenizer.
+Returns: a list of integer token ids.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-special-ids (bpe-train (open-input-string \"hi\") 259))
+  => (256 257 258)
+PyTorch: none"
+  (map cdr (bpe-specials tok)))
 
 (define (bpe-special-id tok text)
-  "The id of the special token TEXT, or #f."
+  "The id of one special token.
+
+Args:
+  tok: a tokenizer.
+  text: the special token text, such as <eos>.
+Returns: the token id, or #f when text is not a special token.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-special-id (bpe-train (open-input-string \"hi\") 259) \"<eos>\")
+  => 258
+PyTorch: none"
   (let ((id (hash-ref (bpe-token->id tok) (string->utf8 text) #f)))
     (and id (memv id (bpe-special-ids tok)) id)))
 
 (define (bpe-add-special! tok text)
-  "Make TEXT a special token (matched verbatim before BPE) in TOK and return
-its id. If the vocabulary already holds those bytes, that token becomes
-special; otherwise the token is appended after every existing id."
+  "Make a text a special token.
+
+The text will be matched verbatim before BPE. If the vocabulary already holds
+those bytes, that existing token becomes special; otherwise a new token is
+appended after every existing id.
+Args:
+  tok: a tokenizer, modified in place.
+  text: the special token text, not empty.
+Returns: the token id.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-add-special! (bpe-train (open-input-string \"hi\") 259) \"<|x|>\")
+  => 259
+PyTorch: none"
   (let* ((bytes (string->utf8 text))
          (n (bytevector-length bytes)))
     (when (= n 0) (error "bpe-add-special!: empty token"))
@@ -327,7 +412,21 @@ special; otherwise the token is appended after every existing id."
     bv))
 
 (define (bpe-save tok path)
-  "Write TOK's vocabulary to PATH.vocab and its merges to PATH.merges."
+  "Write a tokenizer to a pair of files.
+
+PATH is a base name: the vocabulary goes to PATH.vocab, hex-escaped one token
+per line with a header carrying the special ids, and the merges go to
+PATH.merges in rank order.
+Args:
+  tok: a tokenizer.
+  path: the base path of the files to write.
+Returns: path.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (bpe-save (bpe-train (open-input-string \"hello\") 259)
+            \"/tmp/sonicboom-docs-tok\")
+  => \"/tmp/sonicboom-docs-tok\"
+PyTorch: none"
   (let ((special-ids (bpe-special-ids tok))
         (vocab (bpe-vocab tok)))
     (call-with-output-file (string-append path ".vocab")
@@ -360,7 +459,22 @@ special; otherwise the token is appended after every existing id."
               (loop (cons line acc))))))))
 
 (define (bpe-load path)
-  "Load a tokenizer written by bpe-save from PATH.vocab and PATH.merges."
+  "Load a tokenizer written by bpe-save.
+
+The vocabulary and the merges are read from PATH.vocab and PATH.merges; a
+malformed file, or a merge whose result is not at its rank position, is an
+error.
+Args:
+  path: the base path written by bpe-save.
+Returns: a tokenizer.
+Example:
+  (use-modules (sonicboom tokenizer bpe))
+  (let* ((tok (bpe-train (open-input-string \"hello\") 259))
+         (base \"/tmp/sonicboom-docs-tok-load\"))
+    (bpe-save tok base)
+    (bpe-decode (bpe-load base) (bpe-encode tok \"hello\")))
+  => \"hello\"
+PyTorch: none"
   (let* ((lines (read-lines (string-append path ".vocab")))
          (header (and (pair? lines) (string-prefix? "#" (car lines)) (car lines)))
          (token-lines (if header (cdr lines) lines))
