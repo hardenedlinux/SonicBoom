@@ -143,6 +143,14 @@ struct KvCacheSession {
   // way it shares `caches`. Null for a model with no recurrent block.
   std::shared_ptr<void> states;
 
+  // Host checkpoints of that state, one per prefill segment boundary
+  // (position -> copy of the state set), owned opaquely for the same reason.
+  // The prefill path creates and fills it; a rollback restores the highest
+  // checkpoint the new prompt can still reuse. Null until the first stateful
+  // prefill through this session, and always null for a model with no
+  // recurrent block.
+  std::shared_ptr<void> state_checkpoints;
+
   // RAII release for the runtimes bound to this set (a
   // model::SessionRuntimeOwner). kv_session_allocate stores one when it gives
   // the set an identity, next to `caches` and declared after it, so the owner

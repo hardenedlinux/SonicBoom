@@ -48,6 +48,7 @@
 #include <cuda_runtime.h>  // cudaGetDeviceProperties (record device line)
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 #include <sonicboom/nn/cuda_elementwise.h>
+#include <sonicboom/planner/gdn_state_dev.h>  // state checkpoints (section 11)
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 #include "../nn/cuda_resident.h"  // attn_decode_plan_chunk (split-KV schedule)
 #include "../quant/cuda_resident.h"  // warm_verify_gemv_wp (verify gemv split)
@@ -6176,6 +6177,28 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     }
 
     const auto t_pf0 = std::chrono::steady_clock::now();
+    // Section 11: a checkpoint of the recurrent state after every segment that
+    // ends on an absolute multiple of the segment size — the boundaries this
+    // prefill already lays (a short final segment's end usually is not one).
+    // The state lives in the decode runtime's set, which every segment shares,
+    // so the copy is the sequence's own; it is kept in the session's store so
+    // it outlives the runtime. The synchronous host copy orders after the
+    // segment's kernels: they run on a blocking stream, which a synchronous
+    // cudaMemcpy on the legacy stream waits for. A model with no recurrent
+    // state has no store and takes this path unchanged.
+    planner::StateCheckpointStoreDev* state_checkpoints = nullptr;
+    if (model_has_recurrent_state(m) && session) {
+      if (!session->state_checkpoints)
+        session->state_checkpoints =
+            std::make_shared<planner::StateCheckpointStoreDev>();
+      state_checkpoints = static_cast<planner::StateCheckpointStoreDev*>(
+          session->state_checkpoints.get());
+    }
+    auto checkpoint_segment = [&](uint64_t end_pos) {
+      if (!state_checkpoints || end_pos % chunk != 0) return;
+      const std::shared_ptr<planner::StateSetDev>& st = rt->cuda->states();
+      if (st) state_checkpoints->checkpoint(*st, end_pos);
+    };
     for (uint64_t off = 0; off < n; ) {
       Phase _seg("prefill:segment", phase_timing);
       const uint64_t pos = start_pos + off;
@@ -6212,6 +6235,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                     << " graph replay failed\n";
           return 0;
         }
+        checkpoint_segment(pos + nseg);
         off += nseg;
         continue;
       }
@@ -6270,6 +6294,7 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                            std::span<const float>(z, vocab));
         }
       }
+      checkpoint_segment(pos + nseg);
       off += nseg;
     }
     if (gen_timing) {

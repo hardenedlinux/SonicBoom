@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <expected>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -163,6 +164,32 @@ class StateSetDev {
 
  private:
   std::vector<GdnStateDev> states_;
+};
+
+// Host checkpoints of a recurrent state set, keyed by the position they follow
+// (the design doc's section 11). The store belongs to a session (next to its
+// `states`), not to the state set: the device backend may replace the state set
+// it runs with, while the checkpoints outlive that. checkpoint() copies the
+// committed device state to the host; the store holds what
+// SONICBOOM_STATE_CKPT_MB (MiB, default 1024; <= 0 disables) allows, dropping
+// the lowest position when a new one does not fit. A position already stored is
+// replaced. The rest of the API reads the store: the highest position at or
+// below a bound, every position, and the removal of the positions above a bound
+// (the abandoned continuation).
+class StateCheckpointStoreDev {
+ public:
+  StateCheckpointStoreDev();
+
+  void checkpoint(const StateSetDev& states, uint64_t position);
+  void drop_checkpoints_above(uint64_t position);
+  bool checkpoint_below(uint64_t bound, uint64_t& position,
+                        const std::vector<GdnStateSnapshot>*& snapshot) const;
+  std::vector<uint64_t> checkpoint_positions() const;
+
+ private:
+  std::map<uint64_t, std::vector<GdnStateSnapshot>> checkpoints_;
+  uint64_t checkpoint_bytes_ = 0;
+  uint64_t checkpoint_budget_ = 0;
 };
 
 } // namespace sonicboom::planner

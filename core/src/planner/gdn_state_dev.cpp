@@ -23,6 +23,7 @@
 
 #include <sonicboom/nn/cuda_gdn.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -57,6 +58,27 @@ float* dev_mut(const hal::Buffer& buf) {
 hal::Buffer view(const float* p, uint64_t bytes) {
   return hal::Buffer{reinterpret_cast<uint64_t>(p), bytes, hal::DeviceId{},
                      hal::MemoryKind::DeviceLocal};
+}
+
+// The host checkpoint budget: SONICBOOM_STATE_CKPT_MB in MiB, default 1024.
+// <= 0 disables checkpoints; an unparsable value keeps the default.
+uint64_t state_ckpt_budget_bytes() {
+  constexpr uint64_t kDefaultMiB = 1024;
+  const char* e = std::getenv("SONICBOOM_STATE_CKPT_MB");
+  if (!e || !*e) return kDefaultMiB << 20;
+  char* end = nullptr;
+  const long long mib = std::strtoll(e, &end, 10);
+  if (end == e || *end != '\0') return kDefaultMiB << 20;
+  if (mib <= 0) return 0;
+  return uint64_t(mib) << 20;
+}
+
+// The host bytes a snapshot holds.
+uint64_t snapshot_bytes(const std::vector<GdnStateSnapshot>& snap) {
+  uint64_t bytes = 0;
+  for (const GdnStateSnapshot& s : snap)
+    bytes += (s.hist.size() + s.mem.size()) * sizeof(float);
+  return bytes;
 }
 
 } // namespace
@@ -332,6 +354,63 @@ std::expected<void, std::string> StateSetDev::restore(
     if (auto r = states_[i].restore(snapshot[i]); !r) return r;
   }
   return {};
+}
+
+StateCheckpointStoreDev::StateCheckpointStoreDev()
+    : checkpoint_budget_(state_ckpt_budget_bytes()) {}
+
+void StateCheckpointStoreDev::checkpoint(const StateSetDev& states,
+                                         uint64_t position) {
+  if (checkpoint_budget_ == 0 || states.size() == 0) return;
+  std::vector<GdnStateSnapshot> snap = states.save();
+  const uint64_t bytes = snapshot_bytes(snap);
+  // Nothing was allocated (or the copy failed): there is no state to keep.
+  if (bytes == 0) return;
+  auto it = checkpoints_.find(position);
+  if (it != checkpoints_.end()) {
+    // The same boundary recomputed: keep the newer copy.
+    checkpoint_bytes_ -= snapshot_bytes(it->second);
+    it->second = std::move(snap);
+    checkpoint_bytes_ += bytes;
+    return;
+  }
+  // Make room by dropping the lowest position. A checkpoint larger than the
+  // whole budget is not kept at all.
+  while (!checkpoints_.empty() &&
+         checkpoint_bytes_ + bytes > checkpoint_budget_) {
+    auto lowest = checkpoints_.begin();
+    checkpoint_bytes_ -= snapshot_bytes(lowest->second);
+    checkpoints_.erase(lowest);
+  }
+  if (bytes > checkpoint_budget_) return;
+  checkpoints_.emplace(position, std::move(snap));
+  checkpoint_bytes_ += bytes;
+}
+
+void StateCheckpointStoreDev::drop_checkpoints_above(uint64_t position) {
+  auto it = checkpoints_.upper_bound(position);
+  while (it != checkpoints_.end()) {
+    checkpoint_bytes_ -= snapshot_bytes(it->second);
+    it = checkpoints_.erase(it);
+  }
+}
+
+bool StateCheckpointStoreDev::checkpoint_below(
+    uint64_t bound, uint64_t& position,
+    const std::vector<GdnStateSnapshot>*& snapshot) const {
+  auto it = checkpoints_.upper_bound(bound);
+  if (it == checkpoints_.begin()) return false;
+  --it;
+  position = it->first;
+  snapshot = &it->second;
+  return true;
+}
+
+std::vector<uint64_t> StateCheckpointStoreDev::checkpoint_positions() const {
+  std::vector<uint64_t> out;
+  out.reserve(checkpoints_.size());
+  for (const auto& [position, snapshot] : checkpoints_) out.push_back(position);
+  return out;
 }
 
 } // namespace sonicboom::planner
