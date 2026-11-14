@@ -450,6 +450,13 @@ constexpr KnobRow kKnobRows[] = {
     {"expert-stats", "SONICBOOM_EXPERT_STATS", "off", "on|off",
      "print the expert pool counters at the end of the run",
      "none (reporting only)", 0, 0},
+    {"prefill.chunk-moe", "SONICBOOM_PREFILL_CHUNK_MOE", "512 (default)",
+     "positive token count",
+     "device prefill segment for a window-less mixture-of-experts model: it "
+     "sizes the prefill graph's token buffer and the prompt tokens one batched "
+     "segment carries, on the first-2048-token prefill measurements",
+     "none (measurement lever: an unset value keeps the default segment)",
+     0, 0},
     {"debug.dump-nodes", "SONICBOOM_DUMP_NODES", "off", "prefix[,prefix...]",
      "write the first output of every matching node, per graph execution",
      "none (reporting only)", 0, 0},

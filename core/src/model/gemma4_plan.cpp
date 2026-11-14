@@ -125,6 +125,39 @@ sx::Attribute attr_s(const char* name, std::string v) {
 // graph's token buffer). 512 matches the segment size the windowed models use.
 constexpr uint64_t kDefaultPrefillChunk = 512;
 
+// SONICBOOM_PREFILL_CHUNK_MOE raises the device prefill segment for a model
+// with routed experts: the segment bounds the prefill graph's token buffer and
+// sets how many prompt tokens one batched segment carries, so it is the lever
+// for the MoE prefill measurements. Unset (or a dense model) keeps the default.
+// A windowed model keeps its ring size: a segment that wraps the ring is a
+// correctness boundary, not a tuning choice. A malformed value is reported and
+// ignored rather than silently changing the run.
+uint64_t moe_prefill_chunk_override() {
+  const char* env = std::getenv("SONICBOOM_PREFILL_CHUNK_MOE");
+  if (!env || !*env) return 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(env, &end, 10);
+  if (end == env || *end != '\0' || v == 0) {
+    std::fprintf(stderr,
+                 "[prefill-cuda] ignoring SONICBOOM_PREFILL_CHUNK_MOE=%s "
+                 "(not a positive count)\n",
+                 env);
+    return 0;
+  }
+  return uint64_t(v);
+}
+
+// The prefill segment size, shared by kv_cache_spec (which sizes the device
+// prefill token buffer) and the segment loop that executes it.
+uint64_t prefill_chunk_for(const Gemma4Config& cfg) {
+  if (cfg.sliding_window > 0) return cfg.sliding_window;
+  if (cfg.n_expert > 0) {
+    const uint64_t o = moe_prefill_chunk_override();
+    if (o) return o;
+  }
+  return kDefaultPrefillChunk;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -141,7 +174,7 @@ planner::KvCacheSpec kv_cache_spec(const Gemma4Config& cfg) {
   // wraps the ring); a window-less model has no ring constraint, so it gets the
   // fixed default segment instead of 0 — the backend sizes its prefill token
   // buffer from this and rejects a segment larger than it.
-  spec.chunk = (cfg.sliding_window > 0) ? cfg.sliding_window : kDefaultPrefillChunk;
+  spec.chunk = prefill_chunk_for(cfg);
   spec.layers.reserve(spec.n_layers);
   for (uint32_t l = 0; l < spec.n_layers; ++l) {
     const LayerConfig& lc = cfg.layer_config(l);
@@ -5976,10 +6009,10 @@ static uint64_t prefill_decode_cuda_impl(
     // ring still attends correctly. Only the last segment's final hidden column
     // feeds lm_head.
     const uint64_t n = prompt.size();
-    // Segment size == the KV spec's chunk (see kv_cache_spec): the ring size where
-    // the model has a window, else the fixed default segment.
-    const uint64_t chunk = (m.config.sliding_window > 0) ? m.config.sliding_window
-                                                        : kDefaultPrefillChunk;
+    // Segment size == the KV spec's chunk (see kv_cache_spec): the ring size
+    // where the model has a window, the MoE override for a window-less mixture
+    // of experts, else the fixed default segment.
+    const uint64_t chunk = prefill_chunk_for(m.config);
 
     // One symbolic plan per shape class (the full chunk; the final segment is
     // usually shorter but stays in the chunk's class and binds its own length
