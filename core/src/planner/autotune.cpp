@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +36,8 @@
 #include <mutex>
 #include <sstream>
 #include <sys/file.h>
+#include <sys/resource.h>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +45,8 @@
 #ifdef SONICBOOM_USE_CUDA
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+#include "../nn/cuda_stream.h"
 #endif
 
 namespace sonicboom::tune {
@@ -580,6 +585,225 @@ void trace_event(std::string_view event, std::string_view op,
                  std::string_view key, std::string_view fp,
                  const char *caller) {
   trace_line(event, op, key, fp, caller);
+}
+
+// --- machine quiet check ----------------------------------------------------
+//
+// A tune record is a measurement, and it is written once: every later process
+// of this build reuses it. One made while another program (a compiler, a
+// second benchmark, another agent's build) is using the machine would outlive
+// the contention that produced it. The check below is what the stores ask
+// before committing a record to disk; a busy machine keeps the record in the
+// measuring process only.
+
+namespace {
+
+bool quiet_disabled() {
+  const char *e = std::getenv("SONICBOOM_TUNE_QUIET");
+  return e != nullptr && std::strcmp(e, "off") == 0;
+}
+
+// Busy and total jiffies across all CPUs from /proc/stat's aggregate line.
+bool read_cpu_jiffies(uint64_t *busy, uint64_t *total) {
+  std::ifstream f("/proc/stat");
+  std::string line;
+  if (!f || !std::getline(f, line)) return false;
+  if (line.rfind("cpu", 0) != 0) return false;
+  std::istringstream is(line.substr(3));
+  uint64_t v[10] = {};
+  int n = 0;
+  while (n < 10 && (is >> v[n])) ++n;
+  if (n < 8) return false;
+  // user nice system idle iowait irq softirq steal [guest guest_nice]
+  *busy = v[0] + v[1] + v[2] + v[5] + v[6] + v[7];
+  *total = *busy + v[3] + v[4];
+  return true;
+}
+
+double process_cpu_seconds() {
+  struct rusage ru {};
+  if (::getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+  return double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) / 1e6 +
+         double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) / 1e6;
+}
+
+// More than `kCores` of CPU spent by anything other than this process over a
+// 0.1 s window. This process's own work is subtracted because a tuner is
+// supposed to be busy; a concurrent compiler is not.
+bool cpu_busy(std::string *why) {
+  constexpr double kCores = 0.5;
+  uint64_t b0 = 0, t0 = 0, b1 = 0, t1 = 0;
+  const double p0 = process_cpu_seconds();
+  if (!read_cpu_jiffies(&b0, &t0)) return false;
+  const auto start = std::chrono::steady_clock::now();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const double p1 = process_cpu_seconds();
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  if (!read_cpu_jiffies(&b1, &t1) || t1 <= t0) return false;
+  const long ncpu = std::max(1L, ::sysconf(_SC_NPROCESSORS_ONLN));
+  const double busy_cores = double(b1 - b0) * double(ncpu) / double(t1 - t0);
+  const double own_cores = (p1 - p0) / std::max(elapsed, 1e-6);
+  const double other = busy_cores - own_cores;
+  if (other <= kCores) return false;
+  char buf[96];
+  std::snprintf(buf, sizeof(buf), "cpu %.2f cores busy (%.0f%% of %ld)",
+                other, 100.0 * other / double(ncpu), ncpu);
+  *why = buf;
+  return true;
+}
+
+#ifdef SONICBOOM_USE_CUDA
+
+// The 64 MiB copy the GPU side of the check times, 5 launches, median ms.
+bool gpu_probe_ms(double *out) {
+  constexpr size_t kBytes = 64ull << 20;
+  constexpr int kReps = 5;
+  void *src = nullptr;
+  void *dst = nullptr;
+  if (cudaMalloc(&src, kBytes) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (cudaMalloc(&dst, kBytes) != cudaSuccess) {
+    cudaGetLastError();
+    cudaFree(src);
+    return false;
+  }
+  cudaEvent_t begin = nullptr;
+  cudaEvent_t end = nullptr;
+  bool ok = cudaEventCreate(&begin) == cudaSuccess &&
+            cudaEventCreate(&end) == cudaSuccess;
+  std::vector<double> ms;
+  cudaStream_t stream = ::sonicboom::cuda::sb_current_stream();
+  if (ok) {
+    // Warm-up, untimed: the first copy pays the page/context cost.
+    ok = cudaMemcpyAsync(dst, src, kBytes, cudaMemcpyDeviceToDevice, stream) ==
+         cudaSuccess;
+    for (int i = 0; ok && i < kReps; ++i) {
+      ok = cudaEventRecord(begin, stream) == cudaSuccess &&
+           cudaMemcpyAsync(dst, src, kBytes, cudaMemcpyDeviceToDevice,
+                           stream) == cudaSuccess &&
+           cudaEventRecord(end, stream) == cudaSuccess &&
+           cudaEventSynchronize(end) == cudaSuccess;
+      if (ok) {
+        float t = 0.0f;
+        ok = cudaEventElapsedTime(&t, begin, end) == cudaSuccess;
+        if (ok) ms.push_back(double(t));
+      }
+    }
+  }
+  if (begin) cudaEventDestroy(begin);
+  if (end) cudaEventDestroy(end);
+  cudaFree(dst);
+  cudaFree(src);
+  if (!ok || ms.empty()) {
+    cudaGetLastError();
+    return false;
+  }
+  std::sort(ms.begin(), ms.end());
+  *out = ms[ms.size() / 2];
+  return true;
+}
+
+std::string probe_file_path() {
+  return (std::filesystem::path(cache_root()) / device_dir() / "probe.json")
+      .string();
+}
+
+// The smallest probe median recorded for this device, if any.
+bool read_probe_min(double *min_ms) {
+  std::ifstream f(probe_file_path());
+  if (!f) return false;
+  std::string text((std::istreambuf_iterator<char>(f)),
+                   std::istreambuf_iterator<char>());
+  const size_t at = text.find("\"min_ms\"");
+  if (at == std::string::npos) return false;
+  const size_t colon = text.find(':', at);
+  if (colon == std::string::npos) return false;
+  char *end = nullptr;
+  const double v = std::strtod(text.c_str() + colon + 1, &end);
+  if (end == text.c_str() + colon + 1 || !(v > 0.0)) return false;
+  *min_ms = v;
+  return true;
+}
+
+void write_probe_min(double min_ms) {
+  const std::string path = probe_file_path();
+  std::error_code ec;
+  std::filesystem::create_directories(
+      std::filesystem::path(path).parent_path(), ec);
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::trunc);
+    if (!f) return;
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "{\"min_ms\": %.6f}\n", min_ms);
+    f << buf;
+    if (!f) return;
+  }
+  std::filesystem::rename(tmp, path, ec);
+}
+
+// The probe against the smallest median this device has recorded: a device
+// doing other work copies slower than it did when quiet. The first probe of a
+// device has nothing to compare against and becomes the history.
+bool gpu_busy(std::string *why) {
+  constexpr double kRatio = 1.15;
+  double fresh = 0.0;
+  if (!gpu_probe_ms(&fresh)) return false;
+  double history = 0.0;
+  if (!read_probe_min(&history)) {
+    write_probe_min(fresh);
+    return false;
+  }
+  if (fresh > history * kRatio) {
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "gpu probe %.3f ms vs %.3f ms quiet",
+                  fresh, history);
+    *why = buf;
+    return true;
+  }
+  if (fresh < history) write_probe_min(fresh);
+  return false;
+}
+
+#else
+
+bool gpu_busy(std::string *) { return false; }
+
+#endif
+
+} // namespace
+
+bool machine_quiet(std::string *why) {
+  if (quiet_disabled()) return true;
+  // The verdict is sampled at most every two seconds; a measurement sequence
+  // runs many stores in a row and they should agree on the machine's state.
+  static std::mutex mutex;
+  static std::chrono::steady_clock::time_point sampled_at;
+  static bool quiet = true;
+  static std::string sampled_why;
+  std::lock_guard<std::mutex> lk(mutex);
+  const auto now = std::chrono::steady_clock::now();
+  if (sampled_at != std::chrono::steady_clock::time_point{} &&
+      now - sampled_at < std::chrono::seconds(2)) {
+    if (!quiet && why != nullptr) *why = sampled_why;
+    return quiet;
+  }
+  std::string reason;
+  bool ok = true;
+  if (cpu_busy(&reason)) {
+    ok = false;
+  } else if (gpu_busy(&reason)) {
+    ok = false;
+  }
+  sampled_at = now;
+  quiet = ok;
+  sampled_why = reason;
+  if (!ok && why != nullptr) *why = reason;
+  return ok;
 }
 
 namespace {

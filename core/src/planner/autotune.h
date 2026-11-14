@@ -202,6 +202,23 @@ struct TableFile {
 };
 std::vector<TableFile> table_files();
 
+// Whether the machine is quiet enough that a timing measurement made now is
+// worth keeping. Two signals are sampled, cached together for two seconds:
+//
+//   CPU  a /proc/stat busy-time delta over a 0.1 s window, minus this
+//        process's own CPU time (getrusage) over the same window, is more
+//        than 0.5 cores: some other work is running.
+//   GPU  a 64 MiB device-to-device copy, 5 times, median, against the
+//        smallest median recorded before in <cache>/<device>/probe.json;
+//        more than 1.15x that minimum is contention. The first probe of a
+//        device has no history, so it is recorded and counts as quiet.
+//
+// Returns true (quiet) when both are quiet, or when nothing could be sampled.
+// On false, `why` (when non-null) receives the reason. SONICBOOM_TUNE_QUIET=off
+// makes this always return true: the check is a guard for tuning runs on a
+// shared machine, not a correctness rule.
+bool machine_quiet(std::string *why = nullptr);
+
 #ifdef SONICBOOM_USE_CUDA
 // Median of `reps` individually timed launches after `warmups` untimed ones.
 // The events are recorded on `stream`, which must be the stream the launch
