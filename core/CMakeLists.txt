@@ -230,6 +230,9 @@ if(SONICBOOM_USE_CUDA)
     # Mixture-of-experts projections: the decode/verify per-(row, expert) gemv
     # and the prefill per-expert batched matmul (CUDA twins of nn/moe.cpp).
     ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_moe.cu
+    # Gated DeltaNet scan: the convolution/normalization/gates pass and the
+    # sequential memory pass (CUDA twin of nn/gdn.cpp).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/nn/cuda_gdn.cu
     # SonicBoom-owned prefill attention (boom_fattn), the prefill attention
     # implementation. Plain device code, no device lambdas, so it needs no
     # per-source flags.
