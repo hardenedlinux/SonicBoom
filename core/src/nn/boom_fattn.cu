@@ -31,6 +31,8 @@
 // gather into the f16 workspace. The d128/GQA-6 class is served by the
 // strict-order path in boom_fattn_strict.cu by default; SONICBOOM_FATTN_G6=mma
 // routes it to the regular tensor-core kernel at its own GQA unit count.
+// Qwen3.6's d256/GQA-8 class is the same 16-query tile family with the GQA-8
+// unit count (32 warps at NW=4).
 //
 // Structure, and where it differs from the llama.cpp prefill kernel:
 //
@@ -457,11 +459,11 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8);
   // Instantiated tensor-core classes: the two Gemma head widths at GQA 4, the
-  // Qwen 7:1 group ratio at head dims 64 and 128, and the DeepSeek 6:1 group
-  // ratio at d128.
+  // Qwen3.6 d256 8:1 group ratio, the Qwen 7:1 group ratio at head dims 64 and
+  // 128, and the DeepSeek 6:1 group ratio at d128.
   if (!((head_dim == 512 && gqa == 4) || (head_dim == 256 && gqa == 4) ||
-        (head_dim == 128 && gqa == 7) || (head_dim == 128 && gqa == 6) ||
-        (head_dim == 64 && gqa == 7)))
+        (head_dim == 256 && gqa == 8) || (head_dim == 128 && gqa == 7) ||
+        (head_dim == 128 && gqa == 6) || (head_dim == 64 && gqa == 7)))
     return false;
   // A 1024-thread block caps ptxas at 64 registers/thread, so the per-warp PV
   // output slice is kept at <= 16 mma tiles (32 accumulator registers). The
@@ -492,6 +494,15 @@ bool flash_attention_boom_fattn_chunk_dev_pos(
     return run_chunk<512, 4, 16, 16, 8, false>(
         q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
         n_heads_kv, sliding_window, scale, out, kv_f16, kv_q8);
+  }
+  // The Qwen3.6 full-attention geometry. UNITS = (BR/16) * GQA is 8 at the
+  // class's 16-query tile, so the 32-warp block holds the NW=4 family exactly;
+  // there is no f32-accumulator variant at this unit count.
+  if (head_dim == 256 && gqa == 8) {
+    if (!acc_f16()) return false;
+    return run_tuned<256, 8>(q, k_batch, v_batch, k_cache, v_cache, start,
+                             n_slots, n, n_heads_q, n_heads_kv,
+                             sliding_window, scale, out, kv_f16, kv_q8);
   }
   if (head_dim == 256) {
     if (acc_f16()) {
@@ -653,6 +664,8 @@ bool flash_attention_boom_fattn_config(int head_dim, int gqa, int* br, int* bk,
     }
     return true;
   }
+  if (head_dim == 256 && gqa == 8)
+    return describe_tuned(256, 8, br, bk, block, smem);
   if (head_dim == 256) {
     if (acc_f16()) {
       const int mode = d256_mode();
@@ -716,6 +729,8 @@ void* fattn_tune::aot_kernel(int candidate, int head_dim, int gqa) {
     return qreg_aot_candidate<512, 4, 16, 16, 4>(candidate);
   if (head_dim == 256 && gqa == 4)
     return qreg_aot_candidate<256, 4, 16, 16, 4>(candidate);
+  if (head_dim == 256 && gqa == 8)
+    return qreg_aot_candidate<256, 8, 16, 16, 4>(candidate);
   if (head_dim == 128 && gqa == 7)
     return qreg_aot_candidate<128, 7, 16, 16, 4>(candidate);
   if (head_dim == 128 && gqa == 6)

@@ -6787,10 +6787,10 @@ bool flash_attention_chunk_dev_pos(const float* q, const float* k_batch,
 
   // boom_fattn is the prefill attention implementation. Instantiated shape
   // classes: d64/GQA-7, d128/GQA-7, d128/GQA-6 (the strict-order path), d256/
-  // GQA-4 and d512/GQA-4, over f32, f16 and q8 KV caches (the gather
-  // dequantizes every cache dtype into the f16 workspace). There is no second
-  // prefill backend: a shape class without an instantiation fails here rather
-  // than falling through to a different kernel.
+  // GQA-4, d256/GQA-8 (Qwen3.6) and d512/GQA-4, over f32, f16 and q8 KV caches
+  // (the gather dequantizes every cache dtype into the f16 workspace). There is
+  // no second prefill backend: a shape class without an instantiation fails
+  // here rather than falling through to a different kernel.
   if (!flash_attention_boom_fattn_chunk_dev_pos(
           q, k_batch, v_batch, k_cache, v_cache, start, n_slots, n, n_heads_q,
           n_heads_kv, head_dim, sliding_window, scale, out, kv_f16, kv_q8))
