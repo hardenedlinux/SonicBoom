@@ -689,6 +689,24 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<const uint8_t> sample_mask = {},
                                             std::span<float> logits_out = {});
 
+// The continuation policy for a session with recurrent state, selected by
+// SONICBOOM_REPRO_CONTINUE or by sb_llm_model_load_ex(SB_LLM_LOAD_CONTINUE_REPLAY):
+//
+//   live    (default) a request that extends the whole recorded session
+//           continues from the live state after it, prefilling from the
+//           session's end; nothing is restored. A request that falls back
+//           within it, or that is not longer than it, follows the checkpoint
+//           rule of replay.
+//   replay  a continuation resumes only at a state checkpoint, and only when
+//           the session ends on a prefill segment boundary; otherwise the
+//           highest accepted checkpoint at or below the KV reuse length is
+//           restored (at most one segment is recomputed).
+//
+// Models without recurrent state behave identically in both modes. Either the
+// environment or the load option asking for replay makes the policy replay.
+bool repro_continue_replay();
+void set_repro_continue_replay(bool on);
+
 // Build the model's plan and record what executing it does, step by step.
 //
 // These are the producers behind the plan dump: given a loaded model and a

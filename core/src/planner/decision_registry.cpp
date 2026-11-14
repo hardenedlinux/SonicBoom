@@ -439,6 +439,11 @@ constexpr KnobRow kKnobRows[] = {
      "ceiling on drafts per verify", "a shorter verify runs the same kernels", 0, 0},
     {"prefix.align", "SONICBOOM_PREFIX_ALIGN", "on", "on|off",
      "hold the reuse boundary on a prefill chunk", "restores identical reuse", 0, 0},
+    {"repro.continue", "SONICBOOM_REPRO_CONTINUE", "live", "live|replay",
+     "a session with recurrent state continues from the state after its whole "
+     "recorded history (live), or resumes only at a state checkpoint and "
+     "recomputes up to one prefill segment (replay)",
+     "same recurrent state at the start of the suffix in both modes", 0, 0},
     {"train.graph", "SONICBOOM_TRAIN_GRAPH", "on", "on|off",
      "capture the training step", "bit-identical launches", 0, 0},
     {"train.aten", "SONICBOOM_TRAIN_ATEN", "off", "off|on",

@@ -694,8 +694,17 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
  * produce the same tokens on an empty and on a populated tune directory.
  * Numerics-neutral picks (tile grids, timing tables) keep tuning. It is the
  * programmatic form of SONICBOOM_TUNE=canonical and is sticky for the
- * process, like the numerics profile. Any other bit is SB_ERR_BINDING. */
+ * process, like the numerics profile.
+ *
+ * SB_LLM_LOAD_CONTINUE_REPLAY makes a session with recurrent state continue
+ * under the replay rule (resume only at a state checkpoint) instead of the
+ * default live rule (continue the whole recorded session from its live state).
+ * It is the programmatic form of SONICBOOM_REPRO_CONTINUE=replay and is sticky
+ * for the process.
+ *
+ * Any other bit is SB_ERR_BINDING. */
 #define SB_LLM_LOAD_CANONICAL 1u
+#define SB_LLM_LOAD_CONTINUE_REPLAY 2u
 sb_status sb_llm_model_load_ex(const char *gguf_path, uint32_t flags,
                                sb_llm_model **model_out, sb_error **err_out);
 

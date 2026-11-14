@@ -2131,9 +2131,12 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
 sb_status sb_llm_model_load_ex(const char *gguf_path, uint32_t flags,
                                sb_llm_model **model_out,
                                sb_error **err_out) {
-  if ((flags & ~uint32_t(SB_LLM_LOAD_CANONICAL)) != 0)
+  if ((flags & ~uint32_t(SB_LLM_LOAD_CANONICAL | SB_LLM_LOAD_CONTINUE_REPLAY)) !=
+      0)
     return fail_arg(err_out);
   if ((flags & SB_LLM_LOAD_CANONICAL) != 0) tune::set_canonical(true);
+  if ((flags & SB_LLM_LOAD_CONTINUE_REPLAY) != 0)
+    model::set_repro_continue_replay(true);
   return sb_llm_model_load(gguf_path, model_out, err_out);
 }
 

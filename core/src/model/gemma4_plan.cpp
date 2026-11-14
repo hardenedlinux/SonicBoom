@@ -1170,6 +1170,24 @@ bool spec_reckless_unsupported() {
          numerics_profile() == NumericsProfile::Strict;
 }
 
+// Which continuation rule a stateful session follows (see plan.h): live
+// continues the whole recorded session from its live state, replay follows the
+// checkpoint rule. Set by the environment or by the C API load option; either
+// selecting replay makes the policy replay. The environment is read per call so
+// a test can switch between the two in one process. Defined outside the
+// CUDA-only section below because the C ABI calls the setter in every build.
+std::atomic<bool> g_repro_continue_replay{false};
+
+bool repro_continue_replay() {
+  if (g_repro_continue_replay.load(std::memory_order_relaxed)) return true;
+  const char* e = std::getenv("SONICBOOM_REPRO_CONTINUE");
+  return e != nullptr && std::string_view(e) == "replay";
+}
+
+void set_repro_continue_replay(bool on) {
+  if (on) g_repro_continue_replay.store(true, std::memory_order_relaxed);
+}
+
 #ifdef SONICBOOM_USE_CUDA
 
 // ---------------------------------------------------------------------------
@@ -7039,7 +7057,21 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
   // then yields the reuse length R.
   const uint64_t common =
       (start_pos == 0) ? session.common_prefix_len(prompt) : 0;
-  uint64_t prefix_len = accepted_reuse_len(m, session, prompt.size(), common);
+
+  // Continuation policy (see plan.h). Live: a request that extends the whole
+  // recorded session starts right after it, from the state the session already
+  // holds, with no checkpoint restore and no alignment hold-back (the recorded
+  // session's end is exactly where the live state stands). Every other request
+  // follows the checkpoint rule below, in both modes. A model without recurrent
+  // state keeps one behaviour: the live state is the KV cache, whose reuse
+  // length is already `common`.
+  const bool live_continue =
+      !repro_continue_replay() && model_has_recurrent_state(m) &&
+      start_pos == 0 && common > 0 && common == session.filled_tokens.size() &&
+      prompt.size() > common;
+  uint64_t prefix_len =
+      live_continue ? common
+                    : accepted_reuse_len(m, session, prompt.size(), common);
 
   // Section 11: both memories of a model with recurrent state restart from one
   // position. R (above) is the most the KV cache can keep; the state can only
@@ -7072,7 +7104,10 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                : kDefaultPrefillChunk;
     const bool continues_live =
         prefix_len == session_len && session_len % chunk == 0;
-    if (!continues_live) {
+    if (live_continue) {
+      // Continue the whole recorded session from the live state: it is already
+      // at the end of the session, so there is nothing to restore.
+    } else if (!continues_live) {
       // The highest checkpoint the existing rule accepts as a reuse length.
       uint64_t pick_pos = 0;
       uint64_t bound = prefix_len;
