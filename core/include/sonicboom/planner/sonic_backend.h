@@ -71,6 +71,12 @@ public:
   // per-KV-layer cache and the per-sequence recurrent state are shared.
   void share_caches(const SonicBackend& other);
 
+  // The recurrent-block state set this backend updates (indexed the way a
+  // gdn_scan node's `state` attribute numbers them); null for a graph with no
+  // scan. Read-only seam for diagnostics that compare a step's committed state
+  // across backends.
+  const std::shared_ptr<StateSet>& states() const noexcept { return states_; }
+
 private:
   // One KV layer's persistent decode cache (K is RoPE'd + per-head-normed then
   // fp16-rounded; V is per-head-normed then fp16-rounded — the llama.cpp

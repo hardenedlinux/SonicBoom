@@ -317,6 +317,12 @@ public:
   }
   bool has_caches() const noexcept { return bool(caches_); }
 
+  // The recurrent state set this backend updates, the device twin of
+  // SonicBackend::states.
+  const std::shared_ptr<StateSetDev>& states() const noexcept {
+    return states_;
+  }
+
   // The identity of the cache set this backend is bound to (see
   // KvCacheSession::cache_id). Runtime registries and capture checks compare
   // this value, never the caches pointer.
