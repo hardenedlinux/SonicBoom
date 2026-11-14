@@ -39,13 +39,54 @@
 (define SB_ERR_PARSE 1)
 (define SB_ERR_WEIGHT 2)
 (define SB_ERR_COMPILE 3)
+;; The status of a parameter-binding failure.
+;;
+;; The value is 4, one of the sb_status codes of the C ABI; sb-status->message
+;; renders it as "binding".
+;;
+;; Example:
+;;   (use-modules (sonicboom ffi))
+;;   (sb-status->message SB_ERR_BINDING)
+;;   => "binding"
+;; PyTorch: none
 (define SB_ERR_BINDING 4)
 (define SB_ERR_RUNTIME 5)
+;; The status of an internal failure.
+;;
+;; The value is 6, one of the sb_status codes of the C ABI; sb-status->message
+;; renders it as "internal".
+;;
+;; Example:
+;;   (use-modules (sonicboom ffi))
+;;   (sb-status->message SB_ERR_INTERNAL)
+;;   => "internal"
+;; PyTorch: none
 (define SB_ERR_INTERNAL 6)
 (define SB_ERR_UNSUPPORTED 7)
+;; The status of a call that was cancelled.
+;;
+;; The value is 8, one of the sb_status codes of the C ABI; sb-status->message
+;; renders it as "cancelled".
+;;
+;; Example:
+;;   (use-modules (sonicboom ffi))
+;;   (sb-status->message SB_ERR_CANCELLED)
+;;   => "cancelled"
+;; PyTorch: none
 (define SB_ERR_CANCELLED 8)
 
-(define (sb-status-ok? status) (= status SB_OK))
+(define (sb-status-ok? status)
+  "Whether a C ABI status code is SB_OK.
+
+Args:
+  status: a status code.
+Returns: #t for SB_OK (0), #f otherwise.
+Example:
+  (use-modules (sonicboom ffi))
+  (sb-status-ok? 0)
+  => #t
+PyTorch: none"
+  (= status SB_OK))
 
 (define *status-names*
   `((,SB_OK . "ok") (,SB_ERR_PARSE . "parse") (,SB_ERR_WEIGHT . "weight")
@@ -54,6 +95,19 @@
     (,SB_ERR_UNSUPPORTED . "unsupported") (,SB_ERR_CANCELLED . "cancelled")))
 
 (define (sb-status->message status)
+  "The name of a C ABI status code.
+
+The names are ok, parse, weight, compile, binding, runtime, internal,
+unsupported and cancelled.
+
+Args:
+  status: a status code.
+Returns: the name as a string, or \"unknown\" for a code outside the set.
+Example:
+  (use-modules (sonicboom ffi))
+  (sb-status->message SB_ERR_CANCELLED)
+  => \"cancelled\"
+PyTorch: none"
   (or (assq-ref *status-names* status) "unknown"))
 
 (define %null %null-pointer)
@@ -67,15 +121,40 @@
 (define %lib-error (make-parameter #f))
 
 (define (library-load-error)
-  "The dynamic-linker/exception text from the failed load of
-libsonicboom.so, or #f if no load has been attempted or it succeeded."
+  "Why the last attempt to load libsonicboom.so failed.
+
+The text is the one from the dynamic linker, rendered by exception-text; it is
+kept after a failed load so a caller can report it instead of just saying the
+library is unavailable.
+
+Args:
+  none.
+Returns: a string, or #f when no load has been attempted or the last one
+  succeeded.
+Example:
+  (use-modules (sonicboom ffi))
+  (begin (libsonicboom-available?) (library-load-error))
+  => #f
+PyTorch: none"
   (%lib-error))
 
 (define (exception-text key args)
-  "A one-line, human-readable rendering of a caught exception from its
-`catch` key and args (the exception object itself is not needed). This is
-what the dynamic loader's failure looks like: a misc-error whose message is
-the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
+  "Render a caught exception as one line of text.
+
+The exception object itself is not needed: KEY and ARGS are what a catch
+handler receives. A system-error is rendered from its errno and message; a
+misc-error from its message, format string and irritants; anything else as the
+key followed by the arguments.
+
+Args:
+  key: the catch key.
+  args: the catch arguments.
+Returns: a string.
+Example:
+  (use-modules (sonicboom ffi))
+  (exception-text 'system-error '(2 \"No such file\" (2 . \"open\")))
+  => \"No such file (errno 2)\"
+PyTorch: none"
   (cond
     ((eq? key 'system-error)
      (format #f "~a (errno ~a)" (cadr args) (car args)))
@@ -91,6 +170,20 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
     (else (format #f "~a: ~s" key args))))
 
 (define (libsonicboom-available?)
+  "Whether libsonicboom.so can be loaded.
+
+The library is loaded on the first call and the result is cached, so later
+calls do not go to the dynamic linker again. A missing library is not an
+error here; library-load-error tells why it was missing.
+
+Args:
+  none.
+Returns: #t when the library is loaded, #f otherwise.
+Example:
+  (use-modules (sonicboom ffi))
+  (libsonicboom-available?)
+  => #t
+PyTorch: none"
   (unless (%lib)
     (lock-mutex %lib-mutex)
     (unless (%lib)
@@ -304,15 +397,68 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
         (%procs table)
         table)))
 
-(define (proc name) (assq-ref (ensure-procs) name))
+(define (proc name)
+  "The foreign procedure registered under NAME.
+
+The procedure table is resolved from libsonicboom.so on first use and then
+cached; NAME is the C function name as a symbol, for example 'sb_build_info.
+This is plumbing for the modules that call the C ABI directly.
+
+Args:
+  name: the C function name as a symbol.
+Returns: a foreign procedure, or #f when the table has no such entry.
+Example:
+  (use-modules (sonicboom ffi))
+  (procedure? (proc 'sb_build_info))
+  => #t
+PyTorch: none"
+  (assq-ref (ensure-procs) name))
 
 ;;; --- pointer helpers --------------------------------------------------------
 
 ;; A "slot" is a zeroed bytevector of one machine pointer, used as an out-param
 ;; (T**). Read it back with `slot-ref`.
-(define (make-slot) (make-bytevector (sizeof '*) 0))
-(define (slot-ptr slot) (bytevector->pointer slot))
+(define (make-slot)
+  "A fresh out-parameter slot.
+
+A slot is a zeroed bytevector holding one machine pointer. It is passed by its
+address to C functions that return a pointer through a T** out-parameter, and
+slot-ref reads the pointer back.
+
+Args:
+  none.
+Returns: a bytevector.
+Example:
+  (use-modules (sonicboom ffi) (rnrs bytevectors))
+  (bytevector? (make-slot))
+  => #t
+PyTorch: none"
+  (make-bytevector (sizeof '*) 0))
+(define (slot-ptr slot)
+  "The address of SLOT, to pass to a C ABI call.
+
+Args:
+  slot: a slot.
+Returns: a pointer.
+Example:
+  (use-modules (sonicboom ffi) (system foreign))
+  (pointer? (slot-ptr (make-slot)))
+  => #t
+PyTorch: none"
+  (bytevector->pointer slot))
 (define (slot-ref slot)
+  "The pointer stored in SLOT.
+
+A slot that no call has filled still holds the null pointer.
+
+Args:
+  slot: a slot.
+Returns: a pointer.
+Example:
+  (use-modules (sonicboom ffi) (system foreign))
+  (null-pointer? (slot-ref (make-slot)))
+  => #t
+PyTorch: none"
   (dereference-pointer (slot-ptr slot)))
 (define (slot-null! slot)
   (bytevector-fill! slot 0))
@@ -320,8 +466,20 @@ the procedure name (\"dlopen\") and whose irritants carry the dlerror text."
 ;;; --- error capture ----------------------------------------------------------
 
 (define (capture-error err-slot)
-  "Return the message string of the sb_error held in ERR-SLOT, then free it and
-NULL the slot."
+  "Take the message out of an error slot, then free the error.
+
+When the slot holds an error object its message is returned, the object is
+freed and the slot is set to the null pointer. A slot without an error gives
+the empty string.
+
+Args:
+  err-slot: the slot that received the call's error object.
+Returns: a string.
+Example:
+  (use-modules (sonicboom ffi))
+  (capture-error (make-slot))
+  => \"\"
+PyTorch: none"
   (let* ((p (slot-ref err-slot))
          (msg (if (null-pointer? p)
                   ""
@@ -353,9 +511,23 @@ NULL the slot."
     (else 'none)))
 
 (define (sb-check! status err-slot what)
-  "If STATUS is not SB_OK, raise a &sonicboom-error built from STATUS and the
-sb_error in ERR-SLOT (which is freed either way), with WHAT prefixed to the
-message. This is the one place a C ABI failure becomes a Guile exception."
+  "Raise a Guile exception when a C ABI call failed.
+
+When STATUS is SB_OK the call returns quietly. Otherwise a &sonicboom-error is
+raised carrying STATUS, a kind and a message; the message is the error text
+from ERR-SLOT, or the status name when the C side left no error object, and
+WHAT is prefixed to it. The error object is freed either way.
+
+Args:
+  status: the status a C ABI call returned.
+  err-slot: the slot that received the call's error object.
+  what: a string prefixed to the message, or #f.
+Returns: unspecified when the status is SB_OK.
+Example:
+  (use-modules (sonicboom ffi))
+  (begin (sb-check! 0 (make-slot) \"demo\") #t)
+  => #t
+PyTorch: none"
   (unless (sb-status-ok? status)
     (let* ((code (error-kind-code err-slot))
            (msg (capture-error err-slot))
@@ -371,11 +543,11 @@ message. This is the one place a C ABI failure becomes a Guile exception."
 
 ;;; The C ABI reports how libsonicboom.so was configured as a JSON object (see
 ;;; sb_build_info in capi.h). It is JSON rather than a struct so the field set
-;;; can grow without breaking a caller; here it is decoded once and the string
+;;; can grow without breaking a caller; here it is decoded and the string
 ;;; keys are turned into symbols, so a caller writes
 ;;;
-;;;   (assq-ref (build-info) 'git-commit)
-;;;   (assq-ref (assq-ref (build-info) 'cuda) 'archs)   ; => ("86")
+;;;   (assq-ref (build-info) 'git_commit)
+;;;   (assq-ref (assq-ref (build-info) 'cuda) 'archs)   ; on a CUDA build
 ;;;
 ;;; Nested objects (cuda, llvm) become alists too; arrays become lists.
 (define (json-key->symbol key) (string->symbol key))
@@ -390,9 +562,22 @@ message. This is the one place a C ABI failure becomes a Guile exception."
         (else node)))
 
 (define (build-info)
-  "How the loaded libsonicboom.so was built, as a symbol-keyed alist: git
-commit, build type, CUDA (enabled/archs/toolkit), LLVM (version/major/origin),
-and target platform. Signals an error if the library cannot be loaded."
+  "How the loaded libsonicboom.so was built.
+
+The C ABI reports the configuration as JSON; here it is decoded, with the
+string keys turned into symbols and nested objects turned into alists. The keys
+are platform, llvm, cuda, build_type, git_tag and git_commit; llvm and cuda are
+alists and their arch lists are lists. The library is loaded if it has not been
+yet.
+
+Args:
+  none.
+Returns: a symbol-keyed alist.
+Example:
+  (use-modules (sonicboom ffi))
+  (string? (assq-ref (build-info) 'platform))
+  => #t
+PyTorch: none"
   (normalize-json
    (with-input-from-string
        (pointer->string ((proc 'sb_build_info)))
@@ -401,10 +586,24 @@ and target platform. Signals an error if the library cannot be loaded."
 ;;; --- high-level execution ---------------------------------------------------
 
 (define (run-s-expr text input-bv)
-  "Compile the S-Expr v0.1 graph TEXT and run it once with the little-endian
-input bytes INPUT-BV. Returns two values on success: the output bytevector and
-#f. On failure returns #f and an error-message string. Ownership of the
-document/executable/error handles is always released."
+  "Compile an S-Expr v0.1 graph and run it once.
+
+The graph text is compiled and executed with INPUT-BV as the little-endian
+input bytes. The intermediate document and executable are always released,
+whether the run succeeds or not.
+
+Args:
+  text: the graph, in S-Expr v0.1 form.
+  input-bv: the input bytes.
+Returns: two values. On success the output bytevector and #f; on failure #f
+  and an error-message string.
+Example:
+  (use-modules (sonicboom ffi) (rnrs bytevectors))
+  (call-with-values
+      (lambda () (run-s-expr \"not-a-graph\" (make-bytevector 0)))
+    (lambda (output error) (list output (string? error))))
+  => (#f #t)
+PyTorch: none"
   (ensure-lib)
   (let* ((doc-slot (make-slot))
          (exe-slot (make-slot))
