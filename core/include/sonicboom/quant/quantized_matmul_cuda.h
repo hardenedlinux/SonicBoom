@@ -138,6 +138,16 @@ bool matmul_f32_device_weight(const QuantizedTensor& W, const void* d_w,
                               std::span<const float> X, std::span<float> Y,
                               uint64_t n);
 
+// The same two against pooled weight bytes with the activation also already on
+// the device: identical kernels and arguments, no copy in either direction and
+// no host synchronisation. The caller owns x/Y and keeps them resident across
+// kernels; the kernels run on the current stream (cuda_stream.h). Failure
+// semantics are those of the host-span forms.
+bool matvec_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
+                                  const float* x, float* y);
+bool matmul_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
+                                  const float* X, float* Y, int n);
+
 // Loader hook for the same cache: record that `dptr` already holds W's packed
 // bytes, so later calls skip the upload. The caller owns the allocation, which
 // must stay valid until unregister_weight_device() or clear_cache(), and must

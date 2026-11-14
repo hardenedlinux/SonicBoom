@@ -3710,6 +3710,16 @@ bool matvec_f32_device_weight(const QuantizedTensor& W, const void* d_w,
                     cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
+// Both operands device-resident: the gemv kernel exactly as above, with no
+// staging copies and no synchronisation. Used by the device-side mixture of
+// experts, which keeps the activations in place across the whole node.
+bool matvec_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
+                                  const float* x, float* y) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2 || !d_w || !x || !y) return false;
+  return matvec_f32_weight_dev(W, d_w, x, y);
+}
+
 // Batched (prefill) matmul: Y = W @ X for X [cols, n] (n innermost) and Y
 // [rows, n] (n innermost). The q8_1 path transposes X to [n, cols], quantizes
 // each position's activation to q8_1 (contiguous blocks), then runs one batched
@@ -5520,6 +5530,16 @@ bool matmul_f32_device_weight(const QuantizedTensor& W, const void* d_w,
     return false;
   return cudaMemcpy(Y.data(), d_Y, rows * n * sizeof(float),
                     cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+// Both operands device-resident: the batched kernel exactly as above, with no
+// staging copies and no synchronisation.
+bool matmul_f32_dev_device_weight(const QuantizedTensor& W, const void* d_w,
+                                  const float* X, float* Y, int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2 || !d_w || !X || !Y || n <= 0)
+    return false;
+  return matmul_f32_weight_dev(W, d_w, X, Y, n);
 }
 
 // Public host-span batched matmul: uploads X, runs the device-resident matmul,
