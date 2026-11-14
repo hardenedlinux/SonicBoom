@@ -36,6 +36,15 @@
 
 ;;; --- the param record --------------------------------------------------------
 
+;; The record of a native trainable parameter.
+;;
+;; A parameter holds its values, its gradient and AdamW's two moment buffers in
+;; one sb_param handle (see (sonicboom param)). The handle is owned by this
+;; record: `free-param!` releases it explicitly, and the guardian used by
+;; `reap-params!` releases it if the record is collected first.
+;; PyTorch: none
+;; Note: The nearest PyTorch concept is a parameter together with its optimizer
+;; state, which PyTorch keeps in separate objects.
 (define-record-type <param>
   (%make-param dims numel ptr freed)
   param?
@@ -47,8 +56,20 @@
   (freed param-freed? set-param-freed!))
 
 (define (free-param! p)
-  "Release P's native handle. Idempotent: freeing an already-freed (or
-guardian-reaped) parameter is a no-op, never an error."
+  "Release a parameter's native handle.
+
+Idempotent: freeing an already-freed (or guardian-reaped) parameter is a no-op,
+never an error.
+Args:
+  p: a parameter.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom param))
+  (let ((p (make-param '(2)))) (free-param! p) (param-freed? p))
+  => #t
+PyTorch: none
+Note: PyTorch parameters are released by garbage collection; there is no
+explicit free."
   (unless (param-freed? p)
     (set-param-freed! p #t)             ; claim it before touching the pointer
     (let ((ptr (param-ptr p)))
@@ -61,8 +82,15 @@ guardian-reaped) parameter is a no-op, never an error."
 (define %param-guardian (make-guardian))
 
 (define (reap-params!)
-  "Release every parameter whose record has been collected without an explicit
-`free-param!`. Returns the number of handles released."
+  "Release every parameter collected without an explicit free-param!.
+
+Returns: the number of handles released.
+Example:
+  (use-modules (sonicboom param))
+  (reap-params!)
+PyTorch: none
+Note: The count is zero in a fresh process; the example shows the call, and a
+collection is what makes it return a positive number."
   (let loop ((n 0))
     (let ((dead (%param-guardian)))
       (if (or (not dead) (null? dead))
@@ -91,10 +119,22 @@ guardian-reaped) parameter is a no-op, never an error."
 ;;; --- construction ------------------------------------------------------------
 
 (define* (make-param dims #:key init)
-  "Create a float32 parameter of shape DIMS (a non-empty list of positive
-integers, row-major) holding INIT's little-endian bytes, or zeros when INIT is
-#f. The gradient and both AdamW moment buffers start at zero. Returns a
-<param>; release it with `free-param!`."
+  "Create a native float32 parameter of a given shape.
+
+The gradient and both AdamW moment buffers start at zero. The handle is owned by
+the returned record; release it with free-param!.
+Args:
+  dims: a non-empty list of positive integers, row-major.
+  init: the initial values as a little-endian float32 bytevector of numel*4
+        bytes, or #f for zeros.
+Returns: a <param>.
+Example:
+  (use-modules (sonicboom param))
+  (list (param? (make-param '(2 3))) (param-numel (make-param '(2 3))))
+  => (#t 6)
+PyTorch: torch.nn.Parameter
+Note: The parameter lives in native memory and its optimizer state is part of
+the same handle; it is not a Scheme tensor."
   (unless (and (pair? dims)
                (every (lambda (d) (and (exact-integer? d) (>= d 1))) dims))
     (raise-sonicboom-error
@@ -129,18 +169,50 @@ integers, row-major) holding INIT's little-endian bytes, or zeros when INIT is
 ;;; --- inspection --------------------------------------------------------------
 
 (define (param-on-device? p)
-  "Whether P's buffers are device-resident (a CUDA device was present at
-creation), so each update is one fused kernel launch."
+  "Whether a parameter's buffers are device-resident.
+
+A CUDA device present at creation keeps the four buffers in device memory, so
+each update is one fused kernel launch; otherwise the host reference runs.
+Args:
+  p: a parameter.
+Returns: #t for device-resident buffers.
+Example:
+  (use-modules (sonicboom param))
+  (param-on-device? (make-param '(2)))
+PyTorch: torch.Tensor.is_cuda
+Note: The expected value depends on the build and the machine, so the example
+does not compare it."
   (live-ptr p "param-on-device?")
   (not (zero? ((proc 'sb_param_on_device) (param-ptr p)))))
 
 (define (param-step-count p)
-  "The number of AdamW updates applied so far (0 before the first step)."
+  "The number of AdamW updates applied to a parameter so far.
+
+Args:
+  p: a parameter.
+Returns: the step count; 0 before the first update.
+Example:
+  (use-modules (sonicboom param))
+  (param-step-count (make-param '(2)))
+  => 0
+PyTorch: none
+Note: PyTorch keeps the step count inside each optimizer's per-parameter state
+rather than on the parameter."
   (live-ptr p "param-step-count")
   ((proc 'sb_param_step_count) (param-ptr p)))
 
 (define (param-read p)
-  "Copy P's current values out as a little-endian float32 bytevector."
+  "Copy a parameter's current values out.
+
+Args:
+  p: a parameter.
+Returns: a little-endian float32 bytevector of numel*4 bytes.
+Example:
+  (use-modules (sonicboom param))
+  (bytevector-length (param-read (make-param '(2 3))))
+  => 24
+PyTorch: none
+Note: In PyTorch the values are read from the parameter tensor itself."
   (let* ((ptr (live-ptr p "param-read"))
          (bytes (* 4 (param-numel p)))
          (out (make-bytevector bytes 0))
@@ -154,7 +226,20 @@ creation), so each update is one fused kernel launch."
 ;;; --- updates -----------------------------------------------------------------
 
 (define (param-zero-grad! p)
-  "Zero P's gradient."
+  "Zero a parameter's gradient.
+
+Args:
+  p: a parameter.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom param))
+  (let ((p (make-param '(2))))
+    (param-zero-grad! p)
+    (param-step-count p))
+  => 0
+PyTorch: torch.optim.Optimizer.zero_grad
+Note: It zeros one parameter, whereas the PyTorch method walks the optimizer's
+parameter groups."
   (let ((err-slot (make-slot)))
     (sb-check! ((proc 'sb_param_zero_grad) (live-ptr p "param-zero-grad!")
                 (slot-ptr err-slot))
@@ -162,8 +247,20 @@ creation), so each update is one fused kernel launch."
     *unspecified*))
 
 (define (param-set-grad! p grad)
-  "Replace P's gradient with GRAD, a little-endian float32 bytevector of
-numel*4 bytes."
+  "Replace a parameter's gradient with a bytevector.
+
+Args:
+  p: a parameter.
+  grad: a little-endian float32 bytevector of numel*4 bytes.
+Returns: unspecified.
+Example:
+  (use-modules (sonicboom param) (rnrs bytevectors))
+  (let ((p (make-param '(2))))
+    (param-set-grad! p (make-bytevector 8 0))
+    (param-step-count p))
+  => 0
+PyTorch: none
+Note: In PyTorch gradients are produced by backward() and stored in .grad."
   (let ((ptr (live-ptr p "param-set-grad!")))
     (unless (bytevector? grad)
       (raise-sonicboom-error SB_ERR_BINDING 'binding
@@ -180,10 +277,25 @@ numel*4 bytes."
       *unspecified*)))
 
 (define (param-step! p lr beta1 beta2 eps weight-decay)
-  "Apply one AdamW update to P and return the new step count. LR is either a
-real number or a one-element float32 tensor handle (as returned by
-`tensor-from-list`); the handle form reads the rate on the host while P's own
-buffers stay device-resident, which is how a traced schedule carries the rate."
+  "Apply one AdamW update to a parameter.
+
+Args:
+  p: a parameter.
+  lr: a real learning rate, or a one-element float32 tensor handle read on the host.
+  beta1: the first-moment decay.
+  beta2: the second-moment decay.
+  eps: the denominator epsilon.
+  weight-decay: the decoupled weight decay.
+Returns: the new step count.
+Example:
+  (use-modules (sonicboom param))
+  (let ((p (make-param '(2))))
+    (param-step! p 0.1 0.9 0.999 1e-8 0.01))
+  => 1
+PyTorch: torch.optim.AdamW.step
+Note: One call is one update of one parameter, not of a parameter group. The
+tensor-handle form of lr lets a traced learning-rate schedule carry the rate
+while the parameter's own buffers stay device-resident."
   (let ((ptr (live-ptr p "param-step!"))
         (err-slot (make-slot)))
     (let ((st
