@@ -451,6 +451,17 @@ std::optional<TileConfig> AutotuneCache::lookup(std::string_view op,
 
 bool AutotuneCache::store(std::string_view op, std::string_view shape_class,
                           const TileConfig& cfg, std::string_view name) {
+  // Every record here is a timed pick among candidates that produce the same
+  // bytes, so a busy machine can only spoil its quality, never a result. The
+  // record then stays in this process (the runner memoizes it); a later idle
+  // process measures and stores again.
+  std::string busy_why;
+  if (!tune::machine_quiet(&busy_why)) {
+    tune::trace_deferred("autotune/" + sm_file_name(),
+                         std::string(op) + "|" + std::string(shape_class),
+                         busy_why, __builtin_FUNCTION());
+    return true;
+  }
   const int fd = open_cache_file();
   if (fd < 0) return false;
   bool ok = false;

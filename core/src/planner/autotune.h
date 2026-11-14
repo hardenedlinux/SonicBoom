@@ -219,6 +219,17 @@ std::vector<TableFile> table_files();
 // shared machine, not a correctness rule.
 bool machine_quiet(std::string *why = nullptr);
 
+// Test-only: force machine_quiet()'s verdict (-1 resumes sampling, 0 forces
+// busy, 1 forces quiet). The private quiet-machine suite drives both sides of
+// the store rule with it; nothing in the runtime calls this.
+void set_quiet_override_for_test(int state);
+
+// Trace a timing record that was measured while the machine was busy and so
+// stayed in this process (event "store-deferred", with the reason last).
+void trace_deferred(std::string_view op, std::string_view key,
+                    std::string_view why,
+                    const char *caller = __builtin_FUNCTION());
+
 #ifdef SONICBOOM_USE_CUDA
 // Median of `reps` individually timed launches after `warmups` untimed ones.
 // The events are recorded on `stream`, which must be the stream the launch

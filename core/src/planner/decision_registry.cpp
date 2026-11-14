@@ -347,6 +347,10 @@ constexpr KnobRow kKnobRows[] = {
      "JIT candidate tuner; off = static geometry", "bit-identical gate", 0, 0},
     {"autotune.budget-ms", "SONICBOOM_AUTOTUNE_BUDGET_MS", "10000", "",
      "process-wide cold-tuning budget; <=0 unlimited", "none (timing only)", 0, 0},
+    {"autotune.quiet-check", "SONICBOOM_TUNE_QUIET", "on", "on|off",
+     "timing records measured while the machine is busy stay in the process "
+     "(/proc/stat CPU delta; 64 MiB device-copy probe against probe.json)",
+     "none (timing only: a deferred record never changes a result)", 0, 0},
     {"cuda-graph.decode", "SONICBOOM_CUDA_GRAPHS", "on", "on|off",
      "capture/replay one decode step", "bit-identical to the launch path", 0, 0},
     {"cuda-graph.prefill", "SONICBOOM_CUDA_GRAPHS", "on", "on|off",

@@ -119,6 +119,19 @@ std::vector<TuneKeyPattern> &key_patterns() {
   return v;
 }
 
+// Whether the op's registered TuneKeyPattern marks its table as
+// numerics-neutral (its choices produce the same bytes). An op with no
+// registered pattern is not neutral for this purpose: an unknown table keeps
+// its write path, as it did before the quiet-machine rule.
+bool registered_neutral(std::string_view op) {
+  std::string want(op);
+  want += ".json";
+  std::lock_guard<std::mutex> lk(key_pattern_mutex());
+  for (const TuneKeyPattern &p : key_patterns())
+    if (p.file == want) return !p.numerics;
+  return false;
+}
+
 long long fnv32(std::string_view s) {
   uint64_t h = 0xcbf29ce484222325ull;
   for (unsigned char c : s) {
@@ -198,10 +211,10 @@ std::mutex g_trace_mutex;
 
 void trace_line(std::string_view event, std::string_view op,
                 std::string_view key, std::string_view fp,
-                const char *caller) {
+                const char *caller, std::string_view why = {}) {
   if (!trace_line_enabled()) return;
   std::string line;
-  line.reserve(160 + key.size());
+  line.reserve(160 + key.size() + why.size());
   line += "[tune] ";
   line += event;
   line += " file=";
@@ -218,6 +231,10 @@ void trace_line(std::string_view event, std::string_view op,
   line += exe_name();
   line += " caller=";
   line += caller != nullptr ? caller : "?";
+  if (!why.empty()) {
+    line += " why=";
+    line += why;
+  }
   line += '\n';
   std::lock_guard<std::mutex> lk(g_trace_mutex);
   std::fwrite(line.data(), 1, line.size(), stderr);
@@ -587,6 +604,11 @@ void trace_event(std::string_view event, std::string_view op,
   trace_line(event, op, key, fp, caller);
 }
 
+void trace_deferred(std::string_view op, std::string_view key,
+                    std::string_view why, const char *caller) {
+  trace_line("store-deferred", op, key, "-", caller, why);
+}
+
 // --- machine quiet check ----------------------------------------------------
 //
 // A tune record is a measurement, and it is written once: every later process
@@ -777,8 +799,19 @@ bool gpu_busy(std::string *) { return false; }
 
 } // namespace
 
+static std::atomic<int> g_quiet_override{-1};
+
+void set_quiet_override_for_test(int state) {
+  g_quiet_override.store(state, std::memory_order_relaxed);
+}
+
 bool machine_quiet(std::string *why) {
   if (quiet_disabled()) return true;
+  const int override_state = g_quiet_override.load(std::memory_order_relaxed);
+  if (override_state >= 0) {
+    if (override_state == 0 && why != nullptr) *why = "test override";
+    return override_state != 0;
+  }
   // The verdict is sampled at most every two seconds; a measurement sequence
   // runs many stores in a row and they should agree on the machine's state.
   static std::mutex mutex;
@@ -906,6 +939,17 @@ void store(std::string_view op, std::string_view key,
   // carries. A table without either is numerics-neutral by key.
   const long long new_fp = effective_fp(values, fp);
   const std::string fp_s = fp_text(new_fp);
+  // A timing record made while the machine is busy stays in this process. The
+  // table's registered TuneKeyPattern says whether its pick is numerics-neutral
+  // (the candidates produce the same bytes: MMQ tiles, gemv width, the
+  // spec-length curve), and only a neutral one may be deferred; a deferred
+  // record costs later processes a retune, never a different result.
+  // Numerics-affecting records have their own epoch rules and are never
+  // deferred: refusing an undecided choice would leave the model unbuilt.
+  bool deferred = false;
+  std::string busy_why;
+  if (registered_neutral(op_s) && !machine_quiet(&busy_why))
+    deferred = true;
   std::lock_guard<std::mutex> lk(g_mutex);
   // After the model-load epoch closed, a numerics-affecting table is read-only:
   // its choices were resolved at load and a write here means something missed.
@@ -941,6 +985,16 @@ void store(std::string_view op, std::string_view key,
       return;
     }
     replaced = true;
+  }
+  if (deferred) {
+    // In-memory only: this process uses the pick it just measured, and the
+    // next process measures again instead of inheriting a busy-machine one.
+    entries[key_s] = values;
+    g_cache[op_s] = std::move(entries);
+    g_loaded[op_s] = true;
+    trace_line("store-deferred", op_s, key_s, fp_s, caller, busy_why);
+    record_pick(op_s, key_s, values, planner::decisions::Source::Measured);
+    return;
   }
   entries[key_s] = values;
   entries["__format__"] = {{"v", kJsonFormatVersion}};
