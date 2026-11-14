@@ -42,6 +42,7 @@
 #include "decision_registry.h"
 #include "device_allocator.h"
 #include "device_pool.h"
+#include "expert_pool.h"
 #include "glue_jit.h"
 
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
@@ -2876,8 +2877,24 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
                                            ups.data(), ups.size()),
                                        std::span<const quant::QuantizedTensor>(
                                            downs.data(), downs.size())};
+      // The experts live in the bounded device pool, not the upload-once
+      // cache: select() brings this node's experts resident (the ids above are
+      // this node's one synchronous read) and records each one's slot for the
+      // kernel.
+      auto pool = expert_pool_for(model_->weights);
+      if (!pool) return std::unexpected(fail(pool.error()));
+      const auto selected = (*pool)->select(weight_layer, ids);
+      if (!selected) return std::unexpected(fail(selected.error()));
+      const nn::cuda::MoeExpertPool pooled{
+          (*pool)->data(ExpertPool::kGate), (*pool)->data(ExpertPool::kUp),
+          (*pool)->data(ExpertPool::kDown),
+          (*pool)->slot_bytes(ExpertPool::kGate),
+          (*pool)->slot_bytes(ExpertPool::kUp),
+          (*pool)->slot_bytes(ExpertPool::kDown),
+          static_cast<const int32_t*>((*pool)->selection())};
       std::vector<float> y(rows * dim, 0.0f);
-      ok = nn::cuda::moe_experts(x, ids, wts, views, act, y, rows, prefill);
+      ok = nn::cuda::moe_experts(x, ids, wts, views, act, y, rows, prefill,
+                                 &pooled);
       if (ok)
         ok = device::upload(y.data(), out_handle,
                             rows * dim * sizeof(float));

@@ -124,6 +124,20 @@ bool gather_f32(const QuantizedTensor& W, int64_t token, std::span<float> out);
 bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y);
 bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n);
 
+// The same host-span matvec / batched matmul against weight bytes that are
+// already on the device at `d_w` (the expert pool): identical kernels and
+// arithmetic, but W's bytes are never uploaded and its address-keyed cache is
+// not consulted. `W` supplies the type and shape only; its host bytes may be
+// empty or change afterwards. `d_w` must hold W.byte_size() packed bytes
+// followed by the kernels' 256-byte read-ahead tail, which the caller keeps
+// zeroed (see register_weight_device). Returns false, writing nothing to y/Y,
+// on the same conditions as the uploading forms.
+bool matvec_f32_device_weight(const QuantizedTensor& W, const void* d_w,
+                              std::span<const float> x, std::span<float> y);
+bool matmul_f32_device_weight(const QuantizedTensor& W, const void* d_w,
+                              std::span<const float> X, std::span<float> Y,
+                              uint64_t n);
+
 // Loader hook for the same cache: record that `dptr` already holds W's packed
 // bytes, so later calls skip the upload. The caller owns the allocation, which
 // must stay valid until unregister_weight_device() or clear_cache(), and must

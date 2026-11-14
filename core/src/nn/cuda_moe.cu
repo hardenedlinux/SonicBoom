@@ -20,6 +20,8 @@
 #include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include <cuda_runtime.h>
+
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -87,13 +89,21 @@ bool route_row(std::span<const float> x, const quant::QuantizedTensor* router,
   return true;
 }
 
+// A pooled matrix's address: the role's array plus the slot's stride. Only the
+// address differs from the uploading path.
+const void* pooled(const void* bytes, uint64_t stride, int32_t slot) {
+  return static_cast<const char*>(bytes) + uint64_t(slot) * stride;
+}
+
 // One expert's routed FFN for one row: gate and up through the decode gemv,
 // the activation, then down. `out` receives the expert's d values, unwritten
-// on failure.
+// on failure. With `pool` set the matrices come from the pool's slot `slot`;
+// the type and shape still come from the block's views.
 bool expert_row(std::span<const float> x, const MoeExpertWeights& experts,
                 uint64_t e, MoeActivation activation, std::span<float> out,
                 std::vector<float>& gate, std::vector<float>& up,
-                std::vector<float>& hidden) {
+                std::vector<float>& hidden, const MoeExpertPool* pool,
+                int32_t slot) {
   const quant::QuantizedTensor& gw = experts.gate[e];
   const quant::QuantizedTensor& uw = experts.up[e];
   const quant::QuantizedTensor& dw = experts.down[e];
@@ -103,13 +113,24 @@ bool expert_row(std::span<const float> x, const MoeExpertWeights& experts,
   gate.assign(ff, 0.0f);
   up.assign(ff, 0.0f);
   hidden.assign(ff, 0.0f);
-  if (!quant::cuda::matvec_f32(gw, x, gate)) return false;
-  if (!quant::cuda::matvec_f32(uw, x, up)) return false;
+  bool ok = false;
+  if (pool)
+    ok = quant::cuda::matvec_f32_device_weight(
+             gw, pooled(pool->gate_bytes, pool->gate_stride, slot), x, gate) &&
+         quant::cuda::matvec_f32_device_weight(
+             uw, pooled(pool->up_bytes, pool->up_stride, slot), x, up);
+  else
+    ok = quant::cuda::matvec_f32(gw, x, gate) &&
+         quant::cuda::matvec_f32(uw, x, up);
+  if (!ok) return false;
   const bool act_ok =
       activation == MoeActivation::Silu ? silu(gate, gate) : gelu_fp16(gate, gate);
   if (!act_ok) return false;
   for (uint64_t i = 0; i < ff; ++i) hidden[i] = gate[i] * up[i];
   std::span<float> down = out.first(dw.dims()[1]);
+  if (pool)
+    return quant::cuda::matvec_f32_device_weight(
+        dw, pooled(pool->down_bytes, pool->down_stride, slot), hidden, down);
   return quant::cuda::matvec_f32(dw, hidden, down);
 }
 
@@ -136,7 +157,8 @@ bool moe_route(std::span<const float> x, const quant::QuantizedTensor* router,
 bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
                  std::span<const float> weights,
                  const MoeExpertWeights& experts, MoeActivation activation,
-                 std::span<float> y, uint64_t rows, bool group_by_expert) {
+                 std::span<float> y, uint64_t rows, bool group_by_expert,
+                 const MoeExpertPool* pool) {
   if (rows == 0 || x.empty() || x.size() % rows != 0 ||
       ids.size() != weights.size() || ids.size() % rows != 0 ||
       experts.gate.size() != experts.up.size() ||
@@ -150,6 +172,18 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
     if (id < 0 || uint64_t(id) >= e_count) return false;
   if (k == 0) return true;
 
+  // The pool wrote one slot per id; read it once (the backend has already
+  // synchronised on the ids themselves).
+  std::vector<int32_t> slots;
+  if (pool) {
+    if (!pool->slots) return false;
+    slots.resize(ids.size());
+    if (cudaMemcpy(slots.data(), pool->slots,
+                   ids.size() * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+      return false;
+  }
+
   if (!group_by_expert) {
     // Decode / verify: one row at a time, each selected expert through the
     // decode gemv in the order the ids give them (ascending expert index).
@@ -158,8 +192,9 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
       std::span<float> yrow = y.subspan(r * d, d);
       for (uint64_t j = 0; j < k; ++j) {
         const uint64_t e = uint64_t(ids[r * k + j]);
+        const int32_t slot = pool ? slots[r * k + j] : 0;
         if (!expert_row(x.subspan(r * d, d), experts, e, activation, one, gate,
-                        up, hidden))
+                        up, hidden, pool, slot))
           return false;
         const float w = weights[r * k + j];
         for (uint64_t i = 0; i < d; ++i) yrow[i] += w * one[i];
@@ -176,11 +211,13 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
   for (uint64_t e = 0; e < e_count; ++e) {
     rows_of.clear();
     std::vector<float> w_row;  // this expert's weight for each gathered row
+    int32_t slot = 0;          // the pool slot of this expert
     for (uint64_t r = 0; r < rows; ++r) {
       for (uint64_t j = 0; j < k; ++j) {
         if (uint64_t(ids[r * k + j]) == e) {
           rows_of.push_back(r);
           w_row.push_back(weights[r * k + j]);
+          if (pool) slot = slots[r * k + j];
           break;
         }
       }
@@ -200,14 +237,31 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
     for (uint64_t c = 0; c < nnz; ++c)
       for (uint64_t i = 0; i < d; ++i) X[c * d + i] = x[rows_of[c] * d + i];
     std::vector<float> G(ff * nnz), U(ff * nnz), H(ff * nnz), D(d * nnz);
-    if (!quant::cuda::matmul_f32(gw, X, G, nnz)) return false;
-    if (!quant::cuda::matmul_f32(uw, X, U, nnz)) return false;
+    if (pool) {
+      if (!quant::cuda::matmul_f32_device_weight(
+              gw, pooled(pool->gate_bytes, pool->gate_stride, slot), X, G,
+              nnz))
+        return false;
+      if (!quant::cuda::matmul_f32_device_weight(
+              uw, pooled(pool->up_bytes, pool->up_stride, slot), X, U, nnz))
+        return false;
+    } else {
+      if (!quant::cuda::matmul_f32(gw, X, G, nnz)) return false;
+      if (!quant::cuda::matmul_f32(uw, X, U, nnz)) return false;
+    }
     const bool act_ok = activation == MoeActivation::Silu
                             ? silu(G, G)
                             : gelu_fp16(G, G);
     if (!act_ok) return false;
     for (uint64_t i = 0; i < ff * nnz; ++i) H[i] = G[i] * U[i];
-    if (!quant::cuda::matmul_f32(dw, H, D, nnz)) return false;
+    if (pool) {
+      if (!quant::cuda::matmul_f32_device_weight(
+              dw, pooled(pool->down_bytes, pool->down_stride, slot), H, D,
+              nnz))
+        return false;
+    } else if (!quant::cuda::matmul_f32(dw, H, D, nnz)) {
+      return false;
+    }
     for (uint64_t c = 0; c < nnz; ++c) {
       std::span<float> yrow = y.subspan(rows_of[c] * d, d);
       const float w = w_row[c];

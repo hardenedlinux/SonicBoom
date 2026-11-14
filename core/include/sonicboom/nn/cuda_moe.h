@@ -53,6 +53,23 @@ bool moe_route(std::span<const float> x, const quant::QuantizedTensor* router,
                uint32_t used, float weight_scale, std::span<int64_t> ids,
                std::span<float> weights, uint64_t rows);
 
+// A routed expert's matrices already resident on the device, in the planner's
+// bounded expert pool (design §9): one slot per (block, expert), slot s of role
+// r at role_bytes + s * role_stride. `slots` holds one int32 slot per
+// (row, selected expert) entry in `ids` order, as the pool wrote it. With the
+// pool null the kernels take the uploading path (each expert's device copy
+// cached on first use). Residency changes only where a matrix is found, never
+// the arithmetic.
+struct MoeExpertPool {
+  const void* gate_bytes = nullptr;
+  const void* up_bytes = nullptr;
+  const void* down_bytes = nullptr;
+  uint64_t gate_stride = 0;
+  uint64_t up_stride = 0;
+  uint64_t down_stride = 0;
+  const int32_t* slots = nullptr;
+};
+
 // y = sum over the rows' selected experts of w_e * down_e(act(gate_e x) * up_e x).
 // x is [rows, d], ids and weights are [rows, used], y is [rows, d]. `y` is
 // accumulated into, exactly as nn::moe_experts accumulates: the caller supplies
@@ -64,6 +81,7 @@ bool moe_route(std::span<const float> x, const quant::QuantizedTensor* router,
 bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
                  std::span<const float> weights,
                  const MoeExpertWeights& experts, MoeActivation activation,
-                 std::span<float> y, uint64_t rows, bool group_by_expert);
+                 std::span<float> y, uint64_t rows, bool group_by_expert,
+                 const MoeExpertPool* pool = nullptr);
 
 } // namespace sonicboom::nn::cuda

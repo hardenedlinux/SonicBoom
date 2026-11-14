@@ -3657,23 +3657,57 @@ bool matvec_f32(const QuantizedTensor& W, std::span<const float> x,
 // buffers and no host copy happens — the caller keeps the activation resident and
 // chains this back-to-back with other device kernels. W is uploaded+cached exactly
 // as in matvec_f32.
-bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
-  if (!available()) return false;
-  if (!W.valid() || W.dims().size() != 2) return false;
+namespace {
+
+// The gemv over a weight copy that is already on the device. Shared by the
+// uploading form (whose cache provides d_w) and the expert pool's slots.
+bool matvec_f32_weight_dev(const QuantizedTensor& W, const void* d_w,
+                           const float* x, float* y) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
-  if (!x || !y) return false;
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
   if (blocks_per_row == 0) return false;
-
-  const void* d_w = upload_weight(W);
-  if (!d_w) return false;
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   const int num_rows = int(rows);
   if (q8_1_enabled())
     return launch_gemv_q8_1(W.type(), wp, x, y, int(blocks_per_row), num_rows);
   launch_gemv(W.type(), wp, x, y, int(blocks_per_row), num_rows);
   return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool matvec_f32_dev(const QuantizedTensor& W, const float* x, float* y) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  if (!x || !y) return false;
+
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return matvec_f32_weight_dev(W, d_w, x, y);
+}
+
+// The expert pool's form: W's host bytes are never read, and no cache entry is
+// created or consulted.
+bool matvec_f32_device_weight(const QuantizedTensor& W, const void* d_w,
+                              std::span<const float> x, std::span<float> y) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2 || !d_w) return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (x.size() < cols || y.size() < rows) return false;
+
+  void* d_x = grow_scratch(g_dx, g_dx_bytes, cols * sizeof(float));
+  void* d_y = grow_scratch(g_dy, g_dy_bytes, rows * sizeof(float));
+  if (!d_x || !d_y) return false;
+  if (cudaMemcpy(d_x, x.data(), cols * sizeof(float),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  if (!matvec_f32_weight_dev(W, d_w, static_cast<const float*>(d_x),
+                             static_cast<float*>(d_y)))
+    return false;
+  return cudaMemcpy(y.data(), d_y, rows * sizeof(float),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 // Batched (prefill) matmul: Y = W @ X for X [cols, n] (n innermost) and Y
@@ -3892,8 +3926,12 @@ bool matmul_f16_lt_tail(const __half* wf, const __half* xf, float* y, int rows,
   return ok;
 }
 
-bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
-                           int n, bool force_blocked = false) {
+namespace {
+
+// The blocked fp16 GEMM over an existing device copy of W's packed bytes.
+bool matmul_f16_cublas_weight_dev(const QuantizedTensor& W, const void* d_w,
+                                  const float* X, float* Y, int n,
+                                  bool force_blocked) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
 
@@ -3901,7 +3939,7 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
   __half* wf = static_cast<__half*>(
       grow_scratch(g_wf16, g_wf16_bytes, rows * cols * sizeof(__half)));
   if (!wf) return false;
-  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
+  const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   if (!wp) return false;
   const int64_t numel = int64_t(rows * cols);
   const dim3 dgrid((numel + 255) / 256);
@@ -4019,6 +4057,15 @@ bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
                                                chunk_n);
   }
   return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool matmul_f16_cublas_dev(const QuantizedTensor& W, const float* X, float* Y,
+                           int n, bool force_blocked) {
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return matmul_f16_cublas_weight_dev(W, d_w, X, Y, n, force_blocked);
 }
 
 // The MMQ-supported quant formats, as the imported kernel's type enum, or
@@ -4696,17 +4743,18 @@ void warm_decode_family_group(const QuantizedTensor* const* weights, int count,
 // blocks contiguous), and the kernel writes dst [n, rows] — so no transpose on
 // either side (C.3a). The activation scale layout follows the weight type:
 // Q3_K/Q6_K/Q5_0/Q8_0 use float d4 scales, Q4_K/Q5_K use half2 ds4 scales.
-bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
-                    std::span<const float> bias, const float* add) {
+namespace {
+
+// The mmq launch over an existing device copy of W's packed bytes.
+bool matmul_mmq_weight_dev(const QuantizedTensor& W, const void* d_w,
+                           const float* X, float* Y, int n,
+                           std::span<const float> bias, const float* add) {
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
-  if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
   const int ic = int(cols), ir = int(rows);
   const std::optional<MmqUpType> type = mmq_up_type_of(W.type());
   if (!type) return false;
-
-  const uint8_t* wp = static_cast<const uint8_t*>(upload_weight(W));
-  if (!wp) return false;
+  const uint8_t* wp = static_cast<const uint8_t*>(d_w);
 
   // 1. Quantize X [n, cols] -> block_q8_1_mmq [K/128][n] (+ J_max tail guard).
   mmq::block_q8_1_mmq* y_q8 = static_cast<mmq::block_q8_1_mmq*>(
@@ -4738,6 +4786,18 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
   return mmq_up_matmul(
       wp, *type, reinterpret_cast<const int32_t*>(y_q8), Y, ir, ic, n,
       cur_stream(), cfg, pin.split_k, d_bias, add);
+}
+
+}  // namespace
+
+bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
+                    std::span<const float> bias, const float* add) {
+  const uint64_t cols = W.dims()[0];
+  if (cols % mmq::QK8_1_MMQ != 0) return false;  // kernel precondition
+  if (!mmq_up_type_of(W.type())) return false;
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return matmul_mmq_weight_dev(W, d_w, X, Y, n, bias, add);
 }
 
 // MMQ matmul consuming a *pre-quantized* block_q8_1_mmq activation (C.4): no
@@ -5354,11 +5414,13 @@ bool silu_mul_quantize_mmq_q8_1_dev(const float* gate, const float* up,
   return cudaGetLastError() == cudaSuccess;
 }
 
-bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
-  if (!available()) return false;
-  if (!W.valid() || W.dims().size() != 2) return false;
-  if (n <= 0 || !X || !Y) return false;
-  if (n == 1) return matvec_f32_dev(W, X, Y);
+namespace {
+
+// The batched matmul over a weight copy that is already on the device. Shared
+// by the uploading form (whose cache provides d_w) and the expert pool's slots.
+bool matmul_f32_weight_dev(const QuantizedTensor& W, const void* d_w,
+                           const float* X, float* Y, int n) {
+  if (n == 1) return matvec_f32_weight_dev(W, d_w, X, Y);
   const uint64_t cols = W.dims()[0];
   const uint64_t rows = W.dims()[1];
   const uint32_t blocks_per_row = uint32_t(cols / W.block_size());  // exact (valid())
@@ -5378,7 +5440,7 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // 0.5B's 896) stays on MMQ: zero_pad_planes covers its tail plane.
   const bool mmq_type = cols >= 256 && cols % mmq::QK8_1_MMQ == 0;
   if (q8_1_enabled() && mmq_enabled() && n >= mmq_min_n() && mmq_type)
-    return matmul_mmq_dev(W, X, Y, n);
+    return matmul_mmq_weight_dev(W, d_w, X, Y, n, {}, nullptr);
 
   // Every prefill n >= mmq_min_n() that does not take MMQ takes the blocked
   // fp16 cuBLAS GEMM, in both numerics profiles; n == 1 is the q8_1 dp4a
@@ -5387,10 +5449,8 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
   // is long or short (prefix-reuse identity). Only when q8_1 is active — the
   // fp32 fallback is the CPU-matching differential path and must stay fp32.
   if (q8_1_enabled() && cublas_enabled() && n >= mmq_min_n())
-    return matmul_f16_cublas_dev(W, X, Y, n, /*force_blocked=*/true);
-
-  const void* d_w = upload_weight(W);
-  if (!d_w) return false;
+    return matmul_f16_cublas_weight_dev(W, d_w, X, Y, n,
+                                        /*force_blocked=*/true);
 
   const uint8_t* wp = static_cast<const uint8_t*>(d_w);
   const int ic = int(cols), ir = int(rows);
@@ -5425,6 +5485,41 @@ bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
       return false;
   }
   return cudaGetLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool matmul_f32_dev(const QuantizedTensor& W, const float* X, float* Y, int n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2) return false;
+  if (n <= 0 || !X || !Y) return false;
+  const void* d_w = upload_weight(W);
+  if (!d_w) return false;
+  return matmul_f32_weight_dev(W, d_w, X, Y, n);
+}
+
+// The expert pool's form: W's host bytes are never read, and no cache entry is
+// created or consulted.
+bool matmul_f32_device_weight(const QuantizedTensor& W, const void* d_w,
+                              std::span<const float> X, std::span<float> Y,
+                              uint64_t n) {
+  if (!available()) return false;
+  if (!W.valid() || W.dims().size() != 2 || !d_w) return false;
+  const uint64_t cols = W.dims()[0];
+  const uint64_t rows = W.dims()[1];
+  if (n == 0 || X.size() < cols * n || Y.size() < rows * n) return false;
+
+  void* d_X = grow_scratch(g_dx, g_dx_bytes, cols * n * sizeof(float));
+  void* d_Y = grow_scratch(g_dy, g_dy_bytes, rows * n * sizeof(float));
+  if (!d_X || !d_Y) return false;
+  if (cudaMemcpy(d_X, X.data(), cols * n * sizeof(float),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  if (!matmul_f32_weight_dev(W, d_w, static_cast<const float*>(d_X),
+                             static_cast<float*>(d_Y), int(n)))
+    return false;
+  return cudaMemcpy(Y.data(), d_Y, rows * n * sizeof(float),
+                    cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 
 // Public host-span batched matmul: uploads X, runs the device-resident matmul,
