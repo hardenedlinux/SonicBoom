@@ -34,6 +34,14 @@
 
 ;;; --- the model record -------------------------------------------------------
 
+;; A trainable model: an (sonicboom nn) structure and native parameters.
+;;
+;; Each parameter of the structure becomes one native sb_tensor, which is the
+;; authoritative store that training updates in place and export writes out. The
+;; input dimensions are part of the record because they are fixed per model.
+;; PyTorch: torch.nn.Module
+;; Note: The structure decides the shape and naming of the parameters, while the
+;; values live in native tensors rather than in Scheme.
 (define-record-type <nn-model>
   (%make-nn-model structure params input-dims)
   nn-model?
@@ -42,18 +50,42 @@
   (input-dims  nn-model-input-dims)) ; list of ints; the input tensor's shape
 
 (define (model-param model name)
-  "Look up a native parameter sb_tensor by its \"<layer>.<key>\" name."
+  "Look up a native parameter by its \"<layer>.<key>\" name.
+
+Args:
+  model: a trainable model.
+  name: the parameter name as a string.
+Returns: the native sb_tensor handle.
+Example:
+  (use-modules (sonicboom model) (sonicboom nn) (system foreign))
+  (let ((m (make-model '(1 2) (sequential (linear 2 1 #:name 'l)))))
+    (pointer? (model-param m \"l.weight\")))
+  => #t
+PyTorch: none
+Note: PyTorch reaches the same tensor as a named parameter of the module."
   (or (assoc-ref (nn-model-params model) name)
       (error "model-param: no such parameter" name)))
 
 ;;; --- construction -----------------------------------------------------------
 
 (define* (make-model input-dims structure #:key init-values)
-  "Build a trainable model from an (sonicboom nn) STRUCTURE. Each parameter of
-STRUCTURE becomes a native sb_tensor (the authoritative store), seeded from the
-layer's Guile tensor. INIT-VALUES, when given, is an alist of
-(\"<layer>.<key>\" . flat-number-list) overriding the seed, for deterministic
-training."
+  "Build a trainable model from an (sonicboom nn) structure.
+
+Each parameter of the structure becomes a native sb_tensor, seeded from the
+layer's Guile tensor. The input dimensions are recorded on the model.
+Args:
+  input-dims: the input shape as a list of integers.
+  structure: a model made with sequential.
+  init-values: an alist of \"<layer>.<key>\" to flat number list overriding the
+               seed, for deterministic training.
+Returns: a trainable model.
+Example:
+  (use-modules (sonicboom model) (sonicboom nn))
+  (nn-model-input-dims (make-model '(1 2) (sequential (linear 2 3))))
+  => (1 2)
+PyTorch: torch.nn.Module
+Note: A PyTorch module is built by its constructor and finds its parameters in
+the module tree; here they are copied into native tensors at construction."
   (let ((params
          (map (lambda (pair)
                 (let* ((sym  (car pair))
@@ -99,9 +131,29 @@ training."
     (else (error "apply-layer-forward: unknown layer kind" (layer-kind layer)))))
 
 (define (model-forward-native model x tape)
-  "Run MODEL's layers forward over native tensor X on TAPE. Returns the output
-sb_tensor; every intermediate tensor it allocates is freed, and X (caller-owned)
-is left untouched."
+  "Run a model's layers forward over a native tensor.
+
+Every intermediate tensor allocated during the pass is freed; the input is
+left untouched. The pass records on the tape so a backward pass can follow.
+Args:
+  model: a trainable model.
+  x: a native input tensor.
+  tape: the autograd tape that records the pass.
+Returns: the native output tensor.
+Example:
+  (use-modules (sonicboom model) (sonicboom nn) (sonicboom tensor)
+               ((sonicboom train) #:prefix t:))
+  (let* ((m (make-model '(1 2) (sequential (linear 2 1 #:init 'ones))))
+         (tape (t:make-tape))
+         (x (t:tensor-from-list '(1 2) '(1.0 2.0)))
+         (y (model-forward-native m x tape))
+         (out (t:tensor->list y 1)))
+    (t:tensor-free! y) (t:tensor-free! x) (t:tape-free! tape)
+    out)
+  => (3.0)
+PyTorch: torch.nn.Module.forward
+Note: The caller owns the returned tensor and must free it. A linear layer
+must carry both a weight and a bias in v0, so a bias-less linear is rejected."
   (let loop ((layers (model-layers (nn-model-structure model)))
              (cur x)
              (own-cur? #f))
@@ -115,11 +167,30 @@ is left untouched."
 
 (define* (model-train! model x tgt #:key (epochs 1000) (lr 0.5)
                        (max-grad-norm #f))
-  "Train MODEL by plain SGD on the full dataset X (native [N,in]) and TGT
-(native [N,out]) for EPOCHS iterations, updating parameters in place. When
-MAX-GRAD-NORM is a number, the global gradient norm is clipped to it after
-every backward pass. Returns (values initial-loss final-loss), the mean-squared
-error before/after."
+  "Train a model by plain SGD on a full dataset.
+
+Parameters are updated in place for the given number of epochs; the loss is
+the mean squared error.
+Args:
+  model: a trainable model.
+  x: the native input dataset, shape [N, in].
+  tgt: the native target dataset, shape [N, out].
+  epochs: the number of passes over the dataset.
+  lr: the SGD learning rate.
+  max-grad-norm: when a number, the global gradient norm is clipped to it after
+                 every backward pass.
+Returns: two values, the initial and the final loss.
+Example:
+  (use-modules (sonicboom model) (sonicboom nn)
+               ((sonicboom train) #:prefix t:))
+  (let* ((m (make-model '(1 1) (sequential (linear 1 1 #:init 'ones))))
+         (x (t:tensor-from-list '(1 1) '(1.0)))
+         (tgt (t:tensor-from-list '(1 1) '(2.0))))
+    (call-with-values (lambda () (model-train! m x tgt #:epochs 2 #:lr 0.1))
+                      list))
+PyTorch: none
+Note: In PyTorch a training loop combines an optimizer's step with backward();
+here one call performs a fixed number of full-batch SGD steps."
   (let ((tape (train:make-tape)))
     (define (step)
       (train:tape-zero-grad! tape)
@@ -144,9 +215,17 @@ error before/after."
 ;;; --- export -----------------------------------------------------------------
 
 (define (model-export! model dir)
-  "Write MODEL's graph text plus its trained native parameters to DIR
-(model.sx + weights.bin) via sb_export_model. The artifact loads independently
-in C++ with no Guile or Python."
+  "Write a model's graph text and trained parameters to a directory.
+
+The output is model.sx plus weights.bin, written through sb_export_model. The
+artifact loads independently in C++ with no Guile or Python.
+Args:
+  model: a trainable model.
+  dir: the target directory.
+Returns: unspecified.
+PyTorch: none
+Note: The nearest PyTorch operation is torch.onnx.export, which belongs to a
+part of PyTorch that SonicBoom does not mirror."
   (let* ((text (model-graph-text (nn-model-structure model)
                                  (nn-model-input-dims model)))
          (params (nn-model-params model))

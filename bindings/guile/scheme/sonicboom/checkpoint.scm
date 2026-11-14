@@ -104,8 +104,21 @@ the file."
 ;;; --- save / load -------------------------------------------------------------
 
 (define (save-params! path entries)
-  "Write ENTRIES, an alist name → float32 ctensor, to checkpoint PATH,
-overwriting it. Names must be unique. Returns PATH."
+  "Write named float32 tensors to a checkpoint file.
+
+The file is self-describing little-endian binary; entries are matched by name,
+so save and load order need not agree. Names must be unique.
+Args:
+  path: the checkpoint path; an existing file is overwritten.
+  entries: an alist of name to float32 ctensor, where a name is a symbol or string.
+Returns: path.
+Example:
+  (use-modules (sonicboom checkpoint) (sonicboom trace tensor))
+  (save-params! \"/tmp/sonicboom-docs-example.ckpt\"
+                (list (cons 'w (make-ctensor 'float32 '(2) '(1.0 2.0)))))
+  => \"/tmp/sonicboom-docs-example.ckpt\"
+PyTorch: torch.save
+Note: Only float32 tensors are supported by the C ABI's checkpoint surface."
   (let* ((pairs (normalize entries))
          (handles (map (lambda (p) (ctensor->handle 'save-params! (cdr p))) pairs))
          (name-ptrs (map (lambda (p) (string->pointer (entry-name (car p))))
@@ -130,10 +143,24 @@ overwriting it. Names must be unique. Returns PATH."
         (for-each (lambda (h) ((proc 'sb_tensor_free) h)) handles)))))
 
 (define (load-params! path entries)
-  "Load ENTRIES, an alist name → template float32 ctensor whose shapes describe
-the checkpoint entries to restore, from checkpoint PATH. Returns an alist
-name → new ctensor in the same order. All-or-nothing: on a missing name or a
-shape mismatch, an error is signalled and no tensor is returned."
+  "Load named float32 tensors from a checkpoint file.
+
+The template tensors supply each entry's shape. Loading is all-or-nothing: a
+missing name or a shape mismatch signals an error before any value is produced.
+Args:
+  path: the checkpoint path.
+  entries: an alist of name to template float32 ctensor describing the entries.
+Returns: an alist of name to new ctensor, in the order of entries.
+Example:
+  (use-modules (sonicboom checkpoint) (sonicboom trace tensor))
+  (let* ((path \"/tmp/sonicboom-docs-example-load.ckpt\")
+         (saved (save-params! path (list (cons 'w (make-ctensor 'float32 '(2) '(1.0 2.0))))))
+         (loaded (load-params! path (list (cons 'w (make-ctensor 'float32 '(2) '(0.0 0.0)))))))
+    (ctensor-ref (cdr (car loaded)) 1))
+  => 2.0
+PyTorch: torch.load
+Note: The template shapes are required because the file is loaded into native
+tensors; PyTorch's load reconstructs tensors from the file itself."
   (let* ((pairs (normalize entries))
          (handles (map (lambda (p) (ctensor->handle 'load-params! (cdr p))) pairs))
          (name-ptrs (map (lambda (p) (string->pointer (entry-name (car p))))
