@@ -119,8 +119,26 @@ Registry& registry() {
   return r;
 }
 
+// The CUDA backend's wall-clock accumulators; only touched under the stats
+// flag, so a normal run pays nothing.
+struct TimingRegistry {
+  std::mutex mutex;
+  ExpertTiming timing;
+};
+
+TimingRegistry& timing_registry() {
+  static TimingRegistry r;
+  return r;
+}
+
 void print_stats_at_exit() {
   Registry& r = registry();
+  ExpertTiming t;
+  {
+    TimingRegistry& tr = timing_registry();
+    std::lock_guard<std::mutex> lk(tr.mutex);
+    t = tr.timing;
+  }
   std::lock_guard<std::mutex> lk(r.mutex);
   if (!r.pool) return;
   const ExpertPool::Stats s = r.pool->stats();
@@ -131,6 +149,9 @@ void print_stats_at_exit() {
                static_cast<unsigned long long>(s.hits),
                static_cast<unsigned long long>(s.misses),
                static_cast<unsigned long long>(s.bytes));
+  std::fprintf(stderr,
+               "expert stats: select=%.6f s experts=%.6f s route=%.6f s\n",
+               t.select_s, t.experts_s, t.route_s);
 }
 
 } // namespace
@@ -371,6 +392,14 @@ void ExpertPool::clear() {
   std::fill(stamp_.begin(), stamp_.end(), 0);
   std::fill(slot_of_.begin(), slot_of_.end(), -1);
   stats_ = Stats{};
+}
+
+void add_expert_timing(const ExpertTiming& t) {
+  TimingRegistry& tr = timing_registry();
+  std::lock_guard<std::mutex> lk(tr.mutex);
+  tr.timing.select_s += t.select_s;
+  tr.timing.experts_s += t.experts_s;
+  tr.timing.route_s += t.route_s;
 }
 
 std::expected<ExpertPool*, std::string> expert_pool_for(

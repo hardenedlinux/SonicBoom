@@ -140,6 +140,18 @@ class ExpertPool {
   Stats stats_;
 };
 
+// Wall-clock seconds the CUDA backend spent in the mixture-of-experts stages,
+// accumulated only when SONICBOOM_EXPERT_STATS is on: inside ExpertPool::select,
+// inside the routed-expert kernel call, and inside a routing node. Printed with
+// the counters at exit.
+struct ExpertTiming {
+  double select_s = 0.0;
+  double experts_s = 0.0;
+  double route_s = 0.0;
+};
+
+void add_expert_timing(const ExpertTiming& t);
+
 // The process's pool for this weights set, created on first use and kept on
 // the same lifetime as the device weight cache (one per model; a reload at a
 // new address is a different weights object and so a different pool).

@@ -49,6 +49,7 @@
 #include <nvtx3/nvToolsExt.h>  // header-only NVTX (no libnvtx link)
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -84,6 +85,46 @@ bool nvtx_enabled() {
   }();
   return on;
 }
+
+// The mixture-of-experts timing breakdown (SONICBOOM_EXPERT_STATS). Off by
+// default, in which case the timer does not even read the clock.
+bool expert_stats_enabled() {
+  static const bool on = [] {
+    const char* e = std::getenv("SONICBOOM_EXPERT_STATS");
+    return e && *e && std::string_view(e) != "0";
+  }();
+  return on;
+}
+
+// Accumulates one mixture-of-experts stage's wall time into the pool's
+// counters at the end of its scope, so an early failure still records it.
+struct ExpertStageTimer {
+  enum Stage { kSelect, kExperts, kRoute };
+  bool on;
+  Stage stage;
+  std::chrono::steady_clock::time_point t0;
+
+  explicit ExpertStageTimer(Stage s)
+      : on(expert_stats_enabled()), stage(s) {
+    if (on) t0 = std::chrono::steady_clock::now();
+  }
+  ~ExpertStageTimer() {
+    if (!on) return;
+    const double s = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count();
+    ExpertTiming t;
+    if (stage == kSelect)
+      t.select_s = s;
+    else if (stage == kExperts)
+      t.experts_s = s;
+    else
+      t.route_s = s;
+    add_expert_timing(t);
+  }
+  ExpertStageTimer(const ExpertStageTimer&) = delete;
+  ExpertStageTimer& operator=(const ExpertStageTimer&) = delete;
+};
 
 // Verify matmul launch shape (V1 ablation). Default: one row-invariant batched
 // mmvq launch per projection over the step's k+1 query rows. With
@@ -2729,6 +2770,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       break;
     }
     case OpKind::MoeRoute: {
+      ExpertStageTimer route_timer(ExpertStageTimer::kRoute);
       // inputs: {activation}. The router projection runs on the device; the
       // softmax, top-k and renormalisation run on the host, so the ids and
       // weights are decided in the same arithmetic as the CPU kernel. The ids
@@ -2890,7 +2932,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       // kernel.
       auto pool = expert_pool_for(model_->weights);
       if (!pool) return std::unexpected(fail(pool.error()));
-      const auto selected = (*pool)->select(weight_layer, ids);
+      std::expected<void, std::string> selected;
+      {
+        ExpertStageTimer select_timer(ExpertStageTimer::kSelect);
+        selected = (*pool)->select(weight_layer, ids);
+      }
       if (!selected) return std::unexpected(fail(selected.error()));
       const nn::cuda::MoeExpertPool pooled{
           (*pool)->data(ExpertPool::kGate), (*pool)->data(ExpertPool::kUp),
@@ -2900,8 +2946,11 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
           (*pool)->slot_bytes(ExpertPool::kDown),
           static_cast<const int32_t*>((*pool)->selection())};
       std::vector<float> y(rows * dim, 0.0f);
-      ok = nn::cuda::moe_experts(x, ids, wts, views, act, y, rows, prefill,
-                                 &pooled);
+      {
+        ExpertStageTimer experts_timer(ExpertStageTimer::kExperts);
+        ok = nn::cuda::moe_experts(x, ids, wts, views, act, y, rows, prefill,
+                                   &pooled);
+      }
       if (ok)
         ok = device::upload(y.data(), out_handle,
                             rows * dim * sizeof(float));
