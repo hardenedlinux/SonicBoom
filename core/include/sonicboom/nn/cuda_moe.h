@@ -98,4 +98,24 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
                  std::span<float> y, uint64_t rows, bool group_by_expert,
                  const MoeExpertPool* pool = nullptr);
 
+// The device-resident form of the same node. x, weights_dev, y and slots_dev
+// are device buffers, x [rows, d], weights_dev [rows, k], y [rows, d] and
+// slots_dev [rows, k]; y must be zeroed by the caller (the backend issues a
+// cudaMemsetAsync) and every weight stays resident. ids_host and slots_host are
+// the host copies of the two routing results (the pool selection reads ids
+// back; slots are the pool's assignment), so the node downloads only the ids.
+//
+// The arithmetic is the host form's: the decode/verify path runs one gemv per
+// (row, expert) and a final j-ascending weighted sum; the prefill path groups
+// the rows by expert and visits the experts in ascending index on one stream,
+// scattering with an explicit __fadd_rn/__fmul_rn. `stream` is an opaque CUDA
+// stream handle (nullptr = the current stream); the kernels run there.
+bool moe_experts_dev(const float* x, const int64_t* ids_host,
+                     const float* weights_dev, const int32_t* slots_dev,
+                     const int32_t* slots_host,
+                     const MoeExpertWeights& experts, MoeActivation activation,
+                     float* y, uint64_t rows, uint64_t k, uint64_t d,
+                     bool group_by_expert, const MoeExpertPool& pool,
+                     void* stream = nullptr);
+
 } // namespace sonicboom::nn::cuda

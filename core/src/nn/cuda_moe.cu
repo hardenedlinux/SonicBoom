@@ -20,6 +20,7 @@
 #include <sonicboom/nn/cuda_elementwise.h>
 #include <sonicboom/quant/quantized_matmul_cuda.h>
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include "cuda_resident.h"
@@ -146,6 +147,45 @@ void* scratch(int slot, size_t need) {
   return p;
 }
 
+__device__ inline float moe_half_roundtrip(float v) {
+  return __half2float(__float2half_rn(v));
+}
+
+// ggml's ggml_gelu_f32, the same constants and order as the CPU's
+// gelu_tanh_f32 and the elementwise kernel's device copy.
+__device__ inline float moe_gelu_tanh(float x) {
+  constexpr float sqrt_2_over_pi = 0.79788456080286535587989211986876f;
+  constexpr float gelu_coef_a = 0.044715f;
+  return 0.5f * x *
+         (1.0f + tanhf(sqrt_2_over_pi * x * (1.0f + gelu_coef_a * x * x)));
+}
+
+// h[i] = act(gate[i]) * up[i], the host form's silu/gelu_fp16 followed by the
+// elementwise multiply, with the same per-element operations (expf, fp16
+// round-trip around the tanh) so the result matches the host step bit for bit.
+__global__ void moe_act_mul_kernel(const float* __restrict__ gate,
+                                   const float* __restrict__ up,
+                                   float* __restrict__ h, int64_t n,
+                                   int gelu) {
+  const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const float v = gate[i];
+  float a;
+  if (gelu) {
+    if (v <= -10.0f)
+      a = 0.0f;
+    else if (v >= 10.0f)
+      a = v;
+    else
+      a = moe_half_roundtrip(moe_gelu_tanh(moe_half_roundtrip(v)));
+  } else {
+    a = v / (1.0f + expf(-v));
+  }
+  h[i] = a * up[i];
+}
+
+// One row per block, thread 0: the post-logit half of route_row. logits is the
+// device scratch buffer, overwritten with the probabilities in place.
 __global__ void moe_route_topk_kernel(float* __restrict__ logits,
                                       uint32_t experts, uint32_t used,
                                       float weight_scale,
@@ -215,6 +255,64 @@ __global__ void moe_route_topk_kernel(float* __restrict__ logits,
     idrow[j] = int64_t(selected[j]);
     wrow[j] = p[selected[j]] / denom * weight_scale;
   }
+}
+
+// Decode / verify: y[r, i] = sum over j of w[r, j] * out[r, j, i], j ascending.
+// The explicit intrinsic mul/add keep the compiler from contracting the pair
+// into an FMA — the host form's rounding is a rounded multiply then a rounded
+// add.
+__global__ void moe_weighted_sum_kernel(const float* __restrict__ out,
+                                        const float* __restrict__ w,
+                                        float* __restrict__ y, int64_t rows,
+                                        int64_t k, int64_t d) {
+  const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= rows * d) return;
+  const int64_t r = idx / d;
+  const int64_t i = idx - r * d;
+  float acc = 0.0f;
+  for (int64_t j = 0; j < k; ++j)
+    acc = __fadd_rn(acc,
+                    __fmul_rn(w[r * k + j], out[(r * k + j) * d + i]));
+  y[idx] = acc;
+}
+
+// Prefill: gather the selected rows of one expert into a position-major
+// [nnz, d] activation.
+__global__ void moe_gather_kernel(const float* __restrict__ x,
+                                  const int32_t* __restrict__ row_of,
+                                  float* __restrict__ X, int64_t nnz,
+                                  int64_t d) {
+  const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= nnz * d) return;
+  const int64_t c = idx / d;
+  const int64_t i = idx - c * d;
+  X[idx] = x[int64_t(row_of[c]) * d + i];
+}
+
+// Prefill: the weight of each gathered entry, read from the routing node's
+// device weights by the flat (row, selected) index.
+__global__ void moe_gather_weights_kernel(const float* __restrict__ weights_dev,
+                                          const int32_t* __restrict__ kw_of,
+                                          float* __restrict__ w_of,
+                                          int64_t nnz) {
+  const int64_t c = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (c >= nnz) return;
+  w_of[c] = weights_dev[kw_of[c]];
+}
+
+// Prefill: y[row, i] += w * D[c, i] for one expert, with the explicit
+// multiply/add pair of the host loop.
+__global__ void moe_scatter_kernel(const float* __restrict__ D,
+                                   const int32_t* __restrict__ row_of,
+                                   const float* __restrict__ w_of,
+                                   float* __restrict__ y, int64_t nnz,
+                                   int64_t d) {
+  const int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= nnz * d) return;
+  const int64_t c = idx / d;
+  const int64_t i = idx - c * d;
+  const int64_t o = int64_t(row_of[c]) * d + i;
+  y[o] = __fadd_rn(y[o], __fmul_rn(w_of[c], D[idx]));
 }
 
 // One expert's routed FFN for one row: gate and up through the decode gemv,
@@ -432,6 +530,165 @@ bool moe_experts(std::span<const float> x, std::span<const int64_t> ids,
       const float w = w_row[c];
       for (uint64_t i = 0; i < d; ++i) yrow[i] += w * D[c * d + i];
     }
+  }
+  return true;
+}
+
+bool moe_experts_dev(const float* x, const int64_t* ids_host,
+                     const float* weights_dev, const int32_t* slots_dev,
+                     const int32_t* slots_host,
+                     const MoeExpertWeights& experts, MoeActivation activation,
+                     float* y, uint64_t rows, uint64_t k, uint64_t d,
+                     bool group_by_expert, const MoeExpertPool& pool,
+                     void* stream) {
+  if (!quant::cuda::available() || rows == 0 || k == 0 || d == 0 || !x ||
+      !ids_host || !weights_dev || !y || !slots_host)
+    return false;
+  if (experts.gate.size() != experts.up.size() ||
+      experts.gate.size() != experts.down.size() ||
+      experts.gate.empty())
+    return false;
+  if (!pool.gate_bytes || !pool.up_bytes || !pool.down_bytes) return false;
+  (void)slots_dev;  // the pool's device buffer; the host copy drives the launches
+
+  const uint64_t e_count = experts.gate.size();
+  uint64_t ff_max = 0;
+  for (uint64_t e = 0; e < e_count; ++e) {
+    const quant::QuantizedTensor& gw = experts.gate[e];
+    if (!gw.valid() || gw.dims().size() != 2) return false;
+    ff_max = std::max(ff_max, gw.dims()[1]);
+  }
+  if (ff_max == 0) return false;
+  for (uint64_t i = 0; i < rows * k; ++i)
+    if (ids_host[i] < 0 || uint64_t(ids_host[i]) >= e_count) return false;
+
+  const cudaStream_t s =
+      stream ? static_cast<cudaStream_t>(stream) : sonicboom::cuda::sb_current_stream();
+  sonicboom::cuda::StreamScope scope(s);
+  const int gelu = activation == MoeActivation::GeluFp16 ? 1 : 0;
+
+  if (!group_by_expert) {
+    // Decode / verify: one (row, expert) at a time, the decode gemv per
+    // projection, the activation and the multiply fused into one kernel whose
+    // per-element arithmetic is the host silu/gelu_fp16 + multiply.
+    float* out = static_cast<float*>(
+        scratch(kDecodeOut, rows * k * d * sizeof(float)));
+    float* gate =
+        static_cast<float*>(scratch(kA, ff_max * sizeof(float)));
+    float* up = static_cast<float*>(scratch(kB, ff_max * sizeof(float)));
+    if (!out || !gate || !up) return false;
+    for (uint64_t r = 0; r < rows; ++r) {
+      for (uint64_t j = 0; j < k; ++j) {
+        const uint64_t e = uint64_t(ids_host[r * k + j]);
+        const int32_t slot = slots_host[r * k + j];
+        const quant::QuantizedTensor& gw = experts.gate[e];
+        const quant::QuantizedTensor& uw = experts.up[e];
+        const quant::QuantizedTensor& dw = experts.down[e];
+        if (!uw.valid() || !dw.valid()) return false;
+        const uint64_t ff = gw.dims()[1];
+        if (ff == 0 || ff > ff_max) return false;
+        const float* xr = x + r * d;
+        if (!quant::cuda::matvec_f32_dev_device_weight(
+                gw, pooled(pool.gate_bytes, pool.gate_stride, slot), xr, gate) ||
+            !quant::cuda::matvec_f32_dev_device_weight(
+                uw, pooled(pool.up_bytes, pool.up_stride, slot), xr, up))
+          return false;
+        const int ff_i = int(ff);
+        moe_act_mul_kernel<<<moe_grid(ff_i), 256, 0, s>>>(
+            gate, up, gate, ff_i, gelu);
+        if (cudaGetLastError() != cudaSuccess) return false;
+        if (!quant::cuda::matvec_f32_dev_device_weight(
+                dw, pooled(pool.down_bytes, pool.down_stride, slot), gate,
+                out + (r * k + j) * d))
+          return false;
+      }
+    }
+    if (rows * d > uint64_t(INT32_MAX)) return false;
+    moe_weighted_sum_kernel<<<moe_grid(int64_t(rows * d)), 256, 0, s>>>(
+        out, weights_dev, y, int64_t(rows), int64_t(k), int64_t(d));
+    return cudaGetLastError() == cudaSuccess;
+  }
+
+  // Prefill: group the rows by expert in ascending expert order, exactly as the
+  // host form builds its lists (row ascending, the first matching selection).
+  std::vector<int32_t> row_of;
+  std::vector<int32_t> kw_of;
+  std::vector<int32_t> offsets(e_count + 1, 0);
+  row_of.reserve(rows * k);
+  kw_of.reserve(rows * k);
+  for (uint64_t e = 0; e < e_count; ++e) {
+    offsets[e] = int32_t(row_of.size());
+    for (uint64_t r = 0; r < rows; ++r) {
+      for (uint64_t j = 0; j < k; ++j) {
+        if (uint64_t(ids_host[r * k + j]) != e) continue;
+        row_of.push_back(int32_t(r));
+        kw_of.push_back(int32_t(r * k + j));
+        break;
+      }
+    }
+  }
+  offsets[e_count] = int32_t(row_of.size());
+  const uint64_t nnz = row_of.size();
+  if (nnz == 0) return true;
+  if (nnz > uint64_t(INT32_MAX) || rows * k > uint64_t(INT32_MAX))
+    return false;
+
+  int32_t* d_row = static_cast<int32_t*>(
+      scratch(kRowOf, nnz * sizeof(int32_t)));
+  int32_t* d_kw = static_cast<int32_t*>(
+      scratch(kKwOf, nnz * sizeof(int32_t)));
+  int32_t* d_off = static_cast<int32_t*>(
+      scratch(kOffsets, (e_count + 1) * sizeof(int32_t)));
+  float* d_w = static_cast<float*>(
+      scratch(kWeightOf, nnz * sizeof(float)));
+  float* X = static_cast<float*>(scratch(kA, rows * d * sizeof(float)));
+  float* G = static_cast<float*>(scratch(kB, rows * ff_max * sizeof(float)));
+  float* U = static_cast<float*>(scratch(kC, rows * ff_max * sizeof(float)));
+  float* D = static_cast<float*>(scratch(kD, rows * d * sizeof(float)));
+  if (!d_row || !d_kw || !d_off || !d_w || !X || !G || !U || !D) return false;
+  if (cudaMemcpy(d_row, row_of.data(), nnz * sizeof(int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_kw, kw_of.data(), nnz * sizeof(int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess ||
+      cudaMemcpy(d_off, offsets.data(), (e_count + 1) * sizeof(int32_t),
+                 cudaMemcpyHostToDevice) != cudaSuccess)
+    return false;
+  moe_gather_weights_kernel<<<moe_grid(int64_t(nnz)), 256, 0, s>>>(
+      weights_dev, d_kw, d_w, int64_t(nnz));
+  if (cudaGetLastError() != cudaSuccess) return false;
+
+  // One expert at a time on this stream, ascending: a row's accumulation order
+  // is the expert order, so no atomics are needed.
+  for (uint64_t e = 0; e < e_count; ++e) {
+    const uint64_t begin = uint64_t(offsets[e]);
+    const uint64_t n_e = uint64_t(offsets[e + 1]) - begin;
+    if (n_e == 0) continue;
+    const quant::QuantizedTensor& gw = experts.gate[e];
+    const quant::QuantizedTensor& uw = experts.up[e];
+    const quant::QuantizedTensor& dw = experts.down[e];
+    if (!uw.valid() || !dw.valid()) return false;
+    const uint64_t ff = gw.dims()[1];
+    if (ff == 0 || ff > ff_max) return false;
+    const int32_t slot = slots_host[kw_of[begin]];
+    const int n_i = int(n_e);
+    moe_gather_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
+        x, d_row + begin, X, int64_t(n_e), int64_t(d));
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!quant::cuda::matmul_f32_dev_device_weight(
+            gw, pooled(pool.gate_bytes, pool.gate_stride, slot), X, G, n_i) ||
+        !quant::cuda::matmul_f32_dev_device_weight(
+            uw, pooled(pool.up_bytes, pool.up_stride, slot), X, U, n_i))
+      return false;
+    const int ff_i = int(ff * n_e);
+    moe_act_mul_kernel<<<moe_grid(ff_i), 256, 0, s>>>(
+        G, U, G, ff_i, gelu);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (!quant::cuda::matmul_f32_dev_device_weight(
+            dw, pooled(pool.down_bytes, pool.down_stride, slot), G, D, n_i))
+      return false;
+    moe_scatter_kernel<<<moe_grid(int64_t(n_e * d)), 256, 0, s>>>(
+        D, d_row + begin, d_w + begin, y, int64_t(n_e), int64_t(d));
+    if (cudaGetLastError() != cudaSuccess) return false;
   }
   return true;
 }
