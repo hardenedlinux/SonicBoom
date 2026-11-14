@@ -41,10 +41,19 @@
 // result: the kernel's arithmetic, including the ascending-expert summation
 // order, is unchanged, and only where a matrix is found moves.
 //
+// The copies go through a pinned, double-buffered staging pipeline (device::
+// Staging): the host fills a pinned half, the half travels on a dedicated copy
+// stream, and events order it against the compute stream. The arrays are zeroed
+// once at creation; a slot's read-ahead tail is still zeroed when it is filled,
+// because a smaller matrix may follow a larger one there. SONICBOOM_EXPERT_STAGE_KB
+// sizes the staging buffer (default 16384 KiB; the tests use 64).
+//
 // The pool is internal runtime machinery (core/src/planner), not part of the
 // Layer 2 surface: no CUDA type appears here.
 
 #include <sonicboom/model/weights.h>
+
+#include "device_pool.h"
 
 #include <cstdint>
 #include <expected>
@@ -139,6 +148,9 @@ class ExpertPool {
   uint64_t sel_handle_ = 0;
   uint64_t sel_entries_ = 0;
   std::vector<int32_t> sel_host_;
+  // The pinned staging pipeline; null when it could not be created, in which
+  // case select() falls back to the synchronous copy.
+  device::Staging* staging_ = nullptr;
 
   Stats stats_;
 };

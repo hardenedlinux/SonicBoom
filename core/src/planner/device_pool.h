@@ -59,6 +59,32 @@ bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes);        // D2D
 // legacy default stream this is synchronous, matching the old cudaMemset.
 bool memset_device(uint64_t handle, int value, uint64_t bytes);
 
+// A pinned, double-buffered staging pipeline for large host-to-device copies
+// (the routed experts' matrices). The host copies pageable bytes into a pinned
+// half; the half is then sent to the device asynchronously on a dedicated
+// non-blocking copy stream. A copy larger than a half is split into chunks
+// across the two halves. The ordering is carried by events, not by host
+// synchronisation:
+//
+//   staging_begin()   the copy stream waits for everything already launched on
+//                     the current stream (so a slot read by an earlier node's
+//                     kernel is not overwritten under it)
+//   staging_upload()  host memcpy into the pinned half + cudaMemcpyAsync
+//   staging_commit()  the current stream waits for every issued copy
+//
+// The only host wait is the reuse of a pinned half whose previous copy has not
+// completed yet (cudaEventQuery/Sync at that point); the default 16 MiB holds
+// a whole node's misses, so it is not reached within a node.
+struct Staging;  // opaque; the CUDA types stay in device_pool.cpp
+
+// `bytes` of pinned host memory (split in two). Returns null without a device.
+Staging* staging_create(uint64_t bytes);
+void staging_destroy(Staging* s);
+bool staging_begin(Staging* s);
+bool staging_upload(Staging* s, const void* host, uint64_t handle,
+                    uint64_t bytes);
+bool staging_commit(Staging* s);
+
 // Block until all device work is complete.
 bool synchronize();
 

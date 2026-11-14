@@ -21,7 +21,10 @@
 #include "../nn/cuda_stream.h"
 #endif
 
+#include <algorithm>
+#include <cstring>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -182,6 +185,138 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes) {
                          sonicboom::cuda::sb_current_stream()) == cudaSuccess;
 #else
   (void)handle; (void)value; (void)bytes;
+  return false;
+#endif
+}
+
+// --- pinned staging pipeline -------------------------------------------------
+
+#ifdef SONICBOOM_USE_CUDA
+
+struct Staging {
+  unsigned char* pinned = nullptr;
+  uint64_t half = 0;      // bytes per half; the two halves are contiguous
+  uint64_t used = 0;      // bytes written in the current half
+  int cur = 0;
+  cudaStream_t copy = nullptr;
+  cudaEvent_t ev[2] = {nullptr, nullptr};  // last copy issued out of each half
+  bool pending[2] = {false, false};
+  cudaEvent_t wake = nullptr;   // compute stream -> copy stream
+  cudaEvent_t ready = nullptr;  // copy stream -> compute stream
+};
+
+#endif
+
+Staging* staging_create(uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!available()) return nullptr;
+  // Two halves of 256-byte multiples; a very small request is still usable.
+  uint64_t half = (bytes / 2) & ~uint64_t(kAlignment - 1);
+  if (half < kAlignment) half = kAlignment;
+  Staging* s = new (std::nothrow) Staging;
+  if (!s) return nullptr;
+  s->half = half;
+  if (cudaMallocHost(reinterpret_cast<void**>(&s->pinned), 2 * half) !=
+      cudaSuccess) {
+    delete s;
+    return nullptr;
+  }
+  if (cudaStreamCreateWithFlags(&s->copy, cudaStreamNonBlocking) !=
+      cudaSuccess) {
+    cudaFreeHost(s->pinned);
+    delete s;
+    return nullptr;
+  }
+  for (int i = 0; i < 2; ++i)
+    cudaEventCreateWithFlags(&s->ev[i], cudaEventDisableTiming);
+  cudaEventCreateWithFlags(&s->wake, cudaEventDisableTiming);
+  cudaEventCreateWithFlags(&s->ready, cudaEventDisableTiming);
+  return s;
+#else
+  (void)bytes;
+  return nullptr;
+#endif
+}
+
+void staging_destroy(Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s) return;
+  cudaStreamSynchronize(s->copy);
+  for (int i = 0; i < 2; ++i)
+    if (s->ev[i]) cudaEventDestroy(s->ev[i]);
+  if (s->wake) cudaEventDestroy(s->wake);
+  if (s->ready) cudaEventDestroy(s->ready);
+  if (s->copy) cudaStreamDestroy(s->copy);
+  if (s->pinned) cudaFreeHost(s->pinned);
+  delete s;
+#else
+  (void)s;
+#endif
+}
+
+bool staging_begin(Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s) return false;
+  // Everything already launched on the compute stream has to be ordered before
+  // the copies: a slot handed back by the LRU may still be read by an earlier
+  // node's kernel. The synchronous cudaMemcpy this replaces got that ordering
+  // implicitly; here it is an event.
+  if (cudaEventRecord(s->wake, sonicboom::cuda::sb_current_stream()) !=
+      cudaSuccess)
+    return false;
+  return cudaStreamWaitEvent(s->copy, s->wake, 0) == cudaSuccess;
+#else
+  (void)s;
+  return false;
+#endif
+}
+
+bool staging_upload(Staging* s, const void* host, uint64_t handle,
+                    uint64_t bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s || (!host && bytes != 0) || handle == 0) return false;
+  if (bytes == 0) return true;
+  const unsigned char* src = static_cast<const unsigned char*>(host);
+  uint64_t off = 0;
+  while (off < bytes) {
+    if (s->used == s->half) {
+      s->cur ^= 1;
+      s->used = 0;
+      if (s->pending[s->cur]) {
+        // The half is about to be overwritten by the host. With the default
+        // 16 MiB this is the reuse of the other half between nodes; a small
+        // staging buffer (the tests use 64 KiB) reaches it mid-node.
+        if (cudaEventSynchronize(s->ev[s->cur]) != cudaSuccess) return false;
+        s->pending[s->cur] = false;
+      }
+    }
+    const uint64_t chunk = std::min<uint64_t>(bytes - off, s->half - s->used);
+    unsigned char* slot =
+        s->pinned + static_cast<uint64_t>(s->cur) * s->half + s->used;
+    std::memcpy(slot, src + off, static_cast<size_t>(chunk));
+    if (cudaMemcpyAsync(reinterpret_cast<void*>(handle + off), slot, chunk,
+                        cudaMemcpyHostToDevice, s->copy) != cudaSuccess)
+      return false;
+    if (cudaEventRecord(s->ev[s->cur], s->copy) != cudaSuccess) return false;
+    s->pending[s->cur] = true;
+    s->used += chunk;
+    off += chunk;
+  }
+  return true;
+#else
+  (void)s; (void)host; (void)handle; (void)bytes;
+  return false;
+#endif
+}
+
+bool staging_commit(Staging* s) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!s) return false;
+  if (cudaEventRecord(s->ready, s->copy) != cudaSuccess) return false;
+  return cudaStreamWaitEvent(sonicboom::cuda::sb_current_stream(), s->ready,
+                             0) == cudaSuccess;
+#else
+  (void)s;
   return false;
 #endif
 }

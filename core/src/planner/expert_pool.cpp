@@ -171,6 +171,10 @@ ExpertPool::Stats ExpertPool::stats() const {
 }
 
 ExpertPool::~ExpertPool() {
+  // Drain the copy stream before the arrays go back to the pool: a staged copy
+  // may still be in flight.
+  if (staging_) device::staging_destroy(staging_);
+  staging_ = nullptr;
   for (uint64_t& h : handles_) {
     if (h) device::release(h, 0);
     h = 0;
@@ -273,6 +277,35 @@ std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
     return std::unexpected(std::string("expert pool: cannot allocate ") +
                            std::to_string(pool_bytes) + " bytes on the device");
 
+  // The arrays start zeroed once; select() then only has to keep the tail of a
+  // slot zero, where a smaller matrix follows a larger one.
+  for (uint32_t role = 0; role < 3; ++role) {
+    if (!device::memset_device(pool->handles_[role], 0,
+                               pool->n_slots_ * pool->stride_[role]))
+      return std::unexpected(
+          std::string("expert pool: cannot zero the pool arrays"));
+  }
+
+  // The pinned staging pipeline. A failed creation is not fatal: select()
+  // falls back to the synchronous pageable copy.
+  uint64_t stage_bytes = 16ull << 20;
+  if (const char* kb_env = std::getenv("SONICBOOM_EXPERT_STAGE_KB");
+      kb_env && *kb_env) {
+    char* end = nullptr;
+    const unsigned long long kb = std::strtoull(kb_env, &end, 10);
+    if (end == kb_env || *end != '\0' || kb == 0)
+      return std::unexpected(
+          std::string("expert pool: SONICBOOM_EXPERT_STAGE_KB is not a "
+                      "positive size in KiB: ") +
+          kb_env);
+    stage_bytes = uint64_t(kb) * 1024ull;
+  }
+  pool->staging_ = device::staging_create(stage_bytes);
+  if (!pool->staging_ && stats_enabled())
+    std::fprintf(stderr,
+                 "expert pool: pinned staging unavailable, uploads stay "
+                 "synchronous\n");
+
   if (stats_enabled())
     std::fprintf(stderr, "expert pool: %llu slots x %llu bytes, %llu MiB\n",
                  static_cast<unsigned long long>(pool->n_slots_),
@@ -320,6 +353,18 @@ std::expected<void, std::string> ExpertPool::select(
   }
   sel_host_.resize(ids.size());
 
+  // The copy stream must not overwrite a slot an earlier node's kernel may
+  // still be reading (the synchronous cudaMemcpy this replaces got that for
+  // free). One event orders all the copies of this node behind that work.
+  if (staging_ && !device::staging_begin(staging_))
+    return std::unexpected(
+        "expert pool: cannot start the staging pipeline");
+
+  auto put = [this](const void* host, uint64_t handle, uint64_t bytes) {
+    if (staging_) return device::staging_upload(staging_, host, handle, bytes);
+    return device::upload(host, handle, bytes);
+  };
+
   for (size_t j = 0; j < ids.size(); ++j) {
     const int64_t key = int64_t(info.key_base) + ids[j];
     int32_t slot = slot_of_[key];
@@ -351,7 +396,7 @@ std::expected<void, std::string> ExpertPool::select(
         const quant::QuantizedTensor& t = *role_tensors[role];
         const uint64_t bytes = t.byte_size();
         const uint64_t base = handles_[role] + uint64_t(victim) * stride_[role];
-        if (!device::upload(t.data().data(), base, bytes)) {
+        if (!put(t.data().data(), base, bytes)) {
           owner_[victim] = -1;
           return std::unexpected(
               "expert pool: cannot copy an expert matrix to the device");
@@ -360,7 +405,7 @@ std::expected<void, std::string> ExpertPool::select(
         const uint64_t tail = stride_[role] - bytes;
         if (tail > 0) {
           static const std::byte zeros[kSlotAlignment] = {};
-          if (!device::upload(zeros, base + bytes, tail)) {
+          if (!put(zeros, base + bytes, tail)) {
             owner_[victim] = -1;
             return std::unexpected(
                 "expert pool: cannot zero a slot's read-ahead tail");
@@ -379,10 +424,13 @@ std::expected<void, std::string> ExpertPool::select(
   // Stamp every slot this node uses, once.
   for (int64_t key : needed) stamp_[size_t(slot_of_[key])] = node;
 
-  if (!device::upload(sel_host_.data(), sel_handle_,
-                      uint64_t(ids.size()) * sizeof(int32_t)))
+  if (!put(sel_host_.data(), sel_handle_,
+           uint64_t(ids.size()) * sizeof(int32_t)))
     return std::unexpected(
         "expert pool: cannot write the selection buffer");
+  if (staging_ && !device::staging_commit(staging_))
+    return std::unexpected(
+        "expert pool: cannot commit the staged copies");
   return {};
 }
 
