@@ -1370,6 +1370,30 @@ static bool spec_enabled() {
          m == SpecMode::Reckless;
 }
 
+// §10's entry guards read these two recipe predicates. A recipe has one entry
+// per block and never changes after load, so the recipe is rebuilt here rather
+// than cached; the call sites are load-time or once per generation call.
+static bool model_has_routed_experts(const Gemma4Model& m) {
+  return has_routed_experts(recipe_for(m));
+}
+
+static bool model_has_recurrent_state(const Gemma4Model& m) {
+  return has_recurrent_state(recipe_for(m));
+}
+
+// One line per process, the first time a guard sends the run down the plain
+// loop, so the absence of a capture or of speculative steps is visible.
+static void log_plain_loop(const Gemma4Model& m) {
+  static std::atomic<bool> logged{false};
+  if (logged.exchange(true, std::memory_order_relaxed)) return;
+  std::cerr << "[loop] plain loop (model=" << &m << "):";
+  if (model_has_routed_experts(m))
+    std::cerr << " no captured steps (routed experts)";
+  if (model_has_recurrent_state(m))
+    std::cerr << " no speculation, no measurement runs (recurrent state)";
+  std::cerr << "\n";
+}
+
 // Read the program back out of the lifted module. The program verifier has
 // already checked the shape; this only recovers the attributes the executor
 // needs (the prefill call's name, the stop set and the emitted-count bound, and
@@ -2048,6 +2072,10 @@ static void spec_measure_cost_curve(const Gemma4Model& m, uint64_t n_ctx,
                                     DecodeRuntime& rt,
                                     planner::KvCacheSession& session) {
   if (!tune::enabled()) return;
+  // §10: a recipe with recurrent state is never measured. The curve is priced
+  // by replaying verify and plain steps on the live session, and every replay
+  // would advance the state.
+  if (model_has_recurrent_state(m)) return;
   // Reckless verifies through the prefill path, whose price is a different
   // measurement; the decode-dealt curve is not used there.
   if (spec_mode() == SpecMode::Reckless) return;
@@ -3152,8 +3180,12 @@ static DecodeRuntime* get_decode_runtime(const Gemma4Model& m, uint64_t n_ctx,
   }
 
   // Capture the greedy decode step once (the warm-up run allocates every pooled
-  // device buffer and weight-upload so the capture pass only records).
-  if (cuda_graph_decode_enabled()) {
+  // device buffer and weight-upload so the capture pass only records). A recipe
+  // with routed experts or recurrent state is never captured (§10): the pool
+  // needs the host between the router and the experts, and the warm-up run
+  // would advance a recurrent state.
+  if (cuda_graph_decode_enabled() && !model_has_routed_experts(m) &&
+      !model_has_recurrent_state(m)) {
     // The warm-up run executes the step but has its KV stores suppressed (see
     // set_kv_write_suppressed): a session that already holds history must not
     // have any live row overwritten, and on a sliding-window ring the tail
@@ -3401,7 +3433,10 @@ static SampledRuntime* get_sampled_runtime(const Gemma4Model& m, uint64_t n_ctx,
   // onto a live prompt slot. The captured graph (recorded with the flag
   // cleared) carries the session cache's pointers and stores normally on
   // replay; the warm-up only allocates and loads what the capture records.
-  if (cuda_graph_decode_enabled()) {
+  // Routed experts and recurrent state are never captured (§10, see
+  // build_decode_runtime above).
+  if (cuda_graph_decode_enabled() && !model_has_routed_experts(m) &&
+      !model_has_recurrent_state(m)) {
     const uint64_t warm_pos = n_ctx > 0 ? n_ctx - 1 : 0;
     const std::vector<sx::Bytes> warm_in{encode_i64(0), encode_i64(warm_pos)};
     auto warm_run = [&]() -> bool {
@@ -3857,7 +3892,11 @@ static std::unique_ptr<VerifySet> build_verify_set(
   // to one of them.
   const int build_upto = verify_bucket_at_most(limit);
   if (build_upto < 2) return nullptr;
-  const bool graphs = cuda_graph_decode_enabled();
+  // Each bucket's warm-up executes a verify step on the session; a recipe with
+  // routed experts or recurrent state is neither warmed nor captured (§10).
+  const bool graphs = cuda_graph_decode_enabled() &&
+                      !model_has_routed_experts(m) &&
+                      !model_has_recurrent_state(m);
   const auto t0 = std::chrono::steady_clock::now();
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(
@@ -3953,6 +3992,8 @@ static VerifySet* get_verify_set(const Gemma4Model& m, uint64_t n_ctx,
 
 static void warm_verify_set(const Gemma4Model& m, uint64_t n_ctx,
                             const planner::KvCacheSession& session) {
+  // §10: no warm-up runs for a recipe with recurrent state.
+  if (model_has_recurrent_state(m)) return;
   (void)get_verify_set(m, n_ctx, session);
 }
 
@@ -4003,8 +4044,14 @@ static VerifyRuntime* get_repro_verify_runtime(
   if (!rt) return nullptr;
   if (tune_resolution_failed("repro verify runtime")) return nullptr;
   // Warm and capture like the spec set. The warm-up's KV writes are suppressed,
-  // so no live row of the session cache is touched before the first chunk.
-  (void)warm_verify_runtime(*rt, n_ctx, rows, cuda_graph_decode_enabled());
+  // so no live row of the session cache is touched before the first chunk. A
+  // recipe with recurrent state pays no warm run (§10) — it would advance the
+  // state — and its runtime is left uncaptured; the first real batch allocates
+  // its buffers. Routed experts are warmed but never captured.
+  if (!model_has_recurrent_state(m))
+    (void)warm_verify_runtime(*rt, n_ctx, rows,
+                              cuda_graph_decode_enabled() &&
+                                  !model_has_routed_experts(m));
   std::lock_guard<std::mutex> lk(g_registry_mutex);
   auto it = g_repro_verify_runtimes.find(key);
   if (it != g_repro_verify_runtimes.end()) return it->second.get();
@@ -4084,6 +4131,9 @@ static bool spec_probe_measure(const Gemma4Model& m, DecodeRuntime* rt,
                                const planner::KvCacheSession* session,
                                uint64_t& verify_cache_id, double& plain_ms,
                                double& verify_ms) {
+  // §10: the probe replays a plain step and a verify step on the live cache;
+  // a recipe with recurrent state is never measured.
+  if (model_has_recurrent_state(m)) return false;
   if (!cuda_graph_decode_enabled() || !rt || !rt->prog) return false;
   if (pos + 2 > n_ctx) return false;  // the k=1 verify appends 2 rows
   // The probe's verify runtime is bound to the same cache as the decode runtime
@@ -4163,6 +4213,12 @@ static bool spec_probe_injected(double& plain_ms, double& verify_ms) {
 static DecodeRuntime* spec_resolve_probe(
     const Gemma4Model& m, DecodeRuntime* rt, uint64_t n_ctx, uint64_t pos,
     const planner::KvCacheSession* session) {
+  // §10: a recipe with recurrent state does not speculate. The mode is left
+  // untouched — the probe (or a cached ratio) would otherwise select a loop
+  // shape this model never runs — and the dispatch sites below read the same
+  // predicate, so the speculative program is not run even if the process-wide
+  // mode was resolved by another model.
+  if (model_has_recurrent_state(m)) return rt;
   if (!rt || env_spec_mode() != SpecMode::Undecided ||
       g_spec_mode != SpecMode::Undecided)
     return rt;
@@ -5026,6 +5082,9 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
               << " bytes < " << (m.config.vocab_size + 7) / 8 << "\n";
     return 0;
   }
+  // §10: the first generate call of a guarded recipe announces the plain loop.
+  if (model_has_routed_experts(m) || model_has_recurrent_state(m))
+    log_plain_loop(m);
   std::lock_guard<std::recursive_mutex> exec_lock(g_exec_mutex);
 
   const bool gen_timing = std::getenv("SONICBOOM_GEN_TIMING") != nullptr;
@@ -5134,10 +5193,13 @@ uint64_t generate_spine_cuda(const Gemma4Model& m, uint64_t start_token,
   }
 
   const uint32_t chunk = rt->cuda->decode_chunk();
+  // §10: a recipe with recurrent state never runs the speculative program; it
+  // takes the plain program branch below.
   if (masked) {
     // the masked single step above already produced the call's one token
   } else if (ir_program_enabled() && rt->program.valid &&
-             rt->program.speculative && spec_enabled()) {
+             rt->program.speculative && spec_enabled() &&
+             !model_has_recurrent_state(m)) {
     // The speculative program drives the loop. Its proposals are verified,
     // never trusted, so the token stream is the plain loop's. The drafter is
     // seeded with the session's filled history (the prompt plus the tokens fed
@@ -5767,6 +5829,9 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                  "numerics profile\n";
     return 0;
   }
+  // §10: the first generate call of a guarded recipe announces the plain loop.
+  if (model_has_routed_experts(m) || model_has_recurrent_state(m))
+    log_plain_loop(m);
   // The final logits exist only on the attention prefill path (lm_head over the
   // last hidden column); the per-token reference graph emits an argmax only.
   if (!logits_out.empty() &&
@@ -6052,7 +6117,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
     // persistent cache, so the device pointers do not move. Reuse skips the
     // warm-up too — it exists to initialize the kernels and allocations the
     // capture records, and those are already initialized once the graph exists.
-    const bool use_graphs = cuda_graph_prefill_enabled();
+    // The capture's warm-up executes the first chunk on the live cache, which a
+  // recipe with routed experts or recurrent state must not capture (§10, as
+  // for the decode step).
+  const bool use_graphs = cuda_graph_prefill_enabled() &&
+                          !model_has_routed_experts(m) &&
+                          !model_has_recurrent_state(m);
     if (use_graphs && n > chunk && start_pos == 0) {
       Phase _cap("prefill:capture_graph", phase_timing);
       PrefillSegment* full = segment_for(chunk);
@@ -6268,8 +6338,10 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
                                             rt->cuda->cache_id());
   if (rt->prog && !replay_ok)
     log_capture_refusal("prefill-decode", m, n_ctx, rt->cuda->cache_id());
+  // §10: a recipe with recurrent state never runs the speculative program.
   if (!dump_logits && ir_program_enabled() && rt->program.valid &&
-      rt->program.speculative && spec_enabled()) {
+      rt->program.speculative && spec_enabled() &&
+      !model_has_recurrent_state(m)) {
     // The speculative program drives the loop over the same cache the prefill
     // filled: the session's when the caller passed one, otherwise a session
     // published from this runtime's own cache (the one the step capture was

@@ -204,6 +204,22 @@ struct Recipe {
   Head head;
 };
 
+// Whether any block routes to experts. A recipe whose routed matrices come
+// from a device pool needs the host between the router and the experts, which
+// a captured step cannot carry (§10).
+inline bool has_routed_experts(const Recipe& recipe) noexcept {
+  for (const Block& b : recipe.blocks)
+    if (std::holds_alternative<MoeFfn>(b.ffn)) return true;
+  return false;
+}
+
+// Whether the recipe carries recurrent state across steps. Every executed step
+// advances it, so a speculative or measurement run on a live sequence would
+// change the sequence it measures (§10).
+inline bool has_recurrent_state(const Recipe& recipe) noexcept {
+  return recipe.states > 0;
+}
+
 // The recipe of a loaded model: its architecture's layer kinds, with the
 // widths of its config and the quantization of its weights.
 Recipe recipe_for(const Gemma4Model& m);
