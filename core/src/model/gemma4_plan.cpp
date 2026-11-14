@@ -6080,6 +6080,12 @@ static uint64_t prefill_decode_cuda_impl(const Gemma4Model& m,
       seg->cuda = std::make_unique<planner::SonicCudaBackend>(
           kv_cache_spec(m.config), seg->graph, n_ctx, std::move(seg_caches),
           rt->cuda->cache_id());
+      // A segment is one more backend of the sequence: it shares the decode
+      // runtime's cache set and its recurrent state set, so the scans it
+      // commits are the positions the decode steps continue from. The state
+      // lives where the KV caches live (design doc section 6), and the CPU
+      // prefill backend has shared both through share_caches from the start.
+      seg->cuda->share_caches(*rt->cuda);
       seg->cuda->bind_model(m);
       seg->exec = std::make_unique<planner::RuntimeExecutor>(
           std::map<planner::BackendTag, planner::Backend*>{
