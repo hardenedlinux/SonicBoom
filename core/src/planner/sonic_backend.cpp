@@ -32,6 +32,7 @@
 
 #include "async_prefetch.h"
 #include "calibration.h"
+#include "node_dump.h"
 
 #include <algorithm>
 #include <cmath>
@@ -107,8 +108,15 @@ bool attr_s(const GraphNodeDesc& n, std::string_view name,
 
 SonicBackend::SonicBackend(const model::Gemma4Model& model, const Graph& graph,
                            uint64_t n_ctx)
-    : model_(model), graph_(graph) {
+    : model_(model), graph_(graph), dump_(NodeDump::create()) {
   ensure_caches(n_ctx);
+}
+
+SonicBackend::~SonicBackend() = default;
+
+void SonicBackend::bind_segment_extent(uint64_t extent) {
+  segment_extent_ = extent;
+  if (dump_) dump_->begin_graph();
 }
 
 void SonicBackend::share_caches(const SonicBackend& other) {
@@ -744,6 +752,12 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicBackend::execute(
   // declared output count (mirrors the CUDA backend's identical handling).
   if (task.outputs.empty())
     return std::vector<TensorValue>{};
+
+  // Debug dump (node_dump.h): the first output, host bytes as they are. The
+  // dump names the node by its first output's tensor name (the emitter's
+  // unique name; the runtime node name is the shared op kind).
+  if (dump_)
+    dump_->write(out_td->name, out.data(), out.size(), out_td->dtype);
 
   std::vector<TensorValue> res;
   res.push_back(TensorValue::from_host(std::move(out)));

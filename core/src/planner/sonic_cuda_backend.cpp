@@ -40,6 +40,7 @@
 #include "../spec_diag_counters.h"
 #include "async_prefetch.h"
 #include "decision_registry.h"
+#include "node_dump.h"
 #include "device_allocator.h"
 #include "device_pool.h"
 #include "expert_pool.h"
@@ -267,7 +268,13 @@ SonicCudaBackend::SonicCudaBackend(const KvCacheSpec& spec, const Graph& graph,
   init_staging();
 }
 
+void SonicCudaBackend::bind_segment_extent(uint64_t extent) {
+  segment_extent_ = extent;
+  if (dump_) dump_->begin_graph();
+}
+
 void SonicCudaBackend::init_staging() {
+  dump_ = NodeDump::create();
   // Persistent current-token slot; sized for the verify step's widest row set
   // (k+1 <= kMaxVerifyRows) so one Argmax node's row indices land contiguously
   // for a single D2H read. Decode reads element 0 only.
@@ -2978,6 +2985,16 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
     if (!borrowed) device::release(out_handle, alloc_bytes);
     for (const auto& e : sibling_outs) device::release(e.first, e.second);
     return std::vector<TensorValue>{};
+  }
+
+  // Debug dump (node_dump.h): the first output, read back synchronously. The
+  // dump covers the uncaptured path only — a capture's memcpy cannot be
+  // recorded. The dump names the node by its first output's tensor name (the
+  // emitter's unique name; the runtime node name is the shared op kind).
+  if (dump_ && !sonicboom::cuda::sb_capturing()) {
+    std::vector<std::byte> host(out_bytes);
+    if (device::download(out_handle, host.data(), out_bytes))
+      dump_->write(out_td->name, host.data(), out_bytes, out_td->dtype);
   }
 
   std::vector<TensorValue> res;

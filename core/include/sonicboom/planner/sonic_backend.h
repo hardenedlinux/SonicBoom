@@ -37,6 +37,8 @@
 
 namespace sonicboom::planner {
 
+class NodeDump; // node_dump.h: optional per-node output dump (debug only)
+
 class SonicBackend : public Backend {
 public:
   // Both `model` and `graph` must outlive the backend: the model owns the weight
@@ -47,6 +49,8 @@ public:
   // Attention task.
   SonicBackend(const model::Gemma4Model& model, const Graph& graph,
                uint64_t n_ctx = 0);
+  // Out of line: the node dump is an incomplete type here.
+  ~SonicBackend() override;
 
   DeviceKind kind() const noexcept override { return DeviceKind::CPU; }
 
@@ -56,7 +60,7 @@ public:
   // The prefill segment length this execution runs with (Backend::
   // bind_segment_extent): it replaces the planned `batch` of every batched
   // node and sizes every dynamic tensor's buffer.
-  void bind_segment_extent(uint64_t extent) override { segment_extent_ = extent; }
+  void bind_segment_extent(uint64_t extent) override;
 
   // Share another backend's KV cache and recurrent-block state (same session).
   // The prefill graph's FlashAttention nodes fill the cache that the decode
@@ -87,6 +91,7 @@ private:
   // node's `state` attribute numbers them; null for a graph with no scan.
   std::shared_ptr<StateSet> states_;
   uint64_t segment_extent_ = 0;  // bound prefill segment length (0: static)
+  std::unique_ptr<NodeDump> dump_;  // null unless the debug dump is on
 
   void ensure_caches(uint64_t n_ctx);
 };

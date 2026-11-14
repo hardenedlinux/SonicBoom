@@ -52,6 +52,8 @@ namespace sonicboom::planner {
 // is sized for the widest bucket's argmax results.
 inline constexpr int kMaxVerifyRows = 64;
 
+class NodeDump; // node_dump.h: optional per-node output dump (debug only)
+
 class SonicCudaBackend : public Backend {
 public:
   // `spec` describes the KV-cache geometry (copied into the backend) and `graph`
@@ -93,7 +95,7 @@ public:
   // bind_segment_extent). On a plan lowered from a symbolic IR it replaces the
   // planned `batch` of every batched node and sizes every dynamic tensor's
   // buffer, so one plan serves every segment of its shape class.
-  void bind_segment_extent(uint64_t extent) override { segment_extent_ = extent; }
+  void bind_segment_extent(uint64_t extent) override;
 
   // Seed the device-resident token-id buffer (Phase 3.2 B4): uploads `token` as
   // a float index so the first decode step's Embedding gather reads it from the
@@ -415,6 +417,7 @@ private:
   int capture_tier_ = -1;           // depth tier being warmed/captured (-1 off)
   uint64_t n_ctx_ = 0;              // decode length (global layers' key window)
   uint64_t segment_extent_ = 0;     // bound prefill segment length (0: static)
+  std::unique_ptr<NodeDump> dump_;  // null unless the debug dump is on
   bool kv_write_suppressed_ = false;  // warm-up: skip KV stores (see setter)
 
   // The device address of the position / token a kernel reads or writes for the

@@ -450,6 +450,12 @@ constexpr KnobRow kKnobRows[] = {
     {"expert-stats", "SONICBOOM_EXPERT_STATS", "off", "on|off",
      "print the expert pool counters at the end of the run",
      "none (reporting only)", 0, 0},
+    {"debug.dump-nodes", "SONICBOOM_DUMP_NODES", "off", "prefix[,prefix...]",
+     "write the first output of every matching node, per graph execution",
+     "none (reporting only)", 0, 0},
+    {"debug.dump-dir", "SONICBOOM_DUMP_DIR", "off", "directory",
+     "directory the node dump writes to; both variables must be set",
+     "none (reporting only)", 0, 0},
 };
 
 }  // namespace
