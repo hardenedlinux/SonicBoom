@@ -48,6 +48,28 @@
 ;;; --- unrolled, with a limit ------------------------------------------------------
 
 (define (%loop site body . inits)
+  "The run-time hook of a rewritten do or named let.
+
+Outside a trace, BODY is run as ordinary recursion. While tracing, the loop is
+unrolled into the graph up to the context's maximum unroll count; a longer
+loop becomes one loop node holding one iteration's graph, executed as a host
+loop. The body must continue by a tail call to the SELF parameter it is given,
+and a tensor loop variable must keep its dtype and shape.
+
+Args:
+  site: the source location of the form.
+  body: a procedure of SELF and the loop variables.
+  inits: the initial loop variable values.
+Returns: the loop's final value.
+Example:
+  (use-modules (sonicboom trace loop))
+  (%loop 'example
+         (lambda (self n acc) (if (= n 0) acc (self (- n 1) (+ acc n))))
+         3 0)
+  => 6
+PyTorch: none
+Note: The macro walker produces these calls from do and named let in a traced
+body; call this directly only in eager Scheme code."
   (let ((rec (current-tracer)))
     (if (not rec)
         (plain-loop body inits)
