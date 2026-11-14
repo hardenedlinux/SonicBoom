@@ -68,14 +68,17 @@
 
 namespace sonicboom::vocab::ggml_gpt2 {
 
-// --- qwen2 pre-tokenizer ----------------------------------------------------
+// --- qwen2 / qwen35 pre-tokenizer -------------------------------------------
 
 // Split one span into the words the BPE merge tables are keyed on, i.e. the
-// qwen2 regex above. The alternation is tried in the order the regex states,
-// at each position, exactly as the hand-written matcher does; `_get_flags`
-// off the end of the span yields the empty flag set, so every arm's lookahead
-// terminates there.
-inline std::vector<std::string> qwen2_split(std::string_view span) {
+// qwen2 regex above, or the qwen35 one when `marks` is set. The two differ only
+// in the letter arms: qwen35's regex spells them \p{L}\p{M} (llama.cpp's
+// unicode_regex_split_custom_qwen35), so a combining mark stays inside the word
+// it modifies. The alternation is tried in the order the regex states, at each
+// position, exactly as the hand-written matcher does; `_get_flags` off the end
+// of the span yields the empty flag set, so every arm's lookahead terminates
+// there.
+inline std::vector<std::string> pre_split(std::string_view span, bool marks) {
   using ggml_unicode::CptFlags;
   constexpr uint32_t kOutOfRange = 0xFFFFFFFFu;
 
@@ -123,11 +126,15 @@ inline std::vector<std::string> qwen2_split(std::string_view span) {
       }
     }
 
-    // [^\r\n\p{L}\p{N}]?\p{L}+
+    // [^\r\n\p{L}\p{N}]?\p{L}+ (qwen35: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+)
+    const auto word_char = [&](size_t at) {
+      const CptFlags f = flags_at(at);
+      return f.is_letter || (marks && f.is_mark);
+    };
     if (!(cpt == '\r' || cpt == '\n' || flags.is_number)) {
-      if (flags.is_letter || flags_at(pos + 1).is_letter) {
+      if (word_char(pos) || word_char(pos + 1)) {
         ++pos;
-        while (flags_at(pos).is_letter) ++pos;
+        while (word_char(pos)) ++pos;
         add_word(pos);
         continue;
       }
@@ -139,13 +146,16 @@ inline std::vector<std::string> qwen2_split(std::string_view span) {
       continue;
     }
 
-    // <space>?[^\s\p{L}\p{N}]+[\r\n]*
+    // <space>?[^\s\p{L}\p{N}]+[\r\n]* (qwen35 also excludes \p{M})
     CptFlags flags2 = (cpt == ' ') ? flags_at(pos + 1) : flags;
-    if (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags.any) {
+    const auto punct = [&](const CptFlags& f) {
+      return !(f.is_whitespace || f.is_letter || (marks && f.is_mark) ||
+               f.is_number) &&
+             f.any;
+    };
+    if (punct(flags2) && flags.any) {
       if (cpt == ' ') ++pos;
-      while (!(flags2.is_whitespace || flags2.is_letter || flags2.is_number) && flags2.any) {
-        flags2 = flags_at(++pos);
-      }
+      while (punct(flags2)) flags2 = flags_at(++pos);
       uint32_t cpt2 = cpt_at(pos);
       while (cpt2 == '\r' || cpt2 == '\n') {
         cpt2 = cpt_at(++pos);
@@ -189,11 +199,11 @@ inline std::vector<std::string> qwen2_split(std::string_view span) {
   return words;
 }
 
-// One span -> tokens: the qwen2 split, then byte-level encode each word, then
-// run it through the shared BPE merge.
+// One span -> tokens: the pre-tokenizer's split, then byte-level encode each
+// word, then run it through the shared BPE merge.
 inline void tokenize_span(const Vocab& v, std::string_view span,
-                          std::vector<int32_t>& out) {
-  for (const std::string& word : qwen2_split(span)) {
+                          std::vector<int32_t>& out, bool marks) {
+  for (const std::string& word : pre_split(span, marks)) {
     ggml_bpe::tokenize_word(v, ggml_unicode::byte_encode(word), out,
                             /*byte_encoded=*/true);
   }
@@ -204,12 +214,13 @@ inline void tokenize_span(const Vocab& v, std::string_view span,
 // asks for them.
 inline std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
                                      bool parse_special = false,
-                                     bool add_special = true) {
+                                     bool add_special = true,
+                                     bool marks = false) {
   std::vector<int32_t> out;
   if (add_special && v.add_bos && v.bos >= 0) out.push_back(v.bos);
 
   if (!parse_special) {
-    tokenize_span(v, text, out);
+    tokenize_span(v, text, out, marks);
   } else {
     const std::vector<int32_t> specials = ggml_bpe::special_token_ids(v);
     size_t start = 0, i = 0;
@@ -227,12 +238,13 @@ inline std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
         ++i;
         continue;
       }
-      if (i > start) tokenize_span(v, text.substr(start, i - start), out);
+      if (i > start)
+        tokenize_span(v, text.substr(start, i - start), out, marks);
       out.push_back(hit);
       i += v.tokens[hit].size();
       start = i;
     }
-    if (start < text.size()) tokenize_span(v, text.substr(start), out);
+    if (start < text.size()) tokenize_span(v, text.substr(start), out, marks);
   }
 
   if (add_special && v.add_eos && v.eos >= 0) out.push_back(v.eos);

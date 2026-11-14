@@ -66,12 +66,13 @@ enum class TokenType : uint8_t {
   Byte = 6,
 };
 
-// Which pre-tokenizer the vocabulary uses. The two kinds differ in how a piece
-// of text is cut into words and how a word's bytes are spelled in the merge
+// Which pre-tokenizer the vocabulary uses. The kinds differ in how a piece of
+// text is cut into words and how a word's bytes are spelled in the merge
 // tables; the merge tables themselves and the detokenize rules are common.
 enum class TokenizerKind : uint8_t {
   Gemma4 = 0,    // SPM-style BPE: ▁-escaped input, <0xNN> byte fallback
   Gpt2Qwen2 = 1, // byte-level BPE with the qwen2 pre-tokenizer regex
+  Gpt2Qwen35 = 2, // byte-level BPE with the qwen35 regex (\p{M} joins a word)
 };
 
 struct Vocab {

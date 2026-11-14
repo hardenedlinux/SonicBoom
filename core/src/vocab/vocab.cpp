@@ -69,17 +69,22 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
     v.kind = TokenizerKind::Gemma4;
   } else if (model->s == "gpt2") {
     // A gpt2 model is byte-level BPE; the pre-tokenizer decides how its words
-    // are cut. Only the qwen2 pattern is implemented; llama.cpp groups these
-    // four names onto that same pattern, so an alias is the same tokenizer, not
-    // a different one (DeepSeek-R1-Distill-Qwen names it 'deepseek-r1-qwen').
+    // are cut. Two patterns are implemented. llama.cpp groups these four names
+    // onto the qwen2 pattern, so an alias is the same tokenizer, not a
+    // different one (DeepSeek-R1-Distill-Qwen names it 'deepseek-r1-qwen');
+    // 'qwen35' spells its letter arms \p{L}\p{M} and is its own pattern.
     const Value* pre = reader.find("tokenizer.ggml.pre");
     const std::string pre_s = pre ? pre->s : std::string();
-    if (pre_s != "qwen2" && pre_s != "deepseek-r1-qwen" && pre_s != "kormo" &&
-        pre_s != "f2llmv2") {
+    if (pre_s == "qwen2" || pre_s == "deepseek-r1-qwen" || pre_s == "kormo" ||
+        pre_s == "f2llmv2") {
+      v.kind = TokenizerKind::Gpt2Qwen2;
+    } else if (pre_s == "qwen35") {
+      v.kind = TokenizerKind::Gpt2Qwen35;
+    } else {
       return std::unexpected("unsupported gpt2 pre-tokenizer '" + pre_s +
-                             "' (expected 'qwen2' or an alias of it)");
+                             "' (expected 'qwen2' or an alias of it, or "
+                             "'qwen35')");
     }
-    v.kind = TokenizerKind::Gpt2Qwen2;
   } else {
     return std::unexpected("unsupported tokenizer model '" + model->s +
                            "' (expected 'gemma4' or 'gpt2')");
@@ -140,8 +145,9 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
     v.clean_spaces = true;
     if (!v.add_bos) v.add_bos = true;
   } else {
-    // gpt2 / qwen2 (llama.cpp): the piece text is byte-level encoded, so it is
-    // not ▁-escaped, and the qwen2 pre-tokenizer turns the clean-up pass off.
+    // gpt2 / qwen2 / qwen35 (llama.cpp): the piece text is byte-level encoded,
+    // so it is not ▁-escaped, and these pre-tokenizers turn the clean-up pass
+    // off.
     // add_bos keeps whatever the file said — a Qwen2 prompt does not start with
     // a framework token.
     v.escape_whitespaces = false;
@@ -157,14 +163,17 @@ std::expected<Vocab, std::string> load_vocab(const gguf::Reader& reader) {
 
 std::vector<int32_t> tokenize(const Vocab& v, std::string_view text,
                               bool parse_special, bool add_special) {
-  if (v.kind == TokenizerKind::Gpt2Qwen2) {
+  if (v.kind == TokenizerKind::Gpt2Qwen2)
     return ggml_gpt2::tokenize(v, text, parse_special, add_special);
-  }
+  if (v.kind == TokenizerKind::Gpt2Qwen35)
+    return ggml_gpt2::tokenize(v, text, parse_special, add_special,
+                               /*marks=*/true);
   return ggml_bpe::tokenize(v, text, parse_special, add_special);
 }
 
 std::string detokenize(const Vocab& v, const int32_t* tokens, size_t n) {
-  if (v.kind == TokenizerKind::Gpt2Qwen2) {
+  if (v.kind == TokenizerKind::Gpt2Qwen2 ||
+      v.kind == TokenizerKind::Gpt2Qwen35) {
     return ggml_gpt2::detokenize(v, tokens, n);
   }
   return ggml_bpe::detokenize(v, tokens, n);

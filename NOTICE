@@ -103,14 +103,17 @@ core/src/vocab/ggml_derived/bpe_tokenizer.h
       - unicode_len_utf8, newline-run regex split               ← llama.cpp/src/unicode.cpp
 
 core/src/vocab/ggml_derived/gpt2_bpe_tokenizer.h
-    Byte-level BPE pre-tokenizer, qwen2 pattern. Ported from:
+    Byte-level BPE pre-tokenizer, qwen2 and qwen35 patterns. Ported from:
       - unicode_regex_split_custom_qwen2 (the matcher for the qwen2 regex)
+      - unicode_regex_split_custom_qwen35 (the qwen35 regex, whose word and
+        punctuation arms also treat combining marks, \p{M}, as word characters)
                                                                  ← llama.cpp/src/unicode.cpp
 
 core/src/vocab/ggml_derived/unicode_cpt_flags.h
     Unicode codepoint classes (\p{L} / \p{N}) and the whitespace set the
     pre-tokenizer regexes split on. Transcribed from:
       - unicode_ranges_flags, unicode_set_whitespace   ← llama.cpp/src/unicode-data.cpp
+        (including the mark bit the qwen35 pattern reads)
       - unicode_cpt_flags_from_cpt                     ← llama.cpp/src/unicode.cpp
     (Adaptation: stored as maximal runs queried by binary search, instead of
      upstream's 0x110000-entry array expanded at load.)
