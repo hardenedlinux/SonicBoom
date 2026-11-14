@@ -26,7 +26,14 @@
 (define %body-parses 0)
 (define %body-hits 0)
 (define (interp-body-cache-stats)
-  "(parses . hits) of the loop-body parse cache since start."
+  "The parses and hits of the loop-body parse cache since start.
+
+Returns: a pair (parses . hits).
+Example:
+  (use-modules (sonicboom trace interp))
+  (pair? (interp-body-cache-stats))
+  => #t
+PyTorch: none"
   (cons %body-parses %body-hits))
 (define (body-doc text)
   (let ((doc (table-ref %body-cache text #f)))
@@ -73,8 +80,38 @@
            (cons (ctensor-dtype t) (ctensor-shape t)) type)))
 
 (define (interpret-sexpr doc inputs)
-  "Evaluate document datum DOC. INPUTS is an alist (name . ctensor). Returns an
-alist (output-name . ctensor) in the graph's output order."
+  "Evaluate a parsed S-Expr v0.1 document on concrete tensors.
+
+It enforces the parts of the format the tracer relies on: version (0 1), a
+single definition per value name, topological order, the declared input types,
+and that every node output matches the type the kernel produced. `loop` nodes
+run their body document TRIP-COUNT times.
+
+Args:
+  doc: the document datum.
+  inputs: an alist (name . ctensor).
+Returns: an alist (output-name . ctensor) in the graph's output order.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace interp))
+  (ctensor->list
+   (assoc-ref
+    (interpret-sexpr
+     '(sonicboom-s-expr
+       (version 0 1)
+       (graph
+        (name \"g\")
+        (inputs (input \"x\" (tensor float32 (shape 2))))
+        (outputs (output \"y\"))
+        (parameters)
+        (nodes (node relu (inputs \"x\")
+                     (outputs (\"y\" (tensor float32 (shape 2))))
+                     (attrs)))))
+     (list (cons \"x\" (list->ctensor '(-1.0 2.0)))))
+    \"y\"))
+  => (0.0 2.0)
+PyTorch: none
+Note: this is the reference interpreter for the S-Expr format; it reads the
+text back and re-derives every declared type."
   (match doc
     (('sonicboom-s-expr ('version 0 1) ('graph . _)) #t)
     (_ (error "interp: not a sonicboom-s-expr v0.1 document")))
@@ -150,5 +187,24 @@ alist (output-name . ctensor) in the graph's output order."
           doc))))
 
 (define (interpret-sexpr-text text inputs)
-  "Parse TEXT (one S-Expr v0.1 document) and evaluate it; see interpret-sexpr."
+  "Parse TEXT and evaluate it.
+
+TEXT is one S-Expr v0.1 document. Parsed documents are cached by the text
+string, so a repeated call on the same text does not parse it again.
+
+Args:
+  text: the document text.
+  inputs: an alist (name . ctensor).
+Returns: an alist (output-name . ctensor); see `interpret-sexpr`.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace graph)
+               (sonicboom trace interp))
+  (let ((text (sexpr->text (graph->sexpr \"g\" '((\"x\" float32 (2)))
+                                         '(\"x\") '() '()))))
+    (ctensor->list
+     (assoc-ref (interpret-sexpr-text text
+                                     (list (cons \"x\" (list->ctensor '(1.0 2.0)))))
+                \"x\")))
+  => (1.0 2.0)
+PyTorch: none"
   (interpret-sexpr (parse-text text) inputs))

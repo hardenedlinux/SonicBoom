@@ -20,7 +20,12 @@
             gparam-values
             type->sx graph->sexpr sexpr->text))
 
-;; OUTPUTS is a list of (name dtype shape); ATTRS is the S-Expr attr list.
+;; A recorded graph node: an operator, its inputs, its outputs and its attributes.
+;;
+;; OUTPUTS is a list of (name dtype shape) entries; ATTRS is the S-Expr attribute
+;; list. A segment is a list of nodes in topological order.
+;;
+;; PyTorch: none
 (define-record-type <gnode>
   (make-gnode op inputs outputs attrs)
   gnode?
@@ -29,8 +34,25 @@
   (outputs gnode-outputs)
   (attrs   gnode-attrs))
 
-(define (gnode-output-names n) (map car (gnode-outputs n)))
+(define (gnode-output-names n)
+  "The output value names of node N.
 
+Args:
+  n: a graph node.
+Returns: a list of strings, one per output.
+Example:
+  (use-modules (sonicboom trace graph))
+  (gnode-output-names (make-gnode 'relu '(\"x\") '((\"y\" float32 (2))) '()))
+  => (\"y\")
+PyTorch: none"
+  (map car (gnode-outputs n)))
+
+;; An inline graph constant: its name, dtype, shape and flat values.
+;;
+;; The value list is stored already coerced to DTYPE. The S-Expr emission writes
+;; it as (data :values ...).
+;;
+;; PyTorch: none
 (define-record-type <gparam>
   (make-gparam name dtype shape values)
   gparam?
@@ -39,7 +61,19 @@
   (shape  gparam-shape)
   (values gparam-values))   ; flat list, already coerced to dtype
 
-(define (type->sx dtype shape) `(tensor ,dtype (shape ,@shape)))
+(define (type->sx dtype shape)
+  "The S-Expr type form of DTYPE and SHAPE.
+
+Args:
+  dtype: a dtype symbol.
+  shape: a list of dimensions.
+Returns: (tensor <dtype> (shape <dims> ...)).
+Example:
+  (use-modules (sonicboom trace graph))
+  (type->sx 'float32 '(2 3))
+  => (tensor float32 (shape 2 3))
+PyTorch: none"
+  `(tensor ,dtype (shape ,@shape)))
 
 (define (node-attrs n)
   ;; Emitted attrs: the node's own, plus the PyTorch Core ATen operator it
@@ -51,9 +85,25 @@
         (gnode-attrs n))))
 
 (define (graph->sexpr name inputs outputs params nodes)
-  "Build the S-Expr v0.1 document datum. INPUTS is a list of (name dtype shape),
-OUTPUTS a list of value names, PARAMS a list of gparams, NODES a list of gnodes
-in topological order."
+  "Build the S-Expr v0.1 document datum of one segment.
+
+INPUTS is a list of (name dtype shape), OUTPUTS a list of value names, PARAMS
+a list of gparams and NODES a list of gnodes in topological order. Every node
+whose operator has an ATen counterpart gains an (aten (string ...)) attribute.
+
+Args:
+  name: the graph name.
+  inputs: a list of (name dtype shape).
+  outputs: a list of output value names.
+  params: a list of gparams.
+  nodes: a list of gnodes in topological order.
+Returns: the document datum, ready for `sexpr->text`.
+Example:
+  (use-modules (sonicboom trace graph))
+  (car (graph->sexpr \"g\" '((\"x\" float32 (2))) '(\"y\") '()
+                     (list (make-gnode 'relu '(\"x\") '((\"y\" float32 (2))) '()))))
+  => sonicboom-s-expr
+PyTorch: none"
   `(sonicboom-s-expr
     (version 0 1)
     (graph
@@ -78,9 +128,23 @@ in topological order."
              nodes)))))
 
 (define (sexpr->text doc)
-  "Render a document datum as text: one graph section per line group, one
-input/output/parameter/node per line. `write` gives strings for names, symbols
-for vocabulary, and floats with a decimal point or exponent."
+  "Render a document datum as text.
+
+One graph section per line group, one input, output, parameter or node per
+line. Strings are written as strings, vocabulary as symbols and floats with a
+decimal point or an exponent.
+
+Args:
+  doc: an S-Expr document datum.
+Returns: the document text.
+Example:
+  (use-modules (sonicboom trace graph))
+  (string? (sexpr->text
+            (graph->sexpr \"g\" '((\"x\" float32 (2))) '(\"y\") '()
+                          (list (make-gnode 'relu '(\"x\")
+                                            '((\"y\" float32 (2))) '())))))
+  => #t
+PyTorch: none"
   (define (w x) (let ((p (open-output-string))) (write x p) (get-output-string p)))
   (define (section head items)
     (if (null? items)

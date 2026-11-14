@@ -54,10 +54,13 @@
 
 ;;; --- executor -----------------------------------------------------------------
 
-;; An executor is (text inputs) -> outputs, where TEXT is an S-Expr v0.1
-;; document, INPUTS an alist (name . ctensor) and the result an alist
-;; (output-name . ctensor). The default is the pure-Scheme reference
-;; interpreter; a native backend would plug in here.
+;; The graph-break executor used by traced functions that do not supply one.
+;;
+;; An executor is a procedure (text inputs) returning outputs: TEXT is an S-Expr
+;; v0.1 document, INPUTS an alist (name . ctensor), and the result an alist
+;; (output-name . ctensor). The default is the reference interpreter.
+;;
+;; PyTorch: none
 (define current-executor (make-parameter interpret-sexpr-text))
 
 ;;; --- records --------------------------------------------------------------------
@@ -711,21 +714,40 @@ caller's .value, unless the trace-time value is still the leaf's own input."
 (define* (trace-function proc #:key (multi-resume? #f) (max-side-nodes 16)
                          (max-depth 3) (executor #f) (retrace-on-miss? #f)
                          (guards '()) (strict? 'default) (max-unroll 64))
-  "Return a procedure that runs PROC through the tracer. Tensor arguments are
-ctensors (they become symbolic inputs \"arg<i>\"); other arguments are static
-and part of the cache key. GUARDS is an alist (name . thunk): the thunks'
-values at call time are also part of the cache key (define-traced /
-traced-lambda fill this with the body's free variables). MULTI-RESUME?
-asserts that PROC has no side effects after its `bool` points, allowing a
-branch to be resolved inside the graph when each side records at most
-MAX-SIDE-NODES nodes and branches nest at most MAX-DEPTH deep.
-RETRACE-ON-MISS? traces PROC again from the start on a cache miss instead of
-re-entering a stored continuation (and stores none). STRICT? reports
-symbolic tensors passed to procedures the macro walker did not cover
-('default follows the strict-tracing parameter). MAX-UNROLL bounds how many
-iterations of a do / named-let loop are unrolled into the graph; a longer loop
-becomes a host loop over one cached body graph (#f: always unroll). EXECUTOR
-overrides `current-executor`."
+  "Return a procedure that runs PROC through the tracer.
+
+Tensor arguments become symbolic inputs named \"arg0\", \"arg1\", ...; arguments
+inside lists and vectors become \"arg<i>.<k>\". Other arguments are static and
+part of the cache key. The first call traces PROC and replays the recorded
+graph; later calls on the same input signature and guard values replay it.
+
+Args:
+  proc: the procedure to trace.
+  multi-resume?: keyword; resolve a data-dependent branch inside the graph when
+    each side records at most MAX-SIDE-NODES nodes and branches nest at most
+    MAX-DEPTH deep (default #f).
+  max-side-nodes: keyword; the per-side node budget (default 16).
+  max-depth: keyword; the branch nesting bound (default 3).
+  executor: keyword; the executor used for recorded segments, overriding
+    `current-executor` (default #f).
+  retrace-on-miss?: keyword; on a cache miss, trace PROC again from the start
+    instead of re-entering a stored continuation (default #f).
+  guards: keyword; an alist (name . thunk); the thunks' values at call time are
+    part of the cache key (default '()).
+  strict?: keyword; report symbolic tensors passed to procedures the macro
+    walker did not cover; #t, #f or 'default (default 'default).
+  max-unroll: keyword; how many loop iterations are unrolled into the graph
+    before a loop becomes a host loop over one body graph (default 64).
+Returns: a procedure with PROC's arity.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer))
+  (let ((f (trace-function (lambda (x) (relu x)))))
+    (ctensor->list (f (list->ctensor '(-1.0 2.0)))))
+  => (0.0 2.0)
+PyTorch: torch.compile
+Note: torch.compile returns a compiled callable; this returns a wrapper that
+records the graph on the first call and replays it afterwards."
   (let* ((st (make-tstate proc (make-trace-context max-side-nodes strict? max-unroll)
                           multi-resume? max-depth executor retrace-on-miss? guards
                           (make-table) #f (make-table) '()))
@@ -737,6 +759,12 @@ overrides `current-executor`."
     wrapper))
 
 (define (traced-function? f)
+  "True when F is a traced function.
+
+Args:
+  f: any value.
+Returns: a boolean.
+PyTorch: none"
   (tstate? (procedure-tag f 'sonicboom-trace)))
 
 (define (state-of f)
@@ -745,14 +773,24 @@ overrides `current-executor`."
       (error "not a traced function" f)))
 
 (define (trace-stats f)
-  "Counters of traced function F: calls, cache-hits (calls that traced
-nothing), traces (fresh traces + cache-miss re-entries or retraces),
-guard-misses (fresh traces caused by a changed guard value), retraces,
-retrace-divergences, segments-traced, graph-breaks, merges (continuation
-multi-resume joins), branch-merges (macro-rewritten ifs joined with where),
-logic-merges (and/or on symbolic conditions), loop-breaks (symbolic branches
-re-entered recursively, i.e. data-dependent loops, resolved by a graph
-break), output-warnings, strict-warnings, executor-calls."
+  "The counters of traced function F.
+
+The alist has one entry per counter: calls, cache-hits, traces, guard-misses,
+retraces, retrace-divergences, segments-traced, graph-breaks, merges,
+branch-merges, logic-merges, loop-breaks, host-loops, loop-body-traces,
+loop-body-hits, output-warnings, strict-warnings and executor-calls.
+
+Args:
+  f: a traced function.
+Returns: an alist (counter . integer).
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer))
+  (let ((f (trace-function (lambda (x) (relu x)))))
+    (f (list->ctensor '(-1.0 2.0)))
+    (assq-ref (trace-stats f) 'calls))
+  => 1
+PyTorch: none"
   (let* ((st (state-of f))
          (h (tstate-stats st))
          (c (trace-context-counters (tstate-ctx st))))
@@ -766,13 +804,23 @@ break), output-warnings, strict-warnings, executor-calls."
            output-warnings strict-warnings executor-calls))))
 
 (define (trace-strict-warnings f)
-  "Strict-mode reports of F: one string per procedure that received a
-symbolic tensor without being covered by the macro walker."
+  "The strict-mode reports of F.
+
+Args:
+  f: a traced function.
+Returns: a list of strings, one per procedure that received a symbolic tensor
+without being covered by the macro walker.
+PyTorch: none"
   (trace-context-notes (tstate-ctx (state-of f))))
 
 (define (trace-warnings f)
-  "Text written to current-output-port while F was being traced, one string
-per tracing run that wrote something."
+  "The output F wrote while it was being traced.
+
+Args:
+  f: a traced function.
+Returns: a list of strings, one per tracing run that wrote to
+current-output-port.
+PyTorch: none"
   (tstate-warnings (state-of f)))
 
 (define (all-trees f)
@@ -783,8 +831,21 @@ per tracing run that wrote something."
               (table->alist (tstate-trees (state-of f)))))
 
 (define (trace-segments f)
-  "List of (label . S-Expr text) for every cached segment of F, depth first.
-Labels are paths: \"trace\", \"trace.t\", \"trace.t.f\", ..."
+  "The cached segments of F as (label . text) pairs, depth first.
+
+Labels are paths in the trace tree: \"trace\", \"trace.t\", \"trace.t.f\", ...
+
+Args:
+  f: a traced function.
+Returns: a list of (label . S-Expr text).
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer))
+  (let ((f (trace-function (lambda (x) (relu x)))))
+    (f (list->ctensor '(-1.0 2.0)))
+    (map car (trace-segments f)))
+  => (\"trace\")
+PyTorch: none"
   (append-map
    (lambda (entry)
      (let walk ((n (cdr entry)))
@@ -800,9 +861,16 @@ Labels are paths: \"trace\", \"trace.t\", \"trace.t.f\", ..."
           guard-values))
 
 (define (trace-tree f)
-  "The shape of F's trace trees: ((signature . data-guards) . tree), where
-data-guards are the guard values other than procedures and unbound names, and
-tree is (leaf <output>) or (branch <condition> (#t . tree) (#f . tree))."
+  "The shape of F's trace trees.
+
+Each entry is ((signature . data-guards) . tree), where data-guards are the
+guard values other than procedures and unbound names, and tree is
+(leaf <output>) or (branch <condition> (#t . tree) (#f . tree)).
+
+Args:
+  f: a traced function.
+Returns: a list of entries.
+PyTorch: none"
   (map (lambda (entry)
          (cons (cons (caar entry) (data-guards (cdar entry)))
                (let walk ((n (cdr entry)))
@@ -814,8 +882,21 @@ tree is (leaf <output>) or (branch <condition> (#t . tree) (#f . tree))."
        (all-trees f)))
 
 (define (trace->sexpr proc . args)
-  "Trace PROC once on ARGS (with multi-resume enabled) and return the S-Expr
-v0.1 text of the single resulting graph. Errors if a graph break remained."
+  "Trace PROC once on ARGS and return the S-Expr v0.1 text of the graph.
+
+Tracing runs with multi-resume enabled; a remaining graph break is an error.
+
+Args:
+  proc: the procedure to trace.
+  args: its arguments.
+Returns: the document text of the single resulting graph.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace tracer))
+  (car (string->list (trace->sexpr (lambda (x) (relu x))
+                                   (list->ctensor '(-1.0 2.0)))))
+  => #\\(
+PyTorch: none"
   (let ((f (trace-function proc #:multi-resume? #t)))
     (apply f args)
     (match (trace-segments f)

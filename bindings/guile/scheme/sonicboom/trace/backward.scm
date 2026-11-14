@@ -110,10 +110,26 @@
 ;;; --- public API ----------------------------------------------------------------------
 
 (define (backward! loss)
-  "Reverse-mode differentiation of LOSS (a rank-0 symbolic tensor) on the tape
-being traced, emitting fused adjoint ops. Stores each parameter leaf's gradient
-in its .grad field and returns the list of gradients, in the order the leaves
-were bound. Needs tracing; call it inside a traced function."
+  "Reverse-mode differentiation of LOSS on the tape being traced.
+
+Walks the nodes recorded so far backwards from LOSS and appends the adjoint
+nodes to the same recording, so the graph holds the forward and the backward
+pass together. Each leaf's gradient is stored in its .grad slot.
+
+Args:
+  loss: a rank-0 symbolic tensor.
+Returns: the list of gradients, in the order the leaves were bound.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace symbolic)
+               (sonicboom trace macro) (sonicboom trace backward))
+  (define-traced (f x) (let ((loss (sum (mul x x)))) (backward! loss) loss))
+  (let ((leaf (make-leaf (list->ctensor '(1.0 2.0)))))
+    (f leaf)
+    (ctensor->list (leaf-grad leaf)))
+  => (2.0 4.0)
+PyTorch: torch.autograd.backward
+Note: must be called inside a traced function; the backward pass is part of
+the recorded graph and replays with it."
   (let ((rec (current-tracer)))
     (unless rec
       (error "backward!: needs tracing (call it inside a traced function)"))
@@ -203,13 +219,39 @@ were bound. Needs tracing; call it inside a traced function."
              leaves)))))
 
 (define* (zero-grad! leaves)
-  "Clear the .grad slot of a leaf or of every leaf in a list."
+  "Clear the .grad slot of a leaf or of every leaf in a list.
+
+Args:
+  leaves: a leaf or a list of leaves.
+Returns: LEAVES.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace backward))
+  (let ((leaf (make-leaf (list->ctensor '(1.0)))))
+    (set-leaf-grad! leaf (list->ctensor '(5.0)))
+    (zero-grad! leaf)
+    (leaf-grad leaf))
+  => #f
+PyTorch: torch.optim.Optimizer.zero_grad
+Note: clears one slot per leaf; the optimizer is not involved."
   (for-each (lambda (l) (set-leaf-grad! l #f))
             (if (leaf? leaves) (list leaves) leaves))
   leaves)
 
 (define* (leaf-grads leaves)
-  "The current .grad of a leaf or of every leaf in a list."
+  "The current .grad of a leaf or of every leaf in a list.
+
+Args:
+  leaves: a leaf or a list of leaves.
+Returns: the gradient tensor of one leaf, or a list of gradients in LEAVES
+order.
+Example:
+  (use-modules (sonicboom trace tensor) (sonicboom trace backward))
+  (let ((leaf (make-leaf (list->ctensor '(1.0)))))
+    (set-leaf-grad! leaf (list->ctensor '(5.0)))
+    (ctensor->list (leaf-grads leaf)))
+  => (5.0)
+PyTorch: torch.Tensor.grad
+Note: a leaf without a gradient returns #f."
   (if (leaf? leaves)
       (leaf-grad leaves)
       (map leaf-grad leaves)))
