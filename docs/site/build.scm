@@ -531,9 +531,10 @@
        (render-api-page site module))
      modules)
     (site-index-redirect-script site)
-    (format (current-error-port)
-            "site generated: ~a (~a pages, ~a api pages)\n"
-            site (length entries) (length modules))))
+    (let ((indexed (write-search-index site modules)))
+      (format (current-error-port)
+              "site generated: ~a (~a pages, ~a api pages, ~a search entries)\n"
+              site (length entries) (length modules) indexed))))
 
 ;; /sonicboom without the trailing slash redirects to /sonicboom/, so that the
 ;; relative links of index.html resolve.
@@ -553,6 +554,177 @@
                                      script
                                      (substring text head
                                                 (string-length text)))))))))
+
+;;; ----------------------------------------------------------------- search ---
+
+(define (html-files directory)
+  (append-map
+   (lambda (name)
+     (if (member name '("." ".."))
+         '()
+         (let ((path (string-append directory "/" name)))
+           (if (eq? (stat:type (stat path)) 'directory)
+               (html-files path)
+               (if (string-suffix? ".html" name) (list path) '())))))
+   (scandir directory)))
+
+(define (strip-tags text)
+  (regexp-substitute/global
+   #f "<[^>]*>" text 'pre "" 'post))
+
+(define entity-pattern
+  (make-regexp "&(amp|lt|gt|quot|#39|nbsp);"))
+
+(define (unescape-html text)
+  (regexp-substitute/global
+   #f entity-pattern text 'pre
+   (lambda (match)
+     (case (string->symbol (match:substring match 1))
+       ((amp) "&") ((lt) "<") ((gt) ">") ((quot) "\"")
+       ((nbsp) " ") (else "'")))
+   'post))
+
+(define (text-of-html html)
+  (string-trim (unescape-html (strip-tags html))))
+
+(define (collapse-space text)
+  (string-join (delete "" (string-split text #\space)) " "))
+
+(define (summarize text limit)
+  (let ((flat (collapse-space text)))
+    (if (> (string-length flat) limit)
+        (string-append (substring flat 0 limit) "…")
+        flat)))
+
+;; All matches of a pattern anchored at the opening of a tag.
+(define (tag-start-matches text pattern)
+  (let loop ((start 0) (acc '()))
+    (let ((match (regexp-exec pattern text start)))
+      (if match
+          (loop (match:end match 0) (cons match acc))
+          (reverse acc)))))
+
+(define (inner-html text start end-tag)
+  (let ((close (string-contains text end-tag start)))
+    (and close (substring text start close))))
+
+(define h1-start-pattern (make-regexp "<h1[^>]*>"))
+(define h2-start-pattern (make-regexp "<h2 id=\"([^\"]+)\"[^>]*>"))
+(define paragraph-start-pattern (make-regexp "<p>"))
+
+(define (first-heading-text text)
+  (let ((match (regexp-exec h1-start-pattern text)))
+    (and match
+         (let ((inner (inner-html text (match:end match 0) "</h1>")))
+           (and inner (text-of-html inner))))))
+
+(define (first-paragraph-text text)
+  (let ((match (regexp-exec paragraph-start-pattern text)))
+    (and match
+         (let ((inner (inner-html text (match:end match 0) "</p>")))
+           (and inner (text-of-html inner))))))
+
+(define (h2-blocks text)
+  (map (lambda (match)
+         (list (match:substring match 1)
+               (let ((inner (inner-html text (match:end match 0) "</h2>")))
+                 (if inner (text-of-html inner) ""))))
+       (tag-start-matches text h2-start-pattern)))
+
+(define (relative-url site file)
+  (substring file (+ (string-length site) 1) (string-length file)))
+
+(define (nav-entry-for-path url)
+  (find (lambda (one) (string=? (page-path (caddr one)) url))
+        (append (nav-entries) (concepts-tail-entries))))
+
+(define (section-of-page url)
+  (let ((entry (nav-entry-for-path url)))
+    (cond (entry (car entry))
+          ((string-prefix? "api/" url) "API reference")
+          (else "SonicBoom"))))
+
+(define (module-by-name modules name)
+  (find (lambda (module) (string=? (assq-ref module 'name) name)) modules))
+
+(define (export-summary module symbol)
+  (and module
+       (let ((export (find (lambda (one)
+                             (string=? (assq-ref one 'name) symbol))
+                           (assq-ref module 'exports))))
+         (and export
+              (doc-field (assq-ref export 'doc) 'summary)))))
+
+(define (heading-entries site file page-title modules)
+  (let* ((text (read-file file))
+         (module (module-by-name modules page-title))
+         (relative (relative-url site file)))
+    (map (lambda (block)
+           (let* ((anchor (car block))
+                  (heading (cadr block))
+                  (symbol? (string-prefix? "sym-" anchor))
+                  (summary (and symbol? (export-summary module heading))))
+             (list (cons 't heading)
+                   (cons 'k (if symbol? "symbol" "heading"))
+                   (cons 'm page-title)
+                   (cons 's (or summary ""))
+                   (cons 'u (string-append relative "#" anchor)))))
+         (h2-blocks text))))
+
+(define (page-title-of text relative)
+  (or (first-heading-text text)
+      (let ((entry (nav-entry-for-path relative)))
+        (if entry (cadr entry) relative))))
+
+(define (page-search-entries site modules)
+  (append-map
+   (lambda (file)
+     (let* ((text (read-file file))
+            (relative (relative-url site file))
+            (title (page-title-of text relative))
+            (paragraph (first-paragraph-text text))
+            (page (list (cons 't title)
+                        (cons 'k "page")
+                        (cons 'm (section-of-page relative))
+                        (cons 's (if paragraph (summarize paragraph 160) ""))
+                        (cons 'u relative))))
+       (append (list page)
+               (heading-entries site file title modules))))
+   (html-files site)))
+
+(define (json-escape text)
+  (with-output-to-string
+    (lambda ()
+      (string-for-each
+       (lambda (ch)
+         (case ch
+           ((#\") (display "\\\""))
+           ((#\\) (display "\\\\"))
+           ((#\newline) (display "\\n"))
+           ((#\return) (display "\\r"))
+           ((#\tab) (display "\\t"))
+           (else
+            (if (< (char->integer ch) 32)
+                (format #t "\\u~4,'0x" (char->integer ch))
+                (display ch)))))
+       text))))
+
+(define (entry->json entry)
+  (format #f "{\"t\":\"~a\",\"k\":\"~a\",\"m\":\"~a\",\"s\":\"~a\",\"u\":\"~a\"}"
+          (json-escape (assq-ref entry 't))
+          (json-escape (assq-ref entry 'k))
+          (json-escape (assq-ref entry 'm))
+          (json-escape (assq-ref entry 's))
+          (json-escape (assq-ref entry 'u))))
+
+(define (write-search-index site modules)
+  (let ((entries (page-search-entries site modules)))
+    (write-file (string-append site "/search-index.json")
+                (string-append "[\n"
+                               (string-join (map entry->json entries)
+                                            ",\n")
+                               "\n]\n"))
+    (length entries)))
 
 ;;; -------------------------------------------------------------------- cli ---
 
