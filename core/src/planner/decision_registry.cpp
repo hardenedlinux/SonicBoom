@@ -443,6 +443,13 @@ constexpr KnobRow kKnobRows[] = {
      "lr from the node attribute (ablation)", "same arithmetic", 0, 0},
     {"async.prefetch", "SONICBOOM_ASYNC_PREFETCH", "off", "on|off",
      "prefill prefetch markers", "no arithmetic change", 0, 0},
+    {"expert-pool.mb", "SONICBOOM_EXPERT_POOL_MB",
+     "auto (free VRAM - non-expert weights - 1024 MB)", "MiB",
+     "bounded device pool of routed experts, one slot per (block, expert)",
+     "residency cannot change the arithmetic", 0, 0},
+    {"expert-stats", "SONICBOOM_EXPERT_STATS", "off", "on|off",
+     "print the expert pool counters at the end of the run",
+     "none (reporting only)", 0, 0},
 };
 
 }  // namespace

@@ -1,0 +1,401 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#include "expert_pool.h"
+
+#include "device_pool.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string_view>
+
+namespace sonicboom::planner {
+
+namespace {
+
+// The kernels' zeroed read-ahead tail; a slot's stride is a multiple of it so
+// every slot start is too.
+constexpr uint64_t kSlotAlignment = 256;
+
+uint64_t align_up(uint64_t n) {
+  const uint64_t rem = n % kSlotAlignment;
+  return rem == 0 ? n : n + (kSlotAlignment - rem);
+}
+
+// The expert views of one block are the three stacked tensors split per
+// expert; they must agree on the expert count and each be a usable quantized
+// matrix.
+uint32_t block_experts(const model::BlockWeights& block, uint32_t layer) {
+  const size_t n = block.expert_gate.size();
+  if (n == 0 || block.expert_up.size() != n || block.expert_down.size() != n)
+    return 0;
+  for (size_t e = 0; e < n; ++e) {
+    if (!block.expert_gate[e].valid() || !block.expert_up[e].valid() ||
+        !block.expert_down[e].valid())
+      return 0;
+  }
+  (void)layer;
+  return n > UINT32_MAX ? 0 : uint32_t(n);
+}
+
+uint64_t span_bytes(std::span<const float> s) {
+  return uint64_t(s.size()) * sizeof(float);
+}
+
+uint64_t span_bytes(std::span<const uint16_t> s) {
+  return uint64_t(s.size()) * sizeof(uint16_t);
+}
+
+uint64_t tensor_bytes(const quant::QuantizedTensor& t) {
+  return t.valid() ? t.byte_size() : 0;
+}
+
+// Bytes of every weight the model keeps outside the routed experts. The
+// device copy of a non-expert weight is paid lazily on top of the pool, so it
+// is reserved up front (design §9).
+uint64_t non_expert_bytes(const model::Gemma4Weights& weights) {
+  uint64_t n = tensor_bytes(weights.token_embd) +
+               tensor_bytes(weights.per_layer_token_embd) +
+               tensor_bytes(weights.output) +
+               span_bytes(weights.per_layer_proj_norm) +
+               span_bytes(weights.per_layer_model_proj) +
+               span_bytes(weights.output_norm) +
+               span_bytes(weights.rope_freqs);
+  for (const model::BlockWeights& b : weights.blocks) {
+    n += span_bytes(b.attn_norm) + span_bytes(b.ffn_norm) +
+         span_bytes(b.attn_q_norm) + span_bytes(b.attn_k_norm) +
+         span_bytes(b.post_attention_norm) + span_bytes(b.post_ffw_norm) +
+         span_bytes(b.post_norm) + span_bytes(b.attn_q_bias) +
+         span_bytes(b.attn_k_bias) + span_bytes(b.attn_v_bias) +
+         span_bytes(b.attn_output_bias) + span_bytes(b.inp_gate) +
+         span_bytes(b.proj) + span_bytes(b.layer_output_scale) +
+         span_bytes(b.expert_router_f32) + span_bytes(b.shared_gate_in) +
+         span_bytes(b.gdn_qkv_f32) + span_bytes(b.gdn_gate_f32) +
+         span_bytes(b.gdn_beta_f32) + span_bytes(b.gdn_alpha_f32) +
+         span_bytes(b.gdn_out_f32) + span_bytes(b.gdn_conv) +
+         span_bytes(b.gdn_dt) + span_bytes(b.gdn_a) + span_bytes(b.gdn_norm);
+    n += tensor_bytes(b.attn_q) + tensor_bytes(b.attn_k) +
+         tensor_bytes(b.attn_v) + tensor_bytes(b.attn_output) +
+         tensor_bytes(b.ffn_gate) + tensor_bytes(b.ffn_up) +
+         tensor_bytes(b.ffn_down) + tensor_bytes(b.expert_router) +
+         tensor_bytes(b.shared_gate) + tensor_bytes(b.shared_up) +
+         tensor_bytes(b.shared_down) + tensor_bytes(b.gdn_qkv) +
+         tensor_bytes(b.gdn_gate) + tensor_bytes(b.gdn_beta) +
+         tensor_bytes(b.gdn_alpha) + tensor_bytes(b.gdn_out);
+  }
+  return n;
+}
+
+bool stats_enabled() {
+  const char* env = std::getenv("SONICBOOM_EXPERT_STATS");
+  return env && *env && std::strcmp(env, "0") != 0;
+}
+
+// One process-wide pool, keyed by the weights object it belongs to.
+struct Registry {
+  std::mutex mutex;
+  const model::Gemma4Weights* key = nullptr;
+  std::unique_ptr<ExpertPool> pool;
+};
+
+Registry& registry() {
+  static Registry r;
+  return r;
+}
+
+void print_stats_at_exit() {
+  Registry& r = registry();
+  std::lock_guard<std::mutex> lk(r.mutex);
+  if (!r.pool) return;
+  const ExpertPool::Stats s = r.pool->stats();
+  std::fprintf(stderr,
+               "expert pool: nodes=%llu hits=%llu misses=%llu uploaded=%llu "
+               "bytes\n",
+               static_cast<unsigned long long>(s.nodes),
+               static_cast<unsigned long long>(s.hits),
+               static_cast<unsigned long long>(s.misses),
+               static_cast<unsigned long long>(s.bytes));
+}
+
+} // namespace
+
+const void* ExpertPool::data(uint32_t role) const noexcept {
+  if (role > kDown) return nullptr;
+  return reinterpret_cast<const void*>(handles_[role]);
+}
+
+const void* ExpertPool::selection() const noexcept {
+  return reinterpret_cast<const void*>(sel_handle_);
+}
+
+ExpertPool::Stats ExpertPool::stats() const {
+  std::lock_guard<std::mutex> lk(mutex_);
+  return stats_;
+}
+
+ExpertPool::~ExpertPool() {
+  for (uint64_t& h : handles_) {
+    if (h) device::release(h, 0);
+    h = 0;
+  }
+  if (sel_handle_) device::release(sel_handle_, 0);
+  sel_handle_ = 0;
+}
+
+std::expected<std::unique_ptr<ExpertPool>, std::string> ExpertPool::create(
+    const model::Gemma4Weights& weights) {
+  if (!device::available())
+    return std::unexpected(std::string("expert pool: no CUDA device"));
+  auto pool = std::unique_ptr<ExpertPool>(new ExpertPool());
+
+  // The block/expert tables and the largest matrix of each role. blocks_ is
+  // indexed by the node's layer, so a dense block keeps an empty entry and a
+  // node that names it is rejected.
+  pool->blocks_.resize(weights.blocks.size());
+  uint32_t max_experts = 0;
+  uint32_t key_base = 0;
+  for (uint32_t layer = 0; layer < weights.blocks.size(); ++layer) {
+    const model::BlockWeights& b = weights.blocks[layer];
+    pool->blocks_[layer].key_base = key_base;
+    const uint32_t n = block_experts(b, layer);
+    if (n == 0) continue;  // a dense block has no routed experts
+    pool->blocks_[layer].experts = n;
+    for (uint32_t e = 0; e < n; ++e) {
+      const quant::QuantizedTensor* g = &b.expert_gate[e];
+      const quant::QuantizedTensor* u = &b.expert_up[e];
+      const quant::QuantizedTensor* d = &b.expert_down[e];
+      pool->gate_of_.push_back(g);
+      pool->up_of_.push_back(u);
+      pool->down_of_.push_back(d);
+      pool->stride_[kGate] =
+          std::max(pool->stride_[kGate], align_up(g->byte_size()));
+      pool->stride_[kUp] =
+          std::max(pool->stride_[kUp], align_up(u->byte_size()));
+      pool->stride_[kDown] =
+          std::max(pool->stride_[kDown], align_up(d->byte_size()));
+    }
+    key_base += n;
+    max_experts = std::max(max_experts, n);
+  }
+  if (key_base == 0 ||
+      pool->stride_[kGate] == 0 || pool->stride_[kUp] == 0 ||
+      pool->stride_[kDown] == 0)
+    return std::unexpected(
+        std::string("expert pool: the model has no routed expert weights"));
+  pool->total_keys_ = key_base;
+
+  // Pool bytes: the environment override, otherwise what the card can spare
+  // beyond the non-expert weights and 1024 MB.
+  const uint64_t slot_bytes =
+      pool->stride_[kGate] + pool->stride_[kUp] + pool->stride_[kDown];
+  uint64_t pool_bytes = 0;
+  const char* mb_env = std::getenv("SONICBOOM_EXPERT_POOL_MB");
+  if (mb_env && *mb_env) {
+    char* end = nullptr;
+    const unsigned long long mb = std::strtoull(mb_env, &end, 10);
+    if (end == mb_env || *end != '\0')
+      return std::unexpected(std::string("expert pool: SONICBOOM_EXPERT_POOL_MB "
+                                         "is not a byte count in MiB: ") +
+                             mb_env);
+    pool_bytes = uint64_t(mb) * (1024ull * 1024ull);
+  } else {
+    uint64_t free_mem = 0;
+    if (!device::free_bytes(&free_mem))
+      return std::unexpected(
+          std::string("expert pool: cannot read the free device memory"));
+    const uint64_t reserved = 1024ull * 1024ull * 1024ull;
+    const uint64_t taken = non_expert_bytes(weights);
+    pool_bytes = free_mem > reserved + taken ? free_mem - reserved - taken : 0;
+  }
+
+  pool->n_slots_ = pool_bytes / slot_bytes;
+  if (pool->n_slots_ < max_experts) {
+    const uint64_t need = slot_bytes * max_experts;
+    const uint64_t missing = need > pool_bytes ? need - pool_bytes : 0;
+    char msg[512];
+    std::snprintf(
+        msg, sizeof msg,
+        "expert pool: %llu bytes hold %llu slots of %llu bytes, fewer than "
+        "the %u experts one block may select at once; %llu more bytes are "
+        "needed (SONICBOOM_EXPERT_POOL_MB)",
+        static_cast<unsigned long long>(pool_bytes),
+        static_cast<unsigned long long>(pool->n_slots_),
+        static_cast<unsigned long long>(slot_bytes), max_experts,
+        static_cast<unsigned long long>(missing));
+    return std::unexpected(std::string(msg));
+  }
+
+  pool->owner_.assign(pool->n_slots_, -1);
+  pool->stamp_.assign(pool->n_slots_, 0);
+  pool->slot_of_.assign(pool->total_keys_, -1);
+  pool->handles_[kGate] = device::acquire(pool->n_slots_ * pool->stride_[kGate]);
+  pool->handles_[kUp] = device::acquire(pool->n_slots_ * pool->stride_[kUp]);
+  pool->handles_[kDown] =
+      device::acquire(pool->n_slots_ * pool->stride_[kDown]);
+  if (!pool->handles_[kGate] || !pool->handles_[kUp] || !pool->handles_[kDown])
+    return std::unexpected(std::string("expert pool: cannot allocate ") +
+                           std::to_string(pool_bytes) + " bytes on the device");
+
+  if (stats_enabled())
+    std::fprintf(stderr, "expert pool: %llu slots x %llu bytes, %llu MiB\n",
+                 static_cast<unsigned long long>(pool->n_slots_),
+                 static_cast<unsigned long long>(slot_bytes),
+                 static_cast<unsigned long long>(pool_bytes >> 20));
+  return pool;
+}
+
+std::expected<void, std::string> ExpertPool::select(
+    uint32_t block, std::span<const int64_t> ids) {
+  std::lock_guard<std::mutex> lk(mutex_);
+  const BlockInfo& info = block < blocks_.size() ? blocks_[block] : BlockInfo{};
+  if (info.experts == 0)
+    return std::unexpected("expert pool: block " + std::to_string(block) +
+                           " has no routed experts");
+  for (int64_t id : ids) {
+    if (id < 0 || uint64_t(id) >= info.experts)
+      return std::unexpected("expert pool: expert " + std::to_string(id) +
+                             " out of range for block " +
+                             std::to_string(block));
+  }
+  if (ids.empty()) return {};
+
+  const uint64_t node = ++stats_.nodes;
+
+  // The distinct keys this node needs; a slot holding one of them may not be
+  // evicted.
+  std::vector<int64_t> needed;
+  needed.reserve(ids.size());
+  for (int64_t id : ids) {
+    const int64_t key = int64_t(info.key_base) + id;
+    if (std::find(needed.begin(), needed.end(), key) == needed.end())
+      needed.push_back(key);
+  }
+
+  // The selection buffer, one int32 slot per id.
+  if (uint64_t(ids.size()) > sel_entries_) {
+    const uint64_t handle = device::acquire(uint64_t(ids.size()) * sizeof(int32_t));
+    if (!handle)
+      return std::unexpected(
+          "expert pool: cannot grow the selection buffer");
+    if (sel_handle_) device::release(sel_handle_, 0);
+    sel_handle_ = handle;
+    sel_entries_ = uint64_t(ids.size());
+  }
+  sel_host_.resize(ids.size());
+
+  for (size_t j = 0; j < ids.size(); ++j) {
+    const int64_t key = int64_t(info.key_base) + ids[j];
+    int32_t slot = slot_of_[key];
+    if (slot >= 0) {
+      ++stats_.hits;
+    } else {
+      // Evict the least recently used slot this node does not need; lowest
+      // slot index on ties.
+      int32_t victim = -1;
+      uint64_t victim_stamp = 0;
+      for (uint64_t s = 0; s < n_slots_; ++s) {
+        if (owner_[s] >= 0 &&
+            std::find(needed.begin(), needed.end(), owner_[s]) != needed.end())
+          continue;
+        if (victim < 0 || stamp_[s] < victim_stamp) {
+          victim = int32_t(s);
+          victim_stamp = stamp_[s];
+        }
+      }
+      if (victim < 0)
+        return std::unexpected(
+            "expert pool: every slot is needed by one node");
+      if (owner_[victim] >= 0) slot_of_[owner_[victim]] = -1;
+
+      const quant::QuantizedTensor* role_tensors[3] = {gate_of_[key],
+                                                       up_of_[key],
+                                                       down_of_[key]};
+      for (uint32_t role = 0; role < 3; ++role) {
+        const quant::QuantizedTensor& t = *role_tensors[role];
+        const uint64_t bytes = t.byte_size();
+        const uint64_t base = handles_[role] + uint64_t(victim) * stride_[role];
+        if (!device::upload(t.data().data(), base, bytes)) {
+          owner_[victim] = -1;
+          return std::unexpected(
+              "expert pool: cannot copy an expert matrix to the device");
+        }
+        // Keep the kernel's read-ahead tail zero.
+        const uint64_t tail = stride_[role] - bytes;
+        if (tail > 0) {
+          static const std::byte zeros[kSlotAlignment] = {};
+          if (!device::upload(zeros, base + bytes, tail)) {
+            owner_[victim] = -1;
+            return std::unexpected(
+                "expert pool: cannot zero a slot's read-ahead tail");
+          }
+        }
+        stats_.bytes += bytes;
+      }
+      owner_[victim] = key;
+      slot_of_[key] = victim;
+      ++stats_.misses;
+      slot = victim;
+    }
+    sel_host_[j] = slot;
+  }
+
+  // Stamp every slot this node uses, once.
+  for (int64_t key : needed) stamp_[size_t(slot_of_[key])] = node;
+
+  if (!device::upload(sel_host_.data(), sel_handle_,
+                      uint64_t(ids.size()) * sizeof(int32_t)))
+    return std::unexpected(
+        "expert pool: cannot write the selection buffer");
+  return {};
+}
+
+void ExpertPool::clear() {
+  std::lock_guard<std::mutex> lk(mutex_);
+  std::fill(owner_.begin(), owner_.end(), -1);
+  std::fill(stamp_.begin(), stamp_.end(), 0);
+  std::fill(slot_of_.begin(), slot_of_.end(), -1);
+  stats_ = Stats{};
+}
+
+std::expected<ExpertPool*, std::string> expert_pool_for(
+    const model::Gemma4Weights& weights) {
+  Registry& r = registry();
+  std::lock_guard<std::mutex> lk(r.mutex);
+  if (r.pool && r.key != &weights) {
+    r.pool.reset();
+    r.key = nullptr;
+  }
+  if (!r.pool) {
+    auto created = ExpertPool::create(weights);
+    if (!created) return std::unexpected(created.error());
+    r.pool = std::move(*created);
+    r.key = &weights;
+    if (stats_enabled()) std::atexit(print_stats_at_exit);
+  }
+  return r.pool.get();
+}
+
+void clear_expert_pool() {
+  Registry& r = registry();
+  std::lock_guard<std::mutex> lk(r.mutex);
+  r.pool.reset();
+  r.key = nullptr;
+}
+
+} // namespace sonicboom::planner

@@ -62,6 +62,10 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes);
 // Block until all device work is complete.
 bool synchronize();
 
+// Free device memory right now (what a new allocation could take). False when
+// no device is present or the query fails.
+bool free_bytes(uint64_t* bytes);
+
 // Pool accounting. "live" is what callers currently hold (KV caches, staging,
 // activations); "retained" is what was released back to the pool and can be
 // handed to a new session without a cudaMalloc. The two are reported

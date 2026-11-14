@@ -194,6 +194,20 @@ bool synchronize() {
 #endif
 }
 
+bool free_bytes(uint64_t* bytes) {
+#ifdef SONICBOOM_USE_CUDA
+  if (!bytes || !available()) return false;
+  size_t free_mem = 0;
+  size_t total = 0;
+  if (cudaMemGetInfo(&free_mem, &total) != cudaSuccess) return false;
+  *bytes = static_cast<uint64_t>(free_mem);
+  return true;
+#else
+  (void)bytes;
+  return false;
+#endif
+}
+
 Stats stats() noexcept {
 #ifdef SONICBOOM_USE_CUDA
   std::lock_guard<std::mutex> lk(g_mutex);
