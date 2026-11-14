@@ -344,6 +344,9 @@ std::expected<ResourceSnapshot, PlannerError> CpuResourceProvider::snapshot(
         // per-row gemv / prefill group-by-expert batched matmul), and the
         // shared expert's row gate.
         OpKind::MoeRoute,       OpKind::MoeExperts, OpKind::ScaleBy,
+        // The gated DeltaNet scan of a recurrent block runs the SonicBoom-owned
+        // CUDA kernel against the sequence's device state.
+        OpKind::GdnScan,
     };
     // MMQ1: the prefill dispatch of the same projections onto the
     // compiler-generated int8 tensor-core kernel. Registered only while that

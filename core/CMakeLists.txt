@@ -43,6 +43,10 @@ file(GLOB_RECURSE SONICBOOM_PLANNER_SOURCES CONFIGURE_DEPENDS
 # re-added in the CUDA block below.
 list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
+# gdn_state_dev.cpp is the device twin of gdn_state.cpp: it calls the CUDA scan
+# kernel, so it is compiled only with SONICBOOM_USE_CUDA (re-added below).
+list(REMOVE_ITEM SONICBOOM_PLANNER_SOURCES
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/gdn_state_dev.cpp)
 
 # vulkan_backend.cpp is the community-backend stub (zero kernels, no Vulkan
 # loader). Excluded from the unconditional planner glob and re-added only when
@@ -258,6 +262,9 @@ if(SONICBOOM_USE_CUDA)
     # only the device code is a .cu.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model/moss_dit_cuda.cu
+    # The device-resident recurrent state: host orchestration over the CUDA scan
+    # kernel (compiled by g++, C++23; only the kernel itself is a .cu).
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/gdn_state_dev.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/planner/sonic_cuda_backend.cpp)
   # ggml-derived MMQ at upstream build parity (step 9): llama.cpp compiles
   # ggml-cuda/mmq.cu with -use_fast_math -extended-lambda. The arch already

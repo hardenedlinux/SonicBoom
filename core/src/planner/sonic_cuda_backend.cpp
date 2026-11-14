@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <span>
@@ -810,8 +811,30 @@ void SonicCudaBackend::ensure_caches(uint64_t n_ctx) {
   caches_ = allocate_cache_set(spec_, n_ctx);
 }
 
+void SonicCudaBackend::bind_model(const model::Gemma4Model& model) {
+  model_ = &model;
+  ensure_states();
+}
+
+void SonicCudaBackend::ensure_states() {
+  // Allocated once, from the bound model's config: one zeroed device state per
+  // recurrent block, in the order the blocks appear (the same numbering the
+  // CPU backend's StateSet uses). A model with no recurrent block gets an empty
+  // set, so a graph with no GdnScan node never allocates anything.
+  if (states_ || !model_) return;
+  const model::Gemma4Config& mc = model_->config;
+  size_t n_states = 0;
+  for (bool recurrent : mc.recurrent_layers) n_states += recurrent ? 1 : 0;
+  const nn::GdnDims dims{mc.ssm_group_count, mc.ssm_time_step_rank,
+                         mc.ssm_state_size, mc.ssm_conv_kernel,
+                         mc.rms_epsilon};
+  states_ = std::make_shared<StateSetDev>(
+      std::vector<nn::GdnDims>(n_states, dims));
+}
+
 void SonicCudaBackend::share_caches(const SonicCudaBackend& other) {
   caches_ = other.caches_;
+  states_ = other.states_;
   cache_id_ = other.cache_id_;
 }
 
@@ -820,6 +843,11 @@ void SonicCudaBackend::share_caches(const KvCacheSession& session) {
     caches_ = session.caches;  // adopt the session's cache (prefix reuse)
     cache_id_ = session.cache_id;
   }
+  // The session's state set is opaque here (the header stays model-agnostic);
+  // it was published as a shared_ptr<StateSetDev> and the control block keeps
+  // that ownership.
+  if (session.states)
+    states_ = std::static_pointer_cast<StateSetDev>(session.states);
 }
 
 void SonicCudaBackend::publish_cache(KvCacheSession& session) const {
@@ -827,6 +855,7 @@ void SonicCudaBackend::publish_cache(KvCacheSession& session) const {
   session.caches = caches_;
   if (session.cache_id == 0) session.cache_id = cache_id_;
   session.n_ctx = n_ctx_;
+  if (states_) session.states = states_;
 }
 
 bool SonicCudaBackend::read_cache_row(const KvCacheDev& cache, bool is_k,
@@ -2852,6 +2881,59 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
       if (ok)
         ok = device::upload(y.data(), out_handle,
                             rows * dim * sizeof(float));
+      break;
+    }
+    case OpKind::GdnScan: {
+      // The gated DeltaNet recurrence of one block over this execution's
+      // positions, committed to the sequence's device state: inputs {qkv [n, C],
+      // beta logits [n, heads_v], alpha logits [n, heads_v], pos}. The geometry
+      // and the state's index are the node's attributes; the convolution, dt
+      // and a weights are the node's `slot`, `slot_dt` and `slot_a` roles. The
+      // position check itself runs on the host in the state object, as on the
+      // CPU backend.
+      int64_t state_index = -1, heads_k = 0, heads_v = 0, gdim = 0, kernel = 0;
+      int64_t slot_dt_i = 0, slot_a_i = 0;
+      if (!attr_i(*node, "state", state_index) || state_index < 0 ||
+          !attr_i(*node, "heads_k", heads_k) || heads_k <= 0 ||
+          !attr_i(*node, "heads_v", heads_v) || heads_v <= 0 ||
+          !attr_i(*node, "dim", gdim) || gdim <= 0 ||
+          !attr_i(*node, "kernel", kernel) || kernel <= 0 ||
+          !attr_i(*node, "slot_dt", slot_dt_i) ||
+          !attr_i(*node, "slot_a", slot_a_i)) {
+        ok = false;
+        break;
+      }
+      if (!states_ || size_t(state_index) >= states_->size() || in.size() < 4 ||
+          in[3].on_device ||
+          in[3].host.size() < sizeof(uint64_t) || !in[0].on_device ||
+          !in[1].on_device || !in[2].on_device) {
+        ok = false;
+        break;
+      }
+      const uint64_t hv = uint64_t(heads_v);
+      const uint64_t C = 2 * uint64_t(heads_k) * uint64_t(gdim) +
+                         hv * uint64_t(gdim);
+      const uint64_t rows = row_count();
+      if (C == 0 || rows == 0 ||
+          rows > uint64_t(std::numeric_limits<int>::max()) ||
+          rows * C * sizeof(float) > in[0].device.size_bytes ||
+          rows * hv * sizeof(float) > in[1].device.size_bytes ||
+          rows * hv * sizeof(float) > in[2].device.size_bytes ||
+          out_bytes < rows * uint64_t(gdim) * hv * sizeof(float)) {
+        ok = false;
+        break;
+      }
+      uint64_t start = 0;
+      std::memcpy(&start, in[3].host.data(), sizeof(start));
+      const nn::GdnWeights w{
+          fweight(slot),
+          fweight(static_cast<model::WeightSlot>(slot_dt_i)),
+          fweight(static_cast<model::WeightSlot>(slot_a_i))};
+      const auto r = states_->commit(size_t(state_index), uint32_t(layer),
+                                     start, w, dev(in[0]), dev(in[1]),
+                                     dev(in[2]), int(rows), out);
+      if (!r) return std::unexpected(fail(r.error()));
+      ok = true;
       break;
     }
     default:

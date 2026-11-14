@@ -137,6 +137,12 @@ struct KvCacheSession {
   // is paid once per session instead of once per call.
   std::shared_ptr<void> spec_evidence;
 
+  // The session's recurrent-block state (one device state per recurrent block),
+  // owned opaquely so this model-agnostic header carries no state type: the
+  // device backend publishes its StateSetDev here and adopts it back, the same
+  // way it shares `caches`. Null for a model with no recurrent block.
+  std::shared_ptr<void> states;
+
   // RAII release for the runtimes bound to this set (a
   // model::SessionRuntimeOwner). kv_session_allocate stores one when it gives
   // the set an identity, next to `caches` and declared after it, so the owner

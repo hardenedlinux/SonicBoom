@@ -35,6 +35,7 @@
 #include <sonicboom/model/loader.h>
 #include <sonicboom/nn/sampling.h>
 #include <sonicboom/planner/backend.h>
+#include <sonicboom/planner/gdn_state_dev.h>
 #include <sonicboom/planner/graph.h>
 #include <sonicboom/planner/kv_cache.h>
 
@@ -75,8 +76,9 @@ public:
   // Bind the compute model the backend reads weights / per-layer config from.
   // Required before execute(); the pointer is stored (the model must outlive the
   // backend). Decoupled from the constructor so cache geometry (KvCacheSpec) and
-  // compute (model) are independent inputs.
-  void bind_model(const model::Gemma4Model& model) { model_ = &model; }
+  // compute (model) are independent inputs. Also allocates the recurrent state
+  // set, whose geometry comes from the model's config.
+  void bind_model(const model::Gemma4Model& model);
 
   ~SonicCudaBackend() override;
 
@@ -268,22 +270,24 @@ public:
   std::unique_ptr<hal::StepProgram> record_step(
       const std::function<bool()> &step_fn) override;
 
-  // Share another backend's KV cache (same session). The prefill graph's
-  // FlashAttention nodes fill the cache that the decode graph's Attention nodes
-  // then read, so the prefill backend and decode backend must reference the same
-  // cache. Both backends stay bound to their own Graph (for node lookup); only
-  // the per-KV-layer device cache is shared. The last owner frees the device
-  // buffers (the shared_ptr holds a device-buffer-freeing deleter).
+  // Share another backend's KV cache and recurrent state (same session). The
+  // prefill graph's FlashAttention nodes fill the cache that the decode graph's
+  // Attention nodes then read, and a prefill segment's GdnScan nodes leave the
+  // state the decode steps' scans continue from, so the two backends must
+  // reference the same cache and the same StateSetDev. Both backends stay bound
+  // to their own Graph (for node lookup); only the device cache and state are
+  // shared. The last owner frees the device buffers.
   void share_caches(const SonicCudaBackend& other);
 
-  // Adopt a persistent session's device cache (prefix reuse): replaces this
-  // backend's freshly-allocated constructor cache with the session's shared
-  // cache, so a later prefill fills the same buffers the next request reads.
+  // Adopt a persistent session's device cache and state (prefix reuse):
+  // replaces this backend's freshly-allocated constructor cache and state with
+  // the session's shared ones, so a later prefill fills the same buffers the
+  // next request reads.
   void share_caches(const KvCacheSession& session);
 
-  // Publish this backend's device cache into a session (first prefix-cache
-  // prefill): the session takes shared ownership so the cache survives this
-  // backend's destruction. No-op-safe when the session already owns a cache.
+  // Publish this backend's device cache and state into a session (first
+  // prefix-cache prefill): the session takes shared ownership so they survive
+  // this backend's destruction. No-op-safe when the session already owns them.
   void publish_cache(KvCacheSession& session) const;
 
   // Allocate a standalone cache set for `spec` at decode length `n_ctx`, with
@@ -375,6 +379,10 @@ private:
   // index == KV layer (0 .. n_layer_kv-1). Shared across the decode backend and
   // a prefill backend bound to a different graph (see share_caches).
   std::shared_ptr<std::vector<KvCacheDev>> caches_;
+  // One device state per recurrent block of the model, indexed the way a
+  // GdnScan node's `state` attribute numbers them; null until bind_model(), and
+  // shared with the session's other backends alongside caches_.
+  std::shared_ptr<StateSetDev> states_;
   uint64_t cache_id_ = 0;           // identity of caches_ (KvCacheSession::cache_id)
   CaptureResources capture_res_;    // set by record_step() on a successful capture
   hal::Buffer token_buf_;           // persistent device buffer: current token id (float)
@@ -417,6 +425,9 @@ private:
   uint64_t token_out_slot() const;
 
   void ensure_caches(uint64_t n_ctx);
+  // Allocate the recurrent state set from the bound model's config (one state
+  // per recurrent block); a model with no recurrent block gets an empty set.
+  void ensure_states();
   void init_staging();
 };
 
