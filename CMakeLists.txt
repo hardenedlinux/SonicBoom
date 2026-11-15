@@ -124,12 +124,40 @@ function(sonicboom_sanitize target)
 endfunction()
 
 if(SONICBOOM_USE_CUDA)
-  # Default to the GPU detected at build time (native); override with
-  # -DCMAKE_CUDA_ARCHITECTURES=<arch>, required on GPU-less build machines.
+  # Default to the architecture of the GPU in this machine, compiled as SASS
+  # only: the first card's compute capability ("8.6") becomes "86-real". An
+  # explicit -DCMAKE_CUDA_ARCHITECTURES is kept as given — including a plain
+  # "86", which CMake builds as SASS plus PTX. There is no silent fallback to
+  # 'native': a build for a guessed architecture might not run on the host, so
+  # an undetectable GPU stops the configure and asks for the value.
+  #
   # Must be set before enable_language(CUDA), which otherwise adopts the
   # compiler default.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA SM archs (native = detected GPU)")
+    set(_boom_compute_cap_rc 1)
+    find_program(_boom_nvidia_smi NAMES nvidia-smi)
+    if(_boom_nvidia_smi)
+      execute_process(
+        COMMAND ${_boom_nvidia_smi} --query-gpu=compute_cap --format=csv,noheader
+        OUTPUT_VARIABLE _boom_compute_caps
+        ERROR_QUIET
+        RESULT_VARIABLE _boom_compute_cap_rc)
+    endif()
+    string(REGEX REPLACE "\r?\n.*$" "" _boom_compute_cap "${_boom_compute_caps}")
+    string(STRIP "${_boom_compute_cap}" _boom_compute_cap)
+    if(NOT _boom_compute_cap_rc EQUAL 0 OR
+       NOT _boom_compute_cap MATCHES "^[0-9]+\\.[0-9]+$")
+      message(FATAL_ERROR
+        "CMAKE_CUDA_ARCHITECTURES is not set and the GPU of this build "
+        "machine could not be detected (nvidia-smi --query-gpu=compute_cap). "
+        "Pass the architecture explicitly, for example "
+        "-DCMAKE_CUDA_ARCHITECTURES=86-real for SASS only, or 86 for SASS "
+        "plus PTX.")
+    endif()
+    string(REPLACE "." "" _boom_compute_cap "${_boom_compute_cap}")
+    message(STATUS "SonicBoom: CUDA architecture ${_boom_compute_cap}-real (host GPU)")
+    set(CMAKE_CUDA_ARCHITECTURES "${_boom_compute_cap}-real" CACHE STRING
+        "CUDA SM archs (default: the host GPU's, SASS only)")
   endif()
 
   # native-torch headers (c10/util/intrusive_ptr.h) use C++20's operator<=>,

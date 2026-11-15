@@ -12,8 +12,9 @@ nothing else is needed at run time.
   it does not compile there as it stands. The port is a guard plus a NEON
   sibling of the same fixed-point kernel.
 - CUDA toolkit 12.0 or newer and an NVIDIA GPU, compute capability 6.1 or
-  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. The release is
-  built and tested for **sm_86** only (RTX 30-series).
+  newer (`__dp4a`) — 7.5 or newer for the tensor-core MMQ path. The default
+  build targets the build machine's GPU as SASS only (see *CUDA architecture*);
+  the release is built and tested for **sm_86** (RTX 30-series).
 - GNU Guile 3.0 and
   [guile-json](https://github.com/aconchillo/guile-json) (the `(json)` module,
   used by the Guile binding for build info and by the serve front end).
@@ -70,6 +71,27 @@ A different LLVM major is accepted with a warning, naming the version SonicBoom
 is tested against (23). MLIR is required — the compiler library it carries is
 the only rewrite path the runtime has — and the error message when it is missing
 lists both routes.
+
+### CUDA architecture
+
+With `SONICBOOM_USE_CUDA=ON` and no `-DCMAKE_CUDA_ARCHITECTURES`, configure
+asks `nvidia-smi` for the first GPU's compute capability and compiles only
+that architecture, as SASS: `8.6` becomes `86-real`. No PTX is embedded, so
+`cuobjdump --list-ptx` reports none, and the library carries code for the
+build machine's GPU only.
+
+A value given on the command line is used as is. To build for another GPU,
+name its architecture — one, or several separated by `;`:
+
+| value | what nvcc emits |
+|---|---|
+| `86` | SASS and PTX for sm_86 |
+| `86-real` | SASS only |
+| `86-virtual` | PTX only |
+| `80;89` | SASS and PTX for both |
+
+A build machine without a GPU must pass the value; otherwise configure stops
+with an error naming the option.
 
 ### Build information
 
