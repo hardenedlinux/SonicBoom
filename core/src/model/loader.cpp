@@ -18,7 +18,7 @@
 #include <sonicboom/model/plan.h>
 
 #include "../quant/foreign_dequant.h"
-#include "../quant/ggml_derived/quantize_q5_k.h"
+#include "../quant/quantize_q5_k.h"
 
 #include <algorithm>
 #include <cmath>

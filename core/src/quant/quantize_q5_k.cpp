@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: MIT
 // Portions derived from llama.cpp (MIT License), commit 43fe9c642; see LICENSES/.
 
-#include "ggml_derived/quantize_q5_k.h"
+#include "quantize_q5_k.h"
 
 #include <algorithm>
 #include <bit>

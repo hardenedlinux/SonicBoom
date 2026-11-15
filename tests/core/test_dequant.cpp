@@ -32,7 +32,7 @@
 #include <sonicboom/gguf/reader.h>
 
 #include "../../core/src/quant/foreign_dequant.h"
-#include "../../core/src/quant/ggml_derived/quantize_q5_k.h"
+#include "../../core/src/quant/quantize_q5_k.h"
 
 #include "ggml_baseline.h"
 
