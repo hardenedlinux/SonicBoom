@@ -162,6 +162,9 @@ Open `build/site/sonicboom/index.html`, or serve the directory with
 `python3 -m http.server` to use the search box. `ctest -L docs` checks the
 Guile docstrings, the API reference and the generated site.
 
+The published documentation is at
+[hardenedvault.com/sonicboom](https://hardenedvault.com/sonicboom/).
+
 ### Thanks
 
 Community runs keep these numbers honest beyond one card. Thanks to
