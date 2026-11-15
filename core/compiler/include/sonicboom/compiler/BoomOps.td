@@ -183,7 +183,13 @@ def Boom_StepOp : Op<Boom_Dialect, "step",
     I64Attr:$dynamic_extent,
     // The lifted graph's recorded stages (GraphOp::stages), carried with its
     // tensor table.
-    OptionalAttr<DenseI64ArrayAttr>:$stages);
+    OptionalAttr<DenseI64ArrayAttr>:$stages,
+    // Where the step's consumer resolution stands: "pre" after resolveConsumer
+    // with finishConsumer still owed (only a sample_select step), "done" once
+    // the loop's reader is complete. A step derives its consumer from the loop
+    // op that reads its result, so the resolved state is recorded rather than
+    // dropping a declaration (design §2.2).
+    OptionalAttr<StrAttr>:$consumer_resolved);
 
   let results = (outs Variadic<Boom_ValueType>:$results);
 
@@ -309,7 +315,13 @@ def Boom_VerifyOp : Op<Boom_Dialect, "verify", [Boom_KvReadWrite]> {
 def Boom_AcceptOp : Op<Boom_Dialect, "accept"> {
   let summary = "longest matching draft prefix plus the verifier's token";
 
-  let arguments = (ins Variadic<Boom_AnyType>:$inputs);
+  let arguments = (ins
+    Variadic<Boom_AnyType>:$inputs,
+    // The step's allowed-list declaration, carried here: the accept node is
+    // the speculative loop's reader of the step result, and its argmax ranges
+    // over the program's runtime list when there is one (same meaning as
+    // boom.sample's attribute).
+    OptionalAttr<I64Attr>:$allowed_list);
 
   let results = (outs Variadic<Boom_ValueType>:$tokens,
                       Boom_ValueType:$next,

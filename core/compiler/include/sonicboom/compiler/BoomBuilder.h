@@ -90,6 +90,33 @@ mlir::Operation *createBoomNode(mlir::OpBuilder &builder, mlir::Location loc,
                                 llvm::ArrayRef<sx::Attribute> attributes,
                                 std::optional<planner::BackendTag> backend);
 
+// What a generation program is, apart from the decode graph it lifts
+// (design §2.3): the loop shape, whether its sampler draws (plain loop only),
+// whether the loop reads a runtime index list, and the program's own numbers.
+// `max_drafts` is the speculative loop's proposal cap; `draft_strategy` names
+// the proposal source. The list capacity comes from the graph's consumer_list
+// declaration.
+struct ProgramSpec {
+  enum class Loop { Plain, Speculative };
+  Loop loop = Loop::Plain;
+  bool stochastic = false;  // plain loop only
+  bool listed = false;      // the loop reads a runtime list
+  std::string name, prefill_graph;
+  std::vector<int64_t> prompt_shape, eos_tokens;
+  int64_t max_tokens = 0, max_drafts = 0;
+  std::string draft_strategy;
+};
+
+// Lift the module's decode graph into the program `spec` describes, in one
+// call. The loop op that ends up reading the step is what derives that step's
+// consumer (argmax for a plain loop without a draw and for a speculative loop's
+// accept node, sample_select for a plain loop that draws); when the graph still
+// declares a consumer or a consumer_list, both must agree with `spec` — the
+// failure names both — and the declaration's list capacity becomes the reader's
+// `allowed_list`. The declaration is dropped with the graph op, whose body
+// moves into the step.
+mlir::LogicalResult addProgram(mlir::ModuleOp module, const ProgramSpec &spec);
+
 // Lift a module's single boom.graph (a decode graph) into the greedy generation
 // program (docs/boom-ir.md): a `boom.program` holding a
 // `boom.prefill` call, then an `scf.while` whose body is the decode graph as a

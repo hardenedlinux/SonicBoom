@@ -845,6 +845,13 @@ bool isArithOp(Operation &op) {
 mlir::LogicalResult StepOp::verify() {
   if (mlir::failed(verifyStages(getOperation(), getStages())))
     return mlir::failure();
+  // The resolution state, when the step has one: resolveConsumer writes "pre"
+  // (a sample_select step still owes finishConsumer's nodes) and "done" marks
+  // a step whose loop reader is complete.
+  if (auto resolved = getConsumerResolved())
+    if (*resolved != "pre" && *resolved != "done")
+      return emitOpError() << "consumer_resolved is '" << *resolved
+                           << "', which is neither \"pre\" nor \"done\"";
   // 1. The tensor table: unique ids, every entry a #boom.tensor_desc.
   TensorTable table;
   for (Attribute entry : getTensors()) {
@@ -1279,6 +1286,9 @@ mlir::LogicalResult AcceptOp::verify() {
       return emitOpError() << "operand " << index << " is typed "
                            << operand.getType()
                            << ", which is not a Boom value";
+  if (auto n = getAllowedList())
+    if (*n <= 0)
+      return emitOpError() << "allowed_list must be positive";
   return mlir::success();
 }
 
@@ -1288,6 +1298,41 @@ mlir::LogicalResult PosIncOp::verify() {
   if (getDelta() < 1)
     return emitOpError() << "delta must be positive";
   return mlir::success();
+}
+
+// What a loop op that reads a step result says the step's consumer is
+// (design §2.1): the consumer kind the reader implies and the runtime list it
+// ranges over, when it carries one.
+struct StepReaderDesc {
+  mlir::Operation *op = nullptr;
+  llvm::StringRef consumer;
+  std::optional<int64_t> list;
+};
+
+static std::optional<StepReaderDesc> stepReaderOf(mlir::Operation *op) {
+  if (auto sample = llvm::dyn_cast<SampleOp>(op)) {
+    StepReaderDesc reader;
+    reader.op = op;
+    reader.consumer = sample.getStochastic() ? "sample_select" : "argmax";
+    if (auto list = sample.getAllowedList())
+      reader.list = *list;
+    return reader;
+  }
+  if (auto accept = llvm::dyn_cast<AcceptOp>(op)) {
+    StepReaderDesc reader;
+    reader.op = op;
+    reader.consumer = "argmax";
+    if (auto list = accept.getAllowedList())
+      reader.list = *list;
+    return reader;
+  }
+  return std::nullopt;
+}
+
+static std::string stepReaderListText(std::optional<int64_t> list) {
+  if (!list)
+    return "no runtime list";
+  return "a runtime list of " + std::to_string(*list) + " ids";
 }
 
 // The program: a prefill call, then a while loop carrying (token, position,
@@ -1459,6 +1504,37 @@ mlir::LogicalResult ProgramOp::verify() {
     if (!(atStep < atSample && atSample < atEmit && atEmit < atStop))
       return loop.emitOpError()
              << "the step, sample, emit and stop check are out of order";
+  }
+
+  // The step's consumer is what its loop reader says it is (design §2.1). A
+  // step result read by two readers that imply different consumers, or the
+  // same consumer over different runtime lists, has no single answer and is
+  // rejected here rather than resolved by an arbitrary choice later.
+  for (auto [index, result] : llvm::enumerate(step.getResults())) {
+    std::optional<StepReaderDesc> first;
+    for (mlir::Operation *user : result.getUsers()) {
+      const std::optional<StepReaderDesc> reader = stepReaderOf(user);
+      if (!reader)
+        continue;
+      if (!first) {
+        first = reader;
+        continue;
+      }
+      if (reader->consumer != first->consumer)
+        return step.emitOpError()
+               << "result " << index << " is read by "
+               << first->op->getName() << " as '" << first->consumer
+               << "' and by " << reader->op->getName() << " as '"
+               << reader->consumer << "'; the two readings disagree";
+      if (reader->list != first->list)
+        return step.emitOpError()
+               << "result " << index << " is read by "
+               << first->op->getName() << " over "
+               << stepReaderListText(first->list) << " and by "
+               << reader->op->getName() << " over "
+               << stepReaderListText(reader->list)
+               << "; the two readings disagree";
+    }
   }
 
   PosIncOp posInc;
