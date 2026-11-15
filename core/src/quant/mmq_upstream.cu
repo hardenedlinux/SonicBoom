@@ -39,6 +39,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -335,6 +336,31 @@ int group_k_tiles(int K_vram, int blocks_per_row) {
     return (blocks_per_row + blocks_per_iter - 1) / blocks_per_iter;
 }
 
+// Grant a kernel at least `bytes` of dynamic shared memory.  Every launch that
+// asks for more than the 48 KiB default must have done this first; the grant
+// is remembered per kernel so a launch pays for it once, whether or not the
+// warm-up ran.  A failure is cleared and reported through the return value,
+// never fatal.
+bool ensure_dynamic_smem(const void * kernel, int bytes) {
+    if (bytes <= 48 * 1024) {
+        return true;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<const void *, int> granted;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = granted.find(kernel);
+    if (it != granted.end() && bytes <= it->second) {
+        return true;
+    }
+    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    granted[kernel] = bytes;
+    return true;
+}
+
 // Launch the group at one tile width.  split_k > 1 runs the group's K tiles in
 // that many slices (capped at the smallest member tile count) and then reduces
 // the shared partial buffer once over all members.
@@ -377,6 +403,13 @@ bool group_launch_j(const sb_cuda_props & props,
             {{"t0", (long long)T0}, {"t1", (long long)T1},
              {"t2", (long long)T2}, {"J", J}}),
         grid, block, nbs, stream);
+    // The launch itself is the one that needs the grant: a cached warm-up may
+    // never have run, and the default limit is smaller than nbs here.
+    if (!ensure_dynamic_smem(reinterpret_cast<const void *>(
+                                 mul_mat_q_group<T0, T1, T2, J>),
+                             int(nbs))) {
+        return false;
+    }
     mul_mat_q_group<T0, T1, T2, J><<<grid, block, nbs, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
 
@@ -477,12 +510,7 @@ bool group_launch_typed(const sb_cuda_props & props,
 // keeps the untuned default instead of aborting the process.
 template <typename Kernel>
 bool set_group_smem(Kernel kernel, size_t nbs) {
-    if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             int(nbs)) == cudaSuccess) {
-        return true;
-    }
-    (void)cudaGetLastError();
-    return false;
+    return ensure_dynamic_smem(reinterpret_cast<const void *>(kernel), int(nbs));
 }
 
 // Raise the shared-memory limit for every tile width the group kernel can be
