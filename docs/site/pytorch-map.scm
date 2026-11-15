@@ -35,48 +35,56 @@
      (note "SonicBoom models are not subclasses; the nn-model accessors play this role."))
    (torch "torch.nn.Module.forward"
      (status supported)
-     (use ((sonicboom model) model-forward-native) ((sonicboom nn) model-forward)))
+     (use ((sonicboom model) model-forward-native) ((sonicboom nn) model-forward))
+     (note "The native accessor takes the autograd tape."))
    (torch "torch.nn.Sequential"
      (status supported)
-     (use ((sonicboom nn) model?) ((sonicboom nn) model-layers) ((sonicboom nn) model-parameters) ((sonicboom nn) sequential)))
+     (use ((sonicboom nn) model?) ((sonicboom nn) model-layers) ((sonicboom nn) model-parameters) ((sonicboom nn) sequential))
+     (note "SonicBoom models are flat lists of named layers, not subclasses of a module."))
    (torch "torch.nn.Linear"
      (status supported)
-     (use ((sonicboom nn) linear)))
+     (use ((sonicboom nn) linear))
+     (note "The weight initializer defaults to randn; PyTorch initializes with kaiming uniform."))
    (torch "torch.nn.functional.relu"
      (aliases "torch.relu")
      (status supported)
      (use ((sonicboom nn) relu) ((sonicboom trace symbolic) relu) ((sonicboom train) autograd-relu))
-     (note "torch.relu is accepted as an alias."))
+     (note "torch.relu is accepted as an alias. The nn form builds a layer; the symbolic and tape forms compute the tensor."))
    (torch "torch.nn.parameter.Parameter"
      (aliases "torch.nn.Parameter")
      (status supported)
      (use ((sonicboom param) make-param) ((sonicboom tensor) parameter) ((sonicboom trace tensor) leaf?) ((sonicboom trace tensor) leaf-value) ((sonicboom trace tensor) set-leaf-value!) ((sonicboom trace tensor) leaf-grad) ((sonicboom trace tensor) set-leaf-grad!))
-     (note "torch.nn.Parameter is accepted as an alias."))
+     (note "torch.nn.Parameter is accepted as an alias. make-param builds from dimensions and initial bytes; the leaf accessors hold the value and the gradient in two slots."))
    (torch "torch.Tensor.is_cuda"
      (status supported)
      (use ((sonicboom param) param-on-device?)))
    (torch "torch.optim.Optimizer.zero_grad"
      (status supported)
-     (use ((sonicboom param) param-zero-grad!) ((sonicboom trace backward) zero-grad!) ((sonicboom train) tape-zero-grad!)))
+     (use ((sonicboom param) param-zero-grad!) ((sonicboom trace backward) zero-grad!) ((sonicboom train) tape-zero-grad!))
+     (note "Clears the gradient slots, which matches set_to_none=True; the forms take one parameter, a list of leaves, or a tape."))
    (torch "torch.optim.AdamW.step"
      (status supported)
-     (use ((sonicboom param) param-step!)))
+     (use ((sonicboom param) param-step!))
+     (note "Returns the new step count; the parameter is updated in place."))
    (torch "torch.Tensor"
      (status supported)
      (use ((sonicboom tensor) <tensor>) ((sonicboom tensor) tensor?) ((sonicboom tensor) tensor-dtype) ((sonicboom tensor) tensor-shape) ((sonicboom tensor) tensor-requires-grad?) ((sonicboom tensor) tensor-grad) ((sonicboom tensor) set-tensor-grad!) ((sonicboom trace tensor) ctensor?) ((sonicboom trace tensor) ctensor-dtype) ((sonicboom trace tensor) ctensor-shape))
      (note "The tensor type; the binding also exposes its accessors."))
    (torch "torch.tensor"
      (status supported)
-     (use ((sonicboom tensor) make-tensor) ((sonicboom tensor) list->tensor) ((sonicboom trace tensor) make-ctensor) ((sonicboom trace tensor) list->ctensor) ((sonicboom trace tensor) scalar->ctensor) ((sonicboom train) tensor-from-list)))
+     (use ((sonicboom tensor) make-tensor) ((sonicboom tensor) list->tensor) ((sonicboom trace tensor) make-ctensor) ((sonicboom trace tensor) list->ctensor) ((sonicboom trace tensor) scalar->ctensor) ((sonicboom train) tensor-from-list))
+     (note "The shape is given separately and the dtype defaults to float32; torch.tensor infers both from the data. Integer data becomes float32 unless a dtype is given."))
    (torch "torch.frombuffer"
      (status supported)
-     (use ((sonicboom tensor) bytevector->tensor) ((sonicboom trace tensor) bytevector->ctensor) ((sonicboom train) tensor-from-bytes)))
+     (use ((sonicboom tensor) bytevector->tensor) ((sonicboom trace tensor) bytevector->ctensor) ((sonicboom train) tensor-from-bytes))
+     (note "The shape replaces count and offset, and the dtype defaults to float32; torch.frombuffer requires the dtype. The result shares the buffer."))
    (torch "torch.Tensor.numel"
      (status supported)
      (use ((sonicboom tensor) tensor-numel) ((sonicboom trace tensor) ctensor-numel)))
    (torch "torch.Tensor.tolist"
      (status supported)
-     (use ((sonicboom tensor) tensor->list) ((sonicboom trace tensor) ctensor->list) ((sonicboom trace tensor) ctensor->nested) ((sonicboom train) tensor->list)))
+     (use ((sonicboom tensor) tensor->list) ((sonicboom trace tensor) ctensor->list) ((sonicboom trace tensor) ctensor->nested) ((sonicboom train) tensor->list))
+     (note "The list forms are flat and row-major; ctensor->nested returns the nested form torch.tolist uses."))
    (torch "torch.Tensor.clone"
      (status supported)
      (use ((sonicboom tensor) tensor-copy) ((sonicboom trace tensor) ctensor-copy)))
@@ -91,43 +99,56 @@
      (use ((sonicboom tensor) randn)))
    (torch "torch.Tensor.grad"
      (status supported)
-     (use ((sonicboom tensor) parameter-grad) ((sonicboom train) autograd-grad)))
+     (use ((sonicboom tensor) parameter-grad) ((sonicboom train) autograd-grad))
+     (note "The gradient is read through functions from the parameter's slot or from the tape; PyTorch exposes .grad as an attribute, None when unset."))
    (torch "torch.autograd.grad"
      (status supported)
-     (use ((sonicboom trace autodiff) grad)))
+     (use ((sonicboom trace autodiff) grad))
+     (note "Returns one tensor or a list instead of a tuple, and runs while the graph is being traced."))
    (torch "torch.func.grad_and_value"
      (status supported)
-     (use ((sonicboom trace autodiff) value-and-grad)))
+     (use ((sonicboom trace autodiff) value-and-grad))
+     (note "Returns the value before the gradients; grad_and_value returns the gradients first."))
    (torch "torch.autograd.backward"
      (status supported)
-     (use ((sonicboom trace backward) backward!)))
+     (use ((sonicboom trace backward) backward!))
+     (note "Runs while the graph is being traced and returns the gradients; the leaf gradients land in their slots."))
    (torch "torch.nn.functional.softmax"
      (status supported)
-     (use ((sonicboom trace fused) fused-softmax) ((sonicboom trace layers) softmax)))
+     (use ((sonicboom trace fused) fused-softmax) ((sonicboom trace layers) softmax))
+     (note "The axis defaults to the last axis; PyTorch's dim defaults to None and picks an axis by rank."))
    (torch "torch.nn.functional.rms_norm"
      (status supported)
-     (use ((sonicboom trace fused) fused-rms-norm) ((sonicboom trace layers) rms-norm)))
+     (use ((sonicboom trace fused) fused-rms-norm) ((sonicboom trace layers) rms-norm))
+     (note "The normalised shape comes from the weight, and eps defaults to 1e-6; PyTorch's eps defaults to the dtype epsilon."))
    (torch "torch.nn.functional.cross_entropy"
      (status supported)
-     (use ((sonicboom trace fused) fused-cross-entropy) ((sonicboom trace layers) cross-entropy)))
+     (use ((sonicboom trace fused) fused-cross-entropy) ((sonicboom trace layers) cross-entropy))
+     (note "Class-index targets and the mean reduction only; PyTorch also accepts probabilities, weights and other reductions."))
    (torch "torch.optim.AdamW"
      (status supported)
-     (use ((sonicboom trace fused) adamw-step!)))
+     (use ((sonicboom trace fused) adamw-step!))
+     (note "Updates functional tensors and returns the new parameter and moments; PyTorch's step updates in place and returns None."))
    (torch "torch.nn.utils.clip_grad_norm_"
      (status supported)
-     (use ((sonicboom trace fused) fused-clip-grad-norm) ((sonicboom trace fused) clip-grad-norm!) ((sonicboom train) clip-grad-norm!)))
+     (use ((sonicboom trace fused) fused-clip-grad-norm) ((sonicboom trace fused) clip-grad-norm!) ((sonicboom train) clip-grad-norm!))
+     (note "Max-norm defaults to 1.0 instead of being required; the fused forms return the clipped gradients, the tape form returns the pre-clip global norm."))
    (torch "torch.nn.functional.log_softmax"
      (status supported)
-     (use ((sonicboom trace layers) log-softmax)))
+     (use ((sonicboom trace layers) log-softmax))
+     (note "The axis defaults to the last axis; PyTorch's dim defaults to None and picks an axis by rank."))
    (torch "torch.nn.functional.layer_norm"
      (status supported)
-     (use ((sonicboom trace layers) layer-norm)))
+     (use ((sonicboom trace layers) layer-norm))
+     (note "Only the last axis is normalised; gamma and beta are required and the normalised shape comes from gamma."))
    (torch "torch.nn.functional.embedding"
      (status supported)
-     (use ((sonicboom trace layers) embedding)))
+     (use ((sonicboom trace layers) embedding))
+     (note "The table comes first; PyTorch's input comes first. padding_idx, max_norm, scale_grad_by_freq and sparse are not offered."))
    (torch "torch.nn.functional.linear"
      (status supported)
-     (use ((sonicboom trace layers) linear) ((sonicboom train) autograd-linear)))
+     (use ((sonicboom trace layers) linear) ((sonicboom train) autograd-linear))
+     (note "The weight is [in, out] and is used without transposing; PyTorch's weight is [out, in]. The bias is required."))
    (torch "torch.tril" (status missing))
    (torch "torch.export.export"
      (status missing)
@@ -137,10 +158,12 @@
      (use ((sonicboom trace ops) broadcast-shapes)))
    (torch "torch.optim.SGD"
      (status supported)
-     (use ((sonicboom trace optim) sgd-update)))
+     (use ((sonicboom trace optim) sgd-update))
+     (note "Returns the updated tensors; lr defaults to 0.1. momentum, dampening, weight_decay and nesterov are not offered."))
    (torch "torch.optim.Adam"
      (status supported)
-     (use ((sonicboom trace optim) adam-init) ((sonicboom trace optim) adam-update)))
+     (use ((sonicboom trace optim) adam-init) ((sonicboom trace optim) adam-update))
+     (note "Split into init and update; lr defaults to 1e-2. weight_decay and amsgrad are not offered."))
    (torch "torch.add"
      (status supported)
      (use ((sonicboom trace symbolic) add)))
@@ -185,7 +208,8 @@
      (use ((sonicboom trace symbolic) div)))
    (torch "torch.transpose"
      (status supported)
-     (use ((sonicboom trace symbolic) transpose)))
+     (use ((sonicboom trace symbolic) transpose))
+     (note "Swaps the last two axes; torch.transpose takes dim0 and dim1."))
    (torch "torch.permute"
      (status supported)
      (use ((sonicboom trace symbolic) permute)))
@@ -209,7 +233,8 @@
      (use ((sonicboom trace symbolic) tsqrt)))
    (torch "torch.nn.functional.gelu"
      (status supported)
-     (use ((sonicboom trace symbolic) gelu)))
+     (use ((sonicboom trace symbolic) gelu))
+     (note "Uses the tanh approximation (approximate='tanh'); the default approximate='none' uses erf."))
    (torch "torch.amax"
      (status supported)
      (use ((sonicboom trace symbolic) amax)))
@@ -224,16 +249,19 @@
      (use ((sonicboom trace symbolic) index-select)))
    (torch "torch.Tensor.index_add_"
      (status supported)
-     (use ((sonicboom trace symbolic) index-add)))
+     (use ((sonicboom trace symbolic) index-add))
+     (note "Returns a new tensor and leaves the base unchanged; the index has the shape of src. alpha is not offered."))
    (torch "torch.gather"
      (status supported)
      (use ((sonicboom trace symbolic) gather)))
    (torch "torch.Tensor.scatter_add_"
      (status supported)
-     (use ((sonicboom trace symbolic) scatter-add)))
+     (use ((sonicboom trace symbolic) scatter-add))
+     (note "Returns a new tensor and leaves the base unchanged; the index has the shape of src."))
    (torch "torch.concat"
      (status supported)
-     (use ((sonicboom trace symbolic) concat)))
+     (use ((sonicboom trace symbolic) concat))
+     (note "The axis is required; torch.concat's dim defaults to 0."))
    (torch "torch.narrow"
      (status recipe)
      (recipe "(ctensor->list (slice x dim start (+ start length)))")
@@ -248,13 +276,16 @@
    (torch "torch.compile" (status missing))
    (torch "torch.nn.functional.mse_loss"
      (status supported)
-     (use ((sonicboom train) autograd-mse)))
+     (use ((sonicboom train) autograd-mse))
+     (note "The tape form records the loss; the mean reduction matches the PyTorch default."))
    (torch "torch.Tensor.backward"
      (status supported)
-     (use ((sonicboom train) autograd-backward)))
+     (use ((sonicboom train) autograd-backward))
+     (note "Runs while the graph is being traced and takes the tape; the implicit gradient of ones matches the PyTorch default."))
    (torch "torch.optim.SGD.step"
      (status supported)
-     (use ((sonicboom train) autograd-sgd-step!)))
+     (use ((sonicboom train) autograd-sgd-step!))
+     (note "Applies one step to a recorded parameter; lr is required as in torch.optim.SGD."))
    (torch "torch.optim.lr_scheduler.CosineAnnealingLR" (status missing))
    (torch "torch.optim.lr_scheduler.ConstantLR" (status missing))
    (torch "torch.optim.lr_scheduler.LinearLR" (status missing))
@@ -1747,7 +1778,7 @@
    (torch "torch.nn.Module.get_parameter"
      (status supported)
      (use ((sonicboom nn) layer-parameter-ref) ((sonicboom nn) model-parameter-ref))
-     (note "Looks a parameter up by its key in the layer or in the merged model."))
+     (note "Looks a parameter up by its key in the layer or in the merged model; returns #f when the key is absent, where PyTorch raises AttributeError."))
    (torch "torch.nn.Module.get_submodule" (status missing))
    (torch "torch.nn.Module.half" (status missing))
    (torch "torch.nn.Module.ipu" (status missing))
