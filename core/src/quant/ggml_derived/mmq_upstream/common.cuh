@@ -60,7 +60,7 @@
 // ggml-impl.h.  Only the host or device variants actually used are provided.
 // ---------------------------------------------------------------------------
 
-[[noreturn]] inline void sb_ggml_abort(const char * file, int line, const char * fmt, ...) {
+[[noreturn]] inline void boom_ggml_abort(const char * file, int line, const char * fmt, ...) {
     va_list args;
     va_start(args, fmt);
     fprintf(stderr, "%s:%d: ", file, line);
@@ -73,7 +73,7 @@
 #ifdef __CUDA_ARCH__
 #define GGML_ABORT(...) do { __trap(); } while (0)
 #else
-#define GGML_ABORT(...) sb_ggml_abort(__FILE__, __LINE__, __VA_ARGS__)
+#define GGML_ABORT(...) boom_ggml_abort(__FILE__, __LINE__, __VA_ARGS__)
 #endif
 #define GGML_ASSERT(x) if (!(x)) GGML_ABORT("GGML_ASSERT(%s) failed", #x)
 
@@ -88,7 +88,7 @@
 // SonicBoom: CUDA error checking.
 // ---------------------------------------------------------------------------
 
-[[noreturn]] inline void sb_cuda_error(const char * stmt, const char * func, const char * file, int line,
+[[noreturn]] inline void boom_cuda_error(const char * stmt, const char * func, const char * file, int line,
                                        cudaError_t err) {
     fprintf(stderr, "%s:%d: %s: CUDA error: %s (%s)\n", file, line, func,
             cudaGetErrorString(err), stmt);
@@ -99,7 +99,7 @@
     do {                                                                             \
         cudaError_t err_ = (err);                                                    \
         if (err_ != cudaSuccess) {                                                   \
-            sb_cuda_error(#err, __func__, __FILE__, __LINE__, err_);                 \
+            boom_cuda_error(#err, __func__, __FILE__, __LINE__, err_);                 \
         }                                                                            \
     } while (0)
 
@@ -109,10 +109,10 @@
 // variant, so one flag per macro expansion is enough.
 #define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                 \
     do {                                                                                             \
-        static bool sb_shared_memory_limit_raised = false;                                           \
-        if (!sb_shared_memory_limit_raised) {                                                        \
+        static bool boom_shared_memory_limit_raised = false;                                           \
+        if (!boom_shared_memory_limit_raised) {                                                        \
             CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-            sb_shared_memory_limit_raised = true;                                                    \
+            boom_shared_memory_limit_raised = true;                                                    \
         }                                                                                            \
     } while (0)
 
@@ -941,7 +941,7 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ3_S> {
 // SonicBoom: plain device-properties struct supplied by the host wrapper.
 // Replaces ggml_cuda_info().devices[id] and ggml_cuda_get_device().
 // ---------------------------------------------------------------------------
-struct sb_cuda_props {
+struct boom_cuda_props {
     int cc;        // compute capability, e.g. 860 for sm_86
     int nsm;       // multiprocessor count
     int warp_size; // physical warp size (32 on NVIDIA)
@@ -955,14 +955,14 @@ struct sb_cuda_props {
 // path (not exercised yet).
 // ---------------------------------------------------------------------------
 template <typename T>
-struct sb_pool_alloc {
+struct boom_pool_alloc {
     T * ptr = nullptr;
 
-    sb_pool_alloc() = default;
-    explicit sb_pool_alloc(size_t n) { alloc(n); }
-    sb_pool_alloc(const sb_pool_alloc &) = delete;
-    sb_pool_alloc & operator=(const sb_pool_alloc &) = delete;
-    ~sb_pool_alloc() {
+    boom_pool_alloc() = default;
+    explicit boom_pool_alloc(size_t n) { alloc(n); }
+    boom_pool_alloc(const boom_pool_alloc &) = delete;
+    boom_pool_alloc & operator=(const boom_pool_alloc &) = delete;
+    ~boom_pool_alloc() {
         if (ptr != nullptr) {
             cudaFree(ptr);
         }

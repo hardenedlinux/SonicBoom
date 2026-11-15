@@ -15,7 +15,7 @@ arithmetic is not written in Scheme.
 
 Guile 3.0.9 or later, plus
 [guile-json](https://github.com/aconchillo/guile-json) 4.7.3 for its `(json)`
-module: [`(sonicboom ffi)`](scheme/sonicboom/ffi.scm) decodes `sb_build_info()`
+module: [`(sonicboom ffi)`](scheme/sonicboom/ffi.scm) decodes `boom_build_info()`
 with it, and [`(sonicboom serve)`](scheme/sonicboom/serve) uses it for chat
 templates and the OpenAI-compatible API.
 
@@ -196,7 +196,7 @@ exports the same name for Guile tensors.
 
 An S-Expr graph parsed and compiled once, then run many times.
 
-- `compile-s-expr text` — `sb_parse` + `sb_compile` once; returns an executable
+- `compile-s-expr text` — `boom_parse` + `boom_compile` once; returns an executable
 - `executable-run exe input-bv` — one run; returns `(values output-bv #f)`, or `(values #f message)` on failure
 - `executable-graph-text`, `executable-input-nbytes`, `executable-output-nbytes` — what it was compiled from
 - `executable?`, `executable-freed?`, `free-executable!` — lifetime; freeing is idempotent
@@ -245,7 +245,7 @@ rarely needs it directly.
 - `run-s-expr text input-bv` — parse, execute and retrieve in one call
 - `build-info` — how the loaded `libsonicboom.so` was built (see below)
 - `libsonicboom-available?` — whether the library loaded at all
-- `sb-status-ok?`, `sb-status->message`, `SB_ERR_BINDING` — status handling
+- `sb-status-ok?`, `sb-status->message`, `BOOM_ERR_BINDING` — status handling
 - `make-slot`, `slot-ptr`, `slot-ref`, `capture-error` — out-parameter helpers
 
 ### `(build-info)`
@@ -267,7 +267,7 @@ so a benchmark result or a bug report can name the exact binary behind it:
 | `llvm` | alist: `version` and `major` of the LLVM/MLIR linked in, `origin` (`"bundled"` for the install `tools/mlir/build-mlir.sh` produces in-tree, `"external"` for any other — MLIR is required, so these are always real values) |
 | `platform` | target CPU the library was compiled for (`"x86_64"`), not the caller's machine |
 
-The underlying `sb_build_info()` C function (capi.h) returns the same thing as
+The underlying `boom_build_info()` C function (capi.h) returns the same thing as
 a JSON object; the field set may grow, so read by name rather than by position.
 
 ## (sonicboom trace ...) — the tracer
@@ -440,7 +440,7 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
   re-detokenize the prefix (which `generate-stream` does; that is O(tokens²)
   per call).
 - **A prompt already resident in a session's KV cache is reused down to its last
-  token.** `sb_llm_prefill` reuses at most `n - 1` tokens and re-prefills the
+  token.** `boom_llm_prefill` reuses at most `n - 1` tokens and re-prefills the
   final one, so the prefill suffix is never empty: an identical repeat of a
   prompt succeeds and reports `n_reused = n - 1`.
 - **Control-token parsing is opt-in, and the server turns it on only for the
@@ -452,8 +452,8 @@ These are current facts, not policy; several are recorded as NEEDS-CORE work.
   every message is `'text`; `tokenize-segments` parses the first and never the
   second, which is what makes the injection impossible while the markers become
   the vocabulary's single control tokens (`<|turn>` = 105, `<turn|>` = 106 —
-  the same id as the model's eos). `sb_llm_tokenize` keeps its old text-only
-  behaviour, byte for byte; the new flag lives in `sb_llm_tokenize_ex`.
+  the same id as the model's eos). `boom_llm_tokenize` keeps its old text-only
+  behaviour, byte for byte; the new flag lives in `boom_llm_tokenize_ex`.
 - Python is not used anywhere in the binding.
 
 ## Tests

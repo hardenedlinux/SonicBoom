@@ -41,7 +41,7 @@
 #include "cuda_resident.h"
 #include "cuda_stream.h"
 
-#include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -56,7 +56,7 @@ namespace sonicboom::nn::cuda {
 namespace {
 
 // Current stream for device-resident kernels (see cuda_stream.h).
-inline cudaStream_t cur_stream() { return ::sonicboom::cuda::sb_current_stream(); }
+inline cudaStream_t cur_stream() { return ::sonicboom::cuda::boom_current_stream(); }
 
 constexpr int FA_BK = 32;  // keys per online-softmax tile
 
@@ -632,7 +632,7 @@ bool launch_exact_flash_attention(const float* q, const float* k_batch,
   constexpr int smem_bytes =
       (NHKV * FA_BK * HEAD_DIM + NQ * NHQ * FA_BK) * (int)sizeof(float);
   auto kfn = flash_attention_chunk_exact_kernel<KV, HEAD_DIM, NHQ, NHKV, NQ>;
-  SB_NOTE_LAUNCH_TP("flash_attention_chunk_exact_kernel",
+  BOOM_NOTE_LAUNCH_TP("flash_attention_chunk_exact_kernel",
                     ::sonicboom::planner::plan_detail::tp_label(
                         {{"HEAD_DIM", HEAD_DIM}, {"NHQ", NHQ}, {"NHKV", NHKV}}),
                     (n + NQ - 1) / NQ, NHQ * 32, smem_bytes, cur_stream());
@@ -676,7 +676,7 @@ bool flash_attention_boom_fattn_strict_chunk_dev_pos(
   }
 
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
-  SB_NOTE_LAUNCH(flash_attention_chunk_pos_kernel, n, n_heads_q * 32, smem,
+  BOOM_NOTE_LAUNCH(flash_attention_chunk_pos_kernel, n, n_heads_q * 32, smem,
                  cur_stream());
   auto launch_scalar = [&](auto tag) {
     using KV = decltype(tag);

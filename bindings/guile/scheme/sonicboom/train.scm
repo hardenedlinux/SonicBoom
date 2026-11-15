@@ -101,7 +101,7 @@ Note: This path does no per-element Scheme conversion; use it when the source
 already holds float32 bytes."
   (let* ((out-slot (make-slot))
          (err-slot (make-slot)))
-    (let ((st ((proc 'sb_tensor_from_f32) (dims->pointer dims) (length dims)
+    (let ((st ((proc 'boom_tensor_from_f32) (dims->pointer dims) (length dims)
                (bytevector->pointer bv) (bytevector-length bv)
                (slot-ptr out-slot) (slot-ptr err-slot))))
       (unless (sb-status-ok? st)
@@ -139,7 +139,7 @@ PyTorch: torch.Tensor.tolist"
   (let* ((bv (make-bytevector (* 4 numel)))
          (wr (make-bytevector 8 0))       ; size_t out slot (64-bit target)
          (err-slot (make-slot)))
-    (let ((st ((proc 'sb_tensor_bytes) handle (bytevector->pointer bv)
+    (let ((st ((proc 'boom_tensor_bytes) handle (bytevector->pointer bv)
                (* 4 numel) (bytevector->pointer wr) (slot-ptr err-slot))))
       (unless (sb-status-ok? st)
         (error "tensor->list:" (capture-error err-slot)))
@@ -154,7 +154,7 @@ Returns: unspecified.
 PyTorch: none
 Note: The caller owns every tensor obtained from this module and must release
 it; PyTorch tensors are released by the garbage collector."
-  ((proc 'sb_tensor_free) handle))
+  ((proc 'boom_tensor_free) handle))
 
 (define (make-tape)
   "Create an autograd tape that records differentiable operations.
@@ -169,7 +169,7 @@ PyTorch: none
 Note: PyTorch records on an implicit graph inside each tensor; here the tape
 is an explicit object passed to every differentiable operation."
   (let ((s (make-slot)) (e (make-slot)))
-    (let ((st ((proc 'sb_tape_new) (slot-ptr s) (slot-ptr e))))
+    (let ((st ((proc 'boom_tape_new) (slot-ptr s) (slot-ptr e))))
       (unless (sb-status-ok? st)
         (error "make-tape:" (capture-error e)))
       (slot-ref s))))
@@ -181,7 +181,7 @@ Args:
   tape: a tape handle from make-tape.
 Returns: unspecified.
 PyTorch: none"
-  ((proc 'sb_tape_free) tape))
+  ((proc 'boom_tape_free) tape))
 (define (tape-zero-grad! tape)
   "Clear the gradients the tape has accumulated.
 
@@ -191,7 +191,7 @@ Args:
   tape: a tape handle.
 Returns: unspecified.
 PyTorch: torch.optim.Optimizer.zero_grad"
-  ((proc 'sb_tape_zero_grad) tape))
+  ((proc 'boom_tape_zero_grad) tape))
 
 ;;; --- differentiable ops (each records on the tape) ---------------------------
 
@@ -230,7 +230,7 @@ Example:
   => (6.5)
 PyTorch: torch.nn.functional.linear
 Note: The caller owns the returned tensor."
-  (call-tensor-op 'sb_linear (list x w b tape)))
+  (call-tensor-op 'boom_linear (list x w b tape)))
 
 (define (autograd-relu x tape)
   "A differentiable rectified linear unit.
@@ -248,7 +248,7 @@ Example:
   => (1.0 0.0)
 PyTorch: torch.nn.functional.relu
 Note: The caller owns the returned tensor."
-  (call-tensor-op 'sb_relu (list x tape)))
+  (call-tensor-op 'boom_relu (list x tape)))
 
 (define (autograd-mse pred target tape)
   "A differentiable mean squared error.
@@ -268,7 +268,7 @@ Example:
   => (4.0)
 PyTorch: torch.nn.functional.mse_loss
 Note: The reduction is always a mean over all elements."
-  (call-tensor-op 'sb_mse_loss (list pred target tape)))
+  (call-tensor-op 'boom_mse_loss (list pred target tape)))
 
 (define (autograd-backward loss tape)
   "Backpropagate from a loss through the recorded operations.
@@ -280,7 +280,7 @@ Args:
   tape: the tape that recorded the forward pass.
 Returns: unspecified.
 PyTorch: torch.Tensor.backward"
-  (call-status 'sb_backward (list loss tape)))
+  (call-status 'boom_backward (list loss tape)))
 
 (define (autograd-sgd-step! tape param lr)
   "Apply one plain SGD update to a parameter, in place.
@@ -306,7 +306,7 @@ Example:
     (tensor->list w 1))
   => (3.799999952316284)
 PyTorch: torch.optim.SGD.step"
-  (call-status 'sb_sgd_step (list tape param lr)))
+  (call-status 'boom_sgd_step (list tape param lr)))
 
 (define (autograd-grad tape param)
   "The gradient autograd-backward accumulated for a parameter.
@@ -329,7 +329,7 @@ Example:
   => (-8.0)
 PyTorch: torch.Tensor.grad
 Note: The caller owns the returned tensor."
-  (call-tensor-op 'sb_grad (list tape param)))
+  (call-tensor-op 'boom_grad (list tape param)))
 
 ;;; --- global-norm gradient clipping ------------------------------------------
 
@@ -366,7 +366,7 @@ PyTorch: torch.nn.utils.clip_grad_norm_"
         (bytevector-u64-native-set! ptr-bv (* 8 i)
                                     (pointer-address (car gs)))
         (loop (+ i 1) (cdr gs))))
-    (let ((st ((proc 'sb_clip_grad_norm)
+    (let ((st ((proc 'boom_clip_grad_norm)
                (bytevector->pointer ptr-bv) count (exact->inexact max-norm)
                (bytevector->pointer norm-bv) (slot-ptr err-slot))))
       (for-each tensor-free! grads)

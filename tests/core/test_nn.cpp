@@ -18,7 +18,7 @@
 #include <sonicboom/quant/dequant.h>
 #include <sonicboom/quant/quantized_matmul.h>
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
 #include <cuda_runtime.h>
 
 #include <sonicboom/nn/cuda_moe.h>
@@ -92,7 +92,7 @@ void test_sigmoid() {
         "sigmoid rejects a too-short output span");
 }
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
 // The device sigmoid against the CPU one on the same values. Device expf and
 // host exp are not required to be bit-identical, so this is the comparison the
 // tree's other device-kernel suites use (an independent reference within
@@ -863,7 +863,7 @@ void test_moe() {
     check(asc_exact, "moe_experts sums the routed experts in ascending order");
   }
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
   // The CUDA twin on the same example: decode within the tree's fp32
   // tolerance of the CPU kernel, a four-row verify bit-identical row by row to
   // four single-row decodes, and a four-row prefill within tolerance of the
@@ -1118,7 +1118,7 @@ void test_rope_heads_partial() {
         "rope_neox_heads rejects short freq_factors for rot_dims");
 }
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
 // The device partial rope against the CPU reference on the same values. Device
 // arithmetic is not required to be bit-identical, so this is a tolerance check.
 void test_rope_heads_cuda() {
@@ -1203,7 +1203,7 @@ void test_layer_combine() {
 int main() {
   test_silu();
   test_sigmoid();
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
   test_sigmoid_cuda();
 #endif
   test_gelu();
@@ -1222,7 +1222,7 @@ int main() {
   test_rms_norm_heads();
   test_rope_heads();
   test_rope_heads_partial();
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
   test_rope_heads_cuda();
 #endif
   test_gqa_broadcast();

@@ -62,28 +62,28 @@ void check(bool ok, const std::string& what) {
   }
 }
 
-void die(const char* what, sb_error* err) {
+void die(const char* what, boom_error* err) {
   std::fprintf(stderr, "  %s: %s\n", what,
-               err ? sb_error_message(err) : "(none)");
-  if (err) sb_error_free(err);
+               err ? boom_error_message(err) : "(none)");
+  if (err) boom_error_free(err);
   g_failures = 1;
 }
 
-void check_status(sb_status st, sb_error* err, const char* what) {
-  if (st != SB_OK) die(what, err);
+void check_status(boom_status st, boom_error* err, const char* what) {
+  if (st != BOOM_OK) die(what, err);
 }
 
 // The greedy sampling contract: temperature 0 is the historical argmax path.
-sb_llm_sampling greedy() {
-  sb_llm_sampling s;
+boom_llm_sampling greedy() {
+  boom_llm_sampling s;
   std::memset(&s, 0, sizeof s);
   s.struct_size = sizeof s;
   s.max_tokens = kMaxTokens;
   return s;
 }
 
-int collect_tokens(void* user, sb_token token) {
-  auto* out = static_cast<std::vector<sb_token>*>(user);
+int collect_tokens(void* user, boom_token token) {
+  auto* out = static_cast<std::vector<boom_token>*>(user);
   out->push_back(token);
   return 0;
 }
@@ -114,32 +114,32 @@ int child_main(const std::string& path, const std::string& mode,
     ::setenv("SONICBOOM_SPEC", spec ? "on" : "off", 1);
   }
 
-  sb_error* err = nullptr;
-  sb_llm_model* model = nullptr;
-  if (sb_llm_model_load(path.c_str(), &model, &err) != SB_OK) {
+  boom_error* err = nullptr;
+  boom_llm_model* model = nullptr;
+  if (boom_llm_model_load(path.c_str(), &model, &err) != BOOM_OK) {
     die("model_load", err);
     return 1;
   }
 
-  sb_token prompt[1024];
+  boom_token prompt[1024];
   size_t n_prompt = 0;
-  if (sb_llm_tokenize(model, kPromptText, std::strlen(kPromptText), prompt,
-                      1024, &n_prompt, &err) != SB_OK) {
+  if (boom_llm_tokenize(model, kPromptText, std::strlen(kPromptText), prompt,
+                      1024, &n_prompt, &err) != BOOM_OK) {
     die("tokenize", err);
-    sb_llm_model_free(model);
+    boom_llm_model_free(model);
     return 1;
   }
   if (n_prompt < kPromptTokens) {
     std::fprintf(stderr, "  prompt tokenized to %zu tokens, need %zu\n",
                  n_prompt, kPromptTokens);
-    sb_llm_model_free(model);
+    boom_llm_model_free(model);
     return 1;
   }
 
-  sb_llm_session* session = nullptr;
-  if (sb_llm_session_new(model, n_ctx, &session, &err) != SB_OK) {
+  boom_llm_session* session = nullptr;
+  if (boom_llm_session_new(model, n_ctx, &session, &err) != BOOM_OK) {
     die("session_new", err);
-    sb_llm_model_free(model);
+    boom_llm_model_free(model);
     return 1;
   }
 
@@ -149,42 +149,42 @@ int child_main(const std::string& path, const std::string& mode,
     // prefills the first 24 tokens, then the full 40-token prompt, so the
     // second call processes only the 16 new tokens (the last prompt token is
     // always processed, hence at most 23 reused).
-    if (sb_llm_prefill(session, prompt, kReuseFirst, &reused, &err) != SB_OK) {
+    if (boom_llm_prefill(session, prompt, kReuseFirst, &reused, &err) != BOOM_OK) {
       die("prefill (first 24)", err);
-      sb_llm_session_free(session);
-      sb_llm_model_free(model);
+      boom_llm_session_free(session);
+      boom_llm_model_free(model);
       return 1;
     }
-    if (sb_llm_prefill(session, prompt, kPromptTokens, &reused, &err) != SB_OK) {
+    if (boom_llm_prefill(session, prompt, kPromptTokens, &reused, &err) != BOOM_OK) {
       die("prefill (rest)", err);
-      sb_llm_session_free(session);
-      sb_llm_model_free(model);
+      boom_llm_session_free(session);
+      boom_llm_model_free(model);
       return 1;
     }
     std::fprintf(stderr, "  reuse: %llu of %zu leading tokens reused\n",
                  static_cast<unsigned long long>(reused), kReuseFirst);
   } else {
-    if (sb_llm_prefill(session, prompt, kPromptTokens, &reused, &err) != SB_OK) {
+    if (boom_llm_prefill(session, prompt, kPromptTokens, &reused, &err) != BOOM_OK) {
       die("prefill", err);
-      sb_llm_session_free(session);
-      sb_llm_model_free(model);
+      boom_llm_session_free(session);
+      boom_llm_model_free(model);
       return 1;
     }
   }
 
-  std::vector<sb_token> tokens;
-  const sb_llm_sampling s = greedy();
+  std::vector<boom_token> tokens;
+  const boom_llm_sampling s = greedy();
   uint32_t n_out = 0;
-  if (sb_llm_decode(session, &s, collect_tokens, &tokens, &n_out, &err) !=
-      SB_OK) {
+  if (boom_llm_decode(session, &s, collect_tokens, &tokens, &n_out, &err) !=
+      BOOM_OK) {
     die("decode", err);
-    sb_llm_session_free(session);
-    sb_llm_model_free(model);
+    boom_llm_session_free(session);
+    boom_llm_model_free(model);
     return 1;
   }
 
-  sb_llm_session_free(session);
-  sb_llm_model_free(model);
+  boom_llm_session_free(session);
+  boom_llm_model_free(model);
 
   std::ofstream out(out_path, std::ios::binary);
   if (!out) {
@@ -192,7 +192,7 @@ int child_main(const std::string& path, const std::string& mode,
     return 1;
   }
   out.write(reinterpret_cast<const char*>(tokens.data()),
-            static_cast<std::streamsize>(tokens.size() * sizeof(sb_token)));
+            static_cast<std::streamsize>(tokens.size() * sizeof(boom_token)));
   if (!out) {
     std::fprintf(stderr, "short write %s\n", out_path.c_str());
     return 1;
@@ -205,7 +205,7 @@ int child_main(const std::string& path, const std::string& mode,
 
 std::string g_self;
 
-std::vector<sb_token> run_child(const std::string& model, const std::string& mode,
+std::vector<boom_token> run_child(const std::string& model, const std::string& mode,
                                 bool* ok) {
   char tmpl[] = "/tmp/sb-guarantees-XXXXXX";
   const int fd = ::mkstemp(tmpl);
@@ -235,10 +235,10 @@ std::vector<sb_token> run_child(const std::string& model, const std::string& mod
     ::unlink(tmpl);
     return {};
   }
-  std::vector<sb_token> tokens;
+  std::vector<boom_token> tokens;
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
     std::ifstream in(tmpl, std::ios::binary);
-    sb_token t = 0;
+    boom_token t = 0;
     while (in.read(reinterpret_cast<char*>(&t), sizeof t)) tokens.push_back(t);
     *ok = true;
   } else {
@@ -250,8 +250,8 @@ std::vector<sb_token> run_child(const std::string& model, const std::string& mod
 }
 
 void compare(const std::string& label, const std::string& a_mode,
-             const std::vector<sb_token>& a, const std::string& b_mode,
-             const std::vector<sb_token>& b) {
+             const std::vector<boom_token>& a, const std::string& b_mode,
+             const std::vector<boom_token>& b) {
   check(a.size() == kMaxTokens && b.size() == kMaxTokens,
         label + ": both runs produced " + std::to_string(kMaxTokens) +
             " tokens (" + a_mode + " " + std::to_string(a.size()) + ", " +
@@ -276,7 +276,7 @@ void compare(const std::string& label, const std::string& a_mode,
   }
 }
 
-std::string tokens_text(const std::vector<sb_token>& v) {
+std::string tokens_text(const std::vector<boom_token>& v) {
   std::string s;
   for (size_t i = 0; i < v.size(); ++i) {
     if (i) s += ' ';

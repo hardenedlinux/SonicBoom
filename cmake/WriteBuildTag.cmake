@@ -1,8 +1,8 @@
-# Writes the build-tag header (SB_BUILD_GIT, SB_BUILD_GIT_TAG).
+# Writes the build-tag header (BOOM_BUILD_GIT, BOOM_BUILD_GIT_TAG).
 #
 # Runs in script mode (-P) twice: once at configure time to populate the header,
 # and once per build through the `sonicboom_build_tag` custom target. Running it
-# at build time is what keeps sb_build_info() honest after a commit: the tag is
+# at build time is what keeps boom_build_info() honest after a commit: the tag is
 # resolved from the working tree of the build in progress, not from the last
 # configure.
 #
@@ -48,12 +48,12 @@ endif()
 
 set(_content
 "// Generated at build time by cmake/WriteBuildTag.cmake. Do not edit.
-// The revision this library was built from; reported by sb_build_info().
+// The revision this library was built from; reported by boom_build_info().
 #ifndef SONICBOOM_SB_BUILD_TAG_H
 #define SONICBOOM_SB_BUILD_TAG_H
 
-#define SB_BUILD_GIT \"${_git}\"
-#define SB_BUILD_GIT_TAG \"${_tag}\"
+#define BOOM_BUILD_GIT \"${_git}\"
+#define BOOM_BUILD_GIT_TAG \"${_tag}\"
 
 #endif // SONICBOOM_SB_BUILD_TAG_H
 ")

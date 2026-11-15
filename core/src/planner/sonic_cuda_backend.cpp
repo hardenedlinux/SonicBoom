@@ -3065,7 +3065,7 @@ std::expected<std::vector<TensorValue>, RuntimeError> SonicCudaBackend::execute(
   // dump covers the uncaptured path only — a capture's memcpy cannot be
   // recorded. The dump names the node by its first output's tensor name (the
   // emitter's unique name; the runtime node name is the shared op kind).
-  if (dump_ && !sonicboom::cuda::sb_capturing()) {
+  if (dump_ && !sonicboom::cuda::boom_capturing()) {
     std::vector<std::byte> host(out_bytes);
     if (device::download(out_handle, host.data(), out_bytes))
       dump_->write(out_td->name, host.data(), out_bytes, out_td->dtype);

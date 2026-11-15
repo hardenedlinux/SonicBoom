@@ -149,7 +149,7 @@
     reused))
 
 (define (real-step session sampler constraint)
-  ;; One sb_llm_decode call per token on the persistent session (prefill already
+  ;; One boom_llm_decode call per token on the persistent session (prefill already
   ;; ran). The sampler's parameters go through on every call: the core keys its
   ;; draws by (seed, absolute position, history) and keeps that state in the
   ;; session, so a per-step decode follows the same stream as one decode call of
@@ -178,7 +178,7 @@
      ((constraint? constraint) #f)
      (else (error "SonicBoom backend produced no token")))))
 
-;; One sb_llm_decode call over the whole remaining reply. The callback appends
+;; One boom_llm_decode call over the whole remaining reply. The callback appends
 ;; the token to the session history, so a session released after the reply holds
 ;; prompt + reply exactly as the per-step path leaves it, and calls ON-TOKEN;
 ;; ON-TOKEN returning #f aborts the decode, which commits the reply up to that
@@ -214,7 +214,7 @@
                   #:frequency-penalty (sampler-frequency-penalty sampler)))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_decode) handle (bytevector->pointer smp-bv)
+         (st ((proc 'boom_llm_decode) handle (bytevector->pointer smp-bv)
               cb-ptr %null-pointer (bytevector->pointer n-slot)
               (slot-ptr err-slot))))
     (if failure
@@ -252,6 +252,6 @@ Note: the libsonicboom shared library must be loadable by the process."
    #:prefill real-prefill
    #:step real-step
    #:generate real-generate
-   ;; real-step and real-generate pass the sampler to sb_llm_decode's sampled
+   ;; real-step and real-generate pass the sampler to boom_llm_decode's sampled
    ;; session path.
    #:sampling? #t))

@@ -7,10 +7,10 @@
 ;;; autograd surface into one trainable model object. A model holds:
 ;;;
 ;;;   - the layer structure (the S-Expr deployment graph's source of truth), and
-;;;   - one native sb_tensor per parameter — the single authoritative store.
+;;;   - one native boom_tensor per parameter — the single authoritative store.
 ;;;
 ;;; Training mutates those native tensors in place through the C ABI autograd;
-;;; export writes them out through sb_export_model. Deployment (S-Expr → MLIR)
+;;; export writes them out through boom_export_model. Deployment (S-Expr → MLIR)
 ;;; and training (native-torch autograd) are two distinct engines that share
 ;;; structure, parameter naming, shapes and math semantics — never a graph
 ;;; object. No per-element arithmetic happens in Scheme.
@@ -36,7 +36,7 @@
 
 ;; A trainable model: an (sonicboom nn) structure and native parameters.
 ;;
-;; Each parameter of the structure becomes one native sb_tensor, which is the
+;; Each parameter of the structure becomes one native boom_tensor, which is the
 ;; authoritative store that training updates in place and export writes out. The
 ;; input dimensions are part of the record because they are fixed per model.
 ;; PyTorch: torch.nn.Module
@@ -46,7 +46,7 @@
   (%make-nn-model structure params input-dims)
   nn-model?
   (structure   nn-model-structure)   ; (sonicboom nn) <model>
-  (params      nn-model-params)      ; alist of (name-string . sb_tensor)
+  (params      nn-model-params)      ; alist of (name-string . boom_tensor)
   (input-dims  nn-model-input-dims)) ; list of ints; the input tensor's shape
 
 (define (model-param model name)
@@ -55,7 +55,7 @@
 Args:
   model: a trainable model.
   name: the parameter name as a string.
-Returns: the native sb_tensor handle.
+Returns: the native boom_tensor handle.
 Example:
   (use-modules (sonicboom model) (sonicboom nn) (system foreign))
   (let ((m (make-model '(1 2) (sequential (linear 2 1 #:name 'l)))))
@@ -71,7 +71,7 @@ Note: PyTorch reaches the same tensor as a named parameter of the module."
 (define* (make-model input-dims structure #:key init-values)
   "Build a trainable model from an (sonicboom nn) structure.
 
-Each parameter of the structure becomes a native sb_tensor, seeded from the
+Each parameter of the structure becomes a native boom_tensor, seeded from the
 layer's Guile tensor. The input dimensions are recorded on the model.
 Args:
   input-dims: the input shape as a list of integers.
@@ -100,7 +100,7 @@ the module tree; here they are copied into native tensors at construction."
                                 (error "make-model: init-values length mismatch for"
                                        name))
                               (train:tensor-from-list dims override))
-                            ;; sb_tensor_from_f32 takes float32 bytes, so a
+                            ;; boom_tensor_from_f32 takes float32 bytes, so a
                             ;; float32 parameter crosses as its own bytes — no
                             ;; per-element Scheme list. Other dtypes keep the
                             ;; numeric path, which converts their values to
@@ -217,7 +217,7 @@ here one call performs a fixed number of full-batch SGD steps."
 (define (model-export! model dir)
   "Write a model's graph text and trained parameters to a directory.
 
-The output is model.sx plus weights.bin, written through sb_export_model. The
+The output is model.sx plus weights.bin, written through boom_export_model. The
 artifact loads independently in C++ with no Guile or Python.
 Args:
   model: a trainable model.
@@ -235,7 +235,7 @@ part of PyTorch that SonicBoom does not mirror."
          (names-arr (make-c-struct (map (lambda (_) '*) names) name-ptrs))
          (params-arr (make-c-struct (map (lambda (_) '*) tensors) tensors))
          (err-slot (make-slot))
-         (st ((proc 'sb_export_model) (string->pointer text) (string-length text)
+         (st ((proc 'boom_export_model) (string->pointer text) (string-length text)
               names-arr params-arr (length params) (string->pointer dir)
               (slot-ptr err-slot))))
     (unless (sb-status-ok? st)

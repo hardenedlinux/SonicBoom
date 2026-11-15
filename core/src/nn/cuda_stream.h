@@ -31,7 +31,7 @@
 
 namespace sonicboom::cuda {
 
-inline cudaStream_t& sb_current_stream() {
+inline cudaStream_t& boom_current_stream() {
   static thread_local cudaStream_t s = cudaStreamLegacy;
   return s;
 }
@@ -40,10 +40,10 @@ inline cudaStream_t& sb_current_stream() {
 class StreamScope {
  public:
   explicit StreamScope(cudaStream_t stream)
-      : prev_(sb_current_stream()) {
-    sb_current_stream() = stream;
+      : prev_(boom_current_stream()) {
+    boom_current_stream() = stream;
   }
-  ~StreamScope() { sb_current_stream() = prev_; }
+  ~StreamScope() { boom_current_stream() = prev_; }
   StreamScope(const StreamScope&) = delete;
   StreamScope& operator=(const StreamScope&) = delete;
 
@@ -51,7 +51,7 @@ class StreamScope {
   cudaStream_t prev_;
 };
 
-inline bool& sb_capturing() {
+inline bool& boom_capturing() {
   static thread_local bool b = false;
   return b;
 }
@@ -62,8 +62,8 @@ inline bool& sb_capturing() {
 // the result from a persistent device slot after replay instead.
 class CaptureScope {
  public:
-  CaptureScope() : prev_(sb_capturing()) { sb_capturing() = true; }
-  ~CaptureScope() { sb_capturing() = prev_; }
+  CaptureScope() : prev_(boom_capturing()) { boom_capturing() = true; }
+  ~CaptureScope() { boom_capturing() = prev_; }
   CaptureScope(const CaptureScope&) = delete;
   CaptureScope& operator=(const CaptureScope&) = delete;
 

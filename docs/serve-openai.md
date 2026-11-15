@@ -59,13 +59,13 @@ A **sampler** (`make-sampler #:temperature #:top-p #:top-k #:seed
 random state; temperature 0 is greedy. The reference logits sampler
 (`sample-from-logits`) applies temperature, top-k and top-p. The libsonicboom
 backend passes the whole sampler through on every step: each `step` is one
-`sb_llm_decode` call (`max_tokens` 1) on the persistent session, and the core's
+`boom_llm_decode` call (`max_tokens` 1) on the persistent session, and the core's
 sampled path keeps its draw state across calls, so the per-step stream matches
 a one-shot decode with the same parameters. `presence_penalty` and
 `frequency_penalty` reach the C ABI's sampled path; the mock sampler has no
 penalty model.
 
-The real backend also implements `generate`: one `sb_llm_decode` call covers
+The real backend also implements `generate`: one `boom_llm_decode` call covers
 the whole reply, and its token callback drives the engine's per-token work
 (the session history, the text filter, cancellation). A reply is therefore one
 decode call rather than one per token, which is what speculative decoding
@@ -226,7 +226,7 @@ exactly. `top_p` defaults to 1 and `top_k` to 0; `presence_penalty` and
 `frequency_penalty` default to 0 and are validated to [-2, 2].
 
 With the real backend, `temperature`, `top_p`, `top_k`, `seed` and the two
-penalties are passed to `sb_llm_decode` on every step. A request with
+penalties are passed to `boom_llm_decode` on every step. A request with
 `temperature` > 0 therefore samples, and repeating the same body repeats the
 reply exactly; the penalties are part of the C ABI's sampled path, so they take
 effect only when `temperature` > 0 — the greedy default is a plain argmax and
@@ -265,7 +265,7 @@ valid JSON produces the same tokens it would have produced anyway.
 ### Image generation
 
 `POST /v1/images/generations` runs the MOSS-Image pipeline through
-`(sonicboom image)` (C ABI `sb_image_*`). The model directory is
+`(sonicboom image)` (C ABI `boom_image_*`). The model directory is
 `--image-model` (default `models/MOSS-Image-SFT`) and is loaded on the first
 image request, so a chat-only server never claims the DiT's device memory.
 Generations run in a runner thread, one at a time (the pipeline's device
@@ -286,7 +286,7 @@ blocks) and base64-encoded in Scheme — Guile 3.0.9 has no `(ice-9 base64)`.
 The same request twice returns the same pixels, because both the noise and
 the sampler are seeded. A model that cannot be loaded, and a generation
 failure, are 500s (`server_error`); a cancelled generation would be
-`SB_ERR_CANCELLED`, but the server never cancels one.
+`BOOM_ERR_CANCELLED`, but the server never cancels one.
 
 Streaming: the first chunk carries `delta.role`, then content deltas (one per
 token here), the tool-call deltas (a header with `index`, `id`, `type`, `name`

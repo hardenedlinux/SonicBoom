@@ -21,20 +21,20 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 CHECK=cuda
 
 if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
-  sb_record SKIP "$CHECK/gpu" "no usable CUDA device"
+  boom_record SKIP "$CHECK/gpu" "no usable CUDA device"
   exit 0
 fi
-if [ -z "${SB_COMPUTE_SANITIZER:-}" ] || [ ! -x "$SB_COMPUTE_SANITIZER" ]; then
-  sb_record SKIP "$CHECK/tool" "compute-sanitizer not found"
+if [ -z "${BOOM_COMPUTE_SANITIZER:-}" ] || [ ! -x "$BOOM_COMPUTE_SANITIZER" ]; then
+  boom_record SKIP "$CHECK/tool" "compute-sanitizer not found"
   exit 0
 fi
-if [ -z "$SB_CUDA_BUILD" ] || [ ! -f "$SB_CUDA_BUILD/CMakeCache.txt" ]; then
-  sb_record SKIP "$CHECK/build" \
+if [ -z "$BOOM_CUDA_BUILD" ] || [ ! -f "$BOOM_CUDA_BUILD/CMakeCache.txt" ]; then
+  boom_record SKIP "$CHECK/build" \
     "set SONICBOOM_QUALITY_CUDA_BUILD to an existing CUDA-enabled build tree"
   exit 0
 fi
-if ! grep -q '^SONICBOOM_USE_CUDA:BOOL=ON' "$SB_CUDA_BUILD/CMakeCache.txt"; then
-  sb_record SKIP "$CHECK/build" "build tree is not CUDA-enabled: $SB_CUDA_BUILD"
+if ! grep -q '^SONICBOOM_USE_CUDA:BOOL=ON' "$BOOM_CUDA_BUILD/CMakeCache.txt"; then
+  boom_record SKIP "$CHECK/build" "build tree is not CUDA-enabled: $BOOM_CUDA_BUILD"
   exit 0
 fi
 
@@ -42,34 +42,34 @@ fi
 # list with SONICBOOM_QUALITY_CUDA_TESTS.
 read -r -a tests <<< "${SONICBOOM_QUALITY_CUDA_TESTS:-test_backward_ops test_clip_grad_norm}"
 
-export LD_LIBRARY_PATH="$SB_CUDA_BUILD/core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$BOOM_CUDA_BUILD/core${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 lock="${SONICBOOM_QUALITY_GPU_LOCK:-/tmp/sonicboom-quality-gpu.lock}"
 
 found=0
 rc=0
 for t in "${tests[@]}"; do
-  bin="$SB_CUDA_BUILD/tests/core/$t"
+  bin="$BOOM_CUDA_BUILD/tests/core/$t"
   if [ ! -x "$bin" ]; then
-    sb_record SKIP "$CHECK/$t" "test binary not built: $bin"
+    boom_record SKIP "$CHECK/$t" "test binary not built: $bin"
     continue
   fi
   found=1
   for tool in memcheck initcheck synccheck racecheck; do
-    log="$SB_LOG_DIR/cuda-$t-$tool.log"
+    log="$BOOM_LOG_DIR/cuda-$t-$tool.log"
     echo "-- compute-sanitizer --tool $tool $t"
-    if flock "$lock" "$SB_COMPUTE_SANITIZER" --tool "$tool" \
+    if flock "$lock" "$BOOM_COMPUTE_SANITIZER" --tool "$tool" \
          --error-exitcode 99 "$bin" > "$log" 2>&1; then
-      sb_record PASS "$CHECK/$t/$tool" "no errors"
+      boom_record PASS "$CHECK/$t/$tool" "no errors"
     else
       summary="$(grep -E 'ERROR SUMMARY|========= ERROR' "$log" | tail -2 | tr '\n' ' ')"
-      sb_record FAIL "$CHECK/$t/$tool" "see cuda-$t-$tool.log${summary:+; $summary}"
+      boom_record FAIL "$CHECK/$t/$tool" "see cuda-$t-$tool.log${summary:+; $summary}"
       rc=1
     fi
   done
 done
 
 if [ "$found" -eq 0 ]; then
-  sb_record SKIP "$CHECK/tests" "none of the configured CUDA tests were built"
+  boom_record SKIP "$CHECK/tests" "none of the configured CUDA tests were built"
   exit 0
 fi
 exit "$rc"

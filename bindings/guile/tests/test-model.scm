@@ -7,7 +7,7 @@
 ;;;   LD_LIBRARY_PATH=build/core guile --no-auto-compile -L bindings/guile/scheme \
 ;;;       bindings/guile/tests/test-model.scm
 ;;;
-;;; make-model seeds each native sb_tensor parameter. A float32 parameter is
+;;; make-model seeds each native boom_tensor parameter. A float32 parameter is
 ;;; seeded from the Guile tensor's own bytes (no per-element Scheme list); a
 ;;; non-float32 parameter, and every init-values override, keeps the numeric
 ;;; path. Both must produce exactly the layer tensor's values.

@@ -43,9 +43,9 @@ static uint64_t hash_token(uint64_t h, uint64_t token) {
   return h * HASH_MUL;
 }
 
-static void die(const char *what, const sb_error *err) {
+static void die(const char *what, const boom_error *err) {
   fprintf(stderr, "codeedit_bench: %s: %s\n", what,
-          err ? sb_error_message(err) : "(no error object)");
+          err ? boom_error_message(err) : "(no error object)");
   exit(1);
 }
 
@@ -84,24 +84,24 @@ static char *read_file(const char *path, size_t *len_out) {
 
 // Tokenize with explicit flags; *out is malloc'd and valid when the call
 // succeeds (NULL for an empty encoding).
-static int tokenize(const sb_llm_model *model, const char *text, size_t len,
-                    int flags, sb_token **out, size_t *n_out) {
+static int tokenize(const boom_llm_model *model, const char *text, size_t len,
+                    int flags, boom_token **out, size_t *n_out) {
   size_t need = 0;
-  const sb_status st =
-      sb_llm_tokenize_ex(model, text, len, flags, NULL, 0, &need, NULL);
-  if (st != SB_ERR_BINDING && st != SB_OK) {
+  const boom_status st =
+      boom_llm_tokenize_ex(model, text, len, flags, NULL, 0, &need, NULL);
+  if (st != BOOM_ERR_BINDING && st != BOOM_OK) {
     fprintf(stderr, "codeedit_bench: tokenize sizing failed (%d)\n", (int)st);
     return 0;
   }
-  sb_token *tok = need ? (sb_token *)malloc(need * sizeof(sb_token)) : NULL;
+  boom_token *tok = need ? (boom_token *)malloc(need * sizeof(boom_token)) : NULL;
   if (need && !tok) return 0;
   if (need) {
-    sb_error *err = NULL;
+    boom_error *err = NULL;
     size_t got = 0;
-    if (sb_llm_tokenize_ex(model, text, len, flags, tok, need, &got, &err) !=
-        SB_OK)
+    if (boom_llm_tokenize_ex(model, text, len, flags, tok, need, &got, &err) !=
+        BOOM_OK)
       die("tokenize", err);
-    sb_error_free(err);
+    boom_error_free(err);
     if (got != need) {
       fprintf(stderr, "codeedit_bench: tokenize count moved\n");
       free(tok);
@@ -125,13 +125,13 @@ struct turn {
 };
 
 struct collect {
-  sb_token *tokens;
+  boom_token *tokens;
   size_t count;
   size_t cap;
   int overflow;
 };
 
-static int on_token(void *user, sb_token token) {
+static int on_token(void *user, boom_token token) {
   struct collect *c = (struct collect *)user;
   if (c->count == c->cap) {
     c->overflow = 1;
@@ -143,7 +143,7 @@ static int on_token(void *user, sb_token token) {
 
 // Measurement aid: write one turn's token ids, for cross-tool identity checks.
 // Off unless CODEEDIT_IDS_DIR is set.
-static void dump_ids(const char *index, const sb_token *first,
+static void dump_ids(const char *index, const boom_token *first,
                      const struct collect *out) {
   const char *dir = getenv("CODEEDIT_IDS_DIR");
   if (!dir || !*dir) return;
@@ -171,21 +171,21 @@ static void usage(void) {
 
 // Tokenize one turn's prompt (instruction bytes followed by the file bytes);
 // only turn 0 adds <bos>.
-static sb_token *turn_prompt_ids(const sb_llm_model *model,
+static boom_token *turn_prompt_ids(const boom_llm_model *model,
                                  const struct turn *t, size_t *n_out) {
-  sb_token *ids = NULL;
+  boom_token *ids = NULL;
   if (!tokenize(model, t->prompt, t->prompt_len,
-                t->add_special ? SB_TOKENIZE_ADD_SPECIAL : 0, &ids, n_out))
+                t->add_special ? BOOM_TOKENIZE_ADD_SPECIAL : 0, &ids, n_out))
     exit(1);
   return ids;
 }
 
-static void prefill_ids(sb_llm_session *session, const sb_token *ids, size_t n) {
-  sb_error *err = NULL;
+static void prefill_ids(boom_llm_session *session, const boom_token *ids, size_t n) {
+  boom_error *err = NULL;
   uint64_t reused = 0;
-  if (sb_llm_prefill(session, ids, n, &reused, &err) != SB_OK)
+  if (boom_llm_prefill(session, ids, n, &reused, &err) != BOOM_OK)
     die("prefill", err);
-  sb_error_free(err);
+  boom_error_free(err);
 }
 
 int main(int argc, char **argv) {
@@ -283,19 +283,19 @@ int main(int argc, char **argv) {
   }
 
   // The model's tokenizer is needed even for --ctx-only.
-  sb_error *err = NULL;
-  sb_llm_model *model = NULL;
-  if (sb_llm_model_load(model_path, &model, &err) != SB_OK)
+  boom_error *err = NULL;
+  boom_llm_model *model = NULL;
+  if (boom_llm_model_load(model_path, &model, &err) != BOOM_OK)
     die("model load", err);
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
   unsigned long long max_need = 0;
   for (size_t i = 0; i < n_turns; ++i) {
-    sb_token *ids = NULL;
+    boom_token *ids = NULL;
     size_t n = 0;
     if (!tokenize(model, turns[i].prompt, turns[i].prompt_len,
-                  turns[i].add_special ? SB_TOKENIZE_ADD_SPECIAL : 0, &ids,
+                  turns[i].add_special ? BOOM_TOKENIZE_ADD_SPECIAL : 0, &ids,
                   &n))
       return 1;
     free(ids);
@@ -322,19 +322,19 @@ int main(int argc, char **argv) {
       free(turns[i].prompt);
       free(turns[i].file);
     }
-    sb_llm_model_free(model);
+    boom_llm_model_free(model);
     return 0;
   }
 
   // One session for every turn and rep, allocated and warmed at construction
   // (the --warm-session / --warmup behaviour of the workload harness).
-  sb_llm_session *session = NULL;
-  if (sb_llm_session_new(model, n_ctx, &session, &err) != SB_OK)
+  boom_llm_session *session = NULL;
+  if (boom_llm_session_new(model, n_ctx, &session, &err) != BOOM_OK)
     die("session new", err);
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
-  sb_llm_sampling greedy;
+  boom_llm_sampling greedy;
   memset(&greedy, 0, sizeof greedy);
   greedy.struct_size = sizeof greedy;
   greedy.temperature = 0.0f;
@@ -348,29 +348,29 @@ int main(int argc, char **argv) {
   greedy.presence_penalty = 0.0f;
   greedy.frequency_penalty = 0.0f;
 
-  sb_token first_buf[1];
+  boom_token first_buf[1];
   struct collect first = {first_buf, 0, 1, 0};
 
   // Warm the plan/capture caches on the first turn, generation shortened to
   // 64 tokens (the harness's --warmup warm turn).
   {
     size_t prompt_n = 0;
-    sb_token *prompt_ids = turn_prompt_ids(model, &turns[0], &prompt_n);
+    boom_token *prompt_ids = turn_prompt_ids(model, &turns[0], &prompt_n);
     prefill_ids(session, prompt_ids, prompt_n);
     first.count = 0;
     first.overflow = 0;
     greedy.max_tokens = 1;
     uint32_t made = 0;
-    if (sb_llm_decode(session, &greedy, on_token, &first, &made, &err) != SB_OK)
+    if (boom_llm_decode(session, &greedy, on_token, &first, &made, &err) != BOOM_OK)
       die("warm decode (first)", err);
-    sb_error_free(err);
+    boom_error_free(err);
     err = NULL;
 
     // The second call prefills the prompt with the carried token appended, the
     // way the workload harness's turn is structured.
-    sb_token *extended = (sb_token *)malloc((prompt_n + 1) * sizeof(sb_token));
+    boom_token *extended = (boom_token *)malloc((prompt_n + 1) * sizeof(boom_token));
     if (!extended) return 1;
-    memcpy(extended, prompt_ids, prompt_n * sizeof(sb_token));
+    memcpy(extended, prompt_ids, prompt_n * sizeof(boom_token));
     extended[prompt_n] = first.tokens[0];
     prefill_ids(session, extended, prompt_n + 1);
     free(extended);
@@ -378,15 +378,15 @@ int main(int argc, char **argv) {
 
     const size_t warm_gen =
         turns[0].file_tokens < 64 ? turns[0].file_tokens : 64;
-    sb_token *warm = (sb_token *)malloc((warm_gen ? warm_gen : 1) *
-                                        sizeof(sb_token));
+    boom_token *warm = (boom_token *)malloc((warm_gen ? warm_gen : 1) *
+                                        sizeof(boom_token));
     if (!warm) return 1;
     struct collect warm_c = {warm, 0, warm_gen, 0};
     greedy.max_tokens = (uint32_t)warm_gen;
     made = 0;
-    if (sb_llm_decode(session, &greedy, on_token, &warm_c, &made, &err) != SB_OK)
+    if (boom_llm_decode(session, &greedy, on_token, &warm_c, &made, &err) != BOOM_OK)
       die("warm decode", err);
-    sb_error_free(err);
+    boom_error_free(err);
     err = NULL;
     free(warm);
   }
@@ -395,8 +395,8 @@ int main(int argc, char **argv) {
   size_t max_gen = 0;
   for (size_t i = 0; i < n_turns; ++i)
     if (turns[i].file_tokens > max_gen) max_gen = turns[i].file_tokens;
-  sb_token *decoded =
-      (sb_token *)malloc((max_gen ? max_gen : 1) * sizeof(sb_token));
+  boom_token *decoded =
+      (boom_token *)malloc((max_gen ? max_gen : 1) * sizeof(boom_token));
   if (!decoded) return 1;
   struct collect out = {decoded, 0, max_gen, 0};
 
@@ -407,7 +407,7 @@ int main(int argc, char **argv) {
 
     for (size_t t = 0; t < n_turns; ++t) {
       size_t prompt_n = 0;
-      sb_token *prompt_ids = turn_prompt_ids(model, &turns[t], &prompt_n);
+      boom_token *prompt_ids = turn_prompt_ids(model, &turns[t], &prompt_n);
       prefill_ids(session, prompt_ids, prompt_n);
 
       // The prefill's carried token is the turn's first generated token.
@@ -415,10 +415,10 @@ int main(int argc, char **argv) {
       first.overflow = 0;
       greedy.max_tokens = 1;
       uint32_t made = 0;
-      if (sb_llm_decode(session, &greedy, on_token, &first, &made, &err) !=
-          SB_OK)
+      if (boom_llm_decode(session, &greedy, on_token, &first, &made, &err) !=
+          BOOM_OK)
         die("decode (first)", err);
-      sb_error_free(err);
+      boom_error_free(err);
       err = NULL;
       if (made != 1 || first.overflow) {
         fprintf(stderr, "codeedit_bench: turn %s produced no first token\n",
@@ -430,9 +430,9 @@ int main(int argc, char **argv) {
       // The decode phase proper: prefill the prompt with the carried token
       // appended (the harness's second call), then generate the file's own
       // token count from it.
-      sb_token *extended = (sb_token *)malloc((prompt_n + 1) * sizeof(sb_token));
+      boom_token *extended = (boom_token *)malloc((prompt_n + 1) * sizeof(boom_token));
       if (!extended) return 1;
-      memcpy(extended, prompt_ids, prompt_n * sizeof(sb_token));
+      memcpy(extended, prompt_ids, prompt_n * sizeof(boom_token));
       extended[prompt_n] = first.tokens[0];
       free(prompt_ids);
 
@@ -442,12 +442,12 @@ int main(int argc, char **argv) {
       made = 0;
       const double t0 = now_ms();
       prefill_ids(session, extended, prompt_n + 1);
-      const sb_status dec =
-          sb_llm_decode(session, &greedy, on_token, &out, &made, &err);
+      const boom_status dec =
+          boom_llm_decode(session, &greedy, on_token, &out, &made, &err);
       const double decode_ms = now_ms() - t0;
       free(extended);
-      if (dec != SB_OK) die("decode", err);
-      sb_error_free(err);
+      if (dec != BOOM_OK) die("decode", err);
+      boom_error_free(err);
       err = NULL;
       if (out.overflow || made != turns[t].file_tokens) {
         fprintf(stderr, "codeedit_bench: turn %s produced %u of %zu tokens\n",
@@ -472,8 +472,8 @@ int main(int argc, char **argv) {
   }
 
   free(decoded);
-  sb_llm_session_free(session);
-  sb_llm_model_free(model);
+  boom_llm_session_free(session);
+  boom_llm_model_free(model);
   for (size_t i = 0; i < n_turns; ++i) {
     free(turns[i].prompt);
     free(turns[i].file);

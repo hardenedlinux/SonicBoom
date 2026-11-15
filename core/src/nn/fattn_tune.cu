@@ -52,7 +52,7 @@
 
 #include "../planner/autotune.h"  // [tune] trace lines
 #include "../planner/mlir_autotune.h"
-#include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
 
 #include <sonicboom/runtime_features.h>
 
@@ -1097,7 +1097,7 @@ bool resolve_target(const Call& c, const Cand& cand, int jit, Target* t,
 // Launch a resolved target with the call's parameters. `out` is the destination
 // (the caller's buffer, or the tuning scratch).
 bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
-  cudaStream_t stream = ::sonicboom::cuda::sb_current_stream();
+  cudaStream_t stream = ::sonicboom::cuda::boom_current_stream();
   const __half* q = c.q16;
   const __half* k = c.k_ws;
   const __half* v = c.v_ws;
@@ -1113,7 +1113,7 @@ bool launch_target(Target& t, const Call& c, const Geometry& g, float* out) {
                     &n,  &nq,  &nkv, &ne_pad, &scale,  &out};
 
   const dim3 grid((unsigned)((c.n + g.br - 1) / g.br), (unsigned)c.n_heads_kv);
-  SB_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid, g.block, g.smem, stream);
+  BOOM_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid, g.block, g.smem, stream);
 
   if (t.jit)
     return fattn_jit::launch(t.spec, grid, args, stream, g.smem, g.block);
@@ -1183,7 +1183,7 @@ bool registers_legal(const Dev& d, const Target& t, const Geometry& g,
 // ---------------------------------------------------------------------------
 // Output comparison.
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ bool sb_nonfinite(float v) {
+__device__ __forceinline__ bool boom_nonfinite(float v) {
   return !(v == v) || ::isinf(v);
 }
 
@@ -1198,7 +1198,7 @@ __global__ void fattn_cmp_kernel(const float* __restrict__ a,
        i += stride) {
     const float x = a[i];
     const float y = b[i];
-    if (sb_nonfinite(x) || sb_nonfinite(y)) {
+    if (boom_nonfinite(x) || boom_nonfinite(y)) {
       ++bad;
       continue;
     }
@@ -1433,7 +1433,7 @@ void report_prologue(ReportData* r, const Call& c, const Fingerprints& fp) {
   r->n_heads_q = c.n_heads_q;
   r->n_heads_kv = c.n_heads_kv;
   r->window = c.window;
-  r->capturing = ::sonicboom::cuda::sb_capturing();
+  r->capturing = ::sonicboom::cuda::boom_capturing();
   r->cache_version = mlir_tune::cache_version();
   if (fp.cache_disabled) {
     r->cache_status = "unavailable";
@@ -1575,7 +1575,7 @@ Tuned tune_class(const Call& c, const Fingerprints& fp) {
   }
 
   // ---- scratch -----------------------------------------------------------
-  cudaStream_t stream = ::sonicboom::cuda::sb_current_stream();
+  cudaStream_t stream = ::sonicboom::cuda::boom_current_stream();
   const size_t out_elems = (size_t)c.n * (size_t)c.n_heads_q * (size_t)c.head_dim;
   const size_t out_bytes = out_elems * sizeof(float);
   float* scratch_ref = nullptr;
@@ -2129,7 +2129,7 @@ bool run(const Call& call) {
     // Under CUDA-graph capture a measurement would enqueue events and
     // allocations inside the capture. Take the reference and leave the class
     // unresolved, so the first non-captured call still tunes.
-    if (::sonicboom::cuda::sb_capturing()) {
+    if (::sonicboom::cuda::boom_capturing()) {
       Tuned t = reference_tuned(call, fp, "default",
                                 "CUDA-graph capture; no tuning under capture");
       t.report.capturing = true;

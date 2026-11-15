@@ -5,7 +5,7 @@
 ;;;
 ;;; Every failure that comes from libsonicboom.so is raised as one Guile 3
 ;;; exception type, &sonicboom-error, carrying the three things the C ABI
-;;; reports: the sb_status code, the sb_error_kind as a Scheme symbol, and the
+;;; reports: the boom_status code, the boom_error_kind as a Scheme symbol, and the
 ;;; message ("" when the C side had no diagnostic).
 ;;;
 ;;;   (use-modules (sonicboom error))
@@ -15,7 +15,7 @@
 ;;;                    (sonicboom-error-message c))))
 ;;;     (load-model "not-a-gguf"))
 ;;;
-;;; The kind symbols are the sb_error_kind vocabulary in capi.h: none,
+;;; The kind symbols are the boom_error_kind vocabulary in capi.h: none,
 ;;; parse-lexical, parse-syntax, parse-semantic, parse-unsupported, weight,
 ;;; compile, binding, runtime, internal, cancelled.
 
@@ -32,8 +32,8 @@
 
 ;; The condition type of every failure raised by libsonicboom.so.
 ;;
-;; It carries three fields: status, the sb_status code as an exact integer; kind,
-;; the sb_error_kind as a Scheme symbol; and message, the diagnostic string (empty
+;; It carries three fields: status, the boom_status code as an exact integer; kind,
+;; the boom_error_kind as a Scheme symbol; and message, the diagnostic string (empty
 ;; when the C side had none). The kind symbols are none, parse-lexical,
 ;; parse-syntax, parse-semantic, parse-unsupported, weight, compile, binding,
 ;; runtime, internal and cancelled.
@@ -42,16 +42,16 @@
 ;; error type the C ABI reports.
 (define-condition-type &sonicboom-error &error
   sonicboom-error?
-  (status sonicboom-error-status)     ; the sb_status code
+  (status sonicboom-error-status)     ; the boom_status code
   (kind sonicboom-error-kind)         ; a symbol, see below
   (message sonicboom-error-message))  ; a string, possibly ""
 
-;; sb_error_kind (capi.h) -> symbol.
+;; boom_error_kind (capi.h) -> symbol.
 (define (sb-error-kind->symbol code)
-  "Translate an sb_error_kind code to its Scheme symbol.
+  "Translate an boom_error_kind code to its Scheme symbol.
 
 Args:
-  code: the numeric sb_error_kind.
+  code: the numeric boom_error_kind.
 Returns: the matching symbol, or unknown for a code outside the vocabulary.
 Example:
   (use-modules (sonicboom error))
@@ -79,8 +79,8 @@ PyTorch: none"
 This is the constructor used inside the binding; application code normally
 catches the condition instead of raising it.
 Args:
-  status: an sb_status code.
-  kind: a symbol from the sb_error_kind vocabulary.
+  status: an boom_status code.
+  kind: a symbol from the boom_error_kind vocabulary.
   message: a string, possibly empty.
 Returns: does not return; the exception is raised.
 PyTorch: none"

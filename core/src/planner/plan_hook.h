@@ -17,7 +17,7 @@
 #pragma once
 
 // Launch hook for the plan record (plan_record.h). Included by the CUDA kernels
-// only. SB_NOTE_LAUNCH is inserted immediately before a kernel launch; it costs
+// only. BOOM_NOTE_LAUNCH is inserted immediately before a kernel launch; it costs
 // one thread-local load and a not-taken branch when no recorder is installed
 // (recording off), and does no allocation or string work in that case.
 
@@ -75,17 +75,17 @@ inline void unpack(const dim3& d, unsigned& x, unsigned& y, unsigned& z) {
 // Record the launch that immediately follows: the kernel's name, its launch
 // configuration, and the stream. KERNEL must be a plain identifier (a
 // template-id with commas would split the macro arguments — use
-// SB_NOTE_LAUNCH_TP with an explicit instantiation label for those).
-#define SB_NOTE_LAUNCH(KERNEL, GRID, BLOCK, SMEM, STREAM)                     \
+// BOOM_NOTE_LAUNCH_TP with an explicit instantiation label for those).
+#define BOOM_NOTE_LAUNCH(KERNEL, GRID, BLOCK, SMEM, STREAM)                     \
   do {                                                                        \
-    if (auto* sb_rec_ = ::sonicboom::planner::recorder()) {                   \
-      unsigned sb_gx_, sb_gy_, sb_gz_, sb_bx_, sb_by_, sb_bz_;                \
-      ::sonicboom::planner::plan_detail::unpack((GRID), sb_gx_, sb_gy_,       \
-                                                sb_gz_);                      \
-      ::sonicboom::planner::plan_detail::unpack((BLOCK), sb_bx_, sb_by_,      \
-                                                sb_bz_);                      \
-      sb_rec_->add_launch(#KERNEL, "", sb_gx_, sb_gy_, sb_gz_, sb_bx_, sb_by_,\
-                          sb_bz_, static_cast<std::uint64_t>(SMEM),           \
+    if (auto* boom_rec_ = ::sonicboom::planner::recorder()) {                   \
+      unsigned boom_gx_, boom_gy_, boom_gz_, boom_bx_, boom_by_, boom_bz_;                \
+      ::sonicboom::planner::plan_detail::unpack((GRID), boom_gx_, boom_gy_,       \
+                                                boom_gz_);                      \
+      ::sonicboom::planner::plan_detail::unpack((BLOCK), boom_bx_, boom_by_,      \
+                                                boom_bz_);                      \
+      boom_rec_->add_launch(#KERNEL, "", boom_gx_, boom_gy_, boom_gz_, boom_bx_, boom_by_,\
+                          boom_bz_, static_cast<std::uint64_t>(SMEM),           \
                           reinterpret_cast<const void*>(STREAM));             \
     }                                                                         \
   } while (0)
@@ -93,16 +93,16 @@ inline void unpack(const dim3& d, unsigned& x, unsigned& y, unsigned& z) {
 // The template-instantiation form: TPARAMS is a C string naming the concrete
 // instantiation the launch selects (e.g. "ds=ds4"). Evaluated only when a
 // recorder is installed.
-#define SB_NOTE_LAUNCH_TP(KERNEL, TPARAMS, GRID, BLOCK, SMEM, STREAM)          \
+#define BOOM_NOTE_LAUNCH_TP(KERNEL, TPARAMS, GRID, BLOCK, SMEM, STREAM)          \
   do {                                                                        \
-    if (auto* sb_rec_ = ::sonicboom::planner::recorder()) {                   \
-      unsigned sb_gx_, sb_gy_, sb_gz_, sb_bx_, sb_by_, sb_bz_;                \
-      ::sonicboom::planner::plan_detail::unpack((GRID), sb_gx_, sb_gy_,       \
-                                                sb_gz_);                      \
-      ::sonicboom::planner::plan_detail::unpack((BLOCK), sb_bx_, sb_by_,      \
-                                                sb_bz_);                      \
-      sb_rec_->add_launch(KERNEL, (TPARAMS), sb_gx_, sb_gy_, sb_gz_, sb_bx_,  \
-                          sb_by_, sb_bz_, static_cast<std::uint64_t>(SMEM),   \
+    if (auto* boom_rec_ = ::sonicboom::planner::recorder()) {                   \
+      unsigned boom_gx_, boom_gy_, boom_gz_, boom_bx_, boom_by_, boom_bz_;                \
+      ::sonicboom::planner::plan_detail::unpack((GRID), boom_gx_, boom_gy_,       \
+                                                boom_gz_);                      \
+      ::sonicboom::planner::plan_detail::unpack((BLOCK), boom_bx_, boom_by_,      \
+                                                boom_bz_);                      \
+      boom_rec_->add_launch(KERNEL, (TPARAMS), boom_gx_, boom_gy_, boom_gz_, boom_bx_,  \
+                          boom_by_, boom_bz_, static_cast<std::uint64_t>(SMEM),   \
                           reinterpret_cast<const void*>(STREAM));             \
     }                                                                         \
   } while (0)

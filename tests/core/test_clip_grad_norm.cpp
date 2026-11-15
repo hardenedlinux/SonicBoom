@@ -21,7 +21,7 @@
 //    norm == max_norm boundary);
 //  * clipping brings the global norm to max_norm (+1e-5) under a double
 //    accumulator;
-//  * the C ABI sb_clip_grad_norm over real sb_tensor handles;
+//  * the C ABI boom_clip_grad_norm over real boom_tensor handles;
 //  * when this build has CUDA, the fused device kernels (one accumulation
 //    pass over every tensor, then one scale per tensor), with their cost.
 
@@ -29,7 +29,7 @@
 #include <sonicboom/tensor.h>
 #include <sonicboom/training/clip_grad_norm.h>
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
 #include "../../core/src/training/device_graph_kernels.h"
 #endif
 
@@ -148,16 +148,16 @@ void test_host_reference() {
 }
 
 void test_c_abi() {
-  std::cout << "C ABI sb_clip_grad_norm\n";
+  std::cout << "C ABI boom_clip_grad_norm\n";
   const float a[] = {3.0f, 4.0f};
   const float b[] = {12.0f};
-  sb_tensor* ta = nullptr;
-  sb_tensor* tb = nullptr;
-  sb_error* err = nullptr;
+  boom_tensor* ta = nullptr;
+  boom_tensor* tb = nullptr;
+  boom_error* err = nullptr;
   const int64_t da[] = {2}, db[] = {1};
-  check(sb_tensor_from_f32(da, 1, a, sizeof(a), &ta, &err) == SB_OK,
+  check(boom_tensor_from_f32(da, 1, a, sizeof(a), &ta, &err) == BOOM_OK,
         "create gradient tensor a");
-  check(sb_tensor_from_f32(db, 1, b, sizeof(b), &tb, &err) == SB_OK,
+  check(boom_tensor_from_f32(db, 1, b, sizeof(b), &tb, &err) == BOOM_OK,
         "create gradient tensor b");
   if (!ta || !tb) {
     std::cerr << "  cannot continue without tensors\n";
@@ -165,15 +165,15 @@ void test_c_abi() {
     return;
   }
 
-  sb_tensor* grads[] = {ta, tb};
+  boom_tensor* grads[] = {ta, tb};
   float norm = -1.0f;
-  check(sb_clip_grad_norm(grads, 2, 5.0f, &norm, &err) == SB_OK,
+  check(boom_clip_grad_norm(grads, 2, 5.0f, &norm, &err) == BOOM_OK,
         "clip over two handles");
   check(std::abs(norm - 13.0f) < 1e-5f, "C ABI reports the pre-clip norm 13");
 
   float out[2] = {0.0f, 0.0f};
   size_t written = 0;
-  check(sb_tensor_bytes(ta, out, sizeof(out), &written, &err) == SB_OK &&
+  check(boom_tensor_bytes(ta, out, sizeof(out), &written, &err) == BOOM_OK &&
             written == sizeof(out),
         "read back a");
   const float s = 5.0f / (13.0f + 1e-6f);
@@ -183,24 +183,24 @@ void test_c_abi() {
 
   // The unchanged path through the C ABI: a fresh 3-4 tensor, norm 5, no clip
   // at max_norm 5.0 (the comparison is strict, so equality is no clip).
-  sb_tensor* tc = nullptr;
-  check(sb_tensor_from_f32(da, 1, a, sizeof(a), &tc, &err) == SB_OK,
+  boom_tensor* tc = nullptr;
+  check(boom_tensor_from_f32(da, 1, a, sizeof(a), &tc, &err) == BOOM_OK,
         "create a fresh tensor");
-  sb_tensor* one[] = {tc};
-  check(sb_clip_grad_norm(one, 1, 5.0f, nullptr, &err) == SB_OK,
+  boom_tensor* one[] = {tc};
+  check(boom_clip_grad_norm(one, 1, 5.0f, nullptr, &err) == BOOM_OK,
         "clip with a NULL norm_out");
-  check(sb_tensor_bytes(tc, out, sizeof(out), &written, &err) == SB_OK,
+  check(boom_tensor_bytes(tc, out, sizeof(out), &written, &err) == BOOM_OK,
         "read back the fresh tensor");
   check(out[0] == 3.0f && out[1] == 4.0f,
         "norm == max_norm leaves the C ABI tensor unchanged");
 
-  sb_tensor_free(ta);
-  sb_tensor_free(tb);
-  sb_tensor_free(tc);
-  if (err) sb_error_free(err);
+  boom_tensor_free(ta);
+  boom_tensor_free(tb);
+  boom_tensor_free(tc);
+  if (err) boom_error_free(err);
 }
 
-#ifdef SB_TEST_CUDA
+#ifdef BOOM_TEST_CUDA
 void test_device_kernels() {
   std::cout << "device kernels\n";
   if (!nt::cuda_available()) {

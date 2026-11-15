@@ -27,7 +27,7 @@
 #include "../planner/decision_registry.h"  // attribute-keyed attention classes
 #include "../planner/glue_jit.h"  // generated attention kernel (Stage 3)
 #include "../planner/mlir_autotune.h"  // Q3: prefill attention shape classes
-#include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
 #include "../planner/reduce_mode.h"  // ReduceMode selection (f64 / df32 / f32)
 
 #include "boom_fdec_device.cuh"  // tensor-core decode/verify attention
@@ -72,7 +72,7 @@ namespace sonicboom::nn::cuda {
 namespace {
 
 // Current stream for device-resident kernels (see cuda_stream.h).
-inline cudaStream_t cur_stream() { return ::sonicboom::cuda::sb_current_stream(); }
+inline cudaStream_t cur_stream() { return ::sonicboom::cuda::boom_current_stream(); }
 
 // --- device helpers ---------------------------------------------------------
 
@@ -2820,7 +2820,7 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
     return false;
   if (cudaMemset(g_sum, 0, sizeof(double)) != cudaSuccess) return false;
 
-  SB_NOTE_LAUNCH(rms_sum_sq_kernel, 1, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rms_sum_sq_kernel, 1, 256, 0, cur_stream());
   // The kernel writes the accumulator in its mode's representation (8 bytes
   // for f64 and df32, 4 for f32); the mean is formed the same way the kernel's
   // own mean_to_float does, so the apply sees one value either way.
@@ -2855,7 +2855,7 @@ bool rms_norm(std::span<const float> x, std::span<const float> weight, float eps
   }();
   // mean then float (sqrt/recip), the CPU reference's rounding order.
   const float inv = 1.0f / std::sqrt(mean + eps);
-  SB_NOTE_LAUNCH(rms_apply_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rms_apply_kernel, grid_for(int(n)), 256, 0, cur_stream());
   rms_apply_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), d_w,
                                               int(n), inv, static_cast<float*>(d_y));
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -2872,7 +2872,7 @@ bool gelu_fp16(std::span<const float> x, std::span<float> y) {
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  SB_NOTE_LAUNCH(gelu_fp16_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(gelu_fp16_kernel, grid_for(int(n)), 256, 0, cur_stream());
   gelu_fp16_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x),
                                               static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -2891,7 +2891,7 @@ bool mul(std::span<const float> a, std::span<const float> b, std::span<float> y)
   if (cudaMemcpy(d_a, a.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(d_b, b.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  SB_NOTE_LAUNCH(mul_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(mul_kernel, grid_for(int(n)), 256, 0, cur_stream());
   mul_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_a),
                                         static_cast<const float*>(d_b),
                                         static_cast<float*>(d_y), int(n));
@@ -2911,7 +2911,7 @@ bool add(std::span<const float> a, std::span<const float> b, std::span<float> y)
   if (cudaMemcpy(d_a, a.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess ||
       cudaMemcpy(d_b, b.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  SB_NOTE_LAUNCH(add_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(add_kernel, grid_for(int(n)), 256, 0, cur_stream());
   add_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_a),
                                         static_cast<const float*>(d_b),
                                         static_cast<float*>(d_y), int(n));
@@ -2929,7 +2929,7 @@ bool scale(std::span<const float> x, float s, std::span<float> y) {
   if (!d_x || !d_y) return false;
   if (cudaMemcpy(d_x, x.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  SB_NOTE_LAUNCH(scale_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(scale_kernel, grid_for(int(n)), 256, 0, cur_stream());
   scale_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_x), s,
                                           static_cast<float*>(d_y), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -2944,7 +2944,7 @@ bool cast_fp16(std::span<float> v) {
   if (!d_v) return false;
   if (cudaMemcpy(d_v, v.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
     return false;
-  SB_NOTE_LAUNCH(cast_fp16_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(cast_fp16_kernel, grid_for(int(n)), 256, 0, cur_stream());
   cast_fp16_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(static_cast<float*>(d_v), int(n));
   if (cudaGetLastError() != cudaSuccess) return false;
   return cudaMemcpy(v.data(), d_v, n * sizeof(float), cudaMemcpyDeviceToHost) ==
@@ -2973,7 +2973,7 @@ bool rope_neox(std::span<float> x, uint64_t pos, float theta_base, float freq_sc
     return false;
 
   const float log_base = std::log(theta_base);  // matches CPU's float(std::log(base))
-  SB_NOTE_LAUNCH(rope_neox_kernel, grid_for(int(half)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_kernel, grid_for(int(half)), 256, 0, cur_stream());
   rope_neox_kernel<<<grid_for(int(half)), 256, 0, cur_stream()>>>(static_cast<float*>(d_x), int(half),
                                                  int(n), pos, freq_scale, log_base, d_ff);
   if (cudaGetLastError() != cudaSuccess) return false;
@@ -3007,7 +3007,7 @@ bool rope_neox_heads(std::span<float> x, uint64_t head_dim, uint64_t pos,
     return false;
 
   const float log_base = std::log(theta_base);
-  SB_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(int(n)), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(int(n)), 256, 0, cur_stream());
   rope_neox_heads_kernel<<<grid_for(int(n)), 256, 0, cur_stream()>>>(
       static_cast<float*>(d_x), int(head_dim), int(n), pos, freq_scale, log_base,
       d_ff, int(dims));
@@ -3036,22 +3036,22 @@ bool matvec_f32(std::span<const float> W, uint64_t cols, std::span<const float> 
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)r * k_split * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const float*>(d_w), static_cast<const float*>(d_x),
           partial, int(cols), r, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(r), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(r), 256, 0, cur_stream());
       gemv_reduce_kernel<<<grid_for(r), 256, 0, cur_stream()>>>(partial,
                                                static_cast<float*>(d_y), r,
                                                k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_dense_f32_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_dense_f32_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const float*>(d_w), static_cast<const float*>(d_x),
           static_cast<float*>(d_y), int(cols), r, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_dense_f32, grid_for(int(rows)), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(gemv_dense_f32, grid_for(int(rows)), 256, 0, cur_stream());
     gemv_dense_f32<<<grid_for(int(rows)), 256, 0, cur_stream()>>>(static_cast<const float*>(d_w),
                                                  static_cast<const float*>(d_x),
                                                  static_cast<float*>(d_y), int(cols),
@@ -3082,22 +3082,22 @@ bool matvec_bf16(std::span<const uint16_t> W, uint64_t cols, std::span<const flo
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)r * k_split * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
           partial, int(cols), r, k_split);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(r), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_reduce_kernel, grid_for(r), 256, 0, cur_stream());
       gemv_reduce_kernel<<<grid_for(r), 256, 0, cur_stream()>>>(partial,
                                                static_cast<float*>(d_y), r,
                                                k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_bf16_v, gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_bf16_v<<<gemv_grid(r, k_split), kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           static_cast<const uint16_t*>(d_w), static_cast<const float*>(d_x),
           static_cast<float*>(d_y), int(cols), r, k_split);
     }
   } else {
-    SB_NOTE_LAUNCH(gemv_bf16, grid_for(int(rows)), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(gemv_bf16, grid_for(int(rows)), 256, 0, cur_stream());
     gemv_bf16<<<grid_for(int(rows)), 256, 0, cur_stream()>>>(static_cast<const uint16_t*>(d_w),
                                             static_cast<const float*>(d_x),
                                             static_cast<float*>(d_y), int(cols), int(rows));
@@ -3180,7 +3180,7 @@ bool flash_attention(std::span<const float> q, uint64_t n_q,
           cudaSuccess)
     return false;
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
-  SB_NOTE_LAUNCH(flash_attention_kernel, (unsigned)n_q, (unsigned)(n_heads_q * 32), smem, cur_stream());
+  BOOM_NOTE_LAUNCH(flash_attention_kernel, (unsigned)n_q, (unsigned)(n_heads_q * 32), smem, cur_stream());
   flash_attention_kernel<<<(unsigned)n_q, (unsigned)(n_heads_q * 32), smem, cur_stream()>>>(
       static_cast<const float*>(d_q), static_cast<const float*>(d_k),
       static_cast<const float*>(d_v), (int)n_kv, (int)n_heads_q, (int)n_heads_kv,
@@ -3206,7 +3206,7 @@ bool rms_norm_dev(std::span<const float> weight, const float* x, float eps,
     d_w = static_cast<const float*>(upload_bytes(weight.data(), n * sizeof(float)));
     if (!d_w) return false;
   }
-  SB_NOTE_LAUNCH(rms_norm_fused_kernel, dim3(1, rows), 1024, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rms_norm_fused_kernel, dim3(1, rows), 1024, 0, cur_stream());
   launch_rms_norm_fused(dim3(1, rows), 1024, cur_stream(), x, d_w, n, eps, y,
                         add);
   return cudaGetLastError() == cudaSuccess;
@@ -3225,7 +3225,7 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
   }
   // One block per head; thread 0 reduces the sum, the block applies. head_dim
   // ≤ 256 keeps the whole apply in one pass (Gemma 4 head_dim is 256).
-  SB_NOTE_LAUNCH(rms_heads_fused_kernel, dim3(heads, rows), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rms_heads_fused_kernel, dim3(heads, rows), 256, 0, cur_stream());
   launch_rms_heads_fused(dim3(heads, rows), 256, cur_stream(), x, d_w, head_dim,
                          eps, y, add);
   return cudaGetLastError() == cudaSuccess;
@@ -3234,7 +3234,7 @@ bool rms_norm_heads_dev(std::span<const float> weight, const float* x, float eps
 bool gelu_fp16_dev(const float* x, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  SB_NOTE_LAUNCH(gelu_fp16_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(gelu_fp16_kernel, grid_for(n), 256, 0, cur_stream());
   gelu_fp16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3242,7 +3242,7 @@ bool gelu_fp16_dev(const float* x, float* y, int n) {
 bool silu_dev(const float* x, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  SB_NOTE_LAUNCH(silu_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(silu_kernel, grid_for(n), 256, 0, cur_stream());
   silu_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3250,7 +3250,7 @@ bool silu_dev(const float* x, float* y, int n) {
 bool sigmoid_dev(const float* x, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  SB_NOTE_LAUNCH(sigmoid_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(sigmoid_kernel, grid_for(n), 256, 0, cur_stream());
   sigmoid_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3258,7 +3258,7 @@ bool sigmoid_dev(const float* x, float* y, int n) {
 bool mul_dev(const float* a, const float* b, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !a || !b || !y) return false;
-  SB_NOTE_LAUNCH(mul_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(mul_kernel, grid_for(n), 256, 0, cur_stream());
   mul_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3266,7 +3266,7 @@ bool mul_dev(const float* a, const float* b, float* y, int n) {
 bool mul_row_dev(const float* x, const float* s, float* y, int n, int rows) {
   if (!available()) return false;
   if (n <= 0 || rows <= 0 || n % rows != 0 || !x || !s || !y) return false;
-  SB_NOTE_LAUNCH(mul_row_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(mul_row_kernel, grid_for(n), 256, 0, cur_stream());
   mul_row_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, s, y, n, n / rows);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3274,7 +3274,7 @@ bool mul_row_dev(const float* x, const float* s, float* y, int n, int rows) {
 bool add_dev(const float* a, const float* b, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !a || !b || !y) return false;
-  SB_NOTE_LAUNCH(add_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(add_kernel, grid_for(n), 256, 0, cur_stream());
   add_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(a, b, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3288,7 +3288,7 @@ bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n) 
   const float* d_b = static_cast<const float*>(
       upload_bytes(bias.data(), size_t(bias_n) * sizeof(float)));
   if (!d_b) return false;
-  SB_NOTE_LAUNCH(add_bias_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(add_bias_kernel, grid_for(n), 256, 0, cur_stream());
   add_bias_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, d_b, bias_n, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3296,7 +3296,7 @@ bool add_bias_dev(std::span<const float> bias, const float* x, float* y, int n) 
 bool scale_dev(const float* x, float s, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y) return false;
-  SB_NOTE_LAUNCH(scale_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(scale_kernel, grid_for(n), 256, 0, cur_stream());
   scale_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, s, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3304,7 +3304,7 @@ bool scale_dev(const float* x, float s, float* y, int n) {
 bool softcap_dev(const float* x, float cap, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !x || !y || !(cap > 0.0f)) return false;
-  SB_NOTE_LAUNCH(softcap_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(softcap_kernel, grid_for(n), 256, 0, cur_stream());
   softcap_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, cap, y, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3312,7 +3312,7 @@ bool softcap_dev(const float* x, float cap, float* y, int n) {
 bool cast_fp16_dev(float* v, int n) {
   if (!available()) return false;
   if (n <= 0 || !v) return false;
-  SB_NOTE_LAUNCH(cast_fp16_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(cast_fp16_kernel, grid_for(n), 256, 0, cur_stream());
   cast_fp16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(v, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3320,7 +3320,7 @@ bool cast_fp16_dev(float* v, int n) {
 bool cast_bf16_dev(float* v, int n) {
   if (!available()) return false;
   if (n <= 0 || !v) return false;
-  SB_NOTE_LAUNCH(cast_bf16_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(cast_bf16_kernel, grid_for(n), 256, 0, cur_stream());
   cast_bf16_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(v, n);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3342,7 +3342,7 @@ bool rope_neox_heads_dev(float* x, int head_dim, int heads, uint64_t pos,
     if (!d_ff) return false;
   }
   const float log_base = std::log(base);
-  SB_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_heads_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(x, head_dim, n, pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3364,7 +3364,7 @@ bool rope_neox_heads_dev_pos(float* x, int head_dim, int heads,
     if (!d_ff) return false;
   }
   const float log_base = std::log(base);
-  SB_NOTE_LAUNCH(rope_neox_heads_pos_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_heads_pos_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
       x, head_dim, n, pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
@@ -3402,32 +3402,32 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
       const dim3 grid(gemv_grid(row_tiles, k_split));
       const int block = kGemvWarpsPerBlock * 32;
       const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
-      SB_NOTE_LAUNCH(gemv_dense_f32_v_reuse, grid, block, 0, cur_stream());
-#define SB_LAUNCH_REUSE(RR, TT)                                              \
+      BOOM_NOTE_LAUNCH(gemv_dense_f32_v_reuse, grid, block, 0, cur_stream());
+#define BOOM_LAUNCH_REUSE(RR, TT)                                              \
   gemv_dense_f32_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
       d_w, x, dst, cols, rows, k_split, n_rows)
       switch (R) {
         case 1:
           switch (T) {
-            case 2: SB_LAUNCH_REUSE(1, 2); break;
-            case 4: SB_LAUNCH_REUSE(1, 4); break;
-            case 8: SB_LAUNCH_REUSE(1, 8); break;
-            default: SB_LAUNCH_REUSE(1, 16); break;
+            case 2: BOOM_LAUNCH_REUSE(1, 2); break;
+            case 4: BOOM_LAUNCH_REUSE(1, 4); break;
+            case 8: BOOM_LAUNCH_REUSE(1, 8); break;
+            default: BOOM_LAUNCH_REUSE(1, 16); break;
           }
           break;
         default:
           switch (T) {
-            case 2: SB_LAUNCH_REUSE(2, 2); break;
-            case 4: SB_LAUNCH_REUSE(2, 4); break;
-            case 8: SB_LAUNCH_REUSE(2, 8); break;
-            default: SB_LAUNCH_REUSE(2, 16); break;
+            case 2: BOOM_LAUNCH_REUSE(2, 2); break;
+            case 4: BOOM_LAUNCH_REUSE(2, 4); break;
+            case 8: BOOM_LAUNCH_REUSE(2, 8); break;
+            default: BOOM_LAUNCH_REUSE(2, 16); break;
           }
           break;
       }
-#undef SB_LAUNCH_REUSE
+#undef BOOM_LAUNCH_REUSE
       if (k_split > 1) {
         const dim3 rgrid(grid_for(rows), n_rows);
-        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        BOOM_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
         gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
                                                             k_split);
       }
@@ -3439,20 +3439,20 @@ bool matvec_f32_dev(std::span<const float> W, int cols, const float* x,
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
       const dim3 rgrid(grid_for(rows), n_rows);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
       gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_dense_f32_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_dense_f32_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
     const dim3 grid(grid_for(rows), n_rows);
-    SB_NOTE_LAUNCH(gemv_dense_f32, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(gemv_dense_f32, grid, 256, 0, cur_stream());
     gemv_dense_f32<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
@@ -3486,32 +3486,32 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
       const dim3 grid(gemv_grid(row_tiles, k_split));
       const int block = kGemvWarpsPerBlock * 32;
       const int T = n_rows <= 2 ? 2 : n_rows <= 4 ? 4 : n_rows <= 8 ? 8 : 16;
-      SB_NOTE_LAUNCH(gemv_bf16_v_reuse, grid, block, 0, cur_stream());
-#define SB_LAUNCH_REUSE(RR, TT)                                              \
+      BOOM_NOTE_LAUNCH(gemv_bf16_v_reuse, grid, block, 0, cur_stream());
+#define BOOM_LAUNCH_REUSE(RR, TT)                                              \
   gemv_bf16_v_reuse<RR, TT><<<grid, block, 0, cur_stream()>>>(                          \
       d_w, x, dst, cols, rows, k_split, n_rows)
       switch (R) {
         case 1:
           switch (T) {
-            case 2: SB_LAUNCH_REUSE(1, 2); break;
-            case 4: SB_LAUNCH_REUSE(1, 4); break;
-            case 8: SB_LAUNCH_REUSE(1, 8); break;
-            default: SB_LAUNCH_REUSE(1, 16); break;
+            case 2: BOOM_LAUNCH_REUSE(1, 2); break;
+            case 4: BOOM_LAUNCH_REUSE(1, 4); break;
+            case 8: BOOM_LAUNCH_REUSE(1, 8); break;
+            default: BOOM_LAUNCH_REUSE(1, 16); break;
           }
           break;
         default:
           switch (T) {
-            case 2: SB_LAUNCH_REUSE(2, 2); break;
-            case 4: SB_LAUNCH_REUSE(2, 4); break;
-            case 8: SB_LAUNCH_REUSE(2, 8); break;
-            default: SB_LAUNCH_REUSE(2, 16); break;
+            case 2: BOOM_LAUNCH_REUSE(2, 2); break;
+            case 4: BOOM_LAUNCH_REUSE(2, 4); break;
+            case 8: BOOM_LAUNCH_REUSE(2, 8); break;
+            default: BOOM_LAUNCH_REUSE(2, 16); break;
           }
           break;
       }
-#undef SB_LAUNCH_REUSE
+#undef BOOM_LAUNCH_REUSE
       if (k_split > 1) {
         const dim3 rgrid(grid_for(rows), n_rows);
-        SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+        BOOM_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
         gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows,
                                                             k_split);
       }
@@ -3523,20 +3523,20 @@ bool matvec_bf16_dev(std::span<const uint16_t> W, int cols, const float* x,
           grow_scratch(g_partial, g_partial_bytes,
                        (size_t)rows * k_split * n_rows * sizeof(float)));
       if (!partial) return false;
-      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, partial, cols, rows, k_split);
       const dim3 rgrid(grid_for(rows), n_rows);
-      SB_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_reduce_kernel, rgrid, 256, 0, cur_stream());
       gemv_reduce_kernel<<<rgrid, 256, 0, cur_stream()>>>(partial, y, rows, k_split);
     } else {
-      SB_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(gemv_bf16_v, grid, kGemvWarpsPerBlock * 32, 0, cur_stream());
       gemv_bf16_v<<<grid, kGemvWarpsPerBlock * 32, 0, cur_stream()>>>(
           d_w, x, y, cols, rows, k_split);
     }
   } else {
     const dim3 grid(grid_for(rows), n_rows);
-    SB_NOTE_LAUNCH(gemv_bf16, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(gemv_bf16, grid, 256, 0, cur_stream());
     gemv_bf16<<<grid, 256, 0, cur_stream()>>>(d_w, x, y, cols, rows);
   }
   return cudaGetLastError() == cudaSuccess;
@@ -3546,7 +3546,7 @@ bool gqa_broadcast_dev(const float* src, float* dst, int n_q, int n_kv, int head
   if (!available()) return false;
   if (n_q <= 0 || n_kv <= 0 || head_dim <= 0 || !src || !dst) return false;
   const int n = n_q * head_dim;
-  SB_NOTE_LAUNCH(gqa_broadcast_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(gqa_broadcast_kernel, grid_for(n), 256, 0, cur_stream());
   gqa_broadcast_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(src, dst, n_q, n_kv, head_dim);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -3951,7 +3951,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
   const size_t smem = (size_t)hpb * chunk * sizeof(float);
   const unsigned split_grid = (unsigned)(n_chunks * (uint64_t)n_heads_kv *
                                          (uint64_t)hblocks);
-  SB_NOTE_LAUNCH(decode_attention_split_kernel, split_grid, block, smem, cur_stream());
+  BOOM_NOTE_LAUNCH(decode_attention_split_kernel, split_grid, block, smem, cur_stream());
   if (kv_f16)
     decode_attention_split_kernel<<<split_grid, block, smem,
                                     cur_stream()>>>(
@@ -3971,7 +3971,7 @@ bool decode_attention_dev(const float* q, const float* k_cache,
                                     cur_stream()>>>(
         q, k_cache, v_cache, pos, n_slots, chunk, sliding_window, n_heads_q,
         n_heads_kv, head_dim, scale, hpb, hblocks, partial);
-  SB_NOTE_LAUNCH(decode_attention_merge_kernel, (unsigned)n_heads_q, head_dim, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(decode_attention_merge_kernel, (unsigned)n_heads_q, head_dim, 0, cur_stream());
   decode_attention_merge_kernel<<<(unsigned)n_heads_q, head_dim, 0, cur_stream()>>>(
       partial, pos, chunk, sliding_window, (int)n_chunks, n_heads_q, head_dim,
       out);
@@ -4098,15 +4098,15 @@ bool decode_attention_mq_dev_impl(
   // by shared memory: the block's score rows plus one K (then V) tile must fit
   // 48 KiB.
   const int dpl = head_dim / 32;  // instantiated below for 2, 4, 8, 16
-#define SB_MQ_MAX_WARPS(KVT)                                    \
+#define BOOM_MQ_MAX_WARPS(KVT)                                    \
   (dpl == 2   ? mq_max_warps<KVT, 2>()                          \
    : dpl == 4 ? mq_max_warps<KVT, 4>()                          \
    : dpl == 8 ? mq_max_warps<KVT, 8>()                          \
               : mq_max_warps<KVT, 16>())
   const int max_warps =
-      kv_f16 ? SB_MQ_MAX_WARPS(__half) : kv_q8 ? SB_MQ_MAX_WARPS(int8_t)
-                                               : SB_MQ_MAX_WARPS(float);
-#undef SB_MQ_MAX_WARPS
+      kv_f16 ? BOOM_MQ_MAX_WARPS(__half) : kv_q8 ? BOOM_MQ_MAX_WARPS(int8_t)
+                                               : BOOM_MQ_MAX_WARPS(float);
+#undef BOOM_MQ_MAX_WARPS
   if (max_warps < 1 || group_q > max_warps) return false;
   const size_t kSmemFloats = 48 * 1024 / sizeof(float);
   int rows_per_block = std::min(n_q, max_warps / group_q);
@@ -4139,28 +4139,28 @@ bool decode_attention_mq_dev_impl(
   const dim3 grid((unsigned)n_chunks, (unsigned)n_heads_kv,
                   (unsigned)((n_q + rows_per_block - 1) / rows_per_block));
   const dim3 block(32, (unsigned)warps);
-  SB_NOTE_LAUNCH(decode_attention_split_mq_kernel, grid, block, mq_smem_bytes,
+  BOOM_NOTE_LAUNCH(decode_attention_split_mq_kernel, grid, block, mq_smem_bytes,
                  cur_stream());
-#define SB_MQ_SPLIT_LAUNCH(KVT, DPLV)                                        \
+#define BOOM_MQ_SPLIT_LAUNCH(KVT, DPLV)                                        \
   decode_attention_split_mq_kernel<KVT, DPLV><<<grid, block, mq_smem_bytes,  \
                                                 cur_stream()>>>(             \
       q, reinterpret_cast<const KVT*>(k_cache),                              \
       reinterpret_cast<const KVT*>(v_cache), pos, n_slots, chunk,            \
       sliding_window, n_heads_q, n_heads_kv, head_dim, scale, n_q,           \
       rows_per_block, warps, tile_keys, (int)n_chunks, pos_offset0, partial)
-#define SB_MQ_SPLIT_DPL(KVT)                       \
+#define BOOM_MQ_SPLIT_DPL(KVT)                       \
   do {                                             \
-    if (dpl == 2) SB_MQ_SPLIT_LAUNCH(KVT, 2);      \
-    else if (dpl == 4) SB_MQ_SPLIT_LAUNCH(KVT, 4); \
-    else if (dpl == 8) SB_MQ_SPLIT_LAUNCH(KVT, 8); \
-    else SB_MQ_SPLIT_LAUNCH(KVT, 16);              \
+    if (dpl == 2) BOOM_MQ_SPLIT_LAUNCH(KVT, 2);      \
+    else if (dpl == 4) BOOM_MQ_SPLIT_LAUNCH(KVT, 4); \
+    else if (dpl == 8) BOOM_MQ_SPLIT_LAUNCH(KVT, 8); \
+    else BOOM_MQ_SPLIT_LAUNCH(KVT, 16);              \
   } while (0)
-  if (kv_f16) SB_MQ_SPLIT_DPL(__half);
-  else if (kv_q8) SB_MQ_SPLIT_DPL(int8_t);
-  else SB_MQ_SPLIT_DPL(float);
-#undef SB_MQ_SPLIT_DPL
-#undef SB_MQ_SPLIT_LAUNCH
-  SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
+  if (kv_f16) BOOM_MQ_SPLIT_DPL(__half);
+  else if (kv_q8) BOOM_MQ_SPLIT_DPL(int8_t);
+  else BOOM_MQ_SPLIT_DPL(float);
+#undef BOOM_MQ_SPLIT_DPL
+#undef BOOM_MQ_SPLIT_LAUNCH
+  BOOM_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
                  dim3((unsigned)n_heads_q, (unsigned)n_q), head_dim, 0,
                  cur_stream());
   decode_attention_merge_mq_kernel<<<dim3((unsigned)n_heads_q, (unsigned)n_q),
@@ -4202,26 +4202,26 @@ bool kv_append_dev(float* dst_k, float* dst_v, const float* src_k,
   if (dst_q8) {
     if (head_dim <= 0 || row_elems % head_dim != 0) return false;
     const int nhkv = row_elems / head_dim;
-    SB_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
     kv_append_q8_kernel<<<nhkv, 128, 0, cur_stream()>>>(
         reinterpret_cast<int8_t*>(dst_k), src_k, pos, n_slots, nhkv, head_dim);
-    SB_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_q8_kernel, nhkv, 128, 0, cur_stream());
     kv_append_q8_kernel<<<nhkv, 128, 0, cur_stream()>>>(
         reinterpret_cast<int8_t*>(dst_v), src_v, pos, n_slots, nhkv, head_dim);
     return cudaGetLastError() == cudaSuccess;
   }
   const int grid = grid_for(row_elems);
-  SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
     kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(
         reinterpret_cast<__half*>(dst_k), src_k, pos, n_slots, row_elems);
-    SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
     kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(
         reinterpret_cast<__half*>(dst_v), src_v, pos, n_slots, row_elems);
   } else {
     kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_k, src_k, pos,
                                                      n_slots, row_elems);
-    SB_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_kernel, grid, 256, 0, cur_stream());
     kv_append_kernel<<<grid, 256, 0, cur_stream()>>>(dst_v, src_v, pos,
                                                      n_slots, row_elems);
   }
@@ -4240,7 +4240,7 @@ bool flash_attention_dev(const float* q, const float* k, const float* v,
   if (head_dim % 32 != 0 || head_dim > 512) return false;
   if (n_heads_q > 32) return false;  // one warp per query head; 32 warps = block limit
   const size_t smem = (size_t)n_heads_q * FA_BK * sizeof(float);
-  SB_NOTE_LAUNCH(flash_attention_kernel, n_q, n_heads_q * 32, smem, cur_stream());
+  BOOM_NOTE_LAUNCH(flash_attention_kernel, n_q, n_heads_q * 32, smem, cur_stream());
   flash_attention_kernel<<<n_q, n_heads_q * 32, smem, cur_stream()>>>(
       q, k, v, n_kv, n_heads_q, n_heads_kv, head_dim, sliding_window, scale,
       out);
@@ -4271,7 +4271,7 @@ bool launch_tiled_flash_attention(const float* q, const float* k_batch,
     configured = true;
   }
   const int grid_x = (n + QB - 1) / QB;
-  SB_NOTE_LAUNCH_TP("flash_attention_tiled_kernel",
+  BOOM_NOTE_LAUNCH_TP("flash_attention_tiled_kernel",
                     ::sonicboom::planner::plan_detail::tp_label({{"HEAD_DIM", HEAD_DIM},
                                                                  {"BK", BK}, {"NW", NW},
                                                                  {"QB", QB}, {"GQA", GQA}}),
@@ -4678,7 +4678,7 @@ bool fdec_launch_mt(const float* q, const __half* k_cache,
   const dim3 grid(unsigned(n_chunks), unsigned(n_heads_kv),
                   unsigned((n_q + rows_per_block - 1) / rows_per_block));
   const dim3 block(W * 32);
-  SB_NOTE_LAUNCH_TP(
+  BOOM_NOTE_LAUNCH_TP(
       "boom_fdec_kernel",
       ::sonicboom::planner::plan_detail::tp_label(
           {{"D", D}, {"KT", KT}, {"W", W}, {"S", STAGES}, {"MT", MT}}),
@@ -4688,7 +4688,7 @@ bool fdec_launch_mt(const float* q, const __half* k_cache,
           q, k_cache, v_cache, pos, n_slots, n_heads_q, n_heads_kv, gqa,
           sliding_window, part, int(n_chunks), n_q, pos_offset0,
           rows_per_block, scale, partial);
-  SB_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
+  BOOM_NOTE_LAUNCH(decode_attention_merge_mq_kernel,
                  dim3(unsigned(n_heads_q), unsigned(n_q)), D, 0,
                  cur_stream());
   decode_attention_merge_mq_kernel<<<dim3(unsigned(n_heads_q), unsigned(n_q)),
@@ -6823,7 +6823,7 @@ bool layer_combine_dev(const float* proj, const float* ple, float ple_scale,
                        float combine_scale, float* y, int n) {
   if (!available()) return false;
   if (n <= 0 || !proj || !ple || !y) return false;
-  SB_NOTE_LAUNCH(layer_combine_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(layer_combine_kernel, grid_for(n), 256, 0, cur_stream());
   layer_combine_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(proj, ple, ple_scale, combine_scale,
                                              y, n);
   return cudaGetLastError() == cudaSuccess;
@@ -6850,7 +6850,7 @@ bool layer_combine_batched_dev(const float* proj, const float* ple, float ple_sc
                                int col, int total_per) {
   if (!available()) return false;
   if (per <= 0 || n <= 0 || total_per <= 0 || !proj || !ple || !y) return false;
-  SB_NOTE_LAUNCH(layer_combine_strided_kernel, grid_for(n * per), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(layer_combine_strided_kernel, grid_for(n * per), 256, 0, cur_stream());
   layer_combine_strided_kernel<<<grid_for(n * per), 256, 0, cur_stream()>>>(
       proj, ple, ple_scale, combine_scale, y, per, n, col, total_per);
   return cudaGetLastError() == cudaSuccess;
@@ -6866,7 +6866,7 @@ bool argmax_dev(const float* x, int n, float* out) {
   int grid = (n4 + kThreads - 1) / kThreads;
   if (grid > sm_count() * 8) grid = sm_count() * 8;
   if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
-    SB_NOTE_LAUNCH(argmax_kernel, 1, 1024, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(argmax_kernel, 1, 1024, 0, cur_stream());
     argmax_kernel<<<1, 1024, 0, cur_stream()>>>(x, out, n);
     return cudaGetLastError() == cudaSuccess;
   }
@@ -6874,9 +6874,9 @@ bool argmax_dev(const float* x, int n, float* out) {
       g_argmax_keys, g_argmax_keys_bytes,
       (size_t)grid * sizeof(unsigned long long)));
   if (!keys) return false;
-  SB_NOTE_LAUNCH(argmax_partial_kernel, grid, kThreads, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_partial_kernel, grid, kThreads, 0, cur_stream());
   argmax_partial_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, n, keys);
-  SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -6897,10 +6897,10 @@ bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
   if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
     const dim3 g(1, n_rows);
     if (mask) {
-      SB_NOTE_LAUNCH(argmax_masked_kernel, g, 1024, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(argmax_masked_kernel, g, 1024, 0, cur_stream());
       argmax_masked_kernel<<<g, 1024, 0, cur_stream()>>>(x, mask, out, n);
     } else {
-      SB_NOTE_LAUNCH(argmax_kernel, g, 1024, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(argmax_kernel, g, 1024, 0, cur_stream());
       argmax_kernel<<<g, 1024, 0, cur_stream()>>>(x, out, n);
     }
     return cudaGetLastError() == cudaSuccess;
@@ -6911,14 +6911,14 @@ bool argmax_rows_dev(const float* x, int n_rows, int n, const uint8_t* mask,
   if (!keys) return false;
   const dim3 g(grid, n_rows);
   if (mask) {
-    SB_NOTE_LAUNCH(argmax_partial_masked_kernel, g, kThreads, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(argmax_partial_masked_kernel, g, kThreads, 0, cur_stream());
     argmax_partial_masked_kernel<<<g, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
   } else {
-    SB_NOTE_LAUNCH(argmax_partial_kernel, g, kThreads, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(argmax_partial_kernel, g, kThreads, 0, cur_stream());
     argmax_partial_kernel<<<g, kThreads, 0, cur_stream()>>>(x, n, keys);
   }
   const dim3 fg(1, n_rows);
-  SB_NOTE_LAUNCH(argmax_finalize_kernel, fg, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_finalize_kernel, fg, 256, 0, cur_stream());
   argmax_finalize_kernel<<<fg, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -6960,7 +6960,7 @@ bool argmax_ids_dev(const float* x, int cap, const int32_t* ids,
                     const int32_t* count, float* out) {
   if (!available()) return false;
   if (cap <= 0 || cap > 1024 * 4 || !x || !ids || !count || !out) return false;
-  SB_NOTE_LAUNCH(argmax_ids_kernel, 1, 1024, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_ids_kernel, 1, 1024, 0, cur_stream());
   argmax_ids_kernel<<<1, 1024, 0, cur_stream()>>>(x, cap, ids, count, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -6973,7 +6973,7 @@ bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
   int grid = (n4 + kThreads - 1) / kThreads;
   if (grid > sm_count() * 8) grid = sm_count() * 8;
   if (grid < 2 || (reinterpret_cast<uintptr_t>(x) & 15u) != 0) {
-    SB_NOTE_LAUNCH(argmax_masked_kernel, 1, 1024, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(argmax_masked_kernel, 1, 1024, 0, cur_stream());
     argmax_masked_kernel<<<1, 1024, 0, cur_stream()>>>(x, mask, out, n);
     return cudaGetLastError() == cudaSuccess;
   }
@@ -6981,9 +6981,9 @@ bool argmax_masked_dev(const float* x, int n, const uint8_t* mask, float* out) {
       g_argmax_keys, g_argmax_keys_bytes,
       (size_t)grid * sizeof(unsigned long long)));
   if (!keys) return false;
-  SB_NOTE_LAUNCH(argmax_partial_masked_kernel, grid, kThreads, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_partial_masked_kernel, grid, kThreads, 0, cur_stream());
   argmax_partial_masked_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, mask, n, keys);
-  SB_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(argmax_finalize_kernel, 1, 256, 0, cur_stream());
   argmax_finalize_kernel<<<1, 256, 0, cur_stream()>>>(keys, grid, out);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -7008,7 +7008,7 @@ bool sample_select_launch(const float* logits, int vocab, const uint8_t* mask,
       grow_scratch_keep(g_select_keys, g_select_keys_bytes,
                         size_t(vocab) * sizeof(unsigned long long)));
   if (!keys) return false;
-  SB_NOTE_LAUNCH(sample_select_kernel, 1, kSelectThreads, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(sample_select_kernel, 1, kSelectThreads, 0, cur_stream());
   sample_select_kernel<<<1, kSelectThreads, 0, cur_stream()>>>(
       logits, vocab, mask, ids, count, window, dyn, window_len, temperature,
       repeat_penalty, presence, frequency, keys, out, out_count);
@@ -7084,7 +7084,7 @@ bool compact_f32_dev(const float* x, const int32_t* ids, int m, float* y) {
   if (m <= 0 || !x || !ids || !y) return false;
   constexpr int kThreads = 256;
   const int grid = (m + kThreads - 1) / kThreads;
-  SB_NOTE_LAUNCH(compact_f32_kernel, grid, kThreads, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(compact_f32_kernel, grid, kThreads, 0, cur_stream());
   compact_f32_kernel<<<grid, kThreads, 0, cur_stream()>>>(x, ids, m, y);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -7108,7 +7108,7 @@ bool slice_strided_dev(const float* x, float* y, int rows, int length, int offse
                        int stride) {
   if (!available()) return false;
   if (rows <= 0 || length <= 0 || stride <= 0 || !x || !y) return false;
-  SB_NOTE_LAUNCH(slice_strided_kernel, grid_for(rows * length), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(slice_strided_kernel, grid_for(rows * length), 256, 0, cur_stream());
   slice_strided_kernel<<<grid_for(rows * length), 256, 0, cur_stream()>>>(
       x, y, rows, length, offset, stride);
   return cudaGetLastError() == cudaSuccess;
@@ -7135,7 +7135,7 @@ bool rope_neox_heads_batched_dev(float* x, int head_dim, int heads_per_pos,
     if (!d_ff) return false;
   }
   const float log_base = std::log(base);
-  SB_NOTE_LAUNCH(rope_neox_heads_batched_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_heads_batched_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_batched_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
       x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff, dims);
   return cudaGetLastError() == cudaSuccess;
@@ -7161,7 +7161,7 @@ bool rope_neox_heads_batched_dev_pos(float* x, int head_dim, int heads_per_pos,
     if (!d_ff) return false;
   }
   const float log_base = std::log(base);
-  SB_NOTE_LAUNCH(rope_neox_heads_batched_pos_kernel, grid_for(n), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(rope_neox_heads_batched_pos_kernel, grid_for(n), 256, 0, cur_stream());
   rope_neox_heads_batched_pos_kernel<<<grid_for(n), 256, 0, cur_stream()>>>(
       x, n, head_dim, heads_per_pos, start_pos, freq_scale, log_base, d_ff,
       dims);
@@ -7376,7 +7376,7 @@ bool matvec_f32_sgemm_chunked(const float* d_w, int cols, const float* x,
       float* c = y + (size_t)c0 * rows;
       if (!full) {
         if (!need_pack()) return false;
-        SB_NOTE_LAUNCH(pad_f32_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+        BOOM_NOTE_LAUNCH(pad_f32_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
         pad_f32_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
                               cur_stream()>>>(x, xpack, cols, c0, chunk_n);
         a = xpack;
@@ -7385,20 +7385,20 @@ bool matvec_f32_sgemm_chunked(const float* d_w, int cols, const float* x,
       st = cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, rows, kDenseCublasWidth,
                        cols, &alpha, d_w, cols, a, cols, &beta, c, rows);
       if (st == CUBLAS_STATUS_SUCCESS && !full) {
-        SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        BOOM_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
         copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
             outpack, y, rows, c0, chunk_n);
       }
     } else {
       if (!need_pack()) return false;
-      SB_NOTE_LAUNCH(pack_f32_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(pack_f32_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
       pack_f32_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
                               cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
       st = cublasSgemm(
           h, CUBLAS_OP_N, CUBLAS_OP_N, kDenseCublasWidth, rows, cols, &alpha, xpack,
           kDenseCublasWidth, d_w, cols, &beta, outpack, kDenseCublasWidth);
       if (st == CUBLAS_STATUS_SUCCESS) {
-        SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+        BOOM_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
         copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
             outpack, y, rows, ncols, c0, chunk_n);
       }
@@ -7406,7 +7406,7 @@ bool matvec_f32_sgemm_chunked(const float* d_w, int cols, const float* x,
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }
   if (alpha != 1.0f) {
-    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
     scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
         y, alpha, y, rows * ncols);
   }
@@ -8026,7 +8026,7 @@ bool dense_lt_bf16_strided(const uint16_t* xb, const uint16_t* d_w, float* y,
     float* c = y + (size_t)c0 * rows;
     if (!full) {
       if (!need_pack()) return false;
-      SB_NOTE_LAUNCH(pad_bf16_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(pad_bf16_tail_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
       pad_bf16_tail_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
                              cur_stream()>>>(xb, xpack, cols, c0, chunk_n);
       a = xpack;
@@ -8042,14 +8042,14 @@ bool dense_lt_bf16_strided(const uint16_t* xb, const uint16_t* d_w, float* y,
                            cols, &beta, c, CUDA_R_32F, rows, CUBLAS_COMPUTE_32F,
                            CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_SUCCESS && !full) {
-      SB_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(copyback_tail_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
       copyback_tail_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
           outpack, y, rows, c0, chunk_n);
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }
   if (alpha != 1.0f) {
-    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
     scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
         y, alpha, y, rows * ncols);
   }
@@ -8217,7 +8217,7 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
     uint16_t* xb = static_cast<uint16_t*>(grow_scratch(
         g_xb, g_xb_bytes, (size_t)cols * ncols * sizeof(uint16_t)));
     if (!xb) return false;
-    SB_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
     cast_bf16_rows_kernel<<<grid_for(cols * ncols), 256, 0, cur_stream()>>>(
         x, xb, cols * ncols);
     // One launch per projection when the shape class selected the generated
@@ -8234,7 +8234,7 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
     // cuBLASLt has no epilogue here; the folded scale runs as its own pass, so
     // the ablation arm produces the same output as the generated kernel's.
     if (alpha != 1.0f) {
-      SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
       scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
           y, alpha, y, rows * ncols);
     }
@@ -8248,7 +8248,7 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
   for (int c0 = 0; c0 < ncols; c0 += kDenseCublasWidth) {
     const int chunk_n = std::min(kDenseCublasWidth, ncols - c0);
     if (!need_pack()) return false;
-    SB_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(pack_bf16_chunk_kernel, grid_for(cols * kDenseCublasWidth), 256, 0, cur_stream());
     pack_bf16_chunk_kernel<<<grid_for(cols * kDenseCublasWidth), 256, 0,
                              cur_stream()>>>(x, xpack, cols, ncols, c0, chunk_n);
     cublasStatus_t st = cublasGemmEx(
@@ -8256,14 +8256,14 @@ bool matvec_bf16_cublas_dev(const uint16_t* d_w, int cols, const float* x,
         CUDA_R_16BF, kDenseCublasWidth, d_w, CUDA_R_16BF, cols, &zero, outpack,
         CUDA_R_32F, kDenseCublasWidth, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
     if (st == CUBLAS_STATUS_SUCCESS) {
-      SB_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
+      BOOM_NOTE_LAUNCH(copyback_chunk_kernel, grid_for(rows * chunk_n), 256, 0, cur_stream());
       copyback_chunk_kernel<<<grid_for(rows * chunk_n), 256, 0, cur_stream()>>>(
           outpack, y, rows, ncols, c0, chunk_n);
     }
     if (st != CUBLAS_STATUS_SUCCESS) return false;
   }
   if (alpha != 1.0f) {
-    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
     scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
         y, alpha, y, rows * ncols);
   }
@@ -8283,7 +8283,7 @@ bool matvec_f32_batched_dev(std::span<const float> W, int cols, const float* x,
     return true;
   // The gemv reads the same position-major activation in either layout.
   const int total = rows * ncols;
-  SB_NOTE_LAUNCH(gemv_dense_f32_batched, grid_for(total), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(gemv_dense_f32_batched, grid_for(total), 256, 0, cur_stream());
   gemv_dense_f32_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
       d_w, x, y, cols, rows, ncols);
   return cudaGetLastError() == cudaSuccess;
@@ -8304,7 +8304,7 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
   // The gemv fallbacks below have no epilogue: the folded scale is a pass.
   const auto scale_if = [&] {
     if (alpha == 1.0f) return;
-    SB_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(scale_kernel, grid_for(rows * ncols), 256, 0, cur_stream());
     scale_kernel<<<grid_for(rows * ncols), 256, 0, cur_stream()>>>(
         y, alpha, y, rows * ncols);
   };
@@ -8314,18 +8314,18 @@ bool matvec_bf16_batched_dev(std::span<const uint16_t> W, int cols, const float*
     uint16_t* xb = static_cast<uint16_t*>(grow_scratch(
         g_xpack, g_xpack_bytes, (size_t)cols * ncols * sizeof(uint16_t)));
     if (!xb) return false;
-    SB_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(cast_bf16_rows_kernel, grid_for(cols * ncols), 256, 0, cur_stream());
     cast_bf16_rows_kernel<<<grid_for(cols * ncols), 256, 0, cur_stream()>>>(
         x, xb, cols * ncols);
     const int total = rows * ncols;
-    SB_NOTE_LAUNCH(gemv_bf16_batched_xb, grid_for(total), 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(gemv_bf16_batched_xb, grid_for(total), 256, 0, cur_stream());
     gemv_bf16_batched_xb<<<grid_for(total), 256, 0, cur_stream()>>>(
         d_w, xb, y, cols, rows, ncols);
     scale_if();
     return cudaGetLastError() == cudaSuccess;
   }
   const int total = rows * ncols;
-  SB_NOTE_LAUNCH(gemv_bf16_batched, grid_for(total), 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(gemv_bf16_batched, grid_for(total), 256, 0, cur_stream());
   gemv_bf16_batched<<<grid_for(total), 256, 0, cur_stream()>>>(
       d_w, x, y, cols, rows, ncols);
   scale_if();
@@ -8344,30 +8344,30 @@ bool kv_append_batched_dev(float* dst_k, float* dst_v, const float* src_k,
     if (head_dim <= 0 || row_elems % head_dim != 0) return false;
     const int nhkv = row_elems / head_dim;
     const int grid = n * nhkv;
-    SB_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
     kv_append_batched_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
         reinterpret_cast<int8_t*>(dst_k), src_k, start_pos, n_slots, nhkv,
         head_dim, n);
-    SB_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_batched_q8_kernel, grid, 128, 0, cur_stream());
     kv_append_batched_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
         reinterpret_cast<int8_t*>(dst_v), src_v, start_pos, n_slots, nhkv,
         head_dim, n);
     return cudaGetLastError() == cudaSuccess;
   }
   const int grid = grid_for(row_elems * n);
-  SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
     kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
         reinterpret_cast<__half*>(dst_k), src_k, start_pos, n_slots, row_elems,
         n);
-    SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
     kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
         reinterpret_cast<__half*>(dst_v), src_v, start_pos, n_slots, row_elems,
         n);
   } else {
     kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
         dst_k, src_k, start_pos, n_slots, row_elems, n);
-    SB_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
+    BOOM_NOTE_LAUNCH(kv_append_batched_kernel, grid, 256, 0, cur_stream());
     kv_append_batched_kernel<<<grid, 256, 0, cur_stream()>>>(
         dst_v, src_v, start_pos, n_slots, row_elems, n);
   }
@@ -8386,7 +8386,7 @@ bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
     if (head_dim <= 0 || row_elems % head_dim != 0) return false;
     const int nhkv = row_elems / head_dim;
     const int grid = 2 * n * nhkv;
-    SB_NOTE_LAUNCH(kv_append_batched_pos_kv_q8_kernel, grid, 128, 0,
+    BOOM_NOTE_LAUNCH(kv_append_batched_pos_kv_q8_kernel, grid, 128, 0,
                    cur_stream());
     kv_append_batched_pos_kv_q8_kernel<<<grid, 128, 0, cur_stream()>>>(
         reinterpret_cast<int8_t*>(dst_k), reinterpret_cast<int8_t*>(dst_v),
@@ -8394,7 +8394,7 @@ bool kv_append_batched_dev_pos(float* dst_k, float* dst_v, const float* src_k,
     return cudaGetLastError() == cudaSuccess;
   }
   const int grid = grid_for(2 * row_elems * n);
-  SB_NOTE_LAUNCH(kv_append_batched_pos_kv_kernel, grid, 256, 0, cur_stream());
+  BOOM_NOTE_LAUNCH(kv_append_batched_pos_kv_kernel, grid, 256, 0, cur_stream());
   if (dst_f16) {
     kv_append_batched_pos_kv_kernel<<<grid, 256, 0, cur_stream()>>>(
         reinterpret_cast<__half*>(dst_k), reinterpret_cast<__half*>(dst_v),

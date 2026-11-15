@@ -95,7 +95,7 @@ const char kMetadataData[] = "abcdefghijklmnopqrstuvwx";  // 24 bytes
 
 int main() {
   const fs::path tmp = fs::temp_directory_path() /
-                       ("sb_safetensors_test_" + std::to_string(::getpid()));
+                       ("boom_safetensors_test_" + std::to_string(::getpid()));
   fs::remove_all(tmp);
   fs::create_directories(tmp);
 

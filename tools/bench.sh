@@ -346,7 +346,7 @@ num1() { # number|nan|n/a|"" -> one decimal, "n/a" when there is no number
     printf "%.1f", v}'
 }
 
-row() { # LABEL SB_MEDIAN SB_SD LL RATIO UNIT
+row() { # LABEL BOOM_MEDIAN BOOM_SD LL RATIO UNIT
   printf '| %-14s | %18s %-5s | %10s %-5s | %6s |\n' \
     "$1" "$(pm "$2" "$3")" "$6" "$(fmt "$4")" "$6" "$5"
 }
@@ -358,7 +358,7 @@ row() { # LABEL SB_MEDIAN SB_SD LL RATIO UNIT
 # checkout (it links libsonicboom.so) and reads the cache location from the same
 # environment the runtime does.
 RUN_TMP=$(mktemp -d)
-sb_tune() {
+boom_tune() {
   local t="$ROOT/tools/sb-tune"
   [ -x "$t" ] || bash "$ROOT/tools/build_sb_tune.sh" >/dev/null
   "$t" "$@"
@@ -385,7 +385,7 @@ if [ -n "$TUNE_IMPORT" ]; then
     import_file=$(find "$RUN_TMP/untar" -type f | sed -n '1p')
     [ -n "$import_file" ] || { echo "tune archive is empty: $TUNE_IMPORT" >&2; exit 2; }
   fi
-  sb_tune import --in "$import_file" >/dev/null
+  boom_tune import --in "$import_file" >/dev/null
   echo "tune table: imported $TUNE_IMPORT" >&2
 fi
 
@@ -393,22 +393,22 @@ fi
 # Each metric reports the median of RUNS runs *and* their spread: the median
 # alone cannot say whether a later comparison's difference is bigger than this
 # harness's own repeatability.
-sb_tg64_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
+boom_tg64_stats=$(bench_stats tok_s "$BASELINE/longctx_bench" --depth 0 --steps 64)
 # d512 measures plain decode: speculation is pinned off for the row (not left to
 # whatever this script exports) and the session is sized for the whole measured
 # segment — depth + steps + the tool's 8 warm steps + margin — so all 64 steps
 # complete. d512-spec is the same segment with SONICBOOM_SPEC unset, i.e. the
 # startup probe decides, and is reported separately.
 D512_NCTX=600
-sb_d512_stats=$(bench_stats tok_s env SONICBOOM_SPEC=off \
+boom_d512_stats=$(bench_stats tok_s env SONICBOOM_SPEC=off \
                   "$BASELINE/longctx_bench" --depth 512 --steps 64 \
                   --n-ctx "$D512_NCTX")
-sb_d512_spec_stats=$(bench_stats tok_s env -u SONICBOOM_SPEC \
+boom_d512_spec_stats=$(bench_stats tok_s env -u SONICBOOM_SPEC \
                        "$BASELINE/longctx_bench" --depth 512 --steps 64 \
                        --n-ctx "$D512_NCTX")
 # pp is the steady-state (reused-session) number; the fresh-session lifecycle
 # cost is a separate scenario and is measured by the tool itself, not folded in.
-sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
+boom_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
                    --prompt 512 --reps 3 --session reused)
 # prefix_cache_bench needs prompt token ids that are valid for the model under
 # test: real_prompt.tokens is a Gemma-vocab fixture, and feeding it to Qwen
@@ -418,16 +418,16 @@ sb_pp512_stats=$(bench_stats pp_marginal_tok_s "$BASELINE/prefill_bench" \
 # supported model's vocab.
 TOKFILE=$(mktemp)
 seq 2 1000 | tr '\n' ' ' >"$TOKFILE"
-sb_reuse_stats=$(bench_stats reuse_ms "$BASELINE/prefix_cache_bench" \
+boom_reuse_stats=$(bench_stats reuse_ms "$BASELINE/prefix_cache_bench" \
                    --prefix 512 --new 64 --steps 4 --reps 3 \
                    --tokens-file "$TOKFILE")
 rm -f "$TOKFILE"
 
-sb_tg64="${sb_tg64_stats%% *}"; sb_tg64_sd="${sb_tg64_stats##* }"
-sb_d512="${sb_d512_stats%% *}"; sb_d512_sd="${sb_d512_stats##* }"
-sb_d512_spec="${sb_d512_spec_stats%% *}"; sb_d512_spec_sd="${sb_d512_spec_stats##* }"
-sb_pp512="${sb_pp512_stats%% *}"; sb_pp512_sd="${sb_pp512_stats##* }"
-sb_reuse="${sb_reuse_stats%% *}"; sb_reuse_sd="${sb_reuse_stats##* }"
+boom_tg64="${boom_tg64_stats%% *}"; boom_tg64_sd="${boom_tg64_stats##* }"
+boom_d512="${boom_d512_stats%% *}"; boom_d512_sd="${boom_d512_stats##* }"
+boom_d512_spec="${boom_d512_spec_stats%% *}"; boom_d512_spec_sd="${boom_d512_spec_stats##* }"
+boom_pp512="${boom_pp512_stats%% *}"; boom_pp512_sd="${boom_pp512_stats##* }"
+boom_reuse="${boom_reuse_stats%% *}"; boom_reuse_sd="${boom_reuse_stats##* }"
 
 # --- llama.cpp (optional) --------------------------------------------------
 ll_tg64="nan"; ll_d512="nan"; ll_pp512="nan"
@@ -465,13 +465,13 @@ echo "median ± sd of $RUNS runs, CUDA spine, whole model in VRAM (llama.cpp -ng
 echo
 echo "| metric         | SonicBoom          | llama.cpp      |  ratio |"
 echo "|----------------|--------------------|----------------|--------|"
-row "tg64 (depth 0)" "$sb_tg64" "$sb_tg64_sd" "$ll_tg64" "$(ratio "$sb_tg64" "$ll_tg64")" "tok/s"
-row "d512"           "$sb_d512" "$sb_d512_sd" "$ll_d512" "$(ratio "$sb_d512" "$ll_d512")" "tok/s"
-row "d512-spec"      "$sb_d512_spec" "$sb_d512_spec_sd" "n/a" "n/a" "tok/s"
-row "pp512"          "$sb_pp512" "$sb_pp512_sd" "$ll_pp512" "$(ratio "$sb_pp512" "$ll_pp512")" "tok/s"
-row "reuse 512+64"   "$sb_reuse" "$sb_reuse_sd" "n/a" "n/a" "ms"
+row "tg64 (depth 0)" "$boom_tg64" "$boom_tg64_sd" "$ll_tg64" "$(ratio "$boom_tg64" "$ll_tg64")" "tok/s"
+row "d512"           "$boom_d512" "$boom_d512_sd" "$ll_d512" "$(ratio "$boom_d512" "$ll_d512")" "tok/s"
+row "d512-spec"      "$boom_d512_spec" "$boom_d512_spec_sd" "n/a" "n/a" "tok/s"
+row "pp512"          "$boom_pp512" "$boom_pp512_sd" "$ll_pp512" "$(ratio "$boom_pp512" "$ll_pp512")" "tok/s"
+row "reuse 512+64"   "$boom_reuse" "$boom_reuse_sd" "n/a" "n/a" "ms"
 echo
-echo "RESULT bench model=$LABEL tg64=$sb_tg64 d512=$sb_d512 d512_spec=$sb_d512_spec pp512=$sb_pp512 reuse_ms=$sb_reuse"
+echo "RESULT bench model=$LABEL tg64=$boom_tg64 d512=$boom_d512 d512_spec=$boom_d512_spec pp512=$boom_pp512 reuse_ms=$boom_reuse"
 
 # --- extended-context tiers (--long) ---------------------------------------
 # One llama-bench invocation per run with -r 1: the deep tiers are long enough
@@ -543,10 +543,10 @@ if [ "$SPEC" = 1 ]; then
 
   echo "code editing: SonicBoom spec off, 1 rep" >&2
   SONICBOOM_SPEC=off "$CB" --model "$GGUF" --data "$DATA" --reps 1 \
-    > "$SPEC_OUT/sb_off.txt"
+    > "$SPEC_OUT/boom_off.txt"
   echo "code editing: SonicBoom spec auto, $RUNS reps" >&2
   SONICBOOM_SPEC=auto "$CB" --model "$GGUF" --data "$DATA" --reps "$RUNS" \
-    > "$SPEC_OUT/sb_auto.txt"
+    > "$SPEC_OUT/boom_auto.txt"
 
   LLAMA_OK=0
   if [ -n "${LLAMA_SERVER:-}" ] && [ -x "${LLAMA_SERVER}" ]; then
@@ -554,19 +554,19 @@ if [ "$SPEC" = 1 ]; then
     echo "code editing: llama.cpp no spec, 1 rep" >&2
     guile "$ROOT/tools/bench/llama-codeedit.scm" --server "$LLAMA_SERVER" \
       --model "$GGUF" --data "$DATA" --ctx "$CTX" \
-      --gen-tokens "$SPEC_OUT/sb_off.txt" --arm off --reps 1 \
+      --gen-tokens "$SPEC_OUT/boom_off.txt" --arm off --reps 1 \
       --out "$SPEC_OUT/llama_off" > "$SPEC_OUT/llama_off.txt"
     echo "code editing: llama.cpp ngram-mod, $RUNS reps" >&2
     guile "$ROOT/tools/bench/llama-codeedit.scm" --server "$LLAMA_SERVER" \
       --model "$GGUF" --data "$DATA" --ctx "$CTX" \
-      --gen-tokens "$SPEC_OUT/sb_off.txt" --arm ngram-mod --reps "$RUNS" \
+      --gen-tokens "$SPEC_OUT/boom_off.txt" --arm ngram-mod --reps "$RUNS" \
       --out "$SPEC_OUT/llama_ngram" > "$SPEC_OUT/llama_ngram.txt"
   else
     echo "note: LLAMA_SERVER not set; llama.cpp arms skipped" >&2
   fi
 
-  sb_off_ts=$(sed -n 's/^rep=[0-9]* tok_s=//p' "$SPEC_OUT/sb_off.txt" | median)
-  sb_auto_ts=$(sed -n 's/^rep=[0-9]* tok_s=//p' "$SPEC_OUT/sb_auto.txt" | median)
+  boom_off_ts=$(sed -n 's/^rep=[0-9]* tok_s=//p' "$SPEC_OUT/boom_off.txt" | median)
+  boom_auto_ts=$(sed -n 's/^rep=[0-9]* tok_s=//p' "$SPEC_OUT/boom_auto.txt" | median)
   ll_off_ts="nan"; ll_ngram_ts="nan"
   if [ "$LLAMA_OK" = 1 ]; then
     ll_off_ts=$(sed -n 's/^rep=[0-9]* tok_s=//p' "$SPEC_OUT/llama_off.txt" | median)
@@ -576,7 +576,7 @@ if [ "$SPEC" = 1 ]; then
   # A SonicBoom auto rep is identical to the off arm turn by turn when every
   # turn's running hash matches; the hash chains all tokens of all turns seen
   # so far in the rep.
-  sb_ident=$(awk '
+  boom_ident=$(awk '
     FNR==NR { if (substr($1,1,5) == "turn=") off[substr($1,6)] = substr($6,6); next }
     substr($1,1,5) == "turn=" {
       t = substr($1,6); r = substr($2,5); h = substr($6,6)
@@ -584,7 +584,7 @@ if [ "$SPEC" = 1 ]; then
       n[r]++
       if (off[t] == h) same[r]++ }
     END { for (i = 0; i < reps; i++) printf "%s%d/%d", (i ? " " : ""), same[i], n[i] }
-  ' "$SPEC_OUT/sb_off.txt" "$SPEC_OUT/sb_auto.txt")
+  ' "$SPEC_OUT/boom_off.txt" "$SPEC_OUT/boom_auto.txt")
 
   # A llama.cpp ngram-mod rep is identical to the no-spec arm when every turn's
   # generated bytes are the same.
@@ -603,12 +603,12 @@ if [ "$SPEC" = 1 ]; then
     done
   fi
 
-  turns=$(grep -c '^turn=' "$SPEC_OUT/sb_off.txt")
+  turns=$(grep -c '^turn=' "$SPEC_OUT/boom_off.txt")
   echo
   echo "code editing: $LABEL, $turns turns, greedy, reps=$RUNS"
   printf '%-28s%5s    %s\n' "arm" "tok/s" "identical to spec off (per rep)"
-  printf '%-28s%5s    %s\n' "SonicBoom spec off" "$(num1 "$sb_off_ts")" "-"
-  printf '%-28s%5s    %s\n' "SonicBoom spec auto" "$(num1 "$sb_auto_ts")" "$sb_ident"
+  printf '%-28s%5s    %s\n' "SonicBoom spec off" "$(num1 "$boom_off_ts")" "-"
+  printf '%-28s%5s    %s\n' "SonicBoom spec auto" "$(num1 "$boom_auto_ts")" "$boom_ident"
   if [ "$LLAMA_OK" = 1 ]; then
     printf '%-28s%5s    %s\n' "llama.cpp no spec" "$(num1 "$ll_off_ts")" "-"
     printf '%-28s%5s    %s\n' "llama.cpp ngram-mod" "$(num1 "$ll_ngram_ts")" "$ll_ident"
@@ -616,8 +616,8 @@ if [ "$SPEC" = 1 ]; then
     printf '%-28s%5s    %s\n' "llama.cpp no spec" "n/a" "-"
     printf '%-28s%5s    %s\n' "llama.cpp ngram-mod" "n/a" "-"
   fi
-  echo "SonicBoom auto / llama.cpp ngram-mod: $(ratio "$sb_auto_ts" "$ll_ngram_ts")"
-  echo "RESULT codeedit model=$LABEL sb_off=$sb_off_ts sb_auto=$sb_auto_ts llama_off=$ll_off_ts llama_ngram=$ll_ngram_ts"
+  echo "SonicBoom auto / llama.cpp ngram-mod: $(ratio "$boom_auto_ts" "$ll_ngram_ts")"
+  echo "RESULT codeedit model=$LABEL boom_off=$boom_off_ts boom_auto=$boom_auto_ts llama_off=$ll_off_ts llama_ngram=$ll_ngram_ts"
 
   echo
   echo "per-turn hashes (SonicBoom):"
@@ -637,9 +637,9 @@ if [ "$SPEC" = 1 ]; then
         for (r = 0; r < reps; r++) printf " %-16s", auto[t, r]
         printf "\n"
       }
-    }' "$SPEC_OUT/sb_off.txt" "$SPEC_OUT/sb_auto.txt"
+    }' "$SPEC_OUT/boom_off.txt" "$SPEC_OUT/boom_auto.txt"
 fi
 
 if [ -n "$TUNE_EXPORT" ]; then
-  sb_tune export --out "$TUNE_EXPORT" >&2
+  boom_tune export --out "$TUNE_EXPORT" >&2
 fi

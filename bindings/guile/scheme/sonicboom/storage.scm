@@ -18,7 +18,7 @@
 ;;;                   the aliasing bytevector itself stays mutable and must
 ;;;                   not be written. OWNER is the <executable> record that
 ;;;                   keeps the handle alive and HANDLE owns the native
-;;;                   sb_storage view that pins the memory itself.
+;;;                   boom_storage view that pins the memory itself.
 ;;;
 ;;; A borrowed view does not depend on the executable handle: releasing the view
 ;;; (storage-release!) drops its native ownership reference, and if a tensor is
@@ -93,7 +93,7 @@ PyTorch: none"
 ;;;
 ;;; HANDLE is a box #(native-view released?) shared with the guardian entry. Both
 ;;; explicit release and the guardian flip `released?` before releasing, so the
-;;; native sb_storage is released exactly once whichever path runs first. The
+;;; native boom_storage is released exactly once whichever path runs first. The
 ;;; guardian only holds a weak reference: a tensor that becomes unreachable is
 ;;; handed back by the next reap-storage-views! call.
 
@@ -103,13 +103,13 @@ PyTorch: none"
   "Storage viewing native parameter memory through a bytevector.
 
 The bytevector aliases native memory without copying. The owner is kept alive
-for the caller's convenience; the native view is the sb_storage handle that
+for the caller's convenience; the native view is the boom_storage handle that
 pins the memory itself. The aliasing bytevector stays mutable because Guile
 bytevectors cannot be read-only; tensor-set! enforces the read-only rule.
 Args:
   data: a bytevector aliasing the native memory.
   owner: the object that must outlive the view, usually an executable.
-  native-view: the sb_storage handle pinning the memory.
+  native-view: the boom_storage handle pinning the memory.
 Returns: read-only-through-the-tensor-API storage.
 PyTorch: none
 Note: This requires an executable with native parameters and therefore has no
@@ -128,7 +128,7 @@ this call released it."
         (let ((view (vector-ref box 0)))
           (vector-set! box 0 %null-pointer)
           (unless (null-pointer? view)
-            ((proc 'sb_storage_release) view)
+            ((proc 'boom_storage_release) view)
             #t)))))
 
 (define (storage-release! s)

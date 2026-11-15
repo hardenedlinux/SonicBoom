@@ -115,7 +115,7 @@ NumericsProfile numerics_profile() {
     chosen = *s.application;
     origin.source = planner::decisions::Source::Application;
     origin.reason = "application";
-    origin.inputs = "sb_set_numerics_profile";
+    origin.inputs = "boom_set_numerics_profile";
   }
 
   planner::decisions::Entry entry;

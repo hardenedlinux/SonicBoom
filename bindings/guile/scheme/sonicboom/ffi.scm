@@ -27,72 +27,72 @@
             sb-status-ok?
             sb-status->message
             sb-check!
-            SB_ERR_BINDING
-            SB_ERR_INTERNAL
-            SB_ERR_CANCELLED
+            BOOM_ERR_BINDING
+            BOOM_ERR_INTERNAL
+            BOOM_ERR_CANCELLED
             ;; low-level FFI plumbing exposed for the training module
             proc make-slot slot-ptr slot-ref capture-error))
 
-;;; --- status codes (mirror capi.h sb_status) --------------------------------
+;;; --- status codes (mirror capi.h boom_status) --------------------------------
 
-(define SB_OK 0)
-(define SB_ERR_PARSE 1)
-(define SB_ERR_WEIGHT 2)
-(define SB_ERR_COMPILE 3)
+(define BOOM_OK 0)
+(define BOOM_ERR_PARSE 1)
+(define BOOM_ERR_WEIGHT 2)
+(define BOOM_ERR_COMPILE 3)
 ;; The status of a parameter-binding failure.
 ;;
-;; The value is 4, one of the sb_status codes of the C ABI; sb-status->message
+;; The value is 4, one of the boom_status codes of the C ABI; sb-status->message
 ;; renders it as "binding".
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom ffi))
-;;   (sb-status->message SB_ERR_BINDING)
+;;   (sb-status->message BOOM_ERR_BINDING)
 ;;   => "binding"
 ;; PyTorch: none
-(define SB_ERR_BINDING 4)
-(define SB_ERR_RUNTIME 5)
+(define BOOM_ERR_BINDING 4)
+(define BOOM_ERR_RUNTIME 5)
 ;; The status of an internal failure.
 ;;
-;; The value is 6, one of the sb_status codes of the C ABI; sb-status->message
+;; The value is 6, one of the boom_status codes of the C ABI; sb-status->message
 ;; renders it as "internal".
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom ffi))
-;;   (sb-status->message SB_ERR_INTERNAL)
+;;   (sb-status->message BOOM_ERR_INTERNAL)
 ;;   => "internal"
 ;; PyTorch: none
-(define SB_ERR_INTERNAL 6)
-(define SB_ERR_UNSUPPORTED 7)
+(define BOOM_ERR_INTERNAL 6)
+(define BOOM_ERR_UNSUPPORTED 7)
 ;; The status of a call that was cancelled.
 ;;
-;; The value is 8, one of the sb_status codes of the C ABI; sb-status->message
+;; The value is 8, one of the boom_status codes of the C ABI; sb-status->message
 ;; renders it as "cancelled".
 ;;
 ;; Example:
 ;;   (use-modules (sonicboom ffi))
-;;   (sb-status->message SB_ERR_CANCELLED)
+;;   (sb-status->message BOOM_ERR_CANCELLED)
 ;;   => "cancelled"
 ;; PyTorch: none
-(define SB_ERR_CANCELLED 8)
+(define BOOM_ERR_CANCELLED 8)
 
 (define (sb-status-ok? status)
-  "Whether a C ABI status code is SB_OK.
+  "Whether a C ABI status code is BOOM_OK.
 
 Args:
   status: a status code.
-Returns: #t for SB_OK (0), #f otherwise.
+Returns: #t for BOOM_OK (0), #f otherwise.
 Example:
   (use-modules (sonicboom ffi))
   (sb-status-ok? 0)
   => #t
 PyTorch: none"
-  (= status SB_OK))
+  (= status BOOM_OK))
 
 (define *status-names*
-  `((,SB_OK . "ok") (,SB_ERR_PARSE . "parse") (,SB_ERR_WEIGHT . "weight")
-    (,SB_ERR_COMPILE . "compile") (,SB_ERR_BINDING . "binding")
-    (,SB_ERR_RUNTIME . "runtime") (,SB_ERR_INTERNAL . "internal")
-    (,SB_ERR_UNSUPPORTED . "unsupported") (,SB_ERR_CANCELLED . "cancelled")))
+  `((,BOOM_OK . "ok") (,BOOM_ERR_PARSE . "parse") (,BOOM_ERR_WEIGHT . "weight")
+    (,BOOM_ERR_COMPILE . "compile") (,BOOM_ERR_BINDING . "binding")
+    (,BOOM_ERR_RUNTIME . "runtime") (,BOOM_ERR_INTERNAL . "internal")
+    (,BOOM_ERR_UNSUPPORTED . "unsupported") (,BOOM_ERR_CANCELLED . "cancelled")))
 
 (define (sb-status->message status)
   "The name of a C ABI status code.
@@ -105,7 +105,7 @@ Args:
 Returns: the name as a string, or \"unknown\" for a code outside the set.
 Example:
   (use-modules (sonicboom ffi))
-  (sb-status->message SB_ERR_CANCELLED)
+  (sb-status->message BOOM_ERR_CANCELLED)
   => \"cancelled\"
 PyTorch: none"
   (or (assq-ref *status-names* status) "unknown"))
@@ -216,182 +216,182 @@ PyTorch: none"
 (define (ensure-procs)
   (or (%procs)
       (let ((table
-             `((sb_build_info . ,(foreign-proc "sb_build_info" '* (list)))
-               (sb_parse . ,(foreign-proc "sb_parse" int
+             `((boom_build_info . ,(foreign-proc "boom_build_info" '* (list)))
+               (boom_parse . ,(foreign-proc "boom_parse" int
                                           (list '* size_t '* '*)))
-               (sb_compile . ,(foreign-proc "sb_compile" int
+               (boom_compile . ,(foreign-proc "boom_compile" int
                                             (list '* '* '* '*)))
-               (sb_input_info . ,(foreign-proc "sb_input_info" int
+               (boom_input_info . ,(foreign-proc "boom_input_info" int
                                                (list '* '* '* '* '*)))
-               (sb_output_info . ,(foreign-proc "sb_output_info" int
+               (boom_output_info . ,(foreign-proc "boom_output_info" int
                                                 (list '* '* '* '* '*)))
-               ;; device training graph (sb_compile_device) — see capi.h
-               (sb_compile_device . ,(foreign-proc "sb_compile_device" int
+               ;; device training graph (boom_compile_device) — see capi.h
+               (boom_compile_device . ,(foreign-proc "boom_compile_device" int
                                                    (list '* '* '*)))
-               (sb_input_count . ,(foreign-proc "sb_input_count" int
+               (boom_input_count . ,(foreign-proc "boom_input_count" int
                                                 (list '* '*)))
-               (sb_output_count . ,(foreign-proc "sb_output_count" int
+               (boom_output_count . ,(foreign-proc "boom_output_count" int
                                                  (list '* '*)))
-               (sb_input_info_at . ,(foreign-proc "sb_input_info_at" int
+               (boom_input_info_at . ,(foreign-proc "boom_input_info_at" int
                                                   (list '* size_t '* '* '* '*)))
-               (sb_output_info_at . ,(foreign-proc "sb_output_info_at" int
+               (boom_output_info_at . ,(foreign-proc "boom_output_info_at" int
                                                    (list '* size_t '* '* '* '*)))
-               (sb_input_name_at . ,(foreign-proc "sb_input_name_at" int
+               (boom_input_name_at . ,(foreign-proc "boom_input_name_at" int
                                                   (list '* size_t '*)))
-               (sb_output_name_at . ,(foreign-proc "sb_output_name_at" int
+               (boom_output_name_at . ,(foreign-proc "boom_output_name_at" int
                                                    (list '* size_t '*)))
-               (sb_run_multi . ,(foreign-proc "sb_run_multi" int
+               (boom_run_multi . ,(foreign-proc "boom_run_multi" int
                                               (list '* '* '* size_t '* '* size_t
                                                     '* '*)))
                ;; read-only parameter views (see capi.h)
-               (sb_api_version . ,(foreign-proc "sb_api_version" uint32 (list)))
-               (sb_executable_parameter_count
-                . ,(foreign-proc "sb_executable_parameter_count" int
+               (boom_api_version . ,(foreign-proc "boom_api_version" uint32 (list)))
+               (boom_executable_parameter_count
+                . ,(foreign-proc "boom_executable_parameter_count" int
                                  (list '* '* '*)))
-               (sb_executable_parameter_name_at
-                . ,(foreign-proc "sb_executable_parameter_name_at" int
+               (boom_executable_parameter_name_at
+                . ,(foreign-proc "boom_executable_parameter_name_at" int
                                  (list '* size_t '* '*)))
-               (sb_executable_parameter_desc
-                . ,(foreign-proc "sb_executable_parameter_desc" int
+               (boom_executable_parameter_desc
+                . ,(foreign-proc "boom_executable_parameter_desc" int
                                  (list '* size_t '* '*)))
-               (sb_executable_parameter_view
-                . ,(foreign-proc "sb_executable_parameter_view" int
+               (boom_executable_parameter_view
+                . ,(foreign-proc "boom_executable_parameter_view" int
                                  (list '* size_t '* '*)))
-               (sb_storage_data . ,(foreign-proc "sb_storage_data" int
+               (boom_storage_data . ,(foreign-proc "boom_storage_data" int
                                                  (list '* '* '* '*)))
-               (sb_storage_desc . ,(foreign-proc "sb_storage_desc" int
+               (boom_storage_desc . ,(foreign-proc "boom_storage_desc" int
                                                  (list '* '* '*)))
-               (sb_storage_release . ,(foreign-proc "sb_storage_release" void
+               (boom_storage_release . ,(foreign-proc "boom_storage_release" void
                                                     (list '*)))
                ;; deferred (:bound) parameters (see capi.h)
-               (sb_bind_parameter . ,(foreign-proc "sb_bind_parameter" int
+               (boom_bind_parameter . ,(foreign-proc "boom_bind_parameter" int
                                                    (list '* '* '* size_t '*)))
-               (sb_bindings_complete
-                . ,(foreign-proc "sb_bindings_complete" int
+               (boom_bindings_complete
+                . ,(foreign-proc "boom_bindings_complete" int
                                  (list '* '* '*)))
-               (sb_run_resident . ,(foreign-proc "sb_run_resident" int
+               (boom_run_resident . ,(foreign-proc "boom_run_resident" int
                                                  (list '* '* '* size_t '* size_t
                                                        '* '* '* '*)))
-               (sb_input_is_resident . ,(foreign-proc "sb_input_is_resident" int
+               (boom_input_is_resident . ,(foreign-proc "boom_input_is_resident" int
                                                       (list '* size_t '* '*)))
-               (sb_bind_input . ,(foreign-proc "sb_bind_input" int
+               (boom_bind_input . ,(foreign-proc "boom_bind_input" int
                                                (list '* '* size_t '*)))
-               (sb_execute . ,(foreign-proc "sb_execute" int (list '* '*)))
-               (sb_retrieve_output . ,(foreign-proc "sb_retrieve_output" int
+               (boom_execute . ,(foreign-proc "boom_execute" int (list '* '*)))
+               (boom_retrieve_output . ,(foreign-proc "boom_retrieve_output" int
                                                     (list '* '* size_t '* '*)))
-               (sb_error_message . ,(foreign-proc "sb_error_message" '*
+               (boom_error_message . ,(foreign-proc "boom_error_message" '*
                                                   (list '*)))
-               (sb_error_get_kind . ,(foreign-proc "sb_error_get_kind" int
+               (boom_error_get_kind . ,(foreign-proc "boom_error_get_kind" int
                                                    (list '*)))
-               (sb_error_free . ,(foreign-proc "sb_error_free" void (list '*)))
-               (sb_document_free . ,(foreign-proc "sb_document_free" void
+               (boom_error_free . ,(foreign-proc "boom_error_free" void (list '*)))
+               (boom_document_free . ,(foreign-proc "boom_document_free" void
                                                   (list '*)))
-               (sb_executable_free . ,(foreign-proc "sb_executable_free" void
+               (boom_executable_free . ,(foreign-proc "boom_executable_free" void
                                                     (list '*)))
                ;; training (minimal autograd) surface — see capi.h
-               (sb_tensor_from_f32 . ,(foreign-proc "sb_tensor_from_f32" int
+               (boom_tensor_from_f32 . ,(foreign-proc "boom_tensor_from_f32" int
                                                     (list '* int64 '* size_t '* '*)))
-               (sb_tensor_bytes . ,(foreign-proc "sb_tensor_bytes" int
+               (boom_tensor_bytes . ,(foreign-proc "boom_tensor_bytes" int
                                                  (list '* '* size_t '* '*)))
-               (sb_tensor_free . ,(foreign-proc "sb_tensor_free" void (list '*)))
-               (sb_tape_new . ,(foreign-proc "sb_tape_new" int (list '* '*)))
-               (sb_tape_free . ,(foreign-proc "sb_tape_free" void (list '*)))
-               (sb_tape_zero_grad . ,(foreign-proc "sb_tape_zero_grad" void (list '*)))
-               (sb_linear . ,(foreign-proc "sb_linear" int
+               (boom_tensor_free . ,(foreign-proc "boom_tensor_free" void (list '*)))
+               (boom_tape_new . ,(foreign-proc "boom_tape_new" int (list '* '*)))
+               (boom_tape_free . ,(foreign-proc "boom_tape_free" void (list '*)))
+               (boom_tape_zero_grad . ,(foreign-proc "boom_tape_zero_grad" void (list '*)))
+               (boom_linear . ,(foreign-proc "boom_linear" int
                                           (list '* '* '* '* '* '*)))
-               (sb_relu . ,(foreign-proc "sb_relu" int (list '* '* '* '*)))
-               (sb_mse_loss . ,(foreign-proc "sb_mse_loss" int
+               (boom_relu . ,(foreign-proc "boom_relu" int (list '* '* '* '*)))
+               (boom_mse_loss . ,(foreign-proc "boom_mse_loss" int
                                             (list '* '* '* '* '*)))
-               (sb_backward . ,(foreign-proc "sb_backward" int (list '* '* '*)))
-               (sb_sgd_step . ,(foreign-proc "sb_sgd_step" int
+               (boom_backward . ,(foreign-proc "boom_backward" int (list '* '* '*)))
+               (boom_sgd_step . ,(foreign-proc "boom_sgd_step" int
                                             (list '* '* double '*)))
-               (sb_grad . ,(foreign-proc "sb_grad" int (list '* '* '* '*)))
-               (sb_clip_grad_norm . ,(foreign-proc "sb_clip_grad_norm" int
+               (boom_grad . ,(foreign-proc "boom_grad" int (list '* '* '* '*)))
+               (boom_clip_grad_norm . ,(foreign-proc "boom_clip_grad_norm" int
                                                    (list '* int float '* '*)))
                ;; export: graph text + named trained tensors → artifact dir
-               (sb_export_model . ,(foreign-proc "sb_export_model" int
+               (boom_export_model . ,(foreign-proc "boom_export_model" int
                                                  (list '* size_t '* '* size_t '* '*)))
                ;; checkpoints: named float32 tensors ↔ one binary file
-               (sb_save_params . ,(foreign-proc "sb_save_params" int
+               (boom_save_params . ,(foreign-proc "boom_save_params" int
                                                 (list '* '* '* size_t '*)))
-               (sb_load_params . ,(foreign-proc "sb_load_params" int
+               (boom_load_params . ,(foreign-proc "boom_load_params" int
                                                 (list '* '* '* size_t '*)))
                ;; planner decision registry (see (sonicboom explain))
-               (sb_explain_table . ,(foreign-proc "sb_explain_table" int
+               (boom_explain_table . ,(foreign-proc "boom_explain_table" int
                                                   (list '* size_t '* '*)))
-               (sb_explain_json . ,(foreign-proc "sb_explain_json" int
+               (boom_explain_json . ,(foreign-proc "boom_explain_json" int
                                                  (list '* size_t '* '*)))
                ;; training parameters (fused AdamW) — see (sonicboom param)
-               (sb_param_create . ,(foreign-proc "sb_param_create" int
+               (boom_param_create . ,(foreign-proc "boom_param_create" int
                                                  (list '* int64 '* size_t '* '*)))
-               (sb_param_numel . ,(foreign-proc "sb_param_numel" int
+               (boom_param_numel . ,(foreign-proc "boom_param_numel" int
                                                 (list '* '*)))
-               (sb_param_on_device . ,(foreign-proc "sb_param_on_device" int
+               (boom_param_on_device . ,(foreign-proc "boom_param_on_device" int
                                                     (list '*)))
-               (sb_param_step_count . ,(foreign-proc "sb_param_step_count" uint64
+               (boom_param_step_count . ,(foreign-proc "boom_param_step_count" uint64
                                                      (list '*)))
-               (sb_param_zero_grad . ,(foreign-proc "sb_param_zero_grad" int
+               (boom_param_zero_grad . ,(foreign-proc "boom_param_zero_grad" int
                                                     (list '* '*)))
-               (sb_param_set_grad . ,(foreign-proc "sb_param_set_grad" int
+               (boom_param_set_grad . ,(foreign-proc "boom_param_set_grad" int
                                                    (list '* '* size_t '*)))
-               (sb_param_step . ,(foreign-proc "sb_param_step" int
+               (boom_param_step . ,(foreign-proc "boom_param_step" int
                                                (list '* float float float float
                                                      float '*)))
-               (sb_param_step_lr . ,(foreign-proc "sb_param_step_lr" int
+               (boom_param_step_lr . ,(foreign-proc "boom_param_step_lr" int
                                                   (list '* '* float float float
                                                         float '*)))
-               (sb_param_read . ,(foreign-proc "sb_param_read" int
+               (boom_param_read . ,(foreign-proc "boom_param_read" int
                                                (list '* '* size_t '* '*)))
-               (sb_param_free . ,(foreign-proc "sb_param_free" void (list '*)))
+               (boom_param_free . ,(foreign-proc "boom_param_free" void (list '*)))
                ;; numerics profile (process-wide, latched; see capi.h)
-               (sb_set_numerics_profile . ,(foreign-proc "sb_set_numerics_profile" int
+               (boom_set_numerics_profile . ,(foreign-proc "boom_set_numerics_profile" int
                                                          (list int '*)))
-               (sb_get_numerics_profile . ,(foreign-proc "sb_get_numerics_profile" int
+               (boom_get_numerics_profile . ,(foreign-proc "boom_get_numerics_profile" int
                                                          (list '* '*)))
-               ;; inference (minimal LLM surface) — see capi.h sb_llm_*
-               (sb_llm_model_load . ,(foreign-proc "sb_llm_model_load" int
+               ;; inference (minimal LLM surface) — see capi.h boom_llm_*
+               (boom_llm_model_load . ,(foreign-proc "boom_llm_model_load" int
                                                    (list '* '* '*)))
-               (sb_llm_model_free . ,(foreign-proc "sb_llm_model_free" void (list '*)))
-               (sb_llm_model_arch . ,(foreign-proc "sb_llm_model_arch" int
+               (boom_llm_model_free . ,(foreign-proc "boom_llm_model_free" void (list '*)))
+               (boom_llm_model_arch . ,(foreign-proc "boom_llm_model_arch" int
                                                    (list '* '* size_t '* '*)))
-               (sb_llm_model_eos . ,(foreign-proc "sb_llm_model_eos" int
+               (boom_llm_model_eos . ,(foreign-proc "boom_llm_model_eos" int
                                                   (list '* '* size_t '* '*)))
-               (sb_llm_tokenize . ,(foreign-proc "sb_llm_tokenize" int
+               (boom_llm_tokenize . ,(foreign-proc "boom_llm_tokenize" int
                                                  (list '* '* size_t '* size_t '* '*)))
-               (sb_llm_tokenize_ex . ,(foreign-proc "sb_llm_tokenize_ex" int
+               (boom_llm_tokenize_ex . ,(foreign-proc "boom_llm_tokenize_ex" int
                                                     (list '* '* size_t int '* size_t '* '*)))
-               (sb_llm_detokenize . ,(foreign-proc "sb_llm_detokenize" int
+               (boom_llm_detokenize . ,(foreign-proc "boom_llm_detokenize" int
                                                    (list '* '* size_t '* size_t '* '*)))
-               (sb_llm_session_new . ,(foreign-proc "sb_llm_session_new" int
+               (boom_llm_session_new . ,(foreign-proc "boom_llm_session_new" int
                                                     (list '* uint64 '* '*)))
-               (sb_llm_session_free . ,(foreign-proc "sb_llm_session_free" void (list '*)))
-               (sb_llm_prefill . ,(foreign-proc "sb_llm_prefill" int
+               (boom_llm_session_free . ,(foreign-proc "boom_llm_session_free" void (list '*)))
+               (boom_llm_prefill . ,(foreign-proc "boom_llm_prefill" int
                                                 (list '* '* size_t '* '*)))
-               (sb_llm_decode . ,(foreign-proc "sb_llm_decode" int
+               (boom_llm_decode . ,(foreign-proc "boom_llm_decode" int
                                                (list '* '* '* '* '* '*)))
                ;; constrained decoding (session grammar) — see capi.h
-               (sb_llm_json_schema_to_gbnf
-                . ,(foreign-proc "sb_llm_json_schema_to_gbnf" int
+               (boom_llm_json_schema_to_gbnf
+                . ,(foreign-proc "boom_llm_json_schema_to_gbnf" int
                                  (list '* '* '* '* size_t '* '*)))
-               (sb_llm_session_set_grammar . ,(foreign-proc "sb_llm_session_set_grammar" int
+               (boom_llm_session_set_grammar . ,(foreign-proc "boom_llm_session_set_grammar" int
                                                             (list '* '* '*)))
-               (sb_llm_session_set_json_schema . ,(foreign-proc "sb_llm_session_set_json_schema"
+               (boom_llm_session_set_json_schema . ,(foreign-proc "boom_llm_session_set_json_schema"
                                                                 int (list '* '* '*)))
-               (sb_llm_session_clear_grammar . ,(foreign-proc "sb_llm_session_clear_grammar"
+               (boom_llm_session_clear_grammar . ,(foreign-proc "boom_llm_session_clear_grammar"
                                                               void (list '*)))
-               (sb_llm_session_constraint_state . ,(foreign-proc "sb_llm_session_constraint_state"
+               (boom_llm_session_constraint_state . ,(foreign-proc "boom_llm_session_constraint_state"
                                                                  int (list '* '* '* '*)))
-               ;; image generation (MOSS-Image) — see capi.h sb_image_*
-               (sb_image_model_load . ,(foreign-proc "sb_image_model_load" int
+               ;; image generation (MOSS-Image) — see capi.h boom_image_*
+               (boom_image_model_load . ,(foreign-proc "boom_image_model_load" int
                                                      (list '* '* '*)))
-               (sb_image_model_free . ,(foreign-proc "sb_image_model_free" void
+               (boom_image_model_free . ,(foreign-proc "boom_image_model_free" void
                                                      (list '*)))
-               (sb_image_model_arch . ,(foreign-proc "sb_image_model_arch" int
+               (boom_image_model_arch . ,(foreign-proc "boom_image_model_arch" int
                                                      (list '* '* size_t '* '*)))
-               (sb_image_generate . ,(foreign-proc "sb_image_generate" int
+               (boom_image_generate . ,(foreign-proc "boom_image_generate" int
                                                    (list '* '* '* '* '* size_t
                                                          '* '*)))
-               (sb_image_write_png . ,(foreign-proc "sb_image_write_png" int
+               (boom_image_write_png . ,(foreign-proc "boom_image_write_png" int
                                                     (list '* '* uint32 uint32
                                                           '*))))))
         (%procs table)
@@ -401,7 +401,7 @@ PyTorch: none"
   "The foreign procedure registered under NAME.
 
 The procedure table is resolved from libsonicboom.so on first use and then
-cached; NAME is the C function name as a symbol, for example 'sb_build_info.
+cached; NAME is the C function name as a symbol, for example 'boom_build_info.
 This is plumbing for the modules that call the C ABI directly.
 
 Args:
@@ -409,7 +409,7 @@ Args:
 Returns: a foreign procedure, or #f when the table has no such entry.
 Example:
   (use-modules (sonicboom ffi))
-  (procedure? (proc 'sb_build_info))
+  (procedure? (proc 'boom_build_info))
   => #t
 PyTorch: none"
   (assq-ref (ensure-procs) name))
@@ -483,37 +483,37 @@ PyTorch: none"
   (let* ((p (slot-ref err-slot))
          (msg (if (null-pointer? p)
                   ""
-                  (pointer->string ((proc 'sb_error_message) p)))))
+                  (pointer->string ((proc 'boom_error_message) p)))))
     (unless (null-pointer? p)
-      ((proc 'sb_error_free) p)
+      ((proc 'boom_error_free) p)
       (slot-null! err-slot))
     msg))
 
 ;;; --- status/error raising ----------------------------------------------------
 
-;; The kind the sb_error in ERR-SLOT reports, read before capture-error frees it.
-;; 0 (SB_ERRKIND_NONE) when the call left no error object.
+;; The kind the boom_error in ERR-SLOT reports, read before capture-error frees it.
+;; 0 (BOOM_ERRKIND_NONE) when the call left no error object.
 (define (error-kind-code err-slot)
   (let ((p (slot-ref err-slot)))
-    (if (null-pointer? p) 0 ((proc 'sb_error_get_kind) p))))
+    (if (null-pointer? p) 0 ((proc 'boom_error_get_kind) p))))
 
 ;; When the C side left no error object, the status code still says roughly
 ;; what kind of failure it was.
 (define (status-kind status)
   (case status
-    ((SB_ERR_PARSE) 'parse-syntax)
-    ((SB_ERR_WEIGHT) 'weight)
-    ((SB_ERR_COMPILE) 'compile)
-    ((SB_ERR_BINDING) 'binding)
-    ((SB_ERR_RUNTIME) 'runtime)
-    ((SB_ERR_INTERNAL) 'internal)
-    ((SB_ERR_CANCELLED) 'cancelled)
+    ((BOOM_ERR_PARSE) 'parse-syntax)
+    ((BOOM_ERR_WEIGHT) 'weight)
+    ((BOOM_ERR_COMPILE) 'compile)
+    ((BOOM_ERR_BINDING) 'binding)
+    ((BOOM_ERR_RUNTIME) 'runtime)
+    ((BOOM_ERR_INTERNAL) 'internal)
+    ((BOOM_ERR_CANCELLED) 'cancelled)
     (else 'none)))
 
 (define (sb-check! status err-slot what)
   "Raise a Guile exception when a C ABI call failed.
 
-When STATUS is SB_OK the call returns quietly. Otherwise a &sonicboom-error is
+When STATUS is BOOM_OK the call returns quietly. Otherwise a &sonicboom-error is
 raised carrying STATUS, a kind and a message; the message is the error text
 from ERR-SLOT, or the status name when the C side left no error object, and
 WHAT is prefixed to it. The error object is freed either way.
@@ -522,7 +522,7 @@ Args:
   status: the status a C ABI call returned.
   err-slot: the slot that received the call's error object.
   what: a string prefixed to the message, or #f.
-Returns: unspecified when the status is SB_OK.
+Returns: unspecified when the status is BOOM_OK.
 Example:
   (use-modules (sonicboom ffi))
   (begin (sb-check! 0 (make-slot) \"demo\") #t)
@@ -542,7 +542,7 @@ PyTorch: none"
 ;;; --- build info -------------------------------------------------------------
 
 ;;; The C ABI reports how libsonicboom.so was configured as a JSON object (see
-;;; sb_build_info in capi.h). It is JSON rather than a struct so the field set
+;;; boom_build_info in capi.h). It is JSON rather than a struct so the field set
 ;;; can grow without breaking a caller; here it is decoded and the string
 ;;; keys are turned into symbols, so a caller writes
 ;;;
@@ -580,7 +580,7 @@ Example:
 PyTorch: none"
   (normalize-json
    (with-input-from-string
-       (pointer->string ((proc 'sb_build_info)))
+       (pointer->string ((proc 'boom_build_info)))
      json->scm)))
 
 ;;; --- high-level execution ---------------------------------------------------
@@ -612,39 +612,39 @@ PyTorch: none"
          (len (string-length text)))
     (define (cleanup!)
       (unless (null-pointer? (slot-ref doc-slot))
-        ((proc 'sb_document_free) (slot-ref doc-slot)))
+        ((proc 'boom_document_free) (slot-ref doc-slot)))
       (unless (null-pointer? (slot-ref exe-slot))
-        ((proc 'sb_executable_free) (slot-ref exe-slot))))
+        ((proc 'boom_executable_free) (slot-ref exe-slot))))
     (define (fail status)
       (cleanup!)
       (sb-check! status err-slot "run-s-expr"))
 
     (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
-        (let ((st ((proc 'sb_parse) txt-ptr len (slot-ptr doc-slot)
+        (let ((st ((proc 'boom_parse) txt-ptr len (slot-ptr doc-slot)
                    (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
-        (let ((st ((proc 'sb_compile) (slot-ref doc-slot) (string->pointer "")
+        (let ((st ((proc 'boom_compile) (slot-ref doc-slot) (string->pointer "")
                    (slot-ptr exe-slot) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
         ;; Query the single output's byte size to allocate the destination
         ;; buffer. (uint64 is 8 bytes on every 64-bit target; `sizeof` only
         ;; accepts pointer types in Guile's FFI, so scalar sizes are hardcoded.)
         (let* ((num-slot (make-bytevector 8 0))
-               (st ((proc 'sb_output_info) (slot-ref exe-slot) %null
+               (st ((proc 'boom_output_info) (slot-ref exe-slot) %null
                      %null %null (bytevector->pointer num-slot))))
           (unless (sb-status-ok? st) (fail st))
           (let ((out-len (bytevector-u64-native-ref num-slot 0)))
             (let ((out-bv (make-bytevector out-len 0)))
-              (let ((st ((proc 'sb_bind_input) (slot-ref exe-slot)
+              (let ((st ((proc 'boom_bind_input) (slot-ref exe-slot)
                          (bytevector->pointer input-bv)
                          (bytevector-length input-bv)
                          (slot-ptr err-slot))))
                 (unless (sb-status-ok? st) (fail st)))
-              (let ((st ((proc 'sb_execute) (slot-ref exe-slot)
+              (let ((st ((proc 'boom_execute) (slot-ref exe-slot)
                          (slot-ptr err-slot))))
                 (unless (sb-status-ok? st) (fail st)))
               (let* ((written-slot (make-bytevector 8 0))
-                     (st ((proc 'sb_retrieve_output) (slot-ref exe-slot)
+                     (st ((proc 'boom_retrieve_output) (slot-ref exe-slot)
                            (bytevector->pointer out-bv) out-len
                            (bytevector->pointer written-slot)
                            (slot-ptr err-slot))))

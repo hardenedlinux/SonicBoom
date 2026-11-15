@@ -233,7 +233,7 @@ int64_t sampled_step_cuda(const Gemma4Model& m, uint64_t token,
 // constructs the backends, and captures one decode step — ~1 s on Gemma 4 E4B,
 // of which the capture (warm-up + record) is most. That cost belongs to
 // load/serve setup, not to the first request: a caller that knows its session's
-// n_ctx (the CLI, the server, sb_llm_session_new) can pay it here and keep the
+// n_ctx (the CLI, the server, boom_llm_session_new) can pay it here and keep the
 // first token's time-to-first-token at the steady-state value. The runtime is
 // exactly the one the first generate call would build and is cached under the
 // same (model, n_ctx) key, so a later call is a map hit. Returns false when the
@@ -396,7 +396,7 @@ uintptr_t decode_runtime_identity(const Gemma4Model& m, uint64_t n_ctx,
 // no longer bit-identical to plain decoding (the mode logs that once). Under
 // the strict numerics profile that trade is not available — strict promises the
 // decode path as a fixed reference — and the combination is refused: callers
-// report SB_ERR_UNSUPPORTED and the generation entry points return 0. True
+// report BOOM_ERR_UNSUPPORTED and the generation entry points return 0. True
 // exactly when reckless is selected and the active numerics profile is strict.
 bool spec_reckless_unsupported();
 
@@ -695,7 +695,7 @@ uint64_t generate_prefill_spine_cuda_prefix(const Gemma4Model& m,
                                             std::span<float> logits_out = {});
 
 // The continuation policy for a session with recurrent state, selected by
-// SONICBOOM_REPRO_CONTINUE or by sb_llm_model_load_ex(SB_LLM_LOAD_CONTINUE_REPLAY):
+// SONICBOOM_REPRO_CONTINUE or by boom_llm_model_load_ex(BOOM_LLM_LOAD_CONTINUE_REPLAY):
 //
 //   live    (default) a request that extends the whole recorded session
 //           continues from the live state after it, prefilling from the

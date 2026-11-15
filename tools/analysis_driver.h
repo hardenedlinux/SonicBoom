@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-namespace sb_tools {
+namespace boom_tools {
 
 // The prompt the analysis runs: short, so the reports stay readable; the
 // calibrated facts, not this prompt, are what bound the values.
@@ -64,4 +64,4 @@ inline bool run_range_analysis(const std::string &model_path,
   return true;
 }
 
-} // namespace sb_tools
+} // namespace boom_tools

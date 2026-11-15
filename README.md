@@ -108,7 +108,7 @@ LD_LIBRARY_PATH=build/core guile -L bindings/guile/scheme
 (display (generate model session "The three laws of thermodynamics are" 64))
 ```
 
-The same calls are available from C (`sb_llm_*` in
+The same calls are available from C (`boom_llm_*` in
 [`capi.h`](capi/include/sonicboom/capi.h)).
 
 ### Serve an OpenAI-compatible API

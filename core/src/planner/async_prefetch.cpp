@@ -21,7 +21,7 @@
 #include <cstring>
 
 #ifdef SONICBOOM_USE_CUDA
-#include "../nn/cuda_stream.h"  // cuda::sb_capturing
+#include "../nn/cuda_stream.h"  // cuda::boom_capturing
 #endif
 
 namespace sonicboom::planner {
@@ -73,7 +73,7 @@ void AsyncPrefetchRuntime::begin(int layer, uint64_t bytes) {
     ++begins_;
     bytes_ += bytes;
     if (policy_) policy_->touch(layer);
-    create = stream_ == nullptr && !cuda::sb_capturing();
+    create = stream_ == nullptr && !cuda::boom_capturing();
   }
   if (create) {
     cudaStream_t s = nullptr;
@@ -111,7 +111,7 @@ void AsyncPrefetchRuntime::wait(int layer) {
   // Nothing is queued on the stream yet; the synchronization is the hook the
   // real prefetch issues its copies through. Never synchronize into a capture:
   // a sync cannot be recorded into a CUDA graph.
-  if (stream != nullptr && !cuda::sb_capturing())
+  if (stream != nullptr && !cuda::boom_capturing())
     (void)cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
 #endif
 }

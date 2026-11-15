@@ -39,30 +39,30 @@ namespace sonicboom::nn::cuda {
 namespace {
 
 template <bool B, typename T, typename F>
-struct sb_cond {
+struct boom_cond {
   using type = T;
 };
 template <typename T, typename F>
-struct sb_cond<false, T, F> {
+struct boom_cond<false, T, F> {
   using type = F;
 };
 template <bool B, typename T, typename F>
-using sb_cond_t = typename sb_cond<B, T, F>::type;
+using boom_cond_t = typename boom_cond<B, T, F>::type;
 
 // ---------------------------------------------------------------------------
 // MMA and fragment helpers (m16n8k16 row.col; same fragment layout as the
 // native tiled kernel: C holds 16 queries x 8 keys / dims).
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ __half2 sb_as_h2(uint32_t u) {
+__device__ __forceinline__ __half2 boom_as_h2(uint32_t u) {
   return *reinterpret_cast<__half2*>(&u);
 }
 
-__device__ __forceinline__ uint32_t sb_as_u32(__half2 h) {
+__device__ __forceinline__ uint32_t boom_as_u32(__half2 h) {
   return *reinterpret_cast<uint32_t*>(&h);
 }
 
-__device__ __forceinline__ void sb_mma_f32(float c[4], const uint32_t a[4],
+__device__ __forceinline__ void boom_mma_f32(float c[4], const uint32_t a[4],
                                            const uint32_t b[2]) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
@@ -71,7 +71,7 @@ __device__ __forceinline__ void sb_mma_f32(float c[4], const uint32_t a[4],
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-__device__ __forceinline__ void sb_mma_f16(uint32_t c[2], const uint32_t a[4],
+__device__ __forceinline__ void boom_mma_f16(uint32_t c[2], const uint32_t a[4],
                                            const uint32_t b[2]) {
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
@@ -89,7 +89,7 @@ __device__ __forceinline__ void sb_mma_f16(uint32_t c[2], const uint32_t a[4],
 // fit in L1. Materializing Q as f16 once per call halves that traffic and
 // removes the per-tile float->half conversion (the f16 rounding is the same
 // __float2half_rn the old pack2 did, so the result is bit-identical).
-__device__ __forceinline__ void sb_load_q(uint32_t a[4],
+__device__ __forceinline__ void boom_load_q(uint32_t a[4],
                                           const __half* __restrict__ q, int hq,
                                           int n_heads_q, int head_dim, int qr,
                                           int k0, int n) {
@@ -111,7 +111,7 @@ __device__ __forceinline__ void sb_load_q(uint32_t a[4],
 
 // B-fragment from the K tile [BK][head_dim]: n = keys key_off..+7, k = dims
 // k0..k0+15.
-__device__ __forceinline__ void sb_load_k(uint32_t b[2],
+__device__ __forceinline__ void boom_load_k(uint32_t b[2],
                                           const __half* __restrict__ k_tile,
                                           int head_dim, int k0, int key_off) {
   const int lane = threadIdx.x & 31;
@@ -124,7 +124,7 @@ __device__ __forceinline__ void sb_load_k(uint32_t b[2],
 
 // B-fragment from the transposed V tile [head_dim][v_stride]: n = dims
 // n0..n0+7, k = keys key_off..+15.
-__device__ __forceinline__ void sb_load_v(uint32_t b[2],
+__device__ __forceinline__ void boom_load_v(uint32_t b[2],
                                           const __half* __restrict__ v_tile,
                                           int v_stride, int n0, int key_off) {
   const int lane = threadIdx.x & 31;
@@ -135,13 +135,13 @@ __device__ __forceinline__ void sb_load_v(uint32_t b[2],
   b[1] = *reinterpret_cast<const uint32_t*>(p + t * 2 + 8);
 }
 
-__device__ __forceinline__ float sb_rmax4(float x) {
+__device__ __forceinline__ float boom_rmax4(float x) {
   x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1, 4));
   x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2, 4));
   return x;
 }
 
-__device__ __forceinline__ float sb_rsum4(float x) {
+__device__ __forceinline__ float boom_rsum4(float x) {
   x += __shfl_xor_sync(0xffffffffu, x, 1, 4);
   x += __shfl_xor_sync(0xffffffffu, x, 2, 4);
   return x;
@@ -151,7 +151,7 @@ __device__ __forceinline__ float sb_rsum4(float x) {
 // cp.async (16-byte copy, one commit group per key tile)
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ void sb_cp_async_16(void* dst, const void* src) {
+__device__ __forceinline__ void boom_cp_async_16(void* dst, const void* src) {
   const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s),
                "l"(src));
@@ -161,7 +161,7 @@ __device__ __forceinline__ void sb_cp_async_16(void* dst, const void* src) {
 // only, so a 40-byte V row (BKP = BK+4) can only be staged with .ca. Measured
 // ~20 % slower than the 16-byte path on sm_86 -- the layout is kept as an
 // explicit experiment candidate, never a default.
-__device__ __forceinline__ void sb_cp_async_8(void* dst, const void* src) {
+__device__ __forceinline__ void boom_cp_async_8(void* dst, const void* src) {
   uint32_t saddr = static_cast<uint32_t>(
       __cvta_generic_to_shared(static_cast<const char*>(src)));
   uint32_t daddr =
@@ -170,12 +170,12 @@ __device__ __forceinline__ void sb_cp_async_8(void* dst, const void* src) {
                "r"(saddr));
 }
 
-__device__ __forceinline__ void sb_cp_commit() {
+__device__ __forceinline__ void boom_cp_commit() {
   asm volatile("cp.async.commit_group;\n" ::);
 }
 
 template <int N>
-__device__ __forceinline__ void sb_cp_wait() {
+__device__ __forceinline__ void boom_cp_wait() {
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
@@ -196,7 +196,7 @@ __device__ __forceinline__ void sb_cp_wait() {
 
 constexpr uint64_t kSpanAlign = 32;
 
-__device__ __forceinline__ uint64_t sb_span_base(uint64_t start,
+__device__ __forceinline__ uint64_t boom_span_base(uint64_t start,
                                                  uint64_t window) {
   uint64_t b = (window > 0 && start + 1 >= window) ? start - (window - 1) : 0;
   b -= b % kSpanAlign;
@@ -231,7 +231,7 @@ __device__ __forceinline__ void boom_fattn_copy8(__half dst[8], const CACHE* src
 // value precision, exactly as the f16 cache path is. The batch rows are f32
 // and take the same f16 rounding as the f16 cache path, which is the scalar
 // kernel's kv_load_batch rounding for every non-f32 instantiation.
-struct sb_q8_cache {};
+struct boom_q8_cache {};
 
 // Cache row at `row` (element 0 of the row), elements d..d+7. Four-byte loads:
 // a q8 row starts at a multiple of head_dim+4 bytes, which is only 4-byte
@@ -240,7 +240,7 @@ template <typename CACHE>
 __device__ __forceinline__ void boom_fattn_copy8_row(__half dst[8],
                                                      const CACHE* row, int d,
                                                      int head_dim) {
-  if constexpr (std::is_same_v<CACHE, sb_q8_cache>) {
+  if constexpr (std::is_same_v<CACHE, boom_q8_cache>) {
     const int8_t* p = reinterpret_cast<const int8_t*>(row);
     const float scale = *reinterpret_cast<const float*>(p + head_dim);
     const int8_t* q = p + d;
@@ -258,7 +258,7 @@ __device__ __forceinline__ void boom_fattn_copy8_row(__half dst[8],
   }
 }
 
-union sb_half8 {
+union boom_half8 {
   __half h[8];
   uint4 u;
 };
@@ -272,7 +272,7 @@ __global__ void __launch_bounds__(256) boom_fattn_qcast_kernel(
   if (e >= n_elems) return;
   const float4 a = *reinterpret_cast<const float4*>(q + e);
   const float4 b = *reinterpret_cast<const float4*>(q + e + 4);
-  sb_half8 h;
+  boom_half8 h;
   h.h[0] = __float2half_rn(a.x);
   h.h[1] = __float2half_rn(a.y);
   h.h[2] = __float2half_rn(a.z);
@@ -293,7 +293,7 @@ __global__ void __launch_bounds__(256) boom_fattn_gather_kernel(
     __half* __restrict__ k_ws, __half* __restrict__ v_ws) {
   const uint64_t start = *start_ptr;
   const uint64_t key_end = start + (uint64_t)n;  // exclusive
-  const uint64_t base = sb_span_base(start, window);
+  const uint64_t base = boom_span_base(start, window);
   const int h = blockIdx.z;
   const int d0 = blockIdx.x * 64;
 
@@ -312,22 +312,22 @@ __global__ void __launch_bounds__(256) boom_fattn_gather_kernel(
     __syncthreads();  // previous iteration's V read of `tile` is done
     const uint64_t abs = base + (uint64_t)(key0 + key);
 
-    sb_half8 kv, vv;
+    boom_half8 kv, vv;
     if (abs < key_end) {
       if (abs < start) {
         const uint64_t slot = abs % n_slots;
         const uint64_t row_index =
             slot * (uint64_t)n_heads_kv + (uint64_t)h;
-        if constexpr (std::is_same_v<CACHE, sb_q8_cache>) {
+        if constexpr (std::is_same_v<CACHE, boom_q8_cache>) {
           const size_t row_bytes = (size_t)row_index * (size_t)(head_dim + 4);
           boom_fattn_copy8_row(
               kv.h,
-              reinterpret_cast<const sb_q8_cache*>(
+              reinterpret_cast<const boom_q8_cache*>(
                   reinterpret_cast<const int8_t*>(k_cache) + row_bytes),
               d, head_dim);
           boom_fattn_copy8_row(
               vv.h,
-              reinterpret_cast<const sb_q8_cache*>(
+              reinterpret_cast<const boom_q8_cache*>(
                   reinterpret_cast<const int8_t*>(v_cache) + row_bytes),
               d, head_dim);
         } else {
@@ -359,7 +359,7 @@ __global__ void __launch_bounds__(256) boom_fattn_gather_kernel(
 
     const int dim = tid & 63;
     const int kc = tid >> 6;  // 4 groups of 8 keys
-    sb_half8 tv;
+    boom_half8 tv;
     #pragma unroll
     for (int i = 0; i < 8; ++i) tv.h[i] = tile[kc * 8 + i][dim];
     *reinterpret_cast<uint4*>(v_ws + ((size_t)h * (size_t)head_dim +
@@ -456,7 +456,7 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
   // and dropping them is bit-exact.
   const uint64_t last_q = start + (uint64_t)blockIdx.x * (uint64_t)BR + (uint64_t)(BR - 1);
   const uint64_t key_last = last_q < key_end ? last_q : key_end;
-  const uint64_t base = sb_span_base(start, window);
+  const uint64_t base = boom_span_base(start, window);
   const uint64_t rel_first = j0_start - base;
 
   auto stage = [&](int b, uint64_t rel0) {
@@ -465,7 +465,7 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
       const int e = i * 8;
       const int key = e / HEAD_DIM;
       const int dd = e - key * HEAD_DIM;
-      sb_cp_async_16(kd + key * HEAD_DIM + dd,
+      boom_cp_async_16(kd + key * HEAD_DIM + dd,
                      k_ws + ((size_t)kvh * (size_t)ne_pad +
                              (size_t)(rel0 + (uint64_t)key)) *
                                 (size_t)HEAD_DIM +
@@ -476,14 +476,14 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
       const int e = i * 8;
       const int dim = e / BK;
       const int koff = e - dim * BK;
-      sb_cp_async_16(vd + dim * BKP + koff,
+      boom_cp_async_16(vd + dim * BKP + koff,
                      v_ws + ((size_t)kvh * (size_t)HEAD_DIM + (size_t)dim) *
                                 (size_t)ne_pad +
                          rel0 + (uint64_t)koff);
     }
   };
 
-  using ACC_T = sb_cond_t<F16ACC, uint32_t, float>;
+  using ACC_T = boom_cond_t<F16ACC, uint32_t, float>;
   constexpr int ACC_N = F16ACC ? 2 : 4;
   ACC_T o[NT][ACC_N] = {};
 
@@ -491,17 +491,17 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
   float l[2] = {0.0f, 0.0f};
 
   stage(0, rel_first);
-  sb_cp_commit();
+  boom_cp_commit();
   int buf = 0;
   for (uint64_t j0 = j0_start; j0 <= key_last; j0 += (uint64_t)BK) {
     __syncthreads();  // previous tile's compute finished; p_buf reusable
     const bool has_next = (j0 + (uint64_t)BK <= key_last);
     if (has_next) {
       stage(buf ^ 1, j0 + (uint64_t)BK - base);
-      sb_cp_commit();
-      sb_cp_wait<1>();
+      boom_cp_commit();
+      boom_cp_wait<1>();
     } else {
-      sb_cp_wait<0>();
+      boom_cp_wait<0>();
     }
     __syncthreads();  // staged tile visible to every warp
 
@@ -515,11 +515,11 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
         float s1[4] = {0.f, 0.f, 0.f, 0.f};
         for (int k0 = 0; k0 < HEAD_DIM; k0 += 16) {
           uint32_t aq[4], bb[2];
-          sb_load_q(aq, q, hq, n_heads_q, HEAD_DIM, qr, k0, n);
-          sb_load_k(bb, kt, HEAD_DIM, k0, key_off);
-          sb_mma_f32(s0, aq, bb);
-          sb_load_k(bb, kt, HEAD_DIM, k0, key_off + 8);
-          sb_mma_f32(s1, aq, bb);
+          boom_load_q(aq, q, hq, n_heads_q, HEAD_DIM, qr, k0, n);
+          boom_load_k(bb, kt, HEAD_DIM, k0, key_off);
+          boom_mma_f32(s0, aq, bb);
+          boom_load_k(bb, kt, HEAD_DIM, k0, key_off + 8);
+          boom_mma_f32(s1, aq, bb);
         }
 
         const uint64_t jb = j0 + (uint64_t)key_off + (uint64_t)t * 2;
@@ -533,9 +533,9 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
         s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
 
         const float mx0 =
-            sb_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
+            boom_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
         const float mx1 =
-            sb_rmax4(fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3])));
+            boom_rmax4(fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3])));
         const float m_new0 = fmaxf(m[0], mx0);
         const float m_new1 = fmaxf(m[1], mx1);
         const float rs0 = expf(m[0] - m_new0);
@@ -550,8 +550,8 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
         const float p18 = (s1[2] > -1e29f) ? expf(s1[2] - m_new1) : 0.0f;
         const float p19 = (s1[3] > -1e29f) ? expf(s1[3] - m_new1) : 0.0f;
 
-        l[0] = l[0] * rs0 + sb_rsum4(p00 + p01 + p08 + p09);
-        l[1] = l[1] * rs1 + sb_rsum4(p10 + p11 + p18 + p19);
+        l[0] = l[0] * rs0 + boom_rsum4(p00 + p01 + p08 + p09);
+        l[1] = l[1] * rs1 + boom_rsum4(p10 + p11 + p18 + p19);
 
         __half* pg = pbuf + p_base + g * BK + key_off;
         __half* pg8 = pg + 8 * BK;
@@ -582,8 +582,8 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
         if constexpr (F16ACC) {
           const __half2 h0 = __float2half2_rn(rs0);
           const __half2 h1 = __float2half2_rn(rs1);
-          o[i][0] = sb_as_u32(__hmul2(sb_as_h2(o[i][0]), h0));
-          o[i][1] = sb_as_u32(__hmul2(sb_as_h2(o[i][1]), h1));
+          o[i][0] = boom_as_u32(__hmul2(boom_as_h2(o[i][0]), h0));
+          o[i][1] = boom_as_u32(__hmul2(boom_as_h2(o[i][1]), h1));
         } else {
           o[i][0] *= rs0;
           o[i][1] *= rs0;
@@ -601,11 +601,11 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
 #pragma unroll
       for (int i = 0; i < NT; ++i) {
         uint32_t bv[2];
-        sb_load_v(bv, vt, BKP, dim0 + i * 8, key_off);
+        boom_load_v(bv, vt, BKP, dim0 + i * 8, key_off);
         if constexpr (F16ACC) {
-          sb_mma_f16(o[i], ap, bv);
+          boom_mma_f16(o[i], ap, bv);
         } else {
-          sb_mma_f32(o[i], ap, bv);
+          boom_mma_f32(o[i], ap, bv);
         }
       }
     }
@@ -629,8 +629,8 @@ __global__ void __launch_bounds__(1024) boom_fattn_attn_kernel(
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     if constexpr (F16ACC) {
-      const float2 f0 = __half22float2(sb_as_h2(o[i][0]));
-      const float2 f1 = __half22float2(sb_as_h2(o[i][1]));
+      const float2 f0 = __half22float2(boom_as_h2(o[i][0]));
+      const float2 f1 = __half22float2(boom_as_h2(o[i][1]));
       if (w0) {
         out0[i * 8] = f0.x * inv0;
         out0[i * 8 + 1] = f0.y * inv0;
@@ -719,13 +719,13 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
                 "V row must be a whole number of cp.async transfers");
   // V is unpadded by default: stride BK halves (32 B rows) keeps every
   // cp.async.cg 16-byte aligned at all HEAD_DIMs, and measured faster than
-  // BKP = BK + 8 even though the 8-word stride makes the sb_load_v fragment
+  // BKP = BK + 8 even though the 8-word stride makes the boom_load_v fragment
   // loads a 2-way conflict (BKP = BK + 4 needs 8-byte copies and loses ~20 %).
   // The 16 KB this saves pays for the third V buffer of the pipeline.
   constexpr int BKP = BK + VPAD;
   // K rows: at stride HEAD_DIM (= 256 words for d512) the 8 g-rows of a
   // fragment load all start on the same bank, an 8-way conflict on every
-  // sb_load_k. HEAD_DIM+8 keeps 16-byte alignment for cp.async and gives a
+  // boom_load_k. HEAD_DIM+8 keeps 16-byte alignment for cp.async and gives a
   // 4-word row step, so the 8 rows cover the 32 banks.
   constexpr int KSTRIDE = HEAD_DIM + KPAD;
   constexpr int SUBS = BK / 16;
@@ -779,7 +779,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
   const uint64_t j0_start = key_start - key_start % (uint64_t)BK;
   const uint64_t last_q = start + (uint64_t)blockIdx.x * (uint64_t)BR + (uint64_t)(BR - 1);
   const uint64_t key_last = last_q < key_end ? last_q : key_end;
-  const uint64_t base = sb_span_base(start, window);
+  const uint64_t base = boom_span_base(start, window);
   const uint64_t rel_first = j0_start - base;
 
   // Q, once per call: this warp's dim slice of its unit, f16, 4 words per
@@ -790,7 +790,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
   if constexpr (QRES) {
 #pragma unroll
     for (int j = 0; j < KSTEPS; ++j)
-      sb_load_q(qreg[j], q, hq, n_heads_q, HEAD_DIM, qr, dim0 + j * 16, n);
+      boom_load_q(qreg[j], q, hq, n_heads_q, HEAD_DIM, qr, dim0 + j * 16, n);
   }
 
   // Stage one 16-key tile into its buffers. K is double-buffered (tile & 1);
@@ -802,7 +802,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
       const int e = i * 8;
       const int key = e / HEAD_DIM;
       const int dd = e - key * HEAD_DIM;
-      sb_cp_async_16(kd + key * KSTRIDE + dd,
+      boom_cp_async_16(kd + key * KSTRIDE + dd,
                      k_ws + ((size_t)kvh * (size_t)ne_pad +
                              (size_t)(rel0 + (uint64_t)key)) *
                                 (size_t)HEAD_DIM +
@@ -815,7 +815,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
         const int e = i * 4;
         const int dim = e / BK;
         const int koff = e - dim * BK;
-        sb_cp_async_8(vd + dim * BKP + koff,
+        boom_cp_async_8(vd + dim * BKP + koff,
                       v_ws + ((size_t)kvh * (size_t)HEAD_DIM + (size_t)dim) *
                                  (size_t)ne_pad +
                           rel0 + (uint64_t)koff);
@@ -825,7 +825,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
         const int e = i * 8;
         const int dim = e / BK;
         const int koff = e - dim * BK;
-        sb_cp_async_16(vd + dim * BKP + koff,
+        boom_cp_async_16(vd + dim * BKP + koff,
                        v_ws + ((size_t)kvh * (size_t)HEAD_DIM + (size_t)dim) *
                                   (size_t)ne_pad +
                            rel0 + (uint64_t)koff);
@@ -833,7 +833,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
     }
   };
 
-  using ACC_T = sb_cond_t<F16ACC, uint32_t, float>;
+  using ACC_T = boom_cond_t<F16ACC, uint32_t, float>;
   constexpr int ACC_N = F16ACC ? 2 : 4;
   ACC_T o[NT][ACC_N] = {};
 
@@ -853,14 +853,14 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
           if constexpr (QRES) {
             aq = qreg[j];
           } else {
-            sb_load_q(aql, q, hq, n_heads_q, HEAD_DIM, qr, dim0 + j * 16, n);
+            boom_load_q(aql, q, hq, n_heads_q, HEAD_DIM, qr, dim0 + j * 16, n);
             aq = aql;
           }
           uint32_t bb[2];
-          sb_load_k(bb, kt, KSTRIDE, dim0 + j * 16, key_off);
-          sb_mma_f32(s0, aq, bb);
-          sb_load_k(bb, kt, KSTRIDE, dim0 + j * 16, key_off + 8);
-          sb_mma_f32(s1, aq, bb);
+          boom_load_k(bb, kt, KSTRIDE, dim0 + j * 16, key_off);
+          boom_mma_f32(s0, aq, bb);
+          boom_load_k(bb, kt, KSTRIDE, dim0 + j * 16, key_off + 8);
+          boom_mma_f32(s1, aq, bb);
         }
         float* p = psbuf + ((unit * NW + dim_slice) * SUBS + sub) * 256;
         p[g * 16 + t * 2 + 0] = s0[0];
@@ -909,7 +909,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
             s1[1] = (jb + 9 > pe || jb + 9 < lo) ? -1e30f : s1[1] * scale;
 
             const float mx =
-                sb_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
+                boom_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
             const float m_new = fmaxf(m[0], mx);
             const float rs = expf(m[0] - m_new);
 
@@ -918,7 +918,7 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
             const float p08 = (s1[0] > -1e29f) ? expf(s1[0] - m_new) : 0.0f;
             const float p09 = (s1[1] > -1e29f) ? expf(s1[1] - m_new) : 0.0f;
 
-            l[0] = l[0] * rs + sb_rsum4(p00 + p01 + p08 + p09);
+            l[0] = l[0] * rs + boom_rsum4(p00 + p01 + p08 + p09);
 
             __half* pg = pbuf + p_base + (g + rh) * BK + key_off;
             pg[t * 2] = __float2half_rn(p00);
@@ -962,9 +962,9 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
         s1[3] = (jb + 9 > p1 || jb + 9 < low1) ? -1e30f : s1[3] * scale;
 
         const float mx0 =
-            sb_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
+            boom_rmax4(fmaxf(fmaxf(s0[0], s0[1]), fmaxf(s1[0], s1[1])));
         const float mx1 =
-            sb_rmax4(fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3])));
+            boom_rmax4(fmaxf(fmaxf(s0[2], s0[3]), fmaxf(s1[2], s1[3])));
         const float m_new0 = fmaxf(m[0], mx0);
         const float m_new1 = fmaxf(m[1], mx1);
         const float rs0 = expf(m[0] - m_new0);
@@ -979,8 +979,8 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
         const float p18 = (s1[2] > -1e29f) ? expf(s1[2] - m_new1) : 0.0f;
         const float p19 = (s1[3] > -1e29f) ? expf(s1[3] - m_new1) : 0.0f;
 
-        l[0] = l[0] * rs0 + sb_rsum4(p00 + p01 + p08 + p09);
-        l[1] = l[1] * rs1 + sb_rsum4(p10 + p11 + p18 + p19);
+        l[0] = l[0] * rs0 + boom_rsum4(p00 + p01 + p08 + p09);
+        l[1] = l[1] * rs1 + boom_rsum4(p10 + p11 + p18 + p19);
 
         __half* pg = pbuf + p_base + g * BK + key_off;
         __half* pg8 = pg + 8 * BK;
@@ -1011,8 +1011,8 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
           if constexpr (F16ACC) {
             const __half2 h0 = __float2half2_rn(rs0);
             const __half2 h1 = __float2half2_rn(rs1);
-            o[i][0] = sb_as_u32(__hmul2(sb_as_h2(o[i][0]), h0));
-            o[i][1] = sb_as_u32(__hmul2(sb_as_h2(o[i][1]), h1));
+            o[i][0] = boom_as_u32(__hmul2(boom_as_h2(o[i][0]), h0));
+            o[i][1] = boom_as_u32(__hmul2(boom_as_h2(o[i][1]), h1));
           } else {
             o[i][0] *= rs0;
             o[i][1] *= rs0;
@@ -1030,11 +1030,11 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
   #pragma unroll
         for (int i = 0; i < NT; ++i) {
           uint32_t bv[2];
-          sb_load_v(bv, vt, BKP, dim0 + i * 8, key_off);
+          boom_load_v(bv, vt, BKP, dim0 + i * 8, key_off);
           if constexpr (F16ACC) {
-            sb_mma_f16(o[i], ap, bv);
+            boom_mma_f16(o[i], ap, bv);
           } else {
-            sb_mma_f32(o[i], ap, bv);
+            boom_mma_f32(o[i], ap, bv);
           }
         }
       }
@@ -1055,13 +1055,13 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
     // iteration k; that is why K needs only two buffers.
     const int n_tiles = (int)((key_last - j0_start) / (uint64_t)BK) + 1;
     stage(0, rel_first);
-    sb_cp_commit();
+    boom_cp_commit();
     if (n_tiles > 1) {
       stage(1, j0_start + (uint64_t)BK - base);
-      sb_cp_commit();
-      sb_cp_wait<1>();
+      boom_cp_commit();
+      boom_cp_wait<1>();
     } else {
-      sb_cp_wait<0>();
+      boom_cp_wait<0>();
     }
     __syncthreads();  // staged tile 0 visible to every warp
     qk_tile(kbuf);
@@ -1074,10 +1074,10 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
       const uint64_t j0_next = j0 + (uint64_t)BK;
       if (tile + 2 < n_tiles) {
         stage(tile + 2, j0_next + (uint64_t)BK - base);
-        sb_cp_commit();
-        sb_cp_wait<1>();
+        boom_cp_commit();
+        boom_cp_wait<1>();
       } else {
-        sb_cp_wait<0>();
+        boom_cp_wait<0>();
       }
       __syncthreads();  // K_{tile+1} / V_{tile+1} visible to every warp
       qk_tile(kbuf + ((tile + 1) & 1) * (K_ELEMS / 2));
@@ -1092,17 +1092,17 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
     // because only V_k is live at a time. The pre-pipeline schedule, kept as a
     // candidate (the pipeline's win is shape- and device-dependent).
     stage(0, rel_first);
-    sb_cp_commit();
+    boom_cp_commit();
     int buf = 0;
     for (uint64_t j0 = j0_start; j0 <= key_last; j0 += (uint64_t)BK) {
       __syncthreads();  // previous tile's compute finished; pbuf reusable
       const bool has_next = (j0 + (uint64_t)BK <= key_last);
       if (has_next) {
         stage(buf ^ 1, j0 + (uint64_t)BK - base);
-        sb_cp_commit();
-        sb_cp_wait<1>();
+        boom_cp_commit();
+        boom_cp_wait<1>();
       } else {
-        sb_cp_wait<0>();
+        boom_cp_wait<0>();
       }
       __syncthreads();  // staged tile visible to every warp
       qk_tile(kbuf + buf * (K_ELEMS / 2));
@@ -1139,8 +1139,8 @@ __device__ __forceinline__ void boom_fattn_qreg_body(
 #pragma unroll
   for (int i = 0; i < NT; ++i) {
     if constexpr (F16ACC) {
-      const float2 f0 = __half22float2(sb_as_h2(o[i][0]));
-      const float2 f1 = __half22float2(sb_as_h2(o[i][1]));
+      const float2 f0 = __half22float2(boom_as_h2(o[i][0]));
+      const float2 f1 = __half22float2(boom_as_h2(o[i][1]));
       if (w0) {
         out0[i * 8] = f0.x * inv0;
         out0[i * 8 + 1] = f0.y * inv0;

@@ -14,7 +14,7 @@
 ;;; Shapes: seq 32, hidden 64, 4 heads of 16, FFN 128, vocabulary 256.
 ;;;
 ;;; The traced step is executed twice from the same initial parameters:
-;;;   - on the GPU: S-Expr → sb_compile_device → Blade → Boom IR (Training
+;;;   - on the GPU: S-Expr → boom_compile_device → Blade → Boom IR (Training
 ;;;     passes) → per-node CUDA kernels;
 ;;;   - by the pure-Scheme reference interpreter on the same emitted graph.
 ;;; Every parameter gradient must agree to 1e-5 (absolute), and the GPU run

@@ -19,7 +19,7 @@
              (sonicboom ffi)
              (sonicboom inference))
 
-;; sb_llm_sampling as a native-layout bytevector (mirror inference.scm):
+;; boom_llm_sampling as a native-layout bytevector (mirror inference.scm):
 ;;   struct_size u64@0, temperature f32@8, top_p f32@12, top_k u32@16,
 ;;   seed u64@24, max_tokens u32@32  → 40 bytes. Greedy decode.
 (define (make-sampling-bv max-tokens)
@@ -49,7 +49,7 @@
          (smp-bv (make-sampling-bv max-tokens))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_decode) session (bytevector->pointer smp-bv)
+         (st ((proc 'boom_llm_decode) session (bytevector->pointer smp-bv)
               cb-ptr %null-pointer (bytevector->pointer n-slot)
               (slot-ptr err-slot))))
     (sb-check! st err-slot "decode")

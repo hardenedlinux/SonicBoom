@@ -40,15 +40,15 @@ endif()
 # SONICBOOM_PRIVATE_TESTS_DIR/data. The public tree carries none. Tests that
 # read it take this definition and skip (exit 77) when it is unset or the file
 # is absent, so a public-only checkout still configures and passes.
-set(SB_PRIVATE_DATA_DIR "")
+set(BOOM_PRIVATE_DATA_DIR "")
 if(SONICBOOM_PRIVATE_TESTS_DIR)
-  set(SB_PRIVATE_DATA_DIR "${SONICBOOM_PRIVATE_TESTS_DIR}/data")
+  set(BOOM_PRIVATE_DATA_DIR "${SONICBOOM_PRIVATE_TESTS_DIR}/data")
 endif()
 
 # Register a C++ suite with CTest. The suites load libsonicboom.so at runtime,
 # so the loader path must include its directory; the executable path is resolved
 # through a generator expression so it stays valid across build configurations.
-function(sb_add_cpp_test name)
+function(boom_add_cpp_test name)
   add_test(NAME ${name}
            COMMAND ${CMAKE_COMMAND} -E env
                    LD_LIBRARY_PATH=$<TARGET_FILE_DIR:sonicboom>
@@ -58,17 +58,17 @@ endfunction()
 foreach(test_name IN ITEMS test_schema test_value test_operator test_backend test_tensor test_s_expr test_s_expr_exec test_native_ops test_autograd test_gguf test_dequant test_nn test_gemma4 test_qwen2_config test_vocab test_clip_grad_norm test_safetensors test_grammar test_sampling test_png test_tune_fingerprint test_gated_attention)
   add_executable(${test_name} ${test_name}.cpp)
   target_link_libraries(${test_name} PRIVATE sonicboom)
-  sb_add_cpp_test(${test_name})
+  boom_add_cpp_test(${test_name})
 endforeach()
 
 # test_clip_grad_norm exercises the fused device kernels directly when the
 # library was built with CUDA (the internal kernel header is CUDA-only).
 if(SONICBOOM_USE_CUDA)
-  target_compile_definitions(test_clip_grad_norm PRIVATE SB_TEST_CUDA=1)
+  target_compile_definitions(test_clip_grad_norm PRIVATE BOOM_TEST_CUDA=1)
   set_tests_properties(test_clip_grad_norm PROPERTIES RESOURCE_LOCK gpu_vram)
   # The same arrangement for test_nn: its sigmoid check also runs the internal
   # device kernel (core/src/nn/cuda_resident.h) when the build has CUDA.
-  target_compile_definitions(test_nn PRIVATE SB_TEST_CUDA=1)
+  target_compile_definitions(test_nn PRIVATE BOOM_TEST_CUDA=1)
   target_link_libraries(test_nn PRIVATE CUDA::cudart)
   set_tests_properties(test_nn PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
@@ -93,7 +93,7 @@ set_tests_properties(test_dequant test_gemma4 test_vocab
 if(SONICBOOM_USE_CUDA)
   add_executable(test_backward_ops test_backward_ops.cpp)
   target_link_libraries(test_backward_ops PRIVATE sonicboom)
-  sb_add_cpp_test(test_backward_ops)
+  boom_add_cpp_test(test_backward_ops)
   set_tests_properties(test_backward_ops PROPERTIES RESOURCE_LOCK gpu_vram)
 endif()
 
@@ -101,7 +101,7 @@ endif()
 # <sonicboom/planner/...> + <sonicboom/sx/...> public headers.
 add_executable(test_persistence test_persistence.cpp)
 target_link_libraries(test_persistence PRIVATE sonicboom)
-sb_add_cpp_test(test_persistence)
+boom_add_cpp_test(test_persistence)
 
 # test_e2e_load is the independent-inference half of the Guile → C++ loop. It
 # takes a required <artifact-dir> argument and is driven by the `guile-cpp-e2e`
@@ -117,9 +117,9 @@ foreach(test_name IN ITEMS test_s_expr_resnet18 test_s_expr_resnet18_exec test_o
   target_link_libraries(${test_name} PRIVATE sonicboom)
   target_compile_definitions(${test_name} PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
-    SONICBOOM_PRIVATE_DATA_DIR="${SB_PRIVATE_DATA_DIR}"
+    SONICBOOM_PRIVATE_DATA_DIR="${BOOM_PRIVATE_DATA_DIR}"
     SONICBOOM_IMPORT_DIR="${CMAKE_BINARY_DIR}/import")
-  sb_add_cpp_test(${test_name})
+  boom_add_cpp_test(${test_name})
 endforeach()
 
 # The two end-to-end ResNet-18 tests run over generated artifacts (the weight /
@@ -132,15 +132,15 @@ find_package(Python3 COMPONENTS Interpreter)
 if(NOT Python3_EXECUTABLE)
   set(Python3_EXECUTABLE python3)
 endif()
-set(SB_RESNET18_PYTHON "${CMAKE_SOURCE_DIR}/models/.venv/bin/python")
-if(NOT EXISTS "${SB_RESNET18_PYTHON}")
-  set(SB_RESNET18_PYTHON "${Python3_EXECUTABLE}")
+set(BOOM_RESNET18_PYTHON "${CMAKE_SOURCE_DIR}/models/.venv/bin/python")
+if(NOT EXISTS "${BOOM_RESNET18_PYTHON}")
+  set(BOOM_RESNET18_PYTHON "${Python3_EXECUTABLE}")
 endif()
 add_test(NAME resnet18_artifacts
          COMMAND ${CMAKE_COMMAND} -E env
-                 "SONICBOOM_PRIVATE_DATA_DIR=${SB_PRIVATE_DATA_DIR}"
+                 "SONICBOOM_PRIVATE_DATA_DIR=${BOOM_PRIVATE_DATA_DIR}"
                  ${CMAKE_CURRENT_SOURCE_DIR}/gen_resnet18_artifacts.sh
-                 "${CMAKE_SOURCE_DIR}" "${SB_RESNET18_PYTHON}"
+                 "${CMAKE_SOURCE_DIR}" "${BOOM_RESNET18_PYTHON}"
                  "${CMAKE_BINARY_DIR}/import")
 set_tests_properties(resnet18_artifacts PROPERTIES
   SKIP_RETURN_CODE 77
@@ -158,23 +158,23 @@ set_tests_properties(test_s_expr_resnet18 PROPERTIES SKIP_RETURN_CODE 77)
 # fabsf.
 add_executable(test_capi test_capi.c)
 target_link_libraries(test_capi PRIVATE sonicboom m)
-sb_add_cpp_test(test_capi)
+boom_add_cpp_test(test_capi)
 
 # Multi-input / multi-output C ABI: one graph returning both a+b and a*b,
-# driven through sb_run_multi and the per-index introspection.
+# driven through boom_run_multi and the per-index introspection.
 add_executable(test_capi_multi test_capi_multi.c)
 target_link_libraries(test_capi_multi PRIVATE sonicboom m)
-sb_add_cpp_test(test_capi_multi)
+boom_add_cpp_test(test_capi_multi)
 
 add_executable(test_capi_parameter_view test_capi_parameter_view.c)
 target_link_libraries(test_capi_parameter_view PRIVATE sonicboom)
-sb_add_cpp_test(test_capi_parameter_view)
+boom_add_cpp_test(test_capi_parameter_view)
 
 # Deferred (:bound) parameters: compile without bytes, the binding contract,
 # per-executable binding state, and reuse through parameter views.
 add_executable(test_capi_binding test_capi_binding.c)
 target_link_libraries(test_capi_binding PRIVATE sonicboom)
-sb_add_cpp_test(test_capi_binding)
+boom_add_cpp_test(test_capi_binding)
 
 # Seeded sampling through the C ABI (Qwen2.5-7B, CUDA): determinism, seed
 # sensitivity, prefix-reuse identity, the greedy golden and grammar+sampling.
@@ -184,8 +184,8 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_capi_sampling PRIVATE sonicboom m CUDA::cudart)
   target_compile_definitions(test_capi_sampling PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
-    SONICBOOM_PRIVATE_DATA_DIR="${SB_PRIVATE_DATA_DIR}")
-  sb_add_cpp_test(test_capi_sampling)
+    SONICBOOM_PRIVATE_DATA_DIR="${BOOM_PRIVATE_DATA_DIR}")
+  boom_add_cpp_test(test_capi_sampling)
   # The token goldens are recorded under canonical numerics: the tuner's
   # arithmetic-bearing picks are fixed, so a rebuild (and an empty tune
   # directory) does not move the stream.
@@ -197,7 +197,7 @@ endif()
 # Image generation through the C ABI (MOSS-Image, CUDA, 512x512, 4 steps): the
 # pixels match `sb-moss sample` under the same settings, the same request is
 # deterministic, image 0 of a batch equals the single image, and a cancelling
-# progress callback returns SB_ERR_CANCELLED. The sb-moss reference is the
+# progress callback returns BOOM_ERR_CANCELLED. The sb-moss reference is the
 # out-of-tree tool built by tools/build_sb_moss.sh; the test skips (77) when it
 # or the model is absent.
 if(SONICBOOM_USE_CUDA)
@@ -205,8 +205,8 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_capi_image PRIVATE sonicboom m CUDA::cudart)
   target_compile_definitions(test_capi_image PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}"
-    SB_MOSS_BIN="${CMAKE_SOURCE_DIR}/tools/sb-moss")
-  sb_add_cpp_test(test_capi_image)
+    BOOM_MOSS_BIN="${CMAKE_SOURCE_DIR}/tools/sb-moss")
+  boom_add_cpp_test(test_capi_image)
   set_tests_properties(test_capi_image PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long)
 endif()
@@ -220,7 +220,7 @@ if(SONICBOOM_USE_CUDA)
   target_link_libraries(test_guarantees PRIVATE sonicboom m CUDA::cudart)
   target_compile_definitions(test_guarantees PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-  sb_add_cpp_test(test_guarantees)
+  boom_add_cpp_test(test_guarantees)
   # Its token goldens are canonical numerics (see test_capi_sampling).
   set_tests_properties(test_guarantees PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long
@@ -239,7 +239,7 @@ if(SONICBOOM_USE_CUDA)
                                                        CUDA::cudart)
   target_compile_definitions(test_plan_record_smoke PRIVATE
     SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-  sb_add_cpp_test(test_plan_record_smoke)
+  boom_add_cpp_test(test_plan_record_smoke)
   set_tests_properties(test_plan_record_smoke PROPERTIES
     SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_vram LABELS long
     ENVIRONMENT "SONICBOOM_TUNE=canonical")
@@ -249,14 +249,14 @@ endif()
 # independent double-precision reference (max-abs <= 1e-6).
 add_executable(test_adamw test_adamw.cpp)
 target_link_libraries(test_adamw PRIVATE sonicboom)
-sb_add_cpp_test(test_adamw)
+boom_add_cpp_test(test_adamw)
 
 # R7: named parameter checkpoints through the C ABI. save → load is bit-exact
 # and load order independent; malformed files and name/shape mismatches are
 # rejected without touching any target.
 add_executable(test_checkpoint test_checkpoint.cpp)
 target_link_libraries(test_checkpoint PRIVATE sonicboom)
-sb_add_cpp_test(test_checkpoint)
+boom_add_cpp_test(test_checkpoint)
 
 # Boom IR dialect test: op registration against planner::OpKind, the generated
 # assembly formats, the type verifiers. It links the compiler library
@@ -266,7 +266,7 @@ sb_add_cpp_test(test_checkpoint)
 add_executable(test_boom_dialect test_boom_dialect.cpp)
 target_link_libraries(test_boom_dialect PRIVATE sonicboom sonicboom_compiler
                                              MLIRAsmParser)
-sb_add_cpp_test(test_boom_dialect)
+boom_add_cpp_test(test_boom_dialect)
 
 # Blade -> Boom IR lowering test (docs/boom-ir.md): the
 # direct document lowering must build the same IR as
@@ -276,7 +276,7 @@ sb_add_cpp_test(test_boom_dialect)
 add_executable(test_blade_to_boom test_blade_to_boom.cpp)
 target_link_libraries(test_blade_to_boom PRIVATE sonicboom sonicboom_compiler
                                                     MLIRAsmParser)
-sb_add_cpp_test(test_blade_to_boom)
+boom_add_cpp_test(test_blade_to_boom)
 
 # F2: the Boom data-flow analyses. Transfer functions on hand-checked
 # intervals, the reduction-safety rows against the standard forward-error
@@ -285,7 +285,7 @@ sb_add_cpp_test(test_blade_to_boom)
 add_executable(test_boom_analysis test_boom_analysis.cpp)
 target_link_libraries(test_boom_analysis PRIVATE sonicboom sonicboom_compiler
                                                      MLIRAsmParser)
-sb_add_cpp_test(test_boom_analysis)
+boom_add_cpp_test(test_boom_analysis)
 
 # Graph -> Boom IR -> graph smoke test on the six model/mode cases: the
 # emitter's graph comes back structurally identical (tensor table and every
@@ -299,7 +299,7 @@ target_link_libraries(test_boom_conversion_smoke PRIVATE sonicboom
                                                     MLIRAsmParser)
 target_compile_definitions(test_boom_conversion_smoke PRIVATE
   SONICBOOM_SRC_DIR="${CMAKE_SOURCE_DIR}")
-sb_add_cpp_test(test_boom_conversion_smoke)
+boom_add_cpp_test(test_boom_conversion_smoke)
 # The graph's decode-attention geometry is a numerics-affecting choice: outside
 # canonical mode, building a graph without a model-load resolution is reported
 # as a [tune] BUG. The round trip is a structural property and takes the
@@ -324,7 +324,7 @@ set_tests_properties(test_boom_conversion_smoke PROPERTIES
 # build references no path outside this repository; when a developer sets
 # SONICBOOM_PRIVATE_TESTS_DIR, that directory's CMakeLists.txt is added here,
 # so its suites build and register into the same build and ctest run. It links
-# the same targets and reuses sb_add_cpp_test above.
+# the same targets and reuses boom_add_cpp_test above.
 if(SONICBOOM_PRIVATE_TESTS_DIR)
   add_subdirectory("${SONICBOOM_PRIVATE_TESTS_DIR}" private_tests)
 endif()

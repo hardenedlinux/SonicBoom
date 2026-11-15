@@ -79,13 +79,13 @@ Guile and the OpenAI-compatible server — to the v0.0.5 runtime. Its limits:
 - **GPU:** CUDA on sm_86. `CMAKE_CUDA_ARCHITECTURES` defaults to `native` (the
   GPU in the build machine) and is resolved at configure time; other
   architectures have not been tested. Whatever was compiled is reported by
-  `sb_build_info()` / `tools/sb-report.sh`, so a binary never has to be taken on
+  `boom_build_info()` / `tools/sb-report.sh`, so a binary never has to be taken on
   trust about which SMs it contains. One community report ran on an RTX 4060 Ti
   (Ada) with decode tokens identical to the sm_86 results, see the README's
   *Community results*. A CPU path exists but is a reference implementation, not
   a fast one.
 - **Sampling:** greedy is the zero-valued default and stays bit-identical to
-  the historical argmax path. `sb_llm_sampling` adds seeded temperature, top-k,
+  the historical argmax path. `boom_llm_sampling` adds seeded temperature, top-k,
   top-p, min-p and repeat/presence/frequency penalties, drawing from the top
   256 candidates; the same seed, position and history reproduce the same token
   independently of KV-cache capacity or prefix reuse. A penalty window above
@@ -101,7 +101,7 @@ Guile and the OpenAI-compatible server — to the v0.0.5 runtime. Its limits:
   delta, KL, same-top, top-1 agreement, determinism and prefix-reuse identity).
   A q8 KV cache is opt-in.
 - **Image generation:** MOSS-Image text-to-image is exposed through the C ABI
-  (`sb_image_*`), Guile and `/v1/images/generations`. Only the language models
+  (`boom_image_*`), Guile and `/v1/images/generations`. Only the language models
   above are benchmarked in the README.
 - **Chat template:** the serving layer picks the format from the loaded
   architecture — Gemma's `<|turn>…` turn markers, or Qwen2's ChatML — and takes

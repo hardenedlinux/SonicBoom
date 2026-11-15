@@ -355,7 +355,7 @@ bool gdn_scan_dev(const GdnDims& dims, const GdnWeights& weights,
   void* d_counter = grow_scratch(5, sizeof(unsigned int));
   if (!d_qn || !d_kn || !d_v || !d_beta || !d_eg || !d_counter) return false;
 
-  const cudaStream_t stream = sonicboom::cuda::sb_current_stream();
+  const cudaStream_t stream = sonicboom::cuda::boom_current_stream();
   const float inv_sqrt_S = 1.0f / std::sqrt((float)S);
   if (smem > 48 * 1024 &&
       cudaFuncSetAttribute(gdn_prep_kernel,

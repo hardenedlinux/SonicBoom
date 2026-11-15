@@ -139,7 +139,7 @@
 ;;   stats          (model)                        -> alist (optional)
 ;; The sampling? capability says whether `step` honors the sampler's
 ;; temperature / top-p / top-k / seed and penalties. The libsonicboom backend
-;; claims it: each `step` is one sb_llm_decode call on the persistent session,
+;; claims it: each `step` is one boom_llm_decode call on the persistent session,
 ;; and the core's sampled path (temperature > 0) keeps its draw state across
 ;; those calls, so a per-step decode samples exactly like a one-shot decode.
 ;; A backend that cannot sample returns #f (the default), and the HTTP layer

@@ -147,7 +147,7 @@ std::string spec_string(const Spec& s) {
 std::string wrapper_source(const Spec& s) {
   std::string src = device_source();
   src += "\nextern \"C\" __global__ void __launch_bounds__(" +
-         std::to_string(threads_for(s)) + ") sb_fattn_jit_" +
+         std::to_string(threads_for(s)) + ") boom_fattn_jit_" +
          std::to_string(s.id) +
          "(const __half* q, const __half* k_ws, const __half* v_ws,\n"
          " const uint64_t* start_ptr, uint64_t n_slots, uint64_t window,\n"
@@ -422,7 +422,7 @@ bool prepare(const Spec& spec, std::string* err) {
     modules()[key] = Loaded{};
     return false;
   }
-  const std::string name = "sb_fattn_jit_" + std::to_string(spec.id);
+  const std::string name = "boom_fattn_jit_" + std::to_string(spec.id);
   r = ::cuModuleGetFunction(&entry.fn, entry.module, name.c_str());
   if (r != CUDA_SUCCESS) {
     *err = "cuModuleGetFunction(" + name + ") failed";

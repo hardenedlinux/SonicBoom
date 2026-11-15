@@ -68,16 +68,16 @@ struct Df32 {
 };
 
 #if defined(__CUDACC__)
-#define SB_REDUCE_HD __host__ __device__
+#define BOOM_REDUCE_HD __host__ __device__
 #else
-#define SB_REDUCE_HD
+#define BOOM_REDUCE_HD
 #endif
 
 // Knuth's TwoSum on plain additions: s = fl(a.hi + b.hi) and the pair (s, e)
 // represents a.hi + b.hi exactly. Both low parts are folded into e with one
 // rounding each. No multiplication here, so -fmad cannot change the result;
 // plain `+`/`-` round to nearest and are never reassociated.
-SB_REDUCE_HD inline Df32 df32_add(Df32 a, Df32 b) noexcept {
+BOOM_REDUCE_HD inline Df32 df32_add(Df32 a, Df32 b) noexcept {
   const float s = a.hi + b.hi;
   const float v = s - a.hi;
   const float e0 = (a.hi - (s - v)) + (b.hi - v);
@@ -86,7 +86,7 @@ SB_REDUCE_HD inline Df32 df32_add(Df32 a, Df32 b) noexcept {
 }
 
 // TwoSum with a pure-f32 addend (lo = 0): one fewer add than df32_add.
-SB_REDUCE_HD inline Df32 df32_add_float(Df32 a, float b) noexcept {
+BOOM_REDUCE_HD inline Df32 df32_add_float(Df32 a, float b) noexcept {
   const float s = a.hi + b;
   const float v = s - a.hi;
   const float e = ((a.hi - (s - v)) + (b - v)) + a.lo;
@@ -94,8 +94,8 @@ SB_REDUCE_HD inline Df32 df32_add_float(Df32 a, float b) noexcept {
 }
 
 // The pair's value, rounded once to f32.
-SB_REDUCE_HD inline float df32_value(Df32 a) noexcept { return a.hi + a.lo; }
+BOOM_REDUCE_HD inline float df32_value(Df32 a) noexcept { return a.hi + a.lo; }
 
-#undef SB_REDUCE_HD
+#undef BOOM_REDUCE_HD
 
 } // namespace sonicboom::compiler

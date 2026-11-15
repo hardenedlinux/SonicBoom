@@ -7,7 +7,7 @@
 ;;; MMQ/attention implementation and tiles, dense path, prefetch, the training
 ;;; switches) once per device or static shape class and records it with its
 ;;; inputs, candidates, reason, numerics class and resource costs. The C ABI
-;;; exports that registry (capi.h sb_explain_*) in the two views tools/sb-explain
+;;; exports that registry (capi.h boom_explain_*) in the two views tools/sb-explain
 ;;; prints:
 ;;;
 ;;;   (explain-table) → the human table, as a string
@@ -26,14 +26,14 @@
 (define %null %null-pointer)
 
 ;; Two-call sizing (capi.h): *len_out is the byte count including the NUL and
-;; is written on both calls; a NULL buffer answers SB_ERR_BINDING, which is the
+;; is written on both calls; a NULL buffer answers BOOM_ERR_BINDING, which is the
 ;; sizing answer rather than a failure. The error handle that call leaves behind
 ;; is freed unread.
 (define (explain-bytes fn what)
   (let* ((len-bv (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
     (let ((st (fn %null 0 (bytevector->pointer len-bv) (slot-ptr err-slot))))
-      (unless (= st SB_ERR_BINDING) (sb-check! st err-slot what))
+      (unless (= st BOOM_ERR_BINDING) (sb-check! st err-slot what))
       (capture-error err-slot))                ; the expected sizing error
     (let* ((n (bytevector-u64-native-ref len-bv 0))
            (out (make-bytevector n 0))
@@ -56,7 +56,7 @@ Example:
   (string? (explain-table))
   => #t
 PyTorch: none"
-  (let ((out (explain-bytes (proc 'sb_explain_table) "explain-table")))
+  (let ((out (explain-bytes (proc 'boom_explain_table) "explain-table")))
     (pointer->string (bytevector->pointer out))))
 
 ;; JSON objects become symbol-keyed alists and arrays become lists, the same
@@ -83,7 +83,7 @@ Example:
   (assq-ref (explain-json) 'version)
   => 1
 PyTorch: none"
-  (let ((out (explain-bytes (proc 'sb_explain_json) "explain-json")))
+  (let ((out (explain-bytes (proc 'boom_explain_json) "explain-json")))
     (normalize-json
      (with-input-from-string (pointer->string (bytevector->pointer out))
        json->scm))))

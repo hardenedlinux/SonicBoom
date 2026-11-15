@@ -4,7 +4,7 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
 ;;; The (sonicboom inference) module binds the minimal LLM C ABI (capi.h
-;;; sb_llm_*) through (sonicboom ffi), which is the only path Guile uses to
+;;; boom_llm_*) through (sonicboom ffi), which is the only path Guile uses to
 ;;; reach libsonicboom.so. It exposes load-model / make-session / generate —
 ;;; a decode inference loop over the GGUF built-in tokenizer (greedy by
 ;;; default, seeded sampling when temperature > 0).
@@ -36,7 +36,7 @@
 
 ;;; --- numerics profile -------------------------------------------------------
 
-;;; The process-wide numeric contract (capi.h sb_set_numerics_profile): 'strict
+;;; The process-wide numeric contract (capi.h boom_set_numerics_profile): 'strict
 ;;; keeps every historical reduction, 'standard allows the profile's
 ;;; substitutions (today: f16 KV storage). It is latched at the first model or
 ;;; session, so call set-numerics-profile! first. Until either is called the
@@ -58,7 +58,7 @@ Note: The profile is chosen before the first model or session exists; see
 set-numerics-profile!."
   (let ((err (make-slot))
         (out (make-bytevector (sizeof int) 0)))
-    (sb-check! ((proc 'sb_get_numerics_profile) (bytevector->pointer out)
+    (sb-check! ((proc 'boom_get_numerics_profile) (bytevector->pointer out)
                 (slot-ptr err))
                err "numerics-profile")
     (case (bytevector-s32-native-ref out 0)
@@ -83,20 +83,20 @@ PyTorch: none"
                 ((strict) 0)
                 ((standard) 1)
                 (else (raise-sonicboom-error
-                       SB_ERR_BINDING 'binding
+                       BOOM_ERR_BINDING 'binding
                        (string-append "unknown numerics profile: "
                                       (object->string profile))))))
         (err (make-slot)))
-    (sb-check! ((proc 'sb_set_numerics_profile) code (slot-ptr err))
+    (sb-check! ((proc 'boom_set_numerics_profile) code (slot-ptr err))
                err "set-numerics-profile!")
     (numerics-profile)))
 
 ;;; --- helpers ----------------------------------------------------------------
 
 ;; sb-check! comes from (sonicboom ffi): it raises a &sonicboom-error carrying
-;; the C status, the sb_error_kind and the message.
+;; the C status, the boom_error_kind and the message.
 
-;; A list of token ids → a native-endian int32 bytevector (sb_token[]).
+;; A list of token ids → a native-endian int32 bytevector (boom_token[]).
 (define (tokens->bv tokens)
   (let* ((n (length tokens))
          (bv (make-bytevector (* n 4) 0)))
@@ -124,7 +124,7 @@ PyTorch: none"
         (loop (+ i 1) (cons (bytevector-s32-native-ref bv (* i 4)) acc))
         (reverse acc))))
 
-;; sb_llm_sampling as a native-layout bytevector (x86-64; see capi.h):
+;; boom_llm_sampling as a native-layout bytevector (x86-64; see capi.h):
 ;;   struct_size u64@0, temperature f32@8, top_p f32@12, top_k u32@16,
 ;;   seed u64@24, max_tokens u32@32, min_p f32@36, repeat_penalty f32@40,
 ;;   repeat_last_n u32@44, presence_penalty f32@48,
@@ -194,7 +194,7 @@ Note: GGUF is SonicBoom's model-file format; PyTorch core has no GGUF
 loader."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_model_load) (string->pointer path)
+         (st ((proc 'boom_llm_model_load) (string->pointer path)
               (slot-ptr model-slot) (slot-ptr err-slot))))
     (sb-check! st err-slot "load-model")
     (slot-ref model-slot)))
@@ -208,7 +208,7 @@ Args:
   model: a model handle from load-model.
 Returns: unspecified.
 PyTorch: none"
-  ((proc 'sb_llm_model_free) model))
+  ((proc 'boom_llm_model_free) model))
 
 ;; The model's architecture, as its GGUF declares it in general.architecture
 ;; ("gemma4", "qwen2", ...). Who formats the prompt reads this from the model
@@ -225,13 +225,13 @@ guessed from the path."
   (let* ((len-slot (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
     ;; Sizing call (cap 0): fills *len_out (the length, no NUL).
-    (let ((st ((proc 'sb_llm_model_arch) model %null-pointer 0
+    (let ((st ((proc 'boom_llm_model_arch) model %null-pointer 0
                (bytevector->pointer len-slot) (slot-ptr err-slot))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "model-arch")))
     (let* ((m (bytevector-u64-native-ref len-slot 0))
            (out (make-bytevector (+ m 1) 0))    ; +1 for the NUL terminator
-           (st ((proc 'sb_llm_model_arch) model (bytevector->pointer out) (+ m 1)
+           (st ((proc 'boom_llm_model_arch) model (bytevector->pointer out) (+ m 1)
                 (bytevector->pointer len-slot) (slot-ptr err-slot))))
       (sb-check! st err-slot "model-arch")
       (utf8->string (bytevector-range out 0 m)))))
@@ -250,13 +250,13 @@ Note: Generation stops on these ids, per model rather than per family."
   (let* ((n-slot (make-bytevector 8 0))        ; size_t
          (err-slot (make-slot)))
     ;; Sizing call (cap 0): fills *n_out (the count).
-    (let ((st ((proc 'sb_llm_model_eos) model %null-pointer 0
+    (let ((st ((proc 'boom_llm_model_eos) model %null-pointer 0
                (bytevector->pointer n-slot) (slot-ptr err-slot))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "model-eos")))
     (let* ((n (bytevector-u64-native-ref n-slot 0))
            (bv (make-bytevector (* n 4) 0))
-           (st ((proc 'sb_llm_model_eos) model (bytevector->pointer bv) n
+           (st ((proc 'boom_llm_model_eos) model (bytevector->pointer bv) n
                 (bytevector->pointer n-slot) (slot-ptr err-slot))))
       (sb-check! st err-slot "model-eos")
       (s32-bv->list bv n))))
@@ -275,7 +275,7 @@ Returns: an opaque session handle.
 PyTorch: none"
   (let* ((session-slot (make-slot))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_session_new) model n-ctx
+         (st ((proc 'boom_llm_session_new) model n-ctx
               (slot-ptr session-slot) (slot-ptr err-slot))))
     (sb-check! st err-slot "make-session")
     (slot-ref session-slot)))
@@ -287,7 +287,7 @@ Args:
   session: a session handle from make-session.
 Returns: unspecified.
 PyTorch: none"
-  ((proc 'sb_llm_session_free) session))
+  ((proc 'boom_llm_session_free) session))
 
 ;;; --- constrained decoding ---------------------------------------------------
 
@@ -310,7 +310,7 @@ Returns: unspecified.
 PyTorch: none
 Note: Constrained decoding is not part of PyTorch's generation loop."
   (let ((err-slot (make-slot)))
-    (sb-check! ((proc 'sb_llm_session_set_grammar) session
+    (sb-check! ((proc 'boom_llm_session_set_grammar) session
                 (string->pointer gbnf) (slot-ptr err-slot))
                err-slot "set-grammar!")))
 
@@ -325,7 +325,7 @@ Args:
 Returns: unspecified.
 PyTorch: none"
   (let ((err-slot (make-slot)))
-    (sb-check! ((proc 'sb_llm_session_set_json_schema) session
+    (sb-check! ((proc 'boom_llm_session_set_json_schema) session
                 (string->pointer schema-json) (slot-ptr err-slot))
                err-slot "set-json-schema!")))
 
@@ -336,7 +336,7 @@ Args:
   session: a session handle.
 Returns: unspecified.
 PyTorch: none"
-  ((proc 'sb_llm_session_clear_grammar) session))
+  ((proc 'boom_llm_session_clear_grammar) session))
 
 (define (constraint-state session)
   "The state of a session's constrained decoding.
@@ -349,7 +349,7 @@ PyTorch: none"
   (let* ((active (make-bytevector (sizeof int) 0))
          (complete (make-bytevector (sizeof int) 0))
          (err-slot (make-slot)))
-    (sb-check! ((proc 'sb_llm_session_constraint_state) session
+    (sb-check! ((proc 'boom_llm_session_constraint_state) session
                 (bytevector->pointer active) (bytevector->pointer complete)
                 (slot-ptr err-slot))
                err-slot "constraint-state")
@@ -378,16 +378,16 @@ function's arguments schema."
          (head (list (string->pointer schema-json)
                      (string->pointer prefix) (string->pointer suffix))))
     ;; Sizing call (cap 0): fills *len_out (the length, no NUL).
-    (let ((st (apply (proc 'sb_llm_json_schema_to_gbnf)
+    (let ((st (apply (proc 'boom_llm_json_schema_to_gbnf)
                      (append head
                              (list %null-pointer 0
                                    (bytevector->pointer len-slot)
                                    (slot-ptr err-slot))))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "json-schema->gbnf")))
     (let* ((m (bytevector-u64-native-ref len-slot 0))
            (out (make-bytevector (+ m 1) 0))    ; +1 for the NUL terminator
-           (st (apply (proc 'sb_llm_json_schema_to_gbnf)
+           (st (apply (proc 'boom_llm_json_schema_to_gbnf)
                       (append head
                               (list (bytevector->pointer out) (+ m 1)
                                     (bytevector->pointer len-slot)
@@ -397,24 +397,24 @@ function's arguments schema."
 
 ;;; --- tokenize / detokenize --------------------------------------------------
 
-;; sb_llm_tokenize_ex flags, from capi.h.
+;; boom_llm_tokenize_ex flags, from capi.h.
 (define sb-tokenize-parse-special 1)
 (define sb-tokenize-add-special 2)
 
-;; The two-call sizing path over sb_llm_tokenize_ex: TEXT with the given FLAGS.
+;; The two-call sizing path over boom_llm_tokenize_ex: TEXT with the given FLAGS.
 (define (tokenize-flags model text flags)
   (let* ((bv (string->utf8 text))
          (len (bytevector-length bv))
          (n-slot (make-bytevector 8 0))          ; size_t
          (err-slot (make-slot))
-         (fn (proc 'sb_llm_tokenize_ex))
+         (fn (proc 'boom_llm_tokenize_ex))
          (head (list model (bytevector->pointer bv) len flags)))
-    ;; Sizing call (cap 0): fills *n_out, returns SB_ERR_BINDING.
+    ;; Sizing call (cap 0): fills *n_out, returns BOOM_ERR_BINDING.
     (let ((st (apply fn (append head
                                 (list %null-pointer 0
                                       (bytevector->pointer n-slot)
                                       (slot-ptr err-slot))))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "tokenize")))
     (let* ((n (bytevector-u64-native-ref n-slot 0))
            (out (make-bytevector (* n 4) 0))
@@ -481,14 +481,14 @@ to hold back until the rest arrives."
              (len-slot (make-bytevector 8 0))        ; size_t
              (err-slot (make-slot)))
         ;; Sizing call (cap 0): fills *len_out (the text length, no NUL).
-        (let ((st ((proc 'sb_llm_detokenize) model (bytevector->pointer in) n
+        (let ((st ((proc 'boom_llm_detokenize) model (bytevector->pointer in) n
                    %null-pointer 0 (bytevector->pointer len-slot)
                    (slot-ptr err-slot))))
-          (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+          (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
             (sb-check! st err-slot "detokenize")))
         (let* ((m (bytevector-u64-native-ref len-slot 0))
                (out (make-bytevector (+ m 1) 0))     ; +1 for the NUL terminator
-               (st ((proc 'sb_llm_detokenize) model (bytevector->pointer in) n
+               (st ((proc 'boom_llm_detokenize) model (bytevector->pointer in) n
                      (bytevector->pointer out) (+ m 1) (bytevector->pointer len-slot)
                      (slot-ptr err-slot))))
           (sb-check! st err-slot "detokenize")
@@ -522,7 +522,7 @@ PyTorch: none"
          (n (length tokens))
          (reused-slot (make-bytevector 8 0))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_prefill) session (bytevector->pointer bv) n
+         (st ((proc 'boom_llm_prefill) session (bytevector->pointer bv) n
               (bytevector->pointer reused-slot) (slot-ptr err-slot))))
     (sb-check! st err-slot "prefill")
     (bytevector-u64-native-ref reused-slot 0)))
@@ -568,7 +568,7 @@ PyTorch: none"
                                    #:frequency-penalty frequency-penalty))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
-         (st ((proc 'sb_llm_decode) session (bytevector->pointer smp-bv)
+         (st ((proc 'boom_llm_decode) session (bytevector->pointer smp-bv)
               cb-ptr %null-pointer (bytevector->pointer n-slot)
               (slot-ptr err-slot))))
     (sb-check! st err-slot "decode")
@@ -612,7 +612,7 @@ PyTorch: none"
 
 ;;; --- streaming --------------------------------------------------------------
 ;;; The C ABI hands each produced token to a callback as it is decoded
-;;; (sb_llm_decode's sb_llm_token_cb), so a per-token stream only needs the text
+;;; (boom_llm_decode's boom_llm_token_cb), so a per-token stream only needs the text
 ;;; side to be assembled. Two things make that less trivial than "detokenize
 ;;; this token":
 ;;;
@@ -715,7 +715,7 @@ generate-stream."
                                    #:frequency-penalty frequency-penalty))
          (n-slot (make-bytevector 4 0))
          (err-slot (make-slot))
-         (st ((sb-fn 'sb_llm_decode) session (bytevector->pointer smp-bv)
+         (st ((sb-fn 'boom_llm_decode) session (bytevector->pointer smp-bv)
               cb-ptr %null-pointer (bytevector->pointer n-slot)
               (slot-ptr err-slot))))
     (if failure

@@ -4,7 +4,7 @@
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
 ;;; The (sonicboom image) module binds the MOSS-Image C ABI (capi.h
-;;; sb_image_*) through (sonicboom ffi), the only path Guile uses to reach
+;;; boom_image_*) through (sonicboom ffi), the only path Guile uses to reach
 ;;; libsonicboom.so:
 ;;;
 ;;;   Guile → (sonicboom image) → (sonicboom ffi) → libsonicboom.so
@@ -26,7 +26,7 @@
 ;;; --- errors -----------------------------------------------------------------
 
 ;; sb-check! comes from (sonicboom ffi): a C ABI failure is a &sonicboom-error
-;; with the status, the sb_error_kind and the message. A cancelled generation
+;; with the status, the boom_error_kind and the message. A cancelled generation
 ;; arrives here with kind 'cancelled.
 
 ;; Free (and NULL) whatever error an expected non-OK status left in ERR.
@@ -51,7 +51,7 @@ PyTorch: none
 Note: Diffusion-model inference is not part of PyTorch's core library."
   (let* ((model-slot (make-slot))
          (err-slot (make-slot))
-         (st ((proc 'sb_image_model_load) (string->pointer dir)
+         (st ((proc 'boom_image_model_load) (string->pointer dir)
               (slot-ptr model-slot) (slot-ptr err-slot))))
     (sb-check! st err-slot "load-image-model")
     (slot-ref model-slot)))
@@ -63,10 +63,10 @@ Args:
   model: an image-model handle from load-image-model.
 Returns: unspecified.
 PyTorch: none"
-  ((proc 'sb_image_model_free) model))
+  ((proc 'boom_image_model_free) model))
 
 ;; The architecture name, two-call sizing like the LLM surface's model-arch:
-;; the sizing call fills the length (no NUL) and reports SB_ERR_BINDING.
+;; the sizing call fills the length (no NUL) and reports BOOM_ERR_BINDING.
 (define (image-model-arch model)
   "The image model's architecture name.
 
@@ -76,21 +76,21 @@ Returns: \"moss-image\" for the model family this binding supports.
 PyTorch: none"
   (let* ((len-slot (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
-    (let ((st ((proc 'sb_image_model_arch) model %null-pointer 0
+    (let ((st ((proc 'boom_image_model_arch) model %null-pointer 0
                (bytevector->pointer len-slot) (slot-ptr err-slot))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "image-model-arch"))
       (discard-error! err-slot))
     (let* ((m (bytevector-u64-native-ref len-slot 0))
            (out (make-bytevector (+ m 1) 0))    ; +1 for the NUL terminator
-           (st ((proc 'sb_image_model_arch) model (bytevector->pointer out)
+           (st ((proc 'boom_image_model_arch) model (bytevector->pointer out)
                 (+ m 1) (bytevector->pointer len-slot) (slot-ptr err-slot))))
       (sb-check! st err-slot "image-model-arch")
       (pointer->string (bytevector->pointer out)))))
 
 ;;; --- generation -------------------------------------------------------------
 
-;; sb_image_request as a native-layout bytevector (x86-64; see capi.h):
+;; boom_image_request as a native-layout bytevector (x86-64; see capi.h):
 ;;   struct_size size_t@0, prompt ptr@8, negative_prompt ptr@16,
 ;;   width u32@24, height u32@28, steps u32@32, guidance_scale f32@36,
 ;;   seed u64@40, batch u32@48  → 56 bytes.
@@ -160,15 +160,15 @@ PyTorch: none"
          (bytes-slot (make-bytevector 8 0))
          (err-slot (make-slot)))
     ;; Two-call sizing: the byte count depends only on the request.
-    (let ((st ((proc 'sb_image_generate) model (bytevector->pointer req)
+    (let ((st ((proc 'boom_image_generate) model (bytevector->pointer req)
                %null-pointer %null-pointer %null-pointer 0
                (bytevector->pointer bytes-slot) (slot-ptr err-slot))))
-      (unless (or (sb-status-ok? st) (= st SB_ERR_BINDING))
+      (unless (or (sb-status-ok? st) (= st BOOM_ERR_BINDING))
         (sb-check! st err-slot "generate-images"))
       (discard-error! err-slot))
     (let* ((n (bytevector-u64-native-ref bytes-slot 0))
            (rgb (make-bytevector n 0))
-           (st ((proc 'sb_image_generate) model (bytevector->pointer req)
+           (st ((proc 'boom_image_generate) model (bytevector->pointer req)
                 (if cb cb %null-pointer) %null-pointer
                 (bytevector->pointer rgb) n
                 (bytevector->pointer bytes-slot) (slot-ptr err-slot))))
@@ -206,10 +206,10 @@ PyTorch: none
 Note: An rgb bytevector shorter than width*height*3 signals a
 &sonicboom-error."
   (unless (and (bytevector? rgb) (>= (bytevector-length rgb) (* width height 3)))
-    (raise-sonicboom-error SB_ERR_BINDING 'binding
+    (raise-sonicboom-error BOOM_ERR_BINDING 'binding
                            "write-png: rgb is shorter than width*height*3"))
   (let ((err-slot (make-slot)))
-    (sb-check! ((proc 'sb_image_write_png) (string->pointer path)
+    (sb-check! ((proc 'boom_image_write_png) (string->pointer path)
                 (bytevector->pointer rgb) width height (slot-ptr err-slot))
                err-slot "write-png")
     #t))

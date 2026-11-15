@@ -45,7 +45,7 @@
 //
 //   fresh (session lifecycle cost, not throughput)
 //     Every repetition creates a new session, exactly as
-//     sb_llm_session_new does: the KV cache is allocated for this session and
+//     boom_llm_session_new does: the KV cache is allocated for this session and
 //     the session-bound runtimes are warmed (the C API pays both in session
 //     creation). The first prefill is then timed separately; its runtime
 //     registries and captured prefill segment are released afterwards
@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, " best=%.3f median=%.3f\n", ms.front(), *median_ms);
   };
 
-  // Session creation, exactly what sb_llm_session_new charges to the session:
+  // Session creation, exactly what boom_llm_session_new charges to the session:
   // allocate the session's own KV cache, then build and warm the runtimes bound
   // to it (with SONICBOOM_WARMUP=0 the build moves into the first prefill).
   auto create_session = [&](uint64_t n_ctx, sbplanner::KvCacheSession& session,
@@ -343,7 +343,7 @@ int main(int argc, char** argv) {
     *ms_out = std::chrono::duration<double, std::milli>(t1 - t0).count();
     return ok;
   };
-  // Mirror sb_llm_session_free: release the runtimes bound to the session's
+  // Mirror boom_llm_session_free: release the runtimes bound to the session's
   // cache identity before dropping the set. On a library without session-keyed
   // registries there is nothing to release.
   auto destroy_session = [&](sbplanner::KvCacheSession& session) {

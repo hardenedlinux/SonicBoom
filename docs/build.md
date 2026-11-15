@@ -74,7 +74,7 @@ lists both routes.
 ### Build information
 
 Whatever was configured is compiled into the library and can be read back —
-from C with `sb_build_info()` ([`capi/include/sonicboom/capi.h`](../capi/include/sonicboom/capi.h)),
+from C with `boom_build_info()` ([`capi/include/sonicboom/capi.h`](../capi/include/sonicboom/capi.h)),
 from Guile with `(build-info)` ([`bindings/guile/README.md`](../bindings/guile/README.md)),
 and from the command line with
 [`tools/sb-report.sh`](../tools/sb-report.sh), which prints it beside the host,
@@ -123,7 +123,7 @@ LD_LIBRARY_PATH=build/core guile -L bindings/guile/scheme
 ```
 
 The same functions are available from C through
-[`capi/include/sonicboom/capi.h`](../capi/include/sonicboom/capi.h) (`sb_llm_*`).
+[`capi/include/sonicboom/capi.h`](../capi/include/sonicboom/capi.h) (`boom_llm_*`).
 To serve an OpenAI-compatible API, see
 [Serve an OpenAI-compatible API](serve-openai.md).
 

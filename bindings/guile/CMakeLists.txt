@@ -104,7 +104,7 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-model.scm)
 
   # guile-checkpoint round-trips named float32 tensors (parameters and AdamW
-  # moments) through (sonicboom checkpoint) → sb_save_params/sb_load_params,
+  # moments) through (sonicboom checkpoint) → boom_save_params/boom_load_params,
   # including the error paths; same shared-library dependency as guile-nn.
   add_test(
     NAME guile-checkpoint
@@ -116,7 +116,7 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-checkpoint.scm)
 
   # guile-explain reads the planner's decision registry through
-  # sb_explain_table/sb_explain_json and checks both views; same shared-library
+  # boom_explain_table/boom_explain_json and checks both views; same shared-library
   # dependency as guile-nn. It tunes nothing, so it needs no device.
   add_test(
     NAME guile-explain
@@ -128,7 +128,7 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-explain.scm)
 
   # guile-param replays tests/core/test_adamw.cpp's 10-step AdamW sequence
-  # through the sb_param_* surface. When a CUDA device is present the parameter
+  # through the boom_param_* surface. When a CUDA device is present the parameter
   # buffers are device-resident, so it holds the device lock.
   add_test(
     NAME guile-param
@@ -229,7 +229,7 @@ if(GUILE_EXECUTABLE)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-trace-lower.scm)
 
   # guile-train-tiny traces a whole tiny Transformer training step (forward,
-  # `backward!`, fused AdamW), compiles it with sb_compile_device and runs it
+  # `backward!`, fused AdamW), compiles it with boom_compile_device and runs it
   # on the GPU, checking every parameter gradient against the pure-Scheme
   # reference (1e-5) and that the loss falls. Same shared-library dependency
   # as guile-nn, plus the GPU.
@@ -276,7 +276,7 @@ if(GUILE_EXECUTABLE)
             -L ${CMAKE_CURRENT_SOURCE_DIR}/scheme
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/test-nn-trace.scm)
 
-  # guile-inference drives the minimal LLM C ABI (sb_llm_*) through
+  # guile-inference drives the minimal LLM C ABI (boom_llm_*) through
   # (sonicboom inference): load-model / make-session / generate. It loads the
   # real Gemma 4 GGUF (skipping cleanly when absent) and checks the generated
   # token stream against the golden decode tokens.
@@ -298,7 +298,7 @@ if(GUILE_EXECUTABLE)
     set_tests_properties(guile-inference PROPERTIES
       RESOURCE_LOCK gpu_vram LABELS long)
 
-  # guile-image drives the MOSS-Image C ABI (sb_image_*) through
+  # guile-image drives the MOSS-Image C ABI (boom_image_*) through
   # (sonicboom image): load-image-model / generate-images / write-png. It
   # loads the real MOSS-Image model (skipping cleanly when absent or without a
   # CUDA device), so it is a model-driven golden like guile-inference and takes
@@ -388,7 +388,7 @@ if(GUILE_EXECUTABLE)
   endif()
 
   # guile-cpp-e2e: the full training → export → independent C++ load loop. The
-  # Guile exporter (train + sb_export_model) writes an artifact, then the C++
+  # Guile exporter (train + boom_export_model) writes an artifact, then the C++
   # loader (test_e2e_load, built in tests/core) reloads it and checks its
   # forward outputs match the trained model's predictions.
   add_test(

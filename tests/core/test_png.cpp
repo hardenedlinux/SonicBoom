@@ -1,4 +1,4 @@
-// Known-answer test for sb_image_write_png: a 2x2 RGB image must produce the
+// Known-answer test for boom_image_write_png: a 2x2 RGB image must produce the
 // exact 82-byte PNG below. The expected bytes were computed independently
 // (Python: struct + zlib.crc32 + zlib.adler32), so this checks the signature,
 // the IHDR fields, the stored-block deflate framing, every CRC and the
@@ -51,13 +51,13 @@ void test_2x2_known_answer() {
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() /
       ("sb-test-png-" + std::to_string(::getpid()) + ".png");
-  sb_error* err = nullptr;
-  const sb_status st =
-      sb_image_write_png(path.c_str(), rgb.data(), 2, 2, &err);
-  check(st == SB_OK, "sb_image_write_png returns SB_OK");
-  if (st != SB_OK && err != nullptr) {
-    std::cerr << "    error: " << sb_error_message(err) << "\n";
-    sb_error_free(err);
+  boom_error* err = nullptr;
+  const boom_status st =
+      boom_image_write_png(path.c_str(), rgb.data(), 2, 2, &err);
+  check(st == BOOM_OK, "boom_image_write_png returns BOOM_OK");
+  if (st != BOOM_OK && err != nullptr) {
+    std::cerr << "    error: " << boom_error_message(err) << "\n";
+    boom_error_free(err);
   }
   std::ifstream in(path, std::ios::binary);
   const std::vector<uint8_t> got((std::istreambuf_iterator<char>(in)),
@@ -75,10 +75,10 @@ void test_2x2_known_answer() {
 }
 
 void test_rejects_null() {
-  sb_error* err = nullptr;
-  check(sb_image_write_png(nullptr, nullptr, 2, 2, &err) != SB_OK,
+  boom_error* err = nullptr;
+  check(boom_image_write_png(nullptr, nullptr, 2, 2, &err) != BOOM_OK,
         "NULL path/rgb is rejected");
-  if (err != nullptr) sb_error_free(err);
+  if (err != nullptr) boom_error_free(err);
 }
 
 }  // namespace

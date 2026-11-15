@@ -6,7 +6,7 @@
 ;;; Trains a small 2→4→1 MLP on XOR through the native-torch autograd surface,
 ;;; writes the trained model's predictions to <dir>/expected.bin, and exports the
 ;;; model + trained weights to <dir>/model.sx + <dir>/weights.bin via
-;;; sb_export_model. The independent C++ loader (tests/core/test_e2e_load.cpp)
+;;; boom_export_model. The independent C++ loader (tests/core/test_e2e_load.cpp)
 ;;; then loads the artifact and must reproduce expected.bin.
 ;;;
 ;;; Usage: test-e2e-export.scm <dir>

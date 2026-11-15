@@ -88,7 +88,7 @@
 #include "cuda_stream.h"
 #include "fattn_tune.h"
 
-#include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
+#include "../planner/plan_hook.h"  // BOOM_NOTE_LAUNCH (plan record; no-op when off)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -123,7 +123,7 @@ size_t g_kv_v_bytes = 0;
 
 void* grow(void*& buf, size_t& have, size_t need) {
   if (have >= need) return buf;
-  if (sonicboom::cuda::sb_capturing()) return nullptr;
+  if (sonicboom::cuda::boom_capturing()) return nullptr;
   if (buf) cudaFree(buf);
   buf = nullptr;
   have = 0;
@@ -249,7 +249,7 @@ bool stage_kv(const float* q, const float* k_batch, const float* v_batch,
   __half* v_ws = static_cast<__half*>(grow(g_kv_v, g_kv_v_bytes, need));
   if (!v_ws) return false;
 
-  cudaStream_t stream = sonicboom::cuda::sb_current_stream();
+  cudaStream_t stream = sonicboom::cuda::boom_current_stream();
 
   // Both kernels derive the span base from the device start position. The
   // key dimension is a fixed lane count (not ne_pad): the launch geometry is
@@ -260,15 +260,15 @@ bool stage_kv(const float* q, const float* k_batch, const float* v_batch,
   constexpr int kGatherKeyLanes = 32;
   const dim3 gather_grid(HEAD_DIM / 64, kGatherKeyLanes,
                          (unsigned)n_heads_kv);
-  SB_NOTE_LAUNCH_TP("boom_fattn_gather_kernel",
+  BOOM_NOTE_LAUNCH_TP("boom_fattn_gather_kernel",
                     kv_q8 ? "cache=q8" : kv_f16 ? "cache=f16" : "cache=f32",
                     gather_grid.x * gather_grid.y * gather_grid.z, 256, 0,
                     stream);
   if (kv_q8) {
-    boom_fattn_gather_kernel<sb_q8_cache><<<gather_grid, 256, 0, stream>>>(
+    boom_fattn_gather_kernel<boom_q8_cache><<<gather_grid, 256, 0, stream>>>(
         k_batch, v_batch,
-        reinterpret_cast<const sb_q8_cache*>(k_cache),
-        reinterpret_cast<const sb_q8_cache*>(v_cache), start, n_slots, n,
+        reinterpret_cast<const boom_q8_cache*>(k_cache),
+        reinterpret_cast<const boom_q8_cache*>(v_cache), start, n_slots, n,
         n_heads_kv, HEAD_DIM, ne_pad, window, k_ws, v_ws);
   } else if (kv_f16) {
     boom_fattn_gather_kernel<__half><<<gather_grid, 256, 0, stream>>>(
@@ -287,7 +287,7 @@ bool stage_kv(const float* q, const float* k_batch, const float* v_batch,
       grow(g_q16, g_q16_bytes, (size_t)q_elems * sizeof(__half)));
   if (!q16) return false;
   const int qcast_blocks = (q_elems / 8 + 255) / 256;
-  SB_NOTE_LAUNCH(boom_fattn_qcast_kernel, qcast_blocks, 256, 0, stream);
+  BOOM_NOTE_LAUNCH(boom_fattn_qcast_kernel, qcast_blocks, 256, 0, stream);
   boom_fattn_qcast_kernel<<<qcast_blocks, 256, 0, stream>>>(q, q_elems, q16);
   debug_check("qcast", stream);
 
@@ -351,13 +351,13 @@ bool run_chunk(const float* q, const float* k_batch, const float* v_batch,
                               kv_f16, kv_q8, &q16, &k_ws, &v_ws, &ne_pad))
     return false;
 
-  cudaStream_t stream = sonicboom::cuda::sb_current_stream();
+  cudaStream_t stream = sonicboom::cuda::boom_current_stream();
   const dim3 grid((unsigned)((n + BR - 1) / BR), (unsigned)n_heads_kv);
   if constexpr (QREG)
-    SB_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid.x * grid.y, WARPS * 32, smem,
+    BOOM_NOTE_LAUNCH(boom_fattn_attn_qreg_kernel, grid.x * grid.y, WARPS * 32, smem,
                    stream);
   else
-    SB_NOTE_LAUNCH(boom_fattn_attn_kernel, grid.x * grid.y, WARPS * 32, smem, stream);
+    BOOM_NOTE_LAUNCH(boom_fattn_attn_kernel, grid.x * grid.y, WARPS * 32, smem, stream);
   kernel<<<grid, WARPS * 32, smem, stream>>>(
       q16, k_ws, v_ws, start, n_slots, window, n, n_heads_q, n_heads_kv, ne_pad,
       scale, out);

@@ -4,10 +4,10 @@
 //      converted the same way (the CHW floats in its MOSIMG01 output);
 //  (b) the same request twice produces the same bytes;
 //  (c) image 0 of a batch of 2 equals the single-image result;
-//  (d) a progress callback that cancels at step 2 returns SB_ERR_CANCELLED.
+//  (d) a progress callback that cancels at step 2 returns BOOM_ERR_CANCELLED.
 //
-// Also checks the two-call sizing of sb_image_model_arch and
-// sb_image_generate. Skips (exit 77) when the model, the sb-moss binary or a
+// Also checks the two-call sizing of boom_image_model_arch and
+// boom_image_generate. Skips (exit 77) when the model, the sb-moss binary or a
 // CUDA device is absent.
 
 #include <sonicboom/capi.h>
@@ -27,8 +27,8 @@
 #ifndef SONICBOOM_SRC_DIR
 #define SONICBOOM_SRC_DIR "."
 #endif
-#ifndef SB_MOSS_BIN
-#define SB_MOSS_BIN "sb-moss"
+#ifndef BOOM_MOSS_BIN
+#define BOOM_MOSS_BIN "sb-moss"
 #endif
 
 static int g_failures = 0;
@@ -40,11 +40,11 @@ static void check(int ok, const char *what) {
   }
 }
 
-static void check_status(sb_status st, sb_error *err, const char *what) {
-  if (st != SB_OK) {
+static void check_status(boom_status st, boom_error *err, const char *what) {
+  if (st != BOOM_OK) {
     fprintf(stderr, "  FAIL: %s: %s\n", what,
-            err ? sb_error_message(err) : "(no error object)");
-    if (err) sb_error_free(err);
+            err ? boom_error_message(err) : "(no error object)");
+    if (err) boom_error_free(err);
     ++g_failures;
   }
 }
@@ -122,7 +122,7 @@ static int run_sb_moss(const char *model_dir, const char *image_out) {
     snprintf(steps, sizeof steps, "%u", STEPS);
     snprintf(seed, sizeof seed, "%u", SEED);
     snprintf(side, sizeof side, "%u", IMAGE_SIDE);
-    execl(SB_MOSS_BIN, SB_MOSS_BIN, "sample", "--model", model_dir, "--text",
+    execl(BOOM_MOSS_BIN, BOOM_MOSS_BIN, "sample", "--model", model_dir, "--text",
           PROMPT, "--height", side, "--width", side, "--steps", steps,
           "--seed", seed, "--image-out", image_out, (char *)NULL);
     _exit(127);
@@ -149,8 +149,8 @@ static int cancel_cb(void *user, uint32_t image_index, uint32_t step,
   return s->cancel_at != 0 && step >= s->cancel_at ? 1 : 0;
 }
 
-static sb_image_request make_request(uint32_t batch) {
-  sb_image_request req;
+static boom_image_request make_request(uint32_t batch) {
+  boom_image_request req;
   memset(&req, 0, sizeof req);
   req.struct_size = sizeof req;
   req.prompt = PROMPT;
@@ -175,8 +175,8 @@ int main(void) {
     fprintf(stderr, "SKIP: %s absent\n", model_dir);
     return 77;
   }
-  if (access(SB_MOSS_BIN, X_OK) != 0) {
-    fprintf(stderr, "SKIP: %s not built\n", SB_MOSS_BIN);
+  if (access(BOOM_MOSS_BIN, X_OK) != 0) {
+    fprintf(stderr, "SKIP: %s not built\n", BOOM_MOSS_BIN);
     return 77;
   }
   int ndev = 0;
@@ -213,39 +213,39 @@ int main(void) {
   convert(ref.values, ref.height, ref.width, ref_rgb);
   free(ref.values);
 
-  sb_error *err = NULL;
-  sb_image_model *model = NULL;
-  check_status(sb_image_model_load(model_dir, &model, &err), err, "load");
+  boom_error *err = NULL;
+  boom_image_model *model = NULL;
+  check_status(boom_image_model_load(model_dir, &model, &err), err, "load");
   if (model == NULL) return 1;
 
   // Architecture name, two-call sizing.
   size_t arch_len = 0;
-  check(sb_image_model_arch(model, NULL, 0, &arch_len, &err) ==
-            SB_ERR_BINDING,
+  check(boom_image_model_arch(model, NULL, 0, &arch_len, &err) ==
+            BOOM_ERR_BINDING,
         "arch: a NULL buffer asks for the size");
   if (err) {
-    sb_error_free(err);
+    boom_error_free(err);
     err = NULL;
   }
   char arch[32];
   check(arch_len == strlen("moss-image"), "arch: len excludes the NUL");
-  check_status(sb_image_model_arch(model, arch, sizeof arch, &arch_len, &err),
+  check_status(boom_image_model_arch(model, arch, sizeof arch, &arch_len, &err),
                err, "arch");
   check(strcmp(arch, "moss-image") == 0, "arch: moss-image");
 
   // (a) generate, two-call sizing first.
   uint8_t *rgb = (uint8_t *)malloc(IMAGE_BYTES);
-  sb_image_request req = make_request(1);
+  boom_image_request req = make_request(1);
   size_t needed = 0;
-  check(sb_image_generate(model, &req, NULL, NULL, NULL, 0, &needed, &err) ==
-            SB_ERR_BINDING,
+  check(boom_image_generate(model, &req, NULL, NULL, NULL, 0, &needed, &err) ==
+            BOOM_ERR_BINDING,
         "(a) a NULL buffer asks for the byte count");
   if (err) {
-    sb_error_free(err);
+    boom_error_free(err);
     err = NULL;
   }
   check(needed == IMAGE_BYTES, "(a) the byte count is 512*512*3");
-  check_status(sb_image_generate(model, &req, NULL, NULL, rgb, IMAGE_BYTES,
+  check_status(boom_image_generate(model, &req, NULL, NULL, rgb, IMAGE_BYTES,
                                  &needed, &err),
                err, "(a) generate");
   if (memcmp(rgb, ref_rgb, IMAGE_BYTES) != 0) {
@@ -259,7 +259,7 @@ int main(void) {
 
   // (b) the same request twice is identical.
   uint8_t *again = (uint8_t *)malloc(IMAGE_BYTES);
-  check_status(sb_image_generate(model, &req, NULL, NULL, again, IMAGE_BYTES,
+  check_status(boom_image_generate(model, &req, NULL, NULL, again, IMAGE_BYTES,
                                  &needed, &err),
                err, "(b) generate again");
   check(memcmp(rgb, again, IMAGE_BYTES) == 0,
@@ -267,24 +267,24 @@ int main(void) {
 
   // (c) image 0 of a batch of 2 equals the single image.
   uint8_t *pair = (uint8_t *)malloc(2 * IMAGE_BYTES);
-  sb_image_request req2 = make_request(2);
-  check_status(sb_image_generate(model, &req2, NULL, NULL, pair,
+  boom_image_request req2 = make_request(2);
+  check_status(boom_image_generate(model, &req2, NULL, NULL, pair,
                                  2 * IMAGE_BYTES, &needed, &err),
                err, "(c) generate a batch of 2");
   check(needed == 2 * IMAGE_BYTES, "(c) the batch needs 2x the bytes");
   check(memcmp(pair, rgb, IMAGE_BYTES) == 0,
         "(c) batch image 0 equals the single image");
 
-  // (d) cancelling at step 2 returns SB_ERR_CANCELLED with the cancelled kind.
+  // (d) cancelling at step 2 returns BOOM_ERR_CANCELLED with the cancelled kind.
   cancel_state state = {0, 0, 0, 2};
   err = NULL;
-  const sb_status st = sb_image_generate(model, &req, cancel_cb, &state, again,
+  const boom_status st = boom_image_generate(model, &req, cancel_cb, &state, again,
                                          IMAGE_BYTES, &needed, &err);
-  check(st == SB_ERR_CANCELLED, "(d) cancelling returns SB_ERR_CANCELLED");
-  check(err != NULL && sb_error_get_kind(err) == SB_ERRKIND_CANCELLED,
+  check(st == BOOM_ERR_CANCELLED, "(d) cancelling returns BOOM_ERR_CANCELLED");
+  check(err != NULL && boom_error_get_kind(err) == BOOM_ERRKIND_CANCELLED,
         "(d) the error kind is cancelled");
   if (err) {
-    sb_error_free(err);
+    boom_error_free(err);
     err = NULL;
   }
   check(state.calls == 2 && state.last_step == 2 && state.total == STEPS,
@@ -294,7 +294,7 @@ int main(void) {
   free(again);
   free(rgb);
   free(ref_rgb);
-  sb_image_model_free(model);
+  boom_image_model_free(model);
 
   if (g_failures != 0) {
     fprintf(stderr, "%d image failure(s)\n", g_failures);

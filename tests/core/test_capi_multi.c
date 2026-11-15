@@ -53,22 +53,22 @@ static const char *ADD_RELU_MULTI =
     "   (node relu (inputs \"b\")"
     "     (outputs (\"z\" (tensor float32 (shape 8))))))))";
 
-static sb_executable *compile_add_mul(sb_document **doc_out) {
-  sb_document *doc = NULL;
-  sb_executable *exe = NULL;
-  sb_error *err = NULL;
+static boom_executable *compile_add_mul(boom_document **doc_out) {
+  boom_document *doc = NULL;
+  boom_executable *exe = NULL;
+  boom_error *err = NULL;
 
-  if (sb_parse(ADD_RELU_MULTI, strlen(ADD_RELU_MULTI), &doc, &err) != SB_OK) {
-    fprintf(stderr, "  FAIL: parse (err: %s)\n", sb_error_message(err));
+  if (boom_parse(ADD_RELU_MULTI, strlen(ADD_RELU_MULTI), &doc, &err) != BOOM_OK) {
+    fprintf(stderr, "  FAIL: parse (err: %s)\n", boom_error_message(err));
     ++g_failures;
-    sb_error_free(err);
+    boom_error_free(err);
     return NULL;
   }
-  if (sb_compile(doc, "", &exe, &err) != SB_OK) {
-    fprintf(stderr, "  FAIL: compile (err: %s)\n", sb_error_message(err));
+  if (boom_compile(doc, "", &exe, &err) != BOOM_OK) {
+    fprintf(stderr, "  FAIL: compile (err: %s)\n", boom_error_message(err));
     ++g_failures;
-    sb_error_free(err);
-    sb_document_free(doc);
+    boom_error_free(err);
+    boom_document_free(doc);
     return NULL;
   }
   *doc_out = doc;
@@ -76,42 +76,42 @@ static sb_executable *compile_add_mul(sb_document **doc_out) {
 }
 
 static void test_arity_and_run(void) {
-  sb_document *doc = NULL;
-  sb_executable *exe = compile_add_mul(&doc);
+  boom_document *doc = NULL;
+  boom_executable *exe = compile_add_mul(&doc);
   if (!exe)
     return;
 
   size_t n_in = 0, n_out = 0;
-  check(sb_input_count(exe, &n_in) == SB_OK && n_in == 2,
+  check(boom_input_count(exe, &n_in) == BOOM_OK && n_in == 2,
         "input_count: 2");
-  check(sb_output_count(exe, &n_out) == SB_OK && n_out == 2,
+  check(boom_output_count(exe, &n_out) == BOOM_OK && n_out == 2,
         "output_count: 2");
 
-  sb_dtype dtype = SB_DTYPE_INT64;
+  boom_dtype dtype = BOOM_DTYPE_INT64;
   int64_t rank = -1;
   const int64_t *dims = NULL;
   uint64_t nbytes = 0;
-  check(sb_input_info_at(exe, 1, &dtype, &rank, &dims, &nbytes) == SB_OK,
+  check(boom_input_info_at(exe, 1, &dtype, &rank, &dims, &nbytes) == BOOM_OK,
         "input_info_at(1): success");
-  check(dtype == SB_DTYPE_FLOAT32 && rank == 1 && dims && dims[0] == 8 &&
+  check(dtype == BOOM_DTYPE_FLOAT32 && rank == 1 && dims && dims[0] == 8 &&
             nbytes == 32,
         "input_info_at(1): f32[8], 32 bytes");
-  check(sb_output_info_at(exe, 1, &dtype, &rank, &dims, &nbytes) == SB_OK,
+  check(boom_output_info_at(exe, 1, &dtype, &rank, &dims, &nbytes) == BOOM_OK,
         "output_info_at(1): success");
-  check(dtype == SB_DTYPE_FLOAT32 && rank == 1 && dims && dims[0] == 8 &&
+  check(dtype == BOOM_DTYPE_FLOAT32 && rank == 1 && dims && dims[0] == 8 &&
             nbytes == 32,
         "output_info_at(1): f32[8], 32 bytes");
 
   /* Index 0 through the old accessors still describes the first tensor. */
-  check(sb_input_info(exe, &dtype, &rank, &dims, &nbytes) == SB_OK &&
+  check(boom_input_info(exe, &dtype, &rank, &dims, &nbytes) == BOOM_OK &&
             nbytes == 32,
         "input_info: index 0 still works");
-  check(sb_output_info(exe, &dtype, &rank, &dims, &nbytes) == SB_OK &&
+  check(boom_output_info(exe, &dtype, &rank, &dims, &nbytes) == BOOM_OK &&
             nbytes == 32,
         "output_info: index 0 still works");
-  check(sb_input_info_at(exe, 2, NULL, NULL, NULL, NULL) == SB_ERR_INTERNAL,
+  check(boom_input_info_at(exe, 2, NULL, NULL, NULL, NULL) == BOOM_ERR_INTERNAL,
         "input_info_at(2): out of range rejected");
-  check(sb_output_info_at(exe, 2, NULL, NULL, NULL, NULL) == SB_ERR_INTERNAL,
+  check(boom_output_info_at(exe, 2, NULL, NULL, NULL, NULL) == BOOM_ERR_INTERNAL,
         "output_info_at(2): out of range rejected");
 
   const float a[8] = {1.0f, 2.0f, -3.0f, 4.0f, -5.0f, 6.0f, -7.0f, 8.0f};
@@ -123,10 +123,10 @@ static void test_arity_and_run(void) {
   size_t caps[2] = {sizeof(y), sizeof(z)};
   size_t written[2] = {0, 0};
 
-  sb_error *err = NULL;
-  check(sb_run_multi(exe, ins, lens, 2, outs, caps, 2, written, &err) == SB_OK,
+  boom_error *err = NULL;
+  check(boom_run_multi(exe, ins, lens, 2, outs, caps, 2, written, &err) == BOOM_OK,
         "run_multi: success");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
   check(written[0] == 32 && written[1] == 32, "run_multi: wrote 32+32 bytes");
 
@@ -145,40 +145,40 @@ static void test_arity_and_run(void) {
 
   /* The single-in/single-out wrapper refuses a two-output graph instead of
    * silently returning the first result. */
-  check(sb_bind_input(exe, a, sizeof(a), &err) == SB_OK,
+  check(boom_bind_input(exe, a, sizeof(a), &err) == BOOM_OK,
         "bind_input: still works on a multi graph");
-  check(sb_execute(exe, &err) == SB_ERR_BINDING,
+  check(boom_execute(exe, &err) == BOOM_ERR_BINDING,
         "execute: 1-out wrapper rejects a 2-output graph");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
   /* Error paths: arity, input length, output capacity. None may touch the
    * output buffers. */
   y[0] = z[0] = 123.0f;
-  check(sb_run_multi(exe, ins, lens, 1, outs, caps, 2, written, &err) ==
-            SB_ERR_BINDING,
+  check(boom_run_multi(exe, ins, lens, 1, outs, caps, 2, written, &err) ==
+            BOOM_ERR_BINDING,
         "run_multi: wrong input count rejected");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
   size_t bad_lens[2] = {sizeof(a), 4};
-  check(sb_run_multi(exe, ins, bad_lens, 2, outs, caps, 2, written, &err) ==
-            SB_ERR_BINDING,
+  check(boom_run_multi(exe, ins, bad_lens, 2, outs, caps, 2, written, &err) ==
+            BOOM_ERR_BINDING,
         "run_multi: wrong input length rejected");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
   size_t small_caps[2] = {sizeof(y), 4};
-  check(sb_run_multi(exe, ins, lens, 2, outs, small_caps, 2, written, &err) ==
-            SB_ERR_BINDING,
+  check(boom_run_multi(exe, ins, lens, 2, outs, small_caps, 2, written, &err) ==
+            BOOM_ERR_BINDING,
         "run_multi: short output buffer rejected");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
   check(y[0] == 123.0f && z[0] == 123.0f,
         "run_multi: failed binding leaves outputs untouched");
 
-  sb_executable_free(exe);
-  sb_document_free(doc);
+  boom_executable_free(exe);
+  boom_document_free(doc);
 }
 
 int main(void) {

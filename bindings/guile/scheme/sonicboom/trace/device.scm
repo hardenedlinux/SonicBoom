@@ -6,9 +6,9 @@
 ;;; An executor for (sonicboom trace tracer) that runs each cached segment on
 ;;; the GPU through the C ABI:
 ;;;
-;;;   S-Expr text → sb_parse → sb_compile_device
+;;;   S-Expr text → boom_parse → boom_compile_device
 ;;;     → Blade → Boom IR → Training passes → per-node CUDA kernels
-;;;     → sb_run_multi
+;;;     → boom_run_multi
 ;;;
 ;;; The executable is compiled once per distinct text and cached, so every
 ;;; later call of the traced function reuses the same device buffers and the
@@ -17,7 +17,7 @@
 ;;; interpreter in (sonicboom trace interp) is the reference this executes
 ;;; against.
 ;;;
-;;; Ownership: a cached segment owns its native sb_executable. A caller that
+;;; Ownership: a cached segment owns its native boom_executable. A caller that
 ;;; looks one up receives a borrowed Scheme reference to the segment. Evicting
 ;;; a segment (a different head state needs a fresh graph) only removes it from
 ;;; the cache; the native executable stays alive for as long as any caller still
@@ -46,7 +46,7 @@
 
 (define (dtype-name code)
   (or (assq-ref %dtype-by-code code)
-      (error "sonicboom-device: unknown sb_dtype code" code)))
+      (error "sonicboom-device: unknown boom_dtype code" code)))
 
 (define (dtype-size dtype)
   (case dtype
@@ -84,8 +84,8 @@ Note: a CPU-only build returns #f."
 
 (define (query-info exe index direction)
   "Descriptor (name dtype shape num-bytes) of input/output INDEX."
-  (let* ((info (if (eq? direction 'in) 'sb_input_info_at 'sb_output_info_at))
-         (named (if (eq? direction 'in) 'sb_input_name_at 'sb_output_name_at))
+  (let* ((info (if (eq? direction 'in) 'boom_input_info_at 'boom_output_info_at))
+         (named (if (eq? direction 'in) 'boom_input_name_at 'boom_output_name_at))
          (dtype-bv (make-bytevector 4 0))
          (rank-bv (make-bytevector 8 0))
          (dims-slot (make-slot))
@@ -114,7 +114,7 @@ Note: a CPU-only build returns #f."
 
 (define (query-count exe direction)
   (let* ((bv (u64-slot))
-         (st ((proc (if (eq? direction 'in) 'sb_input_count 'sb_output_count))
+         (st ((proc (if (eq? direction 'in) 'boom_input_count 'boom_output_count))
               exe (bytevector->pointer bv))))
     (unless (sb-status-ok? st)
       (error "sonicboom-device: count introspection failed" st))
@@ -124,7 +124,7 @@ Note: a CPU-only build returns #f."
   "True when the graph updates input INDEX in place on the device."
   (let ((bv (make-bytevector 4 0))
         (err-slot (make-slot)))
-    (let ((st ((proc 'sb_input_is_resident) exe index
+    (let ((st ((proc 'boom_input_is_resident) exe index
                (bytevector->pointer bv) (slot-ptr err-slot))))
       (unless (sb-status-ok? st)
         (fail "sonicboom-device: residency introspection failed" err-slot))
@@ -178,7 +178,7 @@ observes the claimed flag and does nothing."
     (set-device-segment-freed! seg #t)
     (let ((p (device-segment-exe seg)))
       (unless (null-pointer? p)
-        ((proc 'sb_executable_free) p)))))
+        ((proc 'boom_executable_free) p)))))
 
 (define (reap-device-segments!)
   "Release every evicted segment the GC has collected. Returns the count."
@@ -210,13 +210,13 @@ PyTorch: none"
   (let ((doc-slot (make-slot))
         (exe-slot (make-slot))
         (err-slot (make-slot)))
-    (let ((st ((proc 'sb_parse) (string->pointer text) (string-length text)
+    (let ((st ((proc 'boom_parse) (string->pointer text) (string-length text)
                (slot-ptr doc-slot) (slot-ptr err-slot))))
       (unless (sb-status-ok? st)
         (fail "sonicboom-device: parse failed" err-slot)))
-    (let ((st ((proc 'sb_compile_device) (slot-ref doc-slot) (slot-ptr exe-slot)
+    (let ((st ((proc 'boom_compile_device) (slot-ref doc-slot) (slot-ptr exe-slot)
                (slot-ptr err-slot))))
-      ((proc 'sb_document_free) (slot-ref doc-slot))
+      ((proc 'boom_document_free) (slot-ref doc-slot))
       (unless (sb-status-ok? st)
         (fail "sonicboom-device: compile failed" err-slot)))
     ;; From here the handle is owned by this procedure: if introspection fails,
@@ -241,7 +241,7 @@ PyTorch: none"
               seg)))
         (lambda (key . args)
           ;; No segment record owns the handle yet, so release it directly.
-          ((proc 'sb_executable_free) exe)
+          ((proc 'boom_executable_free) exe)
           (apply throw key args))))))
 
 (define (cache-lookup text)
@@ -383,7 +383,7 @@ SEGMENT's run lock (see run-device-executable)."
          (out-caps (u64-array (map (match-lambda ((_ _ _ b) b)) outputs)))
          (out-lens (u64-array (map (lambda (_) 0) outputs)))
          (err-slot (make-slot))
-         (st ((proc 'sb_run_resident) exe
+         (st ((proc 'boom_run_resident) exe
               (bytevector->pointer in-ptr) (bytevector->pointer in-lens)
               (length inputs)
               (bytevector->pointer dl-idx) (length outputs)

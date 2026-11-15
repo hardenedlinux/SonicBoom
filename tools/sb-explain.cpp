@@ -113,7 +113,7 @@ bool print_analysis(const std::string& model_path, const std::string& facts_path
   const std::string out =
       "/tmp/sb-explain-analysis-" + std::to_string(::getpid()) + ".txt";
   std::string error;
-  if (!sb_tools::run_range_analysis(model_path, facts_path, out, &error)) {
+  if (!boom_tools::run_range_analysis(model_path, facts_path, out, &error)) {
     std::cerr << "sb-explain: " << error << "\n";
     std::remove(out.c_str());
     return false;

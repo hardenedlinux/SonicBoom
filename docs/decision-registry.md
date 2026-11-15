@@ -104,8 +104,8 @@ The decision root is `$SONICBOOM_TUNE_DIR`, else
 
 ## Canonical numerics
 
-`SONICBOOM_TUNE=canonical` (or `sb_llm_model_load_ex` with
-`SB_LLM_LOAD_CANONICAL`) fixes every tuner whose pick changes arithmetic to its
+`SONICBOOM_TUNE=canonical` (or `boom_llm_model_load_ex` with
+`BOOM_LLM_LOAD_CANONICAL`) fixes every tuner whose pick changes arithmetic to its
 documented reference default and makes it read and write no tune record; the
 same model and prompt then produce the same tokens on an empty and on a
 populated tune directory. The tables are:
@@ -193,11 +193,11 @@ nothing.
 The same two views are exported through the C ABI:
 
 ```c
-sb_status sb_explain_table(char *buf, size_t cap, size_t *len_out, sb_error **);
-sb_status sb_explain_json (char *buf, size_t cap, size_t *len_out, sb_error **);
+boom_status boom_explain_table(char *buf, size_t cap, size_t *len_out, boom_error **);
+boom_status boom_explain_json (char *buf, size_t cap, size_t *len_out, boom_error **);
 ```
 
-Two-call sizing: a NULL/short buffer yields `SB_ERR_BINDING` and the byte count
+Two-call sizing: a NULL/short buffer yields `BOOM_ERR_BINDING` and the byte count
 in `*len_out`.
 
 ## Moving the warm-up table: sb-tune export and import

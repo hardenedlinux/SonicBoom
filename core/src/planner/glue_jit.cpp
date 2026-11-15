@@ -532,12 +532,12 @@ bool launch(std::string_view region, void *const *args, int blocks, int threads,
     rec->add_launch(kernel, "", unsigned(blocks), 1, 1, unsigned(threads), 1, 1,
                     static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
   }
 
   const CUresult r = cuLaunchKernel(
       function, unsigned(blocks), 1, 1, unsigned(threads), 1, 1,
-      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::boom_current_stream()),
       const_cast<void **>(args), nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%.*s': %s\n",
@@ -580,11 +580,11 @@ bool launch_attention(const compiler::AttentionShape &shape,
     rec->add_launch(key, "", unsigned(grid_x), unsigned(grid_y), 1,
                     unsigned(threads), 1, 1, static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
   }
   const CUresult r = cuLaunchKernel(
       function, unsigned(grid_x), unsigned(grid_y), 1, unsigned(threads), 1, 1,
-      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::boom_current_stream()),
       const_cast<void **>(args), nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr,
@@ -643,16 +643,16 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
                     unsigned(n_heads_kv), 1, unsigned(threads), 1, 1,
                     static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
     rec->add_launch(key + ":combine", "", unsigned(n_heads_q), 1, 1,
                     unsigned(shape.head_dim), 1, 1, 0,
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
   }
   CUresult r = cuLaunchKernel(
       partial_fn, unsigned(n_chunks), unsigned(n_heads_kv), 1,
       unsigned(threads), 1, 1, unsigned(shared_bytes),
-      CUstream(sonicboom::cuda::sb_current_stream()), part_args, nullptr);
+      CUstream(sonicboom::cuda::boom_current_stream()), part_args, nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
                  key.c_str(), cu_error(r));
@@ -660,7 +660,7 @@ bool launch_attention_decode(const compiler::AttentionShape &shape,
   }
   r = cuLaunchKernel(
       combine_fn, unsigned(n_heads_q), 1, 1, unsigned(shape.head_dim), 1, 1, 0,
-      CUstream(sonicboom::cuda::sb_current_stream()), comb_args, nullptr);
+      CUstream(sonicboom::cuda::boom_current_stream()), comb_args, nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
                  key.c_str(), cu_error(r));
@@ -728,11 +728,11 @@ bool launch_dense_gemm(const compiler::DenseGemmShape &shape, const void *x,
     rec->add_launch(key, "", unsigned(gx), unsigned(gy), 1, unsigned(threads),
                     1, 1, static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
   }
   const CUresult r = cuLaunchKernel(
       function, unsigned(gx), unsigned(gy), 1, unsigned(threads), 1, 1,
-      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::boom_current_stream()),
       args, nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",
@@ -787,11 +787,11 @@ bool launch_mmq_tc(const compiler::MmqTcShape &shape, const void *xq,
     rec->add_launch(key, "", unsigned(gx), unsigned(gy), 1, unsigned(threads),
                     1, 1, static_cast<uint64_t>(shared_bytes),
                     reinterpret_cast<const void *>(
-                        sonicboom::cuda::sb_current_stream()));
+                        sonicboom::cuda::boom_current_stream()));
   }
   const CUresult r = cuLaunchKernel(
       function, unsigned(gx), unsigned(gy), 1, unsigned(threads), 1, 1,
-      unsigned(shared_bytes), CUstream(sonicboom::cuda::sb_current_stream()),
+      unsigned(shared_bytes), CUstream(sonicboom::cuda::boom_current_stream()),
       args, nullptr);
   if (r != CUDA_SUCCESS) {
     std::fprintf(stderr, "glue JIT: cuLaunchKernel failed for '%s': %s\n",

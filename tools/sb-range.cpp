@@ -281,7 +281,7 @@ int main(int argc, char **argv) {
     // without the phase's passes) and lifts a decode clone into a boom.program,
     // so both the marked graphs and the step are reported.
     std::string error;
-    if (!sb_tools::run_range_analysis(model_path, facts_path, report_path,
+    if (!boom_tools::run_range_analysis(model_path, facts_path, report_path,
                                       &error)) {
       std::cerr << error << "\n";
       return 1;

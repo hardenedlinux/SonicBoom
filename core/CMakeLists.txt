@@ -219,15 +219,15 @@ if(SONICBOOM_USE_CUDA)
   # language is re-rooted through CMAKE_FIND_ROOT_PATH (NO_DEFAULT_PATH does
   # not bypass that), and because an absent entry is not an error here: a shim
   # on the compiler's own default include path needs no extra flag.
-  set(_sb_nvtx3_include "")
-  foreach(_sb_cuda_include IN LISTS CUDAToolkit_INCLUDE_DIRS)
-    if(EXISTS "${_sb_cuda_include}/nvtx3/nvToolsExt.h")
-      set(_sb_nvtx3_include "${_sb_cuda_include}")
+  set(_boom_nvtx3_include "")
+  foreach(_boom_cuda_include IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(EXISTS "${_boom_cuda_include}/nvtx3/nvToolsExt.h")
+      set(_boom_nvtx3_include "${_boom_cuda_include}")
       break()
     endif()
   endforeach()
-  if(_sb_nvtx3_include)
-    target_include_directories(sonicboom PRIVATE "${_sb_nvtx3_include}")
+  if(_boom_nvtx3_include)
+    target_include_directories(sonicboom PRIVATE "${_boom_nvtx3_include}")
   endif()
   # SonicBoom-owned CUDA K-quant matvec kernel (dequantize-on-the-fly gemv).
   # Compiled with nvcc (enable_language(CUDA) + CMAKE_CUDA_ARCHITECTURES=86 are
@@ -313,18 +313,18 @@ if(SONICBOOM_USE_CUDA)
   # string here and handed to NVRTC. Reading it at configure time and listing it
   # as a configure dependency is what keeps the two from drifting: editing the
   # header regenerates the string on the next build.
-  set(_sb_fattn_device
+  set(_boom_fattn_device
       "${CMAKE_CURRENT_SOURCE_DIR}/src/nn/boom_fattn_device.cuh")
-  set(_sb_fattn_src_inc
+  set(_boom_fattn_src_inc
       "${CMAKE_CURRENT_BINARY_DIR}/fattn_device_src.inc")
-  file(READ "${_sb_fattn_device}" _sb_fattn_device_text)
-  file(WRITE "${_sb_fattn_src_inc}"
+  file(READ "${_boom_fattn_device}" _boom_fattn_device_text)
+  file(WRITE "${_boom_fattn_src_inc}"
        "// Generated from src/nn/boom_fattn_device.cuh by CMake. Do not edit.\n"
-       "static const char kFattnDeviceSource[] = R\"SB_FATTN_DEVICE(\n")
-  file(APPEND "${_sb_fattn_src_inc}" "${_sb_fattn_device_text}")
-  file(APPEND "${_sb_fattn_src_inc}" ")SB_FATTN_DEVICE\";\n")
+       "static const char kFattnDeviceSource[] = R\"BOOM_FATTN_SRC(\n")
+  file(APPEND "${_boom_fattn_src_inc}" "${_boom_fattn_device_text}")
+  file(APPEND "${_boom_fattn_src_inc}" ")BOOM_FATTN_SRC\";\n")
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-               "${_sb_fattn_device}")
+               "${_boom_fattn_device}")
   target_include_directories(sonicboom PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
   # NVRTC searches no system path: the CUDA headers (<cuda_fp16.h>) have to be
@@ -332,19 +332,19 @@ if(SONICBOOM_USE_CUDA)
   # library was built against. The JIT also probes the usual locations at
   # runtime, so a program run against a differently installed toolkit still
   # finds them.
-  set(_sb_fattn_cuda_includes "")
-  foreach(_sb_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
-    if(_sb_inc)
-      if(_sb_fattn_cuda_includes)
-        string(APPEND _sb_fattn_cuda_includes ":${_sb_inc}")
+  set(_boom_fattn_cuda_includes "")
+  foreach(_boom_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(_boom_inc)
+      if(_boom_fattn_cuda_includes)
+        string(APPEND _boom_fattn_cuda_includes ":${_boom_inc}")
       else()
-        set(_sb_fattn_cuda_includes "${_sb_inc}")
+        set(_boom_fattn_cuda_includes "${_boom_inc}")
       endif()
     endif()
   endforeach()
   target_compile_definitions(sonicboom PRIVATE
     SONICBOOM_VERSION_STRING="${PROJECT_VERSION}"
-    FATTN_JIT_CUDA_INCLUDE="${_sb_fattn_cuda_includes}")
+    FATTN_JIT_CUDA_INCLUDE="${_boom_fattn_cuda_includes}")
 endif()
 
 # Vulkan backend stub (Step 3): pure C++23, no Vulkan loader. OFF by default;

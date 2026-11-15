@@ -1735,7 +1735,7 @@ static __global__ void mul_mat_q_split_k_reduce(const float * __restrict__ part,
 // nsplit slices and must use the same tile configuration for every call that
 // shares it.  The scratch is only touched on the non-stream-K path.
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8, int CFG = 0, bool GATHER = false>
-static void launch_mul_mat_q_impl(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream,
+static void launch_mul_mat_q_impl(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream,
                                   const int nsplit = 1, float * split_scratch = nullptr) {
     const int cc = props.cc;
     const int nsm = props.nsm;
@@ -1784,7 +1784,7 @@ static void launch_mul_mat_q_impl(const sb_cuda_props & props, const mmq_args & 
     if (!config.stream_k) {
         if (split_k_eff > 1) {
             const dim3 block_nums_split(nty, ntx, split_k_eff);
-            SB_NOTE_LAUNCH_TP(
+            BOOM_NOTE_LAUNCH_TP(
                 "mul_mat_q",
                 ::sonicboom::planner::plan_detail::tp_label(
                     {{"type", (long long)type}, {"J", J}, {"cfg", CFG}}),
@@ -1799,7 +1799,7 @@ static void launch_mul_mat_q_impl(const sb_cuda_props & props, const mmq_args & 
             const int64_t n_elem = int64_t(args.nrows_dst)*int64_t(args.ncols_dst);
             const int     reduce_threads = 256;
             const int64_t reduce_blocks  = (n_elem + reduce_threads - 1) / reduce_threads;
-            SB_NOTE_LAUNCH(mul_mat_q_split_k_reduce,
+            BOOM_NOTE_LAUNCH(mul_mat_q_split_k_reduce,
                            dim3((unsigned)reduce_blocks), dim3(reduce_threads), 0,
                            stream);
             mul_mat_q_split_k_reduce<<<(unsigned)reduce_blocks, reduce_threads, 0, stream>>>
@@ -1808,7 +1808,7 @@ static void launch_mul_mat_q_impl(const sb_cuda_props & props, const mmq_args & 
             return;
         }
 
-        SB_NOTE_LAUNCH_TP(
+        BOOM_NOTE_LAUNCH_TP(
             "mul_mat_q",
             ::sonicboom::planner::plan_detail::tp_label(
                 {{"type", (long long)type}, {"J", J}, {"cfg", CFG}}),
@@ -1834,7 +1834,7 @@ static void launch_mul_mat_q_impl(const sb_cuda_props & props, const mmq_args & 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
 
     // SonicBoom: plain cudaMalloc-backed scratch replaces the ggml pool.
-    sb_pool_alloc<float> tmp_fixup;
+    boom_pool_alloc<float> tmp_fixup;
     if (fixup_needed) {
         tmp_fixup.alloc(block_nums_stream_k.x * config.J*config.I);
     }
@@ -1870,7 +1870,7 @@ static constexpr bool mmq_gather_supported(ggml_type t) {
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8, int CFG = 0>
-static void launch_mul_mat_q(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream,
+static void launch_mul_mat_q(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream,
                              const int nsplit = 1, float * split_scratch = nullptr) {
     if (args.row_idx == nullptr) {
         launch_mul_mat_q_impl<type, J, fallback, prec_src1, CFG, false>(props, args, stream, nsplit, split_scratch);
@@ -1885,7 +1885,7 @@ template <ggml_type type, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
 // SonicBoom: plain device-properties parameter replaces the ggml context.
 // cfg selects a small-n tile configuration among the MMQ_CFG_COUNT candidates;
 // 0 is the imported table.  SONICBOOM_MMQ_CFG overrides it for testing.
-void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) {
+void mul_mat_q_switch_J(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) {
     const int    cc    = props.cc;
     const size_t smpbo = props.smpbo;
 
@@ -1945,7 +1945,7 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
         }
     }
 
-#define SB_MMQ_LAUNCH_CFG(J_)                                                                  \
+#define BOOM_MMQ_LAUNCH_CFG(J_)                                                                  \
     switch (cfg_eff) {                                                                         \
         case 1: launch_mul_mat_q<type, J_, fallback, prec_src1, 1>(props, args, stream, nsplit, split_scratch); break; \
         case 2: launch_mul_mat_q<type, J_, fallback, prec_src1, 2>(props, args, stream, nsplit, split_scratch); break; \
@@ -1958,10 +1958,10 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
 
     switch (J_best) {
         case   8:
-            SB_MMQ_LAUNCH_CFG(  8);
+            BOOM_MMQ_LAUNCH_CFG(  8);
             break;
         case  16:
-            SB_MMQ_LAUNCH_CFG( 16);
+            BOOM_MMQ_LAUNCH_CFG( 16);
             break;
         case  24:
             launch_mul_mat_q<type,  24, fallback, prec_src1>(props, args, stream, nsplit, split_scratch);
@@ -2010,12 +2010,12 @@ void mul_mat_q_switch_J(const sb_cuda_props & props, const mmq_args & args, cuda
             GGML_ABORT("fatal error");
             break;
     }
-#undef SB_MMQ_LAUNCH_CFG
+#undef BOOM_MMQ_LAUNCH_CFG
 }
 
 // SonicBoom: plain device-properties parameter replaces the ggml context.
 template <ggml_type type, ggml_prec prec_src1 = GGML_PREC_Q8>
-void mul_mat_q_case(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg = 0,
+void mul_mat_q_case(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg = 0,
                       int nsplit = 1, float * split_scratch = nullptr) {
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
@@ -2029,11 +2029,11 @@ void mul_mat_q_case(const sb_cuda_props & props, const mmq_args & args, cudaStre
 // SonicBoom: the explicit instantiation signature follows the plain
 // device-properties parameter.
 #define DECL_MMQ_CASE(type)                                                        \
-    template void mul_mat_q_case<type>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
+    template void mul_mat_q_case<type>(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
 
 // SonicBoom: the FP4/W4A4 instantiations are not part of this import.
 #define DECL_MMQ_CASE_W4A4(type)                                                   \
-    template void mul_mat_q_case<type, GGML_PREC_Q4>(const sb_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
+    template void mul_mat_q_case<type, GGML_PREC_Q4>(const boom_cuda_props & props, const mmq_args & args, cudaStream_t stream, int cfg, int nsplit, float * split_scratch) \
 
 // SonicBoom: only the six quant types used by SonicBoom are instantiated.
 // Upstream puts these definitions in ggml-cuda/template-instances/*.cu; this

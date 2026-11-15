@@ -17,8 +17,8 @@
 // test_checkpoint.cpp — R7: named parameter checkpoint save/load through the
 // C ABI.
 //
-// sb_save_params writes a self-describing binary file of named float32
-// tensors; sb_load_params restores values by name into existing tensors. The
+// boom_save_params writes a self-describing binary file of named float32
+// tensors; boom_load_params restores values by name into existing tensors. The
 // test covers:
 //   - bit-exact round-trip of tensors of different shapes (including a
 //     zero-numel tensor), with load order different from save order;
@@ -30,7 +30,7 @@
 //   - duplicate save names are rejected without touching an existing file;
 //   - invalid arguments and missing files report the documented status.
 //
-// This runs entirely on the CPU; sb_tensor handles are host tensors.
+// This runs entirely on the CPU; boom_tensor handles are host tensors.
 
 #include <sonicboom/capi.h>
 
@@ -56,36 +56,36 @@ void check(bool ok, const char* what) {
 
 // Run one call, print the diagnostic on failure, free the error handle and
 // clear the slot (the caller never reuses a dangling handle).
-void expect(sb_status got, sb_status want, sb_error*& err, const char* what) {
+void expect(boom_status got, boom_status want, boom_error*& err, const char* what) {
   check(got == want, what);
   if (err) {
     if (got != want)
-      std::fprintf(stderr, "  %s: %s\n", what, sb_error_message(err));
-    sb_error_free(err);
+      std::fprintf(stderr, "  %s: %s\n", what, boom_error_message(err));
+    boom_error_free(err);
     err = nullptr;
   }
 }
 
-sb_tensor* make_tensor(const std::vector<int64_t>& dims,
-                       const std::vector<float>& values, sb_error*& err,
+boom_tensor* make_tensor(const std::vector<int64_t>& dims,
+                       const std::vector<float>& values, boom_error*& err,
                        const char* what) {
-  sb_tensor* t = nullptr;
-  const sb_status st =
-      sb_tensor_from_f32(dims.data(), static_cast<int64_t>(dims.size()),
+  boom_tensor* t = nullptr;
+  const boom_status st =
+      boom_tensor_from_f32(dims.data(), static_cast<int64_t>(dims.size()),
                          values.empty() ? nullptr : values.data(),
                          values.size() * sizeof(float), &t, &err);
-  expect(st, SB_OK, err, what);
+  expect(st, BOOM_OK, err, what);
   return t;
 }
 
-std::vector<float> read_tensor(const sb_tensor* t, std::size_t numel,
-                               sb_error*& err, const char* what) {
+std::vector<float> read_tensor(const boom_tensor* t, std::size_t numel,
+                               boom_error*& err, const char* what) {
   std::vector<float> v(numel);
   std::size_t written = 0;
-  const sb_status st =
-      sb_tensor_bytes(t, v.empty() ? nullptr : v.data(), v.size() * sizeof(float),
+  const boom_status st =
+      boom_tensor_bytes(t, v.empty() ? nullptr : v.data(), v.size() * sizeof(float),
                       &written, &err);
-  expect(st, SB_OK, err, what);
+  expect(st, BOOM_OK, err, what);
   check(written == v.size() * sizeof(float), what);
   return v;
 }
@@ -109,7 +109,7 @@ bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
 } // namespace
 
 int main() {
-  sb_error* err = nullptr;
+  boom_error* err = nullptr;
   const fs::path dir = fs::temp_directory_path() / "sonicboom_checkpoint_test";
   const fs::path ckpt = dir / "params.ckpt";
   std::error_code ec;
@@ -128,35 +128,35 @@ int main() {
     norm_values[i] = 0.75f + 0.0625f * static_cast<float>(i);
   bias_values[0] = -0.375f;
 
-  sb_tensor* src_emb = make_tensor({7, 5}, emb_values, err, "source embedding");
-  sb_tensor* src_norm = make_tensor({5}, norm_values, err, "source norm");
-  sb_tensor* src_bias = make_tensor({1}, bias_values, err, "source bias");
-  sb_tensor* src_empty = make_tensor({0, 3}, {}, err, "source empty");
+  boom_tensor* src_emb = make_tensor({7, 5}, emb_values, err, "source embedding");
+  boom_tensor* src_norm = make_tensor({5}, norm_values, err, "source norm");
+  boom_tensor* src_bias = make_tensor({1}, bias_values, err, "source bias");
+  boom_tensor* src_empty = make_tensor({0, 3}, {}, err, "source empty");
   if (g_failures) {
     std::fprintf(stderr, "FAIL: tensor setup\n");
     return 1;
   }
 
   const char* save_names[] = {"embedding", "norm", "bias", "empty"};
-  const sb_tensor* save_tensors[] = {src_emb, src_norm, src_bias, src_empty};
-  expect(sb_save_params(ckpt.c_str(), save_names, save_tensors, 4, &err), SB_OK,
-         err, "sb_save_params");
+  const boom_tensor* save_tensors[] = {src_emb, src_norm, src_bias, src_empty};
+  expect(boom_save_params(ckpt.c_str(), save_names, save_tensors, 4, &err), BOOM_OK,
+         err, "boom_save_params");
   check(fs::exists(ckpt), "checkpoint file exists");
   check(fs::file_size(ckpt) > 8 + 8, "checkpoint has entries");
 
   // --- round-trip, load order independent of save order ----------------------
-  sb_tensor* dst_emb = make_tensor({7, 5}, std::vector<float>(35, 9.0f), err,
+  boom_tensor* dst_emb = make_tensor({7, 5}, std::vector<float>(35, 9.0f), err,
                                    "target embedding");
-  sb_tensor* dst_norm = make_tensor({5}, std::vector<float>(5, -9.0f), err,
+  boom_tensor* dst_norm = make_tensor({5}, std::vector<float>(5, -9.0f), err,
                                     "target norm");
-  sb_tensor* dst_bias = make_tensor({1}, std::vector<float>(1, 7.0f), err,
+  boom_tensor* dst_bias = make_tensor({1}, std::vector<float>(1, 7.0f), err,
                                     "target bias");
-  sb_tensor* dst_empty = make_tensor({0, 3}, {}, err, "target empty");
+  boom_tensor* dst_empty = make_tensor({0, 3}, {}, err, "target empty");
 
   const char* load_names[] = {"bias", "empty", "embedding", "norm"};
-  sb_tensor* load_tensors[] = {dst_bias, dst_empty, dst_emb, dst_norm};
-  expect(sb_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), SB_OK,
-         err, "sb_load_params");
+  boom_tensor* load_tensors[] = {dst_bias, dst_empty, dst_emb, dst_norm};
+  expect(boom_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), BOOM_OK,
+         err, "boom_load_params");
   check(same_bits(read_tensor(dst_emb, 35, err, "read embedding"), emb_values),
         "embedding round-trips bit-exactly");
   check(same_bits(read_tensor(dst_norm, 5, err, "read norm"), norm_values),
@@ -165,8 +165,8 @@ int main() {
         "bias round-trips bit-exactly");
 
   // Idempotent: a second load produces the same values.
-  expect(sb_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), SB_OK,
-         err, "sb_load_params again");
+  expect(boom_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), BOOM_OK,
+         err, "boom_load_params again");
   check(same_bits(read_tensor(dst_emb, 35, err, "read embedding again"),
                   emb_values),
         "second load is idempotent");
@@ -174,33 +174,33 @@ int main() {
   // --- load → save reproduces the file byte for byte -------------------------
   const fs::path ckpt2 = dir / "params2.ckpt";
   const char* rt_names[] = {"embedding", "norm", "bias", "empty"};
-  const sb_tensor* rt_tensors[] = {dst_emb, dst_norm, dst_bias, dst_empty};
-  expect(sb_save_params(ckpt2.c_str(), rt_names, rt_tensors, 4, &err), SB_OK,
-         err, "sb_save_params round-trip");
+  const boom_tensor* rt_tensors[] = {dst_emb, dst_norm, dst_bias, dst_empty};
+  expect(boom_save_params(ckpt2.c_str(), rt_names, rt_tensors, 4, &err), BOOM_OK,
+         err, "boom_save_params round-trip");
   check(read_file(ckpt) == read_file(ckpt2),
         "save → load → save is byte-identical");
 
   // --- failure paths leave every target untouched ----------------------------
-  sb_tensor* probe = make_tensor({7, 5}, std::vector<float>(35, 3.25f), err,
+  boom_tensor* probe = make_tensor({7, 5}, std::vector<float>(35, 3.25f), err,
                                  "probe embedding");
-  sb_tensor* probe_ok_shape = make_tensor({5}, std::vector<float>(5, 4.5f), err,
+  boom_tensor* probe_ok_shape = make_tensor({5}, std::vector<float>(5, 4.5f), err,
                                           "probe norm");
 
   const char* missing_names[] = {"embedding", "not_there"};
-  sb_tensor* missing_targets[] = {probe, probe_ok_shape};
-  expect(sb_load_params(ckpt.c_str(), missing_names, missing_targets, 2, &err),
-         SB_ERR_BINDING, err, "missing name is rejected");
+  boom_tensor* missing_targets[] = {probe, probe_ok_shape};
+  expect(boom_load_params(ckpt.c_str(), missing_names, missing_targets, 2, &err),
+         BOOM_ERR_BINDING, err, "missing name is rejected");
   check(same_bits(read_tensor(probe, 35, err, "probe embedding after missing"),
                   std::vector<float>(35, 3.25f)),
         "missing name leaves a matching target untouched");
 
-  sb_tensor* wrong_shape = make_tensor({6}, std::vector<float>(6, 8.0f), err,
+  boom_tensor* wrong_shape = make_tensor({6}, std::vector<float>(6, 8.0f), err,
                                        "wrong-shape norm");
   const char* mismatched_names[] = {"embedding", "norm"};
-  sb_tensor* mismatched_targets[] = {probe, wrong_shape};
+  boom_tensor* mismatched_targets[] = {probe, wrong_shape};
   expect(
-      sb_load_params(ckpt.c_str(), mismatched_names, mismatched_targets, 2, &err),
-      SB_ERR_BINDING, err, "shape mismatch is rejected");
+      boom_load_params(ckpt.c_str(), mismatched_names, mismatched_targets, 2, &err),
+      BOOM_ERR_BINDING, err, "shape mismatch is rejected");
   check(same_bits(read_tensor(probe, 35, err, "probe embedding after mismatch"),
                   std::vector<float>(35, 3.25f)),
         "shape mismatch leaves an earlier matching target untouched");
@@ -210,58 +210,58 @@ int main() {
   std::vector<char> bytes = read_file(ckpt);
   bytes[0] = 'X';
   write_file(bad_magic, bytes);
-  expect(sb_load_params(bad_magic.c_str(), missing_names, missing_targets, 2,
+  expect(boom_load_params(bad_magic.c_str(), missing_names, missing_targets, 2,
                         &err),
-         SB_ERR_WEIGHT, err, "bad magic is rejected");
+         BOOM_ERR_WEIGHT, err, "bad magic is rejected");
 
   // Truncated file.
   const fs::path truncated = dir / "truncated.ckpt";
   std::vector<char> cut = read_file(ckpt);
   cut.resize(cut.size() - 5);
   write_file(truncated, cut);
-  expect(sb_load_params(truncated.c_str(), missing_names, missing_targets, 2,
+  expect(boom_load_params(truncated.c_str(), missing_names, missing_targets, 2,
                         &err),
-         SB_ERR_WEIGHT, err, "truncated file is rejected");
+         BOOM_ERR_WEIGHT, err, "truncated file is rejected");
 
   // Trailing bytes are corruption too.
   const fs::path trailing = dir / "trailing.ckpt";
   std::vector<char> extra = read_file(ckpt);
   extra.push_back('\0');
   write_file(trailing, extra);
-  expect(sb_load_params(trailing.c_str(), missing_names, missing_targets, 2,
+  expect(boom_load_params(trailing.c_str(), missing_names, missing_targets, 2,
                         &err),
-         SB_ERR_WEIGHT, err, "trailing bytes are rejected");
+         BOOM_ERR_WEIGHT, err, "trailing bytes are rejected");
 
   // Duplicate save names are rejected before the destination is touched: the
   // existing good file must still load.
   const char* dup_names[] = {"norm", "norm"};
-  const sb_tensor* dup_tensors[] = {src_norm, src_bias};
-  expect(sb_save_params(ckpt.c_str(), dup_names, dup_tensors, 2, &err),
-         SB_ERR_BINDING, err, "duplicate save names are rejected");
-  expect(sb_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), SB_OK,
+  const boom_tensor* dup_tensors[] = {src_norm, src_bias};
+  expect(boom_save_params(ckpt.c_str(), dup_names, dup_tensors, 2, &err),
+         BOOM_ERR_BINDING, err, "duplicate save names are rejected");
+  expect(boom_load_params(ckpt.c_str(), load_names, load_tensors, 4, &err), BOOM_OK,
          err, "rejected save left the existing file intact");
 
   // Missing file, invalid arguments.
-  expect(sb_load_params((dir / "absent.ckpt").c_str(), load_names, load_tensors,
+  expect(boom_load_params((dir / "absent.ckpt").c_str(), load_names, load_tensors,
                         4, &err),
-         SB_ERR_WEIGHT, err, "missing file is rejected");
-  expect(sb_save_params(nullptr, save_names, save_tensors, 4, &err),
-         SB_ERR_INTERNAL, err, "null path is rejected");
-  expect(sb_load_params(ckpt.c_str(), nullptr, load_tensors, 1, &err),
-         SB_ERR_INTERNAL, err, "null name list is rejected");
+         BOOM_ERR_WEIGHT, err, "missing file is rejected");
+  expect(boom_save_params(nullptr, save_names, save_tensors, 4, &err),
+         BOOM_ERR_INTERNAL, err, "null path is rejected");
+  expect(boom_load_params(ckpt.c_str(), nullptr, load_tensors, 1, &err),
+         BOOM_ERR_INTERNAL, err, "null name list is rejected");
 
   // --- cleanup ---------------------------------------------------------------
-  sb_tensor_free(src_emb);
-  sb_tensor_free(src_norm);
-  sb_tensor_free(src_bias);
-  sb_tensor_free(src_empty);
-  sb_tensor_free(dst_emb);
-  sb_tensor_free(dst_norm);
-  sb_tensor_free(dst_bias);
-  sb_tensor_free(dst_empty);
-  sb_tensor_free(probe);
-  sb_tensor_free(probe_ok_shape);
-  sb_tensor_free(wrong_shape);
+  boom_tensor_free(src_emb);
+  boom_tensor_free(src_norm);
+  boom_tensor_free(src_bias);
+  boom_tensor_free(src_empty);
+  boom_tensor_free(dst_emb);
+  boom_tensor_free(dst_norm);
+  boom_tensor_free(dst_bias);
+  boom_tensor_free(dst_empty);
+  boom_tensor_free(probe);
+  boom_tensor_free(probe_ok_shape);
+  boom_tensor_free(wrong_shape);
   fs::remove_all(dir, ec);
 
   std::printf("checkpoint: 4 named tensors, bit-exact round-trip, %s\n",

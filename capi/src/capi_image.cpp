@@ -14,9 +14,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Image generation through the stable C ABI (sb_image_*): the MOSS-Image
+// Image generation through the stable C ABI (boom_image_*): the MOSS-Image
 // pipeline, a request struct, progress/cancellation, RGB HWC output and a
-// minimal PNG writer. All C++ failures are folded into sb_status/sb_error;
+// minimal PNG writer. All C++ failures are folded into boom_status/boom_error;
 // no C++ type crosses the boundary.
 
 #include <sonicboom/capi.h>
@@ -49,7 +49,7 @@ namespace moss = sonicboom::moss;
 
 }  // namespace
 
-struct sb_image_model {
+struct boom_image_model {
   std::filesystem::path root;
   std::unique_ptr<moss::MossPipeline> pipeline;
   sonicboom::vocab::Vocab vocab;
@@ -134,7 +134,7 @@ std::vector<uint8_t> zlib_stored(const std::vector<uint8_t> &raw) {
 
 // A field of a versioned request struct: read only when struct_size covers it.
 template <typename T>
-T field(const sb_image_request *req, size_t offset, T fallback) {
+T field(const boom_image_request *req, size_t offset, T fallback) {
   if (req->struct_size >= offset + sizeof(T)) {
     T value;
     std::memcpy(static_cast<void *>(&value),
@@ -144,117 +144,117 @@ T field(const sb_image_request *req, size_t offset, T fallback) {
   return fallback;
 }
 
-sb_status cancelled(sb_error **err_out) {
-  set_error(err_out, SB_ERRKIND_CANCELLED, "image generation cancelled");
-  return SB_ERR_CANCELLED;
+boom_status cancelled(boom_error **err_out) {
+  set_error(err_out, BOOM_ERRKIND_CANCELLED, "image generation cancelled");
+  return BOOM_ERR_CANCELLED;
 }
 
 }  // namespace
 
 // --- Model -----------------------------------------------------------------
 
-sb_status sb_image_model_load(const char *dir, sb_image_model **out,
-                              sb_error **err_out) {
+boom_status boom_image_model_load(const char *dir, boom_image_model **out,
+                              boom_error **err_out) {
   return guard(
-      [&]() -> sb_status {
+      [&]() -> boom_status {
         if (out == nullptr || dir == nullptr || dir[0] == '\0')
-          return SB_ERR_INTERNAL;
+          return BOOM_ERR_INTERNAL;
         *out = nullptr;
         const std::filesystem::path root(dir);
         auto pipeline = moss::MossPipeline::load(root, /*with_text=*/true);
         if (!pipeline) {
-          set_error(err_out, SB_ERRKIND_WEIGHT, pipeline.error().c_str());
-          return SB_ERR_UNSUPPORTED;
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, pipeline.error().c_str());
+          return BOOM_ERR_UNSUPPORTED;
         }
         std::filesystem::path tok = root / "tokenizer" / "tokenizer.json";
         if (!std::filesystem::exists(tok)) tok = root / "tokenizer.json";
         auto vocab = sonicboom::vocab::load_tokenizer_json(tok);
         if (!vocab) {
-          set_error(err_out, SB_ERRKIND_WEIGHT, vocab.error().c_str());
-          return SB_ERR_UNSUPPORTED;
+          set_error(err_out, BOOM_ERRKIND_WEIGHT, vocab.error().c_str());
+          return BOOM_ERR_UNSUPPORTED;
         }
-        auto model = std::make_unique<sb_image_model>();
+        auto model = std::make_unique<boom_image_model>();
         model->root = root;
         model->pipeline = std::move(*pipeline);
         model->vocab = std::move(*vocab);
         *out = model.release();
-        return SB_OK;
+        return BOOM_OK;
       },
       err_out);
 }
 
-void sb_image_model_free(sb_image_model *model) { delete model; }
+void boom_image_model_free(boom_image_model *model) { delete model; }
 
-sb_status sb_image_model_arch(const sb_image_model *model, char *out,
+boom_status boom_image_model_arch(const boom_image_model *model, char *out,
                               size_t cap, size_t *len_out,
-                              sb_error **err_out) {
+                              boom_error **err_out) {
   return guard(
-      [&]() -> sb_status {
-        if (model == nullptr || len_out == nullptr) return SB_ERR_INTERNAL;
+      [&]() -> boom_status {
+        if (model == nullptr || len_out == nullptr) return BOOM_ERR_INTERNAL;
         static constexpr char kArch[] = "moss-image";
-        // Same convention as sb_llm_model_arch: the length excludes the NUL,
+        // Same convention as boom_llm_model_arch: the length excludes the NUL,
         // and cap must leave room for it.
         const size_t needed = sizeof kArch - 1;
         *len_out = needed;
         if (out == nullptr || cap <= needed) {
-          set_error(err_out, SB_ERRKIND_BINDING,
+          set_error(err_out, BOOM_ERRKIND_BINDING,
                     "the buffer is too small for the architecture name");
-          return SB_ERR_BINDING;
+          return BOOM_ERR_BINDING;
         }
         std::memcpy(out, kArch, needed + 1);
-        return SB_OK;
+        return BOOM_OK;
       },
       err_out);
 }
 
 // --- Generation ------------------------------------------------------------
 
-sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
-                            sb_image_progress_cb cb, void *user,
+boom_status boom_image_generate(boom_image_model *model, const boom_image_request *req,
+                            boom_image_progress_cb cb, void *user,
                             uint8_t *rgb_out, size_t cap, size_t *bytes_out,
-                            sb_error **err_out) {
+                            boom_error **err_out) {
   return guard(
-      [&]() -> sb_status {
+      [&]() -> boom_status {
         if (model == nullptr || req == nullptr || bytes_out == nullptr)
-          return SB_ERR_INTERNAL;
+          return BOOM_ERR_INTERNAL;
 
-        const char *prompt = field<const char *>(req, offsetof(sb_image_request, prompt), nullptr);
+        const char *prompt = field<const char *>(req, offsetof(boom_image_request, prompt), nullptr);
         const char *negative =
-            field<const char *>(req, offsetof(sb_image_request, negative_prompt), nullptr);
+            field<const char *>(req, offsetof(boom_image_request, negative_prompt), nullptr);
         const auto width =
-            field<uint32_t>(req, offsetof(sb_image_request, width), 0);
+            field<uint32_t>(req, offsetof(boom_image_request, width), 0);
         const auto height =
-            field<uint32_t>(req, offsetof(sb_image_request, height), 0);
+            field<uint32_t>(req, offsetof(boom_image_request, height), 0);
         const auto steps =
-            field<uint32_t>(req, offsetof(sb_image_request, steps), 0);
+            field<uint32_t>(req, offsetof(boom_image_request, steps), 0);
         const auto guidance =
-            field<float>(req, offsetof(sb_image_request, guidance_scale), 3.0f);
+            field<float>(req, offsetof(boom_image_request, guidance_scale), 3.0f);
         const auto seed =
-            field<uint64_t>(req, offsetof(sb_image_request, seed), 0);
+            field<uint64_t>(req, offsetof(boom_image_request, seed), 0);
         const auto batch =
-            field<uint32_t>(req, offsetof(sb_image_request, batch), 1);
+            field<uint32_t>(req, offsetof(boom_image_request, batch), 1);
 
         if (prompt == nullptr) {
-          set_error(err_out, SB_ERRKIND_BINDING, "prompt must not be NULL");
-          return SB_ERR_BINDING;
+          set_error(err_out, BOOM_ERRKIND_BINDING, "prompt must not be NULL");
+          return BOOM_ERR_BINDING;
         }
         if (width < 16 || height < 16 || width % 16 || height % 16) {
-          set_error(err_out, SB_ERRKIND_BINDING,
+          set_error(err_out, BOOM_ERRKIND_BINDING,
                     "width and height must be multiples of 16");
-          return SB_ERR_BINDING;
+          return BOOM_ERR_BINDING;
         }
         if (steps < 1) {
-          set_error(err_out, SB_ERRKIND_BINDING, "steps must be >= 1");
-          return SB_ERR_BINDING;
+          set_error(err_out, BOOM_ERRKIND_BINDING, "steps must be >= 1");
+          return BOOM_ERR_BINDING;
         }
         if (batch < 1) {
-          set_error(err_out, SB_ERRKIND_BINDING, "batch must be >= 1");
-          return SB_ERR_BINDING;
+          set_error(err_out, BOOM_ERRKIND_BINDING, "batch must be >= 1");
+          return BOOM_ERR_BINDING;
         }
         if (!std::isfinite(guidance)) {
-          set_error(err_out, SB_ERRKIND_BINDING,
+          set_error(err_out, BOOM_ERRKIND_BINDING,
                     "guidance_scale must be finite");
-          return SB_ERR_BINDING;
+          return BOOM_ERR_BINDING;
         }
 
         // Two-call sizing: the byte count is known from the request, before
@@ -263,43 +263,43 @@ sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
             static_cast<size_t>(batch) * height * width;
         if (pixels / batch / height != width ||
             pixels > std::numeric_limits<size_t>::max() / 3) {
-          set_error(err_out, SB_ERRKIND_INTERNAL, "image buffer size overflow");
-          return SB_ERR_INTERNAL;
+          set_error(err_out, BOOM_ERRKIND_INTERNAL, "image buffer size overflow");
+          return BOOM_ERR_INTERNAL;
         }
         const size_t needed = pixels * 3;
         *bytes_out = needed;
         if (rgb_out == nullptr || cap < needed) {
-          set_error(err_out, SB_ERRKIND_BINDING,
+          set_error(err_out, BOOM_ERRKIND_BINDING,
                     "rgb_out is NULL or too small; *bytes_out has the needed "
                     "byte count");
-          return SB_ERR_BINDING;
+          return BOOM_ERR_BINDING;
         }
 
         // Conditioning: the pipeline's chat rendering, then one encoder pass
         // per prompt (the reference does the same, with no padding).
         auto encode = [&](const std::string &text,
-                          std::vector<float> &dst, int64_t &len) -> sb_status {
+                          std::vector<float> &dst, int64_t &len) -> boom_status {
           const std::string rendered = moss::moss_chat_prompt(text);
           const auto ids =
               sonicboom::vocab::tokenize(model->vocab, rendered, true, false);
           auto hidden = model->pipeline->encode(ids);
           if (!hidden) {
-            set_error(err_out, SB_ERRKIND_RUNTIME, hidden.error().c_str());
-            return SB_ERR_RUNTIME;
+            set_error(err_out, BOOM_ERRKIND_RUNTIME, hidden.error().c_str());
+            return BOOM_ERR_RUNTIME;
           }
           dst = std::move(hidden->values);
           len = hidden->tokens;
-          return SB_OK;
+          return BOOM_OK;
         };
         moss::MossConditioning cond;
-        if (const sb_status st = encode(prompt, cond.text, cond.text_len);
-            st != SB_OK)
+        if (const boom_status st = encode(prompt, cond.text, cond.text_len);
+            st != BOOM_OK)
           return st;
         const bool do_cfg = guidance != 1.0f;
         if (do_cfg) {
-          const sb_status st = encode(negative ? negative : "", cond.negative,
+          const boom_status st = encode(negative ? negative : "", cond.negative,
                                       cond.negative_len);
-          if (st != SB_OK) return st;
+          if (st != BOOM_OK) return st;
         }
 
         moss::MossPipelineConfig cfg;
@@ -343,8 +343,8 @@ sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
         if (!sampled) {
           if (was_cancelled || sampled.error() == "cancelled")
             return cancelled(err_out);
-          set_error(err_out, SB_ERRKIND_RUNTIME, sampled.error().c_str());
-          return SB_ERR_RUNTIME;
+          set_error(err_out, BOOM_ERRKIND_RUNTIME, sampled.error().c_str());
+          return BOOM_ERR_RUNTIME;
         }
 
         std::vector<moss::MossImage> images;
@@ -352,20 +352,20 @@ sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
         for (const auto &latent : *sampled) {
           auto refined = model->pipeline->refine(latent);
           if (!refined) {
-            set_error(err_out, SB_ERRKIND_RUNTIME, refined.error().c_str());
-            return SB_ERR_RUNTIME;
+            set_error(err_out, BOOM_ERRKIND_RUNTIME, refined.error().c_str());
+            return BOOM_ERR_RUNTIME;
           }
           auto image = model->pipeline->decode(*refined);
           if (!image) {
-            set_error(err_out, SB_ERRKIND_RUNTIME, image.error().c_str());
-            return SB_ERR_RUNTIME;
+            set_error(err_out, BOOM_ERRKIND_RUNTIME, image.error().c_str());
+            return BOOM_ERR_RUNTIME;
           }
           if (image->channels != 3 ||
               image->height != static_cast<int64_t>(height) ||
               image->width != static_cast<int64_t>(width)) {
-            set_error(err_out, SB_ERRKIND_INTERNAL,
+            set_error(err_out, BOOM_ERRKIND_INTERNAL,
                       "decoded image does not match the requested size");
-            return SB_ERR_INTERNAL;
+            return BOOM_ERR_INTERNAL;
           }
           images.push_back(std::move(*image));
         }
@@ -389,20 +389,20 @@ sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
           }
         }
         *bytes_out = needed;
-        return SB_OK;
+        return BOOM_OK;
       },
       err_out);
 }
 
-sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
+boom_status boom_image_write_png(const char *path, const uint8_t *rgb,
                              uint32_t width, uint32_t height,
-                             sb_error **err_out) {
+                             boom_error **err_out) {
   return guard(
-      [&]() -> sb_status {
+      [&]() -> boom_status {
         if (path == nullptr || rgb == nullptr || width == 0 || height == 0) {
-          set_error(err_out, SB_ERRKIND_INTERNAL,
+          set_error(err_out, BOOM_ERRKIND_INTERNAL,
                     "png: path, rgb, width and height are required");
-          return SB_ERR_INTERNAL;
+          return BOOM_ERR_INTERNAL;
         }
         const size_t row_bytes = static_cast<size_t>(width) * 3;
         std::vector<uint8_t> raw;
@@ -437,17 +437,17 @@ sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
 
         std::ofstream out(path, std::ios::binary);
         if (!out) {
-          set_error(err_out, SB_ERRKIND_RUNTIME,
+          set_error(err_out, BOOM_ERRKIND_RUNTIME,
                     "png: cannot open the output file");
-          return SB_ERR_RUNTIME;
+          return BOOM_ERR_RUNTIME;
         }
         out.write(reinterpret_cast<const char *>(file.data()),
                   static_cast<std::streamsize>(file.size()));
         if (!out) {
-          set_error(err_out, SB_ERRKIND_RUNTIME, "png: write failed");
-          return SB_ERR_RUNTIME;
+          set_error(err_out, BOOM_ERRKIND_RUNTIME, "png: write failed");
+          return BOOM_ERR_RUNTIME;
         }
-        return SB_OK;
+        return BOOM_OK;
       },
       err_out);
 }

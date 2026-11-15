@@ -120,7 +120,7 @@ PyTorch: none"
        (set-executable-freed! exe #t)   ; claim it before touching the pointer
        (let ((p (executable-ptr exe)))
          (unless (null-pointer? p)
-           ((proc 'sb_executable_free) p))))))
+           ((proc 'boom_executable_free) p))))))
   ;; If EXE was a text-cache entry, drop it: a later lookup must not return a
   ;; released handle. The cache's contract already forbids freeing its entries;
   ;; this makes a contract violation self-correcting instead of leaving a stale
@@ -176,20 +176,20 @@ PyTorch: none"
          (len (string-length text)))
     (define (free-doc!)
       (unless (null-pointer? (slot-ref doc-slot))
-        ((proc 'sb_document_free) (slot-ref doc-slot))
+        ((proc 'boom_document_free) (slot-ref doc-slot))
         (bytevector-fill! doc-slot 0)))
     (define (fail status)
       ;; Release the half-built handles before sb-check! raises.
       (free-doc!)
       (unless (null-pointer? (slot-ref exe-slot))
-        ((proc 'sb_executable_free) (slot-ref exe-slot))
+        ((proc 'boom_executable_free) (slot-ref exe-slot))
         (bytevector-fill! exe-slot 0))
       (sb-check! status err-slot "compile-s-expr"))
-        (let ((st ((proc 'sb_parse) txt-ptr len (slot-ptr doc-slot) (slot-ptr err-slot))))
+        (let ((st ((proc 'boom_parse) txt-ptr len (slot-ptr doc-slot) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
-        (let ((st ((proc 'sb_compile) (slot-ref doc-slot) (string->pointer "")
+        (let ((st ((proc 'boom_compile) (slot-ref doc-slot) (string->pointer "")
                    (slot-ptr exe-slot) (slot-ptr err-slot))))
-          ;; sb_compile copies what it needs out of the document; the document
+          ;; boom_compile copies what it needs out of the document; the document
           ;; handle is not retained by the executable.
           (free-doc!)
           (unless (sb-status-ok? st) (fail st)))
@@ -199,16 +199,16 @@ PyTorch: none"
               (out-bytes (make-bytevector 8 0))
               (in-count (make-bytevector 8 0))
               (out-count (make-bytevector 8 0)))
-          (let ((st ((proc 'sb_input_info) (slot-ref exe-slot) %null %null %null
+          (let ((st ((proc 'boom_input_info) (slot-ref exe-slot) %null %null %null
                      (bytevector->pointer in-bytes))))
             (unless (sb-status-ok? st) (fail st)))
-          (let ((st ((proc 'sb_output_info) (slot-ref exe-slot) %null %null %null
+          (let ((st ((proc 'boom_output_info) (slot-ref exe-slot) %null %null %null
                      (bytevector->pointer out-bytes))))
             (unless (sb-status-ok? st) (fail st)))
-          (let ((st ((proc 'sb_input_count) (slot-ref exe-slot)
+          (let ((st ((proc 'boom_input_count) (slot-ref exe-slot)
                      (bytevector->pointer in-count))))
             (unless (sb-status-ok? st) (fail st)))
-          (let ((st ((proc 'sb_output_count) (slot-ref exe-slot)
+          (let ((st ((proc 'boom_output_count) (slot-ref exe-slot)
                      (bytevector->pointer out-count))))
             (unless (sb-status-ok? st) (fail st)))
           (let ((exe (%make-executable text (slot-ref exe-slot)
@@ -289,13 +289,13 @@ PyTorch: none"
              (= (executable-output-count exe) 1))
         (executable-run-1x1 exe input-bv))
        (else
-        ;; sb_run_multi requires the exact arity; executable-run's contract is
+        ;; boom_run_multi requires the exact arity; executable-run's contract is
         ;; one input and one output. Keep the historical wrapper for any other
         ;; graph so its failure mode (a binding error naming the arity) is
         ;; unchanged.
         (executable-run-legacy exe input-bv))))))
 
-;; The one-in/one-out fast path. sb_run_multi takes the caller's input bytes
+;; The one-in/one-out fast path. boom_run_multi takes the caller's input bytes
 ;; and writes the result directly into the bytevector it returns, so neither
 ;; the bind-time copy into the executable nor the retrieve-time copy out of it
 ;; happens. The executor still copies the input into its own slot and the C ABI
@@ -307,7 +307,7 @@ PyTorch: none"
     (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
       (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
         (raise-sonicboom-error
-         SB_ERR_BINDING 'binding
+         BOOM_ERR_BINDING 'binding
          "executable-run: input size does not match the graph"))
       (let* ((cap (executable-output-nbytes exe))
              (out-bv (make-bytevector cap 0))
@@ -315,7 +315,7 @@ PyTorch: none"
              (out-caps (u64-native-bv cap))
              (in-array (make-c-struct '(*) (list (bytevector->pointer input-bv))))
              (out-array (make-c-struct '(*) (list (bytevector->pointer out-bv))))
-             (st ((proc 'sb_run_multi) (executable-ptr exe)
+             (st ((proc 'boom_run_multi) (executable-ptr exe)
                   in-array (bytevector->pointer in-lens) 1
                   out-array (bytevector->pointer out-caps) 1
                   %null (slot-ptr err-slot))))
@@ -330,18 +330,18 @@ PyTorch: none"
     (guard (c ((sonicboom-error? c) (values #f (sonicboom-error-message c))))
         (unless (= (bytevector-length input-bv) (executable-input-nbytes exe))
           (raise-sonicboom-error
-           SB_ERR_BINDING 'binding
+           BOOM_ERR_BINDING 'binding
            "executable-run: input size does not match the graph"))
-        (let ((st ((proc 'sb_bind_input) (executable-ptr exe)
+        (let ((st ((proc 'boom_bind_input) (executable-ptr exe)
                    (bytevector->pointer input-bv) (bytevector-length input-bv)
                    (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
-        (let ((st ((proc 'sb_execute) (executable-ptr exe) (slot-ptr err-slot))))
+        (let ((st ((proc 'boom_execute) (executable-ptr exe) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st)))
         (let* ((cap (executable-output-nbytes exe))
                (out-bv (make-bytevector cap 0))
                (written (make-bytevector 8 0))
-               (st ((proc 'sb_retrieve_output) (executable-ptr exe)
+               (st ((proc 'boom_retrieve_output) (executable-ptr exe)
                     (bytevector->pointer out-bv) cap
                     (bytevector->pointer written) (slot-ptr err-slot))))
           (unless (sb-status-ok? st) (fail st))
@@ -351,13 +351,13 @@ PyTorch: none"
 ;;;
 ;;; A compiled graph materializes every parameter (a graph constant) into its
 ;;; own buffers at compile time and never writes them, so a parameter can be
-;;; exposed as a zero-copy, read-only <tensor>. The view is an sb_storage handle
+;;; exposed as a zero-copy, read-only <tensor>. The view is an boom_storage handle
 ;;; owned by the tensor's storage; it pins the native implementation, so the
 ;;; tensor stays valid even after free-executable! or a cache eviction. Views
 ;;; are released by tensor-release! or, when the tensor is collected, by the
 ;;; storage guardian that reap-executables! drains.
 
-;; sb_tensor_desc layout: struct_size size_t, dtype enum (int), rank int64,
+;; boom_tensor_desc layout: struct_size size_t, dtype enum (int), rank int64,
 ;; dims pointer, num_bytes uint64, flags uint32, quant enum (int),
 ;; quant_block uint32, name pointer. The type values (uint64, int, ...) are the
 ;; (system foreign) descriptors; '*' is the pointer type symbol.
@@ -389,7 +389,7 @@ PyTorch: none"
 (define %desc-off-dims (list-ref %desc-offsets 3))
 (define %desc-off-num-bytes (list-ref %desc-offsets 4))
 
-;; sb_dtype value → Scheme dtype symbol (capi.h sb_dtype, same order).
+;; boom_dtype value → Scheme dtype symbol (capi.h boom_dtype, same order).
 (define %sb-dtypes
   (vector 'float32 'float16 'bfloat16 'float64 'int8 'uint8
           'int16 'int32 'int64 'bool))
@@ -413,7 +413,7 @@ PyTorch: none"
    (lambda ()
      (let ((count (u64-native-bv 0))
            (err-slot (make-slot)))
-       (let ((st ((proc 'sb_executable_parameter_count) (executable-ptr exe)
+       (let ((st ((proc 'boom_executable_parameter_count) (executable-ptr exe)
                   (bytevector->pointer count) (slot-ptr err-slot))))
          (unless (sb-status-ok? st)
            (sb-check! st err-slot "executable-parameter-count")))
@@ -432,7 +432,7 @@ PyTorch: none"
    (lambda ()
      (let ((name-slot (make-slot))
            (err-slot (make-slot)))
-       (let ((st ((proc 'sb_executable_parameter_name_at) (executable-ptr exe)
+       (let ((st ((proc 'boom_executable_parameter_name_at) (executable-ptr exe)
                   index (slot-ptr name-slot) (slot-ptr err-slot))))
          (unless (sb-status-ok? st)
            (sb-check! st err-slot "executable-parameter-name")))
@@ -456,12 +456,12 @@ PyTorch: none"
    (lambda ()
      (let ((view-slot (make-slot))
            (err-slot (make-slot)))
-       (let ((st ((proc 'sb_executable_parameter_view) (executable-ptr exe) index
+       (let ((st ((proc 'boom_executable_parameter_view) (executable-ptr exe) index
                   (slot-ptr view-slot) (slot-ptr err-slot))))
          (unless (sb-status-ok? st)
            (sb-check! st err-slot "executable-parameter-ref")))
        (let ((view (slot-ref view-slot)))
-         (define (release!) ((proc 'sb_storage_release) view))
+         (define (release!) ((proc 'boom_storage_release) view))
          (define (fail! st)
            (let ((msg (capture-error err-slot)))
              (release!)
@@ -470,11 +470,11 @@ PyTorch: none"
               (string-append "executable-parameter-ref: "
                              (if (string-null? msg) "invalid descriptor" msg)))))
          (let ((desc (make-desc-bv)))
-           (let ((st ((proc 'sb_storage_desc) view (bytevector->pointer desc)
+           (let ((st ((proc 'boom_storage_desc) view (bytevector->pointer desc)
                       (slot-ptr err-slot))))
              (unless (sb-status-ok? st) (fail! st)))
            (let ((data-slot (make-slot)))
-             (let ((st ((proc 'sb_storage_data) view (slot-ptr data-slot) %null
+             (let ((st ((proc 'boom_storage_data) view (slot-ptr data-slot) %null
                         (slot-ptr err-slot))))
                (unless (sb-status-ok? st) (fail! st)))
              (let* ((dtype-code (bytevector-s32-native-ref desc %desc-off-dtype))
@@ -502,7 +502,7 @@ PyTorch: none"
                (when (or (not dtype)
                          (null-pointer? data)
                          (not (= nbytes (* elements (dtype-size dtype)))))
-                 (fail! SB_ERR_INTERNAL))
+                 (fail! BOOM_ERR_INTERNAL))
                (%make-tensor dtype shape
                              (borrowed-host-storage
                               (pointer->bytevector data nbytes) exe view)
@@ -540,7 +540,7 @@ executable-bindings-complete? is false."
    exe "executable-bind-parameter!"
    (lambda ()
      (let ((err-slot (make-slot)))
-       (let ((st ((proc 'sb_bind_parameter) (executable-ptr exe)
+       (let ((st ((proc 'boom_bind_parameter) (executable-ptr exe)
                   (string->pointer name)
                   (bytevector->pointer data-bv)
                   (bytevector-length data-bv)
@@ -562,7 +562,7 @@ PyTorch: none"
    (lambda ()
      (let ((complete (make-bytevector 4 0))
            (err-slot (make-slot)))
-       (let ((st ((proc 'sb_bindings_complete) (executable-ptr exe)
+       (let ((st ((proc 'boom_bindings_complete) (executable-ptr exe)
                   (bytevector->pointer complete) (slot-ptr err-slot))))
          (unless (sb-status-ok? st)
            (sb-check! st err-slot "executable-bindings-complete?")))

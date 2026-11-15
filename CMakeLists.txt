@@ -71,8 +71,8 @@ if(SONICBOOM_SANITIZE)
       "SONICBOOM_SANITIZE='${SONICBOOM_SANITIZE}' is not supported; use "
       "'address;undefined' or 'thread' (empty for a normal build).")
   endif()
-  string(REPLACE ";" "," _sb_sanitize_list "${SONICBOOM_SANITIZE}")
-  set(SONICBOOM_SANITIZE_FLAGS "-fsanitize=${_sb_sanitize_list}")
+  string(REPLACE ";" "," _boom_sanitize_list "${SONICBOOM_SANITIZE}")
+  set(SONICBOOM_SANITIZE_FLAGS "-fsanitize=${_boom_sanitize_list}")
 
   # UBSan's vptr check has to be off. `-fsanitize=undefined` instruments every
   # virtual call and refers to `typeinfo` for the static type of the object,
@@ -201,20 +201,20 @@ set(MLIR_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/build/llvm-mlir-install"
 # re-derived, so changing MLIR_INSTALL_PREFIX takes effect on the next
 # configure without a fresh build directory.
 if(NOT DEFINED SONICBOOM_MLIR_DIR_DERIVED AND MLIR_DIR)
-  set(_sb_mlir_dir_given TRUE)
+  set(_boom_mlir_dir_given TRUE)
 endif()
 if(NOT DEFINED SONICBOOM_LLVM_DIR_DERIVED AND LLVM_DIR)
-  set(_sb_llvm_dir_given TRUE)
+  set(_boom_llvm_dir_given TRUE)
 endif()
-if(NOT MLIR_DIR OR (NOT _sb_mlir_dir_given AND NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake"))
+if(NOT MLIR_DIR OR (NOT _boom_mlir_dir_given AND NOT EXISTS "${MLIR_DIR}/MLIRConfig.cmake"))
   set(MLIR_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/mlir"
       CACHE PATH "MLIR CMake package directory" FORCE)
   set(SONICBOOM_MLIR_DIR_DERIVED TRUE CACHE INTERNAL "MLIR_DIR was derived from MLIR_INSTALL_PREFIX")
 endif()
-if(NOT LLVM_DIR OR (NOT _sb_llvm_dir_given AND NOT EXISTS "${LLVM_DIR}/LLVMConfig.cmake"))
-  get_filename_component(_sb_mlir_cmake_dir "${MLIR_DIR}" DIRECTORY)
-  if(EXISTS "${_sb_mlir_cmake_dir}/llvm/LLVMConfig.cmake")
-    set(LLVM_DIR "${_sb_mlir_cmake_dir}/llvm"
+if(NOT LLVM_DIR OR (NOT _boom_llvm_dir_given AND NOT EXISTS "${LLVM_DIR}/LLVMConfig.cmake"))
+  get_filename_component(_boom_mlir_cmake_dir "${MLIR_DIR}" DIRECTORY)
+  if(EXISTS "${_boom_mlir_cmake_dir}/llvm/LLVMConfig.cmake")
+    set(LLVM_DIR "${_boom_mlir_cmake_dir}/llvm"
         CACHE PATH "LLVM CMake package directory" FORCE)
   else()
     set(LLVM_DIR "${MLIR_INSTALL_PREFIX}/lib/cmake/llvm"
@@ -246,17 +246,17 @@ if(LLVM_VERSION_MAJOR AND NOT LLVM_VERSION_MAJOR EQUAL 23)
     "treat resulting compile/runtime failures as untriaged until it runs on 23.")
 endif()
 
-# Build info. Everything sb_build_info() reports is compiled into the library,
+# Build info. Everything boom_build_info() reports is compiled into the library,
 # so a benchmark result or a bug report can name the exact binary. See
 # capi/include/sonicboom/capi.h.
 #
-# The revision (SB_BUILD_GIT / SB_BUILD_GIT_TAG) is resolved at BUILD time, not
+# The revision (BOOM_BUILD_GIT / BOOM_BUILD_GIT_TAG) is resolved at BUILD time, not
 # at configure time: a configure-time constant goes stale as soon as the next
 # commit lands in a tree that is not re-configured. cmake/WriteBuildTag.cmake
 # rewrites the generated header only when its content changes, so rebuilding
 # after a no-op (or a build of an unchanged revision) neither recompiles capi.cpp
 # nor relinks libsonicboom.so.
-set(SONICBOOM_BUILD_TAG_HEADER "${CMAKE_BINARY_DIR}/generated/sb_build_tag.h")
+set(SONICBOOM_BUILD_TAG_HEADER "${CMAKE_BINARY_DIR}/generated/boom_build_tag.h")
 set(SONICBOOM_BUILD_TAG_SCRIPT "${CMAKE_SOURCE_DIR}/cmake/WriteBuildTag.cmake")
 find_package(Git QUIET)
 
@@ -271,26 +271,26 @@ set(SONICBOOM_BUILD_TAG_DEPS "${SONICBOOM_BUILD_TAG_SCRIPT}")
 if(GIT_EXECUTABLE)
   execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --absolute-git-dir
                   WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                  OUTPUT_VARIABLE _sb_git_dir
+                  OUTPUT_VARIABLE _boom_git_dir
                   OUTPUT_STRIP_TRAILING_WHITESPACE
-                  ERROR_QUIET RESULT_VARIABLE _sb_git_dir_rc)
-  if(_sb_git_dir_rc EQUAL 0 AND _sb_git_dir)
-    list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/HEAD"
-                "${_sb_git_dir}/index")
+                  ERROR_QUIET RESULT_VARIABLE _boom_git_dir_rc)
+  if(_boom_git_dir_rc EQUAL 0 AND _boom_git_dir)
+    list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_boom_git_dir}/HEAD"
+                "${_boom_git_dir}/index")
     # These two may legitimately not exist (a fully packed repository, a
     # packed-away branch); a dependency on a missing file would make the build
     # fail, so only real ones are listed.
-    if(EXISTS "${_sb_git_dir}/packed-refs")
-      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/packed-refs")
+    if(EXISTS "${_boom_git_dir}/packed-refs")
+      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_boom_git_dir}/packed-refs")
     endif()
     execute_process(COMMAND ${GIT_EXECUTABLE} symbolic-ref -q HEAD
                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-                    OUTPUT_VARIABLE _sb_git_ref
+                    OUTPUT_VARIABLE _boom_git_ref
                     OUTPUT_STRIP_TRAILING_WHITESPACE
-                    ERROR_QUIET RESULT_VARIABLE _sb_git_ref_rc)
-    if(_sb_git_ref_rc EQUAL 0 AND _sb_git_ref AND
-       EXISTS "${_sb_git_dir}/${_sb_git_ref}")
-      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_sb_git_dir}/${_sb_git_ref}")
+                    ERROR_QUIET RESULT_VARIABLE _boom_git_ref_rc)
+    if(_boom_git_ref_rc EQUAL 0 AND _boom_git_ref AND
+       EXISTS "${_boom_git_dir}/${_boom_git_ref}")
+      list(APPEND SONICBOOM_BUILD_TAG_DEPS "${_boom_git_dir}/${_boom_git_ref}")
     endif()
   endif()
 endif()
@@ -302,8 +302,8 @@ execute_process(COMMAND ${CMAKE_COMMAND}
                         -DSOURCE_DIR=${CMAKE_SOURCE_DIR}
                         -DOUTPUT=${SONICBOOM_BUILD_TAG_HEADER}
                         -P ${SONICBOOM_BUILD_TAG_SCRIPT}
-                RESULT_VARIABLE _sb_tag_rc)
-if(NOT _sb_tag_rc EQUAL 0)
+                RESULT_VARIABLE _boom_tag_rc)
+if(NOT _boom_tag_rc EQUAL 0)
   message(FATAL_ERROR "failed to write ${SONICBOOM_BUILD_TAG_HEADER}")
 endif()
 add_custom_command(OUTPUT ${SONICBOOM_BUILD_TAG_HEADER}
@@ -322,39 +322,39 @@ add_custom_target(sonicboom_build_tag DEPENDS ${SONICBOOM_BUILD_TAG_HEADER})
 # resolve it here the same way, with a dry run, rather than report the token.
 set(SONICBOOM_BUILD_CUDA_ARCHS "")
 if(SONICBOOM_USE_CUDA AND CMAKE_CUDA_COMPILER)
-  set(_sb_archs "${CMAKE_CUDA_ARCHITECTURES}")
-  if(_sb_archs MATCHES "^(native|all|all-major)$")
-    set(_sb_arch_probe "${CMAKE_BINARY_DIR}/sb-arch-probe.cu")
-    file(WRITE "${_sb_arch_probe}" "// SonicBoom build-info arch probe\n")
+  set(_boom_archs "${CMAKE_CUDA_ARCHITECTURES}")
+  if(_boom_archs MATCHES "^(native|all|all-major)$")
+    set(_boom_arch_probe "${CMAKE_BINARY_DIR}/sb-arch-probe.cu")
+    file(WRITE "${_boom_arch_probe}" "// SonicBoom build-info arch probe\n")
     execute_process(
-      COMMAND ${CMAKE_CUDA_COMPILER} -arch=${_sb_archs} --dryrun -cubin
-              -o ${CMAKE_BINARY_DIR}/sb-arch-probe.cubin "${_sb_arch_probe}"
-      OUTPUT_VARIABLE _sb_arch_out ERROR_VARIABLE _sb_arch_err
-      RESULT_VARIABLE _sb_arch_rc)
-    file(REMOVE "${_sb_arch_probe}" "${CMAKE_BINARY_DIR}/sb-arch-probe.cubin")
-    if(_sb_arch_rc EQUAL 0)
+      COMMAND ${CMAKE_CUDA_COMPILER} -arch=${_boom_archs} --dryrun -cubin
+              -o ${CMAKE_BINARY_DIR}/sb-arch-probe.cubin "${_boom_arch_probe}"
+      OUTPUT_VARIABLE _boom_arch_out ERROR_VARIABLE _boom_arch_err
+      RESULT_VARIABLE _boom_arch_rc)
+    file(REMOVE "${_boom_arch_probe}" "${CMAKE_BINARY_DIR}/sb-arch-probe.cubin")
+    if(_boom_arch_rc EQUAL 0)
       # The dry run prints the resolved toolchain commands; the SM number is the
       # one cicc is invoked with (`-arch compute_86`), which is exactly what
       # ptxas then compiles for (`-arch=sm_86`).
-      string(REGEX MATCHALL "compute_[0-9]+" _sb_arch_hits "${_sb_arch_out}${_sb_arch_err}")
-      foreach(_hit IN LISTS _sb_arch_hits)
+      string(REGEX MATCHALL "compute_[0-9]+" _boom_arch_hits "${_boom_arch_out}${_boom_arch_err}")
+      foreach(_hit IN LISTS _boom_arch_hits)
         string(REGEX REPLACE "compute_" "" _num "${_hit}")
-        list(APPEND _sb_arch_nums "${_num}")
+        list(APPEND _boom_arch_nums "${_num}")
       endforeach()
-      list(REMOVE_DUPLICATES _sb_arch_nums)
-      list(JOIN _sb_arch_nums "," SONICBOOM_BUILD_CUDA_ARCHS)
+      list(REMOVE_DUPLICATES _boom_arch_nums)
+      list(JOIN _boom_arch_nums "," SONICBOOM_BUILD_CUDA_ARCHS)
     endif()
     if(NOT SONICBOOM_BUILD_CUDA_ARCHS)
-      set(SONICBOOM_BUILD_CUDA_ARCHS "${_sb_archs}")  # unresolvable: report the token
+      set(SONICBOOM_BUILD_CUDA_ARCHS "${_boom_archs}")  # unresolvable: report the token
     endif()
   else()
     # A plain list, e.g. "86" or "80;86"; CMake also allows '86-real'/'86-virtual'.
-    foreach(_a IN LISTS _sb_archs)
+    foreach(_a IN LISTS _boom_archs)
       string(REGEX REPLACE "-(real|virtual)$" "" _num "${_a}")
-      list(APPEND _sb_arch_nums "${_num}")
+      list(APPEND _boom_arch_nums "${_num}")
     endforeach()
-    list(REMOVE_DUPLICATES _sb_arch_nums)
-    list(JOIN _sb_arch_nums "," SONICBOOM_BUILD_CUDA_ARCHS)
+    list(REMOVE_DUPLICATES _boom_arch_nums)
+    list(JOIN _boom_arch_nums "," SONICBOOM_BUILD_CUDA_ARCHS)
   endif()
 endif()
 
@@ -364,7 +364,7 @@ if(SONICBOOM_USE_CUDA AND CUDAToolkit_VERSION)
 endif()
 
 # MLIR is required, so these are always a real version/origin; the "none"
-# defaults are kept only because sb_build_info() declares the fields and a
+# defaults are kept only because boom_build_info() declares the fields and a
 # CPU/toolchain-only reader should not have to know that.
 set(SONICBOOM_BUILD_LLVM_VERSION "none")
 set(SONICBOOM_BUILD_LLVM_MAJOR "0")
@@ -379,8 +379,8 @@ if(LLVM_VERSION_MAJOR)
 endif()
 # 'bundled' = the install tools/mlir/build-mlir.sh produces inside this source
 # tree; anything else is an external LLVM/MLIR.
-string(FIND "${MLIR_INSTALL_PREFIX}" "${CMAKE_SOURCE_DIR}" _sb_prefix_in_src)
-if(_sb_prefix_in_src EQUAL 0)
+string(FIND "${MLIR_INSTALL_PREFIX}" "${CMAKE_SOURCE_DIR}" _boom_prefix_in_src)
+if(_boom_prefix_in_src EQUAL 0)
   set(SONICBOOM_BUILD_LLVM_ORIGIN "bundled")
 else()
   set(SONICBOOM_BUILD_LLVM_ORIGIN "external")

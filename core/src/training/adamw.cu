@@ -71,7 +71,7 @@ bool adamw_dev(std::uint64_t param, std::uint64_t grad, std::uint64_t m1,
   int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
   if (blocks > 4096) blocks = 4096;
 
-  adamw_kernel<<<blocks, kThreads, 0, ::sonicboom::cuda::sb_current_stream()>>>(
+  adamw_kernel<<<blocks, kThreads, 0, ::sonicboom::cuda::boom_current_stream()>>>(
       reinterpret_cast<float*>(param), reinterpret_cast<const float*>(grad),
       reinterpret_cast<float*>(m1), reinterpret_cast<float*>(m2), total,
       cfg.lr, cfg.beta1, cfg.beta2, bc1_scale, bc2_scale, cfg.eps,

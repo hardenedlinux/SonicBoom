@@ -156,7 +156,7 @@ bool download(uint64_t handle, void* host, uint64_t bytes) {
   // capture (see cuda::CaptureScope) skip the copy: the caller recovers the
   // result from a persistent device slot after replay, so the graph records
   // only the capturable device work.
-  if (sonicboom::cuda::sb_capturing()) return true;
+  if (sonicboom::cuda::boom_capturing()) return true;
   return cudaMemcpy(host, reinterpret_cast<const void*>(handle), bytes,
                     cudaMemcpyDeviceToHost) == cudaSuccess;
 #else
@@ -171,7 +171,7 @@ bool device_copy(uint64_t src, uint64_t dst, uint64_t bytes) {
   return cudaMemcpyAsync(reinterpret_cast<void*>(dst),
                          reinterpret_cast<const void*>(src), bytes,
                          cudaMemcpyDeviceToDevice,
-                         sonicboom::cuda::sb_current_stream()) == cudaSuccess;
+                         sonicboom::cuda::boom_current_stream()) == cudaSuccess;
 #else
   (void)src; (void)dst; (void)bytes;
   return false;
@@ -182,7 +182,7 @@ bool memset_device(uint64_t handle, int value, uint64_t bytes) {
 #ifdef SONICBOOM_USE_CUDA
   if (handle == 0 || bytes == 0) return false;
   return cudaMemsetAsync(reinterpret_cast<void*>(handle), value, bytes,
-                         sonicboom::cuda::sb_current_stream()) == cudaSuccess;
+                         sonicboom::cuda::boom_current_stream()) == cudaSuccess;
 #else
   (void)handle; (void)value; (void)bytes;
   return false;
@@ -261,7 +261,7 @@ bool staging_begin(Staging* s) {
   // the copies: a slot handed back by the LRU may still be read by an earlier
   // node's kernel. The synchronous cudaMemcpy this replaces got that ordering
   // implicitly; here it is an event.
-  if (cudaEventRecord(s->wake, sonicboom::cuda::sb_current_stream()) !=
+  if (cudaEventRecord(s->wake, sonicboom::cuda::boom_current_stream()) !=
       cudaSuccess)
     return false;
   return cudaStreamWaitEvent(s->copy, s->wake, 0) == cudaSuccess;
@@ -313,7 +313,7 @@ bool staging_commit(Staging* s) {
 #ifdef SONICBOOM_USE_CUDA
   if (!s) return false;
   if (cudaEventRecord(s->ready, s->copy) != cudaSuccess) return false;
-  return cudaStreamWaitEvent(sonicboom::cuda::sb_current_stream(), s->ready,
+  return cudaStreamWaitEvent(sonicboom::cuda::boom_current_stream(), s->ready,
                              0) == cudaSuccess;
 #else
   (void)s;

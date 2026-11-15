@@ -46,7 +46,7 @@
 namespace sonicboom::nn::cuda::fattn_jit {
 
 // The candidate's launch geometry and layout knobs. `id` only names the
-// generated entry point (sb_fattn_jit_<id>).
+// generated entry point (boom_fattn_jit_<id>).
 struct Spec {
   int id = 0;
   int head_dim = 512;

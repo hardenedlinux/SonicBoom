@@ -40,7 +40,7 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "boom_fattn_device.cuh"  // sb_mma_f32, sb_cp_commit, sb_cp_wait
+#include "boom_fattn_device.cuh"  // boom_mma_f32, boom_cp_commit, boom_cp_wait
 #include "fdec_partition.h"
 
 namespace sonicboom::nn::cuda {
@@ -271,16 +271,16 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
       fdec_cp_async_16(kd + size_t(key) * NPAD + dd, k_cache + row, in);
       fdec_cp_async_16(vd + size_t(key) * NPAD + dd, v_cache + row, in);
     }
-    sb_cp_commit();
+    boom_cp_commit();
   };
   const int npre = ntiles < STAGES ? ntiles : STAGES;
   for (int i = 0; i < npre; ++i) stage(t_lo + i, i);
   if (npre == 1) {
-    sb_cp_wait<0>();
+    boom_cp_wait<0>();
   } else if (npre == 2) {
-    sb_cp_wait<1>();
+    boom_cp_wait<1>();
   } else {
-    sb_cp_wait<2>();
+    boom_cp_wait<2>();
   }
   __syncthreads();
 
@@ -339,7 +339,7 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
           if (nt >= NTS) continue;
           uint32_t bk[2];
           fdec_ldm_k(bk, kt, NPAD, k0, nt * 8);
-          sb_mma_f32(s[mt][ni], aq, bk);
+          boom_mma_f32(s[mt][ni], aq, bk);
         }
       }
     }
@@ -386,8 +386,8 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
         mx0 = fmaxf(mx0, fmaxf(sv[0], sv[1]));
         mx1 = fmaxf(mx1, fmaxf(sv[2], sv[3]));
       }
-      mx0 = sb_rmax4(mx0);
-      mx1 = sb_rmax4(mx1);
+      mx0 = boom_rmax4(mx0);
+      mx1 = boom_rmax4(mx1);
       if (t4 == 0) {
         wmax[size_t(warp) * MAXM + rm0] = mx0;
         wmax[size_t(warp) * MAXM + rm1] = mx1;
@@ -451,8 +451,8 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
         pbuf[size_t(mt * 16 + g + 8) * PPAD + key0] = __float2half_rn(p10);
         pbuf[size_t(mt * 16 + g + 8) * PPAD + key0 + 1] =
             __float2half_rn(p11);
-        const float sum0 = sb_rsum4(p00 + p01);
-        const float sum1 = sb_rsum4(p10 + p11);
+        const float sum0 = boom_rsum4(p00 + p01);
+        const float sum1 = boom_rsum4(p10 + p11);
         if (t4 == 0) {
           tsum[size_t(rm0) * NTS + nt] = sum0;
           tsum[size_t(rm1) * NTS + nt] = sum1;
@@ -496,7 +496,7 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
           if (ot >= D / 8) continue;
           uint32_t bv[2];
           fdec_ldm_v(bv, vt, NPAD, ot * 8, ks * 16);
-          sb_mma_f32(o[mt][on], ap, bv);
+          boom_mma_f32(o[mt][on], ap, bv);
         }
       }
     }
@@ -505,9 +505,9 @@ __global__ void __launch_bounds__(W * 32) boom_fdec_kernel(
     if (tt + 1 < ntiles) {
       if (tt + STAGES < ntiles) {
         stage(t_lo + tt + STAGES, buf);
-        sb_cp_wait<STAGES - 1>();
+        boom_cp_wait<STAGES - 1>();
       } else {
-        sb_cp_wait<0>();
+        boom_cp_wait<0>();
       }
       __syncthreads();
     }

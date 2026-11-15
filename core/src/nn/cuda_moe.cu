@@ -412,7 +412,7 @@ bool moe_route_dev(const float* x, const quant::QuantizedTensor* router,
   const size_t smem =
       ((size_t(experts) + 3u) & ~size_t(3)) + size_t(used) * sizeof(uint32_t);
   if (smem > 48u * 1024u) return false;
-  moe_route_topk_kernel<<<rows, 1, smem, sonicboom::cuda::sb_current_stream()>>>(
+  moe_route_topk_kernel<<<rows, 1, smem, sonicboom::cuda::boom_current_stream()>>>(
       logits, experts, used, weight_scale, ids, weights);
   return cudaGetLastError() == cudaSuccess;
 }
@@ -563,7 +563,7 @@ bool moe_experts_dev(const float* x, const int64_t* ids_host,
     if (ids_host[i] < 0 || uint64_t(ids_host[i]) >= e_count) return false;
 
   const cudaStream_t s =
-      stream ? static_cast<cudaStream_t>(stream) : sonicboom::cuda::sb_current_stream();
+      stream ? static_cast<cudaStream_t>(stream) : sonicboom::cuda::boom_current_stream();
   sonicboom::cuda::StreamScope scope(s);
   const int gelu = activation == MoeActivation::GeluFp16 ? 1 : 0;
 

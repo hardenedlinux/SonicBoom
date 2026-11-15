@@ -23,12 +23,12 @@
  *
  * The contract under test:
  *   - compile succeeds without the bytes; bindings_complete is 0;
- *   - run before binding is SB_ERR_BINDING;
- *   - wrong size / unknown name is SB_ERR_BINDING, NULL is SB_ERR_INTERNAL;
+ *   - run before binding is BOOM_ERR_BINDING;
+ *   - wrong size / unknown name is BOOM_ERR_BINDING, NULL is BOOM_ERR_INTERNAL;
  *   - binding fills the slot, completes the bindings and makes run work;
  *   - rebinding before the first successful run replaces the bytes;
  *   - binding copies: later writes to the caller's buffer are not observed;
- *   - rebinding after the first successful run is SB_ERR_BINDING;
+ *   - rebinding after the first successful run is BOOM_ERR_BINDING;
  *   - two executables bind independently (no shared state);
  *   - a parameter view shows the bound bytes and outlives the handle.
  */
@@ -81,60 +81,60 @@ static const float X[8] = {1.0f, 2.0f, -3.0f, 4.0f,
 static const float EXPECTED[8] = {1.5f, 1.0f, 0.0f, 1.0f,
                                   0.0f, 1.0f, 0.0f, 1.0f};
 
-static sb_executable *compile_graph(const char *text) {
-  sb_document *doc = NULL;
-  sb_executable *exe = NULL;
-  sb_error *err = NULL;
+static boom_executable *compile_graph(const char *text) {
+  boom_document *doc = NULL;
+  boom_executable *exe = NULL;
+  boom_error *err = NULL;
 
-  if (sb_parse(text, strlen(text), &doc, &err) != SB_OK) {
-    fprintf(stderr, "  FAIL: parse (err: %s)\n", sb_error_message(err));
+  if (boom_parse(text, strlen(text), &doc, &err) != BOOM_OK) {
+    fprintf(stderr, "  FAIL: parse (err: %s)\n", boom_error_message(err));
     ++g_failures;
-    sb_error_free(err);
+    boom_error_free(err);
     return NULL;
   }
-  if (sb_compile(doc, "", &exe, &err) != SB_OK) {
-    fprintf(stderr, "  FAIL: compile (err: %s)\n", sb_error_message(err));
+  if (boom_compile(doc, "", &exe, &err) != BOOM_OK) {
+    fprintf(stderr, "  FAIL: compile (err: %s)\n", boom_error_message(err));
     ++g_failures;
-    sb_error_free(err);
-    sb_document_free(doc);
+    boom_error_free(err);
+    boom_document_free(doc);
     return NULL;
   }
-  sb_document_free(doc);
+  boom_document_free(doc);
   return exe;
 }
 
-static int run_once(sb_executable *exe, float out[8]) {
-  sb_error *err = NULL;
+static int run_once(boom_executable *exe, float out[8]) {
+  boom_error *err = NULL;
   size_t written = 0;
-  if (sb_bind_input(exe, X, sizeof(X), &err) != SB_OK) {
-    sb_error_free(err);
+  if (boom_bind_input(exe, X, sizeof(X), &err) != BOOM_OK) {
+    boom_error_free(err);
     return 0;
   }
-  if (sb_execute(exe, &err) != SB_OK) {
-    sb_error_free(err);
+  if (boom_execute(exe, &err) != BOOM_OK) {
+    boom_error_free(err);
     return 0;
   }
-  int ok = sb_retrieve_output(exe, out, sizeof(float) * 8, &written, &err) ==
-               SB_OK &&
+  int ok = boom_retrieve_output(exe, out, sizeof(float) * 8, &written, &err) ==
+               BOOM_OK &&
            written == sizeof(X);
-  sb_error_free(err);
+  boom_error_free(err);
   return ok;
 }
 
-static sb_tensor_desc make_desc(void) {
-  sb_tensor_desc d;
+static boom_tensor_desc make_desc(void) {
+  boom_tensor_desc d;
   memset(&d, 0, sizeof(d));
-  d.struct_size = sizeof(sb_tensor_desc);
+  d.struct_size = sizeof(boom_tensor_desc);
   return d;
 }
 
 int main(void) {
-  sb_error *err = NULL;
+  boom_error *err = NULL;
 
-  check(sb_api_version() == SB_API_VERSION,
-        "sb_api_version reports the header's SB_API_VERSION");
+  check(boom_api_version() == BOOM_API_VERSION,
+        "boom_api_version reports the header's BOOM_API_VERSION");
 
-  sb_executable *exe = compile_graph(ADD_RELU_BOUND);
+  boom_executable *exe = compile_graph(ADD_RELU_BOUND);
   if (!exe) {
     fprintf(stderr, "test_capi_binding FAILED to compile the graph\n");
     return 1;
@@ -142,82 +142,82 @@ int main(void) {
 
   /* --- the declaration survives compile without bytes --------------------- */
   size_t count = 0;
-  check(sb_executable_parameter_count(exe, &count, &err) == SB_OK && count == 1,
+  check(boom_executable_parameter_count(exe, &count, &err) == BOOM_OK && count == 1,
         "parameter_count: one bound parameter");
   const char *name = NULL;
-  check(sb_executable_parameter_name_at(exe, 0, &name, &err) == SB_OK &&
+  check(boom_executable_parameter_name_at(exe, 0, &name, &err) == BOOM_OK &&
             name != NULL && strcmp(name, "b") == 0,
         "parameter_name_at(0): \"b\"");
-  sb_tensor_desc desc = make_desc();
-  check(sb_executable_parameter_desc(exe, 0, &desc, &err) == SB_OK &&
-            desc.dtype == SB_DTYPE_FLOAT32 && desc.rank == 1 &&
+  boom_tensor_desc desc = make_desc();
+  check(boom_executable_parameter_desc(exe, 0, &desc, &err) == BOOM_OK &&
+            desc.dtype == BOOM_DTYPE_FLOAT32 && desc.rank == 1 &&
             desc.num_bytes == 32,
         "parameter_desc: f32[8], 32 bytes");
 
   int complete = -1;
-  check(sb_bindings_complete(exe, &complete, &err) == SB_OK && complete == 0,
+  check(boom_bindings_complete(exe, &complete, &err) == BOOM_OK && complete == 0,
         "bindings_complete: not complete before binding");
 
   /* --- running before binding fails with a binding error ------------------ */
   float out[8] = {0};
   check(!run_once(exe, out), "run before binding fails");
 
-  sb_bind_input(exe, X, sizeof(X), &err);
-  check(sb_execute(exe, &err) == SB_ERR_BINDING,
-        "sb_execute before binding: SB_ERR_BINDING");
-  sb_error_free(err);
+  boom_bind_input(exe, X, sizeof(X), &err);
+  check(boom_execute(exe, &err) == BOOM_ERR_BINDING,
+        "boom_execute before binding: BOOM_ERR_BINDING");
+  boom_error_free(err);
   err = NULL;
 
   /* --- binding errors ------------------------------------------------------ */
-  check(sb_bind_parameter(exe, "nope", B, sizeof(B), &err) == SB_ERR_BINDING,
-        "unknown binding name: SB_ERR_BINDING");
-  sb_error_free(err);
+  check(boom_bind_parameter(exe, "nope", B, sizeof(B), &err) == BOOM_ERR_BINDING,
+        "unknown binding name: BOOM_ERR_BINDING");
+  boom_error_free(err);
   err = NULL;
-  check(sb_bind_parameter(exe, "b", B, sizeof(B) - 1, &err) == SB_ERR_BINDING,
-        "wrong byte count: SB_ERR_BINDING");
-  sb_error_free(err);
+  check(boom_bind_parameter(exe, "b", B, sizeof(B) - 1, &err) == BOOM_ERR_BINDING,
+        "wrong byte count: BOOM_ERR_BINDING");
+  boom_error_free(err);
   err = NULL;
-  check(sb_bind_parameter(exe, "b", NULL, sizeof(B), &err) == SB_ERR_INTERNAL,
-        "NULL data: SB_ERR_INTERNAL");
-  sb_error_free(err);
+  check(boom_bind_parameter(exe, "b", NULL, sizeof(B), &err) == BOOM_ERR_INTERNAL,
+        "NULL data: BOOM_ERR_INTERNAL");
+  boom_error_free(err);
   err = NULL;
-  check(sb_bindings_complete(exe, &complete, &err) == SB_OK && complete == 0,
+  check(boom_bindings_complete(exe, &complete, &err) == BOOM_OK && complete == 0,
         "a failed bind leaves the graph incomplete");
 
   /* --- a successful bind makes the graph runnable ------------------------- */
   static const float B2[8] = {1, 1, 1, 1, 1, 1, 1, 1};
-  check(sb_bind_parameter(exe, "b", B, sizeof(B), &err) == SB_OK,
+  check(boom_bind_parameter(exe, "b", B, sizeof(B), &err) == BOOM_OK,
         "bind_parameter: success");
-  check(sb_bindings_complete(exe, &complete, &err) == SB_OK && complete == 1,
+  check(boom_bindings_complete(exe, &complete, &err) == BOOM_OK && complete == 1,
         "bindings_complete: complete after binding");
 
   /* Rebinding before the first successful run replaces the bytes. */
-  check(sb_bind_parameter(exe, "b", B2, sizeof(B2), &err) == SB_OK,
+  check(boom_bind_parameter(exe, "b", B2, sizeof(B2), &err) == BOOM_OK,
         "rebinding before the first run: success");
-  sb_storage *rebound = NULL;
+  boom_storage *rebound = NULL;
   const void *rb_data = NULL;
   uint64_t rb_bytes = 0;
-  check(sb_executable_parameter_view(exe, 0, &rebound, &err) == SB_OK &&
-            sb_storage_data(rebound, &rb_data, &rb_bytes, &err) == SB_OK &&
+  check(boom_executable_parameter_view(exe, 0, &rebound, &err) == BOOM_OK &&
+            boom_storage_data(rebound, &rb_data, &rb_bytes, &err) == BOOM_OK &&
             rb_bytes == sizeof(B2) && memcmp(rb_data, B2, sizeof(B2)) == 0,
         "the rebound bytes replace the first binding");
-  sb_storage_release(rebound);
+  boom_storage_release(rebound);
 
   /* Binding copies: writing through the caller's buffer afterwards changes
      nothing. */
   float scratch[8];
   memcpy(scratch, B, sizeof(B));
-  check(sb_bind_parameter(exe, "b", scratch, sizeof(scratch), &err) == SB_OK,
+  check(boom_bind_parameter(exe, "b", scratch, sizeof(scratch), &err) == BOOM_OK,
         "binding from a caller-owned buffer");
   memset(scratch, 0, sizeof(scratch));
 
   /* The view observes the bound bytes without copying. */
-  sb_storage *view = NULL;
-  check(sb_executable_parameter_view(exe, 0, &view, &err) == SB_OK,
+  boom_storage *view = NULL;
+  check(boom_executable_parameter_view(exe, 0, &view, &err) == BOOM_OK,
         "parameter_view on a bound parameter");
   const void *view_data = NULL;
   uint64_t view_bytes = 0;
-  check(sb_storage_data(view, &view_data, &view_bytes, &err) == SB_OK &&
+  check(boom_storage_data(view, &view_data, &view_bytes, &err) == BOOM_OK &&
             view_bytes == sizeof(B) &&
             memcmp(view_data, B, sizeof(B)) == 0,
         "the view sees the bound bytes, not later writes to the caller's "
@@ -227,24 +227,24 @@ int main(void) {
         "run after binding produces the :values result");
 
   /* --- binding is a one-time initialization ------------------------------- */
-  check(sb_bind_parameter(exe, "b", B, sizeof(B), &err) == SB_ERR_BINDING,
-        "rebinding after a successful run: SB_ERR_BINDING");
-  sb_error_free(err);
+  check(boom_bind_parameter(exe, "b", B, sizeof(B), &err) == BOOM_ERR_BINDING,
+        "rebinding after a successful run: BOOM_ERR_BINDING");
+  boom_error_free(err);
   err = NULL;
 
   /* --- the view outlives the executable handle ----------------------------- */
-  sb_executable_free(exe);
+  boom_executable_free(exe);
   exe = NULL;
-  check(sb_storage_data(view, &view_data, &view_bytes, &err) == SB_OK &&
+  check(boom_storage_data(view, &view_data, &view_bytes, &err) == BOOM_OK &&
             view_bytes == sizeof(B) &&
             memcmp(view_data, B, sizeof(B)) == 0,
-        "the view survives sb_executable_free");
-  sb_storage_release(view);
+        "the view survives boom_executable_free");
+  boom_storage_release(view);
   view = NULL;
 
   /* --- two executables bind independently --------------------------------- */
-  sb_executable *a = compile_graph(ADD_RELU_BOUND);
-  sb_executable *c = compile_graph(ADD_RELU_BOUND);
+  boom_executable *a = compile_graph(ADD_RELU_BOUND);
+  boom_executable *c = compile_graph(ADD_RELU_BOUND);
   if (a && c) {
     static const float B2[8] = {1, 1, 1, 1, 1, 1, 1, 1};
     static const float A_OUT[8] = {1.5f, 1.0f, 0.0f, 1.0f,
@@ -252,9 +252,9 @@ int main(void) {
     static const float C_OUT[8] = {2.0f, 3.0f, 0.0f, 5.0f,
                                    0.0f, 7.0f, 0.0f, 9.0f};
     float oa[8], oc[8];
-    check(sb_bind_parameter(a, "b", B, sizeof(B), &err) == SB_OK,
+    check(boom_bind_parameter(a, "b", B, sizeof(B), &err) == BOOM_OK,
           "executable A binds its own bytes");
-    check(sb_bind_parameter(c, "b", B2, sizeof(B2), &err) == SB_OK,
+    check(boom_bind_parameter(c, "b", B2, sizeof(B2), &err) == BOOM_OK,
           "executable C binds different bytes");
     check(run_once(a, oa) && memcmp(oa, A_OUT, sizeof(A_OUT)) == 0,
           "executable A keeps its binding");
@@ -262,34 +262,34 @@ int main(void) {
           "executable C keeps its own binding");
     check(run_once(a, oa) && memcmp(oa, A_OUT, sizeof(A_OUT)) == 0,
           "executable A is unaffected by C's run");
-    sb_executable_free(a);
-    sb_executable_free(c);
+    boom_executable_free(a);
+    boom_executable_free(c);
   } else {
     check(0, "independent executables compiled");
-    sb_executable_free(a);
-    sb_executable_free(c);
+    boom_executable_free(a);
+    boom_executable_free(c);
   }
 
   /* --- argument checks ----------------------------------------------------- */
-  check(sb_bind_parameter(NULL, "b", B, sizeof(B), &err) == SB_ERR_INTERNAL,
+  check(boom_bind_parameter(NULL, "b", B, sizeof(B), &err) == BOOM_ERR_INTERNAL,
         "NULL executable rejected");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
-  check(sb_bindings_complete(NULL, &complete, &err) == SB_ERR_INTERNAL,
+  check(boom_bindings_complete(NULL, &complete, &err) == BOOM_ERR_INTERNAL,
         "bindings_complete(NULL) rejected");
-  sb_error_free(err);
+  boom_error_free(err);
   err = NULL;
 
   /* A graph without bound parameters is always complete and runs as before. */
-  sb_executable *plain = compile_graph(ADD_RELU_VALUES);
+  boom_executable *plain = compile_graph(ADD_RELU_VALUES);
   if (plain) {
     float po[8];
-    check(sb_bindings_complete(plain, &complete, &err) == SB_OK &&
+    check(boom_bindings_complete(plain, &complete, &err) == BOOM_OK &&
               complete == 1,
           "an all-:values graph is complete");
     check(run_once(plain, po) && memcmp(po, EXPECTED, sizeof(EXPECTED)) == 0,
           "an all-:values graph runs without binding");
-    sb_executable_free(plain);
+    boom_executable_free(plain);
   } else {
     check(0, "the :values graph compiled");
   }

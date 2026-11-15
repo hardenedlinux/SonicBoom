@@ -14,89 +14,89 @@ set -uo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/config.sh"
 
 CHECK=static
-export SB_ROOT
+export BOOM_ROOT
 
-if ! sb_required_tools cmake ninja python3 "$SB_CC" "$SB_CXX"; then
-  sb_record FAIL "$CHECK/toolchain" "required tools missing (see stderr)"
+if ! boom_required_tools cmake ninja python3 "$BOOM_CC" "$BOOM_CXX"; then
+  boom_record FAIL "$CHECK/toolchain" "required tools missing (see stderr)"
   exit 1
 fi
-if [ -z "${SB_CLANG:-}" ] || [ -z "${SB_CLANG_TIDY:-}" ]; then
-  sb_record FAIL "$CHECK/toolchain" "clang/clang-tidy not resolved"
+if [ -z "${BOOM_CLANG:-}" ] || [ -z "${BOOM_CLANG_TIDY:-}" ]; then
+  boom_record FAIL "$CHECK/toolchain" "clang/clang-tidy not resolved"
   exit 1
 fi
 # Clang 18 cannot parse libstdc++ 13's <expected> (see config.sh); fail with a
 # clear reason instead of reporting parse errors from every TU that uses it.
-clang_major="$("$SB_CLANG" -dumpversion 2>/dev/null | cut -d. -f1)"
-tidy_major="$("$SB_CLANG_TIDY" --version 2>/dev/null \
+clang_major="$("$BOOM_CLANG" -dumpversion 2>/dev/null | cut -d. -f1)"
+tidy_major="$("$BOOM_CLANG_TIDY" --version 2>/dev/null \
              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)"
 if [ "${clang_major:-0}" -lt 19 ] || [ "${tidy_major:-0}" -lt 19 ]; then
-  sb_record FAIL "$CHECK/toolchain" \
+  boom_record FAIL "$CHECK/toolchain" \
     "clang and clang-tidy 19+ required (found ${clang_major:-unknown}/${tidy_major:-unknown})"
   exit 1
 fi
-if ! sb_require_mlir; then
-  sb_record FAIL "$CHECK/mlir" "MLIR prefix unavailable"
+if ! boom_require_mlir; then
+  boom_record FAIL "$CHECK/mlir" "MLIR prefix unavailable"
   exit 1
 fi
-if [ -z "${SB_GUILD:-}" ]; then
-  sb_record FAIL "$CHECK/soniccross" "guild not found (required build-time dependency)"
+if [ -z "${BOOM_GUILD:-}" ]; then
+  boom_record FAIL "$CHECK/soniccross" "guild not found (required build-time dependency)"
   exit 1
 fi
 
-echo "configuring $SB_BASE_BUILD for the compilation database"
-if ! sb_configure "$SB_BASE_BUILD" "" "$SB_BUILD_TYPE" \
-     > "$SB_LOG_DIR/static-configure.log" 2>&1; then
-  sb_record FAIL "$CHECK/configure" "see static-configure.log"
+echo "configuring $BOOM_BASE_BUILD for the compilation database"
+if ! boom_configure "$BOOM_BASE_BUILD" "" "$BOOM_BUILD_TYPE" \
+     > "$BOOM_LOG_DIR/static-configure.log" 2>&1; then
+  boom_record FAIL "$CHECK/configure" "see static-configure.log"
   exit 1
 fi
-DB="$SB_BASE_BUILD/compile_commands.json"
+DB="$BOOM_BASE_BUILD/compile_commands.json"
 if [ ! -f "$DB" ]; then
-  sb_record FAIL "$CHECK/compile-db" "compile_commands.json was not generated"
+  boom_record FAIL "$CHECK/compile-db" "compile_commands.json was not generated"
   exit 1
 fi
-sb_record PASS "$CHECK/compile-db" "$DB"
+boom_record PASS "$CHECK/compile-db" "$DB"
 
 # Generated headers (build tag, SonicCross output) must exist before any
 # analyzer parses a TU that includes them. This is the project's normal build,
 # not a modified one; with a warm build it is a no-op.
-echo "building $SB_BASE_BUILD (generated headers)"
-if ! sb_build "$SB_BASE_BUILD" "$SB_LOG_DIR/static-build.log"; then
-  sb_record FAIL "$CHECK/build" "see static-build.log"
+echo "building $BOOM_BASE_BUILD (generated headers)"
+if ! boom_build "$BOOM_BASE_BUILD" "$BOOM_LOG_DIR/static-build.log"; then
+  boom_record FAIL "$CHECK/build" "see static-build.log"
   exit 1
 fi
-sb_record PASS "$CHECK/build" "complete"
+boom_record PASS "$CHECK/build" "complete"
 
 # GCC -fanalyzer keeps a large per-TU state on MLIR-heavy files; two concurrent
 # analyzer processes keep memory bounded on a 32 GiB host. Override only when
 # the host has memory to spare.
-ANALYZER_JOBS="${SONICBOOM_QUALITY_ANALYZER_JOBS:-$(( SB_JOBS > 2 ? 2 : SB_JOBS ))}"
-driver="$SB_Q_DIR/lib/static_driver.py"
+ANALYZER_JOBS="${SONICBOOM_QUALITY_ANALYZER_JOBS:-$(( BOOM_JOBS > 2 ? 2 : BOOM_JOBS ))}"
+driver="$BOOM_Q_DIR/lib/static_driver.py"
 
 run_mode() {
   local name="$1" mode="$2" roots="$3" timeout="$4" jobs="$5"
-  local log="$SB_LOG_DIR/static-$name.log"
+  local log="$BOOM_LOG_DIR/static-$name.log"
   echo
   echo "-- $name (roots: $roots, jobs: $jobs)"
   if python3 "$driver" \
-       --db "$DB" --build-dir "$SB_BASE_BUILD" --log-dir "$SB_LOG_DIR/static" \
+       --db "$DB" --build-dir "$BOOM_BASE_BUILD" --log-dir "$BOOM_LOG_DIR/static" \
        --mode "$mode" --roots "$roots" \
-       --gxx "$SB_CXX" --clang "$SB_CLANG" --clang-tidy "$SB_CLANG_TIDY" \
-       --gcc-install-dir "$SB_GCC_INSTALL_DIR" \
-       --tidy-config "$SB_Q_DIR/clang-tidy.yaml" \
+       --gxx "$BOOM_CXX" --clang "$BOOM_CLANG" --clang-tidy "$BOOM_CLANG_TIDY" \
+       --gcc-install-dir "$BOOM_GCC_INSTALL_DIR" \
+       --tidy-config "$BOOM_Q_DIR/clang-tidy.yaml" \
        --jobs "$jobs" --timeout "$timeout" > "$log" 2>&1; then
     local summary
     summary="$(grep -E '^summary ' "$log" | tail -1)"
-    sb_record PASS "$CHECK/$name" "${summary:-clean}"
+    boom_record PASS "$CHECK/$name" "${summary:-clean}"
     return 0
   fi
   local summary
   summary="$(grep -E '^summary ' "$log" | tail -1)"
-  sb_record FAIL "$CHECK/$name" "see static-$name.log${summary:+; $summary}"
+  boom_record FAIL "$CHECK/$name" "see static-$name.log${summary:+; $summary}"
   return 1
 }
 
 rc=0
-run_mode warnings        warnings       "core,capi,tests" 600 "$SB_JOBS" || rc=1
+run_mode warnings        warnings       "core,capi,tests" 600 "$BOOM_JOBS" || rc=1
 run_mode gcc-analyzer    analyzer       "core,capi"       900 "$ANALYZER_JOBS" || rc=1
 run_mode clang-analyzer  clang-analyzer  "core,capi"       900 "$ANALYZER_JOBS" || rc=1
 run_mode clang-tidy      tidy           "core,capi"       600 "$ANALYZER_JOBS" || rc=1

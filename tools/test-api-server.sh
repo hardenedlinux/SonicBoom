@@ -219,7 +219,7 @@ run_model() {
   fi
 
   # --- sampling --------------------------------------------------------------
-  # The real backend passes the sampler through sb_llm_decode's sampled session
+  # The real backend passes the sampler through boom_llm_decode's sampled session
   # path, one call per step. A request is reproducible per seed: the same body
   # twice must give the same reply. Whether a different seed gives a different
   # reply is model-dependent, so it is not asserted.

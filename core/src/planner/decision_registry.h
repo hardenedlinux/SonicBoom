@@ -103,8 +103,8 @@ std::size_t conflict_count();
 // been recorded.
 uint64_t fingerprint();
 
-// The human table and the JSON form sb-explain / sb_explain_table and
-// sb_explain_json print:
+// The human table and the JSON form sb-explain / boom_explain_table and
+// boom_explain_json print:
 //   name scope = value [source] env=VAR reason="..."
 // and one JSON object per decision.
 std::string dump_text();

@@ -233,7 +233,7 @@ def main() -> int:
     # root is not necessarily its grandparent for out-of-tree builds. Callers
     # pass absolute paths in the DB, and ownership is decided against the
     # repository root passed through the environment.
-    env_root = os.environ.get("SB_ROOT")
+    env_root = os.environ.get("BOOM_ROOT")
     if env_root:
         root = Path(env_root).resolve()
 

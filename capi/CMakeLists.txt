@@ -18,10 +18,10 @@ sonicboom_sanitize(sonicboom_capi)
 target_include_directories(sonicboom_capi
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   # core/src is private internal state (the decision registry, printed by
-  # sb_explain_*), never re-exposed through capi.h.
+  # boom_explain_*), never re-exposed through capi.h.
   PRIVATE ${CMAKE_SOURCE_DIR}/core/include ${CMAKE_SOURCE_DIR}/core/src)
 
-# Build info for sb_build_info(). The commit and tag come from the generated
+# Build info for boom_build_info(). The commit and tag come from the generated
 # header written at build time by cmake/WriteBuildTag.cmake (rewritten only when
 # the revision changes, so an unchanged build does not recompile this object);
 # the CUDA architectures nvcc really compiles and the LLVM/MLIR that was linked
@@ -37,11 +37,11 @@ else()
   set(SONICBOOM_BUILD_PLATFORM "unknown")
 endif()
 target_compile_definitions(sonicboom_capi PRIVATE
-  SB_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-  SB_BUILD_CUDA_ENABLED=$<IF:$<BOOL:${SONICBOOM_USE_CUDA}>,1,0>
-  SB_BUILD_CUDA_ARCHS="${SONICBOOM_BUILD_CUDA_ARCHS}"
-  SB_BUILD_CUDA_TOOLKIT="${SONICBOOM_BUILD_CUDA_TOOLKIT}"
-  SB_BUILD_LLVM_VERSION="${SONICBOOM_BUILD_LLVM_VERSION}"
-  SB_BUILD_LLVM_MAJOR=${SONICBOOM_BUILD_LLVM_MAJOR}   # a number, not a literal
-  SB_BUILD_LLVM_ORIGIN="${SONICBOOM_BUILD_LLVM_ORIGIN}"
-  SB_BUILD_PLATFORM="${SONICBOOM_BUILD_PLATFORM}")
+  BOOM_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+  BOOM_BUILD_CUDA_ENABLED=$<IF:$<BOOL:${SONICBOOM_USE_CUDA}>,1,0>
+  BOOM_BUILD_CUDA_ARCHS="${SONICBOOM_BUILD_CUDA_ARCHS}"
+  BOOM_BUILD_CUDA_TOOLKIT="${SONICBOOM_BUILD_CUDA_TOOLKIT}"
+  BOOM_BUILD_LLVM_VERSION="${SONICBOOM_BUILD_LLVM_VERSION}"
+  BOOM_BUILD_LLVM_MAJOR=${SONICBOOM_BUILD_LLVM_MAJOR}   # a number, not a literal
+  BOOM_BUILD_LLVM_ORIGIN="${SONICBOOM_BUILD_LLVM_ORIGIN}"
+  BOOM_BUILD_PLATFORM="${SONICBOOM_BUILD_PLATFORM}")

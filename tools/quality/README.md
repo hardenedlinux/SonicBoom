@@ -192,7 +192,7 @@ than relying on a number in this file:
 ## Adding a check
 
 1. Add `checks/<name>.sh` and register the mode in `run.sh`.
-2. Record `PASS`/`FAIL`/`SKIP` through `sb_record`.
+2. Record `PASS`/`FAIL`/`SKIP` through `boom_record`.
 3. Use a private build directory (never a developer's `build/`).
 4. Update this README and `.github/workflows/quality.yml` in the same change.
 

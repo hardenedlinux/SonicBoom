@@ -320,7 +320,7 @@
 ;;    state). Unlocked or partially locked accessors crash or report an
 ;;    unexpected error here.
 (define race-iterations
-  (let ((s (getenv "SB_LIFETIME_ITERATIONS")))
+  (let ((s (getenv "BOOM_LIFETIME_ITERATIONS")))
     (if s (max 1 (string->number s)) 100)))
 
 (define (race-free-vs-entry-point name make-exe make-op iterations)

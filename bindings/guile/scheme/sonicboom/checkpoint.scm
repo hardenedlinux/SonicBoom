@@ -3,10 +3,10 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; Named float32 tensors persisted through the C ABI (sb_save_params /
-;;; sb_load_params). A checkpoint is one self-describing little-endian binary
+;;; Named float32 tensors persisted through the C ABI (boom_save_params /
+;;; boom_load_params). A checkpoint is one self-describing little-endian binary
 ;;; file; entries are matched by name, so save and load order need not agree.
-;;; Tensors cross the boundary as sb_tensor handles built from the ctensor's
+;;; Tensors cross the boundary as boom_tensor handles built from the ctensor's
 ;;; float32 bytes, exactly like the rest of (sonicboom train): Guile never does
 ;;; arithmetic here, it only marshals.
 ;;;
@@ -80,7 +80,7 @@ the file."
          (dims (ctensor-shape t))
          (out (make-slot))
          (err (make-slot))
-         (st ((proc 'sb_tensor_from_f32) (bytevector->pointer (dims->pointer dims))
+         (st ((proc 'boom_tensor_from_f32) (bytevector->pointer (dims->pointer dims))
               (length dims) (bytevector->pointer bv) (bytevector-length bv)
               (slot-ptr out) (slot-ptr err))))
     (unless (sb-status-ok? st)
@@ -94,7 +94,7 @@ the file."
         (let* ((bv (make-bytevector (* 4 n)))
                (written (make-bytevector 8 0))
                (err (make-slot))
-               (st ((proc 'sb_tensor_bytes) h (bytevector->pointer bv)
+               (st ((proc 'boom_tensor_bytes) h (bytevector->pointer bv)
                     (bytevector-length bv) (bytevector->pointer written)
                     (slot-ptr err))))
           (unless (sb-status-ok? st)
@@ -132,7 +132,7 @@ Note: Only float32 tensors are supported by the C ABI's checkpoint surface."
     (dynamic-wind
       (lambda () #f)
       (lambda ()
-        (let ((st ((proc 'sb_save_params) path-ptr
+        (let ((st ((proc 'boom_save_params) path-ptr
                    (bytevector->pointer name-arr)
                    (bytevector->pointer handle-arr)
                    (length handles) (slot-ptr err))))
@@ -140,7 +140,7 @@ Note: Only float32 tensors are supported by the C ABI's checkpoint surface."
             (error "save-params!" (capture-error err))))
         path)
       (lambda ()
-        (for-each (lambda (h) ((proc 'sb_tensor_free) h)) handles)))))
+        (for-each (lambda (h) ((proc 'boom_tensor_free) h)) handles)))))
 
 (define (load-params! path entries)
   "Load named float32 tensors from a checkpoint file.
@@ -172,7 +172,7 @@ tensors; PyTorch's load reconstructs tensors from the file itself."
     (dynamic-wind
       (lambda () #f)
       (lambda ()
-        (let ((st ((proc 'sb_load_params) path-ptr
+        (let ((st ((proc 'boom_load_params) path-ptr
                    (bytevector->pointer name-arr)
                    (bytevector->pointer handle-arr)
                    (length handles) (slot-ptr err))))
@@ -183,4 +183,4 @@ tensors; PyTorch's load reconstructs tensors from the file itself."
                      (handle->ctensor 'load-params! h (ctensor-shape (cdr p)))))
              pairs handles))
       (lambda ()
-        (for-each (lambda (h) ((proc 'sb_tensor_free) h)) handles)))))
+        (for-each (lambda (h) ((proc 'boom_tensor_free) h)) handles)))))

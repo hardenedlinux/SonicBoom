@@ -30,112 +30,112 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Version of this ABI surface, reported by sb_api_version(). It changes only
+/* Version of this ABI surface, reported by boom_api_version(). It changes only
  * when an existing declaration changes meaning; additive symbols (new
  * functions, new structs) do not bump it. */
-#define SB_API_VERSION 1u
+#define BOOM_API_VERSION 1u
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /* Opaque handles. Contents are private to the implementation. */
-typedef struct sb_document sb_document;      /* a parsed S-Expr v0.1 document  */
-typedef struct sb_executable sb_executable;  /* a compiled, runnable graph     */
-typedef struct sb_error sb_error;            /* a failure detail               */
-typedef struct sb_tensor sb_tensor;          /* a float32 tensor (autograd)     */
-typedef struct sb_tape sb_tape;              /* a differentiable-op tape        */
-typedef struct sb_param sb_param;            /* a trainable param + AdamW state */
-typedef struct sb_storage sb_storage;        /* a borrowed, read-only view     */
+typedef struct boom_document boom_document;      /* a parsed S-Expr v0.1 document  */
+typedef struct boom_executable boom_executable;  /* a compiled, runnable graph     */
+typedef struct boom_error boom_error;            /* a failure detail               */
+typedef struct boom_tensor boom_tensor;          /* a float32 tensor (autograd)     */
+typedef struct boom_tape boom_tape;              /* a differentiable-op tape        */
+typedef struct boom_param boom_param;            /* a trainable param + AdamW state */
+typedef struct boom_storage boom_storage;        /* a borrowed, read-only view     */
 
 /* Status codes. 0 == success; every non-zero value is a failure. */
-typedef enum sb_status {
-  SB_OK = 0,
-  SB_ERR_PARSE = 1,    /* the S-Expr text was malformed or unsupported        */
-  SB_ERR_WEIGHT = 2,   /* a weight sidecar could not be read/resolved         */
-  SB_ERR_COMPILE = 3,  /* lowering / pass pipeline / JIT compilation failed   */
-  SB_ERR_BINDING = 4,  /* input/output buffer size or type mismatch           */
-  SB_ERR_RUNTIME = 5,  /* the JITted function failed or was unavailable       */
-  SB_ERR_INTERNAL = 6, /* invalid argument to the C API, or unexpected error  */
-  SB_ERR_UNSUPPORTED = 7, /* a requested feature this build/backend lacks     */
-  SB_ERR_CANCELLED = 8, /* the caller's progress callback asked to stop      */
-} sb_status;
+typedef enum boom_status {
+  BOOM_OK = 0,
+  BOOM_ERR_PARSE = 1,    /* the S-Expr text was malformed or unsupported        */
+  BOOM_ERR_WEIGHT = 2,   /* a weight sidecar could not be read/resolved         */
+  BOOM_ERR_COMPILE = 3,  /* lowering / pass pipeline / JIT compilation failed   */
+  BOOM_ERR_BINDING = 4,  /* input/output buffer size or type mismatch           */
+  BOOM_ERR_RUNTIME = 5,  /* the JITted function failed or was unavailable       */
+  BOOM_ERR_INTERNAL = 6, /* invalid argument to the C API, or unexpected error  */
+  BOOM_ERR_UNSUPPORTED = 7, /* a requested feature this build/backend lacks     */
+  BOOM_ERR_CANCELLED = 8, /* the caller's progress callback asked to stop      */
+} boom_status;
 
 /* Error categories (the `message` carries the human-readable detail). */
-typedef enum sb_error_kind {
-  SB_ERRKIND_NONE = 0,
-  SB_ERRKIND_PARSE_LEXICAL = 1,
-  SB_ERRKIND_PARSE_SYNTAX = 2,
-  SB_ERRKIND_PARSE_SEMANTIC = 3,
-  SB_ERRKIND_PARSE_UNSUPPORTED = 4,
-  SB_ERRKIND_WEIGHT = 5,
-  SB_ERRKIND_COMPILE = 6,
-  SB_ERRKIND_BINDING = 7,
-  SB_ERRKIND_RUNTIME = 8,
-  SB_ERRKIND_INTERNAL = 9,
-  SB_ERRKIND_CANCELLED = 10,
-} sb_error_kind;
+typedef enum boom_error_kind {
+  BOOM_ERRKIND_NONE = 0,
+  BOOM_ERRKIND_PARSE_LEXICAL = 1,
+  BOOM_ERRKIND_PARSE_SYNTAX = 2,
+  BOOM_ERRKIND_PARSE_SEMANTIC = 3,
+  BOOM_ERRKIND_PARSE_UNSUPPORTED = 4,
+  BOOM_ERRKIND_WEIGHT = 5,
+  BOOM_ERRKIND_COMPILE = 6,
+  BOOM_ERRKIND_BINDING = 7,
+  BOOM_ERRKIND_RUNTIME = 8,
+  BOOM_ERRKIND_INTERNAL = 9,
+  BOOM_ERRKIND_CANCELLED = 10,
+} boom_error_kind;
 
 /* The frozen v0 dtype set. */
-typedef enum sb_dtype {
-  SB_DTYPE_FLOAT32 = 0,
-  SB_DTYPE_FLOAT16 = 1,
-  SB_DTYPE_BFLOAT16 = 2,
-  SB_DTYPE_FLOAT64 = 3,
-  SB_DTYPE_INT8 = 4,
-  SB_DTYPE_UINT8 = 5,
-  SB_DTYPE_INT16 = 6,
-  SB_DTYPE_INT32 = 7,
-  SB_DTYPE_INT64 = 8,
-  SB_DTYPE_BOOL = 9,
-} sb_dtype;
+typedef enum boom_dtype {
+  BOOM_DTYPE_FLOAT32 = 0,
+  BOOM_DTYPE_FLOAT16 = 1,
+  BOOM_DTYPE_BFLOAT16 = 2,
+  BOOM_DTYPE_FLOAT64 = 3,
+  BOOM_DTYPE_INT8 = 4,
+  BOOM_DTYPE_UINT8 = 5,
+  BOOM_DTYPE_INT16 = 6,
+  BOOM_DTYPE_INT32 = 7,
+  BOOM_DTYPE_INT64 = 8,
+  BOOM_DTYPE_BOOL = 9,
+} boom_dtype;
 
-/* Physical element layout of a tensor. Only SB_QUANT_NONE is produced today;
+/* Physical element layout of a tensor. Only BOOM_QUANT_NONE is produced today;
  * the values are reserved so a later quantized view keeps this enum stable. */
-typedef enum sb_quant_format {
-  SB_QUANT_NONE = 0,
-  SB_QUANT_Q8_1 = 1,
-  SB_QUANT_Q5_0 = 2,
-  SB_QUANT_Q8_0 = 3,
-  SB_QUANT_Q3_K = 4,
-  SB_QUANT_Q4_K = 5,
-  SB_QUANT_Q5_K = 6,
-  SB_QUANT_Q6_K = 7,
-} sb_quant_format;
+typedef enum boom_quant_format {
+  BOOM_QUANT_NONE = 0,
+  BOOM_QUANT_Q8_1 = 1,
+  BOOM_QUANT_Q5_0 = 2,
+  BOOM_QUANT_Q8_0 = 3,
+  BOOM_QUANT_Q3_K = 4,
+  BOOM_QUANT_Q4_K = 5,
+  BOOM_QUANT_Q5_K = 6,
+  BOOM_QUANT_Q6_K = 7,
+} boom_quant_format;
 
-typedef enum sb_tensor_flags {
-  SB_TF_NONE = 0,
-  SB_TF_READ_ONLY = 1u << 0,
-  SB_TF_DEVICE = 1u << 1,
-  SB_TF_QUANTIZED = 1u << 2,
-  SB_TF_EXTERNAL = 1u << 3,
-} sb_tensor_flags;
+typedef enum boom_tensor_flags {
+  BOOM_TF_NONE = 0,
+  BOOM_TF_READ_ONLY = 1u << 0,
+  BOOM_TF_DEVICE = 1u << 1,
+  BOOM_TF_QUANTIZED = 1u << 2,
+  BOOM_TF_EXTERNAL = 1u << 3,
+} boom_tensor_flags;
 
 /* A plain-C tensor description, versioned by struct_size (set it to
- * sizeof(sb_tensor_desc) before the call). `dims` and `name` are borrowed from
+ * sizeof(boom_tensor_desc) before the call). `dims` and `name` are borrowed from
  * the owner and are valid only while the owner is alive: the executable handle
- * for sb_executable_parameter_desc, the view for sb_storage_desc. A library
- * writes the fields it knows and then stores sizeof(sb_tensor_desc) back into
+ * for boom_executable_parameter_desc, the view for boom_storage_desc. A library
+ * writes the fields it knows and then stores sizeof(boom_tensor_desc) back into
  * struct_size, so a caller compiled against a later, larger header can tell
  * which fields it may read. dtype is the logical dtype; num_bytes is the
  * physical byte count (equal to numel * element size for dense tensors). */
-typedef struct sb_tensor_desc {
+typedef struct boom_tensor_desc {
   size_t struct_size;
-  sb_dtype dtype;
+  boom_dtype dtype;
   int64_t rank;
   const int64_t *dims;
   uint64_t num_bytes;
-  uint32_t flags;        /* sb_tensor_flags */
-  sb_quant_format quant;
+  uint32_t flags;        /* boom_tensor_flags */
+  boom_quant_format quant;
   uint32_t quant_block;  /* elements per block; 0 when dense */
   const char *name;      /* may be NULL */
-} sb_tensor_desc;
+} boom_tensor_desc;
 
 /* --- Error inspection ------------------------------------------------------ */
 
 /* Error handles are owned by the caller. On failure, a status-returning call
  * writes a fresh error handle to *err_out *only if* err_out is non-NULL; the
- * caller must release it with sb_error_free. Ownership discipline: if the same
+ * caller must release it with boom_error_free. Ownership discipline: if the same
  * error-slot variable is reused across calls without freeing the previous
  * handle in between, the implementation frees the previous handle before
  * writing a new one, so reuse never leaks. A slot that has never held an error
@@ -143,22 +143,22 @@ typedef struct sb_tensor_desc {
  * dereferences or frees an uninitialized or caller-owned pointer. The caller
  * must still free the last handle written to a slot.
  *
- * Exception containment: no C++ exception escapes any exported sb_* function.
+ * Exception containment: no C++ exception escapes any exported boom_* function.
  * Every status-returning function is wrapped so that an expected failure (the
  * normal error kinds above) and any unexpected exception (including bad_alloc)
  * are both mapped to a status code plus, when err_out is non-NULL, an error
- * handle. Unexpected exceptions surface as SB_ERR_INTERNAL.
+ * handle. Unexpected exceptions surface as BOOM_ERR_INTERNAL.
  *
  * Limitation: handling is not fully reliable if error-object construction
  * itself fails. When allocation of the error handle or its message fails under
  * memory pressure, the slot is left NULL and the failure is still reported by
  * the returned status code, but there is no diagnostic message to retrieve. */
 
-/* NUL-terminated message; valid until sb_error_free(). Never NULL ("" if the
+/* NUL-terminated message; valid until boom_error_free(). Never NULL ("" if the
  * handle is NULL). */
-const char *sb_error_message(const sb_error *err);
-sb_error_kind sb_error_get_kind(const sb_error *err);
-void sb_error_free(sb_error *err);
+const char *boom_error_message(const boom_error *err);
+boom_error_kind boom_error_get_kind(const boom_error *err);
+void boom_error_free(boom_error *err);
 
 /* --- Build info ------------------------------------------------------------ */
 
@@ -184,41 +184,41 @@ void sb_error_free(sb_error *err);
  * build. `llvm.origin` is "bundled" for the install tools/mlir/build-mlir.sh
  * produces inside the source tree and "external" for any other LLVM/MLIR.
  * (MLIR is a required dependency, so `llvm` is always a real version/origin;
- * sb_build_info still reports none/"none" only in a build with no MLIR, which
+ * boom_build_info still reports none/"none" only in a build with no MLIR, which
  * configure now rejects.)
  * `platform` is the target CPU the library was compiled for, not the builder's. */
-const char *sb_build_info(void);
+const char *boom_build_info(void);
 
 /* --- Parse ----------------------------------------------------------------- */
 
 /* Parse an S-Expr v0.1 document. `text` need not be NUL-terminated; `len` is
  * its byte length. On success *doc_out receives a new handle (release with
- * sb_document_free). On failure *doc_out is set to NULL and, if `err_out` is
- * non-NULL, *err_out receives a new error handle (release with sb_error_free). */
-sb_status sb_parse(const char *text, size_t len, sb_document **doc_out,
-                   sb_error **err_out);
+ * boom_document_free). On failure *doc_out is set to NULL and, if `err_out` is
+ * non-NULL, *err_out receives a new error handle (release with boom_error_free). */
+boom_status boom_parse(const char *text, size_t len, boom_document **doc_out,
+                   boom_error **err_out);
 
 /* --- Compile --------------------------------------------------------------- */
 
 /* Compile a parsed document for CPU execution. `base_dir` resolves relative
  * weight-sidecar paths (pass "" to resolve against the process working
  * directory). On success *exe_out receives a new handle (release with
- * sb_executable_free). */
-sb_status sb_compile(const sb_document *doc, const char *base_dir,
-                     sb_executable **exe_out, sb_error **err_out);
+ * boom_executable_free). */
+boom_status boom_compile(const boom_document *doc, const char *base_dir,
+                     boom_executable **exe_out, boom_error **err_out);
 
 /* Compile a parsed document as a device training graph. The document is the
  * forward+backward+step graph a traced training function produced: it is
  * lowered Blade -> Boom IR, run through the Boom IR Training pass phase, and
  * executed node by node on the GPU (CUDA). The graph is bound by name — the
- * tracer names every tensor argument — through sb_input_name_at /
- * sb_output_name_at, and a step runs through sb_run_multi. Parameters must be
+ * tracer names every tensor argument — through boom_input_name_at /
+ * boom_output_name_at, and a step runs through boom_run_multi. Parameters must be
  * inline (`data :values`); external weight sidecars are not supported. On a
- * build without CUDA this fails with SB_ERR_COMPILE and a message saying so;
+ * build without CUDA this fails with BOOM_ERR_COMPILE and a message saying so;
  * the graph is still lowered and verified first, so a bad graph is reported as
- * such on either build. Release with sb_executable_free. */
-sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
-                            sb_error **err_out);
+ * such on either build. Release with boom_executable_free. */
+boom_status boom_compile_device(const boom_document *doc, boom_executable **exe_out,
+                            boom_error **err_out);
 
 /* --- I/O introspection (bind) ---------------------------------------------- */
 
@@ -226,181 +226,181 @@ sb_status sb_compile_device(const sb_document *doc, sb_executable **exe_out,
  * borrowed pointer to the dimension array (valid until the executable is
  * freed). Any output pointer may be NULL if that field is not needed.
  * v0 execution scope is exactly one input and one output tensor. */
-sb_status sb_input_info(const sb_executable *exe, sb_dtype *dtype_out,
+boom_status boom_input_info(const boom_executable *exe, boom_dtype *dtype_out,
                         int64_t *rank_out, const int64_t **dims_out,
                         uint64_t *num_bytes_out);
-sb_status sb_output_info(const sb_executable *exe, sb_dtype *dtype_out,
+boom_status boom_output_info(const boom_executable *exe, boom_dtype *dtype_out,
                          int64_t *rank_out, const int64_t **dims_out,
                          uint64_t *num_bytes_out);
 
 /* Graph arity and per-index introspection. A graph may have several inputs and
  * several outputs (a training graph typically returns one gradient per
- * parameter). sb_input_info/sb_output_info describe index 0; the *_info_at
+ * parameter). boom_input_info/boom_output_info describe index 0; the *_info_at
  * forms describe any index in [0, count). An index out of range is
- * SB_ERR_INTERNAL (invalid argument). */
-sb_status sb_input_count(const sb_executable *exe, size_t *count_out);
-sb_status sb_output_count(const sb_executable *exe, size_t *count_out);
-sb_status sb_input_info_at(const sb_executable *exe, size_t index,
-                           sb_dtype *dtype_out, int64_t *rank_out,
+ * BOOM_ERR_INTERNAL (invalid argument). */
+boom_status boom_input_count(const boom_executable *exe, size_t *count_out);
+boom_status boom_output_count(const boom_executable *exe, size_t *count_out);
+boom_status boom_input_info_at(const boom_executable *exe, size_t index,
+                           boom_dtype *dtype_out, int64_t *rank_out,
                            const int64_t **dims_out, uint64_t *num_bytes_out);
-sb_status sb_output_info_at(const sb_executable *exe, size_t index,
-                            sb_dtype *dtype_out, int64_t *rank_out,
+boom_status boom_output_info_at(const boom_executable *exe, size_t index,
+                            boom_dtype *dtype_out, int64_t *rank_out,
                             const int64_t **dims_out,
                             uint64_t *num_bytes_out);
 
 /* Tensor names in binding order. `*name_out` is a borrowed NUL-terminated
  * string valid until the executable is freed, or NULL when the compiled form
- * does not retain names (the CPU interpreter compiled by sb_compile). A
+ * does not retain names (the CPU interpreter compiled by boom_compile). A
  * device training graph always names its tensors: the tracer's names. */
-sb_status sb_input_name_at(const sb_executable *exe, size_t index,
+boom_status boom_input_name_at(const boom_executable *exe, size_t index,
                            const char **name_out);
-sb_status sb_output_name_at(const sb_executable *exe, size_t index,
+boom_status boom_output_name_at(const boom_executable *exe, size_t index,
                             const char **name_out);
 
 /* --- Execute / retrieve ---------------------------------------------------- */
 
 /* Bind the input tensor buffer. `data` is copied, so the caller may free it
  * immediately after this returns. `len` must equal the input's num_bytes. */
-sb_status sb_bind_input(sb_executable *exe, const void *data, size_t len,
-                        sb_error **err_out);
+boom_status boom_bind_input(boom_executable *exe, const void *data, size_t len,
+                        boom_error **err_out);
 
 /* Run the bound graph. The output is retained internally until the next
- * sb_execute or until the executable is freed. */
-sb_status sb_execute(sb_executable *exe, sb_error **err_out);
+ * boom_execute or until the executable is freed. */
+boom_status boom_execute(boom_executable *exe, boom_error **err_out);
 
 /* Copy the retained output into `out` (capacity `cap` bytes). On success
  * `*written_out` is the output byte count (== the output num_bytes). */
-sb_status sb_retrieve_output(sb_executable *exe, void *out, size_t cap,
-                             size_t *written_out, sb_error **err_out);
+boom_status boom_retrieve_output(boom_executable *exe, void *out, size_t cap,
+                             size_t *written_out, boom_error **err_out);
 
 /* Run the graph over N inputs and M outputs in one call — the general form
- * behind sb_bind_input/sb_execute/sb_retrieve_output (the 1-in/1-out wrapper).
- * `num_inputs` must equal sb_input_count and `num_outputs` must equal
- * sb_output_count. Every input is copied, so the caller may free it as soon as
+ * behind boom_bind_input/boom_execute/boom_retrieve_output (the 1-in/1-out wrapper).
+ * `num_inputs` must equal boom_input_count and `num_outputs` must equal
+ * boom_output_count. Every input is copied, so the caller may free it as soon as
  * this returns; `input_lens[i]` must equal that input's num_bytes.
  * `output_data[i]` must have capacity at least the i-th output's num_bytes and
  * `output_caps[i]` carries that capacity; capacities are checked before the
  * graph runs. On success each result is copied into `output_data[i]` and, when
  * `output_lens` is non-NULL, `output_lens[i]` receives the byte count written.
  * On failure no result buffer is modified. */
-sb_status sb_run_multi(sb_executable *exe, const void *const *input_data,
+boom_status boom_run_multi(boom_executable *exe, const void *const *input_data,
                        const size_t *input_lens, size_t num_inputs,
                        void *const *output_data, const size_t *output_caps,
                        size_t num_outputs, size_t *output_lens,
-                       sb_error **err_out);
+                       boom_error **err_out);
 
 /* Resident training step. A device training graph keeps the parameters and
  * optimizer state the optimizer updates in their device buffers across steps
- * (see sb_input_is_resident). The first successful run — sb_run_multi or
- * sb_run_resident — uploads them; afterwards `input_data[i]` for a resident
+ * (see boom_input_is_resident). The first successful run — boom_run_multi or
+ * boom_run_resident — uploads them; afterwards `input_data[i]` for a resident
  * input may be NULL and its bytes are ignored. Every other input is uploaded on
  * every call, and `input_lens[i]` is still validated for all of them.
  *
  * Only the outputs named by `output_indices[0..num_outputs)` are copied back,
  * in that order: a step that keeps its state on the device downloads the loss,
  * not the parameters. `num_outputs` is therefore independent of
- * sb_output_count. On failure no result buffer is modified. */
-sb_status sb_run_resident(sb_executable *exe, const void *const *input_data,
+ * boom_output_count. On failure no result buffer is modified. */
+boom_status boom_run_resident(boom_executable *exe, const void *const *input_data,
                           const size_t *input_lens, size_t num_inputs,
                           const size_t *output_indices, size_t num_outputs,
                           void *const *output_data, const size_t *output_caps,
-                          size_t *output_lens, sb_error **err_out);
+                          size_t *output_lens, boom_error **err_out);
 
 /* 1 when input `index` is resident in the sense above (the graph writes its
  * next value back into the same device buffer), 0 otherwise. Fails with
- * SB_ERR_BINDING for a non-device executable or an index out of range. */
-sb_status sb_input_is_resident(const sb_executable *exe, size_t index,
-                               int *resident_out, sb_error **err_out);
+ * BOOM_ERR_BINDING for a non-device executable or an index out of range. */
+boom_status boom_input_is_resident(const boom_executable *exe, size_t index,
+                               int *resident_out, boom_error **err_out);
 
 /* --- Parameters and read-only storage views -------------------------------- */
 /* A compiled CPU graph materializes every parameter (a graph constant: inline
  * `:values` data or an `:external` sidecar) into its own buffers at compile
  * time. A run never writes those buffers, so they may be borrowed read-only.
- * A view is an opaque sb_storage handle that pins the executable
- * implementation independently of the public sb_executable handle:
+ * A view is an opaque boom_storage handle that pins the executable
+ * implementation independently of the public boom_executable handle:
  *
- *   - the view stays valid after sb_executable_free (and after a cache
+ *   - the view stays valid after boom_executable_free (and after a cache
  *     eviction that frees the handle);
  *   - several views may pin the same executable independently;
- *   - sb_storage_release drops this view's reference; the memory is freed when
+ *   - boom_storage_release drops this view's reference; the memory is freed when
  *     the last handle (executable or view) is gone. Releasing NULL is safe;
  *     release each non-NULL view exactly once.
  *
- * Device training graphs (sb_compile_device) have no host parameter block:
- * their parameter queries fail with SB_ERR_UNSUPPORTED, and no raw device
+ * Device training graphs (boom_compile_device) have no host parameter block:
+ * their parameter queries fail with BOOM_ERR_UNSUPPORTED, and no raw device
  * pointer ever crosses this ABI. */
 
-/* The ABI version implemented by this library (SB_API_VERSION of the header it
+/* The ABI version implemented by this library (BOOM_API_VERSION of the header it
  * was built from). */
-uint32_t sb_api_version(void);
+uint32_t boom_api_version(void);
 
 /* Number of parameters (graph constants) in `exe`, in graph tensor order. The
  * same parameter name used by several constants appears once per constant. */
-sb_status sb_executable_parameter_count(const sb_executable *exe,
+boom_status boom_executable_parameter_count(const boom_executable *exe,
                                         size_t *count_out,
-                                        sb_error **err_out);
+                                        boom_error **err_out);
 
 /* Parameter `index` in [0, count): its name (a borrowed NUL-terminated string)
  * or its descriptor. Both are borrowed from the executable and valid until
- * sb_executable_free. An index out of range is SB_ERR_INTERNAL. */
-sb_status sb_executable_parameter_name_at(const sb_executable *exe,
+ * boom_executable_free. An index out of range is BOOM_ERR_INTERNAL. */
+boom_status boom_executable_parameter_name_at(const boom_executable *exe,
                                           size_t index,
                                           const char **name_out,
-                                          sb_error **err_out);
-sb_status sb_executable_parameter_desc(const sb_executable *exe, size_t index,
-                                       sb_tensor_desc *desc_out,
-                                       sb_error **err_out);
+                                          boom_error **err_out);
+boom_status boom_executable_parameter_desc(const boom_executable *exe, size_t index,
+                                       boom_tensor_desc *desc_out,
+                                       boom_error **err_out);
 
 /* Acquire a read-only host view of parameter `index`. On success *view_out
- * receives a new handle (release with sb_storage_release). The view keeps the
+ * receives a new handle (release with boom_storage_release). The view keeps the
  * executable implementation alive: the memory stays valid after
- * sb_executable_free. View flags include SB_TF_READ_ONLY, and the byte count
+ * boom_executable_free. View flags include BOOM_TF_READ_ONLY, and the byte count
  * is the parameter's num_bytes. */
-sb_status sb_executable_parameter_view(const sb_executable *exe, size_t index,
-                                       sb_storage **view_out,
-                                       sb_error **err_out);
+boom_status boom_executable_parameter_view(const boom_executable *exe, size_t index,
+                                       boom_storage **view_out,
+                                       boom_error **err_out);
 
 /* Host address and byte count of a view. `data_out` and `bytes_out` may each be
  * NULL. The address is borrowed: the view pins it, so it stays valid until the
  * view is released, and must not be written. */
-sb_status sb_storage_data(const sb_storage *view, const void **data_out,
-                          uint64_t *bytes_out, sb_error **err_out);
+boom_status boom_storage_data(const boom_storage *view, const void **data_out,
+                          uint64_t *bytes_out, boom_error **err_out);
 
-/* Descriptor of a view's tensor, as sb_executable_parameter_desc. dims/name
+/* Descriptor of a view's tensor, as boom_executable_parameter_desc. dims/name
  * stay valid while the view is alive. */
-sb_status sb_storage_desc(const sb_storage *view, sb_tensor_desc *desc_out,
-                          sb_error **err_out);
+boom_status boom_storage_desc(const boom_storage *view, boom_tensor_desc *desc_out,
+                          boom_error **err_out);
 
 /* Drop a view's ownership reference. NULL is safe. */
-void sb_storage_release(sb_storage *view);
+void boom_storage_release(boom_storage *view);
 
 /* --- Bound parameters ------------------------------------------------------ */
 
 /* A graph parameter may be declared `(data :bound "<name>")` instead of
  * carrying inline `:values` bytes or an `:external` sidecar. Compile allocates
  * the constant's slot and records its byte count, but loads nothing: the caller
- * must fill every bound parameter with sb_bind_parameter before the first run.
- * Until then sb_execute, sb_run_multi and sb_run_resident fail with
- * SB_ERR_BINDING. Binding copies `len` bytes (the caller may free `data` on
+ * must fill every bound parameter with boom_bind_parameter before the first run.
+ * Until then boom_execute, boom_run_multi and boom_run_resident fail with
+ * BOOM_ERR_BINDING. Binding copies `len` bytes (the caller may free `data` on
  * return, and later writes through it are not observed); `len` must equal the
  * parameter's num_bytes. A parameter may be rebound before the first
  * successful run, replacing the copied bytes; afterwards binding fails with
- * SB_ERR_BINDING. An unknown name or wrong size is SB_ERR_BINDING; a NULL
- * argument is SB_ERR_INTERNAL. Device training graphs (sb_compile_device)
- * have no bound parameters and fail with SB_ERR_UNSUPPORTED. */
-sb_status sb_bind_parameter(sb_executable *exe, const char *name,
-                            const void *data, size_t len, sb_error **err_out);
+ * BOOM_ERR_BINDING. An unknown name or wrong size is BOOM_ERR_BINDING; a NULL
+ * argument is BOOM_ERR_INTERNAL. Device training graphs (boom_compile_device)
+ * have no bound parameters and fail with BOOM_ERR_UNSUPPORTED. */
+boom_status boom_bind_parameter(boom_executable *exe, const char *name,
+                            const void *data, size_t len, boom_error **err_out);
 
 /* 1 when every `(data :bound ...)` parameter of `exe` has been filled, 0
  * otherwise. A graph without bound parameters (and a device training graph,
  * which has no host parameter block) is complete. */
-sb_status sb_bindings_complete(const sb_executable *exe, int *complete_out,
-                               sb_error **err_out);
+boom_status boom_bindings_complete(const boom_executable *exe, int *complete_out,
+                               boom_error **err_out);
 
 /* --- Release --------------------------------------------------------------- */
 
-void sb_document_free(sb_document *doc);
-void sb_executable_free(sb_executable *exe);
+void boom_document_free(boom_document *doc);
+void boom_executable_free(boom_executable *exe);
 
 /* --- Training (minimal autograd) ------------------------------------------- */
 /* A float32-only reverse-mode autograd surface for a small MLP: linear/relu/
@@ -411,15 +411,15 @@ void sb_executable_free(sb_executable *exe);
 
 /* Create a float32 tensor of the given shape (dims[0..rank)) from little-endian
  * bytes. `len` must equal numel * 4. The handle owns the native tensor. */
-sb_status sb_tensor_from_f32(const int64_t *dims, int64_t rank, const void *data,
-                             size_t len, sb_tensor **out, sb_error **err_out);
+boom_status boom_tensor_from_f32(const int64_t *dims, int64_t rank, const void *data,
+                             size_t len, boom_tensor **out, boom_error **err_out);
 
 /* Copy a tensor's little-endian float32 bytes into `out` (capacity `cap`). On
  * success *written_out is the byte count (== numel * 4). */
-sb_status sb_tensor_bytes(const sb_tensor *t, void *out, size_t cap,
-                          size_t *written_out, sb_error **err_out);
+boom_status boom_tensor_bytes(const boom_tensor *t, void *out, size_t cap,
+                          size_t *written_out, boom_error **err_out);
 
-void sb_tensor_free(sb_tensor *t);
+void boom_tensor_free(boom_tensor *t);
 
 /* --- Training: parameter + fused AdamW -------------------------------------- */
 /* A trainable float32 parameter owns its values, its gradient, and AdamW's two
@@ -431,81 +431,81 @@ void sb_tensor_free(sb_tensor *t);
  * equal numel * 4 and supplies the initial values. The gradient and both moment
  * buffers start at zero. */
 
-sb_status sb_param_create(const int64_t *dims, int64_t rank, const void *init,
-                          size_t len, sb_param **out, sb_error **err_out);
+boom_status boom_param_create(const int64_t *dims, int64_t rank, const void *init,
+                          size_t len, boom_param **out, boom_error **err_out);
 
 /* Element count, and whether the buffers are device-resident (1) or host
  * (0). Both are always available once the handle exists. */
-sb_status sb_param_numel(const sb_param *p, size_t *numel_out);
-int sb_param_on_device(const sb_param *p);
+boom_status boom_param_numel(const boom_param *p, size_t *numel_out);
+int boom_param_on_device(const boom_param *p);
 
-/* Updates applied so far (0 before the first successful sb_param_step). */
-uint64_t sb_param_step_count(const sb_param *p);
+/* Updates applied so far (0 before the first successful boom_param_step). */
+uint64_t boom_param_step_count(const boom_param *p);
 
 /* Zero the gradient, replace it with `grad` (len == numel * 4), and apply one
- * AdamW update. `sb_param_read` copies the current parameter values out. */
-sb_status sb_param_zero_grad(sb_param *p, sb_error **err_out);
-sb_status sb_param_set_grad(sb_param *p, const void *grad, size_t len,
-                            sb_error **err_out);
-sb_status sb_param_step(sb_param *p, float lr, float beta1, float beta2,
-                        float eps, float weight_decay, sb_error **err_out);
+ * AdamW update. `boom_param_read` copies the current parameter values out. */
+boom_status boom_param_zero_grad(boom_param *p, boom_error **err_out);
+boom_status boom_param_set_grad(boom_param *p, const void *grad, size_t len,
+                            boom_error **err_out);
+boom_status boom_param_step(boom_param *p, float lr, float beta1, float beta2,
+                        float eps, float weight_decay, boom_error **err_out);
 
 /* The lr-input form: the learning rate is read from a one-element float32
- * tensor (an sb_tensor handle, which is how a traced schedule carries the
+ * tensor (an boom_tensor handle, which is how a traced schedule carries the
  * rate). The parameter's own buffers stay device-resident; only the single
  * rate is read on the host. The handle's numel must be 1 and its dtype
  * float32. */
-sb_status sb_param_step_lr(sb_param *p, const sb_tensor *lr, float beta1,
+boom_status boom_param_step_lr(boom_param *p, const boom_tensor *lr, float beta1,
                            float beta2, float eps, float weight_decay,
-                           sb_error **err_out);
-sb_status sb_param_read(const sb_param *p, void *out, size_t cap,
-                        size_t *written_out, sb_error **err_out);
+                           boom_error **err_out);
+boom_status boom_param_read(const boom_param *p, void *out, size_t cap,
+                        size_t *written_out, boom_error **err_out);
 
-void sb_param_free(sb_param *p);
+void boom_param_free(boom_param *p);
 
 /* Create an empty tape (no recorded ops, no gradients). */
-sb_status sb_tape_new(sb_tape **out, sb_error **err_out);
+boom_status boom_tape_new(boom_tape **out, boom_error **err_out);
 
-void sb_tape_free(sb_tape *tape);
+void boom_tape_free(boom_tape *tape);
 
 /* Clear the tape's recorded ops and accumulated gradients. */
-void sb_tape_zero_grad(sb_tape *tape);
+void boom_tape_zero_grad(boom_tape *tape);
 
 /* Forward ops: each returns a new tensor handle and records a node on `tape`.
  * linear: y = x @ Wᵀ + b (x [N,in], W [out,in], b [out] → [N,out]). */
-sb_status sb_linear(const sb_tensor *x, const sb_tensor *w, const sb_tensor *b,
-                    sb_tape *tape, sb_tensor **out, sb_error **err_out);
+boom_status boom_linear(const boom_tensor *x, const boom_tensor *w, const boom_tensor *b,
+                    boom_tape *tape, boom_tensor **out, boom_error **err_out);
 
 /* relu: y = max(x, 0), elementwise. */
-sb_status sb_relu(const sb_tensor *x, sb_tape *tape, sb_tensor **out,
-                  sb_error **err_out);
+boom_status boom_relu(const boom_tensor *x, boom_tape *tape, boom_tensor **out,
+                  boom_error **err_out);
 
 /* mse_loss: scalar = mean((pred - target)²); returns a 0-dim tensor. */
-sb_status sb_mse_loss(const sb_tensor *pred, const sb_tensor *target,
-                      sb_tape *tape, sb_tensor **out, sb_error **err_out);
+boom_status boom_mse_loss(const boom_tensor *pred, const boom_tensor *target,
+                      boom_tape *tape, boom_tensor **out, boom_error **err_out);
 
 /* Reverse-mode backprop from `loss` (seeds dL/dL = 1), accumulating gradients
  * into `tape`. */
-sb_status sb_backward(const sb_tensor *loss, sb_tape *tape, sb_error **err_out);
+boom_status boom_backward(const boom_tensor *loss, boom_tape *tape, boom_error **err_out);
 
 /* In-place SGD update param <- param - lr * grad, using `param`'s accumulated
  * gradient in `tape`. The parameter keeps its identity across calls. */
-sb_status sb_sgd_step(sb_tape *tape, sb_tensor *param, double lr,
-                      sb_error **err_out);
+boom_status boom_sgd_step(boom_tape *tape, boom_tensor *param, double lr,
+                      boom_error **err_out);
 
 /* Read `param`'s accumulated gradient as a new tensor handle. Returns
- * SB_ERR_RUNTIME if no gradient has been accumulated for `param`. */
-sb_status sb_grad(const sb_tape *tape, const sb_tensor *param, sb_tensor **out,
-                  sb_error **err_out);
+ * BOOM_ERR_RUNTIME if no gradient has been accumulated for `param`. */
+boom_status boom_grad(const boom_tape *tape, const boom_tensor *param, boom_tensor **out,
+                  boom_error **err_out);
 
 /* Clip a set of gradient tensors by their global L2 norm, in place. GRADS is
- * COUNT float32 CPU tensors (the gradients read back with sb_grad, or any
+ * COUNT float32 CPU tensors (the gradients read back with boom_grad, or any
  * other gradient buffers); the norm is accumulated in double over every
  * element of every tensor. When it exceeds MAX_NORM each tensor is scaled by
  * MAX_NORM / (norm + 1e-6); otherwise the tensors are left byte-for-byte
  * unchanged. *NORM_OUT, when non-NULL, receives the pre-clip global norm. */
-sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
-                            float *norm_out, sb_error **err_out);
+boom_status boom_clip_grad_norm(boom_tensor *const *grads, int count, float max_norm,
+                            float *norm_out, boom_error **err_out);
 
 /* --- Export ----------------------------------------------------------------- */
 
@@ -519,13 +519,13 @@ sb_status sb_clip_grad_norm(sb_tensor *const *grads, int count, float max_norm,
  *
  * `sx_text`/`sx_len` is the graph (the same text the nn composition emits).
  * `names[i]` names the parameter; `params[i]` is its trained float32 tensor,
- * whose byte count must equal the declared shape (SB_ERR_INTERNAL otherwise).
+ * whose byte count must equal the declared shape (BOOM_ERR_INTERNAL otherwise).
  * Parameters not listed keep their existing inline/external data. `dir` is
- * created if needed. The artifact is loadable later with sb_compile using
+ * created if needed. The artifact is loadable later with boom_compile using
  * `dir` as base_dir, with no Guile or Python at load time. */
-sb_status sb_export_model(const char *sx_text, size_t sx_len,
-                          const char *const *names, const sb_tensor *const *params,
-                          size_t count, const char *dir, sb_error **err_out);
+boom_status boom_export_model(const char *sx_text, size_t sx_len,
+                          const char *const *names, const boom_tensor *const *params,
+                          size_t count, const char *dir, boom_error **err_out);
 
 /* --- Checkpoints ------------------------------------------------------------- */
 
@@ -535,7 +535,7 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
  *   u64                            entry count
  *   per entry:
  *     u32 name_len, name bytes     UTF-8, not NUL-terminated
- *     u8 dtype                     sb_dtype (float32 in this version)
+ *     u8 dtype                     boom_dtype (float32 in this version)
  *     u32 rank
  *     i64 dims[rank]               row-major shape
  *     u64 byte_count               == numel * 4
@@ -544,8 +544,8 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
  * All integers are little-endian. Entries are matched by name, so the order in
  * which a caller saves and loads them need not agree.
  *
- * sb_save_params writes `count` named tensors to `path` (overwriting it).
- * Names must be non-empty and unique; tensors must be float32. sb_load_params
+ * boom_save_params writes `count` named tensors to `path` (overwriting it).
+ * Names must be non-empty and unique; tensors must be float32. boom_load_params
  * copies the stored values into the caller's existing tensors, matched by
  * name: each target must be float32 with exactly the stored shape. The file is
  * fully parsed and validated before any target is written, so on any failure
@@ -554,24 +554,24 @@ sb_status sb_export_model(const char *sx_text, size_t sx_len,
  * call may load a subset of its targets from several checkpoints.
  *
  * Errors: a missing, unreadable, truncated or malformed checkpoint is
- * SB_ERR_WEIGHT; a name/shape/dtype mismatch between file and caller is
- * SB_ERR_BINDING (also on save for duplicate names or a non-float32 tensor);
- * an invalid argument is SB_ERR_INTERNAL. */
-sb_status sb_save_params(const char *path, const char *const *names,
-                         const sb_tensor *const *params, size_t count,
-                         sb_error **err_out);
-sb_status sb_load_params(const char *path, const char *const *names,
-                         sb_tensor *const *params, size_t count,
-                         sb_error **err_out);
+ * BOOM_ERR_WEIGHT; a name/shape/dtype mismatch between file and caller is
+ * BOOM_ERR_BINDING (also on save for duplicate names or a non-float32 tensor);
+ * an invalid argument is BOOM_ERR_INTERNAL. */
+boom_status boom_save_params(const char *path, const char *const *names,
+                         const boom_tensor *const *params, size_t count,
+                         boom_error **err_out);
+boom_status boom_load_params(const char *path, const char *const *names,
+                         boom_tensor *const *params, size_t count,
+                         boom_error **err_out);
 
 /* --- Numerics profile ------------------------------------------------------ */
 
 /* The two numerics profiles (see core/include/sonicboom/numerics.h):
  *
- *   SB_NUMERICS_STRICT   -- the v0/v1 reference semantics. Every reduction is
+ *   BOOM_NUMERICS_STRICT   -- the v0/v1 reference semantics. Every reduction is
  *                           identical to the historical binary; the KV cache
  *                           keeps f32; no TF32/DF32 substitutions.
- *   SB_NUMERICS_STANDARD -- the performance profile. Bit-identical to strict
+ *   BOOM_NUMERICS_STANDARD -- the performance profile. Bit-identical to strict
  *                           unless a substitution is enabled for it; today
  *                           that is f16 KV storage (exact for the values the
  *                           cache holds) and the profile's other candidates.
@@ -579,50 +579,50 @@ sb_status sb_load_params(const char *path, const char *const *names,
  * The profile is process-wide and latched: the first inference or explicit
  * set wins, because it is part of the plan, autotune and codegen cache keys.
  * Until it is set the process uses the SONICBOOM_NUMERICS environment variable
- * ("strict" or "standard"), then SB_NUMERICS_STANDARD.
+ * ("strict" or "standard"), then BOOM_NUMERICS_STANDARD.
  *
- * sb_get_numerics_profile returns the effective profile (the latched value, or
+ * boom_get_numerics_profile returns the effective profile (the latched value, or
  * the environment/default value before the first latch). */
-typedef enum sb_numerics_profile {
-  SB_NUMERICS_STRICT = 0,
-  SB_NUMERICS_STANDARD = 1,
-} sb_numerics_profile;
+typedef enum boom_numerics_profile {
+  BOOM_NUMERICS_STRICT = 0,
+  BOOM_NUMERICS_STANDARD = 1,
+} boom_numerics_profile;
 
-/* Request a profile for this process. Returns SB_ERR_UNSUPPORTED (with a
+/* Request a profile for this process. Returns BOOM_ERR_UNSUPPORTED (with a
  * message naming both profiles) if a different profile is already latched;
  * setting the already-effective profile is a no-op success. Call before the
  * first model load or inference for the setting to apply everywhere. */
-sb_status sb_set_numerics_profile(sb_numerics_profile profile,
-                                  sb_error **err_out);
-sb_status sb_get_numerics_profile(sb_numerics_profile *profile_out,
-                                  sb_error **err_out);
+boom_status boom_set_numerics_profile(boom_numerics_profile profile,
+                                  boom_error **err_out);
+boom_status boom_get_numerics_profile(boom_numerics_profile *profile_out,
+                                  boom_error **err_out);
 
-/* --- Inference (minimal LLM surface, sb_llm_*) ----------------------------- */
+/* --- Inference (minimal LLM surface, boom_llm_*) ----------------------------- */
 /* A thin facade over the Layer 2 model loader + planner spine, exposing the
  * smallest inference set the first binding (Guile) needs: model load/free,
  * session new/free, tokenize/detokenize, prefill, and decode with a per-token
  * callback. The scope is intentionally minimal (v1 wrap-up):
- *  - on the device path, after sb_llm_prefill decode continues from the
+ *  - on the device path, after boom_llm_prefill decode continues from the
  *    session's persistent KV cache: each call emits up to max_tokens from where
  *    the previous one stopped, so a max_tokens=1 call is a per-token step. (The
  *    CPU fallback re-runs from the prompt on every call and does not carry
  *    generated tokens across calls.) A single-token prompt is a seed and
  *    decodes directly;
  *  - temperature 0 is greedy (the historical path); temperature > 0 samples
- *    deterministically from sb_llm_sampling's seed, and the sampled draw state
+ *    deterministically from boom_llm_sampling's seed, and the sampled draw state
  *    persists across calls on the same session;
  *  - tokenize/detokenize use the model's GGUF built-in vocabulary (SPM-style
  *    BPE for Gemma 4, byte-level BPE for Qwen2), matching llama-tokenize;
  *  - the architectures SonicBoom models load (Gemma 4, Qwen2); anything else
- *    returns SB_ERR_UNSUPPORTED. Which one loaded is readable with
- *    sb_llm_model_arch, and the model's own stop tokens with sb_llm_model_eos —
+ *    returns BOOM_ERR_UNSUPPORTED. Which one loaded is readable with
+ *    boom_llm_model_arch, and the model's own stop tokens with boom_llm_model_eos —
  *    a caller that formats prompts per family takes both from the model rather
  *    than assuming.
  * These gaps are recorded in the post-v1 list. */
 
-typedef struct sb_llm_model sb_llm_model;
-typedef struct sb_llm_session sb_llm_session;
-typedef int32_t sb_token;   /* a vocabulary index */
+typedef struct boom_llm_model boom_llm_model;
+typedef struct boom_llm_session boom_llm_session;
+typedef int32_t boom_token;   /* a vocabulary index */
 
 /* Sampling parameters for one decode call.
  *
@@ -649,20 +649,20 @@ typedef int32_t sb_token;   /* a vocabulary index */
  * a caller built against an older struct_size gets the neutral defaults below.
  *   min_p              neutral 0    (keep every candidate above the window)
  *   repeat_penalty     neutral 1    (no repetition penalty; 0 = off, < 0 is
- *                                    SB_ERR_BINDING)
+ *                                    BOOM_ERR_BINDING)
  *   repeat_last_n      neutral 64   (penalty window, tokens; 0 disables every
  *                                    penalty; on the CUDA path a value above
- *                                    1024 is SB_ERR_BINDING, the device
+ *                                    1024 is BOOM_ERR_BINDING, the device
  *                                    penalty window's cap)
  *   presence_penalty   neutral 0    (subtracted once per repeated token)
  *   frequency_penalty  neutral 0    (subtracted per occurrence)
- * Zero means "off" throughout: a zero-initialized sb_llm_sampling whose only
- * fields are struct_size = sizeof(sb_llm_sampling) and max_tokens is plain
+ * Zero means "off" throughout: a zero-initialized boom_llm_sampling whose only
+ * fields are struct_size = sizeof(boom_llm_sampling) and max_tokens is plain
  * greedy (temperature 0, no truncation, no penalties).
  * For a token t appearing c times in the window: if repeat_penalty != 1,
  * l[t] = l[t] / repeat_penalty when l[t] > 0 else l[t] * repeat_penalty; then
  * l[t] -= frequency_penalty * c + presence_penalty. */
-typedef struct sb_llm_sampling {
+typedef struct boom_llm_sampling {
   size_t struct_size;
   float temperature;
   float top_p;
@@ -674,21 +674,21 @@ typedef struct sb_llm_sampling {
   uint32_t repeat_last_n;
   float presence_penalty;
   float frequency_penalty;
-} sb_llm_sampling;
+} boom_llm_sampling;
 
 /* Per-token callback: called synchronously on the calling thread, once per
  * produced token, in generation order. Return 0 to continue, non-zero to stop
  * the decode early. `user` is passed through untouched. */
-typedef int (*sb_llm_token_cb)(void *user, sb_token token);
+typedef int (*boom_llm_token_cb)(void *user, boom_token token);
 
 /* Load a GGUF model for inference. The model owns its backing buffer; a
- * session keeps the model alive after sb_llm_model_free. */
-sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
-                            sb_error **err_out);
+ * session keeps the model alive after boom_llm_model_free. */
+boom_status boom_llm_model_load(const char *gguf_path, boom_llm_model **model_out,
+                            boom_error **err_out);
 
-/* sb_llm_model_load_ex flags.
+/* boom_llm_model_load_ex flags.
  *
- * SB_LLM_LOAD_CANONICAL selects canonical numerics for the process: every
+ * BOOM_LLM_LOAD_CANONICAL selects canonical numerics for the process: every
  * tuner whose pick changes arithmetic takes its documented reference default
  * and neither reads nor writes a tune record, so the same model and prompt
  * produce the same tokens on an empty and on a populated tune directory.
@@ -696,75 +696,75 @@ sb_status sb_llm_model_load(const char *gguf_path, sb_llm_model **model_out,
  * programmatic form of SONICBOOM_TUNE=canonical and is sticky for the
  * process, like the numerics profile.
  *
- * SB_LLM_LOAD_CONTINUE_REPLAY makes a session with recurrent state continue
+ * BOOM_LLM_LOAD_CONTINUE_REPLAY makes a session with recurrent state continue
  * under the replay rule (resume only at a state checkpoint) instead of the
  * default live rule (continue the whole recorded session from its live state).
  * It is the programmatic form of SONICBOOM_REPRO_CONTINUE=replay and is sticky
  * for the process.
  *
- * Any other bit is SB_ERR_BINDING. */
-#define SB_LLM_LOAD_CANONICAL 1u
-#define SB_LLM_LOAD_CONTINUE_REPLAY 2u
-sb_status sb_llm_model_load_ex(const char *gguf_path, uint32_t flags,
-                               sb_llm_model **model_out, sb_error **err_out);
+ * Any other bit is BOOM_ERR_BINDING. */
+#define BOOM_LLM_LOAD_CANONICAL 1u
+#define BOOM_LLM_LOAD_CONTINUE_REPLAY 2u
+boom_status boom_llm_model_load_ex(const char *gguf_path, uint32_t flags,
+                               boom_llm_model **model_out, boom_error **err_out);
 
-void sb_llm_model_free(sb_llm_model *model);
+void boom_llm_model_free(boom_llm_model *model);
 
 /* The loaded model's architecture, exactly as its GGUF declares it in
  * `general.architecture` ("gemma4", "qwen2", ...). A caller that must format
  * prompts, pick turn markers or otherwise behave differently per family reads
  * this from the model instead of guessing from the file name. Two-call sizing
  * like the other string out-params; *len_out excludes the NUL. */
-sb_status sb_llm_model_arch(const sb_llm_model *model, char *out, size_t cap,
-                            size_t *len_out, sb_error **err_out);
+boom_status boom_llm_model_arch(const boom_llm_model *model, char *out, size_t cap,
+                            size_t *len_out, boom_error **err_out);
 
 /* The model's end-of-sequence token id(s) as its GGUF declares them
  * (`tokenizer.ggml.eos_token_id`, plus `tokenizer.ggml.eos_token_ids` when the
  * model lists several). *n_out receives the count; none declared gives 0.
  * Two-call sizing: pass out NULL or cap too small for the count. */
-sb_status sb_llm_model_eos(const sb_llm_model *model, sb_token *out, size_t cap,
-                           size_t *n_out, sb_error **err_out);
+boom_status boom_llm_model_eos(const boom_llm_model *model, boom_token *out, size_t cap,
+                           size_t *n_out, boom_error **err_out);
 
 /* Tokenize/detokenize with the model's GGUF built-in vocabulary (SPM-style BPE
  * for Gemma 4). tokenize encodes `text` (UTF-8, `len` bytes) into token ids
  * with <bos> prepended (llama-tokenize add_special); detokenize renders `tokens`
  * back to UTF-8 (NUL-terminated), stripping control tokens and undoing ▁/byte
  * escapes. Both use two-call sizing: pass `out` NULL or `cap` too small to get
- * the needed count in *n_out / *len_out (and SB_ERR_BINDING). */
-sb_status sb_llm_tokenize(const sb_llm_model *model, const char *text, size_t len,
-                          sb_token *out, size_t cap, size_t *n_out, sb_error **err_out);
+ * the needed count in *n_out / *len_out (and BOOM_ERR_BINDING). */
+boom_status boom_llm_tokenize(const boom_llm_model *model, const char *text, size_t len,
+                          boom_token *out, size_t cap, size_t *n_out, boom_error **err_out);
 
-/* sb_llm_tokenize_ex flags. SB_TOKENIZE_ADD_SPECIAL (prepend <bos>) is what
- * sb_llm_tokenize does; a caller that tokenizes a prompt piece by piece turns
+/* boom_llm_tokenize_ex flags. BOOM_TOKENIZE_ADD_SPECIAL (prepend <bos>) is what
+ * boom_llm_tokenize does; a caller that tokenizes a prompt piece by piece turns
  * it on for the first piece only, so <bos> is added exactly once. */
-#define SB_TOKENIZE_PARSE_SPECIAL 1
-#define SB_TOKENIZE_ADD_SPECIAL 2
+#define BOOM_TOKENIZE_PARSE_SPECIAL 1
+#define BOOM_TOKENIZE_ADD_SPECIAL 2
 
-/* sb_llm_tokenize with flags. With SB_TOKENIZE_PARSE_SPECIAL, a CONTROL /
+/* boom_llm_tokenize with flags. With BOOM_TOKENIZE_PARSE_SPECIAL, a CONTROL /
  * USER_DEFINED piece of the vocabulary (e.g. Gemma 4's "<|turn>", "<turn|>")
  * occurring verbatim in `text` becomes that one token instead of being encoded
  * as text. This turns text into control structure, so it must only be used on
  * text the caller itself generated (a chat template's turn markers): a user
  * message containing "<turn|>" would otherwise become a real turn boundary
- * (prompt injection). sb_llm_tokenize is this with SB_TOKENIZE_ADD_SPECIAL
+ * (prompt injection). boom_llm_tokenize is this with BOOM_TOKENIZE_ADD_SPECIAL
  * alone, byte for byte. */
-sb_status sb_llm_tokenize_ex(const sb_llm_model *model, const char *text, size_t len,
-                             int flags, sb_token *out, size_t cap,
-                             size_t *n_out, sb_error **err_out);
-sb_status sb_llm_detokenize(const sb_llm_model *model, const sb_token *tokens,
+boom_status boom_llm_tokenize_ex(const boom_llm_model *model, const char *text, size_t len,
+                             int flags, boom_token *out, size_t cap,
+                             size_t *n_out, boom_error **err_out);
+boom_status boom_llm_detokenize(const boom_llm_model *model, const boom_token *tokens,
                             size_t n, char *out, size_t cap, size_t *len_out,
-                            sb_error **err_out);
+                            boom_error **err_out);
 
 /* Create a session (a prompt/token history + n_ctx). The session holds a
  * reference to the model, so the model handle may be freed first.
  *
  * Calls on the same session from several threads are serialized; a session is
  * not a unit of parallelism. Use one session per concurrent conversation. A
- * call through a handle that has already been freed fails with SB_ERR_INTERNAL
+ * call through a handle that has already been freed fails with BOOM_ERR_INTERNAL
  * ("session is freed") instead of touching freed memory. */
-sb_status sb_llm_session_new(sb_llm_model *model, uint64_t n_ctx,
-                             sb_llm_session **session_out, sb_error **err_out);
-void sb_llm_session_free(sb_llm_session *session);
+boom_status boom_llm_session_new(boom_llm_model *model, uint64_t n_ctx,
+                             boom_llm_session **session_out, boom_error **err_out);
+void boom_llm_session_free(boom_llm_session *session);
 
 /* Set the session's prompt to tokens[0..n). *n_reused_out receives the length
  * of leading tokens reused from the previous prompt's KV state. The last prompt
@@ -772,15 +772,15 @@ void sb_llm_session_free(sb_llm_session *session);
  * logits — so the count is at most n-1, even when the whole prompt is already
  * resident. (The CPU decode path re-prefills rather than reusing KV slots; KV
  * reuse is the CUDA prefix-cache path.) */
-sb_status sb_llm_prefill(sb_llm_session *session, const sb_token *tokens, size_t n,
-                         uint64_t *n_reused_out, sb_error **err_out);
+boom_status boom_llm_prefill(boom_llm_session *session, const boom_token *tokens, size_t n,
+                         uint64_t *n_reused_out, boom_error **err_out);
 
 /* Decode up to sampling->max_tokens tokens from the session's prompt, invoking
  * cb for each (abort on a non-zero return). *n_out receives the count produced.
- * Requires a non-empty prompt (sb_llm_prefill first). */
-sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling,
-                        sb_llm_token_cb cb, void *user, uint32_t *n_out,
-                        sb_error **err_out);
+ * Requires a non-empty prompt (boom_llm_prefill first). */
+boom_status boom_llm_decode(boom_llm_session *session, const boom_llm_sampling *sampling,
+                        boom_llm_token_cb cb, void *user, uint32_t *n_out,
+                        boom_error **err_out);
 
 /* --- Constrained decoding (session grammar) --------------------------------
  *
@@ -788,45 +788,45 @@ sb_status sb_llm_decode(sb_llm_session *session, const sb_llm_sampling *sampling
  * acceptable. `gbnf` is a GBNF document (the llama.cpp dialect: rule ::=
  * alternation, "literals" with the usual escapes, [byte classes], . * + ? and
  * {m,n}, # comments; the first rule is the start rule). The grammar consumes
- * the same bytes sb_llm_detokenize would emit for a token, so it constrains the
+ * the same bytes boom_llm_detokenize would emit for a token, so it constrains the
  * text the model produces, not token ids. The model's EOS ids (see
- * sb_llm_model_eos) are the grammar's stop tokens: they are not text, may be
+ * boom_llm_model_eos) are the grammar's stop tokens: they are not text, may be
  * sampled only where the grammar can end, and end the constrained output
  * without being emitted.
  *
- * sb_llm_session_set_json_schema compiles a JSON Schema (one JSON document) to
+ * boom_llm_session_set_json_schema compiles a JSON Schema (one JSON document) to
  * GBNF first; the supported subset is documented in
  * core/include/sonicboom/vocab/grammar.h, and an unsupported keyword is
  * rejected by name rather than silently ignored.
  *
- * A grammar starts at every sb_llm_prefill (a new turn) and applies to the
- * first token sampled by that prefill and to every sb_llm_decode step. Once a
- * stop token finishes it, sb_llm_decode produces no further tokens.
+ * A grammar starts at every boom_llm_prefill (a new turn) and applies to the
+ * first token sampled by that prefill and to every boom_llm_decode step. Once a
+ * stop token finishes it, boom_llm_decode produces no further tokens.
  *
- * sb_llm_session_constraint_state reports whether a grammar is installed
+ * boom_llm_session_constraint_state reports whether a grammar is installed
  * (*active_out) and whether the text accepted so far is already a complete
  * value of it (*complete_out). */
-/* sb_llm_json_schema_to_gbnf is the compiler alone, as text: it lets a caller
+/* boom_llm_json_schema_to_gbnf is the compiler alone, as text: it lets a caller
  * compose a schema into a larger grammar instead of installing the schema as
  * the whole reply. PREFIX and SUFFIX (may be NULL) are literal UTF-8 text the
  * value must appear between; the root matches exactly that text, so a complete
  * value can only be continued by a stop token.
- * Two-call sizing like sb_llm_model_arch: *len_out always receives the length
+ * Two-call sizing like boom_llm_model_arch: *len_out always receives the length
  * (without NUL), and a capacity that cannot hold the text plus its NUL returns
- * SB_ERR_BINDING with nothing written. */
-sb_status sb_llm_json_schema_to_gbnf(const char *schema_json,
+ * BOOM_ERR_BINDING with nothing written. */
+boom_status boom_llm_json_schema_to_gbnf(const char *schema_json,
                                      const char *prefix, const char *suffix,
                                      char *out, size_t cap, size_t *len_out,
-                                     sb_error **err_out);
-sb_status sb_llm_session_set_grammar(sb_llm_session *session, const char *gbnf,
-                                     sb_error **err_out);
-sb_status sb_llm_session_set_json_schema(sb_llm_session *session,
+                                     boom_error **err_out);
+boom_status boom_llm_session_set_grammar(boom_llm_session *session, const char *gbnf,
+                                     boom_error **err_out);
+boom_status boom_llm_session_set_json_schema(boom_llm_session *session,
                                          const char *schema_json,
-                                         sb_error **err_out);
-void sb_llm_session_clear_grammar(sb_llm_session *session);
-sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
+                                         boom_error **err_out);
+void boom_llm_session_clear_grammar(boom_llm_session *session);
+boom_status boom_llm_session_constraint_state(const boom_llm_session *session,
                                           int *active_out, int *complete_out,
-                                          sb_error **err_out);
+                                          boom_error **err_out);
 
 /* --- Image generation ------------------------------------------------------
  *
@@ -834,14 +834,14 @@ sb_status sb_llm_session_constraint_state(const sb_llm_session *session,
  * pipeline with its text encoder), one request struct, a batch of RGB images
  * and a minimal PNG writer. The model directory is the MOSS-Image root
  * (text_encoder/, transformer/, vae/, tokenizer/); a directory the pipeline
- * rejects is SB_ERR_UNSUPPORTED.
+ * rejects is BOOM_ERR_UNSUPPORTED.
  *
  * Determinism: image i starts from the same seeded noise sb-moss's `sample
  * --seed` draws (seed + i), and images in a batch are denoised one at a time,
  * so image i of a batch is bit-identical to generating it alone.
  */
 
-typedef struct sb_image_model sb_image_model;
+typedef struct boom_image_model boom_image_model;
 
 /* One generation request. Fields beyond `struct_size` take their defaults, so
  * a caller built against an older header keeps working. prompt is required
@@ -850,7 +850,7 @@ typedef struct sb_image_model sb_image_model;
  * width and height are multiples of 16 (and >= 16); batch >= 1; steps >= 1;
  * guidance_scale is used as given (0 is unconditional-only; the reference
  * pipeline's default is 3.0), so a caller sets the guidance it wants. */
-typedef struct sb_image_request {
+typedef struct boom_image_request {
   size_t struct_size;
   const char *prompt;
   const char *negative_prompt;
@@ -860,41 +860,41 @@ typedef struct sb_image_request {
   float guidance_scale;
   uint64_t seed;
   uint32_t batch;
-} sb_image_request;
+} boom_image_request;
 
 /* Called after each denoising step with the image's index in the batch, the
  * steps completed (1-based) and the total. A non-zero return cancels: the
- * generation stops after the current step and sb_image_generate returns
- * SB_ERR_CANCELLED. */
-typedef int (*sb_image_progress_cb)(void *user, uint32_t image_index,
+ * generation stops after the current step and boom_image_generate returns
+ * BOOM_ERR_CANCELLED. */
+typedef int (*boom_image_progress_cb)(void *user, uint32_t image_index,
                                     uint32_t step, uint32_t total_steps);
 
 /* Load the MOSS-Image pipeline and its text encoder from `dir`. */
-sb_status sb_image_model_load(const char *dir, sb_image_model **out,
-                              sb_error **err_out);
-void sb_image_model_free(sb_image_model *model);
+boom_status boom_image_model_load(const char *dir, boom_image_model **out,
+                              boom_error **err_out);
+void boom_image_model_free(boom_image_model *model);
 
 /* The architecture name ("moss-image"), two-call sizing like the other string
- * outputs: a short cap returns SB_ERR_BINDING and the needed byte count. */
-sb_status sb_image_model_arch(const sb_image_model *model, char *out,
+ * outputs: a short cap returns BOOM_ERR_BINDING and the needed byte count. */
+boom_status boom_image_model_arch(const boom_image_model *model, char *out,
                               size_t cap, size_t *len_out,
-                              sb_error **err_out);
+                              boom_error **err_out);
 
 /* Generate `req->batch` images. rgb_out receives batch x height x width x 3
  * bytes, uint8 HWC, row-major, top row first, converted from the pipeline's
  * [-1, 1] CHW floats with clamp and lrintf. Two-call sizing: pass rgb_out NULL
  * (or a cap too small) to get the needed byte count in *bytes_out and
- * SB_ERR_BINDING. cb may be NULL. */
-sb_status sb_image_generate(sb_image_model *model, const sb_image_request *req,
-                            sb_image_progress_cb cb, void *user,
+ * BOOM_ERR_BINDING. cb may be NULL. */
+boom_status boom_image_generate(boom_image_model *model, const boom_image_request *req,
+                            boom_image_progress_cb cb, void *user,
                             uint8_t *rgb_out, size_t cap, size_t *bytes_out,
-                            sb_error **err_out);
+                            boom_error **err_out);
 
 /* Write `rgb` (height rows of width*3 bytes, RGB) as a PNG: 8-bit RGB, one
  * IDAT of stored (uncompressed) deflate blocks, no external dependency. */
-sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
+boom_status boom_image_write_png(const char *path, const uint8_t *rgb,
                              uint32_t width, uint32_t height,
-                             sb_error **err_out);
+                             boom_error **err_out);
 
 /* --- Decision registry (diagnostics) ---------------------------------------
  *
@@ -907,11 +907,11 @@ sb_status sb_image_write_png(const char *path, const uint8_t *rgb,
  * records plus what this process has resolved), as the same human table
  * tools/sb-explain prints or as a JSON document. No C++ type crosses the
  * boundary. Two-call sizing: pass buf NULL or cap too small to get the needed
- * byte count (including the NUL) in *len_out and SB_ERR_BINDING. */
-sb_status sb_explain_table(char *buf, size_t cap, size_t *len_out,
-                           sb_error **err_out);
-sb_status sb_explain_json(char *buf, size_t cap, size_t *len_out,
-                          sb_error **err_out);
+ * byte count (including the NUL) in *len_out and BOOM_ERR_BINDING. */
+boom_status boom_explain_table(char *buf, size_t cap, size_t *len_out,
+                           boom_error **err_out);
+boom_status boom_explain_json(char *buf, size_t cap, size_t *len_out,
+                          boom_error **err_out);
 
 #ifdef __cplusplus
 } /* extern "C" */

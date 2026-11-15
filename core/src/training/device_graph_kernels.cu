@@ -42,7 +42,7 @@ namespace sonicboom::training::detail {
 
 namespace {
 
-inline cudaStream_t cur_stream() { return ::sonicboom::cuda::sb_current_stream(); }
+inline cudaStream_t cur_stream() { return ::sonicboom::cuda::boom_current_stream(); }
 
 template <typename T>
 inline T* ptr(std::uint64_t h) { return reinterpret_cast<T*>(h); }
@@ -462,14 +462,14 @@ void dev_stream_destroy(std::uint64_t stream) {
 }
 
 std::uint64_t dev_stream_push(std::uint64_t stream) {
-  auto& cur = ::sonicboom::cuda::sb_current_stream();
+  auto& cur = ::sonicboom::cuda::boom_current_stream();
   const std::uint64_t previous = reinterpret_cast<std::uint64_t>(cur);
   cur = reinterpret_cast<cudaStream_t>(stream);
   return previous;
 }
 
 void dev_stream_pop(std::uint64_t previous) {
-  ::sonicboom::cuda::sb_current_stream() =
+  ::sonicboom::cuda::boom_current_stream() =
       reinterpret_cast<cudaStream_t>(previous);
 }
 
@@ -483,12 +483,12 @@ bool dev_capture_begin() {
     return false;
   // Kernels that stage scratch through the device pool take the shortcut the
   // planner's own capture scope takes: no host wait, no allocation.
-  ::sonicboom::cuda::sb_capturing() = true;
+  ::sonicboom::cuda::boom_capturing() = true;
   return true;
 }
 
 bool dev_capture_end(void** exec_out) {
-  ::sonicboom::cuda::sb_capturing() = false;
+  ::sonicboom::cuda::boom_capturing() = false;
   if (exec_out == nullptr) return false;
   *exec_out = nullptr;
   cudaGraph_t graph = nullptr;

@@ -40,7 +40,7 @@ set.
   file; `sb-tune import --in FILE` installs it, on the same machine or on
   another machine with the same GPU.
 - **Canonical numerics.** `SONICBOOM_TUNE=canonical`, or loading a model with
-  `SB_LLM_LOAD_CANONICAL`, uses a fixed reference choice for everything that
+  `BOOM_LLM_LOAD_CANONICAL`, uses a fixed reference choice for everything that
   affects arithmetic. The same model and prompt then give the same tokens
   with an empty or a populated cache. It can be slower.
 
@@ -51,7 +51,7 @@ state, and the same sequence of calls always gives the same output.
 
 For models with recurrent layers (for example Qwen3.6), set
 `SONICBOOM_REPRO_CONTINUE=replay`, or load the model with
-`SB_LLM_LOAD_CONTINUE_REPLAY`, to make a continued session give exactly the
+`BOOM_LLM_LOAD_CONTINUE_REPLAY`, to make a continued session give exactly the
 bits that replaying the whole conversation from the start would give. This
 can recompute up to one prefill segment per turn.
 

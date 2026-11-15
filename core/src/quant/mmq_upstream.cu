@@ -79,10 +79,10 @@ ggml_type to_ggml_type(MmqUpType type) {
 // SonicBoom: plain replacement for ggml_cuda_info().devices[id].  The
 // properties are queried once per device: cudaGetDeviceProperties costs
 // hundreds of microseconds, and a prefill calls the matmul thousands of times.
-sb_cuda_props get_props() {
+boom_cuda_props get_props() {
     static std::mutex mutex;
     static std::atomic<int> cached_device{-1};
-    static sb_cuda_props cached{};
+    static boom_cuda_props cached{};
 
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
@@ -92,7 +92,7 @@ sb_cuda_props get_props() {
             cudaDeviceProp prop;
             CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
 
-            sb_cuda_props props;
+            boom_cuda_props props;
             // Upstream encodes the compute capability as 100*major + 10*minor
             // (sm_86 -> 860); every GGML_CUDA_CC_* predicate expects that form.
             props.cc        = 100 * prop.major + 10 * prop.minor;
@@ -109,7 +109,7 @@ sb_cuda_props get_props() {
 // SonicBoom: the same J selection as mul_mat_q_switch_J(), used here only to
 // inspect the selected configuration before launching.  Returns 0 when no
 // configuration fits.
-int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const sb_cuda_props & props) {
+int pick_J(ggml_type type, bool fallback, int64_t ncols_opt, const boom_cuda_props & props) {
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
@@ -181,7 +181,7 @@ template <ggml_type type>
 bool run_mmq(const void * weights, const int32_t * y_q8, float * dst,
              int64_t M, int64_t K, int64_t n, cudaStream_t stream, int cfg,
              int split_k, const float * bias, const float * add) {
-    const sb_cuda_props props = get_props();
+    const boom_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     const bool fallback = M % 128 != 0;
@@ -231,7 +231,7 @@ template <ggml_type type>
 bool run_mmq_gather(const void * weights, const int32_t * y_q8, float * dst,
                     int64_t M, int64_t K, int64_t n, const int * row_idx,
                     cudaStream_t stream, int cfg, int split_k) {
-    const sb_cuda_props props = get_props();
+    const boom_cuda_props props = get_props();
 
     constexpr int qk = ggml_cuda_type_traits<type>::qk;
     const bool fallback = M % 128 != 0;
@@ -365,7 +365,7 @@ bool ensure_dynamic_smem(const void * kernel, int bytes) {
 // that many slices (capped at the smallest member tile count) and then reduces
 // the shared partial buffer once over all members.
 template <ggml_type T0, ggml_type T1, ggml_type T2, int J>
-bool group_launch_j(const sb_cuda_props & props,
+bool group_launch_j(const boom_cuda_props & props,
                     const sonicboom::quant::cuda::MmqGroupArgs & args,
                     const ggml_cuda_mmq_config & c0,
                     const ggml_cuda_mmq_config & c1,
@@ -397,7 +397,7 @@ bool group_launch_j(const sb_cuda_props & props,
                     unsigned((args.ncols_dst + J - 1) / J), unsigned(split_eff));
     // The grouped launch is one kernel for every member, so the record names it
     // once, the way the separate launches would name each member's matmul.
-    SB_NOTE_LAUNCH_TP(
+    BOOM_NOTE_LAUNCH_TP(
         "mul_mat_q_group",
         ::sonicboom::planner::plan_detail::tp_label(
             {{"t0", (long long)T0}, {"t1", (long long)T1},
@@ -417,7 +417,7 @@ bool group_launch_j(const sb_cuda_props & props,
         const int64_t n_elem = int64_t(args.ncols_dst) * int64_t(args.total_rows);
         const int     reduce_threads = 256;
         const int64_t reduce_blocks  = (n_elem + reduce_threads - 1) / reduce_threads;
-        SB_NOTE_LAUNCH(mul_mat_q_group_split_k_reduce,
+        BOOM_NOTE_LAUNCH(mul_mat_q_group_split_k_reduce,
                        dim3((unsigned)reduce_blocks), dim3(reduce_threads), 0,
                        stream);
         mul_mat_q_group_split_k_reduce<<<(unsigned)reduce_blocks, reduce_threads,
@@ -431,7 +431,7 @@ bool group_launch_j(const sb_cuda_props & props,
 // imported launcher makes, which depends only on n.  A member whose table has
 // no configuration at that width makes the group unlaunchable.
 template <ggml_type T0, ggml_type T1, ggml_type T2>
-bool group_launch_typed(const sb_cuda_props & props,
+bool group_launch_typed(const boom_cuda_props & props,
                         const sonicboom::quant::cuda::MmqGroupArgs & args,
                         int split_k, cudaStream_t stream) {
     const int n = args.ncols_dst;
@@ -517,7 +517,7 @@ bool set_group_smem(Kernel kernel, size_t nbs) {
 // launched with.  Nothing is launched here; returns false when a limit could
 // not be raised.
 template <ggml_type T0, ggml_type T1, ggml_type T2>
-bool group_warm_typed(const sb_cuda_props & props) {
+bool group_warm_typed(const boom_cuda_props & props) {
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config c0 = ggml_cuda_mmq_get_config<0>(T0, J, false, props.cc);
         const ggml_cuda_mmq_config c1 = ggml_cuda_mmq_get_config<0>(T1, J, false, props.cc);
@@ -561,7 +561,7 @@ bool group_warm_typed(const sb_cuda_props & props) {
 
 // The format tuples whose group kernels this build instantiates: the sibling
 // projections the four reference models' decode and verify graphs carry.
-bool group_dispatch(const sb_cuda_props & props,
+bool group_dispatch(const boom_cuda_props & props,
                     const sonicboom::quant::cuda::MmqGroupArgs & args,
                     const MmqUpType * types, int split_k, cudaStream_t stream,
                     bool warm) {
@@ -669,7 +669,7 @@ bool mmq_up_j_allowed(MmqUpType type, int64_t M, int J) {
     if (J < 8 || J > 128 || J % 8 != 0) {
         return false;
     }
-    const sb_cuda_props props = get_props();
+    const boom_cuda_props props = get_props();
     const bool fallback = M % 128 != 0;
     const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(gtype, J, fallback, props.cc);
     return config.type != GGML_TYPE_COUNT &&
@@ -730,7 +730,7 @@ bool mmq_up_cfg_allowed(MmqUpType type, int64_t M, int J, int cfg) {
     if (!mmq_up_cfg_neutral(type, cfg)) {
         return false;
     }
-    const sb_cuda_props props = get_props();
+    const boom_cuda_props props = get_props();
     const bool fallback = M % 128 != 0;
     const ggml_cuda_mmq_config base = ggml_cuda_mmq_get_config_base(gtype, J, fallback, props.cc);
     if (base.type == GGML_TYPE_COUNT) {
@@ -744,7 +744,7 @@ bool mmq_up_cfg_allowed(MmqUpType type, int64_t M, int J, int cfg) {
 
 void mmq_up_cfg_dims(MmqUpType type, int64_t M, int J, int cfg, int * I, int * nthreads) {
     const ggml_type gtype = to_ggml_type(type);
-    const sb_cuda_props props = get_props();
+    const boom_cuda_props props = get_props();
     const bool fallback = M % 128 != 0;
     const ggml_cuda_mmq_config config = mmq_apply_cfg(cfg, ggml_cuda_mmq_get_config_base(gtype, J, fallback, props.cc));
     if (I) *I = config.I;
@@ -1317,7 +1317,7 @@ double mmq_group_sep_time(const MmqUpType * types, const int64_t * rows,
 }
 
 // Median of the timed group launches (3 warm-ups, 7 timings).
-double mmq_group_tune_time(const sb_cuda_props & props, const MmqUpType * types,
+double mmq_group_tune_time(const boom_cuda_props & props, const MmqUpType * types,
                            const MmqGroupTuneBuffers & b, const int64_t * rows,
                            int n_members, int64_t cols, int n, int split_k) {
     const auto args = mmq_group_tune_args(b, types, rows, n_members, cols, n);
@@ -1504,7 +1504,7 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
         // kernels' shared-memory opt-in is host-side setup, not a choice: run
         // it here as the measuring path does, or the first grouped launch in
         // the group-use resolution fails with an invalid launch argument.
-        const sb_cuda_props props = get_props();
+        const boom_cuda_props props = get_props();
         sonicboom::quant::cuda::MmqGroupArgs warm{};
         warm.n_members = n_members;
         (void)group_dispatch(props, warm, types, 1, nullptr, /*warm=*/true);
@@ -1534,7 +1534,7 @@ void mmq_up_group_warm_split(const MmqUpType * types, const int64_t * rows,
         tune::trace_event("measure", "mmq-splitk",
                           mmq_group_splitk_key(types, rows, n_members, cols),
                           std::to_string(build_key), __builtin_FUNCTION());
-        const sb_cuda_props props = get_props();
+        const boom_cuda_props props = get_props();
         // Raise the group kernels' shared-memory limits before the first timed
         // launch; only the attribute calls matter here.
         {
@@ -1660,7 +1660,7 @@ void mmq_up_group_warm_use(const MmqUpType * types, const int64_t * rows,
         if (!allocated) continue;  // keep the grouped default
         tune::trace_event("measure", "mmq-group", key,
                           std::to_string(build_key), __builtin_FUNCTION());
-        const sb_cuda_props props = get_props();
+        const boom_cuda_props props = get_props();
         double group_ms = 0.0, sep_ms = 0.0;
         double probe_g[3] = {0.0, 0.0, 0.0};
         double probe_s[3] = {0.0, 0.0, 0.0};

@@ -69,7 +69,7 @@ Notes:
 | `core/src/planner/resource.cpp:270-298` | CUDA device enum: `gpu.name = "cuda"`, capability flags, supported-op set | `hal::Device::probe()` capability report |
 | `core/src/planner/sonic_cuda_backend.cpp` | the CUDA backend: dispatch to `*_dev` kernels, seed/pos/read_token, caches | becomes the CUDA HAL plugin |
 | `core/src/model/cuda_block.cpp:91-249` | single-block CUDA orchestration with raw `cudaMemcpy/cudaMalloc/cudaFree` | HAL buffers + command buffers |
-| `core/src/nn/cuda_stream.h:34` | thread-local `cudaStream_t sb_current_stream()` + `StreamScope`/`CaptureScope` | `hal::Stream` / capture scope on the HAL command recorder |
+| `core/src/nn/cuda_stream.h:34` | thread-local `cudaStream_t boom_current_stream()` + `StreamScope`/`CaptureScope` | `hal::Stream` / capture scope on the HAL command recorder |
 | `core/src/nn/cuda_graph.h:43-100` | `GraphStep` (capture/replay) | `hal::CommandBuffer` pre-record/replay |
 | `core/src/nn/cuda_elementwise.cu`, `cuda_resident.h` | `*_dev` CUDA kernels | CUDA HAL plugin kernel registry |
 | `core/src/quant/cuda_quant_matmul.cu`, `cuda_resident.h` | q8_1/gemv CUDA kernels | CUDA HAL plugin kernel registry |
@@ -82,7 +82,7 @@ The capture/replay machinery is spread over four places today:
    `cudaStreamCreate` / `cudaStreamBeginCapture(…, cudaStreamCaptureModeThreadLocal)`
    / `cudaStreamEndCapture` / `cudaGraphInstantiate` / `cudaGraphLaunch` /
    `cudaStreamSynchronize` (lines 43–100).
-2. **`core/src/nn/cuda_stream.h`** — `sb_current_stream()` (thread-local
+2. **`core/src/nn/cuda_stream.h`** — `boom_current_stream()` (thread-local
    `cudaStream_t`, line 34), `StreamScope` (sets the per-thread current stream,
    lines 42–51), and `CaptureScope` (sets a thread-local "capturing" flag that
    `device_pool::download` checks so the synchronous argmax D2H is skipped under
@@ -93,7 +93,7 @@ The capture/replay machinery is spread over four places today:
    loop (`graph_step.replay()` + `cuda_backend.read_token()`) or the per-step
    fallback loop.
 4. **`core/src/planner/device_pool.cpp:112-118`** — `download()` is capture-aware
-   (`if (sb_capturing()) return true;`) so the uncapturable synchronous
+   (`if (boom_capturing()) return true;`) so the uncapturable synchronous
    `cudaMemcpy` becomes a no-op under capture and the result is read from the
    persistent `token_dev_` slot after replay.
 
@@ -288,11 +288,11 @@ How each backend maps it:
 | **Vulkan** | record into a `vk::CommandBuffer` | `vkQueueSubmit` + fence | pre-record the command buffer once and re-submit; dynamic shape via push-constants / descriptor updates. |
 
 The **fence** is the key to the D2H-on-host problem the current code works around
-with `CaptureScope` + `sb_capturing()`. In the HAL model the executor expresses
+with `CaptureScope` + `boom_capturing()`. In the HAL model the executor expresses
 "the argmax result is needed on the host" as a *host-read* of a buffer; the
 backend decides whether that host-read can be recorded (it can't, in a CUDA
 graph) and instead leaves it as a post-replay `copy_from_host`. The
-`sb_capturing()` flag disappears — the backend owns that policy inside
+`boom_capturing()` flag disappears — the backend owns that policy inside
 `pre_record`.
 
 `core/src/nn/cuda_stream.h`'s thread-local current stream also disappears: the

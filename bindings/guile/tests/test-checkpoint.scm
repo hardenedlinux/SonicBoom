@@ -3,8 +3,8 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; (sonicboom checkpoint) marshals ctensors through sb_save_params /
-;;; sb_load_params. The test writes a checkpoint of several named tensors
+;;; (sonicboom checkpoint) marshals ctensors through boom_save_params /
+;;; boom_load_params. The test writes a checkpoint of several named tensors
 ;;; (model parameters and AdamW moment buffers), loads it back in a different
 ;;; order into freshly initialised templates, and requires every value to be
 ;;; bit-identical. It also checks the error paths: a non-float32 tensor is

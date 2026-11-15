@@ -51,7 +51,7 @@ library, so old and new measurements stay comparable.
     segment/capture path, so it cancels costs that were never added.
 - **fresh** (`RESULT prefill_fresh*`) reports session lifecycle cost, not
   throughput. Every repetition creates and destroys a session exactly as
-  `sb_llm_session_new`/`sb_llm_session_free` do. `session_create_ms` is the KV
+  `boom_llm_session_new`/`boom_llm_session_free` do. `session_create_ms` is the KV
   allocation plus the session-bound runtime warm-up; `first_prefill_ms` is that
   session's first prefill (segment plan build, capture when `N > chunk`,
   execution); `e2e_ms` is their sum — what a server creating one session per

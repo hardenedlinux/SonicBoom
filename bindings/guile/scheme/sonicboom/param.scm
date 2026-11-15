@@ -3,7 +3,7 @@
 ;;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;; Copyright (C) 2026 Nala Ginrut <roy@hardenedlinux.org>
 ;;;
-;;; A <param> is a native float32 parameter (capi.h sb_param_*): its values, its
+;;; A <param> is a native float32 parameter (capi.h boom_param_*): its values, its
 ;;; gradient and AdamW's two moment buffers. When a CUDA device is present the
 ;;; four buffers stay in device memory across steps and the update is one fused
 ;;; kernel launch; otherwise they are host buffers and the host reference runs.
@@ -39,7 +39,7 @@
 ;; The record of a native trainable parameter.
 ;;
 ;; A parameter holds its values, its gradient and AdamW's two moment buffers in
-;; one sb_param handle (see (sonicboom param)). The handle is owned by this
+;; one boom_param handle (see (sonicboom param)). The handle is owned by this
 ;; record: `free-param!` releases it explicitly, and the guardian used by
 ;; `reap-params!` releases it if the record is collected first.
 ;; PyTorch: none
@@ -74,7 +74,7 @@ explicit free."
     (set-param-freed! p #t)             ; claim it before touching the pointer
     (let ((ptr (param-ptr p)))
       (unless (null-pointer? ptr)
-        ((proc 'sb_param_free) ptr))))
+        ((proc 'boom_param_free) ptr))))
   *unspecified*)
 
 ;;; --- GC fallback -------------------------------------------------------------
@@ -104,7 +104,7 @@ collection is what makes it return a positive number."
 (define (live-ptr p what)
   (if (param-freed? p)
       (raise-sonicboom-error
-       SB_ERR_BINDING 'binding
+       BOOM_ERR_BINDING 'binding
        (string-append what ": parameter has already been freed"))
       (param-ptr p)))
 
@@ -138,7 +138,7 @@ the same handle; it is not a Scheme tensor."
   (unless (and (pair? dims)
                (every (lambda (d) (and (exact-integer? d) (>= d 1))) dims))
     (raise-sonicboom-error
-     SB_ERR_BINDING 'binding
+     BOOM_ERR_BINDING 'binding
      "make-param: dims must be a non-empty list of positive integers"))
   (let* ((n (apply * dims))
          (bytes (* n 4))
@@ -146,18 +146,18 @@ the same handle; it is not a Scheme tensor."
           (cond ((not init) (make-bytevector bytes 0))
                 ((not (bytevector? init))
                  (raise-sonicboom-error
-                  SB_ERR_BINDING 'binding
+                  BOOM_ERR_BINDING 'binding
                   "make-param: init must be a bytevector of numel*4 bytes"))
                 ((not (= (bytevector-length init) bytes))
                  (raise-sonicboom-error
-                  SB_ERR_BINDING 'binding
+                  BOOM_ERR_BINDING 'binding
                   (format #f "make-param: init is ~a bytes, the shape needs ~a"
                           (bytevector-length init) bytes)))
                 (else init)))
          (dims-bv (dims->pointer dims))
          (out-slot (make-slot))
          (err-slot (make-slot)))
-    (sb-check! ((proc 'sb_param_create)
+    (sb-check! ((proc 'boom_param_create)
                 (bytevector->pointer dims-bv) (length dims)
                 (bytevector->pointer init-bv) bytes
                 (slot-ptr out-slot) (slot-ptr err-slot))
@@ -183,7 +183,7 @@ PyTorch: torch.Tensor.is_cuda
 Note: The expected value depends on the build and the machine, so the example
 does not compare it."
   (live-ptr p "param-on-device?")
-  (not (zero? ((proc 'sb_param_on_device) (param-ptr p)))))
+  (not (zero? ((proc 'boom_param_on_device) (param-ptr p)))))
 
 (define (param-step-count p)
   "The number of AdamW updates applied to a parameter so far.
@@ -199,7 +199,7 @@ PyTorch: none
 Note: PyTorch keeps the step count inside each optimizer's per-parameter state
 rather than on the parameter."
   (live-ptr p "param-step-count")
-  ((proc 'sb_param_step_count) (param-ptr p)))
+  ((proc 'boom_param_step_count) (param-ptr p)))
 
 (define (param-read p)
   "Copy a parameter's current values out.
@@ -218,7 +218,7 @@ Note: In PyTorch the values are read from the parameter tensor itself."
          (out (make-bytevector bytes 0))
          (written (make-bytevector 8 0))       ; size_t
          (err-slot (make-slot)))
-    (sb-check! ((proc 'sb_param_read) ptr (bytevector->pointer out) bytes
+    (sb-check! ((proc 'boom_param_read) ptr (bytevector->pointer out) bytes
                 (bytevector->pointer written) (slot-ptr err-slot))
                err-slot "param-read")
     out))
@@ -241,7 +241,7 @@ PyTorch: torch.optim.Optimizer.zero_grad
 Note: It zeros one parameter, whereas the PyTorch method walks the optimizer's
 parameter groups."
   (let ((err-slot (make-slot)))
-    (sb-check! ((proc 'sb_param_zero_grad) (live-ptr p "param-zero-grad!")
+    (sb-check! ((proc 'boom_param_zero_grad) (live-ptr p "param-zero-grad!")
                 (slot-ptr err-slot))
                err-slot "param-zero-grad!")
     *unspecified*))
@@ -263,15 +263,15 @@ PyTorch: none
 Note: In PyTorch gradients are produced by backward() and stored in .grad."
   (let ((ptr (live-ptr p "param-set-grad!")))
     (unless (bytevector? grad)
-      (raise-sonicboom-error SB_ERR_BINDING 'binding
+      (raise-sonicboom-error BOOM_ERR_BINDING 'binding
                              "param-set-grad!: grad must be a bytevector"))
     (unless (= (bytevector-length grad) (* 4 (param-numel p)))
       (raise-sonicboom-error
-       SB_ERR_BINDING 'binding
+       BOOM_ERR_BINDING 'binding
        (format #f "param-set-grad!: grad is ~a bytes, the parameter needs ~a"
                (bytevector-length grad) (* 4 (param-numel p)))))
     (let ((err-slot (make-slot)))
-      (sb-check! ((proc 'sb_param_set_grad) ptr (bytevector->pointer grad)
+      (sb-check! ((proc 'boom_param_set_grad) ptr (bytevector->pointer grad)
                   (bytevector-length grad) (slot-ptr err-slot))
                  err-slot "param-set-grad!")
       *unspecified*)))
@@ -301,19 +301,19 @@ while the parameter's own buffers stay device-resident."
     (let ((st
            (cond
             ((pointer? lr)
-             ((proc 'sb_param_step_lr) ptr lr
+             ((proc 'boom_param_step_lr) ptr lr
               (exact->inexact beta1) (exact->inexact beta2)
               (exact->inexact eps) (exact->inexact weight-decay)
               (slot-ptr err-slot)))
             ((real? lr)
-             ((proc 'sb_param_step) ptr
+             ((proc 'boom_param_step) ptr
               (exact->inexact lr) (exact->inexact beta1)
               (exact->inexact beta2) (exact->inexact eps)
               (exact->inexact weight-decay)
               (slot-ptr err-slot)))
             (else
              (raise-sonicboom-error
-              SB_ERR_BINDING 'binding
+              BOOM_ERR_BINDING 'binding
               "param-step!: lr must be a real number or a one-element float32 tensor handle")))))
       (sb-check! st err-slot "param-step!")
       (param-step-count p))))

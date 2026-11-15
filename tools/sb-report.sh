@@ -10,7 +10,7 @@ export LC_ALL=C LANG=C
 # A SonicBoom number means nothing without the machine and the binary behind it,
 # so this prints both: the host, the CPU and its SIMD capability, the GPU, the
 # toolchain, the LLVM/MLIR linked in, and how the loaded libsonicboom.so was
-# built (sb_build_info() through the Guile binding — see bindings/guile/README.md,
+# built (boom_build_info() through the Guile binding — see bindings/guile/README.md,
 # "(build-info)"). Paste it next to a benchmark result or a bug report.
 #
 # The report also *checks* the build it describes. With a model it runs the

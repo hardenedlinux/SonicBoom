@@ -698,7 +698,7 @@ bool gpu_probe_ms(double *out) {
   bool ok = cudaEventCreate(&begin) == cudaSuccess &&
             cudaEventCreate(&end) == cudaSuccess;
   std::vector<double> ms;
-  cudaStream_t stream = ::sonicboom::cuda::sb_current_stream();
+  cudaStream_t stream = ::sonicboom::cuda::boom_current_stream();
   if (ok) {
     // Warm-up, untimed: the first copy pays the page/context cost.
     ok = cudaMemcpyAsync(dst, src, kBytes, cudaMemcpyDeviceToDevice, stream) ==
