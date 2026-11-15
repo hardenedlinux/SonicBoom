@@ -784,6 +784,10 @@ const char* consumer_name(DecodeConsumer consumer) {
 
 } // namespace
 
+int64_t decode_list_capacity(const DecodeGraphSpec& spec) {
+  return spec.allowed_list ? int64_t(nn::kGrammarGatherCap) : 0;
+}
+
 GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
   GraphIr ir;
   ir.context = std::make_unique<mlir::MLIRContext>();
@@ -798,10 +802,11 @@ GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec) {
 
   // The graph ends at the model's logits. What reads them — and so whether the
   // softcap is computed, how much of the head is, and what leaves the device —
-  // is declared, not written.
+  // is declared, not written. A graph that is lifted into a program declares
+  // nothing: the loop that reads the step says what it reads.
   b.set_output(out);
-  b.set_consumer(consumer_name(spec.consumer),
-                 spec.allowed_list ? int64_t(nn::kGrammarGatherCap) : 0);
+  if (!spec.for_program)
+    b.set_consumer(consumer_name(spec.consumer), decode_list_capacity(spec));
 
   ir.module = b.finish();
   return ir;

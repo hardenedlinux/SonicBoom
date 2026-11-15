@@ -95,12 +95,17 @@ mlir::Operation *createBoomNode(mlir::OpBuilder &builder, mlir::Location loc,
 // whether the loop reads a runtime index list, and the program's own numbers.
 // `max_drafts` is the speculative loop's proposal cap; `draft_strategy` names
 // the proposal source. The list capacity comes from the graph's consumer_list
-// declaration.
+// declaration, or from `list_capacity` when the graph declares none.
 struct ProgramSpec {
   enum class Loop { Plain, Speculative };
   Loop loop = Loop::Plain;
   bool stochastic = false;  // plain loop only
   bool listed = false;      // the loop reads a runtime list
+  // The reader's allowed-list capacity when the graph declares none (a graph
+  // emitted for a program does not declare its consumer; the loop is the
+  // declaration). Must be positive when `listed`. A declared consumer_list
+  // still supplies the capacity.
+  int64_t list_capacity = 0;
   std::string name, prefill_graph;
   std::vector<int64_t> prompt_shape, eos_tokens;
   int64_t max_tokens = 0, max_drafts = 0;
@@ -113,8 +118,9 @@ struct ProgramSpec {
 // accept node, sample_select for a plain loop that draws); when the graph still
 // declares a consumer or a consumer_list, both must agree with `spec` — the
 // failure names both — and the declaration's list capacity becomes the reader's
-// `allowed_list`. The declaration is dropped with the graph op, whose body
-// moves into the step.
+// `allowed_list`. A graph that declares nothing is lifted as the loop says, and
+// `spec.list_capacity` supplies the reader's list capacity. The declaration is
+// dropped with the graph op, whose body moves into the step.
 mlir::LogicalResult addProgram(mlir::ModuleOp module, const ProgramSpec &spec);
 
 // Lift a module's single boom.graph (a decode graph) into the greedy generation

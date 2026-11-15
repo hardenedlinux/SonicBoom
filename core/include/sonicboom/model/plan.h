@@ -86,6 +86,11 @@ struct DecodeGraphSpec {
   // With `rewrite`: the decode matmuls run on the mmq kernel, so the mmq
   // producer fusions apply (compiler/BoomPasses.h).
   bool rows_mmq = false;
+  // The graph is going to be lifted into a generation program, whose loop says
+  // what reads the step (compiler/BoomBuilder.h ProgramSpec). The emitter then
+  // leaves the consumer undeclared: the declaration is what a graph-first
+  // lowering needs, and the loop is the declaration once the step is its body.
+  bool for_program = false;
 };
 
 // The decode graph for `spec`: the one entry every decode, verify, sampled and

@@ -3186,6 +3186,8 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   auto rt = std::make_unique<DecodeRuntime>();
   DecodeGraphSpec spec =
       device_decode_spec(DecodeConsumer::Argmax, /*rows=*/1, gather);
+  // The program is the declaration: the emitted graph carries none.
+  spec.for_program = true;
   // §10: the loop's shape follows SONICBOOM_SPEC — the plain greedy program
   // under an explicit "off", the draft/verify/accept program otherwise. An
   // undecided mode may still become auto at the probe, and the loop shape is
@@ -3201,6 +3203,7 @@ static std::unique_ptr<DecodeRuntime> build_decode_runtime(
   ps.loop = spec_loop ? compiler::ProgramSpec::Loop::Speculative
                       : compiler::ProgramSpec::Loop::Plain;
   ps.listed = gather;
+  ps.list_capacity = decode_list_capacity(spec);
   ps.name = spec_loop ? "speculative" : "greedy";
   ps.prefill_graph = "prefill";
   ps.prompt_shape = {1};
@@ -3490,10 +3493,13 @@ static std::unique_ptr<SampledRuntime> build_sampled_runtime(
   // step after the passes.
   DecodeGraphSpec spec =
       device_decode_spec(DecodeConsumer::SampleSelect, /*rows=*/1, gather);
+  // The program is the declaration: the emitted graph carries none.
+  spec.for_program = true;
   compiler::ProgramSpec ps;
   ps.loop = compiler::ProgramSpec::Loop::Plain;
   ps.stochastic = true;
   ps.listed = gather;
+  ps.list_capacity = decode_list_capacity(spec);
   ps.name = "sampled";
   ps.prefill_graph = "prefill";
   ps.prompt_shape = {1};

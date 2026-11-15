@@ -47,6 +47,12 @@ struct GraphIr {
 // derivation (compiler/BoomPasses.h resolveConsumer), not the emitter's.
 GraphIr emit_decode_ir(const Recipe& recipe, const DecodeGraphSpec& spec);
 
+// The list capacity a decode graph for `spec` carries: the grammar gather's
+// cap when it reads a runtime list, 0 otherwise. The graph's consumer_list
+// declaration and the program's reader take it from here, so the two cannot
+// disagree.
+int64_t decode_list_capacity(const DecodeGraphSpec& spec);
+
 // One prefill segment of `n` positions; over a dynamic extent when
 // `dynamic_extent`, with `n` the extent the graph is built at. The graph ends
 // at the residual stream and appends every owned cache's K and V after the

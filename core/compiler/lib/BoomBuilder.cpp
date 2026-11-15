@@ -695,30 +695,43 @@ static mlir::LogicalResult buildGenerationProgram(mlir::ModuleOp module,
   // draw when `stochastic`, the mode otherwise) and the speculative loop's
   // accept node takes the verifier's argmax. A declaration that disagrees with
   // the loop being built names both readings; the declaration's list capacity
-  // moves onto the reader (the sample's or the accept's allowed_list).
+  // moves onto the reader (the sample's or the accept's allowed_list). A graph
+  // that declares nothing is lifted as the loop says; the list capacity then
+  // comes from the spec.
   const llvm::StringRef derived =
       spec.loop == ProgramSpec::Loop::Plain && spec.stochastic
           ? llvm::StringRef("sample_select")
           : llvm::StringRef("argmax");
-  if (auto declared = graph.getConsumer())
-    if (*declared != derived)
-      return graph.emitOpError()
-             << "declares the consumer '" << *declared
-             << "', but the loop being built reads '" << derived << "'";
   const mlir::IntegerAttr declaredList = graph.getConsumerListAttr();
-  if (spec.listed && !declaredList)
+  if (graph.getConsumer() || declaredList) {
+    if (auto declared = graph.getConsumer())
+      if (*declared != derived)
+        return graph.emitOpError()
+               << "declares the consumer '" << *declared
+               << "', but the loop being built reads '" << derived << "'";
+    if (spec.listed && !declaredList)
+      return graph.emitOpError()
+             << "the loop being built reads a runtime list, but the graph "
+                "declares no consumer_list";
+    if (!spec.listed && declaredList)
+      return graph.emitOpError()
+             << "declares a consumer_list of " << declaredList.getInt()
+             << ", but the loop being built reads no runtime list";
+  } else if (spec.listed && spec.list_capacity <= 0) {
     return graph.emitOpError()
-           << "the loop being built reads a runtime list, but the graph "
-              "declares no consumer_list";
-  if (!spec.listed && declaredList)
-    return graph.emitOpError()
-           << "declares a consumer_list of " << declaredList.getInt()
-           << ", but the loop being built reads no runtime list";
+           << "the loop being built reads a runtime list, but the spec "
+              "carries no list capacity";
+  }
   const mlir::UnitAttr stochastic = spec.stochastic
                                         ? mlir::UnitAttr::get(context)
                                         : mlir::UnitAttr();
   const mlir::IntegerAttr allowedList =
-      spec.listed ? declaredList : mlir::IntegerAttr();
+      spec.listed
+          ? (declaredList ? declaredList
+                          : mlir::IntegerAttr::get(
+                                mlir::IntegerType::get(context, 64),
+                                spec.list_capacity))
+          : mlir::IntegerAttr();
 
   // The decode graph's output type is the step's result type.
   if (graph.getOutputs().size() != 1)
