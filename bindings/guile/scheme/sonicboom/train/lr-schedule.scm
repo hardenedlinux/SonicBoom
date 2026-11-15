@@ -34,7 +34,7 @@ Example:
   (use-modules (sonicboom train lr-schedule))
   ((make-constant-schedule 0.01) 42)
   => 0.01
-PyTorch: torch.optim.lr_scheduler.ConstantLR"
+PyTorch: none"
   (check-lr "make-constant-schedule" "lr" lr)
   (lambda (step) (exact->inexact lr)))
 
@@ -51,7 +51,7 @@ Example:
   (use-modules (sonicboom train lr-schedule))
   ((make-linear-warmup-schedule 1.0 10) 5)
   => 0.5
-PyTorch: torch.optim.lr_scheduler.LinearLR"
+PyTorch: none"
   (check-lr "make-linear-warmup-schedule" "base-lr" base-lr)
   (check-steps "make-linear-warmup-schedule" "warmup-steps" warmup-steps)
   (lambda (step)
@@ -76,7 +76,7 @@ Example:
   (use-modules (sonicboom train lr-schedule))
   ((make-cosine-schedule 1.0 0.0 0 2) 1)
   => 0.5
-PyTorch: torch.optim.lr_scheduler.CosineAnnealingLR"
+PyTorch: none"
   (check-lr "make-cosine-schedule" "base-lr" base-lr)
   (check-lr "make-cosine-schedule" "min-lr" min-lr)
   (when (> min-lr base-lr)

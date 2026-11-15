@@ -14,7 +14,9 @@
 ;;;      name in a function's PyTorch: tag has a supported entry;
 ;;;   4. same-as has no cycle and every target exists;
 ;;;   5. out-of-scope appears only on the prefixes the specification names, with
-;;;      the specified note.
+;;;      the specified note;
+;;;   6. every name in a function's PyTorch: tag is a full name of
+;;;      pytorch-names.tsv or an alias of an entry.
 ;;;
 ;;; Pure Scheme: no native library. The recipes themselves are run by
 ;;; test-docs-examples.
@@ -284,6 +286,28 @@
       (unless (entry-ref entry 'use)
         (problem! (format #f "supported ~a has no use" (entry-name entry)))))))
  torch-entries)
+
+;; 6. Every name in a function's tag is a full name of the list or an alias.
+(define tsv-name-set (make-hash-table))
+(for-each (lambda (name) (hash-set! tsv-name-set name #t))
+          (map tsv-name (tsv-names)))
+
+(define (known-tag-name? name)
+  (or (hash-ref tsv-name-set name)
+      (any (lambda (entry)
+             (let ((aliases (entry-ref entry 'aliases)))
+               (and aliases (member name aliases string=?))))
+           torch-entries)))
+
+(hash-for-each
+ (lambda (where tags)
+   (for-each
+    (lambda (tag)
+      (unless (known-tag-name? tag)
+        (problem! (format #f "the tag ~a of ~a ~a is not a name of the list"
+                          tag (car where) (cdr where)))))
+    tags))
+ tag-table)
 
 ;;; ------------------------------------------------------------------ tests ---
 

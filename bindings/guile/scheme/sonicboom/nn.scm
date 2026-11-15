@@ -99,9 +99,8 @@ Example:
   (use-modules (sonicboom nn) (sonicboom tensor))
   (tensor-shape (layer-parameter-ref (linear 2 3) 'bias))
   => (3)
-PyTorch: none
-Note: PyTorch reaches the same tensors through the module's named
-submodule attributes."
+PyTorch: torch.nn.Module.get_parameter
+Note: Looks a parameter up by its key in the layer."
   (assq-ref (layer-parameters layer) key))
 
 (define (initializer dims init)
@@ -284,8 +283,8 @@ Example:
   (let ((m (sequential (linear 2 3 #:name 'l1))))
     (tensor-shape (model-parameter-ref m 'l1.weight)))
   => (3 2)
-PyTorch: none
-Note: PyTorch's named_parameters returns an iterator over the same names."
+PyTorch: torch.nn.Module.get_parameter
+Note: Looks a parameter up by its key in the merged model."
   (assq-ref (model-parameters model) key))
 
 ;; Internal (not exported): the single-flight counter and the executable

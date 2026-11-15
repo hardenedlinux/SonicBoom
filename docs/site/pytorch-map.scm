@@ -5,6 +5,7 @@
 ;;;   (torch NAME (aliases ...) (status supported)
 ;;;     (use ((module) symbol) ...) (note "..."))
 ;;;   (torch NAME (status recipe) (recipe "...") (setup "...") (note "..."))
+;;;   (torch NAME (status missing|out-of-scope) (note "..."))
 ;;;   (torch NAME (same-as NAME))
 ;;;   (prefix "torch.foo." (status missing|out-of-scope) (note "..."))
 ;;;
@@ -26,16 +27,12 @@
      (status supported)
      (use ((sonicboom checkpoint) load-params!))
      (note "The checkpoint format is the binding's own; files are not interchangeable with PyTorch checkpoints."))
-   (torch "torch.utils.data.DataLoader"
-     (status supported)
-     (use ((sonicboom data loader) text-file-loader)))
-   (torch "torch.utils.data.IterableDataset"
-     (status supported)
-     (use ((sonicboom data loader) jsonl-loader)))
+   (torch "torch.utils.data.DataLoader" (status missing))
+   (torch "torch.utils.data.IterableDataset" (status missing))
    (torch "torch.nn.Module"
      (status supported)
-     (use ((sonicboom model) nn-model?) ((sonicboom model) nn-model-structure) ((sonicboom model) nn-model-params) ((sonicboom model) nn-model-input-dims) ((sonicboom model) make-model))
-     (note "SonicBoom models are not subclasses; make-model and the nn-model accessors play this role."))
+     (use ((sonicboom model) nn-model?) ((sonicboom model) nn-model-structure) ((sonicboom model) nn-model-params) ((sonicboom model) nn-model-input-dims))
+     (note "SonicBoom models are not subclasses; the nn-model accessors play this role."))
    (torch "torch.nn.Module.forward"
      (status supported)
      (use ((sonicboom model) model-forward-native) ((sonicboom nn) model-forward)))
@@ -53,7 +50,7 @@
    (torch "torch.nn.parameter.Parameter"
      (aliases "torch.nn.Parameter")
      (status supported)
-     (use ((sonicboom param) make-param) ((sonicboom tensor) parameter) ((sonicboom trace tensor) make-leaf) ((sonicboom trace tensor) leaf?) ((sonicboom trace tensor) leaf-value) ((sonicboom trace tensor) set-leaf-value!) ((sonicboom trace tensor) leaf-grad) ((sonicboom trace tensor) set-leaf-grad!))
+     (use ((sonicboom param) make-param) ((sonicboom tensor) parameter) ((sonicboom trace tensor) leaf?) ((sonicboom trace tensor) leaf-value) ((sonicboom trace tensor) set-leaf-value!) ((sonicboom trace tensor) leaf-grad) ((sonicboom trace tensor) set-leaf-grad!))
      (note "torch.nn.Parameter is accepted as an alias."))
    (torch "torch.Tensor.is_cuda"
      (status supported)
@@ -94,7 +91,7 @@
      (use ((sonicboom tensor) randn)))
    (torch "torch.Tensor.grad"
      (status supported)
-     (use ((sonicboom tensor) parameter-grad) ((sonicboom trace backward) leaf-grads) ((sonicboom train) autograd-grad)))
+     (use ((sonicboom tensor) parameter-grad) ((sonicboom train) autograd-grad)))
    (torch "torch.autograd.grad"
      (status supported)
      (use ((sonicboom trace autodiff) grad)))
@@ -131,13 +128,10 @@
    (torch "torch.nn.functional.linear"
      (status supported)
      (use ((sonicboom trace layers) linear) ((sonicboom train) autograd-linear)))
-   (torch "torch.tril"
-     (status supported)
-     (use ((sonicboom trace layers) causal-mask)))
+   (torch "torch.tril" (status missing))
    (torch "torch.export.export"
-     (status supported)
-     (use ((sonicboom trace lower) trace-graph))
-     (note "The result is a traced graph in the binding's own form."))
+     (status missing)
+     (note "The nearest operation returns a traced graph in the binding's own form."))
    (torch "torch.broadcast_shapes"
      (status supported)
      (use ((sonicboom trace ops) broadcast-shapes)))
@@ -241,28 +235,17 @@
      (status supported)
      (use ((sonicboom trace symbolic) concat)))
    (torch "torch.narrow"
-     (status supported)
-     (use ((sonicboom trace symbolic) slice)))
-   (torch "torch.Tensor.numpy"
-     (status supported)
-     (use ((sonicboom trace tensor) ctensor-data)))
+     (status recipe)
+     (recipe "(ctensor->list (slice x dim start (+ start length)))")
+     (setup "(use-modules (sonicboom trace tensor) (sonicboom trace symbolic))\n(define x (list->ctensor '(1.0 2.0 3.0 4.0)))\n(define dim 0)\n(define start 1)\n(define length 2)"))
+   (torch "torch.Tensor.numpy" (status missing))
    (torch "torch.Tensor.nbytes"
      (status supported)
      (use ((sonicboom trace tensor) ctensor-nbytes)))
-   (torch "torch.Tensor.__getitem__"
-     (status supported)
-     (use ((sonicboom trace tensor) ctensor-ref))
-     (note "The binding has ctensor-ref."))
-   (torch "torch.Tensor.__setitem__"
-     (status supported)
-     (use ((sonicboom trace tensor) ctensor-set!))
-     (note "The binding has ctensor-set!."))
    (torch "torch.Tensor.item"
      (status supported)
      (use ((sonicboom trace tensor) ctensor-item)))
-   (torch "torch.compile"
-     (status supported)
-     (use ((sonicboom trace tracer) trace-function)))
+   (torch "torch.compile" (status missing))
    (torch "torch.nn.functional.mse_loss"
      (status supported)
      (use ((sonicboom train) autograd-mse)))
@@ -272,15 +255,9 @@
    (torch "torch.optim.SGD.step"
      (status supported)
      (use ((sonicboom train) autograd-sgd-step!)))
-   (torch "torch.optim.lr_scheduler.CosineAnnealingLR"
-     (status supported)
-     (use ((sonicboom train lr-schedule) make-cosine-schedule)))
-   (torch "torch.optim.lr_scheduler.ConstantLR"
-     (status supported)
-     (use ((sonicboom train lr-schedule) make-constant-schedule)))
-   (torch "torch.optim.lr_scheduler.LinearLR"
-     (status supported)
-     (use ((sonicboom train lr-schedule) make-linear-warmup-schedule)))
+   (torch "torch.optim.lr_scheduler.CosineAnnealingLR" (status missing))
+   (torch "torch.optim.lr_scheduler.ConstantLR" (status missing))
+   (torch "torch.optim.lr_scheduler.LinearLR" (status missing))
 
    ;; --- recipes ---
    (torch "torch.sigmoid"
@@ -1767,7 +1744,10 @@
    (torch "torch.nn.Module.float" (status missing))
    (torch "torch.nn.Module.get_buffer" (status missing))
    (torch "torch.nn.Module.get_extra_state" (status missing))
-   (torch "torch.nn.Module.get_parameter" (status missing))
+   (torch "torch.nn.Module.get_parameter"
+     (status supported)
+     (use ((sonicboom nn) layer-parameter-ref) ((sonicboom nn) model-parameter-ref))
+     (note "Looks a parameter up by its key in the layer or in the merged model."))
    (torch "torch.nn.Module.get_submodule" (status missing))
    (torch "torch.nn.Module.half" (status missing))
    (torch "torch.nn.Module.ipu" (status missing))

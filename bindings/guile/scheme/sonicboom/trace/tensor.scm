@@ -242,7 +242,7 @@ Example:
   (use-modules (sonicboom trace tensor))
   (bytevector-length (ctensor-data (make-ctensor 'float32 '(2) '(1.0 2.0))))
   => 8
-PyTorch: torch.Tensor.numpy
+PyTorch: none
 Note: The result is the raw bytevector, not a NumPy array."
   (storage-data (ctensor-storage t)))
 
@@ -426,7 +426,7 @@ Example:
   (use-modules (sonicboom trace tensor))
   (ctensor-ref (make-ctensor 'float32 '(2) '(1.5 2.5)) 1)
   => 2.5
-PyTorch: torch.Tensor.__getitem__
+PyTorch: none
 Note: PyTorch indexes with one subscript per axis; this index is flat."
   (check-index "ctensor-ref" t i)
   ;; Direct field read: ctensor-data is an exported procedure, and calling it
@@ -450,7 +450,7 @@ Example:
     (ctensor-set! t 0 5.0)
     (ctensor->list t))
   => (5.0 2.0)
-PyTorch: torch.Tensor.__setitem__
+PyTorch: none
 Note: The write is direct; PyTorch item assignment is subscript-based and
 records autograd history."
   (check-index "ctensor-set!" t i)
@@ -617,7 +617,7 @@ Example:
   (use-modules (sonicboom trace tensor))
   (ctensor->list (leaf-value (make-leaf (make-ctensor 'float32 '(2) '(1.0 2.0)))))
   => (1.0 2.0)
-PyTorch: torch.nn.Parameter
+PyTorch: none
 Note: A PyTorch parameter is a tensor that owns its gradient; a leaf keeps
 the value and the gradient in separate slots."
   (%make-leaf value grad))

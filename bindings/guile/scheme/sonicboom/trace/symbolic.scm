@@ -887,7 +887,8 @@ Example:
   (use-modules (sonicboom trace tensor) (sonicboom trace symbolic))
   (ctensor->list (slice (list->ctensor '(1.0 2.0 3.0 4.0)) 0 1 3))
   => (2.0 3.0)
-PyTorch: torch.narrow"
+PyTorch: none
+Note: For torch.narrow, pass start and start + length."
   (apply-op 'slice (list x) `((axis (int ,axis)) (start (int ,start)) (end (int ,end)))))
 (define (reshape x shape)
   "X with a new shape.

@@ -262,7 +262,7 @@ Example:
   (car (trace-graph (lambda (x) (relu (add x x)))
                     (list->ctensor '(1.0 -2.0))))
   => sonicboom-s-expr
-PyTorch: torch.export.export
+PyTorch: none
 Note: torch.export.export returns an ExportedProgram; this returns the S-Expr
 datum of one segment."
   (call-with-input-string (apply trace->sexpr proc args) read))

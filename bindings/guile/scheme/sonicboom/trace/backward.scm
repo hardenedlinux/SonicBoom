@@ -128,8 +128,8 @@ Example:
     (ctensor->list (leaf-grad leaf)))
   => (2.0 4.0)
 PyTorch: torch.autograd.backward
-Note: must be called inside a traced function; the backward pass is part of
-the recorded graph and replays with it."
+Note: Gradients are recorded into the traced graph and land in each leaf's
+grad slot when it is replayed."
   (let ((rec (current-tracer)))
     (unless rec
       (error "backward!: needs tracing (call it inside a traced function)"))
@@ -232,7 +232,8 @@ Example:
     (leaf-grad leaf))
   => #f
 PyTorch: torch.optim.Optimizer.zero_grad
-Note: clears one slot per leaf; the optimizer is not involved."
+Note: Clears the gradient of every leaf it is given; PyTorch's method clears
+the parameters of one optimizer and by default sets them to None."
   (for-each (lambda (l) (set-leaf-grad! l #f))
             (if (leaf? leaves) (list leaves) leaves))
   leaves)
@@ -250,7 +251,7 @@ Example:
     (set-leaf-grad! leaf (list->ctensor '(5.0)))
     (ctensor->list (leaf-grads leaf)))
   => (5.0)
-PyTorch: torch.Tensor.grad
+PyTorch: none
 Note: a leaf without a gradient returns #f."
   (if (leaf? leaves)
       (leaf-grad leaves)

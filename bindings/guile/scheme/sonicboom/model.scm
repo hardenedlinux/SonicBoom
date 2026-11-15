@@ -83,7 +83,7 @@ Example:
   (use-modules (sonicboom model) (sonicboom nn))
   (nn-model-input-dims (make-model '(1 2) (sequential (linear 2 3))))
   => (1 2)
-PyTorch: torch.nn.Module
+PyTorch: none
 Note: A PyTorch module is built by its constructor and finds its parameters in
 the module tree; here they are copied into native tensors at construction."
   (let ((params

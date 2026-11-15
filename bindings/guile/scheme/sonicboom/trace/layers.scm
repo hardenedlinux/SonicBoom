@@ -168,7 +168,7 @@ Example:
   (use-modules (sonicboom trace tensor) (sonicboom trace layers))
   (ctensor->nested (causal-mask 3))
   => ((#t #f #f) (#t #t #f) (#t #t #t))
-PyTorch: torch.tril
+PyTorch: none
 Note: torch.tril builds a float or integer triangular matrix; this mask is
 boolean."
   (make-ctensor 'bool (list n n)

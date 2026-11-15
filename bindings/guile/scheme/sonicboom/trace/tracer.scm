@@ -745,7 +745,7 @@ Example:
   (let ((f (trace-function (lambda (x) (relu x)))))
     (ctensor->list (f (list->ctensor '(-1.0 2.0)))))
   => (0.0 2.0)
-PyTorch: torch.compile
+PyTorch: none
 Note: torch.compile returns a compiled callable; this returns a wrapper that
 records the graph on the first call and replays it afterwards."
   (let* ((st (make-tstate proc (make-trace-context max-side-nodes strict? max-unroll)

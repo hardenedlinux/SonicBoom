@@ -197,8 +197,8 @@ Example:
     (map ctensor->list r))
   => ((5.0) (2.0 4.0))
 PyTorch: torch.func.grad_and_value
-Note: torch.func.grad_and_value returns the gradient before the value; this
-returns the value first."
+Note: Returns the value before the gradients; grad_and_value returns the
+gradients first."
   (trace-function
    (lambda args
      (let ((loss (apply f args)))

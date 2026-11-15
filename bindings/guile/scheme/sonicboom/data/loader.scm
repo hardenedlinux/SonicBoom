@@ -95,7 +95,7 @@ Example:
            (l (text-file-loader path tok 2 1)))
       (loader-close! l)))
   => #f
-PyTorch: torch.utils.data.DataLoader
+PyTorch: none
 Note: The DataLoader batches samples; this loader packs a token stream into
 fixed next-token windows."
   (check-params "text-file-loader" seq-len batch-size)
@@ -122,7 +122,7 @@ Example:
            (l (jsonl-loader path \"text\" tok 2 1)))
       (loader-close! l)))
   => #f
-PyTorch: torch.utils.data.IterableDataset
+PyTorch: none
 Note: The IterableDataset supplies samples; this loader supplies packed
 next-token batches."
   (unless (string? text-key)
