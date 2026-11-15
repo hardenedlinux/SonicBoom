@@ -153,6 +153,16 @@ prefill rows, for your GPU. The protocol is described in
 [#2](https://github.com/hardenedlinux/SonicBoom/issues/2) and
 [#3](https://github.com/hardenedlinux/SonicBoom/issues/3).
 
+### Build the documentation
+
+```sh
+cmake --build build --target docs-site     # writes build/site/sonicboom/
+```
+
+Open `build/site/sonicboom/index.html`, or serve the directory with
+`python3 -m http.server` to use the search box. `ctest -L docs` checks the
+Guile docstrings, the API reference and the generated site.
+
 ### Thanks
 
 Community runs keep these numbers honest beyond one card. Thanks to
@@ -168,8 +178,10 @@ also surfaced the CUDA 12.9/13.x build and benchmark-harness fixes.
   recomputing it from scratch.
 - **Kernels.** SonicBoom's own attention kernels (`boom_fattn` for prefill,
   `boom_fdec` for decode and verification) and ggml-derived quantized
-  matmuls. The ggml code is MIT-attributed in [NOTICE](NOTICE) and is not
-  linked as a dependency.
+  matmuls. About 10% of the engine's code is identical to llama.cpp, almost
+  all of it these matmuls (measured by
+  [tools/provenance](tools/provenance/README.md)). The ggml code is
+  MIT-attributed in [NOTICE](NOTICE) and is not linked as a dependency.
 - **Compiler.** An MLIR dialect, Boom IR, that lowers fused glue kernels
   straight to PTX. Every pass has an on/off switch.
 - **Beyond LLMs.** MOSS-Image text-to-image through the same C ABI, and a
