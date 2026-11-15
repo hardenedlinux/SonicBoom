@@ -141,23 +141,12 @@ SonicBoom ports a small set of kernels from ggml/llama.cpp under the MIT
 license. They live in `ggml_derived/` directories, with the details in
 [`NOTICE`](../NOTICE) and [`LICENSES/ggml-MIT.txt`](../LICENSES/ggml-MIT.txt).
 
-| | Lines of code |
-|---|---:|
-| Verbatim upstream MMQ import (`core/src/quant/ggml_derived/mmq_upstream/`) | 8,798 |
-| Other ggml/llama.cpp-derived (`core/src/quant/ggml_derived`, `core/src/vocab/ggml_derived`) | 3,899 |
-| **ggml/llama.cpp-derived total** | **12,697** |
-| SonicBoom core total (`core/src`, `core/include`) | 64,268 |
-| **Derived share** | **~19.8%** |
-
-*Counted with `cloc` 1.98. These are code lines only, excluding blanks and
-comments. The C ABI, the Guile bindings and the dependencies are not counted.*
-
-The verbatim import of llama.cpp's concurrent CUDA MMQ kernels
-(`mmq_upstream/`, nine files) accounts for most of the derived share; it is
-kept separate from the SonicBoom-written kernels so the provenance is explicit.
-Without it the derived share is ~6.1%. The imported ggml flash attention and
-its four-file subtree were removed in v0.0.4; prefill attention is SonicBoom's
-own `boom_fattn` kernel.
+About 10% of the engine's code is identical to llama.cpp (commit `43fe9c642`),
+counted as lines that sit in runs of four or more lines matching upstream
+(`tools/provenance/ggml-share.py`). Almost all of it is the quantized
+matrix-multiplication kernels in `core/src/quant/ggml_derived/`, which holds
+only files that are substantially upstream; files elsewhere that derive from
+llama.cpp in part carry its MIT notice in their header.
 
 **Ported:** quantized matrix multiply (MMVQ for decode, MMQ for prefill),
 q8_1 activation quantization, the legacy Q5_0/Q8_0 block formats, and the BPE
