@@ -18,6 +18,7 @@
      ("getting-started" "Getting started")
      ("build" "Building SonicBoom"))
     ("Guides"
+     ("reproducibility" "Reproducibility")
      ("serve-openai" "The OpenAI-compatible server")
      ("artanis-streaming-notes" "Streaming with GNU Artanis")
      ("onnx-to-s-expr-importer" "Importing ONNX")

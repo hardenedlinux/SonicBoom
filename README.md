@@ -65,6 +65,8 @@ The warm-up table is measured on your own GPU when a model loads. You can
 export it and import it elsewhere with `sb-tune`, which carries a run to
 another machine with the same GPU. Batched execution is not covered yet.
 
+Details: [docs/reproducibility.md](docs/reproducibility.md).
+
 ## What's new in v0.0.6
 
 - Speculative decoding runs through every entry point: the C ABI, Guile and
