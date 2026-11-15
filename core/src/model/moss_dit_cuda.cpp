@@ -28,7 +28,7 @@
 #include <sonicboom/quant/quantized_tensor.h>
 #include <sonicboom/safetensors/reader.h>
 
-#include "../quant/ggml_derived/legacy_quants_q5_0_q8_0.h"
+#include "../quant/legacy_quants_q5_0_q8_0.h"
 #include "../safetensors/json.h"
 #include "moss_dit_kernels.h"
 #include "weight_cache.h"

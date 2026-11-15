@@ -17,7 +17,7 @@
 #include <sonicboom/quant/dequant.h>
 
 #include "foreign_dequant.h"
-#include "ggml_derived/legacy_quants_q5_0_q8_0.h"
+#include "legacy_quants_q5_0_q8_0.h"
 
 #include <bit>
 #include <cstdint>

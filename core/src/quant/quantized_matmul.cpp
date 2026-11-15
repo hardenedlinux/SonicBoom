@@ -20,8 +20,8 @@
 
 #include <sonicboom/quant/dequant.h>
 
-#include "ggml_derived/legacy_quants_q5_0_q8_0.h"
-#include "ggml_derived/vec_dot_qK_q8K.h"
+#include "legacy_quants_q5_0_q8_0.h"
+#include "vec_dot_qK_q8K.h"
 
 #ifdef SONICBOOM_USE_CUDA
 #include <sonicboom/quant/quantized_matmul_cuda.h>
@@ -55,7 +55,7 @@ namespace sonicboom::quant {
 
 namespace {
 
-// ggml-derived scalar q8_K reference (moved to ggml_derived/vec_dot_qK_q8K.h,
+// ggml-derived scalar q8_K reference (moved to vec_dot_qK_q8K.h,
 // which carries the ggml MIT copyright + permission notice).
 using ggml_derived::Q8KBlock;
 using ggml_derived::dot_q3_K_block;

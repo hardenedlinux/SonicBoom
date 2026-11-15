@@ -241,7 +241,7 @@ bool matmul_mmq_dev(const QuantizedTensor& W, const float* X, float* Y, int n,
 // block_q8_1_mmq activation block — the mmq int8-tensor-core matmul's input. A
 // 128-element block: four 32-element scales (float d4 for Q3_K weights / half2
 // ds4 for Q4_K,Q5_K, both 16 bytes) + 128 int8 quants; 144 bytes total. POD
-// mirror of ggml_derived/mmq.cuh's block_q8_1_mmq so host-side callers can size
+// mirror of mmq.cuh's block_q8_1_mmq so host-side callers can size
 // the buffer without including the .cuh.
 struct BlockQ8_1Mmq {
   float d4[4];     // scale union (ds4 occupies the same 16 bytes for Q4/Q5)

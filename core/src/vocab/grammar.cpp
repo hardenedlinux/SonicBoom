@@ -46,8 +46,8 @@
 #include <utility>
 #include <vector>
 
-#include "ggml_derived/bpe_tokenizer.h"
-#include "ggml_derived/unicode_byte_map.h"
+#include "bpe_tokenizer.h"
+#include "unicode_byte_map.h"
 
 namespace sonicboom::vocab {
 namespace {

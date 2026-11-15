@@ -16,7 +16,7 @@ ggml / llama.cpp (MIT) — derived code
 The following code is transcribed from ggml (ported, then adapted to
 SonicBoom's GGUF byte layouts where noted). It retains the MIT notice above.
 
-core/src/quant/ggml_derived/mmvq_q8_1.cuh
+core/src/quant/mmvq_q8_1.cuh
     q8_1 int8-activation mmvq (CUDA). Ported from:
       - quantize_q8_1            ← ggml/src/ggml-cuda/quantize.cu
       - vec_dot_q3_K_q8_1        ← ggml/src/ggml-cuda/vecdotq.cuh
@@ -30,7 +30,7 @@ core/src/quant/ggml_derived/mmvq_q8_1.cuh
       - get_int_b2 / get_int_b4, block_q8_1 layout
     (Adaptation: block_q8_1 keeps `d` as fp32; llama.cpp packs d+s into a half2.)
 
-core/src/quant/ggml_derived/mmq.cuh
+core/src/quant/mmq.cuh
     Q3_K / Q4_K / Q5_K / Q6_K int8-tensor-core "mmq" matmul (CUDA, Ampere). Ported from:
       - tile<> + load_ldmatrix + mma         ← ggml/src/ggml-cuda/mma.cuh
       - block_q8_1_mmq, sram_stride, process_tile,
@@ -64,7 +64,7 @@ core/src/quant/ggml_derived/mmq_upstream/
       - quantize_mmq_upstream.cuh  ← ggml/src/ggml-cuda/quantize.cu
     The new entry point core/src/quant/mmq_upstream.cu instantiates them.
 
-core/src/quant/ggml_derived/vec_dot_qK_q8K.h
+core/src/quant/vec_dot_qK_q8K.h
     q8_K scalar fixed-point reference (CPU). Ported from:
       - nearest_int              ← ggml/src/ggml-quants.c
       - Q8KBlock (block_q8_K)    ← ggml/src/ggml-quants.h
@@ -74,7 +74,7 @@ core/src/quant/ggml_derived/vec_dot_qK_q8K.h
       - dot_q5_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q5_K_q8_K_generic)
       - dot_q6_K_block           ← ggml/src/ggml-quants.c (ggml_vec_dot_q6_K_q8_K_generic)
 
-core/src/quant/ggml_derived/legacy_quants_q5_0_q8_0.h
+core/src/quant/legacy_quants_q5_0_q8_0.h
     32-element legacy block formats Q5_0 / Q8_0 (CPU). Ported from:
       - block_q5_0 / block_q8_0  ← ggml/src/ggml-common.h
       - dequantize_row_q5_0 / dequantize_row_q8_0
@@ -83,14 +83,14 @@ core/src/quant/ggml_derived/legacy_quants_q5_0_q8_0.h
       - ggml_vec_dot_q5_0_q8_0_generic / _q8_0_q8_0_generic
                                  ← ggml/src/ggml-cpu/quants.c
 
-core/src/quant/ggml_derived/quantize_q5_k.cpp
+core/src/quant/quantize_q5_k.cpp
     Q5_K reference quantizer. Ported from:
       - quantize_row_q5_K_ref    ← ggml/src/ggml-quants.c
       - make_qkx2_quants         ← ggml/src/ggml-quants.c
       - nearest_int, get_scale_min_k4, binary16 conversions
                                 ← ggml/src/ggml-quants.c / ggml-common.h
 
-core/src/vocab/ggml_derived/bpe_tokenizer.h
+core/src/vocab/bpe_tokenizer.h
     SPM-style BPE tokenize + detokenize, and the symbol-chain BPE merge shared
     by both vocabulary kinds. Ported from:
       - llm_tokenizer_bpe_session (symbol-chain BPE merge, <0xNN> byte fallback,
@@ -102,14 +102,14 @@ core/src/vocab/ggml_derived/bpe_tokenizer.h
                                                                  ← llama.cpp/src/llama-vocab.cpp
       - unicode_len_utf8, newline-run regex split               ← llama.cpp/src/unicode.cpp
 
-core/src/vocab/ggml_derived/gpt2_bpe_tokenizer.h
+core/src/vocab/gpt2_bpe_tokenizer.h
     Byte-level BPE pre-tokenizer, qwen2 and qwen35 patterns. Ported from:
       - unicode_regex_split_custom_qwen2 (the matcher for the qwen2 regex)
       - unicode_regex_split_custom_qwen35 (the qwen35 regex, whose word and
         punctuation arms also treat combining marks, \p{M}, as word characters)
                                                                  ← llama.cpp/src/unicode.cpp
 
-core/src/vocab/ggml_derived/unicode_cpt_flags.h
+core/src/vocab/unicode_cpt_flags.h
     Unicode codepoint classes (\p{L} / \p{N}) and the whitespace set the
     pre-tokenizer regexes split on. Transcribed from:
       - unicode_ranges_flags, unicode_set_whitespace   ← llama.cpp/src/unicode-data.cpp
@@ -118,7 +118,7 @@ core/src/vocab/ggml_derived/unicode_cpt_flags.h
     (Adaptation: stored as maximal runs queried by binary search, instead of
      upstream's 0x110000-entry array expanded at load.)
 
-core/src/vocab/ggml_derived/unicode_byte_map.h
+core/src/vocab/unicode_byte_map.h
     UTF-8 <-> codepoint conversion and the GPT-2 byte-level byte<->codepoint
     maps. Ported from:
       - unicode_cpt_to_utf8, unicode_cpt_from_utf8, unicode_cpts_from_utf8,

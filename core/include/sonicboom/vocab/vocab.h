@@ -34,8 +34,8 @@
 // handling, the bos/eos contract — is the same data, which is why the kind is
 // one enum field and not two types.
 //
-// The BPE/detokenize *algorithms* live in core/src/vocab/ggml_derived/ (MIT,
-// derived from ggml); this header and core/src/vocab/vocab.cpp only carry the
+// The BPE/detokenize *algorithms* live in core/src/vocab/ (MIT, derived from
+// ggml); this header and core/src/vocab/vocab.cpp only carry the
 // SonicBoom-owned data layout and the GGUF loading glue.
 
 #include <cstdint>

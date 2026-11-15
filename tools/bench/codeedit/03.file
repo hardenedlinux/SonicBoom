@@ -18,8 +18,8 @@
 
 #include <sonicboom/gguf/reader.h>
 
-#include "ggml_derived/bpe_tokenizer.h"
-#include "ggml_derived/gpt2_bpe_tokenizer.h"
+#include "bpe_tokenizer.h"
+#include "gpt2_bpe_tokenizer.h"
 
 namespace sonicboom::vocab {
 

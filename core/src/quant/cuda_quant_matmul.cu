@@ -32,8 +32,8 @@
 #include "../planner/mlir_autotune.h"  // Q1 tile-config cache (opt-in)
 #include "../planner/plan_hook.h"  // SB_NOTE_LAUNCH (plan record; no-op when off)
 
-#include "ggml_derived/mmvq_q8_1.cuh"
-#include "ggml_derived/mmq.cuh"
+#include "mmvq_q8_1.cuh"
+#include "mmq.cuh"
 #include "mmq_upstream.h"  // imported ggml MMQ kernels (ggml_derived/mmq_upstream/)
 
 #include <cublasLt.h>
@@ -155,7 +155,7 @@ __device__ inline float dequant_q6_K_value(const uint8_t* blk, int l) {
 // Q5_0 element j is ((nibble) | (5th bit << 4)) - 16, where the low nibbles of
 // qs carry elements 0..15, the high nibbles carry 16..31, and bit j of the
 // little-endian qh word is the 5th bit of element j. This is the same
-// arithmetic as dequantize_q5_0/q8_0 in ggml_derived/legacy_quants_q5_0_q8_0.h.
+// arithmetic as dequantize_q5_0/q8_0 in legacy_quants_q5_0_q8_0.h.
 __device__ inline float dequant_q5_0_value(const uint8_t* blk, int l) {
   const uint32_t xh = uint32_t(blk[2]) | (uint32_t(blk[3]) << 8) |
                       (uint32_t(blk[4]) << 16) | (uint32_t(blk[5]) << 24);
@@ -5163,7 +5163,7 @@ bool matmul_mmq_tc_dev(const QuantizedTensor& W, const BlockQ8_1Mmq* yq,
 // --- MMQ batched/fused prefill quantize (C.4, position-major) ---------------
 
 // Quantize one 128-element block (32 lanes) to block_q8_1_mmq, bit-identical to
-// ggml_derived/mmq.cuh's quantize_mmq_q8_1: each lane owns a 4-float (float4)
+// mmq.cuh's quantize_mmq_q8_1: each lane owns a 4-float (float4)
 // slot, amax is an fmaxf butterfly and the DS4 `sum` is the exact
 // (s0+s4)+(s2+s6)+((s1+s5)+(s3+s7)) shuffle-xor tree. The fused kernels below
 // route one 128-element block per warp so the lane mapping matches the unfused

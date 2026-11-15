@@ -76,7 +76,7 @@ file(GLOB_RECURSE SONICBOOM_SAFETENSORS_SOURCES CONFIGURE_DEPENDS
 
 # Tokenizer vocabulary (core/src/vocab/). Layer 2 data layout + GGUF loading
 # glue; the BPE/detokenize algorithms are header-only, MIT-derived from ggml
-# (core/src/vocab/ggml_derived/bpe_tokenizer.h). No ggml runtime dependency.
+# (core/src/vocab/bpe_tokenizer.h). No ggml runtime dependency.
 file(GLOB_RECURSE SONICBOOM_VOCAB_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/src/vocab/*.cpp)
 
@@ -270,7 +270,7 @@ if(SONICBOOM_USE_CUDA)
   # ggml-cuda/mmq.cu with -use_fast_math -extended-lambda. The arch already
   # matches (both trees emit sm_86 cubins) and the standard stays C++20 for
   # SonicBoom sources. Per-source options are the finest granularity available:
-  # the derived MMQ kernels are header-only (ggml_derived/mmq.cuh) and this TU
+  # the derived MMQ kernels are header-only (mmq.cuh) and this TU
   # is the one that instantiates them, but it also carries SonicBoom's q8_1
   # quantization, rms_norm_quantize_q8_1, gemv and dense-GEMM code.
   #
@@ -288,7 +288,7 @@ if(SONICBOOM_USE_CUDA)
   # The parity that matters is upstream's __launch_bounds__(256, 1), which
   # lets ptxas use 254 registers for Q3_K J=128 instead of 202 (exactly
   # llama.cpp's allocation; measured with cuobjdump). It lives in
-  # ggml_derived/mmq.cuh, next to the kernel it constrains.
+  # mmq.cuh, next to the kernel it constrains.
   #
   # The new upstream-MMQ TU mirrors upstream's command line for the imported
   # kernels (-extended-lambda), but not -use_fast_math: this path is unused for

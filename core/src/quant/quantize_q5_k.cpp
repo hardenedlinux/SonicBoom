@@ -4,8 +4,9 @@
 // LICENSES/ggml-MIT.txt file in the root directory of this source tree.
 //
 // SPDX-License-Identifier: MIT
+// Portions derived from llama.cpp (MIT License), commit 43fe9c642; see LICENSES/.
 
-#include "quantize_q5_k.h"
+#include "ggml_derived/quantize_q5_k.h"
 
 #include <algorithm>
 #include <bit>
